@@ -201,24 +201,31 @@ qwen3_5::execution::VisionParameters vision_parameters_for(const Model& model,
 }
 
 struct HcPlan {
-    Tensor norm, down, up, inject;
-    bool has_inject = false;
+    Tensor norm;
+    ops::HyperConnectionMatrix down, up, inject;
 
-    [[nodiscard]] ops::HyperConnectionWeights weights() const {
-        return {&norm, &down, &up, has_inject ? &inject : nullptr};
-    }
+    [[nodiscard]] ops::HyperConnectionWeights weights() const { return {&norm, down, up, inject}; }
 };
+
+// A hyper-connection matrix as stored: ggml Q8_0 blocks, or BF16 words.
+ops::HyperConnectionMatrix hc_matrix(const Model& model, WeightId id,
+                                     std::initializer_list<std::int32_t> shape) {
+    const Weight w = native_weight(model.weight(id).view);
+    if (w.qtype == QType::GGUF_Q8_0) {
+        return {w.qdata, ops::HyperConnectionMatrix::Format::Q8_0};
+    }
+    return {direct(model, id, shape).data, ops::HyperConnectionMatrix::Format::BF16};
+}
 
 HcPlan make_hc(const Model& model, const HyperConnectionWeights& w, const TextConfig& c) {
     const auto width = static_cast<std::int32_t>(c.hc_count * c.hidden_size);
     const auto low   = static_cast<std::int32_t>(c.hc_lowrank);
     HcPlan out;
     out.norm = direct(model, w.norm, {width});
-    out.down = direct(model, w.down, {width, low});
-    out.up   = direct(model, w.up, {low, width});
+    out.down = hc_matrix(model, w.down, {width, low});
+    out.up   = hc_matrix(model, w.up, {low, width});
     if (w.inject) {
-        out.inject     = direct(model, *w.inject, {width, static_cast<std::int32_t>(c.hc_count)});
-        out.has_inject = true;
+        out.inject = hc_matrix(model, *w.inject, {width, static_cast<std::int32_t>(c.hc_count)});
     }
     return out;
 }
