@@ -397,10 +397,11 @@ int main() {
     failures += run_case(4, true, true, 4554u, true, false);
     // Q8_0 matrices: the narrow kernels, the wide path's BF16 operands and FP32 inject rows,
     // the final mixer, the fused write/read and a graph replay.
-    for (const int tokens : {1, 3, 8, 9, 37}) {
+    for (const int tokens : {1, 3, 8, 9, 37, 300}) {
         failures += run_case(tokens, true, false, 4600u + tokens, false, false, true);
     }
     failures += run_case(1, false, false, 4650u, false, false, true);
+    failures += run_case(40, false, false, 4655u, false, false, true);
     failures += run_case(2, true, false, 4651u, true, false, true);
     failures += run_case(9, true, false, 4652u, true, true, true);
     failures += run_case(4, true, true, 4653u, true, false, true);
