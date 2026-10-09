@@ -344,9 +344,9 @@ python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
 ```
 
 The block keeps its matrices in the GGUF's blocks and its 512 experts, also beside the Coder
-build's 256; its norms drop their stored `1 + w`, and its hyper-connection matrices, which the
-`shared-Q8_0` file stores quantized, are decoded to BF16, the form their kernels read. The
-`shared-Q8_0` block adds 2.8 GB to the model.
+build's 256; its norms drop their stored `1 + w`, and its hyper-connection matrices keep the
+`shared-Q8_0` file's Q8_0 blocks, which their kernels read. The `shared-Q8_0` block adds 2.8 GB to
+the model.
 
 Every matrix keeps the block type the release chose (see [GGUF block formats](gguf.md)); the expert
 banks keep the exporter's expert-major layout, so one expert is one contiguous range of bytes. The

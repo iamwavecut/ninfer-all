@@ -473,7 +473,7 @@ measurements.
 **Built (October 2026).** The `mtp` component comes from Unsloth's `shared-` MTP GGUFs (block 48, `nextn.*`); its
 norms are stored as `1 + w` (their `w` is BF16-exact, checked on the `shared-Q8_0` file), `eh_proj` is
 `[fc_embedding | fc_hidden]` with the embedding's columns first and splits between blocks, and its hyper-connection
-matrices are Q8_0 there, decoded to BF16 for the HC kernels. The hidden norm follows vLLM: one RMSNorm over all 10240
+matrices keep their Q8_0 blocks, which the HC kernels read. The hidden norm follows vLLM: one RMSNorm over all 10240
 values of a cell (llama.cpp normalises per stream). The block runs on the head rank (the last stage); a split looks
 the token embedding up on rank 0 and copies the rows over. Its cells are vLLM's: cell i pairs the target's pre-mixer
 stack of position i with token i + 1 and rotates at i; the executor advances it over every token the model commits
@@ -1113,7 +1113,8 @@ oracle tests in `tests/ops/`, and a `bench/ops` microbenchmark):
    `hc_write(R, y, w_inj) -> R`, plus the fused `hc_write_read` (previous half's write folded into the next read's
    norm, vLLM `combine_and_mix`). Decode: weight-streaming GEMVs over 13 MB per half; multi-column form for verify
    windows (weights read once for T ≤ 16); prefill: two small GEMMs ([T,10240]x[10240,320], [T,320]x[320,10240]).
-   Weights BF16 (`A16Only`); evaluate int8 g64 later by end-to-end KL. Oracle: FP64 formula of 1.3.
+   Weights BF16 or ggml Q8_0 (`A16Only`: activations stay FP32; the GGUF recipe stores Q8_0 since October 9,
+   2026). Oracle: FP64 formula of 1.3 over the values the weights represent.
 2. **`ple_inject`** - `(emb [2560,T], R, hist[9,10240]) -> (R', hist')`: key/value projections (BF16 GEMV/GEMM),
    three grouped norms, signed-sqrt sigmoid gate, dilated causal conv (taps t-9/-6/-3/0), SiLU, residual add, history
    advance; plus a `ngram_dequant_rows` gather-decode (FP8-rowscale / IQ4_NL / BF16 rows -> FP32). Prefill form uses

@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tools.convert import gguf_blocks, qwen4_exp, qwen4_exp_gguf
-from tools.convert.sources.gguf import GGUFFile, write_gguf
+from tools.convert.sources.gguf import TYPE_BF16, GGUFFile, write_gguf
 
 TYPE_Q2_0 = 42
 TYPE_IQ4_NL = 20
@@ -237,3 +237,44 @@ def _pruned(tmp_path):
     path = tmp_path / "pruned.gguf"
     write_gguf(path, {"general.architecture": "qwen4exp", "qwen4exp.expert_count": 256}, [])
     return path
+
+
+def _q8_0_reference(row: np.ndarray) -> bytes:
+    """ggml quantize_row_q8_0_ref, one block at a time in FP32 scalars."""
+
+    out = bytearray()
+    for block in row.astype(np.float32).reshape(-1, 32):
+        d = np.float32(max(abs(float(x)) for x in block)) / np.float32(127)
+        inverse = np.float32(1) / d if d else np.float32(0)
+        out += np.float16(d).tobytes()
+        for x in block:
+            scaled = float(np.float32(x) * inverse)
+            code = int(np.sign(scaled) * np.floor(abs(scaled) + 0.5))
+            out += code.to_bytes(1, "little", signed=True)
+    return bytes(out)
+
+
+def test_hyper_connection_matrices_become_ggml_q8_0_rows(tmp_path):
+    # A BF16 matrix is quantized by ggml's reference rounding; a Q8_0 one keeps its blocks.
+    generator = np.random.default_rng(10)
+    rows, columns = 5, 96
+    values = (generator.standard_normal((rows, columns)) * 0.05).astype(np.float32)
+    values[1, :32] = 0.0
+    words = (values.view(np.uint32) >> 16).astype(np.uint16)
+    blocks = _q8_0_blocks(generator, rows, columns)
+    path = tmp_path / "hc.gguf"
+    write_gguf(path, {"general.architecture": "qwen4exp"},
+               [("bf16", (rows, columns), TYPE_BF16, words.tobytes()),
+                ("q8", (rows, columns), TYPE_Q8_0, blocks.tobytes())])
+    represented = (words.astype(np.uint32) << 16).view(np.float32)
+    with GGUFFile(path) as gguf:
+        quantized = qwen4_exp_gguf.hc_matrix_source(gguf, "bf16", (rows, columns))
+        encoded = quantized.read_encoded(1, 4)
+        assert encoded.format == "gguf_q8_0"
+        assert encoded.codes.numpy().tobytes() == b"".join(
+            _q8_0_reference(represented[r]) for r in range(1, 4))
+        assert torch.equal(quantized.rows(1, 4),
+                           torch.from_numpy(gguf_blocks.dequantize_q8_0(encoded.codes.numpy())))
+        kept = qwen4_exp_gguf.hc_matrix_source(gguf, "q8", (rows, columns))
+        assert torch.equal(kept.read_encoded(0, rows).codes,
+                           torch.from_numpy(blocks.reshape(rows, -1)))
