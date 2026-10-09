@@ -16,10 +16,12 @@ namespace ninfer::ops {
  * input from it and writes its output back into every stream with a per-stream weight.
  *
  * `stack` is FP32 [hidden, streams, tokens] (stream c of token t at column-major offset
- * (t * streams + c) * hidden). The weights are BF16, stored as each row's input contiguous:
- * `norm` [streams * hidden], `down` [streams * hidden, lowrank], `up` [lowrank, streams * hidden],
- * and `inject` [streams * hidden, streams] (absent for the final mixer). With n = streams and
- * xs = stack[:, :, t] flattened stream-major, the read computes in exact arithmetic
+ * (t * streams + c) * hidden). `norm` [streams * hidden] is BF16; the matrices are stored as each
+ * row's input contiguous, in BF16 words or in ggml Q8_0 blocks (32 consecutive inputs of a row as
+ * a binary16 scale d and 32 signed codes q, value d * q): `down` [streams * hidden, lowrank], `up`
+ * [lowrank, streams * hidden], and `inject` [streams * hidden, streams] (absent for the final
+ * mixer). With n = streams and xs = stack[:, :, t] flattened stream-major, the read computes in
+ * exact arithmetic over the represented values
  *
  *   xn[c, d]  = xs[c, d] / sqrt(mean_d xs[c, d]^2 + eps) * (1 + norm[c * hidden + d])
  *   lo        = silu((down . xn) / n)                                         (lowrank)
@@ -33,11 +35,18 @@ namespace ninfer::ops {
  * including the FP32 intermediates in workspace, is implementation-defined. The shapes this
  * implements are streams 4, hidden 2560 and lowrank 320.
  */
+// One matrix of a hyper-connection, 16-byte aligned, in the geometry above.
+struct HyperConnectionMatrix {
+    enum class Format { BF16, Q8_0 };
+    const void* data = nullptr; // null: absent
+    Format format    = Format::BF16;
+};
+
 struct HyperConnectionWeights {
-    const Tensor* norm   = nullptr;
-    const Tensor* down   = nullptr;
-    const Tensor* up     = nullptr;
-    const Tensor* inject = nullptr; // the final mixer has none
+    const Tensor* norm = nullptr;
+    HyperConnectionMatrix down;
+    HyperConnectionMatrix up;
+    HyperConnectionMatrix inject; // the final mixer has none
 };
 
 [[nodiscard]] std::size_t hyper_connection_read_workspace_bytes(std::int32_t streams,
@@ -45,7 +54,9 @@ struct HyperConnectionWeights {
                                                                 std::int32_t lowrank,
                                                                 std::int32_t tokens);
 
-// `inject_weights` must be null exactly when `weights.inject` is.
+// `inject_weights` must be null exactly when `weights.inject` is absent. Up to eight tokens the
+// products accumulate in FP32 over FP32 activations; wider calls multiply BF16 activations by BF16
+// weights (Q8_0 values rounded to BF16) on the tensor cores.
 void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& weights, float eps,
                            WorkspaceArena& workspace, Tensor& mixed, Tensor* inject_weights,
                            cudaStream_t stream);

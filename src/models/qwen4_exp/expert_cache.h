@@ -85,9 +85,11 @@ public:
         std::int32_t victim = -1;                 // the expert that left the slot, or -1
         std::array<const void*, 3> victim_host{}; // the victim's projections in host memory
     };
-    // Takes a slot of a handed-over `layer` for the uncached `expert`: a free one, else the one
-    // whose expert `last_use` stamps least recently among those `in_use` (a flag per expert) does
-    // not mark. False when the layer has no slot to give. The caller copies the expert in and
+    // Takes a slot of a handed-over `layer` for the uncached `expert`: a free one, else, among
+    // the experts `in_use` (a flag per expert) does not mark, the one `last_use` stamps least
+    // recently in the lowest tier of decayed route counts (about once lately, a few times, often),
+    // so a passing decode does not push out a working set other prompts keep routing to. False
+    // when the layer has no slot to give. The caller copies the expert in and
     // updates the device tables before the layer's next call; a route of the expert counts as a
     // miss until the next observe.
     bool admit(std::size_t layer, std::int32_t expert, std::span<const std::uint32_t> last_use,

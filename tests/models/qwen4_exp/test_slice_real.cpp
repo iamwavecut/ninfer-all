@@ -171,14 +171,10 @@ void hc_read(Context& c, const std::string& prefix, Tensor& mixed, Tensor* injec
     Device up(c.ckpt.bytes(prefix + "input_mix_weight_up.weight"));
     std::unique_ptr<Device> inject_rows;
     Tensor t_norm(norm.buffer.p, DType::BF16, {kWidth});
-    Tensor t_down(down.buffer.p, DType::BF16, {kWidth, kLowrank});
-    Tensor t_up(up.buffer.p, DType::BF16, {kLowrank, kWidth});
-    Tensor t_inject;
-    ops::HyperConnectionWeights weights{&t_norm, &t_down, &t_up, nullptr};
+    ops::HyperConnectionWeights weights{&t_norm, {down.buffer.p}, {up.buffer.p}, {}};
     if (inject) {
         inject_rows = std::make_unique<Device>(c.ckpt.bytes(prefix + "block_inject_weight.weight"));
-        t_inject = Tensor(inject_rows->buffer.p, DType::BF16, {kWidth, kHC});
-        weights.inject = &t_inject;
+        weights.inject = {inject_rows->buffer.p};
     }
     WorkspaceArena workspace(ops::hyper_connection_read_workspace_bytes(kHC, kH, kLowrank, c.tokens));
     ops::hyper_connection_read(c.stack, weights, kEps, workspace, mixed, inject, c.device.stream);

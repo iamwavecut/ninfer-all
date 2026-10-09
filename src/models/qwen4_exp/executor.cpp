@@ -201,24 +201,31 @@ qwen3_5::execution::VisionParameters vision_parameters_for(const Model& model,
 }
 
 struct HcPlan {
-    Tensor norm, down, up, inject;
-    bool has_inject = false;
+    Tensor norm;
+    ops::HyperConnectionMatrix down, up, inject;
 
-    [[nodiscard]] ops::HyperConnectionWeights weights() const {
-        return {&norm, &down, &up, has_inject ? &inject : nullptr};
-    }
+    [[nodiscard]] ops::HyperConnectionWeights weights() const { return {&norm, down, up, inject}; }
 };
+
+// A hyper-connection matrix as stored: ggml Q8_0 blocks, or BF16 words.
+ops::HyperConnectionMatrix hc_matrix(const Model& model, WeightId id,
+                                     std::initializer_list<std::int32_t> shape) {
+    const Weight w = native_weight(model.weight(id).view);
+    if (w.qtype == QType::GGUF_Q8_0) {
+        return {w.qdata, ops::HyperConnectionMatrix::Format::Q8_0};
+    }
+    return {direct(model, id, shape).data, ops::HyperConnectionMatrix::Format::BF16};
+}
 
 HcPlan make_hc(const Model& model, const HyperConnectionWeights& w, const TextConfig& c) {
     const auto width = static_cast<std::int32_t>(c.hc_count * c.hidden_size);
     const auto low   = static_cast<std::int32_t>(c.hc_lowrank);
     HcPlan out;
     out.norm = direct(model, w.norm, {width});
-    out.down = direct(model, w.down, {width, low});
-    out.up   = direct(model, w.up, {low, width});
+    out.down = hc_matrix(model, w.down, {width, low});
+    out.up   = hc_matrix(model, w.up, {low, width});
     if (w.inject) {
-        out.inject     = direct(model, *w.inject, {width, static_cast<std::int32_t>(c.hc_count)});
-        out.has_inject = true;
+        out.inject = hc_matrix(model, *w.inject, {width, static_cast<std::int32_t>(c.hc_count)});
     }
     return out;
 }
@@ -622,7 +629,10 @@ struct Executor::Impl {
     struct PoolPrefetch {
         std::size_t layer = ~std::size_t{0};
         cudaEvent_t ready = nullptr, free = nullptr;
+        // Pinned table sources: a copy reads its buffer when it runs, so a buffer is rewritten only
+        // once the copy that last read it is done (`copied`); the host runs ahead of the device.
         std::array<std::unique_ptr<PinnedHostBuffer>, 2> entries;
+        std::array<cudaEvent_t, 2> copied{};
         int next = 0;
     };
     std::vector<PoolPrefetch> prefetches; // by rank
@@ -771,6 +781,9 @@ struct Executor::Impl {
             RankBinding bind(device, r);
             if (prefetches[r].ready != nullptr) { cudaEventDestroy(prefetches[r].ready); }
             if (prefetches[r].free != nullptr) { cudaEventDestroy(prefetches[r].free); }
+            for (cudaEvent_t copied : prefetches[r].copied) {
+                if (copied != nullptr) { cudaEventDestroy(copied); }
+            }
         }
     }
 
@@ -1542,6 +1555,10 @@ struct Executor::Impl {
             for (auto& entries : prefetch.entries) {
                 entries = std::make_unique<PinnedHostBuffer>(3 * experts * sizeof(void*));
             }
+            for (cudaEvent_t& copied : prefetch.copied) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&copied, cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventRecord(copied, device.rank(r).transfer_stream));
+            }
         }
     }
 
@@ -1557,8 +1574,10 @@ struct Executor::Impl {
         CUDA_CHECK(cudaStreamWaitEvent(t, state.free, 0));
         const MoePlan& m          = plan.moe;
         const std::size_t experts = m.gate.pointers.size();
-        auto* entries = static_cast<const void**>(state.entries[std::size_t(state.next)]->data());
+        const auto buffer = std::size_t(state.next);
         state.next ^= 1;
+        CUDA_CHECK(cudaEventSynchronize(state.copied[buffer]));
+        auto* entries = static_cast<const void**>(state.entries[buffer]->data());
         const ExpertTable* tables[3] = {&m.gate, &m.up, &m.down};
         for (std::size_t e = 0; e < experts; ++e) {
             if (cache && cache->cached(index, 0, std::int32_t(e)) != nullptr) {
@@ -1586,6 +1605,7 @@ struct Executor::Impl {
         }
         CUDA_CHECK(cudaMemcpyAsync(pool.tables.p, entries, 3 * experts * sizeof(void*),
                                    cudaMemcpyHostToDevice, t));
+        CUDA_CHECK(cudaEventRecord(state.copied[buffer], t));
         CUDA_CHECK(cudaEventRecord(state.ready, t));
         state.layer = index;
     }

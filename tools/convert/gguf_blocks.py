@@ -205,6 +205,22 @@ def dequantize_q8_0(blocks: np.ndarray) -> np.ndarray:
     return (q * d).reshape(rows, -1)
 
 
+def quantize_q8_0(values: np.ndarray) -> np.ndarray:
+    """ggml quantize_row_q8_0_ref over rows of whole blocks, in FP32: per 32 values a binary16
+    d = amax / 127 and codes round(x / d), halves away from zero. Returns [rows, row bytes]."""
+
+    rows = values.shape[0]
+    blocks = np.ascontiguousarray(values, dtype=np.float32).reshape(rows, -1, 32)
+    d = np.abs(blocks).max(axis=-1) / np.float32(127.0)
+    inverse = np.divide(np.float32(1.0), d, out=np.zeros_like(d), where=d != 0)
+    scaled = blocks * inverse[..., None]
+    codes = (np.sign(scaled) * np.floor(np.abs(scaled) + np.float32(0.5))).astype(np.int8)
+    out = np.empty((rows, blocks.shape[1], 34), dtype=np.uint8)
+    out[..., :2] = d.astype("<f2")[..., None].view(np.uint8)
+    out[..., 2:] = codes.view(np.uint8)
+    return out.reshape(rows, -1)
+
+
 def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Tensor:
     blocks = gguf.read_blocks(tensor, first, last)
     local = {GGML_Q2_0: dequantize_q2_0, GGML_Q8_0: dequantize_q8_0}.get(
