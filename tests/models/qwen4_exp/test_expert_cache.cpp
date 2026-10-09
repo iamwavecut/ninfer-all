@@ -2,8 +2,9 @@
 // admissions and growth, every table entry points either at the expert's bytes in the pinned host
 // block or at a device slot holding the same bytes, a cached down matrix followed by zeros (the
 // expert matrix kernel reads past a down row's end). It must also admit the experts a layer routes
-// to most, keep within its slots, give every layer the same number of slots, take the least
-// recently used slot not in use on an admission, and count a fresh admission's routes as misses.
+// to most, keep within its slots, give every layer the same number of slots, take on an admission
+// the least recently used slot not in use of the lowest frequency tier, and count a fresh
+// admission's routes as misses.
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/qwen4_exp/expert_cache.h"
@@ -176,6 +177,26 @@ int run() {
     device.synchronize();
     require(g1.verify("gate 1 admitted") <= 12 && d1.verify("down 1 admitted", 256) <= 12,
             "admitted slots hold their experts");
+
+    // Frequency outranks recency: once every route count has decayed, an expert routed often
+    // since stays although it was used longest ago, and the least recently used of the rest goes.
+    cache.observe(1, {}, 100000);
+    std::vector<std::int32_t> by_age;
+    for (int e = 0; e < kExperts; ++e) {
+        if (cache.cached(1, 0, e) != nullptr) { by_age.push_back(e); }
+    }
+    for (std::size_t i = 0; i < by_age.size(); ++i) {
+        last_use[std::size_t(by_age[i])] = 1000 + std::uint32_t(i);
+    }
+    cache.observe(1, std::vector<std::int32_t>(8, by_age.front()), 1);
+    std::int32_t third = 0;
+    while (cache.cached(1, 0, third) != nullptr) { ++third; }
+    std::fill(in_use.begin(), in_use.end(), 0);
+    in_use[std::size_t(third)] = 1;
+    const auto tiered = admit(third, last_use, in_use);
+    require(by_age.size() == 12 && tiered.victim == by_age[1],
+            "the least recently used expert of the lowest frequency tier leaves");
+    require(cache.cached(1, 0, by_age.front()) != nullptr, "the often routed expert stays");
 
     // Growth after startup: both layers gain the same number of free slots in a second block,
     // which the next admissions and rebalances fill.

@@ -384,7 +384,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 |---|---|
 | `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin, and after the warm-up what is still free beyond 640 MiB; `0` disables the host-mode cache (disk mode needs one) |
-| `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks straight into the slot of the layer's least recently used expert, by the copy engine while the cached ones run, and keeps it there (`staged`, the default); or its expert kernels read the missing experts across the bus and the cache admits between passes (`mapped`) |
+| `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks straight into the slot of the layer's least recently used expert of the lowest frequency tier, by the copy engine while the cached ones run, and keeps it there (`staged`, the default); or its expert kernels read the missing experts across the bus and the cache admits between passes (`mapped`) |
 | `--expert-dma-share F` | host experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1` (default `1`); below `1` the CPU computes the rest from RAM while the GPU runs the cached ones, in its own arithmetic, and their slots fill behind the call; prefill always runs on the GPU. Neutral on an RTX 3090 with an 8-core CPU |
 | `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers; default is the physical cores less two (counted as half the logical threads), at most 16 |
 | `--expert-cache-adaptive` | replace cold cached native experts between calls; off by default because it changes the CPU/GPU arithmetic partition |
@@ -404,7 +404,9 @@ Every expert runs on the GPU by default. GGUF host experts can give the CPU a sh
 missing experts (`--expert-dma-share`); native-format experiments are retained for reference. The
 existing GGUF artifacts support both host and disk residency. With host experts every expert
 layer gets the same number of cache slots (the MTP block's wider experts take more of the bytes);
-staged misses fill the text layers' slots by recency, and a prompt chunk lets the cache admit its
+staged misses fill the text layers' slots by recency within tiers of decayed route counts (about
+once lately, a few times, often), so a passing decode does not evict a working set other prompts
+keep routing to, and a prompt chunk lets the cache admit its
 most routed experts by decayed counts; disk residency uses a CLOCK device cache. Disk residency
 relies on the OS page cache for repeated file reads. An additional application-managed RAM
 cache of experts is excluded from the current delivery. The device cache and bounded transfer
@@ -683,7 +685,8 @@ available for this model; `--lookup-ngram`, `--adaptive-mtp`, `--mtp-attention-w
 - Up to eight tokens of GGUF host experts run in two stages. A kernel splits the call's routes into
   the cached experts, which run at once, and the missing ones, which it posts to a host service
   through mapped memory, without a host synchronization; the service copies each missing expert
-  into the slot of the layer's least recently used expert (or the CPU computes its share), the
+  into the slot of the layer's least recently used expert of the lowest frequency tier (or the CPU
+  computes its share), the
   layer waits for it on the device, and the second stage runs it. The decode form of the expert
   kernels needs no sort or memset: one small kernel lists each slot's pairs, quantizes the tokens'
   inputs once and zeroes the sum; a block of the fused gate/up kernel takes 32 rows of one
@@ -739,11 +742,19 @@ binaries' outputs part after 40-70 tokens, most likely because the router's sums
 row over four warps and its wide calls run as a BF16 GEMM (not isolated).
 
 The first request's time to first token is unchanged (462 and 464 ms), but a prompt's second run
-now starts later: 298-387 ms instead of 174-320 ms. Staged misses admit every missing expert into
-the least recently used slot, so a decode moves the cache to its own experts and evicts the other
+started later: 298-387 ms instead of 174-320 ms. Staged misses admitted every missing expert into
+the least recently used slot, so a decode moved the cache to its own experts and evicted the other
 prompts' (46-58 MiB copied a token in second runs, against 3-14 MiB before). Letting decayed counts
-veto an admission restored those starts but cost first runs 13-22% of their decode speed, so the
-cache stays recency-only.
+veto an admission restored those starts but cost first runs 13-22% of their decode speed. An
+admission now takes the least recently used slot of the lowest tier of decayed route counts (below
+1.5, below 6, the rest), so the experts other prompts keep routing to outlast a passing decode. On
+a second RTX 3090 (a rented host, driver 580.82.09, CUDA 12.8, the same protocol), against recency
+alone, second runs started after 212-305 instead of 284-397 ms and first runs after 367-416 instead
+of 406-416 ms; first-run decode changed by -4.4% to -0.6% (Chinese 86.2 instead of 90.2 tokens/s),
+second-run decode by -1.6% to +1.0%, and the six requests took 19.44 instead of 19.53 s. Two tiers
+(often or not, at 6 or 12 routes) and the thresholds 1/4 and 3/12 started second runs after 208-371
+ms at a similar decode cost and took longer in total. Recency alone repeated its admissions and
+copies exactly from run to run.
 
 Measured improvements by kernel, from node traces of plain decode (each a share of a 10.1 ms
 token): Q2_0's transposed decoding took the routed up kernel from 26.8 to 18.9 µs and the down
