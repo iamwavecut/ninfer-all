@@ -735,7 +735,8 @@ configuration once; the baseline is commit `a9155e0`.
 | disk experts, code / prose (first run) | 64.5, 66.8 | 68.1, 71.4 |
 
 A 5,669-token prompt prefilled at 1,253 instead of 727 tokens/s, and its 64 output tokens decoded
-at 76.8 instead of 52.0 tokens/s. Run back to back, a repeated prompt decodes at 98.5 (code) and
+at 76.8 instead of 52.0 tokens/s, but this build computed long prompts wrongly with host experts
+(see the prefetch fix below), so these two figures do not stand. Run back to back, a repeated prompt decodes at 98.5 (code) and
 100.4 (prose) tokens/s plain and 137.6 and 123.7 with three drafts. Within each binary every mode
 (plain, MTP 2-4, disk, a CPU share of 0.5, mapped misses) produced the same tokens; the two
 binaries' outputs part after 40-70 tokens, most likely because the router's sums now split each
@@ -761,6 +762,84 @@ token): Q2_0's transposed decoding took the routed up kernel from 26.8 to 18.9 �
 kernel from 25.7 to 21.5 µs per layer; Q3_K's split decoding cut its dense products from 1.06 to
 0.98 ms a token. Shared memory staging of the weights (cp.async) and unconditional clamped loads in
 the dense kernels were slower or neutral and were dropped.
+
+### October 9 fix: prefetched expert tables
+
+From commit `5118e069d` on, a host-expert prompt call of 256 tokens or more prefetched each layer's
+uncached experts into the slot pool and copied the layer's expert tables from one of two pinned
+buffers. A copy reads its buffer when it runs, and the host enqueues layers ahead of the device,
+so a later layer's tables could replace a buffer's contents before its copy ran: such calls
+multiplied some layers' tokens by other layers' experts. Each buffer is now rewritten only after
+the copy that last read it has run. Over the first 40 KB of the WikiText stream of
+`eval/corpora/perplexity-1m` (4,096-token windows, a 2,048-token stride, int8 KV) the Q2 model
+with host experts read 3.995-4.047, varying from run to run, before the fix and 2.5390 after it,
+as disk experts and the build before the prefetch (`a9155e0`, 2.5407) do. Decode steps and prompt
+calls below 256 tokens never took that path, so the decode measurements above stand. On the
+second RTX 3090 of the tier measurements, a 4,958-token prompt prefills at 1,234 tokens/s with the
+fix and 758 with `a9155e0`; its 64 output tokens decode at 79.1 and 61.2 tokens/s.
+
+### October 9 hyper-connection matrices in Q8_0
+
+The hyper-connection projections were the largest read of a decoded token: 97 down/up pairs and
+96 inject matrices, 1.27 GB in BF16. They are now ggml Q8_0 (32 inputs of a row share a binary16
+scale), 0.67 GB. The GGUF recipe quantizes the releases' BF16 matrices with ggml's
+`quantize_row_q8_0_ref` and keeps the MTP GGUF's own Q8_0 blocks, which it used to decode to
+BF16. The three public artifacts were rewritten the same way with `scripts/pods/requantize_hc.py`,
+every other object copied byte for byte: Q2_0 40,709,159,936 bytes, IQ3_S 57,902,944,256 and the
+Coder build 32,685,469,696, each 618,159,104 smaller. Over the text matrices the represented
+values differ from the BF16 ones by at most 0.0334, 4.79e-4 RMS.
+
+The read's kernels for Q8_0 (one RTX 3090, CUDA 12.8, the fused write/read as a CUDA Graph, L2
+evicted between samples, medians of 61):
+
+| Tokens | 1 | 4 | 8 | 9 | 16 | 128 | 512 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| BF16, µs | 23.6 | 28.7 | 44.0 | 43.0 | 45.1 | 98.3 | 384.0 |
+| Q8_0, µs | 19.5 | 27.6 | 38.9 | 67.6 | 68.6 | 122.9 | 403.5 |
+
+Up to eight tokens the kernels decode four weights at a time into exact FP32 values and keep the
+activations FP32; four down rows share each CTA's activation loads. A first version that gave each
+lane a whole 34-byte block made its activation loads 128 bytes apart and was 54-93% slower than
+BF16 from four tokens on. Wider calls round the Q8_0 values to BF16 for the tensor-core products,
+which costs two dequantizations of 13 µs a call: prompts and batches of nine or more tokens a step
+pay 5-57% more for these reads.
+
+Through `ninfer-serve` on the second RTX 3090 (the rented host of the tier measurements: driver
+580.82.09, CUDA 12.8) with the October 9 protocol, the Q2 model before and after the rewrite, each
+configuration run twice: plain decode went from 81.3-93.6 to 84.5-97.7 tokens/s, 3.6-6.0% faster
+for every prompt and run (a configuration's two runs within 0.6% of each other), and decode with
+three MTP drafts from 84.5-114.4 to 83.0-120.4 tokens/s, 0.4-10.0% faster per prompt on average
+(its runs within 5%; one run of the first Chinese answer was 1.8% slower). The weights on the GPU
+went from 3.38 to 2.83 GiB and the device expert cache grew from 17,340 to 17,786 MiB, but its hit
+rate moved by at most half a point, so the gain is the reads'. With the prefetch fix, a 4,958-token
+prompt prefilled at 1,268 instead of 1,234 tokens/s and its 64 output tokens decoded at 81.9
+instead of 79.1 tokens/s (one run each). Both answer coherently; their outputs part within the
+first tokens, as two quantizations do.
+
+Perplexity over the quick corpora (4,096-token windows advancing by 2,048, int8 KV, host experts,
+with the prefetch fix), the BF16 matrices against Q8_0:
+
+| Model, corpus | BF16 | Q8_0 | Change |
+|---|---:|---:|---:|
+| Q2_0, `perplexity-1m` | 3.93783 | 3.93842 | +0.015% |
+| Q2_0, `perplexity-heldout-2026-09` | 4.69573 | 4.69673 | +0.021% |
+
+Domain by domain the Q2_0 changes run from -0.11% (this repository's code) to +0.36% (new English
+Wikipedia articles). The other two builds, whose text matrices are the same bytes, were checked on
+two 40 KB slices only, the start of the WikiText stream above and of the held-out English Wikipedia
+stream (9,234 and 9,477 tokens):
+
+| Model | WikiText slice | Change | Held-out Wikipedia slice | Change |
+|---|---:|---:|---:|---:|
+| Q2_0 | 2.5390 → 2.5440 | +0.20% | 7.3517 → 7.4048 | +0.72% |
+| IQ3_S | 1.9767 → 1.9724 | -0.22% | 6.5552 → 6.5604 | +0.08% |
+| Coder | 4.2254 → 4.1985 | -0.64% | 8.9087 → 8.9281 | +0.22% |
+
+Over so few tokens one quantization moves perplexity by up to 0.7% either way; the corpora above
+are the measure.
+AIME and GPQA were not rerun: one AIME problem is 3.3 points and one GPQA-Diamond run's standard
+error about 2.5, far more than these differences could move, and the pair takes most of a day on
+one RTX 3090.
 
 ### October 8 public MTP attachments
 
