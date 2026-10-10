@@ -178,7 +178,7 @@ int main() {
                           !scheduler.should_attempt_admission(true, true, true, false, false) &&
                           scheduler.should_attempt_admission(true, true, true, true, false) &&
                           !scheduler.should_attempt_admission(true, true, false, false, true) &&
-                          scheduler.choose_execution(true, false, false) == ExecutionAction::Decode,
+                          scheduler.choose_execution(true, false, 0) == ExecutionAction::Decode,
                       "admission and GPU-unit fairness gates changed");
     scheduler.set_prefill_lane(0);
     failures += check(!scheduler.should_attempt_admission(true, true, true, true, false),
@@ -189,9 +189,18 @@ int main() {
                   scheduler.should_attempt_admission(true, true, true, true, false) &&
                   !scheduler.should_attempt_admission(true, true, true, false, false) &&
                   !scheduler.should_attempt_admission(true, true, true, true, true) &&
-                  scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
-                  scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
+                  scheduler.choose_execution(true, true, 0) == ExecutionAction::Decode &&
+                  scheduler.choose_execution(true, true, 1) == ExecutionAction::Prefill,
               "prefill/decode alternation changed");
+    // Several decode rounds after each prefill unit keep decoding streams responsive; a prefill
+    // with nothing decoding runs at once.
+    scheduler.configure_decode_rounds(3);
+    failures += check(scheduler.choose_execution(true, true, 2) == ExecutionAction::Decode &&
+                          scheduler.choose_execution(true, true, 3) == ExecutionAction::Prefill &&
+                          scheduler.choose_execution(false, true, 0) == ExecutionAction::Prefill &&
+                          scheduler.should_attempt_admission(true, true, true, 2, false),
+                      "decode rounds per prefill unit changed");
+    scheduler.configure_decode_rounds(1);
     // Multiple requests may own staged prefill simultaneously; admission stays open while
     // any of them prefill (each unit advances one lane), but an open global topology
     // transition still gates it.

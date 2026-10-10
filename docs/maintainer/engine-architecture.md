@@ -388,7 +388,9 @@ Scheduler 保证：
   `concurrent_prefill`（`--concurrent-prefill`）后，由于 prefill 不持有 resource transaction，
   admission 可以在其它 request prefill 期间进行（仍受 open global topology transition 与 decode
   连续性的门控），多个 request 可以同时处于 staged-prefill 状态；
-- 已有 decode work 不会被连续 prefill 饿死；
+- 已有 decode work 不会被连续 prefill 饿死：每个 prefill unit 之后，只要有 decode work，就先运行
+  `decode_rounds_per_prefill` 个 decode（或 control）unit（`0` 为 `prefill_chunk / 64`，`1` 为严格
+  交替），再运行下一个 prefill unit；
 - decode round 包含所有且仅包含当前 decode-ready requests；
 - batch 使用精确 `B`，不以 inactive lane padding 到 `max_concurrency`。
 

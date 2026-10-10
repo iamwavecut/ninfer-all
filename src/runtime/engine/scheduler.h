@@ -238,21 +238,31 @@ public:
     // Either way it stays gated by any open global resource topology transition
     // (context_transaction) and by decode continuity (existing decode is never starved by
     // admission work).
+    // `decode_run` counts the decode and control units executed since the last prefill unit.
     [[nodiscard]] bool should_attempt_admission(bool have_pending, bool admission_check_pending,
-                                                bool have_decode, bool previous_unit_was_decode,
+                                                bool have_decode, std::uint32_t decode_run,
                                                 bool context_transaction) const noexcept {
         return have_pending && admission_check_pending && !context_transaction &&
-               (concurrent_prefill_ || prefill_lanes_ == 0) &&
-               (!have_decode || previous_unit_was_decode);
+               (concurrent_prefill_ || prefill_lanes_ == 0) && (!have_decode || decode_run != 0);
     }
 
     void allow_concurrent_prefill(bool allowed) noexcept { concurrent_prefill_ = allowed; }
 
+    // Decode (or control) units that run after each prefill unit while decode work exists. A
+    // decode round takes tens of milliseconds and a prefill chunk hundreds, so strict alternation
+    // leaves decoding streams a few percent of the GPU while another request prefills.
+    void configure_decode_rounds(std::uint32_t rounds) {
+        if (rounds == 0) {
+            throw std::invalid_argument("decode rounds per prefill unit must be positive");
+        }
+        decode_rounds_ = rounds;
+    }
+
     [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
-                                                   bool previous_unit_was_decode) const noexcept {
+                                                   std::uint32_t decode_run) const noexcept {
         if (prefill_runnable) {
-            return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
-                                                            : ExecutionAction::Prefill;
+            return have_decode && decode_run < decode_rounds_ ? ExecutionAction::Decode
+                                                              : ExecutionAction::Prefill;
         }
         return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
     }
@@ -407,6 +417,7 @@ public:
 private:
     std::uint64_t prefill_lanes_ = 0; // bit i set when lane i owns staged prefill
     bool concurrent_prefill_     = false;
+    std::uint32_t decode_rounds_ = 1;
     std::optional<std::uint64_t> fifo_head_id_;
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;
