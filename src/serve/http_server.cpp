@@ -455,6 +455,11 @@ void HttpServer::stop_stats_reporter() {
 httplib::Server::HandlerResponse HttpServer::pre_route(const httplib::Request& req,
                                                        httplib::Response& res) const {
     ensure_openai_request_id(req, res);
+    // Every response, the loading 503 and authentication failures included, so a caller can tell
+    // which build answered without a credential.
+    if (!options_.build_version.empty()) {
+        res.set_header("X-NInfer-Version", options_.build_version);
+    }
     if (!ready_.load(std::memory_order_acquire)) {
         // Runs for every route, including /health and OPTIONS, so a caller cannot tell "not
         // ready" apart from "unauthenticated" -- and skips the API-key check below, since a
@@ -989,7 +994,9 @@ void HttpServer::handle_health(httplib::Response& res) const {
         }
     }
     res.status           = available ? 200 : 503;
-    res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
+    res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"},
+                                   {"version", options_.build_version}}
+                        .dump(),
                     "application/json");
 }
 
@@ -1040,6 +1047,7 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         {"model_alias", lease.model()},
         {"model_path", options.artifact_path},
         {"modalities", {{"vision", options.enable_vision}, {"audio", false}}},
+        {"build_info", "ninfer " + options_.build_version},
         {"is_sleeping", service.residency().state == ninfer::ModelResidency::Suspended},
         {"endpoint_slots", true},
         {"endpoint_props", true},

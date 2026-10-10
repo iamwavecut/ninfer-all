@@ -20,6 +20,10 @@ inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
 struct ServeOptions {
     bool help_requested = false;
+    bool version_requested = false;
+    // `<VERSION>+<build id>` of this binary, set by ninfer-serve from its build stamp (not a flag):
+    // GET /health, the X-NInfer-Version header, /props build_info and the server_start record.
+    std::string build_version;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
