@@ -1984,11 +1984,20 @@ private:
     // The lowest lane owning staged prefill that can advance now. A lane offering an active
     // capture, or whose media item still encodes in a concurrent overlay window, yields its unit.
     [[nodiscard]] std::optional<std::uint32_t> runnable_prefill_lane() const {
-        return scheduler_.select_runnable_prefill_lane(max_concurrency_, [&](std::uint32_t lane) {
-            const auto& request = slots_[lane];
-            return request != nullptr && request->is_prefilling() && !request->capture_pending &&
-                   !(request->sequence && instance_.program->vision_pending(*request->sequence));
-        });
+        return scheduler_.select_runnable_prefill_lane(
+            max_concurrency_, [&](std::uint32_t lane) -> std::optional<std::uint32_t> {
+                const auto& request = slots_[lane];
+                if (request == nullptr || !request->is_prefilling() || request->capture_pending ||
+                    (request->sequence && instance_.program->vision_pending(*request->sequence))) {
+                    return std::nullopt;
+                }
+                if (!request->admitted_begin) { return 0U; }
+                const BeginSummary& begin    = *request->admitted_begin;
+                const std::uint64_t computed = std::uint64_t(begin.reused_prompt_tokens) +
+                                               request->computed_prompt_tokens;
+                return static_cast<std::uint32_t>(
+                    begin.prompt_tokens > computed ? begin.prompt_tokens - computed : 0U);
+            });
     }
 
     void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
@@ -2001,6 +2010,7 @@ private:
         if (request == nullptr || !request->is_prefilling() || request->capture_pending) {
             throw std::logic_error("staged prefill lane has invalid request state");
         }
+        scheduler_.record_prefill_unit(lane);
         if (!request->sequence) {
             throw std::logic_error("prefill request has no sequence handle");
         }
