@@ -2177,7 +2177,12 @@ struct Executor::Impl {
         SlotPool& pool = slot_pools[rank.rank];
         if (pool.slots == 0) { return false; }
         const cudaStream_t s = rank.stream;
-        if (t >= kPrefetchTokens && pool.slots >= plan.moe.gate.pointers.size()) {
+        // A span's last chunk may be shorter than kPrefetchTokens, but the pool still holds the
+        // layer's experts that its earlier chunks prefetched: it runs from the pool too, rather
+        // than copying its routed experts over the pool again, and the next layer's copies start
+        // behind it as behind any prefetched call.
+        const bool prefetched = !prefetches.empty() && prefetches[rank.rank].layer == index;
+        if ((t >= kPrefetchTokens || prefetched) && pool.slots >= plan.moe.gate.pointers.size()) {
             PoolPrefetch& state = prefetches[rank.rank];
             if (state.layer != index) { prefetch_layer(index); }
             CUDA_CHECK(cudaStreamWaitEvent(s, state.ready, 0));
@@ -2215,6 +2220,8 @@ struct Executor::Impl {
         CUDA_CHECK(cudaStreamSynchronize(s));
         const MoePlan& m          = plan.moe;
         const std::size_t experts = m.gate.pointers.size();
+        // The copies below overwrite the pool, so it no longer holds a prefetched layer.
+        if (!prefetches.empty()) { prefetches[rank.rank].layer = ~std::size_t{0}; }
         std::vector<char> routed(experts, 0);
         for (std::int32_t i = 0; i < top * t; ++i) {
             const std::int32_t e = routes[i];
