@@ -572,14 +572,15 @@ measured on this model yet.
 its own KV and recurrent state, so every sequence costs device memory (the KV of `--max-context`
 positions, 24 KiB a position in BF16 and less in a quantized `--kv-dtype`, plus 74 MiB of recurrent
 state). Requests are admitted
-in arrival order. Prompts prefill a chunk at a time, each chunk from the prompt with the fewest
+in arrival order. Prompts prefill a step at a time, each step from the prompt with the fewest
 tokens left, so a short or cached request is not held behind a long prompt for its whole prefill
 (a prompt passed over eight times goes next, and a prompt with media, once begun, finishes
-first); after each chunk the requests
-that are decoding run `--decode-rounds-per-prefill` rounds (by default the chunk size over 64, 16
-at the default chunk) before the next chunk, each round one batched pass whose experts read their
-weights once for the whole batch, so the batch costs little more than one token while the experts
-dominate the step.
+first). A step is one chunk, or with host experts on one GPU a span of up to eight chunks of a text
+prompt (see [Execution](#execution)); while other requests decode, a span is two chunks at most,
+since they wait for the whole step. After each step the requests that are decoding run
+`--decode-rounds-per-prefill` rounds (by default the chunk size over 64, 16 at the default chunk)
+before the next step, each round one batched pass whose experts read their weights once for the
+whole batch, so the batch costs little more than one token while the experts dominate the step.
 
 With the context cache on (the default), a sequence keeps its state when its request ends, and a
 snapshot of its recurrent state where the prompt's last user turn closes (or at the prompt's end
