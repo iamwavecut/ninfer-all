@@ -323,6 +323,10 @@ int main(int argc, char** argv) {
         std::cerr << ninfer::cli::usage_text(argv[0]);
         return 1;
     }
+    if (cli.version_requested) {
+        std::cout << "ninfer " << NINFER_VERSION << '+' << NINFER_BUILD_ID << '\n';
+        return 0;
+    }
     if (cli.help_requested) {
         std::cout << ninfer::cli::usage_text(argv[0]);
         return 0;

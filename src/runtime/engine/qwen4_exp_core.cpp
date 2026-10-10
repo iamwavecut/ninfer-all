@@ -14,6 +14,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/mtp_adaptive.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
@@ -112,11 +113,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                     "Qwen3.8-Flash-Next");
     }
     if (speculative.lookup_ngram != 0 || speculative.mtp_attention_window != 0 ||
-        speculative.mtp_policy != MtpDraftPolicy::Fixed ||
         speculative.proposal_head != ProposalHead::Full || speculative.ngram_archive_bytes != 0) {
         throw std::invalid_argument(
             "Qwen3.8-Flash-Next's MTP drafting has no --lookup-ngram, "
-            "--mtp-attention-window, --adaptive-mtp, --lm-head-draft or n-gram archive");
+            "--mtp-attention-window, --lm-head-draft or n-gram archive");
+    }
+    if (speculative.mtp_policy == MtpDraftPolicy::Adaptive && !mtp) {
+        throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
     }
     if (options.context_cache.disk_kv_directstorage) {
         throw std::invalid_argument(
@@ -385,6 +388,7 @@ struct Qwen4ExpCore::Request {
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
     SpeculativeStats speculative; // MTP rounds, an Engine with drafts only
+    runtime::MtpAdaptiveSignal mtp_signal; // how far its drafts survive, with --adaptive-mtp
 };
 
 struct Qwen4ExpCore::Impl {
@@ -418,6 +422,9 @@ struct Qwen4ExpCore::Impl {
     const bool structured_output;
     const bool reuse_prefixes;
     const std::uint32_t drafts; // MTP drafts a speculative round proposes; 0 without speculation
+    // With --adaptive-mtp, the steps a round drafts and verifies: from one draft, since each draft
+    // is a step of the MTP block of its own here, up to `drafts`.
+    std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
 
     mutable std::mutex queue_mutex;
     std::condition_variable queue_cv;
@@ -492,6 +499,10 @@ struct Qwen4ExpCore::Impl {
                                         ? options.decode_rounds_per_prefill
                                         : std::max<std::uint32_t>(
                                               1, i.executor->options().prefill_chunk / 64)) {
+        if (drafts > 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
+            mtp_controller.emplace();
+            mtp_controller->reset(drafts, 1);
+        }
         RankBinding bind(device, i.executor->head_rank());
         const std::size_t rows = slots.size();
         // A sampling call's columns per row: one, or a verification's drafts and bonus.
@@ -1072,6 +1083,11 @@ struct Qwen4ExpCore::Impl {
             r.speculative.enabled      = true;
             r.speculative.draft_window = drafts;
             r.speculative.accepted_per_position.assign(drafts, 0);
+            if (mtp_controller) {
+                r.speculative.adaptive = true;
+                r.speculative.rounds_per_window.assign(drafts, 0);
+                r.mtp_signal.reset();
+            }
         }
         r.prefill_start        = Clock::now();
         {
@@ -1600,9 +1616,33 @@ struct Qwen4ExpCore::Impl {
             sequences.push_back(request->slot);
             anchors.push_back(request->feed.front());
         }
+        const auto round_start = Clock::now();
+        // With --adaptive-mtp the controller picks the round's steps from each request's draft
+        // survival and the round times it has measured; a new set of requests restarts its probe.
+        std::uint32_t steps = drafts;
+        if (mtp_controller) {
+            std::vector<const runtime::MtpAdaptiveSignal*> signals;
+            std::vector<std::uint32_t> available, room;
+            std::uint64_t cohort = 1469598103934665603ULL;
+            for (const auto& request : batch) {
+                signals.push_back(&request->mtp_signal);
+                const auto budget = request->output.model_token_budget_remaining(
+                    request->budget->remaining());
+                room.push_back(static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    {static_cast<std::uint64_t>(budget),
+                     static_cast<std::uint64_t>(max_context - request->position), 1U << 20})));
+                available.push_back(std::min(drafts, room.back() > 0 ? room.back() - 1U : 0U));
+                cohort = (cohort ^ (static_cast<std::uint64_t>(request->slot) << 32U |
+                                    static_cast<std::uint32_t>(
+                                        request->admitted.time_since_epoch().count()))) *
+                         1099511628211ULL;
+            }
+            steps = std::clamp<std::uint32_t>(
+                mtp_controller->select(signals, available, room, cohort), 1, drafts);
+        }
         std::vector<TokenId> all_drafts(b * drafts);
-        std::vector<std::uint32_t> draft_extents(b, drafts);
-        executor.draft(sequences, anchors, all_drafts, draft_extents);
+        std::vector<std::uint32_t> draft_extents(b, steps);
+        executor.draft(sequences, anchors, all_drafts, draft_extents, steps);
         const std::size_t k = *std::max_element(draft_extents.begin(), draft_extents.end());
         const std::size_t w = k + 1;
         const auto columns = static_cast<std::int32_t>(w);
@@ -1767,8 +1807,14 @@ struct Qwen4ExpCore::Impl {
                 }
             }
             r.speculative.rounds += 1;
-            r.speculative.drafted_tokens += drafts; // the captured draft chain still runs in full
+            r.speculative.drafted_tokens += steps; // the draft chain runs all its steps
             r.speculative.accepted_tokens += std::uint32_t(drafts_n);
+            if (mtp_controller) {
+                r.mtp_signal.observe(std::min<std::uint32_t>(draft_extents[j], steps),
+                                     std::uint32_t(drafts_n));
+                ++r.speculative.rounds_per_window[steps - 1];
+                if (mtp_controller->transitioned()) { ++r.speculative.window_transitions; }
+            }
             for (std::int32_t i = 0; i < drafts_n; ++i) {
                 ++r.speculative.accepted_per_position[i];
             }
@@ -1799,6 +1845,10 @@ struct Qwen4ExpCore::Impl {
             }
         }
         executor.commit(sequences, kept);
+        if (mtp_controller) {
+            mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,
+                                              seconds(round_start, Clock::now()));
+        }
         for (std::size_t j = 0; j < b; ++j) {
             Request& r = *batch[j];
             if (failed[j]) { continue; } // its sequence keeps nothing for the context cache
