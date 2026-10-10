@@ -178,7 +178,7 @@ int main() {
                           !scheduler.should_attempt_admission(true, true, true, false, false) &&
                           scheduler.should_attempt_admission(true, true, true, true, false) &&
                           !scheduler.should_attempt_admission(true, true, false, false, true) &&
-                          scheduler.choose_execution(true, false, 0) == ExecutionAction::Decode,
+                          scheduler.choose_execution(true, false, 0, 0) == ExecutionAction::Decode,
                       "admission and GPU-unit fairness gates changed");
     scheduler.set_prefill_lane(0);
     failures += check(!scheduler.should_attempt_admission(true, true, true, true, false),
@@ -189,18 +189,31 @@ int main() {
                   scheduler.should_attempt_admission(true, true, true, true, false) &&
                   !scheduler.should_attempt_admission(true, true, true, false, false) &&
                   !scheduler.should_attempt_admission(true, true, true, true, true) &&
-                  scheduler.choose_execution(true, true, 0) == ExecutionAction::Decode &&
-                  scheduler.choose_execution(true, true, 1) == ExecutionAction::Prefill,
+                  scheduler.choose_execution(true, true, 0, 1024) == ExecutionAction::Decode &&
+                  scheduler.choose_execution(true, true, 1, 1024) == ExecutionAction::Prefill,
               "prefill/decode alternation changed");
     // Several decode rounds after each prefill unit keep decoding streams responsive; a prefill
     // with nothing decoding runs at once.
-    scheduler.configure_decode_rounds(3);
-    failures += check(scheduler.choose_execution(true, true, 2) == ExecutionAction::Decode &&
-                          scheduler.choose_execution(true, true, 3) == ExecutionAction::Prefill &&
-                          scheduler.choose_execution(false, true, 0) == ExecutionAction::Prefill &&
+    scheduler.configure_decode_rounds(16, 1024);
+    const auto choose = [&](std::uint32_t run, std::uint32_t unit) {
+        return scheduler.choose_execution(true, true, run, unit);
+    };
+    failures += check(choose(15, 1024) == ExecutionAction::Decode &&
+                          choose(16, 1024) == ExecutionAction::Prefill &&
+                          choose(15, 4096) == ExecutionAction::Decode &&
+                          scheduler.choose_execution(false, true, 0, 1024) ==
+                              ExecutionAction::Prefill &&
                           scheduler.should_attempt_admission(true, true, true, 2, false),
-                      "decode rounds per prefill unit changed");
-    scheduler.configure_decode_rounds(1);
+                      "decode rounds before a full prefill unit changed");
+    // A shorter unit waits proportionally fewer rounds, at least one: a short prompt gets in
+    // between a long prompt's chunks without starving the streams.
+    failures += check(scheduler.decode_rounds_before(512) == 8 &&
+                          scheduler.decode_rounds_before(20) == 1 &&
+                          scheduler.decode_rounds_before(0) == 1 &&
+                          choose(1, 20) == ExecutionAction::Prefill &&
+                          choose(7, 512) == ExecutionAction::Decode,
+                      "decode rounds were not proportional to the next prefill unit");
+    scheduler.configure_decode_rounds(1, 1024);
     // Multiple requests may own staged prefill simultaneously; admission stays open while
     // any of them prefill (each unit advances one lane), but an open global topology
     // transition still gates it.

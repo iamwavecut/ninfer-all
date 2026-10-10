@@ -577,10 +577,12 @@ tokens left, so a short or cached request is not held behind a long prompt for i
 (a prompt passed over eight times goes next, and a prompt with media, once begun, finishes
 first). A step is one chunk, or with host experts on one GPU a span of up to eight chunks of a text
 prompt (see [Execution](#execution)); while other requests decode, a span is two chunks at most,
-since they wait for the whole step. After each step the requests that are decoding run
+since they wait for the whole step. Before a step, while requests are decoding, they run
 `--decode-rounds-per-prefill` rounds (by default the chunk size over 64, 16 at the default chunk)
-before the next step, each round one batched pass whose experts read their weights once for the
-whole batch, so the batch costs little more than one token while the experts dominate the step.
+for each chunk's worth of prompt the step computes, at least one, so a short prompt gets in after
+one round and the streams keep their share during a long one; each round is one batched pass
+whose experts read their weights once for the whole batch, so the batch costs little more than one
+token while the experts dominate the step.
 
 With the context cache on (the default), a sequence keeps its state when its request ends, and a
 snapshot of its recurrent state where the prompt's last user turn closes (or at the prompt's end

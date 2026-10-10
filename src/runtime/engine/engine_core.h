@@ -116,7 +116,8 @@ public:
         scheduler_.configure_decode_rounds(
             options.decode_rounds_per_prefill != 0
                 ? options.decode_rounds_per_prefill
-                : std::clamp<std::uint32_t>(options.prefill_chunk / 64, 1, 4096));
+                : std::clamp<std::uint32_t>(options.prefill_chunk / 64, 1, 4096),
+            std::max<std::uint32_t>(options.prefill_chunk, 1));
         if (!options.context_cache.max_private_continuations ||
             !options.context_cache.max_shared_prefixes) {
             throw std::logic_error("target admission capacity does not match the Engine");
@@ -2000,6 +2001,17 @@ private:
 
     // The lowest lane owning staged prefill that can advance now. A lane offering an active
     // capture, or whose media item still encodes in a concurrent overlay window, yields its unit.
+    // The prompt tokens a staged-prefill lane has left to compute.
+    [[nodiscard]] std::uint32_t remaining_prompt(std::uint32_t lane) const {
+        const auto& request = slots_[lane];
+        if (request == nullptr || !request->admitted_begin) { return 0U; }
+        const BeginSummary& begin    = *request->admitted_begin;
+        const std::uint64_t computed =
+            std::uint64_t(begin.reused_prompt_tokens) + request->computed_prompt_tokens;
+        return static_cast<std::uint32_t>(
+            begin.prompt_tokens > computed ? begin.prompt_tokens - computed : 0U);
+    }
+
     [[nodiscard]] std::optional<std::uint32_t> runnable_prefill_lane() const {
         return scheduler_.select_runnable_prefill_lane(
             max_concurrency_, [&](std::uint32_t lane) -> std::optional<std::uint32_t> {
@@ -2008,12 +2020,7 @@ private:
                     (request->sequence && instance_.program->vision_pending(*request->sequence))) {
                     return std::nullopt;
                 }
-                if (!request->admitted_begin) { return 0U; }
-                const BeginSummary& begin    = *request->admitted_begin;
-                const std::uint64_t computed = std::uint64_t(begin.reused_prompt_tokens) +
-                                               request->computed_prompt_tokens;
-                return static_cast<std::uint32_t>(
-                    begin.prompt_tokens > computed ? begin.prompt_tokens - computed : 0U);
+                return remaining_prompt(lane);
             });
     }
 
@@ -3060,9 +3067,10 @@ private:
                         throw std::logic_error("prefill owner has no active Engine request");
                     }
                 }
-                const bool prefill_runnable = runnable_prefill_lane().has_value();
+                const std::optional<std::uint32_t> next_lane = runnable_prefill_lane();
                 const ExecutionAction action = scheduler_.choose_execution(
-                    !membership.empty(), prefill_runnable, decode_run);
+                    !membership.empty(), next_lane.has_value(), decode_run,
+                    next_lane ? remaining_prompt(*next_lane) : 0U);
                 if (action == ExecutionAction::Prefill) {
                     set_host_work_class(HostWorkClass::Prefill);
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
