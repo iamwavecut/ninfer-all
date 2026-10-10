@@ -34,6 +34,7 @@ add_library(ninfer_runtime_support STATIC
   engine/device_profile.cpp
   engine/device_profile_build_id.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/engine/device_profiles_builtin.cpp
+  engine/host_memory.cpp
   engine/kv_capacity.cpp
   engine/public_types.cpp
   prefix_cache/block_hash.cpp
