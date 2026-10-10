@@ -693,11 +693,15 @@ draft-chain graph and each width its own verification graph, captured at their s
   in a bank they are the next expert's down or zeros after the last one, and every cache or stream
   slot keeps zeros after its down, which a smaller down from another layer does not uncover (another
   format's bytes there can hold a non-finite scale, and NaN follows). With host experts, a wide call
-  first copies the routed experts the cache does not hold into a device pool (one slot per expert on
-  each GPU, 0.7 GB for Q2_0), so each expert crosses the bus once per chunk. On one GPU a prompt
-  longer than a chunk runs in spans of up to eight chunks layer by layer: every chunk of a span
-  passes a layer before any passes the next, so the layer's uncached experts cross the bus once per
-  span (a 5,669-token prompt prefills at 1,334 instead of 678 tokens/s on an RTX 3090). Weighted
+  first copies the routed experts the cache does not hold into a device pool on each GPU (0.7 GB for
+  Q2_0), a bank per projection laid out as the host's, so experts adjacent on the host cross the bus
+  in one copy and each expert crosses it once per chunk; zeros follow each run of copied downs. On
+  one GPU a prompt longer than a chunk runs in spans of up to eight chunks layer by layer: each layer
+  runs its attention over every chunk of the span, then its experts over every chunk, so the layer's
+  uncached experts cross the bus once per span, during the attention phase that precedes them, and
+  a span's short last chunk runs from the same pool (a 5,669-token prompt prefilled at 1,334 instead
+  of 678 tokens/s on an RTX 3090 when spans came; the bank-shaped pool and the two phases then took a
+  9,297-token Q2_0 prompt from 1.12-1.18k to 1.35k tokens/s from a cold expert cache). Weighted
   expert outputs are summed in fixed point, so the result does not depend on the order experts
   finish in.
 - Up to eight tokens of GGUF host experts run in two stages. A kernel splits the call's routes into
