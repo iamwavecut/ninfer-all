@@ -1748,7 +1748,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--decode-rounds-per-prefill N` | Qwen3.8-Flash-Next: decode rounds that run after each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
+| `--decode-rounds-per-prefill N` | Decode rounds that run after each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
 | `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile) and round `--prefill-chunk` down to whole attention waves; on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
@@ -2192,8 +2192,9 @@ A request joins that batch only after its staged prefill finishes; when it compl
 cancelled, the next boundary rebuilds the batch without an empty row. A staged prefill holds
 admission back until it finishes. With `--concurrent-prefill` waiting requests are still admitted
 to free lanes while others prefill, so a new request's admission and prefill overlap the prefill
-and decode of the others (each prefill unit advances one chunk of the lowest staged lane per
-worker boundary).
+and decode of the others. Each prefill unit advances one chunk of the staged lane with the shortest
+remaining prompt, so a short or prefix-cached request is not held behind a long prompt for its
+whole prefill; a lane passed over eight times runs next, so a long prompt is not starved.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
@@ -2210,14 +2211,17 @@ response the deployment allows rather than to a connection timeout: at C1 on an 
 6,500-token response occupies the engine for about 106 seconds. The 600,000 ms default admits a
 queued caller behind roughly ten such responses; lower it only to fail fast on purpose.
 
-One request owns the staged prefill at a time, and the executor alternates a single prefill chunk
-with a single decode round, so `--prefill-chunk` sets the worst-case pause every active stream sees
-while a new prompt is ingested. On an RTX 3090 ingesting a 4,900-token prompt behind four active
-streams, the largest inter-token gap measured 1,043 ms at chunk 1024, 515 ms at 512, and 312 ms at
-256, against an 82 ms median decode interval; the ingesting request's own prefill rate fell only
-from 1,135 to 1,130 to 1,110 tok/s. Prefill is not batched across requests at any chunk size, so a
-smaller chunk trades almost no ingestion throughput for a proportionally smaller stall. The shipped
-concurrent launcher uses 512.
+One request owns the staged prefill at a time, and after each prefill chunk the executor runs
+`--decode-rounds-per-prefill` decode rounds while other requests generate (by default the chunk
+over 64: 8 at chunk 512, 16 at 1024), so `--prefill-chunk` sets the worst-case pause every active
+stream sees while a new prompt is ingested, and the decode rounds set how much of the GPU the
+streams keep meanwhile. With strict alternation (`1`) a stream got one token per chunk. The
+following measurements predate the decode rounds and used strict alternation: on an RTX 3090
+ingesting a 4,900-token prompt behind four active streams, the largest inter-token gap measured
+1,043 ms at chunk 1024, 515 ms at 512, and 312 ms at 256, against an 82 ms median decode interval;
+the ingesting request's own prefill rate fell only from 1,135 to 1,130 to 1,110 tok/s. Prefill is
+not batched across requests at any chunk size, so a smaller chunk trades almost no ingestion
+throughput for a proportionally smaller stall. The shipped concurrent launcher uses 512.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting

@@ -34,6 +34,8 @@ namespace ninfer::runtime {
 namespace {
 using Clock = std::chrono::steady_clock;
 
+constexpr std::uint32_t kMaximumDecodeRoundsPerPrefill = 4096;
+
 void validate_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
@@ -84,6 +86,9 @@ void validate_options(const EngineOptions& options) {
     }
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
+    }
+    if (options.decode_rounds_per_prefill > kMaximumDecodeRoundsPerPrefill) {
+        throw std::invalid_argument("Engine decode_rounds_per_prefill must be in [0,4096]");
     }
     if (options.enable_vision && options.media_live_bytes == 0) {
         throw std::invalid_argument(
@@ -240,7 +245,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
-
     ContextCacheOptions& cache = options.context_cache;
     if (options.speculative.ngram_archive_bytes != 0 &&
         options.speculative.ngram_draft_tokens == 0) {
