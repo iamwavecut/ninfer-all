@@ -1778,7 +1778,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lm-head-draft` | optimized proposal head | off |
 | `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens`, drafting only those), the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
-| `--lookup-ngram N` | context-lookup drafting alongside `--spec`: the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
+| `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Qwen3.8-Flash-Next: `--spec mtp`): the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
 | `--ngram-archive-mib N` | RAM archive that keeps finished requests' copy sources for later requests naming the same `X-NInfer-Draft-Session` | `0` (off) |

@@ -13,6 +13,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/effective_thinking_budget.h"
@@ -111,11 +112,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("n-gram copy proposals are not available for "
                                     "Qwen3.8-Flash-Next");
     }
-    if (speculative.lookup_ngram != 0 || speculative.mtp_attention_window != 0 ||
-        speculative.proposal_head != ProposalHead::Full || speculative.ngram_archive_bytes != 0) {
-        throw std::invalid_argument(
-            "Qwen3.8-Flash-Next's MTP drafting has no --lookup-ngram, "
-            "--mtp-attention-window, --lm-head-draft or n-gram archive");
+    if (speculative.mtp_attention_window != 0 || speculative.proposal_head != ProposalHead::Full ||
+        speculative.ngram_archive_bytes != 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next's MTP drafting has no "
+                                    "--mtp-attention-window, --lm-head-draft or n-gram archive");
+    }
+    if (speculative.lookup_ngram != 0 && !mtp) {
+        throw std::invalid_argument("--lookup-ngram requires --spec mtp");
     }
     if (speculative.mtp_policy == MtpDraftPolicy::Adaptive && !mtp) {
         throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
@@ -420,6 +423,7 @@ struct Qwen4ExpCore::Impl {
     const bool structured_output;
     const bool reuse_prefixes;
     const std::uint32_t drafts; // MTP drafts a speculative round proposes; 0 without speculation
+    const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
     // With --adaptive-mtp, the steps a round drafts and verifies: from one draft, since each draft
     // is a step of the MTP block of its own here, up to `drafts`.
     std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
@@ -492,6 +496,7 @@ struct Qwen4ExpCore::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
+          lookup_ngram(options.speculative.lookup_ngram),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(options.decode_rounds_per_prefill != 0
                                         ? options.decode_rounds_per_prefill
@@ -1609,7 +1614,44 @@ struct Qwen4ExpCore::Impl {
         }
         std::vector<TokenId> all_drafts(b * drafts);
         std::vector<std::uint32_t> draft_extents(b, steps);
-        executor.draft(sequences, anchors, all_drafts, draft_extents, steps);
+        // Context lookup (--lookup-ngram N): a row whose last N tokens, its anchor last, appeared
+        // earlier in its sequence proposes what followed then, up to `drafts` tokens, in place of
+        // the MTP block's guess, which is weakest where the output repeats its input; verification
+        // keeps it exact. The MTP block drafts the other rows only, and no row when all have one.
+        std::vector<char> looked_up(b, 0);
+        std::size_t lookups = 0;
+        if (lookup_ngram != 0) {
+            for (std::size_t j = 0; j < b; ++j) {
+                std::vector<TokenId>& ledger = slots[batch[j]->slot].fed;
+                ledger.push_back(anchors[j]);
+                const std::uint32_t found = runtime::lookup_draft(
+                    ledger, lookup_ngram, drafts, all_drafts.data() + j * drafts);
+                ledger.pop_back();
+                if (found != 0) {
+                    looked_up[j]     = 1;
+                    draft_extents[j] = found;
+                    ++lookups;
+                }
+            }
+        }
+        if (lookups < b) {
+            std::vector<std::uint32_t> mtp_sequences;
+            std::vector<TokenId> mtp_anchors;
+            for (std::size_t j = 0; j < b; ++j) {
+                if (looked_up[j]) { continue; }
+                mtp_sequences.push_back(sequences[j]);
+                mtp_anchors.push_back(anchors[j]);
+            }
+            std::vector<TokenId> mtp_drafts(mtp_sequences.size() * drafts);
+            std::vector<std::uint32_t> mtp_extents(mtp_sequences.size(), steps);
+            executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, mtp_extents, steps);
+            for (std::size_t j = 0, m = 0; j < b; ++j) {
+                if (looked_up[j]) { continue; }
+                std::copy_n(mtp_drafts.begin() + std::ptrdiff_t(m * drafts), drafts,
+                            all_drafts.begin() + std::ptrdiff_t(j * drafts));
+                draft_extents[j] = mtp_extents[m++];
+            }
+        }
         const std::size_t k = *std::max_element(draft_extents.begin(), draft_extents.end());
         const std::size_t w = k + 1;
         const auto columns = static_cast<std::int32_t>(w);
@@ -1774,9 +1816,15 @@ struct Qwen4ExpCore::Impl {
                 }
             }
             r.speculative.rounds += 1;
-            r.speculative.drafted_tokens += steps; // the draft chain runs all its steps
+            // The MTP draft chain runs all its steps; a lookup proposes what it found.
+            r.speculative.drafted_tokens += looked_up[j] ? draft_extents[j] : steps;
             r.speculative.accepted_tokens += std::uint32_t(drafts_n);
-            if (mtp_controller) {
+            if (looked_up[j]) {
+                // Reported with the n-gram proposals: what the context, not the model, proposed.
+                ++r.speculative.ngram_rounds;
+                r.speculative.ngram_drafted_tokens += draft_extents[j];
+                r.speculative.ngram_accepted_tokens += std::uint32_t(drafts_n);
+            } else if (mtp_controller) {
                 r.mtp_signal.observe(std::min<std::uint32_t>(draft_extents[j], steps),
                                      std::uint32_t(drafts_n));
                 ++r.speculative.rounds_per_window[steps - 1];
@@ -1812,7 +1860,8 @@ struct Qwen4ExpCore::Impl {
             }
         }
         executor.commit(sequences, kept);
-        if (mtp_controller) {
+        // The controller measures rounds of MTP drafts only: a lookup changes the round's width.
+        if (mtp_controller && lookups == 0) {
             mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,
                                               seconds(round_start, Clock::now()));
         }

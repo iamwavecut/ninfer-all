@@ -655,8 +655,13 @@ rounds together, one MTP pass for all of them per draft and one verification pas
 decodes without drafts when its prompt has media, near the end of its context, with one token
 left in its output or thinking budget, and while a
 `--post-thinking` request still reasons. N-gram copy proposals (`--ngram-draft-tokens`) are not
-available for this model; `--lookup-ngram`, `--mtp-attention-window` and `--lm-head-draft` are
-refused.
+available for this model; `--mtp-attention-window` and `--lm-head-draft` are refused.
+
+With `--lookup-ngram N`, a request whose last `N` tokens (the token it feeds next last) appeared
+earlier in its sequence proposes what followed them then, up to `--draft-tokens`, in place of the
+MTP block's drafts; the MTP block drafts the other requests of the round, and none when every
+request has such a proposal. The proposal is verified like any draft, so a wrong one costs speed,
+not tokens. Its rounds are reported with the n-gram proposals (`ngram_rounds`).
 
 With `--adaptive-mtp`, `--draft-tokens K` is the most drafts a round makes. The controller the
 Qwen3.5 models use (see [Adaptive MTP](serving.md#adaptive-mtp)) picks each round's width from

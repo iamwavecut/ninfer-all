@@ -1,4 +1,4 @@
-#include "models/qwen3_5/program/speculative/lookup_draft.h"
+#include "runtime/contract/lookup_draft.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -1044,9 +1044,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     // one-hot either way, so verify treats them identically and a wrong guess costs
                     // throughput rather than correctness.
                     if (lookup_ngram != 0) {
-                        const auto found = ::ninfer::qwen3_5::lookup_draft(std::span<const TokenId>(sequence.ledger),
-                                                                 lookup_ngram, draft_window,
-                                                                 sequence.mtp_drafts.data());
+                        const auto found = ::ninfer::runtime::lookup_draft(
+                            std::span<const TokenId>(sequence.ledger), lookup_ngram, draft_window,
+                            sequence.mtp_drafts.data());
                         if (found != 0) { sequence.mtp_draft_count = found; }
                     }
                 }
