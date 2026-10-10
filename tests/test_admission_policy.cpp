@@ -178,7 +178,7 @@ int main() {
                           !scheduler.should_attempt_admission(true, true, true, false, false) &&
                           scheduler.should_attempt_admission(true, true, true, true, false) &&
                           !scheduler.should_attempt_admission(true, true, false, false, true) &&
-                          scheduler.choose_execution(true, false, false) == ExecutionAction::Decode,
+                          scheduler.choose_execution(true, false, 0) == ExecutionAction::Decode,
                       "admission and GPU-unit fairness gates changed");
     scheduler.set_prefill_lane(0);
     failures += check(!scheduler.should_attempt_admission(true, true, true, true, false),
@@ -189,9 +189,18 @@ int main() {
                   scheduler.should_attempt_admission(true, true, true, true, false) &&
                   !scheduler.should_attempt_admission(true, true, true, false, false) &&
                   !scheduler.should_attempt_admission(true, true, true, true, true) &&
-                  scheduler.choose_execution(true, true, false) == ExecutionAction::Decode &&
-                  scheduler.choose_execution(true, true, true) == ExecutionAction::Prefill,
+                  scheduler.choose_execution(true, true, 0) == ExecutionAction::Decode &&
+                  scheduler.choose_execution(true, true, 1) == ExecutionAction::Prefill,
               "prefill/decode alternation changed");
+    // Several decode rounds after each prefill unit keep decoding streams responsive; a prefill
+    // with nothing decoding runs at once.
+    scheduler.configure_decode_rounds(3);
+    failures += check(scheduler.choose_execution(true, true, 2) == ExecutionAction::Decode &&
+                          scheduler.choose_execution(true, true, 3) == ExecutionAction::Prefill &&
+                          scheduler.choose_execution(false, true, 0) == ExecutionAction::Prefill &&
+                          scheduler.should_attempt_admission(true, true, true, 2, false),
+                      "decode rounds per prefill unit changed");
+    scheduler.configure_decode_rounds(1);
     // Multiple requests may own staged prefill simultaneously; admission stays open while
     // any of them prefill (each unit advances one lane), but an open global topology
     // transition still gates it.
@@ -207,8 +216,10 @@ int main() {
     scheduler.set_prefill_lane(2);
     {
         std::array<std::shared_ptr<SchedulerRequest>, 3> slots{};
-        const auto runnable = [&](std::uint32_t lane) {
-            return slots[lane] != nullptr && !slots[lane]->capture_pending;
+        std::array<std::uint32_t, 3> remaining{0, 4096, 4096};
+        const auto runnable = [&](std::uint32_t lane) -> std::optional<std::uint32_t> {
+            if (slots[lane] == nullptr || slots[lane]->capture_pending) { return std::nullopt; }
+            return remaining[lane];
         };
         slots[1]   = std::make_shared<SchedulerRequest>();
         slots[2]   = std::make_shared<SchedulerRequest>();
@@ -218,7 +229,24 @@ int main() {
                   "runnable staged-prefill lane skipped a capture owner");
         slots[1]->capture_pending = false;
         failures += check(scheduler.select_runnable_prefill_lane(3, runnable) == std::optional(1U),
-                          "runnable staged-prefill lane selection changed");
+                          "equal remaining prompts no longer go to the lower lane");
+        // The shortest remaining prompt runs first, until a longer one has been passed over
+        // kPrefillMaxSkip times.
+        remaining[1] = 200000;
+        remaining[2] = 512;
+        failures += check(scheduler.select_runnable_prefill_lane(3, runnable) == std::optional(2U),
+                          "a short prompt waited behind a long one");
+        for (std::uint32_t unit = 0; unit < ninfer::runtime::kPrefillMaxSkip; ++unit) {
+            failures += check(scheduler.select_runnable_prefill_lane(3, runnable) ==
+                                  std::optional(2U),
+                              "a long prompt ran before its skip bound");
+            scheduler.record_prefill_unit(2);
+        }
+        failures += check(scheduler.select_runnable_prefill_lane(3, runnable) == std::optional(1U),
+                          "a long prompt starved behind shorter ones");
+        scheduler.record_prefill_unit(1);
+        failures += check(scheduler.select_runnable_prefill_lane(3, runnable) == std::optional(2U),
+                          "running a starved lane did not reset its skip count");
         slots[1]->capture_pending = true;
         slots[2].reset();
         failures += check(scheduler.select_runnable_prefill_lane(3, runnable) == std::nullopt,

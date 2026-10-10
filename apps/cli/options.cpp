@@ -150,6 +150,7 @@ std::string usage_text(const char* argv0) {
            "Runs one generation: the answer streams to stdout, reasoning and diagnostics\n"
            "to stderr.\n"
            "  --help, -h                    show this help and exit\n"
+           "  --version                     print the build version and exit\n"
            "\n"
            "INPUT\n"
            "  --prompt TEXT                 one user message\n"
@@ -308,6 +309,10 @@ std::string usage_text(const char* argv0) {
 
 Options parse_options(int argc, char** argv) {
     Options options;
+    if (argc >= 2 && std::string_view(argv[1]) == "--version") {
+        options.version_requested = true;
+        return options;
+    }
     if (argc >= 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;

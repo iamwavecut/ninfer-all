@@ -43,6 +43,7 @@ int main() {
                       "request log accepted the model artifact as its output path");
 
     ServeOptions options;
+    options.build_version                  = "0.12.0-test+v0.12.0-test-3-gabc1234";
     options.artifact_path                  = "/models/qwen3_6_27b.ninfer";
     options.host                           = "127.0.0.1";
     options.port                           = 8123;
@@ -164,6 +165,8 @@ int main() {
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
+    failures += check(server.at("version") == "0.12.0-test+v0.12.0-test-3-gabc1234",
+                      "server_start must record the build version");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
     failures += check(server.at("artifact").at("architecture") == "Qwen3_5ForCausalLM",

@@ -713,6 +713,7 @@ std::string format_server_start_json(
             std::string(requested_reasoning_effort_name(*options.default_reasoning_effort));
     }
 
+    record["version"] = options.build_version;
     record["server"] =
         Json{{"host", options.host},
              {"port", options.port},
