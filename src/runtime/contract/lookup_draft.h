@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <span>
 
-namespace ninfer::qwen3_5 {
+namespace ninfer::runtime {
 
 // Context-lookup drafting: propose the continuation that followed the last time this n-gram
 // appeared.
@@ -79,4 +79,4 @@ namespace ninfer::qwen3_5 {
     return 0;
 }
 
-} // namespace ninfer::qwen3_5
+} // namespace ninfer::runtime

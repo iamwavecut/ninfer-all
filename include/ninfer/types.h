@@ -326,6 +326,15 @@ struct ContextCacheOptions {
     // remainder, and rejects a plan whose state footprint exceeds half the budget.
     // `host_state_slots` and `host_kv_capacity_bytes` are ignored in that mode.
     std::optional<std::size_t> host_cache_budget_bytes;
+    // --host-cache-mib auto: host_cache_budget_bytes is sized at startup, once the weights are
+    // loaded, from the host memory still available (the smaller of the system's available memory
+    // and what the process's memory cgroup allows) less host_cache_reserve_bytes and, with Vision,
+    // the media caches; never above host_cache_max_bytes nor host_cache_percent of the machine's
+    // memory. For a machine that serves this one process: pinned pages cannot be reclaimed.
+    bool host_cache_auto                  = false;
+    std::size_t host_cache_reserve_bytes  = std::size_t{3} << 30;
+    std::optional<std::size_t> host_cache_max_bytes;
+    std::optional<std::uint32_t> host_cache_percent;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count. An engaged
     // host-cache budget raises the anchor count within the state inventory it funds.
     std::optional<std::uint32_t> max_private_continuations;
@@ -598,9 +607,10 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
-    // Decode rounds that run after each prefill chunk while other requests generate. A decode round
-    // takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves decoding
-    // streams a token per chunk; 0 is prefill_chunk / 64.
+    // Decode rounds that run before a prefill chunk while other requests generate, proportionally
+    // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode
+    // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves
+    // decoding streams a token per chunk; 0 is prefill_chunk / 64.
     std::uint32_t decode_rounds_per_prefill = 0;
     // Prefill with the fast INT8-KV prompt-attention kernel and round prefill_chunk down to whole
     // prompt-attention waves. Off keeps the default kernel and the requested chunk.
@@ -1696,6 +1706,16 @@ struct RuntimeStats {
     std::uint32_t last_selected_frontier_tokens      = 0;
     // Aborted requests whose live state was published as a continuation endpoint.
     std::uint64_t salvaged_continuations = 0;
+    // Requests that left the queue without being admitted, and the time they had waited: the
+    // client gave up (cancelled) or the pending timeout fired (expired).
+    std::uint64_t waiting_cancelled_requests = 0;
+    std::uint64_t waiting_expired_requests   = 0;
+    double waiting_abandoned_seconds         = 0.0;
+    // Requests cancelled while their prompt prefilled, the prompt tokens they had computed, and
+    // how many of them the context cache salvaged so a retry resumes where they stopped.
+    std::uint64_t cancelled_prefills                = 0;
+    std::uint64_t cancelled_prefill_computed_tokens = 0;
+    std::uint64_t cancelled_prefills_salvaged       = 0;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;

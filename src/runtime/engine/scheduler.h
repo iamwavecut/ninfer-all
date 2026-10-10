@@ -248,21 +248,34 @@ public:
 
     void allow_concurrent_prefill(bool allowed) noexcept { concurrent_prefill_ = allowed; }
 
-    // Decode (or control) units that run after each prefill unit while decode work exists. A
-    // decode round takes tens of milliseconds and a prefill chunk hundreds, so strict alternation
-    // leaves decoding streams a few percent of the GPU while another request prefills.
-    void configure_decode_rounds(std::uint32_t rounds) {
-        if (rounds == 0) {
+    // Decode (or control) units that run before a prefill unit while decode work exists: `rounds`
+    // for a full chunk of `chunk_tokens`, and proportionally fewer, at least one, for a shorter
+    // unit. A decode round takes tens of milliseconds and a prefill chunk hundreds, so strict
+    // alternation leaves decoding streams a few percent of the GPU while another request
+    // prefills; scaling by the unit keeps that share and lets a short prompt in after one round.
+    void configure_decode_rounds(std::uint32_t rounds, std::uint32_t chunk_tokens) {
+        if (rounds == 0 || chunk_tokens == 0) {
             throw std::invalid_argument("decode rounds per prefill unit must be positive");
         }
         decode_rounds_ = rounds;
+        chunk_tokens_  = chunk_tokens;
     }
 
+    // Decode units due before a prefill unit of `unit_tokens`.
+    [[nodiscard]] std::uint32_t decode_rounds_before(std::uint32_t unit_tokens) const noexcept {
+        const std::uint64_t unit = std::min(unit_tokens, chunk_tokens_);
+        return static_cast<std::uint32_t>(std::max<std::uint64_t>(
+            1, (std::uint64_t(decode_rounds_) * unit + chunk_tokens_ - 1) / chunk_tokens_));
+    }
+
+    // `next_unit_tokens` is the size of the prefill unit that would run next.
     [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
-                                                   std::uint32_t decode_run) const noexcept {
+                                                   std::uint32_t decode_run,
+                                                   std::uint32_t next_unit_tokens) const noexcept {
         if (prefill_runnable) {
-            return have_decode && decode_run < decode_rounds_ ? ExecutionAction::Decode
-                                                              : ExecutionAction::Prefill;
+            return have_decode && decode_run < decode_rounds_before(next_unit_tokens)
+                       ? ExecutionAction::Decode
+                       : ExecutionAction::Prefill;
         }
         return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
     }
@@ -447,6 +460,7 @@ private:
     std::uint64_t prefill_lanes_ = 0; // bit i set when lane i owns staged prefill
     bool concurrent_prefill_     = false;
     std::uint32_t decode_rounds_ = 1;
+    std::uint32_t chunk_tokens_  = 1;
     // Prefill units each lane owning staged prefill has been passed over since its last one.
     std::array<std::uint32_t, kMaximumConcurrency> prefill_skips_{};
     std::optional<std::uint64_t> fifo_head_id_;
