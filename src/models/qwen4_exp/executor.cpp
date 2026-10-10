@@ -645,6 +645,8 @@ struct Executor::Impl {
     static constexpr std::uint32_t kSpanChunks = 8;
     std::uint32_t span_tokens = 0;
     DeviceBuffer span_stack, span_positions, span_rope, span_rows;
+    // Each chunk's MoE input and hyper-connection injection between a layer's two phases.
+    DeviceBuffer span_mixed, span_inject;
     std::size_t span_row_bytes = 0; // n-gram rows of one token
     // A span's chunk before its last runs a layer's experts: the pool keeps that layer's experts.
     bool span_hold = false;
@@ -2591,7 +2593,10 @@ struct Executor::Impl {
         span_stack     = DeviceBuffer(std::size_t(tokens) * width * 4);
         span_positions = DeviceBuffer(std::size_t(tokens) * 4);
         span_rope      = DeviceBuffer(std::size_t(tokens) * 4);
-        std::uint64_t bytes = span_stack.bytes + span_positions.bytes + span_rope.bytes;
+        span_mixed     = DeviceBuffer(std::size_t(tokens) * config.hidden_size * 2);
+        span_inject    = DeviceBuffer(std::size_t(tokens) * config.hc_count * 4);
+        std::uint64_t bytes = span_stack.bytes + span_positions.bytes + span_rope.bytes +
+                              span_mixed.bytes + span_inject.bytes;
         if (table) {
             span_row_bytes = std::size_t(config.ngram_heads()) *
                              ops::ngram_row_bytes(options.ngram->format);
@@ -2666,7 +2671,17 @@ struct Executor::Impl {
             sequence.position += std::uint32_t(t);
         }
         sequence.position = start;
+        void* const own_mixed   = rank.mixed;
+        float* const own_inject = rank.inject;
+        // Chunk k's MoE input and injection, kept between a layer's two phases.
+        const auto chunk_planes = [&](std::size_t k) {
+            rank.mixed  = static_cast<std::byte*>(span_mixed.p) + k * c * std::size_t(h) * 2;
+            rank.inject = static_cast<float*>(span_inject.p) + k * c * std::size_t(hc);
+        };
         try {
+            // Each layer runs in two phases: attention over every chunk of the span, then the
+            // experts over every chunk. The next layer's experts are copied into the pool while its
+            // attention phase runs, so its first expert call rarely waits for them.
             for (std::size_t i = 0; i < layers.size(); ++i) {
                 const LayerPlan& plan = layers[i];
                 LayerState& state     = sequence.layers[i];
@@ -2687,7 +2702,7 @@ struct Executor::Impl {
                                                    cudaMemcpyDeviceToDevice, st));
                     }
                     rank.stack = chunk_stack(k);
-                    span_hold  = k + 1 < chunks;
+                    chunk_planes(k);
                     Tensor stack(rank.stack, DType::FP32, {h, hc, t});
                     Tensor mixed(rank.mixed, DType::BF16, {h, t});
                     Tensor inject(rank.inject, DType::FP32, {hc, t});
@@ -2710,12 +2725,22 @@ struct Executor::Impl {
                             plan.mlp_hc.weights(), config.rms_norm_eps, *rank.workspace, mixed,
                             &inject, st);
                     }
+                }
+                for (std::size_t k = 0; k < chunks; ++k) {
+                    const std::int32_t t = count_of(k);
+                    rank.stack = chunk_stack(k);
+                    chunk_planes(k);
+                    span_hold = k + 1 < chunks;
+                    Tensor stack(rank.stack, DType::FP32, {h, hc, t});
+                    Tensor inject(rank.inject, DType::FP32, {hc, t});
                     run_moe(plan, rank, t, i);
                     ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}), inject,
                                                 st);
                 }
             }
-            span_hold = false;
+            span_hold   = false;
+            rank.mixed  = own_mixed;
+            rank.inject = own_inject;
             // The head reads the last chunk's last rows.
             rank.stack       = chunk_stack(chunks - 1);
             const auto rows  = static_cast<std::int32_t>(logit_rows);
@@ -2746,8 +2771,10 @@ struct Executor::Impl {
                 // The next pass's MTP cells start from the last chunk's stack, which it copied.
             }
         } catch (...) {
-            rank.stack = own_stack;
-            span_hold  = false;
+            rank.stack  = own_stack;
+            rank.mixed  = own_mixed;
+            rank.inject = own_inject;
+            span_hold   = false;
             throw;
         }
         rank.stack = own_stack;
