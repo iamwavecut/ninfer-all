@@ -14,10 +14,12 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "runtime/contract/execution.h"
+#include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/host_memory.h"
 #include "runtime/engine/model_instance.h"
 #include "text/structured_output.h"
 
@@ -41,6 +43,9 @@
 
 namespace ninfer::runtime {
 namespace {
+
+// Prompt chunks in one prefill step while other requests decode (see prefill_step).
+constexpr std::uint32_t kPeerSpanChunks = 2;
 
 using Clock = std::chrono::steady_clock;
 
@@ -112,11 +117,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("n-gram copy proposals are not available for "
                                     "Qwen3.8-Flash-Next");
     }
-    if (speculative.lookup_ngram != 0 || speculative.mtp_attention_window != 0 ||
-        speculative.proposal_head != ProposalHead::Full || speculative.ngram_archive_bytes != 0) {
-        throw std::invalid_argument(
-            "Qwen3.8-Flash-Next's MTP drafting has no --lookup-ngram, "
-            "--mtp-attention-window, --lm-head-draft or n-gram archive");
+    if (speculative.mtp_attention_window != 0 || speculative.proposal_head != ProposalHead::Full ||
+        speculative.ngram_archive_bytes != 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next's MTP drafting has no "
+                                    "--mtp-attention-window, --lm-head-draft or n-gram archive");
+    }
+    if (speculative.lookup_ngram != 0 && !mtp) {
+        throw std::invalid_argument("--lookup-ngram requires --spec mtp");
     }
     if (speculative.mtp_policy == MtpDraftPolicy::Adaptive && !mtp) {
         throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
@@ -246,9 +253,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         // The first request would otherwise load every kernel it reaches.
         StartupPhaseScope warm(options.startup_observer, StartupPhase::CudaGraphPrepare);
         instance->executor->warm_up();
-        // What startup left free beyond a margin for lazily loaded kernels and the CUDA Graphs
-        // the first requests capture becomes expert slots.
-        instance->executor->grow_expert_cache(kGrowthMargin);
+        // With --expert-cache-mib auto, what startup left free beyond a margin for lazily loaded
+        // kernels and the CUDA Graphs the first requests capture becomes expert slots; an
+        // explicit size is the cache's size.
+        if (!options.expert_cache_bytes) { instance->executor->grow_expert_cache(kGrowthMargin); }
         warm.complete();
     }
     instance->free_after_weights = free_after_weights;
@@ -422,6 +430,7 @@ struct Qwen4ExpCore::Impl {
     const bool structured_output;
     const bool reuse_prefixes;
     const std::uint32_t drafts; // MTP drafts a speculative round proposes; 0 without speculation
+    const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
     // With --adaptive-mtp, the steps a round drafts and verifies: from one draft, since each draft
     // is a step of the MTP block of its own here, up to `drafts`.
     std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
@@ -440,8 +449,9 @@ struct Qwen4ExpCore::Impl {
     // Worker-owned.
     std::vector<Slot> slots; // by executor sequence
     std::uint64_t use_clock = 0;
-    // Decode rounds still owed after a prefill chunk before the next chunk may run.
-    std::uint32_t decode_rounds_due = 0;
+    // Decode steps since the last prefill step (saturating), and the steps due before a chunk's
+    // worth of prompt while others decode.
+    std::uint32_t decode_run = 0;
     std::uint32_t decode_rounds_per_prefill = 1;
 
     // Head-device sampling planes, a row per slot; with structured output the grammars' token
@@ -494,6 +504,7 @@ struct Qwen4ExpCore::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
+          lookup_ngram(options.speculative.lookup_ngram),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(options.decode_rounds_per_prefill != 0
                                         ? options.decode_rounds_per_prefill
@@ -559,7 +570,12 @@ struct Qwen4ExpCore::Impl {
         sample_workspace                 = std::make_unique<WorkspaceArena>(workspace);
         const ContextCacheOptions& cache = options.context_cache;
         if (reuse_prefixes) {
-            host_budget = cache.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
+            // An automatic budget is sized here, once the experts are pinned.
+            const ContextCacheOptions sized = resolve_auto_host_cache_now(
+                cache, options.enable_vision ? std::uint64_t(options.media_cache_bytes) +
+                                                   options.media_live_bytes
+                                             : 0U);
+            host_budget = sized.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
             if (!cache.disk_kv_path.empty()) {
                 disk_dir     = cache.disk_kv_path / profile_name(options);
                 disk_budget  = cache.disk_kv_capacity_bytes != 0 ? cache.disk_kv_capacity_bytes
@@ -1146,10 +1162,13 @@ struct Qwen4ExpCore::Impl {
                 prefilling = slot.request;
             }
         }
-        if (prefilling && (decode_rounds_due == 0 || !decoding)) {
-            // A long prompt's chunk takes far longer than a decode round: the streams that are
-            // generating get several rounds after it rather than one.
-            decode_rounds_due = decode_rounds_per_prefill;
+        // A prompt's chunk takes far longer than a decode round, so while others decode a prefill
+        // step waits for decode_rounds_per_prefill rounds per chunk it computes: proportionally
+        // fewer, at least one, for a shorter step, so a short prompt gets in after one round, and
+        // more for a step of several chunks, so the streams keep their share of the GPU.
+        if (prefilling &&
+            (!decoding || decode_run >= decode_rounds_before(prompt_step_tokens(*prefilling)))) {
+            decode_run = 0;
             for (const Slot& slot : slots) {
                 if (slot.request && !slot.request->decoding && slot.request != prefilling &&
                     slot.request->prefill_skips != UINT32_MAX) {
@@ -1161,9 +1180,34 @@ struct Qwen4ExpCore::Impl {
                 prefill_step(prefilling);
             } catch (...) { fail(prefilling, std::current_exception()); }
         } else if (decoding) {
-            if (decode_rounds_due > 0) { --decode_rounds_due; }
+            decode_run += decode_run != UINT32_MAX;
             decode_step();
         }
+    }
+
+    [[nodiscard]] std::uint32_t decode_rounds_before(std::uint32_t tokens) const {
+        const std::uint64_t chunk = std::max<std::uint32_t>(
+            instance.executor->options().prefill_chunk, 1);
+        return static_cast<std::uint32_t>(std::max<std::uint64_t>(
+            1, (std::uint64_t(decode_rounds_per_prefill) * tokens + chunk - 1) / chunk));
+    }
+
+    // The prompt tokens the request's next prefill step computes. A media prompt goes chunk by
+    // chunk; a text prompt in spans where the executor has them. A span is one step, which with
+    // the experts off the GPU lasts seconds, and the requests that are decoding wait for all of
+    // it: while any decodes, a step is two chunks at most.
+    [[nodiscard]] std::uint32_t prompt_step_tokens(const Request& r) const {
+        const auto& executor             = *instance.executor;
+        const auto prompt_n              = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const std::uint32_t until        = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
+        const std::uint32_t chunk_tokens = executor.options().prefill_chunk;
+        std::uint32_t step               = r.media ? chunk_tokens : executor.prompt_step();
+        const bool peers_decoding =
+            std::any_of(slots.begin(), slots.end(), [&](const Slot& other) {
+                return other.request && other.request.get() != &r && other.request->decoding;
+            });
+        if (peers_decoding) { step = std::min(step, kPeerSpanChunks * chunk_tokens); }
+        return std::min(step, until > r.prefilled ? until - r.prefilled : 0U);
     }
 
     // Publishes a committed preview with the logprob records it released, which a streaming
@@ -1387,11 +1431,7 @@ struct Qwen4ExpCore::Impl {
             executor.set_media(r.slot, items, data.positions, data.rope_delta);
             r.vision_seconds = seconds(vision_start, Clock::now());
         }
-        const std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
-        // A media prompt goes chunk by chunk; a text prompt in spans where the executor has them.
-        const std::uint32_t step =
-            r.media ? executor.options().prefill_chunk : executor.prompt_step();
-        const std::uint32_t n = std::min(step, until - r.prefilled);
+        const std::uint32_t n = prompt_step_tokens(r);
         const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
         executor.forward(r.slot, chunk, 1);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
@@ -1642,7 +1682,46 @@ struct Qwen4ExpCore::Impl {
         }
         std::vector<TokenId> all_drafts(b * drafts);
         std::vector<std::uint32_t> draft_extents(b, steps);
-        executor.draft(sequences, anchors, all_drafts, draft_extents, steps);
+        // Context lookup (--lookup-ngram N): a row whose last N tokens, its anchor last, appeared
+        // earlier in its sequence proposes what followed then, in place of the MTP block's guess,
+        // which is weakest where the output repeats its input; verification keeps it exact. It
+        // proposes up to the round's width: with --adaptive-mtp the one the controller chose, since
+        // a wider verification also routes to more experts. The MTP block drafts the other rows
+        // only, and no row when all have a proposal.
+        std::vector<char> looked_up(b, 0);
+        std::size_t lookups = 0;
+        if (lookup_ngram != 0) {
+            for (std::size_t j = 0; j < b; ++j) {
+                std::vector<TokenId>& ledger = slots[batch[j]->slot].fed;
+                ledger.push_back(anchors[j]);
+                const std::uint32_t found = runtime::lookup_draft(
+                    ledger, lookup_ngram, steps, all_drafts.data() + j * drafts);
+                ledger.pop_back();
+                if (found != 0) {
+                    looked_up[j]     = 1;
+                    draft_extents[j] = found;
+                    ++lookups;
+                }
+            }
+        }
+        if (lookups < b) {
+            std::vector<std::uint32_t> mtp_sequences;
+            std::vector<TokenId> mtp_anchors;
+            for (std::size_t j = 0; j < b; ++j) {
+                if (looked_up[j]) { continue; }
+                mtp_sequences.push_back(sequences[j]);
+                mtp_anchors.push_back(anchors[j]);
+            }
+            std::vector<TokenId> mtp_drafts(mtp_sequences.size() * drafts);
+            std::vector<std::uint32_t> mtp_extents(mtp_sequences.size(), steps);
+            executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, mtp_extents, steps);
+            for (std::size_t j = 0, m = 0; j < b; ++j) {
+                if (looked_up[j]) { continue; }
+                std::copy_n(mtp_drafts.begin() + std::ptrdiff_t(m * drafts), drafts,
+                            all_drafts.begin() + std::ptrdiff_t(j * drafts));
+                draft_extents[j] = mtp_extents[m++];
+            }
+        }
         const std::size_t k = *std::max_element(draft_extents.begin(), draft_extents.end());
         const std::size_t w = k + 1;
         const auto columns = static_cast<std::int32_t>(w);
@@ -1807,9 +1886,15 @@ struct Qwen4ExpCore::Impl {
                 }
             }
             r.speculative.rounds += 1;
-            r.speculative.drafted_tokens += steps; // the draft chain runs all its steps
+            // The MTP draft chain runs all its steps; a lookup proposes what it found.
+            r.speculative.drafted_tokens += looked_up[j] ? draft_extents[j] : steps;
             r.speculative.accepted_tokens += std::uint32_t(drafts_n);
-            if (mtp_controller) {
+            if (looked_up[j]) {
+                // Reported with the n-gram proposals: what the context, not the model, proposed.
+                ++r.speculative.ngram_rounds;
+                r.speculative.ngram_drafted_tokens += draft_extents[j];
+                r.speculative.ngram_accepted_tokens += std::uint32_t(drafts_n);
+            } else if (mtp_controller) {
                 r.mtp_signal.observe(std::min<std::uint32_t>(draft_extents[j], steps),
                                      std::uint32_t(drafts_n));
                 ++r.speculative.rounds_per_window[steps - 1];
@@ -1845,7 +1930,8 @@ struct Qwen4ExpCore::Impl {
             }
         }
         executor.commit(sequences, kept);
-        if (mtp_controller) {
+        // The controller measures rounds of MTP drafts only: a lookup changes the round's width.
+        if (mtp_controller && lookups == 0) {
             mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,
                                               seconds(round_start, Clock::now()));
         }

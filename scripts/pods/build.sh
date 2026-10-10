@@ -14,10 +14,11 @@ echo 'nvcc fatbinary compression: balance'
 export NINFER_BUILD_ID=$(/workspace/ninfer-work/py311/bin/python -c \
     'import json; d=json.load(open("/workspace/ninfer-work/source.json")); print(d["commit"][:12]+"-snapshot-"+d["source_sha256"][:12])')
 # A compiler cache carried between rentals (ccache_sync.py): a pod whose sources match an earlier
-# rental's compiles only what changed. ccache rewrites paths under the work root (the parent of
-# these sources) to relative ones, so a tree elsewhere with the same src/build layout matches too.
-# ccache hashes each command line, and nvcc reads NVCC_APPEND_FLAGS from the environment, which
-# ccache does not see: keep it the same for every build that shares this cache.
+# rental's compiles only what changed. Every pod builds in /workspace/ninfer-work, which the entries
+# need: most compile lines carry -ffile-prefix-map=<sources>=., which ccache's base directory does
+# not rewrite, so a tree at another path misses most entries. ccache hashes each command
+# line, and nvcc reads NVCC_APPEND_FLAGS from the environment, which ccache does not see: keep it
+# the same for every build that shares this cache.
 launcher=()
 if command -v ccache >/dev/null; then
     export CCACHE_DIR=${CCACHE_DIR:-/workspace/ccache} CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-40G}
