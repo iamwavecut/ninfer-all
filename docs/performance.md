@@ -548,7 +548,8 @@ which reserves about 64 MiB more per lane.
 DFlash2 accepts every draft count from 1 through 15. Seven is the checkpoint recommendation and the
 best mean on this card; the sweep behind it is in
 [Choosing a speculative backend by concurrency](#choosing-a-speculative-backend-by-concurrency-rtx-3090-qwen38-27b).
-DFlash2's `--lm-head-draft` is within noise of unset at every count and can be left off.
+DFlash2's optimized proposal head is within noise of the full head at every count;
+`--full-draft-head` saves its memory.
 
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 

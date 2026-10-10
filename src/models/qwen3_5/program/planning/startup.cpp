@@ -1013,7 +1013,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
-            options.speculative.proposal_head != ProposalHead::Full) {
+            models::planned_proposal_head(options.speculative.proposal_head) !=
+                ProposalHead::Full) {
             throw std::invalid_argument(
                 "disabled speculative decoding requires draft_tokens=0 and the full proposal head");
         }
@@ -1373,7 +1374,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .ngram_min_match            = options.speculative.ngram_min_match,
         .speculative_backend        = options.speculative.backend,
         .kv_storage                 = options.kv_cache,
-        .proposal_head              = options.speculative.proposal_head,
+        .proposal_head = models::planned_proposal_head(options.speculative.proposal_head),
         .rope_yarn                  = planned_rope_yarn(parameters, options),
         .mtp_attention_window       = options.speculative.mtp_attention_window,
         .features                   = models::load_options(options),

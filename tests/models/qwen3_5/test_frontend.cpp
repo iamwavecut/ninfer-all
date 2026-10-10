@@ -1956,6 +1956,32 @@ int test_attention_pairs_are_diagnostic(const Frontend& frontend) {
     return failures;
 }
 
+// OpenAI's low image detail bounds an image at 256 merged Vision tokens; the same bytes at full
+// detail keep their own prepared media, and counting agrees with preparation.
+int test_low_image_detail(const Frontend& frontend) {
+    const auto bytes = block_ppm(2048, 1536, 91);
+    auto low         = image_text_input(bytes, {}, "low-detail.ppm");
+    low.messages[0].parts[0].media.image_detail = ninfer::ImageDetail::Low;
+    const std::size_t low_count = frontend.count_tokens(low);
+    const auto low_prepared     = frontend.prepare(std::move(low));
+    const auto& low_data        = FrontendFactory::inspect(low_prepared);
+    int failures                = check(
+        low_data.vision_items.size() == 1 && low_data.prepare.vision_tokens > 0 &&
+            low_data.prepare.vision_tokens <= 256 && low_count == low_data.token_ids.size(),
+        "a low-detail image was not bounded at 256 Vision tokens");
+    for (const auto detail : {ninfer::ImageDetail::Auto, ninfer::ImageDetail::High}) {
+        auto full                                    = image_text_input(bytes, {}, "full.ppm");
+        full.messages[0].parts[0].media.image_detail = detail;
+        const auto full_prepared                     = frontend.prepare(std::move(full));
+        const auto& full_data                        = FrontendFactory::inspect(full_prepared);
+        failures += check(full_data.prepare.vision_tokens == 3'072 &&
+                              full_data.vision_items.front().content_digest !=
+                                  low_data.vision_items.front().content_digest,
+                          "full detail reused the low-detail preparation of the same bytes");
+    }
+    return failures;
+}
+
 int test_video_prepare(const Frontend& frontend) {
     ninfer::MessagePart video;
     video.kind              = ninfer::MessagePartKind::Media;
@@ -3260,6 +3286,7 @@ int main() {
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
+    failures += test_low_image_detail(frontend);
     failures += test_video_prepare(frontend);
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);

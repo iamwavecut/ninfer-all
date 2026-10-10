@@ -70,9 +70,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     }
     switch (options.backend) {
     case SpeculativeBackend::None:
-        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {
-            throw std::invalid_argument(
-                "--draft-tokens and --lm-head-draft require --spec mtp|dflash|dflash2");
+        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Auto) {
+            throw std::invalid_argument("--draft-tokens, --lm-head-draft and --full-draft-head "
+                                        "require --spec mtp|dflash|dflash2");
         }
         if (options.mtp_policy != MtpDraftPolicy::Fixed) {
             throw std::invalid_argument("--adaptive-mtp requires --spec mtp");

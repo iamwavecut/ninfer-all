@@ -437,6 +437,20 @@ int main() {
         failures += check(options.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
                               options.speculative.draft_tokens == k,
                           "serve options did not accept an MTP window past five");
+        // Without a selection the load picks the artifact's proposal head when it stores one.
+        failures += check(options.speculative.proposal_head == ninfer::ProposalHead::Auto,
+                          "an unselected draft head was not automatic");
+    }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                             "3", "--full-draft-head"})
+                              .speculative.proposal_head == ninfer::ProposalHead::Full,
+                      "--full-draft-head did not select the full head");
+    for (const char* head : {"--lm-head-draft", "--full-draft-head"}) {
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", head});
+        } catch (const std::invalid_argument&) { refused = true; }
+        failures += check(refused, "a draft head without --spec was accepted");
     }
     bool mtp_sixteen_rejected = false;
     try {
@@ -1028,6 +1042,7 @@ int main() {
                                         "--embedding-q6",
                                         "--fast-prefill-kernel",
                                         "--frequency-penalty",
+                                        "--full-draft-head",
                                         "--gdn-state-fp16",
                                         "--graft",
                                         "--greedy",
@@ -1040,6 +1055,7 @@ int main() {
                                         "--kv-headroom-mib",
                                         "--kv-lease-growth",
                                         "--lenient-assistant-history",
+                                        "--lenient-image-detail",
                                         "--lm-head-draft",
                                         "--lm-head-q4",
                                         "--lm-head-q6",

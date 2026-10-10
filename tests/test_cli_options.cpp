@@ -247,6 +247,7 @@ int run_tests() {
                                         "--embedding-q4",
                                         "--embedding-q6",
                                         "--frequency-penalty",
+                                        "--full-draft-head",
                                         "--gdn-state-fp16",
                                         "--greedy",
                                         "--json",

@@ -321,8 +321,9 @@ std::string usage_text(std::string_view program) {
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 15 with "
            "--spec, 0 without)\n"
         << "  --ngram-min-match <n>      copy admission 4..64 (default: 12)\n"
-        << "  --lm-head-draft             use the optimized proposal head; requires a speculative "
-           "backend\n"
+        << "  --lm-head-draft             use the optimized proposal head (the default when the "
+           "artifact stores one); requires a speculative backend\n"
+        << "  --full-draft-head           use the full output head for drafts\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --no-prefill-a8             full prefill tiles keep their A16 routes\n"
@@ -406,6 +407,8 @@ BenchOptions parse_args(int argc, char** argv) {
                 parse_u32(value("--ngram-min-match"), "ngram-min-match");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (arg == "--full-draft-head") {
+            options.speculative.proposal_head = ProposalHead::Full;
         } else if (arg == "--device") {
             options.device = parse_nonnegative(value("--device"), "device");
         } else if (arg == "--no-cuda-graph") {
@@ -974,6 +977,8 @@ std::string kv_cache_name(KvCacheStorage storage) {
 
 std::string proposal_head_name(ProposalHead head) {
     switch (head) {
+    case ProposalHead::Auto:
+        return "auto";
     case ProposalHead::Full:
         return "full";
     case ProposalHead::Optimized:

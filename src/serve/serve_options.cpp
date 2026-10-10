@@ -327,7 +327,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --spec mtp|dflash|dflash2     speculative decoding backend\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0)\n"
-           "  --lm-head-draft               draft with the optimized proposal head\n"
+           "  --lm-head-draft               draft with the optimized proposal head, which\n"
+           "                                the artifact must store (the default when it does)\n"
+           "  --full-draft-head             draft with the full output head even when the\n"
+           "                                artifact stores a proposal head\n"
            "  --adaptive-mtp                each MTP round verifies 3..--draft-tokens\n"
            "                                drafts, the width the drafts' measured survival\n"
            "                                and round cost favor; greedy output is unchanged\n"
@@ -425,6 +428,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --lenient-assistant-history   accept Responses input whose assistant text or\n"
            "                                reasoning follows function_call Items; it joins\n"
            "                                that turn, rendered before its calls\n"
+           "  --lenient-image-detail        read an OpenAI image detail other than auto, low\n"
+           "                                or high as auto instead of refusing the request\n"
            "  --usage-chunk-choice          give the streamed usage chunk a zero-delta\n"
            "                                choice, for strict parsers that reject\n"
            "                                choices:[]\n"
@@ -1198,6 +1203,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.lenient_assistant_history = true;
             continue;
         }
+        if (arg == "--lenient-image-detail") {
+            options.lenient_image_detail = true;
+            continue;
+        }
         if (arg == "--derive-session-keys") {
             legacy_cache_flag           = "--derive-session-keys";
             options.derive_session_keys = true;
@@ -1224,6 +1233,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+            continue;
+        }
+        if (arg == "--full-draft-head") {
+            options.speculative.proposal_head = ProposalHead::Full;
             continue;
         }
         if (arg == "--adaptive-mtp") {

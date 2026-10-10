@@ -66,7 +66,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--fast-prefill-kernel]
-          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
+          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft|--full-draft-head]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
@@ -81,9 +81,9 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (K=1..15 for every backend);
-`--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
-enabled by default.
+Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (K=1..15 for every backend).
+Drafts use the optimized proposal head when the artifact stores one; `--lm-head-draft` requires it
+and `--full-draft-head` keeps the full output head. CUDA Graph decode is enabled by default.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with

@@ -101,6 +101,9 @@ struct KvCapacityPolicy {
 };
 
 enum class ProposalHead : std::uint8_t {
+    // The artifact's optimized proposal head when it stores one, the full output head otherwise;
+    // resolved when the model loads.
+    Auto,
     Full,
     Optimized,
 };
@@ -127,7 +130,8 @@ struct SpeculativeOptions {
     // Flash-Next MTP: truncate verification after the first draft whose absolute probability
     // is at or below this floor. Zero keeps the full window; drafting still runs the captured chain.
     float draft_min_p = 0;
-    ProposalHead proposal_head = ProposalHead::Full;
+    // An Engine's options() report the resolved head.
+    ProposalHead proposal_head = ProposalHead::Auto;
     // Context-lookup drafting: match this many trailing tokens against the sequence so far and
     // propose whatever followed the last time they appeared. 0 disables it. It costs no device
     // work, it is exact (verify rejects a wrong guess), and it is strongest exactly where a draft
@@ -830,12 +834,22 @@ enum class ImageResizePolicy : std::uint8_t {
     RejectOversized,
 };
 
+// How finely an image is seen (OpenAI's image detail). Low bounds it at the area of a 512 x 512
+// picture, 256 merged Vision tokens (or the server's own bound if that is smaller); Auto and High
+// use the server's bound (--vision-max-merged).
+enum class ImageDetail : std::uint8_t {
+    Auto,
+    Low,
+    High,
+};
+
 struct OwnedMedia {
     MediaKind kind = MediaKind::Image;
     std::vector<std::uint8_t> bytes;
     std::string media_type;
     std::string source_name;
     ImageResizePolicy image_resize_policy = ImageResizePolicy::Downsize;
+    ImageDetail image_detail              = ImageDetail::Auto;
 };
 
 struct ToolCall {

@@ -439,6 +439,29 @@ VisionItem inspect_image_item(std::span<const std::uint8_t> bytes, const Process
     return item;
 }
 
+// A low-detail image's bound: the area of a 512 x 512 picture.
+constexpr std::uint64_t kLowDetailMergedTokens = 256;
+
+// The options one media part is counted and prepared with: a low-detail image is bounded further.
+ProcessorOptions part_options(const ChatPart& part, const ProcessorOptions& options) {
+    ProcessorOptions out = options;
+    if (part.kind == ChatPartKind::Image && part.media.image_detail == ImageDetail::Low) {
+        bound_merged_tokens(out, kLowDetailMergedTokens);
+    }
+    return out;
+}
+
+// The identity of a part's prepared media: its bytes' digest, kept apart for a low-detail image,
+// whose Vision tokens differ from the same bytes seen at full detail.
+Sha256Digest part_digest(const ChatPart& part, const Sha256Digest& bytes_digest) {
+    if (part.kind != ChatPartKind::Image || part.media.image_detail != ImageDetail::Low) {
+        return bytes_digest;
+    }
+    std::string keyed = "ninfer image detail low\n";
+    keyed.append(reinterpret_cast<const char*>(bytes_digest.data()), bytes_digest.size());
+    return sha256(std::string_view(keyed));
+}
+
 void enforce_image_resize_policy(const ChatPart& part, const ProcessorOptions& options,
                                  const media::decode::Policy& policy) {
     if (part.kind != ChatPartKind::Image ||
@@ -885,10 +908,11 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
     try {
         for (const ChatPart* part : parts) {
             check_preparation_control(control);
-            enforce_image_resize_policy(*part, options_, policy);
+            const ProcessorOptions options = part_options(*part, options_);
+            enforce_image_resize_policy(*part, options, policy);
             VisionItem item = part->kind == ChatPartKind::Image
-                                  ? inspect_image_item(part->media.bytes, options_, policy)
-                                  : inspect_video_item(part->media.bytes, options_, policy);
+                                  ? inspect_image_item(part->media.bytes, options, policy)
+                                  : inspect_video_item(part->media.bytes, options, policy);
             PreprocessStats item_stats;
             add_budget(item_stats, item);
             enforce_media_item_resource_limits(item_stats);
@@ -964,7 +988,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         .checkpoint = [&worker_control] { check_preparation_control(worker_control); },
     };
     try {
-        for (const ChatPart* part : parts) { enforce_image_resize_policy(*part, options_, policy); }
+        for (const ChatPart* part : parts) {
+            enforce_image_resize_policy(*part, part_options(*part, options_), policy);
+        }
     } catch (const media::decode::Error& error) { throw_decode_error(error); }
     ProcessedInput output;
     std::vector<VisionItem> items;
@@ -982,8 +1008,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     for (ChatPart* part : parts) {
         try {
             check_preparation_control(control);
-            const auto digest =
-                sha256(part->media.bytes, [&control] { check_preparation_control(control); });
+            const auto digest = part_digest(
+                *part,
+                sha256(part->media.bytes, [&control] { check_preparation_control(control); }));
             const ChatPartKind kind = part->kind;
             const MediaCacheKey key{
                 .digest   = digest,
@@ -991,12 +1018,13 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             };
             PendingMedia pending = media_cache_->begin_prepare(
                 key, worker_control,
-                [this, part, kind, digest, &policy, &request_budget, &worker_control]() {
+                [this, part, kind, digest, options = part_options(*part, options_), &policy,
+                 &request_budget, &worker_control]() {
                     Prepared built =
                         kind == ChatPartKind::Image
-                            ? prepare_image(part->media.bytes, options_, policy, *media_cache_,
+                            ? prepare_image(part->media.bytes, options, policy, *media_cache_,
                                             request_budget, worker_control)
-                            : prepare_video(part->media.bytes, options_, policy, *media_cache_,
+                            : prepare_video(part->media.bytes, options, policy, *media_cache_,
                                             request_budget, worker_control);
                     built.item.content_digest = digest;
                     return PreparedMedia{std::move(built.item), std::move(built.payload)};
