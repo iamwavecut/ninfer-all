@@ -694,6 +694,19 @@ they advance during a long request rather than at its completion, and their rati
 | `ninfer:context_cache_exhausted_requests_total` | counter | requests failed because the context cache had no placement for them |
 | `ninfer:engine_recoveries_total` | counter | host-side worker failures the Engine survived instead of latching unavailable |
 | `ninfer:uptime_seconds` | gauge | seconds since the Engine became ready |
+| `ninfer:waiting_cancelled_requests_total` | counter | requests the client cancelled while they waited for admission (Qwen3.5 cores, as are the five series below) |
+| `ninfer:waiting_expired_requests_total` | counter | requests that reached `--pending-timeout-ms` before admission |
+| `ninfer:waiting_abandoned_seconds_total` | counter | time those cancelled and expired requests had waited |
+| `ninfer:cancelled_prefills_total` | counter | requests cancelled while their prompt prefilled |
+| `ninfer:cancelled_prefill_computed_tokens_total` | counter | prompt tokens those requests had computed |
+| `ninfer:cancelled_prefills_salvaged_total` | counter | cancelled prefills the context cache kept at the point they reached, so the retry resumes there |
+| `ninfer:context_selections_total{source}` | counter | admissions by the context-cache source they started from: `root` (a miss, prefilled from token zero), `private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, `shared_stable_prefix`; the hit rate is 1 - root / all |
+| `ninfer:context_pressure_events_total{event}` | counter | what pressure planning did to inactive owners: `private_owner_evicted`, `private_owner_degraded`, `shared_owner_evicted`, `shared_owner_degraded`, `checkpoint_dropped` |
+| `ninfer:context_pressure_searches_total{result}` | counter | pressure planning searches: `started`, `budget_exhausted`, `maximal_fallback` |
+| `ninfer:context_transfer_bytes_total{object,direction}` | counter | context-cache bytes moved between Device and Host: `object` `state`, `main_kv` or `backend_kv`, `direction` `d2h` or `h2d` |
+| `ninfer:context_transfer_seconds_total` | counter | time admissions waited for context-cache transfers |
+| `ninfer:context_historical_fork_hits_total` | counter | admissions that forked a historical checkpoint instead of the latest endpoint |
+| `ninfer:context_occupancy{pool}` | gauge | `device_state_slots`, `host_state_slots`, `device_main_kv_pages`, `device_backend_kv_pages`, `host_kv_bytes` in use |
 
 ### WebUI
 
@@ -1833,7 +1846,10 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
-| `--host-cache-mib N` | single pinned Host RAM ceiling for the whole retention tier in MiB. Hybrid mode: the slab pool KV blocks and state snapshots share, split at run time by eviction value; `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected. Default cache: the engine derives the Host StateImage slot count from the checkpoint inventory the capture path creates, spends the remaining state headroom on more long anchors per continuation when `--auto-long-anchors` is on, and gives Host KV the remainder. Replaces `--host-state-slots` and `--host-kv-mib`, which are rejected alongside it. | hybrid `8192`; otherwise unset (component flags used) |
+| `--host-cache-mib N\|auto` | single pinned Host RAM ceiling for the whole retention tier in MiB. Hybrid mode: the slab pool KV blocks and state snapshots share, split at run time by eviction value; `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected. Default cache: the engine derives the Host StateImage slot count from the checkpoint inventory the capture path creates, spends the remaining state headroom on more long anchors per continuation when `--auto-long-anchors` is on, and gives Host KV the remainder. `auto` sizes it once the weights are loaded (and, for Qwen3.8-Flash-Next, its experts pinned) from the host memory still available, the smaller of the system's available memory and what the process's memory cgroup allows, less `--host-cache-reserve-mib` and, with Vision, the media caches, and never above `--host-cache-max-mib` or `--host-cache-percent` of the machine's memory; for a machine that serves this one process, since pinned pages cannot be reclaimed. Replaces `--host-state-slots` and `--host-kv-mib`, which are rejected alongside it. | hybrid `8192`; otherwise unset (component flags used) |
+| `--host-cache-reserve-mib N` | with `--host-cache-mib auto`: host memory left free for what grows after startup (request buffers, the response store, graph instantiation) | `3072` |
+| `--host-cache-max-mib N` | with `--host-cache-mib auto`: the largest budget it may choose, for a host whose memory other processes share | none |
+| `--host-cache-percent N` | with `--host-cache-mib auto`: the largest budget as a percentage (1..100) of the machine's memory (physical, or the lower cgroup limit) | none |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 7)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation; with `--auto-long-anchors`, `--host-cache-mib` raises it within the state inventory it funds and never lowers it | `2`, `4` with `--auto-long-anchors` |

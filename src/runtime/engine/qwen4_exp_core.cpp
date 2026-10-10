@@ -18,6 +18,7 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/host_memory.h"
 #include "runtime/engine/model_instance.h"
 #include "text/structured_output.h"
 
@@ -562,7 +563,12 @@ struct Qwen4ExpCore::Impl {
         sample_workspace                 = std::make_unique<WorkspaceArena>(workspace);
         const ContextCacheOptions& cache = options.context_cache;
         if (reuse_prefixes) {
-            host_budget = cache.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
+            // An automatic budget is sized here, once the experts are pinned.
+            const ContextCacheOptions sized = resolve_auto_host_cache_now(
+                cache, options.enable_vision ? std::uint64_t(options.media_cache_bytes) +
+                                                   options.media_live_bytes
+                                             : 0U);
+            host_budget = sized.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
             if (!cache.disk_kv_path.empty()) {
                 disk_dir     = cache.disk_kv_path / profile_name(options);
                 disk_budget  = cache.disk_kv_capacity_bytes != 0 ? cache.disk_kv_capacity_bytes
