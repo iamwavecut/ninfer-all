@@ -662,8 +662,8 @@ left in its output or thinking budget, and while a
 available for this model; `--mtp-attention-window` and `--lm-head-draft` are refused.
 
 With `--lookup-ngram N`, a request whose last `N` tokens (the token it feeds next last) appeared
-earlier in its sequence proposes what followed them then, up to `--draft-tokens`, in place of the
-MTP block's drafts; the MTP block drafts the other requests of the round, and none when every
+earlier in its sequence proposes what followed them then, up to the round's width (`--draft-tokens`,
+or with `--adaptive-mtp` the width the controller chose), in place of the MTP block's drafts; the MTP block drafts the other requests of the round, and none when every
 request has such a proposal. The proposal is verified like any draft, so a wrong one costs speed,
 not tokens. Its rounds are reported with the n-gram proposals (`ngram_rounds`).
 

@@ -1664,9 +1664,11 @@ struct Qwen4ExpCore::Impl {
         std::vector<TokenId> all_drafts(b * drafts);
         std::vector<std::uint32_t> draft_extents(b, steps);
         // Context lookup (--lookup-ngram N): a row whose last N tokens, its anchor last, appeared
-        // earlier in its sequence proposes what followed then, up to `drafts` tokens, in place of
-        // the MTP block's guess, which is weakest where the output repeats its input; verification
-        // keeps it exact. The MTP block drafts the other rows only, and no row when all have one.
+        // earlier in its sequence proposes what followed then, in place of the MTP block's guess,
+        // which is weakest where the output repeats its input; verification keeps it exact. It
+        // proposes up to the round's width: with --adaptive-mtp the one the controller chose, since
+        // a wider verification also routes to more experts. The MTP block drafts the other rows
+        // only, and no row when all have a proposal.
         std::vector<char> looked_up(b, 0);
         std::size_t lookups = 0;
         if (lookup_ngram != 0) {
@@ -1674,7 +1676,7 @@ struct Qwen4ExpCore::Impl {
                 std::vector<TokenId>& ledger = slots[batch[j]->slot].fed;
                 ledger.push_back(anchors[j]);
                 const std::uint32_t found = runtime::lookup_draft(
-                    ledger, lookup_ngram, drafts, all_drafts.data() + j * drafts);
+                    ledger, lookup_ngram, steps, all_drafts.data() + j * drafts);
                 ledger.pop_back();
                 if (found != 0) {
                     looked_up[j]     = 1;
