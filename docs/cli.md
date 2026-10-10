@@ -203,6 +203,14 @@ penalties, and prefix reuse. An artifact without the companion weights reports a
 component when selected. Vision, MTP and DFlash follow the same rule: their weights are required
 only when that component is enabled at startup.
 
+A request that samples (temperature above zero) verifies MTP and DFlash drafts with coupled
+draws: the model draws each verified position with the request's seed and that position as the key,
+exactly as plain decoding does, and keeps a draft only while it equals that draw. Every emitted
+token is the model's own sample; the drafts decide only how many tokens one pass emits, not which.
+What can still separate a speculative answer from a plain one with the same seed is the
+floating-point effect of the verification width, as for greedy decoding. DFlash2 verifies its
+retained proposal distribution by rejection sampling.
+
 ### Choosing a draft count
 
 The draft count is a trade on what the output looks like. Each round verifies K+1 columns and runs

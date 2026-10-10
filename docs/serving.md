@@ -340,8 +340,9 @@ SSE content deltas are ordinary partial JSON bytes; concatenate them before pars
 guarantee format, not factual accuracy or semantic task success.
 
 Masks are applied before target top-k/top-p/min-p filtering at **every** speculative position,
-including correction and bonus tokens. Unconstrained draft distributions remain unchanged;
-accept/reject and residual sampling use the constrained target distribution. Per-request grammar
+including correction and bonus tokens. Drafts are proposed without the mask; every verification
+draw -- MTP and DFlash coupled draws, DFlash2 accept/reject and residual sampling -- uses the
+constrained target distribution. Per-request grammar
 state advances only with Engine output commit, and is never restored from a prompt/KV cache.
 DFlash/DFlash2 CUDA Graphs contain a host matcher node between draft generation and verification;
 this adds a CPU synchronization point and mask transfers per round. No speedup claim is implied.

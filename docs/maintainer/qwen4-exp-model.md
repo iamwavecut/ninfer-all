@@ -95,7 +95,7 @@ supersede the earlier hybrid-platform proposal below; its completed evidence rem
 
 | M5 | the n-gram table described by every model and stored inside it or in a table artifact of its own, refused when missing or different; up to eight concurrent requests with batched decode (the experts read once per batch), FIFO admission between prefill chunks; the context cache's live and turn-closure reuse of a sequence's recurrent state; structured output through the grammar's token masks; the Qwen3.5 Vision tower from the release's mmproj with three-axis RoPE for media prompts | `src/models/qwen4_exp/ngram_component.*`, `executor.*`, `src/runtime/engine/qwen4_exp_core.*`, `tools/convert/qwen4_exp_gguf.py` |
 
-| M5 | MTP speculative decoding (October 2026): the `mtp` component from Unsloth's MTP GGUFs (`eh_proj` split between blocks into `fc_embedding` and `fc_hidden`, hyper-connections decoded to BF16); the MTP block's own sparse-attention KV, pooled keys and indexer tail, its catch-up over every token the model commits; verification of every decoding request's anchor and drafts in one pass, Gated DeltaNet replay records and their fold, the indexer tails and the PLE history advanced over the kept positions (`ple_inject_record`, `ple_history_advance`); the Qwen3.5 family's acceptance (`speculative_accept_greedy_drafts`) with penalties, grammar masks and logprobs; the context cache's sequence images (KV, pooled keys, recurrent and MTP state) in pinned host memory and in disk files | `tools/convert/qwen4_exp*.py`, `src/models/qwen4_exp/{model,executor}.*`, `src/runtime/engine/qwen4_exp_core.*`, `src/ops/{hyper_connection,ple_inject}/` |
+| M5 | MTP speculative decoding (October 2026): the `mtp` component from Unsloth's MTP GGUFs (`eh_proj` split between blocks into `fc_embedding` and `fc_hidden`, hyper-connections decoded to BF16); the MTP block's own sparse-attention KV, pooled keys and indexer tail, its catch-up over every token the model commits; verification of every decoding request's anchor and drafts in one pass, Gated DeltaNet replay records and their fold, the indexer tails and the PLE history advanced over the kept positions (`ple_inject_record`, `ple_history_advance`); the Qwen3.5 family's acceptance (`speculative_accept_coupled_drafts`) with penalties, grammar masks and logprobs; the context cache's sequence images (KV, pooled keys, recurrent and MTP state) in pinned host memory and in disk files | `tools/convert/qwen4_exp*.py`, `src/models/qwen4_exp/{model,executor}.*`, `src/runtime/engine/qwen4_exp_core.*`, `src/ops/{hyper_connection,ple_inject}/` |
 | M5 | 32K/128K public Engine needle checks on two RTX 3090s: 33,024/131,008 input tokens, facts at positions 32,768/98,304, different four-digit facts, plain and MTP K=4, int8 KV, prefix reuse off | `tests/models/qwen4_exp/test_long_context_real.cpp`; October 8, 2026 |
 
 Native Q2 storage/import, vector expert Ops and grouped integer tensor-core prefill are qualified
@@ -329,18 +329,19 @@ multiple columns, with independent Op checks and the completed K=1/4/8/15 Engine
 independent mathematical oracles and exact repetition with the execution configuration fixed.
 Changing verification width, prefill partition or batch composition can change reductions and a near-tie argmax;
 plain-versus-MTP token differences must be reported, but are not a byte-identity requirement.
-Sampling RNG purposes also differ between plain and speculative decoding. Exact context-image
-restore remains required for the same prefix computation history and execution profile, including
-n-gram enablement. The native Q2 cache check initially compared cold 512+218 prefill against a
-512+188 prefix followed by 30 tokens: their eight-token answers differ. Live-prefix and disk-prefix
-continuations agree exactly; the test now checks that required identity and records the cold
-difference separately, rather than treating a change in prefill partition as a restore failure.
-The complete native Q2 Engine suite then passed with `target_differences=0`,
+Plain decode and coupled MTP verification (`speculative_accept_coupled_drafts`) draw each position
+with the same decode key, so only those reductions separate their sampled answers. Exact
+context-image restore remains required for the same prefix computation history and execution
+profile, including n-gram enablement. The native Q2 cache check initially compared cold 512+218
+prefill against a 512+188 prefix followed by 30 tokens: their eight-token answers differ.
+Live-prefix and disk-prefix continuations agree exactly; the test now checks that required identity
+and records the cold difference separately, rather than treating a change in prefill partition as a
+restore failure. The complete native Q2 Engine suite then passed with `target_differences=0`,
 `batch_differences=5`, `failures=0`: K=1/4/8/15, output/thinking budgets, seeded repeats,
-cancellation, logprobs, disk restore and cache-profile isolation. This does not establish
-full-model quality or throughput. The converter/MTP/FP8 source/table suite has 131 passing tests;
-the live range-fetch check retrieved one 5,120-byte HF MTP norm and verified its file hash,
-not the entire MTP block.
+cancellation, logprobs, disk restore and cache-profile isolation. This does not establish full-model
+quality or throughput. The converter/MTP/FP8 source/table suite has 131 passing tests; the live
+range-fetch check retrieved one 5,120-byte HF MTP norm and verified its file hash, not the entire
+MTP block.
 
 The October 8 disk-cache qualification passed exact row checks (including split rows, eviction
 and failed-batch admission) and 12 public Engine comparisons: plain/MTP K=4, buffered reads with
