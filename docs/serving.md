@@ -134,6 +134,16 @@ agree closely but not bit for bit. It reads the tower's weights in the official 
 formats as well as BF16, FP8 and NVFP4; a projection stored with a Hadamard rotation or an input
 gather is refused at load.
 
+### Image detail
+
+OpenAI's image `detail` (Chat Completions `image_url.detail`, Responses `input_image.detail`) is
+accepted as `auto`, `high` or `low`. `auto` and `high` see the image at the resolution
+`--vision-max-merged` allows, which is NInfer's normal preprocessing. `low` bounds the image at the
+area of a 512 x 512 picture, 256 merged Vision tokens (or the server's bound when that is smaller),
+for a cheaper and coarser look. The same bytes at both details are prepared, cached and reused as
+two different images. Any other value is refused with `image_detail_not_supported`, or read as
+`auto` when the server runs with `--lenient-image-detail`.
+
 ## Several models (router)
 
 Started with `--models-dir` or `--models-preset` and no artifact path, the server is a router in
@@ -777,7 +787,8 @@ The endpoint supports:
 - string content and ordered text/refusal parts; adjacent parts are preserved without inserted
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
-  `video_url` extension using HTTP(S) or data URIs; image detail is omitted or `auto`;
+  `video_url` extension using HTTP(S) or data URIs; image `detail` `auto`, `high` or `low` (see
+  [image detail](#image-detail));
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation; llama.cpp's `-1` ("no limit", the WebUI's default) and omitting
   both apply the [default output limit](#default-output-limit);
@@ -821,8 +832,7 @@ The endpoint supports:
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes JSON constrained output on a server without `--structured-output` (unless
 it runs with `--unconstrained-response-format`), nonzero `logit_bias`, audio/file input or audio
-output, `required` tool choice over several callable tools, explicit low/high image detail, web
-search, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
+output, `required` tool choice over several callable tools, web search, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 The vLLM/llama.cpp constrained-decoding extensions (`grammar`, `structured_outputs`, `guided_json`,
 `guided_regex`, `guided_choice`, and `guided_grammar`) are rejected explicitly instead of being
@@ -1311,7 +1321,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; `detail` `auto`, `high` or `low` (see [image detail](#image-detail)); requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
@@ -1336,8 +1346,8 @@ An `input_text`, `input_image`, or tool-result part may carry
 boundaries; they affect reuse opportunities, not prompt identity or output semantics. String
 message status/phase metadata is accepted but has no Qwen prompt representation.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
-reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
+`input_file`, `input_audio`, image `file_id`, reasoning metadata without raw reasoning text,
+partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.
 
@@ -1826,6 +1836,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--unconstrained-response-format` | without `--structured-output`, generate a JSON or JSON Schema request unconstrained instead of refusing it | off |
 | `--assistant-prefill` | continue a Chat Completions request's trailing assistant message in place, as `/v1/messages` does | off |
 | `--lenient-assistant-history` | accept Responses input whose assistant message content or reasoning follows `function_call` Items in one run: it joins that run's assistant turn, as Messages flattens content blocks, and the template renders it before the calls. Without it such input fails with `invalid_assistant_history` rather than being silently reordered | off |
+| `--lenient-image-detail` | read an OpenAI image `detail` other than `auto`, `low` or `high` as `auto` instead of failing with `image_detail_not_supported`, for clients that send values NInfer does not know (see [image detail](#image-detail)) | off |
 | `--thinking-budget-message TEXT` | message a thinking-enabled request receives at its thinking budget instead of the built-in notice; the canonical `</think>` close is appended when missing | built-in |
 | `--default-reasoning-effort E` | effort for requests that name none: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |

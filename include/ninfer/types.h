@@ -830,12 +830,22 @@ enum class ImageResizePolicy : std::uint8_t {
     RejectOversized,
 };
 
+// How finely an image is seen (OpenAI's image detail). Low bounds it at the area of a 512 x 512
+// picture, 256 merged Vision tokens (or the server's own bound if that is smaller); Auto and High
+// use the server's bound (--vision-max-merged).
+enum class ImageDetail : std::uint8_t {
+    Auto,
+    Low,
+    High,
+};
+
 struct OwnedMedia {
     MediaKind kind = MediaKind::Image;
     std::vector<std::uint8_t> bytes;
     std::string media_type;
     std::string source_name;
     ImageResizePolicy image_resize_policy = ImageResizePolicy::Downsize;
+    ImageDetail image_detail              = ImageDetail::Auto;
 };
 
 struct ToolCall {

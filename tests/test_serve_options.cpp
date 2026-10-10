@@ -1040,6 +1040,7 @@ int main() {
                                         "--kv-headroom-mib",
                                         "--kv-lease-growth",
                                         "--lenient-assistant-history",
+                                        "--lenient-image-detail",
                                         "--lm-head-draft",
                                         "--lm-head-q4",
                                         "--lm-head-q6",
