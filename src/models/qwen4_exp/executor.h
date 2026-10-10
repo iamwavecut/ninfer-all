@@ -186,13 +186,15 @@ public:
     // Whether the sequence's MTP state follows its tokens, which a media prompt breaks until the
     // sequence is reset; a sequence drafts only from a position past its first.
     [[nodiscard]] bool can_draft(std::uint32_t sequence) const;
-    // Drafts draft_tokens() tokens for each of `sequences` (distinct) from its next position: the
-    // MTP block runs its anchor (the token it sampled last and has not fed) and then its own
-    // drafts, greedily. `out` receives them sequence-major; returns once they are on the host.
-    // Optional `extents` receives one length per sequence, including the first draft at or below the
-    // probability floor. Drafting still executes the full captured chain.
+    // Drafts `steps` tokens (1..draft_tokens(); 0 means draft_tokens()) for each of `sequences`
+    // (distinct) from its next position: the MTP block runs its anchor (the token it sampled last
+    // and has not fed) and then its own drafts, greedily. `out` receives them sequence-major, each
+    // sequence's row draft_tokens() long; returns once they are on the host. Optional `extents`
+    // receives one length per sequence, up to the first draft at or below the probability floor.
+    // Drafting executes the whole chain of `steps`, captured once per step count.
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
-               std::span<std::int32_t> out, std::span<std::uint32_t> extents = {});
+               std::span<std::int32_t> out, std::span<std::uint32_t> extents = {},
+               std::uint32_t steps = 0);
     // Runs 2..draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
     // positions without committing them, and leaves the logits of every token in logits(), one
     // column per token, sequence after sequence. The sequences' positions and states stay where

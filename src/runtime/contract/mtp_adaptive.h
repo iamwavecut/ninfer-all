@@ -1,11 +1,11 @@
 #pragma once
 
-// Adaptive MTP verification width (--adaptive-mtp). Each request keeps an estimate of how far its
-// drafts survive; a batch controller picks the verification width that maximizes expected
-// committed tokens per unit of round cost, moving between widths only after a candidate has won
-// several rounds and a width has held for a few. Round costs are measured per batch size and
-// width as the rounds run; a width not yet run is priced from a relative cost shape scaled by the
-// widths that have.
+// Adaptive MTP verification width (--adaptive-mtp), shared by the Qwen3.5 Programs and the
+// Qwen3.8-Flash-Next core. Each request keeps an estimate of how far its drafts survive; a batch
+// controller picks the verification width that maximizes expected committed tokens per unit of
+// round cost, moving between widths only after a candidate has won several rounds and a width has
+// held for a few. Round costs are measured per batch size and width as the rounds run; a width not
+// yet run is priced from a relative cost shape scaled by the widths that have.
 
 #include <algorithm>
 #include <array>
@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <span>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace ninfer::runtime {
 
 inline constexpr std::uint32_t kAdaptiveMtpMaximumDrafts = 15;
 inline constexpr std::uint32_t kAdaptiveMtpMaximumBatch  = 8;
@@ -149,8 +149,12 @@ private:
 
 class MtpAdaptiveBatchController final {
 public:
-    void reset(std::uint32_t maximum_window) noexcept {
+    // `floor_window` is the narrowest width the controller settles on while every row has that
+    // many drafts ready: 3 where narrower widths cost about as much (the Qwen3.5 Programs, whose
+    // drafts are ready before the round), 1 where each draft is a step of its own.
+    void reset(std::uint32_t maximum_window, std::uint32_t floor_window = 3) noexcept {
         maximum_window_             = std::clamp(maximum_window, 1U, kAdaptiveMtpMaximumDrafts);
+        floor_window_               = std::clamp(floor_window, 1U, maximum_window_);
         selected_window_            = default_startup_window();
         candidate_window_           = selected_window_;
         rounds_at_window_           = 0;
@@ -315,11 +319,11 @@ private:
 
     [[nodiscard]] std::uint32_t
     minimum_selectable_window(std::span<const std::uint32_t> available) const noexcept {
-        if (maximum_window_ < 3) { return 1; }
+        if (maximum_window_ < floor_window_) { return 1; }
         for (const std::uint32_t row_available : available) {
-            if (row_available < 3) { return 1; }
+            if (row_available < floor_window_) { return 1; }
         }
-        return 3;
+        return floor_window_;
     }
 
     [[nodiscard]] std::uint32_t startup_window(std::span<const MtpAdaptiveSignal* const> signals,
@@ -389,6 +393,7 @@ private:
 
     MtpRoundCostModel costs_;
     std::uint32_t maximum_window_   = 1;
+    std::uint32_t floor_window_     = 3;
     std::uint32_t selected_window_  = 1;
     std::uint32_t candidate_window_ = 1;
     std::uint8_t rounds_at_window_  = 0;
@@ -403,4 +408,4 @@ private:
     std::uint32_t last_transition_to_   = 1;
 };
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace ninfer::runtime
