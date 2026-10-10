@@ -1,5 +1,5 @@
 #pragma once
-#include "models/qwen3_5/program/speculative/mtp_adaptive.h"
+#include "runtime/contract/mtp_adaptive.h"
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
@@ -52,6 +52,8 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+using runtime::MtpAdaptiveBatchController;
+using runtime::MtpAdaptiveSignal;
 using PreparedPromptData    = qwen3_5::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;

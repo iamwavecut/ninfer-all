@@ -85,6 +85,7 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n"
            "  --help, -h                    show this help and exit\n"
+           "  --version                     print the build version and exit\n"
            "\n"
            "MODEL & CONTEXT\n"
            "  --max-context N               logical context ceiling of each request (default\n"
@@ -550,6 +551,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     const char* legacy_cache_flag  = nullptr;
     const char* hybrid_option_flag = nullptr;
     bool original_cache_selected   = false;
+    if (argc >= 2 && std::string(argv[1]) == "--version") {
+        options.version_requested = true;
+        return options;
+    }
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
