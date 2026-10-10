@@ -19,6 +19,7 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/host_memory.h"
 #include "runtime/engine/model_instance.h"
 #include "text/structured_output.h"
 
@@ -42,6 +43,9 @@
 
 namespace ninfer::runtime {
 namespace {
+
+// Prompt chunks in one prefill step while other requests decode (see prefill_step).
+constexpr std::uint32_t kPeerSpanChunks = 2;
 
 using Clock = std::chrono::steady_clock;
 
@@ -564,7 +568,12 @@ struct Qwen4ExpCore::Impl {
         sample_workspace                 = std::make_unique<WorkspaceArena>(workspace);
         const ContextCacheOptions& cache = options.context_cache;
         if (reuse_prefixes) {
-            host_budget = cache.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
+            // An automatic budget is sized here, once the experts are pinned.
+            const ContextCacheOptions sized = resolve_auto_host_cache_now(
+                cache, options.enable_vision ? std::uint64_t(options.media_cache_bytes) +
+                                                   options.media_live_bytes
+                                             : 0U);
+            host_budget = sized.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
             if (!cache.disk_kv_path.empty()) {
                 disk_dir     = cache.disk_kv_path / profile_name(options);
                 disk_budget  = cache.disk_kv_capacity_bytes != 0 ? cache.disk_kv_capacity_bytes
@@ -1394,8 +1403,15 @@ struct Qwen4ExpCore::Impl {
         }
         const std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
         // A media prompt goes chunk by chunk; a text prompt in spans where the executor has them.
-        const std::uint32_t step =
-            r.media ? executor.options().prefill_chunk : executor.prompt_step();
+        // A span is one step, which with the experts off the GPU lasts seconds, and the requests
+        // that are decoding wait for all of it: while any decodes, a step is two chunks at most.
+        const std::uint32_t chunk_tokens = executor.options().prefill_chunk;
+        std::uint32_t step               = r.media ? chunk_tokens : executor.prompt_step();
+        const bool peers_decoding =
+            std::any_of(slots.begin(), slots.end(), [&](const Slot& other) {
+                return other.request && other.request.get() != &r && other.request->decoding;
+            });
+        if (peers_decoding) { step = std::min(step, kPeerSpanChunks * chunk_tokens); }
         const std::uint32_t n = std::min(step, until - r.prefilled);
         const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
         executor.forward(r.slot, chunk, 1);

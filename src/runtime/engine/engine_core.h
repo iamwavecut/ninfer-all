@@ -1558,7 +1558,13 @@ private:
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
             if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }
-            if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
+            if (scheduler_.owns_prefill_lane(lane)) {
+                ++cumulative_stats_.cancelled_prefills;
+                cumulative_stats_.cancelled_prefill_computed_tokens +=
+                    request->computed_prompt_tokens;
+                if (aborted.salvaged) { ++cumulative_stats_.cancelled_prefills_salvaged; }
+                scheduler_.clear_prefill_lane(lane);
+            }
             append_output(request, commit_output(*request));
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             // Free the slot and publish the post-release snapshot before waking the caller so
@@ -1590,8 +1596,19 @@ private:
             }
             have_pending = !pending_.empty();
         }
-        for (const auto& request : cancelled) { scheduler_.on_waiting_removed(request->id); }
-        for (const auto& request : expired) { scheduler_.on_waiting_removed(request->id); }
+        const auto removed = Clock::now();
+        for (const auto& request : cancelled) {
+            ++cumulative_stats_.waiting_cancelled_requests;
+            cumulative_stats_.waiting_abandoned_seconds +=
+                std::chrono::duration<double>(removed - request->submitted).count();
+            scheduler_.on_waiting_removed(request->id);
+        }
+        for (const auto& request : expired) {
+            ++cumulative_stats_.waiting_expired_requests;
+            cumulative_stats_.waiting_abandoned_seconds +=
+                std::chrono::duration<double>(removed - request->submitted).count();
+            scheduler_.on_waiting_removed(request->id);
+        }
         try {
             for (const auto& request : cancelled) { complete_detached_cancelled(request); }
             for (const auto& request : expired) {
