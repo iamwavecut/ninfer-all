@@ -845,6 +845,7 @@ std::string format_server_start_json(
              {"mode", cache.mode == ContextCacheMode::Hybrid ? "hybrid" : "legacy"},
              {"host_cache_budget_bytes",
               cache.host_cache_budget_bytes ? Json(*cache.host_cache_budget_bytes) : Json(nullptr)},
+             {"host_cache_auto", options.context_cache.host_cache_auto},
              {"hybrid",
               cache.mode == ContextCacheMode::Hybrid
                   ? Json{{"device_snapshot_slots", cache.hybrid.device_snapshot_slots.value_or(0)},
