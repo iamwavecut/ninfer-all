@@ -694,6 +694,19 @@ they advance during a long request rather than at its completion, and their rati
 | `ninfer:context_cache_exhausted_requests_total` | counter | requests failed because the context cache had no placement for them |
 | `ninfer:engine_recoveries_total` | counter | host-side worker failures the Engine survived instead of latching unavailable |
 | `ninfer:uptime_seconds` | gauge | seconds since the Engine became ready |
+| `ninfer:waiting_cancelled_requests_total` | counter | requests the client cancelled while they waited for admission (Qwen3.5 cores, as are the five series below) |
+| `ninfer:waiting_expired_requests_total` | counter | requests that reached `--pending-timeout-ms` before admission |
+| `ninfer:waiting_abandoned_seconds_total` | counter | time those cancelled and expired requests had waited |
+| `ninfer:cancelled_prefills_total` | counter | requests cancelled while their prompt prefilled |
+| `ninfer:cancelled_prefill_computed_tokens_total` | counter | prompt tokens those requests had computed |
+| `ninfer:cancelled_prefills_salvaged_total` | counter | cancelled prefills the context cache kept at the point they reached, so the retry resumes there |
+| `ninfer:context_selections_total{source}` | counter | admissions by the context-cache source they started from: `root` (a miss, prefilled from token zero), `private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, `shared_stable_prefix`; the hit rate is 1 - root / all |
+| `ninfer:context_pressure_events_total{event}` | counter | what pressure planning did to inactive owners: `private_owner_evicted`, `private_owner_degraded`, `shared_owner_evicted`, `shared_owner_degraded`, `checkpoint_dropped` |
+| `ninfer:context_pressure_searches_total{result}` | counter | pressure planning searches: `started`, `budget_exhausted`, `maximal_fallback` |
+| `ninfer:context_transfer_bytes_total{object,direction}` | counter | context-cache bytes moved between Device and Host: `object` `state`, `main_kv` or `backend_kv`, `direction` `d2h` or `h2d` |
+| `ninfer:context_transfer_seconds_total` | counter | time admissions waited for context-cache transfers |
+| `ninfer:context_historical_fork_hits_total` | counter | admissions that forked a historical checkpoint instead of the latest endpoint |
+| `ninfer:context_occupancy{pool}` | gauge | `device_state_slots`, `host_state_slots`, `device_main_kv_pages`, `device_backend_kv_pages`, `host_kv_bytes` in use |
 
 ### WebUI
 
