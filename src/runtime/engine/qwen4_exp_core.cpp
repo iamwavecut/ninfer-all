@@ -246,9 +246,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         // The first request would otherwise load every kernel it reaches.
         StartupPhaseScope warm(options.startup_observer, StartupPhase::CudaGraphPrepare);
         instance->executor->warm_up();
-        // What startup left free beyond a margin for lazily loaded kernels and the CUDA Graphs
-        // the first requests capture becomes expert slots.
-        instance->executor->grow_expert_cache(kGrowthMargin);
+        // With --expert-cache-mib auto, what startup left free beyond a margin for lazily loaded
+        // kernels and the CUDA Graphs the first requests capture becomes expert slots; an
+        // explicit size is the cache's size.
+        if (!options.expert_cache_bytes) { instance->executor->grow_expert_cache(kGrowthMargin); }
         warm.complete();
     }
     instance->free_after_weights = free_after_weights;
