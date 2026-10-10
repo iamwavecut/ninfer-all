@@ -326,6 +326,15 @@ struct ContextCacheOptions {
     // remainder, and rejects a plan whose state footprint exceeds half the budget.
     // `host_state_slots` and `host_kv_capacity_bytes` are ignored in that mode.
     std::optional<std::size_t> host_cache_budget_bytes;
+    // --host-cache-mib auto: host_cache_budget_bytes is sized at startup, once the weights are
+    // loaded, from the host memory still available (the smaller of the system's available memory
+    // and what the process's memory cgroup allows) less host_cache_reserve_bytes and, with Vision,
+    // the media caches; never above host_cache_max_bytes nor host_cache_percent of the machine's
+    // memory. For a machine that serves this one process: pinned pages cannot be reclaimed.
+    bool host_cache_auto                  = false;
+    std::size_t host_cache_reserve_bytes  = std::size_t{3} << 30;
+    std::optional<std::size_t> host_cache_max_bytes;
+    std::optional<std::uint32_t> host_cache_percent;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count. An engaged
     // host-cache budget raises the anchor count within the state inventory it funds.
     std::optional<std::uint32_t> max_private_continuations;
