@@ -1,6 +1,9 @@
 ninfer_add_test(ninfer_admission_policy_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_admission_policy.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_host_memory_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_memory.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_context_cost_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_cost.cpp"
   LIBRARIES ninfer_runtime_support ninfer::json)
 

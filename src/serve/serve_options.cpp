@@ -222,7 +222,16 @@ std::string serve_usage_text(const char* argv0) {
            "                                automatic anchors with the headroom, host KV the\n"
            "                                rest; with --use-alt-prefix-caching the pool KV\n"
            "                                blocks and state snapshots share (default 8192,\n"
-           "                                0 keeps the cache on the device)\n"
+           "                                0 keeps the cache on the device); auto: the\n"
+           "                                host memory free once the model is loaded, less\n"
+           "                                --host-cache-reserve-mib (default 3072), at most\n"
+           "                                --host-cache-max-mib and --host-cache-percent of\n"
+           "                                the machine's memory\n"
+           "  --host-cache-reserve-mib N    with --host-cache-mib auto: host memory left free\n"
+           "                                for what grows after startup (default 3072)\n"
+           "  --host-cache-max-mib N        with --host-cache-mib auto: the largest budget\n"
+           "  --host-cache-percent N        with --host-cache-mib auto: the largest budget as\n"
+           "                                a percentage of the machine's memory\n"
            "  --max-private-continuations N private continuation catalog (default 2x\n"
            "                                max-concurrency)\n"
            "  --max-shared-prefixes N       shared stable-prefix catalog (default\n"
@@ -533,6 +542,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool host_state_slots_explicit    = false;
     bool host_kv_mib_explicit         = false;
     bool host_cache_budget_explicit   = false;
+    bool host_cache_reserve_explicit  = false;
     bool long_anchor_spacing_explicit = false;
     bool ngram_width_explicit         = false;
     bool vision_max_merged_explicit   = false;
@@ -803,14 +813,43 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             continue;
         }
         if (arg == "--host-cache-mib") {
-            const std::uint64_t mib =
-                parse_u64(require_value("--host-cache-mib"), "host-cache-mib");
+            const std::string value = require_value("--host-cache-mib");
+            context_capacity_explicit  = true;
+            host_cache_budget_explicit = true;
+            if (value == "auto") {
+                options.context_cache.host_cache_auto = true;
+                options.context_cache.host_cache_budget_bytes.reset();
+                continue;
+            }
+            options.context_cache.host_cache_auto = false;
+            const std::uint64_t mib = parse_u64(value.c_str(), "host-cache-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
                 throw std::invalid_argument("--host-cache-mib is out of range");
             }
             options.context_cache.host_cache_budget_bytes = static_cast<std::size_t>(mib << 20);
-            context_capacity_explicit                     = true;
-            host_cache_budget_explicit                    = true;
+            continue;
+        }
+        if (arg == "--host-cache-reserve-mib" || arg == "--host-cache-max-mib") {
+            const std::uint64_t mib = parse_u64(require_value(arg.c_str()), arg.c_str() + 2);
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument(arg + " is out of range");
+            }
+            const auto bytes = static_cast<std::size_t>(mib << 20);
+            if (arg == "--host-cache-reserve-mib") {
+                options.context_cache.host_cache_reserve_bytes = bytes;
+                host_cache_reserve_explicit                    = true;
+            } else {
+                options.context_cache.host_cache_max_bytes = bytes;
+            }
+            continue;
+        }
+        if (arg == "--host-cache-percent") {
+            const std::uint64_t percent =
+                parse_u64(require_value("--host-cache-percent"), "host-cache-percent");
+            if (percent == 0 || percent > 100) {
+                throw std::invalid_argument("--host-cache-percent must be in [1,100]");
+            }
+            options.context_cache.host_cache_percent = static_cast<std::uint32_t>(percent);
             continue;
         }
         if (arg == "--disk-kv-path") {
@@ -1487,7 +1526,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         if (!file.empty()) {
-            if (host_cache_budget_explicit && options.context_cache.host_cache_budget_bytes == 0) {
+            if (host_cache_budget_explicit && !options.context_cache.host_cache_auto &&
+                options.context_cache.host_cache_budget_bytes == 0) {
                 throw std::invalid_argument(
                     "--prefix-cache-file saves the Host tier, which --host-cache-mib 0 removes");
             }
@@ -1559,6 +1599,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.auto_save_evicted && options.slot_save_path.empty()) {
         throw std::invalid_argument("--auto-save-evicted requires --slot-save-path");
+    }
+    if (!options.context_cache.host_cache_auto &&
+        (host_cache_reserve_explicit || options.context_cache.host_cache_max_bytes ||
+         options.context_cache.host_cache_percent)) {
+        throw std::invalid_argument("--host-cache-reserve-mib, --host-cache-max-mib and "
+                                    "--host-cache-percent size --host-cache-mib auto");
     }
     if (host_cache_budget_explicit) {
         // The budget is the one host RAM ceiling; the two component flags would silently
