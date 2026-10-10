@@ -572,7 +572,10 @@ measured on this model yet.
 its own KV and recurrent state, so every sequence costs device memory (the KV of `--max-context`
 positions, 24 KiB a position in BF16 and less in a quantized `--kv-dtype`, plus 74 MiB of recurrent
 state). Requests are admitted
-in arrival order. Prompts prefill one at a time, a chunk at a time; after each chunk the requests
+in arrival order. Prompts prefill a chunk at a time, each chunk from the prompt with the fewest
+tokens left, so a short or cached request is not held behind a long prompt for its whole prefill
+(a prompt passed over eight times goes next, and a prompt with media, once begun, finishes
+first); after each chunk the requests
 that are decoding run `--decode-rounds-per-prefill` rounds (by default the chunk size over 64, 16
 at the default chunk) before the next chunk, each round one batched pass whose experts read their
 weights once for the whole batch, so the batch costs little more than one token while the experts

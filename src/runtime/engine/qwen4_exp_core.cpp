@@ -13,6 +13,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "runtime/contract/execution.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
@@ -374,6 +375,7 @@ struct Qwen4ExpCore::Request {
     std::uint32_t reused    = 0; // prompt tokens its sequence already held
     PrefixReusePath reuse_path = PrefixReusePath::Root; // where they came from
     std::uint32_t prefilled = 0; // prompt tokens its sequence holds, the reused ones included
+    std::uint32_t prefill_skips = 0; // prefill steps other prompts ran since its last one
     bool decoding           = false;
     bool penalties          = false;
     bool post_thinking      = false;
@@ -1086,6 +1088,30 @@ struct Qwen4ExpCore::Impl {
         }
     }
 
+    // Whether `a` runs the next prefill step before `b`. A media prompt that has begun goes on
+    // first, since the executor keeps one prompt's media embeddings; then a prompt passed over
+    // kPrefillMaxSkip times (the most passed over first); then the shortest remaining prompt, so
+    // a short or cached request is not held behind a long prompt whose chunks take seconds with
+    // the experts off the GPU. Ties go to the earlier request.
+    static bool prefills_before(const Request& a, const Request& b) {
+        const auto media_begun = [](const Request& r) {
+            return r.media && r.prefilled > r.reused;
+        };
+        if (media_begun(a) != media_begun(b)) { return media_begun(a); }
+        const bool a_starved = a.prefill_skips >= kPrefillMaxSkip;
+        const bool b_starved = b.prefill_skips >= kPrefillMaxSkip;
+        if (a_starved != b_starved) { return a_starved; }
+        if (a_starved && a.prefill_skips != b.prefill_skips) {
+            return a.prefill_skips > b.prefill_skips;
+        }
+        const auto left = [](const Request& r) {
+            const std::size_t n = r.prompt_tokens.size();
+            return n - std::min<std::size_t>(r.prefilled, n);
+        };
+        if (!a_starved && left(a) != left(b)) { return left(a) < left(b); }
+        return a.id < b.id;
+    }
+
     void step() {
         auto& executor = *instance.executor;
         const auto cancellation_owner = executor.hybrid_experts() ? slots.front().request : nullptr;
@@ -1100,7 +1126,7 @@ struct Qwen4ExpCore::Impl {
             if (!slot.request) { continue; }
             if (slot.request->decoding) {
                 decoding = true;
-            } else if (!prefilling || slot.request->id < prefilling->id) {
+            } else if (!prefilling || prefills_before(*slot.request, *prefilling)) {
                 prefilling = slot.request;
             }
         }
@@ -1108,6 +1134,13 @@ struct Qwen4ExpCore::Impl {
             // A long prompt's chunk takes far longer than a decode round: the streams that are
             // generating get several rounds after it rather than one.
             decode_rounds_due = decode_rounds_per_prefill;
+            for (const Slot& slot : slots) {
+                if (slot.request && !slot.request->decoding && slot.request != prefilling &&
+                    slot.request->prefill_skips != UINT32_MAX) {
+                    ++slot.request->prefill_skips;
+                }
+            }
+            prefilling->prefill_skips = 0;
             try {
                 prefill_step(prefilling);
             } catch (...) { fail(prefilling, std::current_exception()); }

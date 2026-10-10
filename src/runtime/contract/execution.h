@@ -8,6 +8,11 @@
 
 namespace ninfer::runtime {
 
+// Prefill units a prompt may be passed over for shorter ones before it runs ahead of them: each
+// unit goes to the shortest remaining prompt, so a short or prefix-cached request is not held
+// behind a long prompt for its whole prefill, and this bound keeps the long one from starving.
+inline constexpr std::uint32_t kPrefillMaxSkip = 8;
+
 struct LaneId {
     std::uint32_t value = 0;
 

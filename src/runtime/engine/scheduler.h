@@ -18,10 +18,6 @@
 
 namespace ninfer::runtime {
 
-// Prefill units a lane owning staged prefill may be passed over for shorter prompts before it runs
-// ahead of them.
-inline constexpr std::uint32_t kPrefillMaxSkip = 8;
-
 template <class Request>
 class Scheduler {
 public:
