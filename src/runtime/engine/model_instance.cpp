@@ -630,6 +630,14 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     const auto retained_reader = std::make_shared<artifact::Reader>(options.artifact_path);
     const artifact::Reader& reader = *retained_reader;
     inspect.complete();
+    // An automatic draft head is the artifact's optimized proposal head when it stores one: it
+    // projects drafts onto a shortlist of the vocabulary instead of all of it.
+    if (options.speculative.proposal_head == ProposalHead::Auto) {
+        const bool stored = options.purpose == EnginePurpose::Generation &&
+                            options.speculative.backend != SpeculativeBackend::None &&
+                            reader.directory().component("text").proposal.has_value();
+        options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
+    }
     if (options.devices.size() > 1 && options.stage_layers.empty()) {
         const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
         const std::vector<std::uint64_t> free_bytes(free_now.begin(), free_now.end());

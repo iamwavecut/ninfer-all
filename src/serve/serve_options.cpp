@@ -327,7 +327,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --spec mtp|dflash|dflash2     speculative decoding backend\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0)\n"
-           "  --lm-head-draft               draft with the optimized proposal head\n"
+           "  --lm-head-draft               draft with the optimized proposal head, which\n"
+           "                                the artifact must store (the default when it does)\n"
+           "  --full-draft-head             draft with the full output head even when the\n"
+           "                                artifact stores a proposal head\n"
            "  --adaptive-mtp                each MTP round verifies 3..--draft-tokens\n"
            "                                drafts, the width the drafts' measured survival\n"
            "                                and round cost favor; greedy output is unchanged\n"
@@ -1230,6 +1233,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+            continue;
+        }
+        if (arg == "--full-draft-head") {
+            options.speculative.proposal_head = ProposalHead::Full;
             continue;
         }
         if (arg == "--adaptive-mtp") {
