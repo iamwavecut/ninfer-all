@@ -1695,6 +1695,16 @@ struct RuntimeStats {
     std::uint32_t last_selected_frontier_tokens      = 0;
     // Aborted requests whose live state was published as a continuation endpoint.
     std::uint64_t salvaged_continuations = 0;
+    // Requests that left the queue without being admitted, and the time they had waited: the
+    // client gave up (cancelled) or the pending timeout fired (expired).
+    std::uint64_t waiting_cancelled_requests = 0;
+    std::uint64_t waiting_expired_requests   = 0;
+    double waiting_abandoned_seconds         = 0.0;
+    // Requests cancelled while their prompt prefilled, the prompt tokens they had computed, and
+    // how many of them the context cache salvaged so a retry resumes where they stopped.
+    std::uint64_t cancelled_prefills                = 0;
+    std::uint64_t cancelled_prefill_computed_tokens = 0;
+    std::uint64_t cancelled_prefills_salvaged       = 0;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;
