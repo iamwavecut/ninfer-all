@@ -607,9 +607,10 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
-    // Decode rounds that run after each prefill chunk while other requests generate. A decode round
-    // takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves decoding
-    // streams a token per chunk; 0 is prefill_chunk / 64.
+    // Decode rounds that run before a prefill chunk while other requests generate, proportionally
+    // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode
+    // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves
+    // decoding streams a token per chunk; 0 is prefill_chunk / 64.
     std::uint32_t decode_rounds_per_prefill = 0;
     // Prefill with the fast INT8-KV prompt-attention kernel and round prefill_chunk down to whole
     // prompt-attention waves. Off keeps the default kernel and the requested chunk.

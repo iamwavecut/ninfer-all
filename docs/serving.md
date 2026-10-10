@@ -1761,7 +1761,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--decode-rounds-per-prefill N` | Decode rounds that run after each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
+| `--decode-rounds-per-prefill N` | Decode rounds that run before each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; proportionally fewer, at least one, before a shorter prefill unit, so a short prompt gets in after one round; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
 | `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile) and round `--prefill-chunk` down to whole attention waves; on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
@@ -2227,9 +2227,10 @@ response the deployment allows rather than to a connection timeout: at C1 on an 
 6,500-token response occupies the engine for about 106 seconds. The 600,000 ms default admits a
 queued caller behind roughly ten such responses; lower it only to fail fast on purpose.
 
-One request owns the staged prefill at a time, and after each prefill chunk the executor runs
+One request owns the staged prefill at a time, and before each prefill chunk the executor runs
 `--decode-rounds-per-prefill` decode rounds while other requests generate (by default the chunk
-over 64: 8 at chunk 512, 16 at 1024), so `--prefill-chunk` sets the worst-case pause every active
+over 64: 8 at chunk 512, 16 at 1024; proportionally fewer, at least one, before a shorter prefill
+unit such as a short prompt's), so `--prefill-chunk` sets the worst-case pause every active
 stream sees while a new prompt is ingested, and the decode rounds set how much of the GPU the
 streams keep meanwhile. With strict alternation (`1`) a stream got one token per chunk. The
 following measurements predate the decode rounds and used strict alternation: on an RTX 3090

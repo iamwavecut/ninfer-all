@@ -444,8 +444,9 @@ struct Qwen4ExpCore::Impl {
     // Worker-owned.
     std::vector<Slot> slots; // by executor sequence
     std::uint64_t use_clock = 0;
-    // Decode rounds still owed after a prefill chunk before the next chunk may run.
-    std::uint32_t decode_rounds_due = 0;
+    // Decode steps since the last prefill step (saturating), and the steps due before a chunk's
+    // worth of prompt while others decode.
+    std::uint32_t decode_run = 0;
     std::uint32_t decode_rounds_per_prefill = 1;
 
     // Head-device sampling planes, a row per slot; with structured output the grammars' token
@@ -1155,10 +1156,13 @@ struct Qwen4ExpCore::Impl {
                 prefilling = slot.request;
             }
         }
-        if (prefilling && (decode_rounds_due == 0 || !decoding)) {
-            // A long prompt's chunk takes far longer than a decode round: the streams that are
-            // generating get several rounds after it rather than one.
-            decode_rounds_due = decode_rounds_per_prefill;
+        // A prompt's chunk takes far longer than a decode round, so while others decode a prefill
+        // step waits for decode_rounds_per_prefill rounds per chunk it computes: proportionally
+        // fewer, at least one, for a shorter step, so a short prompt gets in after one round, and
+        // more for a step of several chunks, so the streams keep their share of the GPU.
+        if (prefilling &&
+            (!decoding || decode_run >= decode_rounds_before(prompt_step_tokens(*prefilling)))) {
+            decode_run = 0;
             for (const Slot& slot : slots) {
                 if (slot.request && !slot.request->decoding && slot.request != prefilling &&
                     slot.request->prefill_skips != UINT32_MAX) {
@@ -1170,9 +1174,34 @@ struct Qwen4ExpCore::Impl {
                 prefill_step(prefilling);
             } catch (...) { fail(prefilling, std::current_exception()); }
         } else if (decoding) {
-            if (decode_rounds_due > 0) { --decode_rounds_due; }
+            decode_run += decode_run != UINT32_MAX;
             decode_step();
         }
+    }
+
+    [[nodiscard]] std::uint32_t decode_rounds_before(std::uint32_t tokens) const {
+        const std::uint64_t chunk = std::max<std::uint32_t>(
+            instance.executor->options().prefill_chunk, 1);
+        return static_cast<std::uint32_t>(std::max<std::uint64_t>(
+            1, (std::uint64_t(decode_rounds_per_prefill) * tokens + chunk - 1) / chunk));
+    }
+
+    // The prompt tokens the request's next prefill step computes. A media prompt goes chunk by
+    // chunk; a text prompt in spans where the executor has them. A span is one step, which with
+    // the experts off the GPU lasts seconds, and the requests that are decoding wait for all of
+    // it: while any decodes, a step is two chunks at most.
+    [[nodiscard]] std::uint32_t prompt_step_tokens(const Request& r) const {
+        const auto& executor             = *instance.executor;
+        const auto prompt_n              = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const std::uint32_t until        = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
+        const std::uint32_t chunk_tokens = executor.options().prefill_chunk;
+        std::uint32_t step               = r.media ? chunk_tokens : executor.prompt_step();
+        const bool peers_decoding =
+            std::any_of(slots.begin(), slots.end(), [&](const Slot& other) {
+                return other.request && other.request.get() != &r && other.request->decoding;
+            });
+        if (peers_decoding) { step = std::min(step, kPeerSpanChunks * chunk_tokens); }
+        return std::min(step, until > r.prefilled ? until - r.prefilled : 0U);
     }
 
     // Publishes a committed preview with the logprob records it released, which a streaming
@@ -1396,18 +1425,7 @@ struct Qwen4ExpCore::Impl {
             executor.set_media(r.slot, items, data.positions, data.rope_delta);
             r.vision_seconds = seconds(vision_start, Clock::now());
         }
-        const std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
-        // A media prompt goes chunk by chunk; a text prompt in spans where the executor has them.
-        // A span is one step, which with the experts off the GPU lasts seconds, and the requests
-        // that are decoding wait for all of it: while any decodes, a step is two chunks at most.
-        const std::uint32_t chunk_tokens = executor.options().prefill_chunk;
-        std::uint32_t step               = r.media ? chunk_tokens : executor.prompt_step();
-        const bool peers_decoding =
-            std::any_of(slots.begin(), slots.end(), [&](const Slot& other) {
-                return other.request && other.request.get() != &r && other.request->decoding;
-            });
-        if (peers_decoding) { step = std::min(step, kPeerSpanChunks * chunk_tokens); }
-        const std::uint32_t n = std::min(step, until - r.prefilled);
+        const std::uint32_t n = prompt_step_tokens(r);
         const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
         executor.forward(r.slot, chunk, 1);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
