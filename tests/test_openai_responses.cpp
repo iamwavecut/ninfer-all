@@ -312,7 +312,7 @@ int test_typed_items_and_cache_markers() {
                                       {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}},
                                  Json{{"type", "input_image"},
                                       {"image_url", "data:image/png;base64,AA=="},
-                                      {"detail", "auto"}}})}},
+                                      {"detail", "low"}}})}},
               Json{{"id", "msg_refusal"},
                    {"type", "message"},
                    {"role", "assistant"},
@@ -341,8 +341,22 @@ int test_typed_items_and_cache_markers() {
                           request.prompt.input_turns[1].content[0].cache_boundary_after &&
                           request.prompt.input_turns[1].content[0].cache_boundary_after->kind ==
                               ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
-                          request.prompt.input_turns[1].content[1].kind == ContentKind::Image,
+                          request.prompt.input_turns[1].content[1].kind == ContentKind::Image &&
+                          request.prompt.input_turns[1].content[1].image_detail ==
+                              ninfer::ImageDetail::Low,
                       "typed multimodal tool output and explicit cache marker preserved");
+    Json unknown_detail = body;
+    unknown_detail["input"][2]["output"][1]["detail"] = "original";
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(unknown_detail, limits());
+                      }).code == "image_detail_not_supported",
+                      "an unknown input_image detail was accepted");
+    RequestLimits lenient        = limits();
+    lenient.lenient_image_detail = true;
+    const auto lenient_request   = parse_openai_responses_create_request(unknown_detail, lenient);
+    failures += check(lenient_request.prompt.input_turns[1].content[1].image_detail ==
+                          ninfer::ImageDetail::Auto,
+                      "--lenient-image-detail did not read an unknown input_image detail as auto");
     failures += check(request.prompt.input_turns[2].role == ninfer::ChatRole::Assistant &&
                           request.prompt.input_turns[2].content[0].text == "cannot answer that" &&
                           request.prompt.input_items[3].at("status") == "incomplete" &&

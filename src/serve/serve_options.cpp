@@ -425,6 +425,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --lenient-assistant-history   accept Responses input whose assistant text or\n"
            "                                reasoning follows function_call Items; it joins\n"
            "                                that turn, rendered before its calls\n"
+           "  --lenient-image-detail        read an OpenAI image detail other than auto, low\n"
+           "                                or high as auto instead of refusing the request\n"
            "  --usage-chunk-choice          give the streamed usage chunk a zero-delta\n"
            "                                choice, for strict parsers that reject\n"
            "                                choices:[]\n"
@@ -1196,6 +1198,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--lenient-assistant-history") {
             options.lenient_assistant_history = true;
+            continue;
+        }
+        if (arg == "--lenient-image-detail") {
+            options.lenient_image_detail = true;
             continue;
         }
         if (arg == "--derive-session-keys") {

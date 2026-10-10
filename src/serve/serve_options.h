@@ -128,6 +128,9 @@ struct ServeOptions {
     // --lenient-assistant-history: Responses input whose assistant content or reasoning follows
     // function_call Items joins that run's turn instead of failing with invalid_assistant_history.
     bool lenient_assistant_history = false;
+    // --lenient-image-detail: an OpenAI image detail other than auto, low or high is read as auto
+    // instead of failing with image_detail_not_supported.
+    bool lenient_image_detail = false;
     // Directory for /slots session files; empty disables slot save/restore.
     std::filesystem::path slot_save_path;
     // Spill an involuntarily evicted session back to the slot file it was last saved to or
@@ -196,7 +199,8 @@ struct ServeOptions {
     return RequestLimits{.default_max_tokens        = options.default_max_tokens,
                          .max_context               = static_cast<int>(options.max_context),
                          .assistant_prefill         = options.assistant_prefill,
-                         .lenient_assistant_history = options.lenient_assistant_history};
+                         .lenient_assistant_history = options.lenient_assistant_history,
+                         .lenient_image_detail      = options.lenient_image_detail};
 }
 
 ServeOptions parse_serve_options(int argc, char** argv);

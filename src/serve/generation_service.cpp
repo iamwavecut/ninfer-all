@@ -196,6 +196,7 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     }
     media.bytes               = std::move(source_bytes);
     media.image_resize_policy = part.image_resize_policy;
+    media.image_detail        = part.image_detail;
     return media;
 }
 

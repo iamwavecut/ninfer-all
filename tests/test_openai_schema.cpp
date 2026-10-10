@@ -701,9 +701,25 @@ int test_messages_and_media() {
                           media.messages[0].content[1].kind == ContentKind::Video,
                       "image and video compatibility inputs normalize to Engine media");
 
-    body["messages"][0]["content"][0]["image_url"]["detail"] = "high";
+    failures += check(media.messages[0].content[0].image_detail == ninfer::ImageDetail::Auto,
+                      "image detail auto was not kept");
+    for (const auto& [name, detail] : {std::pair{"low", ninfer::ImageDetail::Low},
+                                       std::pair{"high", ninfer::ImageDetail::High}}) {
+        body["messages"][0]["content"][0]["image_url"]["detail"] = name;
+        failures += check(parse(body).generation.messages[0].content[0].image_detail == detail,
+                          "an OpenAI image detail was not carried to the media");
+    }
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "original";
     failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
-                      "explicit image preprocessing detail rejected");
+                      "an unknown image detail was accepted");
+    RequestLimits lenient        = limits();
+    lenient.lenient_image_detail = true;
+    const auto lenient_media     = parse_chat_completion_request(body, lenient).generation;
+    failures += check(lenient_media.messages[0].content[0].image_detail ==
+                              ninfer::ImageDetail::Auto &&
+                          lenient_media.messages[0].content[0].unknown_image_detail.empty(),
+                      "--lenient-image-detail did not read an unknown detail as auto");
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "auto";
 
     auto content_rejected = [&](const char* role, const char* type) {
         Json invalid                   = base_request();

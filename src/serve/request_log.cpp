@@ -724,6 +724,7 @@ std::string format_server_start_json(
              {"assistant_prefill", options.assistant_prefill},
              {"derive_session_keys", options.derive_session_keys},
              {"lenient_assistant_history", options.lenient_assistant_history},
+             {"lenient_image_detail", options.lenient_image_detail},
              {"max_request_bytes", options.max_request_bytes},
              {"media_cache_bytes", options.media_cache_bytes},
              {"media_live_bytes", options.media_live_bytes},
