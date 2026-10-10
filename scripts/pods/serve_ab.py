@@ -15,7 +15,7 @@ PLAN.json:
    "lock_clocks_mhz": 0}   # nonzero: nvidia-smi -lgc for the run, if the host allows it
 
 Every request is greedy with EOS ignored and thinking off. Each configuration's server runs in its
-own process group, which is ended on exit, on SIGTERM and on SIGINT. DIR receives one JSON per
+own process group, which is ended on exit, on SIGTERM, SIGINT and SIGHUP. DIR receives one JSON per
 server start and summary.json/summary.md: per configuration, pass and prompt, the mean over rounds
 of every rate with its range, the change against the first configuration, and whether the answer
 repeated across rounds.
@@ -214,8 +214,10 @@ def main() -> None:
     if missing:
         raise SystemExit(f"unknown prompts: {missing}")
     args.out.mkdir(parents=True, exist_ok=True)
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+    # A harness stop-job ends the tmux session, which sends SIGHUP: without a handler the default
+    # action ends this script and leaves the server it started running.
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(number, handle_signal)
     locked = lock_clocks(int(plan.get("lock_clocks_mhz", 0)))
     records = []
     try:
