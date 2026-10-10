@@ -383,7 +383,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | Option | Meaning |
 |---|---|
 | `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
-| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin, and after the warm-up what is still free beyond 640 MiB; `0` disables the host-mode cache (disk mode needs one) |
+| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin, and after the warm-up what is still free beyond 640 MiB; `N` is the cache's size, which the warm-up leaves alone; `0` disables the host-mode cache (disk mode needs one) |
 | `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks straight into the slot of the layer's least recently used expert of the lowest frequency tier, by the copy engine while the cached ones run, and keeps it there (`staged`, the default); or its expert kernels read the missing experts across the bus and the cache admits between passes (`mapped`) |
 | `--expert-dma-share F` | host experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1` (default `1`); below `1` the CPU computes the rest from RAM while the GPU runs the cached ones, in its own arithmetic, and their slots fill behind the call; prefill always runs on the GPU. Neutral on an RTX 3090 with an 8-core CPU |
 | `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers; default is the physical cores less two (counted as half the logical threads), at most 16 |
@@ -661,8 +661,13 @@ rounds together, one MTP pass for all of them per draft and one verification pas
 decodes without drafts when its prompt has media, near the end of its context, with one token
 left in its output or thinking budget, and while a
 `--post-thinking` request still reasons. N-gram copy proposals (`--ngram-draft-tokens`) are not
-available for this model; `--lookup-ngram`, `--mtp-attention-window` and `--lm-head-draft` are
-refused.
+available for this model; `--mtp-attention-window` and `--lm-head-draft` are refused.
+
+With `--lookup-ngram N`, a request whose last `N` tokens (the token it feeds next last) appeared
+earlier in its sequence proposes what followed them then, up to the round's width (`--draft-tokens`,
+or with `--adaptive-mtp` the width the controller chose), in place of the MTP block's drafts; the MTP block drafts the other requests of the round, and none when every
+request has such a proposal. The proposal is verified like any draft, so a wrong one costs speed,
+not tokens. Its rounds are reported with the n-gram proposals (`ngram_rounds`).
 
 With `--adaptive-mtp`, `--draft-tokens K` is the most drafts a round makes. The controller the
 Qwen3.5 models use (see [Adaptive MTP](serving.md#adaptive-mtp)) picks each round's width from
