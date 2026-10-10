@@ -238,21 +238,31 @@ public:
     // Either way it stays gated by any open global resource topology transition
     // (context_transaction) and by decode continuity (existing decode is never starved by
     // admission work).
+    // `decode_run` counts the decode and control units executed since the last prefill unit.
     [[nodiscard]] bool should_attempt_admission(bool have_pending, bool admission_check_pending,
-                                                bool have_decode, bool previous_unit_was_decode,
+                                                bool have_decode, std::uint32_t decode_run,
                                                 bool context_transaction) const noexcept {
         return have_pending && admission_check_pending && !context_transaction &&
-               (concurrent_prefill_ || prefill_lanes_ == 0) &&
-               (!have_decode || previous_unit_was_decode);
+               (concurrent_prefill_ || prefill_lanes_ == 0) && (!have_decode || decode_run != 0);
     }
 
     void allow_concurrent_prefill(bool allowed) noexcept { concurrent_prefill_ = allowed; }
 
+    // Decode (or control) units that run after each prefill unit while decode work exists. A
+    // decode round takes tens of milliseconds and a prefill chunk hundreds, so strict alternation
+    // leaves decoding streams a few percent of the GPU while another request prefills.
+    void configure_decode_rounds(std::uint32_t rounds) {
+        if (rounds == 0) {
+            throw std::invalid_argument("decode rounds per prefill unit must be positive");
+        }
+        decode_rounds_ = rounds;
+    }
+
     [[nodiscard]] ExecutionAction choose_execution(bool have_decode, bool prefill_runnable,
-                                                   bool previous_unit_was_decode) const noexcept {
+                                                   std::uint32_t decode_run) const noexcept {
         if (prefill_runnable) {
-            return have_decode && !previous_unit_was_decode ? ExecutionAction::Decode
-                                                            : ExecutionAction::Prefill;
+            return have_decode && decode_run < decode_rounds_ ? ExecutionAction::Decode
+                                                              : ExecutionAction::Prefill;
         }
         return have_decode ? ExecutionAction::Decode : ExecutionAction::Wait;
     }
@@ -270,27 +280,54 @@ public:
 
     [[nodiscard]] bool has_prefill_lane() const noexcept { return prefill_lanes_ != 0; }
 
-    // Deterministic execution order: lowest lane index first. Prefill units are short
-    // (one chunk), so strictly round-robining by index gives every staged request a fair
-    // share of the single execution stream without tracking per-lane progress.
+    // Lowest lane owning staged prefill.
     [[nodiscard]] std::optional<std::uint32_t> select_prefill_lane() const noexcept {
         if (prefill_lanes_ == 0) { return std::nullopt; }
         return static_cast<std::uint32_t>(std::countr_zero(prefill_lanes_));
     }
 
-    // Lowest lane owning staged prefill that `runnable(lane)` lets advance now. The caller skips
-    // a lane that must wait, such as one offering an active capture, so it cannot starve the
-    // other lanes.
-    template <class Runnable>
+    // The lane owning staged prefill that runs the next unit. `remaining(lane)` is the lane's
+    // prompt suffix still to compute, or nullopt for a lane that must wait, such as one offering
+    // an active capture, so it cannot starve the others. A lane passed over kPrefillMaxSkip times
+    // runs first (the most passed over, then the lowest lane); otherwise the shortest remaining
+    // suffix does, so a short or prefix-cached request is not held behind a long prompt for its
+    // whole prefill. Ties go to the lower lane.
+    template <class Remaining>
     [[nodiscard]] std::optional<std::uint32_t>
-    select_runnable_prefill_lane(std::uint32_t max_concurrency, Runnable&& runnable) const {
-        std::uint64_t mask = prefill_lanes_;
+    select_runnable_prefill_lane(std::uint32_t max_concurrency, Remaining&& remaining) const {
+        std::optional<std::uint32_t> best;
+        std::uint32_t best_remaining = 0;
+        bool best_starved            = false;
+        std::uint64_t mask           = prefill_lanes_;
         while (mask != 0) {
             const auto lane = static_cast<std::uint32_t>(std::countr_zero(mask));
             mask &= mask - 1U;
-            if (lane < max_concurrency && runnable(lane)) { return lane; }
+            if (lane >= max_concurrency) { continue; }
+            const std::optional<std::uint32_t> left = remaining(lane);
+            if (!left) { continue; }
+            const bool starved = prefill_skips_[lane] >= kPrefillMaxSkip;
+            const bool better =
+                !best || (starved && !best_starved) ||
+                (starved == best_starved &&
+                 (starved ? prefill_skips_[lane] > prefill_skips_[*best] : *left < best_remaining));
+            if (better) {
+                best           = lane;
+                best_remaining = *left;
+                best_starved   = starved;
+            }
         }
-        return std::nullopt;
+        return best;
+    }
+
+    // Accounts one prefill unit that ran on `lane` against the other lanes owning staged prefill.
+    void record_prefill_unit(std::uint32_t lane) noexcept {
+        std::uint64_t mask = prefill_lanes_;
+        while (mask != 0) {
+            const auto other = static_cast<std::uint32_t>(std::countr_zero(mask));
+            mask &= mask - 1U;
+            if (other != lane && prefill_skips_[other] != UINT32_MAX) { ++prefill_skips_[other]; }
+        }
+        if (lane < kMaximumConcurrency) { prefill_skips_[lane] = 0; }
     }
 
     [[nodiscard]] std::optional<std::uint64_t> protection_epoch() const noexcept {
@@ -302,6 +339,7 @@ public:
             throw std::logic_error("staged prefill lane exceeds the fixed concurrency bound");
         }
         prefill_lanes_ |= 1ULL << lane;
+        prefill_skips_[lane] = 0;
     }
 
     void clear_prefill_lane(std::uint32_t lane) {
@@ -400,6 +438,7 @@ public:
 
     void reset() noexcept {
         prefill_lanes_ = 0;
+        prefill_skips_.fill(0);
         fifo_head_id_.reset();
         protection_.reset();
     }
@@ -407,6 +446,9 @@ public:
 private:
     std::uint64_t prefill_lanes_ = 0; // bit i set when lane i owns staged prefill
     bool concurrent_prefill_     = false;
+    std::uint32_t decode_rounds_ = 1;
+    // Prefill units each lane owning staged prefill has been passed over since its last one.
+    std::array<std::uint32_t, kMaximumConcurrency> prefill_skips_{};
     std::optional<std::uint64_t> fifo_head_id_;
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;

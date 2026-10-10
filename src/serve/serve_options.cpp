@@ -85,6 +85,7 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n"
            "  --help, -h                    show this help and exit\n"
+           "  --version                     print the build version and exit\n"
            "\n"
            "MODEL & CONTEXT\n"
            "  --max-context N               logical context ceiling of each request (default\n"
@@ -92,8 +93,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024)\n"
-           "  --decode-rounds-per-prefill N Qwen3.8-Flash-Next: decode rounds after each prefill\n"
-           "                                chunk while others generate (0: chunk / 64; 1 alternates)\n"
+           "  --decode-rounds-per-prefill N decode rounds after each prefill chunk while\n"
+           "                                others generate (0: chunk / 64; 1 alternates)\n"
            "  --default-max-tokens N        output limit of a request that sets none\n"
            "                                (default: the largest budget that still lets\n"
            "                                every lane be admitted at once, the remaining\n"
@@ -540,6 +541,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     const char* legacy_cache_flag  = nullptr;
     const char* hybrid_option_flag = nullptr;
     bool original_cache_selected   = false;
+    if (argc >= 2 && std::string(argv[1]) == "--version") {
+        options.version_requested = true;
+        return options;
+    }
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;

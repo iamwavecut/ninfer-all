@@ -87,6 +87,35 @@ access. The fallback `restore_slice_inputs.sh` downloads pinned HF inputs, verif
 and preserves the private native artifact's revision. It takes `restore_slice_inputs.py` and the
 retained `model-inputs.json` as job inputs; stage HF authentication first. It omits the unused table.
 
+## Compiler cache, A/B runs and the residency check
+
+`bootstrap.sh` installs ccache and `build.sh` compiles through it. The cache lives in
+`/workspace/ccache` and travels between rentals through the private bucket `WaveCut/ninfer-cache`
+(`ccache/cuda<release>-sm<arch>-<distribution>-<machine>.tar`): `build.sh` pulls it into a new pod
+before the first compile and pushes it after every build (`NINFER_CCACHE_PUSH=0` skips the push).
+Both steps need the credential `hf_archive.py --stage-auth` leaves at `/run/ninfer-hf/token`;
+without it, or without a remote cache, the build compiles cold and says so. The Hub stores only the
+chunks that changed since the last push. `build.sh` prints the build's seconds and ccache's hit
+counts.
+
+```sh
+uv run --python 3.11 --with huggingface_hub python scripts/pods/hf_archive.py --stage-auth
+python3.11 scripts/pods/harness.py start bootstrap scripts/pods/bootstrap.sh
+python3.11 scripts/pods/harness.py start build scripts/pods/build.sh --after bootstrap
+```
+
+`serve_ab.py PLAN.json --out DIR` runs ninfer-serve configurations interleaved: round r starts at
+configuration r mod n, each start passes over the prompts `repeat` times, and every request is
+greedy with EOS ignored. It records decode and prefill rates, time to first token, the expert
+cache's hits and bytes moved, and each answer's digest, and writes a per-configuration summary with
+ranges and the change against the first configuration. Servers run in their own process group and
+are ended on exit or SIGTERM, so `stop-job` leaves none behind. Stage the plan and any prompt files
+with `--input`.
+
+`residency_check.sh` (MODEL and TABLE in the environment) scores the first 40 KB of the WikiText
+stream with host and with disk experts and fails unless the two agree exactly. Run it after any
+change to the expert cache, the misses, the slot pool or the prefetch.
+
 ## N-gram cache qualification
 
 The October 8 release routines reuse the existing public Flash-Next repositories.

@@ -365,7 +365,7 @@ up. A router instead unloads the failed model once its requests are gone and rep
 
 | Method and path | Behavior |
 |---|---|
-| `GET /health` | process health |
+| `GET /health` | process health and build version (see [Server version](#server-version)) |
 | `GET /v1/load` | serving capacity, current load, and monotonic token counters (see [Load](#load)) |
 | `GET /metrics` | Prometheus text with llama.cpp's `--metrics` series plus NInfer's (see [Metrics](#metrics)) |
 | `GET /stats` | the `/v1/load` snapshot plus the ingress peak and every Engine counter since startup (see [Stats](#stats)) |
@@ -430,7 +430,7 @@ read-only and fills only the llama.cpp fields NInfer can state truthfully:
    "params": {"n_predict": -1, "max_tokens": -1, "temperature": 1.0, "top_k": 20, "top_p": 0.95,
               "min_p": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "seed": -1}},
  "total_slots": 1, "model_alias": "qwen3.8-27b", "model_path": "models/qwen3_8_27b.ninfer",
- "modalities": {"vision": false, "audio": false},
+ "modalities": {"vision": false, "audio": false}, "build_info": "ninfer 0.12.0-rtx3090+v0.12.0-rtx3090-57-ge1debb451",
  "endpoint_slots": true, "endpoint_props": true, "endpoint_metrics": true,
  "cors_proxy_enabled": false}
 ```
@@ -442,8 +442,21 @@ cap. The sampler is the loaded model's preset for the default thinking mode (thi
 `--no-thinking`) under the process sampling flags and `--greedy`; request fields still override it
 per request. `seed` is `--seed`, or `-1` when requests draw a fresh random seed. `model_alias` is the
 public model id and `model_path` the artifact path the server was started with.
-`cors_proxy_enabled` reports `--webui-mcp-proxy` (see [WebUI](#webui)). There is no `build_info`,
-`chat_template`, or writable `POST /props`.
+`cors_proxy_enabled` reports `--webui-mcp-proxy` (see [WebUI](#webui)). `build_info` is
+`ninfer <version>` (see [Server version](#server-version)). There is no `chat_template` or writable
+`POST /props`.
+
+### Server version
+
+The running build is reported from one string, `<VERSION>+<build id>`: `ninfer-serve --version`
+and `ninfer --version` print it and exit without loading a model; `GET /health` returns it as
+`{"status": "ok", "version": "0.12.0-rtx3090+v0.12.0-rtx3090-57-ge1debb451"}`; every response,
+the `503` during model load and `401` failures included, carries it in an `X-NInfer-Version`
+header; and the startup log, the `server_start` record and `/props` `build_info` include it.
+`VERSION` is the repository's file of that name. The build id is `git describe --always --tags` of
+the compiled tree with `-dirty` when its product sources differ from `HEAD`, or the
+`NINFER_BUILD_ID` environment variable of the build when it is set, as on rented build hosts that
+compile a snapshot without git metadata.
 
 ### Startup readiness
 
@@ -1748,7 +1761,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--decode-rounds-per-prefill N` | Qwen3.8-Flash-Next: decode rounds that run after each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
+| `--decode-rounds-per-prefill N` | Decode rounds that run after each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
 | `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile) and round `--prefill-chunk` down to whole attention waves; on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
@@ -1789,7 +1802,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--draft-min-p P` | Flash-Next MTP only: verify through the first draft at or below this absolute probability; the full draft chain still runs; see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) | `0` (off) |
 | `--lm-head-draft` | optimized proposal head | off |
-| `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts, the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
+| `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens`, drafting only those), the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec`: the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
@@ -1976,7 +1989,7 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, and redacted argv |
+| `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
@@ -2192,8 +2205,9 @@ A request joins that batch only after its staged prefill finishes; when it compl
 cancelled, the next boundary rebuilds the batch without an empty row. A staged prefill holds
 admission back until it finishes. With `--concurrent-prefill` waiting requests are still admitted
 to free lanes while others prefill, so a new request's admission and prefill overlap the prefill
-and decode of the others (each prefill unit advances one chunk of the lowest staged lane per
-worker boundary).
+and decode of the others. Each prefill unit advances one chunk of the staged lane with the shortest
+remaining prompt, so a short or prefix-cached request is not held behind a long prompt for its
+whole prefill; a lane passed over eight times runs next, so a long prompt is not starved.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
@@ -2210,14 +2224,17 @@ response the deployment allows rather than to a connection timeout: at C1 on an 
 6,500-token response occupies the engine for about 106 seconds. The 600,000 ms default admits a
 queued caller behind roughly ten such responses; lower it only to fail fast on purpose.
 
-One request owns the staged prefill at a time, and the executor alternates a single prefill chunk
-with a single decode round, so `--prefill-chunk` sets the worst-case pause every active stream sees
-while a new prompt is ingested. On an RTX 3090 ingesting a 4,900-token prompt behind four active
-streams, the largest inter-token gap measured 1,043 ms at chunk 1024, 515 ms at 512, and 312 ms at
-256, against an 82 ms median decode interval; the ingesting request's own prefill rate fell only
-from 1,135 to 1,130 to 1,110 tok/s. Prefill is not batched across requests at any chunk size, so a
-smaller chunk trades almost no ingestion throughput for a proportionally smaller stall. The shipped
-concurrent launcher uses 512.
+One request owns the staged prefill at a time, and after each prefill chunk the executor runs
+`--decode-rounds-per-prefill` decode rounds while other requests generate (by default the chunk
+over 64: 8 at chunk 512, 16 at 1024), so `--prefill-chunk` sets the worst-case pause every active
+stream sees while a new prompt is ingested, and the decode rounds set how much of the GPU the
+streams keep meanwhile. With strict alternation (`1`) a stream got one token per chunk. The
+following measurements predate the decode rounds and used strict alternation: on an RTX 3090
+ingesting a 4,900-token prompt behind four active streams, the largest inter-token gap measured
+1,043 ms at chunk 1024, 515 ms at 512, and 312 ms at 256, against an 82 ms median decode interval;
+the ingesting request's own prefill rate fell only from 1,135 to 1,130 to 1,110 tok/s. Prefill is
+not batched across requests at any chunk size, so a smaller chunk trades almost no ingestion
+throughput for a proportionally smaller stall. The shipped concurrent launcher uses 512.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting

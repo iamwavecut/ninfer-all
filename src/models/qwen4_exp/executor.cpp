@@ -420,8 +420,12 @@ struct SequenceState {
     };
     // The captured record strides and kernels depend on the actual verification width.
     std::array<VerifyGraphs, 17> verify;
-    DecodeGraphExecutable draft;
-    std::uint32_t draft_runs = 0;
+    // Draft chains by step count (adaptive MTP drafts fewer than draft_tokens).
+    struct DraftGraph {
+        DecodeGraphExecutable chain;
+        std::uint32_t runs = 0;
+    };
+    std::array<DraftGraph, 16> draft;
 };
 
 // Consecutive layers on one rank, in pass order. The first segment also embeds the tokens, the
@@ -754,9 +758,11 @@ struct Executor::Impl {
                     width.segments[i].reset();
                 }
             }
-            if (sequence.draft.ready()) {
-                RankBinding bind(device, model.head_rank());
-                sequence.draft.reset();
+            for (auto& chain : sequence.draft) {
+                if (chain.chain.ready()) {
+                    RankBinding bind(device, model.head_rank());
+                    chain.chain.reset();
+                }
             }
         }
         for (auto& rank : ranks) {
@@ -3085,12 +3091,14 @@ struct Executor::Impl {
     }
 
     void draft(std::span<const std::uint32_t> batch, std::span<const std::int32_t> anchors,
-               std::span<std::int32_t> out, std::span<std::uint32_t> extents = {}) {
+               std::span<std::int32_t> out, std::span<std::uint32_t> extents = {},
+               std::uint32_t steps = 0) {
         require_mtp("draft");
-        const std::size_t b = batch.size();
-        const std::size_t k = options.draft_tokens;
-        if (b == 0 || b > sequences.size() || anchors.size() != b || out.size() != b * k ||
-            (!extents.empty() && extents.size() != b)) {
+        const std::size_t b      = batch.size();
+        const std::size_t stride = options.draft_tokens;
+        const std::size_t k      = steps == 0 ? stride : steps;
+        if (b == 0 || b > sequences.size() || anchors.size() != b || out.size() != b * stride ||
+            (!extents.empty() && extents.size() != b) || k > stride) {
             throw std::invalid_argument("qwen4_exp draft: one anchor and its drafts per sequence");
         }
         std::vector<SequenceState*> drafting;
@@ -3157,10 +3165,10 @@ struct Executor::Impl {
         // Tokens and positions stay in the staged buffers. Native hybrid experts use the same
         // captured exchange as text decode; GGUF host experts replay too, without counting the
         // draft steps' routes.
-        SequenceState& only = *drafting.front();
+        auto& only       = drafting.front()->draft.at(k);
         const bool graph = options.cuda_graphs && b == 1 && device.size() == 1 && !stream;
         if (misses) { misses->keep_alive(); }
-        if (graph && !only.draft.ready() && only.draft_runs++ > 0) {
+        if (graph && !only.chain.ready() && only.runs++ > 0) {
             DecodeGraphDefinition definition;
             capturing_draft = true;
             try {
@@ -3170,10 +3178,10 @@ struct Executor::Impl {
                 throw;
             }
             capturing_draft = false;
-            only.draft.instantiate(definition);
+            only.chain.instantiate(definition);
         }
-        if (graph && only.draft.ready()) {
-            only.draft.launch(rank.stream);
+        if (graph && only.chain.ready()) {
+            only.chain.launch(rank.stream);
         } else {
             chain();
         }
@@ -3188,7 +3196,7 @@ struct Executor::Impl {
         if (hybrid) { hybrid->finish(); }
         if (draft_prefetch) { draft_prefetch->check(); }
         for (std::size_t j = 0; j < b; ++j) {
-            for (std::size_t i = 0; i < k; ++i) { out[j * k + i] = host[i * b + j]; }
+            for (std::size_t i = 0; i < k; ++i) { out[j * stride + i] = host[i * b + j]; }
             std::uint32_t extent = static_cast<std::uint32_t>(k);
             if (mtp_logprobs.p) {
                 const float floor = std::log(options.draft_min_p);
@@ -3602,8 +3610,8 @@ bool Executor::can_draft(std::uint32_t sequence) const { return impl_->can_draft
 
 void Executor::draft(std::span<const std::uint32_t> sequences,
                      std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
-                     std::span<std::uint32_t> extents) {
-    impl_->draft(sequences, anchors, out, extents);
+                     std::span<std::uint32_t> extents, std::uint32_t steps) {
+    impl_->draft(sequences, anchors, out, extents, steps);
 }
 
 void Executor::verify(std::span<const std::uint32_t> sequences,

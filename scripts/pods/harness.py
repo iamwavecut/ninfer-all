@@ -188,6 +188,9 @@ cmp -s source.json ../{required}/source.json || exit 125
 set -Eeuo pipefail
 cd {shlex.quote(job)}
 trap 'rc=$?; date -u +%FT%TZ > {job}/finished; echo "$rc" > {job}/exit' EXIT
+# A job ended by stop-job (tmux sends SIGHUP) or a signal must not record success: jobs that
+# depend on it read this exit code.
+trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
 date -u +%FT%TZ > started
 cp {REMOTE}/source.json source.json
 {dependency}

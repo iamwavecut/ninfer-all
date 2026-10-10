@@ -572,7 +572,10 @@ measured on this model yet.
 its own KV and recurrent state, so every sequence costs device memory (the KV of `--max-context`
 positions, 24 KiB a position in BF16 and less in a quantized `--kv-dtype`, plus 74 MiB of recurrent
 state). Requests are admitted
-in arrival order. Prompts prefill one at a time, a chunk at a time; after each chunk the requests
+in arrival order. Prompts prefill a chunk at a time, each chunk from the prompt with the fewest
+tokens left, so a short or cached request is not held behind a long prompt for its whole prefill
+(a prompt passed over eight times goes next, and a prompt with media, once begun, finishes
+first); after each chunk the requests
 that are decoding run `--decode-rounds-per-prefill` rounds (by default the chunk size over 64, 16
 at the default chunk) before the next chunk, each round one batched pass whose experts read their
 weights once for the whole batch, so the batch costs little more than one token while the experts
@@ -655,8 +658,15 @@ rounds together, one MTP pass for all of them per draft and one verification pas
 decodes without drafts when its prompt has media, near the end of its context, with one token
 left in its output or thinking budget, and while a
 `--post-thinking` request still reasons. N-gram copy proposals (`--ngram-draft-tokens`) are not
-available for this model; `--lookup-ngram`, `--adaptive-mtp`, `--mtp-attention-window` and
-`--lm-head-draft` are refused.
+available for this model; `--lookup-ngram`, `--mtp-attention-window` and `--lm-head-draft` are
+refused.
+
+With `--adaptive-mtp`, `--draft-tokens K` is the most drafts a round makes. The controller the
+Qwen3.5 models use (see [Adaptive MTP](serving.md#adaptive-mtp)) picks each round's width from
+the requests' measured draft survival and the round times it has measured at each width, but here
+it goes down to one draft: the MTP block runs one step per draft, so a narrower round also drafts
+less, where the Qwen3.5 models' drafts are ready before the round. Each step count has its own
+draft-chain graph and each width its own verification graph, captured at their second use.
 
 ## Execution
 
