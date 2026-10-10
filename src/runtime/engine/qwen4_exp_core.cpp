@@ -548,7 +548,7 @@ struct Qwen4ExpCore::Impl {
              std::size_t{256}});
         if (drafts > 0) {
             workspace =
-                std::max(workspace, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                std::max(workspace, ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
                                         static_cast<std::int32_t>(domain), 1,
                                         static_cast<std::int32_t>(drafts), 1,
                                         static_cast<std::int32_t>(rows)));
@@ -1839,7 +1839,7 @@ struct Qwen4ExpCore::Impl {
         Tensor accepted(spec_accepted.p, DType::I32, {rows_n});
         {
             auto scope = sample_workspace->scope();
-            ops::speculative_accept_greedy_drafts(
+            ops::speculative_accept_coupled_drafts(
                 targets.view({columns, rows_n}), logits.view({logits.ne[0], columns, rows_n}),
                 drafted, extents, lengths, round_anchors, licensed, counts, accepted,
                 static_cast<std::int32_t>(domain), device_config, *sample_workspace, stream);

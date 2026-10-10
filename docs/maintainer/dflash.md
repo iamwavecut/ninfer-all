@@ -226,7 +226,8 @@ mask and configured penalties/temperature/filters, with accepted proposal histor
 scan advances. Greedy verification accepts the matching target-argmax prefix. At the first
 mismatch it emits the target correction; all-accept emits the bonus from p_P.
 
-For positive-temperature target sampling, use the actual proposal distribution:
+For positive-temperature target sampling, DFlash2 uses its retained conditional proposal
+distribution q:
 
 ```text
 accept d_(i+1) with probability min(1, p_i[d_(i+1)] / q_i[d_(i+1)])
@@ -235,8 +236,11 @@ on rejection: r_i(v) = max(p_i(v) - q_i(v), 0)
 on all accept: bonus ~ p_P
 ```
 
-DFlash q is one-hot; DFlash2 q is the retained conditional distribution. This preserves the
-processed target distribution for the verify path. Different draft formats, shortlist heads or
+DFlash's drafts are greedy and go through coupled verification
+(`speculative_accept_coupled_drafts`, shared with MTP): column i draws t_i from p_i with the decode
+key of position F+i+1, keeps d_(i+1) while it equals t_i, and commits t_i at the first difference
+or after the last draft, so a greedy draft survives with probability p_i[d_(i+1)]. Both preserve
+the processed target distribution for the verify path. Different draft formats, shortlist heads or
 block widths can change acceptance and throughput; their logits need not match one another.
 
 ### Live widths
