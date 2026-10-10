@@ -613,15 +613,13 @@ struct Executor::Impl {
     // Host-resident experts, wide calls: a layer's routed experts that the cache does not hold are
     // copied into device slots and the matrix kernel reads them there; one pool and one set of
     // tables per rank, whose layers run one at a time.
+    // The pool holds a bank per projection laid out as the host's: expert e at e times the
+    // layer's matrix bytes, so experts adjacent on the host cross the bus in one copy.
     struct SlotPool {
-        DeviceBuffer storage; // zeroed slots, each down matrix followed by kSlotTail zero bytes
-        std::uint64_t slot_bytes = 0;
-        std::array<std::uint64_t, 3> offset{};
-        std::uint32_t slots = 0;
-        DeviceBuffer tables; // gate, up and down tables of every expert
-        // Bytes of each slot's down region a down has written: past a smaller down from another
-        // layer, the tail is zeroed again.
-        std::vector<std::uint64_t> down_written;
+        DeviceBuffer storage;                 // gate, up and down banks, zeroed when allocated
+        std::array<std::uint64_t, 3> offset{}; // of each bank in storage
+        std::uint32_t slots = 0;              // experts the banks hold: all of a layer's, or none
+        DeviceBuffer tables;                  // gate, up and down tables of every expert
     };
 
     std::vector<SlotPool> slot_pools; // by rank; empty unless the experts are host resident
@@ -1535,16 +1533,16 @@ struct Executor::Impl {
                 }
             }
             if (widest[0] == 0) { continue; }
-            SlotPool& pool  = slot_pools[r];
-            pool.offset     = {0, round_up(widest[0]), round_up(widest[0]) + round_up(widest[1])};
-            pool.slot_bytes = pool.offset[2] + round_up(widest[2] + kSlotTail);
+            SlotPool& pool = slot_pools[r];
+            pool.offset    = {0, round_up(experts * widest[0]),
+                              round_up(experts * widest[0]) + round_up(experts * widest[1])};
             RankBinding bind(device, r);
             std::size_t free_bytes = 0, total = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
-            const std::uint64_t bytes = experts * pool.slot_bytes;
+            // Zeros follow the last down in its bank: the matrix kernel reads past a down.
+            const std::uint64_t bytes = pool.offset[2] + round_up(experts * widest[2] + kSlotTail);
             if (bytes > free_bytes / 2) { continue; }
             pool.slots   = static_cast<std::uint32_t>(experts);
-            pool.down_written.assign(experts, 0);
             pool.storage = DeviceBuffer(bytes);
             CUDA_CHECK(cudaMemset(pool.storage.p, 0, pool.storage.bytes));
             pool.tables = DeviceBuffer(3 * experts * sizeof(void*));
@@ -1568,6 +1566,62 @@ struct Executor::Impl {
         }
     }
 
+    // Copies the experts of text layer `index` that `wanted` selects and the cache lacks into the
+    // pool's banks, each at its own index, and points `entries` (the gate, up and down tables) at
+    // the cache or the copies; unselected experts get none. A run of such experts goes in one copy
+    // per projection wherever the host's are adjacent, and zeros follow the run's last down, which
+    // the matrix kernel reads past: inside a run the bytes after a down are the next expert's
+    // down, as in a host bank.
+    template <class Wanted>
+    void stage_pool(const SlotPool& pool, std::size_t index, Wanted&& wanted,
+                    const void** entries, cudaStream_t stream) {
+        const MoePlan& m             = layers[index].moe;
+        const std::size_t experts    = m.gate.pointers.size();
+        const ExpertTable* tables[3] = {&m.gate, &m.up, &m.down};
+        std::array<std::uint64_t, 3> bytes{};
+        for (int k = 0; k < 3; ++k) {
+            bytes[k] = std::uint64_t(tables[k]->rows) * tables[k]->row_bytes;
+        }
+        auto* storage     = static_cast<std::byte*>(pool.storage.p);
+        const auto cached = [&](std::size_t e) {
+            return cache && cache->cached(index, 0, std::int32_t(e)) != nullptr;
+        };
+        std::size_t e = 0;
+        while (e < experts) {
+            if (!wanted(e) || cached(e)) {
+                for (int k = 0; k < 3; ++k) {
+                    entries[k * experts + e] =
+                        wanted(e) ? cache->cached(index, k, std::int32_t(e)) : nullptr;
+                }
+                ++e;
+                continue;
+            }
+            std::size_t end = e + 1;
+            while (end < experts && wanted(end) && !cached(end)) { ++end; }
+            for (int k = 0; k < 3; ++k) {
+                std::byte* bank = storage + pool.offset[k];
+                for (std::size_t a = e; a < end;) {
+                    std::size_t b = a + 1;
+                    while (b < end && static_cast<const std::byte*>(tables[k]->pointers[b - 1]) +
+                                              bytes[k] ==
+                                          tables[k]->pointers[b]) {
+                        ++b;
+                    }
+                    CUDA_CHECK(cudaMemcpyAsync(bank + a * bytes[k], tables[k]->pointers[a],
+                                               std::size_t((b - a) * bytes[k]),
+                                               cudaMemcpyHostToDevice, stream));
+                    a = b;
+                }
+                for (std::size_t x = e; x < end; ++x) {
+                    entries[k * experts + x] = bank + x * bytes[k];
+                }
+            }
+            CUDA_CHECK(cudaMemsetAsync(storage + pool.offset[2] + end * bytes[2], 0, kSlotTail,
+                                       stream));
+            e = end;
+        }
+    }
+
     // Copies every expert of text layer `index` that the cache lacks into its rank's pool, on the
     // transfer stream once the pool's previous call is done with it, and points the pool's tables
     // at the cache or the copies.
@@ -1584,31 +1638,7 @@ struct Executor::Impl {
         state.next ^= 1;
         CUDA_CHECK(cudaEventSynchronize(state.copied[buffer]));
         auto* entries = static_cast<const void**>(state.entries[buffer]->data());
-        const ExpertTable* tables[3] = {&m.gate, &m.up, &m.down};
-        for (std::size_t e = 0; e < experts; ++e) {
-            if (cache && cache->cached(index, 0, std::int32_t(e)) != nullptr) {
-                for (int k = 0; k < 3; ++k) {
-                    entries[k * experts + e] = cache->cached(index, k, std::int32_t(e));
-                }
-                continue;
-            }
-            auto* base = static_cast<std::byte*>(pool.storage.p) + e * pool.slot_bytes;
-            for (int k = 0; k < 3; ++k) {
-                const std::uint64_t bytes = std::uint64_t(tables[k]->rows) * tables[k]->row_bytes;
-                std::byte* target         = base + pool.offset[k];
-                CUDA_CHECK(cudaMemcpyAsync(target, tables[k]->pointers[e], std::size_t(bytes),
-                                           cudaMemcpyHostToDevice, t));
-                if (k == 2) {
-                    std::uint64_t& written = pool.down_written[e];
-                    if (written > bytes) {
-                        CUDA_CHECK(cudaMemsetAsync(
-                            target + bytes, 0, std::size_t(std::min(written - bytes, kSlotTail)), t));
-                    }
-                    written = std::max(written, bytes);
-                }
-                entries[k * experts + e] = target;
-            }
-        }
+        stage_pool(pool, index, [](std::size_t) { return true; }, entries, t);
         CUDA_CHECK(cudaMemcpyAsync(pool.tables.p, entries, 3 * experts * sizeof(void*),
                                    cudaMemcpyHostToDevice, t));
         CUDA_CHECK(cudaEventRecord(state.copied[buffer], t));
@@ -2227,39 +2257,9 @@ struct Executor::Impl {
             const std::int32_t e = routes[i];
             if (e >= 0 && std::size_t(e) < experts) { routed[e] = 1; }
         }
-        auto* entries                = static_cast<const void**>(slot_entries->data());
-        const ExpertTable* tables[3] = {&m.gate, &m.up, &m.down};
-        std::uint32_t used           = 0;
-        for (std::size_t e = 0; e < experts; ++e) {
-            for (int k = 0; k < 3; ++k) { entries[k * experts + e] = nullptr; }
-            if (!routed[e]) { continue; }
-            if (cache && cache->cached(index, 0, std::int32_t(e)) != nullptr) {
-                for (int k = 0; k < 3; ++k) {
-                    entries[k * experts + e] = cache->cached(index, k, std::int32_t(e));
-                }
-                continue;
-            }
-            if (used == pool.slots) { return false; }
-            const std::uint32_t slot = used++;
-            auto* base =
-                static_cast<std::byte*>(pool.storage.p) + std::size_t(slot) * pool.slot_bytes;
-            for (int k = 0; k < 3; ++k) {
-                const std::uint64_t bytes = std::uint64_t(tables[k]->rows) * tables[k]->row_bytes;
-                std::byte* target         = base + pool.offset[k];
-                CUDA_CHECK(cudaMemcpyAsync(target, tables[k]->pointers[e], std::size_t(bytes),
-                                           cudaMemcpyHostToDevice, s));
-                if (k == 2) {
-                    std::uint64_t& written = pool.down_written[slot];
-                    if (written > bytes) {
-                        CUDA_CHECK(
-                            cudaMemsetAsync(target + bytes, 0,
-                                            std::size_t(std::min(written - bytes, kSlotTail)), s));
-                    }
-                    written = std::max(written, bytes);
-                }
-                entries[k * experts + e] = target;
-            }
-        }
+        if (pool.slots < experts) { return false; }
+        auto* entries = static_cast<const void**>(slot_entries->data());
+        stage_pool(pool, index, [&](std::size_t e) { return routed[e] != 0; }, entries, s);
         CUDA_CHECK(cudaMemcpyAsync(pool.tables.p, entries, 3 * experts * sizeof(void*),
                                    cudaMemcpyHostToDevice, s));
         ops::GgufMoeWeights banks = m.banks();
