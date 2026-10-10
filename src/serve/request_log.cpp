@@ -160,7 +160,15 @@ const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
 }
 
 const char* proposal_head_name(ninfer::ProposalHead proposal) {
-    return proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full";
+    switch (proposal) {
+    case ninfer::ProposalHead::Auto:
+        return "auto";
+    case ninfer::ProposalHead::Full:
+        return "full";
+    case ninfer::ProposalHead::Optimized:
+        return "optimized";
+    }
+    return "unknown";
 }
 
 const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {

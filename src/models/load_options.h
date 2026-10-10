@@ -102,11 +102,17 @@ struct LoadOptions {
     return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2;
 }
 
+// The draft head a plan uses: an automatic head not yet resolved against an artifact
+// (runtime::construct_model resolves it before loading) is the full one.
+[[nodiscard]] constexpr ProposalHead planned_proposal_head(ProposalHead head) noexcept {
+    return head == ProposalHead::Optimized ? ProposalHead::Optimized : ProposalHead::Full;
+}
+
 [[nodiscard]] inline LoadOptions load_options(const EngineOptions& options) noexcept {
     return {.purpose        = options.purpose,
             .vision         = options.enable_vision,
             .speculative    = options.speculative.backend,
-            .proposal_head  = options.speculative.proposal_head,
+            .proposal_head  = planned_proposal_head(options.speculative.proposal_head),
             .lm_head_q4     = options.lm_head_q4,
             .lm_head_q6     = options.lm_head_q6,
             .embedding_q4   = options.embedding_q4,

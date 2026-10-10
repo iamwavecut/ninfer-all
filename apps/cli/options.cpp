@@ -198,7 +198,10 @@ std::string usage_text(const char* argv0) {
            "  --spec mtp|dflash|dflash2     speculative decoding backend\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0)\n"
-           "  --lm-head-draft               draft with the optimized proposal head\n"
+           "  --lm-head-draft               draft with the optimized proposal head, which\n"
+           "                                the artifact must store (the default when it does)\n"
+           "  --full-draft-head             draft with the full output head even when the\n"
+           "                                artifact stores a proposal head\n"
            "  --mtp-attention-window N      the MTP draft head attends to its first 64 keys\n"
            "                                and the newest N before its query, not the\n"
            "                                whole history; verification is unchanged\n"
@@ -400,6 +403,8 @@ Options parse_options(int argc, char** argv) {
             options.speculative.ngram_min_match = parse_u32(value(arg), "ngram-min-match");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (arg == "--full-draft-head") {
+            options.speculative.proposal_head = ProposalHead::Full;
         } else if (arg == "--lm-head-q4") {
             options.lm_head_q4 = true;
         } else if (arg == "--lm-head-q6") {

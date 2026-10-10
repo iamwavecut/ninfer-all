@@ -92,7 +92,8 @@ GPU residency is frozen when the Engine starts:
 - no `--spec` omits MTP/DFlash/DFlash2 weights and state and the optimized proposal head;
 - `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B) load only
   the selected speculative backend;
-- a speculative backend with the full proposal head omits the optimized proposal head;
+- a speculative backend loads the artifact's optimized proposal head when it stores one, unless
+  `--full-draft-head` keeps the drafts on the full output head and omits it;
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
 - `--vision` loads the weights, expands the one Program workspace for Vision encode/handoff, and
   enables image/video input.
@@ -167,9 +168,12 @@ long-decode, and long-context inputs.
 ## Speculative decoding
 
 Speculative decoding is disabled by default. Select MTP, the 35B-A3B DFlash or the Qwen3.8-27B
-DFlash2 backend with one to fifteen draft positions. Only one backend can be enabled per Engine, and
-`--lm-head-draft` selects the optimized proposal head and requires a selected backend. Both
-masked-draft backends may be combined with `--vision`:
+DFlash2 backend with one to fifteen draft positions. Only one backend can be enabled per Engine.
+Drafts go through the artifact's optimized proposal head when it stores one: a vocabulary shortlist
+(131,072 rows of the 27B's 248,320) that is cheaper to project at every draft step, for the memory
+of that matrix (0.3 GiB with the 27B GSQ-RCO IQ3_S artifact). `--lm-head-draft` requires the
+proposal head and `--full-draft-head` keeps the full output head; both need a selected backend.
+Both masked-draft backends may be combined with `--vision`:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -212,7 +216,8 @@ guessing right.
   MTP there, because the head already copies.
 - **DFlash2:** seven is the checkpoint recommendation and the best mean on this card. The best K
   still depends on the workload, so a deployment serving one kind of work should sweep its own.
-  `--lm-head-draft` is within noise of unset for DFlash2 at every count and can be left off.
+  The optimized proposal head is within noise of the full head for DFlash2 at every count, so
+  `--full-draft-head` can save its memory there.
 - **DFlash:** seven forms the measured block length eight; fifteen uses the maximum supported block
   length sixteen.
 
@@ -257,7 +262,8 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--spec mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--draft-min-p P` | Flash-Next MTP only: verify through the first draft at or below this absolute probability; the full draft chain still runs; see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) | `0` (off) |
-| `--lm-head-draft` | optimized proposal head | off |
+| `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
+| `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query, verification keeps full attention (see [serving](serving.md#mtp-attention-window)) | `0` (whole history) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec`: the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
