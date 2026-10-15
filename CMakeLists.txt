@@ -74,6 +74,9 @@ endif()
 if(CMAKE_CUDA_ARCHITECTURES MATCHES "^75(;86)?$")
   add_compile_definitions(NINFER_SM75=1)
 endif()
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75;86")
+  add_compile_definitions(NINFER_SM75_86=1)
+endif()
 # Programmatic dependent launch lets a captured decode-graph kernel stage its weights while the
 # kernel before it finishes (src/core/pdl.cuh). It needs sm_90 or newer, so the compatibility path
 # launches in stream order; NINFER_PDL=ON turns it on for a 120a build of that path. The native
