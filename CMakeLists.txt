@@ -14,9 +14,13 @@ endif()
 # 120a is admitted locally as an unqualified target. Consumer Blackwell is Ada-like at the warp
 # level - mma.sync, ldmatrix and cp.async recompile natively, and there is no tcgen05 or tensor
 # memory at all - so the compatibility path below is what actually runs there.
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|75|80|86|89|120a)$")
+# "75;86" is the one mixed build: one binary for a Turing card and Ampere cards in the same
+# process (a layer pipeline across a TITAN RTX and RTX 30 series cards). Its kernels take the
+# Turing shapes and Turing kernel variants on every card, so the host launches each kernel the same
+# way on both, and each architecture's device code takes its own instructions (NINFER_SM75_DEVICE).
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|75|80|86|89|120a|75;86)$")
   message(FATAL_ERROR
-    "NInfer supports CMAKE_CUDA_ARCHITECTURES=70, 75, 80, 86, 89 or 120a; got "
+    "NInfer supports CMAKE_CUDA_ARCHITECTURES=70, 75, 80, 86, 89, 120a or 75;86; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
@@ -51,7 +55,7 @@ endif()
 # NINFER_SM120_NATIVE=ON to build the native routes instead.
 option(NINFER_SM120_NATIVE
        "On a 120a build, compile upstream's native routes instead of the mma.sync path" OFF)
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|75|80|86|89)$" OR NOT NINFER_SM120_NATIVE)
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|75|80|86|89|75;86)$" OR NOT NINFER_SM120_NATIVE)
   set(NINFER_COMPAT_PATH ON)
   add_compile_definitions(NINFER_SM8X_COMPAT=1)
 else()
@@ -66,7 +70,8 @@ endif()
 # replace the sm_80+ instructions (cp.async, BF16/TF32 and m16n8k16/k32 MMA, packed conversions,
 # warp reductions) with exact Turing forms (src/ops/common/memory.cuh, mma.cuh), kernels fit the
 # 64 KiB per-block shared memory, and the host knows which routes this binary carries.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+# A "75;86" build has it too; its Ampere code keeps the Ampere instructions (NINFER_SM75_DEVICE).
+if(CMAKE_CUDA_ARCHITECTURES MATCHES "^75(;86)?$")
   add_compile_definitions(NINFER_SM75=1)
 endif()
 # Programmatic dependent launch lets a captured decode-graph kernel stage its weights while the

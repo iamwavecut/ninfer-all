@@ -207,7 +207,7 @@ __launch_bounds__(256, resident_ctas_bound(256, MinBlocks)) __global__
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             // Four code bytes per row cover steps ks = 2*half and 2*half + 1.
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_DEVICE)
             // Turing has no BF16 MMA or BF16 arithmetic: the codes decode to FP16 natively, and a
             // tile whose activations are all FP16 values runs FP16 MMA on them, converted once.
             // These are the operands mma_bf16 forms, in its order, so the bits are the same; a

@@ -68,7 +68,7 @@ __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float&
                                          unsigned b1) {
 #if defined(NINFER_SM70_DEVICE)
     pre_sm80::mma_m16n8k16<pre_sm80::Bf16Operands>(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
-#elif defined(NINFER_SM75)
+#elif defined(NINFER_SM75_DEVICE)
     sm75::mma_bf16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -83,7 +83,7 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& 
                                         unsigned b1) {
 #if defined(NINFER_SM70_DEVICE)
     pre_sm80::mma_m16n8k16<pre_sm80::F16Operands>(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
-#elif defined(NINFER_SM75)
+#elif defined(NINFER_SM75_DEVICE)
     sm75::mma_f16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -101,7 +101,7 @@ __device__ __forceinline__ void mma_f16_f16acc(unsigned& d0, unsigned& d1, unsig
                                                unsigned b1) {
 #if defined(NINFER_SM70_DEVICE)
     sm70::mma_m16n8k16_f16acc(d0, d1, a0, a1, a2, a3, b0, b1);
-#elif defined(NINFER_SM75)
+#elif defined(NINFER_SM75_DEVICE)
     sm75::mma_f16_f16acc(d0, d1, a0, a1, a2, a3, b0, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
@@ -115,7 +115,7 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
 #if defined(NINFER_SM70_DEVICE)
     sm70::mma_m16n8k32_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
-#elif defined(NINFER_SM75)
+#elif defined(NINFER_SM75_DEVICE)
     sm75::mma_s8(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -149,7 +149,7 @@ __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, f
                                               unsigned b0, unsigned b1) {
 #if defined(NINFER_SM70_DEVICE)
     pre_sm80::mma_m16n8k8_tf32(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
-#elif defined(NINFER_SM75)
+#elif defined(NINFER_SM75_DEVICE)
     sm75::mma_tf32_bits(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1);
 #else
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "

@@ -14,6 +14,13 @@
 #    define NINFER_PRE_SM80_DEVICE 1
 #endif
 
+// Turing device code of a build that has Turing (NINFER_SM75). NINFER_SM75 sets the shapes the host
+// launches with, which every card of a "75;86" build shares; this selects the instructions, so the
+// Ampere code of that build keeps BF16 MMA and its own operand forms.
+#if defined(NINFER_SM75) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 800
+#    define NINFER_SM75_DEVICE 1
+#endif
+
 namespace ninfer::ops::pre_sm80 {
 
 __device__ __forceinline__ unsigned lane_id() {
