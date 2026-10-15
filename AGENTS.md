@@ -62,7 +62,8 @@ by the user's decision. Keep the bounded transfer buffers and the device expert 
 This line builds for **`sm_86`** (the RTX 30 series; that build also runs the RTX 40 series),
 `sm_89`, `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer) and `sm_75`
 (Turing: the TITAN RTX and RTX 20 series, Turing forms of the sm_80 instructions and Turing shapes
-of the kernels past its 64 KiB of shared memory, `docs/maintainer/build-system.md`), with `sm_80`
+of the kernels past its 64 KiB of shared memory, `docs/maintainer/build-system.md`; a `75;86`
+build pipelines a Turing card with RTX 30 series cards), with `sm_80`
 as an unmeasured compatibility target and `sm_70` (Tesla V100, CUDA 12.x only, its own small-T,
 attention and prompt routes over emulated Ampere warp primitives, built from source); the
 published Docker image carries the `75`, `86` and `120a` builds. It was tuned on the **NVIDIA

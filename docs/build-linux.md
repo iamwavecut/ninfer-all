@@ -125,6 +125,34 @@ The TITAN RTX's device route profile is built in; another Turing part calibrates
 (see [device profiles](device-profiles.md)). What runs and how fast is in the
 [TITAN RTX measurements](performance/titan-rtx-2026-10.md).
 
+### A Turing card with RTX 30 series cards (`75;86`)
+
+`-DCMAKE_CUDA_ARCHITECTURES="75;86"` builds one binary with device code for both, so a layer
+pipeline (`--devices`, `--stage-layers`) can span a TITAN RTX and RTX 30 series cards. It is the
+only multi-architecture value configure accepts:
+
+```bash
+cmake -S . -B build-7586 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+  -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
+  "-DCMAKE_CUDA_ARCHITECTURES=75;86" \
+  -DNINFER_BUILD_APPS=ON
+
+cmake --build build-7586 --parallel
+```
+
+- The host launches every kernel with the Turing shapes (64 KiB of shared memory, the Turing
+  kernel variants) on every card; the Ampere cards run them with the Ampere instructions (BF16 and
+  TF32 MMA, `cp.async`), the Turing card with its own forms.
+- On one card the binary gives the same tokens as the single-architecture build of that card.
+- Its route catalog differs from both, so a built-in profile does not apply: each card calibrates
+  at first start.
+- Each card computes its own layers with its own arithmetic (Turing attention rounds BF16 values
+  and probabilities to FP16), so greedy output across a mixed pipeline may diverge from either
+  card alone after some tokens.
+- A `75` or `86` build still refuses ranks of different compute capability.
+
 ## Tesla V100 (sm_70)
 
 A `70` build runs on Tesla V100 (16 or 32 GB). It needs CUDA 12.8 or 12.9: CUDA 13 no longer
