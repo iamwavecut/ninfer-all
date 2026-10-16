@@ -2,7 +2,8 @@
 
 NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
 `CMAKE_CUDA_ARCHITECTURES` is `70`, `75`, `80`, `86` (the default), `89` or `120a`, one per build
-tree; configure refuses anything else. CUDA 12.8 or newer builds `75` and the `sm_8x` targets, a
+tree, or the one mixed value `75;86` ([mixed build](#mixed-build-7586)); configure refuses anything
+else. CUDA 12.8 or newer builds `75` and the `sm_8x` targets, a
 `70` build needs CUDA 12.x ([Tesla V100](../build-linux.md#tesla-v100-sm_70)), and a `120a` build
 needs CUDA 13.1 or newer.
 
@@ -79,6 +80,22 @@ so the outputs are the same bits. It loads the next K group into registers durin
 group's MMAs. A device profile can run any 8-column K-split tile on four K warps at four CTAs an SM
 (`q8_ksplit/<rows>x<k>` -> `kw4`, `ops/linear/q8/q8_ksplit_config.h`); the TITAN RTX profile does
 so where `ninfer-calibrate` measured it faster ([TITAN RTX measurements](../performance/titan-rtx-2026-10.md)).
+
+### Mixed build (`75;86`)
+
+`CMAKE_CUDA_ARCHITECTURES="75;86"` is the one multi-architecture build: a layer pipeline across a
+Turing card and RTX 30 series cards in one process. `NINFER_SM75=1` is defined for host and device
+code, as in a `75` build, so the host takes the Turing shapes and kernel variants for every card
+(`device_limits.h`, the route table, the kernel variants named above), and both architectures run
+them. `NINFER_SM75_86=1` lets `DeviceContext` admit ranks of 7.5 and 8.6 together; every other build
+still requires one compute capability.
+
+The device code selects its instructions with `NINFER_SM75_DEVICE` (`ops/common/pre_sm80.cuh`:
+`NINFER_SM75` and `__CUDA_ARCH__` from 750 to 799) instead of `NINFER_SM75`. The `sm_86` code
+of this build keeps BF16 and TF32 `mma.sync`, `cp.async` and its own operand forms, and its
+Turing-only branches (`mma.cuh`, the Q4 K-split, Q5 small-T and Q8 K-split MMA, the PV
+probabilities of `bf16_attention.cuh`) are not compiled. A gate that sets a shape or a launch stays on
+`NINFER_SM75`, so the host and both device images agree on it.
 
 Product commands and prerequisites are in the README's [Quick start](../../README.md#quick-start) and
 [Building](../../README.md#building) sections; test and measurement workflows live in

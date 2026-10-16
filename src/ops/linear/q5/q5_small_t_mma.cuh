@@ -242,7 +242,7 @@ __launch_bounds__(256, resident_ctas_bound(256, KWarps < 8 || XCols >= 32
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             // Four code bytes and one high byte per row cover steps ks = 2*half and 2*half + 1.
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_DEVICE)
             // Turing: the codes decode to FP16 natively, and a tile whose activations are all FP16
             // values runs FP16 MMA on the operands mma_bf16 would form, in its order, so the bits
             // are the same; another tile runs mma_bf16 (q4_ksplit_mma.cuh does the same).

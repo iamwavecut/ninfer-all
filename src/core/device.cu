@@ -169,9 +169,21 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
         }
 
         // Every rank must share one compute capability, so kernels built for it run on all of them.
+        // A "75;86" build may mix 7.5 with 8.6: it carries device code for both, and its host
+        // launches every kernel with the Turing shapes both run (CMakeLists.txt).
+        const auto capability = [](const cudaDeviceProp& props) {
+            return props.major * 10 + props.minor;
+        };
         for (std::size_t rank = 1; rank < endpoints_.size(); ++rank) {
-            if (endpoints_[rank].props.major != endpoints_[0].props.major ||
-                endpoints_[rank].props.minor != endpoints_[0].props.minor) {
+            const int first = capability(endpoints_[0].props);
+            const int here  = capability(endpoints_[rank].props);
+#if defined(NINFER_SM75_86)
+            const bool turing_mix =
+                (first == 75 || first == 86) && (here == 75 || here == 86);
+#else
+            const bool turing_mix = false;
+#endif
+            if (here != first && !turing_mix) {
                 throw std::invalid_argument(
                     "model-parallel CUDA devices must have the same compute capability");
             }

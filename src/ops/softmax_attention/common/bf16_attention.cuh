@@ -152,7 +152,7 @@ __device__ __forceinline__ bool copy_bf16x8_as_half(void* dst, const void* src) 
 __device__ __forceinline__ void attention_pv_mma(float& c0, float& c1, float& c2, float& c3,
                                                  unsigned p0, unsigned p1, unsigned p2, unsigned p3,
                                                  unsigned v0, unsigned v1) {
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_DEVICE)
     mma_f16_bf16(c0, c1, c2, c3, p0, p1, p2, p3, v0, v1);
 #else
     mma_bf16(c0, c1, c2, c3, p0, p1, p2, p3, v0, v1);
