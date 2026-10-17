@@ -187,7 +187,7 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   activations directly; wider calls convert them to FP16 once. From 65 columns
   (`NINFER_SM70_CUBLAS_MIN`) the weights are dequantized to FP16 32 MiB at a time and multiplied by
   cuBLAS with FP32 accumulation; a call of more than 8,192 columns (a Vision item's patches) passes
-  over them 8,192 at a time. Activations beyond +-65504 saturate there.
+  over them 8,192 at a time.
 - **T2 projections at one to eight columns** (decode, two requests, an MTP or DFlash2 verify round)
   take an integer route where the projection's policy admits integer activations, as the other
   targets' T2 A8 route does: the activations are quantized to int8 with one scale per 64 values,
@@ -207,6 +207,14 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   as the other targets. Prompt attention gives a CTA 64 query rows of one KV head and decodes each
   32-key tile of the visible pages into shared memory once for all of them; it reads the pages
   where they are and needs no workspace.
+- **BF16 values beyond FP16's range.** Volta's tensor cores take FP16 operands, which saturate at
+  +-65504. Where a BF16 activation of a dense projection, or a query, key or value of attention
+  over a BF16 cache, is beyond that (magnitude 2^16 or more), the conversion flags its 64-value
+  chunk, column or key tile, and the product adds in FP32 what the saturation took: a projection
+  adds the weights times the excess, and attention forms the tile's scores again from the BF16
+  values and adds the probabilities times the values' excess. Data within FP16's range takes the
+  tensor-core paths unchanged. Values below FP16's normal range keep FP16's absolute precision
+  (2^-25), and the queries of a quantized cache, which are rotated in FP16, still saturate.
 - FP8 A8 and NVFP4 W4A4 activations are not available, as on `sm_86`; those weights run their A16
   routes.
 

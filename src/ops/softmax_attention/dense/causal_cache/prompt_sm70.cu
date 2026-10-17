@@ -200,6 +200,70 @@ struct SharedRows {
     }
 };
 
+// A BF16 cache's tile as SharedRows reads it, and the BF16 values its FP16 stage saturates: the
+// queries of the CTA's rows (numbered from 0 at the call's first), and the keys and values of the
+// pages. The flags say whether the tile's keys or values, or the CTA's queries, hold a value
+// beyond FP16 (sm70_attention::attend_tile's exact rows).
+struct SharedBf16Rows : SharedRows {
+    static constexpr bool kExact = true;
+    const __nv_bfloat16* cache_k;
+    const __nv_bfloat16* cache_v;
+    const std::int32_t* table;
+    std::int32_t kv_heads;
+    int kv_head;
+    const __nv_bfloat16* q;
+    std::int32_t q_heads;
+    int group;
+    int row_count;
+    bool tile_beyond;
+    bool query_beyond;
+
+    __device__ __forceinline__ uint4 key8(const __half* row, int d, unsigned&) const {
+        return SharedRows::key8(row, d);
+    }
+    __device__ __forceinline__ uint2 value4(const __half* row, int n, unsigned&) const {
+        return SharedRows::value4(row, n);
+    }
+    __device__ __forceinline__ bool keys_beyond(unsigned) const { return tile_beyond; }
+    __device__ __forceinline__ bool values_beyond(unsigned) const { return tile_beyond; }
+
+    __device__ __forceinline__ const __nv_bfloat16* query(int row) const {
+        return row < row_count ? q + (static_cast<std::int64_t>(row / group) * q_heads +
+                                      kv_head * group + row % group) *
+                                         kHeadDim
+                               : nullptr;
+    }
+    __device__ __forceinline__ const __nv_bfloat16* page_row(const __nv_bfloat16* plane,
+                                                             int k) const {
+        const std::int64_t page = table[k >> kPagedKVPageShift];
+        return plane +
+               ((page * kv_heads + kv_head) * kPagedKVPageSize + (k & kPagedKVPageMask)) * kHeadDim;
+    }
+    __device__ __forceinline__ const __nv_bfloat16* key_bf16(int k) const {
+        return page_row(cache_k, k);
+    }
+    __device__ __forceinline__ const __nv_bfloat16* value_bf16(int k) const {
+        return page_row(cache_v, k);
+    }
+};
+
+// Whether any of a BF16 Raw's 32 values is beyond FP16 (zero for the other codings).
+template <Coding C>
+__device__ __forceinline__ bool raw_beyond(const Raw& r) {
+    if constexpr (C == Coding::Bf16) {
+        unsigned bits = 0u;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            bits |= sm70_attention::beyond_bits(r.w[i].x) | sm70_attention::beyond_bits(r.w[i].y) |
+                    sm70_attention::beyond_bits(r.w[i].z) | sm70_attention::beyond_bits(r.w[i].w);
+        }
+        return (bits & sm70_attention::kBeyondBits) != 0u;
+    } else {
+        (void)r;
+        return false;
+    }
+}
+
 __device__ __forceinline__ void store_row(__half* dst, const unsigned (&words)[16]) {
     auto* p = reinterpret_cast<uint4*>(dst);
 #pragma unroll
@@ -248,6 +312,8 @@ __launch_bounds__(kThreads) __global__
     };
 
     // The CTA's query rows in FP16 (rotated like the keys), zero past the valid ones.
+    constexpr bool Exact = K == Coding::Bf16 && V == Coding::Bf16;
+    bool query_beyond    = false;
     for (int r = warp; r < kRows; r += kWarps) {
         const int row   = row0 + r;
         const bool live = row < row_count;
@@ -259,6 +325,7 @@ __launch_bounds__(kThreads) __global__
         if constexpr (RotatedKeys) { normalized_hadamard_d256_inplace(values, lane); }
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
+            query_beyond |= !(fabsf(values[i]) <= 65504.0f);
             q_s[r * kStride + lane + 32 * i] =
                 __float2half_rn(fminf(fmaxf(values[i], -65504.0f), 65504.0f));
         }
@@ -303,19 +370,38 @@ __launch_bounds__(kThreads) __global__
     Raw key_raw{};
     Raw value_raw{};
     if (tiles > 0) { read(0, key_raw, value_raw); }
-    __syncthreads();
+    // A BF16 query beyond FP16 sends every tile through the exact scores; the others ignore it.
+    query_beyond = __syncthreads_or(query_beyond) != 0;
     for (int tile = 0; tile < tiles; ++tile) {
         const int k0 = tile * kTile;
         unsigned words[16];
+        const bool raw_saturates = raw_beyond<K>(key_raw) || raw_beyond<V>(value_raw);
         decode_raw<K>(key_raw, words);
         store_row(k_s + load_key * kStride + 32 * part, words);
         decode_raw<V>(value_raw, words);
         store_row(v_s + load_key * kStride + 32 * part, words);
-        __syncthreads();
+        const bool tile_beyond = __syncthreads_or(raw_saturates) != 0;
         if (tile + 1 < tiles) { read(k0 + kTile, key_raw, value_raw); }
         if (warp_position >= k0) {
-            sm70_attention::attend_tile(SharedRows{k_s, v_s, k0}, q_row, p_tile, k0, 0, window,
-                                        qabs_a, qabs_b, scale, st);
+            if constexpr (Exact) {
+                const SharedBf16Rows rows{{k_s, v_s, k0},
+                                          static_cast<const __nv_bfloat16*>(cache_k),
+                                          static_cast<const __nv_bfloat16*>(cache_v),
+                                          table,
+                                          kv_heads,
+                                          kv_head,
+                                          q,
+                                          q_heads,
+                                          group,
+                                          row_count,
+                                          tile_beyond,
+                                          query_beyond};
+                sm70_attention::attend_tile(rows, q_row, p_tile, k0, 0, window, qabs_a, qabs_b,
+                                            scale, st, row0 + warp * 8);
+            } else {
+                sm70_attention::attend_tile(SharedRows{k_s, v_s, k0}, q_row, p_tile, k0, 0,
+                                            window, qabs_a, qabs_b, scale, st);
+            }
         }
         __syncthreads();
     }
