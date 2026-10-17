@@ -69,7 +69,7 @@ ninfer_add_test(ninfer_disk_kv_bridge_test
   LIBRARIES ninfer_core)
 
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cu"
-  LIBRARIES ninfer_core)
+  LIBRARIES ninfer_ops)
 
 set_tests_properties(ninfer_device_test PROPERTIES
   ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:")

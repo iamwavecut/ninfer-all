@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/ops/linear.h"
+#include "ops/common/device_tier.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -18,15 +19,23 @@ enum class LinearRouteTable : std::uint8_t {
     Unified,
 };
 
-// Whether the unified table can be selected in this build. A Turing (sm_75) build takes the legacy
-// table for every width, and refuses NINFER_LINEAR_ROUTES=unified and forcing it: most unified
-// schedules were sized for 99 KiB of shared memory per block against Turing's 64 KiB. Their
-// translation units still compile; nothing launches them.
-#if defined(NINFER_SM75)
-inline constexpr bool kUnifiedLinearRoutes = false;
-#else
-inline constexpr bool kUnifiedLinearRoutes = true;
-#endif
+// Whether a card of `tier` can select the unified table. A Turing (sm_75) card takes the legacy
+// table for every width: most unified schedules were sized for 99 KiB of shared memory per block
+// against Turing's 64 KiB. Their translation units still compile; a Turing card launches none of
+// them.
+[[nodiscard]] constexpr bool unified_linear_routes(DeviceTier tier) {
+    return tier != DeviceTier::Turing;
+}
+
+// Whether any card this build runs can select it. A build for Turing alone refuses
+// NINFER_LINEAR_ROUTES=unified and forcing the table; a build of several architectures applies a
+// forced table on the cards that can select it.
+inline constexpr bool kUnifiedLinearRoutesBuilt = kBuildVolta || kBuildAmpere || kBuildBlackwell;
+
+// Whether the calling thread's current device can select it.
+[[nodiscard]] inline bool unified_linear_routes_here() {
+    return unified_linear_routes(current_device_tier());
+}
 
 enum class LinearRouteFamily : std::uint8_t {
     Q4,

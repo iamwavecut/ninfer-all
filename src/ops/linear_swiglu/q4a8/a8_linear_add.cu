@@ -38,18 +38,11 @@ void launch(const Tensor& x, const Weight& down, Tensor& residual, std::int32_t 
         reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, codes, scales);
     CUDA_CHECK(cudaGetLastError());
 
-    const std::size_t smem = a8::shared_bytes<Codec, 1, NT, Rows>(kCols);
     const dim3 grid(kRows / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
-    auto* kernel = a8::a8_mma_kernel<Codec, kCols, 1, NT, Rows, a8::ResidualAddEpilogue>;
-    if (smem > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem));
-        });
-    }
-    kernel<<<grid, a8::kThreads, smem, stream>>>(
-        static_cast<const std::uint8_t*>(down.qdata), static_cast<const std::uint8_t*>(down.qhigh),
-        static_cast<const __half*>(down.scales), codes, scales, tokens, Rows{0},
+    a8::launch_a8_mma<Codec, kCols, 1, NT, Rows, a8::ResidualAddEpilogue>(
+        grid, stream, static_cast<const std::uint8_t*>(down.qdata),
+        static_cast<const std::uint8_t*>(down.qhigh), static_cast<const __half*>(down.scales),
+        codes, scales, tokens, Rows{0},
         a8::ResidualAddEpilogue{reinterpret_cast<__nv_bfloat16*>(residual.data), kRows},
         row_split_panel_shift(down.layout));
     CUDA_CHECK(cudaGetLastError());

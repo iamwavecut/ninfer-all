@@ -46,8 +46,8 @@ target_sources(ninfer_ops PRIVATE
 )
 
 # The fast NVFP4 prompt kernel runs QK on block-scaled FP4 Tensor Cores (kind::mxf4nvf4), which
-# only Blackwell has.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+# only Blackwell has: a build with 120a carries it, and only a card running the 120a code takes it.
+if(NINFER_ARCH_BLACKWELL)
   target_sources(ninfer_ops PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_fast.cu")
 endif()

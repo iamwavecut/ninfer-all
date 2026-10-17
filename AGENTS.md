@@ -81,7 +81,7 @@ toolchain constraints are in `docs/build-windows.md`; this repository has no Win
 CI does not build Windows.
 
 Generation uses one resident model on one GPU, or split into pipeline stages over up to eight
-(`--devices`, Linux only; each stage owns whole layers with their KV and state, and the head,
+(`--devices`; each stage owns whole layers with their KV and state, and the head,
 round state and sampling stay on the first device; design in
 `docs/maintainer/pipeline-stages.md`). It runs startup-fixed concurrency of one to eight
 requests, bounded FIFO ingress, no active-request preemption, and one compact decode batch per

@@ -2,7 +2,9 @@
 
 #include "artifact/permute_row_split.h"
 
+#include <span>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <variant>
 
@@ -56,15 +58,28 @@ void apply_storage_trades(Bindings& bindings, const Config& config, const ModelW
     }
 }
 
-void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
-#if defined(NINFER_SM70)
+void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
+                          std::span<const ops::DeviceTier> rank_tiers) {
+    if constexpr (!ops::kBuildVolta) {
+        (void)bindings;
+        (void)weights;
+        (void)rank_tiers;
+        return;
+    }
     // sm_70's projection routes (ops/linear/sm70) read row-split codes in the panel layout, where
     // one 128-byte line holds a k-group's records of four rows: row-major records cost the decode
     // reads 10 to 40% of the card's bandwidth. The text layers' attention, GDN and dense MLP
     // projections and the MTP input projection take it in the formats those routes read in every
-    // Op that consumes them (T2, Q2, Q4, Q5, Q6; Q8 also reaches an Op without them). Experts,
-    // heads, embeddings, the MTP attention and drafter weights keep the stored layout, and so does
-    // an object another parameter also binds.
+    // Op that consumes them (T2, Q2, Q4, Q5, Q6; Q8 also reaches an Op without them), on a rank
+    // whose device runs Volta's code. Experts, heads, embeddings, the MTP attention and drafter
+    // weights keep the stored layout, and so does an object another parameter also binds.
+    const auto volta_rank = [&](std::size_t rank) {
+        if (rank >= rank_tiers.size()) {
+            throw std::logic_error("device layouts: no device tier for pipeline rank " +
+                                   std::to_string(rank));
+        }
+        return rank_tiers[rank] == ops::DeviceTier::Volta;
+    };
     std::vector<bool> selected(bindings.weights.size(), false);
     std::vector<WeightId> projections;
     const auto take = [&](WeightId id) {
@@ -107,7 +122,10 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
     }
     for (const WeightId id : projections) {
         const auto& parameter = bindings.at(id);
-        if (parameter.reference.residency != artifact::Residency::Device) { continue; }
+        if (parameter.reference.residency != artifact::Residency::Device ||
+            !volta_rank(bindings.weights.at(id.index).rank)) {
+            continue;
+        }
         for (const auto& part : parameter.reference.binding.parts) {
             const auto& geometry = bindings.binder.reader().geometry(part.object);
             const bool format =
@@ -121,10 +139,6 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
             }
         }
     }
-#else
-    (void)bindings;
-    (void)weights;
-#endif
 }
 
 } // namespace ninfer::models::qwen3_5::loading

@@ -116,21 +116,27 @@ void test_compiled_table_parses() {
     }
 }
 
-// The compiled table may only name, for a key calibration measures, schedules calibration knows: a
-// schedule the catalog dropped or renamed would silently keep the compiled route.
+// The code tier a compiled entry's card runs (its hardware class ends in its compute capability).
+ninfer::ops::DeviceTier compiled_entry_tier(const std::string& hardware_class) {
+    using ninfer::ops::DeviceTier;
+    if (hardware_class.ends_with("-sm70")) { return DeviceTier::Volta; }
+    if (hardware_class.ends_with("-sm75")) { return DeviceTier::Turing; }
+    if (hardware_class.ends_with("-sm120")) { return DeviceTier::Blackwell; }
+    return DeviceTier::Ampere;
+}
+
+// The compiled table may only name, for a key calibration measures, schedules calibration knows on
+// the entry's card: a schedule the catalog dropped or renamed would silently keep the compiled
+// route.
 void test_compiled_table_names_catalog_schedules() {
     const auto compiled = ninfer::runtime::parse_device_route_profiles(
         ninfer::runtime::compiled_device_route_profiles_json(), "compiled");
     for (const auto& entry : compiled) {
-#if defined(NINFER_SM75)
-        // No other part runs a Turing build, whose catalog lacks the 64-key small-T attention tier
-        // the newer parts' entries name; only Turing entries can be installed by it.
-        if (!entry.profile.hardware_class.ends_with("-sm75")) { continue; }
-#endif
+        const auto& catalog = ninfer::calibration::calibration_route_catalog(
+            compiled_entry_tier(entry.profile.hardware_class));
         for (const auto& [key, bands] : entry.profile.routes) {
-            const auto& catalog = ninfer::calibration::calibration_route_catalog();
-            const auto found    = std::find_if(catalog.begin(), catalog.end(),
-                                               [&](const auto& item) { return item.key == key; });
+            const auto found = std::find_if(catalog.begin(), catalog.end(),
+                                            [&](const auto& item) { return item.key == key; });
             if (found == catalog.end()) { continue; }
             for (const auto& band : bands) {
                 const bool known =
@@ -144,9 +150,24 @@ void test_compiled_table_names_catalog_schedules() {
             }
         }
     }
-    const std::string& digest = ninfer::calibration::calibration_route_catalog_digest();
-    expect(digest.size() == 16 && digest.find_first_not_of("0123456789abcdef") == std::string::npos,
-           "the route catalog digest is 16 hex digits");
+    using ninfer::ops::DeviceTier;
+    for (const DeviceTier tier :
+         {DeviceTier::Volta, DeviceTier::Turing, DeviceTier::Ampere, DeviceTier::Blackwell}) {
+        const std::string& digest = ninfer::calibration::calibration_route_catalog_digest(tier);
+        expect(digest.size() == 16 &&
+                   digest.find_first_not_of("0123456789abcdef") == std::string::npos,
+               "the route catalog digest is 16 hex digits");
+    }
+    // A 12.0 card runs Blackwell's code from a build with 120a and Ampere's from one without; a
+    // profile it calibrated under either applies under the other.
+    expect(ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Ampere) ==
+               ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Blackwell),
+           "a 12.0 card has one route catalog whichever tier runs it");
+    expect(ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Turing) !=
+                   ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Ampere) &&
+               ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Volta) !=
+                   ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Turing),
+           "the Volta, Turing and Ampere catalogs differ");
 }
 
 // The cards that ship a measured profile, by the name and compute capability the driver reports, so
@@ -170,6 +191,7 @@ void test_builtin_parts() {
         {"Tesla V100-SXM2-32GB", 7, 0, 80},
         {"NVIDIA GeForce RTX 5060 Ti", 12, 0, 36},
         {"NVIDIA GeForce RTX 5070", 12, 0, 48},
+        {"NVIDIA GeForce RTX 5070 Ti", 12, 0, 70},
         {"NVIDIA GeForce RTX 5080", 12, 0, 84},
         {"NVIDIA GeForce RTX 5090 D v2", 12, 0, 170},
         {"NVIDIA RTX PRO 4000 Blackwell", 12, 0, 70},
@@ -363,10 +385,10 @@ void test_wide_tables() {
                fp8_wide_route_table(LinearPolicy::AllowA8Int) == LinearRouteTable::Unified &&
                fp8_wide_route_table(LinearPolicy::AllowA8) == LinearRouteTable::Legacy,
            "an FP8 A16 call names the unified table for wide calls, an A8 call the legacy one");
-    if constexpr (!ninfer::ops::detail::kUnifiedLinearRoutes) {
+    if (!ninfer::ops::detail::unified_linear_routes_here()) {
         expect(linear_route_table(LinearRouteFamily::Fp8, 4096, LinearRouteTable::Unified) ==
                    LinearRouteTable::Legacy,
-               "a build without the unified table takes the legacy one at every width");
+               "a card without the unified table takes the legacy one at every width");
         return;
     }
     constexpr auto kUnified = LinearRouteTable::Unified;

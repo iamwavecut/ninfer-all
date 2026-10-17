@@ -17,12 +17,6 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
                                                       float scale, const CacheView& cache,
                                                       Metadata metadata, Tensor& out,
                                                       cudaStream_t stream) {
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptFp8SmemBytes);
-    });
-
     constexpr auto kStorage = KvCacheStorage::Fp8E4M3Row256;
     const auto* cache_k_ptr = static_cast<const KvKeyCodeT<kStorage>*>(cache.k_pages.data);
     const auto* cache_v_ptr = static_cast<const KvValueCodeT<kStorage>*>(cache.v_pages.data);
@@ -31,13 +25,20 @@ void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Ten
     assert_kv_planes<kStorage, decltype(cache_k_ptr), decltype(cache_v_ptr), decltype(k_scale_ptr),
                      decltype(v_scale_ptr)>();
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
-    const dim3 grid(static_cast<unsigned>(div_up(tokens, kCausalPromptFp8Br)),
-                    static_cast<unsigned>(Geometry::QHeads), 1u);
-    causal_attention_prompt_fp8_kernel<Geometry, Metadata>
-        <<<grid, kCausalPromptFp8Threads, kCausalPromptFp8SmemBytes, stream>>>(
+    with_shape_set([&]<bool TuringShapes>() {
+        using Shape       = CausalPromptFp8Shape<TuringShapes>;
+        const auto kernel = causal_attention_prompt_fp8_kernel<Geometry, Metadata, TuringShapes>;
+        configure_cuda_device_once([&] {
+            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        Shape::SmemBytes);
+        });
+        const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
+                        static_cast<unsigned>(Geometry::QHeads), 1u);
+        kernel<<<grid, kCausalPromptFp8Threads, Shape::SmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), cache_k_ptr, cache_v_ptr, k_scale_ptr,
             v_scale_ptr, metadata, static_cast<const std::int32_t*>(positions.data), scale,
             static_cast<__nv_bfloat16*>(out.data), tokens);
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 

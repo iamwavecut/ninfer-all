@@ -6,9 +6,12 @@ each card are on the [performance](performance.md) page.
 
 ## Architectures
 
-A build targets one architecture (`CMAKE_CUDA_ARCHITECTURES`); configure refuses any other target.
+A build targets one architecture (`CMAKE_CUDA_ARCHITECTURES`), or several for a layer pipeline across
+cards of different architectures ([several architectures](build-linux.md#cards-of-several-architectures-in-one-pipeline));
+configure refuses any other target.
 The Docker image (CUDA 13.4, NVIDIA driver 580 or newer) carries the `75`, `86` and `120a` builds and
-starts the one that matches the GPU.
+starts the one that matches the GPUs; its `multi` tag carries one build of all three for a pipeline
+across cards of different architectures.
 
 | Architecture | Compute capability | Build | CUDA | In the image | Status |
 |---|---|---|---|---|---|
@@ -63,7 +66,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 5090 D | 32 GB | GeForce | | |
 | ⬜ | RTX 5090 D V2 | 24 GB | GeForce | ✓ | |
 | ⬜ | RTX 5080 | 16 GB | GeForce | ✓ | |
-| ⬜ | RTX 5070 Ti | 16 GB | GeForce | | |
+| ⬜ | RTX 5070 Ti | 16 GB | GeForce | ✓ | |
 | ⬜ | RTX 5070 | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 5060 Ti | 16 / 8 GB | GeForce | ✓ | |
 | ⬜ | RTX 5060 | 8 GB | GeForce | | |

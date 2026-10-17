@@ -67,6 +67,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t wave_splits,
         float scale, float* partial_acc, float* partial_m, float* partial_l) {
+    // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
+    // compiles this kernel empty in the Volta image.
+#if !defined(NINFER_SM70_DEVICE)
     constexpr bool PackedKeys          = Keys != KvKeyCoding::Int8;
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
@@ -980,6 +983,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
+#endif
 }
 
 } // namespace ninfer::ops

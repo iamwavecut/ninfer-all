@@ -10,6 +10,7 @@
 
 #include "guarded_main.h"
 #include "models/qwen3_5/execution/ffn.h"
+#include "ops/common/device_tier.h"
 
 #include <cstdint>
 #include <iostream>
@@ -72,13 +73,13 @@ void run_planning() {
         check(verify >= prefill, "verify planning must not undercut prefill at T=" +
                                      std::to_string(width) + " (" + std::to_string(verify) + " < " +
                                      std::to_string(prefill) + ")");
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM70)
+#if defined(NINFER_SM8X_COMPAT)
         // The route stages one s8 code per (token, hidden) plus an FP16 scale per 64-k group, over
-        // the padded tile width. Anything less than that and the arena can throw mid-round. (An
-        // sm_70 build has no integer Q4 route: these widths take its own small-T route, which
+        // the padded tile width. Anything less than that and the arena can throw mid-round. (A
+        // Volta card has no integer Q4 route: these widths take its own small-T route, which
         // stages nothing.)
         const std::size_t codes = static_cast<std::size_t>(width) * 5120;
-        check(verify >= prefill + codes,
+        check(ninfer::ops::current_device_volta() || verify >= prefill + codes,
               "verify planning must cover the integer scratch at T=" + std::to_string(width) +
                   " (needs at least " + std::to_string(codes) + " more than prefill's " +
                   std::to_string(prefill) + ", got " + std::to_string(verify) + ")");
@@ -125,8 +126,8 @@ void run_combined_flags() {
         check(verify >= prefill, "verify planning must not undercut prefill under "
                                   "--no-prefill-a8 --mlp-a8-decode at T=" +
                                       std::to_string(width));
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM70)
-        check(verify > prefill,
+#if defined(NINFER_SM8X_COMPAT)
+        check(ninfer::ops::current_device_volta() || verify > prefill,
               "verify planning must admit the decode route under --no-prefill-a8 "
               "--mlp-a8-decode at T=" +
                   std::to_string(width));

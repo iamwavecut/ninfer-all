@@ -2,6 +2,7 @@
 #include "ninfer/ops/sparse_moe.h"
 
 #include "core/nvtx.h"
+#include "ops/common/device_tier.h"
 #include "ops/sparse_moe/laboratory.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
@@ -286,14 +287,13 @@ static void sparse_moe_impl(const Tensor& x, const SparseMoeWeights& weights,
                              candidate == Candidate::PrefillWide ||
                              (automatic && detail::sparse_moe_uses_prefill(
                                  tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype));
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
     // The NVFP4 prefill route is W4A4 on the Blackwell FP4 tensor cores. Decode and the small-token
-    // route are CUDA-core dot products and run here; a prefill-sized call has no route on sm_8x.
-    if (use_prefill && nvfp4_profile(weights)) {
+    // route are CUDA-core dot products and run on every card; a prefill-sized call has no route on
+    // a card that does not run the 120a code.
+    if (use_prefill && nvfp4_profile(weights) && !current_device_blackwell()) {
         throw std::invalid_argument(
-            "sparse_moe: NVFP4 expert banks prefill only on an sm_120a build");
+            "sparse_moe: NVFP4 expert banks prefill only on a card running sm_120a code");
     }
-#endif
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
                                 : use_small_t ? nvtx::Name::SparseMoeSmallT
                                               : nvtx::Name::SparseMoeDecode,

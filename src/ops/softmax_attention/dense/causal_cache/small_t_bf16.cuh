@@ -215,10 +215,6 @@ causal_small_t_bf16_store(const CausalSmallTBf16Split<CacheInput>& s, const floa
 
 } // namespace ninfer::ops
 
-#if defined(NINFER_SM75)
-// A Turing build takes its own kernel of the same name and contract.
-#    include "ops/softmax_attention/dense/causal_cache/small_t_bf16_sm75.cuh"
-#else
 namespace ninfer::ops {
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
@@ -229,6 +225,10 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     float* partial_acc, float* partial_m, float* partial_l) {
+    if constexpr (!shape_set_in_image(false)) { return; } // not this image's set
+    // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
+    // compiles this kernel empty in the Volta image.
+#if !defined(NINFER_SM70_DEVICE)
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -501,7 +501,10 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
 
             causal_small_t_bf16_store<Geometry>(sp, acc, m0, m1, l0, l1, warp_row0, lane);
         });
+#endif
 }
 
 } // namespace ninfer::ops
-#endif
+
+// The Turing shape set's kernel of the same contract (ops/common/device_tier.h).
+#include "ops/softmax_attention/dense/causal_cache/small_t_bf16_sm75.cuh"

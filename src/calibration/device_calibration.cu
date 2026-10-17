@@ -286,7 +286,8 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
         }
         double best_us = compiled;
         std::string best;
-        for (const std::string& candidate : calibration_candidates(family.key)) {
+        for (const std::string& candidate :
+             calibration_candidates(family.key, ops::current_device_tier())) {
             const ops::DeviceRouteForce force(family.key, candidate);
             if (family.output) {
                 try {
@@ -616,8 +617,8 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
          reset_residual},
     };
     for (const auto* set : {&families, &unified_families}) {
-        // A build that cannot select the unified table has no switch onto it to measure.
-        if (set == &unified_families && !ops::detail::kUnifiedLinearRoutes) { continue; }
+        // A card that cannot select the unified table has no switch onto it to measure.
+        if (set == &unified_families && !ops::detail::unified_linear_routes_here()) { continue; }
         for (const Family& family : *set) {
             auto bands = sweep(family, timer, options);
             if (!bands.empty()) {
@@ -850,9 +851,9 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
             profile.routes[family.key] = std::move(bands);
             ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
         }
-        // A build without the standard INT8 prompt kernel (kCausalPromptI8Standard) runs every
+        // A card without the standard INT8 prompt kernel (causal_prompt_i8_standard) runs every
         // INT8-family prompt on the fast one and has neither switch.
-        if (ops::detail::kCausalPromptI8Standard) {
+        if (ops::detail::causal_prompt_i8_standard_here()) {
             // The standard prompt kernel with each KV head's query heads packed into its tiles, as
             // the PV choice above left it: one 1024-token chunk at 32K and one at 131K of context.
             const Family pack{"attn_pack_gqa",
@@ -1005,15 +1006,10 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     profile.multiprocessors = properties.multiProcessorCount;
     profile.origin          = "calibration";
     Timer timer(options);
-#if defined(NINFER_SM70)
-    // The families outside the sm_70 catalog (calibration/route_catalog.cpp) steer routes that
-    // build never takes.
-    const bool projections = false;
-    const bool attention   = false;
-#else
-    const bool projections = true;
-    const bool attention   = options.attention;
-#endif
+    // The families outside a Volta card's catalog (calibration/route_catalog.cpp) steer routes it
+    // never takes.
+    const bool projections = !ops::current_device_volta();
+    const bool attention   = projections && options.attention;
     if (projections && options.ternary) { calibrate_ternary(profile, timer, options); }
     if (projections && options.groupwise) {
         calibrate_groupwise(profile, timer, options);

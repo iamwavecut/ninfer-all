@@ -46,20 +46,11 @@ void launch_range(const Weight& weight, const std::int8_t* codes, const __half* 
                   std::int32_t tokens, std::int32_t row_begin, std::int32_t row_count,
                   a8::StoreEpilogue epilogue, cudaStream_t stream) {
     constexpr int BN       = a8::kWarpsN * NT * 8;
-    const std::size_t smem = a8::shared_bytes<Codec, 1, NT, Rows>(kHidden);
     const dim3 grid(row_count / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
-    auto* kernel = a8::a8_mma_kernel<Codec, kHidden, 1, NT, Rows, a8::StoreEpilogue>;
-    if (smem > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem));
-        });
-    }
-    kernel<<<grid, a8::kThreads, smem, stream>>>(
-        static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.qhigh),
-        static_cast<const __half*>(weight.scales), codes, scales, tokens, Rows{row_begin},
-        epilogue, row_split_panel_shift(weight.layout));
+    a8::launch_a8_mma<Codec, kHidden, 1, NT, Rows, a8::StoreEpilogue>(
+        grid, stream, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.qhigh), static_cast<const __half*>(weight.scales),
+        codes, scales, tokens, Rows{row_begin}, epilogue, row_split_panel_shift(weight.layout));
     CUDA_CHECK(cudaGetLastError());
 }
 

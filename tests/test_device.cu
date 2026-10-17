@@ -1,5 +1,6 @@
 #include "core/device.h"
 #include "cuda_availability.h"
+#include "ops/common/device_tier.h"
 
 #include <cuda_runtime.h>
 
@@ -41,6 +42,38 @@ bool kernel_runs_on(int device) {
     const cudaError_t finished = launched == cudaSuccess ? cudaDeviceSynchronize() : launched;
     CUDA_CHECK(cudaFree(value));
     return launched == cudaSuccess && finished == cudaSuccess;
+}
+
+// The code tier each device runs: the newest tier this build carries that the device's compute
+// capability reaches, since CUDA loads the newest image a card can run. The current-device
+// predicates and the shape set follow it.
+int check_tiers(int count) {
+    namespace ops = ninfer::ops;
+    using ops::DeviceTier;
+    for (int id = 0; id < count; ++id) {
+        if (!kernel_runs_on(id)) { continue; }
+        cudaDeviceProp props{};
+        CUDA_CHECK(cudaGetDeviceProperties(&props, id));
+        const int capability      = props.major * 10 + props.minor;
+        const DeviceTier expected = ops::kBuildBlackwell && capability >= 120
+                                        ? DeviceTier::Blackwell
+                                    : ops::kBuildAmpere && capability >= 80 ? DeviceTier::Ampere
+                                    : ops::kBuildTuring && capability >= 75 ? DeviceTier::Turing
+                                                                            : DeviceTier::Volta;
+        if (ops::device_tier(id) != expected) {
+            std::cerr << "CUDA device " << id << " (" << props.name << ")\n";
+            return fail("a device runs another tier than its compute capability selects");
+        }
+        CUDA_CHECK(cudaSetDevice(id));
+        if (ops::current_device_tier() != expected ||
+            ops::current_device_volta() != (expected == DeviceTier::Volta) ||
+            ops::current_device_turing() != (expected == DeviceTier::Turing) ||
+            ops::current_device_blackwell() != (expected == DeviceTier::Blackwell) ||
+            ops::turing_shapes_here() != (expected == DeviceTier::Turing)) {
+            return fail("the current-device tier predicates disagree with the device's tier");
+        }
+    }
+    return 0;
 }
 
 // Every visible device in one context: it opens exactly when the build's code runs on each of
@@ -178,7 +211,8 @@ int main(int argc, char** argv) {
         std::cerr << "timer elapsed time was negative\n";
     }
 
-    // Last: it switches the calling thread's current device.
+    // Last: they switch the calling thread's current device.
+    failures += check_tiers(count);
     if (count > 1) { failures += check_all_devices(count); }
 
     return failures == 0 ? 0 : fail("device test failed");

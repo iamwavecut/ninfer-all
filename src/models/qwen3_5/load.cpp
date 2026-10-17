@@ -51,8 +51,17 @@ std::span<const WeightUse> LoadPlan::uses(WeightId id) const {
     return impl_->pending.at(id.index).uses;
 }
 
+std::vector<ops::DeviceTier> rank_tiers(const DeviceContext& device) {
+    std::vector<ops::DeviceTier> tiers;
+    tiers.reserve(device.size());
+    for (std::size_t rank = 0; rank < device.size(); ++rank) {
+        tiers.push_back(ops::device_tier(device.rank(rank).device));
+    }
+    return tiers;
+}
+
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
-                   std::filesystem::path artifact_path) {
+                   std::filesystem::path artifact_path, std::vector<ops::DeviceTier> rank_tiers) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->artifact_path = std::move(artifact_path);
@@ -125,7 +134,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
         if (out->weights.draft) { out->weights.draft->output_head = out->weights.proposal->head; }
     }
     loading::apply_storage_trades(bindings, out->config, out->weights, options);
-    loading::apply_device_layouts(bindings, out->weights);
+    if (rank_tiers.empty()) { rank_tiers.assign(options.ranks, ops::current_device_tier()); }
+    loading::apply_rank_policies(bindings, rank_tiers);
+    loading::apply_device_layouts(bindings, out->weights, rank_tiers);
     if (options.overlay_vision()) {
         loading::apply_vision_overlay_placement(bindings, out->weights, mtp_parameters,
                                                 draft_parameters);
@@ -318,7 +329,8 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,
                                   DeviceContext& device, const StartupObserver* observer) {
     artifact::Reader reader(path);
-    return materialize_model(plan_load(reader, options, path), device, observer);
+    return materialize_model(plan_load(reader, options, path, rank_tiers(device)), device,
+                             observer);
 }
 
 } // namespace ninfer::models::qwen3_5

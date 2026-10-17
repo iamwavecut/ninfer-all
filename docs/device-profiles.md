@@ -18,15 +18,16 @@ Up to three layers answer, per route key:
 1. **Your profile file.** `$NINFER_DEVICE_PROFILES`, else `$XDG_CACHE_HOME/ninfer/device-profiles.json`,
    else `~/.cache/ninfer/device-profiles.json` (`%LOCALAPPDATA%\ninfer\device-profiles.json` on
    Windows). `--device-profile-path` names another file.
-2. **The built-in table.** Profiles measured on 46 GPU models ship inside the binary
+2. **The built-in table.** Profiles measured on 47 GPU models ship inside the binary
    (`src/runtime/engine/device_profiles.json`); the Profile column of the
    [card tables](gpus.md#cards) shows which. Each entry was measured at the card's default power
    limit by the build that serves it: the image's `75`, `86` and `120a` builds (an Ada card runs the
-   `86` build), CUDA 12.8 `80` and `70` builds for the A100 and V100, and a CUDA 12.8 `86` build
-   for the A10, whose host driver (570) predates the image's CUDA 13. Variants that report
-   different names have their own entries, such as the PRO 6000's Workstation (600 W), Max-Q
-   (300 W) and Server editions. The Turing entries come from a `75` build, the only build that runs
-   on them; its route catalog lacks the keys a Turing build never selects.
+   `86` build), CUDA 12.8 `80` and `70` builds for the A100 and V100, a CUDA 12.8 `86` build for
+   the A10, whose host driver (570) predates the image's CUDA 13, and a CUDA 13.1 `120a` build for
+   the RTX 5070 Ti, with the image's route catalog. Variants that report different names have
+   their own entries, such as the PRO 6000's Workstation (600 W), Max-Q (300 W) and Server
+   editions. The Turing entries come from a `75` build, the only build that runs on them; its route
+   catalog lacks the keys a Turing build never selects.
 3. **The compiled route** of each operation, for a key neither names.
 
 For a key both the file and the built-in table name, the file's bands answer up to their last width

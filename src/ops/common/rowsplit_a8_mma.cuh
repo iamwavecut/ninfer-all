@@ -37,6 +37,7 @@
 // one row they are contiguous across groups while for one group they are strided by the row.
 // Nothing in the prefetch path waits on a synchronous global read.
 
+#include "core/device.h"
 #include "core/tensor.h"
 #include "ops/common/device_limits.h"
 #include "ops/common/mma.cuh"
@@ -53,13 +54,13 @@ constexpr int kWarpsM  = 4;
 constexpr int kWarpsN  = 4;
 constexpr int kGroup   = 64; // k per iteration: exactly one scale group
 constexpr int kWRow    = 48; // padded shared stride for a row's 32 packed bytes, 16-byte aligned
-// Turing's copies are synchronous (ops/common/memory.cuh), so a second stage has nothing to overlap
-// there, and the 512-token tile's two stages would need 75 KiB of the 64 KiB a Turing block has.
-#if defined(NINFER_SM75)
-constexpr int kStages = 1;
-#else
-constexpr int kStages = 2;
-#endif
+
+// Stages of the staging ring per shape set (ops/common/device_tier.h). Turing's copies are
+// synchronous (ops/common/memory.cuh), so a second stage has nothing to overlap there, and the
+// 512-token tile's two stages would need 75 KiB of the 64 KiB a Turing block has.
+[[nodiscard]] __host__ __device__ constexpr int stages(bool turing_shapes) {
+    return turing_shapes ? 1 : 2;
+}
 constexpr int kRingGroups = 8; // 16 bytes of one row's scales, the widest cp.async
 constexpr int kRingBufs   = 2;
 
@@ -262,12 +263,15 @@ __global__ void quantize_activations(const __nv_bfloat16* __restrict__ x, std::i
 
 // MT m-tiles of 16 rows and NT n-tiles of 8 tokens per warp, over a 4x4 warp grid: the block tile
 // is (kWarpsM * MT * 16) rows by (kWarpsN * NT * 8) tokens.
-template <class Codec, int kCols, int MT, int NT, class RowMap, class Epilogue>
-__global__ __launch_bounds__(kThreads) void a8_mma_kernel(
-    const std::uint8_t* __restrict__ w_codes, const std::uint8_t* __restrict__ w_high,
-    const __half* __restrict__ w_scales, const std::int8_t* __restrict__ x_codes,
-    const __half* __restrict__ x_scales, std::int32_t tokens, RowMap rows, Epilogue epilogue,
-    int panel_shift) {
+template <class Codec, int kCols, int MT, int NT, class RowMap, class Epilogue, bool TuringShapes>
+__global__ __launch_bounds__(kThreads) void a8_mma_kernel(const std::uint8_t* __restrict__ w_codes,
+                                                          const std::uint8_t* __restrict__ w_high,
+                                                          const __half* __restrict__ w_scales,
+                                                          const std::int8_t* __restrict__ x_codes,
+                                                          const __half* __restrict__ x_scales,
+                                                          std::int32_t tokens, RowMap rows,
+                                                          Epilogue epilogue, int panel_shift) {
+    if constexpr (!shape_set_in_image(TuringShapes)) { return; } // not this image's set
     constexpr int kGroups  = kCols / kGroup;
     constexpr int BM       = RowMap::kStagedRows;
     constexpr int BN       = kWarpsN * NT * 8;
@@ -278,7 +282,9 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
     constexpr int kXsBytes = BN * 2;
     constexpr int kStage   = kWBytes + kHBytes + kXBytes + kXsBytes;
     constexpr int kRingBytes = BM * kRingGroups * 2;
-    static_assert(kStages * kStage + kRingBufs * kRingBytes <= kMaxSharedBytesPerBlock,
+    constexpr int kStages    = stages(TuringShapes);
+    static_assert(kStages * kStage + kRingBufs * kRingBytes <=
+                      shape_max_shared_bytes_per_block(TuringShapes),
                   "rowsplit A8 tile exceeds the per-block shared memory limit");
 
     extern __shared__ char smem[];
@@ -522,7 +528,7 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(
     }
 }
 
-template <class Codec, int MT, int NT, class RowMap>
+template <class Codec, int MT, int NT, class RowMap, bool TuringShapes>
 [[nodiscard]] constexpr std::size_t shared_bytes(int input_rows) {
     constexpr int BM      = RowMap::kStagedRows;
     constexpr int BN      = kWarpsN * NT * 8;
@@ -530,7 +536,7 @@ template <class Codec, int MT, int NT, class RowMap>
     constexpr int kHBytes = Codec::kHasHigh ? BM * 8 : 0;
     constexpr int kXBytes = (BN / 8) * 32 * 16;
     (void)input_rows;
-    return static_cast<std::size_t>(kStages) * (kWBytes + kHBytes + kXBytes + BN * 2) +
+    return static_cast<std::size_t>(stages(TuringShapes)) * (kWBytes + kHBytes + kXBytes + BN * 2) +
            static_cast<std::size_t>(kRingBufs) * BM * kRingGroups * 2;
 }
 
@@ -588,6 +594,27 @@ template <class Codec, int MT, int NT, class RowMap>
 
 [[nodiscard]] inline bool tokens_supported(std::int32_t tokens) {
     return tokens >= 128 && tokens % 128 == 0;
+}
+
+// Launches a8_mma_kernel over `grid` with the current device's shape set
+// (ops/common/device_tier.h).
+template <class Codec, int kCols, int MT, int NT, class RowMap, class Epilogue>
+void launch_a8_mma(dim3 grid, cudaStream_t stream, const std::uint8_t* w_codes,
+                   const std::uint8_t* w_high, const __half* w_scales, const std::int8_t* x_codes,
+                   const __half* x_scales, std::int32_t tokens, RowMap rows, Epilogue epilogue,
+                   int panel_shift) {
+    with_shape_set([&]<bool TuringShapes>() {
+        const std::size_t smem = shared_bytes<Codec, MT, NT, RowMap, TuringShapes>(kCols);
+        auto* kernel = a8_mma_kernel<Codec, kCols, MT, NT, RowMap, Epilogue, TuringShapes>;
+        if (smem > 48 * 1024) {
+            configure_cuda_device_once([&] {
+                return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            static_cast<int>(smem));
+            });
+        }
+        kernel<<<grid, kThreads, smem, stream>>>(w_codes, w_high, w_scales, x_codes, x_scales,
+                                                 tokens, rows, epilogue, panel_shift);
+    });
 }
 
 } // namespace ninfer::ops::detail::rowsplit_a8

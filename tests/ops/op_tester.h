@@ -17,6 +17,7 @@
 #include "core/arena.h"
 #include "core/tensor.h" // ninfer::DType, ninfer::Tensor (for op call sites)
 #include "cuda_availability.h"
+#include "ops/common/device_tier.h"
 #include "ops/op_check.h"
 
 #include <cuda_runtime.h>
@@ -59,28 +60,31 @@ inline void cuda_synchronize(cudaStream_t stream) {
 // FP8 A8 and NVFP4 A4 execution issue tensor-core instructions that exist only on sm_100a /
 // sm_120a and have no Ampere fallback, so those translation units are compiled out under
 // NINFER_SM8X_COMPAT and their entry points throw instead. A 120a build on that path still
-// compiles both (NINFER_SM120_FP8, NINFER_SM120_NVFP4).
+// compiles both (NINFER_SM120_FP8, NINFER_SM120_NVFP4); a build of several architectures with
+// 120a runs them on the cards that run its 120a code only, and its entry points throw the same
+// refusal on the others (ops/common/blackwell_routes.h).
+inline bool a8_execution_available() {
 #if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
-inline constexpr bool kA8ExecutionAvailable = false;
+    return false;
 #else
-inline constexpr bool kA8ExecutionAvailable = true;
+    return ops::current_device_blackwell();
 #endif
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
-inline constexpr bool kA4ExecutionAvailable = false;
-#else
-inline constexpr bool kA4ExecutionAvailable = true;
-#endif
+}
 
-// True when an exception is one of the A8/A4 units refusing to run because this build targets an
-// architecture whose kernels were compiled out. On a build where those kernels exist the answer is
-// always false, so such a throw still fails the test.
+inline bool a4_execution_available() {
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
+    return false;
+#else
+    return ops::current_device_blackwell();
+#endif
+}
+
+// True when an exception is one of the A8/A4 units refusing to run because the current card does
+// not run the code they need. Where those kernels run the answer is always false, so such a throw
+// still fails the test.
 inline bool unsupported_arch_refusal(const std::exception& error) {
-    if constexpr (kA8ExecutionAvailable && kA4ExecutionAvailable) {
-        (void)error;
-        return false;
-    } else {
-        return std::string_view(error.what()).find("requires an sm_") != std::string_view::npos;
-    }
+    if (a8_execution_available() && a4_execution_available()) { return false; }
+    return std::string_view(error.what()).find("requires an sm_") != std::string_view::npos;
 }
 
 // Runs one Op test case, reporting an unsupported-architecture refusal as a skip rather than a
@@ -90,17 +94,13 @@ inline bool unsupported_arch_refusal(const std::exception& error) {
 // runs and is checked.
 template <typename Case>
 int run_case_allowing_arch_skip(std::string_view label, Case&& body) {
-    if constexpr (kA8ExecutionAvailable && kA4ExecutionAvailable) {
-        (void)label;
+    if (a8_execution_available() && a4_execution_available()) { return body(); }
+    try {
         return body();
-    } else {
-        try {
-            return body();
-        } catch (const std::exception& error) {
-            if (!unsupported_arch_refusal(error)) { throw; }
-            std::cout << "SKIP " << label << ": " << error.what() << "\n";
-            return 0;
-        }
+    } catch (const std::exception& error) {
+        if (!unsupported_arch_refusal(error)) { throw; }
+        std::cout << "SKIP " << label << ": " << error.what() << "\n";
+        return 0;
     }
 }
 

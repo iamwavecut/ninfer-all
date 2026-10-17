@@ -1,0 +1,99 @@
+# Publishes ghcr.io/<owner>/<repo>:multi after a push to master: one executable for Turing, Ampere
+# and consumer Blackwell (CMAKE_CUDA_ARCHITECTURES "75;86;120a"), for a layer pipeline across cards
+# of different architectures, where every card runs the kernels of its own build
+# (docs/build-linux.md). It compiles every unit for three architectures, so it runs apart from CI and
+# the main image, whose publishing does not wait for it. CI's per-architecture jobs test the same
+# code; this workflow only builds and packages it.
+# Tags:
+#   multi               the newest master commit this workflow published
+#   sha-<12 hex>-multi  the published commit
+name: Multi-architecture image
+
+on:
+  push:
+    branches: [master]
+    # Documentation and the evaluation data build nothing.
+    paths-ignore: ['**.md', 'docs/**', 'eval/**']
+  workflow_dispatch:
+
+concurrency:
+  group: multiarch-image
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Build and publish the multi-architecture image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Cache location
+        run: |
+          echo "CCACHE_HOST_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
+          df -h /
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Toolchain image
+        run: .github/scripts/toolchain-image.sh
+      - name: Restore ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_HOST_DIR }}
+          key: ccache-multi-${{ github.sha }}
+          restore-keys: ccache-multi-
+      # A step timeout below the job's, so that a cold build which runs out of time still saves its
+      # ccache and the next push continues from there.
+      - name: Build ninfer-multicall
+        id: build
+        timeout-minutes: 320
+        run: |
+          mkdir -p "$CCACHE_HOST_DIR"
+          docker run --rm -v "$PWD:/src" -v "$CCACHE_HOST_DIR:/ccache" -w /src \
+            -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=6G -e 'NINFER_CUDA_ARCH=75;86;120a' \
+            -e NINFER_MULTICALL=ON -e NINFER_TESTS=OFF -e NINFER_BUILD_DIR=/src/build-multi \
+            ninfer-toolchain:ci bash -c \
+            'ccache --zero-stats && scripts/build-native.sh configure && scripts/build-native.sh target ninfer-multicall && ccache --show-stats'
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_HOST_DIR }}
+          key: ccache-multi-${{ github.sha }}
+      - name: Stage the image binary
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ninfer-toolchain:ci \
+            docker/stage-dist.sh build-multi '75;86;120a' dist
+          ls -R dist
+      # Runs finish out of order. Only the commit that is still master's head may move `multi`.
+      - name: Tags
+        id: tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tags="$image:sha-${GITHUB_SHA:0:12}-multi"
+          head="$(gh api "repos/$GITHUB_REPOSITORY/commits/master" --jq .sha)"
+          if [[ "$head" == "$GITHUB_SHA" ]]; then tags+=",$image:multi"; fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          build-contexts: dist=dist
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=NInfer, one build for RTX 20, 30, 40 and 50 GPUs together: a layer pipeline across cards of different architectures
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:latest
+          cache-to: type=inline

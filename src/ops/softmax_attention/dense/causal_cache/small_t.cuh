@@ -37,13 +37,14 @@ inline constexpr int kCausalSmallTQuantizedFixedBytes =
 
 // Whether a quantized-cache small-T tile widens K and V into one shared tile, V overwriting K once
 // QK is done, instead of widening V into its own tile during QK: where the stage with both tiles
-// (`SeparateStageBytes`) does not fit a block beside the rest. On Turing (64 KiB) that is every
-// shape of two and three 16-row tiles. The NVFP4 kernel also stages its one- and two-row-tile
-// shapes so on every architecture.
-template <int RowTiles, int KeyBlock, int SeparateStageBytes>
-inline constexpr bool kCausalSmallTCompactKV =
-    kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> + SeparateStageBytes >
-    kMaxSharedBytesPerBlock;
+// (`SeparateStageBytes`) does not fit a block of the shape set beside the rest. On Turing (64 KiB)
+// that is every shape of two and three 16-row tiles. The NVFP4 kernel also stages its one- and
+// two-row-tile shapes so on every architecture.
+template <int RowTiles, int KeyBlock, int SeparateStageBytes, bool TuringShapes>
+inline constexpr bool
+    kCausalSmallTCompactKV = kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> +
+                                 SeparateStageBytes >
+                             shape_max_shared_bytes_per_block(TuringShapes);
 
 struct CausalAppendInput {
     static constexpr bool writes_cache = true;

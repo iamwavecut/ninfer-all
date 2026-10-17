@@ -28,7 +28,7 @@
 namespace ninfer::ops {
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
+          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput, bool TuringShapes>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void causal_attention_small_t_k8v4_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
@@ -38,6 +38,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
         std::int32_t logical_capacity, float attention_scale, float* partial_acc, float* partial_m,
         float* partial_l) {
+    if constexpr (!shape_set_in_image(TuringShapes)) { return; } // not this image's set
+    // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
+    // compiles this kernel empty in the Volta image.
+#if !defined(NINFER_SM70_DEVICE)
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -56,7 +60,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int PageIds              = 64;
     constexpr int ProducerThreads      = RowTiles * 32;
     constexpr int VLoaderThreads       = Threads - ProducerThreads;
-    constexpr bool CompactKVStage      = kCausalSmallTCompactKV<RowTiles, Bc, 11 * Bc * D / 2>;
+    constexpr bool CompactKVStage =
+        kCausalSmallTCompactKV<RowTiles, Bc, 11 * Bc * D / 2, TuringShapes>;
     constexpr float Log2E              = 1.4426950408889634074F;
     constexpr unsigned FullMask        = 0xffffffffU;
 
@@ -610,6 +615,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
+#endif
 }
 
 template <typename Geometry, bool MultiBatch, bool Masked, bool Offset>

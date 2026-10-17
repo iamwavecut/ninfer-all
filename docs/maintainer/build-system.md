@@ -1,16 +1,34 @@
 # Build system
 
 NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-`CMAKE_CUDA_ARCHITECTURES` is `70`, `75`, `80`, `86` (the default), `89` or `120a`, one per build
-tree; configure refuses anything else. CUDA 12.8 or newer builds `75` and the `sm_8x` targets, a
-`70` build needs CUDA 12.x ([Tesla V100](../build-linux.md#tesla-v100-sm_70)), and a `120a` build
-needs CUDA 13.1 or newer.
+`CMAKE_CUDA_ARCHITECTURES` lists one or more of `70`, `75`, `80`, `86` (the default), `89` and
+`120a` ([several architectures](#builds-of-several-architectures)); configure refuses anything
+else. CUDA 12.8 or newer builds `75` and the `sm_8x` targets, a build with `70` needs CUDA 12.x
+([Tesla V100](../build-linux.md#tesla-v100-sm_70)), and a build with `120a` needs CUDA 13.1 or
+newer, so `70` and `120a` cannot share a build.
 
-## Turing tier (`75`)
+## Code tiers
 
-A `75` build runs on Turing (`sm_75`: the TITAN RTX and the RTX 20 series; it is measured on a
-TITAN RTX). It compiles the `mma.sync` compatibility path with `NINFER_SM75=1` for host and device
-code. Turing lacks some instructions that the path uses, and the device helpers replace them:
+Each architecture of a build belongs to a code tier (`ops/common/device_tier.h`): Volta (`70`),
+Turing (`75`), Ampere (`80`, `86`, `89`) and Blackwell (`120a`). CMake defines `NINFER_TIER_*` for
+each tier the build carries. Device code selects its instructions by `__CUDA_ARCH__`
+(`NINFER_SM70_DEVICE`, `NINFER_SM75_DEVICE`, `NINFER_PRE_SM80_DEVICE`,
+`NINFER_PRE_BLACKWELL_DEVICE`). Host code that sizes a launch, picks a kernel variant or picks a
+route asks for the tier of the device it launches on (`device_tier`, `current_device_tier`): a probe
+kernel's `cudaFuncGetAttributes` reports which image CUDA loaded on the device, once per device.
+A build of one tier answers without asking.
+
+Kernel shapes come in two sets. The Turing set is sized for 64 KiB of shared memory per block; every
+other tier runs the standard set, sized for 99 KiB. A kernel whose shape depends on the set takes it
+as a template argument (`TuringShapes`) and its launcher instantiates the sets the build carries
+(`with_shape_set`). A kernel of one shape for every card asserts against `kMaxSharedBytesPerBlock`
+(`ops/common/device_limits.h`), the smaller limit of the sets the build carries.
+
+### Turing tier (`75`)
+
+The Turing tier runs on Turing (`sm_75`: the TITAN RTX and the RTX 20 series; it is measured on a
+TITAN RTX). It compiles the `mma.sync` compatibility path. Turing lacks some instructions that the
+path uses, and the device helpers replace them:
 
 - `ops/common/pre_sm80.cuh` holds the forms that Volta and Turing share, under
   `NINFER_PRE_SM80_DEVICE` (device code below `sm_80`): `cp.async` as a plain copy with the same
@@ -23,40 +41,40 @@ code. Turing lacks some instructions that the path uses, and the device helpers 
   as the FP32 product of the same operands for the other outputs. No value is narrowed, and an
   output's route depends on its own row and column only, so every tiling of a product gives the
   same bits. `ninfer_mma_fragments_test` qualifies each helper against an FP64 oracle through the
-  PTX fragment layouts.
-- A `70` build keeps the Volta forms in `ops/common/sm70_emulation.cuh` (no `ldmatrix`, no `m16n8`
-  shapes); a `75` build keeps the native `ldmatrix` and FP16/INT8 shapes.
+  PTX fragment layouts. They are defined in every image but Volta's (`NINFER_SM75_FORMS`), so a
+  Turing kernel variant compiles in every image that may hold it.
+- The Volta image keeps the Volta forms in `ops/common/sm70_emulation.cuh` (no `ldmatrix`, no
+  `m16n8` shapes); the Turing image keeps the native `ldmatrix` and FP16/INT8 shapes.
 
-`ops/common/device_limits.h` holds the 64 KiB of shared memory that a Turing block can use and
-the 1,024 threads that a Turing SM holds. Kernel shapes assert against the first or derive from it,
-`pipeline_stages()` limits `cp.async` rings to two stages, and `resident_ctas_bound()` lowers a
-`__launch_bounds__` minimum of resident CTAs that a Turing SM cannot hold to the number it can
-(ptxas ignores such a minimum, which leaves the registers unbounded). A kernel that does not fit
-takes a Turing shape:
+`ops/common/device_limits.h` holds the 1,024 threads that a Turing SM holds:
+`resident_ctas_bound()` lowers a `__launch_bounds__` minimum of resident CTAs that a Turing SM
+cannot hold to the number it can (ptxas ignores such a minimum, which leaves the registers
+unbounded). The Turing shape set differs from the standard one where a kernel does not fit 64 KiB:
 
-- The standard INT8-family prompt kernel needs 93,184 bytes, so a Turing build does not have it
-  (`kCausalPromptI8Standard`): every INT8-family prompt runs on the fast kernel with one K/V stage,
-  and the `attn_pack_gqa` and `attn_prompt_fast` switches do not exist.
-- Small-T INT8 attention has no 64-key arena tier (`kSmallTI8KeyBlock64`).
-- The FP8 prompt kernel takes 16-key tiles (`kCausalPromptFp8Bc`), whose separate widened K and V
+- The standard INT8-family prompt kernel needs 93,184 bytes, so a Turing card does not run it
+  (`causal_prompt_i8_standard`): every INT8-family prompt runs on the fast kernel with one K/V
+  stage, and the `attn_pack_gqa` and `attn_prompt_fast` switches do not exist there.
+- Small-T INT8 attention has no 64-key arena tier (`small_t_i8_key_block64`).
+- The FP8 prompt kernel takes 16-key tiles (`CausalPromptFp8Shape`), whose separate widened K and V
   stages fit 64 KiB, so V widens during QK. The small-T FP8, NVFP4 and K8V4 shapes of two and three
   16-row tiles widen K and V into one shared tile (`kCausalSmallTCompactKV`); V overwrites K after
   QK.
-- The BF16 prompt attention stages K and V through one buffer, context-KV materialization uses
-  64-key blocks, the rowsplit A8 GEMM runs one stage, and the BF16 `n256_k5120` GEMV splits K
-  eight ways at narrow widths.
-- The GGUF flash attention of Gemma 4 (`ops/linear/gguf/ggml_fattn.cu`) takes the most query rows
-  per tile that the build's device code has, computes without a race and its shared memory fits.
-  llama.cpp's Turing kernel has no tile wider than 32 columns, so width 256 takes 16 rows instead
-  of 32 and width 512 takes 4 rows (32 columns) instead of 8. The 512-wide tiles keep Q in shared
-  memory; they race without the combine-loop barrier that the vendored kernel carries
+- The BF16 prompt and small-T attention take their Turing kernels (`prompt_bf16_sm75.cuh`,
+  `small_t_bf16_sm75.cuh`; the prompt kernel stages K and V through one buffer), context-KV
+  materialization uses 64-key blocks, the rowsplit A8 GEMM runs one stage and the BF16 GEMM rings
+  at most two, and the BF16 `n256_k5120` GEMV splits K eight ways at narrow widths.
+- The GGUF flash attention of Gemma 4 (`ops/linear/gguf/ggml_fattn.cu`) takes, per tier, the most
+  query rows per tile that the tier's device code has, computes without a race and its shared
+  memory fits. llama.cpp's Turing kernel has no tile wider than 32 columns, so width 256 takes 16
+  rows instead of 32 and width 512 takes 4 rows (32 columns) instead of 8. The 512-wide tiles keep
+  Q in shared memory; they race without the combine-loop barrier that the vendored kernel carries
   ([README.ninfer.md](../../third_party/ggml-quants/README.ninfer.md)).
 - The cooperative GDN gating projection reads the occupancy of its compiled kernels on the device
   (`bf16_gdn_gating_proj_mma_resident_ctas_per_sm`). A Turing SM holds fewer of these CTAs than an
   `sm_86` SM, so the widest cooperative routes go to the next route that is resident.
 
 Some Ops round private operands differently on Turing. The Op contracts and the oracle criteria
-are the same on every build:
+are the same on every tier:
 
 - BF16-cache attention multiplies Q, K and V as their FP16 roundings: a value from 2^-17 to below
   2^16 is unchanged, and a smaller value changes by at most 2^-25. A tile that holds a value of
@@ -64,21 +82,51 @@ are the same on every build:
   `small_t_bf16_sm75.cuh`, `ops/softmax_attention/common/bf16_attention.cuh`). The fast sweep and
   the FP32 sweep are separate functions, because in one loop body the FP32 route made the fast
   route spill.
-- Every attention PV product with BF16 values rounds the softmax probabilities to FP16, as the
-  INT8-family kernels do on every architecture: BF16-cache causal attention, the packed attention
-  of the vision towers, and the context and sliding-window attention of the drafters
-  (`pack_attention_p`).
+- Every attention PV product with BF16 values rounds the softmax probabilities to FP16 in the
+  Turing image, as the INT8-family kernels do on every architecture: BF16-cache causal attention,
+  the packed attention of the vision towers, and the context and sliding-window attention of the
+  drafters (`pack_attention_p`).
 - An FP16-accumulated product (`mma_f16_f16acc`) rounds its partial sum to FP16 once more per
   16-value step, because it runs as two 8-value steps.
 
-A `75` build selects the legacy Linear route table only (`kUnifiedLinearRoutes`). Most unified
-schedules need more than 64 KiB, and the build refuses `NINFER_LINEAR_ROUTES=unified`. The Q8 G32
-K-split contraction (`ops/linear/q8/q8_ksplit_mma.cuh`) forms its codes as FP16 pairs and runs FP16
-MMA on tiles whose live activations are FP16 values, with the operands and order of the BF16 route,
-so the outputs are the same bits. It loads the next K group into registers during the current
-group's MMAs. A device profile can run any 8-column K-split tile on four K warps at four CTAs an SM
-(`q8_ksplit/<rows>x<k>` -> `kw4`, `ops/linear/q8/q8_ksplit_config.h`); the TITAN RTX profile does
-so where `ninfer-calibrate` measured it faster ([TITAN RTX measurements](../performance/titan-rtx-2026-10.md)).
+A Turing card selects the legacy Linear route table only (`unified_linear_routes`). Most unified
+schedules need more than 64 KiB; a build for Turing alone refuses `NINFER_LINEAR_ROUTES=unified`.
+The Q8 G32 K-split contraction (`ops/linear/q8/q8_ksplit_mma.cuh`) forms its codes as FP16 pairs and
+runs FP16 MMA on tiles whose live activations are FP16 values, with the operands and order of the
+BF16 route, so the outputs are the same bits. It loads the next K group into registers during the
+current group's MMAs. A device profile can run any 8-column K-split tile on four K warps at four
+CTAs an SM (`q8_ksplit/<rows>x<k>` -> `kw4`, `ops/linear/q8/q8_ksplit_config.h`); the TITAN RTX
+profile does so where `ninfer-calibrate` measured it faster
+([TITAN RTX measurements](../performance/titan-rtx-2026-10.md)).
+
+### Volta tier (`70`)
+
+A Volta card runs its own projection routes (`ops/linear/sm70`, chosen by `sm70::enabled()`), its
+decode attention (`small_t_sm70.cuh`) and its single-row prompt attention (`prompt_sm70.cu`);
+those kernels' `mma.m8n8k4` bodies exist in the Volta image only. Its projection weights take the
+panel layout on the ranks whose device runs Volta's code (`apply_device_layouts`). Its route
+catalog holds the GDN prefill switches alone.
+
+### Blackwell tier (`120a`)
+
+A card that runs the `120a` code also takes the FP8 A8 and NVFP4 W4A4 routes and the fast NVFP4
+prompt kernel (`NINFER_SM120_FP8`, `NINFER_SM120_NVFP4`: the build carries them). A stored A8 or
+A4 permission is kept only for a weight on such a rank (`apply_rank_policies`); elsewhere the
+weight runs its A16 route. The warp-specialized TMA kernels are compiled for `120a` alone
+(`ninfer_nvfp4_non_rdc`); the other Blackwell-only instructions compile as traps in the other
+images of the build (`NINFER_PRE_BLACKWELL_DEVICE`), which no launch reaches.
+
+### Builds of several architectures
+
+A build may list several architectures, for a layer pipeline across cards of different tiers in
+one process (`--devices`): for example `70;75;80;86;89` with CUDA 12.8 or `75;80;86;89;120a` with
+CUDA 13.1. CUDA loads on each card the image of the newest listed architecture that the card runs,
+and the host follows that image's tier for every launch, so each card runs the kernels, routes,
+route catalog and built-in profile of its own single-architecture build. The route catalog and its
+digest are per tier (`calibration_route_catalog`), so a calibrated profile entry applies to the
+same card in any build that runs it on the same tier. `DeviceContext` admits ranks of different
+compute capabilities when each runs the build's code (`docs/maintainer/pipeline-stages.md`).
+Compile time and binary size grow with the number of architectures.
 
 Product commands and prerequisites are in the README's [Quick start](../../README.md#quick-start) and
 [Building](../../README.md#building) sections; test and measurement workflows live in

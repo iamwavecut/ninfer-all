@@ -1,4 +1,5 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
+#include "ops/common/blackwell_routes.h"
 
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -68,6 +69,7 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
                                          const std::uint8_t* weight_codes,
                                          const std::uint8_t* weight_scales, __nv_bfloat16* output,
                                          std::int32_t tokens, float alpha, cudaStream_t stream) {
+    require_nvfp4_a4_card();
     if (tokens <= 0) {
         throw std::invalid_argument("nvfp4 LinearSwiGLU TMA needs a positive token count");
     }

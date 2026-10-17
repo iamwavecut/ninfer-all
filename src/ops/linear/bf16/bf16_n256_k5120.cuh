@@ -44,7 +44,7 @@ struct Bf16N256K5120MmaSchedule {
     static constexpr int kSharedBytes = kStagingBytes;
 
     static_assert((5120 % kGroupK) == 0);
-    static_assert(kSharedBytes <= kMaxSharedBytesPerBlock);
+    static_assert(kSharedBytes <= shape_max_shared_bytes_per_block(false));
 };
 
 __device__ __forceinline__ int bf16_n256_k5120_swizzle(int row, int col) {

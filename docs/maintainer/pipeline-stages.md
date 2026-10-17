@@ -15,16 +15,24 @@ each stage read its weights once per micro-batch and win nothing.
 **It is not tensor parallelism.** No layer is divided across devices, so no collective runs inside a
 layer.
 
-**Multi-GPU is a Linux feature.** Repeating one device id (`--devices 0,0`) exercises the whole
-stage path on a single card and is accepted everywhere, which is how the path is tested without a
-second GPU. Distinct ids are refused on Windows.
+**Linux and Windows.** Repeating one device id (`--devices 0,0`) exercises the whole stage path on
+a single card, which is how the path is tested without a second GPU. Under Windows a GeForce card
+runs the WDDM driver model, which gives no peer access, so the stages exchange their boundary rows
+through pinned host memory (`StageLink`), as Linux does between cards without peer access. WDDM
+charges pinned host memory against a card's memory (measured on one card); assuming it charges
+every card of the pipeline, the pinned host KV cache is sized for the rank with the least device
+memory free. This repository has no Windows host with several GPUs: the Windows path is compiled in
+CI and was run by a contributor, not measured here.
 
 **The cards may differ.** Every listed device must run the build's code, which `DeviceContext`
 (`core/device.cu`) checks before any weight is uploaded by loading a kernel on each, and the model
 family checks each device's compute capability. An `86` build therefore pipelines RTX 30 with RTX
-40 cards, and an `80` build, whose sm_80 code also runs on 8.6 and 8.9, an A100 with either. Each
-rank runs the code it would run alone and installs the route profile of its own card. The
-context-cost model of the prefix cache is the first device's.
+40 cards, and an `80` build, whose sm_80 code also runs on 8.6 and 8.9, an A100 with either. A build
+of several architectures (`70;75;80;86;89`, `75;80;86;89;120a`) pipelines cards of different code
+tiers, such as a V100 with a TITAN RTX and RTX 30 cards. Each rank runs the code it would run alone:
+its tier's kernels, shapes and routes (`ops/common/device_tier.h`), the weight layout and
+activation permissions of its tier (`apply_device_layouts`, `apply_rank_policies`), and the route
+profile of its own card. The context-cost model of the prefix cache is the first device's.
 
 ## How it works
 

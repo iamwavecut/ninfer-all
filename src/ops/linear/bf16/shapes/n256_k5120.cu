@@ -35,12 +35,17 @@ void launch_grid(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
 } // namespace
 
 // Narrow widths split K sixteen ways where those warps' 96 KiB of staging fit a block, and eight
-// ways on Turing (64 KiB).
+// ways in Turing's shape set (64 KiB).
+template <bool TuringShapes>
 constexpr int kNarrowKWarps =
-    bf16_n256_k5120_staging_bytes(16, 8) <= kMaxSharedBytesPerBlock ? 16 : 8;
+    bf16_n256_k5120_staging_bytes(16, 8) <= shape_max_shared_bytes_per_block(TuringShapes) ? 16 : 8;
 
 Bf16Launch select_bf16_n256_k5120(std::int32_t tokens) {
-    if (tokens <= 76) return launch_grid<Bf16N256K5120MmaSchedule<kNarrowKWarps, 8>>;
+    if (tokens <= 76) {
+        return with_shape_set([]<bool TuringShapes>() -> Bf16Launch {
+            return launch_grid<Bf16N256K5120MmaSchedule<kNarrowKWarps<TuringShapes>, 8>>;
+        });
+    }
     return launch_grid<Bf16N256K5120MmaSchedule<8, 16>>;
 }
 

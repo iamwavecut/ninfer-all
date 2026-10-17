@@ -5,9 +5,9 @@
 #include "ggml_bridge_internal.cuh"
 
 #include "ggml-cuda/fattn-mma-f16.cuh"
-// This archive's include path holds only the bridge and ggml (sources.cmake); the limits header
-// includes nothing.
-#include "../../common/device_limits.h"
+// This archive's include path holds only the bridge and ggml (sources.cmake); the tier header
+// includes nothing of NInfer's.
+#include "../../common/device_tier.h"
 
 #include <algorithm>
 #include <mutex>
@@ -44,77 +44,76 @@ constexpr std::size_t tile_shared_bytes(const fattn_mma_config& config, int D, i
     return std::max(combine, config.Q_in_reg ? std::max(q_bytes, kv + mask) : q_bytes + kv + mask);
 }
 
-// The configuration table this build's device code compiles (ggml_cuda_fattn_mma_get_config's
-// device form) and the instructions it has.
-constexpr fattn_mma_config build_config(int D, int ncols) {
-#if defined(NINFER_SM70)
-    return ggml_cuda_fattn_mma_get_config_volta(D, D, ncols);
-#elif defined(NINFER_SM75)
-    return ggml_cuda_fattn_mma_get_config_turing(D, D, ncols);
-#else
-    return ggml_cuda_fattn_mma_get_config_ampere(D, D, ncols);
-#endif
+// The configuration table a tier's device code compiles (ggml_cuda_fattn_mma_get_config's device
+// form, which selects it by __CUDA_ARCH__) and the instructions it has.
+template <DeviceTier Tier>
+constexpr fattn_mma_config tier_config(int D, int ncols) {
+    if constexpr (Tier == DeviceTier::Volta) {
+        return ggml_cuda_fattn_mma_get_config_volta(D, D, ncols);
+    } else if constexpr (Tier == DeviceTier::Turing) {
+        return ggml_cuda_fattn_mma_get_config_turing(D, D, ncols);
+    } else {
+        return ggml_cuda_fattn_mma_get_config_ampere(D, D, ncols);
+    }
 }
-#if defined(NINFER_SM70)
-inline constexpr bool kBuildTuringMma = false;
-#else
-inline constexpr bool kBuildTuringMma = true;
-#endif
-#if defined(NINFER_SM70) || defined(NINFER_SM75)
-inline constexpr bool kBuildCpAsync = false;
-#else
-inline constexpr bool kBuildCpAsync = true;
-#endif
+
+template <DeviceTier Tier>
+inline constexpr bool kTuringMma = Tier != DeviceTier::Volta;
+template <DeviceTier Tier>
+inline constexpr bool kCpAsync = Tier == DeviceTier::Ampere || Tier == DeviceTier::Blackwell;
 // The tile widths (query rows times query heads per key/value head) flash_attn_ext_f16 has device
-// code for on this build's architecture: at least 32 on Volta, at most 32 on Turing.
-#if defined(NINFER_SM70)
-inline constexpr int kBuildMinTileColumns = 32;
-#else
-inline constexpr int kBuildMinTileColumns = 1;
-#endif
-#if defined(NINFER_SM75)
-inline constexpr int kBuildMaxTileColumns = 32;
-#else
-inline constexpr int kBuildMaxTileColumns = 1 << 20;
-#endif
-// The most query rows per tile, up to `widest`, whose tile this build's device code has and whose
-// shared memory fits a block: ggml's prompt choices (32 rows at width 256, 8 at width 512) where
-// they do, and on Turing 16 rows at width 256 and 4 at width 512 (its kernel has no tile wider than
-// 32 columns). The vendored combine barrier (third_party/ggml-quants/README.ninfer.md) keeps the
-// tiles that hold Q in shared memory free of the race the upstream kernel had at width 512.
-template <int D, int ncols2>
+// code for on a tier: at least 32 on Volta, at most 32 on Turing.
+template <DeviceTier Tier>
+inline constexpr int kMinTileColumns = Tier == DeviceTier::Volta ? 32 : 1;
+template <DeviceTier Tier>
+inline constexpr int kMaxTileColumns = Tier == DeviceTier::Turing ? 32 : 1 << 20;
+
+// The most query rows per tile, up to `widest`, whose tile the tier's device code has and whose
+// shared memory fits a block of its shape set: ggml's prompt choices (32 rows at width 256, 8 at
+// width 512) where they do, and on Turing 16 rows at width 256 and 4 at width 512 (its kernel has
+// no tile wider than 32 columns). The vendored combine barrier
+// (third_party/ggml-quants/README.ninfer.md) keeps the tiles that hold Q in shared memory free of
+// the race the upstream kernel had at width 512.
+template <int D, int ncols2, DeviceTier Tier>
 constexpr int fitting_ncols1(int widest) {
     for (int ncols1 = widest; ncols1 >= 1; ncols1 /= 2) {
         const int ncols = ncols1 * ncols2;
-        if (ncols < kBuildMinTileColumns) { break; }
-        const fattn_mma_config config = build_config(D, ncols);
-        if (ncols <= kBuildMaxTileColumns && config.nbatch_fa > 0 &&
-            tile_shared_bytes(config, D, ncols1, ncols2, kBuildTuringMma, kBuildCpAsync) <=
-                std::size_t(kMaxSharedBytesPerBlock)) {
+        if (ncols < kMinTileColumns<Tier>) { break; }
+        const fattn_mma_config config = tier_config<Tier>(D, ncols);
+        if (ncols <= kMaxTileColumns<Tier> && config.nbatch_fa > 0 &&
+            tile_shared_bytes(config, D, ncols1, ncols2, kTuringMma<Tier>, kCpAsync<Tier>) <=
+                std::size_t(shape_max_shared_bytes_per_block(turing_shapes(Tier)))) {
             return ncols1;
         }
     }
     return 0;
 }
 
-// The configurations instantiated: width 256 with two query heads per key/value head, width 512
-// with eight, each with the most query rows per tile that fit (fitting_ncols1).
-template <int D> struct Shape;
-template <> struct Shape<256> {
+// The configurations instantiated per tier: width 256 with two query heads per key/value head,
+// width 512 with eight, each with the most query rows per tile that fit (fitting_ncols1).
+template <int D, DeviceTier Tier>
+struct Shape;
+
+template <DeviceTier Tier>
+struct Shape<256, Tier> {
     static constexpr int ncols2 = 2;
-    static constexpr int ncols1 = fitting_ncols1<256, ncols2>(32);
+    static constexpr int ncols1 = fitting_ncols1<256, ncols2, Tier>(32);
+    static_assert(ncols1 > 0, "no flash-attention tile of this tier fits Gemma 4's width 256");
 };
-template <> struct Shape<512> {
+
+template <DeviceTier Tier>
+struct Shape<512, Tier> {
     static constexpr int ncols2 = 8;
-    static constexpr int ncols1 = fitting_ncols1<512, ncols2>(8);
+    static constexpr int ncols1 = fitting_ncols1<512, ncols2, Tier>(8);
+    static_assert(ncols1 > 0, "no flash-attention tile of this tier fits Gemma 4's width 512");
 };
-static_assert(Shape<256>::ncols1 > 0 && Shape<512>::ncols1 > 0,
-              "no flash-attention tile of this build fits Gemma 4's head widths");
-#if defined(NINFER_SM75)
-static_assert(Shape<256>::ncols1 == 16 && Shape<512>::ncols1 == 4);
-#elif !defined(NINFER_SM70)
-static_assert(Shape<256>::ncols1 == 32 && Shape<512>::ncols1 == 8);
-#endif
+
+static_assert(Shape<256, DeviceTier::Turing>::ncols1 == 16 &&
+              Shape<512, DeviceTier::Turing>::ncols1 == 4);
+static_assert(Shape<256, DeviceTier::Ampere>::ncols1 == 32 &&
+              Shape<512, DeviceTier::Ampere>::ncols1 == 8);
+static_assert(Shape<256, DeviceTier::Blackwell>::ncols1 == 32 &&
+              Shape<512, DeviceTier::Blackwell>::ncols1 == 8);
 
 struct Launch {
     fattn_kernel_t kernel = nullptr;
@@ -124,10 +123,10 @@ struct Launch {
     int blocks_per_sm     = 0;
 };
 
-template <int D>
+template <int D, DeviceTier Tier>
 const Launch& launch_for() {
-    constexpr int ncols1 = Shape<D>::ncols1;
-    constexpr int ncols2 = Shape<D>::ncols2;
+    constexpr int ncols1 = Shape<D, Tier>::ncols1;
+    constexpr int ncols2 = Shape<D, Tier>::ncols2;
     constexpr int ncols  = ncols1 * ncols2;
     static Launch launches[16];
     static std::once_flag once[16];
@@ -165,9 +164,9 @@ struct Grid {
     bool fixup     = false;
 };
 
-template <int D>
+template <int D, DeviceTier Tier>
 Grid grid_for(const Launch& launch, int tokens, int kv_heads, int z_gqa, int slots) {
-    constexpr int ncols1 = Shape<D>::ncols1;
+    constexpr int ncols1 = Shape<D, Tier>::ncols1;
     const auto& facts = device_facts();
     Grid g;
     g.ntiles_x   = (tokens + ncols1 - 1) / ncols1;
@@ -188,32 +187,32 @@ Grid grid_for(const Launch& launch, int tokens, int kv_heads, int z_gqa, int slo
     return g;
 }
 
-template <int D>
+template <int D, DeviceTier Tier>
 std::size_t workspace_for(int query_heads, int kv_heads, int max_tokens) {
-    constexpr int ncols = Shape<D>::ncols1 * Shape<D>::ncols2;
+    constexpr int ncols = Shape<D, Tier>::ncols1 * Shape<D, Tier>::ncols2;
     (void)query_heads;
     (void)kv_heads;
     (void)max_tokens;
     // Stream-k never launches more than a wave of blocks; each keeps its partial rows and their
     // (max, sum) pairs.
-    const Launch& launch = launch_for<D>();
+    const Launch& launch     = launch_for<D, Tier>();
     const std::size_t blocks = std::size_t(launch.blocks_per_sm) * device_facts().sm_count;
     return blocks * ncols * (2 + D / 2) * sizeof(float2) + 256;
 }
 
-template <int D>
+template <int D, DeviceTier Tier>
 void run(const FlashAttentionArgs& a, void* workspace, std::size_t workspace_bytes,
          cudaStream_t stream) {
-    constexpr int ncols1 = Shape<D>::ncols1;
-    constexpr int ncols2 = Shape<D>::ncols2;
+    constexpr int ncols1 = Shape<D, Tier>::ncols1;
+    constexpr int ncols2 = Shape<D, Tier>::ncols2;
     constexpr int ncols  = ncols1 * ncols2;
     if (a.query_heads % (a.kv_heads * ncols2) != 0) {
         throw std::invalid_argument("gguf flash attention: unsupported grouping for this width");
     }
     // Query heads per key/value head come in groups of ncols2, one tile column each.
     const int z_gqa      = a.query_heads / (a.kv_heads * ncols2);
-    const Launch& launch = launch_for<D>();
-    const Grid g         = grid_for<D>(launch, a.tokens, a.kv_heads, z_gqa, a.slots);
+    const Launch& launch = launch_for<D, Tier>();
+    const Grid g         = grid_for<D, Tier>(launch, a.tokens, a.kv_heads, z_gqa, a.slots);
     float2* meta         = nullptr;
     if (g.fixup) {
         const std::size_t need = std::size_t(g.blocks) * ncols * (2 + D / 2) * sizeof(float2);
@@ -267,8 +266,14 @@ void run(const FlashAttentionArgs& a, void* workspace, std::size_t workspace_byt
 std::size_t flash_attention_workspace_bytes(int head_dim, int query_heads, int kv_heads,
                                             int max_tokens) {
     switch (head_dim) {
-    case 256: return workspace_for<256>(query_heads, kv_heads, max_tokens);
-    case 512: return workspace_for<512>(query_heads, kv_heads, max_tokens);
+    case 256:
+        return with_current_tier([&]<DeviceTier Tier>() {
+            return workspace_for<256, Tier>(query_heads, kv_heads, max_tokens);
+        });
+    case 512:
+        return with_current_tier([&]<DeviceTier Tier>() {
+            return workspace_for<512, Tier>(query_heads, kv_heads, max_tokens);
+        });
     default: break;
     }
     throw std::invalid_argument("gguf flash attention: head width must be 256 or 512");
@@ -277,9 +282,9 @@ std::size_t flash_attention_workspace_bytes(int head_dim, int query_heads, int k
 int flash_attention_tile_rows(int head_dim) {
     switch (head_dim) {
     case 256:
-        return Shape<256>::ncols1;
+        return with_current_tier([]<DeviceTier Tier>() { return Shape<256, Tier>::ncols1; });
     case 512:
-        return Shape<512>::ncols1;
+        return with_current_tier([]<DeviceTier Tier>() { return Shape<512, Tier>::ncols1; });
     default:
         break;
     }
@@ -296,8 +301,12 @@ void flash_attention(const FlashAttentionArgs& args, void* workspace, std::size_
         throw std::invalid_argument("gguf flash attention: invalid arguments");
     }
     switch (args.head_dim) {
-    case 256: return run<256>(args, workspace, workspace_bytes, stream);
-    case 512: return run<512>(args, workspace, workspace_bytes, stream);
+    case 256:
+        return with_current_tier(
+            [&]<DeviceTier Tier>() { run<256, Tier>(args, workspace, workspace_bytes, stream); });
+    case 512:
+        return with_current_tier(
+            [&]<DeviceTier Tier>() { run<512, Tier>(args, workspace, workspace_bytes, stream); });
     default: break;
     }
     throw std::invalid_argument("gguf flash attention: head width must be 256 or 512");

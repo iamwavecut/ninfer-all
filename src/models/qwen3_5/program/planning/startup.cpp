@@ -11,6 +11,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "ops/common/device_tier.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -1044,28 +1045,21 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // warp-level mma.sync schedules this family is written against, with the same 100 KiB of shared
     // memory per SM. The occupancy and split-k choices are still the sm_86 ones, so the card is
     // supported here in the sense of running correctly, not of being tuned for. 7.0 (Tesla V100)
-    // runs only a build for it, whose kernels emulate the Ampere warp primitives. 7.5 needs the
-    // Turing tier of a 75 build (NINFER_SM75), whose kernels avoid the sm_80 instructions and fit
+    // runs Volta's code, whose kernels emulate the Ampere warp primitives. 7.5 needs Turing's code
+    // (a build with 75 among its architectures), whose kernels avoid the sm_80 instructions and fit
     // its 64 KiB of shared memory.
     // Every rank is checked: pipeline stages may mix capabilities (core/device.cu).
-#if defined(NINFER_SM75)
-    constexpr bool kTuringBuild = true;
-#else
-    constexpr bool kTuringBuild = false;
-#endif
     for (std::size_t rank = 0; rank < device.size(); ++rank) {
         const RankContext& context = device.rank(rank);
         const int capability       = context.compute_capability();
         if (capability == 70 || capability == 80 || capability == 86 || capability == 89 ||
-            capability == 120 || (capability == 75 && kTuringBuild)) {
+            capability == 120 ||
+            (capability == 75 && ops::device_tier(context.device) == ops::DeviceTier::Turing)) {
             continue;
         }
         std::string message =
-            kTuringBuild
-                ? "Qwen3.5 family runtime requires compute capability 7.0, 7.5, 8.0, 8.6, 8.9 or "
-                  "12.0"
-                : "Qwen3.5 family runtime requires compute capability 7.0, 8.0, 8.6, 8.9 or 12.0 "
-                  "(7.5 needs a CMAKE_CUDA_ARCHITECTURES=75 build)";
+            "Qwen3.5 family runtime requires compute capability 7.0, 7.5, 8.0, 8.6, 8.9 or 12.0 "
+            "(7.5 needs a build with 75 among CMAKE_CUDA_ARCHITECTURES)";
         if (device.model_parallel()) {
             message += "; CUDA device " + std::to_string(context.device) + " has " +
                        std::to_string(capability / 10) + "." + std::to_string(capability % 10);

@@ -66,24 +66,27 @@ inline constexpr int kCausalPromptI8FastStageBytes = CausalPromptI8FastStage<fal
 // K/V tiles are double-buffered so the next tile's cp.async overlaps this tile's math, where two
 // stages beside the four-warp shape's Q tile fit a block. Turing's 64 KiB holds one stage, and its
 // copies are synchronous, so a second stage would overlap nothing there.
+template <bool TuringShapes>
 inline constexpr int kCausalPromptI8FastStages =
-    4 * 16 * kCausalPromptHeadDim + 2 * kCausalPromptI8FastStageBytes <= kMaxSharedBytesPerBlock
+    4 * 16 * kCausalPromptHeadDim + 2 * kCausalPromptI8FastStageBytes <=
+            shape_max_shared_bytes_per_block(TuringShapes)
         ? 2
         : 1;
 
 // Each warp owns 16 query rows. Eight warps fill an SM's register file; four warps serve
-// launches too narrow to occupy every SM with 128-row CTAs.
-template <int Warps, bool PackedValues = false>
+// launches too narrow to occupy every SM with 128-row CTAs. TuringShapes selects the shape set
+// (ops/common/device_tier.h).
+template <int Warps, bool PackedValues = false, bool TuringShapes = false>
 struct CausalPromptI8FastShape {
     static_assert(Warps == 4 || Warps == 8);
     static constexpr int Threads   = Warps * 32;
     static constexpr int Br        = Warps * 16;
     static constexpr int QBytes    = Br * kCausalPromptHeadDim;
-    static constexpr int SmemBytes =
-        QBytes + kCausalPromptI8FastStages * CausalPromptI8FastStage<PackedValues>::Bytes;
-    // Whether this shape can launch on the build's architecture (8 warps with INT8 values cannot
-    // on Turing: 66,560 bytes).
-    static constexpr bool Launchable = SmemBytes <= kMaxSharedBytesPerBlock;
+    static constexpr int Stages    = kCausalPromptI8FastStages<TuringShapes>;
+    static constexpr int SmemBytes = QBytes + Stages * CausalPromptI8FastStage<PackedValues>::Bytes;
+    // Whether this shape can launch in its shape set (8 warps with INT8 values cannot on Turing:
+    // 66,560 bytes).
+    static constexpr bool Launchable = SmemBytes <= shape_max_shared_bytes_per_block(TuringShapes);
 };
 
 // A 64-key FP16 partial is bounded by 64 * 127 * max_scale (every probability is at most one).
@@ -94,10 +97,15 @@ inline constexpr float kCausalPromptI8FastPackedF16PartialScaleLimit = 64.0f;
 
 static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
 static_assert(kCausalPromptI8FastGroups == 4);
-static_assert(kCausalPromptI8FastStages == 1 || CausalPromptI8FastShape<8>::SmemBytes == 100352);
+static_assert(CausalPromptI8FastShape<8>::Stages == 2 &&
+              CausalPromptI8FastShape<8>::SmemBytes == 100352);
+static_assert(CausalPromptI8FastShape<8, false, true>::Stages == 1);
 static_assert(CausalPromptI8FastShape<4>::Launchable &&
               CausalPromptI8FastShape<4, true>::Launchable &&
-              CausalPromptI8FastShape<8, true>::Launchable);
+              CausalPromptI8FastShape<8, true>::Launchable &&
+              CausalPromptI8FastShape<4, false, true>::Launchable &&
+              CausalPromptI8FastShape<4, true, true>::Launchable &&
+              CausalPromptI8FastShape<8, true, true>::Launchable);
 
 __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, unsigned& c1,
                                                                   unsigned a0, unsigned a1,
@@ -143,9 +151,9 @@ __device__ __forceinline__ void causal_prompt_i8_fast_decode_v_quad(unsigned cod
 }
 
 template <typename Geometry, typename Metadata, int Warps, bool PackedValues = false,
-          KvKeyCoding Keys = KvKeyCoding::Int8>
+          KvKeyCoding Keys = KvKeyCoding::Int8, bool TuringShapes = false>
 __global__ __launch_bounds__(
-    CausalPromptI8FastShape<Warps, PackedValues>::Threads,
+    CausalPromptI8FastShape<Warps, PackedValues, TuringShapes>::Threads,
     1) void causal_attention_prompt_i8_fast_kernel(const __nv_bfloat16* __restrict__ q,
                                                    const std::int8_t* __restrict__ cache_k,
                                                    const std::int8_t* __restrict__ cache_v,
@@ -155,9 +163,13 @@ __global__ __launch_bounds__(
                                                    const std::int32_t* __restrict__ positions,
                                                    float scale, __nv_bfloat16* __restrict__ out,
                                                    std::int32_t width) {
+    if constexpr (!shape_set_in_image(TuringShapes)) { return; } // not this image's set
+    // A Volta card runs its own prompt route (prompt_sm70.cu) or the standard kernel: a build of
+    // several architectures compiles this kernel empty in the Volta image.
+#if !defined(NINFER_SM70_DEVICE)
     constexpr int D             = kCausalPromptHeadDim;
     constexpr int DB16          = D / 2;
-    using Shape                 = CausalPromptI8FastShape<Warps, PackedValues>;
+    using Shape                 = CausalPromptI8FastShape<Warps, PackedValues, TuringShapes>;
     using Stage                 = CausalPromptI8FastStage<PackedValues>;
     constexpr int VGroups       = Stage::VGroups;
     constexpr int VRowBytes     = Stage::VRowBytes;
@@ -266,8 +278,7 @@ __global__ __launch_bounds__(
     // zero-filled and their scores masked.
     const auto commit_keys = [&](int kb) {
         if constexpr (PackedKeys) {
-            std::int8_t* k_s =
-                reinterpret_cast<std::int8_t*>(stage_base(kb % kCausalPromptI8FastStages));
+            std::int8_t* k_s = reinterpret_cast<std::int8_t*>(stage_base(kb % Shape::Stages));
 #pragma unroll
             for (int i = 0; i < KChunksPerThread; ++i) {
                 const int chunk = tid + i * Threads;
@@ -283,7 +294,7 @@ __global__ __launch_bounds__(
     // packed) and their scales, all contiguous in the cache. Keys past the CTA's last visible key
     // are zero-filled so masked columns stay finite.
     const auto issue_tile = [&](int kb) {
-        unsigned char* base = stage_base(kb % kCausalPromptI8FastStages);
+        unsigned char* base = stage_base(kb % Shape::Stages);
         std::int8_t* k_s    = reinterpret_cast<std::int8_t*>(base);
         std::int8_t* v_s    = k_s + kCausalPromptI8FastTileBytes;
         __half* ks_s        = reinterpret_cast<__half*>(base + Stage::KScaleOffset);
@@ -402,7 +413,7 @@ __global__ __launch_bounds__(
         tile_live    = false;
         const int k0 = kb * Bc;
         if (!warp_active || k0 > warp_max_qabs) { return; }
-        const unsigned char* base  = stage_base(kb % kCausalPromptI8FastStages);
+        const unsigned char* base  = stage_base(kb % Shape::Stages);
         const __nv_bfloat16* k_b16 = reinterpret_cast<const __nv_bfloat16*>(base);
         const __half* ks_s = reinterpret_cast<const __half*>(base + Stage::KScaleOffset);
         const __half* vs_s = ks_s + Bc * Groups;
@@ -523,7 +534,7 @@ __global__ __launch_bounds__(
     };
 
     const auto pv_packed = [&](int kb) {
-        const unsigned char* base = stage_base(kb % kCausalPromptI8FastStages);
+        const unsigned char* base = stage_base(kb % Shape::Stages);
         const std::int8_t* v_s =
             reinterpret_cast<const std::int8_t*>(base) + kCausalPromptI8FastTileBytes;
         const __half* vs_s =
@@ -586,7 +597,7 @@ __global__ __launch_bounds__(
             return;
         }
         const std::int8_t* v_s =
-            reinterpret_cast<const std::int8_t*>(stage_base(kb % kCausalPromptI8FastStages)) +
+            reinterpret_cast<const std::int8_t*>(stage_base(kb % Shape::Stages)) +
             kCausalPromptI8FastTileBytes;
         const __half* vs_s =
             reinterpret_cast<const __half*>(v_s + kCausalPromptI8FastTileBytes) + Bc * Groups;
@@ -669,7 +680,7 @@ __global__ __launch_bounds__(
         }
     };
 
-    if constexpr (kCausalPromptI8FastStages == 1) {
+    if constexpr (Shape::Stages == 1) {
         // One stage: a tile is staged once every warp is done with the previous one, then
         // published.
 #pragma unroll 1
@@ -730,6 +741,7 @@ __global__ __launch_bounds__(
                       acc[b][0][3] * inv_l1, acc[b][1][3] * inv_l1);
         }
     }
+#endif
 }
 
 } // namespace ninfer::ops

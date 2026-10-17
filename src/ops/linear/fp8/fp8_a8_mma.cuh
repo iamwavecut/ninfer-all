@@ -71,7 +71,8 @@ struct Fp8MmaSchedule {
     static_assert(kStages >= 2 && kStages <= 8);
     static_assert(kMinBlocksPerSm >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= kMaxSharedBytesPerBlock);
+    // A8 runs only on a card that runs the 120a code: the standard shape set.
+    static_assert(kSharedBytes <= shape_max_shared_bytes_per_block(false));
     static_assert(kRaster != Fp8MmaRaster::Grouped || kRasterGroupRows > 0);
 };
 

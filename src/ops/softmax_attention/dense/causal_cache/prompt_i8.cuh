@@ -157,6 +157,7 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     std::int32_t width) {
+    if constexpr (!shape_set_in_image(false)) { return; } // not this image's set
     constexpr bool PackedKeys   = Keys != KvKeyCoding::Int8;
     constexpr int D             = kCausalPromptHeadDim;
     constexpr int Br            = kCausalPromptI8Br;

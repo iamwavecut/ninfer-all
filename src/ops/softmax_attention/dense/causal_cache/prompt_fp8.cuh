@@ -26,6 +26,7 @@ namespace ninfer::ops {
 
 inline constexpr int kCausalPromptFp8Warps         = 16;
 inline constexpr int kCausalPromptFp8Threads       = kCausalPromptFp8Warps * 32;
+
 // Br=Bc=64 (this fork's INT8/BF16 prompt tile size) would need a real dequantized BF16 copy of K
 // beside its raw FP8 staging buffer on top of a real (unquantized) BF16 Q buffer, since unlike
 // the native-FP8-QK design this replaces, sm_86/sm_89 must run QK on ordinary BF16 Tensor Cores.
@@ -34,55 +35,59 @@ inline constexpr int kCausalPromptFp8Threads       = kCausalPromptFp8Warps * 32;
 // smaller row/key tiles. Turing's 64 KiB hold separate widened K and V stages only at Bc=16, where
 // V widens during QK instead of into the K stage after it: 13-15% faster than Bc=32 on an RTX 2080
 // Ti at every prompt width from 128 to 4096.
-inline constexpr int kCausalPromptFp8Br            = 32;
-#if defined(NINFER_SM75)
-inline constexpr int kCausalPromptFp8Bc            = 16;
-#else
-inline constexpr int kCausalPromptFp8Bc            = 32;
-#endif
-inline constexpr int kCausalPromptFp8RowTiles      = kCausalPromptFp8Br / 16;
-inline constexpr int kCausalPromptFp8ProducerWarps = 2 * kCausalPromptFp8RowTiles;
-inline constexpr int kCausalPromptFp8DConsumers = kCausalPromptFp8Warps / kCausalPromptFp8RowTiles;
+// The tile of a shape set (ops/common/device_tier.h).
+template <bool TuringShapes>
+struct CausalPromptFp8Shape {
+    static constexpr int Br            = 32;
+    static constexpr int Bc            = TuringShapes ? 16 : 32;
+    static constexpr int RowTiles      = Br / 16;
+    static constexpr int ProducerWarps = 2 * RowTiles;
+    static constexpr int DConsumers    = kCausalPromptFp8Warps / RowTiles;
+    static constexpr int QBytes =
+        Br * kCausalPromptHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
+    static constexpr int KRawBytes = Bc * kCausalPromptHeadDim;
+    static constexpr int KBytes =
+        Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
+    static constexpr int VBytes     = Bc * kCausalPromptHeadDim;
+    static constexpr int PBytes     = Br * Bc * static_cast<int>(sizeof(__half));
+    static constexpr int ScaleBytes = 2 * Bc * static_cast<int>(sizeof(__half));
+    static constexpr int StatsBytes = 7 * Br * static_cast<int>(sizeof(float));
+    // The non-QK warps widen V into its own tile during QK where a block holds it beside the K
+    // tile; on Turing's 64 KiB it does not, and K and V are widened into one shared tile, V
+    // overwriting K once QK is done.
+    static constexpr int SplitVStageBytes =
+        Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__half));
+    static constexpr bool CompactKV  = QBytes + KRawBytes + KBytes + VBytes + SplitVStageBytes +
+                                           PBytes + ScaleBytes + StatsBytes >
+                                       shape_max_shared_bytes_per_block(TuringShapes);
+    static constexpr int VStageBytes = CompactKV ? 0 : SplitVStageBytes;
+    static constexpr int SmemBytes =
+        QBytes + KRawBytes + KBytes + VBytes + VStageBytes + PBytes + ScaleBytes + StatsBytes;
+    static_assert(DConsumers == 8);
+    static_assert(SmemBytes <= shape_max_shared_bytes_per_block(TuringShapes));
+};
 
-inline constexpr int kCausalPromptFp8QBytes =
-    kCausalPromptFp8Br * kCausalPromptHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
-inline constexpr int kCausalPromptFp8KRawBytes = kCausalPromptFp8Bc * kCausalPromptHeadDim;
-inline constexpr int kCausalPromptFp8KBytes =
-    kCausalPromptFp8Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__nv_bfloat16));
-inline constexpr int kCausalPromptFp8VBytes = kCausalPromptFp8Bc * kCausalPromptHeadDim;
-inline constexpr int kCausalPromptFp8PBytes =
-    kCausalPromptFp8Br * kCausalPromptFp8Bc * static_cast<int>(sizeof(__half));
-inline constexpr int kCausalPromptFp8ScaleBytes =
-    2 * kCausalPromptFp8Bc * static_cast<int>(sizeof(__half));
-inline constexpr int kCausalPromptFp8StatsBytes =
-    7 * kCausalPromptFp8Br * static_cast<int>(sizeof(float));
-// The non-QK warps widen V into its own tile during QK where a block holds it beside the K tile;
-// on Turing's 64 KiB it does not, and K and V are widened into one shared tile, V overwriting K
-// once QK is done.
-inline constexpr int kCausalPromptFp8SplitVStageBytes =
-    kCausalPromptFp8Bc * kCausalPromptHeadDim * static_cast<int>(sizeof(__half));
-inline constexpr bool kCausalPromptFp8CompactKV =
-    kCausalPromptFp8QBytes + kCausalPromptFp8KRawBytes + kCausalPromptFp8KBytes +
-        kCausalPromptFp8VBytes + kCausalPromptFp8SplitVStageBytes + kCausalPromptFp8PBytes +
-        kCausalPromptFp8ScaleBytes + kCausalPromptFp8StatsBytes >
-    kMaxSharedBytesPerBlock;
-inline constexpr int kCausalPromptFp8VStageBytes =
-    kCausalPromptFp8CompactKV ? 0 : kCausalPromptFp8SplitVStageBytes;
-inline constexpr int kCausalPromptFp8SmemBytes =
-    kCausalPromptFp8QBytes + kCausalPromptFp8KRawBytes + kCausalPromptFp8KBytes +
-    kCausalPromptFp8VBytes + kCausalPromptFp8VStageBytes + kCausalPromptFp8PBytes +
-    kCausalPromptFp8ScaleBytes + kCausalPromptFp8StatsBytes;
-
-static_assert(kCausalPromptFp8DConsumers == 8);
-static_assert(kCausalPromptFp8SmemBytes <= kMaxSharedBytesPerBlock);
-
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, bool TuringShapes>
 __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
     const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     std::int32_t width) {
+    if constexpr (!shape_set_in_image(TuringShapes)) { return; } // not this image's set
+    using Shape                                 = CausalPromptFp8Shape<TuringShapes>;
+    constexpr int kCausalPromptFp8Br            = Shape::Br;
+    constexpr int kCausalPromptFp8Bc            = Shape::Bc;
+    constexpr int kCausalPromptFp8RowTiles      = Shape::RowTiles;
+    constexpr int kCausalPromptFp8ProducerWarps = Shape::ProducerWarps;
+    constexpr int kCausalPromptFp8DConsumers    = Shape::DConsumers;
+    constexpr int kCausalPromptFp8QBytes        = Shape::QBytes;
+    constexpr int kCausalPromptFp8KRawBytes     = Shape::KRawBytes;
+    constexpr int kCausalPromptFp8KBytes        = Shape::KBytes;
+    constexpr int kCausalPromptFp8VBytes        = Shape::VBytes;
+    constexpr int kCausalPromptFp8PBytes        = Shape::PBytes;
+    constexpr int kCausalPromptFp8VStageBytes   = Shape::VStageBytes;
+    constexpr bool kCausalPromptFp8CompactKV    = Shape::CompactKV;
     constexpr int D             = kCausalPromptHeadDim;
     constexpr int Br            = kCausalPromptFp8Br;
     constexpr int Bc            = kCausalPromptFp8Bc;

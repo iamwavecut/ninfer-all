@@ -91,7 +91,7 @@ __device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned 
     }
 }
 
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_FORMS)
 // q5_small_t_decode_eight as FP16 pairs, for Turing's FP16 MMA: v in the mantissa of FP16 1024.0
 // less 1040, the same codes, formed by native FP16 arithmetic where Turing has no BF16 arithmetic.
 __device__ __forceinline__ void q5_small_t_decode_eight_f16(unsigned word, unsigned high,
@@ -242,7 +242,7 @@ __launch_bounds__(256, resident_ctas_bound(256, KWarps < 8 || XCols >= 32
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             // Four code bytes and one high byte per row cover steps ks = 2*half and 2*half + 1.
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_DEVICE)
             // Turing: the codes decode to FP16 natively, and a tile whose activations are all FP16
             // values runs FP16 MMA on the operands mma_bf16 would form, in its order, so the bits
             // are the same; another tile runs mma_bf16 (q4_ksplit_mma.cuh does the same).

@@ -45,17 +45,6 @@ DeviceContext initialize_device(const EngineOptions& options) {
         phase.complete();
         return device;
     }
-#ifdef _WIN32
-    // Multi-GPU execution is a Linux feature. Repeating one device id still works on Windows, which
-    // exercises the whole stage path on a single card.
-    for (const int id : options.devices) {
-        if (id != options.devices.front()) {
-            throw std::invalid_argument(
-                "multi-GPU execution is supported on Linux only; repeat one device id "
-                "(for example --devices 0,0) to test the pipeline on a single GPU");
-        }
-    }
-#endif
     DeviceContext device{std::span<const int>(options.devices)};
     phase.complete();
     return device;

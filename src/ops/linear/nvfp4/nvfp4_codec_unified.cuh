@@ -2,6 +2,7 @@
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/common/pre_sm80.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
 
 #include <cuda_bf16.h>
@@ -73,6 +74,12 @@ static_assert(alignof(Nvfp4QuantizedK16) == 8);
 
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
+#if defined(NINFER_PRE_BLACKWELL_DEVICE)
+    // Blackwell's FP4 conversion; an image of another architecture in a build of several never
+    // runs the routes that call it.
+    codes_lo = codes_hi = 0;
+    __trap();
+#else
     asm volatile("{\n"
                  ".reg .b8 b0;\n"
                  ".reg .b8 b1;\n"
@@ -98,6 +105,7 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[2].x), "f"(values[2].y), "f"(values[3].x), "f"(values[3].y),
                    "f"(values[4].x), "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
+#endif
 }
 
 // Reciprocal replaces the sixteen per-value divisions with one reciprocal plus multiplies.

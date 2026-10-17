@@ -67,7 +67,7 @@ struct Q4MmaDecodeAtom {
         }
     }
 
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_FORMS)
     // decode_eight as FP16 pairs, for Turing's FP16 MMA: 1024 + (n ^ 8) less 1032, the same
     // integers, formed by native FP16 arithmetic where BF16 arithmetic has none on Turing.
     static __device__ __forceinline__ void decode_eight_f16(unsigned word, unsigned (&out)[4]) {

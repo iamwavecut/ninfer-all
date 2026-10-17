@@ -145,6 +145,19 @@ jobs:
             cuda: 13.4.2
             installer: cuda_13.4.2_windows_x86_64_network.exe
             packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
+          # Builds of several architectures, whose host code instantiates every tier's kernels and
+          # routes (src/ops/common/device_tier.h): the CUDA 12 set with Volta and the CUDA 13 set
+          # with Blackwell.
+          - label: sm_70;75;80;86;89
+            archs: '70;75;80;86;89'
+            cuda: 12.9.1
+            installer: cuda_12.9.1_windows_network.exe
+            packages: nvcc cudart cublas_dev nvtx thrust cuda_profiler_api
+          - label: sm_75;80;86;89;120a
+            archs: '75;80;86;89;120a'
+            cuda: 13.4.2
+            installer: cuda_13.4.2_windows_x86_64_network.exe
+            packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
     steps:
       - uses: actions/checkout@v7
       # The compiler, runtime, cuBLAS import library and the NVTX and CCCL headers: a configure and
@@ -214,7 +227,9 @@ jobs:
           nvcc --version | Select-Object -Last 2
           $curl = $env:CURL_ROOT_DIR
           foreach ($arch in '${{ matrix.build.archs }}'.Split(' ')) {
-            cmake -S . -B "build-$arch" -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            # A list of architectures names its build directory with underscores: CMake reads a
+            # semicolon in a path as a list separator.
+            cmake -S . -B "build-$($arch -replace ';', '_')" -G Ninja -DCMAKE_BUILD_TYPE=Release `
               "-DCMAKE_CUDA_ARCHITECTURES=$arch" "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH\bin\nvcc.exe" `
               -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
               -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=OFF -DCMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES=OFF `
@@ -226,7 +241,7 @@ jobs:
       - name: Run scripts/check-host-compile.py
         shell: pwsh
         run: |
-          $builds = @('${{ matrix.build.archs }}'.Split(' ') | ForEach-Object { "build-$_" })
+          $builds = @('${{ matrix.build.archs }}'.Split(' ') | ForEach-Object { "build-$($_ -replace ';', '_')" })
           python -u scripts/check-host-compile.py $builds --shard ${{ matrix.shard }}/3 --jobs 4
 
   linux-scripts:

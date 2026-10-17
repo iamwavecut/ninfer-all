@@ -2,16 +2,20 @@
 #
 # NInfer server image. ninfer, ninfer-serve, ninfer-perplexity, ninfer-calibrate and
 # ninfer-ngram-profile are built once per architecture -- sm_75 (Turing), sm_86 (Ampere; the same
-# cubins run on Ada sm_89) and sm_120a (consumer Blackwell), since a NInfer build targets exactly
-# one -- as one multi-call executable each (NINFER_MULTICALL), next to the launcher and the
-# downloader. The entrypoint runs the build that matches the GPU it is given (docker/entrypoint.sh).
+# cubins run on Ada sm_89) and sm_120a (consumer Blackwell) -- as one multi-call executable each
+# (NINFER_MULTICALL), next to the launcher and the downloader. A list of architectures in ARCHS
+# ("75;86;120a") builds one executable for all of them, `multi`, whose every card runs its own
+# kernels; the :multi image carries it alone, for a layer pipeline across cards of different
+# architectures. The entrypoint runs the build that matches the GPUs it is given
+# (docker/entrypoint.sh).
 #
 #   docker build -t ninfer .                               every architecture, from source
 #   docker build --build-arg ARCHS=86 -t ninfer .          one architecture
+#   docker build --build-arg 'ARCHS=75;86;120a' -t ninfer:multi .   one build for all three
 #   docker build --build-context dist=<dir> -t ninfer .    package prebuilt binaries (what CI does)
 #
-# A prebuilt dist directory has the layout docker/stage-dist.sh writes: bin/sm<arch>/ and
-# packages/sm<arch>.txt for each architecture.
+# A prebuilt dist directory has the layout docker/stage-dist.sh writes: bin/<build>/ and
+# packages/<build>.txt for each build (sm<arch> or multi).
 
 ARG CUDA_VERSION=13.4.2
 ARG UBUNTU_VERSION=26.04
@@ -96,9 +100,10 @@ RUN apt-get update \
 # --chmod: a dist that went through a CI artifact has lost its executable bits, and a chmod in a
 # later layer would store every binary a second time.
 COPY --from=dist --chmod=0755 /bin/ /opt/ninfer/
-RUN for arch in /opt/ninfer/sm*; do \
+RUN for build in /opt/ninfer/sm* /opt/ninfer/multi; do \
+      [ -d "$build" ] || continue; \
       for name in ninfer ninfer-serve ninfer-calibrate ninfer-perplexity ninfer-ngram-profile; do \
-        ln -s ninfer-multicall "$arch/$name"; \
+        ln -s ninfer-multicall "$build/$name"; \
       done; \
     done
 COPY scripts/run.sh scripts/download-model.sh /opt/ninfer/

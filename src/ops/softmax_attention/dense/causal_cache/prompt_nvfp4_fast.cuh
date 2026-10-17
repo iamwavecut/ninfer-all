@@ -80,7 +80,8 @@ struct CausalPromptRotatedShape {
     static constexpr int QBytes      = Br * kCausalPromptHeadDim;
     static constexpr int QScaleBytes = 2 * Br * kKVCacheNvfp4Groups;
     static constexpr int SmemBytes   = QBytes + QScaleBytes + 2 * Stage::Bytes;
-    static_assert(SmemBytes <= kMaxSharedBytesPerBlock);
+    // Only a card that runs the 120a code launches it: the standard shape set.
+    static_assert(SmemBytes <= shape_max_shared_bytes_per_block(false));
 };
 
 // A 64-key FP16 partial is bounded by 64 * 6 * max_scale (every probability is at most one).
@@ -95,8 +96,11 @@ __device__ __forceinline__ void causal_prompt_rotated_fast_mma_f16_acc(unsigned&
                                                                        unsigned a0, unsigned a1,
                                                                        unsigned a2, unsigned a3,
                                                                        unsigned b0, unsigned b1) {
-#if defined(NINFER_SM70_DEVICE)
-    sm70::mma_m16n8k16_f16acc(c0, c1, a0, a1, a2, a3, b0, b1);
+#if defined(NINFER_PRE_BLACKWELL_DEVICE)
+    // The fast NVFP4 prompt kernel runs only on a card that runs the 120a code; an image of another
+    // architecture in a build of several holds it as a trap.
+    (void)c0, (void)c1, (void)a0, (void)a1, (void)a2, (void)a3, (void)b0, (void)b1;
+    __trap();
 #else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
                  "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"

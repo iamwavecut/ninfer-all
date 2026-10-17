@@ -25,6 +25,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/common/device_tier.h"
 #include "ops/op_check.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -88,15 +89,12 @@ std::vector<std::uint16_t> make_activation(std::int32_t rows, std::int32_t token
 // cannot say, since an exact A16 fallback would pass every bound in this file.
 int expect_route(const std::string& label, const WorkspaceArena& workspace,
                  std::size_t weight_bytes, std::int32_t tokens) {
-#if defined(NINFER_SM70)
-    // An sm_70 build takes its own route at every width (ops/linear/sm70): FP16 weight slabs into
-    // cuBLAS above the small-T widths, never the int8 materialisation. Only accuracy applies there.
-    (void)label;
-    (void)workspace;
-    (void)weight_bytes;
-    (void)tokens;
-    return 0;
-#else
+    if (ops::current_device_volta()) {
+        // A Volta card takes its own route at every width (ops/linear/sm70): FP16 weight slabs
+        // into cuBLAS above the small-T widths, never the int8 materialisation. Only accuracy
+        // applies there.
+        return 0;
+    }
     const bool engaged  = workspace.peak_used() >= weight_bytes;
     const bool expected = tokens >= ops::kCublasPrefillMinTokens;
     if (engaged == expected) { return 0; }
@@ -104,7 +102,6 @@ int expect_route(const std::string& label, const WorkspaceArena& workspace,
               << ", expected it to " << (expected ? "run" : "decline") << " (peak workspace "
               << workspace.peak_used() << " bytes, one weight " << weight_bytes << ")\n";
     return 1;
-#endif
 }
 
 float bf16_value(std::uint16_t bits) {

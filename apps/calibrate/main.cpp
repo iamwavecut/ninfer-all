@@ -87,9 +87,11 @@ int main(int argc, char** argv) {
         if (!quiet) {
             options.log = [](const std::string& line) { std::fprintf(stderr, "%s\n", line.c_str()); };
         }
-        ninfer::runtime::DeviceProfileEntry entry = ninfer::runtime::calibrated_device_profile_entry(
-            ninfer::calibration::calibrate_device_routes(options),
-            ninfer::calibration::calibration_route_catalog_digest());
+        ninfer::runtime::DeviceProfileEntry entry =
+            ninfer::runtime::calibrated_device_profile_entry(
+                ninfer::calibration::calibrate_device_routes(options),
+                ninfer::calibration::calibration_route_catalog_digest(
+                    ninfer::ops::device_tier(device)));
         entry.profile.hardware_class = ninfer::runtime::context_cost_hardware_class(
             properties.name, properties.major, properties.minor);
         entry.profile.origin = std::string("ninfer-calibrate on ") + properties.name;

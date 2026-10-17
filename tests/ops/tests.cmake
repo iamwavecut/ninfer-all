@@ -291,10 +291,11 @@ add_test(NAME ninfer_gdn_replay_fold_wide_test
 set_tests_properties(ninfer_gdn_replay_fold_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 RUN_SERIAL TRUE)
 
-# A Turing build has no selectable unified table (src/ops/linear/common/route_table.h), so its
-# route-table variants run the legacy table only.
+# A Turing card has no selectable unified table (src/ops/linear/common/route_table.h), so a build
+# for Turing alone runs the route-table variants on the legacy table only; in a build of several
+# architectures a Turing card runs its legacy table under either variant.
 set(ninfer_linear_route_tables legacy unified)
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+if(NINFER_ARCH_TURING AND NOT (NINFER_ARCH_VOLTA OR NINFER_ARCH_AMPERE OR NINFER_ARCH_BLACKWELL))
   set(ninfer_linear_route_tables legacy)
 endif()
 

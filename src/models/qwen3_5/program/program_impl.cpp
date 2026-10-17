@@ -494,8 +494,22 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // The 1 GiB floor inside the clamp is memory the run still needs after this point and that
         // no plan accounts for (module loads, graph instantiation, launch-local backing); halving
         // what remains is the conservative split, so the cache never takes more than it leaves.
-        std::size_t free_device = 0, total_device = 0;
-        if (cudaMemGetInfo(&free_device, &total_device) == cudaSuccess) {
+        // Every GPU of a pipeline can address pinned host memory, so the buffer is sized for the
+        // rank with the least device memory free; that a mapping is charged to each of them is an
+        // assumption, measured on one card only.
+        std::size_t free_device       = std::numeric_limits<std::size_t>::max();
+        bool measured                 = false;
+        const std::size_t active_rank = device.active_rank();
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            device.activate_rank(rank);
+            std::size_t free_rank = 0, total_rank = 0;
+            if (cudaMemGetInfo(&free_rank, &total_rank) == cudaSuccess) {
+                free_device = std::min(free_device, free_rank);
+                measured    = true;
+            }
+        }
+        device.activate_rank(active_rank);
+        if (measured) {
             reserved_bytes =
                 clamp_host_kv_reservation_bytes(reserved_bytes, free_device, minimum_stride);
         }

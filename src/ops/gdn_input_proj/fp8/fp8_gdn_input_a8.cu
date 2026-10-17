@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 
 #include "core/device.h"
@@ -48,6 +49,7 @@ void launch_mma(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace wor
 
 void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                              Fp8A8Workspace workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
         launch_mma<true>(weight, qkv, z, workspace, x.ne[1], stream);

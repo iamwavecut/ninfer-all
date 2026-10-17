@@ -4,6 +4,9 @@
 #include "artifact/views.h"
 
 #include <cmath>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::loading {
@@ -43,6 +46,28 @@ bool keeps_permission(const artifact::Reader& reader, const artifact::ParameterR
 
 } // namespace
 #endif
+
+void apply_rank_policies(Bindings& bindings, std::span<const ops::DeviceTier> rank_tiers) {
+    // A build without 120a narrowed these permissions when it bound the weights.
+    if constexpr (!ops::kBuildBlackwell) {
+        (void)bindings;
+        (void)rank_tiers;
+        return;
+    }
+    for (PendingWeight& weight : bindings.weights) {
+        if (weight.rank >= rank_tiers.size()) {
+            throw std::logic_error("rank policies: no device tier for pipeline rank " +
+                                   std::to_string(weight.rank));
+        }
+        if (rank_tiers[weight.rank] == ops::DeviceTier::Blackwell) { continue; }
+        for (WeightUse& use : weight.uses) {
+            if (use.policy == ops::LinearPolicy::AllowA8 ||
+                use.policy == ops::LinearPolicy::AllowA4) {
+                use.policy = ops::LinearPolicy::A16Only;
+            }
+        }
+    }
+}
 
 WeightUseId Bindings::use(WeightId id, std::string_view input) const {
     const auto& parameter = at(id);

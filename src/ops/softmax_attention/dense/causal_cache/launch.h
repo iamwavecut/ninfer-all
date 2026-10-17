@@ -20,12 +20,20 @@ enum class CausalAttentionRoute { SmallT, ChunkedSmallT, Prompt };
 // block divides it.
 inline constexpr std::int32_t kPromptWaveRows = 128;
 
-// Shared memory of the standard INT8-family prompt kernel's tile (prompt_i8.cuh), and whether this
-// build's blocks hold it. A Turing build's 64 KiB do not: there every INT8-family prompt runs on
-// the fast kernel, and the "attn_pack_gqa" and "attn_prompt_fast" switches have nothing to choose.
+// Shared memory of the standard INT8-family prompt kernel's tile (prompt_i8.cuh), and whether the
+// blocks of a shape set hold it (ops/common/device_tier.h). Turing's 64 KiB do not: there every
+// INT8-family prompt runs on the fast kernel, and the "attn_pack_gqa" and "attn_prompt_fast"
+// switches have nothing to choose.
 inline constexpr int kCausalPromptI8StandardSmemBytes = 93184;
-inline constexpr bool kCausalPromptI8Standard =
-    kCausalPromptI8StandardSmemBytes <= kMaxSharedBytesPerBlock;
+
+[[nodiscard]] constexpr bool causal_prompt_i8_standard(bool turing_shapes) {
+    return kCausalPromptI8StandardSmemBytes <= shape_max_shared_bytes_per_block(turing_shapes);
+}
+
+// The current device's.
+[[nodiscard]] inline bool causal_prompt_i8_standard_here() {
+    return causal_prompt_i8_standard(turing_shapes_here());
+}
 
 // Whether a prompt call on this storage takes the fast kernel (register-resident rows, FP16 PV per
 // 64-key tile): when the caller asks for it (--fast-prefill-kernel), else as NINFER_PROMPT_FAST=0|1

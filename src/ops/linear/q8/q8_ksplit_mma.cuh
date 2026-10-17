@@ -54,7 +54,7 @@ __device__ __forceinline__ unsigned q8_ksplit_bf16_pair_from_s8(unsigned values)
     return result.bits;
 }
 
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_FORMS)
 // Turing has neither BF16 MMA nor BF16 arithmetic: the pair above runs __hsub2_rn in software and
 // mma_bf16 converts all six operands on every call. The codes are integers, exact in FP16 as in
 // BF16, so a Turing build forms the FP16 pair directly: code + 128 in the mantissa of 1024.0, then
@@ -219,7 +219,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
     cp_wait<0>();
     __syncthreads();
 
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_DEVICE)
     // Turing copies synchronously (ops/common/memory.cuh), so a stage issued between this group's
     // barriers would wait out its whole load latency there. The next group's codes and scales, and
     // its activations when they take at most two 16-byte loads a lane, are loaded into registers
@@ -365,7 +365,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
 #pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_DEVICE)
         if (group_index + 1 < kGroups) { load_next(group_k0 + kGroupK); }
 #endif
 
@@ -376,7 +376,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                 lane_scale_pair =
                     *reinterpret_cast<const unsigned*>(&scale_shared[scale_row][warp_koff / 16]);
             } else {
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_DEVICE)
                 lane_scale_pair = direct_scale_pair;
 #else
                 const int scale_row = row_policy.weight_row(cta_row0, gid + lid * 8);
@@ -410,7 +410,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_DEVICE)
                 // The FP16 codes and, when every live activation of the tile is an FP16 value, the
                 // converted activations are the operands mma_bf16 would form, issued in its order,
                 // so the bits are the same; a tile holding any other live activation runs
@@ -482,7 +482,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
 
         if (group_index + 1 < kGroups) {
             __syncthreads();
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_DEVICE)
             store_next(group_k0 + kGroupK);
 #else
             stage_codes(group_k0 + kGroupK);

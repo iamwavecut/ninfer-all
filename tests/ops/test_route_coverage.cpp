@@ -42,18 +42,14 @@ namespace {
 constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 // Resolves as the fused Ops do where the device profile sends a width to upstream's routes over
-// the unified templates. A build that cannot select that table resolves its legacy routes.
+// the unified templates. A card that cannot select that table resolves its legacy routes.
 template <class Resolve>
 auto under_unified_table(Resolve&& resolve) {
-    if constexpr (!ninfer::ops::detail::kUnifiedLinearRoutes) {
-        return resolve();
-    } else {
-        ninfer::ops::detail::force_linear_route_table(
-            ninfer::ops::detail::LinearRouteTable::Unified);
-        const auto schedule = resolve();
-        ninfer::ops::detail::force_linear_route_table(std::nullopt);
-        return schedule;
-    }
+    if (!ninfer::ops::detail::unified_linear_routes_here()) { return resolve(); }
+    ninfer::ops::detail::force_linear_route_table(ninfer::ops::detail::LinearRouteTable::Unified);
+    const auto schedule = resolve();
+    ninfer::ops::detail::force_linear_route_table(std::nullopt);
+    return schedule;
 }
 
 // Column counts to resolve at. Every width to 2304 covers each table's dense low end and its
@@ -206,8 +202,8 @@ int main() {
         "linear_add.q5.mma.r64.c16.cta_collective_residual",
         "linear_add.q5.mma.r64.c24.cta_collective_residual",
         "linear_add.q5.mma.r64.c32.cta_collective_residual"};
-    if (!detail::kUnifiedLinearRoutes) {
-        // A build that cannot select the unified table (kUnifiedLinearRoutes in
+    if (!detail::unified_linear_routes_here()) {
+        // A card that cannot select the unified table (unified_linear_routes in
         // ops/linear/common/route_table.h) routes none of its schedules.
         q5_add_unrouted.insert(
             q5_add_unrouted.end(),
@@ -326,7 +322,7 @@ int main() {
     //                          2026-09-24 catch-up, upstream's 13..32 band on a native sm_120
     //                          build, and MixedR32C32K128S2, the native build's T=32 route.
     //
-    // A build that cannot select the unified table (a Turing build) adds q5_linear_add's 13
+    // A card that cannot select the unified table (a Turing card) adds q5_linear_add's 13
     // unified schedules.
     //
     // All of them are kept on purpose: deleting an upstream schedule costs merge effort at every
@@ -336,8 +332,8 @@ int main() {
 #else
     constexpr std::size_t kTableUnrouted = 28;
 #endif
-    constexpr std::size_t kExpectedUnrouted =
-        kTableUnrouted + (ninfer::ops::detail::kUnifiedLinearRoutes ? 0 : 13);
+    const std::size_t kExpectedUnrouted =
+        kTableUnrouted + (ninfer::ops::detail::unified_linear_routes_here() ? 0 : 13);
     if (total != kExpectedUnrouted) {
         std::cerr << "route coverage changed: " << total << " unrouted schedules, expected "
                   << kExpectedUnrouted

@@ -2,7 +2,8 @@
 
 Native Windows builds run the same engine as Linux: one model per server with concurrent
 requests, the context cache, speculative decoding, Vision, and the OpenAI, Anthropic and llama.cpp
-APIs. Pipeline stages over several GPUs (`--devices` with distinct ids) are Linux-only. The
+APIs, and pipeline stages over several GPUs (`--devices`), which exchange their boundary rows
+through pinned host memory under WDDM ([pipeline stages](maintainer/pipeline-stages.md)). The
 README inside a release archive is [`release-archive-windows.md`](release-archive-windows.md);
 this guide is for a checkout.
 

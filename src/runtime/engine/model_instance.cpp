@@ -474,7 +474,8 @@ void install_device_route_profile_on(const EngineOptions& options, int device) {
     const std::filesystem::path path = options.device_profile_path.empty()
                                            ? default_device_profile_path()
                                            : options.device_profile_path;
-    const std::string& route_catalog = calibration::calibration_route_catalog_digest();
+    const std::string& route_catalog =
+        calibration::calibration_route_catalog_digest(ops::device_tier(device));
     std::optional<ops::DeviceRouteProfile> profile;
     if (!calibrate) {
         try {
@@ -655,7 +656,9 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     }
     core::set_wddm_evictable_budget(options.wddm_evictable_budget);
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
-    auto plan = models::qwen3_5::plan_load(reader, models::load_options(options), options.artifact_path);
+    auto plan =
+        models::qwen3_5::plan_load(reader, models::load_options(options), options.artifact_path,
+                                   models::qwen3_5::rank_tiers(device));
     binding.complete();
     auto model = models::qwen3_5::materialize_model(
         std::move(plan), device, &options.startup_observer,

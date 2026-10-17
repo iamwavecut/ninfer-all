@@ -241,18 +241,10 @@ template <std::int32_t kCols, int NT, class Epilogue>
 void gemm(const Weight& w, Epilogue epilogue, std::int32_t tokens, const std::int8_t* codes,
           const __half* scales, cudaStream_t stream) {
     constexpr int BN       = a8::kWarpsN * NT * 8;
-    const std::size_t smem = a8::shared_bytes<a8::T2Codec, 1, NT, Rows>(kCols);
     const dim3 grid(w.n / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
-    auto* kernel = a8::a8_mma_kernel<a8::T2Codec, kCols, 1, NT, Rows, Epilogue>;
-    if (smem > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem));
-        });
-    }
-    kernel<<<grid, a8::kThreads, smem, stream>>>(static_cast<const std::uint8_t*>(w.qdata), nullptr,
-                                                 static_cast<const __half*>(w.scales), codes,
-                                                 scales, tokens, Rows{0}, epilogue, 0);
+    a8::launch_a8_mma<a8::T2Codec, kCols, 1, NT, Rows, Epilogue>(
+        grid, stream, static_cast<const std::uint8_t*>(w.qdata), nullptr,
+        static_cast<const __half*>(w.scales), codes, scales, tokens, Rows{0}, epilogue, 0);
     CUDA_CHECK(cudaGetLastError());
 }
 

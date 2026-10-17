@@ -1,6 +1,7 @@
 #include "ops/softmax_attention/dense/causal_cache/prompt_sm70.h"
 
 #include "core/device.h"
+#include "ops/common/device_tier.h"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/e8_root_codec.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
@@ -427,14 +428,8 @@ void launch(const Tensor& q, const Tensor& positions, const std::int32_t* valid_
 } // namespace
 
 bool causal_attention_prompt_sm70_applies(KvCacheStorage storage, std::int32_t batch) {
-#if defined(NINFER_SM70)
     (void)storage; // every KV storage has a coding here
-    return batch == 1;
-#else
-    (void)storage;
-    (void)batch;
-    return false;
-#endif
+    return batch == 1 && current_device_volta();
 }
 
 void causal_attention_prompt_sm70_launch(const Tensor& q, const Tensor& positions, float scale,

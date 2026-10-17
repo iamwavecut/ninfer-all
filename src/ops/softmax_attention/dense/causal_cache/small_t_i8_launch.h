@@ -15,10 +15,20 @@
 
 namespace ninfer::ops::detail {
 
-// Whether this build has the partial kernel's "12x1x64d" tier: its 64-key dynamic arena of 64 KiB
-// beside the kernel's static tiles needs more than 64 KiB of shared memory per block, which Turing
-// does not have; there 2K-8K windows take 12x1x32 and the tier is no calibration candidate.
-inline constexpr bool kSmallTI8KeyBlock64 = kMaxSharedBytesPerBlock > 64 * 1024;
+// Whether a card of a shape set runs the partial kernel's "12x1x64d" tier: its 64-key dynamic arena
+// of 64 KiB beside the kernel's static tiles needs more than 64 KiB of shared memory per block,
+// which Turing does not have; there 2K-8K windows take 12x1x32 and the tier is no calibration
+// candidate.
+[[nodiscard]] constexpr bool small_t_i8_key_block64(bool turing_shapes) {
+    return shape_max_shared_bytes_per_block(turing_shapes) > 64 * 1024;
+}
+
+// Whether any card this build runs takes it, and whether the current device does.
+inline constexpr bool kSmallTI8KeyBlock64Built = kBuildStandardShapes;
+
+[[nodiscard]] inline bool small_t_i8_key_block64_here() {
+    return small_t_i8_key_block64(turing_shapes_here());
+}
 
 // Device-profile key of the INT8-family partial kernel's launch tier:
 // "attn_i8_small/h24/rk8v4/w8". The axis is the launch's implementation window.

@@ -69,47 +69,52 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                                                 float scale, const CacheView& cache,
                                                 Metadata metadata, Tensor& out,
                                                 cudaStream_t stream) {
-    // Eight warps with INT8 values do not fit Turing's shared memory; those launches take four.
-    constexpr bool kWide = CausalPromptI8FastShape<8, PackedValues>::Launchable;
-    if constexpr (kWide) {
+    with_shape_set([&]<bool TuringShapes>() {
+        // Eight warps with INT8 values do not fit Turing's shared memory; those launches take four.
+        constexpr bool kWide = CausalPromptI8FastShape<8, PackedValues, TuringShapes>::Launchable;
+        if constexpr (kWide) {
+            configure_cuda_device_once([] {
+                return cudaFuncSetAttribute(
+                    causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues,
+                                                           Keys, TuringShapes>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    CausalPromptI8FastShape<8, PackedValues, TuringShapes>::SmemBytes);
+            });
+        }
         configure_cuda_device_once([] {
             return cudaFuncSetAttribute(
-                causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys>,
+                causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 4, PackedValues, Keys,
+                                                       TuringShapes>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
-                CausalPromptI8FastShape<8, PackedValues>::SmemBytes);
+                CausalPromptI8FastShape<4, PackedValues, TuringShapes>::SmemBytes);
         });
-    }
-    configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 4, PackedValues, Keys>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            CausalPromptI8FastShape<4, PackedValues>::SmemBytes);
-    });
 
-    const auto tokens = static_cast<std::int32_t>(q.ne[2]);
-    const auto launch = [&]<int Warps>() {
-        using Shape = CausalPromptI8FastShape<Warps, PackedValues>;
-        const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
-                        static_cast<unsigned>(Geometry::QHeads), 1u);
-        causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues, Keys>
-            <<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const std::int8_t*>(cache.k_pages.data),
-                static_cast<const std::int8_t*>(cache.v_pages.data),
-                static_cast<const __half*>(cache.k_scale_pages.data),
-                static_cast<const __half*>(cache.v_scale_pages.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
-                static_cast<__nv_bfloat16*>(out.data), tokens);
-    };
-    if constexpr (kWide) {
-        if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
-            launch.template operator()<4>();
+        const auto tokens = static_cast<std::int32_t>(q.ne[2]);
+        const auto launch = [&]<int Warps>() {
+            using Shape = CausalPromptI8FastShape<Warps, PackedValues, TuringShapes>;
+            const dim3 grid(static_cast<unsigned>(div_up(tokens, Shape::Br)),
+                            static_cast<unsigned>(Geometry::QHeads), 1u);
+            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, Warps, PackedValues, Keys,
+                                                   TuringShapes>
+                <<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const std::int8_t*>(cache.k_pages.data),
+                    static_cast<const std::int8_t*>(cache.v_pages.data),
+                    static_cast<const __half*>(cache.k_scale_pages.data),
+                    static_cast<const __half*>(cache.v_scale_pages.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+        };
+        if constexpr (kWide) {
+            if (causal_attention_prompt_i8_fast_prefers_narrow(tokens, Geometry::QHeads)) {
+                launch.template operator()<4>();
+            } else {
+                launch.template operator()<8>();
+            }
         } else {
-            launch.template operator()<8>();
+            launch.template operator()<4>();
         }
-    } else {
-        launch.template operator()<4>();
-    }
+    });
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -119,44 +124,49 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                                                   Metadata metadata, Tensor& out, bool fast,
                                                   cudaStream_t stream) {
     fast = causal_attention_prompt_fast_kernel(cache.storage, fast);
-#if !defined(NINFER_SM70)
-    // The fast kernels hold 100 KiB of shared memory, past sm_70's 96 KiB; a 70 build skips them.
-    if (fast && cache.storage == KvCacheStorage::Int8Group64) {
-        causal_attention_prompt_i8_fast_launch_for<Geometry, false>(q, positions, scale, cache,
-                                                                    metadata, out, stream);
-        return;
+    // The fast kernels hold 100 KiB of shared memory, past sm_70's 96 KiB: a Volta card never takes
+    // them (causal_attention_prompt_fast_kernel), and a build for Volta alone does not compile
+    // them.
+    if constexpr (kBuildTuring || kBuildAmpere || kBuildBlackwell) {
+        if (fast && cache.storage == KvCacheStorage::Int8Group64) {
+            causal_attention_prompt_i8_fast_launch_for<Geometry, false>(q, positions, scale, cache,
+                                                                        metadata, out, stream);
+            return;
+        }
+        if (fast && cache.storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
+            causal_attention_prompt_i8_fast_launch_for<Geometry, true>(q, positions, scale, cache,
+                                                                       metadata, out, stream);
+            return;
+        }
+        if (fast && cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+            causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::Lloyd4>(
+                q, positions, scale, cache, metadata, out, stream);
+            return;
+        }
+        if (fast && cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
+            causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::Int4E8>(
+                q, positions, scale, cache, metadata, out, stream);
+            return;
+        }
+        if (fast && cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
+            causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::RootE8>(
+                q, positions, scale, cache, metadata, out, stream);
+            return;
+        }
     }
-    if (fast && cache.storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
-        causal_attention_prompt_i8_fast_launch_for<Geometry, true>(q, positions, scale, cache,
-                                                                   metadata, out, stream);
-        return;
-    }
-    if (fast && cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
-        causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::Lloyd4>(
-            q, positions, scale, cache, metadata, out, stream);
-        return;
-    }
-    if (fast && cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
-        causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::Int4E8>(
-            q, positions, scale, cache, metadata, out, stream);
-        return;
-    }
-    if (fast && cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
-        causal_attention_prompt_i8_fast_launch_for<Geometry, true, KvKeyCoding::RootE8>(
-            q, positions, scale, cache, metadata, out, stream);
-        return;
-    }
-#endif
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     const auto tokens     = static_cast<std::int32_t>(q.ne[2]);
     if (kv_cache_is_int8_family(cache.storage)) {
-        if constexpr (!kCausalPromptI8Standard) {
+        if (!causal_prompt_i8_standard_here()) {
             // Every INT8-family coding took the fast kernel above
             // (causal_attention_prompt_fast_kernel).
             throw std::logic_error(
-                "INT8-family prompt attention reached the standard kernel, which this build lacks");
-        } else {
+                "INT8-family prompt attention reached the standard kernel, which this card's shape "
+                "set lacks");
+        }
+        // A build of Turing's shape set alone does not compile the standard kernel.
+        if constexpr (kBuildStandardShapes) {
             // The INT8 family is the one place that deliberately does not take its plane types from
             // ops/kv_cache/plane_types.h. One kernel serves both codings, so its value parameter is
             // std::int8_t* for int8-g64 and for rk8v4 alike, and the packed-int4 path re-casts to
@@ -191,70 +201,67 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                         static_cast<const std::int32_t*>(positions.data), scale,
                         static_cast<__nv_bfloat16*>(out.data), tokens);
                 };
-#if defined(NINFER_SM70)
-                // A 70 build emulates these tiles; one variant per coding keeps ptxas within
-                // bounds.
-                (void)pack_gqa;
-                launch.template operator()<false>();
-#else
-                if (pack_gqa) {
-                    launch.template operator()<true>();
-                } else {
-                    launch.template operator()<false>();
+                // A Volta card emulates these tiles: one variant per coding keeps ptxas within
+                // bounds, and a build for Volta alone compiles no other.
+                if constexpr (kBuildTuring || kBuildAmpere || kBuildBlackwell) {
+                    if (pack_gqa && !current_device_volta()) {
+                        launch.template operator()<true>();
+                        return;
+                    }
                 }
-#endif
+                launch.template operator()<false>();
             };
             // A U8 key plane is a packed key coding (rk4v4, rk4v4-e8 or rk2v4-e8), told apart by
             // storage; a U8 value plane is the packed signed int4 coding they share with rk8v4.
-#if defined(NINFER_SM70)
+            // FP16 PV sums where the profile says so; a Volta card takes none (one variant per
+            // coding, as above).
+            const auto with_pv = [&]<bool PackedValues, KvKeyCoding Keys>() {
+                if constexpr (kBuildTuring || kBuildAmpere || kBuildBlackwell) {
+                    if (!current_device_volta() && prompt_pv_f16()) {
+                        launch_i8.template operator()<PackedValues, Keys, true>();
+                        return;
+                    }
+                }
+                launch_i8.template operator()<PackedValues, Keys, false>();
+            };
             if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
-                launch_i8.template operator()<true, KvKeyCoding::Lloyd4, false>();
+                with_pv.template operator()<true, KvKeyCoding::Lloyd4>();
             } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
-                launch_i8.template operator()<true, KvKeyCoding::Int4E8, false>();
+                with_pv.template operator()<true, KvKeyCoding::Int4E8>();
             } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
                 launch_i8.template operator()<true, KvKeyCoding::RootE8, false>();
             } else if (cache_v.dtype == DType::U8) {
-                launch_i8.template operator()<true, KvKeyCoding::Int8, false>();
+                with_pv.template operator()<true, KvKeyCoding::Int8>();
             } else {
                 launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
             }
-#else
-            const bool pv_f16 = prompt_pv_f16();
-            if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value && pv_f16) {
-                launch_i8.template operator()<true, KvKeyCoding::Lloyd4, true>();
-            } else if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
-                launch_i8.template operator()<true, KvKeyCoding::Lloyd4, false>();
-            } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 && pv_f16) {
-                launch_i8.template operator()<true, KvKeyCoding::Int4E8, true>();
-            } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
-                launch_i8.template operator()<true, KvKeyCoding::Int4E8, false>();
-            } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
-                launch_i8.template operator()<true, KvKeyCoding::RootE8, false>();
-            } else if (cache_v.dtype == DType::U8 && pv_f16) {
-                launch_i8.template operator()<true, KvKeyCoding::Int8, true>();
-            } else if (cache_v.dtype == DType::U8) {
-                launch_i8.template operator()<true, KvKeyCoding::Int8, false>();
-            } else {
-                launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
-            }
-#endif
         }
     } else {
-        // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        kCausalPromptBf16SmemBytes);
-        });
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
-        causal_attention_prompt_bf16_kernel<Geometry, Metadata>
-            <<<attention_grid, kCausalPromptThreads, kCausalPromptBf16SmemBytes, stream>>>(
+        // The kernel of the current device's shape set, past the default 48 KiB dynamic-smem
+        // ceiling in both.
+        const auto launch = [&](auto kernel, int smem) {
+            configure_cuda_device_once([&] {
+                return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem);
+            });
+            kernel<<<attention_grid, kCausalPromptThreads, smem, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
                 static_cast<const __nv_bfloat16*>(cache_k.data),
                 static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
+        };
+        with_shape_set([&]<bool TuringShapes>() {
+            if constexpr (TuringShapes) {
+                launch(causal_attention_prompt_bf16_turing_kernel<Geometry, Metadata>,
+                       kCausalPromptBf16TuringSmemBytes);
+            } else {
+                launch(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
+                       kCausalPromptBf16SmemBytes);
+            }
+        });
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -262,11 +269,8 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
 } // namespace
 
 bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested) {
-#if defined(NINFER_SM70)
-    (void)storage;
-    (void)requested;
-    return false;
-#endif
+    // The fast kernels hold 100 KiB of shared memory, past a Volta card's 96 KiB.
+    if (current_device_volta()) { return false; }
     const bool supported = storage == KvCacheStorage::Int8Group64 ||
                            storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                            storage == KvCacheStorage::RotatedLloyd4KeyInt4Value ||
@@ -274,9 +278,11 @@ bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested)
                            storage == KvCacheStorage::RotatedE8RootKeyInt4Value ||
                            storage == KvCacheStorage::Nvfp4Group16;
     if (!supported) { return false; }
-    // A build without the standard INT8-family prompt kernel (kCausalPromptI8Standard) takes the
+    // A card without the standard INT8-family prompt kernel (causal_prompt_i8_standard) takes the
     // fast one for every INT8-family coding.
-    if (!kCausalPromptI8Standard && storage != KvCacheStorage::Nvfp4Group16) { return true; }
+    if (!causal_prompt_i8_standard_here() && storage != KvCacheStorage::Nvfp4Group16) {
+        return true;
+    }
     if (requested) { return true; }
     static const int forced = [] {
         const char* value = std::getenv("NINFER_PROMPT_FAST");

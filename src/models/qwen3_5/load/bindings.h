@@ -5,6 +5,7 @@
 #include "models/qwen3_5/expert_sources.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
+#include "ops/common/device_tier.h"
 
 #include <map>
 #include <span>
@@ -105,8 +106,13 @@ void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& 
 // the load-time transcodes on the selected parameters.
 void apply_storage_trades(Bindings& bindings, const Config& config, const ModelWeights& weights,
                           const LoadOptions& options);
-// sm_70: the panel layout for the projection weights its routes read (storage_trades.cpp).
-void apply_device_layouts(Bindings& bindings, const ModelWeights& weights);
+// The FP8 A8 and NVFP4 A4 permissions a stored weight keeps only on a rank whose device runs the
+// 120a code (`rank_tiers`, one per rank): elsewhere its uses take the A16 routes (prepare.cpp).
+void apply_rank_policies(Bindings& bindings, std::span<const ops::DeviceTier> rank_tiers);
+// sm_70: the panel layout for the projection weights its routes read, on the ranks whose devices
+// run Volta's code (`rank_tiers`, one per rank; storage_trades.cpp).
+void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
+                          std::span<const ops::DeviceTier> rank_tiers);
 // --vision-residency overlay: rank the device weights an exclusive Vision window may borrow.
 // `mtp_parameters` and `draft_parameters` are the half-open WeightId index ranges registered by
 // bind_mtp and bind_draft.

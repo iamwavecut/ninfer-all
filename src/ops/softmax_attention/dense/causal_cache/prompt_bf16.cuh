@@ -339,12 +339,6 @@ __device__ __forceinline__ void causal_prompt_store(float (&acc)[kCausalPromptPV
                                              tid, kCausalPromptThreads);
 }
 
-#if defined(NINFER_SM75)
-} // namespace ninfer::ops
-
-// A Turing build takes its own kernel of the same name and contract.
-#    include "ops/softmax_attention/dense/causal_cache/prompt_bf16_sm75.cuh"
-#else
 inline constexpr int kCausalPromptBf16SmemBytes = kCausalPromptSmemBytes;
 
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
@@ -359,6 +353,7 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                                              const std::int32_t* __restrict__ positions,
                                              float scale, __nv_bfloat16* __restrict__ out,
                                              std::int32_t width) {
+    if constexpr (!shape_set_in_image(false)) { return; } // not this image's set
     constexpr int D       = kCausalPromptHeadDim; // 256
     constexpr int Br      = kCausalPromptBr;      // 64 query rows
     constexpr int Bc      = kCausalPromptBc;      // 64 key cols
@@ -485,4 +480,6 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
 }
 
 } // namespace ninfer::ops
-#endif
+
+// The Turing shape set's kernel of the same contract (ops/common/device_tier.h).
+#include "ops/softmax_attention/dense/causal_cache/prompt_bf16_sm75.cuh"

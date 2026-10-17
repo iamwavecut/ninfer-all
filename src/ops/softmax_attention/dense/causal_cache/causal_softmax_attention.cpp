@@ -6,6 +6,7 @@
 #include "core/layout.h"
 #include "core/device.h"
 #include "core/paged_kv_storage.h"
+#include "ops/common/device_tier.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
@@ -58,12 +59,14 @@ void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
 }
 
 // Whether a prompt-route launch over this cache runs the fast NVFP4 kernel: NVFP4-G16 storage on a
-// Blackwell build, the fast prompt kernel selected (--fast-prefill-kernel, NINFER_PROMPT_FAST or the
-// profile's attn_prompt_fast), more than 2048 visible keys and a single query row.
+// card running the 120a code, the fast prompt kernel selected (--fast-prefill-kernel,
+// NINFER_PROMPT_FAST or the profile's attn_prompt_fast), more than 2048 visible keys and a single
+// query row.
 bool prompt_nvfp4_fast(KvCacheStorage storage, CausalAttentionExecutionEnvelope envelope,
                        std::int32_t batch_size) {
 #if defined(NINFER_SM120_NVFP4)
     return storage == KvCacheStorage::Nvfp4Group16 && batch_size == 1 &&
+           current_device_blackwell() &&
            detail::causal_attention_prompt_fast_kernel(storage, envelope.fast_prompt_kernel) &&
            detail::nvfp4_fast_prompt_applies(envelope.max_visible_keys);
 #else

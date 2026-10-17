@@ -2,6 +2,7 @@
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/common/pre_sm80.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -74,6 +75,12 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
 // two neighbouring lanes so that every thread of the block takes part.
 __device__ __forceinline__ std::uint32_t pack_nvfp4_e2m1x8(const float2 (&values)[4]) {
     std::uint32_t codes = 0;
+#if defined(NINFER_PRE_BLACKWELL_DEVICE)
+    // Blackwell's FP4 conversion; an image of another architecture in a build of several never
+    // runs the routes that call it.
+    codes = 0;
+    __trap();
+#else
     asm volatile("{\n"
                  ".reg .b8 b0;\n"
                  ".reg .b8 b1;\n"
@@ -88,6 +95,7 @@ __device__ __forceinline__ std::uint32_t pack_nvfp4_e2m1x8(const float2 (&values
                  : "=r"(codes)
                  : "f"(values[0].x), "f"(values[0].y), "f"(values[1].x), "f"(values[1].y),
                    "f"(values[2].x), "f"(values[2].y), "f"(values[3].x), "f"(values[3].y));
+#endif
     return codes;
 }
 

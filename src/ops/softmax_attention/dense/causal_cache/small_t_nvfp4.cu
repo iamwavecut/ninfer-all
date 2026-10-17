@@ -5,7 +5,7 @@
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_nvfp4.cuh"
 #include "ops/kv_cache/plane_types.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
 #endif
 
@@ -20,64 +20,76 @@ void launch_nvfp4_partial(const Tensor& q, CacheInput input, const Tensor& posit
                           PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                           Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
-#if defined(NINFER_SM70)
-    // Volta's own kernel (small_t_sm70.cuh): the same grid, splits and partial outputs. The tiled
-    // kernel is Ampere's; a 70 build does not compile it.
-    launch_small_t_sm70_quantized<Geometry, TokenTile, MultiBatch, Masked, CacheInput, false,
-                                  false>(q, input, positions, scale, cache, invocation,
-                                         logical_capacity, splits, partial_acc, partial_m,
-                                         partial_l, stream);
-#else
-    constexpr int RowCount             = TokenTile * Geometry::GroupSize;
-    constexpr int RowTiles             = (RowCount + 15) / 16;
-    constexpr int Warps                = RowTiles == 3 ? 12 : 8;
-    constexpr int KeyBlock             = 32;
-    constexpr int MinBlocks            = RowTiles <= 2 ? 2 : 1;
-    constexpr bool Compact =
-        RowTiles <= 2 || kCausalSmallTCompactKV<RowTiles, KeyBlock, 5 * KeyBlock * kCausalHeadDim>;
-    constexpr std::size_t DynamicBytes = (Compact ? 3u : 5u) * KeyBlock * kCausalHeadDim;
-    static_assert(kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> + DynamicBytes <=
-                  kMaxSharedBytesPerBlock);
-    using KernelInput                  = CacheInput;
-    const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-    const auto launch = [&]() {
-        auto kernel = causal_attention_small_t_nvfp4_tiled_kernel<
-            Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked, KernelInput>;
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(DynamicBytes));
-        });
-
-        const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
-        const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);
-        constexpr auto kStorage  = KvCacheStorage::Nvfp4Group16;
-        const auto cache_k_ptr   = static_cast<KvKeyCodeT<kStorage>*>(cache.k_pages.data);
-        const auto cache_v_ptr   = static_cast<KvValueCodeT<kStorage>*>(cache.v_pages.data);
-        const auto k_scale_ptr   = static_cast<KvKeyScaleT<kStorage>*>(cache.k_scale_pages.data);
-        const auto v_scale_ptr   = static_cast<KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
-        assert_kv_planes<kStorage, decltype(cache_k_ptr), decltype(cache_v_ptr),
-                         decltype(k_scale_ptr), decltype(v_scale_ptr)>();
-        const auto tables_ptr    = static_cast<const std::int32_t*>(cache.block_tables.data);
-        const auto valid_ptr =
-            invocation.valid_columns == nullptr
-                ? nullptr
-                : static_cast<const std::int32_t*>(invocation.valid_columns->data);
-        const auto rows_ptr   = invocation.table_rows == nullptr
-                                    ? nullptr
-                                    : static_cast<const std::int32_t*>(invocation.table_rows->data);
-        auto* partial_acc_ptr = static_cast<float*>(partial_acc.data);
-        auto* partial_m_ptr   = static_cast<float*>(partial_m.data);
-        auto* partial_l_ptr   = static_cast<float*>(partial_l.data);
-        kernel<<<grid, Warps * 32, DynamicBytes, stream>>>(
-            q_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
-            tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0], invocation.full_width,
-            invocation.column_begin, logical_capacity, scale, partial_acc_ptr, partial_m_ptr,
-            partial_l_ptr);
-        CUDA_CHECK(cudaGetLastError());
-    };
-
-    launch();
+#if defined(NINFER_TIER_VOLTA)
+    if (current_device_volta()) {
+        // Volta's own kernel (small_t_sm70.cuh): the same grid, splits and partial outputs. The
+        // tiled kernel is the other tiers'; a build of Volta alone does not compile it.
+        launch_small_t_sm70_quantized<Geometry, TokenTile, MultiBatch, Masked, CacheInput, false,
+                                      false>(q, input, positions, scale, cache, invocation,
+                                             logical_capacity, splits, partial_acc, partial_m,
+                                             partial_l, stream);
+        return;
+    }
 #endif
+    if constexpr (kBuildPostVolta) {
+        with_shape_set([&]<bool TuringShapes>() {
+            constexpr int RowCount  = TokenTile * Geometry::GroupSize;
+            constexpr int RowTiles  = (RowCount + 15) / 16;
+            constexpr int Warps     = RowTiles == 3 ? 12 : 8;
+            constexpr int KeyBlock  = 32;
+            constexpr int MinBlocks = RowTiles <= 2 ? 2 : 1;
+            constexpr bool Compact =
+                RowTiles <= 2 ||
+                kCausalSmallTCompactKV<RowTiles, KeyBlock, 5 * KeyBlock * kCausalHeadDim,
+                                       TuringShapes>;
+            constexpr std::size_t DynamicBytes = (Compact ? 3u : 5u) * KeyBlock * kCausalHeadDim;
+            static_assert(kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> + DynamicBytes <=
+                          shape_max_shared_bytes_per_block(TuringShapes));
+            using KernelInput = CacheInput;
+            const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+            const auto launch = [&]() {
+                auto kernel = causal_attention_small_t_nvfp4_tiled_kernel<
+                    Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked,
+                    KernelInput, TuringShapes>;
+                configure_cuda_device_once([&] {
+                    return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                static_cast<int>(DynamicBytes));
+                });
+
+                const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
+                const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);
+                constexpr auto kStorage  = KvCacheStorage::Nvfp4Group16;
+                const auto cache_k_ptr   = static_cast<KvKeyCodeT<kStorage>*>(cache.k_pages.data);
+                const auto cache_v_ptr   = static_cast<KvValueCodeT<kStorage>*>(cache.v_pages.data);
+                const auto k_scale_ptr =
+                    static_cast<KvKeyScaleT<kStorage>*>(cache.k_scale_pages.data);
+                const auto v_scale_ptr =
+                    static_cast<KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
+                assert_kv_planes<kStorage, decltype(cache_k_ptr), decltype(cache_v_ptr),
+                                 decltype(k_scale_ptr), decltype(v_scale_ptr)>();
+                const auto tables_ptr = static_cast<const std::int32_t*>(cache.block_tables.data);
+                const auto valid_ptr =
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data);
+                const auto rows_ptr =
+                    invocation.table_rows == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.table_rows->data);
+                auto* partial_acc_ptr = static_cast<float*>(partial_acc.data);
+                auto* partial_m_ptr   = static_cast<float*>(partial_m.data);
+                auto* partial_l_ptr   = static_cast<float*>(partial_l.data);
+                kernel<<<grid, Warps * 32, DynamicBytes, stream>>>(
+                    q_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
+                    tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0],
+                    invocation.full_width, invocation.column_begin, logical_capacity, scale,
+                    partial_acc_ptr, partial_m_ptr, partial_l_ptr);
+                CUDA_CHECK(cudaGetLastError());
+            };
+
+            launch();
+        });
+    }
 }
 
 template <typename Geometry, bool MultiBatch, bool Masked>

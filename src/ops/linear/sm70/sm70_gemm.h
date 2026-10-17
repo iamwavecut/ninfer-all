@@ -12,6 +12,8 @@
 // FP16 holds every BF16 activation of magnitude below 65504 with at least BF16's precision; larger
 // values saturate at +-65504 instead of becoming infinite.
 
+#include "ops/common/device_tier.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -32,21 +34,15 @@ __device__ __forceinline__ unsigned bf16x2_to_f16x2(unsigned word) {
 }
 #endif
 
-// Whether this build targets sm_70 (the route exists only there).
-[[nodiscard]] constexpr bool enabled() {
-#if defined(NINFER_SM70)
-    return true;
-#else
-    return false;
-#endif
-}
+// Whether the calling thread's current device runs Volta's code (the route exists only there).
+[[nodiscard]] inline bool enabled() { return current_device_volta(); }
 
 // The narrowest product the route takes: 65 columns, or NINFER_SM70_CUBLAS_MIN. Decode and verify
 // batches stay below it on the formats' own kernels, whose launches CUDA graphs capture.
 inline constexpr std::int32_t kCublasMinTokens = 65;
 [[nodiscard]] std::int32_t cublas_min_tokens();
 
-// Whether a product of `tokens` columns takes the route in this build.
+// Whether a product of `tokens` columns takes the route on the current device.
 [[nodiscard]] inline bool takes(std::int32_t tokens) {
     return enabled() && tokens >= cublas_min_tokens();
 }
