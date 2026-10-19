@@ -241,6 +241,23 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     models::qwen4_exp::ExecutorOptions executor;
     executor.max_context     = options.max_context;
     executor.sequences       = options.max_concurrency;
+    // An explicit --kv-capacity of at least one window but less than a window per sequence makes
+    // the sequences share one KV pool of that size (what the requests hold at once).
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit && options.max_concurrency > 1 &&
+        options.kv_capacity.explicit_tokens >= options.max_context &&
+        std::uint64_t(options.kv_capacity.explicit_tokens) <
+            std::uint64_t(options.max_concurrency) * options.max_context) {
+        const auto& cache = options.context_cache;
+        if (cache.enabled && (cache.host_state_slots != 0 || cache.host_kv_capacity_bytes != 0 ||
+                              cache.host_cache_budget_bytes.value_or(0) != 0 ||
+                              cache.host_cache_auto || !cache.disk_kv_path.empty())) {
+            throw std::invalid_argument(
+                "Qwen3.8-Flash-Next's shared KV pool (--kv-capacity below max-concurrency x "
+                "max-context) keeps no host or disk context cache: pass --host-state-slots 0 "
+                "--host-kv-mib 0");
+        }
+        executor.kv_pool_tokens = options.kv_capacity.explicit_tokens;
+    }
     executor.draft_tokens    = mtp ? speculative.draft_tokens : 0;
     executor.draft_min_p     = speculative.draft_min_p;
     // A chunk also holds a verification of every sequence at once.
@@ -1229,6 +1246,51 @@ struct Qwen4ExpCore::Impl {
         return true;
     }
 
+    // ---- A shared KV pool (an explicit --kv-capacity below a window per sequence) ----
+    // A request takes pages for its prompt when it is admitted and for a few rounds ahead before
+    // each decode step; an idle sequence's pages (and with them its cached prefix) go to whoever
+    // needs them, least recently used first. A prompt waits in the queue while running requests
+    // hold the pages it needs; a decoding request that finds none finishes at its context capacity.
+    struct KvPoolBusy {};
+
+    // Positions beyond a request's next feed that a step may write: a speculative round with its
+    // guessed window, or a decode group's steps in flight.
+    [[nodiscard]] std::uint32_t kv_margin() const noexcept {
+        return 2 * (drafts + 1) + group_steps() + 1;
+    }
+
+    bool make_room(std::uint32_t s, std::uint64_t tokens) {
+        auto& executor = *instance.executor;
+        if (!executor.kv_pooled()) { return true; }
+        const auto want = static_cast<std::uint32_t>(std::min<std::uint64_t>(tokens, max_context));
+        if (executor.reserve_kv(s, want)) { return true; }
+        std::vector<std::uint32_t> idle;
+        for (std::uint32_t o = 0; o < slots.size(); ++o) {
+            if (o != s && !slots[o].request && executor.kv_held_tokens(o) > 0) { idle.push_back(o); }
+        }
+        std::sort(idle.begin(), idle.end(),
+                  [&](std::uint32_t a, std::uint32_t b) { return slots[a].last_used < slots[b].last_used; });
+        for (const std::uint32_t o : idle) {
+            executor.reset(o);
+            slots[o].fed.clear();
+            slots[o].anchor.clear();
+            if (executor.reserve_kv(s, want)) { return true; }
+        }
+        return false;
+    }
+
+    // Whether the pool could hold `tokens` more positions for a new request: its free pages and
+    // the idle sequences' pages.
+    [[nodiscard]] bool pool_could_hold(std::uint64_t tokens) const {
+        const auto& executor = *instance.executor;
+        if (!executor.kv_pooled()) { return true; }
+        std::uint64_t available = executor.kv_free_tokens();
+        for (std::uint32_t o = 0; o < slots.size(); ++o) {
+            if (!slots[o].request) { available += executor.kv_held_tokens(o); }
+        }
+        return tokens <= available;
+    }
+
     // Moves queued requests into free sequences, oldest first: each into the free sequence whose
     // cached state serves the most of its prompt, else the least recently used.
     void admit() {
@@ -1252,6 +1314,11 @@ struct Qwen4ExpCore::Impl {
                     }
                 }
                 if (!best) { return; }
+                // With a shared KV pool, a prompt the running requests leave no room for waits.
+                if (any_active() &&
+                    !pool_could_hold(pending.front()->prompt_tokens.size() + kv_margin())) {
+                    return;
+                }
                 request = std::move(pending.front());
                 pending.pop_front();
             }
@@ -1263,6 +1330,10 @@ struct Qwen4ExpCore::Impl {
             }
             try {
                 begin(request, *best);
+            } catch (const KvPoolBusy&) {
+                std::lock_guard lock(queue_mutex);
+                pending.push_front(std::move(request));
+                return;
             } catch (...) { fail(request, std::current_exception()); }
         }
     }
@@ -1314,6 +1385,11 @@ struct Qwen4ExpCore::Impl {
             slot.fed.clear();
             // The snapshot's prefix is about to be overwritten.
             slot.anchor.clear();
+        }
+        if (!make_room(s, std::uint64_t(prompt_n) + kv_margin())) {
+            if (any_active()) { throw KvPoolBusy{}; }
+            throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                               "prepared prompt exceeds the shared KV pool");
         }
         slot.request   = request;
         slot.last_used = ++use_clock;
@@ -1837,6 +1913,13 @@ struct Qwen4ExpCore::Impl {
             // A copy: finishing or failing the request clears its slot.
             const std::shared_ptr<Request> request = slot.request;
             if (!request || !request->decoding) { continue; }
+            // A shared KV pool: pages for the step's positions, or the request ends at its capacity.
+            if (executor.kv_pooled() && !request->awaiting_sample &&
+                !make_room(request->slot, std::uint64_t(request->position) + request->feed.size() +
+                                              kv_margin())) {
+                finish_now(request, FinishReason::ContextCapacity);
+                continue;
+            }
             if (request->awaiting_sample) {
                 // Its logits wait for its grammar mask; a cancellation need not.
                 if (mask_ready(*request)) {
@@ -2914,7 +2997,9 @@ MemorySummary Qwen4ExpCore::memory_summary() const {
     MemorySummary out;
     out.device                    = devices.front().device;
     out.max_context               = impl_->max_context;
-    out.kv_capacity               = impl_->max_context;
+    out.kv_capacity               = impl_->instance.executor->kv_pooled()
+                                        ? impl_->instance.executor->options().kv_pool_tokens
+                                        : impl_->max_context;
     out.kv_cache                      = impl_->instance.executor->options().kv_cache;
     out.weights                   = devices.front().weights;
     out.sequence                  = devices.front().sequence;

@@ -451,6 +451,19 @@ one round and the streams keep their share during a long one; each round is one 
 whose experts read their weights once for the whole batch, so the batch costs little more than one
 token while the experts dominate the step.
 
+An explicit `--kv-capacity` of at least `--max-context` but below `--max-concurrency` windows makes
+the sequences share one KV pool of that many positions instead: every sparse-attention layer (and
+the MTP layer) keeps one set of KV planes, and a sequence's block table maps its positions' pages
+into them, taken as it grows and returned when its sequence is reset. So four sequences of 262,144
+tokens can share 262,144 positions: one long request and short ones beside it, or several of any
+length while they fit together, each up to `--max-context`. A request takes pages for its prompt
+when it is admitted and for a few rounds ahead before each decode step; when the pool is short, a
+free sequence gives up its pages (and its cached prefix), least recently used first. A prompt that
+does not fit beside the running requests waits in the queue; a decoding request that finds no
+pages left finishes at its context capacity. A sequence still costs its own pooled keys (1.5 KiB a
+position of `--max-context`) and recurrent state: about 0.45 GiB a sequence at 262,144 tokens. The pool keeps no host images, so it needs
+`--host-state-slots 0 --host-kv-mib 0`.
+
 With the context cache on (the default), a sequence keeps its state when its request ends, and a
 snapshot of its recurrent state where the prompt's last user turn closes (or at the prompt's end
 when the template marks no turn), 74 MiB on the device: a later prompt that continues what the
@@ -638,8 +651,8 @@ draft-chain graph and each width its own verification graph, captured at their s
 Between GPUs without peer access (every GeForce pair under Windows/WDDM), a stream that waits on
 another device's event, or a staged peer copy, blocks the host thread that queues it until the other
 device gets there. One host thread queuing every stage therefore walks each pass through the
-pipeline at device speed, and the stages take turns. Three opt-in modes, for device experts with
-CUDA Graphs, change that:
+pipeline at device speed, and the stages take turns. Three opt-in modes, for device experts, change
+that:
 
 - **Rank threads** (`NINFER_QWEN4_RANK_THREADS=1`). The host thread prepares a pass's inputs
   (positions, n-gram rows) into a staging entry and posts it; each stage's own thread uploads them,
@@ -669,7 +682,7 @@ CUDA Graphs, change that:
   others get a turn (default 8).
 
 `NINFER_QWEN4_ROUND_TIMING=1` prints the host's time per MTP round phase every 100 rounds (with
-the guesses made and held), and for host-ordered verifications each stage's device time in a window. Without CUDA Graphs the rank threads stay off.
+the guesses made and held), and for host-ordered verifications each stage's device time in a window.
 
 ## Measurements
 

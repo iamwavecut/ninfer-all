@@ -33,15 +33,25 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp {
+
+// A pass needed pages a shared KV pool did not have; nothing of it was queued.
+struct KvPoolExhausted : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 struct ExecutorOptions {
     std::uint32_t max_context = 32768;
     // Tokens per forward call: a prompt is fed in calls of at most this many.
     std::uint32_t prefill_chunk = 2048;
     std::uint32_t sequences     = 1;
+    // A KV pool shared by the sequences (tokens, page-aligned up): each sequence takes pages from
+    // it as its positions grow, up to max_context, and returns them at reset(). Zero gives every
+    // sequence its own max_context window.
+    std::uint32_t kv_pool_tokens = 0;
     // The n-gram table of the PLE layer. Empty runs the model without it: the PLE injection is
     // skipped, which is what an all-zero table would give.
     std::optional<NgramTableSource> ngram;
@@ -231,6 +241,15 @@ public:
 
     // Pipeline windows (NINFER_QWEN4_PIPELINE_WINDOWS=1 with rank threads, one sequence): while
     // the head rank verifies a window, the front ranks run the guessed next one.
+    // A shared KV pool (ExecutorOptions::kv_pool_tokens): the tokens its free pages hold, and the
+    // tokens of pages `sequence` holds. reserve_kv() takes pages for `sequence` up to `tokens`
+    // positions and returns false, taking none, when the pool lacks them; a pass past a sequence's
+    // reserved positions throws KvPoolExhausted.
+    [[nodiscard]] bool kv_pooled() const noexcept;
+    [[nodiscard]] std::uint64_t kv_free_tokens() const noexcept;
+    [[nodiscard]] std::uint64_t kv_held_tokens(std::uint32_t sequence) const noexcept;
+    bool reserve_kv(std::uint32_t sequence, std::uint32_t tokens);
+
     [[nodiscard]] bool pipeline_windows() const noexcept;
     // After draft() and before verify(): the MTP chain runs on past the drafts to the guess.
     void guess_after_draft();
