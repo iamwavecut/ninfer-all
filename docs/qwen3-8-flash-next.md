@@ -985,6 +985,16 @@ Four concurrent chat requests (512 tokens each, four slots of 65,536 tokens, rk8
 in all with decode groups (`NINFER_QWEN4_DECODE_GROUPS=4`) against 45.7 with MTP3 rounds, A 112.4
 against 40.9, each request's text unchanged; one request alone kept MTP (61.0 and 49.1 tok/s).
 
+A shared KV pool of 262,144 positions with pipeline windows and decode groups: B (int8) with four
+slots of 262,144 tokens left 819 MiB free at startup against 1.06 GiB with one slot. A chat alone
+decoded at 90.7 tok/s and the 206K prompt alone at 61.7 (1.59k tok/s prefill), the one-slot server's
+text both times; the 206K request with three chats beside it decoded at 40.7 tok/s while the chats
+ran at 41.0-43.8. A (rk8v4) holds two such slots (four ran out of memory at startup): the 206K prompt
+alone at 45.4 tok/s, the one-slot text, and beside a chat at 35.9 while the chat ran at 46.5. A chat
+alone three times, one slot against the pool, same build: B 91.0/93.5/93.7 against 91.2/92.4/92.6
+tok/s (four slots), A 64.4/64.4/64.4 against 64.2/64.4/64.5 (two slots). Without decode groups four
+pooled chats at once ran at about 10.5 tok/s each.
+
 ### Hyper-connections in Q8_0
 
 The hyper-connection projections (97 down/up pairs and 96 inject matrices) are stored as ggml Q8_0,
