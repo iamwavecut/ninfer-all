@@ -29,6 +29,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -171,6 +172,13 @@ public:
     // leaves their logits in logits(), one column per sequence in that order. The experts read
     // their weights once for the whole batch; each sequence's mixers run on its own state.
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
+    // The same, and `after_head` runs once the pass's head is queued, with the head stream and
+    // the pass's logits: work it queues there reads them before any later pass overwrites them.
+    // With rank threads it runs on the head rank's thread (the caller must not touch the head
+    // stream or logits() before it has run); otherwise before decode() returns.
+    using AfterHead = std::function<void(cudaStream_t, const Tensor&)>;
+    void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
+                AfterHead after_head);
     // Copies the sequence's recurrent state into `out`, and back; both wait for the copies.
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     // Device bytes one SequenceSnapshot's buffers take once its first snapshot sizes them.
@@ -220,6 +228,24 @@ public:
     // `sequences[i]`, which lists the verified sequences in their order: each sequence's state is
     // then what feeding those tokens would have left, and its MTP block has run their cells.
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> columns);
+
+    // Pipeline windows (NINFER_QWEN4_PIPELINE_WINDOWS=1 with rank threads, one sequence): while
+    // the head rank verifies a window, the front ranks run the guessed next one.
+    [[nodiscard]] bool pipeline_windows() const noexcept;
+    // After draft() and before verify(): the MTP chain runs on past the drafts to the guess.
+    void guess_after_draft();
+    // The last guess: the bonus token the window in flight would end with if kept whole, then
+    // the drafts after it (draft_tokens() + 1 tokens). Waits for the head rank's chain.
+    void take_guess(std::span<std::int32_t> out);
+    // The front ranks run `tokens` (a guess) as the window after the one in flight.
+    void verify_ahead(std::span<const std::int32_t> tokens);
+    [[nodiscard]] bool guess_live() const noexcept;
+    // The verdict did not keep the window in flight whole with the guessed bonus.
+    void drop_guess();
+    // After commit() kept the window in flight whole with the guessed bonus: verifies the guessed
+    // window (`tokens`, as guessed), whose front ranks' part has run, and starts the next guess
+    // chain (take_guess()).
+    void verify_guessed(std::span<const std::int32_t> tokens);
 
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
     [[nodiscard]] std::size_t head_rank() const noexcept;

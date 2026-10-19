@@ -34,6 +34,7 @@
 #include <bit>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -668,6 +669,10 @@ struct Qwen4ExpCore::Impl {
         }
         queue_cv.notify_all();
         if (worker.joinable()) { worker.join(); }
+        if (!group_done.empty()) {
+            RankBinding bind(device, instance.executor->head_rank());
+            for (cudaEvent_t event : group_done) { cudaEventDestroy(event); }
+        }
     }
 
     [[nodiscard]] std::size_t mask_words() const noexcept {
@@ -1848,6 +1853,19 @@ struct Qwen4ExpCore::Impl {
             }
         }
         if (batch.empty() && alone.empty() && speculative.empty() && deferred.empty()) { return; }
+        // With decode groups over a pipeline, several decoding requests run plain steps in groups
+        // that keep every stage busy, which outruns their MTP rounds; a request alone keeps its
+        // drafts (the rounds of one sequence cannot overlap stages).
+        if (decode_groups() >= 2 && device.size() >= 2 && speculative.size() + batch.size() >= 2) {
+            for (const auto& request : speculative) {
+                if (!request->constrained && !request->options.execution.logprobs) {
+                    batch.push_back(request);
+                }
+            }
+            std::erase_if(speculative, [](const auto& r) {
+                return !r->constrained && !r->options.execution.logprobs;
+            });
+        }
         const auto start = Clock::now();
         if (!deferred.empty()) { sample_deferred(deferred); }
         for (const auto& request : alone) {
@@ -1928,10 +1946,210 @@ struct Qwen4ExpCore::Impl {
         }
     }
 
+    // Decode groups (NINFER_QWEN4_DECODE_GROUPS=G, at least 2): over a layer pipeline, a plain step
+    // splits its requests into up to G groups and queues one decode pass and the sampling of each
+    // group after the other without waiting, so the first stage runs a group while later stages run
+    // the groups before it; the host waits once for all of them. 0 or 1 keeps one pass for the batch.
+    [[nodiscard]] static std::size_t decode_groups() {
+        static const std::size_t groups = [] {
+            const char* value = std::getenv("NINFER_QWEN4_DECODE_GROUPS");
+            return value ? std::size_t(std::clamp<long>(std::strtol(value, nullptr, 10), 0, 8)) : 0;
+        }();
+        return groups;
+    }
+
+    // Queues the sampling of `rows` from the first rows.size() columns of `logits` on `stream`
+    // (the head rank's, current) into entries [base, base + rows.size()) of the sampling planes,
+    // the tokens copied to the host; no grammar masks or logprobs. collect_plain() reads them once
+    // the stream has finished. It may run on the executor's head-rank thread (decode groups).
+    void enqueue_plain_sample(std::span<const SampleRow> rows, std::size_t base,
+                              cudaStream_t stream, const Tensor& head_logits) {
+        const std::size_t n       = rows.size();
+        auto* configs             = static_cast<ops::SamplingConfig*>(host_sample->data());
+        auto* positions           = reinterpret_cast<std::int32_t*>(configs + slots.size());
+        auto* tokens              = positions + slots.size();
+        for (std::size_t b = 0; b < n; ++b) {
+            const SampleRow& row = rows[b];
+            ops::SamplingConfig config;
+            config.temperature       = row.params->temperature;
+            config.top_k             = row.params->top_k;
+            config.top_p             = row.params->top_p;
+            config.min_p             = row.params->min_p;
+            config.presence_penalty  = row.params->presence_penalty;
+            config.frequency_penalty = row.params->frequency_penalty;
+            config.seed              = row.params->seed;
+            config.token_counts =
+                row.counts ? static_cast<std::int32_t*>(token_counts.p) + std::size_t(row.slot) * domain
+                           : nullptr;
+            configs[base + b]   = config;
+            positions[base + b] = static_cast<std::int32_t>(row.position);
+        }
+        auto* device_configs = static_cast<ops::SamplingConfig*>(sample_config.p) + base;
+        auto* device_positions = static_cast<std::int32_t*>(sample_position.p) + base;
+        auto* device_out       = static_cast<std::int32_t*>(sample_out.p) + base;
+        CUDA_CHECK(cudaMemcpyAsync(device_configs, configs + base, n * sizeof(ops::SamplingConfig),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_positions, positions + base, n * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream));
+        const auto width = static_cast<std::int32_t>(n);
+        Tensor sampled(device_out, DType::I32, {width});
+        const Tensor logical(device_positions, DType::I32, {width});
+        const Tensor logits(head_logits.data, DType::BF16, {head_logits.ne[0], width});
+        {
+            auto scope = sample_workspace->scope();
+            ops::sample(logits, sampled, static_cast<std::int32_t>(domain), device_configs, logical,
+                        ops::kSamplePurposeDecode, *sample_workspace, stream);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(tokens + base, device_out, n * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+    }
+
+    // The token enqueue_plain_sample() drew for entry `index`, once the head stream is done.
+    [[nodiscard]] TokenId collect_plain(std::size_t index) const {
+        const auto* configs = static_cast<const ops::SamplingConfig*>(host_sample->data());
+        const auto* tokens  = reinterpret_cast<const std::int32_t*>(configs + slots.size()) + slots.size();
+        const std::int32_t token = tokens[index];
+        if (token == ops::kSamplerNonFiniteToken || token < 0 || std::uint32_t(token) >= domain) {
+            throw std::runtime_error("Qwen3.8-Flash-Next produced non-finite logits");
+        }
+        return token;
+    }
+
+    // Steps a grouped call runs per request (NINFER_QWEN4_GROUP_STEPS, default 8): each group is
+    // queued again as soon as its own token is back, while the other groups are still in the
+    // pipeline, so the stages drain once per call instead of once per step.
+    [[nodiscard]] static std::uint32_t group_steps() {
+        static const std::uint32_t steps = [] {
+            const char* value = std::getenv("NINFER_QWEN4_GROUP_STEPS");
+            return value ? std::uint32_t(std::clamp<long>(std::strtol(value, nullptr, 10), 1, 64)) : 8U;
+        }();
+        return steps;
+    }
+
+    struct DecodeGroup {
+        std::vector<std::shared_ptr<Request>> requests;
+        std::vector<SampleRow> rows; // the step in flight's
+        std::size_t base     = 0; // its entries of the sampling planes
+        std::uint32_t steps  = 0; // left in this call
+        bool in_flight       = false;
+        std::uint64_t issued = 0; // steps queued
+    };
+    std::vector<cudaEvent_t> group_done; // on the head stream, one per group
+    // Steps whose sampling the head-rank callback has queued, by group: the event above belongs
+    // to a step only once its count has caught up.
+    std::mutex group_mutex;
+    std::condition_variable group_cv;
+    std::vector<std::uint64_t> group_sampled;
+
+    // Whether a request of a decode group takes another step in this call.
+    [[nodiscard]] bool keeps_stepping(const std::shared_ptr<Request>& request) const {
+        return active(request) && request->decoding && request->feed.size() == 1 &&
+               !request->awaiting_sample && !request->constrained &&
+               !request->cancelled.load(std::memory_order_acquire) &&
+               request->position + 1 <= max_context;
+    }
+
+    // Queues one decode pass of the group and the sampling of its tokens.
+    void issue_group(DecodeGroup& group, std::size_t index) {
+        std::erase_if(group.requests, [&](const auto& r) { return !keeps_stepping(r); });
+        if (group.requests.empty() || group.steps == 0) {
+            group.in_flight = false;
+            return;
+        }
+        auto& executor = *instance.executor;
+        std::vector<std::uint32_t> sequences;
+        std::vector<TokenId> tokens;
+        group.rows.clear();
+        for (const auto& request : group.requests) {
+            sequences.push_back(request->slot);
+            tokens.push_back(request->feed.front());
+            group.rows.push_back(sample_row(*request));
+        }
+        const std::uint64_t step = ++group.issued;
+        // The sampling follows the head on the head stream, queued by whoever queues the head (the
+        // head rank's thread with rank threads), so a later group's head cannot overwrite these
+        // logits before they are read.
+        executor.decode(sequences, tokens,
+                        [this, &group, index, step](cudaStream_t stream, const Tensor& logits) {
+                            enqueue_plain_sample(group.rows, group.base, stream, logits);
+                            CUDA_CHECK(cudaEventRecord(group_done[index], stream));
+                            {
+                                std::lock_guard lock(group_mutex);
+                                group_sampled[index] = step;
+                            }
+                            group_cv.notify_all();
+                        });
+        group.in_flight = true;
+        --group.steps;
+    }
+
+    // A plain step in decode groups (decode_groups()); requests with grammar masks or logprobs
+    // take the one-pass step.
+    [[nodiscard]] bool grouped_step(const std::vector<std::shared_ptr<Request>>& batch) {
+        const std::size_t count = std::min({decode_groups(), batch.size(), device.size()});
+        if (count < 2) { return false; }
+        for (const auto& request : batch) {
+            if (request->constrained || request->options.execution.logprobs) { return false; }
+        }
+        auto& executor = *instance.executor;
+        {
+            RankBinding bind(device, executor.head_rank());
+            while (group_done.size() < count) {
+                cudaEvent_t event = nullptr;
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+                group_done.push_back(event);
+            }
+        }
+        {
+            std::lock_guard lock(group_mutex);
+            group_sampled.assign(count, 0);
+        }
+        // Contiguous groups whose sizes differ by at most one.
+        std::vector<DecodeGroup> groups(count);
+        std::size_t begin = 0;
+        for (std::size_t g = 0; g < count; ++g) {
+            const std::size_t end = begin + (batch.size() - begin) / (count - g);
+            groups[g].requests.assign(batch.begin() + std::ptrdiff_t(begin),
+                                      batch.begin() + std::ptrdiff_t(end));
+            groups[g].base  = begin;
+            groups[g].steps = group_steps();
+            begin           = end;
+        }
+        for (std::size_t g = 0; g < count; ++g) { issue_group(groups[g], g); }
+        // Round robin: each group's tokens are taken as soon as they are back, and the group is
+        // queued again behind the others.
+        for (bool any = true; any;) {
+            any = false;
+            for (std::size_t g = 0; g < count; ++g) {
+                DecodeGroup& group = groups[g];
+                if (!group.in_flight) { continue; }
+                any = true;
+                {
+                    std::unique_lock lock(group_mutex);
+                    group_cv.wait(lock, [&] { return group_sampled[g] >= group.issued; });
+                }
+                CUDA_CHECK(cudaEventSynchronize(group_done[g]));
+                for (std::size_t b = 0; b < group.requests.size(); ++b) {
+                    const auto& request = group.requests[b];
+                    slots[request->slot].fed.push_back(request->feed.front());
+                    request->position += 1;
+                    if (drafts > 0) { ++request->speculative.fallback_steps; }
+                    try {
+                        accept(request, collect_plain(group.base + b), nullptr);
+                        next_mask(request);
+                    } catch (...) { fail(request, std::current_exception()); }
+                }
+                issue_group(group, g);
+            }
+        }
+        return true;
+    }
+
     // One batched decode step of the requests that feed one token, whose experts read their weights
     // once. A grammar row whose mask is still being computed keeps its logits for later; the step
     // itself does not wait for the mask.
     void plain_step(const std::vector<std::shared_ptr<Request>>& batch) {
+        if (grouped_step(batch)) { return; }
         auto& executor = *instance.executor;
         std::vector<std::uint32_t> sequences;
         std::vector<TokenId> tokens;
@@ -1990,6 +2208,49 @@ struct Qwen4ExpCore::Impl {
     // accepted drafts and a correction or bonus, sampled as the request samples, so the output
     // follows the target's distribution), the output policy takes what it accepts of the run, and
     // the executor commits the tokens fed up to the last of them.
+    // NINFER_QWEN4_ROUND_TIMING=1: the host's wall time of an MTP round's phases (the draft with its
+    // synchronization, the verification until the acceptance is on the host, the commit and the
+    // bookkeeping after it), printed every 100 rounds. A diagnostic of pipelined rounds.
+    struct RoundTiming {
+        double draft = 0, verify = 0, accept = 0, commit = 0, total = 0;
+        std::uint64_t rounds = 0, tokens = 0, full = 0, guessed = 0, held = 0;
+    };
+    RoundTiming round_timing;
+    static bool round_timing_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("NINFER_QWEN4_ROUND_TIMING");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+    void report_round_timing() {
+        RoundTiming& t = round_timing;
+        if (t.rounds % 100 != 0) { return; }
+        const double n = double(t.rounds);
+        std::fprintf(stderr,
+                     "round timing | %llu rounds, %.2f tokens/round, %.0f%% whole windows, guesses "
+                     "%llu held %llu | ms/round: total %.2f draft %.2f verify %.2f accept %.2f "
+                     "commit %.2f\n",
+                     static_cast<unsigned long long>(t.rounds), double(t.tokens) / n,
+                     100.0 * double(t.full) / n, static_cast<unsigned long long>(t.guessed),
+                     static_cast<unsigned long long>(t.held), 1e3 * t.total / n, 1e3 * t.draft / n,
+                     1e3 * t.verify / n, 1e3 * t.accept / n, 1e3 * t.commit / n);
+        t = RoundTiming{};
+    }
+
+    // Pipeline windows (the executor's): a lone unconstrained request without logprobs, MTP drafts
+    // of the full width. A round whose verdict keeps its window whole with the guessed bonus
+    // leaves the guessed window as the next round's, already through the front ranks.
+    bool guessed_next = false;
+    std::uint32_t guessed_slot = 0;
+    std::vector<TokenId> guessed_tokens;
+    [[nodiscard]] bool pipelined_round(const std::vector<std::shared_ptr<Request>>& batch) const {
+        const auto& executor = *instance.executor;
+        return executor.pipeline_windows() && batch.size() == 1 && lookup_ngram == 0 &&
+               !mtp_controller && executor.options().draft_min_p == 0 &&
+               !batch.front()->constrained && !batch.front()->options.execution.logprobs;
+    }
+
     void speculative_round(const std::vector<std::shared_ptr<Request>>& batch) {
         auto& executor      = *instance.executor;
         const std::size_t b = batch.size();
@@ -1999,6 +2260,14 @@ struct Qwen4ExpCore::Impl {
             sequences.push_back(request->slot);
             anchors.push_back(request->feed.front());
         }
+        const bool pipelined  = pipelined_round(batch);
+        const bool continuing = pipelined && guessed_next && guessed_slot == batch.front()->slot &&
+                                guessed_tokens.size() == std::size_t(drafts) + 1 &&
+                                anchors.front() == guessed_tokens.front();
+        if (!continuing && executor.pipeline_windows() && executor.guess_live()) {
+            executor.drop_guess();
+        }
+        guessed_next = false;
         const auto round_start = Clock::now();
         // With --adaptive-mtp the controller picks the round's steps from each request's draft
         // survival and the round times it has measured; a new set of requests restarts its probe.
@@ -2047,7 +2316,10 @@ struct Qwen4ExpCore::Impl {
                 }
             }
         }
-        if (lookups < b) {
+        if (continuing) {
+            // The guessed window: its drafts are the guess's.
+            std::copy(guessed_tokens.begin() + 1, guessed_tokens.end(), all_drafts.begin());
+        } else if (lookups < b) {
             std::vector<std::uint32_t> mtp_sequences;
             std::vector<TokenId> mtp_anchors;
             for (std::size_t j = 0; j < b; ++j) {
@@ -2058,6 +2330,7 @@ struct Qwen4ExpCore::Impl {
             std::vector<TokenId> mtp_drafts(mtp_sequences.size() * drafts);
             std::vector<std::uint32_t> mtp_extents(mtp_sequences.size(), steps);
             executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, mtp_extents, steps);
+            if (round_timing_enabled()) { round_timing.draft += seconds(round_start, Clock::now()); }
             for (std::size_t j = 0, m = 0; j < b; ++j) {
                 if (looked_up[j]) { continue; }
                 std::copy_n(mtp_drafts.begin() + std::ptrdiff_t(m * drafts), drafts,
@@ -2091,7 +2364,21 @@ struct Qwen4ExpCore::Impl {
                 std::vector<TokenId>(proposed.begin() + std::ptrdiff_t(j * k),
                                      proposed.begin() + std::ptrdiff_t(j * k + own)));
         }
-        executor.verify(sequences, tokens);
+        const auto verify_start = Clock::now();
+        if (continuing) {
+            executor.verify_guessed(tokens);
+        } else {
+            if (pipelined) { executor.guess_after_draft(); }
+            executor.verify(sequences, tokens);
+        }
+        // The guess of the window after this one goes to the front ranks while the head rank
+        // verifies this one.
+        std::vector<TokenId> guess;
+        if (pipelined && batch.front()->position + 2 * w <= max_context) {
+            guess.resize(w);
+            executor.take_guess(guess);
+            executor.verify_ahead(guess);
+        }
 
         RankBinding bind(device, executor.head_rank());
         const cudaStream_t stream = executor.head_stream();
@@ -2215,6 +2502,7 @@ struct Qwen4ExpCore::Impl {
                                    stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         instance.executor->raise_service_failure();
+        const auto accept_start = Clock::now();
 
         // The output policy takes its part of each licensed run; the executor then keeps the tokens
         // fed up to the last one taken.
@@ -2298,7 +2586,42 @@ struct Qwen4ExpCore::Impl {
                 ops::increment_token_counts(ids, row_counts, stream);
             }
         }
+        const auto commit_start = Clock::now();
         executor.commit(sequences, kept);
+        if (!guess.empty()) {
+            // The guess holds when the request took the whole window and its bonus was guessed.
+            // NINFER_QWEN4_PIPELINE_FORCE_MISS=1 drops every guess (a test of the shadow states).
+            static const bool force_miss = [] {
+                const char* value = std::getenv("NINFER_QWEN4_PIPELINE_FORCE_MISS");
+                return value != nullptr && value[0] == '1';
+            }();
+            const std::int32_t licensed_n = host[b * w];
+            const bool hold = !force_miss && !failed.front() && active(batch.front()) &&
+                              kept.front() == w && licensed_n == columns &&
+                              host[w - 1] == guess.front();
+            if (hold) {
+                guessed_next   = true;
+                guessed_slot   = batch.front()->slot;
+                guessed_tokens = std::move(guess);
+                if (round_timing_enabled()) { round_timing.held += 1; }
+            } else {
+                executor.drop_guess();
+            }
+            if (round_timing_enabled()) { round_timing.guessed += 1; }
+        }
+        if (round_timing_enabled()) {
+            const auto now = Clock::now();
+            round_timing.verify += seconds(verify_start, accept_start);
+            round_timing.accept += seconds(accept_start, commit_start);
+            round_timing.commit += seconds(commit_start, now);
+            round_timing.total += seconds(round_start, now);
+            round_timing.rounds += 1;
+            for (std::size_t j = 0; j < b; ++j) {
+                round_timing.tokens += kept[j];
+                if (kept[j] == w) { round_timing.full += 1; }
+            }
+            report_round_timing();
+        }
         // The controller measures rounds of MTP drafts only: a lookup changes the round's width.
         if (mtp_controller && lookups == 0) {
             mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,

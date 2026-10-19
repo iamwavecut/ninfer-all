@@ -44,9 +44,18 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <future>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <numeric>
 #include <optional>
 #include <stdexcept>
@@ -489,8 +498,12 @@ struct RankState {
     DeviceBuffer activations;
     std::unique_ptr<DeviceArena> workspace;
     DeviceBuffer block_table;
-    std::unique_ptr<PinnedHostBuffer> staging;
-    cudaEvent_t staged = nullptr;
+    // A ring of host staging buffers, one per pass in flight (Impl::staging_slot picks the
+    // pass's), each with the event that marks its uploads done: a pass rewrites a buffer only
+    // once the pass that used it ring-size passes ago has uploaded it, so prompt chunks can fill
+    // every stage of a pipeline instead of the host waiting for the previous pass on all ranks.
+    std::vector<std::unique_ptr<PinnedHostBuffer>> staging;
+    std::vector<cudaEvent_t> staged;
     cudaEvent_t done   = nullptr;
     cudaEvent_t copied = nullptr; // its stack has been copied in from the previous rank
     cudaEvent_t routes = nullptr; // the last pass's routes reached the host
@@ -527,10 +540,12 @@ struct RankState {
     // DeltaNet layers and their fold, each sparse-attention layer's indexer projections (BF16
     // [640, columns] per layer), the PLE layer's normalised convolution input (FP32
     // [10240, columns]), and scratch for the states a verification reads but must not advance.
-    DeviceBuffer record_backing;
-    std::optional<GdnReplayRecords> records;
-    std::optional<ops::GdnReplayFoldPlan> fold;
-    DeviceBuffer index_records, ple_records;
+    // Pipeline windows keep a second record set, so a guessed window can record while the window
+    // before it still awaits its commit, and each set's positions for that commit.
+    std::array<DeviceBuffer, 2> record_backing;
+    std::array<std::optional<GdnReplayRecords>, 2> records;
+    std::array<std::optional<ops::GdnReplayFoldPlan>, 2> fold;
+    std::array<DeviceBuffer, 2> index_records, ple_records, window_positions;
     DeviceBuffer conv_scratch, tail_scratch;
     // Streamed sparse-attention layers: a prompt chunk reads one layer's whole KV from this
     // device copy (the four planes, every page), which holds `kv_staged`'s positions before
@@ -585,6 +600,8 @@ struct Executor::Impl {
     std::size_t rows_rank = 0;
     bool rows_waited      = true;
     bool warming          = false; // warm_up() runs: the expert cache counts no routes
+    // The staging buffer of every rank the current pass uses (RankState::staging).
+    std::size_t staging_slot = 0;
     std::array<StallEvents, 8> stall_events{};
     std::size_t stall_next = 0;
     std::uint64_t stalls   = 0;
@@ -608,6 +625,19 @@ struct Executor::Impl {
     std::int32_t domain        = 0;
     bool verifying             = false;
     std::vector<SequenceState*> verified; // the last verify()'s sequences, in order
+    // What the segments a thread queues compute: a verification (its record set, verified rows and
+    // width), or a guessed window ahead of the verdict on the front ranks (pipeline windows), which
+    // reads the sequence's shadow states. The host thread sets it around verify(); a rank thread
+    // takes it from its task.
+    struct PassMode {
+        bool verify         = false;
+        bool ahead          = false;
+        std::uint32_t set   = 0;
+        std::int32_t rows   = 0;
+        std::uint32_t width = 0;
+    };
+    static inline thread_local PassMode pass_mode{};
+    std::uint32_t verified_set = 0; // the record set of the last verification
     // The MTP chain on the head rank: token ids and positions of a pass's cells (a draft step's at
     // step * sequences), staged from the host.
     DeviceBuffer mtp_ids, mtp_positions, ngram_prefetch_tokens;
@@ -812,6 +842,7 @@ struct Executor::Impl {
             throw std::invalid_argument("--expert-prefill-buffers needs GGUF host experts");
         }
         plan_segments();
+        pipeline = pipeline_requested();
         allocate_ranks();
         allocate_vision();
         allocate_sequences();
@@ -828,6 +859,9 @@ struct Executor::Impl {
     }
 
     ~Impl() {
+        // Every queued pass reaches its device before the buffers it reads go away.
+        drain_quietly();
+        stop_rank_threads();
         draft_prefetch.reset();
         // The copier's queued copies finish before the events and buffers they use go.
         for (auto& prefetch : prefetches) {
@@ -839,6 +873,12 @@ struct Executor::Impl {
             }
         }
         pool_copier.reset();
+        for (std::size_t i = 0; i < window_timing.events.size(); ++i) {
+            RankBinding bind(device, segments[i].rank);
+            for (cudaEvent_t event : window_timing.events[i]) {
+                if (event != nullptr) { cudaEventDestroy(event); }
+            }
+        }
         // A pass that failed between starting the row reads and waiting for them leaves them
         // writing into a staging buffer.
         if (table) {
@@ -866,7 +906,7 @@ struct Executor::Impl {
         }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
-            if (rank.staged != nullptr) { cudaEventDestroy(rank.staged); }
+            for (cudaEvent_t event : rank.staged) { cudaEventDestroy(event); }
             if (rank.done != nullptr) { cudaEventDestroy(rank.done); }
             if (rank.copied != nullptr) { cudaEventDestroy(rank.copied); }
             if (rank.routes != nullptr) { cudaEventDestroy(rank.routes); }
@@ -877,6 +917,10 @@ struct Executor::Impl {
         if (mtp_staged != nullptr) {
             RankBinding bind(device, model.head_rank());
             cudaEventDestroy(mtp_staged);
+        }
+        for (const CrossRing& ring : crossings) {
+            for (cudaEvent_t event : ring.written) { cudaEventDestroy(event); }
+            for (cudaEvent_t event : ring.read) { cudaEventDestroy(event); }
         }
         for (const StallEvents& events : stall_events) {
             RankBinding bind(device, rows_rank);
@@ -1180,16 +1224,29 @@ struct Executor::Impl {
                 offset += round_up(bytes);
             }
             rank.workspace = std::make_unique<DeviceArena>(workspace_bytes(r));
-            std::vector<std::int32_t> identity(std::max<std::uint32_t>(pages, options.sequences));
+            // Pool slots: one per sequence, and with pipeline windows the shadow slot after them.
+            const std::uint32_t slots = options.sequences + (pipeline ? 1 : 0);
+            std::vector<std::int32_t> identity(std::max<std::uint32_t>(pages, slots));
             std::iota(identity.begin(), identity.end(), 0);
             rank.block_table = DeviceBuffer(std::size_t(pages) * 4);
             rank.block_table.copy_from_host(identity.data(), std::size_t(pages) * 4);
-            rank.slot_ids = DeviceBuffer(std::size_t(options.sequences) * 4);
-            rank.slot_ids.copy_from_host(identity.data(), std::size_t(options.sequences) * 4);
+            rank.slot_ids = DeviceBuffer(std::size_t(slots) * 4);
+            rank.slot_ids.copy_from_host(identity.data(), std::size_t(slots) * 4);
             // ids, positions, RoPE positions, scatter columns, three-axis RoPE positions, rows.
-            rank.staging = std::make_unique<PinnedHostBuffer>(
-                round_up(t * 28) + round_up(std::uint64_t(config.ngram_heads()) * t * row_b));
-            CUDA_CHECK(cudaEventCreateWithFlags(&rank.staged, cudaEventDisableTiming));
+            // One more buffer than there are stages: every stage can hold a pass while the host
+            // stages the next. NINFER_QWEN4_STAGING_RING=N sets the ring (1: the host waits for
+            // the previous pass on every rank, as before the ring), for A/B measurements.
+            std::size_t ring = device.size() + 1;
+            if (const char* value = std::getenv("NINFER_QWEN4_STAGING_RING")) {
+                ring = std::clamp<std::size_t>(std::strtoull(value, nullptr, 10), 1, 16);
+            }
+            for (std::size_t s = 0; s < ring; ++s) {
+                rank.staging.push_back(std::make_unique<PinnedHostBuffer>(
+                    round_up(t * 28) + round_up(std::uint64_t(config.ngram_heads()) * t * row_b)));
+                cudaEvent_t event = nullptr;
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+                rank.staged.push_back(event);
+            }
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.done, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.copied, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.routes, cudaEventDisableTiming));
@@ -1413,7 +1470,7 @@ struct Executor::Impl {
                 .value_heads    = static_cast<std::int32_t>(config.linear_num_value_heads),
                 .value_head_dim = static_cast<std::int32_t>(config.linear_value_head_dim),
                 .key_head_dim   = static_cast<std::int32_t>(config.linear_key_head_dim),
-                .slot_count     = static_cast<std::int32_t>(options.sequences),
+                .slot_count     = static_cast<std::int32_t>(options.sequences + (pipeline ? 1 : 0)),
             };
             LayoutBuilder builder;
             const auto layout = plan_linear_attention_state_pool(builder, spec);
@@ -1457,6 +1514,49 @@ struct Executor::Impl {
             sequences.push_back(std::move(sequence));
             reset(s);
         }
+        if (!pipeline) { return; }
+        // The shadow of the sequence's states on the front ranks: its states as if the window in
+        // flight were kept whole, which a guessed window reads. Its KV and pooled keys are the
+        // sequence's own (a guessed window writes positions after the verified one).
+        ahead_layers.resize(layers.size());
+        const auto shadow = static_cast<std::int32_t>(options.sequences);
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const LayerPlan& plan = layers[i];
+            if (plan.rank == model.head_rank()) { continue; }
+            RankBinding bind(device, plan.rank);
+            LayerState& state = ahead_layers[i];
+            if (plan.gdn) {
+                state.ssm  = ranks[plan.rank].gdn->recurrent_slot(gdn_local[i], shadow);
+                state.conv = ranks[plan.rank].gdn->conv_slot(gdn_local[i], shadow);
+            }
+            if (plan.qsa) {
+                state.tail = DeviceBuffer(sequences.front().layers[i].tail.bytes);
+                memory.ranks[plan.rank].state_bytes += state.tail.bytes;
+            }
+            if (plan.ple) {
+                state.history = DeviceBuffer(sequences.front().layers[i].history.bytes);
+                memory.ranks[plan.rank].state_bytes += state.history.bytes;
+            }
+        }
+    }
+
+    // Pipeline windows (NINFER_QWEN4_PIPELINE_WINDOWS=1, with rank threads): while the head rank
+    // verifies a window, the front ranks run the next one, guessed by the MTP block on the
+    // assumption that this window is kept whole with the block's bonus; a wrong guess is dropped.
+    // One sequence, MTP drafts, device experts and CUDA Graphs.
+    bool pipeline = false;
+    std::vector<LayerState> ahead_layers; // the shadow states, by layer (front ranks)
+    [[nodiscard]] bool pipeline_requested() const {
+        const auto on = [](const char* name) {
+            const char* value = std::getenv(name);
+            return value != nullptr && value[0] == '1';
+        };
+        const bool split = std::any_of(segments.begin(), segments.end(), [&](const Segment& s) {
+            return s.rank != model.head_rank();
+        });
+        return on("NINFER_QWEN4_PIPELINE_WINDOWS") && on("NINFER_QWEN4_RANK_THREADS") && split &&
+               verify_width > 0 && options.sequences == 1 && options.cuda_graphs &&
+               model.options().experts == ExpertResidency::Device;
     }
 
     // What a speculative round needs beyond the sequences' state: on every rank the replay records
@@ -1473,43 +1573,60 @@ struct Executor::Impl {
         for (std::size_t i = 0; i < layers.size(); ++i) {
             if (layers[i].qsa) { qsa_local[i] = attention[layers[i].rank]++; }
         }
+        const std::size_t sets = pipeline ? 2 : 1;
         for (RankState& rank : ranks) {
             RankBinding bind(device, rank.rank);
             std::uint64_t bytes = 0;
-            if (rank.gdn) {
-                const auto& pool = rank.gdn->spec();
-                const GdnReplayRecordSpec spec{
-                    .layers          = static_cast<std::int32_t>(pool.layers),
-                    .record_capacity = static_cast<std::int32_t>(options.sequences),
-                    .width           = static_cast<std::int32_t>(verify_width),
-                    .conv_channels   = pool.conv_channels,
-                    .qk_heads        = static_cast<std::int32_t>(config.linear_num_key_heads),
-                    .value_heads     = pool.value_heads,
-                    .key_dim         = pool.key_head_dim,
-                    .value_dim       = pool.value_head_dim,
-                };
-                LayoutBuilder builder;
-                const auto layout   = plan_gdn_replay_records(builder, spec);
-                rank.record_backing = DeviceBuffer(builder.finish(256, "GDN replay records"));
-                rank.records.emplace(DeviceSpan{rank.record_backing.p, rank.record_backing.bytes},
-                                     layout);
-                rank.fold.emplace(*rank.records, rank.gdn->all_layers_view());
-                rank.conv_scratch = DeviceBuffer(std::uint64_t(pool.conv_channels) *
-                                                 (config.linear_conv_kernel_dim - 1) * 2);
-                bytes += rank.record_backing.bytes + rank.conv_scratch.bytes;
-            }
-            if (attention[rank.rank] > 0) {
-                rank.index_records = DeviceBuffer(attention[rank.rank] * index_rows * columns * 2);
-                rank.tail_scratch  = DeviceBuffer(std::uint64_t(config.indexer_head_dim) *
-                                                  (config.indexer_compress_ratio - 1) * 4);
-                bytes += rank.index_records.bytes + rank.tail_scratch.bytes;
-            }
             const bool ple_here =
                 std::any_of(layers.begin(), layers.end(),
                             [&](const LayerPlan& p) { return p.ple && p.rank == rank.rank; });
-            if (ple_here) {
-                rank.ple_records = DeviceBuffer(stack_width * columns * 4);
-                bytes += rank.ple_records.bytes;
+            for (std::size_t set = 0; set < sets; ++set) {
+                if (rank.gdn) {
+                    const auto& pool = rank.gdn->spec();
+                    const GdnReplayRecordSpec spec{
+                        .layers          = static_cast<std::int32_t>(pool.layers),
+                        .record_capacity = static_cast<std::int32_t>(options.sequences),
+                        .width           = static_cast<std::int32_t>(verify_width),
+                        .conv_channels   = pool.conv_channels,
+                        .qk_heads        = static_cast<std::int32_t>(config.linear_num_key_heads),
+                        .value_heads     = pool.value_heads,
+                        .key_dim         = pool.key_head_dim,
+                        .value_dim       = pool.value_head_dim,
+                    };
+                    LayoutBuilder builder;
+                    const auto layout = plan_gdn_replay_records(builder, spec);
+                    rank.record_backing[set] =
+                        DeviceBuffer(builder.finish(256, "GDN replay records"));
+                    rank.records[set].emplace(DeviceSpan{rank.record_backing[set].p,
+                                                         rank.record_backing[set].bytes},
+                                              layout);
+                    rank.fold[set].emplace(*rank.records[set], rank.gdn->all_layers_view());
+                    bytes += rank.record_backing[set].bytes;
+                }
+                if (attention[rank.rank] > 0) {
+                    rank.index_records[set] =
+                        DeviceBuffer(attention[rank.rank] * index_rows * columns * 2);
+                    bytes += rank.index_records[set].bytes;
+                }
+                if (ple_here) {
+                    rank.ple_records[set] = DeviceBuffer(stack_width * columns * 4);
+                    bytes += rank.ple_records[set].bytes;
+                }
+                if (pipeline) {
+                    rank.window_positions[set] = DeviceBuffer(columns * 4);
+                    bytes += rank.window_positions[set].bytes;
+                }
+            }
+            if (rank.gdn) {
+                const auto& pool  = rank.gdn->spec();
+                rank.conv_scratch = DeviceBuffer(std::uint64_t(pool.conv_channels) *
+                                                 (config.linear_conv_kernel_dim - 1) * 2);
+                bytes += rank.conv_scratch.bytes;
+            }
+            if (attention[rank.rank] > 0) {
+                rank.tail_scratch = DeviceBuffer(std::uint64_t(config.indexer_head_dim) *
+                                                 (config.indexer_compress_ratio - 1) * 4);
+                bytes += rank.tail_scratch.bytes;
             }
             memory.ranks[rank.rank].workspace_bytes += bytes;
         }
@@ -1523,7 +1640,8 @@ struct Executor::Impl {
         if (options.draft_min_p > 0) {
             mtp_logprobs = DeviceBuffer(std::uint64_t(options.draft_tokens) * options.sequences * 4);
         }
-        if (table && options.ngram_read.residency != NgramResidency::Ram) {
+        // Pipeline windows read a verification's rows on the host thread as they stage it.
+        if (table && options.ngram_read.residency != NgramResidency::Ram && !pipeline) {
             draft_prefetch = std::make_unique<NgramDraftPrefetch>(
                 device.rank(head), *table, ngram, config.eos_token_id, config.vocab_size,
                 options.sequences, options.draft_tokens);
@@ -1537,6 +1655,62 @@ struct Executor::Impl {
         }
         memory.ranks[head].workspace_bytes += mtp_ids.bytes + mtp_positions.bytes + mtp_logprobs.bytes + ngram_prefetch_tokens.bytes +
                                               sequences.size() * sequences.front().mtp.tail.bytes;
+        mirror_embedding_for_head();
+    }
+
+    // A split model's MTP cells take their token embeddings from rank 0's table; without peer
+    // access each draft step's lookup is a round trip head -> rank 0 -> head that the host waits
+    // on twice. The head instead reads the rows from a mapped copy of the table's payload in pinned
+    // host memory (the same bytes through the same lookup, a row of the bus per cell), which also
+    // keeps the draft chain on one device, where it can be captured.
+    std::unique_ptr<PinnedHostBuffer> head_embedding_host;
+    Weight head_embedding; // payload == nullptr: look the rows up on rank 0
+    void mirror_embedding_for_head() {
+        const std::size_t head = model.head_rank();
+        const Weight& table    = embedding_table;
+        if (head == 0 || table.payload == nullptr || table.payload_bytes == 0) { return; }
+        if (const char* value = std::getenv("NINFER_QWEN4_HEAD_EMBEDDING"); value && value[0] == '0') {
+            return;
+        }
+        const auto* begin = static_cast<const std::byte*>(table.payload);
+        const auto* end   = begin + table.payload_bytes;
+        const auto inside = [&](const void* p) {
+            return p == nullptr || (static_cast<const std::byte*>(p) >= begin &&
+                                    static_cast<const std::byte*>(p) < end);
+        };
+        if (!inside(table.qdata) || !inside(table.qhigh) || !inside(table.scales) ||
+            !inside(table.weight_divisors) || !inside(table.input_columns)) {
+            return;
+        }
+        auto host = std::make_unique<PinnedHostBuffer>(table.payload_bytes);
+        {
+            RankBinding bind(device, 0);
+            CUDA_CHECK(cudaMemcpy(host->data(), table.payload, table.payload_bytes,
+                                  cudaMemcpyDeviceToHost));
+        }
+        void* mapped = nullptr;
+        {
+            RankBinding bind(device, head);
+            if (cudaHostGetDevicePointer(&mapped, host->data(), 0) != cudaSuccess) {
+                (void)cudaGetLastError();
+                return;
+            }
+        }
+        const auto rebase = [&](const void* p) -> const void* {
+            if (p == nullptr) { return nullptr; }
+            return static_cast<const std::byte*>(mapped) + (static_cast<const std::byte*>(p) - begin);
+        };
+        head_embedding               = table;
+        head_embedding.payload       = mapped;
+        head_embedding.qdata         = rebase(table.qdata);
+        head_embedding.qhigh         = rebase(table.qhigh);
+        head_embedding.scales        = rebase(table.scales);
+        head_embedding.weight_divisors = rebase(table.weight_divisors);
+        head_embedding.input_columns =
+            static_cast<const std::int32_t*>(rebase(table.input_columns));
+        head_embedding_host = std::move(host);
+        std::fprintf(stderr, "qwen4_exp: MTP embeddings read from a %.1f MiB host copy of the table\n",
+                     double(table.payload_bytes) / (1024.0 * 1024.0));
     }
 
     // The layers whose experts the route records, the expert cache and the expert stream serve:
@@ -2009,6 +2183,8 @@ struct Executor::Impl {
     }
 
     void reset(std::uint32_t s) {
+        reset_pipeline();
+        drain();
         auto& sequence    = sequences.at(s);
         if (std::find(verified.begin(), verified.end(), &sequence) != verified.end()) { verified.clear(); }
         sequence.position = 0;
@@ -2053,6 +2229,526 @@ struct Executor::Impl {
         }
         if (mtp) { forget(sequence.mtp, model.head_rank()); }
     }
+
+    // A stage boundary's host bounce buffers (rank threads): the source's thread copies its stack
+    // into one on its stream, the target's thread uploads it on its own, each copy ordered by
+    // events. A buffer is written again only once the target has read it.
+    struct CrossRing {
+        std::vector<std::unique_ptr<PinnedHostBuffer>> buffers;
+        std::vector<cudaEvent_t> written; // on the source's stream
+        std::vector<cudaEvent_t> read;    // on the target's stream
+    };
+    std::vector<CrossRing> crossings; // by target rank
+    static constexpr std::size_t kCrossRing = 2;
+
+    // ---- Rank threads (NINFER_QWEN4_RANK_THREADS=1) ----
+    //
+    // Between devices without peer access, a stream waiting on another device's event or a staged
+    // peer copy blocks the calling host thread until the other device gets there (Windows/WDDM).
+    // One host thread queuing every rank's work therefore walks a pass through the pipeline at
+    // device speed, and the next pass starts only once the last rank has it: the stages take
+    // turns. With rank threads the main thread prepares a pass's inputs and posts it; each rank's
+    // thread uploads them, waits on the host for its stack from the rank before (the only thread
+    // that blocks), runs its segments and hands the stack on through pinned host memory. Prompt
+    // chunks then fill every stage. The head rank's thread runs the MTP catch-up, whose cells take
+    // the pass's embeddings from host memory (rank 0 copied them there) instead of a round trip to
+    // rank 0, which would order rank 0's next chunk after the head's work.
+    //
+    // Prompt chunks and plain decode passes of device-resident experts without media take this
+    // route; anything else, and every call that reads results or state, first waits until the
+    // threads have queued all posted passes (drain()).
+    struct RankTask {
+        std::uint64_t id    = 0;
+        std::size_t slot    = 0; // staging ring entry
+        std::int32_t t      = 0; // 0: no pass, only `work`
+        std::uint32_t logit_rows = 0;
+        std::size_t row_bytes    = 0;
+        std::vector<Part> parts;
+        SequenceState* graph_sequence = nullptr; // replay its decode graphs
+        bool catch_up = false;                   // run the MTP catch-up on the head rank
+        std::vector<Committed> committed;        // its tokens point into `tokens`
+        std::vector<std::int32_t> tokens;
+        Executor::AfterHead after_head;          // on the head rank's thread, after the head
+        // Pipeline windows: the pass's kind, the segments it runs, per-segment graphs to replay,
+        // whether its stack crosses to the head rank through the guessed window's buffer (a
+        // guessed window) or the head rank's segments take it from there (its verification), and
+        // work each rank's thread does first (a commit, the shadow states, the guess chain).
+        PassMode mode;
+        std::size_t first_segment = 0, end_segment = ~std::size_t{0};
+        std::vector<DecodeGraphExecutable>* graphs = nullptr;
+        bool to_ahead = false, from_ahead = false;
+        std::uint64_t ahead_number = 0;
+        std::function<void(std::size_t)> work;
+    };
+    struct RankWorker {
+        std::thread thread;
+        std::deque<std::shared_ptr<const RankTask>> queue;
+    };
+    bool rank_threads = false;
+    std::vector<RankWorker> workers;
+    std::mutex worker_mutex;
+    std::condition_variable worker_cv;
+    std::vector<std::uint64_t> done_upto; // by rank, task ids
+    // Stage boundaries, by target rank: stacks sent and received so far. Both ends count the
+    // passes that cross the boundary in the same order, so a pass's crossing number picks its
+    // buffer without the ids of passes that do not cross there.
+    std::vector<std::uint64_t> cross_sent, cross_received;
+    std::vector<std::uint64_t> send_count, receive_count; // each touched by one thread only
+    std::vector<std::uint64_t> slot_owner;                // the pass task that last staged a slot
+    std::uint64_t staged_passes = 0;
+    std::uint64_t posted          = 0;
+    bool workers_stop             = false;
+    std::exception_ptr worker_error;
+    std::vector<std::unique_ptr<PinnedHostBuffer>> embedded_host; // rank 0's, by staging entry
+    DeviceBuffer embed_scratch; // rank 0: graph passes' embeddings for the MTP catch-up
+
+    void start_rank_threads() {
+        const char* value = std::getenv("NINFER_QWEN4_RANK_THREADS");
+        if (value == nullptr || value[0] != '1' || ranks.size() < 2) { return; }
+        if (model.options().experts != ExpertResidency::Device || hybrid || misses || stream) {
+            return;
+        }
+        // Without CUDA Graphs the threads' eager decode steps hit an illegal address during the
+        // warm-up (Windows, 4 stages, unresolved), so that mode keeps the host-ordered passes.
+        if (!options.cuda_graphs) { return; }
+        rank_threads = true;
+        const std::size_t ring = ranks.front().staging.size();
+        const std::size_t capacity =
+            std::size_t(config.hc_count) * config.hidden_size * options.prefill_chunk * 4;
+        crossings.resize(ranks.size());
+        for (std::size_t to = 1; to < ranks.size(); ++to) {
+            CrossRing& cross = crossings[to];
+            for (std::size_t i = 0; i < kCrossRing; ++i) {
+                cross.buffers.push_back(std::make_unique<PinnedHostBuffer>(capacity));
+                cudaEvent_t written = nullptr, read = nullptr;
+                {
+                    RankBinding bind(device, to - 1);
+                    CUDA_CHECK(cudaEventCreateWithFlags(&written, cudaEventDisableTiming));
+                }
+                {
+                    RankBinding bind(device, to);
+                    CUDA_CHECK(cudaEventCreateWithFlags(&read, cudaEventDisableTiming));
+                }
+                cross.written.push_back(written);
+                cross.read.push_back(read);
+            }
+        }
+        for (std::size_t s = 0; s < ring; ++s) {
+            embedded_host.push_back(std::make_unique<PinnedHostBuffer>(
+                std::size_t(config.hidden_size) * options.prefill_chunk * 2));
+        }
+        if (mtp && options.cuda_graphs) {
+            RankBinding bind(device, 0);
+            embed_scratch = DeviceBuffer(std::size_t(config.hidden_size) * kVectorTokens * 2);
+        }
+        done_upto.assign(ranks.size(), 0);
+        cross_sent.assign(ranks.size(), 0);
+        cross_received.assign(ranks.size(), 0);
+        send_count.assign(ranks.size(), 0);
+        receive_count.assign(ranks.size(), 0);
+        slot_owner.assign(ring, 0);
+        if (pipeline) { start_pipeline(); }
+        workers = std::vector<RankWorker>(ranks.size());
+        for (std::size_t r = 0; r < ranks.size(); ++r) {
+            workers[r].thread = std::thread([this, r] { worker_loop(r); });
+        }
+    }
+
+    void stop_rank_threads() noexcept {
+        if (!rank_threads) { return; }
+        {
+            std::lock_guard lock(worker_mutex);
+            workers_stop = true;
+        }
+        worker_cv.notify_all();
+        for (RankWorker& worker : workers) {
+            if (worker.thread.joinable()) { worker.thread.join(); }
+        }
+    }
+
+    // Waits until `counter[rank]` reaches `value`; a failed thread ends every wait with its error.
+    void wait_for(const std::vector<std::uint64_t>& counter, std::size_t rank, std::uint64_t value) {
+        std::unique_lock lock(worker_mutex);
+        worker_cv.wait(lock, [&] { return counter[rank] >= value || worker_error != nullptr; });
+        if (worker_error) { std::rethrow_exception(worker_error); }
+    }
+
+    // Waits until the rank threads have queued every posted pass on their devices.
+    void drain() {
+        if (!rank_threads) { return; }
+        for (std::size_t r = 0; r < ranks.size(); ++r) { wait_for(done_upto, r, posted); }
+    }
+    // The same for the head rank's thread alone: with pipeline windows the front ranks may still
+    // be queuing a guessed window while the host reads the verdict or drafts on the head rank.
+    void drain_head() {
+        if (!rank_threads) { return; }
+        if (!pipeline) {
+            drain();
+            return;
+        }
+        wait_for(done_upto, model.head_rank(), posted);
+    }
+    void drain_quietly() noexcept {
+        try {
+            drain();
+        } catch (...) {}
+    }
+    void drain_head_quietly() noexcept {
+        try {
+            drain_head();
+        } catch (...) {}
+    }
+
+    void worker_loop(std::size_t r) {
+        for (;;) {
+            std::shared_ptr<const RankTask> task;
+            {
+                std::unique_lock lock(worker_mutex);
+                worker_cv.wait(lock, [&] { return workers_stop || !workers[r].queue.empty(); });
+                if (workers[r].queue.empty()) { return; }
+                task = workers[r].queue.front();
+                workers[r].queue.pop_front();
+            }
+            try {
+                bool failed = false;
+                {
+                    std::lock_guard lock(worker_mutex);
+                    failed = worker_error != nullptr;
+                }
+                if (!failed) { run_rank_task(r, *task); }
+            } catch (...) {
+                std::lock_guard lock(worker_mutex);
+                if (!worker_error) { worker_error = std::current_exception(); }
+            }
+            {
+                std::lock_guard lock(worker_mutex);
+                done_upto[r] = task->id;
+            }
+            worker_cv.notify_all();
+        }
+    }
+
+    [[nodiscard]] std::size_t stack_bytes(std::int32_t t) const {
+        return std::size_t(config.hc_count) * config.hidden_size * std::size_t(t) * 4;
+    }
+
+    // The source half of a stage boundary, on the source's thread: the stack goes to the
+    // boundary's host buffer for this task once the target has read what it held before.
+    void send_stack(std::size_t from, std::size_t to, const RankTask& task) {
+        CrossRing& ring       = crossings[to];
+        const std::uint64_t n = ++send_count[to];
+        const std::size_t s   = n % kCrossRing;
+        if (n > kCrossRing) {
+            wait_for(cross_received, to, n - kCrossRing);
+            CUDA_CHECK(cudaEventSynchronize(ring.read[s]));
+        }
+        RankState& source = ranks[from];
+        CUDA_CHECK(cudaMemcpyAsync(ring.buffers[s]->data(), source.stack, stack_bytes(task.t),
+                                   cudaMemcpyDeviceToHost, source.stream));
+        CUDA_CHECK(cudaEventRecord(ring.written[s], source.stream));
+        {
+            std::lock_guard lock(worker_mutex);
+            cross_sent[to] = n;
+        }
+        worker_cv.notify_all();
+    }
+
+    // The target half, on the target's thread: waits on the host for the source's copy, then
+    // uploads the stack on its own stream.
+    void receive_stack(std::size_t to, const RankTask& task) {
+        CrossRing& ring       = crossings[to];
+        const std::uint64_t n = ++receive_count[to];
+        const std::size_t s   = n % kCrossRing;
+        wait_for(cross_sent, to, n);
+        CUDA_CHECK(cudaEventSynchronize(ring.written[s]));
+        RankState& target = ranks[to];
+        CUDA_CHECK(cudaMemcpyAsync(target.stack, ring.buffers[s]->data(), stack_bytes(task.t),
+                                   cudaMemcpyHostToDevice, target.stream));
+        CUDA_CHECK(cudaEventRecord(ring.read[s], target.stream));
+        {
+            std::lock_guard lock(worker_mutex);
+            cross_received[to] = n;
+        }
+        worker_cv.notify_all();
+    }
+
+    // The guessed window's crossing to the head rank (pipeline windows): one buffer, written by
+    // the last front rank once the head rank has read, or the host has dropped, the guess before;
+    // read by the head rank only when the guess holds.
+    std::unique_ptr<PinnedHostBuffer> ahead_buffer;
+    cudaEvent_t ahead_written = nullptr, ahead_read = nullptr;
+    std::uint64_t ahead_sent = 0, ahead_resolved = 0; // guessed windows (worker_mutex)
+    std::uint64_t ahead_count = 0;                    // the host's count of guessed windows
+
+    void send_ahead(std::size_t from, const RankTask& task, std::uint64_t number) {
+        {
+            std::unique_lock lock(worker_mutex);
+            worker_cv.wait(lock, [&] { return ahead_resolved + 1 >= number || worker_error; });
+            if (worker_error) { std::rethrow_exception(worker_error); }
+        }
+        RankState& source = ranks[from];
+        CUDA_CHECK(cudaMemcpyAsync(ahead_buffer->data(), source.stack, stack_bytes(task.t),
+                                   cudaMemcpyDeviceToHost, source.stream));
+        CUDA_CHECK(cudaEventRecord(ahead_written, source.stream));
+        {
+            std::lock_guard lock(worker_mutex);
+            ahead_sent = number;
+        }
+        worker_cv.notify_all();
+    }
+
+    void receive_ahead(std::size_t to, const RankTask& task, std::uint64_t number) {
+        {
+            std::unique_lock lock(worker_mutex);
+            worker_cv.wait(lock, [&] { return ahead_sent >= number || worker_error; });
+            if (worker_error) { std::rethrow_exception(worker_error); }
+        }
+        CUDA_CHECK(cudaEventSynchronize(ahead_written));
+        RankState& target = ranks[to];
+        CUDA_CHECK(cudaMemcpyAsync(target.stack, ahead_buffer->data(), stack_bytes(task.t),
+                                   cudaMemcpyHostToDevice, target.stream));
+        // The host waits for this upload before the next guess overwrites the buffer.
+        CUDA_CHECK(cudaEventRecord(ahead_read, target.stream));
+        CUDA_CHECK(cudaEventSynchronize(ahead_read));
+        {
+            std::lock_guard lock(worker_mutex);
+            ahead_resolved = std::max(ahead_resolved, number);
+        }
+        worker_cv.notify_all();
+    }
+
+    void run_rank_task(std::size_t r, const RankTask& task) {
+        RankBinding bind(device, r);
+        RankState& rank = ranks[r];
+        pass_mode       = task.mode;
+        struct ModeReset {
+            ~ModeReset() { pass_mode = {}; }
+        } mode_reset;
+        if (task.work) { task.work(r); }
+        if (task.t == 0) { return; }
+        const std::size_t end = std::min(task.end_segment, segments.size());
+        bool runs             = false;
+        for (std::size_t i = task.first_segment; i < end; ++i) { runs = runs || segments[i].rank == r; }
+        if (!runs) { return; }
+        const std::size_t c = options.prefill_chunk;
+        auto* base          = static_cast<std::byte*>(rank.staging[task.slot]->data());
+        const std::size_t bytes = std::size_t(task.t) * 4;
+        CUDA_CHECK(cudaMemcpyAsync(rank.ids, base, bytes, cudaMemcpyHostToDevice, rank.stream));
+        CUDA_CHECK(cudaMemcpyAsync(rank.positions, base + 4 * c, bytes, cudaMemcpyHostToDevice,
+                                   rank.stream));
+        CUDA_CHECK(cudaMemcpyAsync(rank.rope, base + 8 * c, bytes, cudaMemcpyHostToDevice,
+                                   rank.stream));
+        if (task.mode.verify && pipeline) {
+            // The window's positions for its commit, which later passes' staging overwrites.
+            CUDA_CHECK(cudaMemcpyAsync(rank.window_positions[task.mode.set].p, rank.positions, bytes,
+                                       cudaMemcpyDeviceToDevice, rank.stream));
+        }
+        for (std::size_t i = task.first_segment; i < end; ++i) {
+            const Segment& segment = segments[i];
+            if (segment.rank != r) { continue; }
+            if (i > 0 && segments[i - 1].rank != r) {
+                if (task.from_ahead && i == task.first_segment) {
+                    receive_ahead(r, task, task.ahead_number);
+                } else {
+                    receive_stack(r, task);
+                }
+            }
+            if (segment.rows && table) {
+                CUDA_CHECK(cudaMemcpyAsync(rank.rows, staged_rows(rank, task.slot, task.row_bytes).data(),
+                                           task.row_bytes, cudaMemcpyHostToDevice, rank.stream));
+            }
+            if (task.graphs != nullptr) {
+                (*task.graphs)[i].launch(rank.stream);
+            } else if (task.graph_sequence != nullptr) {
+                if (segment.embed && task.catch_up) {
+                    // The graph's embedding plane is rewritten by its layers; the MTP catch-up
+                    // takes the tokens' embeddings from a lookup of their own.
+                    const auto h = static_cast<std::int32_t>(config.hidden_size);
+                    Tensor rows(embed_scratch.p, DType::BF16, {h, task.t});
+                    ops::embedding(Tensor(rank.ids, DType::I32, {task.t}), embedding_table, rows,
+                                   rank.stream);
+                    CUDA_CHECK(cudaMemcpyAsync(embedded_host[task.slot]->data(), embed_scratch.p,
+                                               std::size_t(h) * task.t * 2, cudaMemcpyDeviceToHost,
+                                               rank.stream));
+                }
+                task.graph_sequence->decode[i].launch(rank.stream);
+            } else {
+                void* embedded = segment.embed && task.catch_up ? embedded_host[task.slot]->data()
+                                                                 : nullptr;
+                run_segment(task.parts, segment, task.t, task.logit_rows, embedded);
+            }
+            if (segment.head && task.catch_up) {
+                mtp_catch_up(task.committed,
+                             static_cast<const std::byte*>(embedded_host[task.slot]->data()));
+            }
+            if (segment.head && task.after_head) {
+                task.after_head(rank.stream, head_logits(std::size_t(task.logit_rows)));
+            }
+            if (i + 1 < segments.size() && segments[i + 1].rank != r) {
+                if (task.to_ahead && i + 1 == end) {
+                    send_ahead(r, task, task.ahead_number);
+                } else if (i + 1 < end) {
+                    send_stack(r, segments[i + 1].rank, task);
+                }
+            }
+        }
+        // The staging entry (and rank 0's embeddings in it) may be rewritten once this is done.
+        CUDA_CHECK(cudaEventRecord(rank.staged[task.slot], rank.stream));
+    }
+
+    // Whether a pass over `parts` can go to the rank threads.
+    [[nodiscard]] bool threadable(std::span<const Part> parts, std::int32_t t) const {
+        if (!rank_threads || verifying) { return false; }
+        for (const Part& part : parts) {
+            if (!part.sequence->media_rope.empty() &&
+                part.sequence->position < part.sequence->media_rope.size() / 3) {
+                return false;
+            }
+        }
+        (void)t;
+        return true;
+    }
+
+    // Prepares a pass's inputs on the host and posts it to the rank threads; the sequences'
+    // positions advance at once (the threads read positions from the staged planes).
+    void threaded_pass(std::span<const Part> parts, std::span<const std::int32_t> tokens,
+                       std::uint32_t logit_rows, Executor::AfterHead after_head = {}) {
+        const auto t = static_cast<std::int32_t>(tokens.size());
+        for (const Part& part : parts) {
+            if (part.sequence->position + std::uint32_t(part.count) > options.max_context) {
+                throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
+            }
+        }
+        std::vector<NgramContext*> contexts;
+        for (const Part& part : parts) { contexts.push_back(&part.sequence->context); }
+        auto task        = stage_task(parts, tokens, logit_rows, contexts, 0, segments.size());
+        task->after_head = std::move(after_head);
+        // Decode graphs: the first single-token pass runs eagerly, the second captures them (with
+        // the threads drained, since a capture forbids other threads' launches).
+        SequenceState& first = *parts.front().sequence;
+        if (options.cuda_graphs && t == 1 && parts.size() == 1) {
+            if (first.decode.empty() && first.decode_steps++ > 0) {
+                drain();
+                capture_decode(first);
+            }
+            if (!first.decode.empty()) { task->graph_sequence = &first; }
+        }
+        if (mtp) {
+            task->catch_up = true;
+            task->tokens.assign(tokens.begin(), tokens.end());
+            for (const Part& part : parts) {
+                task->committed.push_back(
+                    {part.sequence, part.column, part.count, part.sequence->position,
+                     std::span<const std::int32_t>(task->tokens)
+                         .subspan(std::size_t(part.column), std::size_t(part.count))});
+            }
+        }
+        post(task);
+        for (const Part& part : parts) {
+            part.sequence->position += static_cast<std::uint32_t>(part.count);
+        }
+    }
+
+    // A task id for the next post.
+    std::shared_ptr<RankTask> new_task() {
+        auto task = std::make_shared<RankTask>();
+        task->id  = posted + 1;
+        return task;
+    }
+
+    void post(const std::shared_ptr<RankTask>& task) {
+        {
+            std::lock_guard lock(worker_mutex);
+            if (worker_error) { std::rethrow_exception(worker_error); }
+            if (task->id != posted + 1) { throw std::logic_error("qwen4_exp: rank tasks out of order"); }
+            for (RankWorker& worker : workers) { worker.queue.push_back(task); }
+            posted = task->id;
+        }
+        worker_cv.notify_all();
+    }
+
+    // The host half of a pass to the rank threads: a staging entry (once every rank has queued the
+    // pass that staged it last) with the tokens, their positions from each part's sequence position
+    // plus `offset`, their RoPE positions and, when a segment in [first, end) reads them, their
+    // n-gram rows, hashed from `contexts` (one per part, advanced over the part's tokens) and read
+    // on this thread.
+    std::shared_ptr<RankTask> stage_task(std::span<const Part> parts,
+                                         std::span<const std::int32_t> tokens,
+                                         std::uint32_t logit_rows,
+                                         std::span<NgramContext* const> contexts,
+                                         std::uint32_t offset, std::size_t end,
+                                         std::size_t first_segment = 0) {
+        const std::size_t ring = ranks.front().staging.size();
+        auto task              = new_task();
+        const std::size_t slot = ++staged_passes % ring;
+        if (slot_owner[slot] != 0) {
+            for (std::size_t r = 0; r < ranks.size(); ++r) { wait_for(done_upto, r, slot_owner[slot]); }
+            for (auto& rank : ranks) { CUDA_CHECK(cudaEventSynchronize(rank.staged[slot])); }
+        }
+        slot_owner[slot]    = task->id;
+        task->slot          = slot;
+        task->t             = static_cast<std::int32_t>(tokens.size());
+        task->logit_rows    = logit_rows;
+        task->first_segment = first_segment;
+        task->end_segment   = end;
+        task->parts.assign(parts.begin(), parts.end());
+        std::vector<std::int32_t> positions(tokens.size()), rope(tokens.size());
+        const std::size_t heads = config.ngram_heads();
+        bool rows_read          = false;
+        for (std::size_t i = first_segment; i < end; ++i) { rows_read = rows_read || segments[i].rows; }
+        rows_read         = rows_read && table;
+        std::size_t row_b = 0;
+        if (rows_read) {
+            row_ids.resize(tokens.size() * heads);
+            row_b = ops::ngram_row_bytes(options.ngram->format);
+        }
+        for (std::size_t k = 0; k < parts.size(); ++k) {
+            const Part& part              = parts[k];
+            const SequenceState& sequence = *part.sequence;
+            const auto start = static_cast<std::int32_t>(sequence.position + offset);
+            const auto at    = positions.begin() + part.column;
+            std::iota(at, at + part.count, start);
+            for (std::int32_t i = 0; i < part.count; ++i) {
+                rope[std::size_t(part.column + i)] = start + i + sequence.rope_delta;
+            }
+            const auto own = tokens.subspan(std::size_t(part.column), std::size_t(part.count));
+            if (rows_read) {
+                ngram_row_ids(ngram, own, config.eos_token_id, config.vocab_size, *contexts[k],
+                              std::span(row_ids).subspan(std::size_t(part.column) * heads,
+                                                         std::size_t(part.count) * heads));
+            } else if (table) {
+                std::vector<std::uint64_t> scratch(own.size() * heads);
+                ngram_row_ids(ngram, own, config.eos_token_id, config.vocab_size, *contexts[k],
+                              scratch);
+            }
+        }
+        const std::size_t c = options.prefill_chunk;
+        if (rows_read) {
+            task->row_bytes = row_ids.size() * row_b;
+            // Read on this thread: the threads only upload the rows.
+            table->submit(row_ids, staged_rows(ranks[rows_rank], slot, task->row_bytes));
+            table->wait();
+            const auto rows = staged_rows(ranks[rows_rank], slot, task->row_bytes);
+            for (auto& rank : ranks) {
+                if (&rank == &ranks[rows_rank]) { continue; }
+                const bool consumes = std::any_of(segments.begin(), segments.end(), [&](const Segment& s) {
+                    return s.rows && s.rank == rank.rank;
+                });
+                if (consumes) {
+                    std::memcpy(staged_rows(rank, slot, task->row_bytes).data(), rows.data(),
+                                task->row_bytes);
+                }
+            }
+        }
+        for (auto& rank : ranks) {
+            auto* base = static_cast<std::byte*>(rank.staging[slot]->data());
+            std::memcpy(base, tokens.data(), tokens.size() * 4);
+            std::memcpy(base + 4 * c, positions.data(), positions.size() * 4);
+            std::memcpy(base + 8 * c, rope.data(), rope.size() * 4);
+        }
+        return task;
+    }
+
 
     // Moves the stack's first `tokens` columns from one rank to another, ordered after the
     // source's work. The source's next pass (the next prompt chunk, queued before the target gets
@@ -2168,11 +2864,13 @@ struct Executor::Impl {
                 table->wait();
             } catch (...) {}
         }
+        staging_slot = (staging_slot + 1) % ranks.front().staging.size();
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
-            // The staging buffer is rewritten only once the previous upload has left it.
-            CUDA_CHECK(cudaEventSynchronize(rank.staged));
-            auto* base = static_cast<std::byte*>(rank.staging->data());
+            // The staging buffer is rewritten only once its last upload, ring-size passes ago, has
+            // left it.
+            CUDA_CHECK(cudaEventSynchronize(rank.staged[staging_slot]));
+            auto* base = static_cast<std::byte*>(rank.staging[staging_slot]->data());
             const auto upload = [&](void* target, std::size_t at,
                                     const std::vector<std::int32_t>& values) {
                 std::memcpy(base + at, values.data(), values.size() * 4);
@@ -2195,13 +2893,16 @@ struct Executor::Impl {
             const bool ple_here =
                 std::any_of(layers.begin(), layers.end(),
                             [&](const LayerPlan& p) { return p.ple && p.rank == rank.rank; });
-            if (!ple_here || !read_rows) { CUDA_CHECK(cudaEventRecord(rank.staged, rank.stream)); }
+            if (!ple_here || !read_rows) { CUDA_CHECK(cudaEventRecord(rank.staged[staging_slot], rank.stream)); }
         }
     }
 
     // The n-gram rows' place in a rank's staging buffer.
     std::span<std::uint8_t> staged_rows(RankState& rank, std::size_t bytes) const {
-        auto* base = static_cast<std::byte*>(rank.staging->data());
+        return staged_rows(rank, staging_slot, bytes);
+    }
+    std::span<std::uint8_t> staged_rows(RankState& rank, std::size_t slot, std::size_t bytes) const {
+        auto* base = static_cast<std::byte*>(rank.staging[slot]->data());
         return {reinterpret_cast<std::uint8_t*>(
                     base + round_up(28 * std::uint64_t(options.prefill_chunk))),
                 bytes};
@@ -2222,7 +2923,7 @@ struct Executor::Impl {
         }
         CUDA_CHECK(
             cudaMemcpyAsync(rank.rows, rows.data(), bytes, cudaMemcpyHostToDevice, rank.stream));
-        CUDA_CHECK(cudaEventRecord(rank.staged, rank.stream));
+        CUDA_CHECK(cudaEventRecord(rank.staged[staging_slot], rank.stream));
     }
 
     // Waits for the rows being read, unless already waited for, between a pair of stall events on
@@ -2280,8 +2981,8 @@ struct Executor::Impl {
     }
 
     // A verification's record row of the part: its position among the verified sequences.
-    [[nodiscard]] std::int32_t record_row(const Part& part) const {
-        return part.column / static_cast<std::int32_t>(active_verify_width);
+    [[nodiscard]] static std::int32_t record_row(const Part& part) {
+        return part.column / static_cast<std::int32_t>(pass_mode.width);
     }
 
     void run_gdn(const LayerPlan& plan, std::size_t index, LayerState& state, RankState& rank,
@@ -2302,14 +3003,18 @@ struct Executor::Impl {
         // A verification records its raw projection, the transitions and the gates for the fold
         // that commits a prefix, and leaves the sequence's states as they were.
         std::optional<GdnReplayRecordLayer> record;
-        if (verifying) {
+        if (pass_mode.verify) {
             const auto row = record_row(part);
-            const auto all = rank.records->layer(static_cast<std::int32_t>(gdn_local[index]),
-                                                 static_cast<std::int32_t>(verified.size()),
-                                                 static_cast<std::int32_t>(active_verify_width));
+            const auto all = rank.records[pass_mode.set]->layer(
+                static_cast<std::int32_t>(gdn_local[index]), pass_mode.rows,
+                static_cast<std::int32_t>(pass_mode.width));
             record = GdnReplayRecordLayer{all.conv.slice(2, row, 1), all.key.slice(3, row, 1),
                                           all.value.slice(3, row, 1), all.gate.slice(3, row, 1)};
         }
+        // A guessed window reads the shadow slot.
+        const LayerState& source = pass_mode.ahead ? ahead_layers[index] : state;
+        const std::uint32_t source_slot =
+            pass_mode.ahead ? options.sequences : part.sequence->slot;
         Tensor qkv = record ? Tensor(record->conv.data, DType::BF16, {g.qkv.rows, t})
                             : Tensor(rank.a, DType::BF16, {g.qkv.rows, t});
         Tensor z(rank.b, DType::BF16, {vd, t});
@@ -2326,7 +3031,7 @@ struct Executor::Impl {
         Tensor k(conv_out + round_up(std::uint64_t(kd) * t * 2), DType::BF16, {kd, t});
         Tensor v(rank.e, DType::BF16, {vd, t});
         const auto window = static_cast<std::int32_t>(config.linear_conv_kernel_dim - 1);
-        Tensor conv_state(state.conv.data, DType::BF16, {g.qkv.rows, window});
+        Tensor conv_state(source.conv.data, DType::BF16, {g.qkv.rows, window});
         Tensor conv_next =
             record ? Tensor(rank.conv_scratch.p, DType::BF16, {g.qkv.rows, window}) : conv_state;
         ops::causal_conv1d_silu_split(qkv, g.convolution, conv_state, conv_next, q, k, v, s);
@@ -2340,7 +3045,7 @@ struct Executor::Impl {
         const float scale = 1.0F / std::sqrt(float(dh));
         if (record) {
             const Tensor states = rank.gdn->layer_view(gdn_local[index]).recurrent;
-            const Tensor slot(static_cast<std::int32_t*>(rank.slot_ids.p) + part.sequence->slot,
+            const Tensor slot(static_cast<std::int32_t*>(rank.slot_ids.p) + source_slot,
                               DType::I32, {1});
             Tensor o4 = o.view({dh, nv, t, 1});
             ops::gated_delta_net_replay_record(q3.view({dh, nk, t, 1}), k3.view({dh, nk, t, 1}),
@@ -2381,13 +3086,14 @@ struct Executor::Impl {
                            .index     = nullptr,
                            .tail      = state.tail.p,
                            .first     = part.sequence->position};
-        if (verifying) {
+        if (pass_mode.verify) {
             const std::uint64_t rows =
                 std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
             const std::uint64_t columns = std::uint64_t(verify_width) * options.sequences;
-            in.index = static_cast<std::byte*>(rank.index_records.p) +
+            in.index = static_cast<std::byte*>(rank.index_records[pass_mode.set].p) +
                        (qsa_local[index] * columns + std::uint64_t(part.column)) * rows * 2;
-            CUDA_CHECK(cudaMemcpyAsync(rank.tail_scratch.p, state.tail.p, state.tail.bytes,
+            const DeviceBuffer& tail = pass_mode.ahead ? ahead_layers[index].tail : state.tail;
+            CUDA_CHECK(cudaMemcpyAsync(rank.tail_scratch.p, tail.p, tail.bytes,
                                        cudaMemcpyDeviceToDevice, rank.stream));
             in.tail = rank.tail_scratch.p;
         }
@@ -2498,7 +3204,8 @@ struct Executor::Impl {
         project(a.output, flat, y, ws, s);
     }
 
-    void run_ple(const LayerPlan& plan, LayerState& state, RankState& rank, const Part& part) {
+    void run_ple(const LayerPlan& plan, std::size_t index, LayerState& state, RankState& rank,
+                 const Part& part) {
         const PlePlan& p     = *plan.ple;
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
@@ -2517,15 +3224,16 @@ struct Executor::Impl {
         Tensor value(rank.b, DType::BF16, {h, t});
         project(p.key, embedding, key, ws, s);
         project(p.value, embedding, value, ws, s);
-        Tensor history(state.history.p, DType::FP32,
+        const DeviceBuffer& own = pass_mode.ahead ? ahead_layers[index].history : state.history;
+        Tensor history(own.p, DType::FP32,
                        {width, static_cast<std::int32_t>((config.ple_conv_kernel_size - 1) *
                                                          config.ngram.ngram_size)});
         const ops::PleInjectWeights weights{&p.norm_key, &p.norm_query, &p.norm_conv,
                                             &p.convolution};
         auto scope = ws.scope();
-        if (verifying) {
+        if (pass_mode.verify) {
             // The history stays; commit() advances it over the kept positions' recorded input.
-            Tensor normalized(static_cast<float*>(rank.ple_records.p) +
+            Tensor normalized(static_cast<float*>(rank.ple_records[pass_mode.set].p) +
                                   std::size_t(width) * std::size_t(part.column),
                               DType::FP32, {width, t});
             ops::ple_inject_record(stack, key, value, weights, config.rms_norm_eps, history,
@@ -2645,7 +3353,7 @@ struct Executor::Impl {
         if (m.native) {
             Tensor y(rank.y, DType::FP32, {h, t});
             if (hybrid) {
-                hybrid->run(hybrid_layers[index], mixed, ids, weights, shared, m.native->banks(), t == 1 || verifying,
+                hybrid->run(hybrid_layers[index], mixed, ids, weights, shared, m.native->banks(), t == 1 || pass_mode.verify,
                             ws, y);
                 return;
             }
@@ -2727,8 +3435,10 @@ struct Executor::Impl {
 
     // Queues one segment of the pass for the parts' `t` tokens on its rank's stream; with `head`,
     // the logits of the last `logit_rows` tokens.
+    // `embedded_host` (rank threads with MTP): the pass's token embeddings are also copied there,
+    // pinned host memory the head rank reads for the MTP catch-up instead of asking rank 0 again.
     void run_segment(std::span<const Part> parts, const Segment& segment, std::int32_t t,
-                     std::uint32_t logit_rows) {
+                     std::uint32_t logit_rows, void* embedded_host = nullptr) {
         RankState& rank = ranks[segment.rank];
         const auto h    = static_cast<std::int32_t>(config.hidden_size);
         const auto hc   = static_cast<std::int32_t>(config.hc_count);
@@ -2745,6 +3455,10 @@ struct Executor::Impl {
                 const Tensor columns(rank.scatter + run.offset, DType::I32, {run.count});
                 ops::scatter(source, columns, mixed, rank.stream);
             }
+            if (embedded_host != nullptr) {
+                CUDA_CHECK(cudaMemcpyAsync(embedded_host, rank.mixed, std::size_t(h) * t * 2,
+                                           cudaMemcpyDeviceToHost, rank.stream));
+            }
             ops::hyper_connection_expand(mixed, stack, rank.stream);
         }
         // A layer's MoE output is written into the stack by the next layer's read, which takes
@@ -2758,7 +3472,7 @@ struct Executor::Impl {
                 if (pending) { ops::hyper_connection_write(stack, moe_out, inject, rank.stream); }
                 pending = false;
                 for (const Part& part : parts) {
-                    run_ple(plan, part.sequence->layers[i], rank, part);
+                    run_ple(plan, i, part.sequence->layers[i], rank, part);
                 }
             }
             {
@@ -2806,9 +3520,17 @@ struct Executor::Impl {
 
     // A graph per segment of a pass over one part of `t` tokens of `sequence` (a decode step, or a
     // verification while `verifying`).
-    std::vector<DecodeGraphExecutable> capture_segments(SequenceState& sequence, std::int32_t t) {
+    // Pipeline windows capture segments [first, end) only; the others stay empty.
+    std::vector<DecodeGraphExecutable> capture_segments(SequenceState& sequence, std::int32_t t,
+                                                        std::size_t first = 0,
+                                                        std::size_t end   = ~std::size_t{0}) {
         std::vector<DecodeGraphExecutable> graphs;
-        for (const Segment& segment : segments) {
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            const Segment& segment = segments[i];
+            if (i < first || i >= end) {
+                graphs.emplace_back();
+                continue;
+            }
             RankBinding bind(device, segment.rank);
             DecodeGraphDefinition definition;
             const Part part{.sequence = &sequence, .column = 0, .count = t};
@@ -2872,12 +3594,15 @@ struct Executor::Impl {
         if (verification && verification->segments.empty() && verification->runs++ > 0) {
             verification->segments = capture_segments(first, t);
         }
+        const bool timed_window = verifying && window_timing_enabled();
+        if (timed_window) { collect_window_timing(); }
         for (std::size_t i = 0; i < segments.size(); ++i) {
             const Segment& segment = segments[i];
             if (i > 0 && segments[i - 1].rank != segment.rank) {
                 cross(segments[i - 1].rank, segment.rank, t);
             }
             RankBinding bind(device, segment.rank);
+            if (timed_window) { record_window_event(i, 0, ranks[segment.rank].stream); }
             if (segment.rows && table) { stage_rows(ranks[segment.rank]); }
             if (graph && !first.decode.empty()) {
                 first.decode[i].launch(ranks[segment.rank].stream);
@@ -2886,7 +3611,9 @@ struct Executor::Impl {
             } else {
                 run_segment(parts, segment, t, logit_rows);
             }
+            if (timed_window) { record_window_event(i, 1, ranks[segment.rank].stream); }
         }
+        if (timed_window) { window_timing.pending = true; }
         if (hybrid) { hybrid->finish(); }
         // A verification commits its positions later (commit()).
         if (!verifying) {
@@ -2900,6 +3627,52 @@ struct Executor::Impl {
         // the misses' service, and the service's own calls for the loader. The caller's next
         // kernels therefore follow a pass that may have waited.
         if (misses && t <= kVectorTokens) { synchronize_ranks(); }
+    }
+
+    // NINFER_QWEN4_ROUND_TIMING=1: each stage's device time in a verification window (events around
+    // its segments, read at the next window), printed every 100 windows.
+    struct WindowTiming {
+        std::vector<std::array<cudaEvent_t, 2>> events; // by segment
+        std::array<double, 8> stage{};
+        std::uint64_t windows = 0;
+        bool pending          = false;
+    };
+    WindowTiming window_timing;
+    static bool window_timing_enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("NINFER_QWEN4_ROUND_TIMING");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+    void record_window_event(std::size_t segment, int end, cudaStream_t stream) {
+        auto& events = window_timing.events;
+        if (events.size() != segments.size()) {
+            events.resize(segments.size(), {nullptr, nullptr});
+        }
+        auto& event = events[segment][std::size_t(end)];
+        if (event == nullptr) { CUDA_CHECK(cudaEventCreate(&event)); }
+        CUDA_CHECK(cudaEventRecord(event, stream));
+    }
+    void collect_window_timing() {
+        WindowTiming& w = window_timing;
+        if (!w.pending) { return; }
+        w.pending = false;
+        for (std::size_t i = 0; i < w.events.size(); ++i) {
+            RankBinding bind(device, segments[i].rank);
+            CUDA_CHECK(cudaEventSynchronize(w.events[i][1]));
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, w.events[i][0], w.events[i][1]));
+            w.stage[std::min<std::size_t>(segments[i].rank, 7)] += ms;
+        }
+        if (++w.windows % 100 != 0) { return; }
+        std::fprintf(stderr, "window timing | %llu windows | device ms/window:",
+                     static_cast<unsigned long long>(w.windows));
+        for (std::size_t r = 0; r < ranks.size() && r < w.stage.size(); ++r) {
+            std::fprintf(stderr, " r%zu %.2f", r, w.stage[r] / 100.0);
+        }
+        std::fprintf(stderr, "\n");
+        w.stage = {};
     }
 
     void synchronize_ranks() {
@@ -3134,7 +3907,7 @@ struct Executor::Impl {
                     Tensor stack(rank.stack, DType::FP32, {h, hc, t});
                     Tensor mixed(rank.mixed, DType::BF16, {h, t});
                     Tensor inject(rank.inject, DType::FP32, {hc, t});
-                    if (plan.ple) { run_ple(plan, state, rank, part); }
+                    if (plan.ple) { run_ple(plan, i, state, rank, part); }
                     {
                         auto scope = rank.workspace->scope();
                         ops::hyper_connection_read(stack, plan.attn_hc.weights(),
@@ -3238,6 +4011,7 @@ struct Executor::Impl {
             throw std::invalid_argument("qwen4_exp forward: more next tokens than a prompt step");
         }
         if (tokens.size() > options.prefill_chunk) {
+            drain();
             forward_span(s, tokens, logit_rows, next);
             return;
         }
@@ -3246,6 +4020,12 @@ struct Executor::Impl {
         const std::uint32_t position = sequence.position;
         const Part part{
             .sequence = &sequence, .column = 0, .count = static_cast<std::int32_t>(tokens.size())};
+        if (threadable(std::span(&part, 1), part.count)) {
+            threaded_pass(std::span(&part, 1), tokens, logit_rows);
+            hint_next(sequence, next);
+            return;
+        }
+        drain();
         pass(std::span(&part, 1), tokens, logit_rows);
         hint_next(sequence, next);
         if (mtp) {
@@ -3254,7 +4034,8 @@ struct Executor::Impl {
         }
     }
 
-    void decode(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens) {
+    void decode(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens,
+                Executor::AfterHead after_head) {
         if (batch.empty() || batch.size() != tokens.size()) {
             throw std::invalid_argument("qwen4_exp decode: one token per sequence");
         }
@@ -3270,6 +4051,12 @@ struct Executor::Impl {
             }
             parts.push_back({.sequence = sequence, .column = std::int32_t(j), .count = 1});
         }
+        if (threadable(parts, static_cast<std::int32_t>(tokens.size()))) {
+            threaded_pass(parts, tokens, static_cast<std::uint32_t>(tokens.size()),
+                          std::move(after_head));
+            return;
+        }
+        drain();
         std::vector<Committed> committed;
         for (const Part& part : parts) {
             committed.push_back({part.sequence, part.column, 1, part.sequence->position,
@@ -3277,6 +4064,15 @@ struct Executor::Impl {
         }
         pass(parts, tokens, static_cast<std::uint32_t>(tokens.size()));
         if (mtp) { mtp_catch_up(committed); }
+        if (after_head) {
+            RankBinding bind(device, model.head_rank());
+            after_head(ranks[model.head_rank()].stream, head_logits(tokens.size()));
+        }
+    }
+
+    [[nodiscard]] Tensor head_logits(std::size_t rows) const {
+        return Tensor(ranks[model.head_rank()].logits, DType::BF16,
+                      {static_cast<std::int32_t>(config.vocab_size), static_cast<std::int32_t>(rows)});
     }
 
     void warm_up() {
@@ -3300,7 +4096,7 @@ struct Executor::Impl {
         prefill(2);
         const std::uint32_t sequence = 0;
         if (sequences.front().position + 1 < options.max_context) {
-            decode(std::span(&sequence, 1), std::span(tokens).first(1));
+            decode(std::span(&sequence, 1), std::span(tokens).first(1), {});
         }
         if (mtp && can_draft(0) &&
             sequences.front().position + verify_width <= options.max_context) {
@@ -3407,10 +4203,10 @@ struct Executor::Impl {
         const std::size_t head = model.head_rank();
         const auto h           = static_cast<std::int32_t>(config.hidden_size);
         RankState& last        = ranks[head];
-        if (head == 0) {
+        if (head == 0 || head_embedding.payload != nullptr) {
             Tensor rows(out, DType::BF16, {h, n});
-            ops::embedding(Tensor(const_cast<std::int32_t*>(ids), DType::I32, {n}), embedding_table,
-                           rows, last.stream);
+            ops::embedding(Tensor(const_cast<std::int32_t*>(ids), DType::I32, {n}),
+                           head == 0 ? embedding_table : head_embedding, rows, last.stream);
             return;
         }
         RankState& first = ranks[0];
@@ -3451,7 +4247,19 @@ struct Executor::Impl {
         const auto h         = static_cast<std::int32_t>(config.hidden_size);
         const auto hc        = static_cast<std::int32_t>(config.hc_count);
         const float eps      = config.rms_norm_eps;
-        embed_cells(ids, n, rank.mixed);
+        if (catch_up_host != nullptr) {
+            // A rank-thread catch-up: the cells' embeddings are the pass's own, which rank 0 left
+            // in pinned host memory before it handed the stack on.
+            for (const CatchUpRows& rows : catch_up_rows) {
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(rank.mixed) +
+                                               std::size_t(rows.cell) * h * 2,
+                                           catch_up_host + std::size_t(rows.column) * h * 2,
+                                           std::size_t(rows.count) * h * 2,
+                                           cudaMemcpyHostToDevice, s));
+            }
+        } else {
+            embed_cells(ids, n, rank.mixed);
+        }
         Tensor embedded(rank.mixed, DType::BF16, {h, n});
         Tensor embedded_norm(rank.d, DType::BF16, {h, n});
         ops::rmsnorm(embedded, mtp->embedding_norm, eps, true, embedded_norm, s);
@@ -3550,13 +4358,16 @@ struct Executor::Impl {
     // position, each pairing that position's stack with the next token, and keeps the last
     // committed position's stack for the next cell. The target's stacks are still in the head
     // rank's stack plane.
-    void mtp_catch_up(std::span<const Committed> committed) {
+    // `embedded` (rank threads): the pass's token embeddings in pinned host memory, one column per
+    // pass column, which the cells take instead of a round trip to rank 0.
+    void mtp_catch_up(std::span<const Committed> committed, const std::byte* embedded = nullptr) {
         RankBinding bind(device, model.head_rank());
         RankState& rank  = ranks[model.head_rank()];
         const auto width = std::size_t(config.hc_count) * config.hidden_size;
         std::vector<MtpPart> parts;
         std::vector<std::int32_t> ids, positions;
         std::int32_t n = 0;
+        catch_up_rows.clear();
         for (const Committed& c : committed) {
             SequenceState& sequence = *c.sequence;
             if (!sequence.mtp_follows || c.count == 0) { continue; }
@@ -3565,6 +4376,8 @@ struct Executor::Impl {
             const std::int32_t cells  = c.count - (kept ? 0 : 1);
             const std::uint32_t first = kept ? c.position - 1 : 0;
             if (cells == 0) { continue; }
+            catch_up_rows.push_back(
+                {.cell = n, .column = c.column + (kept ? 0 : 1), .count = cells});
             if (kept) { stage_hidden(sequence.mtp_pending.p, 1, n); }
             if (c.count > 1) {
                 stage_hidden(rank.stack + width * std::size_t(c.column), c.count - 1,
@@ -3588,10 +4401,24 @@ struct Executor::Impl {
         if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_mtp(ids, 0, positions, 0);
         if (misses) { misses->keep_alive(); }
-        mtp_pass(parts, n, static_cast<const std::int32_t*>(mtp_ids.p),
-                 static_cast<const std::int32_t*>(mtp_positions.p), false);
+        catch_up_host = embedded;
+        try {
+            mtp_pass(parts, n, static_cast<const std::int32_t*>(mtp_ids.p),
+                     static_cast<const std::int32_t*>(mtp_positions.p), false);
+        } catch (...) {
+            catch_up_host = nullptr;
+            throw;
+        }
+        catch_up_host = nullptr;
         if (hybrid) { hybrid->finish(); }
     }
+
+    // The rows of a rank-thread catch-up's cells in its pass's host embeddings.
+    struct CatchUpRows {
+        std::int32_t cell = 0, column = 0, count = 0;
+    };
+    std::vector<CatchUpRows> catch_up_rows;
+    const std::byte* catch_up_host = nullptr;
 
     void draft(std::span<const std::uint32_t> batch, std::span<const std::int32_t> anchors,
                std::span<std::int32_t> out, std::span<std::uint32_t> extents = {},
@@ -3622,19 +4449,24 @@ struct Executor::Impl {
             }
             drafting.push_back(sequence);
         }
+        drain_head();
         RankBinding bind(device, model.head_rank());
         RankState& rank = ranks[model.head_rank()];
         // Step i's cell of a sequence sits at its position - 1 + i and pairs the stack before it
-        // (the kept one at step 0) with the step's token (the anchor at step 0).
-        std::vector<std::int32_t> positions(k * b);
+        // (the kept one at step 0) with the step's token (the anchor at step 0). Pipeline windows
+        // stage the positions of the guess chain's steps after them too.
+        const std::size_t staged = pipeline && b == 1 ? 2 * k + 1 : k;
+        std::vector<std::int32_t> positions(staged * b);
         std::vector<MtpPart> parts;
         for (std::size_t j = 0; j < b; ++j) {
             const std::uint32_t first = drafting[j]->position - 1;
-            for (std::size_t i = 0; i < k; ++i) {
+            for (std::size_t i = 0; i < staged; ++i) {
                 positions[i * b + j] = static_cast<std::int32_t>(first + i);
             }
             parts.push_back({drafting[j], std::int32_t(j), 1, first});
         }
+        draft_first = drafting.front()->position - 1;
+        draft_steps = static_cast<std::uint32_t>(k);
         if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_mtp(anchors, 0, positions, 0);
         if (draft_prefetch) {
@@ -3669,7 +4501,9 @@ struct Executor::Impl {
         // captured exchange as text decode; GGUF host experts replay too, without counting the
         // draft steps' routes.
         auto& only       = drafting.front()->draft.at(k);
-        const bool graph = options.cuda_graphs && b == 1 && device.size() == 1 && !stream;
+        // A split model's chain stays on the head rank once its embeddings come from the host copy.
+        const bool graph = options.cuda_graphs && b == 1 &&
+                           (device.size() == 1 || head_embedding.payload != nullptr) && !stream;
         if (misses) { misses->keep_alive(); }
         if (graph && !only.chain.ready() && only.runs++ > 0) {
             DecodeGraphDefinition definition;
@@ -3744,7 +4578,28 @@ struct Executor::Impl {
                                            tokens.begin() + std::ptrdiff_t((j + 1) * w));
             verified.push_back(sequence);
         }
+        // The host's pass orders itself after every rank thread's queued work.
+        if (!pipeline) { drain(); }
         verifying = true;
+        verified_set = pipeline ? next_set() : 0;
+        pass_mode    = {.verify = true,
+                        .ahead  = false,
+                        .set    = verified_set,
+                        .rows   = static_cast<std::int32_t>(b),
+                        .width  = static_cast<std::uint32_t>(w)};
+        if (pipeline) {
+            try {
+                threaded_verify(parts, tokens);
+            } catch (...) {
+                pass_mode = {};
+                verifying = false;
+                verified.clear();
+                throw;
+            }
+            pass_mode = {};
+            verifying = false;
+            return;
+        }
         try {
             pass(parts, tokens, static_cast<std::uint32_t>(tokens.size()));
             if (draft_prefetch) {
@@ -3764,11 +4619,84 @@ struct Executor::Impl {
                 draft_prefetch->join(rank.stream);
             }
         } catch (...) {
+            pass_mode = {};
             verifying = false;
             verified.clear();
             throw;
         }
+        pass_mode = {};
         verifying = false;
+    }
+
+    // One rank's part of a commit, on its stream: its sparse-attention layers' indexer tails and
+    // its PLE histories advance over the kept positions' records of `set` (a window of width `w`),
+    // and its Gated DeltaNet layers replay the kept transitions. `shadow` (pipeline windows): the
+    // window is taken whole into the shadow states, which start from the sequence's own.
+    void commit_rank(std::size_t r, std::span<SequenceState* const> rows_of,
+                     std::span<const std::uint32_t> kept, std::uint32_t set, std::uint32_t w,
+                     bool shadow) {
+        RankState& rank = ranks[r];
+        const auto di   = static_cast<std::int32_t>(config.indexer_head_dim);
+        const std::uint64_t index_rows =
+            std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
+        const std::uint64_t columns = std::uint64_t(verify_width) * options.sequences;
+        const auto stack_width      = std::int32_t(config.hc_count * config.hidden_size);
+        // The window's positions: still staged, unless a later pass has been staged since.
+        const auto* positions = pipeline ? static_cast<const std::int32_t*>(rank.window_positions[set].p)
+                                         : rank.positions;
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const LayerPlan& plan = layers[i];
+            if (plan.rank != r) { continue; }
+            for (std::size_t j = 0; j < rows_of.size(); ++j) {
+                LayerState& state  = rows_of[j]->layers[i];
+                LayerState& target = shadow ? ahead_layers[i] : state;
+                const auto m       = static_cast<std::int32_t>(kept[j]);
+                if (plan.qsa) {
+                    // The indexer's tail advances over the kept positions' recorded projections.
+                    if (shadow) {
+                        CUDA_CHECK(cudaMemcpyAsync(target.tail.p, state.tail.p, state.tail.bytes,
+                                                   cudaMemcpyDeviceToDevice, rank.stream));
+                    }
+                    const QsaPlan& a = *plan.qsa;
+                    const Tensor projection(static_cast<std::byte*>(rank.index_records[set].p) +
+                                                (qsa_local[i] * columns + j * w) * index_rows * 2,
+                                            DType::BF16, {a.index.rows, m});
+                    const Tensor first(const_cast<std::int32_t*>(positions) + j * w, DType::I32, {1});
+                    Tensor pooled(state.pooled.p, DType::FP32,
+                                  {di, static_cast<std::int32_t>(pooled_slots)});
+                    Tensor tail(target.tail.p, DType::FP32,
+                                {di, static_cast<std::int32_t>(config.indexer_compress_ratio - 1)});
+                    const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
+                    ops::qsa_indexer_append(projection, first, iw, config.rms_norm_eps, pooled,
+                                            tail, rank.stream);
+                }
+                if (plan.ple) {
+                    // The PLE history advances over the kept positions' recorded input.
+                    if (shadow) {
+                        CUDA_CHECK(cudaMemcpyAsync(target.history.p, state.history.p,
+                                                   state.history.bytes, cudaMemcpyDeviceToDevice,
+                                                   rank.stream));
+                    }
+                    Tensor history(
+                        target.history.p, DType::FP32,
+                        {stack_width, static_cast<std::int32_t>((config.ple_conv_kernel_size - 1) *
+                                                                config.ngram.ngram_size)});
+                    const Tensor normalized(static_cast<float*>(rank.ple_records[set].p) +
+                                                std::size_t(stack_width) * j * w,
+                                            DType::FP32, {stack_width, m});
+                    ops::ple_history_advance(history, normalized, rank.stream);
+                }
+            }
+        }
+        // The Gated DeltaNet layers replay the kept transitions into each sequence's slot.
+        if (!rank.fold[set]) { return; }
+        std::vector<ops::GdnReplayFoldRow> rows;
+        for (std::size_t j = 0; j < rows_of.size(); ++j) {
+            const auto slot = static_cast<std::int32_t>(rows_of[j]->slot);
+            const auto to   = shadow ? static_cast<std::int32_t>(options.sequences) : slot;
+            rows.push_back({slot, to, static_cast<std::int32_t>(kept[j])});
+        }
+        rank.fold[set]->execute(rows, static_cast<std::int32_t>(w), rank.stream);
     }
 
     void commit(std::span<const std::uint32_t> batch, std::span<const std::uint32_t> kept) {
@@ -3783,6 +4711,11 @@ struct Executor::Impl {
                                             "1 to draft_tokens + 1 tokens each");
             }
         }
+        if (pipeline) {
+            pipelined_commit(kept);
+            return;
+        }
+        drain();
         if (draft_prefetch) {
             RankBinding bind(device, model.head_rank());
             // Captured events encode graph dependencies; wait on the joined stream before
@@ -3790,57 +4723,9 @@ struct Executor::Impl {
             CUDA_CHECK(cudaStreamSynchronize(ranks[model.head_rank()].stream));
             draft_prefetch->check();
         }
-        const auto di = static_cast<std::int32_t>(config.indexer_head_dim);
-        const std::uint64_t index_rows =
-            std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
-        const std::uint64_t columns = std::uint64_t(verify_width) * options.sequences;
-        const auto stack_width      = std::int32_t(config.hc_count * config.hidden_size);
-        for (std::size_t i = 0; i < layers.size(); ++i) {
-            const LayerPlan& plan = layers[i];
-            RankBinding bind(device, plan.rank);
-            RankState& rank = ranks[plan.rank];
-            for (std::size_t j = 0; j < verified.size(); ++j) {
-                LayerState& state = verified[j]->layers[i];
-                const auto m      = static_cast<std::int32_t>(kept[j]);
-                if (plan.qsa) {
-                    // The indexer's tail advances over the kept positions' recorded projections;
-                    // the verification's first position is still staged.
-                    const QsaPlan& a = *plan.qsa;
-                    const Tensor projection(static_cast<std::byte*>(rank.index_records.p) +
-                                                (qsa_local[i] * columns + j * w) * index_rows * 2,
-                                            DType::BF16, {a.index.rows, m});
-                    const Tensor first(rank.positions + j * w, DType::I32, {1});
-                    Tensor pooled(state.pooled.p, DType::FP32,
-                                  {di, static_cast<std::int32_t>(pooled_slots)});
-                    Tensor tail(state.tail.p, DType::FP32,
-                                {di, static_cast<std::int32_t>(config.indexer_compress_ratio - 1)});
-                    const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
-                    ops::qsa_indexer_append(projection, first, iw, config.rms_norm_eps, pooled,
-                                            tail, rank.stream);
-                }
-                if (plan.ple) {
-                    // The PLE history advances over the kept positions' recorded input.
-                    Tensor history(
-                        state.history.p, DType::FP32,
-                        {stack_width, static_cast<std::int32_t>((config.ple_conv_kernel_size - 1) *
-                                                                config.ngram.ngram_size)});
-                    const Tensor normalized(static_cast<float*>(rank.ple_records.p) +
-                                                std::size_t(stack_width) * j * w,
-                                            DType::FP32, {stack_width, m});
-                    ops::ple_history_advance(history, normalized, rank.stream);
-                }
-            }
-        }
-        // The Gated DeltaNet layers replay the kept transitions into each sequence's slot.
-        std::vector<ops::GdnReplayFoldRow> rows;
-        for (std::size_t j = 0; j < verified.size(); ++j) {
-            const auto slot = static_cast<std::int32_t>(verified[j]->slot);
-            rows.push_back({slot, slot, static_cast<std::int32_t>(kept[j])});
-        }
-        for (RankState& rank : ranks) {
-            if (!rank.fold) { continue; }
-            RankBinding bind(device, rank.rank);
-            rank.fold->execute(rows, static_cast<std::int32_t>(w), rank.stream);
+        for (std::size_t r = 0; r < ranks.size(); ++r) {
+            RankBinding bind(device, r);
+            commit_rank(r, verified, kept, verified_set, w, false);
         }
         std::vector<Committed> committed;
         std::vector<std::uint64_t> scratch;
@@ -3858,6 +4743,308 @@ struct Executor::Impl {
         }
         verified.clear();
         mtp_catch_up(committed);
+    }
+
+    // ---- Pipeline windows ----
+    // A round's verification goes to the rank threads. Before it, the head rank's thread runs the
+    // MTP chain on past the round's drafts to the window that would follow if this one is kept
+    // whole: its bonus token and drafts after it (the guess). The host posts that window to the
+    // front ranks at once; they run it on shadow states (theirs advanced over the window in flight,
+    // taken whole) while the head rank verifies. When the verdict keeps the window whole and its
+    // bonus is the guessed one, the head rank completes the guessed window from the front ranks'
+    // stack; otherwise the guess is dropped and the next round drafts as before. Every token is
+    // still the verification's, so the output is the serial loop's.
+    std::size_t head_first = 0;      // the first segment of the head rank
+    std::uint32_t set_flip = 0;      // the record set of the last window
+    struct Window {                  // the last window posted to the front ranks
+        std::uint32_t set = 0, width = 0, position = 0;
+        std::vector<std::int32_t> tokens;
+        NgramContext context;        // the n-gram context before it
+    } window;
+    struct Ahead {                   // the guessed window the front ranks run
+        bool live            = false;
+        std::uint64_t number = 0;
+        std::uint32_t set = 0, width = 0, position = 0;
+        std::vector<std::int32_t> tokens;
+    } ahead;
+    std::unique_ptr<PinnedHostBuffer> guess_host;
+    cudaEvent_t guess_event      = nullptr;
+    std::uint64_t guess_posted   = 0; // the host's count of guess chains
+    std::uint64_t guess_recorded = 0; // the head thread's (worker_mutex)
+    std::uint32_t draft_first = 0, draft_steps = 0; // the last draft chain
+    // Graphs per record set and width: verification (every segment) and guessed windows (the
+    // front ranks' segments), for the one sequence.
+    std::array<std::array<SequenceState::VerifyGraphs, 17>, 2> verify_graphs, ahead_graphs;
+    static constexpr std::size_t kDiscardCell = 512; // where forced chain steps write their argmax
+
+    void start_pipeline() {
+        const std::size_t head = model.head_rank();
+        head_first = 0;
+        while (head_first < segments.size() && segments[head_first].rank != head) { ++head_first; }
+        bool layout = head_first > 0 && head_first < segments.size();
+        for (std::size_t i = head_first; layout && i < segments.size(); ++i) {
+            layout = segments[i].rank == head;
+        }
+        if (!layout) {
+            pipeline = false;
+            return;
+        }
+        ahead_buffer = std::make_unique<PinnedHostBuffer>(stack_bytes(std::int32_t(verify_width)));
+        {
+            RankBinding bind(device, segments[head_first - 1].rank);
+            CUDA_CHECK(cudaEventCreateWithFlags(&ahead_written, cudaEventDisableTiming));
+        }
+        RankBinding bind(device, head);
+        CUDA_CHECK(cudaEventCreateWithFlags(&ahead_read, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&guess_event, cudaEventDisableTiming));
+        guess_host = std::make_unique<PinnedHostBuffer>(64 * sizeof(std::int32_t));
+        std::fprintf(stderr, "qwen4_exp: pipeline windows on (%zu front segments)\n", head_first);
+    }
+
+    std::uint32_t next_set() {
+        set_flip ^= 1U;
+        return set_flip;
+    }
+
+    // A verification posted to the rank threads (the host's pass_mode describes it).
+    void threaded_verify(std::span<const Part> parts, std::span<const std::int32_t> tokens) {
+        SequenceState& sequence = *parts.front().sequence;
+        const auto w            = static_cast<std::uint32_t>(tokens.size());
+        NgramContext context    = sequence.context;
+        NgramContext* contexts[] = {&context};
+        auto task  = stage_task(parts, tokens, w, contexts, 0, segments.size());
+        task->mode = pass_mode;
+        auto& graphs = verify_graphs[pass_mode.set][w];
+        if (graphs.segments.empty() && graphs.runs++ > 0) {
+            drain();
+            graphs.segments = capture_segments(sequence, std::int32_t(w), 0, segments.size());
+        }
+        if (!graphs.segments.empty()) { task->graphs = &graphs.segments; }
+        post(task);
+        window = {.set      = pass_mode.set,
+                  .width    = w,
+                  .position = sequence.position,
+                  .tokens   = std::vector<std::int32_t>(tokens.begin(), tokens.end()),
+                  .context  = sequence.context};
+    }
+
+    // The MTP chain on the head rank's thread from step `from` to step `to` of a chain whose cells
+    // start at position `first`; steps before `forced` take the staged tokens (their argmax is
+    // dropped). The argmax of steps forced - 1 .. to - the guessed bonus and drafts - goes to the
+    // host.
+    void run_guess_chain(SequenceState* sequence, std::uint32_t first, std::uint32_t from,
+                         std::uint32_t to, std::uint32_t forced, std::uint64_t number) {
+        RankState& rank = ranks[model.head_rank()];
+        auto* ids       = static_cast<std::int32_t*>(mtp_ids.p);
+        const auto* at  = static_cast<const std::int32_t*>(mtp_positions.p);
+        const MtpPart part{sequence, 0, 1, first};
+        for (std::uint32_t i = from; i <= to; ++i) {
+            if (i == 0) {
+                CUDA_CHECK(cudaMemcpyAsync(sequence->mtp_scratch_tail.p, sequence->mtp.tail.p,
+                                           sequence->mtp.tail.bytes, cudaMemcpyDeviceToDevice,
+                                           rank.stream));
+                stage_hidden(sequence->mtp_pending.p, 1, 0);
+            } else {
+                stage_hidden(rank.stack, 1, 0);
+            }
+            mtp_pass(std::span(&part, 1), 1, ids + i, at + i, true);
+            mtp_head(1, i + 1 < forced ? ids + kDiscardCell : ids + i + 1);
+        }
+        const std::uint32_t k = to / 2; // the guess: steps k .. 2k write cells k + 1 .. 2k + 1
+        CUDA_CHECK(cudaMemcpyAsync(guess_host->data(), ids + k + 1, (k + 1) * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, rank.stream));
+        CUDA_CHECK(cudaEventRecord(guess_event, rank.stream));
+        {
+            std::lock_guard lock(worker_mutex);
+            guess_recorded = number;
+        }
+        worker_cv.notify_all();
+    }
+
+    void post_head_work(std::function<void()> work) {
+        auto task  = new_task();
+        task->work = [this, work = std::move(work)](std::size_t r) {
+            if (r == model.head_rank()) { work(); }
+        };
+        post(task);
+    }
+
+    // After draft(): the head rank's thread runs the chain on from the drafts (before it takes
+    // the verification's stack).
+    void guess_after_draft() {
+        const std::uint64_t number = ++guess_posted;
+        SequenceState* sequence    = &sequences.front();
+        const std::uint32_t k = draft_steps, first = draft_first;
+        post_head_work([=, this] { run_guess_chain(sequence, first, k, 2 * k, 0, number); });
+    }
+
+    // The guess of the last chain: the bonus token and the drafts after it (width tokens).
+    void take_guess(std::span<std::int32_t> out) {
+        {
+            std::unique_lock lock(worker_mutex);
+            worker_cv.wait(lock, [&] { return guess_recorded >= guess_posted || worker_error; });
+            if (worker_error) { std::rethrow_exception(worker_error); }
+        }
+        RankBinding bind(device, model.head_rank());
+        CUDA_CHECK(cudaEventSynchronize(guess_event));
+        std::memcpy(out.data(), guess_host->data(), out.size() * sizeof(std::int32_t));
+    }
+
+    // The front ranks run `tokens` as the window after the one in flight, taken whole.
+    void verify_ahead(std::span<const std::int32_t> tokens) {
+        SequenceState& sequence = sequences.front();
+        const auto w            = static_cast<std::uint32_t>(tokens.size());
+        NgramContext start      = window.context;
+        if (table) {
+            std::vector<std::uint64_t> scratch(window.tokens.size() * config.ngram_heads());
+            ngram_row_ids(ngram, window.tokens, config.eos_token_id, config.vocab_size, start,
+                          scratch);
+        }
+        NgramContext context     = start;
+        NgramContext* contexts[] = {&context};
+        const std::uint32_t position = window.position + window.width;
+        if (position + w > options.max_context) {
+            throw std::invalid_argument("qwen4_exp: a guessed window past max_context");
+        }
+        const Part part{.sequence = &sequence, .column = 0, .count = std::int32_t(w)};
+        const std::uint32_t set = next_set();
+        auto task = stage_task(std::span(&part, 1), tokens, w, contexts,
+                               position - sequence.position, head_first);
+        task->mode         = {.verify = true, .ahead = true, .set = set, .rows = 1, .width = w};
+        task->to_ahead     = true;
+        task->ahead_number = ++ahead_count;
+        const std::uint32_t source = window.set, width = window.width;
+        SequenceState* rows_of     = &sequence;
+        task->work = [this, source, width, rows_of](std::size_t r) {
+            if (r == model.head_rank()) { return; }
+            SequenceState* const of[] = {rows_of};
+            const std::uint32_t kept[] = {width};
+            commit_rank(r, of, kept, source, width, true);
+        };
+        auto& graphs = ahead_graphs[set][w];
+        if (graphs.segments.empty() && graphs.runs++ > 0) {
+            drain();
+            const PassMode host = pass_mode;
+            pass_mode           = task->mode;
+            try {
+                graphs.segments = capture_segments(sequence, std::int32_t(w), 0, head_first);
+            } catch (...) {
+                pass_mode = host;
+                throw;
+            }
+            pass_mode = host;
+        }
+        if (!graphs.segments.empty()) { task->graphs = &graphs.segments; }
+        post(task);
+        ahead  = {.live     = true,
+                  .number   = task->ahead_number,
+                  .set      = set,
+                  .width    = w,
+                  .position = position,
+                  .tokens   = std::vector<std::int32_t>(tokens.begin(), tokens.end())};
+        window = {.set      = set,
+                  .width    = w,
+                  .position = position,
+                  .tokens   = ahead.tokens,
+                  .context  = start};
+    }
+
+    [[nodiscard]] bool guess_live() const noexcept { return ahead.live; }
+
+    // The verdict dropped the guessed window.
+    void drop_guess() {
+        if (!ahead.live) { return; }
+        {
+            std::lock_guard lock(worker_mutex);
+            ahead_resolved = std::max(ahead_resolved, ahead.number);
+        }
+        worker_cv.notify_all();
+        ahead.live = false;
+    }
+
+    // The verdict kept the window in flight whole with the guessed bonus: the guessed window is
+    // the next verification. The head rank's thread first runs the next guess chain (through the
+    // guessed window's tokens, then past them), then completes the window from the front ranks'
+    // stack.
+    void verify_guessed(std::span<const std::int32_t> tokens) {
+        SequenceState& sequence = sequences.front();
+        const auto w            = static_cast<std::uint32_t>(tokens.size());
+        if (!ahead.live || w != ahead.width || sequence.position != ahead.position ||
+            !std::equal(tokens.begin(), tokens.end(), ahead.tokens.begin())) {
+            throw std::logic_error("qwen4_exp: the verification is not the guessed window");
+        }
+        verified.assign(1, &sequence);
+        sequence.verify_tokens.assign(tokens.begin(), tokens.end());
+        sequence.verify_context = sequence.context;
+        active_verify_width     = w;
+        verified_set            = ahead.set;
+        const std::uint32_t k     = w - 1;
+        const std::uint32_t first = sequence.position - 1;
+        const std::uint64_t number = ++guess_posted;
+        std::vector<std::int32_t> forced(tokens.begin(), tokens.end());
+        std::vector<std::int32_t> positions(2 * k + 1);
+        std::iota(positions.begin(), positions.end(), static_cast<std::int32_t>(first));
+        SequenceState* of = &sequence;
+        post_head_work([=, this] {
+            stage_mtp(forced, 0, positions, 0);
+            run_guess_chain(of, first, 0, 2 * k, k + 1, number);
+        });
+        NgramContext context     = sequence.context;
+        NgramContext* contexts[] = {&context};
+        const Part part{.sequence = &sequence, .column = 0, .count = std::int32_t(w)};
+        auto task = stage_task(std::span(&part, 1), tokens, w, contexts, 0, segments.size(),
+                               head_first);
+        task->mode = {.verify = true, .ahead = false, .set = ahead.set, .rows = 1, .width = w};
+        task->from_ahead   = true;
+        task->ahead_number = ahead.number;
+        auto& graphs       = verify_graphs[ahead.set][w];
+        if (!graphs.segments.empty()) { task->graphs = &graphs.segments; }
+        post(task);
+        ahead.live = false;
+    }
+
+    // A commit on the rank threads: each rank's part, and on the head rank the MTP catch-up.
+    void pipelined_commit(std::span<const std::uint32_t> kept) {
+        const std::uint32_t w = active_verify_width;
+        auto task             = new_task();
+        std::vector<SequenceState*> rows_of(verified.begin(), verified.end());
+        std::vector<std::uint32_t> counts(kept.begin(), kept.end());
+        for (SequenceState* sequence : rows_of) {
+            task->tokens.insert(task->tokens.end(), sequence->verify_tokens.begin(),
+                                sequence->verify_tokens.end());
+        }
+        std::vector<std::uint64_t> scratch;
+        for (std::size_t j = 0; j < rows_of.size(); ++j) {
+            SequenceState& sequence = *rows_of[j];
+            const std::span<const std::int32_t> tokens(task->tokens.data() + j * w, kept[j]);
+            if (table) {
+                scratch.resize(tokens.size() * config.ngram_heads());
+                ngram_row_ids(ngram, tokens, config.eos_token_id, config.vocab_size,
+                              sequence.context, scratch);
+            }
+            task->committed.push_back({&sequence, static_cast<std::int32_t>(j * w),
+                                       static_cast<std::int32_t>(kept[j]), sequence.position,
+                                       tokens});
+            sequence.position += kept[j];
+        }
+        const std::uint32_t set = verified_set;
+        RankTask* own           = task.get();
+        task->work = [this, rows_of, counts, set, w, own](std::size_t r) {
+            commit_rank(r, rows_of, counts, set, w, false);
+            if (r == model.head_rank()) { mtp_catch_up(own->committed); }
+        };
+        verified.clear();
+        post(task);
+    }
+
+    void reset_pipeline() {
+        if (!pipeline) { return; }
+        {
+            std::lock_guard lock(worker_mutex);
+            ahead_resolved = ahead_count;
+        }
+        worker_cv.notify_all();
+        ahead.live = false;
     }
 
     std::uint64_t snapshot_bytes() const {
@@ -4059,7 +5246,11 @@ struct Executor::Impl {
 };
 
 Executor::Executor(const Model& model, DeviceContext& device, ExecutorOptions options)
-    : impl_(std::make_unique<Impl>(model, device, std::move(options))) {}
+    : impl_(std::make_unique<Impl>(model, device, std::move(options))) {
+    impl_->start_rank_threads();
+    // Pipeline windows run on the rank threads.
+    if (!impl_->rank_threads) { impl_->pipeline = false; }
+}
 
 Executor::~Executor() = default;
 
@@ -4075,9 +5266,14 @@ std::uint64_t Executor::ngram_resident_bytes() const noexcept {
 
 void Executor::reset(std::uint32_t sequence) { impl_->reset(sequence); }
 
-void Executor::warm_up() { impl_->warm_up(); }
+void Executor::warm_up() {
+    impl_->drain();
+    impl_->warm_up();
+    impl_->drain();
+}
 std::uint32_t Executor::prompt_step() const noexcept { return impl_->prompt_step(); }
 void Executor::grow_expert_cache(std::uint64_t keep_free_bytes) {
+    impl_->drain();
     impl_->grow_expert_cache(keep_free_bytes);
 }
 
@@ -4092,16 +5288,23 @@ void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tok
 
 void Executor::decode(std::span<const std::uint32_t> sequences,
                       std::span<const std::int32_t> tokens) {
-    impl_->decode(sequences, tokens);
+    impl_->decode(sequences, tokens, {});
+}
+
+void Executor::decode(std::span<const std::uint32_t> sequences,
+                      std::span<const std::int32_t> tokens, AfterHead after_head) {
+    impl_->decode(sequences, tokens, std::move(after_head));
 }
 
 void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
+    impl_->drain();
     impl_->snapshot(sequence, out);
 }
 
 std::uint64_t Executor::snapshot_bytes() const { return impl_->snapshot_bytes(); }
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
+    impl_->drain();
     impl_->restore(sequence, from);
 }
 
@@ -4111,16 +5314,19 @@ std::uint64_t Executor::image_bytes(std::uint32_t position) const {
 
 SequenceImage Executor::save_image(std::uint32_t sequence, const SequenceSnapshot* at,
                                    std::span<std::byte* const> pages, std::size_t page_bytes) {
+    impl_->drain();
     return impl_->save_image(sequence, at, pages, page_bytes);
 }
 
 void Executor::load_image(std::uint32_t sequence, const SequenceImage& image,
                           std::span<std::byte* const> pages, std::size_t page_bytes) {
+    impl_->drain();
     impl_->load_image(sequence, image, pages, page_bytes);
 }
 
 void Executor::set_media(std::uint32_t sequence, std::span<const MediaItem> items,
                          std::vector<std::int32_t> rope_positions, std::int32_t rope_delta) {
+    impl_->drain();
     impl_->set_media(sequence, items, std::move(rope_positions), rope_delta);
 }
 
@@ -4148,7 +5354,24 @@ void Executor::commit(std::span<const std::uint32_t> sequences,
     impl_->commit(sequences, columns);
 }
 
+bool Executor::pipeline_windows() const noexcept { return impl_->pipeline; }
+
+void Executor::guess_after_draft() { impl_->guess_after_draft(); }
+
+void Executor::take_guess(std::span<std::int32_t> out) { impl_->take_guess(out); }
+
+void Executor::verify_ahead(std::span<const std::int32_t> tokens) { impl_->verify_ahead(tokens); }
+
+bool Executor::guess_live() const noexcept { return impl_->guess_live(); }
+
+void Executor::drop_guess() { impl_->drop_guess(); }
+
+void Executor::verify_guessed(std::span<const std::int32_t> tokens) {
+    impl_->verify_guessed(tokens);
+}
+
 Tensor Executor::logits(std::uint32_t rows) const {
+    impl_->drain_head_quietly();
     return Tensor(
         impl_->ranks[impl_->model.head_rank()].logits, DType::BF16,
         {static_cast<std::int32_t>(impl_->config.vocab_size), static_cast<std::int32_t>(rows)});
@@ -4176,6 +5399,7 @@ ExpertCacheStats Executor::expert_cache_stats() const noexcept {
 }
 
 cudaStream_t Executor::head_stream() const noexcept {
+    impl_->drain_head_quietly();
     return impl_->ranks[impl_->model.head_rank()].stream;
 }
 
@@ -4211,6 +5435,7 @@ void Executor::raise_service_failure() {
 }
 
 void Executor::abort(std::uint32_t sequence) {
+    impl_->drain_quietly();
     if (impl_->table) { impl_->table->wait(); }
     impl_->rows_waited = true;
     impl_->device.synchronize();
