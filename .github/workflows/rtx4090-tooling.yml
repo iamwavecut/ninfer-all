@@ -1,0 +1,19 @@
+# Fast CPU-only verification for the RTX 4090 tuning controller.
+# Runs on draft pull requests too; the main CI deliberately skips drafts.
+name: RTX 4090 tooling checks
+on:
+  pull_request:
+    paths:
+      - 'tools/bench/tune_rtx4090.py'
+      - 'tests/test_tune_rtx4090.py'
+      - '.github/workflows/rtx4090-tooling.yml'
+jobs:
+  tuner:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --quiet pytest
+      - run: python -m pytest -q tests/test_tune_rtx4090.py
