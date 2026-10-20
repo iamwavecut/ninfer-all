@@ -107,8 +107,9 @@ try {
     # Quote the -D arguments: PowerShell does not reliably expand a variable inside a bare token
     # that begins with "-D", and cmake then sees the literal "$Arch".
     $BenchmarksOption = if ($BuildBenchmarks) { 'ON' } else { 'OFF' }
+    $TestsOption = if ($Test) { 'ON' } else { 'OFF' }
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
-          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption"
+          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DBUILD_TESTING=$TestsOption"
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
     $buildArgs = @('--build', $BuildDir)
