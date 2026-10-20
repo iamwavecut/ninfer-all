@@ -30,6 +30,7 @@ param(
     [switch]$Package,
     [switch]$Clean,
     [switch]$Benchmarks,
+    [switch]$ExperimentalFastSfu,
     [string]$Target,
     [string]$BuildDir,
     [ValidateSet('12.8', '12.9', '13.1', '13.2', '13.3', '13.4')][string]$CudaVersion,
@@ -108,8 +109,10 @@ try {
     # that begins with "-D", and cmake then sees the literal "$Arch".
     $BenchmarksOption = if ($BuildBenchmarks) { 'ON' } else { 'OFF' }
     $TestsOption = if ($Test) { 'ON' } else { 'OFF' }
+    $SfuOption = if ($ExperimentalFastSfu) { 'ON' } else { 'OFF' }
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
-          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DBUILD_TESTING=$TestsOption"
+          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DBUILD_TESTING=$TestsOption" `
+          "-DNINFER_SFU_SIGMOID_SILU=$SfuOption" "-DNINFER_SFU_SOFTPLUS=$SfuOption"
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
     $buildArgs = @('--build', $BuildDir)
