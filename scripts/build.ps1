@@ -7,8 +7,9 @@
 #   12.8's host_config.h rejects outright - it accepts 1910-1949. If a VS 2026 cl.exe wins on
 #   PATH you get a wall of host_config errors that say nothing about the compiler version.
 #
-#   CUDA 12.8, forced through CUDACXX. If an older toolkit is also installed it is picked up from
-#   PATH instead and the configure step fails the CMakeLists version guard.
+#   The selected CUDA toolkit is forced through CUDACXX, avoiding a different nvcc on PATH.
+#   The existing default prefers CUDA 12.8/12.9; -CudaVersion selects a newer installed toolkit
+#   explicitly without silently changing the toolchain of existing builds.
 #
 #   The Ninja generator. MSBuild's CUDA integration needs CUDA_PATH_V12_8, which the CUDA
 #   installer does not always set; without it CudaToolkitDir resolves empty and every .cu fails.
@@ -22,6 +23,7 @@
 #   .\scripts\build.ps1 -Benchmarks      ... include bench\ (implied by -Package)
 #   .\scripts\build.ps1 -Clean           delete the build directory first
 #   .\scripts\build.ps1 -Target ninfer-serve
+#   .\scripts\build.ps1 -Arch 89 -CudaVersion 13.4 -Benchmarks -BuildDir build-rtx4090
 [CmdletBinding()]
 param(
     [switch]$Test,
@@ -30,6 +32,7 @@ param(
     [switch]$Benchmarks,
     [string]$Target,
     [string]$BuildDir,
+    [ValidateSet('12.8', '12.9', '13.1', '13.2', '13.3', '13.4')][string]$CudaVersion,
     [ValidateSet('75', '80', '86', '89')][string]$Arch = '86'
 )
 
@@ -68,12 +71,16 @@ $CudaCandidates = @(
     'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe',
     'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin\nvcc.exe'
 )
+if ($CudaVersion) {
+    $CudaCandidates = @("C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$CudaVersion\bin\nvcc.exe")
+}
 $Nvcc = $CudaCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $Nvcc) {
     throw @"
-No CUDA 12.8+ toolkit found. Looked in:
+No suitable CUDA toolkit found. Looked in:
 $($CudaCandidates -join "`n")
-CMakeLists requires CUDA >= 12.8. Set CUDACXX yourself if your toolkit lives elsewhere.
+CMakeLists requires CUDA >= 12.8. Choose an installed version with -CudaVersion
+(or install CUDA 12.8/12.9 to use the existing default).
 "@
 }
 
