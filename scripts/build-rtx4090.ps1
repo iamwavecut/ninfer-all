@@ -6,18 +6,22 @@ param(
     [string]$CudaVersion = '13.4',
     [string]$BuildDir,
     [switch]$Clean,
-    [switch]$Test
+    [switch]$Test,
+    [switch]$ExperimentalFastSfu
 )
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-if (-not $BuildDir) { $BuildDir = Join-Path $RepoRoot 'build-rtx4090' }
+if (-not $BuildDir) {
+    $BuildDir = Join-Path $RepoRoot $(if ($ExperimentalFastSfu) { 'build-rtx4090-sfu' } else { 'build-rtx4090' })
+}
 
 $BuildArgs = @{
     Arch = '89'
     CudaVersion = $CudaVersion
     BuildDir = $BuildDir
     Benchmarks = $true
+    ExperimentalFastSfu = [bool]$ExperimentalFastSfu
 }
 if ($Clean) { $BuildArgs['Clean'] = $true }
 if ($Test) { $BuildArgs['Test'] = $true }
