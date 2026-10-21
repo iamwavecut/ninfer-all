@@ -74,7 +74,7 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     const auto out_addr  = reinterpret_cast<std::uintptr_t>(out.data);
 #if defined(NINFER_ADA_SILU_BF16X8) && NINFER_ADA_SILU_BF16X8
     if (((gate_addr | up_addr | out_addr) & (alignof(Bf16x8Pack) - 1)) == 0 &&
-        (n % 8) == 0) {
+        (n % 8) == 0 && n >= 262144) {
         constexpr int kMaxGrid = 4096;
         const auto packs = n / 8;
         const int grid = static_cast<int>(std::min<std::int64_t>(

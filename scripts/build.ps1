@@ -92,7 +92,9 @@ Write-Host "toolchain: $Nvcc"
 $VcEnv = cmd /c "`"$VcVars`" >nul 2>&1 && set"
 # Windows may expose both PATH and Path. Importing the latter last discards
 # vcvars' compiler directory in PowerShell's case-insensitive environment.
-$VcPath = $VcEnv | Where-Object { $_ -cmatch '^PATH=' } | Select-Object -First 1
+$VcPath = $VcEnv | Where-Object {
+    $_ -match '^PATH=' -and $_ -match 'MSVC\\[^;]+\\bin\\HostX64\\x64'
+} | Select-Object -First 1
 if (-not $VcPath) { throw 'vcvars64 did not return PATH' }
 $VcEnv | ForEach-Object {
     if ($_ -match '^([^=]+)=(.*)$' -and $Matches[1] -ine 'PATH') {
@@ -101,6 +103,12 @@ $VcEnv | ForEach-Object {
 }
 $env:PATH = $VcPath.Substring(5)
 $env:CUDACXX = $Nvcc
+
+$VcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } else { 'C:\vcpkg' }
+$VcpkgToolchain = Join-Path $VcpkgRoot 'scripts\buildsystems\vcpkg.cmake'
+if (-not (Test-Path -LiteralPath $VcpkgToolchain -PathType Leaf)) {
+    throw "vcpkg toolchain not found: $VcpkgToolchain (set VCPKG_ROOT)"
+}
 
 $cl = (Get-Command cl.exe -ErrorAction SilentlyContinue)
 if ($cl) { Write-Host "toolchain: $($cl.Source)" }
@@ -121,6 +129,7 @@ try {
     $SfuOption = if ($ExperimentalFastSfu) { 'ON' } else { 'OFF' }
     $VectorSiluOption = if ($ExperimentalVectorSilu) { 'ON' } else { 'OFF' }
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
+          "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain" '-DVCPKG_TARGET_TRIPLET=x64-windows' `
           "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DBUILD_TESTING=$TestsOption" `
           "-DNINFER_SFU_SIGMOID_SILU=$SfuOption" "-DNINFER_SFU_SOFTPLUS=$SfuOption" `
           "-DNINFER_ADA_SILU_BF16X8=$VectorSiluOption"
@@ -131,7 +140,7 @@ try {
     cmake @buildArgs
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 
-    if ($Test) {
+    if ($Test -and -not $Target) {
         # One GPU, so keep the parallelism low: unrelated CUDA tests contend for memory and
         # produce failures that do not reproduce when the test is run on its own.
         ctest --test-dir $BuildDir -j2 --output-on-failure

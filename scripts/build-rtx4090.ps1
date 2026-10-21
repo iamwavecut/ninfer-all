@@ -5,6 +5,7 @@ param(
     [ValidateSet('12.8', '12.9', '13.1', '13.2', '13.3', '13.4')]
     [string]$CudaVersion = '13.4',
     [string]$BuildDir,
+    [string]$Target,
     [switch]$Clean,
     [switch]$Test,
     [switch]$ExperimentalFastSfu,
@@ -31,6 +32,7 @@ $BuildArgs = @{
 }
 if ($Clean) { $BuildArgs['Clean'] = $true }
 if ($Test) { $BuildArgs['Test'] = $true }
+if ($Target) { $BuildArgs['Target'] = $Target }
 & (Join-Path $PSScriptRoot 'build.ps1') @BuildArgs
 
 Write-Host ''
