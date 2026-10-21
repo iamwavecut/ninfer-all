@@ -112,6 +112,9 @@ if (-not (Test-Path -LiteralPath $VcpkgToolchain -PathType Leaf)) {
 
 $cl = (Get-Command cl.exe -ErrorAction SilentlyContinue)
 if ($cl) { Write-Host "toolchain: $($cl.Source)" }
+$rc = (Get-Command rc.exe -ErrorAction SilentlyContinue)
+if (-not $rc) { throw 'Windows SDK rc.exe was not found in the VS 2022 build environment' }
+Write-Host "toolchain: $($rc.Source)"
 
 # --- configure and build ----------------------------------------------------------------------
 
@@ -129,6 +132,7 @@ try {
     $SfuOption = if ($ExperimentalFastSfu) { 'ON' } else { 'OFF' }
     $VectorSiluOption = if ($ExperimentalVectorSilu) { 'ON' } else { 'OFF' }
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
+          "-DCMAKE_RC_COMPILER=$($rc.Source)" `
           "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain" '-DVCPKG_TARGET_TRIPLET=x64-windows' `
           "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DBUILD_TESTING=$TestsOption" `
           "-DNINFER_SFU_SIGMOID_SILU=$SfuOption" "-DNINFER_SFU_SOFTPLUS=$SfuOption" `
