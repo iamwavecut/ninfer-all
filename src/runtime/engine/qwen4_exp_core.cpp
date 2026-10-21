@@ -647,7 +647,9 @@ struct Qwen4ExpCore::Impl {
         }
         sample_workspace                 = std::make_unique<WorkspaceArena>(workspace);
         const ContextCacheOptions& cache = options.context_cache;
-        if (reuse_prefixes) {
+        // Sequences of a shared KV pool keep no images (their pages go back to the pool), so the
+        // pool runs without the host and disk image store.
+        if (reuse_prefixes && !i.executor->kv_pooled()) {
             // An automatic budget is sized here, once the experts are pinned.
             const ContextCacheOptions sized = resolve_auto_host_cache_now(
                 cache, options.enable_vision ? std::uint64_t(options.media_cache_bytes) +
