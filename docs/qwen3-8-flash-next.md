@@ -1004,6 +1004,36 @@ alone three times, one slot against the pool, same build: B 91.0/93.5/93.7 again
 tok/s (four slots), A 64.4/64.4/64.4 against 64.2/64.4/64.5 (two slots). Without decode groups four
 pooled chats at once ran at about 10.5 tok/s each.
 
+On master f6ec88bb (graph segments of at most six layers), A with rk8v4, each row adding one mode to
+the row before, a 33,009-token prompt and a 1,024-token chat, through `ninfer-serve`:
+
+| Modes | Prefill tok/s | Decode tok/s |
+|---|---:|---:|
+| none, MTP3, `NINFER_QWEN4_HEAD_EMBEDDING=0` | 573 | 49.9 |
+| the head stage's embedding copy | 703 | 51.3 |
+| rank threads | 1,644 | 51.3 |
+| pipeline windows, MTP2 | 1,641 | 67.3 |
+| decode groups, two slots sharing a 262,144-token pool | 1,648 | 67.2 |
+| the same, a build that kept each stage's segment whole | 1,646 | 67.2 |
+
+Every text was the first row's. On the 206K prompt A decoded at 33.4 tok/s (510 tok/s prefill)
+without the modes and 45.8 (1,754) with the last row's, B with int8 at 42.4 (699) and 61.8 (1,617,
+four pooled slots), the same text in each pair; B's four pooled slots ran the 206K prompt beside
+three chats at 40.7 tok/s and the chats at 40.4-42.5. Without the clock floor the RTX 3060s sank to
+210 MHz between their stages' bursts: A then decoded the chat at 9.6 tok/s, each 3060's share of a
+verification taking 60-77 ms instead of 8.
+
+The message checkpoint on the same build, B with int8 and four pooled slots: the 206K docs prompt as
+a user message, then a turn that repeats it with the next user message's environment block dropped,
+as Cline-family clients send it. The build before it prefilled that turn's 206,299 tokens again
+(2 min 12 s to the first token); this one resumed from the checkpoint, 206,080 tokens reused, and
+answered in 1.1 s. A third turn that only appended was reused whole by both (0.6 s). Against a cold
+prefill of the same prompts (`--no-prefix-reuse`, top-2 logprobs), the turn resumed from the
+checkpoint kept the cold run's first 85 of 128 tokens and then took the other side of a near tie
+(" block" and " " 0.125 nats apart cold, equal resumed), its chosen tokens' logprobs up to 0.133 nats
+from the cold run's before that; the third turn, resumed from the live state as before, kept all 128
+tokens with logprobs up to 0.153 nats apart.
+
 ### Hyper-connections in Q8_0
 
 The hyper-connection projections (97 down/up pairs and 96 inject matrices) are stored as ggml Q8_0,
