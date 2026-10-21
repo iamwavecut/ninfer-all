@@ -150,6 +150,11 @@ int main() {
     int failures = 0;
     failures += run_contiguous_case("silu_mul [17408,1]", 17408, 1, 101u);
     failures += run_contiguous_case("silu_mul [17408,48]", 17408, 48, 102u);
+    // The opt-in Ada pack path must agree with the FP64 oracle at pack boundaries;
+    // its BF16x2 fallback must still handle the odd tail.
+    failures += run_contiguous_case("silu_mul [8,1]", 8, 1, 103u);
+    failures += run_contiguous_case("silu_mul [9,1]", 9, 1, 104u);
+    failures += run_contiguous_case("silu_mul [17415,1]", 17415, 1, 105u);
     failures += run_strided_gate_up_case();
     failures += run_edge_case();
     std::cout << (failures ? "FAIL" : "OK") << " silu_mul\n";

@@ -72,6 +72,20 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     const auto gate_addr = reinterpret_cast<std::uintptr_t>(gate.data);
     const auto up_addr   = reinterpret_cast<std::uintptr_t>(up.data);
     const auto out_addr  = reinterpret_cast<std::uintptr_t>(out.data);
+#if defined(NINFER_ADA_SILU_BF16X8) && NINFER_ADA_SILU_BF16X8
+    if (((gate_addr | up_addr | out_addr) & (alignof(Bf16x8Pack) - 1)) == 0 &&
+        (n % 8) == 0) {
+        constexpr int kMaxGrid = 4096;
+        const auto packs = n / 8;
+        const int grid = static_cast<int>(std::min<std::int64_t>(
+            kMaxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(kBlock)))));
+        silu_and_mul_bf16x8_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const Bf16x8Pack*>(gate.data),
+            static_cast<const Bf16x8Pack*>(up.data), static_cast<Bf16x8Pack*>(out.data), packs);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
     if (((gate_addr | up_addr | out_addr) & (alignof(__nv_bfloat162) - 1)) != 0) {
         const int scalar_grid = static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));
         silu_and_mul_scalar_kernel<<<scalar_grid, kBlock, 0, stream>>>(
