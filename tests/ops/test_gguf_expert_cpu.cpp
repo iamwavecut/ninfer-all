@@ -19,6 +19,7 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <numbers>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -496,7 +497,7 @@ double ulps(float got, double exact) {
 
 double silu64(double x) { return x / (1.0 + std::exp(-x)); }
 // 0.5 x (1 + tanh(u)) = x / (1 + e^-2u), the second form keeping its precision for negative u.
-double gelu_u(double x) { return std::sqrt(2.0 / M_PI) * (x + 0.044715 * x * x * x); }
+double gelu_u(double x) { return std::sqrt(2.0 / std::numbers::pi_v<double>) * (x + 0.044715 * x * x * x); }
 double gelu64(double x) { return x / (1.0 + std::exp(-2.0 * gelu_u(x))); }
 
 void check_silu(std::mt19937& rng) {
