@@ -1023,16 +1023,83 @@ three chats at 40.7 tok/s and the chats at 40.4-42.5. Without the clock floor th
 210 MHz between their stages' bursts: A then decoded the chat at 9.6 tok/s, each 3060's share of a
 verification taking 60-77 ms instead of 8.
 
-The message checkpoint on the same build, B with int8 and four pooled slots: the 206K docs prompt as
-a user message, then a turn that repeats it with the next user message's environment block dropped,
-as Cline-family clients send it. The build before it prefilled that turn's 206,299 tokens again
-(2 min 12 s to the first token); this one resumed from the checkpoint, 206,080 tokens reused, and
-answered in 1.1 s. A third turn that only appended was reused whole by both (0.6 s). Against a cold
-prefill of the same prompts (`--no-prefix-reuse`, top-2 logprobs), the turn resumed from the
-checkpoint kept the cold run's first 85 of 128 tokens and then took the other side of a near tie
-(" block" and " " 0.125 nats apart cold, equal resumed), its chosen tokens' logprobs up to 0.133 nats
-from the cold run's before that; the third turn, resumed from the live state as before, kept all 128
-tokens with logprobs up to 0.153 nats apart.
+Against master f6ec88bb as pulled (with only the MSVC line of `build/windows-release`), run as an API
+ran before these modes (MTP3, one slot), and this branch as the API runs it (rank threads, pipeline
+windows, decode groups of four, MTP2, four slots sharing a 262,144-token pool on B, two on A), both
+with 2,048-token chunks, greedy and without logprobs (a request with logprobs runs no pipeline
+windows): on A and on B every one of 17 texts was master's byte for byte. They were the 206K prompt
+(335 tokens on A, 422 on B), the 33K prompt, a code prompt and two 1,024-token chats, one at a time;
+four turns of an agent session over a 67K docs prompt, the second and third dropping the
+environment block of the user message before them as Cline-family clients send them, the fourth only
+appending; four chats at once; and the 33K prompt beside three chats. Master's plain decode (`--spec
+none`) gave its MTP3 texts on B's five single prompts.
+
+| A, rk8v4 | Master, MTP3 | This branch |
+|---|---:|---:|
+| 206K prompt: prefill / decode, tok/s | 531 / 35.1 | 1,750 / 46.0 |
+| 33K prompt: prefill / decode, tok/s | 569 / 40.3 | 1,600 / 56.7 |
+| code prompt, decode tok/s | 63.7 | 96.3 |
+| chats of 1,024 tokens, decode tok/s | 50.0, 58.0 | 69.5, 90.0 |
+| agent turns 1-4, time to the first token | 2 min 0 s, 2 min 0 s, 2 min 0 s, 0.56 s | 42 s, 4.5 s, 4.9 s, 0.54 s |
+| four chats: one after another (master), two at once (this branch) | 38.6 s | 25.9 s |
+
+On A's two slots a chat beside the 33K prompt's prefill decoded at 12.6 tok/s until the prompt was
+done (a prompt chunk between decode steps), against 37-46 beside another chat.
+
+What each mode costs in GPU power, one server per row adding one mode to the row before (A) or
+switching one (B): the 33K prompt with one output token (prefill) and a 1,024-token chat (decode),
+nvidia-smi sampling every card each 100 ms; the energy is the layout's cards' mean power over the
+request's wall time, times that time, per token. Master's rows are master as pulled.
+
+| A | Prefill tok/s | W | J/token | Decode tok/s | W | J/token |
+|---|---:|---:|---:|---:|---:|---:|
+| master, plain decode | 761 | 384 | 0.505 | 34.7 | 254 | 7.41 |
+| master, MTP3 | 573 | 345 | 0.603 | 48.0 | 278 | 5.89 |
+| the head stage's embedding copy | 702 | 377 | 0.539 | 49.2 | 280 | 5.79 |
+| rank threads | 1,653 | 549 | 0.333 | 49.0 | 274 | 5.69 |
+| MTP2 | 1,650 | 550 | 0.335 | 47.2 | 258 | 5.58 |
+| pipeline windows | 1,652 | 551 | 0.335 | 67.6 | 423 | 6.43 |
+| decode groups, two pooled slots | 1,653 | 553 | 0.336 | 67.7 | 424 | 6.45 |
+| the same without the RTX 3060 clock floor | 1,620 | 546 | 0.338 | 59.2 | 369 | 6.63 |
+
+| B | Prefill tok/s | W | J/token | Decode tok/s | W | J/token |
+|---|---:|---:|---:|---:|---:|---:|
+| master, MTP3 | 761 | 428 | 0.563 | 55.6 | 307 | 5.62 |
+| rank threads, decode groups, MTP2, four pooled slots | 1,570 | 548 | 0.350 | 57.6 | 301 | 5.32 |
+| the same with pipeline windows | 1,572 | 554 | 0.354 | 90.4 | 593 | 6.74 |
+
+Rank threads run the same passes, only at once: prefill 2.4 times as fast for 1.46 times the
+power, 38% less energy a prompt token. Pipeline windows are the one mode that computes what may be
+thrown away: 197 of the 437 guessed windows of A's chat held (45%), 203 of 428 on B (47%), and the
+dropped ones cost 15% (A) and 27% (B) more energy a generated token for 43% and 57% more speed.
+Four chats at once on B ran at 127.8 tok/s in all with decode groups (718 W, 5.62 J/token), against
+53.7 one after another on master (290 W, 5.41 J/token) and 41.3 in the engine's batched rounds
+without decode groups (305 W, 7.40 J/token); the decode groups' texts were the ones master gave
+one at a time, the batched rounds' were not (four of four differed). Idle, A's cards drew 64 W with
+the RTX 3060s held at 1,500 MHz and 48 W without; `--gpu-clock-floor` holds the floor only while
+requests run.
+
+At master's default prompt chunk (1,024 tokens) this branch gave master's 1,024-token texts on B's
+206K, code and chat prompts too, and prefilled the 206K prompt at 1,457 tok/s on B and 1,557 on A,
+against 1,614 and 1,753 with 2,048-token chunks (master: 665 against 700). Master's own 206K answer
+differs between the two chunk sizes; the short prompts, one chunk either way, do not.
+
+| B, int8 | Master, plain | Master, MTP3 | This branch |
+|---|---:|---:|---:|
+| 206K prompt: prefill / decode, tok/s | 760 / 37.3 | 700 / 43.8 | 1,610 / 64.7 |
+| 33K prompt: prefill / decode, tok/s | 810 / 44.2 | 751 / 50.4 | 1,540 / 70.5 |
+| code prompt, decode tok/s | 42.6 | 74.2 | 115.9 |
+| chats of 1,024 tokens, decode tok/s | 40.9, 40.9 | 56.6, 67.8 | 90.9, 118.1 |
+| agent turns 1-4, time to the first token | | 1 min 30 s, 1 min 31 s, 1 min 31 s, 0.51 s | 44 s, 3.5 s, 3.9 s, 0.44 s |
+| four chats: one after another (master), at once (this branch) | | 32.8 s | 14.0 s |
+
+Master prefilled each of the first three agent turns from scratch. This branch resumed the second
+and third from the message checkpoint at position 65,536 (2,048 tokens times 32, the boundary before
+the message's start) and the fourth from the live state. The checkpoint used to sit at the message's
+start, which split a prompt chunk: a 206K turn resumed from it answered in 1.1 s instead of 2 min
+12 s but kept a cold prefill's first 85 of 128 tokens only, then took the other side of a 0.125-nat
+tie; a turn resumed from the live state still matches a prefill from scratch only up to rounding (it
+kept all 128 tokens, with logprobs up to 0.153 nats apart), as on master.
 
 ### Hyper-connections in Q8_0
 
