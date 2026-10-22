@@ -24,7 +24,7 @@
  #include "models/qwen3_5/program/structured_round.h"
  #include "models/qwen3_5/program/graph_execution.h"
  #include "models/qwen3_5/execution/linear.h"
-@@ -754,6 +755,16 @@
+@@ -754,6 +755,17 @@
                           DecodeGraphExecutable* executable) {
      auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
      run_prepared(state, executable, body);
@@ -33,6 +33,7 @@
 +        {"logits", trace_frame.target_logits.slice(2,0,batch_size)},
 +        {"ids", trace_frame.verify_ids.slice(1,0,batch_size)},
 +        {"positions", trace_frame.verify_positions.slice(1,0,batch_size)},
++        {"valid", trace_frame.target_valid_columns.slice(0,0,batch_size)},
 +        {"targets", trace_frame.target_argmax.slice(1,0,batch_size)},
 +        {"drafts", trace_frame.draft_tokens.slice(1,0,batch_size)},
 +        {"licensed", trace_frame.licensed_tokens.slice(1,0,batch_size)},

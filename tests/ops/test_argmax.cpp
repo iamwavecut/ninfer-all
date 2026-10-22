@@ -59,6 +59,12 @@ std::vector<std::uint16_t> make_logits(std::int32_t physical_rows, std::int32_t 
         }
         logits[base + first]  = f32_to_bf16(token % 3 == 0 ? -0.5f : 32.0f + static_cast<float>(token));
         logits[base + second] = logits[base + first];
+        if (token % 3 == 2) {
+            // One represented BF16 step, beside the exact ties above. A small numerical
+            // change can legitimately switch greedy identity; argmax must still be exact.
+            logits[base + first] = f32_to_bf16(25.125f);
+            logits[base + second] = f32_to_bf16(25.25f);
+        }
 
         if (token == 0) {
             std::fill(logits.begin() + base, logits.begin() + base + valid_rows, f32_to_bf16(-4.0f));

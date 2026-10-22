@@ -34,6 +34,7 @@ param(
     [switch]$ExperimentalVectorSilu,
     [switch]$ExperimentalGgufIq3sT6Loop,
     [string]$Target,
+    [ValidateRange(0, 256)][int]$Jobs = 0,
     [string]$BuildDir,
     [ValidateSet('12.8', '12.9', '13.1', '13.2', '13.3', '13.4')][string]$CudaVersion,
     [ValidateSet('75', '80', '86', '89')][string]$Arch = '86'
@@ -144,6 +145,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
     $buildArgs = @('--build', $BuildDir, '-j')
+    if ($Jobs) { $buildArgs += $Jobs }
     if ($Target) { $buildArgs += @('--target', $Target) }
     cmake @buildArgs
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }

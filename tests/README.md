@@ -125,6 +125,26 @@ The variable-width DFlash2 target-attention subset can be run with
 cache codecs, W=2..16, B=1..8, request-local prefixes, cache effects, and Graph metadata/input
 updates. The default executable also runs the existing attention geometries and prefill tests.
 
+`ctest --test-dir build -R '^ninfer_attention_precision_' -j1 --output-on-failure`
+checks the existing device-default, forced FP32-PV and FP16-tile-PV implementations
+in separate processes. The D256/H24/KV4 cases cover BF16 and rk4v4, widths1/2/4/6/16,
+with the matching built-in card profile explicitly installed (missing profiles skip;
+no calibration or on-disk profile access),
+contexts0/68/512/3585, and widths1/6 at8192, fragmented pages, append/cached/batched
+production entries, Graph execution and the fused-gate boundary. Each route is
+checked against the independent represented-input FP64 oracle, not another width.
+Criteria are unchanged: ungated relative L2 <=0.0028 BF16 /0.00325 rk4v4,
+gross error <=0.001 /0.0011 + (2/256)*max(abs(reference)); gated criteria add
+2^-9 to relative L2 and the relative gross term. These cover the tested activation
+range, not arbitrary adversarial BF16 magnitudes or a promise of FP32 internal math.
+
+The model trace matrix in `tools/bench/trace_qwen_greedy.py --study stability`
+and `analyze_stability_matrix.py` separately reports exact token identity, close
+Top-2 observations, full-logit drift (without inventing a model-level tolerance),
+and wrong target argmax/licensed tokens/accepted prefixes. `test_target_trace.py`
+injects actual verification errors to check the detector; the GPU argmax suite
+checks exact ties and adjacent BF16 logits against its exact scalar oracle.
+
 `--quantized-depth-only` checks FP8, NVFP4 and K8V4 after 8,192 and 61,440 context tokens,
 at one query column and four verification columns, for both D256 geometries. It compares
 append-and-attend and cached-only Graph execution over fragmented pages with independently decoded

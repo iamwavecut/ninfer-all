@@ -4,6 +4,10 @@ Maintainer orchestration for the public `ninfer_bench` throughput tool, serving 
 runners, and the external Serve TTFT client. Correctness is owned by the affected suites under
 [`tests/`](../../tests/README.md).
 
+See the [RTX 4090 stability qualification](../../docs/performance/rtx4090-stability-2026-10.md)
+for exact greedy-verification audits, phase-scoped NVTX traces, and controlled
+baseline/baseline variance data. No unverified speedup is enabled by default.
+
 ## Interleaved A/B between two builds
 
 `run_interleaved_ab.py` compares two executables by alternating them **inside** each repetition.
