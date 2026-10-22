@@ -10,6 +10,8 @@
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
 #include "ops/softmax_attention/oracle.h"
+#include "runtime/engine/context_cache/context_cost.h"
+#include "runtime/engine/device_profile.h"
 
 #include <algorithm>
 #include <array>
@@ -4622,6 +4624,57 @@ int run_softmax_attention_pack_gqa_tests() {
     failures += run_rk4v4_e8_cases();
     failures += run_rk2v4_e8_cases();
     std::cout << (failures ? "FAIL" : "PASS") << " packed-GQA INT8 prompt causal attention\n";
+    return failures ? 1 : 0;
+}
+
+int run_softmax_attention_precision_contract_tests() {
+    if (cuda_unavailable()) return 77;
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp props{};
+    CUDA_CHECK(cudaGetDeviceProperties(&props, device));
+    auto profile = runtime::compiled_device_route_profile(
+        runtime::context_cost_hardware_class(props.name, props.major, props.minor),
+        props.multiProcessorCount);
+    if (!profile) {
+        std::cout << "SKIP: precision qualification requires a matching built-in card profile\n";
+        return 77;
+    }
+    struct RestoreProfile {
+        std::shared_ptr<const ops::DeviceRouteProfile> previous;
+        ~RestoreProfile() { ops::install_device_route_profile(std::move(previous)); }
+    } restore{ops::installed_device_route_profile()};
+    std::cout << "built-in precision profile=" << profile->hardware_class << '\n';
+    ops::install_device_route_profile(
+        std::make_shared<const ops::DeviceRouteProfile>(std::move(*profile)));
+    int failures = 0;
+    const char* forced = std::getenv("NINFER_SMALLT_PV_F16");
+    const char* prompt = std::getenv("NINFER_PROMPT_PV_F16");
+    std::cout << "PV Small-T=" << (forced ? forced : "device-default")
+              << " prompt=" << (prompt ? prompt : "device-default")
+              << " profile attn_pv_f16=" << ops::device_route_schedule("attn_pv_f16", 1) << '\n';
+    // Each production entry is independently compared to the represented-input FP64 oracle.
+    // Parity between widths is deliberately not an accuracy criterion. Batch cases additionally
+    // check the standalone/fused gate boundary, cache mutation, guards and graph metadata.
+    // Packed INT8-family fixtures use CachePlan; the enum overload is for the other
+    // storage families and does not allocate Lloyd4/int4 code planes.
+    for (const CachePlan& plan : {kPlanBf16, kPlanRk4v4}) {
+        for (int depth : {0, 68, 512, 3585, 8192}) {
+            for (int width : {1, 2, 4, 6, 16}) {
+                if (depth == 8192 && width != 1 && width != 6) continue;
+                std::cout << "precision " << cache_name(plan) << " W=" << width
+                          << " context=" << depth << std::endl;
+                const AttentionCase c{.tokens=width, .base=depth,
+                    .envelope_max=static_cast<std::uint32_t>(depth+width),
+                    .seed=static_cast<std::uint32_t>(7000+depth+width), .graph_replay=true};
+                failures += run_a1_case(kGeometries[0], plan, c, MappingPattern::Fragmented);
+                failures += run_a3_case(kGeometries[0], plan, c, MappingPattern::Fragmented);
+                failures += run_batch_case(kGeometries[0], plan,
+                    {width, {depth}, {width}, {0}, MappingPattern::Fragmented, c.seed});
+            }
+        }
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " attention precision contract\n";
     return failures ? 1 : 0;
 }
 

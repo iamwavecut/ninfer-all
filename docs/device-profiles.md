@@ -121,6 +121,15 @@ survives a second interleaved measurement, and its output matches the compiled r
 turns the prompt key splits off and `N` forces N splits wherever a call may split; `NINFER_LINEAR_ROUTES`
 (`legacy` or `unified`) takes one table for every Linear shape and every `unified/*` switch. `--fast-prefill-kernel` turns the fast prompt kernel on regardless.
 
+`attn_pv_f16=on` permits the INT8-family tensor-core prompt and Small-T routes to sum
+each key tile's P/V products with an FP16 accumulator, then widen the tile result into
+the FP32 running accumulator. `off` uses FP32 PV accumulation. Both retain FP32
+split state, merge and normalization and the same represented-input FP64 oracle and
+output-error criterion in `softmax_attention.h`. Neither setting guarantees identical
+logits or greedy tokens across verification widths; forcing FP32 PV does not remove
+other rounding, query quantization or reduction-order differences. These switches
+are diagnostics, not a new default or a universal accuracy guarantee.
+
 ## Batch composition
 
 A profile picks each width's fastest schedule, and schedules differ in the order in which they sum.

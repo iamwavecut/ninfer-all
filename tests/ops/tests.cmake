@@ -66,7 +66,7 @@ ninfer_add_op_test(ninfer_softmax_attention_test
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/plain_and_packed.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/context.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_ops ninfer_runtime_support)
 
 add_test(NAME ninfer_softmax_attention_nvfp4_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --nvfp4-only)
@@ -88,6 +88,18 @@ add_test(NAME ninfer_softmax_attention_rk2v4_e8_test
 # under a third of it.
 add_test(NAME ninfer_softmax_attention_dflash2_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --dflash2-only)
+foreach(pv IN ITEMS default 0 1)
+  add_test(NAME ninfer_attention_precision_${pv}_test
+    COMMAND ninfer_tests ninfer_softmax_attention_test --precision-contract-only)
+  if(NOT pv STREQUAL "default")
+    set_tests_properties(ninfer_attention_precision_${pv}_test
+      PROPERTIES ENVIRONMENT "NINFER_SMALLT_PV_F16=${pv};NINFER_PROMPT_PV_F16=${pv}")
+  else()
+    set_tests_properties(ninfer_attention_precision_${pv}_test PROPERTIES
+      ENVIRONMENT_MODIFICATION "NINFER_SMALLT_PV_F16=unset:;NINFER_PROMPT_PV_F16=unset:")
+  endif()
+  set_tests_properties(ninfer_attention_precision_${pv}_test PROPERTIES RUN_SERIAL TRUE)
+endforeach()
 add_test(NAME ninfer_softmax_attention_int8_prompt_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --int8-prompt-only)
 add_test(NAME ninfer_softmax_attention_prompt_split_test
