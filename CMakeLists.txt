@@ -157,6 +157,21 @@ option(NINFER_SFU_SIGMOID_SILU
 if(NINFER_SFU_SIGMOID_SILU)
   add_compile_definitions(NINFER_SFU_SIGMOID_SILU=1)
 endif()
+option(NINFER_ADA_SILU_BF16X8
+       "Use aligned BF16x8 SiLU multiplication candidate on sm_89 builds" OFF)
+if(NINFER_ADA_SILU_BF16X8)
+  if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
+    message(FATAL_ERROR "NINFER_ADA_SILU_BF16X8 requires a single sm_89 build")
+  endif()
+  add_compile_definitions(NINFER_ADA_SILU_BF16X8=1)
+endif()
+option(NINFER_ADA_GGUF_IQ3S_T6_LOOP
+       "Keep the IQ3_S T=6 K=5120 loop rolled on sm_89" OFF)
+if(NINFER_ADA_GGUF_IQ3S_T6_LOOP)
+  if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
+    message(FATAL_ERROR "NINFER_ADA_GGUF_IQ3S_T6_LOOP requires a single sm_89 build")
+  endif()
+endif()
 option(NINFER_SFU_SOFTPLUS
        "Evaluate the GDN gate's softplus on the SFU instead of expf and log1pf" OFF)
 if(NINFER_SFU_SOFTPLUS)

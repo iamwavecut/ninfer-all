@@ -1,0 +1,61 @@
+--- a/src/models/qwen3_5/program/decode.cpp
++++ b/src/models/qwen3_5/program/decode.cpp
+@@ -1,3 +1,4 @@
++#include "../../../../tools/bench/qwen_target_trace.h"
+ #include "models/qwen3_5/program/structured_round.h"
+ #include "models/qwen3_5/program/program_impl.h"
+ #include "models/qwen3_5/program/context_work.h"
+@@ -93,6 +94,11 @@
+                            DecodeGraphExecutable* executable) {
+     auto body = ordinary_batch_body(state, batch_size, envelope);
+     run_prepared(state, executable, body);
++    diagnostic::target_trace("plain", {
++        {"logits", state.frame.logits.slice(1,0,batch_size)},
++        {"ids", state.frame.tokens.slice(0,0,batch_size)},
++        {"positions", state.frame.cache_positions.slice(0,0,batch_size)},
++        {"sampled", state.frame.sampled_tokens.slice(0,0,batch_size)}}, state.execution.device.stream);
+ }
+
+ } // namespace ninfer::models::qwen3_5::execution
+--- a/src/models/qwen3_5/execution/draft.cpp
++++ b/src/models/qwen3_5/execution/draft.cpp
+@@ -1,3 +1,4 @@
++#include "../../../../tools/bench/qwen_target_trace.h"
+ #include "models/qwen3_5/program/structured_round.h"
+ #include "models/qwen3_5/program/graph_execution.h"
+ #include "models/qwen3_5/execution/linear.h"
+@@ -754,6 +755,17 @@
+                          DecodeGraphExecutable* executable) {
+     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
+     run_prepared(state, executable, body);
++    auto trace_frame = state.frame.narrowed(k);
++    diagnostic::target_trace("verify", {
++        {"logits", trace_frame.target_logits.slice(2,0,batch_size)},
++        {"ids", trace_frame.verify_ids.slice(1,0,batch_size)},
++        {"positions", trace_frame.verify_positions.slice(1,0,batch_size)},
++        {"valid", trace_frame.target_valid_columns.slice(0,0,batch_size)},
++        {"targets", trace_frame.target_argmax.slice(1,0,batch_size)},
++        {"drafts", trace_frame.draft_tokens.slice(1,0,batch_size)},
++        {"licensed", trace_frame.licensed_tokens.slice(1,0,batch_size)},
++        {"counts", trace_frame.licensed_counts.slice(0,0,batch_size)},
++        {"accepted", trace_frame.accepted_drafts.slice(0,0,batch_size)}}, state.execution.device.stream);
+ }
+
+ } // namespace ninfer::models::qwen3_5::execution
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -1,3 +1,4 @@
++#include "../../../../tools/bench/qwen_target_trace.h"
+ #include "models/qwen3_5/program/internal.h"
+ #include "models/qwen3_5/execution/text.h"
+ #include "models/qwen3_5/execution/attention.h"
+@@ -1228,6 +1229,9 @@
+                          layer + 1 < end ? next_projection_hints(static_cast<int>(layer))
+                                          : ops::SparseMoeHints{});
+             }
++            if (ph == Phase::Verify && std::getenv("NINFER_TRACE_LAYERS")) {
++                diagnostic::target_trace("layer-"+std::to_string(layer), {{"hidden",x},{"positions",*active_cache_positions_}},ctx_.stream);
++            }
+             if constexpr (Tap::enabled) {
+                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
+             }

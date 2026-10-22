@@ -20,7 +20,9 @@ std::uint16_t load16(const std::uint8_t* p) noexcept {
     return value;
 }
 
-float half(std::uint16_t bits) noexcept { return _cvtsh_ss(bits); }
+float half(std::uint16_t bits) noexcept {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)));
+}
 
 // Signed integer codes to weights: (code ^ bias) - bias, times the scale.
 __m256 weight(__m256i code, int bias, __m256 scale) noexcept {

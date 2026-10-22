@@ -35,8 +35,10 @@ if [[ -n "$crlf" ]]; then
   printf 'Linux bash rejects these outright inside a `case` block.\n' >&2
   exit 1
 fi
-# Every Windows script needs a Bash sibling. There used to be an exemption list here; the
-# counterpart was written instead, so the list is gone rather than empty. An exemption list is where the next Windows-only script quietly goes.
+# Windows scripts normally need a Bash sibling. These three Ada/RTX 4090 wrappers
+# are intentionally Windows-only (PowerShell, MSVC and native CUDA 13.4);
+# they do not ship as Linux launchers. Keep the exceptions explicit rather than
+# exempting all PowerShell scripts or weakening the Linux release guard.
 #
 # Accumulate rather than exiting on the first miss. This loop used to `exit 1` immediately, and
 # because it was failing on a cosmetic counterpart rule, none of the downloader coverage below it
@@ -44,6 +46,9 @@ fi
 # stops at its first complaint disables everything after it.
 missing=''
 for windows_script in "$root"/*.bat "$root"/*.ps1; do
+  case "$(basename -- "$windows_script")" in
+    benchmark-rtx4090.ps1|build-rtx4090.ps1|compare-rtx4090-sfu.ps1) continue ;;
+  esac
   counterpart="${windows_script%.*}.sh"
   [[ -f "$counterpart" ]] || missing+="  $(basename -- "$counterpart")"$'
 '

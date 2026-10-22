@@ -269,6 +269,7 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
 void append_timings_json(std::ostringstream& out, const GenerationTimings& timings,
                          std::string_view indent) {
     out << indent << "\"timings\": {" << "\"prepare_seconds\": " << number(timings.prepare_seconds)
+        << ", \"first_token_seconds\": " << number(timings.first_token_seconds)
         << ", " << "\"vision_seconds\": " << number(timings.vision_seconds) << ", "
         << "\"prefill_seconds\": " << number(timings.prefill_seconds) << ", "
         << "\"decode_seconds\": " << number(timings.decode_seconds) << ", "

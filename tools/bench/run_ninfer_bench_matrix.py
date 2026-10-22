@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 16
+REPORT_SCHEMA_VERSIONS = (16, 17, 18, 19)
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -250,8 +250,8 @@ def load_bench_report(report_path: Path) -> dict[str, Any]:
         report.get("artifact_type"),
         report.get("tool"),
     )
-    expected = (REPORT_SCHEMA_VERSION, REPORT_ARTIFACT_TYPE, REPORT_TOOL)
-    if identity != expected:
+    expected = (REPORT_SCHEMA_VERSIONS, REPORT_ARTIFACT_TYPE, REPORT_TOOL)
+    if identity[0] not in REPORT_SCHEMA_VERSIONS or identity[1:] != expected[1:]:
         raise ValueError(
             "unsupported benchmark report identity: "
             f"schema_version={identity[0]!r}, artifact_type={identity[1]!r}, "

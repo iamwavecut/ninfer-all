@@ -79,6 +79,9 @@ build option, untested:
 
 The other build options are in the [Linux guide](build-linux.md#build-options).
 
+For a dedicated RTX 4090 build with a selected CUDA 13.4 toolkit and reproducible
+benchmark reports, use the [RTX 4090 development workflow](rtx4090.md).
+
 ## Run
 
 `scripts\download-model.bat qwen38-27b` fetches the pinned official Qwen3.8-27B artifact and checks

@@ -73,18 +73,26 @@ struct ContextAttentionExecutionEnvelope {
  * plain FP8 V plane is not rotated, so its reduction has no inverse-rotation step).
  *
  * The qualified BFloat16 compute profile keeps Q/K and persistent K at BF16 and uses native BF16
- * QK plus FP16 P/V MMA. INT8-G64 uses native signed-INT8 Q/K MMA; its prompt route uses FP16 P/V
- * MMA and its small-T route uses BF16 P/V MMA. sm_100a/sm_120a use native E4M3FN QK MMA for FP8
+ * QK plus FP16 P/V MMA. INT8-G64 uses native signed-INT8 Q/K MMA and FP16 P/V operands in its
+ * tensor-core prompt and small-T routes. sm_100a/sm_120a use native E4M3FN QK MMA for FP8
  * and K8V4's key plane; this fork's sm_86/sm_89 build has no FP8 tensor-core path at all (unlike
  * INT8), so FP8, K8V4, and NVFP4 instead dequantize both K and V to BF16/FP16 up front and run QK
  * on native BF16 MMA, exactly as the BFloat16 profile does. NVFP4 and K8V4 never quantize Q to
  * FP4 or FP8 on any target. INT8 QK accumulates each group in INT32 and combines represented group
- * products in FP32; the other QK profiles accumulate in FP32. Every profile retains FP32
- * accumulation for PV, split state, merge, normalization, and applicable Hadamard reductions. P is
+ * products in FP32; the other QK profiles accumulate in FP32. INT8-family tensor-core prompt and small-T
+ * routes may accumulate a key tile's PV products in FP16, as selected by the device profile
+ * (or the respective NINFER_PROMPT_PV_F16 / NINFER_SMALLT_PV_F16 diagnostic override).
+ * Each tile result is widened and added to
+ * the FP32 running accumulator. The alternative accumulates PV directly in FP32. Split state,
+ * merge, normalization, and applicable Hadamard reductions remain FP32 in either case. P is
  * never quantized to FP8/FP4, and only the final public output is stored as BF16. These arithmetic
  * paths are implementation profiles rather than extra public tensor boundaries. Every cache route
  * has one named numerical criterion and is checked directly against its independent oracle;
  * route-to-route parity is only supplementary evidence.
+ * This is an output-error contract against the represented-input oracle, not a guarantee of
+ * FP32 arithmetic at every internal stage or bit identity across verification widths, routes,
+ * or precision overrides. Greedy token identity is a separate model-level observation; a valid
+ * target argmax can change when close logits move within the numerical error of those routes.
  * Newly appended rows cross their specified persistent codec boundary before attention
  * observes them.
  * Those criteria apply to the registered geometries, tested extents, conformance matrix, and

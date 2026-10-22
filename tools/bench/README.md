@@ -4,6 +4,10 @@ Maintainer orchestration for the public `ninfer_bench` throughput tool, serving 
 runners, and the external Serve TTFT client. Correctness is owned by the affected suites under
 [`tests/`](../../tests/README.md).
 
+See the [RTX 4090 stability qualification](../../docs/performance/rtx4090-stability-2026-10.md)
+for exact greedy-verification audits, phase-scoped NVTX traces, and controlled
+baseline/baseline variance data. No unverified speedup is enabled by default.
+
 ## Interleaved A/B between two builds
 
 `run_interleaved_ab.py` compares two executables by alternating them **inside** each repetition.
@@ -178,7 +182,9 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v16. The flattened summary and schema-v5 matrix
+Each raw report must be `ninfer_bench_report` schema v16–19. The matrix, RTX 4090 tuner,
+speed-of-light reader and paired GGUF reader accept these versions. Missing observed TTFT
+stays unavailable; phase times are not substituted for it. The flattened summary and schema-v5 matrix
 manifest carry native facts from the report: architecture, public name, actual formats, prefill signature, artifact,
 load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
 inside the unified workspace and CUDA Graph allowance, per-test planned logical and

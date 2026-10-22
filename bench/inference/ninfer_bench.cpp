@@ -1,6 +1,7 @@
 #include "ninfer_bench_support.h"
 
 #include "ninfer/engine.h"
+#include "core/nvtx.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -15,6 +16,18 @@
 #include <vector>
 
 namespace {
+
+class RepetitionRange {
+public:
+    RepetitionRange(const char* kind, const std::string& label, int repetition) {
+        const std::string name = std::string("bench.") + kind + "/" + label + "/" +
+                                 std::to_string(repetition);
+        nvtxRangePushA(name.c_str());
+    }
+    ~RepetitionRange() { nvtxRangePop(); }
+    RepetitionRange(const RepetitionRange&) = delete;
+    RepetitionRange& operator=(const RepetitionRange&) = delete;
+};
 
 std::string command_line(int argc, char** argv) {
     std::ostringstream out;
@@ -207,6 +220,7 @@ int main(int argc, char** argv) {
             result.test = test;
             engine.reset_memory_peaks();
             for (int warmup = 0; warmup < options.warmup; ++warmup) {
+                RepetitionRange range("warmup", test.label, warmup);
                 (void)run_repetition(engine, test, corpus);
             }
             result.reps.reserve(static_cast<std::size_t>(options.repetitions));
@@ -215,6 +229,7 @@ int main(int argc, char** argv) {
                 require_cuda(cudaProfilerStart(), "cudaProfilerStart");
             }
             for (int repetition = 0; repetition < options.repetitions; ++repetition) {
+                RepetitionRange range("measured", test.label, repetition);
                 result.reps.push_back(run_repetition(engine, test, corpus));
             }
             if (options.profile_measured) {
