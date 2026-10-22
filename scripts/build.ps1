@@ -31,6 +31,7 @@ param(
     [switch]$Clean,
     [switch]$Benchmarks,
     [switch]$ExperimentalFastSfu,
+    [switch]$ExperimentalVectorSilu,
     [string]$Target,
     [string]$BuildDir,
     [ValidateSet('12.8', '12.9', '13.1', '13.2', '13.3', '13.4')][string]$CudaVersion,
@@ -88,13 +89,32 @@ CMakeLists requires CUDA >= 12.8. Choose an installed version with -CudaVersion
 # vcvars64.bat only exports into its own cmd process, so run it and copy the result back.
 Write-Host "toolchain: $VcVars"
 Write-Host "toolchain: $Nvcc"
-cmd /c "`"$VcVars`" >nul 2>&1 && set" | ForEach-Object {
-    if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2] }
+$VcEnv = cmd /c "`"$VcVars`" >nul 2>&1 && set"
+# Windows may expose both PATH and Path. Importing the latter last discards
+# vcvars' compiler directory in PowerShell's case-insensitive environment.
+$VcPath = $VcEnv | Where-Object {
+    $_ -match '^PATH=' -and $_ -match 'MSVC\\[^;]+\\bin\\HostX64\\x64'
+} | Select-Object -First 1
+if (-not $VcPath) { throw 'vcvars64 did not return PATH' }
+$VcEnv | ForEach-Object {
+    if ($_ -match '^([^=]+)=(.*)$' -and $Matches[1] -ine 'PATH') {
+        Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2]
+    }
 }
+$env:PATH = $VcPath.Substring(5)
 $env:CUDACXX = $Nvcc
+
+$VcpkgRoot = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } else { 'C:\vcpkg' }
+$VcpkgToolchain = Join-Path $VcpkgRoot 'scripts\buildsystems\vcpkg.cmake'
+if (-not (Test-Path -LiteralPath $VcpkgToolchain -PathType Leaf)) {
+    throw "vcpkg toolchain not found: $VcpkgToolchain (set VCPKG_ROOT)"
+}
 
 $cl = (Get-Command cl.exe -ErrorAction SilentlyContinue)
 if ($cl) { Write-Host "toolchain: $($cl.Source)" }
+$rc = (Get-Command rc.exe -ErrorAction SilentlyContinue)
+if (-not $rc) { throw 'Windows SDK rc.exe was not found in the VS 2022 build environment' }
+Write-Host "toolchain: $($rc.Source)"
 
 # --- configure and build ----------------------------------------------------------------------
 
@@ -110,9 +130,13 @@ try {
     $BenchmarksOption = if ($BuildBenchmarks) { 'ON' } else { 'OFF' }
     $TestsOption = if ($Test) { 'ON' } else { 'OFF' }
     $SfuOption = if ($ExperimentalFastSfu) { 'ON' } else { 'OFF' }
+    $VectorSiluOption = if ($ExperimentalVectorSilu) { 'ON' } else { 'OFF' }
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
+          "-DCMAKE_RC_COMPILER=$($rc.Source)" `
+          "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain" '-DVCPKG_TARGET_TRIPLET=x64-windows' `
           "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DBUILD_TESTING=$TestsOption" `
-          "-DNINFER_SFU_SIGMOID_SILU=$SfuOption" "-DNINFER_SFU_SOFTPLUS=$SfuOption"
+          "-DNINFER_SFU_SIGMOID_SILU=$SfuOption" "-DNINFER_SFU_SOFTPLUS=$SfuOption" `
+          "-DNINFER_ADA_SILU_BF16X8=$VectorSiluOption"
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
     $buildArgs = @('--build', $BuildDir)
@@ -120,7 +144,7 @@ try {
     cmake @buildArgs
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 
-    if ($Test) {
+    if ($Test -and -not $Target) {
         # One GPU, so keep the parallelism low: unrelated CUDA tests contend for memory and
         # produce failures that do not reproduce when the test is run on its own.
         ctest --test-dir $BuildDir -j2 --output-on-failure

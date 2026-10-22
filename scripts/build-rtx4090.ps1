@@ -5,15 +5,21 @@ param(
     [ValidateSet('12.8', '12.9', '13.1', '13.2', '13.3', '13.4')]
     [string]$CudaVersion = '13.4',
     [string]$BuildDir,
+    [string]$Target,
     [switch]$Clean,
     [switch]$Test,
-    [switch]$ExperimentalFastSfu
+    [switch]$ExperimentalFastSfu,
+    [switch]$ExperimentalVectorSilu
 )
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $BuildDir) {
-    $BuildDir = Join-Path $RepoRoot $(if ($ExperimentalFastSfu) { 'build-rtx4090-sfu' } else { 'build-rtx4090' })
+    $suffix = if ($ExperimentalFastSfu -and $ExperimentalVectorSilu) { '-sfu-vector' }
+              elseif ($ExperimentalFastSfu) { '-sfu' }
+              elseif ($ExperimentalVectorSilu) { '-vector' }
+              else { '' }
+    $BuildDir = Join-Path $RepoRoot "build-rtx4090$suffix"
 }
 
 $BuildArgs = @{
@@ -22,9 +28,11 @@ $BuildArgs = @{
     BuildDir = $BuildDir
     Benchmarks = $true
     ExperimentalFastSfu = [bool]$ExperimentalFastSfu
+    ExperimentalVectorSilu = [bool]$ExperimentalVectorSilu
 }
 if ($Clean) { $BuildArgs['Clean'] = $true }
 if ($Test) { $BuildArgs['Test'] = $true }
+if ($Target) { $BuildArgs['Target'] = $Target }
 & (Join-Path $PSScriptRoot 'build.ps1') @BuildArgs
 
 Write-Host ''

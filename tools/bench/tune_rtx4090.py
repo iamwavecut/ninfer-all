@@ -37,10 +37,13 @@ class Candidate:
         return args
 
 
-def candidates(preset: str) -> list[Candidate]:
+def candidates(preset: str, backends: Sequence[str] = ()) -> list[Candidate]:
     kv_types = ("rk4v4",) if preset == "quick" else ("rk4v4", "rk8v4")
-    modes = (("none", 0), ("mtp", 3), ("mtp", 5),
-             ("dflash2", 5), ("dflash2", 7))
+    modes = [("none", 0)]
+    if "mtp" in backends:
+        modes += [("mtp", 3), ("mtp", 5)]
+    if "dflash2" in backends:
+        modes += [("dflash2", 3), ("dflash2", 5), ("dflash2", 7)]
     return [Candidate(kv, backend, drafts)
             for kv in kv_types for backend, drafts in modes]
 
@@ -119,6 +122,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--preset", choices=("quick", "full"), default="quick")
+    p.add_argument("--backends", nargs="*", choices=("mtp", "dflash2"), default=[],
+                   help="only draft components confirmed in the artifact; omitted means plain decode")
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--dry-run", action="store_true")
@@ -137,7 +142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if opts.out.exists():
         raise SystemExit(f"refusing to overwrite existing output: {opts.out}")
     opts.out.mkdir(parents=True)
-    matrix = candidates(opts.preset)
+    matrix = candidates(opts.preset, opts.backends)
     plan = {
         "artifact_type": "ninfer_rtx4090_tuning",
         "schema_version": 1,

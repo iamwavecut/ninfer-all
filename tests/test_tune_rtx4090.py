@@ -9,11 +9,13 @@ from tools.bench.tune_rtx4090 import (
 
 def test_candidates_have_single_baseline_and_unique_names():
     for preset in ("quick", "full"):
-        modes = candidates(preset)
+        modes = candidates(preset, ("mtp", "dflash2"))
         assert len(modes) == len({m.slug for m in modes})
         assert modes[0] == Candidate("rk4v4")
         assert all(m.backend == "none" or m.drafts > 0 for m in modes)
     assert workloads("full")[-1] == (32768, 128)
+    assert candidates("quick") == [Candidate("rk4v4")]
+    assert Candidate("rk4v4", "dflash2", 3) in candidates("quick", ("dflash2",))
 
 
 def test_command_uses_real_api_and_isolates_ngram(tmp_path):
