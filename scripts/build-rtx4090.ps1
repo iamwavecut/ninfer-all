@@ -9,13 +9,15 @@ param(
     [switch]$Clean,
     [switch]$Test,
     [switch]$ExperimentalFastSfu,
-    [switch]$ExperimentalVectorSilu
+    [switch]$ExperimentalVectorSilu,
+    [switch]$ExperimentalGgufIq3sT6Loop
 )
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $BuildDir) {
-    $suffix = if ($ExperimentalFastSfu -and $ExperimentalVectorSilu) { '-sfu-vector' }
+    $suffix = if ($ExperimentalGgufIq3sT6Loop) { '-iq3s-t6-loop' }
+              elseif ($ExperimentalFastSfu -and $ExperimentalVectorSilu) { '-sfu-vector' }
               elseif ($ExperimentalFastSfu) { '-sfu' }
               elseif ($ExperimentalVectorSilu) { '-vector' }
               else { '' }
@@ -29,6 +31,7 @@ $BuildArgs = @{
     Benchmarks = $true
     ExperimentalFastSfu = [bool]$ExperimentalFastSfu
     ExperimentalVectorSilu = [bool]$ExperimentalVectorSilu
+    ExperimentalGgufIq3sT6Loop = [bool]$ExperimentalGgufIq3sT6Loop
 }
 if ($Clean) { $BuildArgs['Clean'] = $true }
 if ($Test) { $BuildArgs['Test'] = $true }

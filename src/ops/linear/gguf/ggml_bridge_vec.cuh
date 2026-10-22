@@ -701,8 +701,18 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
         };
         if constexpr (KS != 0) {
             static_assert(KS % 1024 == 0);
+#if defined(NINFER_ADA_GGUF_IQ3S_T6_LOOP)
+            // Only the profiled Ada verification hotspot: keep other K shapes and the
+            // single-token/fused products on their measured baseline schedules.
+            if constexpr (type == GGML_TYPE_IQ3_S && T == 6 && !Fused && KS == 5120) {
+#pragma unroll 1
+                for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+            } else
+#endif
+            {
 #pragma unroll
-            for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+                for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+            }
         } else {
             for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
         }

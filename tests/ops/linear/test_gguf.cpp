@@ -16,6 +16,11 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+// Published IQ3_S codebook; decoding and the FP64 product below are host scalar oracles.
+#define GGML_COMMON_DECL_CPP
+#define GGML_COMMON_IMPL_CPP
+#include "ggml-common.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -23,6 +28,7 @@
 #include <exception>
 #include <iostream>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -59,11 +65,13 @@ float half_value(const std::uint8_t* p) {
 
 // An independent host decode of the formats simple enough to state here, each value d * (code -
 // offset): Q4_0 (low nibbles first, then high), Q5_0 (Q4_0 plus bit j of qh as bit 4 of value j)
-// and Q2_0 (two bits per value, low bits first). Empty for every other type.
+// and Q2_0 (two bits per value, low bits first), plus scalar IQ3_S codebook decoding.
+// Empty for every other type.
 std::vector<float> host_decode(QType qtype, const std::vector<std::uint8_t>& bytes) {
     std::vector<float> out;
     const auto block = gguf_block_shape(qtype);
-    if (qtype != QType::GGUF_Q4_0 && qtype != QType::GGUF_Q5_0 && qtype != QType::GGUF_Q2_0) {
+    if (qtype != QType::GGUF_Q4_0 && qtype != QType::GGUF_Q5_0 &&
+        qtype != QType::GGUF_Q2_0 && qtype != QType::GGUF_IQ3_S) {
         return out;
     }
     const std::size_t blocks = bytes.size() / block.bytes;
@@ -72,6 +80,18 @@ std::vector<float> host_decode(QType qtype, const std::vector<std::uint8_t>& byt
         const std::uint8_t* b = bytes.data() + i * block.bytes;
         const float d         = half_value(b);
         for (int j = 0; j < block.elements; ++j) {
+            if (qtype == QType::GGUF_IQ3_S) {
+                const int sub = j / 32, group = (j % 32) / 8, element = j % 8;
+                const int code_index = 2 * group + element / 4;
+                const int index = b[2 + 8 * sub + code_index]
+                                | (((b[66 + sub] >> code_index) & 1) << 8);
+                const auto word = iq3s_grid[index];
+                const int magnitude = (word >> (8 * (element % 4))) & 255;
+                const int sign = (b[74 + 4 * sub + group] >> element) & 1;
+                const int scale = 1 + 2 * ((b[106 + sub / 2] >> (4 * (sub % 2))) & 15);
+                out.push_back(d * float(scale * magnitude * (sign ? -1 : 1)));
+                continue;
+            }
             int code = 0;
             if (qtype == QType::GGUF_Q2_0) {
                 code = ((b[2 + j / 4] >> (2 * (j % 4))) & 3) - 1;
@@ -173,11 +193,10 @@ Error compare(const std::vector<float>& got, const std::vector<double>& want) {
 // products' last pass over a row with half of a warp's lanes idle; and Gemma 4's widths 2816, 2112
 // and 704, which are no whole number of the matrix kernel's 512-value activation steps (2112 and
 // 704 not even of its 256-value weight steps).
-int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
-    constexpr std::int32_t kRows = 256;
+int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k,
+             std::span<const std::int32_t> widths, std::int32_t kRows = 256) {
     const std::int32_t kK        = k;
-    const std::int32_t widths[]  = {1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130};
-    const std::int32_t max_t     = 130;
+    const std::int32_t max_t     = *std::max_element(widths.begin(), widths.end());
     std::mt19937 rng(seed);
     int failures = 0;
 
@@ -208,9 +227,12 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
             return 1;
         }
     }
-    if (const auto host = host_decode(c.qtype, host_blocks); !host.empty() && host != exact) {
-        std::cerr << "FAIL " << c.name << ": dequantization differs from the host decode\n";
-        return 1;
+    if (auto host = host_decode(c.qtype, host_blocks); !host.empty()) {
+        if (host != exact) {
+            std::cerr << "FAIL " << c.name << ": dequantization differs from the host decode\n";
+            return 1;
+        }
+        exact = std::move(host);
     }
 
     std::normal_distribution<float> normal(0.0f, 1.0f);
@@ -355,13 +377,31 @@ int main() {
     try {
         int failures      = 0;
         std::uint32_t seed = 9001;
+        const std::int32_t widths[] = {1, 2, 3, 4, 5, 6, 8, 9, 17, 40, 70, 130};
+        const std::int32_t iq3s_real_k_widths[] = {1, 6};
         for (const auto& c : cases()) {
             for (const std::int32_t k : {1536, 2560, 2816, 2112, 704}) {
                 if (k % gguf_block_shape(c.qtype).elements != 0) { continue; }
-                const int f = run_type(c, seed++, k);
+                const int f = run_type(c, seed++, k, widths);
                 std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
                           << '\n';
                 failures += f;
+            }
+            if (c.qtype == QType::GGUF_IQ3_S) {
+                const int f = run_type(c, seed++, 5120, iq3s_real_k_widths, 6144);
+                std::cout << (f == 0 ? "OK   " : "FAIL ")
+                          << "gguf iq3_s N=6144 K=5120 T=1,6\n";
+                failures += f;
+                const std::int32_t tail_widths[] = {5, 6, 7};
+                const int tail = run_type(c, seed++, 5120, tail_widths, 257);
+                std::cout << (tail == 0 ? "OK   " : "FAIL ")
+                          << "gguf iq3_s N=257 K=5120 T=5,6,7\n";
+                failures += tail;
+                const std::int32_t profile_width[] = {6};
+                const int profile = run_type(c, seed++, 5120, profile_width, 10240);
+                std::cout << (profile == 0 ? "OK   " : "FAIL ")
+                          << "gguf iq3_s N=10240 K=5120 T=6\n";
+                failures += profile;
             }
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " GGUF Linear\n";

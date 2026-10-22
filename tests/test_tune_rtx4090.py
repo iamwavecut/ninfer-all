@@ -29,7 +29,7 @@ def test_command_uses_real_api_and_isolates_ngram(tmp_path):
 
 
 def test_report_rejects_wrong_device_and_nonfinite():
-    report = {"schema_version": 18, "artifact_type": "ninfer_bench_report",
+    report = {"schema_version": 19, "artifact_type": "ninfer_bench_report",
               "tool": "ninfer_bench", "environment": {"gpu_name": "NVIDIA GeForce RTX 4090"},
               "tests": [{"n_prompt": 2048, "n_gen": 128,
                          "decode_output_tok_s_mean": 178.5}]}

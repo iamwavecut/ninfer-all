@@ -93,7 +93,7 @@ class SpeedOfLightTests(unittest.TestCase):
         artifact = fake_artifact(config)
         report = {
             "artifact_type": "ninfer_bench_report",
-            "schema_version": 16,
+            "schema_version": 19,
             "load": {"architecture": "Qwen3_5ForCausalLM", "name": "test"},
             "config": {"speculative_backend": "none"},
             "environment": {"gpu_name": "test gpu"},
@@ -183,11 +183,10 @@ class SpeedOfLightTests(unittest.TestCase):
             "memory": {"kv_capacity": 8, "kv_payload_bytes": 64},
             "tests": [],
         }
-        # v18 adds the expert residency and delivery counters, which leave the counted work alone.
-        report["schema_version"] = 18
-        assert estimate(report, artifact, 1, 1)["tests"] == []
         report["schema_version"] = 19
-        with self.assertRaisesRegex(ValueError, "v16, v17 or v18"):  # noqa: PT027
+        assert estimate(report, artifact, 1, 1)["tests"] == []
+        report["schema_version"] = 18
+        with self.assertRaisesRegex(ValueError, "schema v19"):  # noqa: PT027
             estimate(report, artifact, 1, 1)
 
     def test_speculative_report_is_rejected(self):
@@ -200,7 +199,7 @@ class SpeedOfLightTests(unittest.TestCase):
         artifact = fake_artifact(config)
         report = {
             "artifact_type": "ninfer_bench_report",
-            "schema_version": 16,
+            "schema_version": 19,
             "load": {"architecture": "Qwen3_5ForCausalLM"},
             "config": {"speculative_backend": "mtp"},
         }
