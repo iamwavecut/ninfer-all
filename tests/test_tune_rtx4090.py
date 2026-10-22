@@ -28,8 +28,9 @@ def test_command_uses_real_api_and_isolates_ngram(tmp_path):
     assert command[command.index("--ngram-draft-tokens") + 1] == "0"
 
 
-def test_report_rejects_wrong_device_and_nonfinite():
-    report = {"schema_version": 19, "artifact_type": "ninfer_bench_report",
+@pytest.mark.parametrize("version", [16, 17, 18, 19])
+def test_report_rejects_wrong_device_and_nonfinite(version):
+    report = {"schema_version": version, "artifact_type": "ninfer_bench_report",
               "tool": "ninfer_bench", "environment": {"gpu_name": "NVIDIA GeForce RTX 4090"},
               "tests": [{"n_prompt": 2048, "n_gen": 128,
                          "decode_output_tok_s_mean": 178.5}]}

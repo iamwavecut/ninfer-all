@@ -183,10 +183,11 @@ class SpeedOfLightTests(unittest.TestCase):
             "memory": {"kv_capacity": 8, "kv_payload_bytes": 64},
             "tests": [],
         }
-        report["schema_version"] = 19
-        assert estimate(report, artifact, 1, 1)["tests"] == []
-        report["schema_version"] = 18
-        with self.assertRaisesRegex(ValueError, "schema v19"):  # noqa: PT027
+        for version in (16, 17, 18, 19):
+            report["schema_version"] = version
+            assert estimate(report, artifact, 1, 1)["tests"] == []
+        report["schema_version"] = 20
+        with self.assertRaisesRegex(ValueError, "schema v16–19"):  # noqa: PT027
             estimate(report, artifact, 1, 1)
 
     def test_speculative_report_is_rejected(self):

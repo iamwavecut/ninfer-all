@@ -165,7 +165,7 @@ matching test, phase, and roof it reports the measured time change and the fract
 the pre-change gap to the roof that the change closed; a negative value moved the run
 away from the roof. A baseline already at or above a roof reports `n/a` for that roof's
 gap closure. Tests or phases present in only one run are listed as unmatched.
-The tool requires schema v19 and `--spec none`. It rejects speculative runs because proposals,
+The tool accepts schemas v16–19 and requires `--spec none`. It rejects speculative runs because proposals,
 verification, and acceptance make output tokens an invalid proxy for executed model work.
 
 Projection compute work is counted as `2 * matrix elements` for each executed text projection.

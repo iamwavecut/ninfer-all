@@ -25,6 +25,20 @@ FIELDS = (
 )
 
 
+def case_metrics(data: dict) -> dict:
+    if data.get("schema_version") not in (16, 17, 18, 19):
+        raise ValueError("expected benchmark schema 16–19")
+    tests = {}
+    for test in data["tests"]:
+        values = {key: test[key] for key in FIELDS}
+        ttft = [rep["timings"].get("first_token_seconds") for rep in test["reps"]]
+        # Earlier reports have no observed TTFT. Never manufacture it from phase timers.
+        values["ttft_seconds_mean"] = (statistics.mean(ttft)
+                                       if ttft and all(t is not None for t in ttft) else None)
+        tests[test["label"]] = values
+    return tests
+
+
 class ProcessVram:
     """Sample WDDM dedicated bytes by PID (NVML reports N/A on this host)."""
 
@@ -91,11 +105,11 @@ def gpu_sample() -> dict[str, float] | None:
 
 
 def run_one(exe: Path, weights: Path, out: Path, mode: str, pair: int,
-            arm: str) -> dict:
+            arm: str, warmup: int = 1) -> dict:
     stem = f"{mode}-{pair}-{arm}"
     report = out / f"{stem}.json"
     command = [str(exe), "--weights", str(weights), "-p", "512,2048", "-n", "128",
-               "-pg", "512,128;2048,128;8192,128", "-r", "2", "--warmup", "1",
+               "-pg", "512,128;2048,128;8192,128", "-r", "2", "--warmup", str(warmup),
                "--kv-dtype", "rk4v4", "--max-ctx", "16384", "-o", "json",
                "--output-file", str(report)]
     if mode == "dflash2":
@@ -121,8 +135,6 @@ def run_one(exe: Path, weights: Path, out: Path, mode: str, pair: int,
     if process.returncode:
         raise RuntimeError(f"{stem} failed with exit {process.returncode}; see stderr")
     data = json.loads(report.read_text(encoding="utf-8"))
-    if data.get("schema_version") != 19:
-        raise RuntimeError(f"{stem}: expected benchmark schema 19 with Engine TTFT")
     if data["environment"]["gpu_name"] != "NVIDIA GeForce RTX 4090":
         raise RuntimeError(f"{stem}: unexpected GPU")
     if [test["label"] for test in data["tests"]] != list(CASES):
@@ -136,13 +148,7 @@ def run_one(exe: Path, weights: Path, out: Path, mode: str, pair: int,
     expected_backend = "none" if mode == "plain" else "dflash2"
     if data["config"]["speculative_backend"] != expected_backend:
         raise RuntimeError(f"{stem}: unexpected speculative backend")
-    tests = {}
-    for test in data["tests"]:
-        values = {key: test[key] for key in FIELDS}
-        values["ttft_seconds_mean"] = statistics.mean(
-            rep["timings"]["first_token_seconds"] for rep in test["reps"]
-        )
-        tests[test["label"]] = values
+    tests = case_metrics(data)
     measured = {
         "mode": mode, "pair": pair, "arm": arm, "command": command,
         "start_unix_seconds": start, "elapsed_seconds": time.time() - start,
