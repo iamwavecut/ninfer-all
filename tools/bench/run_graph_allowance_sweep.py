@@ -1,36 +1,18 @@
-"""Measure CUDA Graph memory consumption against KV capacity.
+"""Measure CUDA Graph startup-memory deltas with repeated, matched model runs.
 
-The engine plans a graph allowance at startup and aborts if capture exceeds it::
+Reports are device-wide CUDA allocation observations, not VRAM exclusively
+owned by this process; changes in WDDM/desktop GPU activity can dominate.
+The historic ordinary graph count estimate is a legacy hint and is omitted
+for speculative MTP and DFlash2; it is NOT a current topology guarantee.
 
-    error: CUDA Graph preparation consumed 875819008 bytes, exceeding the planned
-    allowance of 12582912 bytes
+Examples (from the repository root):
 
-The non-speculative allowance is a flat ``12 MiB * max_concurrency`` with no capacity term
-(``layouts_impl.h``), while the number of captured graphs is
-``len(ordinary_graph_profiles(capacity)) * max_concurrency`` (``variant.cpp``). This sweep measures
-what capture actually costs so the allowance can be given a defensible formula instead of a
-constant.
+    python -m tools.bench.run_graph_allowance_sweep --cli PATH_TO_NINFER \\
+        --model MODEL.ninfer --spec dflash2 --kv-dtype rk4v4 \\
+        --capacities 8192 16384 32768 --repeats 5 --output profiles/baseline
 
-No profiler is involved. The CLI prints ``CUDA Graph memory <observed> / <allowance>`` itself, and
-a failure names both figures in the error text, so a failed run is still a data point.
-
-Two properties of the measurement drive the design:
-
-**It is a device-wide delta, not this process's allocation.** ``prepare_graphs`` brackets capture
-with two ``cudaMemGetInfo`` calls, so anything else resident on the GPU during that window lands in
-the number. Repeats are therefore mandatory: a single reading per capacity cannot distinguish a
-real curve from desktop VRAM drift. ``--repeats`` defaults to 3 and the report leads with spread.
-
-**Capture is eager and happens at construction**, before any prompt is seen. Prompt length cannot
-affect it. The prompt here is deliberately trivial and ``--max-new`` is 1: this measures startup,
-so each point costs roughly one model load rather than a benchmark run.
-
-Usage::
-
-    export LD_LIBRARY_PATH=/usr/lib/wsl/drivers/nvddi.inf_amd64_dabe455c4b5cf6f0:/usr/lib/wsl/lib
-    uv run python -m tools.bench.run_graph_allowance_sweep
-
-Edit the configuration constants below before running the sweep.
+See docs/performance/upstream-backport-review-2026-10.md for the A/B contract.
+Missing or unparseable memory instrumentation is reported as incomplete.
 """
 
 from __future__ import annotations
