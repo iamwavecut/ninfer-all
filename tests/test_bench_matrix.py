@@ -7,12 +7,13 @@ from tools.bench.run_ninfer_bench_matrix import BenchCase, load_bench_report, re
 
 
 @pytest.mark.parametrize("ngram_enabled", [False, True])
-def test_schema_v16_report_is_flattened_for_matrix_summary(tmp_path, ngram_enabled) -> None:
+@pytest.mark.parametrize("version", [16, 17, 18, 19])
+def test_supported_report_is_flattened_for_matrix_summary(tmp_path, ngram_enabled, version) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
         json.dumps(
             {
-                "schema_version": 16,
+                "schema_version": version,
                 "artifact_type": "ninfer_bench_report",
                 "tool": "ninfer_bench",
                 "artifact": {"path": "model.ninfer"},
@@ -128,7 +129,7 @@ def test_schema_v16_report_is_flattened_for_matrix_summary(tmp_path, ngram_enabl
     assert row["spec_accepted_per_position"] == "[1,1,1,1,1]"
 
 
-@pytest.mark.parametrize("version", [15, 17])
+@pytest.mark.parametrize("version", [15, 20])
 def test_matrix_rejects_different_report_schema(tmp_path, version) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(json.dumps({"schema_version": version,
@@ -136,3 +137,12 @@ def test_matrix_rejects_different_report_schema(tmp_path, version) -> None:
                                        "tool": "ninfer_bench"}), encoding="utf-8")
     with pytest.raises(ValueError, match="unsupported benchmark report identity"):
         load_bench_report(report_path)
+
+
+@pytest.mark.parametrize("version", [16, 17, 18, 19])
+def test_matrix_accepts_supported_legacy_reports(tmp_path, version):
+    path = tmp_path / 'legacy.json'
+    report = {"schema_version": version, "artifact_type": "ninfer_bench_report",
+              "tool": "ninfer_bench", "config": {}, "tests": []}
+    path.write_text(json.dumps(report), encoding='utf-8')
+    assert load_bench_report(path) == report

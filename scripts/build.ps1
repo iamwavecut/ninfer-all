@@ -32,6 +32,7 @@ param(
     [switch]$Benchmarks,
     [switch]$ExperimentalFastSfu,
     [switch]$ExperimentalVectorSilu,
+    [switch]$ExperimentalGgufIq3sT6Loop,
     [string]$Target,
     [string]$BuildDir,
     [ValidateSet('12.8', '12.9', '13.1', '13.2', '13.3', '13.4')][string]$CudaVersion,
@@ -115,6 +116,7 @@ if ($cl) { Write-Host "toolchain: $($cl.Source)" }
 $rc = (Get-Command rc.exe -ErrorAction SilentlyContinue)
 if (-not $rc) { throw 'Windows SDK rc.exe was not found in the VS 2022 build environment' }
 Write-Host "toolchain: $($rc.Source)"
+$RcCmake = $rc.Source.Replace('\', '/')
 
 # --- configure and build ----------------------------------------------------------------------
 
@@ -131,15 +133,17 @@ try {
     $TestsOption = if ($Test) { 'ON' } else { 'OFF' }
     $SfuOption = if ($ExperimentalFastSfu) { 'ON' } else { 'OFF' }
     $VectorSiluOption = if ($ExperimentalVectorSilu) { 'ON' } else { 'OFF' }
+    $GgufIq3sT6LoopOption = if ($ExperimentalGgufIq3sT6Loop) { 'ON' } else { 'OFF' }
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
-          "-DCMAKE_RC_COMPILER=$($rc.Source)" `
+          "-DCMAKE_RC_COMPILER=$RcCmake" `
           "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain" '-DVCPKG_TARGET_TRIPLET=x64-windows' `
           "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DBUILD_TESTING=$TestsOption" `
           "-DNINFER_SFU_SIGMOID_SILU=$SfuOption" "-DNINFER_SFU_SOFTPLUS=$SfuOption" `
-          "-DNINFER_ADA_SILU_BF16X8=$VectorSiluOption"
+          "-DNINFER_ADA_SILU_BF16X8=$VectorSiluOption" `
+          "-DNINFER_ADA_GGUF_IQ3S_T6_LOOP=$GgufIq3sT6LoopOption"
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
-    $buildArgs = @('--build', $BuildDir)
+    $buildArgs = @('--build', $BuildDir, '-j')
     if ($Target) { $buildArgs += @('--target', $Target) }
     cmake @buildArgs
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }

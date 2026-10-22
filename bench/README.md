@@ -165,7 +165,7 @@ matching test, phase, and roof it reports the measured time change and the fract
 the pre-change gap to the roof that the change closed; a negative value moved the run
 away from the roof. A baseline already at or above a roof reports `n/a` for that roof's
 gap closure. Tests or phases present in only one run are listed as unmatched.
-The tool requires schema v16, v17 or v18 and `--spec none`. It rejects speculative runs because proposals,
+The tool accepts schemas v16–19 and requires `--spec none`. It rejects speculative runs because proposals,
 verification, and acceptance make output tokens an invalid proxy for executed model work.
 
 Projection compute work is counted as `2 * matrix elements` for each executed text projection.
@@ -1258,13 +1258,14 @@ closed.
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 18 records the public value objects directly:
+statistics. JSON schema version 19 records the public value objects directly:
 
 - `load`: architecture, public name, actual formats, prefill signature, load/upload time,
   file/H2D/staging bytes and Device/Host object counts;
 - `memory`: weights/sequence/unified-workspace arenas, the optional non-additive Vision layout,
   planned context, KV storage, CUDA Graph allowance, and KV payload;
-- each repetition's `timings`: prepare, Vision, prefill, decode, and total seconds;
+- each repetition's `timings`: prepare, first token (Engine TTFT, including preparation),
+  Vision, prefill, decode, and total seconds;
 - each repetition's `speculative`: window, rounds, drafted/accepted tokens, fallbacks,
   separate ngram rounds/drafted/accepted tokens, and per-position
 acceptance.

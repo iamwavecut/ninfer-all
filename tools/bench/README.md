@@ -178,7 +178,9 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v16. The flattened summary and schema-v5 matrix
+Each raw report must be `ninfer_bench_report` schema v16–19. The matrix, RTX 4090 tuner,
+speed-of-light reader and paired GGUF reader accept these versions. Missing observed TTFT
+stays unavailable; phase times are not substituted for it. The flattened summary and schema-v5 matrix
 manifest carry native facts from the report: architecture, public name, actual formats, prefill signature, artifact,
 load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
 inside the unified workspace and CUDA Graph allowance, per-test planned logical and

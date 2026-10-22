@@ -55,7 +55,7 @@ def workloads(preset: str) -> list[tuple[int, int]]:
 def valid_speed(report: dict, expected_prompt: int, expected_decode: int) -> float:
     if (report.get("tool") != "ninfer_bench" or
             report.get("artifact_type") != "ninfer_bench_report" or
-            report.get("schema_version") not in (16, 17, 18)):
+            report.get("schema_version") not in (16, 17, 18, 19)):
         raise ValueError("unexpected benchmark schema")
     gpu = str(report.get("environment", {}).get("gpu_name", ""))
     if "RTX 4090" not in gpu:
