@@ -41,6 +41,14 @@ include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/sparse_moe/sources.cmake")
 
+# This experiment changes only the IQ3_S vector instantiations. Keep the define on their
+# translation unit so other GGUF codecs and CUDA families retain their baseline binaries.
+if(NINFER_ADA_GGUF_IQ3S_T6_LOOP)
+  set_source_files_properties(
+    "${CMAKE_CURRENT_LIST_DIR}/linear/gguf/ggml_vec_iq3_s.cu"
+    PROPERTIES COMPILE_DEFINITIONS NINFER_ADA_GGUF_IQ3S_T6_LOOP=1)
+endif()
+
 if(NINFER_COMPAT_PATH)
   # NVFP4 W4A4 uses mma.sync...kind::mxf4nvf4.block_scale; FP8 A8 uses
   # mma.sync...kind::f8f6f4. Both qualifiers are Blackwell-only, and sm_80/86/89 have no FP8 or FP4

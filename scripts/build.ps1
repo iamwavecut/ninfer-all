@@ -31,6 +31,8 @@ param(
     [switch]$Clean,
     [switch]$Benchmarks,
     [switch]$ExperimentalFastSfu,
+    [switch]$ExperimentalVectorSilu,
+    [switch]$ExperimentalGgufIq3sT6Loop,
     [string]$Target,
     [ValidateRange(0, 256)][int]$Jobs = 0,
     [string]$BuildDir,
@@ -131,11 +133,15 @@ try {
     $BenchmarksOption = if ($BuildBenchmarks) { 'ON' } else { 'OFF' }
     $TestsOption = if ($Test) { 'ON' } else { 'OFF' }
     $SfuOption = if ($ExperimentalFastSfu) { 'ON' } else { 'OFF' }
+    $VectorSiluOption = if ($ExperimentalVectorSilu) { 'ON' } else { 'OFF' }
+    $GgufIq3sT6LoopOption = if ($ExperimentalGgufIq3sT6Loop) { 'ON' } else { 'OFF' }
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
           "-DCMAKE_RC_COMPILER=$RcCmake" `
           "-DCMAKE_TOOLCHAIN_FILE=$VcpkgToolchain" '-DVCPKG_TARGET_TRIPLET=x64-windows' `
           "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DBUILD_TESTING=$TestsOption" `
-          "-DNINFER_SFU_SIGMOID_SILU=$SfuOption" "-DNINFER_SFU_SOFTPLUS=$SfuOption"
+          "-DNINFER_SFU_SIGMOID_SILU=$SfuOption" "-DNINFER_SFU_SOFTPLUS=$SfuOption" `
+          "-DNINFER_ADA_SILU_BF16X8=$VectorSiluOption" `
+          "-DNINFER_ADA_GGUF_IQ3S_T6_LOOP=$GgufIq3sT6LoopOption"
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
     $buildArgs = @('--build', $BuildDir, '-j')

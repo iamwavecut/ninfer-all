@@ -6,6 +6,8 @@
 // docs/op-development.md §6 (no math approximation).
 
 #include "ops/common/math.cuh"
+#include "ops/common/bf16_vector.cuh"
+#include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
 
@@ -19,6 +21,24 @@ __device__ __forceinline__ __nv_bfloat162 silu_mul_pair(__nv_bfloat162 g, __nv_b
     const float r0 = silu(__low2float(g)) * __low2float(u);
     const float r1 = silu(__high2float(g)) * __high2float(u);
     return __floats2bfloat162_rn(r0, r1);
+}
+
+// Ada candidate: one aligned 16-byte transaction per operand and output per
+// lane. Keep the FP32 SiLU and BF16 rounding of the production pair kernel.
+__launch_bounds__(256) __global__ void silu_and_mul_bf16x8_kernel(
+    const Bf16x8Pack* gate, const Bf16x8Pack* up, Bf16x8Pack* out, std::int64_t packs) {
+    const std::int64_t start = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < packs; i += stride) {
+        const Bf16x8Pack g = load_vec<Bf16x8Pack>(gate + i);
+        const Bf16x8Pack u = load_vec<Bf16x8Pack>(up + i);
+        Bf16x8Pack result;
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            result.pair[pair] = silu_mul_pair(g.pair[pair], u.pair[pair]);
+        }
+        store_vec(out + i, result);
+    }
 }
 
 __global__ void silu_and_mul_scalar_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up,

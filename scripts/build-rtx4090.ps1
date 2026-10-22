@@ -9,13 +9,20 @@ param(
     [ValidateRange(0, 256)][int]$Jobs = 0,
     [switch]$Clean,
     [switch]$Test,
-    [switch]$ExperimentalFastSfu
+    [switch]$ExperimentalFastSfu,
+    [switch]$ExperimentalVectorSilu,
+    [switch]$ExperimentalGgufIq3sT6Loop
 )
 
 $ErrorActionPreference = 'Stop'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $BuildDir) {
-    $BuildDir = Join-Path $RepoRoot $(if ($ExperimentalFastSfu) { 'build-rtx4090-sfu' } else { 'build-rtx4090' })
+    $suffix = if ($ExperimentalGgufIq3sT6Loop) { '-iq3s-t6-loop' }
+              elseif ($ExperimentalFastSfu -and $ExperimentalVectorSilu) { '-sfu-vector' }
+              elseif ($ExperimentalFastSfu) { '-sfu' }
+              elseif ($ExperimentalVectorSilu) { '-vector' }
+              else { '' }
+    $BuildDir = Join-Path $RepoRoot "build-rtx4090$suffix"
 }
 
 $BuildArgs = @{
@@ -24,6 +31,8 @@ $BuildArgs = @{
     BuildDir = $BuildDir
     Benchmarks = $true
     ExperimentalFastSfu = [bool]$ExperimentalFastSfu
+    ExperimentalVectorSilu = [bool]$ExperimentalVectorSilu
+    ExperimentalGgufIq3sT6Loop = [bool]$ExperimentalGgufIq3sT6Loop
 }
 if ($Clean) { $BuildArgs['Clean'] = $true }
 if ($Test) { $BuildArgs['Test'] = $true }

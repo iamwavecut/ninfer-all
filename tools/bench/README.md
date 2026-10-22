@@ -4,12 +4,9 @@ Maintainer orchestration for the public `ninfer_bench` throughput tool, serving 
 runners, and the external Serve TTFT client. Correctness is owned by the affected suites under
 [`tests/`](../../tests/README.md).
 
-The [RTX4090 stabilization report](../../docs/performance/rtx4090-stability-2026-10.md)
-documents `trace_qwen_greedy.py`, its diagnostic-only patch and exact verification
-audit, plus `profile_gguf_variance_4090.py` and explicit per-repetition NVTX phase
-analysis. Logit tolerance, token identity and verification errors are separate
-results. CPU/WDDM completeness is reported explicitly; CUDA elapsed time is not
-SM-busy time. These tools establish no automatic tuning or numerical default.
+See the [RTX 4090 stability qualification](../../docs/performance/rtx4090-stability-2026-10.md)
+for exact greedy-verification audits, phase-scoped NVTX traces, and controlled
+baseline/baseline variance data. No unverified speedup is enabled by default.
 
 ## Interleaved A/B between two builds
 
