@@ -9,11 +9,13 @@ from tools.bench.tune_rtx4090 import (
 
 def test_candidates_have_single_baseline_and_unique_names():
     for preset in ("quick", "full"):
-        modes = candidates(preset)
+        modes = candidates(preset, ("mtp", "dflash2"))
         assert len(modes) == len({m.slug for m in modes})
         assert modes[0] == Candidate("rk4v4")
         assert all(m.backend == "none" or m.drafts > 0 for m in modes)
     assert workloads("full")[-1] == (32768, 128)
+    assert candidates("quick") == [Candidate("rk4v4")]
+    assert Candidate("rk4v4", "dflash2", 3) in candidates("quick", ("dflash2",))
 
 
 def test_command_uses_real_api_and_isolates_ngram(tmp_path):
@@ -26,8 +28,9 @@ def test_command_uses_real_api_and_isolates_ngram(tmp_path):
     assert command[command.index("--ngram-draft-tokens") + 1] == "0"
 
 
-def test_report_rejects_wrong_device_and_nonfinite():
-    report = {"schema_version": 18, "artifact_type": "ninfer_bench_report",
+@pytest.mark.parametrize("version", [16, 17, 18, 19])
+def test_report_rejects_wrong_device_and_nonfinite(version):
+    report = {"schema_version": version, "artifact_type": "ninfer_bench_report",
               "tool": "ninfer_bench", "environment": {"gpu_name": "NVIDIA GeForce RTX 4090"},
               "tests": [{"n_prompt": 2048, "n_gen": 128,
                          "decode_output_tok_s_mean": 178.5}]}

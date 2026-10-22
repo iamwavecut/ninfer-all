@@ -436,7 +436,8 @@ qb::BenchEnvironment sample_environment() {
 int test_report_contract() {
     int failures                   = 0;
     const qb::BenchEnvironment env = sample_environment();
-    const auto results             = sample_results();
+    auto results                   = sample_results();
+    results[0].reps[0].timings.first_token_seconds = 0.527;
     Json report;
     try {
         report = Json::parse(qb::format_json(env,
@@ -449,7 +450,10 @@ int test_report_contract() {
 
     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
                        "report preserves runtime YaRN factor");
-    failures += expect(report.at("schema_version") == 18, "report schema v18");
+    failures += expect(report.at("schema_version") == 19, "report schema v19");
+    failures += expect(report.at("tests").at(0).at("reps").at(0).at("timings")
+                           .at("first_token_seconds") == results[0].reps[0].timings.first_token_seconds,
+                       "report preserves Engine TTFT");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");
