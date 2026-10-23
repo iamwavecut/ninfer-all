@@ -69,3 +69,16 @@ ninfer_add_op_test(ninfer_linear_gguf_mmq_store_test
 
 ninfer_add_op_test(ninfer_linear_gguf_mmq_limits_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_mmq_limits.cpp")
+
+ninfer_add_op_test(ninfer_linear_gguf_cooperative_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_cooperative.cu"
+  LIBRARIES ninfer_ops)
+
+target_include_directories(ninfer_linear_gguf_cooperative_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/include"
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+
+if(NINFER_GGUF_COOPERATIVE_LOADS)
+  target_compile_definitions(ninfer_linear_gguf_cooperative_test
+    PRIVATE NINFER_GGUF_COOPERATIVE_LOADS=1)
+endif()

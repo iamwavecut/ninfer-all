@@ -28,6 +28,12 @@ inline constexpr int kVecWarps = 4;
 
 namespace vec {
 
+#if defined(NINFER_GGUF_COOPERATIVE_LOADS)
+inline constexpr bool kCooperativeLoads = true;
+#else
+inline constexpr bool kCooperativeLoads = false;
+#endif
+
 struct Slice {
     int w[8];
     float f[6];
@@ -313,6 +319,7 @@ template <>
 struct Decoder<GGML_TYPE_Q4_K> {
     static constexpr int kBlockElems = 256, kBlockBytes = 144, kTableWords = 0;
     __device__ static const std::uint32_t* table() { return nullptr; }
+    template <bool Cooperative = false>
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t*, Slice& s) {
         const float2 dm = __half22float2(*reinterpret_cast<const half2*>(b));
@@ -321,8 +328,20 @@ struct Decoder<GGML_TYPE_Q4_K> {
         s.f[0]              = dm.x * float(sc);
         s.f[1]              = dm.y * float(m);
         const uint4* qs     = reinterpret_cast<const uint4*>(b + 16 + 32 * (u / 2));
-        const uint4 a0      = qs[0];
-        const uint4 a1      = qs[1];
+        uint4 a0, a1;
+        if constexpr (Cooperative) {
+            const unsigned mask = 0xFFu << (threadIdx.x & 24);
+            const uint4 own = qs[u & 1];
+            const uint4 peer = make_uint4(__shfl_xor_sync(mask, own.x, 1, 8),
+                                          __shfl_xor_sync(mask, own.y, 1, 8),
+                                          __shfl_xor_sync(mask, own.z, 1, 8),
+                                          __shfl_xor_sync(mask, own.w, 1, 8));
+            a0 = (u & 1) ? peer : own;
+            a1 = (u & 1) ? own : peer;
+        } else {
+            a0 = qs[0];
+            a1 = qs[1];
+        }
         const int shift     = 4 * (u & 1);
         const std::uint32_t v[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
 #pragma unroll
@@ -364,6 +383,7 @@ template <>
 struct Decoder<GGML_TYPE_Q6_K> {
     static constexpr int kBlockElems = 256, kBlockBytes = 210, kTableWords = 0;
     __device__ static const std::uint32_t* table() { return nullptr; }
+    template <bool Cooperative = false>
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t*, Slice& s) {
         const int h = u / 4, q = u % 4;
@@ -373,12 +393,31 @@ struct Decoder<GGML_TYPE_Q6_K> {
         s.f[1]               = d * float(sc[2 * q + 1]);
         const std::uint8_t* ql = b + 64 * h + 32 * (q & 1);
         const std::uint8_t* qh = b + 128 + 32 * h;
+        if constexpr (Cooperative) {
+            const unsigned mask = 0xFu << (threadIdx.x & 28);
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const std::uint32_t v = ((u32_a2(ql + 4 * i) >> (4 * (q >> 1))) & 0x0F0F0F0Fu) |
-                                    (((u32_a2(qh + 4 * i) >> (2 * q)) << 4) & 0x30303030u);
-            // v - 32 per byte, v in [0, 64): flip the high bits by whether v is below 32.
-            s.w[i] = int(v ^ 0xE0E0E0E0u ^ ((v & 0x20202020u) * 6u));
+            for (int base = 0; base < 8; base += 4) {
+                const std::uint32_t hi = u32_a2(qh + 4 * (base + q));
+                const std::uint32_t lo0 = u32_a2(ql + 4 * (base + (q >> 1)));
+                const std::uint32_t lo1 = u32_a2(ql + 4 * (base + 2 + (q >> 1)));
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const std::uint32_t high = __shfl_sync(mask, hi, j, 4);
+                    const std::uint32_t low = __shfl_sync(mask, j < 2 ? lo0 : lo1,
+                                                         (q & 1) + 2 * (j & 1), 4);
+                    const std::uint32_t v = ((low >> (4 * (q >> 1))) & 0x0F0F0F0Fu) |
+                                            (((high >> (2 * q)) << 4) & 0x30303030u);
+                    s.w[base + j] = int(v ^ 0xE0E0E0E0u ^ ((v & 0x20202020u) * 6u));
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const std::uint32_t v = ((u32_a2(ql + 4 * i) >> (4 * (q >> 1))) & 0x0F0F0F0Fu) |
+                                        (((u32_a2(qh + 4 * i) >> (2 * q)) << 4) & 0x30303030u);
+                // v - 32 per byte, v in [0, 64): flip the high bits by whether v is below 32.
+                s.w[i] = int(v ^ 0xE0E0E0E0u ^ ((v & 0x20202020u) * 6u));
+            }
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
@@ -639,7 +678,7 @@ struct Decoder<GGML_TYPE_IQ1_M> {
 
 // KS: the static K the slice loop unrolls over, or 0 for the runtime K. Fused: the weight is one
 // [gate; up] parent and each output row is silu(gate row) * up row.
-template <ggml_type type, int T, bool Fused, int KS>
+template <ggml_type type, int T, bool Fused, int KS, bool Cooperative = kCooperativeLoads>
 __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
     using D                 = Decoder<type>;
     constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
@@ -694,7 +733,15 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
                 Slice sl;
-                D::decode(rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes, sub, table, sl);
+                const auto* block = rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes;
+#if __CUDA_ARCH__ == 860
+                if constexpr (Cooperative && (type == GGML_TYPE_Q6_K || (type == GGML_TYPE_Q4_K && T == 1))) {
+                    D::template decode<true>(block, sub, table, sl);
+                } else
+#endif
+                {
+                    D::decode(block, sub, table, sl);
+                }
 #pragma unroll
                 for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
             }
