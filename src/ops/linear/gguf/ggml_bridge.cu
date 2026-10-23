@@ -2,6 +2,7 @@
 // activation quantizers follow ggml's q8_1, reading BF16 and optionally gathering the input columns.
 
 #include "ggml_bridge_internal.cuh"
+#include "mmq_limits.h"
 
 #include "ggml-cuda/dequantize.cuh"
 
@@ -42,6 +43,9 @@ const DeviceFacts& device_facts() {
         facts[device].cc                     = 100 * properties.major + 10 * properties.minor;
         facts[device].sm_count               = properties.multiProcessorCount;
         facts[device].shared_per_block_optin = properties.sharedMemPerBlockOptin;
+        for (int axis = 0; axis != 3; ++axis) {
+            facts[device].max_grid[axis] = properties.maxGridSize[axis];
+        }
     });
     return facts[device];
 }
@@ -738,6 +742,14 @@ int matrix_activation_layout(GgmlType type) {
 }
 
 std::size_t matrix_activation_bytes(int k, int columns) {
+    if (k <= 0 || k % QK8_1_MMQ != 0 || columns <= 0) {
+        throw std::invalid_argument("gguf matrix activation: unsupported geometry");
+    }
+    constexpr int words = sizeof(block_q8_1_mmq) / sizeof(int);
+    const std::int64_t padded_columns = (std::int64_t(columns) + 127) / 128 * 128;
+    detail::matrix_index_span(k / QK8_1_MMQ, std::int64_t(columns) * words, padded_columns * words);
+    detail::matrix_grid(columns, 1 + (k - 1) / (4 * detail::kMatrixQuantizeThreads), 1,
+                        detail::device_facts().max_grid);
     return std::size_t(columns) * (k / QK8_1_MMQ) * sizeof(block_q8_1_mmq) +
            detail::kMatrixActivationSlack;
 }
@@ -748,10 +760,9 @@ namespace {
 void quantize_matrix(GgmlType type, const __nv_bfloat16* x, int k, int k_padded, int columns,
                      const std::int32_t* input_columns, const std::int32_t* column_map,
                      int column_group, void* out, cudaStream_t stream) {
-    const dim3 blocks(columns,
-                      (k_padded + 4 * detail::kMatrixQuantizeThreads - 1) /
-                          (4 * detail::kMatrixQuantizeThreads),
-                      1);
+    (void)matrix_activation_bytes(k_padded, columns);
+    const int groups = 1 + (k_padded - 1) / (4 * detail::kMatrixQuantizeThreads);
+    const dim3 blocks(columns, groups, 1);
     auto* y = static_cast<block_q8_1_mmq*>(out);
     switch (mmq_get_q8_1_ds_layout(detail::to_ggml(type))) {
     case MMQ_Q8_1_DS_LAYOUT_D4:
@@ -786,9 +797,7 @@ void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, in
 namespace {
 
 // The matrix kernel's K step: an activation covers whole steps.
-constexpr int kMatrixStep = 256;
-
-int moe_padded_k(int k) { return (k + kMatrixStep - 1) / kMatrixStep * kMatrixStep; }
+int moe_padded_k(int k) { return detail::matrix_padded_width(k); }
 
 } // namespace
 

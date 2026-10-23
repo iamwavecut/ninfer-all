@@ -141,6 +141,55 @@ void check_rejected_geometry(const TypeCase& c) {
                                  nullptr, 128, nullptr, nullptr);
         }, "unsupported geometry");
     }
+    const std::int64_t small_row = std::int64_t(512 / block.elements) * block.bytes;
+    const auto reject_layout = [&](std::int64_t row, std::int64_t stride) {
+        const auto rejected = [&](auto call) {
+            reject(call, stride < 128 ? "unsupported output layout" : "index span");
+        };
+        rejected([&] {
+            gguf::matrix_product(c.type, nullptr, row, 128, 512, nullptr, 9,
+                                 nullptr, stride, nullptr, nullptr);
+        });
+        for (const bool accumulate : {false, true}) {
+            rejected([&] {
+                gguf::matrix_product_bf16(c.type, nullptr, row, 128, 512, nullptr, 9,
+                                          nullptr, stride, nullptr, nullptr, nullptr, accumulate);
+            });
+        }
+    };
+    for (const std::int64_t stride : {std::int64_t(-1), std::int64_t(0), std::int64_t(127),
+                                      std::int64_t(INT_MAX), std::int64_t(INT_MAX) + 1, INT64_MAX}) {
+        reject_layout(small_row, stride);
+    }
+    for (const std::int64_t stride : {std::int64_t(INT_MAX), std::int64_t(INT_MAX) + 1}) {
+        reject_layout(stride * block.bytes, 128);
+    }
+    reject([&] {
+        gguf::matrix_product(c.type, nullptr, std::int64_t(65536 / block.elements) * block.bytes,
+                             128, 65536, nullptr, 1000000, nullptr, 128, nullptr, nullptr);
+    }, "index span");
+    reject([&] { (void)gguf::matrix_activation_bytes(65536, 1000000); }, "index span");
+    reject([&] { (void)gguf::matrix_padded_k(INT_MAX); }, "padded K");
+    cudaDeviceProp properties{};
+    int device = 0;
+    check(cudaGetDevice(&device), "device for grid limit");
+    check(cudaGetDeviceProperties(&properties, device), "grid limit properties");
+    if (properties.maxGridSize[1] < (INT_MAX - 511) / 512) {
+        const int boundary = properties.maxGridSize[1] * 512;
+        (void)gguf::matrix_activation_bytes(boundary, 1);
+        reject([&] { (void)gguf::matrix_activation_bytes(boundary + 128, 1); },
+               "grid exceeds device limit");
+        reject([&] {
+            gguf::quantize_matrix_activation(c.type, nullptr, boundary + 512, 1,
+                                             nullptr, nullptr, nullptr);
+        }, "grid exceeds device limit");
+        reject([&] { (void)gguf::matrix_activation_bytes(INT_MAX - 511, 1); },
+               "grid exceeds device limit");
+        reject([&] {
+            gguf::quantize_matrix_activation(c.type, nullptr, INT_MAX - 511, 1,
+                                             nullptr, nullptr, nullptr);
+        }, "grid exceeds device limit");
+    }
 }
 
 void compare_outputs(const TypeCase& c, int k, int columns, int rows, int padding,

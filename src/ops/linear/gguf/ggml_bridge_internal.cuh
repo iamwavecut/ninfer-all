@@ -12,6 +12,7 @@
 #include "../../common/silu.h"
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -22,6 +23,7 @@ struct DeviceFacts {
     int cc         = 0; // ggml's compute capability: 100 * major + 10 * minor
     int sm_count   = 0;
     std::size_t shared_per_block_optin = 0;
+    std::array<int, 3> max_grid{};
 };
 
 [[nodiscard]] const DeviceFacts& device_facts();

@@ -50,6 +50,9 @@ MatrixLaunch select_matrix_launch(int rows, int columns) {
         if (tiles == 1) { break; }
     }
     if (best.J == 0) { throw std::invalid_argument("gguf matrix product: no tile fits this device"); }
+    if (rows > INT_MAX - (best.I - 1)) {
+        throw std::invalid_argument("gguf matrix product: row index range exceeded");
+    }
     best.row_tiles    = 1 + (rows - 1) / best.I;
     best.column_tiles = 1 + (columns - 1) / best.J;
     const int tiles   = matrix_work_blocks(best.row_tiles, best.column_tiles, 1);
@@ -61,6 +64,12 @@ MatrixLaunch select_matrix_launch(int rows, int columns) {
     } else {
         best.blocks = tiles;
     }
+    matrix_grid(best.stream_k ? best.blocks : best.row_tiles,
+                best.stream_k ? 1 : best.column_tiles, 1, device.max_grid);
+    if (best.fixup) {
+        matrix_grid(best.blocks, best.I / WARP_SIZE, 1, device.max_grid);
+        matrix_index_span(best.blocks, best.J * best.I, best.J * best.I);
+    }
     return best;
 }
 
@@ -71,11 +80,23 @@ std::size_t matrix_fixup_bytes_impl(int rows, int columns) {
 }
 
 template <ggml_type type, int J, typename Dst, bool accumulate>
-void launch_matrix(const MatrixLaunch& launch, const char* weight, int stride_row_blocks, int rows,
+void launch_matrix(const MatrixLaunch& launch, const char* weight, std::int64_t row_stride_blocks, int rows,
                    int k, const int* activation, int columns, Dst* out,
                    std::int64_t out_column_stride, float* fixup, cudaStream_t stream, float* partial) {
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     const std::int64_t work = matrix_work_blocks(launch.row_tiles, launch.column_tiles, k / qk);
+    if (rows % launch.I != 0 || out_column_stride < rows) {
+        throw std::invalid_argument("gguf matrix product: unsupported output layout");
+    }
+    const std::int64_t padded_blocks =
+        (std::int64_t(k / qk) + launch.k_step - 1) / launch.k_step * launch.k_step;
+    matrix_index_span(rows, row_stride_blocks, padded_blocks);
+    matrix_index_span(columns, out_column_stride, rows);
+    constexpr int activation_ints = sizeof(block_q8_1_mmq) / sizeof(int);
+    const std::int64_t padded_columns = std::int64_t(launch.column_tiles) * J;
+    matrix_index_span(padded_blocks * qk / QK8_1_MMQ,
+                      std::int64_t(columns) * activation_ints, padded_columns * activation_ints);
+    const int stride_row_blocks = static_cast<int>(row_stride_blocks);
     static std::once_flag raised[16];
     int device = 0;
     check(cudaGetDevice(&device), "device");
@@ -156,7 +177,7 @@ void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, i
     const auto* x             = static_cast<const char*>(weight);
     const auto* y             = static_cast<const int*>(activation);
     auto* f                   = static_cast<float*>(fixup);
-    const int stride_row      = static_cast<int>(row_bytes / block_bytes);
+    const std::int64_t stride_row = row_bytes / block_bytes;
     switch (launch.J) {
     case 16:
         launch_matrix<type, 16, Dst, accumulate>(launch, x, stride_row, rows, k, y, columns, out,
