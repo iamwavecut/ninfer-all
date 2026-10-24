@@ -1,40 +1,23 @@
-"""Measure CUDA Graph memory consumption against KV capacity.
+"""Measure CUDA Graph startup-memory deltas with repeated, matched model runs.
 
-The engine plans a graph allowance at startup and aborts if capture exceeds it::
+Reports are device-wide CUDA allocation observations, not VRAM exclusively
+owned by this process; changes in WDDM/desktop GPU activity can dominate.
+The historic ordinary graph count estimate is a legacy hint and is omitted
+for speculative MTP and DFlash2; it is NOT a current topology guarantee.
 
-    error: CUDA Graph preparation consumed 875819008 bytes, exceeding the planned
-    allowance of 12582912 bytes
+Examples (from the repository root):
 
-The non-speculative allowance is a flat ``12 MiB * max_concurrency`` with no capacity term
-(``layouts_impl.h``), while the number of captured graphs is
-``len(ordinary_graph_profiles(capacity)) * max_concurrency`` (``variant.cpp``). This sweep measures
-what capture actually costs so the allowance can be given a defensible formula instead of a
-constant.
+    python -m tools.bench.run_graph_allowance_sweep --cli PATH_TO_NINFER \\
+        --model MODEL.ninfer --spec dflash2 --kv-dtype rk4v4 \\
+        --capacities 8192 16384 32768 --repeats 5 --output profiles/baseline
 
-No profiler is involved. The CLI prints ``CUDA Graph memory <observed> / <allowance>`` itself, and
-a failure names both figures in the error text, so a failed run is still a data point.
-
-Two properties of the measurement drive the design:
-
-**It is a device-wide delta, not this process's allocation.** ``prepare_graphs`` brackets capture
-with two ``cudaMemGetInfo`` calls, so anything else resident on the GPU during that window lands in
-the number. Repeats are therefore mandatory: a single reading per capacity cannot distinguish a
-real curve from desktop VRAM drift. ``--repeats`` defaults to 3 and the report leads with spread.
-
-**Capture is eager and happens at construction**, before any prompt is seen. Prompt length cannot
-affect it. The prompt here is deliberately trivial and ``--max-new`` is 1: this measures startup,
-so each point costs roughly one model load rather than a benchmark run.
-
-Usage::
-
-    export LD_LIBRARY_PATH=/usr/lib/wsl/drivers/nvddi.inf_amd64_dabe455c4b5cf6f0:/usr/lib/wsl/lib
-    uv run python -m tools.bench.run_graph_allowance_sweep
-
-Edit the configuration constants below before running the sweep.
+See docs/performance/upstream-backport-review-2026-10.md for the A/B contract.
+Missing or unparseable memory instrumentation is reported as incomplete.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import statistics
@@ -131,11 +114,13 @@ def measure(cli: Path, model: Path, capacity: int, spec: str | None, draft_token
     observed = allowance = None
     # A run that aborts still reports both figures, in exact bytes rather than the summary's
     # two-decimal MiB, so failures are the more precise data points.
-    error = GRAPH_ERROR.search(result.stderr)
+    # Windows CLI and different logging backends may write the diagnostic to stdout.
+    combined = result.stderr + "\n" + result.stdout
+    error = GRAPH_ERROR.search(combined)
     if error:
         observed, allowance = int(error.group(1)), int(error.group(2))
     else:
-        line = GRAPH_LINE.search(result.stderr)
+        line = GRAPH_LINE.search(combined)
         if line:
             observed = parse_bytes(line.group(1), line.group(2))
             allowance = parse_bytes(line.group(3), line.group(4))
@@ -147,65 +132,84 @@ def measure(cli: Path, model: Path, capacity: int, spec: str | None, draft_token
         "graph_blocked": error is not None,
         "observed_bytes": observed,
         "allowance_bytes": allowance,
-        "predicted_graphs": ordinary_graph_count(capacity),
+        # This table only models ordinary graphs, not MTP/DFlash2 variants.
+        "predicted_graphs": ordinary_graph_count(capacity) if spec is None else None,
         "wall_s": round(wall, 2),
         "stderr_tail": result.stderr.strip().splitlines()[-1] if result.returncode else "",
         # A run that neither reports a figure nor aborts is the one case this sweep cannot
         # interpret, so keep its output rather than recording a silent None.
-        "unparsed_stderr": None if observed is not None else result.stderr[-4000:],
+        "unparsed_output": None if observed is not None else combined[-4000:],
     }
 
 
-def main() -> int:
-    if SPEC not in (None, "mtp"):
-        raise SystemExit(f"unsupported speculative mode: {SPEC}")
-    if REPEATS < 2:
-        raise SystemExit("REPEATS must be at least 2 to separate signal from device-wide noise")
-    if not CLI.exists():
-        raise SystemExit(f"engine binary not found: {CLI}")
-    if not MODEL.exists():
-        raise SystemExit(f"model artifact not found: {MODEL}")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cli", type=Path, default=CLI, help="ninfer CLI executable")
+    parser.add_argument("--model", type=Path, default=MODEL, help="read-only .ninfer artifact")
+    parser.add_argument("--capacities", nargs="+", type=int, default=list(CAPACITIES))
+    parser.add_argument("--repeats", type=int, default=REPEATS)
+    parser.add_argument("--spec", choices=("none", "mtp", "dflash2"), default=SPEC or "none")
+    parser.add_argument("--draft-tokens", type=int, default=DRAFT_TOKENS)
+    parser.add_argument("--kv-dtype", default=KV_DTYPE)
+    parser.add_argument("--prefill-chunk", type=int, default=PREFILL_CHUNK)
+    parser.add_argument("--output", type=Path, default=OUT)
+    args = parser.parse_args(argv)
+    spec = None if args.spec == "none" else args.spec
+    if args.repeats < 2:
+        parser.error("--repeats must be >= 2 to expose device-wide VRAM noise")
+    if not args.capacities or any(v < 1 for v in args.capacities):
+        parser.error("--capacities must contain positive integers")
+    if args.draft_tokens < 1 or args.prefill_chunk < 1:
+        parser.error("--draft-tokens and --prefill-chunk must be positive")
+    if not args.cli.is_file():
+        parser.error(f"engine binary not found: {args.cli}")
+    if not args.model.is_file():
+        parser.error(f"model artifact not found: {args.model}")
 
-    OUT.mkdir(parents=True, exist_ok=True)
+    args.output.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
-
-    print(f"{'capacity':>9}  {'graphs':>6}  {'observed':>12}  {'allowance':>10}  {'per graph':>10}  "
+    print(f"{'capacity':>9}  {'graphs':>6}  {'observed':>12}  {'allowance':>10}  "
           f"{'spread':>8}  result")
-    for capacity in CAPACITIES:
+    for capacity in args.capacities:
         runs = [
-            measure(CLI, MODEL, capacity, SPEC, DRAFT_TOKENS, KV_DTYPE, PREFILL_CHUNK)
-            for _ in range(REPEATS)
+            measure(args.cli, args.model, capacity, spec, args.draft_tokens,
+                    args.kv_dtype, args.prefill_chunk)
+            for _ in range(args.repeats)
         ]
         rows.extend(runs)
-
         seen = [r["observed_bytes"] for r in runs if r["observed_bytes"] is not None]
         graphs = runs[0]["predicted_graphs"]
         if not seen:
-            print(f"{capacity:>9}  {graphs:>6}  {'—':>12}  {'—':>10}  {'—':>10}  {'—':>8}  "
-                  f"no graph figure reported")
+            print(f"{capacity:>9}  {'n/a' if graphs is None else graphs!s:>6}  "
+                  "no graph figure reported")
             continue
-
         median = statistics.median(seen)
         spread = max(seen) - min(seen)
         allowance = next(r["allowance_bytes"] for r in runs if r["allowance_bytes"] is not None)
         blocked = sum(1 for r in runs if r["graph_blocked"])
-        verdict = "ok" if blocked == 0 else f"BLOCKED {blocked}/{len(runs)}"
-        print(f"{capacity:>9}  {graphs:>6}  {median / MIB:>10.2f} MiB  {allowance / MIB:>8.2f} MiB  "
-              f"{median / graphs / MIB:>8.2f} MiB  {spread / MIB:>6.2f} MiB  {verdict}")
+        verdict = "ok" if blocked == 0 and len(seen) == len(runs) else (
+            f"BLOCKED {blocked}/{len(runs)}" if blocked else "INCOMPLETE"
+        )
+        graph_label = "n/a" if graphs is None else str(graphs)
+        print(f"{capacity:>9}  {graph_label:>6}  {median / MIB:>10.2f} MiB  "
+              f"{allowance / MIB:>8.2f} MiB  {spread / MIB:>6.2f} MiB  {verdict}")
 
     report = {
+        "schema_version": 2,
+        "interpretation": ("Device-wide observed allocation deltas, not per-process GPU memory. "
+                           "No WDDM or scheduling attribution is implied."),
         "config": {
-            "cli": str(CLI), "model": str(MODEL), "repeats": REPEATS,
-            "spec": SPEC, "draft_tokens": DRAFT_TOKENS if SPEC else None,
-            "kv_dtype": KV_DTYPE, "prefill_chunk": PREFILL_CHUNK,
+            "cli": str(args.cli), "model": str(args.model), "repeats": args.repeats,
+            "spec": spec, "draft_tokens": args.draft_tokens if spec else None,
+            "kv_dtype": args.kv_dtype, "prefill_chunk": args.prefill_chunk,
+            "capacities": args.capacities,
         },
         "runs": rows,
     }
-    label = SPEC or "ordinary"
-    destination = OUT / f"graph-allowance-{label}-{KV_DTYPE}.json"
+    destination = args.output / f"graph-allowance-{args.spec}-{args.kv_dtype}.json"
     destination.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"\nwrote {destination}")
-    return 0
+    return 0 if all(r["observed_bytes"] is not None for r in rows) else 2
 
 
 if __name__ == "__main__":

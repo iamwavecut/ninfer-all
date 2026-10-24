@@ -8,6 +8,15 @@ See the [RTX 4090 stability qualification](../../docs/performance/rtx4090-stabil
 for exact greedy-verification audits, phase-scoped NVTX traces, and controlled
 baseline/baseline variance data. No unverified speedup is enabled by default.
 
+## Targeted upstream integration / CUDA Graph startup VRAM
+
+The [upstream backport audit](../../docs/performance/upstream-backport-review-2026-10.md)
+records what the fork already implements and why high-risk runtime rewrites
+are not yet imported. Use `run_graph_allowance_sweep.py` for repeated, explicitly
+parameterized baseline/candidate startup-memory experiments on Windows and
+`compare_graph_allowance_sweeps.py` to compare matched capacities without
+mistaking device-wide VRAM noise for GPU compute speed.
+
 ## Interleaved A/B between two builds
 
 `run_interleaved_ab.py` compares two executables by alternating them **inside** each repetition.
