@@ -1,3 +1,6 @@
+option(NINFER_GGUF_COOPERATIVE_LOADS
+  "Share packed Q4_K/Q6_K vector loads across sm86 lanes" OFF)
+
 # ggml's block-quant kernels (third_party/ggml-quants) behind a plain bridge. They build as their own
 # archive: the ggml headers define CUDA_CHECK and friends, so no NInfer translation unit may see them.
 set(NINFER_GGML_QUANTS_ROOT "${PROJECT_SOURCE_DIR}/third_party/ggml-quants")
@@ -49,6 +52,10 @@ if(WIN32)
     COMPILE_PDB_NAME ninfer_ggml_quants
     COMPILE_PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/ninfer_ggml_quants.dir")
 endif()
+if(NINFER_GGUF_COOPERATIVE_LOADS)
+  target_compile_definitions(ninfer_ggml_quants PRIVATE NINFER_GGUF_COOPERATIVE_LOADS=1)
+endif()
+
 target_include_directories(ninfer_ggml_quants PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}"
   "${NINFER_GGML_QUANTS_ROOT}/include"
