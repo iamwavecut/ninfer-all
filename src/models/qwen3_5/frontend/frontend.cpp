@@ -893,6 +893,12 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
 
 ModelSamplingDefaults default_sampling(Architecture architecture) {
     ModelSamplingDefaults sampling;
+    if (architecture == Architecture::Llama) {
+        sampling.thinking = {.temperature=0.6F,.top_k=20,.top_p=0.95F,.min_p=0,
+                             .presence_penalty=0,.frequency_penalty=0};
+        sampling.non_thinking=sampling.thinking;sampling.post_thinking=sampling.thinking;
+        return sampling;
+    }
     if (architecture == Architecture::Flint) {
         // Flint's generation_config.json, whether or not it reasons (it decides that itself).
         sampling.thinking      = {.temperature       = 1.0F,
@@ -955,6 +961,7 @@ public:
               compile_chat_template(resources, options.chat_template_path,
                                     options.architecture != Architecture::Gemma4 &&
                                         options.architecture != Architecture::Flint &&
+                                        options.architecture != Architecture::Llama &&
                                         options.architecture != Architecture::DeepSeekV41)),
           tokenizer(resources.tokenizer),
           processor(!options.vision_enabled                             ? fi::ProcessorOptions{}

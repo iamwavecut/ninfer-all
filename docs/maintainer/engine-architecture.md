@@ -59,6 +59,12 @@ Engine core（`runtime/engine/qwen4_exp_core`），共享 Qwen3.5 的 Frontend �
 （`runtime/engine/gemma4_core`、`flint_core`、`deepseek_v41_core`），以各自的方言共享 Qwen3.5 的
 Frontend，只在一个 GPU 上运行。
 
+Dense Llama/Nanbeige (`models/llama`, `runtime/engine/llama_core`) also owns explicit load and
+execution. Its single active sequence stores F16 KV in pageable host pages and runs attention on
+CUDA through bounded pinned/device staging, with an initial prefix sized to free VRAM resident (256 MiB planning headroom).
+Only populated rows of a transfer tile are uploaded. It shares the
+frontend through Metaspace-first BPE and the release's ChatML template; it uses eager execution.
+
 V3 artifact 保存配置、物理对象、逻辑参数的 Binding、使用位置的 Use，以及 Frontend 资源。
 Converter 负责源映射、量化或保值导入、融合存储、packing 和 layout 转换；loader 根据实际绑定
 验证、读取并上传原字节。相同架构和可处理的配置更换训练权重或组合已有表示，沿用同一模型代码。

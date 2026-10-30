@@ -64,8 +64,19 @@ role-marker chat template, reasoning the model opens itself, GLM-4.7 tool calls)
 sequences in prompt chunks of 2048 tokens with an F16 KV cache, drafts by context lookup only
 (`--lookup-ngram`; Recursive publishes no draft model), and has no vision, rotation scaling or
 pipeline stages; several GPUs divide its routed experts (`--tensor-parallel`).
+Dense Llama (`LlamaForCausalLM`; `src/models/llama`, `runtime/engine/llama_core`) is an explicit
+family for bias-free, untied, SiLU dense blocks with D128 heads and unscaled RoPE, including
+Nanbeige4.3-33B. Its GGUF converter reverses the Q/K rotary-pair row permutation into NeoX order
+without requantizing blocks. It shares the frontend with Metaspace-first BPE and the release's
+ChatML/XML-tool template. One active sequence runs eagerly in chunks up to 512 tokens; context
+lookup is optional. F16 active KV grows in pageable host pages, a prefix sized to free VRAM cached
+on the GPU (256 MiB planning headroom) and the rest staged through bounded pinned/device buffers.
+Only populated rows cross PCIe, including a partial transfer tile. All attention arithmetic
+stays on CUDA. At 262144 positions Nanbeige's host KV is 52 GiB; this is separate from bounded
+prefix-image storage. No vision, scaled RoPE, separate draft model or multi-GPU path. Limits and
+qualification evidence are in `docs/llama.md`.
 DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`; `src/models/deepseek_v41`,
-`runtime/engine/deepseek_v41_core`) is a fifth explicit family converted from ISTA-DASLab's
+`runtime/engine/deepseek_v41_core`) is a sixth explicit family converted from ISTA-DASLab's
 GSQ-RCO GGUF (IQ1_M) and its Engram table GGUF with the ggml blocks kept as stored. It shares the
 Qwen3.5 frontend in a DeepSeek dialect (the converter's transcription of the release's encoder as
 its chat template, DSML tool calls, reasoning opened by the prompt), runs one to eight sequences in

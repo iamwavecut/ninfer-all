@@ -409,3 +409,7 @@ ninfer_add_test(ninfer_stream_cpu_test
   LIBRARIES ninfer_ops)
 target_include_directories(ninfer_gguf_expert_cpu_test PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+
+ninfer_add_op_test(ninfer_dense_decoder_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dense_decoder.cpp"
+  LIBRARIES ninfer_ops)

@@ -164,6 +164,7 @@ public:
     // SentencePiece-style BPE (Gemma 4): spaces become U+2581, the whole text between added tokens
     // is one BPE word over code points, and a code point outside the vocabulary falls back to its
     // <0xXX> byte tokens. False for the byte-level Qwen tokenizer.
+    [[nodiscard]] bool strip_initial_space() const noexcept { return metaspace_first_; }
     [[nodiscard]] bool sentencepiece() const noexcept { return sentencepiece_; }
 
 private:
@@ -171,6 +172,7 @@ private:
                             const nlohmann::json& model, TokenizerResources resources);
 
     bool sentencepiece_ = false;
+    bool metaspace_first_ = false;
     // Byte-level: whether ordinary text is NFC-normalized first, and how it splits into words.
     bool nfc_              = true;
     ByteLevelSplit split_ = ByteLevelSplit::Qwen;

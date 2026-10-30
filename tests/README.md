@@ -525,3 +525,14 @@ The physical selection disables device-profile calibration (`device_profile=off`
 correctness gate. It does not qualify device-profile performance. The runner must record distinct
 GPU UUIDs for CUDA devices 0 and 1. A `0,0` result does not qualify two physical GPUs. On `sm_75`,
 use the pinned groupwise Qwen3.6 artifact; NVFP4 expert banks are not supported.
+
+## Dense Llama / Nanbeige qualification
+
+`ninfer_dense_decoder_test` checks represented-input FP64 numerical oracles at Nanbeige's width,
+GQA 56/8, position 262143 and 262144-key cache, with both 1024- and 8192-key segmentation.
+`ninfer_llama_frontend_test` checks the independent HF Metaspace fixtures; its optional argument
+is an equivalent fixture carrying a real tokenizer and cases.
+`ninfer_llama_real_test` is manual because the full artifact needs a V100-sized device and the
+capacity case needs 52 GiB of RAM. See [the model guide](../docs/llama.md#qualification) for its
+`logits`, `state`, `state-boundary`, `capacity-fast` and `capacity` modes and the limits of the resulting evidence. Conversion tests
+run with Python 3.11: `python3.11 -m pytest tests/convert/test_llama.py`.

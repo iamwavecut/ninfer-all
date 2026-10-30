@@ -347,6 +347,11 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   for speculative decoding. On an RTX 3090 it prefills a 10,000-token prompt at 6,045 tok/s and decodes at 215
   tok/s, 190 after 10,000 tokens, against llama.cpp's 4,697, 169 and 152 on the same GGUF; with two
   drafts a round chat answers decode at 291 tok/s instead of 209 ([Gemma 4](docs/gemma4.md)).
+- **Nanbeige4.3-33B / dense Llama.** Native GGUF import with exact Q/K row permutation,
+  Metaspace tokenization, one active sequence and F16 KV streamed from RAM. The 256k capacity
+  needs 52 GiB of host KV; a separate fast 8k profile fits a larger prefix in free VRAM and
+  enables context lookup. Short-context speed does not apply to a full window
+  ([capabilities and qualification](docs/llama.md)).
 - **Flint.** Recursive's 39.8B coding MoE (2.5B active), from a llama.cpp GGUF such as Unsloth's
   UD-Q4_K_XL, imported block for block (23.4 GiB): sliding-window and position-free full-attention
   blocks with learned sinks, 256 routed experts beside a shared one, up to eight concurrent

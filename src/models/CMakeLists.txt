@@ -21,3 +21,5 @@ include(qwen4_exp/loading_sources.cmake)
 include(gemma4/sources.cmake)
 include(flint/sources.cmake)
 include(deepseek_v41/sources.cmake)
+
+include(llama/sources.cmake)

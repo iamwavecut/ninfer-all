@@ -84,3 +84,5 @@ if(NINFER_WINDOWS_KERNEL_DLL)
   target_link_libraries(ninfer_kernels PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cublas)
   target_link_libraries(ninfer_ops PRIVATE ninfer_kernels)
 endif()
+
+target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/dense_decoder/dense_decoder.cu")
