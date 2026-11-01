@@ -17,16 +17,38 @@
 namespace ninfer::ops::detail::unified {
 namespace {
 
-// The registered 27B gate_up profile this route serves.
+// K is the one dimension a tensor-parallel column split leaves alone -- it splits the gate_up rows
+// between the ranks -- so it stays a compile-time constant, and every K-derived schedule stays with
+// it: the crossover the mainloops select on, the tile's column count, the quantiser's grid. The row
+// count is the call's: a rank holds a contiguous share of the [gate; up] rows, so the launch reads
+// it from gate_up.n instead of baking it.
+constexpr std::int32_t kCols = 5120;
+// Both halves' rows start on a 128-row tile boundary, so a gate_up pair is a whole number of 256
+// rows and any share of one is too.
+constexpr std::int32_t kRowTile = 128;
+
+// The registered 27B gate_up profile. The workspace query further down sees the profile but not the
+// Weight, so it sizes for the whole plane: a share is never wider than the plane it was cut from,
+// which keeps that answer an upper bound for every rank.
 constexpr std::int32_t kRows = 34816;
 constexpr std::int32_t kOut  = kRows / 2; // gate rows [0,17408) then up rows [17408,34816)
-constexpr std::int32_t kCols = 5120;
+
+// Which share of the gate_up rows this route admits: positive, no wider than the registered profile
+// the capacity query is sized for, and each half a whole number of row tiles.
+inline bool rows_admitted(std::int32_t rows) {
+    return rows > 0 && rows <= kRows && rows % (2 * kRowTile) == 0;
+}
+
+inline std::int32_t half_rows(std::int32_t rows) { return rows / 2; }
 
 // Row bytes of the E2M1 code plane and the row offset of the up half's block in the
 // BlockScaleK16M128x4 scale plane: both halves' rows start on a 128-row tile boundary, so the
-// up weight is the same single-source plane seen from row kOut.
-constexpr std::size_t kHalfCodeBytes = std::size_t(kOut) * (kCols / 2);
-constexpr std::size_t kHalfScaleBytes = std::size_t(kOut / 128) * (kCols / 64) * 512;
+// up weight is the same single-source plane seen from row `half`.
+inline std::size_t half_code_bytes(std::int32_t half) { return std::size_t(half) * (kCols / 2); }
+
+inline std::size_t half_scale_bytes(std::int32_t half) {
+    return std::size_t(half / kRowTile) * (kCols / 64) * 512;
+}
 
 constexpr std::size_t round256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
@@ -88,9 +110,12 @@ bool nvfp4_linear_swiglu_int8_tokens_supported(std::int32_t tokens) {
     return nvfp4_int8_route_admits(tokens);
 }
 
+// The lane's own share of the gate_up rows, not only the registered whole plane: a tensor-parallel
+// rank holds a contiguous share of them, and the route is shape-generic in the one dimension the
+// split moves, so a share the row tiles divide is served exactly as the whole plane is.
 bool nvfp4_linear_swiglu_int8_grouped_supported(const Weight& gate_up, std::int32_t tokens) {
     return gate_up.qtype == QType::NVFP4 && gate_up.layout == QuantLayout::BlockScaleK16M128x4 &&
-           gate_up.group == 16 && gate_up.n == kRows && gate_up.k == kCols &&
+           gate_up.group == 16 && rows_admitted(gate_up.n) && gate_up.k == kCols &&
            gate_up.qdata != nullptr && gate_up.scales != nullptr &&
            nvfp4_int8_route_admits(tokens);
 }
@@ -134,7 +159,11 @@ namespace {
 // (Nvfp4Int8SwiGluRowPolicy), so it needs no gate plane and no second launch.
 void launch_from_planes(const Weight& weight, const void* codes, const void* scales,
                         const void* gate_plane, Tensor& out, bool narrow_route, bool mmq_route,
-                        bool mmvq_route, std::int32_t tokens, cudaStream_t stream) {
+                        bool mmvq_route, std::int32_t tokens, std::int32_t rows,
+                        cudaStream_t stream) {
+    // The call's own share of the [gate; up] rows: a rank's column split moves this and leaves kCols
+    // alone, so everything below is written in terms of it. Both projections cover one half.
+    const std::int32_t half = half_rows(rows);
     // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode,
     // where llama.cpp folds it too, like the A16 route's global divisor. Both
     // projections share it -- the gate plane holds the rescaled gate, so silu(gate)*up is the
@@ -144,40 +173,42 @@ void launch_from_planes(const Weight& weight, const void* codes, const void* sca
     const auto* weight_scales = static_cast<const std::uint8_t*>(weight.scales);
     const auto* x_codes       = reinterpret_cast<const std::int8_t*>(codes);
     const auto* x_scales      = reinterpret_cast<const float*>(scales);
+    const std::size_t up_code_offset  = half_code_bytes(half);
+    const std::size_t up_scale_offset = half_scale_bytes(half);
 
     if (mmvq_route || mmq_route) {
         const LinearF32Output gate_output{reinterpret_cast<float*>(const_cast<void*>(gate_plane)),
-                                          kOut};
+                                          half};
         const LinearBf16GateSiluOutput up_output{
-            static_cast<__nv_bfloat16*>(out.data), kOut,
-            reinterpret_cast<const float*>(gate_plane), kOut};
+            static_cast<__nv_bfloat16*>(out.data), half,
+            reinterpret_cast<const float*>(gate_plane), half};
         if (mmvq_route) {
             if (narrow_route) {
                 narrow::launch<LinearF32Output>(weight_codes, weight_scales, x_codes, x_scales,
-                                                alpha, gate_output, kCols, tokens, kOut, stream);
+                                                alpha, gate_output, kCols, tokens, half, stream);
                 narrow::launch<LinearBf16GateSiluOutput>(
-                    weight_codes + kHalfCodeBytes, weight_scales + kHalfScaleBytes, x_codes,
-                    x_scales, alpha, up_output, kCols, tokens, kOut, stream);
+                    weight_codes + up_code_offset, weight_scales + up_scale_offset, x_codes,
+                    x_scales, alpha, up_output, kCols, tokens, half, stream);
             } else {
                 mmvq::launch<LinearF32Output>(weight_codes, weight_scales, x_codes, x_scales, alpha,
-                                              gate_output, kCols, tokens, kOut, stream);
+                                              gate_output, kCols, tokens, half, stream);
                 mmvq::launch<LinearBf16GateSiluOutput>(
-                    weight_codes + kHalfCodeBytes, weight_scales + kHalfScaleBytes, x_codes,
-                    x_scales, alpha, up_output, kCols, tokens, kOut, stream);
+                    weight_codes + up_code_offset, weight_scales + up_scale_offset, x_codes,
+                    x_scales, alpha, up_output, kCols, tokens, half, stream);
             }
         } else {
             mmq::launch<LinearF32Output>(weight_codes, weight_scales, x_codes, alpha, gate_output,
-                                         kCols, tokens, kOut, stream);
-            mmq::launch<LinearBf16GateSiluOutput>(weight_codes + kHalfCodeBytes,
-                                                  weight_scales + kHalfScaleBytes, x_codes, alpha,
-                                                  up_output, kCols, tokens, kOut, stream);
+                                         kCols, tokens, half, stream);
+            mmq::launch<LinearBf16GateSiluOutput>(weight_codes + up_code_offset,
+                                                  weight_scales + up_scale_offset, x_codes, alpha,
+                                                  up_output, kCols, tokens, half, stream);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    const LinearBf16Output paired_output{static_cast<__nv_bfloat16*>(out.data), kOut};
+    const LinearBf16Output paired_output{static_cast<__nv_bfloat16*>(out.data), half};
     nvfp4_int8_grouped_swiglu_launch<LinearBf16Output>(
-        weight_codes, weight_scales, x_codes, x_scales, alpha, paired_output, kCols, tokens, kRows,
+        weight_codes, weight_scales, x_codes, x_scales, alpha, paired_output, kCols, tokens, rows,
         stream);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -194,6 +225,10 @@ void nvfp4_linear_swiglu_int8_grouped_launch(const Tensor& x, const Weight& weig
     // the first kernel never wrote is a SiLU argument the second one still reads.
     const bool narrow_route = narrow::select(tokens, table);
     const std::int32_t padded = narrow::addressed_tokens(tokens, table);
+    // This call's share of the [gate; up] rows, which the admission below has already checked the
+    // row tiles divide: a tensor-parallel rank holds a contiguous share of them.
+    const std::int32_t rows = weight.n;
+    const std::int32_t half = half_rows(rows);
     if (!nvfp4_linear_swiglu_int8_grouped_supported(weight, tokens)) {
         throw std::invalid_argument("nvfp4 linear_swiglu int8: unsupported profile");
     }
@@ -220,7 +255,7 @@ void nvfp4_linear_swiglu_int8_grouped_launch(const Tensor& x, const Weight& weig
     // routes below the crossover need the FP32 gate plane.
     const bool two_projection = mmq_route || mmvq_route;
     const DeviceSpan gate_plane =
-        two_projection ? workspace.alloc_bytes(std::size_t(kOut) * padded * sizeof(float))
+        two_projection ? workspace.alloc_bytes(std::size_t(half) * padded * sizeof(float))
                        : DeviceSpan{};
 
     if (mmq_route) {
@@ -232,7 +267,7 @@ void nvfp4_linear_swiglu_int8_grouped_launch(const Tensor& x, const Weight& weig
     }
 
     launch_from_planes(weight, codes.data, scales.data, gate_plane.data, out, narrow_route,
-                       mmq_route, mmvq_route, tokens, stream);
+                       mmq_route, mmvq_route, tokens, rows, stream);
 }
 
 // The fused-edge entry for the gate_up pair: the RMSNorm that produced these activations folds into
@@ -247,6 +282,9 @@ void nvfp4_linear_swiglu_int8_fused_norm_launch(const Tensor& residual, const Te
     const std::int32_t tokens = residual.ne[1];
     const bool narrow_route   = narrow::select(tokens, table);
     const std::int32_t padded = narrow::addressed_tokens(tokens, table);
+    // This call's share of the [gate; up] rows -- see the plain entry above.
+    const std::int32_t rows = weight.n;
+    const std::int32_t half = half_rows(rows);
     if (!nvfp4_linear_swiglu_int8_grouped_supported(weight, tokens)) {
         throw std::invalid_argument("nvfp4 linear_swiglu int8 fused: unsupported profile");
     }
@@ -267,13 +305,13 @@ void nvfp4_linear_swiglu_int8_fused_norm_launch(const Tensor& residual, const Te
                                                     (kCols / 32) * sizeof(float));
     const bool two_projection = mmq_route || mmvq_route;
     const DeviceSpan gate_plane =
-        two_projection ? workspace.alloc_bytes(std::size_t(kOut) * padded * sizeof(float))
+        two_projection ? workspace.alloc_bytes(std::size_t(half) * padded * sizeof(float))
                        : DeviceSpan{};
 
     launch_rmsnorm_int8_quantize(residual, norm_weight, eps,
                                  static_cast<std::int8_t*>(codes.data),
                                  static_cast<float*>(scales.data), padded, stream);
     launch_from_planes(weight, codes.data, scales.data, gate_plane.data, out, narrow_route,
-                       mmq_route, mmvq_route, tokens, stream);
+                       mmq_route, mmvq_route, tokens, rows, stream);
 }
 } // namespace ninfer::ops::detail::unified

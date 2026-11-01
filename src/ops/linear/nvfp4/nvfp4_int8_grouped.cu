@@ -73,36 +73,49 @@ void nvfp4_linear_int8_grouped_launch(const Tensor& x, const Weight& weight, Ten
             reinterpret_cast<std::int8_t*>(codes.data), reinterpret_cast<float*>(scales.data));
     }
 
-    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), weight.n};
     const auto* w_codes  = static_cast<const std::uint8_t*>(weight.qdata);
     const auto* w_scales = static_cast<const std::uint8_t*>(weight.scales);
     const auto* x_int8   = reinterpret_cast<const std::int8_t*>(codes.data);
     const auto* x_scale  = reinterpret_cast<const float*>(scales.data);
     const float alpha    = 1.0F / weight.weight_scale_divisor;
-    if (mmvq_route) {
-        if (narrow_route) {
-            narrow::launch<LinearBf16Output>(w_codes, w_scales, x_int8, x_scale, alpha, output,
-                                             weight.k, tokens, weight.n, stream);
-        } else {
-            mmvq::launch<LinearBf16Output>(w_codes, w_scales, x_int8, x_scale, alpha, output,
-                                           weight.k, tokens, weight.n, stream);
+    // The mainloops store through `store` alone, so one set of launches serves either writer: BF16
+    // for a single device's result, FP32 for a tensor-parallel rank's partial sum, which the ranks
+    // add before the one rounding (core/tensor_parallel.h). The dtype picks the writer here rather
+    // than at the call site: writing FP32 through the BF16 writer would fill half of a four-byte
+    // buffer and leave the rest stale, without raising anything.
+    const auto launch = [&]<class Output>(const Output& output) {
+        if (mmvq_route) {
+            if (narrow_route) {
+                narrow::launch<Output>(w_codes, w_scales, x_int8, x_scale, alpha, output, weight.k,
+                                       tokens, weight.n, stream);
+            } else {
+                mmvq::launch<Output>(w_codes, w_scales, x_int8, x_scale, alpha, output, weight.k,
+                                     tokens, weight.n, stream);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
         }
+        if (mmq_route) {
+            mmq::launch<Output>(w_codes, w_scales, x_int8, alpha, output, weight.k, tokens,
+                                weight.n, stream);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode,
+        // where llama.cpp folds it too -- the same for every route on this mainloop. Both int8
+        // mainloops take the caller's real token count and predicate their stores on it, so the
+        // surplus columns a padded tile computes are dropped rather than written.
+        nvfp4_int8_grouped_launch<Output>(w_codes, w_scales, x_int8, x_scale, alpha, output,
+                                          weight.k, tokens, weight.n, stream);
         CUDA_CHECK(cudaGetLastError());
-        return;
+    };
+    if (out.dtype == DType::FP32) {
+        launch(LinearFp32Output{static_cast<float*>(out.data), weight.n});
+    } else if (out.dtype == DType::BF16) {
+        launch(LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n});
+    } else {
+        throw std::invalid_argument("nvfp4 linear int8: unsupported output dtype");
     }
-    if (mmq_route) {
-        mmq::launch<LinearBf16Output>(w_codes, w_scales, x_int8, alpha, output, weight.k, tokens,
-                                      weight.n, stream);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-    // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode, where
-    // llama.cpp folds it too -- the same for every route on this mainloop. Both int8 mainloops take
-    // the caller's real token count and predicate their stores on it, so the surplus columns a padded
-    // tile computes are dropped rather than written.
-    nvfp4_int8_grouped_launch<LinearBf16Output>(w_codes, w_scales, x_int8, x_scale, alpha, output,
-                                                weight.k, tokens, weight.n, stream);
-    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail::unified

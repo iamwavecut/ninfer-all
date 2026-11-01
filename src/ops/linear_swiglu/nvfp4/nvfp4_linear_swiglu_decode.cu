@@ -9,18 +9,21 @@
 
 #include <cuda_bf16.h>
 
+#include <stdexcept>
+
 namespace ninfer::ops::detail {
 namespace {
 
+// The 27B parent's geometry, which fixes every K-derived extent of the staging storage. The row
+// count is the call's: a tensor-parallel rank's share is gate rows with the matching up rows half
+// its own row count further down, and the grid divides its intermediate rows.
 using Geometry = Nvfp4N34816K5120;
 using Schedule =
     Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 4>;
 
-constexpr int kIntermediate = Geometry::kOutputRows / 2;
 static_assert(Schedule::kRowsPerWarp == 2);
 static_assert((Schedule::kWarpsPerCta % 4) == 0);
 static_assert((128 % Schedule::kWarpsPerCta) == 0);
-static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
 
 __global__ __launch_bounds__(
     Schedule::kThreads,
@@ -31,6 +34,7 @@ __global__ __launch_bounds__(
                                                                 const std::
                                                                     uint8_t* __restrict__ scales,
                                                                 float inverse_weight_divisor,
+                                                                int intermediate,
                                                                 __nv_bfloat16* __restrict__ out) {
     __shared__ Nvfp4GemvSharedStorage<Geometry, Schedule> shared;
     constexpr int kCtasPerM128                    = 128 / Schedule::kWarpsPerCta;
@@ -43,7 +47,7 @@ __global__ __launch_bounds__(
     const int rmod                                = flat_pair >> 2;
     const int quartile                            = flat_pair & 3;
     const int gate_row                            = m_tile * 128 + rmod + quartile * 32;
-    const int parent_rows[Schedule::kRowsPerWarp] = {gate_row, gate_row + kIntermediate};
+    const int parent_rows[Schedule::kRowsPerWarp] = {gate_row, gate_row + intermediate};
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_rows<Geometry, Schedule>(
@@ -66,11 +70,16 @@ __global__ __launch_bounds__(
 
 void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                        cudaStream_t stream) {
-    constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
-    const float inverse   = 1.0F / weight.weight_scale_divisor;
-    nvfp4_linear_swiglu_decode_kernel<<<kBlocks, Schedule::kThreads, 0, stream>>>(
+    const std::int32_t intermediate = weight.n / 2;
+    if (intermediate <= 0 || (intermediate % Schedule::kWarpsPerCta) != 0 ||
+        (intermediate % 128) != 0) {
+        throw std::invalid_argument("nvfp4 linear_swiglu decode: unsupported weight geometry");
+    }
+    const int blocks    = intermediate / Schedule::kWarpsPerCta;
+    const float inverse = 1.0F / weight.weight_scale_divisor;
+    nvfp4_linear_swiglu_decode_kernel<<<blocks, Schedule::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), inverse,
+        static_cast<const std::uint8_t*>(weight.scales), inverse, intermediate,
         static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }

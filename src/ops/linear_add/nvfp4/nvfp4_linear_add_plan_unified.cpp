@@ -20,7 +20,10 @@ enum class Nvfp4LinearAddRoute : std::uint8_t {
 
 Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                   LinearPolicy policy, std::int32_t tokens) {
-    if (tokens <= 0 || output_rows != 5120 || (input_rows != 6144 && input_rows != 17408)) {
+    // The residual width is undivided; the projection's columns are 6144, 17408, or a
+    // tensor-parallel rank's whole NVFP4 share of either.
+    if (tokens <= 0 || output_rows != 5120 || input_rows <= 0 || input_rows > 17408 ||
+        (input_rows % 256) != 0) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
@@ -32,6 +35,9 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
         return Nvfp4LinearAddRoute::Int8Grouped;
     }
     if (!allows_a4(policy)) { throw std::invalid_argument("nvfp4 linear_add: unsupported policy"); }
+    // A share has no per-geometry A4 instance -- the A4 route resolves a registered geometry -- so
+    // it runs A16, which reads K at launch time.
+    if (input_rows != 6144 && input_rows != 17408) { return Nvfp4LinearAddRoute::A16; }
     // With the three-stage A4 tile, K=6144 is ahead of A16 from 8 tokens too: 21.1 us against
     // 23.1-31.3 us at 8-16 tokens on RTX 5090.
     const std::int32_t first_a4 = 8;

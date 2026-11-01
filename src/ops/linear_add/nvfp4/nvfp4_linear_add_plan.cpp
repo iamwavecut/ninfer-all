@@ -40,7 +40,10 @@ enum class Nvfp4LinearAddRoute : std::uint8_t {
 
 Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
                                   LinearPolicy policy, std::int32_t tokens) {
-    if (tokens <= 0 || output_rows != 5120 || (input_rows != 6144 && input_rows != 17408)) {
+    // The residual width is undivided; the projection's columns are 6144, 17408, or a
+    // tensor-parallel rank's whole NVFP4 share of either.
+    if (tokens <= 0 || output_rows != 5120 || input_rows <= 0 || input_rows > 17408 ||
+        (input_rows % 256) != 0) {
         throw std::invalid_argument("nvfp4 linear_add: unsupported shape");
     }
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
@@ -53,6 +56,9 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
         return Nvfp4LinearAddRoute::Int8Grouped;
     }
     if (!allows_a4(policy)) { throw std::invalid_argument("nvfp4 linear_add: unsupported policy"); }
+    // A share has no per-geometry A4 instance -- the A4 route resolves a registered geometry -- so
+    // it runs A16, which reads K at launch time.
+    if (input_rows != 6144 && input_rows != 17408) { return Nvfp4LinearAddRoute::A16; }
     const std::int32_t first_w4a4 = input_rows == 6144 ? 7 : 8;
     return tokens >= first_w4a4 ? Nvfp4LinearAddRoute::W4A4 : Nvfp4LinearAddRoute::A16;
 }
@@ -112,7 +118,12 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
         // 32-token chunks that each re-read the whole weight. See nvfp4_attn_input_plan.cpp for the
         // measured figures, the one-ulp consequence inside 3..32, and the sm_75 shared-memory note.
         const std::int32_t tokens = x.ne[1];
-        if (tokens == 1) {
+        // This table's own decode and small-T routes are instances of a registered geometry, so a
+        // tensor-parallel rank's share takes the unified A16 lane, which reads K at launch time, at
+        // every width.
+        if (weight.k != 6144 && weight.k != 17408) {
+            unified::nvfp4_linear_add_a16_launch(x, weight, residual, stream);
+        } else if (tokens == 1) {
             nvfp4_linear_add_decode_launch(x, weight, residual, stream);
         } else if (tokens <= kOwnSmallTMaxTokens) {
             nvfp4_linear_add_small_t_launch(x, weight, residual, stream);

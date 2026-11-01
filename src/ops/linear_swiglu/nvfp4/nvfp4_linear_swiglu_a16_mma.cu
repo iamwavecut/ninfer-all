@@ -17,6 +17,11 @@
 //
 // That last point is why this is fused at all: routing through a BF16 gate/up pair plus silu_mul
 // (the LinearA16Post composition) rounds each projection once before SiLU and loses accuracy.
+//
+// The row count is the call's, not a template argument: a tensor-parallel rank holds a contiguous
+// share of the parent's gate rows with the matching up rows, so its fused parent is
+// [gate_share; up_share] with the up half starting at n/2. The input width, which a column split
+// does not divide, stays a template argument, so every K-specialised schedule is unchanged.
 
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan_unified.h"
 
@@ -24,6 +29,7 @@
 #include "core/weight.h"
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/nvfp4/nvfp4_geometry.h"
+#include "ops/linear/nvfp4/nvfp4_instances.cuh"
 #include "ops/linear/nvfp4/nvfp4_operands.h"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
@@ -36,32 +42,50 @@
 namespace ninfer::ops::detail::unified {
 namespace {
 
-using Geometry              = Nvfp4Geometry<34816, 5120>;
-constexpr int kIntermediate = Geometry::kOutputRows / 2;
+using Geometry = Nvfp4Geometry<34816, 5120>;
+
+// A rank's share of the fused parent: gate rows [0, n/2) then up rows [n/2, n), both halves on a
+// 128-row tile so the up half's plane offset stays a whole tile. The input rows are the hidden
+// width, which a column split does not divide, so K stays the template argument it always was.
+constexpr std::int32_t kRowTile = 128;
+
+constexpr bool rows_admitted(std::int32_t rows) {
+    return rows > 0 && rows <= Geometry::kOutputRows && (rows % (2 * kRowTile)) == 0;
+}
+
+// Above the SIMT band: the wide MMA ladder, at the width the whole parent uses.
+template <class Output>
+void launch_wide(const Nvfp4A16Operands& p, Output output, std::int32_t tokens,
+                 cudaStream_t stream) {
+    const auto epilogue = SwiGluRowMajorMmaEpilogue{};
+    const auto launch   = [&]<class Schedule>() {
+        using Instance = Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>;
+        launch_nvfp4_a16_mma<Instance>(p, output, epilogue, stream,
+                                      SwiGluRowMajorMmaRows<Instance>{});
+    };
+    if (tokens <= 64) {
+        launch.template operator()<Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>();
+    } else if (tokens <= 96) {
+        launch.template operator()<Nvfp4A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>();
+    } else {
+        launch.template operator()<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>();
+    }
+}
+
+void check(const Weight& weight) {
+    if (!rows_admitted(weight.n) || weight.k != Geometry::kInputRows) {
+        throw std::invalid_argument("nvfp4 linear_swiglu A16 MMA: unsupported weight geometry");
+    }
+}
 
 } // namespace
 
 void nvfp4_linear_swiglu_a16_mma_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream) {
-    if (weight.n != Geometry::kOutputRows || weight.k != Geometry::kInputRows) {
-        throw std::invalid_argument("nvfp4 linear_swiglu A16 MMA: unsupported weight geometry");
-    }
+    check(weight);
     const auto operands = nvfp4_a16_operands(x, weight);
-    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
-    const auto launch = [&]<class Schedule>() {
-        using Instance = Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>;
-        launch_nvfp4_a16_mma<Instance>(operands, output, SwiGluRowMajorMmaEpilogue{}, stream,
-                                      SwiGluRowMajorMmaRows<Instance>{});
-    };
-    // The tiling is the one the same geometry's plain NVFP4 Linear A16 route selects, over the
-    // registered rows/K extents of this Op's only shape.
-    if (x.ne[1] <= 64) {
-        launch.template operator()<Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>();
-    } else if (x.ne[1] <= 96) {
-        launch.template operator()<Nvfp4A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>();
-    } else {
-        launch.template operator()<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>();
-    }
+    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), weight.n / 2};
+    launch_wide(operands, output, x.ne[1], stream);
 }
 
 } // namespace ninfer::ops::detail::unified

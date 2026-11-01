@@ -115,6 +115,31 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
 
 void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                  cudaStream_t stream) {
+    if (weight.k != 6144 && weight.k != 17408) {
+        // A rank's share of the projection's columns. The ladders below are per-K instances, so a
+        // share -- whole NVFP4 column shares of the same projection -- runs the MMA schedules with
+        // K left open, as the general route does, and the residual add rides the same epilogue.
+        if (weight.n <= 0 || (weight.n % 128) != 0 || (weight.k % 256) != 0) {
+            throw std::invalid_argument(
+                "nvfp4 linear_add A16 MMA: a share needs M128 rows and whole NVFP4 column shares");
+        }
+        const auto p        = nvfp4_a16_operands(x, weight);
+        const auto output   = LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n};
+        const auto epilogue = LinearResidualAddEpilogue{
+            {static_cast<__nv_bfloat16*>(residual.data), weight.n}};
+        const int tokens = x.ne[1];
+        if (tokens <= 64) {
+            launch_nvfp4_a16_mma<Nvfp4A16MmaSchedule<32, 64, 128, 32, 16, 2, 2>>(p, output, epilogue,
+                                                                                stream);
+        } else if (tokens <= 128) {
+            launch_nvfp4_a16_mma<Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>>(p, output, epilogue,
+                                                                                stream);
+        } else {
+            launch_nvfp4_a16_mma<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>(p, output, epilogue,
+                                                                                stream);
+        }
+        return;
+    }
     if (x.ne[1] == 1) {
         nvfp4_linear_add_decode_launch(x, weight, residual, stream);
         return;

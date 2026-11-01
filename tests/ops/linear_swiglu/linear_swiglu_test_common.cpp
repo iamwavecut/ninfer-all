@@ -240,8 +240,12 @@ void validate_profile(const Profile& profile) {
                               profile.output_rows == 6144;
     const bool q8_dflash2 = profile.qtype == QType::Q8_G32_FP16 && profile.gate_up_rows == 34816 &&
                             profile.input_rows == 5120 && profile.output_rows == 17408;
-    const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.gate_up_rows == 34816 &&
-                       profile.input_rows == 5120 && profile.output_rows == 17408;
+    // The 27B's fused parent, and a tensor-parallel rank's share of it: the same K, gate and up
+    // rows divided so that each share's halves stay whole 128-row tiles.
+    const bool nvfp4 = profile.qtype == QType::NVFP4 && profile.input_rows == 5120 &&
+                       profile.gate_up_rows > 0 && profile.gate_up_rows <= 34816 &&
+                       (profile.gate_up_rows % 256) == 0 &&
+                       profile.gate_up_rows == 2 * profile.output_rows;
     const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16 && profile.gate_up_rows == 34816 &&
                      profile.input_rows == 5120 && profile.output_rows == 17408;
     if ((!q4 && !t2 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||

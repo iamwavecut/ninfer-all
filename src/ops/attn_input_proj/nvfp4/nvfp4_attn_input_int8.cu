@@ -22,21 +22,22 @@
 namespace ninfer::ops::detail::unified {
 namespace {
 
-constexpr std::int32_t kRows = 14336;
 constexpr std::int32_t kCols = 5120;
 
 // The mainloop half, identical whichever way the planes were filled: the quantise pass above it is
 // the only thing the fused route replaces.
 void launch_from_planes(const Weight& weight, const void* codes, const void* scales, Tensor& q,
-                        Tensor& gate, Tensor& k, Tensor& v, bool narrow_route, bool mmq_route,
-                        bool mmvq_route, std::int32_t tokens, cudaStream_t stream) {
+                        Tensor& gate, Tensor& k, Tensor& v, const AttentionInputShare& share,
+                        bool narrow_route, bool mmq_route, bool mmvq_route, std::int32_t tokens,
+                        cudaStream_t stream) {
     // The fused weight's rows are [query; key; gate; value], the order every other route's
     // segmented adapter maps (see nvfp4_attn_input_a16.cu); q, k, gate, v here, not the call's
-    // argument order.
-    const Nvfp4AttentionInputOutput output{static_cast<__nv_bfloat16*>(q.data),
-                                           static_cast<__nv_bfloat16*>(k.data),
-                                           static_cast<__nv_bfloat16*>(gate.data),
-                                           static_cast<__nv_bfloat16*>(v.data)};
+    // argument order. The rows are this call's share, so the adapter is the runtime-segment one.
+    const Nvfp4AttentionInputShareOutput output{static_cast<__nv_bfloat16*>(q.data),
+                                                static_cast<__nv_bfloat16*>(k.data),
+                                                static_cast<__nv_bfloat16*>(gate.data),
+                                                static_cast<__nv_bfloat16*>(v.data), share};
+    const std::int32_t rows = share.total();
     // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode,
     // where llama.cpp folds it too, so the half factor appears once and the store rounds once.
     const auto* w_codes  = static_cast<const std::uint8_t*>(weight.qdata);
@@ -46,23 +47,23 @@ void launch_from_planes(const Weight& weight, const void* codes, const void* sca
     const float alpha    = 1.0F / weight.weight_scale_divisor;
     if (mmvq_route) {
         if (narrow_route) {
-            narrow::launch<Nvfp4AttentionInputOutput>(w_codes, w_scales, x_int8, x_scale, alpha,
-                                                      output, kCols, tokens, kRows, stream);
+            narrow::launch<Nvfp4AttentionInputShareOutput>(w_codes, w_scales, x_int8, x_scale, alpha,
+                                                           output, kCols, tokens, rows, stream);
         } else {
-            mmvq::launch<Nvfp4AttentionInputOutput>(w_codes, w_scales, x_int8, x_scale, alpha,
-                                                   output, kCols, tokens, kRows, stream);
+            mmvq::launch<Nvfp4AttentionInputShareOutput>(w_codes, w_scales, x_int8, x_scale, alpha,
+                                                         output, kCols, tokens, rows, stream);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     if (mmq_route) {
-        mmq::launch<Nvfp4AttentionInputOutput>(w_codes, w_scales, x_int8, alpha, output, kCols,
-                                               tokens, kRows, stream);
+        mmq::launch<Nvfp4AttentionInputShareOutput>(w_codes, w_scales, x_int8, alpha, output, kCols,
+                                                    tokens, rows, stream);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    nvfp4_int8_grouped_launch<Nvfp4AttentionInputOutput>(w_codes, w_scales, x_int8, x_scale, alpha,
-                                                         output, kCols, tokens, kRows, stream);
+    nvfp4_int8_grouped_launch<Nvfp4AttentionInputShareOutput>(
+        w_codes, w_scales, x_int8, x_scale, alpha, output, kCols, tokens, rows, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -84,9 +85,13 @@ void nvfp4_attn_input_int8_launch(const Tensor& x, const Weight& weight, Tensor&
     // quantiser's grid both follow this one number; disagreeing halves leave columns uninitialised.
     const bool narrow_route = narrow::select(tokens, table);
     const std::int32_t padded = narrow::addressed_tokens(tokens, table);
+    // This call's share of the fused plane: the four output tensors carry their own row counts, and
+    // a tensor-parallel rank holds whole KV heads and their query heads, so each segment keeps its
+    // order and only shrinks.
+    const AttentionInputShare share{q.ne[0], k.ne[0], gate.ne[0], v.ne[0]};
     if (weight.qtype != QType::NVFP4 || weight.layout != QuantLayout::BlockScaleK16M128x4 ||
-        weight.group != 16 || weight.n != kRows || weight.k != kCols ||
-        weight.qdata == nullptr || weight.scales == nullptr ||
+        weight.group != 16 || weight.k != kCols || weight.n != share.total() ||
+        !attention_input_share_admitted(share) || weight.qdata == nullptr || weight.scales == nullptr ||
         !nvfp4_int8_route_admits(tokens)) {
         throw std::invalid_argument("nvfp4 attn_input_proj int8: unsupported profile");
     }
@@ -116,7 +121,7 @@ void nvfp4_attn_input_int8_launch(const Tensor& x, const Weight& weight, Tensor&
             reinterpret_cast<std::int8_t*>(codes.data), reinterpret_cast<float*>(scales.data));
     }
 
-    launch_from_planes(weight, codes.data, scales.data, q, gate, k, v, narrow_route, mmq_route,
+    launch_from_planes(weight, codes.data, scales.data, q, gate, k, v, share, narrow_route, mmq_route,
                        mmvq_route, tokens, stream);
 }
 
@@ -133,9 +138,11 @@ void nvfp4_attn_input_int8_fused_norm_launch(const Tensor& residual, const Tenso
     const std::int32_t tokens = residual.ne[1];
     const bool narrow_route   = narrow::select(tokens, table);
     const std::int32_t padded = narrow::addressed_tokens(tokens, table);
+    // This call's share of the fused plane -- see the plain entry above.
+    const AttentionInputShare share{q.ne[0], k.ne[0], gate.ne[0], v.ne[0]};
     if (weight.qtype != QType::NVFP4 || weight.layout != QuantLayout::BlockScaleK16M128x4 ||
-        weight.group != 16 || weight.n != kRows || weight.k != kCols ||
-        weight.qdata == nullptr || weight.scales == nullptr ||
+        weight.group != 16 || weight.k != kCols || weight.n != share.total() ||
+        !attention_input_share_admitted(share) || weight.qdata == nullptr || weight.scales == nullptr ||
         !nvfp4_int8_route_admits(tokens)) {
         throw std::invalid_argument("nvfp4 attn_input_proj int8 fused: unsupported profile");
     }
@@ -157,7 +164,7 @@ void nvfp4_attn_input_int8_fused_norm_launch(const Tensor& residual, const Tenso
     launch_rmsnorm_int8_quantize(residual, norm_weight, eps,
                                  static_cast<std::int8_t*>(codes.data),
                                  static_cast<float*>(scales.data), padded, stream);
-    launch_from_planes(weight, codes.data, scales.data, q, gate, k, v, narrow_route, mmq_route,
+    launch_from_planes(weight, codes.data, scales.data, q, gate, k, v, share, narrow_route, mmq_route,
                        mmvq_route, tokens, stream);
 }
 

@@ -21,6 +21,18 @@
 namespace ninfer::ops::detail::unified {
 namespace {
 
+// The residual's width. No split moves it: a tensor-parallel row split cuts this projection's K
+// between the ranks and leaves the residual -- and so the output rows -- whole on every rank.
+constexpr std::int32_t kRows = 5120;
+// The widest down projection this route was measured on, and the bound a share stays inside.
+constexpr std::int32_t kMaxColumns = 17408;
+// The share a row split may cut: kNvfp4ShareUnits.columns, 256 columns, which is also whole 64-column
+// groups for the format and whole k-tiles for the mainloop. Every share the splitter produces lands
+// on one, and both registered widths (6144 and 17408) are among them.
+inline bool columns_admitted(std::int32_t columns) {
+    return columns > 0 && columns <= kMaxColumns && columns % 256 == 0;
+}
+
 // The epilogue adds the scaled projection into the residual tile before the single BF16 rounding,
 // which is exactly linear_add's contract (A16 routes fuse the same addition).
 struct Nvfp4LinearAddInt8Output {
@@ -49,8 +61,13 @@ void nvfp4_linear_add_int8_launch(const Tensor& x, const Weight& weight, Tensor&
     // so the planes are the call's rows. Allocation and the quantiser's grid follow this one number.
     const bool narrow_route = narrow::select(tokens, table);
     const std::int32_t padded = narrow::addressed_tokens(tokens, table);
+    // A tensor-parallel row split cuts this projection's K between the ranks, so K is the call's own
+    // share rather than one of two registered widths: the share unit is the only thing that
+    // constrains it. N is the residual's width and no split moves it. Everything below already reads
+    // weight.k, and the plan's capacity query takes this call's input rows, so a share is sized for
+    // exactly the rows it holds.
     if (weight.qtype != QType::NVFP4 || weight.layout != QuantLayout::BlockScaleK16M128x4 ||
-        weight.group != 16 || weight.n != 5120 || (weight.k != 6144 && weight.k != 17408) ||
+        weight.group != 16 || weight.n != kRows || !columns_admitted(weight.k) ||
         weight.qdata == nullptr || weight.scales == nullptr ||
         !nvfp4_int8_route_admits(tokens)) {
         throw std::invalid_argument("nvfp4 linear_add int8: unsupported profile");

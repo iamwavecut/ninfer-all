@@ -122,7 +122,11 @@ std::size_t linear_swiglu_route_workspace_bytes(QType qtype, std::int32_t gate_u
         }
         return widest;
     }
-    if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
+    // The 27B's fused parent and a tensor-parallel rank's share of it. The NVFP4 route's capacity
+    // follows the policy and the token interval alone -- its planes are the call's width by K, not
+    // the parent's rows -- so a share is sized by the same answer, never a larger one.
+    if (qtype == QType::NVFP4 && input_rows == 5120 && gate_up_rows > 0 &&
+        gate_up_rows <= 34816 && (gate_up_rows % 256) == 0) {
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16 && gate_up_rows == 34816 && input_rows == 5120) {
@@ -178,8 +182,17 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool q8_shape = x.ne[0] == 2048 && out.ne[0] == 6144 && gate_up_weight.n == 12288 &&
                           gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
                           gate_up_weight.padded_shape[1] == 2048;
+    // A tensor-parallel rank's share of the 27B NVFP4 parent: the same input width, and gate and up
+    // rows divided so that each share's halves are whole 128-row tiles. The whole parent satisfies
+    // this too; large_shape above is the tighter statement of it.
+    const bool nvfp4_share = gate_up_weight.qtype == QType::NVFP4 && x.ne[0] == 5120 &&
+                             gate_up_weight.k == 5120 && gate_up_weight.n > 0 &&
+                             gate_up_weight.n <= 34816 && (gate_up_weight.n % 256) == 0 &&
+                             out.ne[0] == gate_up_weight.n / 2 &&
+                             gate_up_weight.padded_shape[0] == gate_up_weight.n &&
+                             gate_up_weight.padded_shape[1] == 5120;
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
-        out.ne[3] != 1 || (!large_shape && !q8_shape)) {
+        out.ne[3] != 1 || (!large_shape && !q8_shape && !nvfp4_share)) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
     }
     if (!x.is_contiguous() || !out.is_contiguous()) {
@@ -202,7 +215,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         (q8_shape || large_shape) && gate_up_weight.qtype == QType::Q8_G32_FP16 &&
         gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
-    const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
+    const bool nvfp4_weight =
+        (large_shape || nvfp4_share) && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
     const bool t2_weight    = large_shape && gate_up_weight.qtype == QType::T2_G128_FP16 &&
                               gate_up_weight.qhigh == nullptr &&

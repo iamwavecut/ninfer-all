@@ -334,8 +334,17 @@ int main() {
         return 77;
     }
     int failures = 0;
+    std::cout << "shape n=5120 k=6144" << std::endl;
     failures += run_shape(5120, 6144, 811U);
+    std::cout << "shape n=5120 k=17408" << std::endl;
     failures += run_shape(5120, 17408, 821U);
+    // A tensor-parallel rank's share of the down projection's columns: 17408 split over two ranks
+    // and over four, both whole NVFP4 column shares. The K ladders above are per-K instances, so
+    // these take the runtime-K MMA and the residual add has to land exactly as it does whole.
+    std::cout << "shape n=5120 k=8704" << std::endl;
+    failures += run_shape(5120, 8704, 831U);
+    std::cout << "shape n=5120 k=4352" << std::endl;
+    failures += run_shape(5120, 4352, 841U);
     failures += check_residual_cancellation(6144);
     failures += check_residual_cancellation(17408);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";

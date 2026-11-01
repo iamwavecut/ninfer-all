@@ -214,6 +214,16 @@ int main() {
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
                                 kA16Cases);
+        // A tensor-parallel rank's share of the fused parent: gate and up rows divided over two
+        // ranks and over four, each share's halves still whole 128-row tiles. The share keeps K,
+        // so only the row count moves, and every A16 width has to answer -- including the ones the
+        // whole parent sends to the decode and small-T routes.
+        failures += run_profile("LinearSwiGLU NVFP4_A16 share 2 ranks",
+                                {QType::NVFP4, 17408, 5120, 8704, 1805U, ActivationCompute::A16},
+                                kA16Cases);
+        failures += run_profile("LinearSwiGLU NVFP4_A16 share 4 ranks",
+                                {QType::NVFP4, 8704, 5120, 4352, 1809U, ActivationCompute::A16},
+                                kA16Cases);
         failures += run_profile("LinearSwiGLU NVFP4_A4",
                                 {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4},
                                 kA4Cases, std::array<std::int32_t, 4>{65, 97, 128, 129});

@@ -180,10 +180,14 @@ std::size_t linear_add_route_workspace_bytes(QType qtype, std::int32_t output_ro
             output_rows, input_rows, policy, min_tokens, max_tokens);
     }
     if (qtype == QType::NVFP4) {
+        // The 27B's two down projections, and a tensor-parallel rank's share of the wider one: the
+        // residual width is undivided, and the projection's columns are whole NVFP4 shares.
         const bool supported = (output_rows == detail::Nvfp4N5120K6144::kOutputRows &&
                                 input_rows == detail::Nvfp4N5120K6144::kInputRows) ||
                                (output_rows == detail::Nvfp4N5120K17408::kOutputRows &&
-                                input_rows == detail::Nvfp4N5120K17408::kInputRows);
+                                input_rows > 0 &&
+                                input_rows <= detail::Nvfp4N5120K17408::kInputRows &&
+                                (input_rows % 256) == 0);
         if (!supported) {
             throw std::invalid_argument("linear_add workspace: unsupported NVFP4 profile");
         }
@@ -350,7 +354,8 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         const bool supported_shape = (w.n == detail::Nvfp4N5120K6144::kOutputRows &&
                                       w.k == detail::Nvfp4N5120K6144::kInputRows) ||
                                      (w.n == detail::Nvfp4N5120K17408::kOutputRows &&
-                                      w.k == detail::Nvfp4N5120K17408::kInputRows);
+                                      w.k > 0 && w.k <= detail::Nvfp4N5120K17408::kInputRows &&
+                                      (w.k % 256) == 0);
         if (!supported_shape) {
             throw std::invalid_argument("nvfp4 linear_add: unsupported weight shape");
         }

@@ -18,8 +18,8 @@
 namespace ninfer::ops::detail::unified {
 namespace {
 
-using Geometry              = Nvfp4N34816K5120;
-constexpr int kIntermediate = Geometry::kOutputRows / 2;
+// The row count is the call's: a tensor-parallel rank's share is gate rows with the matching up
+// rows half its own row count further down, and the output stride divides the same number.
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
@@ -35,7 +35,7 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
                              Nvfp4SimtBlockOrder::RowsContiguous, 1>;
     launch_nvfp4_a16_simt<Nvfp4ScheduleInstance<Schedule, 5120, ActiveTokens, true>>(
         nvfp4_a16_operands(x, weight),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n / 2},
         Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<1>{});
 }
 
@@ -51,7 +51,7 @@ constexpr auto kLaunchers = make_launchers(std::make_index_sequence<1>{});
 void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         cudaStream_t stream) {
     const auto p = nvfp4_a16_operands(x, weight);
-    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
+    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), weight.n / 2};
     if (x.ne[1] <= 2)
         kLaunchers[0](x, weight, out, stream);
     else if (x.ne[1] <= 8)
