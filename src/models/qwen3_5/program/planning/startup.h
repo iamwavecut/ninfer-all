@@ -129,6 +129,8 @@ struct SequencePlanningInputs {
     // Main KV pages that stay allocated for the life of the Engine (injected graft prefixes). The
     // pool grows by this many so requests keep the capacity that was asked for.
     std::uint32_t resident_main_pages = 0;
+    // Whether every pair of devices has peer access, which a tensor-parallel exchange may use.
+    bool peer_access = false;
 };
 
 } // namespace ninfer::models::qwen3_5::detail
@@ -184,6 +186,10 @@ struct SequencePlanImpl {
                                    static_cast<std::uint64_t>(plan.max_concurrency) *
                                        (widest_verify_window(plan) + 1U));
 }
+
+// One slot of a tensor-parallel exchange: an FP32 partial of the widest pass's residual, or of its
+// position-split attention outputs where those are wider (they go through the same slots).
+[[nodiscard]] std::size_t tensor_parallel_slot_bytes(const SequencePlanImpl& plan);
 
 // The int32 control block a stage boundary carries for `columns` columns: cache positions,
 // RoPE positions (three rows with multimodal RoPE), KV table rows, valid columns and the source and

@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/graft_injection.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/execution/stage_runtime.h"
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -707,6 +708,12 @@ std::uint32_t Program::hybrid_prefetch_room() const noexcept {
 }
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->hybrid_stats(); }
+
+std::string Program::tensor_parallel_routes() const {
+    const auto& stages = impl_->stage_runtime;
+    return stages && stages->tensor_parallel ? stages->tensor_parallel->exchange->describe()
+                                             : std::string();
+}
 
 void Program::set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost) {
     impl_->set_hybrid_cost(cost);

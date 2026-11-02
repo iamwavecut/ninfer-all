@@ -1184,6 +1184,19 @@ int main() {
         failures += check(rejected,
                           "--tensor-attention positions without --tensor-parallel was accepted");
     }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1", "--tensor-parallel",
+                             "--tensor-parallel-transport", "peer-read"})
+                              .tensor_parallel_transport ==
+                          ninfer::TensorParallelTransport::PeerRead,
+                      "--tensor-parallel-transport did not reach serving options");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--tensor-parallel-transport", "host"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected,
+                          "--tensor-parallel-transport without --tensor-parallel was accepted");
+    }
 
     bool exclusive_rejected = false;
     try {

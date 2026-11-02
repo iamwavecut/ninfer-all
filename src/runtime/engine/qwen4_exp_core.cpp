@@ -282,9 +282,14 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // Host and disk experts trade device KV for expert slots by default.
     executor.kv_resident = options.kv_resident_positions.value_or(
         options.expert_residency == ExpertResidency::Device ? 0 : kDefaultKvResidentPositions);
+    executor.tensor_parallel_transport = options.tensor_parallel_transport;
     instance->executor = std::make_unique<models::qwen4_exp::Executor>(*model, device, executor);
     device.synchronize();
     program.complete();
+    if (const std::string routes = instance->executor->tensor_parallel_routes(); !routes.empty()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "%s",
+                           routes.c_str());
+    }
     {
         // The first request would otherwise load every kernel it reaches.
         StartupPhaseScope warm(options.startup_observer, StartupPhase::CudaGraphPrepare);

@@ -1388,9 +1388,10 @@ struct Executor::Impl {
         if (!tensor()) { return; }
         const std::size_t bytes = std::size_t(config.hidden_size) * options.prefill_chunk * 4;
         tensor_exchange = std::make_unique<TensorParallelExchange>(
-            device, TensorParallelExchangeOptions{.slot_bytes = bytes});
+            device, TensorParallelExchangeOptions{.slot_bytes = bytes,
+                                                  .transport  = options.tensor_parallel_transport});
         for (std::size_t r = 0; r < device.size(); ++r) {
-            memory.ranks[r].workspace_bytes += TensorParallelExchange::kSlots * bytes;
+            memory.ranks[r].workspace_bytes += tensor_exchange->device_bytes();
         }
     }
 
@@ -3166,7 +3167,7 @@ struct Executor::Impl {
                 on(r, [&](RankState& rank) {
                     const bool contributes = r < contributors;
                     if (contributes) { partial(r, rank, exchange.partial(r, slot)); }
-                    exchange.publish(r, slot, contributes ? bytes : 0, rank.stream, sum);
+                    exchange.publish(r, slot, contributes ? bytes : 0, rank.y, rank.stream, sum);
                 });
             }
             for (std::size_t r = 0; r < n; ++r) {
@@ -4849,6 +4850,10 @@ NgramTableStats Executor::ngram_stats() { return impl_->ngram_stats(); }
 
 std::uint64_t Executor::ngram_resident_bytes() const noexcept {
     return impl_->table ? impl_->table->resident_bytes() : 0;
+}
+
+std::string Executor::tensor_parallel_routes() const {
+    return impl_->tensor_exchange ? impl_->tensor_exchange->describe() : std::string();
 }
 
 void Executor::reset(std::uint32_t sequence) { impl_->reset(sequence); }

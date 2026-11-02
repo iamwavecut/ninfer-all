@@ -78,6 +78,7 @@ struct ServeOptions {
     // The relative size of each device's tensor-parallel share. Empty lets the engine choose.
     std::vector<double> tensor_split;
     TensorAttention tensor_attention = TensorAttention::Heads;
+    TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
     bool invariant_attention         = false;
     // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ExpertResidency expert_residency = ExpertResidency::Device;

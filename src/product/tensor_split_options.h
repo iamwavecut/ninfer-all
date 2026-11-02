@@ -49,6 +49,24 @@ inline constexpr std::string_view kTensorAttentionHelp =
     "                                every device holds every head of its pages and\n"
     "                                the devices merge their partial outputs\n";
 
+// "auto", "host", "peer-read" or "peer-write" (--tensor-parallel-transport).
+inline TensorParallelTransport parse_tensor_parallel_transport(std::string_view text) {
+    if (text == "auto") { return TensorParallelTransport::Auto; }
+    if (text == "host") { return TensorParallelTransport::Host; }
+    if (text == "peer-read") { return TensorParallelTransport::PeerRead; }
+    if (text == "peer-write") { return TensorParallelTransport::PeerWrite; }
+    throw std::invalid_argument(
+        "--tensor-parallel-transport must be auto, host, peer-read or peer-write");
+}
+
+inline constexpr std::string_view kTensorParallelTransportHelp =
+    "  --tensor-parallel-transport auto|host|peer-read|peer-write\n"
+    "                                with --tensor-parallel, how the devices exchange\n"
+    "                                their partial sums: through host memory, by\n"
+    "                                reading or by writing each other's memory (peer\n"
+    "                                access), or by whichever was fastest at each\n"
+    "                                size when timed at startup (default: auto)\n";
+
 inline constexpr std::string_view kInvariantAttentionHelp =
     "  --invariant-attention         attention outputs independent of decode width,\n"
     "                                verification window and batch (Qwen3.5-core)\n";
@@ -68,6 +86,13 @@ inline void check_tensor_split(const std::vector<double>& weights, std::size_t d
 inline void check_tensor_attention(TensorAttention mode, bool tensor_parallel) {
     if (mode == TensorAttention::Positions && !tensor_parallel) {
         throw std::invalid_argument("--tensor-attention needs --tensor-parallel");
+    }
+}
+
+inline void check_tensor_parallel_transport(TensorParallelTransport transport,
+                                            bool tensor_parallel) {
+    if (transport != TensorParallelTransport::Auto && !tensor_parallel) {
+        throw std::invalid_argument("--tensor-parallel-transport needs --tensor-parallel");
     }
 }
 

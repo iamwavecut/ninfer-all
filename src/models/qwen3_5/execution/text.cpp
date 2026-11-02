@@ -1804,7 +1804,7 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                     residual_partial_ = nullptr;
                 }
                 exchange.publish(rank, exchange_slot, contributes ? partial_bytes : 0,
-                                 ctx_.stream);
+                                 replica.data, ctx_.stream);
             });
         }
         for (std::size_t rank = 0; rank < ranks; ++rank) {
@@ -1864,8 +1864,8 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                 }
                 exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
                     std::array<const float*, ops::kCausalAttentionMaximumMergeRanks> parts{};
-                    exchange.gather(rank, gather_slot, std::span<const float*>(parts.data(), ranks),
-                                    ctx_.stream);
+                    exchange.gather(rank, gather_slot, gather_bytes,
+                                    std::span<const float*>(parts.data(), ranks), ctx_.stream);
                     attn_merge_output(block(rank), replica,
                                       std::span<const float* const>(parts.data(), ranks),
                                       attention_gates[rank], ph);

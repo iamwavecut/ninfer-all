@@ -146,6 +146,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --tensor-split A,B,...        relative share of each --devices entry (default:\n"
            "                                by each card's measured bandwidth and free memory)\n" +
            std::string(product::kTensorAttentionHelp) +
+           std::string(product::kTensorParallelTransportHelp) +
            std::string(product::kInvariantAttentionHelp) +
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
@@ -1175,6 +1176,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 product::parse_tensor_attention(require_value("--tensor-attention"));
             continue;
         }
+        if (arg == "--tensor-parallel-transport") {
+            options.tensor_parallel_transport = product::parse_tensor_parallel_transport(
+                require_value("--tensor-parallel-transport"));
+            continue;
+        }
         if (arg == "--invariant-attention") {
             options.invariant_attention = true;
             continue;
@@ -1789,6 +1795,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     product::check_tensor_split(options.tensor_split, options.devices.size(),
                                 options.tensor_parallel);
     product::check_tensor_attention(options.tensor_attention, options.tensor_parallel);
+    product::check_tensor_parallel_transport(options.tensor_parallel_transport,
+                                             options.tensor_parallel);
     if (options.request_log_max_mib != 0 && options.request_log_jsonl.empty()) {
         throw std::invalid_argument("--request-log-max-mib requires --request-log-jsonl");
     }
