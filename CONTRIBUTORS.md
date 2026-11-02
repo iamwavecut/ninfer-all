@@ -39,7 +39,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | Matt Anderson | wide Q5 split tiles and an idle Engine that fails only the request it cannot place |
 | hyz615, lededev, NikolaFC | schema assertions in constrained decoding; the disk tier persisted on an orderly stop and MSVC-safe test builtins; Q8_0 `ssm_alpha`/`ssm_beta` in GGUF conversion |
 | [b1231227](https://github.com/b1231227) | a BF16 output head in the dense GGUF recipe, and the native re-quantisation of a GGUF that exposed `ssm_out`'s stored column order ([#185](https://github.com/iamwavecut/ninfer-all/pull/185)) |
-| [13thblade/ninfer-all-nvfp4](https://github.com/13thblade/ninfer-all-nvfp4) (13thblade) | NVFP4 weights on GPUs without FP4 tensor cores: the wide W4A16 kernels and the W4A8 int8 routes (`--nvfp4-w4a8-int`, `--nvfp4-w4a16`), and the integer E2M1/E4M3 expansions of the NVFP4 and FP8 KV caches |
+| [13thblade/ninfer-all-nvfp4](https://github.com/13thblade/ninfer-all-nvfp4) (13thblade) | NVFP4 weights on GPUs without FP4 tensor cores: the wide W4A16 kernels and the W4A8 int8 routes (`--nvfp4-w4a8-int`, `--nvfp4-w4a16`) with their tensor-parallel shares, and the integer E2M1/E4M3 expansions of the NVFP4 and FP8 KV caches |
 | [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090) (AshAlliants) | the prefill stall budget (`--prefill-stall-budget-ms`) |
 
 ## Pull requests to Neroued/ninfer ported here

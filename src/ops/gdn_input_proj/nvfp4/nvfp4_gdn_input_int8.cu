@@ -20,6 +20,7 @@
 namespace ninfer::ops::detail::unified {
 namespace {
 
+constexpr std::int32_t kRows = 16384; // qkv [0,10240) then z [10240,16384)
 constexpr std::int32_t kCols = 5120;
 
 } // namespace
@@ -38,12 +39,9 @@ void nvfp4_gdn_input_int8_launch(const Tensor& x, const Weight& weight, Tensor& 
     // so the planes are the call's rows. Allocation and the quantiser's grid follow this one number.
     const bool narrow_route = narrow::select(tokens, table);
     const std::int32_t padded = narrow::addressed_tokens(tokens, table);
-    // This call's share of the fused [qkv; z] plane: the two output tensors carry their own row
-    // counts, and a rank holds whole GDN key heads, so each segment keeps its order and only shrinks.
-    const GdnInputShare share{qkv.ne[0], z.ne[0]};
     if (weight.qtype != QType::NVFP4 || weight.layout != QuantLayout::BlockScaleK16M128x4 ||
-        weight.group != 16 || weight.k != kCols || weight.n != share.total() ||
-        !gdn_input_share_admitted(share) || weight.qdata == nullptr || weight.scales == nullptr ||
+        weight.group != 16 || weight.n != kRows || weight.k != kCols ||
+        weight.qdata == nullptr || weight.scales == nullptr ||
         !nvfp4_int8_route_admits(tokens)) {
         throw std::invalid_argument("nvfp4 gdn_input_proj int8: unsupported profile");
     }
@@ -73,9 +71,8 @@ void nvfp4_gdn_input_int8_launch(const Tensor& x, const Weight& weight, Tensor& 
             reinterpret_cast<std::int8_t*>(codes.data), reinterpret_cast<float*>(scales.data));
     }
 
-    const Nvfp4GdnInputShareOutput output{static_cast<__nv_bfloat16*>(qkv.data),
-                                          static_cast<__nv_bfloat16*>(z.data), share};
-    const std::int32_t rows = share.total();
+    const Nvfp4GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
+                                     static_cast<__nv_bfloat16*>(z.data)};
     // alpha = 1/weight_scale_divisor: the E2M1 1/2 already folded into the E4M3 scale decode,
     // where llama.cpp folds it too, so the half factor appears once and the store rounds once.
     const auto* w_codes  = static_cast<const std::uint8_t*>(weight.qdata);
@@ -85,23 +82,23 @@ void nvfp4_gdn_input_int8_launch(const Tensor& x, const Weight& weight, Tensor& 
     const float alpha    = 1.0F / weight.weight_scale_divisor;
     if (mmvq_route) {
         if (narrow_route) {
-            narrow::launch<Nvfp4GdnInputShareOutput>(w_codes, w_scales, x_int8, x_scale, alpha,
-                                                     output, kCols, tokens, rows, stream);
+            narrow::launch<Nvfp4GdnInputOutput>(w_codes, w_scales, x_int8, x_scale, alpha, output, kCols,
+                                               tokens, kRows, stream);
         } else {
-            mmvq::launch<Nvfp4GdnInputShareOutput>(w_codes, w_scales, x_int8, x_scale, alpha, output,
-                                                   kCols, tokens, rows, stream);
+            mmvq::launch<Nvfp4GdnInputOutput>(w_codes, w_scales, x_int8, x_scale, alpha, output, kCols,
+                                              tokens, kRows, stream);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
     if (mmq_route) {
-        mmq::launch<Nvfp4GdnInputShareOutput>(w_codes, w_scales, x_int8, alpha, output, kCols,
-                                              tokens, rows, stream);
+        mmq::launch<Nvfp4GdnInputOutput>(w_codes, w_scales, x_int8, alpha, output, kCols, tokens,
+                                         kRows, stream);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    nvfp4_int8_grouped_launch<Nvfp4GdnInputShareOutput>(w_codes, w_scales, x_int8, x_scale, alpha,
-                                                        output, kCols, tokens, rows, stream);
+    nvfp4_int8_grouped_launch<Nvfp4GdnInputOutput>(w_codes, w_scales, x_int8, x_scale, alpha, output,
+                                                   kCols, tokens, kRows, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

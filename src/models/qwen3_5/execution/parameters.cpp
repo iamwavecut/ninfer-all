@@ -79,36 +79,28 @@ public:
     //
     // A card with native FP4 tensor cores stores AllowA4 for an NVFP4 weight, and there the flag
     // replaces that permission: W4A8 keeps activation precision the A4 route trades away, on an s8
-    // MMA every sm_80+ part runs. Registered per exact shape like the integer routes.
+    // MMA every sm_80+ part runs. Registered per shape like the integer routes, a tensor-parallel
+    // rank's share of the shape included (nvfp4_shape_or_share).
     void nvfp4_int8_route(LinearParameters& p, std::int32_t n, std::int32_t k) const {
         if (!model_.options().nvfp4_w4a8_int || model_.options().nvfp4_w4a16) { return; }
         if (p.policy != ops::LinearPolicy::A16Only && p.policy != ops::LinearPolicy::AllowA4) {
             return;
         }
-        if (p.weight.qtype != QType::NVFP4) { return; }
-        const auto& w = p.weight;
-        // A rank binds the same projection at its share of the divided dimension: gate and up rows,
-        // or down columns. Admit those as well as the whole shape -- the family reads both
-        // dimensions at launch time and writes whichever dtype the result names, so a share is a
-        // shape it can serve. The share need not divide the parent: --tensor-split sizes the ranks
-        // by measured bandwidth, so a share's extent is what the launcher aligns, not a quotient.
-        // The alignment is the launcher's: rows a whole 128-tile, K a whole 64-group (four G16
-        // blocks), which the loader's cuts already give every share.
-        const bool whole        = w.n == n && w.k == k;
-        const bool column_share = w.k == k && w.n > 0 && w.n < n;
-        const bool row_share    = w.n == n && w.k > 0 && w.k < k;
-        if (!(whole || column_share || row_share)) { return; }
-        if ((w.n % 128) != 0 || (w.k % 64) != 0) { return; }
+        if (!nvfp4_shape_or_share(p.weight, n, k)) { return; }
+        // The family reads both dimensions at launch time and writes whichever dtype the result
+        // names, so a share is a shape it serves. Its alignment is the launcher's: rows a whole
+        // 128-tile, K a whole 64-group (four G16 blocks), which the loader's cuts give every share.
+        if ((p.weight.n % 128) != 0 || (p.weight.k % 64) != 0) { return; }
         p.policy = ops::LinearPolicy::AllowNvfp4Int8;
     }
 
     // --nvfp4-w4a16 asks a native-FP4 card for the dequantising A16 routes instead of A4. On every
     // other card the permission was already lowered to A16Only while loading, so the flag is a
-    // no-op there: it only ever trades A4 away.
+    // no-op there: it only ever trades A4 away. A rank's share takes the general A16 route, which
+    // reads both dimensions at launch time.
     void nvfp4_w4a16_route(LinearParameters& p, std::int32_t n, std::int32_t k) const {
         if (!model_.options().nvfp4_w4a16) { return; }
-        if (p.policy == ops::LinearPolicy::AllowA4 && p.weight.qtype == QType::NVFP4 &&
-            p.weight.n == n && p.weight.k == k) {
+        if (p.policy == ops::LinearPolicy::AllowA4 && nvfp4_shape_or_share(p.weight, n, k)) {
             p.policy = ops::LinearPolicy::A16Only;
         }
     }
@@ -131,12 +123,7 @@ public:
             parts->policy != ops::LinearPolicy::AllowA4) {
             return;
         }
-        for (const auto& part : parts->parts) {
-            if (part.weight.qtype != QType::NVFP4 || part.weight.k != k || part.weight.n <= 0 ||
-                (part.weight.n % 128) != 0) {
-                return;
-            }
-        }
+        if (!nvfp4_parts(*parts, k)) { return; }
         parts->policy = ops::LinearPolicy::AllowNvfp4Int8;
     }
 
@@ -144,7 +131,36 @@ public:
                                   std::int32_t k) const {
         if (auto* single = std::get_if<ops::SingleProjectionWeight>(&projection)) {
             nvfp4_w4a16_route(*single, n, k);
+            return;
         }
+        auto* parts = std::get_if<ops::PartProjectionWeights>(&projection);
+        if (parts == nullptr || parts->parts.empty() || !model_.options().nvfp4_w4a16) { return; }
+        if (parts->policy == ops::LinearPolicy::AllowA4 && nvfp4_parts(*parts, k)) {
+            parts->policy = ops::LinearPolicy::A16Only;
+        }
+    }
+
+    // A tensor-parallel rank binds a projection at its share of the divided dimension: gate and up
+    // rows, or the columns of down and the mixer outputs. The share need not divide the parent:
+    // --tensor-split sizes the ranks by measured bandwidth.
+    static bool nvfp4_shape_or_share(const Weight& w, std::int32_t n, std::int32_t k) {
+        if (w.qtype != QType::NVFP4) { return false; }
+        const bool whole        = w.n == n && w.k == k;
+        const bool column_share = w.k == k && w.n > 0 && w.n < n;
+        const bool row_share    = w.n == n && w.k > 0 && w.k < k;
+        return whole || column_share || row_share;
+    }
+
+    // Every part of a rank's input projection is NVFP4 at the full input width, in whole 128-row
+    // tiles; project_parts runs each through plain Linear under the parts' one policy.
+    static bool nvfp4_parts(const ops::PartProjectionWeights& parts, std::int32_t k) {
+        for (const auto& part : parts.parts) {
+            if (part.weight.qtype != QType::NVFP4 || part.weight.k != k || part.weight.n <= 0 ||
+                (part.weight.n % 128) != 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     LinearParameters linear(WeightId id) const {
@@ -221,11 +237,11 @@ public:
                     out.up      = ops::prepare_linear_weight(up);
                 }
                 out.down = rotated_linear(w.down);
-                // A rank holds gate and up as two parents of the projection the joined form
-                // registers: gate rows of 17408 -- over the rank count -- and down columns of
-                // 17408. Promote on those parent shapes. The two-parent form runs each product
-                // through its own Linear into an unrounded plane, so an int8 gate or up takes the
-                // family's FP32 writer, which is exactly what that plane is.
+                // A tensor-parallel rank holds gate and up as two parents: its share of the 17408
+                // gate rows, and its share of down's 17408 columns. Promote on those parent shapes.
+                // The two-parent form runs gate and up through plain Linear into unrounded FP32
+                // planes under the gate's policy, so an int8 gate or up takes the family's FP32
+                // writer, which is exactly what that plane is.
                 nvfp4_w4a16_route(out.gate_up, 17408, 5120);
                 nvfp4_w4a16_route(out.down, 5120, 17408);
                 nvfp4_int8_route(out.gate_up, 17408, 5120);

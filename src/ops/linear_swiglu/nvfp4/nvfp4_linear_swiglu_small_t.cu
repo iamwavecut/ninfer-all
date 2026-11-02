@@ -9,8 +9,6 @@
 
 #include <cuda_bf16.h>
 
-#include <stdexcept>
-
 #include <array>
 #include <cstddef>
 #include <utility>
@@ -18,10 +16,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// The 27B parent's geometry, which fixes every K-derived extent of the staging storage. The row
-// count is the call's: a tensor-parallel rank's share is gate rows with the matching up rows half
-// its own row count further down.
-using Geometry = Nvfp4N34816K5120;
+using Geometry              = Nvfp4N34816K5120;
+constexpr int kIntermediate = Geometry::kOutputRows / 2;
 
 template <int ActiveTokens, class Schedule>
 __global__ __launch_bounds__(
@@ -33,7 +29,6 @@ __global__ __launch_bounds__(
                                                                  const std::
                                                                      uint8_t* __restrict__ scales,
                                                                  float inverse_weight_divisor,
-                                                                 int intermediate,
                                                                  __nv_bfloat16* __restrict__ out) {
     static_assert(Schedule::kWarpsPerRow == 1);
     static_assert(Schedule::kRowsPerWarp == 2);
@@ -52,7 +47,7 @@ __global__ __launch_bounds__(
     const int rmod                                = flat_pair >> 2;
     const int quartile                            = flat_pair & 3;
     const int gate_row                            = m_tile * 128 + rmod + quartile * 32;
-    const int parent_rows[Schedule::kRowsPerWarp] = {gate_row, gate_row + intermediate};
+    const int parent_rows[Schedule::kRowsPerWarp] = {gate_row, gate_row + kIntermediate};
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kTokenTile][Schedule::kAccumulatorChains] =
         {};
@@ -72,7 +67,7 @@ __global__ __launch_bounds__(
         gate = warp_reduce_sum(gate);
         up   = warp_reduce_sum(up);
         if (lane == 0) {
-            out[static_cast<std::int64_t>(token) * intermediate + gate_row] =
+            out[static_cast<std::int64_t>(token) * kIntermediate + gate_row] =
                 __float2bfloat16_rn(silu(gate) * up);
         }
     }
@@ -94,18 +89,14 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
     using Schedule = Nvfp4SimtSchedule<kWarpsPerCta, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
                                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                                        Nvfp4SimtBlockOrder::RowsContiguous, kMinBlocksPerSm>;
-    const std::int32_t intermediate = weight.n / 2;
-    if (intermediate <= 0 || (intermediate % Schedule::kWarpsPerCta) != 0 ||
-        (intermediate % 128) != 0) {
-        throw std::invalid_argument("nvfp4 linear_swiglu small-T: unsupported weight geometry");
-    }
-    const int blocks    = intermediate / Schedule::kWarpsPerCta;
-    const float inverse = 1.0F / weight.weight_scale_divisor;
+    static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
+    constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
+    const float inverse   = 1.0F / weight.weight_scale_divisor;
     nvfp4_linear_swiglu_small_t_kernel<ActiveTokens, Schedule>
-        <<<blocks, Schedule::kThreads, 0, stream>>>(
+        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), inverse, intermediate,
+            static_cast<const std::uint8_t*>(weight.scales), inverse,
             static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }
