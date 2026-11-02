@@ -86,14 +86,18 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     // The int8 flag is authoritative for plain Linear on either table: the family's route is
     // shape-generic (its grid comes from N and its k-tiles from K at launch time), so an own-table
     // width takes it too instead of refusing or falling back to A16. A geometry its alignment
-    // contract cannot tile is refused by the launcher, not answered by a slower composition.
+    // contract cannot tile is refused by the launcher, not answered by a slower composition. The
+    // route also writes whichever dtype the result names -- BF16 on one device, FP32 for a
+    // tensor-parallel rank's partial sum, which the ranks add before the one rounding
+    // (core/tensor_parallel.h) -- so the flag answers an FP32 result with its own s8 mainloop
+    // rather than losing it to the A16 composition.
     if (allows_nvfp4_int8(policy)) {
         unified::nvfp4_dispatch(x, weight, out, policy, workspace, stream);
         return;
     }
-    // A tensor-parallel rank's partial sum is FP32, and the int8 family writes BF16, so the general
-    // route answers it -- with A4 for a share above its crossover, A16 otherwise and for a
-    // registered row a table still covers.
+    // Under every other policy an FP32 result -- still a rank's partial sum -- takes the general
+    // runtime-shape route: A4 for a share above its crossover, A16 otherwise and for a registered
+    // row a table still covers.
     if (out.dtype == DType::FP32) {
         if (!registered && allows_a4(policy) && nvfp4_general_uses_a4(weight.k, x.ne[1])) {
             if (workspace == nullptr)

@@ -9,6 +9,7 @@
 #include "ops/linear/nvfp4/nvfp4_int8_grouped_host.h"
 #include "ops/linear/nvfp4/nvfp4_int8_narrow_host.h"
 #include "ops/linear/nvfp4/nvfp4_mmq_host.h"
+#include "ops/linear/nvfp4/nvfp4_shapes_unified.h"
 #include "ops/op_tester.h" // test::ScopedNvfp4Int8Mainloop
 
 #include <cmath>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -284,6 +286,92 @@ int verify_ue4m3_scale_table() {
     return failures;
 }
 
+// A tensor-parallel rank's partial sum is FP32, and the family writes it through its FP32 writer:
+// storing BF16 into a four-byte buffer fills half of it and leaves the rest stale, silently.
+// Enter the family directly -- the dispatcher answers this dtype too, but going through the entry
+// keeps the check on the writer rather than on the routing -- and poison the result first, so
+// anything the kernel leaves unwritten stays NaN and is counted below.
+int verify_fp32_partial_writer() {
+    if (!cuda_available()) {
+        std::cout << "NVFP4_Int8Grouped FP32 partial: SKIP, no CUDA device\n";
+        return 0;
+    }
+    constexpr std::int32_t kRows   = 5120;
+    constexpr std::int32_t kCols   = 8704; // a two-rank share of the 17408-column down projection
+    constexpr std::int32_t kTokens = 64;
+
+    const auto host_weight = make_nvfp4_weight(kRows, kCols, 809U);
+    std::vector<std::uint16_t> activation_bits(std::size_t(kCols) * kTokens);
+    for (std::size_t i = 0; i < activation_bits.size(); ++i) {
+        const float value = std::sin(static_cast<float>(i) * 0.017F);
+        std::uint32_t raw = 0;
+        std::memcpy(&raw, &value, sizeof raw);
+        activation_bits[i] = static_cast<std::uint16_t>(raw >> 16);
+    }
+    DeviceBuffer device_activation(activation_bits.size() * sizeof(std::uint16_t));
+    device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
+    DeviceBuffer device_weight(host_weight.payload.size());
+    device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes);
+    const Weight weight = host_weight.device_weight(device_weight.p);
+    Tensor input(device_activation.p, DType::BF16, {kCols, kTokens});
+
+    const std::size_t elements = std::size_t(kRows) * kTokens;
+    const std::size_t capacity = ops::linear_workspace_capacity_bytes(
+        weight.qtype, kRows, kCols, ops::LinearPolicy::AllowNvfp4Int8, kTokens, kTokens);
+    DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+
+    const std::vector<float> poison(elements, std::numeric_limits<float>::quiet_NaN());
+    DeviceBuffer wide_buffer(elements * sizeof(float));
+    wide_buffer.copy_from_host(poison.data(), wide_buffer.bytes);
+    DeviceBuffer narrow_buffer(elements * sizeof(std::uint16_t));
+    Tensor wide_output(wide_buffer.p, DType::FP32, {kRows, kTokens});
+    Tensor narrow_output(narrow_buffer.p, DType::BF16, {kRows, kTokens});
+
+    try {
+        ops::detail::unified::nvfp4_linear_int8_grouped_launch(input, weight, narrow_output,
+                                                               workspace, nullptr);
+        ops::detail::unified::nvfp4_linear_int8_grouped_launch(input, weight, wide_output, workspace,
+                                                               nullptr);
+    } catch (const std::exception& error) {
+        std::cerr << "NVFP4_Int8Grouped FP32 partial: " << error.what() << '\n';
+        return 1;
+    }
+    test::cuda_check(cudaDeviceSynchronize(), "finish the int8 FP32 writer");
+
+    std::vector<float> wide_host(elements);
+    std::vector<std::uint16_t> narrow_host(elements);
+    wide_buffer.copy_to_host(wide_host.data(), wide_buffer.bytes);
+    narrow_buffer.copy_to_host(narrow_host.data(), narrow_buffer.bytes);
+
+    std::size_t unwritten = 0;
+    std::size_t diverged  = 0;
+    for (std::size_t i = 0; i < elements; ++i) {
+        if (std::isnan(wide_host[i])) {
+            ++unwritten;
+            continue;
+        }
+        std::uint32_t raw = static_cast<std::uint32_t>(narrow_host[i]) << 16;
+        float narrow_value = 0.0F;
+        std::memcpy(&narrow_value, &raw, sizeof narrow_value);
+        if (std::fabs(wide_host[i] - narrow_value) > 0.01F * (1.0F + std::fabs(wide_host[i]))) {
+            ++diverged;
+        }
+    }
+    if (unwritten != 0) {
+        std::cerr << "NVFP4_Int8Grouped FP32 partial: " << unwritten << " of " << elements
+                  << " elements left unwritten\n";
+        return 1;
+    }
+    if (diverged != 0) {
+        std::cerr << "NVFP4_Int8Grouped FP32 partial: " << diverged
+                  << " elements differ from the BF16 result by more than one rounding\n";
+        return 1;
+    }
+    std::cout << "NVFP4_Int8Grouped FP32 partial [" << kRows << "," << kCols << "] T=" << kTokens
+              << ": " << elements << " elements written, within one rounding of the BF16 result\n";
+    return 0;
+}
+
 int run_nvfp4_int8() {
     const UnifiedInt8Route unified;
     std::vector<Invocation> invocations;
@@ -314,6 +402,25 @@ int run_nvfp4_int8() {
                         std::pair{5120, 6144}, std::pair{5120, 17408}}) {
         failures += verify_int8_workspace_envelopes(n, k);
     }
+    // A tensor-parallel rank's partial sum is FP32: the row-split projections reach the family at a
+    // K share (8704 over two ranks, 4352 over four) and the mixer output at K = 6144, and the
+    // family writes FP32 through its own writer rather than losing the call to A16.
+    for (const auto& [k, seed] : {std::pair{8704, 811U}, std::pair{4352, 813U},
+                                 std::pair{6144, 815U}}) {
+        failures += run_shape("NVFP4_Int8Grouped", ActivationCompute::Int8Grouped,
+                              make_nvfp4_weight,
+                              {5120, k, seed, Comparison::SampledRows, true, invocations,
+                               ActivationSigns::Centered, DType::FP32});
+    }
+    // A share that does not divide its parent: --tensor-split sizes the ranks by measured
+    // bandwidth, so a rank of the 17,408-row gate/up or of the 17,408-column down holds an extent
+    // such as 5,888. The family still answers it -- the launcher aligns the extent, not a quotient.
+    failures += run_shape("NVFP4_Int8Grouped", ActivationCompute::Int8Grouped, make_nvfp4_weight,
+                          {5888, 5120, 817U, Comparison::SampledRows, true, invocations});
+    failures += run_shape("NVFP4_Int8Grouped", ActivationCompute::Int8Grouped, make_nvfp4_weight,
+                          {5120, 5888, 819U, Comparison::SampledRows, true, invocations,
+                           ActivationSigns::Centered, DType::FP32});
+    failures += verify_fp32_partial_writer();
     failures += run_generic_geometries();
     failures += run_forced_padded_widths();
     failures += run_narrow_band_width_ladder();
