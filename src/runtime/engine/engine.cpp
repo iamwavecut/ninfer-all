@@ -68,13 +68,22 @@ EngineOptions with_family_embedding(EngineOptions options) {
     return options;
 }
 
-// Position-split and invariant attention are Qwen3.5 Program schedules over its paged cache.
+// Position-split and invariant attention are Qwen3.5 Program schedules over its paged cache. The
+// partial-sum exchange is the Qwen3.5 Program's and Flash-Next's; the other families divide only
+// their routed experts and sum them their own way.
 EngineOptions with_family_attention(EngineOptions options) {
     if ((options.tensor_attention != TensorAttention::Heads || options.invariant_attention) &&
         own_family_artifact(options.artifact_path)) {
         throw std::invalid_argument(
             "--tensor-attention and --invariant-attention apply to Qwen3_5ForCausalLM and "
             "Qwen3_5MoeForCausalLM artifacts");
+    }
+    if (options.tensor_parallel_transport != TensorParallelTransport::Auto &&
+        own_family_artifact(options.artifact_path) &&
+        !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        throw std::invalid_argument(
+            "--tensor-parallel-transport applies to Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM "
+            "and Qwen4ExpForCausalLM artifacts");
     }
     return options;
 }

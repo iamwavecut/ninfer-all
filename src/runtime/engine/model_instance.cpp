@@ -894,6 +894,10 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
                                                         device, options.startup_observer,
                                                         std::move(experts));
+    if (const std::string routes = instance->program->tensor_parallel_routes(); !routes.empty()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "%s",
+                           routes.c_str());
+    }
     LoadSummary::PrefixCacheRestore restore;
     if (resolved.context_cache.enabled && resolved.context_cache.mode == ContextCacheMode::Hybrid) {
         instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));

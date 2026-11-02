@@ -65,6 +65,8 @@ struct LoadOptions {
     std::vector<double> tensor_split;
     // How the ranks divide a full-attention layer (`--tensor-attention`).
     TensorAttention tensor_attention = TensorAttention::Heads;
+    // How the ranks exchange their partial sums (`--tensor-parallel-transport`).
+    TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -156,7 +158,8 @@ struct LoadOptions {
             .stage_layers = options.stage_layers,
             .tensor_parallel = options.tensor_parallel,
             .tensor_split    = options.tensor_split,
-            .tensor_attention = options.tensor_attention};
+            .tensor_attention = options.tensor_attention,
+            .tensor_parallel_transport = options.tensor_parallel_transport};
 }
 
 } // namespace ninfer::models

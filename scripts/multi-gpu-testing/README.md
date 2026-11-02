@@ -43,7 +43,8 @@ from `--devices 0,1` against greedy text from `--device 0`, byte for byte.
 **Most of it is testable on one GPU.** `--devices 0,0` puts both stages on the same card. It frees
 no memory and is not a deployment, but it exercises per-stage placement and materialization,
 per-stage workspaces, KV pools and state shards, and the boundary transfers (forced through pinned
-host memory with `NINFER_FORCE_STAGED_LINKS=1`). What it cannot see is a pointer that is valid on
+host memory with `NINFER_FORCE_STAGED_LINKS=1`; a tensor-parallel exchange takes
+`--tensor-parallel-transport host` instead). What it cannot see is a pointer that is valid on
 the wrong device, because both stages can read everything; that, the PCIe cost and the
 compute-capability check are what the second card is for.
 

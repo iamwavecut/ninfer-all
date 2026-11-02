@@ -81,6 +81,22 @@ enum class TensorAttention : std::uint8_t {
     Positions,
 };
 
+// Tensor parallelism over a Qwen3.5-core model or Qwen3.8-Flash-Next: how the devices exchange
+// their partial sums.
+enum class TensorParallelTransport : std::uint8_t {
+    // Each exchange size takes whichever of the others, with the reduce's form, was fastest when
+    // the engine timed them on these devices at startup.
+    Auto,
+    // Through pinned host memory: the copy engines write each partial there and every device's
+    // kernels read the others' copies. Works between any cards.
+    Host,
+    // Every device's kernels read the other devices' memory (peer access).
+    PeerRead,
+    // Every device writes what another device sums into that device's memory, and reads only its
+    // own (peer access).
+    PeerWrite,
+};
+
 // Qwen3.8-Flash-Next: where the n-gram table's rows come from.
 enum class NgramResidency : std::uint8_t {
     // The table's file, with a bounded cache of rows read as the hash addresses them.

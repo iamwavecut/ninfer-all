@@ -340,24 +340,42 @@ families](#expert-parallelism-of-the-other-moe-families)).
   layer has two exchanges (`core/tensor_parallel.h`): after the mixer (attention: the ranks holding
   KV heads, each over its own planes and block-table copy; GDN: every rank) and after the FFN. A
   contributor writes its output projection as FP32 partials; every rank then adds all partials to
-  its replica in rank order and rounds once to BF16, so the replicas stay identical. A partial of at
-  least 128 KiB (a prompt chunk, or a step of 7 or more columns of a 5,120-wide residual) where each
-  rank reads the others through host memory from its own card, or of at least 320 KiB (16 or more
-  columns) where the ranks read peer memory or share a card, is reduced as a reduce-scatter and an
-  all-gather: each rank sums the partials only over its own range of the values, whole 64-value
-  blocks, and then copies the other ranks' finished BF16 ranges into its replica. Every value is
-  still the same rank-order sum, and a rank reads 1/N of each other rank's partial and (N-1)/N of a
-  replica instead of N-1 whole partials. Peer reads where every pair of cards has peer access,
-  mapped pinned host memory otherwise; both capture into the decode graphs. Through host memory a
-  publish copies only the ranges the other ranks read, and an owner copies its finished range there.
-  The startup log names the pairs without peer access
-  (`peer access: none between CUDA devices 0-1; ...`), or says every pair reads peer memory. Without
-  peer access, and with every rank on its own card, a partial of up to 32 KiB (a decode step or a
-  short verification) travels as low-latency words: each rank's reduce kernel stores its FP32 values
-  with the exchange's epoch as 8-byte words into its own mapped host row and polls the other ranks'
-  rows, with no copy and no cross-device fence (`TensorParallelExchange`). Each rank counts its
-  exchanges in device memory, so a graph replays them without new arguments; a wait longer than five
-  minutes traps.
+  its replica in rank order and rounds once to BF16, so the replicas stay identical. All of it
+  captures into the decode graphs.
+- **Transports and forms.** An exchange moves the partials one of three ways: through mapped pinned
+  host memory (`host`: the copy engines write each partial there, every rank's kernels read the
+  others' copies; works between any cards), by reading the other cards' memory (`peer-read`), or by
+  writing into it (`peer-write`: a rank stores what another rank sums into that rank's memory, so
+  every kernel reads only its own card). The two peer transports need peer access between every pair
+  of cards. Each moves an exchange in one of three forms. Words, for partials of up to 32 KiB (a
+  decode step or a short verification) with every rank on its own card: each rank's reduce kernel
+  stores its FP32 values with the exchange's epoch as 8-byte words, into its own mapped host row or
+  into its row in every other card's memory, and polls the others' words, with no copy and no
+  cross-device fence; each rank counts its exchanges in device memory, so a graph replays them
+  without new arguments, and a wait longer than five minutes traps. A whole reduce: every rank sums
+  every value. A reduce-scatter and all-gather: each rank sums the partials only over its own range
+  of the values, whole 64-value blocks, and the other ranks' finished BF16 ranges then reach its
+  replica; every value is still the same rank-order sum, and a rank moves 1/N of each other rank's
+  partial and (N-1)/N of a replica instead of N-1 whole partials. Through host memory a publish
+  copies only the ranges the other ranks read, and an owner copies its finished range there; by
+  peer writes the owner stores its finished range straight into the other replicas.
+- **Choosing a route.** Which route is fastest depends on the partial's size, the number of cards
+  and the platform. On a 4x RTX 5060 Ti box with the community peer-access driver host memory beat
+  peer reads (#170); on a 4x RTX A4000 box peer reads beat host memory, on four of its cards peer
+  writes beat both at every size, and a whole reduce by peer reads took more than six times the
+  reduce-scatter's time at 40 MiB (measurements below). At startup the exchange times every route
+  the cards allow, in captured graphs on every rank at once, at partial sizes from 4 KiB doubling up
+  to its slot, and frees the buffers of the routes it did not choose. Between two measured sizes a
+  route's time is read off the line through its two times, at sixteenths of the step, since one
+  octave apart a crossover could be off by half the size; an exchange takes the fastest route at the
+  smallest of all these sizes that holds it. `--tensor-parallel-transport host|peer-read|peer-write`
+  keeps every exchange to one transport (its forms still measured); a peer transport without peer
+  access refuses to start. The startup log names the pairs without peer access (`peer access: none
+  between CUDA devices 0-1; ...`), or says every pair reads peer memory, and then the routes chosen
+  with their times (`tensor-parallel exchange, 4 ranks, measured at startup: peer-write words to 32
+  KiB (14.0 us), peer-write whole to 100 KiB (29.1 us), peer-write scatter to 40 MiB (3837.0 us)`).
+  `tools/tp_exchange_bench.cu` prints what the exchange measured at startup and every route at every
+  size beside the chosen ones.
 - **One exchange per step.** Every step, a long prompt chunk included, exchanges each layer's
   partials once. Cutting a prompt chunk into pieces whose exchanges overlap the next piece's
   compute was measured slower and is not done: the dense Qwen3.8-27B GSQ-RCO IQ3_S prefilled a
@@ -426,8 +444,7 @@ repeats, not with one device's.
   prefills the long prompt at 799-904 tok/s against 1,550-1,574. One answer of five matched one
   card's under every split; the others part from it after 17 to 470 characters.
 - **2x Tesla V100-SXM2-32GB** (Vast, NVLink, so peer reads; the sm_70 routes). Decode 60.2-60.4
-  tok/s against 43.9 on one card (+37%); with `NINFER_FORCE_STAGED_LINKS=1` the mapped host
-  transport gives 54.6-55.0 (+25%). With MTP 83.4-122.3 against 58.1-87.1 (+29% to +44%). Over
+  tok/s against 43.9 on one card (+37%); through the mapped host transport 54.6-55.0 (+25%). With MTP 83.4-122.3 against 58.1-87.1 (+29% to +44%). Over
   NVLink prefill gains as well: the 7,014-token prompt runs at 1,300 tok/s against 865-867 (+50%),
   decode after it at 58.3 against 42.9 (+36%), and a 40-token prompt's TTFT is 113-135 ms against
   129-130 ms.
@@ -505,9 +522,7 @@ repeats, not with one device's.
   on one card, through peer reads, a whole reduce stays ahead up to 260 KiB (3.4 against 4.2 us in
   two runs) and the two tie at 320 KiB (4.4-4.8 against 4.3-4.4 us); through host memory two runs
   disagree at 260 and 320 KiB (58.1-88.6 against 61.3-81.9 us, 70.9-90.9 against 66.8-97.6 us), so
-  the crossover lies within their spread. Where the ranks read peer memory or share a card the
-  reduce-scatter starts at 320 KiB. No rented host here had peer access between cards, so that case
-  is not measured. The copy engines bring in the reduce-scatter's bytes about twice as fast as its
+  the crossover lies within their spread. The copy engines bring in the reduce-scatter's bytes about twice as fast as its
   kernels read them from mapped memory (two ranks, 2,048 columns: 2.44 against 4.90 ms, the
   publish's copies left out). Qwen3.8-27B (`download-model.sh qwen38-27b`, `--max-context 16384`;
   greedy 256-token answers to two short prompts and one after a 9,715-token prompt, two rounds): the
@@ -520,8 +535,7 @@ repeats, not with one device's.
   Perplexity over 40 KB of WikiText (9,234 tokens, 4,096-token windows, stride 2,048, int8 KV)
   equals master's to the last digit: 6.22103 on two cards and on one card's two ranks, 6.22150 on
   four; it scores 721 tok/s against 642 on two cards, 592 against 578 on one card and 533 against
-  300 on four. These runs used one 256 KiB threshold; the thresholds now in place change only
-  exchanges of 7 to 15 columns, which they do not make.
+  300 on four. These runs reduce-scattered every partial from 256 KiB.
 - **W4A4 and W8A8 shares on 2x RTX 5090** (2026-10-29, against master's A16 shares; Vast, CUDA
   13.4, no peer access, so the host transport). Qwen3.8-27B NVFP4 (`--max-context 16384`; greedy
   256-token answers to two short prompts and one after a 9,715-token prompt, two rounds): the long
@@ -615,11 +629,10 @@ every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.
   routes the call itself from the same input, runs the pairs routed to its experts (rank 0 the
   shared expert too) into a 2^-32 fixed-point part (`moe_experts_gguf_part`), stores the part as an
   FP32 partial and exchanges again (`StoreFp32`), so every rank adds the same FP32 MoE output to its
-  stack. That is two exchanges per layer, 96 per pass; partials of up to 32 KiB (decode and
-  verification) travel as low-latency words where each rank has its own card, and prompt chunks as a
-  reduce-scatter and an all-gather from Qwen3.5-core's thresholds, except the expert exchange of two
-  ranks: its FP32 ranges would cross the bus with as many bytes as the whole partials, so it reduces
-  whole. Each rank embeds the tokens from its replica of the table; a media prompt's merged
+  stack. That is two exchanges per layer, 96 per pass, on the routes the exchange measured at startup
+  as Qwen3.5-core's are (`--tensor-parallel-transport` applies), except that the expert exchange of
+  two ranks never scatters: its FP32 ranges would cross the bus with as many bytes as the whole
+  partials, so it reduces whole on the fastest whole route. Each rank embeds the tokens from its replica of the table; a media prompt's merged
   embeddings are copied to every rank once the tower has run.
 - **Graphs and branches.** A segment forks the other ranks' streams from rank 0's and joins them
   back, so the decode and verification graphs capture every rank's work; each segment makes an
@@ -730,3 +743,19 @@ What the transport costs was measured before this was built:
   32 KiB per partial. The V100 box reports peer access, but its IOMMU translates the cards' DMA
   (`iommu.strict=1`), so the preflight refuses it: there the probe's peer kernel delivered correct
   data at about 0.4 GB/s (a 20 MB exchange in 51 ms, against 3.7 ms through host memory).
+- **Measured routes** (`tools/tp_exchange_bench.cu`, a rented 4x RTX A4000 box with peer access,
+  PCIe 4.0 x16 under one EPYC 7272, driver 595.91, 2026-11-02; hidden 5120 added into a BF16
+  residual). On four cards one decode column (20 KiB) took 24.1 us through host words, 15.7 us by a
+  whole reduce reading the peers and 9.9 us by peer-written words; four columns (a verification of
+  three drafts) 31.4 us by peer reads and 23.4 us by peer-written whole partials; a 40 MiB prompt
+  chunk 5.6 ms by a reduce-scatter through host memory, 4.1 ms by one reading the peers, 3.8 ms by
+  one writing them and 27.4 ms by a whole reduce reading them. On two cards one column took 7.3 us
+  by peer reads and 4.9 us by peer-written words. The routes chosen at startup came within 8% of the
+  fastest at every size; the worst were 31.1 us against 29.1 at eight columns on four cards, where
+  the startup times put the two reduce-scatters the other way round, and 5.3 us against 4.9 for one
+  column on two. Measuring took 0.4 s on two cards and 1.0 s on four for a 20 MiB slot. Qwen3.8-27B
+  (groupwise, INT8 KV, MTP with three drafts, `--tensor-split 1,1,1,1`) on the four cards took
+  38.4-40.1 ms per decode round against 39.4-41.1 with `--tensor-parallel-transport peer-read` and
+  40.0-41.5 with `host`, and prefilled a 6,768-token prompt at 1,445 tok/s against 1,370 and 1,238;
+  `peer-write` alone took 38.2-39.8 ms and 1,447 tok/s. On two of the cards the measured routes and
+  `peer-write` decoded within 1% of each other. Every answer was the same.

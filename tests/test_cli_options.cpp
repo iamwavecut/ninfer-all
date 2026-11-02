@@ -579,6 +579,22 @@ int run_tests() {
                                        "0,1", "--tensor-parallel", "--tensor-attention", "rows"});
                       }),
                       "an unknown --tensor-attention mode was accepted");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                             "--tensor-parallel", "--tensor-parallel-transport", "peer-write"})
+                              .tensor_parallel_transport ==
+                          ninfer::TensorParallelTransport::PeerWrite,
+                      "--tensor-parallel-transport did not reach the options");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--tensor-parallel-transport", "host"});
+                      }),
+                      "--tensor-parallel-transport without --tensor-parallel was accepted");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices",
+                                       "0,1", "--tensor-parallel", "--tensor-parallel-transport",
+                                       "peer"});
+                      }),
+                      "an unknown --tensor-parallel-transport was accepted");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
                              "--invariant-attention"})
                           .invariant_attention,

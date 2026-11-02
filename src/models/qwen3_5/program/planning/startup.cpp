@@ -13,6 +13,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "core/tensor_parallel.h"
 #include "ops/common/device_tier.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
@@ -1402,12 +1403,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     // persistent state. Its graph allowance is the primary device's scaled by the share of layers
     // it runs; the primary keeps the whole figure, which only over-reserves it a little.
     const auto& text = impl->parameters->text;
-    // A tensor-parallel exchange holds two FP32 partials of the widest pass on every rank.
+    // A tensor-parallel exchange holds two FP32 partials of the widest pass on every rank, with
+    // the buffers of the transports it may take.
     const std::size_t exchange_bytes =
         text.tensor_parallel()
-            ? checked_mul(stage_boundary_columns(*impl) * 2U * sizeof(float),
-                          static_cast<std::size_t>(impl->parameters->model.config().text.hidden_size),
-                          "tensor-parallel exchange")
+            ? TensorParallelExchange::device_bytes(tensor_parallel_slot_bytes(*impl),
+                                                   text.rank_count, inputs.peer_access,
+                                                   inputs.features.tensor_parallel_transport)
             : 0U;
     impl->device_reservation_bytes =
         checked_add(impl->device_reservation_bytes, exchange_bytes, "tensor-parallel exchange");
@@ -1428,6 +1430,19 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 }
 
 } // namespace
+
+std::size_t tensor_parallel_slot_bytes(const SequencePlanImpl& plan) {
+    const auto& text   = plan.parameters->model.config().text;
+    std::size_t values = static_cast<std::size_t>(text.hidden_size);
+    const auto& shares = plan.parameters->text.tensor_shares;
+    if (!shares.empty() && shares.front().attention_positions) {
+        values = std::max<std::size_t>(
+            values, ops::causal_attention_partial_elements(
+                        static_cast<std::int32_t>(text.attention->num_attention_heads), 1));
+    }
+    return checked_mul(static_cast<std::size_t>(stage_boundary_columns(plan)) * sizeof(float),
+                       values, "tensor-parallel exchange");
+}
 
 void resolve_host_cache_budget(ContextCacheOptions& cache, std::uint32_t private_capacity,
                                std::uint32_t shared_capacity, std::uint32_t capacity,
@@ -1562,6 +1577,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .device                     = options.device,
         .context_cache              = options.context_cache,
         .resident_main_pages        = resident_main_pages,
+        .peer_access                = device.peer_access(),
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     // Injected graft prefixes hold their Main pages for good, on top of what requests use.

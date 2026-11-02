@@ -1260,6 +1260,9 @@ public:
     // Device pages a prefetch could fill now: free ones and host-backed cached ones.
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
+    // The tensor-parallel exchange's routes (TensorParallelExchange::describe); empty without
+    // tensor parallelism.
+    [[nodiscard]] std::string tensor_parallel_routes() const;
     // Installs the Engine's calibrated machine model for hybrid admission choice and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
     // Longest predicted wait for a prefilling sibling's snapshot that admission may choose over

@@ -149,6 +149,7 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
 
     const std::uint64_t columns = stage_boundary_columns(plan);
     const std::size_t hidden = static_cast<std::size_t>(parameters.model.config().text.hidden_size);
+    // Tests run the staged boundary protocol between ranks on one card.
     const bool force_staged  = [] {
         const char* value = std::getenv("NINFER_FORCE_STAGED_LINKS");
         return value != nullptr && value[0] != '\0' && value[0] != '0';
@@ -173,17 +174,10 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
             tp.shards.push_back(
                 qwen3_5::tensor_parallel_share(parameters.model.config().text, share));
         }
-        // A position-split attention exchanges its partial outputs through the same slots.
-        std::size_t values = hidden;
-        if (!tp.shares.empty() && tp.shares.front().attention_positions) {
-            const auto& attention = *parameters.model.config().text.attention;
-            values                = std::max<std::size_t>(
-                values, ops::causal_attention_partial_elements(
-                            static_cast<std::int32_t>(attention.num_attention_heads), 1));
-        }
         tp.exchange = std::make_unique<TensorParallelExchange>(
-            device, TensorParallelExchangeOptions{.slot_bytes   = columns * values * sizeof(float),
-                                                  .force_staged = force_staged});
+            device,
+            TensorParallelExchangeOptions{.slot_bytes = tensor_parallel_slot_bytes(plan),
+                                          .transport  = plan.features.tensor_parallel_transport});
         for (std::size_t rank = 1; rank < stages; ++rank) { tp.joined.emplace_back(device.rank(rank)); }
         return runtime;
     }

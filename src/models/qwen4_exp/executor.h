@@ -35,6 +35,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp {
@@ -76,6 +77,8 @@ struct ExecutorOptions {
     // YaRN past the model's native window (a factor above one), for the sparse-attention layers'
     // RoPE, their indexer's and the MTP block's alike; inactive keeps the unscaled rotation.
     ops::RopeYarn rope_yarn;
+    // With tensor parallelism, how the ranks' exchanges travel (TensorParallelExchange).
+    TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
 };
 
 // One media item of a prompt for the Vision tower: its patches and the frontend's control.
@@ -141,6 +144,9 @@ public:
     // The n-gram table's reads since startup, and the RAM its resident rows take.
     [[nodiscard]] NgramTableStats ngram_stats();
     [[nodiscard]] std::uint64_t ngram_resident_bytes() const noexcept;
+    // The tensor-parallel exchange's routes (TensorParallelExchange::describe); empty without
+    // tensor parallelism.
+    [[nodiscard]] std::string tensor_parallel_routes() const;
 
     // Empties the sequence: position zero, zero states, a fresh n-gram context.
     void reset(std::uint32_t sequence);

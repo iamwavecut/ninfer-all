@@ -3,19 +3,17 @@
 // The oracle is the reduction itself evaluated on the host in the same order: each rank's FP32
 // partials summed in rank order, added to the BF16 residual in FP32, rounded once. Only adds
 // appear, so the host evaluates the same IEEE operations and the comparison is exact. Every rank's
-// replica must also equal every other rank's. Ranks share device 0, as in the stage-link test:
-// `force_staged` runs the real mapped-host path, and without it ranks on one card take the peer
-// path. With two or more devices the ranks are also dealt over them, so the staged path crosses
-// cards. A captured sequence of exchanges with changed inputs between replays checks that the
-// protocol holds inside one graph spanning every rank's stream. Two ranks on two cards without
-// peer access exchange decode-sized partials as low-latency words; a sequence alternating them
-// with staged exchanges and with one contributor checks that the two protocols share the slots.
-// A partial of at least the scatter threshold reduces as a reduce-scatter and an all-gather, from a
-// larger one where the ranks read peer memory or share a card; the default thresholds send a prompt
-// chunk that way, and a threshold of four bytes sends every
-// exchange that is not low-latency words, at sizes whose ranges end in a partial block or leave
-// some ranks without a range; two ranks storing an FP32 sum still reduce whole. The captured pass
-// then reuses a slot within one graph.
+// replica must also equal every other rank's. Ranks share device 0, as in the stage-link test,
+// where every transport runs (peer access holds within one card) and words fall back to whole
+// reduces; with two or more devices the ranks are also dealt over them, so the transports cross
+// cards, and two ranks on two cards exchange words. Each case names one route for every size:
+// every transport the devices allow in every form, at a decode column, a verify window, an odd size,
+// a size whose scatter ranges end in a partial block or leave some ranks without one, and a prompt
+// chunk past PeerWrite's whole reduces. A captured sequence of exchanges with changed inputs
+// between replays checks that the protocol holds inside one graph spanning every rank's stream and
+// reuses a slot within it. Two ranks on two cards then interleave bands of different transports and
+// forms over both slots, with all ranks or only rank 0 contributing, so host and peer words share
+// one epoch. Last, an exchange measures its routes and runs on what it chose.
 //
 // The host writes the inputs with blocking copies from pageable memory, which may return before
 // the data reaches the device; the rank streams do not wait for them (they are non-blocking), so
@@ -28,18 +26,23 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <algorithm>
 #include <cstring>
 #include <exception>
 #include <iostream>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace {
 
+using ninfer::TensorParallelForm;
+using ninfer::TensorParallelRoute;
+using ninfer::TensorParallelSum;
+using ninfer::TensorParallelTransport;
 using ninfer::test::cuda_unavailable;
 
 int expect(bool condition, const char* label) {
@@ -57,22 +60,42 @@ std::uint16_t bits(__nv_bfloat16 value) {
 struct Case {
     std::size_t ranks;
     std::int64_t values;
-    bool force_staged;
     int devices; // ranks are dealt over devices [0, devices)
-    std::size_t scatter_bytes;
-    std::size_t near_scatter_bytes;
+    TensorParallelRoute route;
 };
+
+// The route an exchange of `bytes` whose slot is `bytes` takes when its one band names `asked`:
+// words only between ranks on their own cards, up to 32 KiB and not by reading; two ranks storing an
+// FP32 sum reduce whole; PeerWrite reduces a partial that fills its slot whole up to 1 MiB and
+// reads past it.
+TensorParallelRoute expected_route(TensorParallelRoute asked, std::size_t bytes, std::size_t ranks,
+                                   bool own_cards, TensorParallelSum sum) {
+    TensorParallelRoute route = asked;
+    if (route.form == TensorParallelForm::Words &&
+        (route.transport == TensorParallelTransport::PeerRead || !own_cards ||
+         bytes > (32U << 10U))) {
+        route.form = TensorParallelForm::Whole;
+    }
+    if (route.form == TensorParallelForm::Scatter && sum == TensorParallelSum::StoreFp32 &&
+        ranks == 2) {
+        route.form = TensorParallelForm::Whole;
+    }
+    if (route.form == TensorParallelForm::Whole &&
+        route.transport == TensorParallelTransport::PeerWrite && bytes > (1U << 20U)) {
+        route.transport = TensorParallelTransport::PeerRead;
+    }
+    return route;
+}
 
 // One exchange on every rank's stream: ranks [0, contributors) publish their partials of `values`,
 // the others nothing, and every rank reduces into `out[r]` and completes it.
 template <class Out>
 void exchange_all(ninfer::TensorParallelExchange& exchange, ninfer::DeviceContext& ctx,
                   std::size_t slot, const std::vector<Out*>& out, std::int64_t values,
-                  std::size_t contributors,
-                  ninfer::TensorParallelSum sum = ninfer::TensorParallelSum::AddBf16) {
+                  std::size_t contributors, TensorParallelSum sum = TensorParallelSum::AddBf16) {
     const auto bytes = static_cast<std::size_t>(values) * sizeof(float);
     for (std::size_t r = 0; r < out.size(); ++r) {
-        exchange.publish(r, slot, r < contributors ? bytes : 0, ctx.rank(r).stream, sum);
+        exchange.publish(r, slot, r < contributors ? bytes : 0, out[r], ctx.rank(r).stream, sum);
     }
     for (std::size_t r = 0; r < out.size(); ++r) {
         exchange.reduce(r, slot, out[r], values, contributors, ctx.rank(r).stream, sum);
@@ -112,10 +135,19 @@ int compare_replicas(const std::vector<__nv_bfloat16*>& replica, std::int64_t va
     return failures;
 }
 
+// Rank r on device r % devices, and whether every rank has a card of its own.
+std::vector<int> deal(std::size_t ranks, int devices, bool& own_cards) {
+    std::vector<int> ids(ranks);
+    for (std::size_t r = 0; r < ranks; ++r) { ids[r] = static_cast<int>(r) % devices; }
+    own_cards = ranks <= static_cast<std::size_t>(devices);
+    return ids;
+}
+
 int run_case(const Case& c, std::mt19937& rng) {
-    std::vector<int> ids(c.ranks);
-    for (std::size_t r = 0; r < c.ranks; ++r) { ids[r] = static_cast<int>(r) % c.devices; }
+    bool own_cards = false;
+    const std::vector<int> ids = deal(c.ranks, c.devices, own_cards);
     ninfer::DeviceContext ctx(std::span<const int>(ids.data(), ids.size()));
+    if (c.route.transport != TensorParallelTransport::Host && !ctx.peer_access()) { return 0; }
     const auto settle = [&] {
         for (int device = 0; device < c.devices; ++device) {
             CUDA_CHECK(cudaSetDevice(device));
@@ -124,31 +156,16 @@ int run_case(const Case& c, std::mt19937& rng) {
         CUDA_CHECK(cudaSetDevice(0));
     };
     const std::size_t bytes = static_cast<std::size_t>(c.values) * sizeof(float);
-    ninfer::TensorParallelExchange exchange(ctx, {.slot_bytes         = bytes,
-                                                  .force_staged       = c.force_staged,
-                                                  .scatter_bytes      = c.scatter_bytes,
-                                                  .near_scatter_bytes = c.near_scatter_bytes});
-    // Across cards the transport follows their peer access; on one card it is the override's.
-    int failures = expect((c.devices > 1 && !c.force_staged) ||
-                              exchange.transport() == (c.force_staged
-                                                           ? ninfer::TensorParallelTransport::StagedHost
-                                                           : ninfer::TensorParallelTransport::Peer),
-                          "transport follows the topology and the override");
-    bool distinct = true;
-    for (std::size_t a = 0; a < c.ranks; ++a) {
-        for (std::size_t b = a + 1; b < c.ranks; ++b) { distinct = distinct && ids[a] != ids[b]; }
+    ninfer::TensorParallelExchange exchange(ctx, {.slot_bytes = bytes,
+                                                  .routes     = {{.bytes = bytes, .route = c.route}}});
+    int failures = 0;
+    for (const TensorParallelSum sum :
+         {TensorParallelSum::AddBf16, TensorParallelSum::StoreBf16, TensorParallelSum::StoreFp32}) {
+        failures += expect(exchange.route(bytes, sum) ==
+                               expected_route(c.route, bytes, c.ranks, own_cards, sum),
+                           "a named route holds where the size, cards and sum allow it");
     }
-    const bool host =
-        exchange.transport() == ninfer::TensorParallelTransport::StagedHost && distinct;
-    const bool words = host && bytes <= (32U << 10U);
-    failures += expect(exchange.low_latency(bytes) == words,
-                       "low-latency words exactly for small staged exchanges between cards");
-    const std::size_t threshold = host ? c.scatter_bytes : c.near_scatter_bytes;
-    failures += expect(exchange.scatter(bytes) == (!words && threshold != 0 && bytes >= threshold),
-                       "a reduce-scatter exactly from its topology's threshold, never for words");
-    failures += expect(exchange.scatter(bytes, ninfer::TensorParallelSum::StoreFp32) ==
-                           (exchange.scatter(bytes) && c.ranks > 2),
-                       "two ranks storing an FP32 sum reduce whole");
+    failures += expect(exchange.timings().empty(), "named routes are not measured");
 
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<__nv_bfloat16*> replica(c.ranks);
@@ -211,8 +228,7 @@ int run_case(const Case& c, std::mt19937& rng) {
         const auto residual = residual_of(4.0f);
         const auto partials = partials_of(1.0f);
         load(residual, partials, 0);
-        exchange_all(exchange, ctx, 0, replica, c.values, c.ranks,
-                     ninfer::TensorParallelSum::StoreBf16);
+        exchange_all(exchange, ctx, 0, replica, c.values, c.ranks, TensorParallelSum::StoreBf16);
         ctx.synchronize();
         const std::vector<__nv_bfloat16> zero(residual.size(), __float2bfloat16(0.0f));
         failures += compare_replicas(replica, c.values, oracle(zero, partials),
@@ -225,8 +241,7 @@ int run_case(const Case& c, std::mt19937& rng) {
         }
         CUDA_CHECK(cudaSetDevice(0));
         load(residual, partials, 1);
-        exchange_all(exchange, ctx, 1, sums, c.values, c.ranks,
-                     ninfer::TensorParallelSum::StoreFp32);
+        exchange_all(exchange, ctx, 1, sums, c.values, c.ranks, TensorParallelSum::StoreFp32);
         ctx.synchronize();
         std::vector<float> want(static_cast<std::size_t>(c.values));
         for (std::size_t i = 0; i < want.size(); ++i) {
@@ -304,7 +319,7 @@ int run_case(const Case& c, std::mt19937& rng) {
     }
 
     try {
-        exchange.publish(0, 0, bytes + sizeof(float), ctx.rank(0).stream);
+        exchange.publish(0, 0, bytes + sizeof(float), replica[0], ctx.rank(0).stream);
         failures += expect(false, "an oversized partial is refused");
     } catch (const std::invalid_argument&) {}
     for (std::size_t r = 0; r < c.ranks; ++r) {
@@ -315,40 +330,33 @@ int run_case(const Case& c, std::mt19937& rng) {
     return failures;
 }
 
-// Two ranks on two cards: low-latency words, whole staged reduces and reduce-scatters interleaved
-// over both slots, with all ranks or only rank 0 contributing.
-int run_mixed(std::mt19937& rng) {
-    const int ids[] = {0, 1};
-    ninfer::DeviceContext ctx(std::span<const int>(ids, 2));
-    constexpr std::int64_t kWide = 5120 * 4;
-    constexpr std::int64_t kWhole = 5120 * 2;
-    ninfer::TensorParallelExchange exchange(ctx, {.slot_bytes    = kWide * sizeof(float),
-                                                  .force_staged  = true,
-                                                  .scatter_bytes = kWide * sizeof(float)});
-    int failures = expect(exchange.low_latency(5120 * sizeof(float)) &&
-                              !exchange.low_latency(kWhole * sizeof(float)) &&
-                              !exchange.scatter(kWhole * sizeof(float)) &&
-                              exchange.scatter(kWide * sizeof(float)),
-                          "decode columns as words, a short window whole, a wide one scattered");
+// Exchanges of the sizes in `sizes`, each with its contributor count, on `exchange` over `ctx`'s
+// ranks (rank r on device r), against the oracle.
+int run_sequence(ninfer::TensorParallelExchange& exchange, ninfer::DeviceContext& ctx,
+                 std::span<const std::int64_t> sizes, std::span<const std::size_t> contributors,
+                 std::mt19937& rng, const char* label) {
     std::normal_distribution<float> normal(0.0f, 1.0f);
-    std::vector<__nv_bfloat16*> replica(2);
-    for (int r = 0; r < 2; ++r) {
-        CUDA_CHECK(cudaSetDevice(r));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&replica[r]), kWide * sizeof(__nv_bfloat16)));
+    const std::size_t ranks = ctx.size();
+    std::int64_t widest     = 0;
+    for (const std::int64_t values : sizes) { widest = std::max(widest, values); }
+    std::vector<__nv_bfloat16*> replica(ranks);
+    for (std::size_t r = 0; r < ranks; ++r) {
+        CUDA_CHECK(cudaSetDevice(ctx.rank(r).device));
+        CUDA_CHECK(
+            cudaMalloc(reinterpret_cast<void**>(&replica[r]), widest * sizeof(__nv_bfloat16)));
     }
-    const std::int64_t sizes[]       = {5120, kWide, 1031, kWhole, kWide, 5120, kWhole, kWide};
-    const std::size_t contributors[] = {2, 2, 1, 1, 1, 2, 2, 2};
-    for (std::size_t step = 0; step < std::size(sizes); ++step) {
+    int failures = 0;
+    for (std::size_t step = 0; step < sizes.size(); ++step) {
         const std::int64_t values = sizes[step];
         const std::size_t slot    = step % 2;
         std::vector<__nv_bfloat16> residual(static_cast<std::size_t>(values));
         for (auto& v : residual) { v = __float2bfloat16(4.0f * normal(rng)); }
-        std::vector<std::vector<float>> partials(2, std::vector<float>(residual.size()));
+        std::vector<std::vector<float>> partials(ranks, std::vector<float>(residual.size()));
         for (auto& p : partials) {
             for (auto& v : p) { v = normal(rng); }
         }
-        for (int r = 0; r < 2; ++r) {
-            CUDA_CHECK(cudaSetDevice(r));
+        for (std::size_t r = 0; r < ranks; ++r) {
+            CUDA_CHECK(cudaSetDevice(ctx.rank(r).device));
             CUDA_CHECK(cudaMemcpy(replica[r], residual.data(), values * sizeof(__nv_bfloat16),
                                   cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(exchange.partial(r, slot), partials[r].data(),
@@ -358,14 +366,97 @@ int run_mixed(std::mt19937& rng) {
         exchange_all(exchange, ctx, slot, replica, values, contributors[step]);
         ctx.synchronize();
         partials.resize(contributors[step]);
-        failures += compare_replicas(replica, values, oracle(residual, partials),
-                                     "interleaved exchanges match the rank-order sum");
+        failures += compare_replicas(replica, values, oracle(residual, partials), label);
     }
-    for (int r = 0; r < 2; ++r) {
-        CUDA_CHECK(cudaSetDevice(r));
+    for (std::size_t r = 0; r < ranks; ++r) {
+        CUDA_CHECK(cudaSetDevice(ctx.rank(r).device));
         CUDA_CHECK(cudaFree(replica[r]));
     }
     CUDA_CHECK(cudaSetDevice(0));
+    return failures;
+}
+
+// Two ranks on two cards: bands of different transports and forms interleaved over both slots. With
+// peer access, host words and peer words take turns on one epoch.
+int run_mixed(std::mt19937& rng) {
+    const int ids[] = {0, 1};
+    ninfer::DeviceContext ctx(std::span<const int>(ids, 2));
+    constexpr std::size_t kSlot = 5120 * 4 * sizeof(float);
+    using Band                  = ninfer::TensorParallelBand;
+    std::vector<Band> routes;
+    if (ctx.peer_access()) {
+        routes = {
+            {16U << 10U, {TensorParallelTransport::Host, TensorParallelForm::Words}},
+            {32U << 10U, {TensorParallelTransport::PeerWrite, TensorParallelForm::Words}},
+            {40U << 10U, {TensorParallelTransport::PeerWrite, TensorParallelForm::Whole}},
+            {60U << 10U, {TensorParallelTransport::Host, TensorParallelForm::Scatter}},
+            {kSlot, {TensorParallelTransport::PeerWrite, TensorParallelForm::Scatter}},
+        };
+    } else {
+        routes = {
+            {32U << 10U, {TensorParallelTransport::Host, TensorParallelForm::Words}},
+            {40U << 10U, {TensorParallelTransport::Host, TensorParallelForm::Whole}},
+            {kSlot, {TensorParallelTransport::Host, TensorParallelForm::Scatter}},
+        };
+        try {
+            ninfer::TensorParallelExchange refused(
+                ctx, {.slot_bytes = kSlot, .transport = TensorParallelTransport::PeerWrite});
+            return expect(false, "a peer transport without peer access is refused");
+        } catch (const std::invalid_argument&) {}
+    }
+    ninfer::TensorParallelExchange exchange(ctx, {.slot_bytes = kSlot, .routes = routes});
+    int failures = 0;
+    for (const Band& band : routes) {
+        failures += expect(exchange.route(band.bytes) == band.route,
+                           "every band's route holds at its size");
+    }
+    const std::int64_t sizes[]       = {5120, 20480, 1031, 10240, 15360,
+                                        20480, 5120, 10240, 1031, 15360};
+    const std::size_t contributors[] = {2, 2, 1, 1, 2, 1, 2, 2, 1, 2};
+    failures += run_sequence(exchange, ctx, sizes, contributors, rng,
+                             "interleaved routes match the rank-order sum");
+    return failures;
+}
+
+// An exchange that measures its routes: its bands cover the slot with routes the devices allow, and
+// every size runs on what it chose. A forced transport keeps every band to it.
+int run_measured(int devices, std::mt19937& rng) {
+    bool own_cards = false;
+    const std::vector<int> ids = deal(2, devices, own_cards);
+    ninfer::DeviceContext ctx(std::span<const int>(ids.data(), ids.size()));
+    constexpr std::size_t kSlot = 5120 * 64 * sizeof(float);
+    int failures                = 0;
+    std::vector<TensorParallelTransport> transports{TensorParallelTransport::Auto,
+                                                    TensorParallelTransport::Host};
+    if (ctx.peer_access()) { transports.push_back(TensorParallelTransport::PeerWrite); }
+    for (const TensorParallelTransport transport : transports) {
+        ninfer::TensorParallelExchange exchange(ctx, {.slot_bytes = kSlot, .transport = transport});
+        const auto& bands = exchange.bands();
+        failures += expect(!bands.empty() && bands.back().bytes == kSlot &&
+                               !exchange.whole_bands().empty() && !exchange.timings().empty(),
+                           "a measured exchange times its routes and covers its slot");
+        for (const auto& band : bands) {
+            failures += expect(transport == TensorParallelTransport::Auto ||
+                                   band.route.transport == transport,
+                               "a forced transport keeps every band");
+            failures += expect(band.route.transport == TensorParallelTransport::Host ||
+                                   ctx.peer_access(),
+                               "a peer route only with peer access");
+            failures += expect(band.route.form != TensorParallelForm::Words ||
+                                   (own_cards && band.bytes <= (32U << 10U)),
+                               "words only between cards, up to their size");
+        }
+        for (const auto& band : exchange.whole_bands()) {
+            failures += expect(band.route.form == TensorParallelForm::Whole,
+                               "the gather bands reduce whole");
+        }
+        failures += expect(!exchange.describe().empty(), "a measured exchange describes itself");
+        std::cout << exchange.describe() << '\n';
+        const std::int64_t sizes[]       = {1031, 5120, 20480, 81920, 327680, 5120, 327680};
+        const std::size_t contributors[] = {2, 2, 2, 1, 2, 1, 2};
+        failures += run_sequence(exchange, ctx, sizes, contributors, rng,
+                                 "measured routes match the rank-order sum");
+    }
     return failures;
 }
 
@@ -380,24 +471,27 @@ int run() {
     CUDA_CHECK(cudaSetDevice(0));
     std::mt19937 rng(20261025);
     int failures = 0;
-    // One decode column of the 27B residual, a verify window, an odd size and a prompt chunk at the
-    // default threshold; then every exchange above words as a reduce-scatter, down to ranges of one
-    // partial block and ranks without one.
-    const ninfer::TensorParallelExchangeOptions defaults{};
+    // A decode column of the 27B residual, a verify window, an odd size, ranges of one partial
+    // block and ranks without one, and a prompt chunk; words at the sizes they take.
     for (const int devices : {1, std::min(count, 2)}) {
-        for (const bool staged : {true, false}) {
+        for (const TensorParallelTransport transport :
+             {TensorParallelTransport::Host, TensorParallelTransport::PeerRead,
+              TensorParallelTransport::PeerWrite}) {
             for (const std::size_t ranks : {2U, 3U, 4U, 8U}) {
-                for (const std::int64_t values : {5120LL, 5120LL * 4, 1031LL, 5120LL * 512}) {
-                    failures += run_case({ranks, values, staged, devices, defaults.scatter_bytes,
-                                          defaults.near_scatter_bytes},
-                                         rng);
+                for (const TensorParallelForm form :
+                     {TensorParallelForm::Whole, TensorParallelForm::Scatter}) {
+                    for (const std::int64_t values :
+                         {5120LL, 5120LL * 4, 1031LL, 100LL, 5120LL * 512}) {
+                        failures += run_case({ranks, values, devices, {transport, form}}, rng);
+                    }
                 }
-                for (const std::int64_t values : {5120LL, 5120LL * 4, 1031LL, 100LL}) {
+                for (const std::int64_t values : {5120LL, 1031LL, 100LL}) {
                     failures += run_case(
-                        {ranks, values, staged, devices, sizeof(float), sizeof(float)}, rng);
+                        {ranks, values, devices, {transport, TensorParallelForm::Words}}, rng);
                 }
             }
         }
+        failures += run_measured(devices, rng);
         if (count < 2) { break; }
     }
     if (count >= 2) { failures += run_mixed(rng); }
