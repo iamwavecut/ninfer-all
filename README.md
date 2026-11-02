@@ -14,6 +14,13 @@ a state, each option with its probability, through TypeSafe's System One and Ope
 NInfer-all continues [NInfer](https://github.com/Neroued/ninfer) through the NInfer-3090 line and
 carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits each of them.
 
+> [!NOTE]
+> **Support GPU testing.** Choose a custom amount on [GitHub Sponsors](https://github.com/sponsors/iamwavecut)
+> to help cover GPU rentals for correctness checks, kernel tuning, and benchmarks.
+> This is a voluntary contribution without sponsor benefits.
+> For compute credits, GPU access, or individual sponsorship terms,
+> [contact the maintainer](https://selit.ski/#contact) directly.
+
 ## What's New
 
 - **2026-11-02:** [Tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism) times its exchanges at startup and gives each size the fastest of three transports: through host memory, by reading the other GPUs' memory, or by writing into it, which is new. On four RTX A4000s with peer access Qwen3.8-27B with MTP decodes 1 to 2% faster and prefills a 6,768-token prompt 7 to 9% faster, with the same answers; where host memory measures faster than peer reads, the exchanges take it. [`--tensor-parallel-transport`](docs/cli.md#common-options) keeps them to one transport, and the startup log lists the routes chosen.
