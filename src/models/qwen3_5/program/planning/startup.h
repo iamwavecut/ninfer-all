@@ -209,6 +209,10 @@ struct SequencePlanImpl {
 // position-split attention outputs where those are wider (they go through the same slots).
 [[nodiscard]] std::size_t tensor_parallel_slot_bytes(const SequencePlanImpl& plan);
 
+// One slot of a divided head's link from a rank to rank 0: the widest rank's rows of the widest
+// head, in its logits' type, at every lane's verification columns. 0 when no head is divided.
+[[nodiscard]] std::size_t divided_head_link_bytes(const SequencePlanImpl& plan);
+
 // The int32 control block a stage boundary carries for `columns` columns: cache positions,
 // RoPE positions (three rows with multimodal RoPE), KV table rows, valid columns and the source and
 // destination state slots, each at most `columns` entries, plus alignment.

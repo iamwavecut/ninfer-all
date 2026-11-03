@@ -519,6 +519,22 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                             ops::linear_workspace_capacity_bytes(
                                 p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last)));
     };
+    // A divided head (tensor parallelism): every rank but 0 holds the hidden it receives and its
+    // rows, rank 0 one buffer of the widest rank's rows, each with its share's scratch. Every rank's
+    // scratch has rank 0's size, so one layout holds both.
+    const auto divided_head_scratch = [&](WorkspaceLayoutBuilder& layout,
+                                          const execution::HeadShares& head, DType dtype,
+                                          int first, int last) {
+        if (!head.divided()) { return; }
+        std::int64_t widest = 0;
+        for (std::size_t rank = 0; rank < head.shares.size(); ++rank) {
+            widest = std::max(widest, head.rows[rank + 1] - head.rows[rank]);
+        }
+        auto scope = layout.scope();
+        matrix(layout, DType::BF16, dimension(config.hidden_size), last);
+        matrix(layout, dtype, static_cast<std::int32_t>(widest), last);
+        for (const auto& share : head.shares) { linear_scratch(layout, share, first, last); }
+    };
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last,
                                  bool wide_verification = false) {
@@ -638,11 +654,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             }
         }
         // A prompt chunk projects only its last column through the head; a verify round projects
-        // every column.
+        // every column, through the divided head under tensor parallelism.
         if (!plan.causal_scoring) {
             const std::int32_t head_last = phase == TextPhase::Prefill ? 1 : last;
             linear_scratch(layout, parameters.text.output_head, std::min(first, head_last),
                            head_last);
+            if (phase != TextPhase::Prefill) {
+                divided_head_scratch(layout, parameters.text.output_head_shares, logits_dtype,
+                                     first, last);
+            }
         }
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
@@ -651,15 +671,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {
-            const auto& head = parameters.proposal->head;
-            matrix(layout, execution::fp32_proposal_logits(head) ? DType::FP32 : DType::BF16,
-                   dimension(parameters.proposal->rows), columns);
+            const auto& head  = parameters.proposal->head;
+            const DType dtype = execution::fp32_proposal_logits(head) ? DType::FP32 : DType::BF16;
+            matrix(layout, dtype, dimension(parameters.proposal->rows), columns);
             linear_scratch(layout, head, columns, columns);
+            divided_head_scratch(layout, parameters.proposal->head_shares, dtype, columns, columns);
         } else {
-            if (execution::fp32_proposal_logits(parameters.mtp->output_head)) {
-                matrix(layout, DType::FP32, dimension(config.vocab_size), columns);
-            }
+            const bool fp32 = execution::fp32_proposal_logits(parameters.mtp->output_head);
+            if (fp32) { matrix(layout, DType::FP32, dimension(config.vocab_size), columns); }
             linear_scratch(layout, parameters.mtp->output_head, columns, columns);
+            divided_head_scratch(layout, parameters.mtp->output_head_shares,
+                                 fp32 ? DType::FP32 : DType::BF16, columns, columns);
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
@@ -1467,6 +1489,32 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 }
 
 } // namespace
+
+std::size_t divided_head_link_bytes(const SequencePlanImpl& plan) {
+    const auto& parameters = *plan.parameters;
+    std::size_t widest     = 0;
+    const auto widest_of   = [&](const execution::HeadShares& head, DType dtype) {
+        for (std::size_t rank = 1; rank < head.shares.size(); ++rank) {
+            widest = std::max(widest, static_cast<std::size_t>(head.rows[rank + 1] - head.rows[rank]) *
+                                          dtype_size(dtype));
+        }
+    };
+    const auto draft_dtype = [](const execution::LinearParameters& head) {
+        return execution::fp32_proposal_logits(head) ? DType::FP32 : DType::BF16;
+    };
+    widest_of(parameters.text.output_head_shares,
+              execution::target_logits_dtype(parameters.text.output_head));
+    if (parameters.proposal) {
+        widest_of(parameters.proposal->head_shares, draft_dtype(parameters.proposal->head));
+    }
+    if (parameters.mtp) {
+        widest_of(parameters.mtp->output_head_shares, draft_dtype(parameters.mtp->output_head));
+    }
+    return checked_mul(widest,
+                       static_cast<std::size_t>(plan.max_concurrency) *
+                           (widest_verify_window(plan) + 1U),
+                       "divided head link");
+}
 
 std::size_t tensor_parallel_slot_bytes(const SequencePlanImpl& plan) {
     const auto& text   = plan.parameters->model.config().text;

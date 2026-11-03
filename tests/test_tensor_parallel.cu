@@ -6,14 +6,16 @@
 // replica must also equal every other rank's. Ranks share device 0, as in the stage-link test,
 // where every transport runs (peer access holds within one card) and words fall back to whole
 // reduces; with two or more devices the ranks are also dealt over them, so the transports cross
-// cards, and two ranks on two cards exchange words. Each case names one route for every size:
+// cards, and ranks on cards of their own exchange words. Each case names one route for every size:
 // every transport the devices allow in every form, at a decode column, a verify window, an odd size,
 // a size whose scatter ranges end in a partial block or leave some ranks without one, and a prompt
 // chunk past PeerWrite's whole reduces. A captured sequence of exchanges with changed inputs
 // between replays checks that the protocol holds inside one graph spanning every rank's stream and
-// reuses a slot within it. Two ranks on two cards then interleave bands of different transports and
-// forms over both slots, with all ranks or only rank 0 contributing, so host and peer words share
-// one epoch. Last, an exchange measures its routes and runs on what it chose.
+// reuses a slot within it. Ranks on two and on four cards then interleave bands of different
+// transports and forms over both slots, with all ranks or only rank 0 contributing, so host and peer
+// words share one epoch, and run words exchanges across the wrap of their count, widening past what
+// the epochs before the wrap stored. Last, an exchange measures its routes and runs on what it
+// chose.
 //
 // The host writes the inputs with blocking copies from pageable memory, which may return before
 // the data reaches the device; the rank streams do not wait for them (they are non-blocking), so
@@ -376,11 +378,12 @@ int run_sequence(ninfer::TensorParallelExchange& exchange, ninfer::DeviceContext
     return failures;
 }
 
-// Two ranks on two cards: bands of different transports and forms interleaved over both slots. With
-// peer access, host words and peer words take turns on one epoch.
-int run_mixed(std::mt19937& rng) {
-    const int ids[] = {0, 1};
-    ninfer::DeviceContext ctx(std::span<const int>(ids, 2));
+// `ranks` ranks on as many cards: bands of different transports and forms interleaved over both
+// slots. With peer access, host words and peer words take turns on one epoch.
+int run_mixed(int ranks, std::mt19937& rng) {
+    std::vector<int> ids(static_cast<std::size_t>(ranks));
+    for (int r = 0; r < ranks; ++r) { ids[static_cast<std::size_t>(r)] = r; }
+    ninfer::DeviceContext ctx(std::span<const int>(ids.data(), ids.size()));
     constexpr std::size_t kSlot = 5120 * 4 * sizeof(float);
     using Band                  = ninfer::TensorParallelBand;
     std::vector<Band> routes;
@@ -410,11 +413,38 @@ int run_mixed(std::mt19937& rng) {
         failures += expect(exchange.route(band.bytes) == band.route,
                            "every band's route holds at its size");
     }
-    const std::int64_t sizes[]       = {5120, 20480, 1031, 10240, 15360,
-                                        20480, 5120, 10240, 1031, 15360};
-    const std::size_t contributors[] = {2, 2, 1, 1, 2, 1, 2, 2, 1, 2};
+    const std::int64_t sizes[] = {5120, 20480, 1031, 10240, 15360, 20480, 5120, 10240, 1031, 15360};
+    const auto all             = static_cast<std::size_t>(ranks);
+    const std::size_t contributors[] = {all, all, 1, 1, all, 1, all, all, 1, all};
     failures += run_sequence(exchange, ctx, sizes, contributors, rng,
                              "interleaved routes match the rank-order sum");
+    return failures;
+}
+
+// `ranks` ranks on as many cards exchanging words across the wrap of their count, under every
+// words transport the cards allow: narrow exchanges up to the wrap, then wider ones, whose words
+// past the narrow width no epoch before the wrap stored.
+int run_wrap(int ranks, std::mt19937& rng) {
+    std::vector<int> ids(static_cast<std::size_t>(ranks));
+    for (int r = 0; r < ranks; ++r) { ids[static_cast<std::size_t>(r)] = r; }
+    ninfer::DeviceContext ctx(std::span<const int>(ids.data(), ids.size()));
+    constexpr std::size_t kSlot = 5120 * sizeof(float);
+    std::vector<TensorParallelTransport> transports{TensorParallelTransport::Host};
+    if (ctx.peer_access()) { transports.push_back(TensorParallelTransport::PeerWrite); }
+    int failures = 0;
+    for (const TensorParallelTransport transport : transports) {
+        ninfer::TensorParallelExchange exchange(
+            ctx, {.slot_bytes  = kSlot,
+                  .routes      = {{.bytes = kSlot, .route = {transport, TensorParallelForm::Words}}},
+                  .words_count = 0xFFFFFFFFU - 3U});
+        failures += expect(exchange.route(kSlot).form == TensorParallelForm::Words,
+                           "ranks on their own cards exchange words");
+        const std::int64_t sizes[] = {100, 100, 100, 5120, 5120, 100, 5120, 5120};
+        const auto all             = static_cast<std::size_t>(ranks);
+        const std::size_t contributors[] = {all, all, all, all, 1, all, all, all};
+        failures += run_sequence(exchange, ctx, sizes, contributors, rng,
+                                 "words across the wrap of their count match the rank-order sum");
+    }
     return failures;
 }
 
@@ -473,7 +503,11 @@ int run() {
     int failures = 0;
     // A decode column of the 27B residual, a verify window, an odd size, ranges of one partial
     // block and ranks without one, and a prompt chunk; words at the sizes they take.
-    for (const int devices : {1, std::min(count, 2)}) {
+    std::vector<int> device_counts{1};
+    for (const int devices : {2, 4}) {
+        if (count >= devices) { device_counts.push_back(devices); }
+    }
+    for (const int devices : device_counts) {
         for (const TensorParallelTransport transport :
              {TensorParallelTransport::Host, TensorParallelTransport::PeerRead,
               TensorParallelTransport::PeerWrite}) {
@@ -492,9 +526,12 @@ int run() {
             }
         }
         failures += run_measured(devices, rng);
-        if (count < 2) { break; }
     }
-    if (count >= 2) { failures += run_mixed(rng); }
+    for (const int devices : device_counts) {
+        if (devices < 2) { continue; }
+        failures += run_mixed(devices, rng);
+        failures += run_wrap(devices, rng);
+    }
     if (failures != 0) { return 1; }
     std::cout << "tensor-parallel exchange holds\n";
     return 0;

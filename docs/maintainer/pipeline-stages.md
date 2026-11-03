@@ -266,7 +266,9 @@ families](#expert-parallelism-of-the-other-moe-families)).
   heads' planes of every layer's KV cache. The ranks holding KV heads are a prefix of the ranks;
   with more ranks than the heads allow, the others hold no attention, unless `--tensor-attention
   positions` divides it by cache pages ([attention by positions](#attention-by-positions)). The
-  embedding, the final norm, the head and MTP stay on rank 0. `TensorShare` and `tensor_parallel_share`
+  embedding, the final norm and MTP stay on rank 0, and so do the whole output and proposal heads;
+  every rank also holds a row range of each head, which decode projects divided (below).
+  `TensorShare` and `tensor_parallel_share`
   (`models/qwen3_5/config.h`) state a rank's ranges and geometry.
 - **Expert parallelism.** In a MoE model a rank holds a contiguous range of the routed experts in
   place of FFN rows: one device selection of each expert bank, its experts side by side as the bank
@@ -312,8 +314,8 @@ families](#expert-parallelism-of-the-other-moe-families)).
   card divide its figure) as its speed, works out how much of the divided weights, GDN state and KV
   cache for the configured context and concurrency each card can hold beside what every rank holds
   and, on rank 0, the embedding, the head and, as selected, MTP's layer with its KV, the proposal
-  head, a DFlash drafter and a resident Vision tower (`default_tensor_split`,
-  `models/qwen3_5/load.cpp`), and fills the cards in proportion to speed, capping a card at its room
+  head, a DFlash drafter and a resident Vision tower, the heads' row ranges counting with the divided
+  weights (`default_tensor_split`, `models/qwen3_5/load.cpp`), and fills the cards in proportion to speed, capping a card at its room
   and passing the excess to the others (`fill_shares`). Automatic KV capacity also keeps its
   headroom free on every card, and when the longest context fits nowhere it divides the cards by
   room instead of speed, so the KV it shrinks to is the most that fits. What the Engine reserves
@@ -342,6 +344,23 @@ families](#expert-parallelism-of-the-other-moe-families)).
   contributor writes its output projection as FP32 partials; every rank then adds all partials to
   its replica in rank order and rounds once to BF16, so the replicas stay identical. All of it
   captures into the decode graphs.
+- **Divided heads** (`TextContext::project_head`). Every rank holds a contiguous row range of the
+  output head and of the proposal head, in proportion to the split and ending where the stored
+  blocks and the head's Linear route allow (`bind_head_shares`, `models/qwen3_5/load/text.cpp`).
+  Decode, verification and MTP drafts project the head divided: rank 0 sends the final hidden state
+  over the forward links, every rank projects its rows at once, each other rank returns its logits
+  over a link of its own (`StageRuntime::TensorParallel::heads`), and rank 0 places every range in
+  its rows of the logits. A logit is still one dot product over the whole hidden state, so the
+  logits are one device's wherever the share takes the whole head's route; prefill, offline scoring
+  and the heads that `--lm-head-q4` and `--lm-head-q6` transcode (a piece cannot be) project whole on
+  rank 0, which keeps the whole heads. Without the split rank 0 projected the heads alone while the
+  other cards waited: on four RTX A4000s the Q8 output head over a round's four columns took 4.0 ms
+  and the three Q4 proposal-head drafts 3.1 ms of a 39.4 ms MTP round. Divided, Qwen3.8-27B
+  (int8 KV, three MTP drafts through the proposal head, one request, even split) decodes a round in
+  31.1 ms against 34.5 and a token without drafts in 16.2 ms against 18.4 on four RTX 5060 Ti
+  (PCIe 4.0 x8, host transport), and a round in 34.4 ms against 39.4 on the four A4000s (capped at
+  110 W), with the same text and accepted drafts; prefill is unchanged. The ranges cost every card
+  their bytes (0.40 GiB on each of four cards for Qwen3.8-27B with its proposal head).
 - **Transports and forms.** An exchange moves the partials one of three ways: through mapped pinned
   host memory (`host`: the copy engines write each partial there, every rank's kernels read the
   others' copies; works between any cards), by reading the other cards' memory (`peer-read`), or by
@@ -369,9 +388,11 @@ families](#expert-parallelism-of-the-other-moe-families)).
   route's time is read off the line through its two times, at sixteenths of the step, since one
   octave apart a crossover could be off by half the size; an exchange takes the fastest route at the
   smallest of all these sizes that holds it. `--tensor-parallel-transport host|peer-read|peer-write`
-  keeps every exchange to one transport (its forms still measured); a peer transport without peer
-  access refuses to start. The startup log names the pairs without peer access (`peer access: none
-  between CUDA devices 0-1; ...`), or says every pair reads peer memory, and then the routes chosen
+  keeps every exchange to one transport (its forms still measured), except that under peer-write a
+  two-rank FP32 sum too large for an inbox row reduces whole by peer reads; a peer transport
+  without peer access refuses to start. The startup log names the pairs without peer access
+  (`peer access: none between CUDA devices 0-1; ...`), or says every pair reads peer memory, and
+  then the routes chosen
   with their times (`tensor-parallel exchange, 4 ranks, measured at startup: peer-write words to 32
   KiB (14.0 us), peer-write whole to 100 KiB (29.1 us), peer-write scatter to 40 MiB (3837.0 us)`).
   `tools/tp_exchange_bench.cu` prints what the exchange measured at startup and every route at every

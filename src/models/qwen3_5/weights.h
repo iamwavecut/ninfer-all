@@ -116,9 +116,21 @@ struct RankLayerWeights {
     std::variant<DenseWeights, MoeWeights> ffn;
 };
 
+// A vocabulary head divided over the tensor-parallel ranks for decode: rank r holds rows
+// [rows[r], rows[r + 1]) of it as shares[r], on its own device, read through uses[r].
+struct HeadShareWeights {
+    std::vector<WeightId> shares;
+    std::vector<WeightUseId> uses;
+    std::vector<std::uint64_t> rows;
+};
+
 struct TextWeights {
     WeightId token_embedding, output_head, final_norm;
     WeightUseId output_head_use;
+    // Tensor parallelism: every rank's rows of the output head, which decode and verification
+    // project divided; rank 0 also keeps the whole head for every other projection. Empty
+    // otherwise, and with --lm-head-q4/--lm-head-q6, whose narrower head only rank 0 holds.
+    HeadShareWeights output_head_shares;
     // With tensor parallelism, rank 0's share of each layer's GDN or attention heads and dense FFN
     // rows or experts.
     std::vector<BlockWeights> layers;
@@ -137,6 +149,9 @@ struct MtpWeights {
     BlockWeights layer;
     WeightId token_embedding, output_head;
     WeightUseId output_head_use;
+    // Tensor parallelism without a proposal head: the output head's shares, read through MTP's
+    // input for the drafts. Empty otherwise.
+    HeadShareWeights output_head_shares;
 };
 
 struct NormWeights {
@@ -190,6 +205,9 @@ struct ProposalWeights {
     std::optional<WeightId> token_ids;
     std::uint32_t rows = 0;
     std::vector<std::int32_t> global_token_ids;
+    // Tensor parallelism: every rank's rows of the head, each read through its one use. Empty
+    // otherwise.
+    HeadShareWeights head_shares;
 };
 
 // Handles refer to the frozen model's weight array. No artifact ID lookup is needed in execution.

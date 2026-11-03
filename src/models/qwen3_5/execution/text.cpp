@@ -276,7 +276,7 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
         const auto& p = *parameters_.proposal;
         set_proposal_head(
             &p.head, p.token_ids ? static_cast<const std::int32_t*>(p.token_ids->data) : nullptr,
-            dimension(p.rows));
+            dimension(p.rows), &p.head_shares);
     }
 }
 
@@ -621,7 +621,7 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         Tensor proposal_logits =
             work_.alloc(fp32_proposal_logits(*proposal_head_) ? DType::FP32 : DType::BF16,
                         {proposal_head_n_, T});
-        project(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
+        project_head(hidden, *proposal_head_, proposal_head_shares_, proposal_logits);
         ops::argmax(proposal_logits, proposal_tokens,
                     proposal_head_ids_
                         ? proposal_head_n_
@@ -635,9 +635,79 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         Tensor output_logits = fp32_proposal_logits(mtp_->output_head)
                                    ? work_.alloc(DType::FP32, {dimension(config_.vocab_size), T})
                                    : bf16_window(logits, T);
-        project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
+        project_head(hidden, mtp_->output_head, &mtp_->output_head_shares, output_logits);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
+    }
+}
+
+void TextContext::project_head(const Tensor& hidden, const LinearParameters& whole,
+                               const HeadShares* shares, Tensor& logits) {
+    if (shares == nullptr || !shares->divided() || stage_runtime_ == nullptr ||
+        !stage_runtime_->tensor_parallel) {
+        project(hidden, whole, logits, work_, ctx_.stream);
+        return;
+    }
+    StageRuntime& runtime = *stage_runtime_;
+    auto& tp              = *runtime.tensor_parallel;
+    const std::size_t ranks = shares->shares.size();
+    if (ranks != tp.heads.size() + 1 || ranks != runtime.forward.size() + 1 ||
+        ctx_.active_rank() != 0) {
+        throw std::logic_error("a divided head does not match the tensor-parallel ranks");
+    }
+    const std::int32_t columns = hidden.ne[1];
+    if (hidden.dtype != DType::BF16 || !hidden.is_contiguous() || logits.ne[1] != columns ||
+        logits.ne[0] != shares->rows.back() || logits.ne[2] != 1 || logits.ne[3] != 1) {
+        throw std::invalid_argument("a divided head's hidden or logits have the wrong shape");
+    }
+    const auto rows_of = [&](std::size_t rank) {
+        return static_cast<std::int32_t>(shares->rows[rank + 1] - shares->rows[rank]);
+    };
+    // The hidden reaches every rank over its forward link, and its rows come back over its head
+    // link: each rank reads only its rows of the head, all at once.
+    const std::uint32_t slot = runtime.next_slot;
+    runtime.next_slot = (slot + 1U) % static_cast<std::uint32_t>(runtime.forward.front().slots());
+    const std::uint32_t head_slot = tp.next_head_slot;
+    tp.next_head_slot =
+        (head_slot + 1U) % static_cast<std::uint32_t>(tp.heads.front().slots());
+    const cudaStream_t entry = ctx_.stream;
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        runtime.forward[rank - 1].send(hidden.data, hidden.bytes(), slot, entry);
+    }
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        ScopedDeviceRank device_guard(ctx_, rank);
+        ScopedArenaRank arena_guard(work_, rank);
+        auto scope     = work_.scope();
+        Tensor replica = work_.alloc(DType::BF16, {hidden.ne[0], columns});
+        runtime.forward[rank - 1].recv(replica.data, replica.bytes(), slot, ctx_.stream);
+        Tensor part = work_.alloc(logits.dtype, {rows_of(rank), columns});
+        project(replica, shares->shares[rank], part, work_, ctx_.stream);
+        tp.heads[rank - 1].send(part.data, part.bytes(), head_slot, ctx_.stream);
+        tp.joined[rank - 1].record(ctx_.stream);
+    }
+    // Rank 0 projects its own rows, then takes every other rank's, through one buffer of the
+    // widest share, and places each into its rows of every column.
+    std::int32_t widest = 0;
+    for (std::size_t rank = 0; rank < ranks; ++rank) { widest = std::max(widest, rows_of(rank)); }
+    auto scope        = work_.scope();
+    Tensor buffer     = work_.alloc(logits.dtype, {widest, columns});
+    const auto value  = dtype_size(logits.dtype);
+    const auto place  = [&](std::size_t rank) {
+        const auto row_bytes = static_cast<std::size_t>(rows_of(rank)) * value;
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            static_cast<std::byte*>(logits.data) + static_cast<std::size_t>(shares->rows[rank]) * value,
+            static_cast<std::size_t>(logits.nb[1]), buffer.data, row_bytes, row_bytes,
+            static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice, entry));
+    };
+    Tensor own(buffer.data, logits.dtype, {rows_of(0), columns});
+    project(hidden, shares->shares[0], own, work_, entry);
+    place(0);
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        const auto bytes = static_cast<std::size_t>(rows_of(rank)) * value *
+                           static_cast<std::size_t>(columns);
+        tp.heads[rank - 1].recv(buffer.data, bytes, head_slot, entry);
+        place(rank);
+        tp.joined[rank - 1].wait(entry);
     }
 }
 
@@ -754,7 +824,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
-        project(hidden, *lm_head_, logits, work_, stream);
+        project_head(hidden, *lm_head_, &parameters_.text.output_head_shares, logits);
     }
     work_.reset();
 }
@@ -815,7 +885,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
         Tensor flat_tokens = target_tokens.view({columns});
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
-        project(flat_hidden, *lm_head_, flat_logits, work_, stream);
+        project_head(flat_hidden, *lm_head_, &parameters_.text.output_head_shares, flat_logits);
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
     }

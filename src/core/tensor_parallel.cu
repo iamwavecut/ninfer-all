@@ -188,11 +188,19 @@ __device__ __forceinline__ std::uint32_t await_word(const unsigned long long* wo
     return static_cast<std::uint32_t>(seen);
 }
 
+// The epoch of the exchange after one of `epoch`. Rows start zeroed, as if every word carried
+// epoch 0, so after 2^32 - 1 exchanges the count goes on at 2: a word nobody stored never matches,
+// and the parity, the row's slot, still alternates.
+__device__ __forceinline__ std::uint32_t next_words_epoch(std::uint32_t epoch) {
+    return epoch == 0xFFFFFFFFU ? 2U : epoch + 1U;
+}
+
 // One rank's words exchange: stores its words into every row of `targets` (its own host row, or
 // its row in every other rank's memory), then reads rank r's words from `sources[r]`.
 template <TensorParallelSum Sum>
 __global__ void tensor_parallel_words_kernel(WordsArgs a) {
-    const std::uint32_t epoch = *reinterpret_cast<const volatile std::uint32_t*>(a.epoch) + 1U;
+    const std::uint32_t epoch =
+        next_words_epoch(*reinterpret_cast<const volatile std::uint32_t*>(a.epoch));
     const std::int64_t base   = static_cast<std::int64_t>(epoch & 1U) * a.capacity;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t first  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -615,7 +623,9 @@ TensorParallelExchange::TensorParallelExchange(const DeviceContext& context,
             }
             check(cudaMalloc(reinterpret_cast<void**>(&rank.epoch), 2 * sizeof(std::uint32_t)),
                   "cudaMalloc");
-            check(cudaMemset(rank.epoch, 0, 2 * sizeof(std::uint32_t)), "cudaMemset");
+            const std::uint32_t count[2] = {options.words_count, 0};
+            check(cudaMemcpy(rank.epoch, count, sizeof(count), cudaMemcpyHostToDevice),
+                  "cudaMemcpy");
         }
         if (!options.routes.empty()) {
             for (std::size_t i = 0; i < options.routes.size(); ++i) {

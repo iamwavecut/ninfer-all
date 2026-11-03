@@ -88,12 +88,12 @@ struct StageRuntime {
     std::uint32_t next_slot = 0;
 
     // Tensor parallelism (`--tensor-parallel`) instead of stages: every rank runs a share of each
-    // layer's GDN heads and dense FFN rows or experts, and the ranks add their output projections'
-    // FP32 partials into identical replicas of the residual through `exchange`. Attention, the KV
-    // cache, the embedding, the head, the shared expert and MTP stay on rank 0, whose attention
-    // output reaches the other replicas through the same exchange. `state[r]` and `replay[r]` are
-    // rank r's shares of every GDN layer, `control[r - 1]` and `forward[r - 1]` carry the control
-    // tensors and the incoming residual from rank 0 to rank r, and `back` is absent.
+    // layer's GDN heads, KV heads and dense FFN rows or experts, and the ranks add their output
+    // projections' FP32 partials into identical replicas of the residual through `exchange`. The
+    // embedding, the shared expert and MTP stay on rank 0; decode divides the heads' rows over the
+    // ranks. `state[r]` and `replay[r]` are rank r's shares of every GDN layer, `control[r - 1]` and
+    // `forward[r - 1]` carry the control tensors and the incoming residual (or the hidden a divided
+    // head projects) from rank 0 to rank r, and `back` is absent.
     struct TensorParallel {
         // shares[r] is rank r's GDN heads, KV heads and dense FFN rows or experts, and shards[r]
         // the model as that share sees it.
@@ -102,6 +102,10 @@ struct StageRuntime {
         std::unique_ptr<TensorParallelExchange> exchange;
         // joined[r - 1] joins rank r's stream back into rank 0's at the end of a pass.
         std::vector<CudaCompletionEvent> joined;
+        // heads[r - 1] carries rank r's rows of a divided head's projection to rank 0, alternating
+        // slots per projection (`next_head_slot`); empty when no head is divided.
+        std::vector<StageLink> heads;
+        std::uint32_t next_head_slot = 0;
     };
     std::optional<TensorParallel> tensor_parallel;
 };
