@@ -23,28 +23,34 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
-<!-- Use one short line per entry. Link to details inline when useful. -->
+<!-- Use one entry per date. Add changes to that date's entry and link to details. -->
 
-- **2026-11-03:** Faster [tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) decode: Q4 and Q5 projection shares run the small-T MMA routes of whole projections.
-- **2026-11-03:** Flash-Next [drafts with MTP for several requests at once](docs/qwen3-8-flash-next.md#mtp-with-several-requests), at 1.01 to 1.16 times the speed without drafts on host experts.
-- **2026-11-03:** Faster [tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) decode with the vocabulary heads divided over the GPUs, and faster prefill with prompt pieces whose exchanges overlap compute.
-- **2026-11-03:** llama.cpp [control vectors and direction LoRA adapters](docs/serving.md#lora-adapters-and-control-vectors) for Qwen3.5-core models, with per-request adapter scales.
+- **2026-11-03:** Qwen3.5-core models speed up [tensor-parallel decode](docs/maintainer/pipeline-stages.md#tensor-parallelism)
+  by splitting vocabulary heads across GPUs.
+  Eligible Q4 and Q5 projection shares use the same small-T MMA routes as whole projections.
+  GPUs can speed up dense text prefill by exchanging one prompt piece while computing the next.
+  Flash-Next [drafts with MTP for several requests at once](docs/qwen3-8-flash-next.md#mtp-with-several-requests).
+  On an RTX 4090 with host experts, automatic drafting ran at 1.01 to 1.16 times the speed without drafts.
+  Qwen3.5-core models support llama.cpp [control vectors and direction LoRA adapters](docs/serving.md#lora-adapters-and-control-vectors)
+  with per-request adapter scales.
 - **2026-11-02:** [Tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism) selects exchange routes by size from startup timings, including peer writes.
 - **2026-10-31:** [Automatic tensor splits](docs/maintainer/pipeline-stages.md#tensor-parallelism) adjust GPU shares using free memory after the first load.
 - **2026-10-30:** [Bundled media libraries](docs/release-archive-linux.md#media-libraries), [pre-Blackwell NVFP4](docs/cli.md#common-options), Qwen3.5 FP32 logits, attention kernel preload, and [prefill pacing](docs/serving.md#execution-behavior).
 - **2026-10-29:** [Faster tensor-parallel prefill](docs/maintainer/pipeline-stages.md#tensor-parallelism) with reduce-scatter and native NVFP4/FP8 on RTX 50.
-- **2026-10-27:** Faster [decode without peer access](docs/maintainer/pipeline-stages.md#tensor-parallelism), full Flash-Next tensor parallelism, and [invariant attention for Qwen3.5](docs/maintainer/qwen3_5-model.md#invariant-attention).
-- **2026-10-27:** The [DeepSeek-V4.1-Flash STQ drafter](docs/deepseek-v41.md#the-stq-drafter) uses half the VRAM of Unsloth's drafter.
-- **2026-10-26:** [Faster Flash-Next prefill and decode](docs/qwen3-8-flash-next.md#expert-placements) with disk experts.
-- **2026-10-26:** [Tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism) for all dense weight formats and DFlash, plus [expert parallelism](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families) for all MoE families.
-- **2026-10-26:** [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) gains CPU-assisted expert execution, DSpark drafting, and image input.
-- **2026-10-25:** [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) support with IQ1_M GGUF and host or disk experts.
-- **2026-10-25:** `--tensor-parallel` for dense Qwen3.5-core models.
+- **2026-10-27:** [Tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism) speeds up decode without peer access and covers all Flash-Next layers.
+  Qwen3.5 gains [invariant attention](docs/maintainer/qwen3_5-model.md#invariant-attention).
+  The [DeepSeek-V4.1-Flash STQ drafter](docs/deepseek-v41.md#the-stq-drafter) uses half the VRAM of Unsloth's drafter.
+- **2026-10-26:** Flash-Next [prefills and decodes faster with disk experts](docs/qwen3-8-flash-next.md#expert-placements).
+  [Tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism) supports all dense weight formats and DFlash.
+  All MoE families support [expert parallelism](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families).
+  [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) gains CPU-assisted expert execution, DSpark drafting, and image input.
+- **2026-10-25:** NInfer supports [DeepSeek-V4.1-Flash](docs/deepseek-v41.md) from IQ1_M GGUF with host or disk experts.
+  Dense Qwen3.5-core models gain `--tensor-parallel`.
 - **2026-10-24:** [Flint](docs/flint.md#measurements) decodes 348 tok/s on an RTX 5090 and 210 on an RTX 4090 with host experts.
-- **2026-10-23:** [Flint](docs/flint.md) from Unsloth's UD-Q4_K_XL GGUF.
-- **2026-10-23:** [Native releases](https://github.com/iamwavecut/ninfer-all/releases) for Windows and Debian 13 with CUDA 12.9 and 13.4.
-- **2026-10-22:** [Typed decisions](docs/serving.md#typed-decisions): `/v1/decisions` and `/v1/systemone`.
-- **2026-10-22:** YaRN for every model family.
+- **2026-10-23:** NInfer supports [Flint](docs/flint.md) from Unsloth's UD-Q4_K_XL GGUF.
+  [Native releases](https://github.com/iamwavecut/ninfer-all/releases) cover Windows and Debian 13 with CUDA 12.9 and 13.4.
+- **2026-10-22:** [Typed decisions](docs/serving.md#typed-decisions) are available at `/v1/decisions` and `/v1/systemone`.
+  Every model family supports YaRN.
 - **2026-10-20:** [CPU threads compute a share of host experts](docs/qwen3-8-flash-next.md#the-cpu-share) beside the GPU.
 - **2026-10-18:** The hybrid prefix cache is the server default.
 - **2026-10-17:** [Pipeline stages across GPU architectures](docs/build-linux.md#cards-of-several-architectures-in-one-pipeline) in one build.
