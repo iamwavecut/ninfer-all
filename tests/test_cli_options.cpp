@@ -604,6 +604,22 @@ int run_tests() {
                                        "peer"});
                       }),
                       "an unknown --tensor-parallel-transport was accepted");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                             "--tensor-parallel", "--tensor-parallel-prompt-partials", "bf16"})
+                              .tensor_parallel_prompt_partials ==
+                          ninfer::TensorParallelPartials::Bf16,
+                      "--tensor-parallel-prompt-partials did not reach the options");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--tensor-parallel-prompt-partials", "bf16"});
+                      }),
+                      "--tensor-parallel-prompt-partials without --tensor-parallel was accepted");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices",
+                                       "0,1", "--tensor-parallel",
+                                       "--tensor-parallel-prompt-partials", "fp16"});
+                      }),
+                      "an unknown --tensor-parallel-prompt-partials was accepted");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
                              "--invariant-attention"})
                           .invariant_attention,

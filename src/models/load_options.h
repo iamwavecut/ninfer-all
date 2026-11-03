@@ -67,6 +67,8 @@ struct LoadOptions {
     TensorAttention tensor_attention = TensorAttention::Heads;
     // How the ranks exchange their partial sums (`--tensor-parallel-transport`).
     TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
+    // How a prompt chunk's partial sums cross host memory (`--tensor-parallel-prompt-partials`).
+    TensorParallelPartials tensor_parallel_prompt_partials = TensorParallelPartials::Fp32;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -159,7 +161,8 @@ struct LoadOptions {
             .tensor_parallel = options.tensor_parallel,
             .tensor_split    = options.tensor_split,
             .tensor_attention = options.tensor_attention,
-            .tensor_parallel_transport = options.tensor_parallel_transport};
+            .tensor_parallel_transport = options.tensor_parallel_transport,
+            .tensor_parallel_prompt_partials = options.tensor_parallel_prompt_partials};
 }
 
 } // namespace ninfer::models

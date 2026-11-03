@@ -190,6 +190,7 @@ std::string usage_text(const char* argv0) {
            "                                by each card's measured bandwidth and free memory)\n" +
            std::string(ninfer::product::kTensorAttentionHelp) +
            std::string(ninfer::product::kTensorParallelTransportHelp) +
+           std::string(ninfer::product::kTensorParallelPartialsHelp) +
            std::string(ninfer::product::kInvariantAttentionHelp) +
            std::string(ninfer::product::kSteeringHelp) +
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
@@ -422,6 +423,9 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--tensor-parallel-transport") {
             options.tensor_parallel_transport =
                 ninfer::product::parse_tensor_parallel_transport(value(arg));
+        } else if (arg == "--tensor-parallel-prompt-partials") {
+            options.tensor_parallel_prompt_partials =
+                ninfer::product::parse_tensor_parallel_partials(value(arg));
         } else if (arg == "--invariant-attention") {
             options.invariant_attention = true;
         } else if (arg == "--expert-residency") {
@@ -663,6 +667,8 @@ Options parse_options(int argc, char** argv) {
     ninfer::product::check_tensor_attention(options.tensor_attention, options.tensor_parallel);
     ninfer::product::check_tensor_parallel_transport(options.tensor_parallel_transport,
                                                      options.tensor_parallel);
+    ninfer::product::check_tensor_parallel_partials(options.tensor_parallel_prompt_partials,
+                                                    options.tensor_parallel);
     if (kv_headroom_mib.has_value()) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
             throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");

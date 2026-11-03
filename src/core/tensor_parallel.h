@@ -112,6 +112,17 @@ namespace ninfer {
 // alternation holds piece by piece: a rank writes piece p of a slot again only after its own reduce
 // and complete of piece p in the exchange in between.
 //
+// Rounded partials (TensorParallelPartials::Bf16, a prompt chunk's exchanges by choice). Under
+// Host, a Whole or Scatter exchange whose sum is BF16 can move its partials rounded to BF16: a
+// publish rounds the rank's whole partial into a device copy (`bf16_partials` allocates it) and
+// copies that into its host slot, the values from the slot's start, and a reduce adds the
+// contributors' rounded partials, its own from the device copy, in FP32 in rank order. Every rank
+// sums the same rounded values, so the replicas stay identical; the sum differs from the FP32
+// partials' by one BF16 rounding of each. A Scatter owner's finished range lies in the upper half
+// of its host slot, past every rounded partial. Words, ScatterFlags, the peer transports and FP32
+// sums take the partials as computed whatever the call asks, and every rank of an exchange asks the
+// same.
+//
 // Routes. Which transport and form is fastest depends on the partial's size, the number of ranks
 // and the platform's links, and no fixed choice holds everywhere: on one host peer reads beat host
 // memory at every size, on another the reverse. Unless `routes` names them, the exchange times every
@@ -164,6 +175,8 @@ struct TensorParallelExchangeOptions {
     std::size_t words_bytes = 32U << 10U;
     // How many exchanges every rank has already counted (tests: an epoch close to the wrap).
     std::uint32_t words_count = 0;
+    // Each rank's device copy of its slots in BF16, which exchanges of rounded partials need.
+    bool bf16_partials = false;
 };
 
 class TensorParallelExchange {
@@ -186,9 +199,11 @@ public:
     TensorParallelExchange& operator=(TensorParallelExchange&&)      = delete;
 
     // Device memory one rank's exchange of `slot_bytes` slots takes at most while it is built, over
-    // `ranks` ranks that do (`peer`) or do not all have peer access, with `transport`.
+    // `ranks` ranks that do (`peer`) or do not all have peer access, with `transport` and, where
+    // `bf16_partials`, the BF16 copies of its slots.
     [[nodiscard]] static std::size_t device_bytes(std::size_t slot_bytes, std::size_t ranks,
-                                                  bool peer, TensorParallelTransport transport);
+                                                  bool peer, TensorParallelTransport transport,
+                                                  bool bf16_partials = false);
 
     [[nodiscard]] std::size_t ranks() const noexcept { return ranks_.size(); }
     [[nodiscard]] std::size_t slot_bytes() const noexcept { return slot_bytes_; }
@@ -219,22 +234,25 @@ public:
     [[nodiscard]] float* partial(std::size_t rank, std::size_t slot) const;
     // Makes `rank`'s partial of `bytes` in `slot` available to the other ranks; `out` is the output
     // the rank's reduce will write and `sum` the exchange's reduce. With a `piece`, `bytes` and
-    // `out` are the piece's, starting at its offset.
+    // `out` are the piece's, starting at its offset. `partials` asks for rounded partials (above).
     void publish(std::size_t rank, std::size_t slot, std::size_t bytes, void* out,
                  cudaStream_t stream, TensorParallelSum sum = TensorParallelSum::AddBf16,
-                 TensorParallelPiece piece = {});
+                 TensorParallelPiece piece        = {},
+                 TensorParallelPartials partials = TensorParallelPartials::Fp32);
     // Adds the partials ranks [0, contributors) published in `slot` to `rank`'s BF16 residual `out`
     // of `count` values, or stores their sum there (`sum`); for a reduce-scatter, only in the rank's
     // own range.
     void reduce(std::size_t rank, std::size_t slot, void* out, std::int64_t count,
                 std::size_t contributors, cudaStream_t stream,
-                TensorParallelSum sum = TensorParallelSum::AddBf16, TensorParallelPiece piece = {});
+                TensorParallelSum sum = TensorParallelSum::AddBf16, TensorParallelPiece piece = {},
+                TensorParallelPartials partials = TensorParallelPartials::Fp32);
     // Brings the other ranks' finished ranges of a reduce-scatter into `rank`'s output; nothing for
     // another form. Every rank's `complete` follows every rank's `reduce` of the exchange, with the
-    // same `out`, `count` and `sum`.
+    // same `out`, `count`, `sum` and `partials`.
     void complete(std::size_t rank, std::size_t slot, void* out, std::int64_t count,
                   cudaStream_t stream, TensorParallelSum sum = TensorParallelSum::AddBf16,
-                  TensorParallelPiece piece = {});
+                  TensorParallelPiece piece        = {},
+                  TensorParallelPartials partials = TensorParallelPartials::Fp32);
     // Pieces: `rank`'s side stream, and the events with which its compute stream hands piece
     // `piece` to the side stream (`piece_ready`) and takes its exchange back (`piece_done`).
     [[nodiscard]] cudaStream_t side_stream(std::size_t rank) const;
@@ -257,6 +275,8 @@ private:
         int device = 0;
         std::array<float*, kSlots> device_slot{};
         std::array<float*, kSlots> host_slot{};
+        // The rank's partial rounded to BF16, per slot (`bf16_partials`).
+        std::array<__nv_bfloat16*, kSlots> rounded{};
         // PeerWrite: [ranks - 1][inbox_values_] partials, or owners' ranges of them, the other
         // ranks stored here, in rank order without the rank itself.
         std::array<float*, kSlots> inbox{};
@@ -305,15 +325,25 @@ private:
     [[nodiscard]] TensorParallelRoute piece_route(std::size_t bytes, TensorParallelSum sum,
                                                   TensorParallelPiece piece) const;
 
+    // Whether an exchange on `route` reducing to `sum` moves the partials rounded, as `partials`
+    // asks (see Rounded partials).
+    [[nodiscard]] bool rounds(TensorParallelRoute route, TensorParallelSum sum,
+                              TensorParallelPartials partials) const;
+    // Under Host, where `owner`'s finished output from value `begin` of a reduce-scatter lies in
+    // its host slot.
+    [[nodiscard]] unsigned char* finished_host(std::size_t owner, std::size_t slot,
+                                               TensorParallelPiece piece, std::int64_t begin,
+                                               bool rounded) const noexcept;
+
     void publish_on(TensorParallelRoute route, std::size_t rank, std::size_t slot,
                     std::size_t bytes, void* out, cudaStream_t stream, TensorParallelSum sum,
-                    TensorParallelPiece piece = {});
+                    TensorParallelPiece piece = {}, bool rounded = false);
     void reduce_on(TensorParallelRoute route, std::size_t rank, std::size_t slot, void* out,
                    std::int64_t count, std::size_t contributors, cudaStream_t stream,
-                   TensorParallelSum sum, TensorParallelPiece piece = {});
+                   TensorParallelSum sum, TensorParallelPiece piece = {}, bool rounded = false);
     void complete_on(TensorParallelRoute route, std::size_t rank, std::size_t slot, void* out,
                      std::int64_t count, cudaStream_t stream, TensorParallelSum sum,
-                     TensorParallelPiece piece = {});
+                     TensorParallelPiece piece = {}, bool rounded = false);
 
     std::vector<Rank> ranks_;
     std::size_t slot_bytes_           = 0;

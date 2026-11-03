@@ -97,6 +97,16 @@ enum class TensorParallelTransport : std::uint8_t {
     PeerWrite,
 };
 
+// Tensor parallelism over a Qwen3.5-core model: how a prompt chunk's partial sums cross pinned
+// host memory.
+enum class TensorParallelPartials : std::uint8_t {
+    // As the devices computed them, in FP32.
+    Fp32,
+    // Each device's partial rounded to BF16 first, which moves half their bytes; the sum differs
+    // from the FP32 partials' by that rounding.
+    Bf16,
+};
+
 // Qwen3.8-Flash-Next: where the n-gram table's rows come from.
 enum class NgramResidency : std::uint8_t {
     // The table's file, with a bounded cache of rows read as the hash addresses them.

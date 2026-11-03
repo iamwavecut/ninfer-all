@@ -1599,9 +1599,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     // the buffers of the transports it may take.
     const std::size_t exchange_bytes =
         text.tensor_parallel()
-            ? TensorParallelExchange::device_bytes(tensor_parallel_slot_bytes(*impl),
-                                                   text.rank_count, inputs.peer_access,
-                                                   inputs.features.tensor_parallel_transport)
+            ? TensorParallelExchange::device_bytes(
+                  tensor_parallel_slot_bytes(*impl), text.rank_count, inputs.peer_access,
+                  inputs.features.tensor_parallel_transport,
+                  inputs.features.tensor_parallel_prompt_partials == TensorParallelPartials::Bf16)
             : 0U;
     impl->device_reservation_bytes =
         checked_add(impl->device_reservation_bytes, exchange_bytes, "tensor-parallel exchange");

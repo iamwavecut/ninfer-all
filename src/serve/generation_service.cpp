@@ -318,6 +318,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.tensor_split             = options.tensor_split;
     engine_options.tensor_attention         = options.tensor_attention;
     engine_options.tensor_parallel_transport = options.tensor_parallel_transport;
+    engine_options.tensor_parallel_prompt_partials = options.tensor_parallel_prompt_partials;
     engine_options.invariant_attention      = options.invariant_attention;
     engine_options.expert_residency           = options.expert_residency;
     engine_options.ngram_table                = options.ngram_table;

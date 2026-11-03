@@ -16,8 +16,10 @@ void check(cudaError_t err, const char* what) {
 }
 
 // Value i of partial r is part[r][i - first[r]]: an inbox row holds an owner's range from its start.
+// The partials are FP32, or rounded to BF16 (see Rounded partials).
+template <class Part>
 struct PartialSet {
-    const float* part[kMaxRanks];
+    const Part* part[kMaxRanks];
     std::int64_t first[kMaxRanks];
     int count;
 };
@@ -38,6 +40,23 @@ __device__ __forceinline__ void store_sum(void* out, std::int64_t i, float sum) 
 struct alignas(8) Bf16x4 {
     __nv_bfloat16 v[4];
 };
+
+__device__ __forceinline__ float load_value(const float* part) { return *part; }
+
+__device__ __forceinline__ float load_value(const __nv_bfloat16* part) {
+    return __bfloat162float(*part);
+}
+
+// Four values from a multiple of four, aligned for one load.
+__device__ __forceinline__ float4 load_value4(const float* part) {
+    return *reinterpret_cast<const float4*>(part);
+}
+
+__device__ __forceinline__ float4 load_value4(const __nv_bfloat16* part) {
+    const Bf16x4 word = *reinterpret_cast<const Bf16x4*>(part);
+    return {__bfloat162float(word.v[0]), __bfloat162float(word.v[1]), __bfloat162float(word.v[2]),
+            __bfloat162float(word.v[3])};
+}
 
 // Four consecutive values' sums, from a multiple of four, each rounded as store_sum rounds it.
 template <TensorParallelSum Sum>
@@ -62,8 +81,8 @@ __device__ __forceinline__ void store_sum4(void* out, std::int64_t i, float4 sum
 // Values [begin, end); the adds run in rank order. `vector` (begin a multiple of four and every
 // pointer and first aligned for it) reads each partial four values at a time, which crosses the bus
 // in fewer, larger requests; the arithmetic per value is the same.
-template <TensorParallelSum Sum>
-__global__ void tensor_parallel_reduce_kernel(void* __restrict__ out, PartialSet parts,
+template <TensorParallelSum Sum, class Part>
+__global__ void tensor_parallel_reduce_kernel(void* __restrict__ out, PartialSet<Part> parts,
                                               std::int64_t begin, std::int64_t end, bool vector) {
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t thread = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -72,10 +91,9 @@ __global__ void tensor_parallel_reduce_kernel(void* __restrict__ out, PartialSet
         const std::int64_t quads = (end - begin) / 4;
         for (std::int64_t q = thread; q < quads; q += stride) {
             const std::int64_t i = begin + 4 * q;
-            float4 sum = *reinterpret_cast<const float4*>(parts.part[0] + (i - parts.first[0]));
+            float4 sum           = load_value4(parts.part[0] + (i - parts.first[0]));
             for (int r = 1; r < parts.count; ++r) {
-                const float4 part =
-                    *reinterpret_cast<const float4*>(parts.part[r] + (i - parts.first[r]));
+                const float4 part = load_value4(parts.part[r] + (i - parts.first[r]));
                 sum.x += part.x;
                 sum.y += part.y;
                 sum.z += part.z;
@@ -86,9 +104,33 @@ __global__ void tensor_parallel_reduce_kernel(void* __restrict__ out, PartialSet
         tail = begin + 4 * quads;
     }
     for (std::int64_t i = tail + thread; i < end; i += stride) {
-        float sum = parts.part[0][i - parts.first[0]];
-        for (int r = 1; r < parts.count; ++r) { sum += parts.part[r][i - parts.first[r]]; }
+        float sum = load_value(parts.part[0] + (i - parts.first[0]));
+        for (int r = 1; r < parts.count; ++r) {
+            sum += load_value(parts.part[r] + (i - parts.first[r]));
+        }
         store_sum<Sum>(out, i, sum);
+    }
+}
+
+// out[i] <- bf16(in[i]) for i < count, four values at a time where `vector` says both allow it.
+__global__ void tensor_parallel_round_kernel(const float* __restrict__ in,
+                                             __nv_bfloat16* __restrict__ out, std::int64_t count,
+                                             bool vector) {
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t thread = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    std::int64_t tail         = 0;
+    if (vector) {
+        const std::int64_t quads = count / 4;
+        for (std::int64_t q = thread; q < quads; q += stride) {
+            const float4 value = reinterpret_cast<const float4*>(in)[q];
+            reinterpret_cast<Bf16x4*>(out)[q] =
+                Bf16x4{{__float2bfloat16(value.x), __float2bfloat16(value.y),
+                        __float2bfloat16(value.z), __float2bfloat16(value.w)}};
+        }
+        tail = 4 * quads;
+    }
+    for (std::int64_t i = tail + thread; i < count; i += stride) {
+        out[i] = __float2bfloat16(in[i]);
     }
 }
 
@@ -523,17 +565,19 @@ std::size_t words_values(std::size_t words_bytes, std::size_t slot_bytes) {
 }
 
 // out[i] <- bf16(float(out[i]) + ((part[0][i] + part[1][i]) + ...)) for values [begin, end), or the
-// sum stored as BF16 or FP32 (`sum`); value i of partial r is parts[r][i - firsts[r]].
-void reduce_values(void* out, const float* const* parts, const std::int64_t* firsts,
+// sum stored as BF16 or FP32 (`sum`); value i of partial r is parts[r][i - firsts[r]], FP32 or
+// rounded to BF16 (`Part`).
+template <class Part>
+void reduce_values(void* out, const Part* const* parts, const std::int64_t* firsts,
                    std::size_t count, std::int64_t begin, std::int64_t end, cudaStream_t stream,
                    TensorParallelSum sum) {
     if (end == begin) { return; }
-    PartialSet set{};
+    PartialSet<Part> set{};
     bool vector = begin % 4 == 0 && aligned(out, 4 * output_bytes(sum));
     for (std::size_t r = 0; r < count; ++r) {
         set.part[r]  = parts[r];
         set.first[r] = firsts[r];
-        vector       = vector && aligned(parts[r], sizeof(float4)) && firsts[r] % 4 == 0;
+        vector       = vector && aligned(parts[r], 4 * sizeof(Part)) && firsts[r] % 4 == 0;
     }
     set.count                 = static_cast<int>(count);
     constexpr int kBlock      = 256;
@@ -542,19 +586,31 @@ void reduce_values(void* out, const float* const* parts, const std::int64_t* fir
     const auto grid           = static_cast<unsigned>(blocks);
     switch (sum) {
     case TensorParallelSum::AddBf16:
-        tensor_parallel_reduce_kernel<TensorParallelSum::AddBf16>
+        tensor_parallel_reduce_kernel<TensorParallelSum::AddBf16, Part>
             <<<grid, kBlock, 0, stream>>>(out, set, begin, end, vector);
         break;
     case TensorParallelSum::StoreBf16:
-        tensor_parallel_reduce_kernel<TensorParallelSum::StoreBf16>
+        tensor_parallel_reduce_kernel<TensorParallelSum::StoreBf16, Part>
             <<<grid, kBlock, 0, stream>>>(out, set, begin, end, vector);
         break;
     case TensorParallelSum::StoreFp32:
-        tensor_parallel_reduce_kernel<TensorParallelSum::StoreFp32>
+        tensor_parallel_reduce_kernel<TensorParallelSum::StoreFp32, Part>
             <<<grid, kBlock, 0, stream>>>(out, set, begin, end, vector);
         break;
     }
     check(cudaGetLastError(), "reduce launch");
+}
+
+// out[i] <- bf16(in[i]) for i < count.
+void round_values(const float* in, __nv_bfloat16* out, std::int64_t count, cudaStream_t stream) {
+    if (count == 0) { return; }
+    const bool vector         = aligned(in, sizeof(float4)) && aligned(out, sizeof(Bf16x4));
+    constexpr int kBlock      = 256;
+    const std::int64_t items  = vector ? (count + 3) / 4 : count;
+    const std::int64_t blocks = std::min<std::int64_t>((items + kBlock - 1) / kBlock, 4096);
+    tensor_parallel_round_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(
+        in, out, count, vector);
+    check(cudaGetLastError(), "round launch");
 }
 
 // Byte copies into `out`: `bytes[i]` from `sources[i]` to `out + offsets[i]`, for i < `count`.
@@ -833,9 +889,11 @@ std::vector<double> rank_copy_bandwidth(const DeviceContext& context) {
 }
 
 std::size_t TensorParallelExchange::device_bytes(std::size_t slot_bytes, std::size_t ranks,
-                                                 bool peer, TensorParallelTransport transport) {
+                                                 bool peer, TensorParallelTransport transport,
+                                                 bool bf16_partials) {
     const std::size_t values = slot_bytes / sizeof(float);
     std::size_t bytes        = kSlots * slot_bytes + 2 * sizeof(std::uint32_t);
+    if (bf16_partials) { bytes += kSlots * values * sizeof(__nv_bfloat16); }
     if (peer && ranks > 1 &&
         (transport == TensorParallelTransport::Auto ||
          transport == TensorParallelTransport::PeerWrite)) {
@@ -851,6 +909,9 @@ std::size_t TensorParallelExchange::device_bytes() const noexcept {
     if (ranks_.empty()) { return 0; }
     const Rank& rank  = ranks_.front();
     std::size_t bytes = kSlots * slot_bytes_ + 2 * sizeof(std::uint32_t);
+    if (rank.rounded[0] != nullptr) {
+        bytes += kSlots * (slot_bytes_ / sizeof(float)) * sizeof(__nv_bfloat16);
+    }
     if (rank.inbox[0] != nullptr) {
         bytes += kSlots * (ranks_.size() - 1) * inbox_values_ * sizeof(float);
     }
@@ -897,6 +958,11 @@ TensorParallelExchange::TensorParallelExchange(const DeviceContext& context,
             for (std::size_t slot = 0; slot < kSlots; ++slot) {
                 check(cudaMalloc(reinterpret_cast<void**>(&rank.device_slot[slot]), slot_bytes_),
                       "cudaMalloc");
+                if (options.bf16_partials) {
+                    check(cudaMalloc(reinterpret_cast<void**>(&rank.rounded[slot]),
+                                     slot_bytes_ / sizeof(float) * sizeof(__nv_bfloat16)),
+                          "cudaMalloc");
+                }
                 // Events cannot be created while a stream captures, so all exist up front. A
                 // rank records its own events.
                 for (std::size_t piece = 0; piece < kPieces; ++piece) {
@@ -973,9 +1039,11 @@ void TensorParallelExchange::release() noexcept {
                 }
             }
             if (rank.device_slot[slot] != nullptr) { (void)cudaFree(rank.device_slot[slot]); }
+            if (rank.rounded[slot] != nullptr) { (void)cudaFree(rank.rounded[slot]); }
             if (rank.host_slot[slot] != nullptr) { (void)cudaFreeHost(rank.host_slot[slot]); }
             if (rank.inbox[slot] != nullptr) { (void)cudaFree(rank.inbox[slot]); }
             rank.device_slot[slot] = nullptr;
+            rank.rounded[slot]     = nullptr;
             rank.host_slot[slot]   = nullptr;
             rank.inbox[slot]       = nullptr;
         }
@@ -1396,33 +1464,62 @@ float* TensorParallelExchange::partial(std::size_t rank, std::size_t slot) const
     return ranks_[rank].device_slot[slot];
 }
 
+bool TensorParallelExchange::rounds(TensorParallelRoute route, TensorParallelSum sum,
+                                    TensorParallelPartials partials) const {
+    if (partials != TensorParallelPartials::Bf16 ||
+        route.transport != TensorParallelTransport::Host ||
+        (route.form != TensorParallelForm::Whole && route.form != TensorParallelForm::Scatter) ||
+        sum == TensorParallelSum::StoreFp32) {
+        return false;
+    }
+    if (ranks_.front().rounded[0] == nullptr) {
+        throw std::logic_error("BF16 tensor-parallel partials need an exchange with bf16_partials");
+    }
+    return true;
+}
+
+unsigned char* TensorParallelExchange::finished_host(std::size_t owner, std::size_t slot,
+                                                     TensorParallelPiece piece, std::int64_t begin,
+                                                     bool rounded) const noexcept {
+    // Unrounded, the owner's own range of its partial, which it never publishes; rounded, the
+    // slot's upper half, past every rounded partial (a BF16 output, as rounding requires).
+    auto* host        = reinterpret_cast<unsigned char*>(ranks_[owner].host_slot[slot]);
+    const auto values = static_cast<std::size_t>(piece.offset + begin);
+    return rounded ? host + slot_bytes_ / 2 + values * sizeof(__nv_bfloat16)
+                   : host + values * sizeof(float);
+}
+
 void TensorParallelExchange::publish(std::size_t rank, std::size_t slot, std::size_t bytes,
                                      void* out, cudaStream_t stream, TensorParallelSum sum,
-                                     TensorParallelPiece piece) {
+                                     TensorParallelPiece piece, TensorParallelPartials partials) {
     check_piece(rank, slot, bytes, piece);
-    publish_on(piece_route(bytes, sum, piece), rank, slot, bytes, out, stream, sum, piece);
+    const TensorParallelRoute route = piece_route(bytes, sum, piece);
+    publish_on(route, rank, slot, bytes, out, stream, sum, piece, rounds(route, sum, partials));
 }
 
 void TensorParallelExchange::reduce(std::size_t rank, std::size_t slot, void* out,
                                     std::int64_t count, std::size_t contributors,
                                     cudaStream_t stream, TensorParallelSum sum,
-                                    TensorParallelPiece piece) {
+                                    TensorParallelPiece piece, TensorParallelPartials partials) {
     const auto bytes = static_cast<std::size_t>(count) * sizeof(float);
     check_piece(rank, slot, bytes, piece);
     if (count <= 0 || contributors == 0 || contributors > ranks_.size()) {
         throw std::invalid_argument(
             "tensor-parallel reduce needs values and one to all ranks as contributors");
     }
-    reduce_on(piece_route(bytes, sum, piece), rank, slot, out, count, contributors, stream, sum,
-              piece);
+    const TensorParallelRoute route = piece_route(bytes, sum, piece);
+    reduce_on(route, rank, slot, out, count, contributors, stream, sum, piece,
+              rounds(route, sum, partials));
 }
 
 void TensorParallelExchange::complete(std::size_t rank, std::size_t slot, void* out,
                                       std::int64_t count, cudaStream_t stream,
-                                      TensorParallelSum sum, TensorParallelPiece piece) {
+                                      TensorParallelSum sum, TensorParallelPiece piece,
+                                      TensorParallelPartials partials) {
     const auto bytes = static_cast<std::size_t>(count) * sizeof(float);
     check_piece(rank, slot, bytes, piece);
-    complete_on(piece_route(bytes, sum, piece), rank, slot, out, count, stream, sum, piece);
+    const TensorParallelRoute route = piece_route(bytes, sum, piece);
+    complete_on(route, rank, slot, out, count, stream, sum, piece, rounds(route, sum, partials));
 }
 
 cudaStream_t TensorParallelExchange::side_stream(std::size_t rank) const {
@@ -1479,7 +1576,7 @@ TensorParallelRoute TensorParallelExchange::piece_route(std::size_t bytes, Tenso
 void TensorParallelExchange::publish_on(TensorParallelRoute route, std::size_t rank,
                                         std::size_t slot, std::size_t bytes, void* out,
                                         cudaStream_t stream, TensorParallelSum sum,
-                                        TensorParallelPiece piece) {
+                                        TensorParallelPiece piece, bool rounded) {
     Rank& self = ranks_[rank];
     DeviceBinding bind(self.device);
     self.output[slot][piece.index]        = out;
@@ -1488,25 +1585,34 @@ void TensorParallelExchange::publish_on(TensorParallelRoute route, std::size_t r
     // for the others to read.
     const auto values  = static_cast<std::int64_t>(bytes / sizeof(float));
     float* const local = self.device_slot[slot] + piece.offset;
+    // Rounded, every value, the rank's own range too, which its reduce adds from the device.
+    if (bytes != 0 && rounded) {
+        round_values(local, self.rounded[slot] + piece.offset, values, stream);
+    }
     if (bytes != 0 && route.transport == TensorParallelTransport::Host &&
         route.form != TensorParallelForm::Words) {
         // A reduce-scatter's own range of the partial stays on the device, since no other rank
         // reads it.
-        std::size_t own_begin = bytes;
-        std::size_t own_end   = bytes;
+        const std::size_t width = rounded ? sizeof(__nv_bfloat16) : sizeof(float);
+        const std::size_t size  = static_cast<std::size_t>(values) * width;
+        std::size_t own_begin   = size;
+        std::size_t own_end     = size;
         if (route.form != TensorParallelForm::Whole) {
             const ValueRange range = scatter_range(rank, ranks_.size(), values);
-            own_begin              = static_cast<std::size_t>(range.begin) * sizeof(float);
-            own_end                = static_cast<std::size_t>(range.end) * sizeof(float);
+            own_begin              = static_cast<std::size_t>(range.begin) * width;
+            own_end                = static_cast<std::size_t>(range.end) * width;
         }
-        auto* host         = reinterpret_cast<unsigned char*>(self.host_slot[slot] + piece.offset);
-        const auto* device = reinterpret_cast<const unsigned char*>(local);
+        auto* host = reinterpret_cast<unsigned char*>(self.host_slot[slot]) +
+                     static_cast<std::size_t>(piece.offset) * width;
+        const auto* device =
+            rounded ? reinterpret_cast<const unsigned char*>(self.rounded[slot] + piece.offset)
+                    : reinterpret_cast<const unsigned char*>(local);
         if (own_begin != 0) {
             check(cudaMemcpyAsync(host, device, own_begin, cudaMemcpyDeviceToHost, stream),
                   "publish copy");
         }
-        if (own_end != bytes) {
-            check(cudaMemcpyAsync(host + own_end, device + own_end, bytes - own_end,
+        if (own_end != size) {
+            check(cudaMemcpyAsync(host + own_end, device + own_end, size - own_end,
                                   cudaMemcpyDeviceToHost, stream),
                   "publish copy");
         }
@@ -1538,7 +1644,8 @@ void TensorParallelExchange::publish_on(TensorParallelRoute route, std::size_t r
 void TensorParallelExchange::reduce_on(TensorParallelRoute route, std::size_t rank,
                                        std::size_t slot, void* out, std::int64_t count,
                                        std::size_t contributors, cudaStream_t stream,
-                                       TensorParallelSum sum, TensorParallelPiece piece) {
+                                       TensorParallelSum sum, TensorParallelPiece piece,
+                                       bool rounded) {
     Rank& self = ranks_[rank];
     DeviceBinding bind(self.device);
     if (route.form == TensorParallelForm::Words) {
@@ -1591,8 +1698,21 @@ void TensorParallelExchange::reduce_on(TensorParallelRoute route, std::size_t ra
                                      : ValueRange{0, count};
     const std::int64_t place = inbox_offset(piece, route.form);
     std::array<const float*, kMaxRanks> parts{};
+    std::array<const __nv_bfloat16*, kMaxRanks> rounded_parts{};
     std::array<std::int64_t, kMaxRanks> firsts{};
     for (std::size_t r = 0; r < ranks_.size(); ++r) {
+        if (rounded) {
+            // Host only: the rank's own rounded partial on its device, the others' host slots.
+            if (r != rank) {
+                check(cudaStreamWaitEvent(stream, ranks_[r].published[slot][piece.index], 0),
+                      "reduce wait");
+            }
+            rounded_parts[r] =
+                (r == rank ? self.rounded[slot]
+                           : reinterpret_cast<const __nv_bfloat16*>(ranks_[r].host_slot[slot])) +
+                piece.offset;
+            continue;
+        }
         if (r == rank) {
             parts[r] = self.device_slot[slot] + piece.offset;
             continue;
@@ -1612,8 +1732,13 @@ void TensorParallelExchange::reduce_on(TensorParallelRoute route, std::size_t ra
             break;
         }
     }
-    reduce_values(out, parts.data(), firsts.data(), contributors, range.begin, range.end, stream,
-                  sum);
+    if (rounded) {
+        reduce_values(out, rounded_parts.data(), firsts.data(), contributors, range.begin,
+                      range.end, stream, sum);
+    } else {
+        reduce_values(out, parts.data(), firsts.data(), contributors, range.begin, range.end,
+                      stream, sum);
+    }
     if (!scatter) { return; }
     if (out != self.output[slot][piece.index]) {
         throw std::logic_error("a tensor-parallel reduce writes another output than its publish named");
@@ -1639,7 +1764,7 @@ void TensorParallelExchange::reduce_on(TensorParallelRoute route, std::size_t ra
         copy_rows(destinations.data(), sources.data(), sizes.data(), copies, stream);
     }
     if (length != 0 && route.transport == TensorParallelTransport::Host) {
-        check(cudaMemcpyAsync(self.host_slot[slot] + piece.offset + range.begin,
+        check(cudaMemcpyAsync(finished_host(rank, slot, piece, range.begin, rounded),
                               static_cast<const unsigned char*>(out) + begin * size, length * size,
                               cudaMemcpyDeviceToHost, stream),
               "reduce copy");
@@ -1650,7 +1775,7 @@ void TensorParallelExchange::reduce_on(TensorParallelRoute route, std::size_t ra
 void TensorParallelExchange::complete_on(TensorParallelRoute route, std::size_t rank,
                                          std::size_t slot, void* out, std::int64_t count,
                                          cudaStream_t stream, TensorParallelSum sum,
-                                         TensorParallelPiece piece) {
+                                         TensorParallelPiece piece, bool rounded) {
     if (route.form != TensorParallelForm::Scatter) { return; }
     DeviceBinding bind(ranks_[rank].device);
     const std::size_t size = output_bytes(sum);
@@ -1671,8 +1796,8 @@ void TensorParallelExchange::complete_on(TensorParallelRoute route, std::size_t 
         sources[copies]  = route.transport == TensorParallelTransport::PeerRead
                                ? static_cast<const unsigned char*>(from.output[slot][piece.index]) +
                                     begin * size
-                               : static_cast<const void*>(from.host_slot[slot] + piece.offset +
-                                                          range.begin);
+                               : static_cast<const void*>(
+                                     finished_host(owner, slot, piece, range.begin, rounded));
         offsets[copies] = range.begin * static_cast<std::int64_t>(size);
         bytes[copies]   = (range.end - range.begin) * static_cast<std::int64_t>(size);
         ++copies;

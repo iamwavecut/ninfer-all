@@ -80,6 +80,7 @@ struct ServeOptions {
     std::vector<double> tensor_split;
     TensorAttention tensor_attention = TensorAttention::Heads;
     TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
+    TensorParallelPartials tensor_parallel_prompt_partials = TensorParallelPartials::Fp32;
     bool invariant_attention         = false;
     // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ExpertResidency expert_residency = ExpertResidency::Device;

@@ -67,6 +67,21 @@ inline constexpr std::string_view kTensorParallelTransportHelp =
     "                                access), or by whichever was fastest at each\n"
     "                                size when timed at startup (default: auto)\n";
 
+// "fp32" or "bf16" (--tensor-parallel-prompt-partials).
+inline TensorParallelPartials parse_tensor_parallel_partials(std::string_view text) {
+    if (text == "fp32") { return TensorParallelPartials::Fp32; }
+    if (text == "bf16") { return TensorParallelPartials::Bf16; }
+    throw std::invalid_argument("--tensor-parallel-prompt-partials must be fp32 or bf16");
+}
+
+inline constexpr std::string_view kTensorParallelPartialsHelp =
+    "  --tensor-parallel-prompt-partials fp32|bf16\n"
+    "                                with --tensor-parallel on a Qwen3.5-core model,\n"
+    "                                how a prompt chunk's partial sums cross host\n"
+    "                                memory: bf16 moves half their bytes but rounds\n"
+    "                                each device's partial, so prompt outputs differ\n"
+    "                                slightly (default: fp32)\n";
+
 inline constexpr std::string_view kInvariantAttentionHelp =
     "  --invariant-attention         attention outputs independent of decode width,\n"
     "                                verification window and batch (Qwen3.5-core)\n";
@@ -93,6 +108,12 @@ inline void check_tensor_parallel_transport(TensorParallelTransport transport,
                                             bool tensor_parallel) {
     if (transport != TensorParallelTransport::Auto && !tensor_parallel) {
         throw std::invalid_argument("--tensor-parallel-transport needs --tensor-parallel");
+    }
+}
+
+inline void check_tensor_parallel_partials(TensorParallelPartials partials, bool tensor_parallel) {
+    if (partials != TensorParallelPartials::Fp32 && !tensor_parallel) {
+        throw std::invalid_argument("--tensor-parallel-prompt-partials needs --tensor-parallel");
     }
 }
 
