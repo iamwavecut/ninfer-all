@@ -1,12 +1,15 @@
 #include "guarded_main.h"
 #include "ninfer/engine.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -374,16 +377,18 @@ void hybrid_test(const char* artifact) {
 // At floor one, a wider draft chain must stop after, and verify exactly, the same first draft as
 // K=1. Repeated requests exercise the per-step graphs' capture and replay, width-specific
 // verification graphs, logprob strides and recovery. Without --spec, host experts draft
-// kAutomaticDraftTokens a round with the floor kAutomaticDraftMinP.
+// kAutomaticDraftTokens a round with the floor kAutomaticDraftMinP, or the one --draft-min-p sets
+// (zero: the whole chain).
 void draft_confidence_test(const char* artifact) {
     const auto input = tokens(128, 47);
     std::vector<ninfer::TokenId> one_draft;
     struct Case {
         unsigned drafts;
-        float floor;
+        std::optional<float> floor;
         bool automatic;
     };
-    for (const Case c : std::vector<Case>{{1, 0, false}, {4, 1, false}, {0, 0, true}, {4, 0, false}}) {
+    for (const Case c : std::vector<Case>{
+             {1, 0.0F, false}, {4, 1.0F, false}, {0, std::nullopt, true}, {0, 0.0F, true}}) {
         auto o = options(artifact, c.drafts);
         o.devices = {0};
         o.max_concurrency = 1;
@@ -395,12 +400,12 @@ void draft_confidence_test(const char* artifact) {
         ninfer::Engine engine(o);
         const auto& resolved = engine.options().speculative;
         const unsigned drafts = resolved.draft_tokens;
-        const float floor     = resolved.draft_min_p;
+        const float floor     = resolved.draft_min_p.value_or(0.0F);
         if (c.automatic) {
             check(resolved.backend == ninfer::SpeculativeBackend::Mtp &&
                       drafts == ninfer::SpeculativeOptions::kAutomaticDraftTokens &&
-                      floor == ninfer::SpeculativeOptions::kAutomaticDraftMinP,
-                  "host experts draft with the automatic width and floor");
+                      floor == c.floor.value_or(ninfer::SpeculativeOptions::kAutomaticDraftMinP),
+                  "host experts draft with the automatic width, and its floor unless one is set");
         }
         auto r = request(64);
         r.execution.logprobs = true;
@@ -442,34 +447,186 @@ void draft_confidence_test(const char* artifact) {
                   "variable-width generation recovers after cancellation");
         }
     }
-    // Different confidence prefixes share a compact physical verification width. Exercise
-    // its per-sequence offsets and live extents on the resident two-device path as well.
+    // Different confidence prefixes and output budgets verify their rows packed at their own
+    // widths, down to the anchor alone; a request that gathers logprobs keeps every row at the
+    // round's width. Both layouts run on the configured devices (one with host experts, as the
+    // automatic drafting runs, or the resident two-device path) and are compared with plain
+    // batched decoding of the same prompts.
     const char* batched = std::getenv("NINFER_FLASH_NEXT_CONFIDENCE_BATCHED");
     if (batched && std::string_view(batched) == "1") {
+        const auto batched_options = [&](std::uint32_t drafts) {
+            auto o = options(artifact, drafts);
+            if (o.devices.size() == 1) {
+                o.expert_residency   = ninfer::ExpertResidency::Host;
+                o.expert_cache_bytes = std::uint64_t{4} << 30;
+            }
+            return o;
+        };
+        const auto run = [](ninfer::Engine& engine, const ninfer::RequestOptions& r) {
+            std::vector<ninfer::GenerationHandle> pending;
+            for (unsigned j = 0; j < 3; ++j) {
+                pending.push_back(
+                    engine.submit(engine.prepare_tokens(tokens(64 + 16 * j, 47 + j)), r));
+            }
+            std::array<ninfer::GenerationResult, 3> results;
+            for (unsigned j = 0; j < 3; ++j) { results[j] = pending[j].wait(); }
+            return results;
+        };
+        auto with_logprobs = request(32);
+        with_logprobs.execution.logprobs = true;
+        std::array<ninfer::GenerationResult, 3> plain;
+        {
+            ninfer::Engine engine(batched_options(0));
+            plain = run(engine, with_logprobs);
+        }
         for (const float floor : {1.0F, 0.3F}) {
-            auto o = options(artifact, 4);
-            o.devices = {0, 1};
+            auto o = batched_options(4);
             o.speculative.draft_min_p = floor;
             ninfer::Engine engine(o);
-            std::array<std::vector<ninfer::TokenId>, 3> expected;
-            auto r = request(32);
-            r.execution.logprobs = true;
-            for (unsigned repeat = 0; repeat < 2; ++repeat) {
-                std::vector<ninfer::GenerationHandle> pending;
-                for (unsigned j = 0; j < 3; ++j) {
-                    pending.push_back(engine.submit(engine.prepare_tokens(tokens(64 + 16 * j, 47 + j)), r));
-                }
-                for (unsigned j = 0; j < 3; ++j) {
-                    const auto result = pending[j].wait();
-                    if (repeat == 0) { expected[j] = result.generated_token_ids; }
-                    check(result.generated_token_ids == expected[j] && expected[j].size() == 32,
-                          "batched confidence prefixes preserve sequence state and repeat");
-                    check(result.speculative.rounds > 0, "batched confidence check ran MTP");
-                    if (floor == 1) {
-                        check(result.speculative.accepted_per_position[1] == 0,
-                              "batched floor one accepted past its confidence prefix");
+            for (const bool logprobs : {false, true}) {
+                auto r = request(32);
+                r.execution.logprobs = logprobs;
+                std::array<std::vector<ninfer::TokenId>, 3> expected;
+                for (unsigned repeat = 0; repeat < 2; ++repeat) {
+                    const auto results = run(engine, r);
+                    for (unsigned j = 0; j < 3; ++j) {
+                        const auto& result = results[j];
+                        if (repeat == 0) { expected[j] = result.generated_token_ids; }
+                        check(result.generated_token_ids == expected[j] && expected[j].size() == 32,
+                              "batched confidence prefixes preserve sequence state and repeat");
+                        check(result.speculative.rounds > 0, "batched confidence check ran MTP");
+                        if (floor == 1) {
+                            check(result.speculative.accepted_per_position[1] == 0,
+                                  "batched floor one accepted past its confidence prefix");
+                        }
+                        std::cout << "DRAFT_CONFIDENCE_BATCHED floor=" << floor
+                                  << " rows=" << (logprobs ? "uniform" : "packed")
+                                  << " repeat=" << repeat << " sequence=" << j
+                                  << " rounds=" << result.speculative.rounds
+                                  << " drafted=" << result.speculative.drafted_tokens
+                                  << " accepted=" << result.speculative.accepted_tokens << '\n';
                     }
                 }
+                // With host experts a verification of more than eight columns in all runs the
+                // general expert products, whose rounding differs from the decode products of
+                // plain decoding, so a near tie may resolve otherwise. A difference names its
+                // first token and, for a content token, both candidates' log probabilities under
+                // plain decoding.
+                for (unsigned j = 0; j < 3; ++j) {
+                    const auto& reference = plain[j].generated_token_ids;
+                    std::cout << (expected[j] == reference ? "SAME" : "DIFF")
+                              << " plain versus " << (logprobs ? "uniform" : "packed")
+                              << " rows, floor=" << floor << " sequence=" << j;
+                    const auto at = static_cast<std::size_t>(
+                        std::mismatch(reference.begin(), reference.end(), expected[j].begin(),
+                                      expected[j].end()).first - reference.begin());
+                    // Content records skip the tokens outside the content.
+                    const ninfer::TokenLogprob* found = nullptr;
+                    for (std::size_t i = 0, next = 0;
+                         i <= at && i < reference.size() && next < plain[j].content_logprobs.size();
+                         ++i) {
+                        const bool content = plain[j].content_logprobs[next].id == reference[i];
+                        if (i == at && content) { found = &plain[j].content_logprobs[next]; }
+                        next += content ? 1 : 0;
+                    }
+                    if (at < reference.size()) {
+                        std::cout << ", from token " << at << ": plain " << reference[at];
+                    }
+                    if (found != nullptr && at < expected[j].size()) {
+                        const auto& record = *found;
+                        std::cout << " at " << record.logprob << ", speculative " << expected[j][at]
+                                  << " at ";
+                        const auto* top = std::find(record.top_ids.begin(), record.top_ids.end(),
+                                                    expected[j][at]);
+                        if (top == record.top_ids.end()) {
+                            std::cout << "none of the top " << record.top_ids.size();
+                        } else {
+                            const auto at = std::size_t(top - record.top_ids.begin());
+                            std::cout << record.top_values[at];
+                        }
+                    }
+                    std::cout << '\n';
+                }
+            }
+        }
+        // --adaptive-mtp picks a lone request's width; a round of several requests drafts as the
+        // automatic drafting does, at most kAutomaticDraftTokens steps (of the four configured).
+        // The controller's widths depend on what ran before, so the outputs are compared with
+        // plain decoding only for the record.
+        {
+            auto o                   = batched_options(4);
+            o.speculative.mtp_policy = ninfer::MtpDraftPolicy::Adaptive;
+            ninfer::Engine engine(o);
+            const auto results = run(engine, request(32));
+            for (unsigned j = 0; j < 3; ++j) {
+                const auto& result = results[j];
+                check(result.generated_token_ids.size() == 32 && result.speculative.rounds > 0,
+                      "adaptive batched requests draft and finish");
+                std::cout << (result.generated_token_ids == plain[j].generated_token_ids ? "SAME"
+                                                                                         : "DIFF")
+                          << " plain versus adaptive, sequence=" << j
+                          << " rounds=" << result.speculative.rounds << " by width";
+                for (const auto rounds : result.speculative.rounds_per_window) {
+                    std::cout << ' ' << rounds;
+                }
+                std::cout << " drafted=" << result.speculative.drafted_tokens
+                          << " accepted=" << result.speculative.accepted_tokens << '\n';
+            }
+        }
+        // The automatic cache with eight requests at once: host experts drafting as the Engine
+        // chooses, disk experts without drafts as it chooses for them and with three a round
+        // under --spec mtp. What the core and the requests allocate after startup stays within
+        // the margin the cache leaves free (kGrowthMargin, 384 MiB).
+        if (batched_options(0).devices.size() == 1) {
+            constexpr double kGrowthMarginMiB = 384;
+            struct Run {
+                ninfer::ExpertResidency residency;
+                std::uint32_t drafts; // 0: as the Engine chooses
+            };
+            for (const Run run : {Run{ninfer::ExpertResidency::Host, 0},
+                                  Run{ninfer::ExpertResidency::Disk, 0},
+                                  Run{ninfer::ExpertResidency::Disk, 3}}) {
+                const bool disk        = run.residency == ninfer::ExpertResidency::Disk;
+                auto o                 = options(artifact, run.drafts);
+                o.expert_residency     = run.residency;
+                o.speculative.automatic = run.drafts == 0;
+                o.max_concurrency      = 8;
+                o.max_pending_requests = 8;
+                o.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(8 * 4096);
+                o.context_cache.enabled = true;
+                ninfer::Engine engine(o);
+                const bool drafting =
+                    engine.options().speculative.backend == ninfer::SpeculativeBackend::Mtp;
+                check(drafting == (!disk || run.drafts > 0),
+                      "the Engine drafts for host experts, for disk experts only under --spec");
+                const auto startup = engine.memory_summary();
+                auto r = request(48);
+                r.execution.allow_prefix_reuse = true;
+                std::vector<ninfer::GenerationHandle> pending;
+                for (unsigned j = 0; j < 8; ++j) {
+                    pending.push_back(engine.submit(
+                        engine.prepare_tokens(tokens(j % 2 ? 1500 : 200, 61 + j)), r));
+                }
+                bool finished = true;
+                std::uint64_t rounds = 0;
+                for (auto& handle : pending) {
+                    const auto result = handle.wait();
+                    finished = finished && result.generated_token_ids.size() == 48;
+                    rounds += result.speculative.rounds;
+                }
+                std::size_t free = 0, total = 0;
+                check(cudaMemGetInfo(&free, &total) == cudaSuccess, "device memory is readable");
+                const double grown =
+                    (double(startup.available_after_startup_bytes) - double(free)) / 1048576.0;
+                const auto drafts = drafting ? engine.options().speculative.draft_tokens : 0;
+                std::cout << "AUTO_CACHE residency=" << (disk ? "disk" : "host")
+                          << " drafts=" << drafts
+                          << " cache_mib=" << startup.expert_cache_bytes / 1048576
+                          << " grown_after_startup_mib=" << grown << " rounds=" << rounds << '\n';
+                check(finished && (rounds > 0) == drafting,
+                      "eight requests finish with the automatic cache, drafting as configured");
+                check(grown <= kGrowthMarginMiB,
+                      "the core and the requests allocate within the automatic cache's margin");
             }
         }
     }

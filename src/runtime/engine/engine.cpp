@@ -99,9 +99,11 @@ EngineOptions with_family_attention(EngineOptions options) {
     return options;
 }
 
-// Without --spec (SpeculativeOptions::automatic), a Flash-Next or Gemma 4 artifact with host or
-// disk experts drafts with the MTP block or assistant it carries: a verification window's routes
-// share the layer's missing experts, which the CPU computes while the cached ones run.
+// Without --spec (SpeculativeOptions::automatic), a Flash-Next artifact with host experts, or a
+// Gemma 4 one with host or disk experts, drafts with the MTP block or assistant it carries: a
+// verification window's routes share the layer's missing experts, which the CPU computes while
+// the cached ones run. Flash-Next's disk experts have no CPU share: a layer reads every expert its
+// cache lacks before it runs, so a verification's drafts multiply the reads.
 EngineOptions with_family_speculation(EngineOptions options) {
     SpeculativeOptions& speculative = options.speculative;
     if (!speculative.automatic || speculative.backend != SpeculativeBackend::None ||
@@ -109,8 +111,9 @@ EngineOptions with_family_speculation(EngineOptions options) {
         options.purpose != EnginePurpose::Generation) {
         return options;
     }
-    if (!runtime::is_gemma4_artifact(options.artifact_path) &&
-        !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+    const bool flash_next = runtime::is_qwen4_exp_artifact(options.artifact_path);
+    if (flash_next ? options.expert_residency == ExpertResidency::Disk
+                   : !runtime::is_gemma4_artifact(options.artifact_path)) {
         return options;
     }
     if (!artifact::Reader(options.artifact_path).directory().components.contains("mtp")) {
@@ -118,8 +121,9 @@ EngineOptions with_family_speculation(EngineOptions options) {
     }
     speculative.backend      = SpeculativeBackend::Mtp;
     speculative.draft_tokens = SpeculativeOptions::kAutomaticDraftTokens;
-    // Flash-Next's chain stops at an unlikely draft, which the round would likely reject.
-    if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+    // Flash-Next's chain stops at an unlikely draft, which the round would likely reject, unless
+    // --draft-min-p sets the floor.
+    if (flash_next && !speculative.draft_min_p) {
         speculative.draft_min_p = SpeculativeOptions::kAutomaticDraftMinP;
     }
     return options;
@@ -490,7 +494,7 @@ public:
             options.expert_residency == ExpertResidency::Device) {
             throw std::invalid_argument("expert routing profiles require host or disk experts");
         }
-        if (options.speculative.draft_min_p != 0) {
+        if (options.speculative.draft_min_p.value_or(0.0F) != 0) {
             throw std::invalid_argument("--draft-min-p requires Qwen3.8-Flash-Next MTP");
         }
         auto constructed  = runtime::construct_model(options, device);

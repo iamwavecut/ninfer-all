@@ -32,7 +32,7 @@ set_tests_properties(ninfer_qwen4_exp_generate_real PROPERTIES SKIP_RETURN_CODE 
 
 ninfer_add_test(ninfer_qwen4_exp_engine_real
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_real.cpp"
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_engine ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen4_exp_engine_real PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_qwen4_exp_long_context_real

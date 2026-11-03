@@ -471,28 +471,20 @@ struct SequenceState {
     // their index plus rope_delta.
     std::vector<std::int32_t> media_columns, media_rope;
     std::int32_t rope_delta = 0;
-    // One decode graph per segment, captured at the sequence's second decode step: the first runs
-    // eagerly, so every lazy initialization of the ops it reaches happens outside capture. The
-    // graphs read the token, its position and n-gram rows from the ranks' staged planes and stay
-    // valid for the sequence's lifetime, across resets.
-    std::vector<DecodeGraphExecutable> decode;
-    std::uint32_t decode_steps = 0;
-    // The same for a verification of this sequence alone (a graph per segment) and for its draft
-    // chain on one device with every expert there (one graph), captured at the second of each.
-    struct VerifyGraphs {
-        std::vector<DecodeGraphExecutable> segments;
-        std::uint32_t runs = 0;
-    };
-    // The captured record strides and kernels depend on the actual verification width.
-    std::array<VerifyGraphs, 17> verify;
-    // Draft chains by step count (adaptive MTP drafts fewer than draft_tokens), and the single
-    // steps by index of a chain a probability floor can end early.
-    struct DraftGraph {
-        DecodeGraphExecutable chain;
-        std::uint32_t runs = 0;
-    };
-    std::array<DraftGraph, 16> draft;
-    std::array<DraftGraph, 15> step;
+};
+
+// The CUDA Graphs of one pass shape of a single sequence, which every sequence shares: a graph per
+// segment (a decode step, a verification at one width) or one (a draft chain on one device with
+// every expert there, a draft step). The first run of the shape is eager, so every lazy
+// initialization of the ops it reaches happens outside a capture; the next run captures the graphs
+// for its sequence, and a run of another sequence captures that one's pass and updates them in
+// place: its nodes are the same kernels and copies over the other sequence's state. They read the
+// tokens, their positions and n-gram rows from the ranks' staged planes, so they stay valid across
+// positions and resets.
+struct PassGraphs {
+    std::vector<DecodeGraphExecutable> graphs;
+    const SequenceState* sequence = nullptr; // the sequence the graphs run
+    std::uint32_t runs            = 0;
 };
 
 // Consecutive layers on one rank, in pass order. The first segment also embeds the tokens, the
@@ -637,6 +629,17 @@ struct Executor::Impl {
     std::size_t rows_rank = 0;
     bool rows_waited      = true;
     bool warming          = false; // warm_up() runs: the expert cache counts no routes
+    // The CUDA Graphs of the single-sequence passes: decode steps, verifications by width, draft
+    // chains by step count, and the single steps by index of a chain a probability floor can end
+    // early. The warm-up captures every shape the options allow, and the device memory they took
+    // on the rank that gave the most.
+    PassGraphs decode_graphs;
+    std::array<PassGraphs, 17> verify_graphs;
+    std::array<PassGraphs, 16> draft_graphs;
+    std::array<PassGraphs, 15> step_graphs;
+    std::uint64_t graph_bytes = 0;
+    // The warm-up runs every draft step of a chain a probability floor would end early.
+    bool every_step = false;
     std::array<StallEvents, 8> stall_events{};
     std::size_t stall_next = 0;
     std::uint64_t stalls   = 0;
@@ -695,6 +698,8 @@ struct Executor::Impl {
     // Expert cache (host-resident experts): every layer's routes of the last pass, on its device
     // and in pinned host memory, and how many tokens they cover.
     std::unique_ptr<ExpertCache> cache;
+    // The routing profile that filled the cache's slots; grow_expert_cache fills its new ones.
+    std::optional<ExpertRouteCounts> cache_profile;
     std::unique_ptr<HybridExperts> hybrid;
     const std::atomic<bool>* cancelled = nullptr;
     // Disk-resident experts: made resident before each layer's experts run.
@@ -702,12 +707,14 @@ struct Executor::Impl {
     // GGUF host or disk experts: a decode or verification call's missing experts, staged (or
     // computed by the CPU) while its cached ones run.
     std::unique_ptr<ExpertMisses> misses;
+    std::uint32_t miss_tokens = 0; // the widest call the misses take
     // Each expert layer's routes of the current pass, [layer][10 * prefill_chunk] in one block per
     // rank (a stage's layers are consecutive), so one copy brings a rank's text layers home.
     std::vector<DeviceBuffer> route_blocks; // by rank
     std::vector<void*> route_records;       // by expert layer
     std::unique_ptr<PinnedHostBuffer> route_host;
     std::uint32_t pending_routes = 0;
+    bool pending_decode          = true; // they came from a decode step or verification
 
     // Tensor parallelism (Model::tensor_parallel()): every rank runs every layer over its replica
     // of the stack, with its run of each mixer's heads and of the routed experts, and exchanges
@@ -931,28 +938,24 @@ struct Executor::Impl {
                 table->wait();
             } catch (...) {}
         }
-        for (auto& sequence : sequences) {
-            for (std::size_t i = 0; i < sequence.decode.size(); ++i) {
+        const auto reset_segments = [&](PassGraphs& shape) {
+            for (std::size_t i = 0; i < shape.graphs.size(); ++i) {
                 RankBinding bind(device, segments[i].rank);
-                sequence.decode[i].reset();
+                shape.graphs[i].reset();
             }
-            for (auto& width : sequence.verify) {
-                for (std::size_t i = 0; i < width.segments.size(); ++i) {
-                    RankBinding bind(device, segments[i].rank);
-                    width.segments[i].reset();
+        };
+        reset_segments(decode_graphs);
+        for (auto& shape : verify_graphs) { reset_segments(shape); }
+        const auto reset_chains = [&](auto& shapes) {
+            for (auto& shape : shapes) {
+                for (auto& graph : shape.graphs) {
+                    RankBinding bind(device, model.head_rank());
+                    graph.reset();
                 }
             }
-            const auto reset = [&](auto& graphs) {
-                for (auto& graph : graphs) {
-                    if (graph.chain.ready()) {
-                        RankBinding bind(device, model.head_rank());
-                        graph.chain.reset();
-                    }
-                }
-            };
-            reset(sequence.draft);
-            reset(sequence.step);
-        }
+        };
+        reset_chains(draft_graphs);
+        reset_chains(step_graphs);
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
             if (rank.staged != nullptr) { cudaEventDestroy(rank.staged); }
@@ -1864,13 +1867,21 @@ struct Executor::Impl {
         if (staged) {
             for (auto& b : bytes) { b = b > kStagingBytes ? b - kStagingBytes : 0; }
         }
+        // The automatic cache starts at half (the disk stream's pools at least at their widest
+        // call): grow_expert_cache completes it once the warm-up and the rest of startup have
+        // allocated what requests use, and can only add.
+        const bool grows = options.expert_cache_bytes == ExecutorOptions::kAutoExpertCache;
         if (residency == ExpertResidency::Disk) {
             if (options.expert_cache_bytes == 0) {
                 throw std::invalid_argument("disk-resident experts need a device expert cache");
             }
-            // One call routes at most a chunk's tokens: a span's chunks prepare one by one.
+            // One call routes at most a chunk's tokens: a span's chunks prepare one by one. The MTP
+            // block's calls are draft steps, a token for each of up to kVectorTokens sequences; its
+            // slots hold one such step's experts, and one sequence's working set.
             const std::size_t widest_call =
                 std::size_t(config.num_experts_per_tok) * options.prefill_chunk;
+            const std::size_t widest_draft =
+                std::size_t(config.num_experts_per_tok) * kVectorTokens;
             std::vector<ExpertStreamLayer> stream_layers;
             for (std::size_t i = 0; i < expert.size(); ++i) {
                 const auto& [plan, moe] = expert[i];
@@ -1880,15 +1891,18 @@ struct Executor::Impl {
                     .experts     = {moe->located_gate, moe->located_up, moe->located_down},
                     .tables      = {plan->moe.gate.table.p, plan->moe.up.table.p,
                                     plan->moe.down.table.p},
-                    .widest_call = widest_call,
+                    .widest_call = i >= layers.size() ? widest_draft : widest_call,
                     .own_pool    = i >= layers.size()});
             }
             stream = std::make_unique<ExpertStream>(device, model.files(), std::move(stream_layers),
-                                                    bytes);
+                                                    bytes, grows);
             for (std::size_t r = 0; r < bytes.size(); ++r) {
-                memory.ranks[r].expert_cache_bytes += bytes[r];
+                memory.ranks[r].expert_cache_bytes += stream->pool_bytes(r);
             }
             return;
+        }
+        if (grows) {
+            for (auto& b : bytes) { b /= 2; }
         }
         std::vector<ExpertCacheLayer> cache_layers;
         for (const auto& [plan, moe] : expert) {
@@ -1906,7 +1920,7 @@ struct Executor::Impl {
         // The routing profile: the one given, else the one recorded on this family's release.
         std::vector<std::size_t> widths;
         for (const auto& [plan, moe] : expert) { widths.push_back(plan->moe.gate.pointers.size()); }
-        std::optional<ExpertRouteCounts> profile;
+        auto& profile = cache_profile;
         if (!options.hybrid_experts.routing_profile.empty()) {
             profile = read_expert_profile(options.hybrid_experts.routing_profile,
                                           model.info().artifact_id, widths);
@@ -1958,15 +1972,15 @@ struct Executor::Impl {
                 cache->hand_over(i);
                 layer.admit = true;
             }
-            if (cache) {
-                layer.resident = cache->storage(i);
-            } else if (stream) {
-                layer.resident[0] = stream->storage(i);
-            }
+            layer.resident = resident_blocks(i);
             out.push_back(std::move(layer));
         }
+        // Every decode step, and every verification up to the calls' limit, the joint one of all
+        // sequences included.
+        const std::uint32_t joint = verify_width * options.sequences;
+        miss_tokens = std::min(kMaxMissTokens, std::max<std::uint32_t>(kVectorTokens, joint));
         MissOptions miss;
-        miss.token_capacity = kVectorTokens;
+        miss.token_capacity = miss_tokens;
         miss.cpu_balance    = !options.hybrid_experts.dma_share && !options.hybrid_experts.mapped_misses;
         miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share.value_or(1.0F));
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
@@ -2193,7 +2207,7 @@ struct Executor::Impl {
             const std::size_t used = std::size_t(config.num_experts_per_tok) * pending_routes;
             // The tier learns from decode and verification passes; a prompt chunk, which routes
             // nearly every expert, only counts toward the statistics.
-            const bool decode = pending_routes <= std::uint32_t(kVectorTokens);
+            const bool decode = pending_decode;
             if (pending_routes > 0) {
                 for (std::size_t i = 0; i < layers.size(); ++i) {
                     cache->observe(i, std::span(host + i * pairs, used), decode);
@@ -2208,6 +2222,7 @@ struct Executor::Impl {
             if (decode) { cache->adapt(); }
         }
         pending_routes = 0;
+        pending_decode = true;
         mtp_routes     = 0;
     }
 
@@ -2232,6 +2247,7 @@ struct Executor::Impl {
             CUDA_CHECK(cudaEventRecord(rank.routes, rank.stream));
         }
         pending_routes = tokens;
+        pending_decode = tokens <= std::uint32_t(kVectorTokens) || verifying;
     }
 
     // The state regions a reset zeroes, a snapshot keeps and a restore puts back: the recurrent
@@ -2547,15 +2563,18 @@ struct Executor::Impl {
         const auto dh = static_cast<std::int32_t>(config.linear_value_head_dim);
         const Tensor mixed(columns(rank.mixed, h, part.column, 2), DType::BF16, {h, t});
         // A verification records its raw projection, the transitions and the gates for the fold
-        // that commits a prefix, and leaves the sequence's states as they were.
+        // that commits a prefix, and leaves the sequence's states as they were. The record rows
+        // are the round's widest width apart; a narrower row fills the first columns of its own.
         std::optional<GdnReplayRecordLayer> record;
         if (verifying) {
             const auto row = record_row(part);
             const auto all = rank.records->layer(static_cast<std::int32_t>(gdn_local[index]),
                                                  static_cast<std::int32_t>(verified.size()),
                                                  static_cast<std::int32_t>(active_verify_width));
-            record = GdnReplayRecordLayer{all.conv.slice(2, row, 1), all.key.slice(3, row, 1),
-                                          all.value.slice(3, row, 1), all.gate.slice(3, row, 1)};
+            record = GdnReplayRecordLayer{all.conv.slice(2, row, 1).slice(1, 0, t),
+                                          all.key.slice(3, row, 1).slice(2, 0, t),
+                                          all.value.slice(3, row, 1).slice(2, 0, t),
+                                          all.gate.slice(3, row, 1).slice(2, 0, t)};
         }
         Tensor qkv = record ? Tensor(record->conv.data, DType::BF16, {g.qkv.rows, t})
                             : Tensor(rank.a, DType::BF16, {g.qkv.rows, t});
@@ -2898,6 +2917,19 @@ struct Executor::Impl {
         return true;
     }
 
+    // Routes the `t` tokens in the rank's mixed plane: their experts into the layer's route record,
+    // their weights and the shared expert's gate into the rank's route planes.
+    void route(const MoePlan& m, RankState& rank, std::int32_t t, std::size_t index) {
+        const auto h   = static_cast<std::int32_t>(config.hidden_size);
+        const auto top = static_cast<std::int32_t>(config.num_experts_per_tok);
+        Tensor ids(route_records[index], DType::I32, {top, t});
+        Tensor weights(rank.route_weights, DType::FP32, {top, t});
+        Tensor shared(rank.route_shared, DType::FP32, {t});
+        auto scope = rank.workspace->scope();
+        ops::moe_route(Tensor(rank.mixed, DType::BF16, {h, t}), m.router, m.shared_gate,
+                       *rank.workspace, ids, weights, shared, rank.stream);
+    }
+
     void run_moe(const LayerPlan& plan, RankState& rank, std::int32_t t, std::size_t index) {
         const MoePlan& m     = plan.moe;
         WorkspaceArena& ws   = *rank.workspace;
@@ -2908,10 +2940,7 @@ struct Executor::Impl {
         Tensor ids(route_records[index], DType::I32, {top, t});
         Tensor weights(rank.route_weights, DType::FP32, {top, t});
         Tensor shared(rank.route_shared, DType::FP32, {t});
-        {
-            auto scope = ws.scope();
-            ops::moe_route(mixed, m.router, m.shared_gate, ws, ids, weights, shared, s);
-        }
+        route(m, rank, t, index);
         if (m.native) {
             Tensor y(rank.y, DType::FP32, {h, t});
             if (hybrid) {
@@ -2923,30 +2952,7 @@ struct Executor::Impl {
             ops::moe_experts_native(mixed, ids, weights, shared, m.native->banks(), nullptr, ws, y, s);
             return;
         }
-        if (misses && index == layers.size() && t > kVectorTokens) {
-            // The MTP block only steers drafts, which verification checks: a prompt chunk's
-            // missing experts are dropped rather than fetched. Draft steps and a round's cells
-            // serve them as a decode layer does, so the drafts follow the block's own routing.
-            Tensor y(rank.y, DType::FP32, {h, t});
-            auto scope = ws.scope();
-            Tensor kept_ids     = ws.alloc(DType::I32, {top, t});
-            Tensor kept_weights = ws.alloc(DType::FP32, {top, t});
-            misses->drop_missing(index, ids, weights, kept_ids, kept_weights, s);
-            if (ops::moe_experts_gguf_decode_supported(m.banks(), t)) {
-                const auto state = ops::moe_experts_gguf_decode_begin(mixed, kept_ids, shared,
-                                                                      m.banks(), ws, s, &rank.side);
-                ops::moe_experts_gguf_decode_finish(state, kept_ids, nullptr, kept_weights,
-                                                    m.banks(), nullptr, nullptr, nullptr, nullptr,
-                                                    y, s);
-                return;
-            }
-            const auto stage = ops::moe_experts_gguf_begin(mixed, ws, s);
-            ops::moe_experts_gguf_add(stage, mixed, kept_ids, kept_weights, &shared, m.banks(), ws,
-                                      s);
-            ops::moe_experts_gguf_finish(stage, y, s);
-            return;
-        }
-        if (misses && t <= kVectorTokens) {
+        if (served_by_misses(t)) {
             // The cached pairs run at once; the missing experts arrive (or the CPU computes them)
             // meanwhile, and run in a second stage.
             Tensor y(rank.y, DType::FP32, {h, t});
@@ -2976,8 +2982,8 @@ struct Executor::Impl {
             ops::moe_experts_gguf_finish(stage, y, s);
             return;
         }
-        // The slot pools are sized for the text layers' experts; the MTP block's wide calls stay
-        // on the vector products over its host banks.
+        // The slot pools are sized for the text layers' experts (the MTP block's calls, a draft
+        // step's, take the vector products).
         if (t > kVectorTokens && !slot_pools.empty() && index < layers.size() &&
             run_through_slots(plan, rank, t, index, ids, weights, shared)) {
             return;
@@ -3332,26 +3338,29 @@ struct Executor::Impl {
         ops::moe_experts_gguf_combine(std::span<const Tensor>(&fixed, 1), y, s);
     }
 
-    // A graph per segment of a pass over one part of `t` tokens of `sequence` (a decode step, or a
-    // verification while `verifying`).
-    std::vector<DecodeGraphExecutable> capture_segments(SequenceState& sequence, std::int32_t t) {
-        std::vector<DecodeGraphExecutable> graphs;
-        for (const Segment& segment : segments) {
+    // Whether a pass over one part of `t` tokens of `sequence` (a decode step, or a verification
+    // while `verifying`) runs from the graphs of `shape`, a graph per segment: false at the
+    // shape's first run, else they are captured, or updated, for the sequence (PassGraphs).
+    bool bind_segments(PassGraphs& shape, SequenceState& sequence, std::int32_t t) {
+        if (shape.graphs.empty() && shape.runs++ == 0) { return false; }
+        if (!shape.graphs.empty() && shape.sequence == &sequence) { return true; }
+        shape.graphs.resize(segments.size());
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            const Segment& segment = segments[i];
             RankBinding bind(device, segment.rank);
             DecodeGraphDefinition definition;
             const Part part{.sequence = &sequence, .column = 0, .count = t};
             definition.capture(ranks[segment.rank].stream, [&] {
                 run_segment(std::span(&part, 1), segment, t, std::uint32_t(t));
             });
-            DecodeGraphExecutable graph;
-            graph.instantiate(definition);
-            graphs.push_back(std::move(graph));
+            if (shape.graphs[i].ready()) {
+                shape.graphs[i].update(definition);
+            } else {
+                shape.graphs[i].instantiate(definition);
+            }
         }
-        return graphs;
-    }
-
-    void capture_decode(SequenceState& sequence) {
-        sequence.decode = capture_segments(sequence, 1);
+        shape.sequence = &sequence;
+        return true;
     }
 
     void check_tokens(std::span<const std::int32_t> tokens, std::uint32_t logit_rows) const {
@@ -3368,8 +3377,8 @@ struct Executor::Impl {
         }
     }
 
-    // One pass over `parts`, whose tokens are `tokens` in column order. A pass of one single-token
-    // part replays its sequence's decode graphs when it has them.
+    // One pass over `parts`, whose tokens are `tokens` in column order. A pass of one part, a
+    // decode step or a verification of up to kVectorTokens tokens, runs from its shape's graphs.
     void pass(std::span<const Part> parts, std::span<const std::int32_t> tokens,
               std::uint32_t logit_rows) {
         const auto t = static_cast<std::int32_t>(tokens.size());
@@ -3382,7 +3391,7 @@ struct Executor::Impl {
         settle_routes();
         // A copy queued for an earlier pass may predate the cache's last swaps.
         forget_prefetches();
-        place_pools(t > kVectorTokens);
+        place_pools(t > kVectorTokens && !served_by_misses(t));
         if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_inputs(parts, tokens);
         // Disk-resident experts need the host between a layer's routing and its experts, so their
@@ -3392,19 +3401,18 @@ struct Executor::Impl {
         SequenceState& first = *parts.front().sequence;
         // Staged misses keep disk experts' decode and verification free of host synchronization.
         const bool host_free = !stream || misses;
-        const bool graph =
+        const bool decode_graph =
             options.cuda_graphs && t == 1 && host_free && !verifying && branch_origin == nullptr;
         const bool verify_graph = options.cuda_graphs && verifying && parts.size() == 1 &&
                                   host_free && t <= kVectorTokens && branch_origin == nullptr;
         if (misses) { misses->keep_alive(); }
-        if (graph && first.decode.empty() && first.decode_steps++ > 0) { capture_decode(first); }
         // Every segment of a tensor-parallel pass makes an even number of exchanges, so each one,
         // captured or not, starts in slot 0.
-        exchange_next      = 0;
-        auto* verification = verify_graph ? &first.verify.at(std::size_t(t)) : nullptr;
-        if (verification && verification->segments.empty() && verification->runs++ > 0) {
-            verification->segments = capture_segments(first, t);
-        }
+        exchange_next     = 0;
+        PassGraphs* shape = decode_graph   ? &decode_graphs
+                            : verify_graph ? &verify_graphs.at(std::size_t(t))
+                                           : nullptr;
+        const bool replay = shape != nullptr && bind_segments(*shape, first, t);
         for (std::size_t i = 0; i < segments.size(); ++i) {
             const Segment& segment = segments[i];
             if (i > 0 && segments[i - 1].rank != segment.rank) {
@@ -3417,10 +3425,8 @@ struct Executor::Impl {
                 RankBinding rows(device, r);
                 stage_rows(ranks[r]);
             }
-            if (graph && !first.decode.empty()) {
-                first.decode[i].launch(ranks[segment.rank].stream);
-            } else if (verification && !verification->segments.empty()) {
-                verification->segments[i].launch(ranks[segment.rank].stream);
+            if (replay) {
+                shape->graphs[i].launch(ranks[segment.rank].stream);
             } else {
                 run_segment(parts, segment, t, logit_rows);
             }
@@ -3440,7 +3446,14 @@ struct Executor::Impl {
         // load a kernel lazily: loading can wait for the device to go idle, the waiting kernel for
         // the misses' service, and the service's own calls for the loader. The caller's next
         // kernels therefore follow a pass that may have waited.
-        if (misses && t <= kVectorTokens) { synchronize_ranks(); }
+        if (served_by_misses(t)) { synchronize_ranks(); }
+    }
+
+    // Whether the staged misses serve a pass of `t` tokens: a decode step, or a verification up to
+    // their widest call, the joint one of all sequences included. A wider pass, a prompt chunk,
+    // copies its layers' missing experts into the slot pools instead.
+    [[nodiscard]] bool served_by_misses(std::int32_t t) const {
+        return misses && (t <= kVectorTokens || (verifying && std::uint32_t(t) <= miss_tokens));
     }
 
     void synchronize_ranks() {
@@ -3993,21 +4006,85 @@ struct Executor::Impl {
         prefill(chunk);
         reset(0);
         prefill(2);
+        // Every graph a single sequence's passes may run is captured now, so that requests take
+        // no device memory for them: the decode step's, a verification's at each width up to
+        // kVectorTokens, and the draft's chains by step count, or its steps under a probability
+        // floor. Each shape's first run is eager (the decode step's was prefill(1)) and its second
+        // captures; the device memory the second runs take is the graphs'. The first run also
+        // verifies the wider widths, which stay eager, and commits a token.
         const std::uint32_t sequence = 0;
-        if (sequences.front().position + 1 < options.max_context) {
+        const auto fits = [&](std::uint32_t s, std::uint32_t count) {
+            return sequences.at(s).position + count <= options.max_context;
+        };
+        // Room for both runs: the commit and the decode step between them take a position each.
+        const bool drafting = mtp && can_draft(sequence) && fits(sequence, verify_width + 2);
+        const auto widest   = std::min<std::uint32_t>(verify_width, kVectorTokens);
+        std::vector<std::int32_t> drafts(options.draft_tokens);
+        std::vector<std::uint32_t> extents(1);
+        const auto shapes = [&](bool first) {
+            if (!drafting) { return; }
+            for (std::uint32_t w = 1; w <= (first ? verify_width : widest); ++w) {
+                verify(std::span(&sequence, 1), std::span(tokens).first(w));
+            }
+            if (first) {
+                const std::uint32_t kept = 1;
+                commit(std::span(&sequence, 1), std::span(&kept, 1));
+            }
+            if (options.draft_min_p > 0) {
+                every_step = true;
+                draft(std::span(&sequence, 1), std::span(tokens).first(1), drafts, extents);
+                every_step = false;
+            } else {
+                for (std::uint32_t k = 1; k <= options.draft_tokens; ++k) {
+                    draft(std::span(&sequence, 1), std::span(tokens).first(1), drafts, {}, k);
+                }
+            }
+        };
+        const auto free_bytes = [&] {
+            std::vector<std::uint64_t> out(ranks.size());
+            for (std::size_t r = 0; r < ranks.size(); ++r) {
+                RankBinding bind(device, r);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::size_t free = 0, total = 0;
+                CUDA_CHECK(cudaMemGetInfo(&free, &total));
+                out[r] = free;
+            }
+            return out;
+        };
+        shapes(true);
+        if (options.cuda_graphs && fits(sequence, 1)) {
+            const auto before = free_bytes();
             decode(std::span(&sequence, 1), std::span(tokens).first(1));
+            shapes(false);
+            const auto after = free_bytes();
+            for (std::size_t r = 0; r < ranks.size(); ++r) {
+                const std::uint64_t taken = before[r] > after[r] ? before[r] - after[r] : 0;
+                graph_bytes               = std::max(graph_bytes, taken);
+            }
         }
-        if (mtp && can_draft(0) &&
-            sequences.front().position + verify_width <= options.max_context) {
-            std::vector<std::int32_t> drafts(options.draft_tokens);
-            draft(std::span(&sequence, 1), std::span(tokens).first(1), drafts);
-            std::vector<std::int32_t> round{kToken};
-            round.insert(round.end(), drafts.begin(), drafts.end());
-            verify(std::span(&sequence, 1), round);
-            const std::uint32_t kept = 1;
-            commit(std::span(&sequence, 1), std::span(&kept, 1));
+        // Batches of several sequences run eagerly: their first passes load the kernels of their
+        // widths now, a plain step of every batch size, then a verification of every sequence at
+        // the full width with the drafts before it.
+        std::vector<std::uint32_t> batch{sequence};
+        for (std::uint32_t s = 1; s < options.sequences; ++s) {
+            reset(s);
+            forward(s, std::span(tokens).first(1), 1, {});
+            batch.push_back(s);
+            if (std::all_of(batch.begin(), batch.end(), [&](auto b) { return fits(b, 1); })) {
+                decode(batch, std::vector<std::int32_t>(batch.size(), kToken));
+            }
         }
-        reset(0);
+        const bool round = batch.size() > 1 && mtp &&
+                           std::all_of(batch.begin(), batch.end(), [&](std::uint32_t s) {
+                               return can_draft(s) && fits(s, verify_width);
+                           });
+        if (round) {
+            std::vector<std::int32_t> batch_drafts(batch.size() * options.draft_tokens);
+            draft(batch, std::vector<std::int32_t>(batch.size(), kToken), batch_drafts);
+            verify(batch, std::vector<std::int32_t>(batch.size() * verify_width, kToken));
+            commit(batch, std::vector<std::uint32_t>(batch.size(), 1));
+        }
+        for (const std::uint32_t s : batch) { reset(s); }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
             CUDA_CHECK(cudaStreamSynchronize(rank.stream));
@@ -4016,7 +4093,7 @@ struct Executor::Impl {
     }
 
     void grow_expert_cache(std::uint64_t keep) {
-        if (!cache) { return; }
+        if (!cache && !stream && !hybrid) { return; }
         std::vector<std::uint64_t> bytes(device.size(), 0);
         for (std::size_t r = 0; r < device.size(); ++r) {
             RankBinding bind(device, r);
@@ -4025,32 +4102,52 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
             bytes[r] = free_bytes > keep ? free_bytes - keep : 0;
         }
-        const auto added = cache->grow(bytes);
+        const auto added = cache    ? cache->grow(bytes)
+                           : stream ? stream->grow(bytes)
+                                    : hybrid->grow(bytes);
         for (std::size_t r = 0; r < added.size(); ++r) {
             memory.ranks[r].expert_cache_bytes += added[r];
             memory.expert_cache_bytes += added[r];
         }
-        std::vector<ExpertCache::Loan> loans;
-        for (std::size_t r = 0; r < slot_pools.size(); ++r) {
-            for (const auto& buffer : slot_pools[r].buffers) {
-                loans.push_back({.rank = r, .base = buffer.storage.p, .bytes = buffer.storage.bytes});
+        if (cache) {
+            // The new slots take the next most routed experts of the profile, as construction's
+            // did.
+            if (cache_profile) { cache->seed(*cache_profile); }
+            std::vector<ExpertCache::Loan> loans;
+            for (std::size_t r = 0; r < slot_pools.size(); ++r) {
+                for (const auto& buffer : slot_pools[r].buffers) {
+                    loans.push_back(
+                        {.rank = r, .base = buffer.storage.p, .bytes = buffer.storage.bytes});
+                }
+            }
+            if (!loans.empty()) {
+                const auto lent = cache->lend(loans);
+                for (std::size_t r = 0; r < lent.size(); ++r) {
+                    memory.ranks[r].expert_cache_bytes += lent[r];
+                    memory.ranks[r].workspace_bytes -= lent[r];
+                    memory.expert_cache_bytes += lent[r];
+                    memory.workspace_bytes -= lent[r];
+                }
+                pools_lent = true;
             }
         }
-        if (!loans.empty()) {
-            const auto lent = cache->lend(loans);
-            for (std::size_t r = 0; r < lent.size(); ++r) {
-                memory.ranks[r].expert_cache_bytes += lent[r];
-                memory.ranks[r].workspace_bytes -= lent[r];
-                memory.expert_cache_bytes += lent[r];
-                memory.workspace_bytes -= lent[r];
-            }
-            pools_lent = true;
-        }
+        // The kernels that split a call's routes read the new blocks as cached.
         if (misses) {
             for (std::size_t i = 0; i < expert_layers().size(); ++i) {
-                misses->set_resident(i, cache->storage(i));
+                misses->set_resident(i, resident_blocks(i));
             }
         }
+    }
+
+    // The device blocks that hold layer i's cached experts: the host cache's or the disk stream's.
+    [[nodiscard]] ExpertCache::Ranges resident_blocks(std::size_t i) const {
+        if (cache) { return cache->storage(i); }
+        ExpertCache::Ranges out{};
+        if (stream) {
+            const auto blocks = stream->storage(i);
+            std::copy(blocks.begin(), blocks.end(), out.begin());
+        }
+        return out;
     }
 
     // ---- MTP speculative decoding ------------------------------------------------------------
@@ -4137,7 +4234,10 @@ struct Executor::Impl {
     // normalised embedding, projected, joins every stream of the normalised stack (one norm over
     // all of a cell's streams, then a projection stream by stream) with unit weight, and the
     // block's sparse-attention layer advances that stack, which stays in the head rank's stack
-    // plane. Drafting cells run the indexer on the sequences' scratch tails.
+    // plane. Drafting cells run the indexer on the sequences' scratch tails. A catch-up (not
+    // drafting) keeps only what the cells leave in the sequences' state, the layer's KV, pooled
+    // keys and indexer tail, which its attention input determines; no draft reads the stack it
+    // would leave, so it runs the router, whose routes the expert cache counts, but no expert.
     void mtp_pass(std::span<const MtpPart> parts, std::int32_t n, const std::int32_t* ids,
                   const std::int32_t* positions, bool drafting) {
         RankState& rank      = ranks[model.head_rank()];
@@ -4185,8 +4285,12 @@ struct Executor::Impl {
             ops::hyper_connection_write_read(stack, Tensor(rank.y, DType::BF16, {h, n}), inject,
                                              plan.mlp_hc.weights(), eps, ws, mixed, &inject, s);
         }
-        run_moe(plan, rank, n, layers.size());
-        ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, n}), inject, s);
+        if (drafting) {
+            run_moe(plan, rank, n, layers.size());
+            ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, n}), inject, s);
+        } else {
+            route(plan.moe, rank, n, layers.size());
+        }
         record_mtp_routes(n);
     }
 
@@ -4280,12 +4384,9 @@ struct Executor::Impl {
                                        width * 4, cudaMemcpyDeviceToDevice, rank.stream));
         }
         if (n == 0) { return; }
-        if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_mtp(ids, 0, positions, 0);
-        if (misses) { misses->keep_alive(); }
         mtp_pass(parts, n, static_cast<const std::int32_t*>(mtp_ids.p),
                  static_cast<const std::int32_t*>(mtp_positions.p), false);
-        if (hybrid) { hybrid->finish(); }
     }
 
     std::uint32_t draft(std::span<const std::uint32_t> batch, std::span<const std::int32_t> anchors,
@@ -4368,12 +4469,13 @@ struct Executor::Impl {
         };
         // Tokens and positions stay in the staged buffers. Native hybrid experts use the same
         // captured exchange as text decode; GGUF host experts replay too, without counting the
-        // draft steps' routes. A graph is captured at its second use.
-        // Under tensor parallelism the MTP block runs on rank 0 alone.
+        // draft steps' routes. A chain or step of one sequence runs from its shape's graph
+        // (PassGraphs). Under tensor parallelism the MTP block runs on rank 0 alone.
         const bool graph  = options.cuda_graphs && b == 1 &&
                             (device.size() == 1 || tensor()) && !stream;
-        const auto replay = [&](SequenceState::DraftGraph& slot, const auto& body) {
-            if (graph && !slot.chain.ready() && slot.runs++ > 0) {
+        const auto replay = [&](PassGraphs& shape, const auto& body) {
+            const bool run = graph && (!shape.graphs.empty() || shape.runs++ > 0);
+            if (run && (shape.graphs.empty() || shape.sequence != drafting.front())) {
                 DecodeGraphDefinition definition;
                 capturing_draft = true;
                 try {
@@ -4383,10 +4485,15 @@ struct Executor::Impl {
                     throw;
                 }
                 capturing_draft = false;
-                slot.chain.instantiate(definition);
+                if (shape.graphs.empty()) {
+                    shape.graphs.emplace_back().instantiate(definition);
+                } else {
+                    shape.graphs.front().update(definition);
+                }
+                shape.sequence = drafting.front();
             }
-            if (graph && slot.chain.ready()) {
-                slot.chain.launch(rank.stream);
+            if (run) {
+                shape.graphs.front().launch(rank.stream);
             } else {
                 body();
             }
@@ -4397,7 +4504,7 @@ struct Executor::Impl {
         std::vector<std::uint32_t> lengths(b, static_cast<std::uint32_t>(k));
         std::size_t ran = k;
         if (confidence == nullptr || extents.empty()) {
-            replay(drafting.front()->draft.at(k), [&] {
+            replay(draft_graphs.at(k), [&] {
                 for (std::size_t i = 0; i < k; ++i) {
                     step(i);
                     prefetch(i);
@@ -4414,7 +4521,7 @@ struct Executor::Impl {
             const float floor = std::log(options.draft_min_p);
             std::vector<char> open(b, 1);
             for (std::size_t i = 0; i < k; ++i) {
-                replay(drafting.front()->step.at(i), [&] { step(i); });
+                replay(step_graphs.at(i), [&] { step(i); });
                 prefetch(i);
                 CUDA_CHECK(cudaMemcpyAsync(logprobs + i * b, confidence + i * b,
                                            b * sizeof(float), cudaMemcpyDeviceToHost, rank.stream));
@@ -4433,7 +4540,7 @@ struct Executor::Impl {
                     }
                     more = more || open[j];
                 }
-                if (!more) {
+                if (!more && !every_step) {
                     ran = i + 1;
                     break;
                 }
@@ -4504,7 +4611,7 @@ struct Executor::Impl {
                 RankState& rank = ranks[model.head_rank()];
                 std::vector<NgramContext> contexts;
                 for (const auto* sequence : verified) { contexts.push_back(sequence->context); }
-                draft_prefetch->begin_verification(std::move(contexts), tokens);
+                draft_prefetch->begin_verification(std::move(contexts), tokens, verified_widths);
                 const auto count = static_cast<std::int32_t>(tokens.size());
                 auto* first = static_cast<std::int32_t*>(ngram_prefetch_tokens.p);
                 auto* second = first + std::size_t(options.sequences) * w;
@@ -4617,20 +4724,6 @@ struct Executor::Impl {
         }
         verified.clear();
         mtp_catch_up(committed);
-    }
-
-    std::uint64_t snapshot_bytes() const {
-        const SequenceState& sequence = sequences.at(0);
-        std::uint64_t bytes = 0;
-        for (std::size_t i = 0; i < layers.size(); ++i) {
-            each_part(sequence, i, [&](std::size_t, const LayerPlan&, const LayerState& state) {
-                for (const auto& region : recurrent_regions(state)) {
-                    if (region.first != nullptr) { bytes += region.second; }
-                }
-            });
-        }
-        if (mtp) { bytes += sequence.mtp.tail.bytes + sequence.mtp_pending.bytes; }
-        return bytes;
     }
 
     void snapshot(std::uint32_t s, SequenceSnapshot& out) {
@@ -4898,7 +4991,11 @@ void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
     impl_->snapshot(sequence, out);
 }
 
-std::uint64_t Executor::snapshot_bytes() const { return impl_->snapshot_bytes(); }
+std::uint64_t Executor::graph_bytes() const { return impl_->graph_bytes; }
+
+void Executor::size_snapshot(SequenceSnapshot& out) {
+    impl_->size_snapshot(impl_->sequences.at(0), out);
+}
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
     impl_->restore(sequence, from);
@@ -5018,6 +5115,7 @@ void Executor::abort(std::uint32_t sequence) {
     impl_->rows_waited = true;
     impl_->device.synchronize();
     impl_->pending_routes = 0;
+    impl_->pending_decode = true;
     impl_->mtp_routes = 0;
     impl_->verifying = false;
     impl_->verified.clear();

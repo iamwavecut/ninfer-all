@@ -15,7 +15,8 @@
 // (gdn_replay_fold), the sparse-attention indexer tails and the PLE history advance over it from
 // what the verification recorded, and the MTP block catches up over the committed cells. Every
 // other pass (a prompt chunk, a plain decode step) advances the MTP block too, so a sequence can
-// draft whenever it decodes.
+// draft whenever it decodes. A catch-up runs the block's attention and router but not its
+// experts, whose output only a draft reads.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -49,13 +50,16 @@ struct ExecutorOptions {
     // skipped, which is what an all-zero table would give.
     std::optional<NgramTableSource> ngram;
     NgramReadOptions ngram_read;
-    // Host-resident experts only: device memory lent to the expert cache, split evenly over the
-    // ranks; kAutoExpertCache takes what each device has free less a margin, 0 none.
+    // Host- or disk-resident experts: device memory lent to the expert cache, split evenly over
+    // the ranks; kAutoExpertCache starts at half of what each device has free less a margin,
+    // which grow_expert_cache completes once startup has allocated the rest; 0 none (host
+    // experts only).
     static constexpr std::uint64_t kAutoExpertCache = ~std::uint64_t{0};
     std::uint64_t expert_cache_bytes                = kAutoExpertCache;
     HybridExpertOptions hybrid_experts;
-    // Decode steps (one token) of device- and host-resident experts replay a CUDA graph per
-    // segment of consecutive layers on one device.
+    // Decode steps (one token), verifications of up to eight tokens and draft chains of a single
+    // sequence of device- and host-resident experts replay CUDA Graphs, a graph per segment of
+    // consecutive layers on one device, which the sequences share.
     bool cuda_graphs = true;
     // A model loaded with its Vision tower: the most merged tokens the media of one prompt may
     // hold, which sizes the encoder's workspace and the embeddings a prefill reads.
@@ -109,7 +113,8 @@ struct ExecutorMemory {
 // indexer's partial block, the PLE history and the n-gram context. Executor::restore continues
 // the sequence from that position after it moved on; the paged KV and the indexer's pooled keys
 // of earlier positions are not copied, since a sequence only writes positions at or past its own.
-// Device buffers on each layer's device, sized at the first snapshot and reused after.
+// Device buffers on each layer's device, sized at the first snapshot (or by size_snapshot) and
+// reused after.
 struct SequenceSnapshot {
     struct Layer {
         std::vector<DeviceBuffer> buffers; // ssm, conv, tail, history; empty where absent
@@ -157,14 +162,23 @@ public:
     // failed expert read among them). Such a pass ran without some missing experts, so call this
     // once its results are on the host and before they are used. No effect without staged misses.
     void raise_service_failure();
-    // Runs the routes requests take on sequence 0 once and resets it, so the first request does
-    // not pay for loading their kernels (CUDA loads each at its first launch): one token, a
-    // verification's width, a full prefill chunk (16 tokens with host or disk experts, which a
-    // chunk would copy or read whole), a decode step and, with drafts, a draft and a commit.
+    // Runs the routes requests take once and resets the sequences, so that requests neither pay
+    // for loading their kernels (CUDA loads each at its first launch) nor take device memory for
+    // them or for CUDA Graphs: on sequence 0 one token, a verification's width, a full prefill
+    // chunk (16 tokens with host or disk experts, which a chunk would copy or read whole), with
+    // drafts a verification at every width and a commit, then the CUDA Graphs of a decode step, of
+    // a verification at every width up to eight and of every draft chain or step; over every
+    // sequence a decode step of each batch size and, with drafts, a round of all of them.
     void warm_up();
-    // After warm_up: gives the host expert cache what each device still has free beyond
-    // `keep_free_bytes`, as more slots. No effect without a host expert cache.
+    // After warm_up and every other allocation of startup (snapshot buffers among them): gives
+    // the automatic expert cache (host, disk or native host experts) what each device still has
+    // free beyond `keep_free_bytes`, as more slots. No effect without one.
     void grow_expert_cache(std::uint64_t keep_free_bytes);
+    // Device bytes, on the rank that took the most, of the CUDA Graphs the warm-up captured
+    // (zero without CUDA Graphs).
+    [[nodiscard]] std::uint64_t graph_bytes() const;
+    // Gives `out` the device buffers snapshot() fills for a sequence, unless it has them.
+    void size_snapshot(SequenceSnapshot& out);
     [[nodiscard]] std::uint32_t position(std::uint32_t sequence) const;
 
     // Prompt tokens one forward() may take: prefill_chunk, or with layer-major spans (one stage,
@@ -206,8 +220,6 @@ public:
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
     // Copies the sequence's recurrent state into `out`, and back; both wait for the copies.
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
-    // Device bytes one SequenceSnapshot's buffers take once its first snapshot sizes them.
-    [[nodiscard]] std::uint64_t snapshot_bytes() const;
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
     // Bytes of an image at `position`.
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;

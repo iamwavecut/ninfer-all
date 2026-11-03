@@ -6,9 +6,10 @@
 // refused; experts already resident are not read again; a call that releases its layer's other
 // residents gives their slots to later calls before any other resident's but after the empty
 // ones, except a released expert routed to again; a layer with slots of its own (the MTP block's
-// wider experts) evicts only its own, and shares the others' when the budget cannot hold both; and
-// a read that fails raises FileReadError and leaves no slot taken for an expert it did not finish
-// reading.
+// wider experts) evicts only its own, and shares the others' when the budget cannot hold both; a
+// pool that starts at half its budget keeps the budget's layout, and growing it adds empty slots
+// to the shared pool, which misses take before any resident's; and a read that fails raises
+// FileReadError and leaves no slot taken for an expert it did not finish reading.
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/file_read_error.h"
@@ -120,13 +121,14 @@ int run() {
     const std::vector<std::uint64_t> budget = {10 * kShared + 4 * kOwn};
     auto owner = std::make_unique<ExpertStream>(device, paths, stream_layers(), budget);
     ExpertStream& stream = *owner;
+    ExpertStream* checked = &stream; // the stream check() prepares and reads
     require(stream.stats().slots == 14, "ten shared slots and four of layer 2's own");
     require(stream.storage(0) == stream.storage(1) && stream.storage(0) != stream.storage(2),
             "layer 2 has slots of its own");
 
     const auto check = [&](int layer, const std::vector<std::int32_t>& ids,
                            const std::string& label, bool release_others = false) {
-        stream.prepare(layer, ids, release_others);
+        checked->prepare(layer, ids, release_others);
         device.synchronize();
         for (int k = 0; k < 3; ++k) {
             std::vector<const void*> entries(kExperts);
@@ -221,6 +223,30 @@ int run() {
         narrow.prepare(0, std::vector<std::int32_t>{3, 7}, false);
         narrow.prepare(2, std::vector<std::int32_t>{0, 1, 2, 3}, false);
         require(narrow.stats().hits == 4, "the shared slots hold both layers' experts");
+        device.synchronize();
+    }
+    {
+        // Started at half the budget: the same layout, layer 2's four own slots and the shared
+        // pool at its widest call (ten slots, more than half the budget's). Growth adds whole
+        // shared slots only; five misses take them, so layer 1's ten experts stay resident and
+        // every expert reads as stored.
+        ExpertStream half(device, paths, stream_layers(),
+                          std::vector<std::uint64_t>{20 * kShared + 4 * kOwn}, true);
+        require(half.stats().slots == 14 && half.pool_bytes(0) == 10 * kShared + 4 * kOwn &&
+                    half.storage(0) != half.storage(2),
+                "a pool that grows starts at its widest call in the budget's layout");
+        checked = &half;
+        check(1, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, "layer 1 fills the started slots");
+        const auto added = half.grow(std::vector<std::uint64_t>{5 * kShared + kShared / 2});
+        require(added.size() == 1 && added[0] == 5 * kShared && half.stats().slots == 19 &&
+                    half.storage(0)[1].second - half.storage(0)[1].first == 5 * kShared &&
+                    half.storage(2)[1].first == half.storage(2)[1].second,
+                "growth adds whole slots to the shared pool only");
+        check(0, {10, 11, 12, 13, 14}, "misses into the grown slots");
+        const auto hits = half.stats().hits;
+        check(1, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, "layer 1 after growth");
+        require(half.stats().hits - hits == 10, "grown slots are taken before residents'");
+        checked = &stream;
         device.synchronize();
     }
 #ifndef _WIN32

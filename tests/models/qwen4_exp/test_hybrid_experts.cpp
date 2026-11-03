@@ -92,8 +92,9 @@ std::vector<double> oracle(const Projection& gate, const Projection& up, const P
     return out;
 }
 
+// `grown` slots are added after construction, as the automatic cache grows after the warm-up.
 void run(DeviceContext& device, std::array<int, 3> bits, bool a8, bool panel,
-         unsigned cached, float share, bool adaptive) {
+         unsigned cached, float share, bool adaptive, unsigned grown = 0) {
     Projection gate(bits[0], I, H, panel, 17), up(bits[1], I, H, panel, 29),
                down(bits[2], H, I, panel, 41);
     Projection gate_b(bits[0], I, H, panel, 59), up_b(bits[1], I, H, panel, 73),
@@ -136,6 +137,14 @@ void run(DeviceContext& device, std::array<int, 3> bits, bool a8, bool panel,
         while (!cancelled.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
     });
     require(hybrid.cache_bytes(0) == cached * slot, "hybrid cache ignored its byte budget");
+    if (grown) {
+        // The new slots take the most routed experts the cache lacks; the products below read them.
+        const auto added = hybrid.grow(std::vector<std::uint64_t>{grown * slot + slot / 2});
+        require(added.size() == 1 && added[0] == grown * slot &&
+                    hybrid.cache_bytes(0) == (cached + grown) * slot &&
+                    hybrid.stats().slots == cached + grown,
+                "hybrid growth adds whole slots");
+    }
 
     // A zero BF16 shared expert still exercises the actual shared GPU route and merge.
     DeviceBuffer zero(H * I * 2); zero.fill(0);
@@ -270,7 +279,7 @@ int main() {
     try {
         DeviceContext device;
         run(device, {2, 2, 2}, true, false, 0, 0, false);
-        run(device, {2, 5, 4}, false, true, 4, 0.5F, false);
+        run(device, {2, 5, 4}, false, true, 4, 0.5F, false, 2);
         run(device, {5, 4, 5}, true, false, 0, 1, false);
         run(device, {4, 4, 4}, true, true, 4, 0, true);
         std::cout << "HYBRID_EXPERT_ORACLE_PASS\n";

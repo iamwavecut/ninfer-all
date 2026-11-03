@@ -121,7 +121,8 @@ struct HybridExperts::Impl {
     struct Layer {
         HybridExpertLayer inputs;
         std::size_t slot_bytes = 0;
-        DeviceBuffer cache;
+        // The slots from the first, then grow's after them.
+        DeviceBuffer cache, grown;
         std::vector<std::int32_t> slot_of, expert_of;
         std::vector<double> score;
     };
@@ -167,6 +168,7 @@ struct HybridExperts::Impl {
     std::mutex wake_mutex;
     std::condition_variable wake;
     std::atomic<bool> stopping{false};
+    bool grew = false;
     std::thread supervisor;
 
     void check_cancelled() const {
@@ -245,8 +247,10 @@ struct HybridExperts::Impl {
             RankBinding bind(device, r);
             std::size_t free = 0, total = 0;
             CUDA_CHECK(cudaMemGetInfo(&free, &total));
+            // The automatic cache starts at half: grow() completes it once startup has
+            // allocated the rest.
             const auto available = free > kMargin ? free - kMargin : 0;
-            const auto budget = requested_cache == ~std::uint64_t{0} ? available :
+            const auto budget = requested_cache == ~std::uint64_t{0} ? available / 2 :
                 std::min<std::uint64_t>(available, requested_cache / ranks.size());
             for (auto& layer : layers) {
                 if (layer.inputs.rank != r) { continue; }
@@ -263,7 +267,7 @@ struct HybridExperts::Impl {
                 counters.slots += static_cast<std::uint32_t>(slots);
                 // Equal counts keep ascending expert IDs; the selected placement is frozen
                 // unless adaptive caching was requested and is part of the context image key.
-                fill_cache(layer);
+                fill_cache(layer, 0);
             }
         }
         supervisor = std::thread([this] { supervise(); });
@@ -276,15 +280,24 @@ struct HybridExperts::Impl {
         if (supervisor.joinable()) { supervisor.join(); }
     }
 
-    void fill_cache(Layer& layer) {
+    // Slot `slot` of the layer: its first block's, then grow's.
+    static std::byte* slot_base(const Layer& layer, std::size_t slot) {
+        const std::size_t first = layer.cache.bytes / layer.slot_bytes;
+        return slot < first
+                   ? static_cast<std::byte*>(layer.cache.p) + slot * layer.slot_bytes
+                   : static_cast<std::byte*>(layer.grown.p) + (slot - first) * layer.slot_bytes;
+    }
+
+    // Copies the experts of slots [from, end) in, which one block holds.
+    void fill_cache(Layer& layer, std::size_t from) {
         auto& rank = ranks[layer.inputs.rank];
         const auto stream = device.rank(layer.inputs.rank).transfer_stream;
         const auto per_batch = std::max<std::size_t>(1, staging_bytes / layer.slot_bytes);
-        std::size_t at = 0, batch = 0;
+        std::size_t at = from, batch = 0;
         while (at < layer.expert_of.size()) {
             if (layer.inputs.registered) {
-                copy_registered(layer.inputs.experts[layer.expert_of[at]],
-                    static_cast<std::byte*>(layer.cache.p) + at * layer.slot_bytes, stream);
+                copy_registered(layer.inputs.experts[layer.expert_of[at]], slot_base(layer, at),
+                                stream);
                 ++at;
                 continue;
             }
@@ -292,7 +305,7 @@ struct HybridExperts::Impl {
             if (batch > staging.size()) { rank.staged[ring]->synchronize(); }
             const auto n = std::min(per_batch, layer.expert_of.size() - at);
             auto* host = static_cast<std::byte*>(staging[ring]->data());
-            auto* target = static_cast<std::byte*>(layer.cache.p) + at * layer.slot_bytes;
+            auto* target = slot_base(layer, at);
             for (std::size_t j = 0; j < n; ++j) {
                 pack(layer.inputs.experts[layer.expert_of[at + j]], host + j * layer.slot_bytes,
                      target + j * layer.slot_bytes);
@@ -302,15 +315,50 @@ struct HybridExperts::Impl {
             at += n;
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (std::size_t slot = 0; slot < layer.expert_of.size(); ++slot) {
+        for (std::size_t slot = from; slot < layer.expert_of.size(); ++slot) {
             layer.slot_of[layer.expert_of[slot]] = static_cast<std::int32_t>(slot);
         }
-        counters.admitted += layer.expert_of.size();
-        counters.copied_bytes += layer.cache.bytes;
+        counters.admitted += layer.expert_of.size() - from;
+        counters.copied_bytes += (layer.expert_of.size() - from) * layer.slot_bytes;
+    }
+
+    // More slots for every layer, from `bytes_by_rank` shared evenly by a rank's layers as at
+    // construction, holding the most routed experts the cache lacks.
+    std::vector<std::uint64_t> grow(std::span<const std::uint64_t> bytes_by_rank) {
+        const std::lock_guard lock(state_mutex);
+        if (grew) { throw std::logic_error("hybrid experts: the cache has grown already"); }
+        grew = true;
+        std::vector<std::uint64_t> added(ranks.size(), 0);
+        std::vector<std::size_t> layer_counts(ranks.size(), 0);
+        for (const auto& layer : layers) { ++layer_counts[layer.inputs.rank]; }
+        for (auto& layer : layers) {
+            const std::size_t r = layer.inputs.rank;
+            if (r >= bytes_by_rank.size()) { continue; }
+            const std::size_t have = layer.expert_of.size();
+            const auto slots = std::min<std::uint64_t>(layer.slot_of.size() - have,
+                bytes_by_rank[r] / layer_counts[r] / layer.slot_bytes);
+            if (slots == 0) { continue; }
+            std::vector<std::int32_t> order;
+            for (std::size_t e = 0; e < layer.slot_of.size(); ++e) {
+                if (layer.slot_of[e] < 0) { order.push_back(static_cast<std::int32_t>(e)); }
+            }
+            std::stable_sort(order.begin(), order.end(), [&](auto a, auto b) {
+                return layer.inputs.route_counts[a] > layer.inputs.route_counts[b];
+            });
+            RankBinding bind(device, r);
+            layer.grown = DeviceBuffer(slots * layer.slot_bytes);
+            layer.expert_of.insert(layer.expert_of.end(), order.begin(),
+                                   order.begin() + static_cast<std::ptrdiff_t>(slots));
+            fill_cache(layer, have);
+            ranks[r].cache_bytes += layer.grown.bytes;
+            added[r] += layer.grown.bytes;
+            counters.slots += static_cast<std::uint32_t>(slots);
+        }
+        return added;
     }
 
     void admit(Layer& layer, std::int32_t expert, std::size_t slot) {
-        auto* target = static_cast<std::byte*>(layer.cache.p) + slot * layer.slot_bytes;
+        auto* target = slot_base(layer, slot);
         const auto stream = device.rank(layer.inputs.rank).transfer_stream;
         if (layer.inputs.registered) { copy_registered(layer.inputs.experts[expert], target, stream); }
         else {
@@ -424,7 +472,7 @@ struct HybridExperts::Impl {
             used.push_back(static_cast<std::int32_t>(e));
             const auto slot = layer.slot_of[e];
             if (slot >= 0) {
-                auto* target = static_cast<std::byte*>(layer.cache.p) + std::size_t(slot) * layer.slot_bytes;
+                auto* target = slot_base(layer, std::size_t(slot));
                 const auto resident = pack(layer.inputs.experts[e], nullptr, target);
                 for (std::size_t p = 0; p < resident.size(); ++p) { tables[p * count + e] = resident[p]; }
                 gpu[e] = true;
@@ -670,6 +718,9 @@ ExpertCacheStats HybridExperts::stats() const noexcept {
     return impl_->counters;
 }
 std::uint64_t HybridExperts::cache_bytes(std::size_t rank) const { return impl_->ranks.at(rank).cache_bytes; }
+std::vector<std::uint64_t> HybridExperts::grow(std::span<const std::uint64_t> bytes_by_rank) {
+    return impl_->grow(bytes_by_rank);
+}
 std::uint64_t HybridExperts::working_bytes(std::size_t index) const {
     const auto& r = impl_->ranks.at(index);
     return r.slots.bytes + r.tables.bytes + r.parts.bytes + r.cpu_sum.bytes + r.sequence.bytes;

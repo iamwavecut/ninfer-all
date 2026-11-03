@@ -117,7 +117,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     if (mtp && (speculative.draft_tokens == 0 || speculative.draft_tokens > 7)) {
         throw std::invalid_argument("Gemma 4: --spec mtp requires --draft-tokens in [1,7]");
     }
-    if (speculative.draft_min_p != 0 || speculative.mtp_attention_window != 0 ||
+    if (speculative.draft_min_p.value_or(0.0F) != 0 || speculative.mtp_attention_window != 0 ||
         speculative.ngram_archive_bytes != 0 || speculative.proposal_head != ProposalHead::Auto) {
         throw std::invalid_argument("Gemma 4's assistant has no --draft-min-p, n-gram archive, "
                                     "--mtp-attention-window or proposal head");

@@ -828,8 +828,10 @@ int main(int argc, char** argv) {
     failures += run_case({24, 48, 10240}, 6, 4, {0, 2, 5, 6}, 1861U, true);
     failures += run_case({7, 48, 10240}, 3, 8, {3, 0, 1, 2, 3, 1, 2, 0}, 1863U);
     failures += run_case({11, 32, 8192}, 6, 2, {6, 1}, 1865U);
-    // Records packed at a round's narrower width inside blocks planned for a wider one.
+    // Records packed at a round's narrower width inside blocks planned for a wider one; a round
+    // that verifies every row at its anchor alone records one column a row.
     failures += run_case({48, 48, 10240}, 5, 3, {1, 3, 5}, 1826U, false, 9);
+    failures += run_case({48, 48, 10240}, 1, 3, {1, 0, 1}, 1828U, false, 4);
     for (const int commit : {0, 1, 4, 15, 16, 17, 30, 31, 32}) {
         failures += run_case({48, 48, 10240}, 32, 1, {commit}, 1925U + commit, true);
         failures += run_case({30, 32, 8192}, 32, 1, {commit}, 2025U + commit, true);

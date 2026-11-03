@@ -299,7 +299,7 @@ int main() {
     }
 
     int failures = 0;
-    for (const auto [batch, width] : {std::pair{2, 17}, {8, 32}, {2, 64}, {1, 65}, {1, 1}}) {
+    for (const auto [batch, width] : {std::pair{2, 17}, {8, 32}, {2, 64}, {1, 65}, {9, 2}}) {
         Tensor q(nullptr, DType::BF16, {128, 16, width, batch});
         Tensor v(nullptr, DType::BF16, {128, 48, width, batch});
         Tensor empty;
@@ -320,7 +320,8 @@ int main() {
     failures += run_case(32, 2, 1, {}, 1701U);
     failures += run_case(32, 16, 1, {7}, 1711U);
     failures += run_case(32, 6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1721U);
-    for (int width = 2; width <= 64; ++width) {
+    // T=1 is a row verified at its anchor alone.
+    for (int width = 1; width <= 64; ++width) {
         failures += run_case(48, width, 1, {}, 1730U + width);
         if (width > 16) {
             failures += run_case(48, width, 1, {width / 2}, 1830U + width);
@@ -338,6 +339,7 @@ int main() {
     failures += run_case(24, 6, 4, {6, 2, 5, 1}, 1793U, 8);
     failures += run_case(12, 16, 2, {16, 9}, 1795U, 4);
     failures += run_case(9, 6, 3, {6, 1, 4}, 1797U, 3);
+    failures += run_case(9, 1, 3, {}, 1798U, 3);
     failures += run_case(10, 16, 2, {11, 16}, 1799U, 5);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;

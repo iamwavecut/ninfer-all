@@ -57,8 +57,9 @@ constexpr std::uint32_t kPeerSpanChunks = 2;
 
 using Clock = std::chrono::steady_clock;
 
-// Device memory kept free when the host expert cache grows after warm-up.
-constexpr std::uint64_t kGrowthMargin = 640ULL << 20;
+// Device memory the automatic expert cache leaves free when it takes the rest after startup, for
+// what requests still allocate: kernels the warm-up did not reach and library workspaces.
+constexpr std::uint64_t kGrowthMargin = 384ULL << 20;
 
 std::uint64_t elapsed_ns(Clock::time_point from, Clock::time_point to) {
     return static_cast<std::uint64_t>(
@@ -121,10 +122,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument(
             "Qwen3.8-Flash-Next drafts with its MTP block only (--spec mtp)");
     }
-    const bool mtp = speculative.backend == SpeculativeBackend::Mtp;
-    if (!std::isfinite(speculative.draft_min_p) || speculative.draft_min_p < 0 ||
-        speculative.draft_min_p > 1 || (!mtp && speculative.draft_min_p != 0)) {
-        throw std::invalid_argument("--draft-min-p requires --spec mtp and a finite value in [0,1]");
+    const bool mtp    = speculative.backend == SpeculativeBackend::Mtp;
+    const float floor = speculative.draft_min_p.value_or(0.0F);
+    if (!std::isfinite(floor) || floor < 0 || floor > 1 || (!mtp && floor != 0)) {
+        throw std::invalid_argument("--draft-min-p requires MTP and a finite value in [0,1]");
     }
     if (mtp && (speculative.draft_tokens == 0 || speculative.draft_tokens > 15)) {
         throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,15]");
@@ -260,7 +261,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.max_context     = options.max_context;
     executor.sequences       = options.max_concurrency;
     executor.draft_tokens    = mtp ? speculative.draft_tokens : 0;
-    executor.draft_min_p     = speculative.draft_min_p;
+    executor.draft_min_p     = speculative.draft_min_p.value_or(0.0F);
     // The rotation past the native window, as every family resolves it (rope_scaling.h): YaRN
     // reaches every rotation this model makes (sparse attention, its indexer, the MTP block);
     // linear position interpolation is refused.
@@ -291,20 +292,17 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                            routes.c_str());
     }
     {
-        // The first request would otherwise load every kernel it reaches.
+        // The first request would otherwise load every kernel it reaches, and requests would take
+        // device memory for them and for the CUDA Graphs the warm-up captures.
         StartupPhaseScope warm(options.startup_observer, StartupPhase::CudaGraphPrepare);
         instance->executor->warm_up();
-        // With --expert-cache-mib auto, what startup left free beyond a margin for lazily loaded
-        // kernels and the CUDA Graphs the first requests capture becomes expert slots, less what
-        // the context cache's per-sequence snapshots take when their first prompts reach an anchor
-        // (they are sized then); an explicit size is the cache's size.
-        if (!options.expert_cache_bytes) {
-            const std::uint64_t snapshots =
-                options.context_cache.enabled
-                    ? std::uint64_t(options.max_concurrency) * instance->executor->snapshot_bytes()
-                    : 0;
-            instance->executor->grow_expert_cache(kGrowthMargin + snapshots);
-        }
+        // Every sequence's snapshot, which the context cache takes at a prompt's anchor and a
+        // branched read at its shared prefix, is sized now, beside its other state.
+        instance->snapshots.resize(executor.sequences);
+        for (auto& snapshot : instance->snapshots) { instance->executor->size_snapshot(snapshot); }
+        // With --expert-cache-mib auto, what startup left free beyond a margin becomes expert
+        // slots; an explicit size is the cache's size.
+        if (!options.expert_cache_bytes) { instance->executor->grow_expert_cache(kGrowthMargin); }
         warm.complete();
     }
     instance->free_after_weights = free_after_weights;
@@ -325,7 +323,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "Qwen3.8-Flash-Next: %zu stage(s), experts in %s memory, n-gram table "
-                       "%s, state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB",
+                       "%s, state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB, CUDA "
+                       "Graphs %.0f MiB",
                        model->stages().stages(),
                        options.expert_residency == ExpertResidency::Host   ? "host"
                        : options.expert_residency == ExpertResidency::Disk ? "the artifact's files"
@@ -333,7 +332,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        table_place.c_str(),
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
-                       double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
+                       double(instance->executor->memory().expert_cache_bytes) / 1048576.0,
+                       double(instance->executor->graph_bytes()) / 1048576.0);
     if (model->tensor_parallel()) {
         std::string keys, kv, experts;
         const auto range = [](std::string& out, std::size_t rank, std::uint32_t begin,
@@ -569,9 +569,10 @@ struct Qwen4ExpCore::Impl {
     // Worker-owned.
     std::vector<Slot> slots; // by executor sequence
     std::uint64_t use_clock = 0;
-    // Decode steps since the last prefill step (saturating), and the steps due before a chunk's
-    // worth of prompt while others decode.
-    std::uint32_t decode_run = 0;
+    // The tokens each decoding request has fed on average since the last prefill step (a plain
+    // round one, a speculative round its committed run), and the rounds of one token due before a
+    // chunk's worth of prompt while others decode.
+    double decode_run = 0;
     std::uint32_t decode_rounds_per_prefill = 1;
 
     // Head-device sampling planes, a row per slot; with structured output the grammars' token
@@ -648,6 +649,10 @@ struct Qwen4ExpCore::Impl {
             mtp_controller.emplace();
             mtp_controller->reset(drafts, 1);
         }
+        for (std::size_t s = 0; s < slots.size() && s < i.snapshots.size(); ++s) {
+            slots[s].snapshot = std::move(i.snapshots[s]);
+        }
+        i.snapshots.clear();
         RankBinding bind(device, i.executor->head_rank());
         const std::size_t rows = slots.size();
         // A sampling call's columns per row: one, or a verification's drafts and bonus.
@@ -1028,8 +1033,9 @@ struct Qwen4ExpCore::Impl {
         return "qwen4_exp-image1-" + id + "-kv" +
                std::to_string(static_cast<int>(options.kv_cache)) + "-drafts" +
                std::to_string(drafts) + "-draft-min-p" +
-               std::to_string(std::bit_cast<std::uint32_t>(options.speculative.draft_min_p)) + "-ngram" +
-               std::to_string(options.ngram_table.disabled ? 0 : 1) + "-experts-" +
+               std::to_string(
+                   std::bit_cast<std::uint32_t>(options.speculative.draft_min_p.value_or(0.0F))) +
+               "-ngram" + std::to_string(options.ngram_table.disabled ? 0 : 1) + "-experts-" +
                instance.executor->expert_execution_profile();
     }
 
@@ -1511,9 +1517,12 @@ struct Qwen4ExpCore::Impl {
         // A prompt's chunk takes far longer than a decode round, so while others decode a prefill
         // step waits for decode_rounds_per_prefill rounds per chunk it computes: proportionally
         // fewer, at least one, for a shorter step, so a short prompt gets in after one round, and
-        // more for a step of several chunks, so the streams keep their share of the GPU.
+        // more for a step of several chunks, so the streams keep their share of the GPU. A
+        // speculative round counts as the tokens its requests fed on average, so drafting gives
+        // the streams the tokens plain rounds would and holds a prompt back no longer.
         if (prefilling &&
-            (!decoding || decode_run >= decode_rounds_before(prompt_step_tokens(*prefilling)))) {
+            (!decoding ||
+             decode_run >= double(decode_rounds_before(prompt_step_tokens(*prefilling))))) {
             decode_run = 0;
             for (const Slot& slot : slots) {
                 if (slot.request && !slot.request->decoding && slot.request != prefilling &&
@@ -1528,8 +1537,7 @@ struct Qwen4ExpCore::Impl {
             return true;
         }
         if (!decoding) { return false; }
-        decode_run += decode_run != UINT32_MAX;
-        decode_step();
+        decode_run += decode_step();
         return true;
     }
 
@@ -2218,8 +2226,9 @@ struct Qwen4ExpCore::Impl {
 
     // One step of every decoding request: those that speculate run one MTP round together, those
     // that feed one token otherwise run as one batch, whose experts read their weights once; one
-    // feeding a thinking-control suffix runs alone.
-    void decode_step() {
+    // feeding a thinking-control suffix runs alone. Returns the tokens the requests that ran fed on
+    // average, at least one.
+    double decode_step() {
         auto& executor = *instance.executor;
         std::vector<std::shared_ptr<Request>> batch, alone, speculative, deferred;
         for (const Slot& slot : slots) {
@@ -2241,7 +2250,13 @@ struct Qwen4ExpCore::Impl {
                 (request->feed.size() == 1 ? batch : alone).push_back(request);
             }
         }
-        if (batch.empty() && alone.empty() && speculative.empty() && deferred.empty()) { return; }
+        if (batch.empty() && alone.empty() && speculative.empty() && deferred.empty()) { return 1; }
+        std::vector<std::pair<const Request*, std::uint32_t>> fed_from;
+        for (const auto* group : {&alone, &batch, &speculative}) {
+            for (const auto& request : *group) {
+                fed_from.emplace_back(request.get(), request->position);
+            }
+        }
         const auto start = Clock::now();
         if (!deferred.empty()) { sample_deferred(deferred); }
         for (const auto& request : alone) {
@@ -2269,10 +2284,17 @@ struct Qwen4ExpCore::Impl {
         }
         if (!batch.empty()) { plain_step(batch); }
         if (!speculative.empty()) { speculative_round(speculative); }
-        std::lock_guard lock(stats_mutex);
-        stats.decode_rounds += 1;
-        stats.decode_row_rounds += batch.size() + alone.size() + speculative.size();
-        stats.decode_seconds_total += seconds(start, Clock::now());
+        {
+            std::lock_guard lock(stats_mutex);
+            stats.decode_rounds += 1;
+            stats.decode_row_rounds += batch.size() + alone.size() + speculative.size();
+            stats.decode_seconds_total += seconds(start, Clock::now());
+        }
+        std::uint64_t fed = 0;
+        for (const auto& [request, position] : fed_from) {
+            fed += request->position > position ? request->position - position : 0;
+        }
+        return fed_from.empty() ? 1.0 : std::max(1.0, double(fed) / double(fed_from.size()));
     }
 
     // Keeps logits row `row` of `source` for the request until its grammar mask is ready.
@@ -2394,10 +2416,17 @@ struct Qwen4ExpCore::Impl {
             anchors.push_back(request->feed.front());
         }
         const auto round_start = Clock::now();
-        // With --adaptive-mtp the controller picks the round's steps from each request's draft
-        // survival and the round times it has measured; a new set of requests restarts its probe.
-        std::uint32_t steps = drafts;
-        if (mtp_controller) {
+        // With --adaptive-mtp the controller picks a lone request's steps from its draft survival
+        // and the round times it has measured; a new request restarts its probe. A round of
+        // several requests drafts as the automatic drafting does, kAutomaticDraftTokens steps at
+        // most, every request verifying its drafts up to the floor: a batch drafts until each of
+        // its requests has reached the floor or the round's width, so a wider round runs nearly
+        // every step for all of them, and verifying fewer drafts than ran wastes the rest.
+        const bool adapts   = mtp_controller && b == 1;
+        std::uint32_t steps = mtp_controller && b > 1
+                                  ? std::min(drafts, SpeculativeOptions::kAutomaticDraftTokens)
+                                  : drafts;
+        if (adapts) {
             std::vector<const runtime::MtpAdaptiveSignal*> signals;
             std::vector<std::uint32_t> available, room;
             std::uint64_t cohort = 1469598103934665603ULL;
@@ -2422,7 +2451,7 @@ struct Qwen4ExpCore::Impl {
         // Context lookup (--lookup-ngram N): a row whose last N tokens, its anchor last, appeared
         // earlier in its sequence proposes what followed then, in place of the MTP block's guess,
         // which is weakest where the output repeats its input; verification keeps it exact. It
-        // proposes up to the round's width: with --adaptive-mtp the one the controller chose, since
+        // proposes up to the round's width (with --adaptive-mtp, the steps the round drafts), since
         // a wider verification also routes to more experts. The MTP block drafts the other rows
         // only, and no row when all have a proposal.
         std::vector<char> looked_up(b, 0);
@@ -2468,7 +2497,7 @@ struct Qwen4ExpCore::Impl {
             draft_extents[j] =
                 static_cast<std::uint32_t>(std::min<std::size_t>(draft_extents[j], remaining - 1));
         }
-        if (mtp_controller) {
+        if (adapts) {
             std::vector<const runtime::MtpAdaptiveSignal*> signals;
             for (std::size_t j = 0; j < b; ++j) {
                 signals.push_back(looked_up[j] ? nullptr : &batch[j]->mtp_signal);
@@ -2685,7 +2714,9 @@ struct Qwen4ExpCore::Impl {
                 r.mtp_signal.observe(std::min<std::uint32_t>(draft_extents[j], steps),
                                      std::uint32_t(drafts_n));
                 ++r.speculative.rounds_per_window[steps - 1];
-                if (mtp_controller->transitioned()) { ++r.speculative.window_transitions; }
+                if (adapts && mtp_controller->transitioned()) {
+                    ++r.speculative.window_transitions;
+                }
             }
             for (std::int32_t i = 0; i < drafts_n; ++i) {
                 ++r.speculative.accepted_per_position[i];
@@ -2723,9 +2754,9 @@ struct Qwen4ExpCore::Impl {
             }
         }
         executor.commit(sequences, kept);
-        // The controller measures rounds of MTP drafts only: a lookup changes the round's width.
-        // The plan prices the rows verified, whatever proposed them.
-        if (mtp_controller) {
+        // The controller measures the rounds it picked of MTP drafts only: a lookup changes the
+        // round's width. The plan prices the rows verified, whatever proposed them.
+        if (adapts) {
             const double round_seconds = seconds(round_start, Clock::now());
             if (lookups == 0) {
                 mtp_controller->observe_execution(static_cast<std::uint32_t>(b), steps,

@@ -222,6 +222,7 @@ ExpertCache::ExpertCache(DeviceContext& device, std::vector<ExpertCacheLayer> la
     staging_ = std::make_unique<PinnedHostBuffer>(std::max<std::size_t>(staging_bytes, 64));
     tier_    = std::make_unique<ExpertTier>(experts_per_layer, pools, tier);
     if (last_is_mtp && !layers_.empty()) { mtp_ = layers_.size() - 1; }
+    if (profile != nullptr) { profile_ = *profile; }
     for (std::size_t index = 0; index < layers_.size(); ++index) {
         tier_->set_free(std::uint32_t(index), layers_[index].slots);
     }
@@ -544,7 +545,8 @@ std::vector<std::uint64_t> ExpertCache::grow(std::span<const std::uint64_t> byte
     std::lock_guard lock(mutex_);
     if (!loans_.empty()) { throw std::logic_error("expert cache: grow before lending buffers"); }
     std::vector<std::uint64_t> added(bytes_by_rank.size(), 0);
-    // As at construction, every growing layer of a rank gains the same number of slots.
+    // As at construction: the profile's ranking from where construction stopped, the MTP block
+    // its even share, else the same number of slots for every growing layer of a rank.
     std::map<std::size_t, std::vector<std::size_t>> on_rank;
     for (std::size_t index = 0; index < layers_.size(); ++index) {
         const Layer& layer = layers_[index];
@@ -557,14 +559,17 @@ std::vector<std::uint64_t> ExpertCache::grow(std::span<const std::uint64_t> byte
         std::vector<std::uint64_t> slot_bytes;
         std::vector<std::size_t> experts;
         std::vector<std::uint32_t> have;
-        for (const auto index : members) {
+        std::vector<const std::vector<std::uint64_t>*> ranked;
+        std::size_t mtp = members.size();
+        for (std::size_t i = 0; i < members.size(); ++i) {
+            const std::size_t index = members[i];
             slot_bytes.push_back(layers_[index].slot_bytes);
             experts.push_back(layers_[index].experts());
             have.push_back(layers_[index].slots);
+            ranked.push_back(profile_.empty() ? nullptr : &profile_[index]);
+            if (index == mtp_) { mtp = i; }
         }
-        const auto more = share_slots(bytes_by_rank[rank], slot_bytes, experts, have,
-                                      std::vector<const std::vector<std::uint64_t>*>(members.size(), nullptr),
-                                      members.size());
+        const auto more = share_slots(bytes_by_rank[rank], slot_bytes, experts, have, ranked, mtp);
         for (std::size_t i = 0; i < members.size(); ++i) {
             if (more[i] == 0) { continue; }
             const std::size_t index = members[i];

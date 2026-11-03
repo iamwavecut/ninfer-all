@@ -30,10 +30,12 @@ public:
     // Capturable: both candidates are device I32 [batch], immutable until join() completes.
     void enqueue(std::size_t step, const std::int32_t* first, const std::int32_t* second,
                   cudaStream_t compute);
-    // Prefix and candidates are sequence-major [batch, width], width in [2, steps + 1]. Each column's candidates
+    // Prefix and candidates are sequence-major, each sequence's columns packed at its own width
+    // (`widths`, each in [1, steps + 1], summing to the prefix's length). Each column's candidates
     // follow that prefix column; neither candidate changes the following column's context.
     void begin_verification(std::vector<NgramContext> contexts,
-                             std::span<const std::int32_t> prefix);
+                             std::span<const std::int32_t> prefix,
+                             std::span<const std::int32_t> widths);
     void enqueue_verification(const std::int32_t* first, const std::int32_t* second,
                                cudaStream_t compute);
     // Capturable join, required before ending a multi-stream capture or reusing the operands.
@@ -58,13 +60,12 @@ private:
     std::int32_t eos_;
     std::uint32_t vocab_;
     std::size_t capacity_, batch_ = 0;
-    std::size_t verification_width_ = 0;
     PinnedHostBuffer tokens_;
     std::vector<Step> steps_;
     CudaCompletionEvent done_;
     cudaStream_t stream_ = nullptr;
     std::vector<NgramContext> contexts_;
-    std::vector<std::int32_t> verification_prefix_;
+    std::vector<std::int32_t> verification_prefix_, verification_widths_;
     std::vector<std::uint64_t> rows_;
     std::exception_ptr failure_;
 };

@@ -202,7 +202,13 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
 
 Qwen3.8-Flash-Next runs end to end from a converted GSQ-RCO release. The generate test answers
 fact prompts and a 4,463-token needle, decodes three sequences as one batch and from a restored
-snapshot, and, where decode replays CUDA graphs, checks every token against eager decode.
+snapshot, and, where decode replays CUDA graphs, checks every token against eager decode;
+sequences that take single steps in turn, which moves the graphs they share at every step, must
+decode exactly as each did alone. With the MTP block it also decodes by speculative rounds, one
+sequence and two at once, the two also with each row verifying its own number of drafts (none to
+all), as the Engine packs a batch, and in turn, rounds alternating between them; after plain
+steps of two sequences at once, which advance the MTP block without drafts, the rounds' drafts
+must survive at least half as often as after a prompt.
 `NINFER_QWEN4_EXP_EXPERTS` picks `device`, `host` or `disk`, `NINFER_QWEN4_EXP_DEVICES` the pipeline
 devices, and `NINFER_QWEN4_EXP_EXPERT_CACHE_MIB` the device expert cache of host or disk experts
 (a 24 GB card's on a larger one); a model stored without its n-gram table takes the table artifact
@@ -232,6 +238,17 @@ NINFER_FLASH_NEXT_DEVICES=0,1 \
 ```
 
 `NINFER_FLASH_NEXT_CACHE_ONLY=1` runs the image spill/restore/isolation regression alone.
+`NINFER_FLASH_NEXT_CONFIDENCE_ONLY=1` runs the draft-confidence checks alone, one request at a time
+on GPU 0 with host experts; `NINFER_FLASH_NEXT_CONFIDENCE_BATCHED=1` adds three concurrent requests
+whose rows verify at their own widths (with logprobs, at the round's width), with host experts when
+`NINFER_FLASH_NEXT_DEVICES` names one device and resident on two. Each request is reported as SAME
+or DIFF against plain batched decoding: with host experts a verification of more than eight columns
+in all runs the general expert products, whose rounding differs from the decode products, so a near
+tie may resolve otherwise. Three `--adaptive-mtp` requests at once must draft and finish. On one
+device it then runs eight requests at once on the automatic expert cache, host experts drafting as
+the Engine chooses and disk experts without drafts (as it chooses for them) and with three a round,
+and requires the device memory taken after startup (`AUTO_CACHE ... grown_after_startup_mib`) to
+stay within the 384 MiB the cache leaves free.
 `NINFER_FLASH_NEXT_SAMPLING_ONLY=1` repeats the seeded K=1 request over three sequence slots,
 with and without CUDA graphs, and reports the first differing token's top-logprob records.
 On Linux, `ninfer_qwen4_exp_peer_copy_order_test` repeats that workload while delaying alternate

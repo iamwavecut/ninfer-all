@@ -459,6 +459,58 @@ int run_case(const Case& c, std::uint32_t seed) {
                 failures += differ == 0 ? 0 : 1;
             }
         }
+        if (tokens > 8 && !device_resident && ops::gguf_cpu_supported(c.gate) &&
+            ops::gguf_cpu_supported(c.up) && ops::gguf_cpu_supported(c.down)) {
+            // A wider call over banks read across the bus, as Flash-Next's misses serve a joint
+            // verification: the separate kernels over the even experts' pairs and the odd ones'
+            // CPU products give the whole call's y bit for bit.
+            std::vector<std::int32_t> first(ids.size(), -1), pairs;
+            std::vector<float> products;
+            for (std::size_t p = 0; p < ids.size(); ++p) {
+                if (ids[p] % 2 == 0) {
+                    first[p] = ids[p];
+                    continue;
+                }
+                const auto* x = reinterpret_cast<const std::uint16_t*>(m.data()) +
+                                (p / kTopK) * std::size_t(kHidden);
+                const auto y = cpu_expert(gate, up, down, ids[p], x);
+                products.insert(products.end(), y.begin(), y.end());
+                pairs.push_back(std::int32_t(p));
+            }
+            const std::int32_t count = std::int32_t(pairs.size());
+            DeviceBuffer d_first(ids.size() * 4), d_count(4),
+                d_products(std::max<std::size_t>(products.size(), 1) * 4),
+                d_pairs(std::max<std::size_t>(pairs.size(), 1) * 4);
+            d_first.copy_from_host(first.data(), first.size() * 4);
+            if (count > 0) {
+                d_products.copy_from_host(products.data(), products.size() * 4);
+                d_pairs.copy_from_host(pairs.data(), pairs.size() * 4);
+            }
+            d_count.copy_from_host(&count, 4);
+            const Tensor t_first(d_first.p, DType::I32, {kTopK, tokens});
+            {
+                auto scope       = workspace.scope();
+                const auto stage = ops::moe_experts_gguf_begin(t_m, workspace, nullptr);
+                ops::moe_experts_gguf_add(stage, t_m, t_first, t_w, &t_s, banks, workspace, nullptr);
+                ops::moe_experts_gguf_add_products(
+                    stage, static_cast<const float*>(d_products.p),
+                    static_cast<const std::int32_t*>(d_pairs.p),
+                    static_cast<const std::int32_t*>(d_count.p), std::int32_t(ids.size()), t_w,
+                    nullptr);
+                ops::moe_experts_gguf_finish(stage, t_y, nullptr);
+            }
+            check(cudaDeviceSynchronize(), "the wide call with CPU products");
+            std::vector<float> hybrid(got.size());
+            d_y.copy_to_host(hybrid.data(), hybrid.size() * 4);
+            std::size_t differ = 0;
+            for (std::size_t i = 0; i < got.size(); ++i) {
+                differ += std::memcmp(&hybrid[i], &got[i], 4) != 0 ? 1 : 0;
+            }
+            std::cout << (differ == 0 ? "OK   " : "FAIL ") << c.name << " T=" << tokens
+                      << " vector with " << count << " CPU products: " << differ << " of "
+                      << got.size() << " outputs differ from the GPU's\n";
+            failures += differ == 0 ? 0 : 1;
+        }
         double num = 0, den = 0, worst = 0, scale = 0;
         for (int t = 0; t < tokens; ++t) {
             std::vector<float> x(kHidden);

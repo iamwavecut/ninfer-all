@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 
@@ -91,9 +92,18 @@ void run() {
                 require(rejected == invalid, "captured hint did not consume this replay's tokens");
                 tokens[at] = saved;
             }
-            // Shrinking and growing in one allocation exercises the row and candidate strides.
-            for (const std::size_t width : std::array<std::size_t, 4>{steps + 1, 2, 5, steps + 1}) {
-            const auto count = batch * width;
+            // Shrinking and growing in one allocation exercises the row and candidate strides; the
+            // last layout packs each sequence at its own width, from the anchor alone to all.
+            const std::array<std::size_t, 5> layouts{steps + 1, 2, 5, steps + 1, 0};
+            for (const std::size_t layout : layouts) {
+            std::vector<std::int32_t> widths(batch);
+            for (std::size_t i = 0; i < batch; ++i) {
+                const std::size_t width = layout != 0 ? layout : 1 + 7 * i % (steps + 1);
+                widths[i]               = static_cast<std::int32_t>(width);
+            }
+            const auto count = std::accumulate(widths.begin(), widths.end(), std::size_t{0});
+            // The last sequence's columns, which the loop below spoils one at a time.
+            const std::size_t width = std::size_t(widths.back()), last = count - width;
             DeviceBuffer predictions(2 * count * sizeof(std::int32_t));
             std::vector<std::int32_t> candidates(2 * count), prefix(count);
             for (std::size_t i = 0; i < count; ++i) {
@@ -104,7 +114,7 @@ void run() {
             const auto stage_verify = [&] {
                 CUDA_CHECK(cudaMemcpyAsync(predictions.p, candidates.data(), predictions.bytes,
                                            cudaMemcpyHostToDevice, stream));
-                prefetch.begin_verification(contexts, prefix);
+                prefetch.begin_verification(contexts, prefix, widths);
             };
             const auto verify_chain = [&] {
                 const auto* first = static_cast<const std::int32_t*>(predictions.p);
@@ -125,7 +135,7 @@ void run() {
                 const bool invalid = bad < 3 * width;
                 const bool bad_prefix = invalid && bad >= 2 * width;
                 const auto column = invalid ? bad % width : 0;
-                const auto at = (batch - 1) * width + column;
+                const auto at = last + column;
                 auto& value = bad_prefix ? prefix[at] :
                     candidates[at + (invalid && bad >= width ? count : 0)];
                 const auto saved = value;

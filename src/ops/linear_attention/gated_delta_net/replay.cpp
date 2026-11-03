@@ -105,7 +105,7 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
     const bool whole_heads = qk_heads > 0 && value_heads >= qk_heads && value_heads % qk_heads == 0;
-    if (!whole_heads || width < 2 || width > 64 || rows <= 0 || rows > kMaximumRows ||
+    if (!whole_heads || width < 1 || width > 64 || rows <= 0 || rows > kMaximumRows ||
         (width > 16 && rows != 1)) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
