@@ -3,12 +3,14 @@
 #include "core/decode_graph.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
+#include "core/tensor_parallel.h"
 #include "core/tensor_split.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
 #include "models/deepseek_v41/cpu_experts.h"
 #include "models/deepseek_v41/kernels.h"
 #include "models/deepseek_v41/vision.h"
+#include "models/divided_head.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
@@ -274,11 +276,13 @@ struct Executor::Impl {
     // The CPU's share of missing experts; it outlives the delivery that calls it.
     std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
-    // Expert parallelism (options.expert_split): rank r serves experts expert_ranges[r] of every
+    // Expert parallelism (several device ranks): rank r serves experts expert_ranges[r] of every
     // block through a delivery of its own (rank 0's is `delivery`); every other rank has a stream
     // and workspace for its part of a MoE call, and the exchange carries a call's input there and
-    // the part back (routed_parallel()).
+    // the part back (routed_parallel()). Without options.expert_split the ranges start equal and
+    // size_expert_ranges() sets them before the deliveries are planned.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> expert_ranges;
+    bool split_by_room = false;
 
     struct ExpertPeer {
         cudaStream_t stream = nullptr;
@@ -290,6 +294,9 @@ struct Executor::Impl {
     std::vector<ExpertPeer> expert_peers; // by rank; rank 0's is unused
     std::unique_ptr<ExpertParallelExchange> expert_exchange;
     DeviceBuffer expert_pack; // a call's packed input, on rank 0
+    // The head divided over the ranks for calls of up to kMaxVectorColumns logit columns; every
+    // rank holds a range of its rows in proportion to its copy bandwidth.
+    std::unique_ptr<models::DividedHead> divided_head;
     mutable std::mutex expert_stats_mutex;
     ExpertDeliveryStats expert_startup_stats;
     Weight embedding, head;
@@ -375,23 +382,19 @@ struct Executor::Impl {
         if (options.sequences == 0 || options.prefill_chunk == 0 || options.max_context == 0) {
             throw std::invalid_argument("deepseek_v41 executor: invalid options");
         }
-        if (!options.expert_split.empty()) {
+        if (!options.expert_split.empty() || device.size() > 1) {
             if (model.expert_banks().empty()) {
                 throw std::invalid_argument("DeepSeek-V4.1 divides its experts over the devices "
                                             "from host memory or the files "
                                             "(--expert-residency host|disk)");
             }
-            if (options.expert_split.size() != device.size() || device.size() < 2) {
+            if (device.size() < 2 ||
+                (!options.expert_split.empty() && options.expert_split.size() != device.size())) {
                 throw std::invalid_argument("expert parallelism needs one share per device rank");
             }
-            const auto ends = split_shares(
-                config.num_experts, unit_positions(config.num_experts, 1), options.expert_split);
-            for (std::size_t r = 0; r + 1 < ends.size(); ++r) {
-                expert_ranges.emplace_back(std::uint32_t(ends[r]), std::uint32_t(ends[r + 1]));
-            }
-        } else if (device.size() != 1) {
-            throw std::invalid_argument("DeepSeek-V4.1 runs on one device, or divides its experts "
-                                        "over several");
+            split_by_room = options.expert_split.empty();
+            set_expert_ranges(split_by_room ? std::vector<double>(device.size(), 1.0)
+                                            : options.expert_split);
         }
         if (options.draft_tokens > std::uint32_t(gguf::kMaxVectorColumns) - 1) {
             throw std::invalid_argument("deepseek_v41 executor: at most 7 drafts a round");
@@ -618,6 +621,7 @@ struct Executor::Impl {
         }
         workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
         allocate_expert_peers();
+        if (split_by_room) { size_expert_ranges(); }
         if (!model.expert_banks().empty()) { plan_delivery(); }
     }
 
@@ -905,6 +909,48 @@ struct Executor::Impl {
         }
     }
 
+    void set_expert_ranges(std::span<const double> weights) {
+        const auto ends =
+            split_shares(config.num_experts, unit_positions(config.num_experts, 1), weights);
+        expert_ranges.clear();
+        for (std::size_t r = 0; r + 1 < ends.size(); ++r) {
+            expert_ranges.emplace_back(std::uint32_t(ends[r]), std::uint32_t(ends[r + 1]));
+        }
+    }
+
+    // Every routed expert's bytes in a device slot: what a cache of all of them would hold.
+    [[nodiscard]] std::uint64_t expert_bytes() const {
+        std::uint64_t bytes = 0;
+        for (const auto& bank : model.expert_banks()) {
+            for (const auto& expert : bank.delivery.experts) {
+                for (const auto& blob : expert) {
+                    bytes += round_up(blob.bytes + blob.zero_tail, kAlign);
+                }
+            }
+        }
+        return bytes;
+    }
+
+    // Expert parallelism without --tensor-split: each rank's share of the experts follows the
+    // memory its cache gets beside what the rank holds now (rank 0 the model, its caches and
+    // workspace; every rank the exchange) and its bus speed, so that every rank's misses take the
+    // same time (delivery_shares). Rank 0's cache counts as the delivery starts it, before the
+    // growing caches take memory back; the layer banks are lent to the cache while decoding.
+    void size_expert_ranges() {
+        const std::uint64_t metadata = delivery_metadata();
+        const auto free_bytes        = rank_free_bytes(device);
+        std::vector<double> room(device.size());
+        for (std::size_t r = 0; r < device.size(); ++r) {
+            const std::uint64_t keep =
+                kGraphReserve + metadata + (r == 0 && growing ? kKvHeadroom : 0);
+            room[r] = options.expert_cache_bytes ? double(*options.expert_cache_bytes)
+                      : free_bytes[r] > keep      ? double(free_bytes[r] - keep)
+                                                  : 0.0;
+        }
+        set_expert_ranges(delivery_shares(room, rank_host_copy_bandwidth(device),
+                                          double(expert_bytes()), rank_copy_bandwidth(device)));
+    }
+
     // A rank's slice [first, last) of a routing profile ([layer][expert]).
     [[nodiscard]] std::optional<ExpertRouteCounts> profile_slice(std::uint32_t first,
                                                                  std::uint32_t last) const {
@@ -981,6 +1027,13 @@ struct Executor::Impl {
             RankBinding bind(device, r);
             CUDA_CHECK(cudaStreamCreateWithFlags(&expert_peers[r].stream, cudaStreamNonBlocking));
             expert_peers[r].workspace = std::make_unique<WorkspaceArena>(expert_part_bytes(t));
+        }
+        // Before the deliveries take what memory is left for their caches.
+        if (models::DividedHead::divides(head, device.size())) {
+            const int columns = gguf::kMaxVectorColumns;
+            divided_head      = std::make_unique<models::DividedHead>(
+                device, head, row_bytes(head), rank_copy_bandwidth(device),
+                std::size_t(columns) * hidden * 2, columns);
         }
     }
 
@@ -1152,6 +1205,7 @@ struct Executor::Impl {
             expert_peers[r].workspace.reset();
             cudaStreamDestroy(expert_peers[r].stream);
         }
+        divided_head.reset();
     }
     Impl(const Impl&)            = delete;
     Impl& operator=(const Impl&) = delete;
@@ -1342,6 +1396,22 @@ struct Executor::Impl {
     }
     void project(Tensor& x, const Weight& w, float* out, int stride, int row = 0) {
         project(x, std::span<const Weight>(&w, 1), out, stride, row);
+    }
+    // The same on another rank's workspace and stream: FP32 columns of w.n rows from `out`.
+    void project_on(Tensor& x, const Weight& w, float* out, WorkspaceArena& space,
+                    cudaStream_t on) const {
+        const int t  = x.ne[1];
+        float* scale = nullptr;
+        if (f16_sums(w, t)) {
+            scale = static_cast<float*>(space.alloc_bytes(std::size_t(t) * 4).data);
+            kernels::guard_columns(static_cast<__nv_bfloat16*>(x.data), x.ne[0], t, scale, on);
+        }
+        ops::detail::GgufProduct product;
+        product.weight   = &w;
+        product.f32      = out;
+        product.f32_rows = w.n;
+        ops::detail::gguf_project(x, {&product, 1}, space, on);
+        if (scale != nullptr) { kernels::unscale_columns(out, w.n, w.n, t, scale, on); }
     }
     // The same into BF16 rows [T][w.n].
     void project_bf16(Tensor& x, const Weight& w, Tensor& out) {
@@ -2169,6 +2239,28 @@ struct Executor::Impl {
 
     // The head of `rows` final-normed rows into logits_bf16 columns [first, first + rows).
     void head_logits(const __nv_bfloat16* rows_x, int rows, int first) {
+        if (divided_head && rows <= gguf::kMaxVectorColumns) {
+            auto scope = workspace->scope();
+            Tensor x   = alloc_bf16(hidden, rows);
+            CUDA_CHECK(cudaMemcpyAsync(x.data, rows_x, std::size_t(rows) * hidden * 2,
+                                       cudaMemcpyDeviceToDevice, stream));
+            std::vector<cudaStream_t> streams{stream};
+            for (std::size_t r = 1; r < expert_peers.size(); ++r) {
+                streams.push_back(expert_peers[r].stream);
+            }
+            divided_head->project(
+                x.data, std::size_t(rows) * hidden * 2, rows,
+                static_cast<__nv_bfloat16*>(logits_bf16.p) + std::int64_t(first) * vocab, streams,
+                [&](std::size_t r, const void* input, const Weight& piece, int columns,
+                    float* plane, __nv_bfloat16* out, cudaStream_t on) {
+                    WorkspaceArena& space = r == 0 ? *workspace : *expert_peers[r].workspace;
+                    auto inner            = space.scope();
+                    Tensor rows_in(const_cast<void*>(input), DType::BF16, {hidden, columns});
+                    project_on(rows_in, piece, plane, space, on);
+                    kernels::f32_to_bf16(plane, out, std::int64_t(columns) * piece.n, on);
+                });
+            return;
+        }
         for (int at = 0; at < rows; at += kHeadRows) {
             const int n = std::min(kHeadRows, rows - at);
             auto scope  = workspace->scope();

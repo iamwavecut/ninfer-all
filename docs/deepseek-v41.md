@@ -91,7 +91,9 @@ and n-gram copy drafts, DSpark drafts while several requests decode, rotation sc
 and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool, the
 disk tier and session slots. Several GPUs divide the routed experts instead (`--devices 0,1
 --tensor-parallel` with host or disk experts: each device its own banks, cache and copies, no CPU
-share; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
+share; without `--tensor-split` the first device, which also holds the model, serves fewer experts,
+so that every device's misses take the same time over its bus; [expert
+parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
 ## Converting
 

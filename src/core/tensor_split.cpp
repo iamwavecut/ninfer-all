@@ -124,4 +124,35 @@ std::vector<double> fill_shares(std::span<const double> speed, std::span<const d
     }
 }
 
+std::vector<double> delivery_shares(std::span<const double> room, std::span<const double> bus,
+                                    double bytes, std::span<const double> speed) {
+    const std::size_t ranks = room.size();
+    if (ranks == 0 || bus.size() != ranks || speed.size() != ranks) {
+        throw std::invalid_argument("delivery shares need one room, bus and speed per rank");
+    }
+    if (!std::isfinite(bytes) || bytes <= 0.0) {
+        throw std::invalid_argument("delivery shares need the experts' bytes");
+    }
+    require_positive(bus, "rank bus speeds");
+    for (const double held : room) {
+        if (!std::isfinite(held) || held < 0.0) {
+            throw std::invalid_argument("rank cache rooms must be finite and not negative");
+        }
+    }
+    const double held = std::accumulate(room.begin(), room.end(), 0.0);
+    if (held >= bytes) {
+        std::vector<double> capacity(ranks);
+        for (std::size_t rank = 0; rank < ranks; ++rank) { capacity[rank] = room[rank] / bytes; }
+        return fill_shares(speed, capacity);
+    }
+    // Rank r copies share[r] * bytes - room[r]; equal times over the buses leave each rank its room
+    // plus `time` seconds of its bus, and the shares add up to every expert.
+    const double time = (bytes - held) / std::accumulate(bus.begin(), bus.end(), 0.0);
+    std::vector<double> out(ranks);
+    for (std::size_t rank = 0; rank < ranks; ++rank) {
+        out[rank] = (room[rank] + time * bus[rank]) / bytes;
+    }
+    return out;
+}
+
 } // namespace ninfer

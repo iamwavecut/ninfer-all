@@ -3,9 +3,11 @@
 #include "core/decode_graph.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
+#include "core/tensor_parallel.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
 #include "models/flint/cpu_experts.h"
+#include "models/divided_head.h"
 #include "models/flint/kernels.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
@@ -177,6 +179,9 @@ struct Executor::Impl {
     std::vector<ExpertPeer> expert_peers; // by rank; rank 0's is unused
     std::unique_ptr<ExpertParallelExchange> expert_exchange;
     DeviceBuffer expert_pack; // a call's packed input, on rank 0
+    // The head divided over the ranks for calls of up to kMaxVectorColumns columns
+    // (divide_head()); null keeps it whole on rank 0.
+    std::unique_ptr<models::DividedHead> divided_head;
     mutable std::mutex expert_stats_mutex;
     ExpertDeliveryStats expert_startup_stats;
     Weight embedding, head;
@@ -652,6 +657,7 @@ struct Executor::Impl {
             expert_peers[r].workspace.reset();
             cudaStreamDestroy(expert_peers[r].stream);
         }
+        divided_head.reset();
     }
     Impl(const Impl&)            = delete;
     Impl& operator=(const Impl&) = delete;
@@ -787,7 +793,32 @@ struct Executor::Impl {
             CUDA_CHECK(cudaStreamCreateWithFlags(&expert_peers[r].stream, cudaStreamNonBlocking));
             expert_peers[r].workspace = std::make_unique<WorkspaceArena>(expert_part_bytes(t));
         }
+        divide_head();
     }
+
+    // Decode and verification calls of up to kMaxVectorColumns columns project the head divided
+    // over the ranks, which otherwise wait for rank 0: each rank a range of its rows in proportion
+    // to its copy bandwidth, where every other rank has room for its range beside a margin for the
+    // CUDA graphs.
+    void divide_head() {
+        const int columns = gguf::kMaxVectorColumns;
+        if (!models::DividedHead::divides(head, device.size())) { return; }
+        const auto speed        = rank_copy_bandwidth(device);
+        const auto free         = rank_free_bytes(device);
+        const std::size_t input = gguf::vector_activation_bytes(hidden, columns);
+        double speeds           = 0;
+        for (const double v : speed) { speeds += v; }
+        // A rank's rows, an FP32 plane and two BF16 copies of them per column, and the input.
+        for (std::size_t r = 1; r < device.size(); ++r) {
+            const double rows = double(head.n) * speed[r] / speeds;
+            const double need = rows * double(row_bytes(head) + 8 * columns) + double(input) +
+                                double(kHeadRoom);
+            if (double(free[r]) < need) { return; }
+        }
+        divided_head = std::make_unique<models::DividedHead>(device, head, row_bytes(head), speed,
+                                                             input, columns);
+    }
+    static constexpr std::size_t kHeadRoom = std::size_t(512) << 20;
 
     // One rank's part of a MoE call of block `p`: the call's pairs routed to the experts the rank
     // holds (`range`), through its `tables`, weighted into the 2^-32 fixed-point sum `fixed`
@@ -1224,6 +1255,26 @@ struct Executor::Impl {
     // The head of the last `rows` of t <= kMaxVectorColumns final-normed q8_1 rows into
     // logits_bf16 columns [0, rows).
     void head_logits_q8(const Q8Act& x, int t, int rows) {
+        if (divided_head) {
+            std::vector<cudaStream_t> streams{stream};
+            for (std::size_t r = 1; r < expert_peers.size(); ++r) {
+                streams.push_back(expert_peers[r].stream);
+            }
+            divided_head->project(
+                x.base, gguf::vector_activation_bytes(hidden, t), rows,
+                static_cast<__nv_bfloat16*>(logits_bf16.p), streams,
+                [&](std::size_t, const void* input, const Weight& piece, int, float* plane,
+                    __nv_bfloat16* out, cudaStream_t on) {
+                    gguf::VectorOutput o;
+                    o.f32           = plane;
+                    o.column_stride = piece.n;
+                    gguf::vector_product(ops::detail::gguf_type(piece.qtype), piece.qdata,
+                                         row_bytes(piece), piece.n, piece.k, input, t, o, on);
+                    kernels::f32_to_bf16(plane + std::int64_t(t - rows) * piece.n, out,
+                                         std::int64_t(rows) * piece.n, on);
+                });
+            return;
+        }
         auto scope  = workspace->scope();
         auto* plane = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * vocab * 4).data);
         vector_f32(x, head, t, plane, vocab);

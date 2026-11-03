@@ -774,9 +774,17 @@ router, the shared expert, the head, the drafters and Vision, as one device does
   pinned host memory or the artifact's files, gives every rank an `ExpertDelivery` of its own over
   its experts (tables of those alone, local ids from `moe_local_experts`): its own layer banks and
   device cache, filled over its own bus. Without `--tensor-split` the device families size the
-  shares by each card's copy bandwidth within its free memory (`models::default_expert_split`),
-  DeepSeek equally. Refused: Gemma 4's and Flint's host or disk experts, DeepSeek's device experts and its CPU share
-  (`--expert-dma-share`, `--expert-cpu-threads`); DeepSeek's prompt spans are off.
+  shares by each card's copy bandwidth within its free memory (`models::default_expert_split`).
+  DeepSeek sizes them once the deliveries are about to start, so that every rank's misses take the
+  same time over its bus (`delivery_shares`): rank r's cache holds `room_r` bytes of its share
+  (its free memory beside the CUDA Graph reserve and the delivery's tables; rank 0's beside the
+  model, its caches and workspace) and its bus copies the rest at `bus_r` (a pinned host copy
+  measured at startup, `rank_host_copy_bandwidth`), so with `B` bytes of experts in all each rank
+  takes `(room_r + t * bus_r) / B` with `t = (B - sum room) / sum bus`. Rank 0, which also holds
+  the model, takes fewer experts; when the caches together hold every expert the shares follow the
+  cards' copy bandwidth within that room. Refused: Gemma 4's and Flint's host or disk experts,
+  DeepSeek's device experts and its CPU share (`--expert-dma-share`, `--expert-cpu-threads`);
+  DeepSeek's prompt spans are off.
 
 Measured on 2x RTX 3090 (Vast, PCIe 4.0 x16, no peer access, so the mapped host transport;
 2026-10-26; `scripts/pods/serve_ab.py`, greedy, four short prompts of 256 tokens and a prompt of

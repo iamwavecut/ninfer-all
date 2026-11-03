@@ -279,12 +279,9 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
     // Expert parallelism: every device serves a share of the routed experts from host memory or
-    // the files over its own bus; without --tensor-split the shares are equal.
-    if (options.tensor_parallel) {
-        executor.expert_split = options.tensor_split.empty()
-                                    ? std::vector<double>(device.size(), 1.0)
-                                    : options.tensor_split;
-    }
+    // the files over its own bus; without --tensor-split the executor sizes the shares by each
+    // device's room for its expert cache and its bus speed.
+    if (options.tensor_parallel) { executor.expert_split = options.tensor_split; }
     executor.engram_table       = std::move(engram);
     executor.engram_read        = {.residency    = table.residency,
                                    .io           = table.io,
