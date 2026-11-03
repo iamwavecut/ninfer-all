@@ -14,8 +14,9 @@
 // reuses a slot within it. Ranks on two and on four cards then interleave bands of different
 // transports and forms over both slots, with all ranks or only rank 0 contributing, so host and peer
 // words share one epoch, and run words exchanges across the wrap of their count, widening past what
-// the epochs before the wrap stored. Last, an exchange measures its routes and runs on what it
-// chose.
+// the epochs before the wrap stored. A prompt chunk's exchanges then run in pieces on the ranks'
+// side streams, under every transport and form, including PeerWrite pieces that outgrow an inbox
+// row and read instead. Last, an exchange measures its routes and runs on what it chose.
 //
 // The host writes the inputs with blocking copies from pageable memory, which may return before
 // the data reaches the device; the rank streams do not wait for them (they are non-blocking), so
@@ -378,6 +379,107 @@ int run_sequence(ninfer::TensorParallelExchange& exchange, ninfer::DeviceContext
     return failures;
 }
 
+// A chunk's exchanges in pieces of `widths` values each (see Pieces in core/tensor_parallel.h), every
+// piece handed from the rank's stream to its side stream and back by the piece events, as a prompt
+// pass does: over both slots and the first again, with every rank contributing and then rank 0
+// alone, under every transport the cards allow in both forms.
+int run_pieces(std::size_t ranks, int devices, std::span<const std::int64_t> widths,
+               std::mt19937& rng, const char* label) {
+    bool own_cards             = false;
+    const std::vector<int> ids = deal(ranks, devices, own_cards);
+    ninfer::DeviceContext ctx(std::span<const int>(ids.data(), ids.size()));
+    std::int64_t values = 0;
+    for (const std::int64_t width : widths) { values += width; }
+    const std::size_t bytes = static_cast<std::size_t>(values) * sizeof(float);
+    std::vector<TensorParallelTransport> transports{TensorParallelTransport::Host};
+    if (ctx.peer_access()) {
+        transports.push_back(TensorParallelTransport::PeerRead);
+        transports.push_back(TensorParallelTransport::PeerWrite);
+    }
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<__nv_bfloat16*> replica(ranks);
+    for (std::size_t r = 0; r < ranks; ++r) {
+        CUDA_CHECK(cudaSetDevice(ids[r]));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&replica[r]),
+                              values * sizeof(__nv_bfloat16)));
+    }
+    int failures = 0;
+    for (const TensorParallelTransport transport : transports) {
+        for (const TensorParallelForm form :
+             {TensorParallelForm::Whole, TensorParallelForm::Scatter}) {
+            ninfer::TensorParallelExchange exchange(
+                ctx, {.slot_bytes = bytes,
+                      .routes     = {{.bytes = bytes, .route = {transport, form}}}});
+            const std::size_t contributors[] = {ranks, ranks, ranks, 1};
+            for (std::size_t round = 0; round < std::size(contributors); ++round) {
+                const std::size_t slot = round % 2;
+                std::vector<__nv_bfloat16> residual(static_cast<std::size_t>(values));
+                for (auto& v : residual) { v = __float2bfloat16(4.0f * normal(rng)); }
+                std::vector<std::vector<float>> partials(ranks,
+                                                         std::vector<float>(residual.size()));
+                for (auto& p : partials) {
+                    for (auto& v : p) { v = normal(rng); }
+                }
+                for (std::size_t r = 0; r < ranks; ++r) {
+                    CUDA_CHECK(cudaSetDevice(ids[r]));
+                    CUDA_CHECK(cudaMemcpy(replica[r], residual.data(),
+                                          values * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(exchange.partial(r, slot), partials[r].data(), bytes,
+                                          cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                }
+                std::int64_t offset = 0;
+                for (std::size_t index = 0; index < widths.size(); ++index) {
+                    const std::int64_t count = widths[index];
+                    const ninfer::TensorParallelPiece piece{.index = index, .offset = offset};
+                    for (std::size_t r = 0; r < ranks; ++r) {
+                        CUDA_CHECK(cudaSetDevice(ids[r]));
+                        const cudaStream_t side = exchange.side_stream(r);
+                        CUDA_CHECK(cudaEventRecord(exchange.piece_ready(r, index),
+                                                   ctx.rank(r).stream));
+                        CUDA_CHECK(cudaStreamWaitEvent(side, exchange.piece_ready(r, index), 0));
+                        exchange.publish(r, slot,
+                                         r < contributors[round]
+                                             ? static_cast<std::size_t>(count) * sizeof(float)
+                                             : 0,
+                                         replica[r] + offset, side, TensorParallelSum::AddBf16,
+                                         piece);
+                    }
+                    for (std::size_t r = 0; r < ranks; ++r) {
+                        exchange.reduce(r, slot, replica[r] + offset, count, contributors[round],
+                                        exchange.side_stream(r), TensorParallelSum::AddBf16,
+                                        piece);
+                    }
+                    for (std::size_t r = 0; r < ranks; ++r) {
+                        CUDA_CHECK(cudaSetDevice(ids[r]));
+                        exchange.complete(r, slot, replica[r] + offset, count,
+                                          exchange.side_stream(r), TensorParallelSum::AddBf16,
+                                          piece);
+                        CUDA_CHECK(cudaEventRecord(exchange.piece_done(r, index),
+                                                   exchange.side_stream(r)));
+                    }
+                    offset += count;
+                }
+                for (std::size_t r = 0; r < ranks; ++r) {
+                    for (std::size_t index = 0; index < widths.size(); ++index) {
+                        CUDA_CHECK(cudaStreamWaitEvent(ctx.rank(r).stream,
+                                                       exchange.piece_done(r, index), 0));
+                    }
+                }
+                ctx.synchronize();
+                partials.resize(contributors[round]);
+                failures += compare_replicas(replica, values, oracle(residual, partials), label);
+            }
+        }
+    }
+    for (std::size_t r = 0; r < ranks; ++r) {
+        CUDA_CHECK(cudaSetDevice(ids[r]));
+        CUDA_CHECK(cudaFree(replica[r]));
+    }
+    CUDA_CHECK(cudaSetDevice(0));
+    return failures;
+}
+
 // `ranks` ranks on as many cards: bands of different transports and forms interleaved over both
 // slots. With peer access, host words and peer words take turns on one epoch.
 int run_mixed(int ranks, std::mt19937& rng) {
@@ -524,6 +626,16 @@ int run() {
                         {ranks, values, devices, {transport, TensorParallelForm::Words}}, rng);
                 }
             }
+        }
+        // A prompt chunk of the 27B residual in pieces of 256 columns and a shorter last one, and
+        // a narrower chunk whose later pieces outgrow a PeerWrite inbox row.
+        const std::int64_t chunk[]  = {5120 * 256, 5120 * 256, 5120 * 256, 5120 * 232};
+        const std::int64_t narrow[] = {131072, 131072, 131072, 131072};
+        for (const std::size_t ranks : {2U, 4U}) {
+            failures += run_pieces(ranks, devices, chunk, rng,
+                                   "a chunk exchanged in pieces matches the rank-order sum");
+            failures += run_pieces(ranks, devices, narrow, rng,
+                                   "pieces past an inbox row match the rank-order sum");
         }
         failures += run_measured(devices, rng);
     }

@@ -1573,6 +1573,10 @@ namespace {
 // The device tensors layer kernels read that live in rank 0's memory.
 constexpr std::size_t kControlTensors = 6;
 
+// The narrowest piece a tensor-parallel prompt chunk is cut into (whole 64-column blocks): narrower
+// pieces lose more to their projections' narrower GEMMs than their exchanges' overlap gains.
+constexpr std::int32_t kTensorParallelPieceColumns = 384;
+
 // Points a TextContext's active control tensors at stage-local copies for one stage, and puts the
 // originals back after it.
 class ScopedControl {
@@ -1930,6 +1934,146 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
         }
     };
 
+    // A text prompt chunk runs each exchange in pieces of whole 64-column blocks: a piece's
+    // partials cross on the ranks' side streams while their compute streams run the next piece
+    // (see Pieces in core/tensor_parallel.h). A piece attends over the keys up to its own last
+    // position and carries the Gated DeltaNet state on to the next, as a shorter chunk would.
+    struct Piece {
+        std::int32_t column  = 0;
+        std::int32_t columns = 0;
+        ops::CausalAttentionExecutionEnvelope envelope{};
+        std::vector<std::array<Tensor, 2>> positions;
+        std::vector<std::array<const Tensor*, kControlTensors>> control;
+    };
+    const std::int32_t T = x.ne[1];
+    std::vector<Piece> pieces;
+    // Dense FFNs only: a MoE layer serves each piece's tokens separately, and a piece of a long
+    // prompt routes to nearly every expert, so most expert weights would be read once per piece.
+    const bool dense = std::all_of(
+        parameters_.text.layers.begin(), parameters_.text.layers.end(),
+        [](const BlockParameters& block) { return std::holds_alternative<DenseParameters>(block.ffn); });
+    if (ph == Phase::Prefill && !Tap::enabled && dense && !positions && steering_ == nullptr &&
+        active_segments_.empty() && active_sequence_batch_ == 0 &&
+        active_causal_attention_envelope_ != nullptr && current[0] != nullptr &&
+        current[0]->numel() == T && current[1] != nullptr && current[1]->numel() == T &&
+        current[3] == nullptr && T >= 2 * kTensorParallelPieceColumns) {
+        const auto count = std::min<std::int32_t>(
+            static_cast<std::int32_t>(TensorParallelExchange::kPieces),
+            T / kTensorParallelPieceColumns);
+        const std::int32_t width = (T + count - 1) / count;
+        const std::int32_t step  = (width + 63) / 64 * 64;
+        for (std::int32_t column = 0; column < T; column += step) {
+            Piece piece;
+            piece.column   = column;
+            piece.columns  = std::min(step, T - column);
+            piece.envelope = *active_causal_attention_envelope_;
+            const auto behind = static_cast<std::uint32_t>(T - piece.column - piece.columns);
+            piece.envelope.min_visible_keys -= behind;
+            piece.envelope.max_visible_keys -= behind;
+            piece.positions.resize(ranks);
+            piece.control.resize(ranks);
+            for (std::size_t rank = 0; rank < ranks; ++rank) {
+                piece.control[rank] = rank == 0 ? current : replicas[rank].control;
+                for (std::size_t i = 0; i < 2; ++i) {
+                    piece.positions[rank][i] =
+                        piece.control[rank][i]->slice(0, piece.column, piece.columns);
+                }
+            }
+            pieces.push_back(std::move(piece));
+        }
+        // The control pointers into each piece's own position slices, now that they stay put.
+        for (Piece& piece : pieces) {
+            for (std::size_t rank = 0; rank < ranks; ++rank) {
+                for (std::size_t i = 0; i < 2; ++i) {
+                    piece.control[rank][i] = &piece.positions[rank][i];
+                }
+            }
+        }
+    }
+    // One exchange in pieces: each rank computes a piece on its compute stream and hands it to its
+    // side stream, which publishes, reduces and completes it there while the next piece computes.
+    // A rank's next step on a piece waits for that piece's exchange.
+    bool first_piece_step = true;
+    const auto piece_step = [&](std::size_t contributors, const auto& share) {
+        const std::size_t exchange_slot = next_exchange;
+        next_exchange ^= 1U;
+        for (std::size_t index = 0; index < pieces.size(); ++index) {
+            const Piece& piece = pieces[index];
+            const std::int64_t piece_values = static_cast<std::int64_t>(x.ne[0]) * piece.columns;
+            const std::int64_t offset = static_cast<std::int64_t>(x.ne[0]) * piece.column;
+            const TensorParallelPiece fence{.index = index, .offset = offset};
+            for (std::size_t rank = 0; rank < ranks; ++rank) {
+                std::optional<ScopedDeviceRank> device_guard;
+                std::optional<ScopedArenaRank> arena_guard;
+                if (rank != 0) {
+                    device_guard.emplace(ctx_, rank);
+                    arena_guard.emplace(work_, rank);
+                }
+                ScopedControl control_guard(current, piece.control[rank], slots);
+                ScopedValue<const ops::CausalAttentionExecutionEnvelope*> envelope_guard(
+                    active_causal_attention_envelope_, &piece.envelope);
+                // Later pieces continue the Gated DeltaNet state the earlier ones wrote.
+                ScopedValue<std::int32_t> state_guard(
+                    linear_state_source_slot_,
+                    index == 0 ? linear_state_source_slot_ : linear_state_destination_slot_);
+                if (!first_piece_step) {
+                    CUDA_CHECK(
+                        cudaStreamWaitEvent(ctx_.stream, exchange.piece_done(rank, index), 0));
+                }
+                const bool contributes = rank < contributors;
+                Tensor sub             = replicas[rank].x.slice(1, piece.column, piece.columns);
+                tensor_rank_           = rank;
+                try {
+                    auto scope = work_.scope();
+                    if (contributes) {
+                        Tensor partial(exchange.partial(rank, exchange_slot) + offset, DType::FP32,
+                                       {x.ne[0], piece.columns});
+                        residual_partial_ = &partial;
+                        share(rank, sub);
+                        residual_partial_ = nullptr;
+                    }
+                } catch (...) {
+                    tensor_rank_      = 0;
+                    residual_partial_ = nullptr;
+                    throw;
+                }
+                tensor_rank_            = 0;
+                const cudaStream_t side = exchange.side_stream(rank);
+                CUDA_CHECK(cudaEventRecord(exchange.piece_ready(rank, index), ctx_.stream));
+                CUDA_CHECK(cudaStreamWaitEvent(side, exchange.piece_ready(rank, index), 0));
+                exchange.publish(rank, exchange_slot,
+                                 contributes ? static_cast<std::size_t>(piece_values) * sizeof(float)
+                                             : 0,
+                                 sub.data, side, TensorParallelSum::AddBf16, fence);
+            }
+            for (std::size_t rank = 0; rank < ranks; ++rank) {
+                std::optional<ScopedDeviceRank> device_guard;
+                if (rank != 0) { device_guard.emplace(ctx_, rank); }
+                exchange.reduce(rank, exchange_slot,
+                                static_cast<__nv_bfloat16*>(replicas[rank].x.data) + offset,
+                                piece_values, contributors, exchange.side_stream(rank),
+                                TensorParallelSum::AddBf16, fence);
+            }
+            for (std::size_t rank = 0; rank < ranks; ++rank) {
+                std::optional<ScopedDeviceRank> device_guard;
+                if (rank != 0) { device_guard.emplace(ctx_, rank); }
+                const cudaStream_t side = exchange.side_stream(rank);
+                exchange.complete(rank, exchange_slot,
+                                  static_cast<__nv_bfloat16*>(replicas[rank].x.data) + offset,
+                                  piece_values, side, TensorParallelSum::AddBf16, fence);
+                CUDA_CHECK(cudaEventRecord(exchange.piece_done(rank, index), side));
+            }
+        }
+        first_piece_step = false;
+    };
+    const auto run_step = [&](std::size_t contributors, const auto& share) {
+        if (pieces.empty()) {
+            exchange_step(contributors, share);
+        } else {
+            piece_step(contributors, share);
+        }
+    };
+
     // Every replica edits its own residual the same way after each exchange, so they stay equal.
     const auto steer_replicas = [&](ops::SteerResidualStep step, std::uint32_t site,
                                     std::int32_t vector_layer) {
@@ -1990,16 +2134,16 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                                       attention_gates[rank], ph);
                 });
             } else if (full) {
-                exchange_step(attention_ranks, [&](std::size_t rank, Tensor& replica) {
+                run_step(attention_ranks, [&](std::size_t rank, Tensor& replica) {
                     attn_mix(block(rank), replica, compact, ph);
                 });
             } else {
-                exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
+                run_step(ranks, [&](std::size_t rank, Tensor& replica) {
                     gdn_mix(block(rank), replica, compact, ph);
                 });
             }
             steer_replicas(ops::SteerResidualStep::Write, mixer_steering_site(layer), -1);
-            exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
+            run_step(ranks, [&](std::size_t rank, Tensor& replica) {
                 mlp_tail(block(rank), replica, ph,
                          rank == 0 && layer + 1 < layers
                              ? next_projection_hints(static_cast<int>(layer))
@@ -2019,7 +2163,14 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                                      error.what());
         }
     }
-    // A captured pass ends with every rank joined back into rank 0's stream.
+    // Each compute stream takes its pieces' last exchanges back before the pass ends; a captured
+    // pass ends with every rank joined back into rank 0's stream.
+    for (std::size_t index = 0; index < pieces.size(); ++index) {
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            CUDA_CHECK(cudaStreamWaitEvent(ctx_.stream_for_rank(rank),
+                                           exchange.piece_done(rank, index), 0));
+        }
+    }
     for (std::size_t rank = 1; rank < ranks; ++rank) {
         tp.joined[rank - 1].record(ctx_.stream_for_rank(rank));
         tp.joined[rank - 1].wait(entry_stream);

@@ -25,6 +25,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Use one short line per entry. Link to details inline when useful. -->
 
+- **2026-11-03:** Faster [tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) decode with the vocabulary heads divided over the GPUs, and faster prefill with prompt pieces whose exchanges overlap compute.
 - **2026-11-03:** llama.cpp [control vectors and direction LoRA adapters](docs/serving.md#lora-adapters-and-control-vectors) for Qwen3.5-core models, with per-request adapter scales.
 - **2026-11-02:** [Tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism) selects exchange routes by size from startup timings, including peer writes.
 - **2026-10-31:** [Automatic tensor splits](docs/maintainer/pipeline-stages.md#tensor-parallelism) adjust GPU shares using free memory after the first load.

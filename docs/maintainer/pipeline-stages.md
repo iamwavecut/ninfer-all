@@ -397,12 +397,27 @@ families](#expert-parallelism-of-the-other-moe-families)).
   KiB (14.0 us), peer-write whole to 100 KiB (29.1 us), peer-write scatter to 40 MiB (3837.0 us)`).
   `tools/tp_exchange_bench.cu` prints what the exchange measured at startup and every route at every
   size beside the chosen ones.
-- **One exchange per step.** Every step, a long prompt chunk included, exchanges each layer's
-  partials once. Cutting a prompt chunk into pieces whose exchanges overlap the next piece's
-  compute was measured slower and is not done: the dense Qwen3.8-27B GSQ-RCO IQ3_S prefilled a
-  9,705-token prompt at 657 tok/s in four pieces against 807 in one on two Tesla V100s (host
-  transport), and Qwen3.6-35B-A3B, whose pieces each read most expert weights, a 7,000-token one
-  at 5,300 against 6,700 on two RTX 3090s.
+- **Prompt pieces.** A text prompt chunk of at least 768 tokens of a model with dense FFNs
+  exchanges each step in two to four pieces of whole 64-column blocks, each at least 384 columns
+  wide (`run_tensor_parallel`; Pieces in `core/tensor_parallel.h`). Every rank computes a piece on
+  its own stream and hands it to a side stream of its own, which publishes, reduces and completes
+  that piece's exchange while the rank's stream computes the next piece; the rank's next step on a
+  piece waits for that piece's exchange. A piece attends over the keys up to its own last position
+  and carries the Gated DeltaNet state to the next piece, so it computes what a prompt chunk of its
+  width computes: in pieces of 384, 384 and 221 columns a 989-token prompt gave the greedy text of
+  `--prefill-chunk 384` without pieces, character for character. Verification, DFlash taps,
+  position-split attention, sequence batches, batched prompt segments, image and video prompts
+  and steering exchange each step whole, and so do MoE models, whose pieces would each
+  read most expert weights (Qwen3.6-35B-A3B prefilled a 7,000-token prompt at 5,300 tok/s in four
+  pieces against 6,700 in one on two RTX 3090s). Narrower pieces lose more to their projections'
+  narrower GEMMs than the overlap gains: in pieces of 256 columns the four A4000s below prefilled a
+  6,768-token prompt at 1,402 tok/s against 1,478 whole, and two Tesla V100s prefilled the dense
+  Qwen3.8-27B GSQ-RCO IQ3_S at 657 tok/s in four pieces of its chunk against 807 whole (host
+  transport). With pieces of at least 384 columns Qwen3.8-27B (int8 KV, even split, one request)
+  prefills a 6,773-token prompt at 1,506 tok/s against 1,194 and a 994-token one at 1,361 against
+  1,087 on four RTX 5060 Ti (host transport), and at 1,615 against 1,492 and 1,510 against 1,330 on
+  four RTX A4000s (peer-write, capped at 110 W). A pieces build's text can differ from an unpieced
+  one's as one prompt-chunk width's differs from another's.
 - **Numerics.** Against one device the order of the FP32 additions of a projection's output
   differs: the shares' partial sums are added, then rounded once, where one device rounds the full
   sum. On `120a` NVFP4 and FP8 shares quantize their activations for W4A4 and W8A8 routes (under

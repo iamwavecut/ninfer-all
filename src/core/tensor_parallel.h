@@ -86,6 +86,15 @@ namespace ninfer {
 //            `complete` for every rank after `reduce` for every rank, since a wait issued before its
 //            event's record would see an earlier record.
 //
+// Pieces. A prompt's exchange may run as up to kPieces pieces, each a contiguous range of the
+// partial's values (`TensorParallelPiece`) with fences of its own, so a piece's exchange crosses on
+// a rank's side stream (`side_stream`) while its compute stream runs the next piece. Each piece is
+// an exchange as above over its own values: its route is its own size's, its reduce-scatter divides
+// its own values, and under PeerWrite an inbox row holds every piece's range at a place of its own;
+// a later piece whose range would pass the row's end reduces whole by peer reads instead. Words
+// take no pieces. The slot alternation holds piece by piece: a rank writes piece p of a slot
+// again only after its own reduce and complete of piece p in the exchange in between.
+//
 // Routes. Which transport and form is fastest depends on the partial's size, the number of ranks
 // and the platform's links, and no fixed choice holds everywhere: on one host peer reads beat host
 // memory at every size, on another the reverse. Unless `routes` names them, the exchange times every
@@ -117,6 +126,14 @@ struct TensorParallelBand {
 // hyper-connections do).
 enum class TensorParallelSum : std::uint8_t { AddBf16, StoreBf16, StoreFp32 };
 
+// A piece of an exchange: the values from `offset` of the partial and of the output, fenced by
+// events of its own (`index`, below kPieces). Pieces of one exchange take increasing offsets and
+// indices. The default is a whole exchange.
+struct TensorParallelPiece {
+    std::size_t index   = 0;
+    std::int64_t offset = 0;
+};
+
 struct TensorParallelExchangeOptions {
     // Largest partial one slot holds.
     std::size_t slot_bytes = 0;
@@ -135,6 +152,7 @@ struct TensorParallelExchangeOptions {
 class TensorParallelExchange {
 public:
     static constexpr std::size_t kSlots                 = 2;
+    static constexpr std::size_t kPieces                = 4;
     static constexpr unsigned long long kWordsTimeoutNs = 300'000'000'000ULL;
     // A PeerWrite inbox row holds an owner's range of a full slot or this much, whichever is more
     // (never more than the slot): the largest partial PeerWrite reduces whole.
@@ -180,20 +198,28 @@ public:
     // Where `rank` writes its FP32 partial for an exchange in `slot`: device memory of that rank.
     [[nodiscard]] float* partial(std::size_t rank, std::size_t slot) const;
     // Makes `rank`'s partial of `bytes` in `slot` available to the other ranks; `out` is the output
-    // the rank's reduce will write and `sum` the exchange's reduce.
+    // the rank's reduce will write and `sum` the exchange's reduce. With a `piece`, `bytes` and
+    // `out` are the piece's, starting at its offset.
     void publish(std::size_t rank, std::size_t slot, std::size_t bytes, void* out,
-                 cudaStream_t stream, TensorParallelSum sum = TensorParallelSum::AddBf16);
+                 cudaStream_t stream, TensorParallelSum sum = TensorParallelSum::AddBf16,
+                 TensorParallelPiece piece = {});
     // Adds the partials ranks [0, contributors) published in `slot` to `rank`'s BF16 residual `out`
     // of `count` values, or stores their sum there (`sum`); for a reduce-scatter, only in the rank's
     // own range.
     void reduce(std::size_t rank, std::size_t slot, void* out, std::int64_t count,
                 std::size_t contributors, cudaStream_t stream,
-                TensorParallelSum sum = TensorParallelSum::AddBf16);
+                TensorParallelSum sum = TensorParallelSum::AddBf16, TensorParallelPiece piece = {});
     // Brings the other ranks' finished ranges of a reduce-scatter into `rank`'s output; nothing for
     // another form. Every rank's `complete` follows every rank's `reduce` of the exchange, with the
     // same `out`, `count` and `sum`.
     void complete(std::size_t rank, std::size_t slot, void* out, std::int64_t count,
-                  cudaStream_t stream, TensorParallelSum sum = TensorParallelSum::AddBf16);
+                  cudaStream_t stream, TensorParallelSum sum = TensorParallelSum::AddBf16,
+                  TensorParallelPiece piece = {});
+    // Pieces: `rank`'s side stream, and the events with which its compute stream hands piece
+    // `piece` to the side stream (`piece_ready`) and takes its exchange back (`piece_done`).
+    [[nodiscard]] cudaStream_t side_stream(std::size_t rank) const;
+    [[nodiscard]] cudaEvent_t piece_ready(std::size_t rank, std::size_t piece) const;
+    [[nodiscard]] cudaEvent_t piece_done(std::size_t rank, std::size_t piece) const;
     // A gather in place of the sum (a position-split attention's partials, merged by
     // ops::causal_attention_merge_partials): `publish_whole` makes `rank`'s partial of `bytes` in
     // `slot` available to the others, never as words; `gather` points `parts[r]` at every rank's
@@ -214,11 +240,16 @@ private:
         // PeerWrite: [ranks - 1][inbox_values_] partials, or owners' ranges of them, the other
         // ranks stored here, in rank order without the rank itself.
         std::array<float*, kSlots> inbox{};
-        std::array<cudaEvent_t, kSlots> published{};
-        // The output the rank's publish named, and whether its reduce-scatter has finished it.
-        std::array<void*, kSlots> output{};
-        std::array<bool, kSlots> reduced_ready{};
-        std::array<cudaEvent_t, kSlots> reduced{};
+        // Per slot and piece: the fence of the rank's publish, the output its publish named,
+        // whether its reduce-scatter has finished it, and the fence of that reduce.
+        std::array<std::array<cudaEvent_t, kPieces>, kSlots> published{};
+        std::array<std::array<void*, kPieces>, kSlots> output{};
+        std::array<std::array<bool, kPieces>, kSlots> reduced_ready{};
+        std::array<std::array<cudaEvent_t, kPieces>, kSlots> reduced{};
+        // Pieces: the side stream and the hand-over events (see `piece_ready`).
+        cudaStream_t side = nullptr;
+        std::array<cudaEvent_t, kPieces> piece_ready{};
+        std::array<cudaEvent_t, kPieces> piece_done{};
         // Words: the rank's mapped host row, [kSlots][words_values_], the rows the other ranks
         // store into in its device memory, [ranks][kSlots][words_values_], and its {exchanges
         // counted, blocks finished} in device memory.
@@ -237,19 +268,28 @@ private:
 
     void release() noexcept;
     void check_slot(std::size_t rank, std::size_t slot, std::size_t bytes) const;
+    void check_piece(std::size_t rank, std::size_t slot, std::size_t bytes,
+                     TensorParallelPiece piece) const;
     [[nodiscard]] bool legal(TensorParallelRoute route, std::size_t bytes) const noexcept;
     [[nodiscard]] Needs needs(const std::vector<TensorParallelBand>& bands) const noexcept;
     void provide(Needs needs);
     void measure(const std::vector<TensorParallelTransport>& transports);
     [[nodiscard]] float* inbox_row(std::size_t rank, std::size_t sender, std::size_t slot) const;
+    // Where in an inbox row a piece's values begin (see Pieces), and the route of its exchange.
+    [[nodiscard]] std::int64_t inbox_offset(TensorParallelPiece piece,
+                                            TensorParallelForm form) const noexcept;
+    [[nodiscard]] TensorParallelRoute piece_route(std::size_t bytes, TensorParallelSum sum,
+                                                  TensorParallelPiece piece) const;
 
     void publish_on(TensorParallelRoute route, std::size_t rank, std::size_t slot,
-                    std::size_t bytes, void* out, cudaStream_t stream, TensorParallelSum sum);
+                    std::size_t bytes, void* out, cudaStream_t stream, TensorParallelSum sum,
+                    TensorParallelPiece piece = {});
     void reduce_on(TensorParallelRoute route, std::size_t rank, std::size_t slot, void* out,
                    std::int64_t count, std::size_t contributors, cudaStream_t stream,
-                   TensorParallelSum sum);
+                   TensorParallelSum sum, TensorParallelPiece piece = {});
     void complete_on(TensorParallelRoute route, std::size_t rank, std::size_t slot, void* out,
-                     std::int64_t count, cudaStream_t stream, TensorParallelSum sum);
+                     std::int64_t count, cudaStream_t stream, TensorParallelSum sum,
+                     TensorParallelPiece piece = {});
 
     std::vector<Rank> ranks_;
     std::size_t slot_bytes_   = 0;
