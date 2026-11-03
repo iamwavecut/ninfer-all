@@ -25,6 +25,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Use one short line per entry. Link to details inline when useful. -->
 
+- **2026-11-03:** Faster [tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) decode: Q4 and Q5 projection shares run the small-T MMA routes of whole projections.
 - **2026-11-03:** Flash-Next [drafts with MTP for several requests at once](docs/qwen3-8-flash-next.md#mtp-with-several-requests), at 1.01 to 1.16 times the speed without drafts on host experts.
 - **2026-11-03:** Faster [tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) decode with the vocabulary heads divided over the GPUs, and faster prefill with prompt pieces whose exchanges overlap compute.
 - **2026-11-03:** llama.cpp [control vectors and direction LoRA adapters](docs/serving.md#lora-adapters-and-control-vectors) for Qwen3.5-core models, with per-request adapter scales.

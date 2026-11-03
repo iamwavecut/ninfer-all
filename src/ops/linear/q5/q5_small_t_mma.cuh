@@ -116,7 +116,8 @@ __device__ __forceinline__ void q5_small_t_decode_eight_f16(unsigned word, unsig
 }
 #endif
 
-// Rows: output rows. K: reduction length, a multiple of the slab (64 * KWarps). XCols: activation
+// Rows: output rows. K: reduction length, a multiple of the slab (64 * KWarps), or zero to read it
+// from `input_rows` (a runtime shape, such as a tensor-parallel rank's share). XCols: activation
 // columns staged (4, 8, 16 or 32), covered by max(1, XCols / 8) eight-column MMA tiles; the B
 // fragments of columns at or past `columns` are zero. Stages: depth of the cp.async ring (1..3).
 // KWarps: the warp layout, SmallTLayout<KWarps>; the grid is Rows / (128 / KWarps).
@@ -140,15 +141,17 @@ __launch_bounds__(256, resident_ctas_bound(256, KWarps < 8 || XCols >= 32
                                           const std::uint8_t* __restrict__ codes,
                                           const std::uint8_t* __restrict__ high_bits,
                                           const std::uint8_t* __restrict__ scales,
-                                          Epilogue epilogue, int columns) {
+                                          Epilogue epilogue, int columns,
+                                          int input_rows = K) {
     using Schedule              = Q5SmallTSchedule<KWarps, TilesPerWarp>;
     constexpr int kTpw          = TilesPerWarp;
     constexpr int kTileK        = 64;
     constexpr int kKWarps       = Schedule::kKWarps;
     constexpr int kRowsPerCta   = Schedule::kRowsPerCta;
     constexpr int kGroupK       = Schedule::kGroupK;
-    constexpr int kSlabs        = K / kGroupK;
-    constexpr int kGroupsPerRow = K / 64;
+    const int k                 = K > 0 ? K : input_rows;
+    const int slabs             = k / kGroupK;
+    const int groups_per_row    = k / 64;
     constexpr int kNt           = XCols < 8 ? 1 : XCols / 8;
     static_assert(XCols == 4 || XCols == 8 || XCols == 16 || XCols == 32);
     static_assert(Stages >= 1 && Stages <= 4);
@@ -175,7 +178,7 @@ __launch_bounds__(256, resident_ctas_bound(256, KWarps < 8 || XCols >= 32
             const int col   = item / kChunksPerCol;
             const int chunk = item - col * kChunksPerCol;
             cp_async<16>(&stage.activations[chunk / 8][col][(chunk % 8) * 8],
-                         &x[static_cast<std::int64_t>(col) * K + slab_k0 + chunk * 8]);
+                         &x[static_cast<std::int64_t>(col) * k + slab_k0 + chunk * 8]);
         }
     };
 
@@ -191,20 +194,20 @@ __launch_bounds__(256, resident_ctas_bound(256, KWarps < 8 || XCols >= 32
             const std::int64_t r = cta_row0 + row;
             if (j < kCodeChunks) {
                 cp_async<16, Schedule::kWeightCache>(&stage.codes[row][j * 16],
-                                        codes + r * (K / 2) + slab_k0 / 2 + j * 16);
+                                        codes + r * (k / 2) + slab_k0 / 2 + j * 16);
             } else if (j < kCodeChunks + kHighChunks) {
                 const int chunk = j - kCodeChunks;
                 cp_async<16, Schedule::kWeightCache>(&stage.high[row][chunk * 16],
-                                        high_bits + r * (K / 8) + slab_k0 / 8 + chunk * 16);
+                                        high_bits + r * (k / 8) + slab_k0 / 8 + chunk * 16);
             } else {
                 cp_async<2 * kKWarps>(&stage.scales[row][0],
-                                      scales + (r * kGroupsPerRow + slab_k0 / 64) * 2);
+                                      scales + (r * groups_per_row + slab_k0 / 64) * 2);
             }
         }
     };
 
     const auto issue_slab = [&](int slab) {
-        if (slab < kSlabs) {
+        if (slab < slabs) {
             Stage& stage = shared.stages[slab % Stages];
             stage_weight(slab * kGroupK, stage);
             stage_x(slab * kGroupK, stage);
@@ -220,7 +223,7 @@ __launch_bounds__(256, resident_ctas_bound(256, KWarps < 8 || XCols >= 32
     for (int prefetch = 0; prefetch < Stages - 1; ++prefetch) { issue_slab(prefetch); }
 
 #pragma unroll 1
-    for (int slab = 0; slab < kSlabs; ++slab) {
+    for (int slab = 0; slab < slabs; ++slab) {
         issue_slab(slab + Stages - 1);
         cp_wait<Stages - 1>();
         __syncthreads();
@@ -400,7 +403,7 @@ void q5_small_t_mma_launch(cudaStream_t stream, const __nv_bfloat16* x, const st
         q5_small_t_mma_kernel<Rows, K, XCols, Stages, Epilogue, KWarps, TilesPerWarp>;
     static_assert(kBytes <= 48 * 1024, "small-T MMA stages must fit static shared memory");
     kernel<<<Rows / Schedule::kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-        x, codes, high_bits, scales, epilogue, columns);
+        x, codes, high_bits, scales, epilogue, columns, K);
 }
 
 } // namespace ninfer::ops::detail

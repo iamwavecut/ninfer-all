@@ -34,29 +34,6 @@ void launch_rows(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     CUDA_CHECK(cudaGetLastError());
 }
 
-// FP32 out: the head's unrounded logits, column-major [rows, columns].
-struct Fp32ColumnStore {
-    float* out;
-    std::int32_t rows;
-    int columns;
-
-    __device__ __forceinline__ void store(int row, int col0, float4 v) const {
-        if (col0 < columns) {
-            out[static_cast<std::int64_t>(col0) * rows + row]     = v.x;
-            out[static_cast<std::int64_t>(col0) * rows + row + 8] = v.z;
-        }
-        if (col0 + 1 < columns) {
-            out[static_cast<std::int64_t>(col0 + 1) * rows + row]     = v.y;
-            out[static_cast<std::int64_t>(col0 + 1) * rows + row + 8] = v.w;
-        }
-    }
-
-    template <int ActiveCols>
-    __device__ __forceinline__ void store(int row, int col0, float4 v) const {
-        store(row, col0, v);
-    }
-};
-
 struct Fp32GemvStore {
     float* out;
 
@@ -70,8 +47,9 @@ struct Fp32GemvStore {
 template <int TileTokens, int KWarps, int Stages, int TilesPerWarp>
 void launch_rows_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const int rows = weight.n;
-    const Fp32ColumnStore store{static_cast<float*>(out.data), rows, x.ne[1]};
-    q4_ksplit_mma_launch<Geometry, TileTokens, TileTokens, Fp32ColumnStore, Q4KSplitIdentityRows,
+    // FP32 out: the head's unrounded logits.
+    const SmallTFp32Store store{static_cast<float*>(out.data), rows, x.ne[1]};
+    q4_ksplit_mma_launch<Geometry, TileTokens, TileTokens, SmallTFp32Store, Q4KSplitIdentityRows,
                          true, KWarps, Stages, TilesPerWarp>(
         rows / SmallTLayout<KWarps, TilesPerWarp>::kRowsPerCta, stream,
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
