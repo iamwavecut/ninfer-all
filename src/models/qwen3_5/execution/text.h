@@ -326,6 +326,9 @@ private:
     void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                           const Tensor& rope_positions,
                           ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden);
+    // Adds the MTP layer's FFN of `mh` [hidden, T] to its residual `x`. Under tensor parallelism
+    // with the FFN divided (MtpParameters::rank_ffn), every rank projects its rows of it.
+    void mtp_ffn(const Tensor& mh, Tensor& x);
     void window_mtp_attention(PagedKVBatchLayerView& view, Tensor& table_rows, Tensor& positions,
                               const Tensor& valid_columns);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,

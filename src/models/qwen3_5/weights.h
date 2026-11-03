@@ -152,6 +152,10 @@ struct MtpWeights {
     // Tensor parallelism without a proposal head: the output head's shares, read through MTP's
     // input for the drafts. Empty otherwise.
     HeadShareWeights output_head_shares;
+    // Tensor parallelism: ranks 1 to N-1's rows of the layer's dense FFN, each on its own device,
+    // with rank 0's in `layer.ffn`. Empty where rank 0 holds the whole FFN: one device, a MoE FFN,
+    // or stored runs that do not cut at the shares' ends.
+    std::vector<DenseWeights> rank_ffn;
 };
 
 struct NormWeights {

@@ -537,6 +537,7 @@ public:
         nvfp4_w4a16_route(out.output, 5120, 6144);
         nvfp4_int8_route(out.output, 5120, 6144);
         out.ffn         = ffn(w.layer.ffn);
+        for (const DenseWeights& share : w.rank_ffn) { out.rank_ffn.push_back(ffn(share)); }
         out.output_head = head(w.output_head_use);
         out.output_head_shares = head_shares(w.output_head_shares);
         return out;

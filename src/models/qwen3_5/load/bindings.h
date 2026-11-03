@@ -135,8 +135,11 @@ private:
 [[nodiscard]] DenseWeights bind_dense(Bindings& bindings, std::uint64_t hidden,
                                       std::uint64_t intermediate, const std::string& prefix,
                                       bool draft = false);
+// `ffn`, where given, is the block's FFN already bound (a tensor-parallel rank 0's share) in place
+// of the whole one.
 [[nodiscard]] BlockWeights bind_block(Bindings& bindings, const TextConfig& config,
-                                      const std::string& prefix, MixerKind mixer);
+                                      const std::string& prefix, MixerKind mixer,
+                                      const DenseWeights* ffn = nullptr);
 // `stages` decides which device holds each whole layer; its identity form (one stage) binds exactly
 // what a single-GPU load always bound.
 [[nodiscard]] TextWeights bind_text(Bindings& bindings, const TextConfig& config,
@@ -152,6 +155,12 @@ private:
 [[nodiscard]] VisionWeights bind_vision(Bindings& bindings, const VisionConfig& config,
                                         std::uint64_t output_hidden,
                                         artifact::Residency residency);
+// Every rank's share of a dense FFN (`shares`, one per rank) bound at `prefix`, or none where its
+// stored runs do not cut at every share's end.
+[[nodiscard]] std::vector<DenseWeights> bind_dense_shares(Bindings& bindings, std::uint64_t hidden,
+                                                          std::uint64_t intermediate,
+                                                          const std::string& prefix,
+                                                          std::span<const TensorShare> shares);
 [[nodiscard]] MtpWeights bind_mtp(Bindings& bindings, const TextConfig& config,
                                   const TextWeights& target);
 [[nodiscard]] DraftWeights bind_draft(Bindings& bindings, const DraftConfig& config,

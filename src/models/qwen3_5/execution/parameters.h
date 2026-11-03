@@ -145,7 +145,10 @@ struct MtpParameters {
     MtpProjectionParameters projection;
     Tensor query_norm, key_norm;
     LinearParameters output;
+    // Rank 0's rows of the FFN where `rank_ffn` holds the other ranks' (TextContext::mtp_ffn), the
+    // whole FFN otherwise.
     FfnParameters ffn;
+    std::vector<FfnParameters> rank_ffn;
     LinearParameters output_head;
     // Tensor parallelism without a proposal head: the output head's shares through MTP's input.
     HeadShares output_head_shares;
