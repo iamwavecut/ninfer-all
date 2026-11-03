@@ -82,12 +82,23 @@ struct BlockParameters {
     std::size_t rank = 0;
 };
 
+// A vocabulary head divided over the tensor-parallel ranks: rank r projects rows
+// [rows[r], rows[r + 1]) with shares[r] on its own device (TextContext::project_head).
+struct HeadShares {
+    std::vector<LinearParameters> shares;
+    std::vector<std::int64_t> rows;
+
+    [[nodiscard]] bool divided() const noexcept { return !shares.empty(); }
+};
+
 struct TextParameters {
     Weight token_embedding;
     // A token table stored in the rotated basis (T2) is restored after the gather with the
     // hidden-width sign vector; empty for an ordinary table.
     Tensor token_embedding_signs;
     LinearParameters output_head;
+    // Tensor parallelism: every rank's rows of the output head, for decode and verification.
+    HeadShares output_head_shares;
     Tensor final_norm;
     std::vector<BlockParameters> layers;
     // Tensor parallelism: `layers` holds rank 0's share of each layer and rank_layers[r - 1] rank
@@ -136,6 +147,8 @@ struct MtpParameters {
     LinearParameters output;
     FfnParameters ffn;
     LinearParameters output_head;
+    // Tensor parallelism without a proposal head: the output head's shares through MTP's input.
+    HeadShares output_head_shares;
 };
 
 struct NormParameters {
@@ -190,6 +203,8 @@ struct ProposalParameters {
     LinearParameters head;
     std::optional<Tensor> token_ids;
     std::uint32_t rows = 0;
+    // Tensor parallelism: every rank's rows of the head.
+    HeadShares head_shares;
 };
 
 // Cold native preparation for the fixed model implementation. This owner is stable before

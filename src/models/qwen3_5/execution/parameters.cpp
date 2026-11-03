@@ -187,6 +187,17 @@ public:
         return out;
     }
 
+    // Each rank's rows of a divided head, read as the whole head is: through the Uses when the
+    // weights name them, else as the parameters themselves.
+    HeadShares head_shares(const HeadShareWeights& w) const {
+        HeadShares out;
+        for (std::size_t rank = 0; rank < w.shares.size(); ++rank) {
+            out.shares.push_back(w.uses.empty() ? head(w.shares[rank]) : head(w.uses[rank]));
+        }
+        out.rows.assign(w.rows.begin(), w.rows.end());
+        return out;
+    }
+
     // Sites whose execution rotates the activation of a Hadamard-rotated matrix.
     LinearParameters rotated_linear(WeightId id) const {
         return with_context(model_.weight(id).name,
@@ -527,6 +538,7 @@ public:
         nvfp4_int8_route(out.output, 5120, 6144);
         out.ffn         = ffn(w.layer.ffn);
         out.output_head = head(w.output_head_use);
+        out.output_head_shares = head_shares(w.output_head_shares);
         return out;
     }
 
@@ -644,7 +656,8 @@ Parameters::Parameters(const Model& source) : model(source) {
     const Prepare prepare(model);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
-    text.output_head     = prepare.head(w.text.output_head_use);
+    text.output_head        = prepare.head(w.text.output_head_use);
+    text.output_head_shares = prepare.head_shares(w.text.output_head_shares);
     if (text.token_embedding.qtype == QType::T2_G128_FP16) {
         // A ternary checkpoint stores its token table rotated by the same hidden-width signs as
         // every 5120-wide input, the output head's among them; the table has no Use of its own.
@@ -692,8 +705,8 @@ Parameters::Parameters(const Model& source) : model(source) {
                              [&] { return prepare.draft(*w.draft); });
     }
     if (w.proposal) {
-        proposal =
-            ProposalParameters{prepare.head(w.proposal->head), std::nullopt, w.proposal->rows};
+        proposal = ProposalParameters{prepare.head(w.proposal->head), std::nullopt,
+                                      w.proposal->rows, prepare.head_shares(w.proposal->head_shares)};
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
     }
 }

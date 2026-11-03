@@ -608,6 +608,28 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& confi
     return out;
 }
 
+// Tensor parallelism: the rows of vocabulary head `name` ([count, columns], read through `inputs`)
+// each rank projects at decode, in proportion to the split (evenly without one) and ending where
+// the stored blocks and the head's Linear route allow, each bound as a piece on its rank.
+HeadShareWeights bind_head_shares(Bindings& b, const std::string& name, std::uint64_t count,
+                                  std::uint64_t columns, const std::vector<std::string>& inputs,
+                                  const LoadOptions& options) {
+    std::vector<double> weights = options.tensor_split;
+    if (weights.empty()) { weights.assign(options.ranks, 1.0); }
+    const std::vector<bool> allowed = b.row_ends(name, {count, columns});
+    std::vector<std::uint64_t> ends;
+    for (std::uint64_t row = 1; row < count; ++row) {
+        if (allowed[row]) { ends.push_back(row); }
+    }
+    HeadShareWeights out;
+    out.rows = split_shares(count, ends, weights);
+    for (std::size_t rank = 0; rank < options.ranks; ++rank) {
+        out.shares.push_back(b.piece(name, {count, columns}, inputs, {}, rank,
+                                     rows({out.rows[rank], out.rows[rank + 1]})));
+    }
+    return out;
+}
+
 } // namespace
 
 TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& options,
@@ -627,6 +649,10 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
     std::vector<std::string> head_inputs{"text/final_hidden"};
     if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");
+    }
+    if (options.tensor_parallel && !options.lm_head_q4 && !options.lm_head_q6) {
+        out.output_head_shares = bind_head_shares(b, "text/output_head", config.vocab_size,
+                                                  config.hidden_size, head_inputs, options);
     }
     out.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
                                   std::move(head_inputs));
@@ -661,8 +687,13 @@ ProposalWeights bind_proposal(Bindings& b, const artifact::Proposal& proposal,
     }
     ProposalWeights out;
     out.rows = static_cast<std::uint32_t>(rows);
-    out.head = b.parameter("proposal/head", {rows, target.hidden_size},
-                           {std::string(options.speculative_component()) + "/final_hidden"});
+    const std::vector<std::string> inputs{std::string(options.speculative_component()) +
+                                          "/final_hidden"};
+    if (options.tensor_parallel) {
+        out.head_shares =
+            bind_head_shares(b, "proposal/head", rows, target.hidden_size, inputs, options);
+    }
+    out.head = b.parameter("proposal/head", {rows, target.hidden_size}, inputs);
     if (proposal.indexed) {
         out.token_ids = b.direct("proposal/token_ids", {rows}, QType::INT32);
         out.global_token_ids =

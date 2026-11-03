@@ -179,6 +179,14 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
             TensorParallelExchangeOptions{.slot_bytes = tensor_parallel_slot_bytes(plan),
                                           .transport  = plan.features.tensor_parallel_transport});
         for (std::size_t rank = 1; rank < stages; ++rank) { tp.joined.emplace_back(device.rank(rank)); }
+        // A divided head's rows come back to rank 0, each rank's logits over its own link.
+        if (const std::size_t head_bytes = divided_head_link_bytes(plan); head_bytes != 0) {
+            const StageLinkOptions heads{
+                .slot_bytes = head_bytes, .slots = 2, .force_staged = force_staged};
+            for (std::size_t rank = 1; rank < stages; ++rank) {
+                tp.heads.emplace_back(device, rank, 0, heads);
+            }
+        }
         return runtime;
     }
     for (std::size_t stage = 0; stage + 1 < stages; ++stage) {

@@ -130,11 +130,13 @@ public:
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
 
-    void set_proposal_head(const LinearParameters* weight, const std::int32_t* ids,
-                           int count) noexcept {
-        proposal_head_     = weight;
-        proposal_head_ids_ = ids;
-        proposal_head_n_   = count;
+    // `shares` divides `weight` over the tensor-parallel ranks (see project_head), or nullptr.
+    void set_proposal_head(const LinearParameters* weight, const std::int32_t* ids, int count,
+                           const HeadShares* shares = nullptr) noexcept {
+        proposal_head_        = weight;
+        proposal_head_ids_    = ids;
+        proposal_head_n_      = count;
+        proposal_head_shares_ = shares;
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
@@ -335,6 +337,12 @@ private:
                            ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
+    // Projects `hidden` [hidden, columns] through the vocabulary head `whole` into `logits`
+    // [rows, columns] (a column window of a wider buffer is fine). Under tensor parallelism with
+    // `shares` divided, every rank projects its own rows of the head instead and rank 0 gathers
+    // them into `logits`.
+    void project_head(const Tensor& hidden, const LinearParameters& whole,
+                      const HeadShares* shares, Tensor& logits);
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;
@@ -410,6 +418,7 @@ private:
     const Tensor* final_norm_                   = nullptr;
     const LinearParameters* lm_head_            = nullptr;
     const LinearParameters* proposal_head_      = nullptr;
+    const HeadShares* proposal_head_shares_     = nullptr;
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;

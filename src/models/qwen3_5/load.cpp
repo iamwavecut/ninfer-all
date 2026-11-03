@@ -148,9 +148,22 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
     }
     out->weights.text.output_head_use =
         bindings.use(out->weights.text.output_head, "text/final_hidden");
+    auto& head_shares = out->weights.text.output_head_shares;
+    for (const WeightId share : head_shares.shares) {
+        head_shares.uses.push_back(bindings.use(share, "text/final_hidden"));
+    }
     if (out->weights.mtp) {
         out->weights.mtp->output_head_use =
             bindings.use(out->weights.mtp->output_head, "mtp/final_hidden");
+        // Drafts without a proposal head project the output head's shares through MTP's input.
+        if (!out->weights.proposal && !head_shares.shares.empty()) {
+            auto& drafts = out->weights.mtp->output_head_shares;
+            drafts.shares = head_shares.shares;
+            drafts.rows   = head_shares.rows;
+            for (const WeightId share : drafts.shares) {
+                drafts.uses.push_back(bindings.use(share, "mtp/final_hidden"));
+            }
+        }
     }
     if (out->weights.draft) {
         out->weights.draft->output_head_use =
@@ -199,7 +212,7 @@ std::uint64_t parameter_bytes(const artifact::Reader& reader, const loading::Bin
 // Binds them into `bindings` only to size them.
 std::uint64_t head_stage_bytes(const artifact::Reader& reader, loading::Bindings& bindings,
                                const Config& config, const TextWeights& weights,
-                               const LoadOptions& options) {
+                               const LoadOptions& options, std::uint64_t* proposal_head = nullptr) {
     const auto& text       = config.text;
     std::uint64_t out      = parameter_bytes(reader, bindings, weights.token_embedding) +
                              parameter_bytes(reader, bindings, weights.output_head) +
@@ -235,8 +248,11 @@ std::uint64_t head_stage_bytes(const artifact::Reader& reader, loading::Bindings
     if (options.proposal_enabled() && proposal) {
         // Sized only: plan_load checks the head's rows against the tokenizer's public tokens.
         const std::size_t first = bindings.weights.size();
-        (void)loading::bind_proposal(bindings, *proposal, text, options,
-                                     std::numeric_limits<std::uint32_t>::max());
+        const ProposalWeights bound = loading::bind_proposal(
+            bindings, *proposal, text, options, std::numeric_limits<std::uint32_t>::max());
+        if (proposal_head != nullptr) {
+            *proposal_head = parameter_bytes(reader, bindings, bound.head);
+        }
         out += bound_since(first);
     }
     return out;
@@ -411,8 +427,12 @@ SplitSizes split_sizes(const artifact::Reader& reader, LoadOptions options,
         out.divided += attention_kv_bytes(text, sizing, text.attention->num_key_value_heads);
     }
     // Rank 0 also holds the head stage's parts and MTP's KV, whose heads stay whole there.
-    out.first += head_stage_bytes(reader, bindings, config, weights, options) +
+    std::uint64_t proposal_head = 0;
+    out.first += head_stage_bytes(reader, bindings, config, weights, options, &proposal_head) +
                  sizing.kv_tokens * mtp_kv_bytes_per_token(config, sizing.kv_storage);
+    // Every rank holds its rows of the heads besides, which decode projects divided.
+    if (!options.lm_head_q4 && !options.lm_head_q6) { out.divided += bytes(weights.output_head); }
+    out.divided += proposal_head;
     return out;
 }
 
