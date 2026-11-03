@@ -209,10 +209,12 @@ std::uint64_t parameter_bytes(const artifact::Reader& reader, const loading::Bin
 // The device bytes of what the head stage (rank 0 under tensor parallelism) holds beside its layers
 // or its share: the embedding, the head and the final norm, and as selected a resident Vision
 // tower, MTP's layer, a DFlash drafter's own weights and the proposal head the drafts project onto.
-// Binds them into `bindings` only to size them.
+// Binds them into `bindings` only to size them. `mtp_ffn` takes the part of MTP's layer that is a
+// dense FFN, which tensor parallelism divides.
 std::uint64_t head_stage_bytes(const artifact::Reader& reader, loading::Bindings& bindings,
                                const Config& config, const TextWeights& weights,
-                               const LoadOptions& options, std::uint64_t* proposal_head = nullptr) {
+                               const LoadOptions& options, std::uint64_t* proposal_head = nullptr,
+                               std::uint64_t* mtp_ffn = nullptr) {
     const auto& text       = config.text;
     std::uint64_t out      = parameter_bytes(reader, bindings, weights.token_embedding) +
                              parameter_bytes(reader, bindings, weights.output_head) +
@@ -234,8 +236,13 @@ std::uint64_t head_stage_bytes(const artifact::Reader& reader, loading::Bindings
     if (config.mtp) {
         // MTP's own parameters; it shares the target's embedding and head.
         const std::size_t first = bindings.weights.size();
-        (void)loading::bind_mtp(bindings, text, weights);
+        const MtpWeights mtp    = loading::bind_mtp(bindings, text, weights);
         out += bound_since(first);
+        if (const auto* dense = std::get_if<DenseWeights>(&mtp.layer.ffn); dense && mtp_ffn) {
+            *mtp_ffn = parameter_bytes(reader, bindings, dense->gate) +
+                       parameter_bytes(reader, bindings, dense->up) +
+                       parameter_bytes(reader, bindings, dense->down);
+        }
     }
     if (config.draft && options.masked_draft()) {
         // The drafter shares the target's embedding and head, so only what it binds anew counts.
@@ -428,11 +435,16 @@ SplitSizes split_sizes(const artifact::Reader& reader, LoadOptions options,
     }
     // Rank 0 also holds the head stage's parts and MTP's KV, whose heads stay whole there.
     std::uint64_t proposal_head = 0;
-    out.first += head_stage_bytes(reader, bindings, config, weights, options, &proposal_head) +
+    std::uint64_t mtp_ffn       = 0;
+    out.first += head_stage_bytes(reader, bindings, config, weights, options, &proposal_head,
+                                  &mtp_ffn) +
                  sizing.kv_tokens * mtp_kv_bytes_per_token(config, sizing.kv_storage);
-    // Every rank holds its rows of the heads besides, which decode projects divided.
+    // Every rank holds its rows of the heads besides, which decode projects divided, and of MTP's
+    // dense FFN instead of rank 0 the whole.
     if (!options.lm_head_q4 && !options.lm_head_q6) { out.divided += bytes(weights.output_head); }
     out.divided += proposal_head;
+    out.first -= mtp_ffn;
+    out.divided += mtp_ffn;
     return out;
 }
 

@@ -267,7 +267,8 @@ families](#expert-parallelism-of-the-other-moe-families)).
   with more ranks than the heads allow, the others hold no attention, unless `--tensor-attention
   positions` divides it by cache pages ([attention by positions](#attention-by-positions)). The
   embedding, the final norm and MTP stay on rank 0, and so do the whole output and proposal heads;
-  every rank also holds a row range of each head, which decode projects divided (below).
+  every rank also holds a row range of each head, which decode projects divided, and its rows of
+  MTP's dense FFN in place of rank 0's whole one (below).
   `TensorShare` and `tensor_parallel_share`
   (`models/qwen3_5/config.h`) state a rank's ranges and geometry.
 - **Expert parallelism.** In a MoE model a rank holds a contiguous range of the routed experts in
@@ -314,8 +315,8 @@ families](#expert-parallelism-of-the-other-moe-families)).
   card divide its figure) as its speed, works out how much of the divided weights, GDN state and KV
   cache for the configured context and concurrency each card can hold beside what every rank holds
   and, on rank 0, the embedding, the head and, as selected, MTP's layer with its KV, the proposal
-  head, a DFlash drafter and a resident Vision tower, the heads' row ranges counting with the divided
-  weights (`default_tensor_split`, `models/qwen3_5/load.cpp`), and fills the cards in proportion to speed, capping a card at its room
+  head, a DFlash drafter and a resident Vision tower, the heads' row ranges and MTP's dense FFN
+  counting with the divided weights (`default_tensor_split`, `models/qwen3_5/load.cpp`), and fills the cards in proportion to speed, capping a card at its room
   and passing the excess to the others (`fill_shares`). Automatic KV capacity also keeps its
   headroom free on every card, and when the longest context fits nowhere it divides the cards by
   room instead of speed, so the KV it shrinks to is the most that fits. What the Engine reserves
@@ -361,6 +362,17 @@ families](#expert-parallelism-of-the-other-moe-families)).
   (PCIe 4.0 x8, host transport), and a round in 34.4 ms against 39.4 on the four A4000s (capped at
   110 W), with the same text and accepted drafts; prefill is unchanged. The ranges cost every card
   their bytes (0.40 GiB on each of four cards for Qwen3.8-27B with its proposal head).
+- **Divided MTP FFN** (`TextContext::mtp_ffn`). Every rank holds its rows of MTP's dense FFN, cut
+  where a layer's FFN is (`bind_dense_shares`), and rank 0 holds no whole one. Every MTP forward,
+  in decode and over prompt chunks, sends the post-attention hidden state over the forward links;
+  every rank projects its rows into an FP32 partial, and one exchange stores the sum, rounded to
+  BF16 once, which rank 0 adds to MTP's residual as one device adds its down projection. Drafts
+  only propose, so the round's text stays the target's. The exchange slots alternate across passes
+  and these calls (`StageRuntime::TensorParallel::next_exchange`), since the drafts follow the
+  verification in one capture. On four RTX 5060 Ti (Qwen3.8-27B, Q8 MTP layer, int8 KV, three
+  drafts, even split) a round takes 23.6-23.9 ms against 24.9-25.0, with the same accepted drafts and
+  text; prefill is unchanged, and rank 0 holds 0.20 GiB less while each other card holds 0.07 GiB
+  more.
 - **Transports and forms.** An exchange moves the partials one of three ways: through mapped pinned
   host memory (`host`: the copy engines write each partial there, every rank's kernels read the
   others' copies; works between any cards), by reading the other cards' memory (`peer-read`), or by

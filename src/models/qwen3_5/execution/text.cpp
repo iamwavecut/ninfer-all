@@ -432,14 +432,91 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     Tensor mh = post.post_mixer_hidden;
     ops::rmsnorm(x, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, s);
-
-    {
-        auto post_mixer_scope = work_.scope();
-        ffn(mh, mtp_->ffn, x, {}, work_, s, true, false, InputBasis::Primal, false, experts_);
-    }
+    mtp_ffn(mh, x);
 
     Tensor flat_mtp_hidden = mtp_hidden.view({dimension(config_.hidden_size), T});
     ops::rmsnorm(x, mtp_->final_norm, config_.rms_norm_eps, true, flat_mtp_hidden, s);
+}
+
+// Divided, rank 0 sends `mh` to every rank, each projects its rows of the FFN into an FP32 partial,
+// and the exchange stores their sum, rounded once, in a buffer of every rank (the other ranks' copy
+// of `mh`, which nothing reads after); rank 0 adds it to `x`, as one device adds its BF16 down
+// projection. The exchange takes the next slot after the pass the drafts follow in one capture.
+void TextContext::mtp_ffn(const Tensor& mh, Tensor& x) {
+    auto scope = work_.scope();
+    if (mtp_->rank_ffn.empty()) {
+        ffn(mh, mtp_->ffn, x, {}, work_, ctx_.stream, true, false, InputBasis::Primal, false,
+            experts_);
+        return;
+    }
+    if (stage_runtime_ == nullptr || !stage_runtime_->tensor_parallel) {
+        throw std::logic_error("a divided MTP FFN needs the tensor-parallel runtime");
+    }
+    StageRuntime& runtime            = *stage_runtime_;
+    auto& tp                         = *runtime.tensor_parallel;
+    TensorParallelExchange& exchange = *tp.exchange;
+    const std::size_t ranks          = exchange.ranks();
+    if (mtp_->rank_ffn.size() + 1 != ranks || runtime.forward.size() + 1 != ranks ||
+        tp.joined.size() + 1 != ranks || ctx_.active_rank() != 0) {
+        throw std::logic_error("the MTP FFN's shares do not match the tensor-parallel ranks");
+    }
+    const std::int64_t values = static_cast<std::int64_t>(x.ne[0]) * x.ne[1];
+    const std::size_t bytes   = static_cast<std::size_t>(values) * sizeof(float);
+    if (bytes > exchange.slot_bytes() || mh.bytes() > runtime.forward.front().slot_bytes()) {
+        throw std::runtime_error("the MTP FFN exceeds the tensor-parallel links");
+    }
+    const std::uint32_t slot = runtime.next_slot;
+    runtime.next_slot = (slot + 1U) % static_cast<std::uint32_t>(runtime.forward.front().slots());
+    const std::size_t exchange_slot = tp.next_exchange;
+    tp.next_exchange ^= 1U;
+    const cudaStream_t entry = ctx_.stream;
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        runtime.forward[rank - 1].send(mh.data, mh.bytes(), slot, entry);
+    }
+
+    std::vector<Tensor> sums(ranks);
+    std::vector<WorkspaceArena::Scope> rank_scopes;
+    rank_scopes.reserve(ranks - 1);
+    const auto on_rank = [&](std::size_t rank, const auto& step) {
+        std::optional<ScopedDeviceRank> device_guard;
+        std::optional<ScopedArenaRank> arena_guard;
+        if (rank != 0) {
+            device_guard.emplace(ctx_, rank);
+            arena_guard.emplace(work_, rank);
+        }
+        step();
+    };
+    for (std::size_t rank = 0; rank < ranks; ++rank) {
+        on_rank(rank, [&] {
+            Tensor input = mh;
+            if (rank != 0) { rank_scopes.push_back(work_.scope()); }
+            sums[rank] = work_.alloc(DType::BF16, {x.ne[0], x.ne[1]});
+            if (rank != 0) {
+                runtime.forward[rank - 1].recv(sums[rank].data, mh.bytes(), slot, ctx_.stream);
+                input = sums[rank];
+            }
+            Tensor partial(exchange.partial(rank, exchange_slot), DType::FP32, {x.ne[0], x.ne[1]});
+            ffn(input, rank == 0 ? mtp_->ffn : mtp_->rank_ffn[rank - 1], sums[rank], {}, work_,
+                ctx_.stream, false, false, InputBasis::Primal, false, nullptr, nullptr, &partial);
+            exchange.publish(rank, exchange_slot, bytes, sums[rank].data, ctx_.stream,
+                             TensorParallelSum::StoreBf16);
+        });
+    }
+    for (std::size_t rank = 0; rank < ranks; ++rank) {
+        on_rank(rank, [&] {
+            exchange.reduce(rank, exchange_slot, sums[rank].data, values, ranks, ctx_.stream,
+                            TensorParallelSum::StoreBf16);
+        });
+    }
+    for (std::size_t rank = 0; rank < ranks; ++rank) {
+        on_rank(rank, [&] {
+            exchange.complete(rank, exchange_slot, sums[rank].data, values, ctx_.stream,
+                              TensorParallelSum::StoreBf16);
+            if (rank != 0) { tp.joined[rank - 1].record(ctx_.stream); }
+        });
+    }
+    for (std::size_t rank = 1; rank < ranks; ++rank) { tp.joined[rank - 1].wait(entry); }
+    ops::residual_add(sums[0], x, entry);
 }
 
 // The MTP draft attends to one sink page and the newest window, so its read stops growing with
@@ -599,10 +676,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
         Tensor mh = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
         ops::rmsnorm(x_last, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, s);
-        {
-            auto post_mixer_scope = work_.scope();
-            ffn(mh, mtp_->ffn, x_last, {}, work_, s, true, false, InputBasis::Primal, false, experts_);
-        }
+        mtp_ffn(mh, x_last);
         ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, true, *final_hidden, s);
         proposal_argmax(*final_hidden, *logits, *draft_token);
     }
@@ -1903,8 +1977,8 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
         tensor_rank_ = 0;
     };
     // One exchange: ranks [0, contributors) project into their partials, every replica adds them.
-    std::size_t next_exchange = 0;
-    const auto exchange_step  = [&](std::size_t contributors, const auto& share) {
+    std::size_t& next_exchange = tp.next_exchange;
+    const auto exchange_step   = [&](std::size_t contributors, const auto& share) {
         const std::size_t exchange_slot = next_exchange;
         next_exchange ^= 1U;
         for (std::size_t rank = 0; rank < ranks; ++rank) {

@@ -90,10 +90,11 @@ struct StageRuntime {
     // Tensor parallelism (`--tensor-parallel`) instead of stages: every rank runs a share of each
     // layer's GDN heads, KV heads and dense FFN rows or experts, and the ranks add their output
     // projections' FP32 partials into identical replicas of the residual through `exchange`. The
-    // embedding, the shared expert and MTP stay on rank 0; decode divides the heads' rows over the
-    // ranks. `state[r]` and `replay[r]` are rank r's shares of every GDN layer, `control[r - 1]` and
-    // `forward[r - 1]` carry the control tensors and the incoming residual (or the hidden a divided
-    // head projects) from rank 0 to rank r, and `back` is absent.
+    // embedding, the shared expert and MTP stay on rank 0, but for a dense MTP FFN, which the ranks
+    // divide as a layer's; decode divides the heads' rows over the ranks. `state[r]` and
+    // `replay[r]` are rank r's shares of every GDN layer, `control[r - 1]` and `forward[r - 1]`
+    // carry the control tensors and the incoming residual (or the hidden a divided head projects)
+    // from rank 0 to rank r, and `back` is absent.
     struct TensorParallel {
         // shares[r] is rank r's GDN heads, KV heads and dense FFN rows or experts, and shards[r]
         // the model as that share sees it.
@@ -106,6 +107,9 @@ struct StageRuntime {
         // slots per projection (`next_head_slot`); empty when no head is divided.
         std::vector<StageLink> heads;
         std::uint32_t next_head_slot = 0;
+        // The exchange slot the next exchange takes: they alternate from pass to pass and through
+        // the MTP layer's divided FFN, so consecutive exchanges in one capture never share a slot.
+        std::size_t next_exchange = 0;
     };
     std::optional<TensorParallel> tensor_parallel;
 };

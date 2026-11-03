@@ -28,6 +28,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 - **2026-11-03:** Qwen3.5-core models speed up [tensor-parallel decode](docs/maintainer/pipeline-stages.md#tensor-parallelism)
   by splitting vocabulary heads across GPUs.
   Eligible Q4 and Q5 projection shares use the same small-T MMA routes as whole projections.
+  The GPUs also divide the dense MTP FFN.
   GPUs can speed up dense text prefill by exchanging one prompt piece while computing the next.
   Flash-Next [drafts with MTP for several requests at once](docs/qwen3-8-flash-next.md#mtp-with-several-requests).
   On an RTX 4090 with host experts, automatic drafting ran at 1.01 to 1.16 times the speed without drafts.

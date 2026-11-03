@@ -667,7 +667,21 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, parameters.mtp->output, first, last);
-        scratch(layout, execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last, true));
+        if (parameters.mtp->rank_ffn.empty()) {
+            scratch(layout, execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last, true));
+            return;
+        }
+        // A divided FFN: each rank's sum, then its share's partial projection. Every rank's
+        // scratch has rank 0's size, so this holds the largest share's needs.
+        auto scope        = layout.scope();
+        std::size_t share = execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last, false,
+                                                           false, false, true);
+        for (const auto& rank_ffn : parameters.mtp->rank_ffn) {
+            share = std::max(share, execution::ffn_workspace_bytes(rank_ffn, first, last, false,
+                                                                   false, false, true));
+        }
+        matrix(layout, DType::BF16, dimension(config.hidden_size), last);
+        scratch(layout, share);
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {

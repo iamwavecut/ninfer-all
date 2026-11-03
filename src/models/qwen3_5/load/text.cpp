@@ -309,6 +309,24 @@ void place_layer(Bindings& b, const BlockWeights& block, std::size_t rank) {
 
 } // namespace
 
+std::vector<DenseWeights> bind_dense_shares(Bindings& b, std::uint64_t hidden,
+                                            std::uint64_t intermediate, const std::string& prefix,
+                                            std::span<const TensorShare> shares) {
+    const auto down = b.column_ends(prefix + "mlp/down", {hidden, intermediate},
+                                    {prefix + "mlp/product"});
+    const auto gate = b.row_ends(prefix + "mlp/gate", {intermediate, hidden});
+    const auto up   = b.row_ends(prefix + "mlp/up", {intermediate, hidden});
+    for (std::size_t rank = 0; rank + 1 < shares.size(); ++rank) {
+        const std::uint64_t end = shares[rank].ffn_end;
+        if (end >= intermediate || !down[end] || !gate[end] || !up[end]) { return {}; }
+    }
+    std::vector<DenseWeights> out;
+    for (std::size_t rank = 0; rank < shares.size(); ++rank) {
+        out.push_back(bind_dense_share(b, hidden, intermediate, prefix, rank, shares[rank]));
+    }
+    return out;
+}
+
 std::vector<WeightId> layer_weights(const BlockWeights& block) {
     std::vector<WeightId> out{block.input_norm, block.post_attention_norm};
     if (const auto* attention = std::get_if<AttentionWeights>(&block.mixer)) {
@@ -336,7 +354,7 @@ std::vector<WeightId> layer_weights(const BlockWeights& block) {
 }
 
 BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string& p,
-                        MixerKind mixer) {
+                        MixerKind mixer, const DenseWeights* ffn) {
     BlockWeights out;
     out.input_norm          = b.direct(p + "input_norm", {config.hidden_size});
     out.post_attention_norm = b.direct(p + "post_attention_norm", {config.hidden_size});
@@ -345,7 +363,9 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
     } else {
         out.mixer = bind_gdn(b, config, p);
     }
-    if (const auto* dense = std::get_if<DenseConfig>(&config.ffn)) {
+    if (ffn != nullptr) {
+        out.ffn = *ffn;
+    } else if (const auto* dense = std::get_if<DenseConfig>(&config.ffn)) {
         out.ffn = bind_dense(b, config.hidden_size, dense->intermediate_size, p);
     } else {
         out.ffn = bind_moe(b, config, p);
