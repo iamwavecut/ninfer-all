@@ -137,6 +137,19 @@ The mixer is gated GQA or GDN according to `layer_types`. Dense FFN is
 bias-free. Fusion may combine projection, activation, normalization and residual work while
 preserving the declared mathematical and observable precision boundaries.
 
+### Residual edits
+
+LoRA adapters and control vectors ([serving](../serving.md#lora-adapters-and-control-vectors),
+`frontend/steering.h`) edit the residual at its write sites: the token embedding, and each layer's
+mixer and FFN outputs. A direction adapter e with unit direction u_e turns a site's write o into
+`o - k_e * u_e * (u_e^T o)`, with `k_e` the request's scale times the adapter's factor at that site,
+every adapter measuring the same o. After layer l's FFN write the control vectors' sum for l is
+added. `ops::steer_residual` applies both in FP32 on the BF16 residual: a Measure step records
+`u_e^T x` before a write, and the Write step after it removes `k_e * u_e * (u_e^T x - measure)` and
+adds the vector, so the fused residual additions stay as they are; the embedding, which has no
+earlier residual, takes the removal directly. Each column reads its request's
+scales from the row of its lane, written at admission. The MTP and DFlash drafters run unedited.
+
 ### Gated full attention
 
 ```text

@@ -248,7 +248,8 @@ std::vector<DeviceArena> make_rank_workspaces(DeviceContext& device,
 
 ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const SequencePlanImpl& plan,
                          DeviceContext& device_in, const StartupObserver& startup_observer,
-                         std::unique_ptr<execution::NativeExpertRuntime> expert_runtime)
+                         std::unique_ptr<execution::NativeExpertRuntime> expert_runtime,
+                         const Steering* steering_source)
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache),
@@ -615,6 +616,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
+    bind_steering(plan, steering_source, backings);
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
     }
@@ -741,6 +743,84 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
 }
 
+void ProgramImpl::bind_steering(const SequencePlanImpl& plan, const Steering* source,
+                                std::span<const DeviceSpan> backings) {
+    const bool loaded = source != nullptr && !source->empty();
+    if (plan.persistent.steering.empty()) {
+        if (loaded) { throw std::invalid_argument("the sequence plan holds no loaded steering"); }
+        return;
+    }
+    if (!loaded || source->adapters.size() != plan.steering_adapters ||
+        source->layer_vectors.empty() == plan.steering_vectors ||
+        plan.persistent.steering.size() != backings.size()) {
+        throw std::invalid_argument("loaded steering does not match the sequence plan");
+    }
+    const auto& config       = parameters.model.config().text;
+    const std::size_t hidden = config.hidden_size;
+    const std::size_t sites  = steering_sites(config.num_hidden_layers);
+    const std::size_t count  = source->adapters.size();
+    // Column-major images of the device tensors (execution::SteeringRank).
+    std::vector<float> directions(hidden * count);
+    std::vector<float> factors(count * sites);
+    std::vector<float> scales(count * max_concurrency);
+    for (std::size_t e = 0; e < count; ++e) {
+        const DirectionAdapter& adapter = source->adapters[e];
+        std::copy(adapter.direction.begin(), adapter.direction.end(),
+                  directions.begin() + static_cast<std::ptrdiff_t>(e * hidden));
+        for (std::size_t site = 0; site < sites; ++site) {
+            factors[site * count + e] = adapter.site_factors[site];
+        }
+        // Until a request takes a lane its row runs the default scales.
+        for (std::size_t lane = 0; lane < max_concurrency; ++lane) {
+            scales[lane * count + e] = adapter.default_scale;
+        }
+    }
+    const auto upload = [](const Tensor& tensor, std::span<const float> values) {
+        if (tensor.bytes() != values.size_bytes()) {
+            throw std::logic_error("planned steering tensor does not match the loaded steering");
+        }
+        CUDA_CHECK(cudaMemcpy(tensor.data, values.data(), values.size_bytes(),
+                              cudaMemcpyHostToDevice));
+    };
+    steering                 = std::make_unique<execution::SteeringView>();
+    steering->adapters       = static_cast<std::int32_t>(count);
+    steering->steered_layers = source->steered_layers;
+    for (std::size_t rank = 0; rank < backings.size(); ++rank) {
+        const SteeringRankLayout& layout = plan.persistent.steering[rank];
+        execution::SteeringRank& out     = steering->ranks.emplace_back();
+        if (count != 0) {
+            out.directions   = layout.directions->bind(backings[rank]);
+            out.site_factors = layout.site_factors->bind(backings[rank]);
+            out.lane_scales  = layout.lane_scales->bind(backings[rank]);
+            out.measures     = layout.measures->bind(backings[rank]);
+            if (layout.column_rows) { out.column_rows = layout.column_rows->bind(backings[rank]); }
+            upload(out.directions, directions);
+            upload(out.site_factors, factors);
+            upload(out.lane_scales, scales);
+        }
+        if (!source->layer_vectors.empty()) {
+            out.vectors = layout.vectors->bind(backings[rank]);
+            upload(out.vectors, source->layer_vectors);
+        }
+    }
+}
+
+void ProgramImpl::write_lane_scales(const SequenceState& sequence,
+                                    const PreparedPromptData& prompt) {
+    if (!steering || steering->adapters == 0) { return; }
+    const std::int32_t row = text_kv_addresses->bound_row(sequence.kv->text);
+    if (row < 0 || static_cast<std::uint32_t>(row) >= max_concurrency) {
+        throw std::logic_error("a sequence's KV table row has no adapter scales");
+    }
+    const auto count = static_cast<std::size_t>(steering->adapters);
+    for (std::size_t rank = 0; rank < steering->ranks.size(); ++rank) {
+        float* destination = static_cast<float*>(steering->ranks[rank].lane_scales.data) +
+                             static_cast<std::size_t>(row) * count;
+        CUDA_CHECK(cudaMemcpyAsync(destination, prompt.lora_scales.data(), count * sizeof(float),
+                                   cudaMemcpyHostToDevice, device.stream_for_rank(rank)));
+    }
+}
+
 void ProgramImpl::lend_kv_to_experts() {
     if (!kv_expert_loan) { return; }
     // At least this many pages move at once, so a lend (which drains the expert service) stays
@@ -864,7 +944,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(0), nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
-                 mtp_attention_window, experts.get()},
+                 mtp_attention_window, experts.get(), steering.get()},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,

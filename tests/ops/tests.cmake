@@ -4,6 +4,7 @@ set(ninfer_op_tests
   hadamard_transform
   silu_mul
   residual_add
+  steer_residual
   sigmoid_mul
   hyper_connection
   ple_inject

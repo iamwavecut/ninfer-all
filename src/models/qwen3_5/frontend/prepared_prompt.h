@@ -181,6 +181,10 @@ struct PreparedPromptData {
     PrepareStats prepare;
     std::string graft_name;
     std::uint32_t graft_frontier = 0;
+    // The request's scale for each loaded LoRA adapter (frontend/steering.h), zero past them, and
+    // what the scales add to the prompt's cache identity: zero when every scale is zero.
+    std::array<float, kMaximumLoraAdapters> lora_scales{};
+    std::array<std::uint64_t, 2> lora_key{};
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
 

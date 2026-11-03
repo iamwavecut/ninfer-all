@@ -13,12 +13,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace ninfer::models::qwen3_5 {
+
+struct Steering;
 
 [[nodiscard]] ModelSamplingDefaults default_sampling(Architecture architecture);
 
@@ -55,6 +58,9 @@ struct FrontendOptions {
     std::uint32_t progress_anchor_tokens = 0;
     // Hidden prompt prefixes a request may select through PromptOptions::graft.
     std::vector<PromptGraft> grafts;
+    // The loaded LoRA adapters and control vectors; null without either. A request's
+    // PromptOptions::lora scales the adapters.
+    std::shared_ptr<const Steering> steering;
 };
 
 struct FrontendResources;
@@ -120,10 +126,10 @@ public:
                                          const PreparationControl& control = {}) const;
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
-    [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
-                                                bool allow_prefix_identity = true,
-                                                bool anchor_prompt_end     = false,
-                                                bool speculative_drafting  = true) const;
+    [[nodiscard]] PreparedPrompt
+    prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity = true,
+                   bool anchor_prompt_end = false, bool speculative_drafting = true,
+                   const std::optional<std::vector<LoraScale>>& lora = std::nullopt) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text,
                                                      bool parse_special = true) const;
     [[nodiscard]] std::string token_bytes(TokenId token) const;

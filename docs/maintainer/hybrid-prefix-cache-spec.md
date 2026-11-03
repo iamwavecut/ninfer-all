@@ -277,8 +277,9 @@ Block `b` of a prompt covers absolute positions `[64b, 64b+64)`.
 ```text
 BlockKey(b) = ( parent NodeId,
                 tokens[64b .. 64b+63],               // TokenId, exact
-                extra = media_key(b) )               // 0 when no Vision item overlaps block b
-media_key(b) = xxh3_64 over, for each Vision item whose token span overlaps block b and every
+                extra = media_key(b) )               // 0 without Vision items and adapter scales
+media_key(b) = a running hash, seeded with the prompt's LoRA adapter key (0 when every adapter
+               scale is 0), over, for each Vision item whose token span overlaps block b and every
                earlier item (Vision changes later MRoPE positions via rope_delta):
                (content_digest[32], modality, grid, span begin/length)
 lookup_hash(b) = xxh3_64(lookup_hash(b-1) || tokens || extra), lookup_hash(-1) = seed
@@ -288,8 +289,12 @@ lookup_hash(b) = xxh3_64(lookup_hash(b-1) || tokens || extra), lookup_hash(-1) =
   `tokens` and `extra` exactly. A forced hash collision must not produce a false hit (tested,
   §13.1).
 - Everything else that affects KV or state is fixed for the Engine lifetime: model artifact,
-  KV profile, speculative backend, RoPE/YaRN options. None of it is part of the key. Positions are
-  a function of tokens and media, so they are covered by the key.
+  KV profile, speculative backend, RoPE/YaRN options, control vectors. None of it is part of the
+  key. Positions are a function of tokens and media, so they are covered by the key. A request's
+  LoRA adapter scales are not fixed, so their key seeds `extra`
+  ([adapters](../serving.md#lora-adapters-and-control-vectors)).
+- A snapshot inside the first block hangs from the root, whose key has no `extra`, so a prompt with
+  a nonzero adapter key neither publishes nor resumes from one.
 - Thinking mode, templates, tools and roles are all rendered into tokens, so they need no key
   field.
 - The Frontend computes `lookup_hash` for every full block during preparation, off the worker, and
@@ -417,7 +422,7 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   error) empties the cache like every cleanup, so a later save holds only what was cached after it.
 - **Load**, at Engine construction before any request: the file is used only when its fingerprint
   (absolute artifact path, size and modification time, prefill signature, KV storage, speculative
-  backend, RoPE scaling, and the product binary's identity — build id plus executable size and
+  backend, RoPE scaling, the control vectors' digest, and the product binary's identity — build id plus executable size and
   time, so any rebuild invalidates it) and its Host geometry equal the running Engine's, and its
   size matches its tables. The file (format 3) holds the header, the block table, the snapshot
   table and only then the slab bytes, so the loader chooses before it reads any slab. A Host tier

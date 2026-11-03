@@ -46,6 +46,8 @@ struct ExecutionCore {
     bool fast_prefill_kernel = false;
     std::uint32_t mtp_attention_window = 0;
     NativeExpertRuntime* experts = nullptr;
+    // Null without LoRA adapters or control vectors.
+    const SteeringView* steering = nullptr;
 };
 
 // The round's logprob gather outputs for a [width, batch] round: I32 and FP32 [kLogprobTopK,

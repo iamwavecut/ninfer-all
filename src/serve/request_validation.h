@@ -29,6 +29,11 @@ bool optional_bool(const RequestJson& object, const char* key, bool fallback);
 // grafts during translation.
 std::optional<std::string> parse_graft_field(const RequestJson& body);
 
+// llama.cpp's `lora` field: [{"id": N, "scale": S}, ...], each loaded adapter listed running at
+// its scale and every other at zero; absent or null (nullopt) runs each at the server's scale.
+// Whether each id is loaded is checked during translation.
+std::optional<std::vector<ninfer::LoraScale>> parse_lora_field(const RequestJson& body);
+
 // The NInfer `thinking_budget` extension field: a positive cap on model-origin thinking tokens for
 // this request, or absent/null (nullopt) to take the server default. Ignored when the request does
 // not think. Anthropic Messages carries the same cap as `thinking.budget_tokens`.

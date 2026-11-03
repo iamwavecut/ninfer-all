@@ -750,7 +750,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
 
         Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
-        embed_tokens(ids, *embed_, parameters_.text.token_embedding_signs, x, stream);
+        embed_input(ids, x, stream);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
@@ -805,7 +805,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
 
         Tensor x        = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
         Tensor flat_ids = ids.view({columns});
-        embed_tokens(flat_ids, *embed_, parameters_.text.token_embedding_signs, x, stream);
+        embed_input(flat_ids, x, stream);
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
@@ -1375,6 +1375,41 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
         InputBasis::Primal, wide, experts_, nullptr, residual_partial_);
 }
 
+void TextContext::embed_input(const Tensor& ids, Tensor& x, cudaStream_t stream) {
+    embed_tokens(ids, *embed_, parameters_.text.token_embedding_signs, x, stream);
+    steer(ops::SteerResidualStep::Embedding, kEmbeddingSteeringSite, -1, x);
+}
+
+void TextContext::steer(ops::SteerResidualStep step, std::uint32_t site, std::int32_t layer,
+                        Tensor& x) {
+    if (steering_ == nullptr) { return; }
+    const bool add_vector = step == ops::SteerResidualStep::Write && layer >= 0 &&
+                            static_cast<std::size_t>(layer) < steering_->steered_layers.size() &&
+                            steering_->steered_layers[static_cast<std::size_t>(layer)] != 0;
+    if (steering_->adapters == 0 && !add_vector) { return; }
+    const SteeringRank& rank = steering_->ranks.at(ctx_.active_rank());
+    const auto hidden        = dimension(config_.hidden_size);
+    Tensor factors;
+    ops::SteerResidualLanes lanes;
+    if (steering_->adapters != 0) {
+        if (step != ops::SteerResidualStep::Measure) {
+            factors = rank.site_factors.slice(1, static_cast<std::int32_t>(site), 1)
+                          .view({steering_->adapters});
+        }
+        lanes.lane_scales = rank.lane_scales;
+        if (active_column_rows_ != nullptr) {
+            lanes.rows = *active_column_rows_;
+        } else {
+            lanes.rows =
+                active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+            lanes.row_width = row_width(x.ne[1]);
+        }
+    }
+    const Tensor vector = add_vector ? rank.vectors.slice(1, layer, 1).view({hidden}) : Tensor{};
+    Tensor measures     = rank.measures;
+    ops::steer_residual(step, x, rank.directions, factors, lanes, measures, vector, ctx_.stream);
+}
+
 TextContext::GdnShard TextContext::gdn_shard(std::uint32_t layer) const {
     if (stage_runtime_ == nullptr) { return {0, layer}; }
     // Every rank holds its share of every layer.
@@ -1409,6 +1444,8 @@ template <class Tap>
 void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& tap) {
     const bool prefill      = ph == Phase::Prefill;
     const std::uint32_t end = parameters_.text.stage_end(stage);
+    // The adapters' measures start from the residual the stage receives.
+    steer(ops::SteerResidualStep::Measure, 0, -1, x);
     for (std::uint32_t layer = parameters_.text.stage_begin[stage]; layer < end; ++layer) {
         const auto& block  = parameters_.text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
@@ -1433,6 +1470,7 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                     gdn_mix(block, x, compact, ph);
                 }
             }
+            steer(ops::SteerResidualStep::Write, mixer_steering_site(layer), -1, x);
             {
                 nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer
                                                 : nvtx::Name::VerifyPostMixer,
@@ -1445,6 +1483,8 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                          layer + 1 < end ? next_projection_hints(static_cast<int>(layer))
                                          : ops::SparseMoeHints{});
             }
+            steer(ops::SteerResidualStep::Write, ffn_steering_site(layer),
+                  static_cast<std::int32_t>(layer), x);
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
             }
@@ -1820,6 +1860,15 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
         }
     };
 
+    // Every replica edits its own residual the same way after each exchange, so they stay equal.
+    const auto steer_replicas = [&](ops::SteerResidualStep step, std::uint32_t site,
+                                    std::int32_t vector_layer) {
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            on_rank(rank, [&](Tensor& replica) { steer(step, site, vector_layer, replica); });
+        }
+    };
+    steer_replicas(ops::SteerResidualStep::Measure, 0, -1);
+
     // The ranks holding KV heads, a prefix of the ranks, run attention; the rest wait for its sum.
     std::size_t attention_ranks = 0;
     while (attention_ranks < tp.shares.size() &&
@@ -1879,12 +1928,15 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                     gdn_mix(block(rank), replica, compact, ph);
                 });
             }
+            steer_replicas(ops::SteerResidualStep::Write, mixer_steering_site(layer), -1);
             exchange_step(ranks, [&](std::size_t rank, Tensor& replica) {
                 mlp_tail(block(rank), replica, ph,
                          rank == 0 && layer + 1 < layers
                              ? next_projection_hints(static_cast<int>(layer))
                              : ops::SparseMoeHints{});
             });
+            steer_replicas(ops::SteerResidualStep::Write, ffn_steering_site(layer),
+                           static_cast<std::int32_t>(layer));
             // Rank 0's replica is one device's residual after the layer: a masked drafter's
             // target features are tapped from it.
             if constexpr (Tap::enabled) {
@@ -2057,7 +2109,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;
-            embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+            embed_input(ids_device, x, s);
             if (!local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
@@ -2277,6 +2329,9 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
     std::vector<std::int32_t> ids;
     std::vector<std::int32_t> positions_host;
     std::vector<std::int32_t> rows_host(segments.size());
+    // Each column's KV table row, which the adapters read their scales by.
+    const bool column_rows = steering_ != nullptr && steering_->adapters != 0;
+    std::vector<std::int32_t> column_rows_host;
     // Output rows: the segments that read their last column, in segment order.
     std::vector<std::int32_t> output_segments;
     std::vector<std::int32_t> sample_rows;
@@ -2302,6 +2357,10 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
             positions_host.push_back(static_cast<std::int32_t>(segment.begin) + t);
         }
         rows_host[static_cast<std::size_t>(i)] = segment.kv_table_row;
+        if (column_rows) {
+            column_rows_host.insert(column_rows_host.end(), segment.ids.size(),
+                                    segment.kv_table_row);
+        }
         if (segment.output != SegmentOutput::None) {
             const auto row = static_cast<std::int32_t>(output_segments.size());
             output_segments.push_back(i);
@@ -2348,6 +2407,12 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
         binding.kv_table_row    = rows.slice(0, i, 1);
     }
 
+    Tensor column_rows_device;
+    if (column_rows) {
+        column_rows_device = steering_->ranks.front().column_rows.slice(0, 0, columns);
+        copy_i32(column_rows_host.data(), column_rows_device, s);
+    }
+
     Tensor x = roots.residual;
     {
         // Token-wise work reads the widest segment's envelope; attention uses each segment's own.
@@ -2360,7 +2425,9 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
         ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, widest->envelope);
         ScopedValue<std::span<const SegmentBinding>> scoped_segments(
             active_segments_, std::span<const SegmentBinding>(bindings.data(), bindings.size()));
-        embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+        ScopedValue<const Tensor*> scoped_column_rows(
+            active_column_rows_, column_rows ? &column_rows_device : nullptr);
+        embed_input(ids_device, x, s);
         run_layers(x, Phase::Prefill);
     }
 

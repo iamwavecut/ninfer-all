@@ -76,6 +76,11 @@ ninfer_add_test(ninfer_qwen3_5_graft_loader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_graft_loader.cpp"
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
+# LoRA adapter and control vector loading, request scales and their cache identity (CPU only).
+ninfer_add_test(ninfer_qwen3_5_steering_loader_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_steering_loader.cpp"
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+
 # The reasoning-loop guard's repeated-passage measure (CPU only).
 ninfer_add_test(ninfer_qwen3_5_reasoning_loop_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reasoning_loop.cpp"

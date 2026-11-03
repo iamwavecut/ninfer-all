@@ -1161,6 +1161,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     parse_truncation(body);
     parse_preserve_thinking(body, out.prompt);
     out.prompt.generation.graft = parse_graft_field(body);
+    out.prompt.generation.lora  = parse_lora_field(body);
     apply_default_output_limit(out.prompt.generation, limits);
     return out;
 }
@@ -1253,6 +1254,7 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "include",
                                                                   "input",
                                                                   "instructions",
+                                                                  "lora",
                                                                   "max_output_tokens",
                                                                   "max_tool_calls",
                                                                   "metadata",
@@ -1286,6 +1288,7 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "graft",
                                                                   "input",
                                                                   "instructions",
+                                                                  "lora",
                                                                   "model",
                                                                   "parallel_tool_calls",
                                                                   "personality",

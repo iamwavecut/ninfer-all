@@ -73,6 +73,34 @@ std::optional<std::string> parse_graft_field(const RequestJson& body) {
     return body.at("graft").get<std::string>();
 }
 
+std::optional<std::vector<ninfer::LoraScale>> parse_lora_field(const RequestJson& body) {
+    if (!body.contains("lora") || body.at("lora").is_null()) { return std::nullopt; }
+    const RequestJson& entries = body.at("lora");
+    if (!entries.is_array()) { bad_request("lora must be an array", "lora"); }
+    if (entries.size() > ninfer::kMaximumLoraAdapters) {
+        bad_request("lora lists more adapters than a server loads", "lora");
+    }
+    std::vector<ninfer::LoraScale> out;
+    out.reserve(entries.size());
+    for (const RequestJson& entry : entries) {
+        if (!entry.is_object() || !entry.contains("id") || !entry.contains("scale")) {
+            bad_request("each lora entry must be an object with id and scale", "lora");
+        }
+        const RequestJson& id    = entry.at("id");
+        const RequestJson& scale = entry.at("scale");
+        if (!id.is_number_integer() || id.get<std::int64_t>() < 0 ||
+            id.get<std::int64_t>() >= static_cast<std::int64_t>(ninfer::kMaximumLoraAdapters)) {
+            bad_request("lora id must be the index of a loaded adapter", "lora");
+        }
+        if (!scale.is_number() || !std::isfinite(scale.get<double>())) {
+            bad_request("lora scale must be a finite number", "lora");
+        }
+        out.push_back(ninfer::LoraScale{.id    = static_cast<std::uint32_t>(id.get<std::int64_t>()),
+                                        .scale = static_cast<float>(scale.get<double>())});
+    }
+    return out;
+}
+
 std::optional<std::uint32_t> parse_thinking_budget_field(const RequestJson& body) {
     const std::optional<int> budget = optional_int(body, "thinking_budget");
     if (!budget) { return std::nullopt; }

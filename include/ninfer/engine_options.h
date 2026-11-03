@@ -330,6 +330,33 @@ struct GraftSource {
     std::filesystem::path path;
 };
 
+// A LoRA adapter in llama.cpp's GGUF form (convert_lora_to_gguf.py, `adapter.type` lora). NInfer
+// runs the adapters that remove one residual direction r: rank one at every site, the same
+// B = -r everywhere and A = r^T W, on the token embedding and on the outputs of the layers that
+// write the residual (attn_output, ssm_out, ffn_down), as abliteration tools write them. Each
+// site's output o becomes o - s * alpha * r (r^T o), which is what llama.cpp computes for such an
+// adapter. A request selects its scale s (PromptOptions::lora); `scale` is the default for
+// requests that name none. Qwen3.5-core models only.
+struct LoraAdapterSource {
+    std::filesystem::path path;
+    float scale = 1.0F;
+};
+
+// A control vector in llama.cpp's GGUF form: F32 tensors direction.N, N >= 1, each added to the
+// residual after layer N. Every request runs with the sum of the loaded vectors, each times its
+// `scale`, as llama.cpp's --control-vector-scaled. Qwen3.5-core models only.
+struct ControlVectorSource {
+    std::filesystem::path path;
+    float scale = 1.0F;
+};
+
+// The layers [first, last] the control vectors steer, as llama.cpp's
+// --control-vector-layer-range; a vector of another layer is dropped.
+struct ControlVectorLayers {
+    std::uint32_t first = 1;
+    std::uint32_t last  = 0;
+};
+
 // Where a suspended model's retained device state waits in host memory.
 enum class SuspendSnapshotMemory : std::uint8_t {
     // Ordinary memory allocated at suspend, sized to the live bytes, freed after the resume.
@@ -610,6 +637,13 @@ struct EngineOptions {
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.
     std::vector<GraftSource> grafts;
+    // LoRA adapters a request scales by index through PromptOptions::lora, at most
+    // kMaximumLoraAdapters, and control vectors every request runs with. Each is loaded and
+    // validated against the resident model at construction.
+    std::vector<LoraAdapterSource> lora_adapters;
+    std::vector<ControlVectorSource> control_vectors;
+    // Unset steers every layer a control vector names.
+    std::optional<ControlVectorLayers> control_vector_layers;
     StartupObserver startup_observer;
     DiagnosticObserver diagnostic_observer;
     SlotAutoSaveOptions slot_auto_save;

@@ -61,6 +61,7 @@ constexpr DigestPair kDigestOffset{1469598103934665603ULL, 7809847782465536322UL
 constexpr DigestPair kDigestMultiplier{0x9e3779b97f4a7c15ULL, 0xd6e8feb86659fd93ULL};
 constexpr std::uint64_t kRewriteDigestDomain = 0x6e696e6665722d72ULL;
 constexpr std::uint64_t kVisionDigestDomain  = 0x6e696e6665722d76ULL;
+constexpr std::uint64_t kLoraDigestDomain    = 0x6e696e6665722d6cULL;
 // Tags the first word of a token record. That word has its top 16 bits clear and the domain words
 // above do not, so the word sequence of a prompt is a unique encoding of its records.
 constexpr std::uint64_t kTokenDigestTag = 0x74ULL << 40U;
@@ -146,6 +147,7 @@ void ResidentPrefixIdentity::clear() noexcept {
     for (auto& axis : positions_) { axis.clear(); }
     vision_items_.clear();
     rewrite_execution_frontiers_.clear();
+    lora_key_ = {};
 }
 
 void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
@@ -160,6 +162,7 @@ void ResidentPrefixIdentity::assign(const PreparedPromptData& prompt) {
     }
     vision_items_                = prompt.vision_items;
     rewrite_execution_frontiers_ = prompt.identity.rewrite_execution_frontiers;
+    lora_key_                    = prompt.lora_key;
 }
 
 void ResidentPrefixIdentity::swap(ResidentPrefixIdentity& other) noexcept {
@@ -167,6 +170,7 @@ void ResidentPrefixIdentity::swap(ResidentPrefixIdentity& other) noexcept {
     positions_.swap(other.positions_);
     vision_items_.swap(other.vision_items_);
     rewrite_execution_frontiers_.swap(other.rewrite_execution_frontiers_);
+    lora_key_.swap(other.lora_key_);
 }
 
 void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t rope_delta,
@@ -206,7 +210,8 @@ void ResidentPrefixIdentity::append_generated(std::size_t count, std::int32_t ro
 void ResidentPrefixIdentity::restore(std::vector<std::uint8_t> token_types,
                                      std::array<std::vector<std::int32_t>, 3> positions,
                                      std::vector<VisionItem> vision_items,
-                                     std::vector<std::uint32_t> rewrite_execution_frontiers) {
+                                     std::vector<std::uint32_t> rewrite_execution_frontiers,
+                                     std::array<std::uint64_t, 2> lora_key) {
     const std::size_t tokens = token_types.size();
     for (const auto& axis : positions) {
         if (axis.size() != tokens) {
@@ -232,6 +237,7 @@ void ResidentPrefixIdentity::restore(std::vector<std::uint8_t> token_types,
     }
     vision_items_                = std::move(vision_items);
     rewrite_execution_frontiers_ = std::move(rewrite_execution_frontiers);
+    lora_key_                    = lora_key;
 }
 
 void ResidentPrefixIdentity::truncate(std::size_t tokens) {
@@ -256,6 +262,7 @@ bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size
         prompt.positions.size() != 3 * prompt_tokens) {
         return false;
     }
+    if (count != 0 && prompt.lora_key != lora_key_) { return false; }
     if (!std::equal(prompt.token_types.begin(),
                     prompt.token_types.begin() + static_cast<std::ptrdiff_t>(count),
                     token_types_.begin())) {
@@ -298,6 +305,7 @@ bool ResidentPrefixIdentity::equals(const ResidentPrefixIdentity& other) const {
 bool ResidentPrefixIdentity::prefix_equals(const ResidentPrefixIdentity& other,
                                            std::size_t count) const {
     if (count > size() || count > other.size() ||
+        (count != 0 && lora_key_ != other.lora_key_) ||
         !std::equal(token_types_.begin(), token_types_.begin() + static_cast<std::ptrdiff_t>(count),
                     other.token_types_.begin())) {
         return false;
@@ -352,7 +360,14 @@ void PrefixShortlistDigests::assign(const PreparedPromptData& prompt) {
     }
     digests_.clear();
     reserve(tokens);
-    digests_.push_back(kDigestOffset);
+    // The adapter scales the prompt runs under seed every frontier's digest.
+    DigestPair seed = kDigestOffset;
+    if (prompt.lora_key != std::array<std::uint64_t, 2>{}) {
+        mix_digest(seed, kLoraDigestDomain);
+        mix_digest(seed, prompt.lora_key[0]);
+        mix_digest(seed, prompt.lora_key[1]);
+    }
+    digests_.push_back(seed);
     std::size_t next_rewrite = 0;
     std::size_t next_vision  = 0;
     std::size_t next_vision_end =

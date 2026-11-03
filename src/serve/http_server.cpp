@@ -626,6 +626,9 @@ void HttpServer::register_routes() {
     server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
         handle_props(req, res);
     });
+    server_.Get("/lora-adapters", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_lora_adapters(req, res);
+    });
     for (const char* base : {"/v1", "/v1/"}) {
         server_.Get(base, [this](const httplib::Request&, httplib::Response& res) {
             res.set_content(
@@ -1019,6 +1022,27 @@ void HttpServer::handle_metrics(const httplib::Request& req, httplib::Response& 
         res.set_content(metrics_.render(model_facts(lease).capacity, load_sample(lease.service())),
                         "text/plain; version=0.0.4; charset=utf-8");
     } catch (const ApiException& exception) { write_openai_error(res, exception.error()); }
+}
+
+// llama.cpp's GET /lora-adapters: each adapter loaded with --lora, by the id a request's `lora`
+// names, with the scale a request that names none runs it at.
+void HttpServer::handle_lora_adapters(const httplib::Request& req, httplib::Response& res) const {
+    ModelRegistry::Lease lease;
+    try {
+        lease = lease_query_model(req);
+    } catch (const ApiException& exception) {
+        write_openai_error(res, exception.error());
+        return;
+    }
+    const product::SteeringFlags& steering = lease.service().options().steering;
+    nlohmann::json adapters                = nlohmann::json::array();
+    for (std::size_t id = 0; id < steering.lora_adapters.size(); ++id) {
+        const ninfer::LoraAdapterSource& adapter = steering.lora_adapters[id];
+        adapters.push_back({{"id", id},
+                            {"path", adapter.path.string()},
+                            {"scale", steering.lora_init_without_apply ? 0.0F : adapter.scale}});
+    }
+    res.set_content(adapters.dump(), "application/json");
 }
 
 void HttpServer::handle_props(const httplib::Request& req, httplib::Response& res) const {

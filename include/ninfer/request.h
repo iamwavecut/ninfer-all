@@ -359,6 +359,15 @@ enum class PromptContinuationMode : std::uint8_t {
     ContinueFinalAssistant,
 };
 
+// The most LoRA adapters one Engine loads (EngineOptions::lora_adapters).
+inline constexpr std::size_t kMaximumLoraAdapters = 8;
+
+// One loaded LoRA adapter's scale for a request: `id` indexes EngineOptions::lora_adapters.
+struct LoraScale {
+    std::uint32_t id = 0;
+    float scale      = 0.0F;
+};
+
 struct PromptOptions {
     PromptContinuationMode continuation = PromptContinuationMode::NewAssistantTurn;
     std::optional<bool> enable_thinking;
@@ -376,6 +385,11 @@ struct PromptOptions {
     // Name of an EngineOptions::grafts entry to place in front of the rendered prompt; empty for
     // none. The rendered prompt should carry no system turn of its own: the graft already holds one.
     std::string graft;
+    // The request's LoRA adapters (EngineOptions::lora_adapters, by index), as llama.cpp's `lora`
+    // field: each listed adapter runs at its scale and every other at zero. Unset runs each at its
+    // EngineOptions scale. The scales belong to the prompt's cache identity: a cached prefix
+    // serves only requests that run the same adapters at the same scales.
+    std::optional<std::vector<LoraScale>> lora;
     // The request drafts (ExecutionOptions::speculative_drafting). False prepares no n-gram
     // proposal index or sources: a request that does not draft reads one token.
     bool speculative_drafting = true;

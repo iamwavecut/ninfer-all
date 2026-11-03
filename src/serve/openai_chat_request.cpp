@@ -1005,6 +1005,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     output.generation.preserve_thinking         = template_options.preserve_thinking;
     output.generation.chat_template_kwargs_json = template_options.kwargs_json;
     output.generation.graft                     = parse_graft_field(body);
+    output.generation.lora                      = parse_lora_field(body);
     output.generation.thinking_budget           = parse_thinking_budget_field(body);
     apply_openai_prompt_cache_policy(output.generation, cache_policy);
     // As on Responses: a client that names its conversation will extend the prompt, so the Engine

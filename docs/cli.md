@@ -331,6 +331,10 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
+| `--lora FNAME[,...]`, `--lora-scaled FNAME:SCALE[,...]` | llama.cpp LoRA adapters that remove a residual direction, at scale 1 or the given scale ([adapters and control vectors](serving.md#lora-adapters-and-control-vectors)) | none |
+| `--lora-init-without-apply` | load the adapters at scale 0 | off |
+| `--control-vector FNAME[,...]`, `--control-vector-scaled FNAME:SCALE[,...]` | llama.cpp control vectors added to the residual, at scale 1 or the given scale | none |
+| `--control-vector-layer-range START END` | add only the control vectors of layers START to END | every layer a file names |
 | `--log-colours on\|off` | `on` gives every statistic of the stderr summary a stable colour, even when stderr is redirected | off |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | stderr verbosity | `info` |
 

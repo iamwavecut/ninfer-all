@@ -186,6 +186,7 @@ private:
     void handle_decisions(const httplib::Request& req, httplib::Response& res,
                           DecisionDialect dialect);
     void handle_props(const httplib::Request& req, httplib::Response& res) const;
+    void handle_lora_adapters(const httplib::Request& req, httplib::Response& res) const;
     void handle_webui(const httplib::Request& req, httplib::Response& res) const;
 
     // What the server reports about one loaded model, computed once per Engine instance: an

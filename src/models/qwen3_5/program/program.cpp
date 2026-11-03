@@ -809,13 +809,14 @@ std::size_t prepare_vision_overlay(const execution::Parameters& parameters, Devi
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
                                         const StartupObserver& startup_observer) {
-    return create_program(parameters, std::move(plan), device, startup_observer, {});
+    return create_program(parameters, std::move(plan), device, startup_observer, {}, nullptr);
 }
 
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
                                         const StartupObserver& startup_observer,
-                                        std::unique_ptr<execution::NativeExpertRuntime> experts) {
+                                        std::unique_ptr<execution::NativeExpertRuntime> experts,
+                                        const Steering* steering) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->parameters != &parameters) {
         throw std::invalid_argument("sequence plan belongs to another model instance");
@@ -828,7 +829,8 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
             parameters.model, device, reserved, plan.impl_->expert_cache_bytes);
     }
     auto impl = std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device,
-                                                      startup_observer, std::move(experts));
+                                                      startup_observer, std::move(experts),
+                                                      steering);
     plan.impl_.reset();
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }

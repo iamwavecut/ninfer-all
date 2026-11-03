@@ -12,6 +12,7 @@
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/rope_yarn_options.h"
+#include "product/steering_options.h"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/logger.h>
@@ -83,6 +84,8 @@ struct Options {
     bool embedding_q4                   = false;
     bool embedding_q6                   = false;
     ninfer::EmbeddingResidency embedding_residency = ninfer::EmbeddingResidency::Device;
+    // LoRA adapters (at their scales) and control vectors the scored model runs with.
+    ninfer::product::SteeringFlags steering;
     bool mtp_experts_q4                 = false;
     bool gdn_state_fp16                 = false;
     bool rope_yarn                      = false;
@@ -121,6 +124,9 @@ std::string usage_text() {
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16]\n"
            "       [--embedding-residency device|host]\n"
+           "       [--lora FNAME[,...]] [--lora-scaled FNAME:SCALE[,...]]\n"
+           "       [--control-vector FNAME[,...]] [--control-vector-scaled FNAME:SCALE[,...]]\n"
+           "       [--control-vector-layer-range START END]   (Qwen3.5-core models)\n"
            "       [--mlp-a8-decode] [--no-prefill-a8] [--rope-yarn] [--rope-yarn-factor F]\n"
            "       [--rope-scaling-factor F [--rope-scaling-original-context N]]\n"
            "       (--mlp-a8-decode is inert here: the route it enables is verify-phase"
@@ -165,6 +171,11 @@ Options parse_options(int argc, char** argv) {
             if (++i >= argc) { usage_error(std::string(label) + " requires a value"); }
             return argv[i];
         };
+        if (ninfer::product::parse_steering_flag(
+                option, [&, label = std::string(option)] { return value(label.c_str()); },
+                out.steering)) {
+            continue;
+        }
         if (option == "--corpus") {
             out.corpus = std::filesystem::path(value("--corpus"));
         } else if (option == "--text") {
@@ -436,6 +447,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.embedding_q4     = options.embedding_q4;
     engine_options.embedding_q6     = options.embedding_q6;
     engine_options.embedding_residency = options.embedding_residency;
+    options.steering.apply(engine_options);
     engine_options.mtp_experts_q4   = options.mtp_experts_q4;
     engine_options.gdn_state_fp16   = options.gdn_state_fp16;
     engine_options.rope_yarn        = options.rope_yarn;

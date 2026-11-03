@@ -3,6 +3,7 @@
 #include "runtime/prefix_cache/block_hash.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <stdexcept>
 
@@ -18,6 +19,7 @@ constexpr std::uint64_t mix64(std::uint64_t state, std::uint64_t value) noexcept
 }
 
 constexpr std::uint64_t kVisionExtraSeed = 0x6e696e666572ULL;
+constexpr std::uint64_t kLoraExtraSeed   = 0x6e696e6665722d6cULL;
 
 } // namespace
 
@@ -61,14 +63,22 @@ std::uint64_t accumulate_vision(std::uint64_t cumulative, std::uint64_t key) noe
     return mix64(cumulative == 0 ? kVisionExtraSeed : cumulative, key);
 }
 
+std::uint64_t prompt_extra_seed(const PreparedPromptData& prompt) noexcept {
+    if (prompt.lora_key == std::array<std::uint64_t, 2>{}) { return 0; }
+    const std::uint64_t seed = mix64(mix64(kLoraExtraSeed, prompt.lora_key[0]), prompt.lora_key[1]);
+    return seed == 0 ? 1 : seed;
+}
+
 void prompt_block_keys(const PreparedPromptData& prompt, std::vector<std::uint64_t>& hashes,
                        std::vector<std::uint64_t>& extras) {
     const std::size_t blocks = prompt.token_ids.size() / pc::kBlockTokens;
+    const std::uint64_t seed = prompt_extra_seed(prompt);
     extras.clear();
-    if (!prompt.vision_items.empty()) {
-        const std::vector<VisionTokenRange> ranges = vision_ranges(prompt);
+    if (!prompt.vision_items.empty() || seed != 0) {
+        const std::vector<VisionTokenRange> ranges =
+            prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
         extras.resize(blocks);
-        std::uint64_t cumulative = 0;
+        std::uint64_t cumulative = seed;
         std::size_t next         = 0;
         for (std::size_t block = 0; block < blocks; ++block) {
             const std::uint64_t end = static_cast<std::uint64_t>(block + 1U) * pc::kBlockTokens;

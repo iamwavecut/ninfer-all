@@ -279,6 +279,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.kv_cache                 = options.kv_cache;
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
+    options.steering.apply(engine_options);
     engine_options.vision_residency         = options.vision_residency;
     engine_options.vision_max_merged_tokens = options.vision_max_merged_tokens;
     engine_options.use_cuda_graph           = options.use_cuda_graph;
@@ -476,8 +477,9 @@ StagedRequest GenerationService::stage_read(const BranchRead& read,
         tokens.insert(tokens.end(), read.continuation.begin(), read.continuation.end());
         staged.prepared.prompt_tokens = static_cast<int>(tokens.size());
         try {
-            staged.submission.prompt = engine_->prepare_tokens(std::move(tokens), true, false,
-                                                               read.request->speculative_drafting);
+            staged.submission.prompt =
+                engine_->prepare_tokens(std::move(tokens), true, false,
+                                        read.request->speculative_drafting, read.request->lora);
         } catch (const std::out_of_range& exception) {
             throw_invalid_input(std::invalid_argument(exception.what()), "invalid_prompt");
         }
@@ -504,7 +506,8 @@ PreparedRequest GenerationService::submit_branches(std::span<const BranchRead> r
         tokens.insert(tokens.end(), continuation.begin(), continuation.end());
         try {
             // A branch's prompt only supplies its tokens: it drafts nothing.
-            return engine_->prepare_tokens(std::move(tokens), true, false, false);
+            return engine_->prepare_tokens(std::move(tokens), true, false, false,
+                                           base_request->lora);
         } catch (const std::out_of_range& exception) {
             throw_invalid_input(std::invalid_argument(exception.what()), "invalid_prompt");
         }
@@ -627,7 +630,7 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             const bool anchor = cached && tokens.size() >= kRawPromptAnchorMinimumTokens;
             try {
                 prompt = engine_->prepare_tokens(std::move(tokens), cached, anchor,
-                                                 request.speculative_drafting);
+                                                 request.speculative_drafting, semantics.lora);
             } catch (const std::out_of_range& exception) {
                 // A token id outside the vocabulary is the client's input, not a server fault.
                 invalid_prompt(exception.what());

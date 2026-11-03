@@ -99,6 +99,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      &state.text_cache, state.drafter ? state.mtp_cache : nullptr);
     card.set_stage_runtime(state.execution.stages);
     card.set_expert_runtime(state.execution.experts);
+    card.set_steering(state.execution.steering);
     card.set_rope_yarn(state.execution.rope_yarn);
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
@@ -131,6 +132,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                      &state.text_cache, state.drafter ? state.mtp_cache : nullptr);
     card.set_stage_runtime(state.execution.stages);
     card.set_expert_runtime(state.execution.experts);
+    card.set_steering(state.execution.steering);
     card.set_rope_yarn(state.execution.rope_yarn);
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
@@ -737,6 +739,7 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         request.readout_tokens = request_plan.readout_tokens;
         request.branches       = request_plan.branches;
         install_sampling(sequence, request, request_plan.sampling);
+        write_lane_scales(sequence, staged.prompt);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
@@ -1211,7 +1214,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             {device, parameters, work, state_images->linear(0),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
-             mtp_attention_window, experts.get()},
+             mtp_attention_window, experts.get(), steering.get()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1793,6 +1796,7 @@ ProgramImpl::advance_prefill_batch(std::span<const std::uint32_t> lanes,
                                     pass_segments.front().begin, qwen3_5::PagedKVCacheView{},
                                     &decoder->text_kv, nullptr);
         card.set_expert_runtime(experts.get());
+        card.set_steering(steering.get());
         card.set_rope_yarn(rope_yarn);
         card.set_fast_prefill_kernel(fast_prefill_kernel);
         card.set_gdn_state_action(execution::GdnStateAction::UpdateInPlace, nullptr);

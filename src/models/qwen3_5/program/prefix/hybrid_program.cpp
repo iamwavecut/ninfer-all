@@ -43,12 +43,21 @@ constexpr std::uint32_t kBlock = pc::kBlockTokens;
 // may wait for blocks it is about to resume over.
 constexpr std::uint32_t kPrefetchBatchBlocks = 256;
 
-std::uint64_t all_vision_key(std::span<const VisionTokenRange> ranges) noexcept {
-    std::uint64_t cumulative = 0;
+std::uint64_t all_vision_key(std::span<const VisionTokenRange> ranges,
+                             std::uint64_t seed) noexcept {
+    std::uint64_t cumulative = seed;
     for (const VisionTokenRange& range : ranges) {
         cumulative = accumulate_vision(cumulative, range.key);
     }
     return cumulative;
+}
+
+// A snapshot inside the first block hangs from the root, whose key carries no block extra, so the
+// adapter key cannot tell its prompts apart: only prompts without adapter scales keep or resume
+// from one.
+bool root_snapshot_allowed(const std::array<std::uint64_t, 2>& lora_key,
+                           std::uint32_t anchor_blocks) noexcept {
+    return anchor_blocks != 0 || lora_key == std::array<std::uint64_t, 2>{};
 }
 
 bool inside_vision(std::uint32_t frontier, std::span<const VisionTokenRange> ranges) noexcept {
@@ -308,7 +317,8 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
         const std::vector<VisionTokenRange> ranges =
             prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
-            return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges);
+            return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges) ||
+                   !root_snapshot_allowed(prompt.lora_key, candidate.path_blocks);
         });
         const pc::AdmissionChoice choice = index.choose(match, lookup_tokens);
         std::vector<std::size_t> order;
@@ -394,7 +404,8 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
     const std::vector<VisionTokenRange> ranges =
         prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
     std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
-        return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges);
+        return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges) ||
+               !root_snapshot_allowed(prompt.lora_key, candidate.path_blocks);
     });
     const pc::AdmissionChoice choice = index.choose(match, n);
     if (!choice.candidate || match.candidates[*choice.candidate].host_only_blocks == 0) {
@@ -920,6 +931,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         sequence.rebuild_work       = quote.root_rebuild_work;
         sequence.rebuild_tail_begin = quote.root_rebuild_tail_begin;
         bind_sequence_kv(sequence);
+        write_lane_scales(sequence, prompt);
 
         const std::uint32_t initial_mtp_extent =
             prepare_mtp ? std::min({draft_window,
@@ -1056,7 +1068,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         const bool disposable = prompt.tap_hints.disposable;
         const std::uint64_t path_hash =
             full == 0 ? pc::kRootLookupHash : transaction.hashes[full - 1U];
-        const std::uint64_t trailing = all_vision_key(ranges);
+        const std::uint64_t trailing = all_vision_key(ranges, prompt_extra_seed(prompt));
 
         RequestControl::Prefill prefill{
             .prompt             = std::move(prompt),
@@ -1257,6 +1269,11 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
             drop(tap);
             continue;
         }
+        if (!root_snapshot_allowed(sequence.prefix_identity.lora_key(), full)) {
+            lane.pending.erase(lane.pending.begin());
+            drop(tap);
+            continue;
+        }
         lane.pending.erase(lane.pending.begin());
         std::optional<std::uint32_t> tail_id;
         if (tail != 0) {
@@ -1449,6 +1466,7 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                                               *sequence.kv->backend));
             if (endpoint && request.publish_continuation && kv_releasable && backend_caught_up &&
                 frontier != 0 &&
+                root_snapshot_allowed(sequence.prefix_identity.lora_key(), anchor_blocks) &&
                 frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
                 !sequence.state.fork_pending && sequence.state.read == sequence.state.write &&

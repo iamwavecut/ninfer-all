@@ -163,13 +163,6 @@ void require_neutral_controls(const Json& body) {
                         control.key, std::string(control.key) + "_not_supported");
         }
     }
-    if (present(body, "lora")) {
-        const Json& lora = body.at("lora");
-        if (!lora.is_array()) { bad_request("lora must be an array", "lora"); }
-        if (!lora.empty()) {
-            bad_request("lora adapters are not supported", "lora", "lora_not_supported");
-        }
-    }
     if (present(body, "logit_bias")) {
         const Json& biases = body.at("logit_bias");
         if (!biases.is_object() && !biases.is_array()) {
@@ -437,6 +430,7 @@ TextCompletionRequest parse_text_completion_request(const Json& body, const Requ
     parse_stop(body, output.generation);
     parse_output_limit(body, limits, dialect, output);
     parse_structured_output_fields(body, dialect, output.generation);
+    output.generation.lora            = parse_lora_field(body);
     output.generation.cache_prompt    = optional_bool(body, "cache_prompt", true);
     output.response.stream            = optional_bool(body, "stream", false);
     output.response.timings_per_token = optional_bool(body, "timings_per_token", false);

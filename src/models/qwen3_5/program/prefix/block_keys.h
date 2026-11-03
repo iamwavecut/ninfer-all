@@ -25,8 +25,13 @@ struct VisionTokenRange {
 
 [[nodiscard]] std::uint64_t accumulate_vision(std::uint64_t cumulative, std::uint64_t key) noexcept;
 
-// The block hashes of every full block of the prompt's tokens, and one cumulative Vision key per
-// block (empty for a text-only prompt).
+// What every block's extra key starts from: the prompt's LoRA adapter key (PreparedPromptData::
+// lora_key), or zero when that is zero.
+[[nodiscard]] std::uint64_t prompt_extra_seed(const PreparedPromptData& prompt) noexcept;
+
+// The block hashes of every full block of the prompt's tokens, and one extra key per block: the
+// adapter key's seed accumulated over the Vision items up to the block's end (empty for a
+// text-only prompt without adapter scales).
 void prompt_block_keys(const PreparedPromptData& prompt, std::vector<std::uint64_t>& hashes,
                        std::vector<std::uint64_t>& extras);
 

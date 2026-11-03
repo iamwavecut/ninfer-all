@@ -267,6 +267,9 @@ struct GenerationRequest {
     // NInfer extension: name of a phantom-kv graft loaded with --graft. Unset => use the server's
     // --default-graft (if any); an empty name explicitly selects no graft.
     std::optional<std::string> graft;
+    // llama.cpp's `lora`: the adapters loaded with --lora this request runs, by id, and their
+    // scales; unset runs each at its server scale (ninfer::PromptOptions::lora).
+    std::optional<std::vector<ninfer::LoraScale>> lora;
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool private_cache_boundary_at_prompt_end   = false;
     bool allow_engine_automatic_shared_prefixes = true;

@@ -471,6 +471,7 @@ up. A router instead unloads the failed model once its requests are gone and rep
 | `GET /slots` | per-cell occupancy of the private context cache (see [Slots](#slots)) |
 | `POST /slots/{id}?action=save\|restore\|erase` | save a retained session to a file, restore one, or evict one (see [Slots](#slots)) |
 | `GET /props` | llama.cpp-shaped server properties: default sampling, context, lanes, modalities (see [Props](#props)) |
+| `GET /lora-adapters` | the loaded LoRA adapters with their ids and startup scales (see [LoRA adapters and control vectors](#lora-adapters-and-control-vectors)) |
 | `GET /v1` | endpoint index for the announced API base: the model alias and this table |
 | `GET /v1/models` | configured OpenAI model alias, effective context limit (`max_model_len`, also as `context_window` and `context_length`), input modalities (`modalities.vision` and an OpenRouter-style `architecture`), and a llama.cpp-compatible `meta` object (see [Models](#models)) |
 | `GET /v1/models/{id}` | lookup of the configured alias with the same fields |
@@ -945,6 +946,7 @@ The endpoint supports:
 - `enable_thinking` and `preserve_thinking`, either at top level or in
   `chat_template_kwargs`;
 - the `graft` extension selecting a [prompt graft](#prompt-grafts);
+- llama.cpp's `lora` field, the request's [LoRA adapter scales](#lora-adapters-and-control-vectors);
 - the `thinking_budget` extension, a positive per-request [thinking cap](#openai-chat-completions);
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
@@ -1377,8 +1379,9 @@ the request out of the context cache). The output limit is llama.cpp's `n_predic
 llama.cpp sampler controls NInfer does not have are accepted at their neutral values and refused
 otherwise, each with `<field>_not_supported`: `repeat_penalty` (1), `typical_p` (1), `tfs_z` (1),
 `dynatemp_range` (0), `mirostat` (0), `xtc_probability` (0), `dry_multiplier` (0), `top_n_sigma` (0
-or below), `n_probs` (0), `n_indent` (0) and `t_max_predict_ms` (0 or below); a `lora` or nonzero
-`logit_bias` is refused too. `samplers`, `n_keep`, `min_keep`, `id_slot` and the parameters of the
+or below), `n_probs` (0), `n_indent` (0) and `t_max_predict_ms` (0 or below); a nonzero
+`logit_bias` is refused too. `lora` sets the request's
+[LoRA adapter scales](#lora-adapters-and-control-vectors). `samplers`, `n_keep`, `min_keep`, `id_slot` and the parameters of the
 controls above are accepted without effect.
 
 `/completion` adds llama.cpp's `json_schema` (the bare schema; `{}` admits any JSON object; needs
@@ -1684,6 +1687,7 @@ wire response contains typed `output` Items.
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts), or `null`; also accepted by input token count |
+| `lora` | llama.cpp's [LoRA adapter scales](#lora-adapters-and-control-vectors), or `null`; also accepted by input token count |
 | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
 | `text.format` | `text`, `json_object`, or flat `json_schema`; see [structured output](#structured-output) |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
@@ -2015,7 +2019,8 @@ stays non-semantic metadata, and a malformed NInfer signature fails with
 `invalid_thinking_signature`. The signature is not encrypted or authenticated: this is a local
 trusted server, and the value is the same reasoning text `summarized` display shows. Count Tokens
 ignores `display`. `preserve_thinking` remains a NInfer extension for closed-turn reasoning
-history, and `graft` selects a [prompt graft](#prompt-grafts). `output_config.effort` passes its
+history, `graft` selects a [prompt graft](#prompt-grafts), and llama.cpp's `lora` field sets the
+request's [LoRA adapter scales](#lora-adapters-and-control-vectors). `output_config.effort` passes its
 protocol-validated value to the selected template, substituting the nearest value the template
 accepts as described above. `output_config.format` accepts `{"type":"json_schema","schema":{...}}`,
 enforced strictly (see [Structured output](#structured-output)); Count Tokens ignores it.
@@ -2136,6 +2141,59 @@ positions are held by ids derived from the container's sha256, so a cached prefi
 matched by requests using the same graft. With `--devices`, each layer's K/V and state are written on the device
 of the stage that holds that layer. The pinned slot belongs to the checkpoint catalog, so a `--graft` selects
 the catalog in place of the default hybrid prefix cache.
+
+## LoRA adapters and control vectors
+
+Qwen3.5-core models read two kinds of llama.cpp residual edits: control vectors, which every request
+runs with, and LoRA adapters that remove one direction from the residual, which each request scales.
+Gemma 4, Flint, Qwen3.8-Flash-Next and DeepSeek-V4.1 refuse both at startup.
+
+```bash
+ninfer-serve model.ninfer --lora-scaled abliterate.gguf:0 \
+  --control-vector-scaled happy.gguf:0.8 --control-vector-layer-range 10 40
+```
+
+A control vector is a llama.cpp control vector GGUF: F32 tensors `direction.N`, each added to the
+residual after layer N (zero-based, N >= 1, as llama.cpp). `--control-vector` adds a file at scale 1,
+`--control-vector-scaled FNAME:SCALE` at its own scale, and several files add up.
+`--control-vector-layer-range START END` keeps only layers START to END; a range that keeps no layer
+of the files refuses startup. The files, scales and range are part of the persisted cache's
+fingerprint and of the disk tier's directory name, so a cache written without them is not read with
+them.
+
+A LoRA adapter is a llama.cpp LoRA GGUF (`general.type` `adapter`, `adapter.type` `lora`) for the
+model's architecture (`qwen35` or `qwen35moe`). NInfer runs the form that abliteration tools write:
+rank one at every site, the same `lora_b = -r` at every site, and sites only on `token_embd`,
+`attn_output`, `ssm_out` and `ffn_down`. Each site's write o becomes o - s * alpha * r (r^T o), with s
+the request's scale and alpha the file's `adapter.lora.alpha` (one without it). This is what llama.cpp
+computes when the adapter's `lora_a` is r^T W, W being the site's weight. NInfer does not read
+`lora_a` and does not check it against the weights: an adapter of another form steers the model
+differently from llama.cpp. Startup refuses a rank above one, a `lora_b` that differs between sites,
+any other projection (`attn_q`, the MoE experts and so on) and activated LoRA, naming the tensor.
+At most 8 adapters load, and their edits add up.
+
+A request scales the adapters with llama.cpp's `lora` field on every API:
+`"lora": [{"id": 0, "scale": 1.5}]`. `id` is the adapter's position in the `--lora` and
+`--lora-scaled` order. Each listed adapter runs at its scale and every other adapter at 0, so
+`"lora": []` turns them all off. A request without `lora` runs each adapter at its startup scale,
+which `--lora-init-without-apply` makes 0. An id past the loaded adapters fails with
+`400 unknown_lora_adapter`; a malformed entry fails as a malformed `lora` field.
+`GET /lora-adapters` lists `[{"id", "path", "scale"}]` with the startup scales. NInfer has no
+`POST /lora-adapters`: the startup scales stay fixed while the server runs.
+
+The adapter files and scales are part of a prompt's cache identity: a cached prefix serves only
+requests that run the same adapters at the same scales, and requests whose scales are all 0 share
+the cache of a server without adapters. The hybrid prefix cache keeps no state snapshot inside the
+first 64-token block for a request with a nonzero scale, so such a request reuses whole blocks only.
+Direct grafts (`softprompt_kv`, `direct_kv`) do not load beside adapters or control vectors, because
+their stored state comes from the unedited model; `prefill_kv` grafts do. MTP and DFlash drafters
+run unedited: the output stays the steered model's, because the target verifies every draft, but
+the acceptance rate can fall.
+
+Each adapter site is one more kernel per step. On an RTX 3090 with Ternary Bonsai 2 27B, a request
+with AtomicChat's abliteration adapter at scale 1 decodes at 83.9 tok/s against the plain model's
+90.9 (−7.8%) and prefills 1.4% slower; adapters loaded at scale 0 cost 1.8% of decode, and a
+control vector on one layer 0.1%.
 
 ## Authentication and CORS
 
@@ -2314,6 +2372,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--graft NAME=PATH` | load a [prompt graft](#prompt-grafts) a request may select by name; repeatable | none |
 | `--default-graft NAME` | apply a loaded graft to requests that state none; `"graft": ""` opts out | none |
+| `--lora FNAME[,FNAME...]` | load llama.cpp [LoRA adapters](#lora-adapters-and-control-vectors) that remove a residual direction, at scale 1; repeatable, at most 8 | none |
+| `--lora-scaled FNAME:SCALE[,...]` | load adapters at the given startup scales | none |
+| `--lora-init-without-apply` | start every adapter at scale 0, so only requests that name it run it | off |
+| `--control-vector FNAME[,...]` | add llama.cpp [control vectors](#lora-adapters-and-control-vectors) to the residual at scale 1; repeatable | none |
+| `--control-vector-scaled FNAME:SCALE[,...]` | add control vectors at the given scales | none |
+| `--control-vector-layer-range START END` | add only the control vectors of layers START to END | every layer a file names |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |

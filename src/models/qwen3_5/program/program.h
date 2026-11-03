@@ -1306,7 +1306,8 @@ private:
 
     friend std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
                                                    DeviceContext&, const StartupObserver&,
-                                                   std::unique_ptr<execution::NativeExpertRuntime>);
+                                                   std::unique_ptr<execution::NativeExpertRuntime>,
+                                                   const Steering*);
 };
 
 namespace detail {
@@ -1476,9 +1477,11 @@ struct RuntimeContractAccess {
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                                       SequencePlan&& plan, DeviceContext& device,
                                                       const StartupObserver& startup_observer);
+// `steering`, when given, holds the LoRA adapters and control vectors the plan was sized for.
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                                       SequencePlan&& plan, DeviceContext& device,
                                                       const StartupObserver& startup_observer,
-                                                      std::unique_ptr<execution::NativeExpertRuntime> experts);
+                                                      std::unique_ptr<execution::NativeExpertRuntime> experts,
+                                                      const Steering* steering);
 
 } // namespace ninfer::models::qwen3_5

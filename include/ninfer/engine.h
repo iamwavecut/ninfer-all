@@ -101,11 +101,11 @@ public:
     // `anchor_prompt_end` also retains a private checkpoint one token short of the prompt's end, so
     // the same prompt sent again (a regenerated raw completion) resumes from it; a raw prompt has
     // no message structure to anchor otherwise. It costs a prefill split and a StateImage.
-    // `speculative_drafting` as PromptOptions::speculative_drafting.
-    [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
-                                                bool allow_prefix_identity = true,
-                                                bool anchor_prompt_end     = false,
-                                                bool speculative_drafting  = true) const;
+    // `speculative_drafting` and `lora` as PromptOptions::speculative_drafting and ::lora.
+    [[nodiscard]] PreparedPrompt
+    prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity = true,
+                   bool anchor_prompt_end = false, bool speculative_drafting = true,
+                   const std::optional<std::vector<LoraScale>>& lora = std::nullopt) const;
 
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added;
     // special-token text in `text` encodes as that token unless `parse_special` is false.
