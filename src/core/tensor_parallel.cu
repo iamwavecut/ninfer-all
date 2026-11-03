@@ -265,6 +265,14 @@ ValueRange scatter_range(std::size_t rank, std::size_t ranks, std::int64_t value
     return {std::min(first * kBlock, values), std::min(last * kBlock, values)};
 }
 
+// A piece's reduce-scatter range in an inbox row begins past every earlier piece's: at a sixty-fourth
+// of its offset over the ranks rounded up, plus kPieceInboxStep floats per earlier piece, which
+// covers both roundings of the ranges (a range is at most values / ranks + 128 floats long).
+constexpr std::int64_t kPieceInboxStep = 192;
+// What the pieces of a full slot take in a row beyond its owner's range of the whole slot.
+constexpr std::size_t kPieceInboxSlack =
+    TensorParallelExchange::kPieces * static_cast<std::size_t>(kPieceInboxStep) + 256;
+
 // Floats of one PeerWrite inbox row: an owner's range of a full slot, or a whole partial of up to
 // kPeerWriteWholeBytes, whichever is more, but never more than the slot; whole 64-value blocks, so
 // every row starts aligned.
@@ -272,7 +280,8 @@ std::size_t inbox_values(std::size_t slot_values, std::size_t ranks) {
     const ValueRange owned = scatter_range(0, ranks, static_cast<std::int64_t>(slot_values));
     const std::size_t whole = TensorParallelExchange::kPeerWriteWholeBytes / sizeof(float);
     const std::size_t row   = std::min(
-        slot_values, std::max(static_cast<std::size_t>(owned.end - owned.begin), whole));
+        slot_values,
+        std::max(static_cast<std::size_t>(owned.end - owned.begin) + kPieceInboxSlack, whole));
     return (row + 63) / 64 * 64;
 }
 
@@ -616,9 +625,20 @@ TensorParallelExchange::TensorParallelExchange(const DeviceContext& context,
                       "cudaMalloc");
                 // Events cannot be created while a stream captures, so all exist up front. A
                 // rank records its own events.
-                check(cudaEventCreateWithFlags(&rank.published[slot], cudaEventDisableTiming),
+                for (std::size_t piece = 0; piece < kPieces; ++piece) {
+                    check(cudaEventCreateWithFlags(&rank.published[slot][piece],
+                                                   cudaEventDisableTiming),
+                          "cudaEventCreate");
+                    check(cudaEventCreateWithFlags(&rank.reduced[slot][piece],
+                                                   cudaEventDisableTiming),
+                          "cudaEventCreate");
+                }
+            }
+            check(cudaStreamCreateWithFlags(&rank.side, cudaStreamNonBlocking), "cudaStreamCreate");
+            for (std::size_t piece = 0; piece < kPieces; ++piece) {
+                check(cudaEventCreateWithFlags(&rank.piece_ready[piece], cudaEventDisableTiming),
                       "cudaEventCreate");
-                check(cudaEventCreateWithFlags(&rank.reduced[slot], cudaEventDisableTiming),
+                check(cudaEventCreateWithFlags(&rank.piece_done[piece], cudaEventDisableTiming),
                       "cudaEventCreate");
             }
             check(cudaMalloc(reinterpret_cast<void**>(&rank.epoch), 2 * sizeof(std::uint32_t)),
@@ -672,17 +692,27 @@ void TensorParallelExchange::release() noexcept {
     for (Rank& rank : ranks_) {
         DeviceBinding bind(rank.device);
         for (std::size_t slot = 0; slot < kSlots; ++slot) {
-            if (rank.published[slot] != nullptr) { (void)cudaEventDestroy(rank.published[slot]); }
-            if (rank.reduced[slot] != nullptr) { (void)cudaEventDestroy(rank.reduced[slot]); }
+            for (std::size_t piece = 0; piece < kPieces; ++piece) {
+                for (cudaEvent_t* event : {&rank.published[slot][piece], &rank.reduced[slot][piece]}) {
+                    if (*event != nullptr) { (void)cudaEventDestroy(*event); }
+                    *event = nullptr;
+                }
+            }
             if (rank.device_slot[slot] != nullptr) { (void)cudaFree(rank.device_slot[slot]); }
             if (rank.host_slot[slot] != nullptr) { (void)cudaFreeHost(rank.host_slot[slot]); }
             if (rank.inbox[slot] != nullptr) { (void)cudaFree(rank.inbox[slot]); }
-            rank.published[slot]   = nullptr;
-            rank.reduced[slot]     = nullptr;
             rank.device_slot[slot] = nullptr;
             rank.host_slot[slot]   = nullptr;
             rank.inbox[slot]       = nullptr;
         }
+        for (std::size_t piece = 0; piece < kPieces; ++piece) {
+            for (cudaEvent_t* event : {&rank.piece_ready[piece], &rank.piece_done[piece]}) {
+                if (*event != nullptr) { (void)cudaEventDestroy(*event); }
+                *event = nullptr;
+            }
+        }
+        if (rank.side != nullptr) { (void)cudaStreamDestroy(rank.side); }
+        rank.side = nullptr;
         if (rank.host_words != nullptr) { (void)cudaFreeHost(rank.host_words); }
         if (rank.peer_words != nullptr) { (void)cudaFree(rank.peer_words); }
         if (rank.epoch != nullptr) { (void)cudaFree(rank.epoch); }
@@ -1064,41 +1094,99 @@ float* TensorParallelExchange::partial(std::size_t rank, std::size_t slot) const
 }
 
 void TensorParallelExchange::publish(std::size_t rank, std::size_t slot, std::size_t bytes,
-                                     void* out, cudaStream_t stream, TensorParallelSum sum) {
-    check_slot(rank, slot, bytes);
-    publish_on(route(bytes, sum), rank, slot, bytes, out, stream, sum);
+                                     void* out, cudaStream_t stream, TensorParallelSum sum,
+                                     TensorParallelPiece piece) {
+    check_piece(rank, slot, bytes, piece);
+    publish_on(piece_route(bytes, sum, piece), rank, slot, bytes, out, stream, sum, piece);
 }
 
 void TensorParallelExchange::reduce(std::size_t rank, std::size_t slot, void* out,
                                     std::int64_t count, std::size_t contributors,
-                                    cudaStream_t stream, TensorParallelSum sum) {
+                                    cudaStream_t stream, TensorParallelSum sum,
+                                    TensorParallelPiece piece) {
     const auto bytes = static_cast<std::size_t>(count) * sizeof(float);
-    check_slot(rank, slot, bytes);
+    check_piece(rank, slot, bytes, piece);
     if (count <= 0 || contributors == 0 || contributors > ranks_.size()) {
         throw std::invalid_argument(
             "tensor-parallel reduce needs values and one to all ranks as contributors");
     }
-    reduce_on(route(bytes, sum), rank, slot, out, count, contributors, stream, sum);
+    reduce_on(piece_route(bytes, sum, piece), rank, slot, out, count, contributors, stream, sum,
+              piece);
 }
 
 void TensorParallelExchange::complete(std::size_t rank, std::size_t slot, void* out,
                                       std::int64_t count, cudaStream_t stream,
-                                      TensorParallelSum sum) {
+                                      TensorParallelSum sum, TensorParallelPiece piece) {
     const auto bytes = static_cast<std::size_t>(count) * sizeof(float);
-    check_slot(rank, slot, bytes);
-    complete_on(route(bytes, sum), rank, slot, out, count, stream, sum);
+    check_piece(rank, slot, bytes, piece);
+    complete_on(piece_route(bytes, sum, piece), rank, slot, out, count, stream, sum, piece);
+}
+
+cudaStream_t TensorParallelExchange::side_stream(std::size_t rank) const {
+    check_slot(rank, 0, 0);
+    return ranks_[rank].side;
+}
+
+cudaEvent_t TensorParallelExchange::piece_ready(std::size_t rank, std::size_t piece) const {
+    check_slot(rank, 0, 0);
+    return ranks_[rank].piece_ready.at(piece);
+}
+
+cudaEvent_t TensorParallelExchange::piece_done(std::size_t rank, std::size_t piece) const {
+    check_slot(rank, 0, 0);
+    return ranks_[rank].piece_done.at(piece);
+}
+
+void TensorParallelExchange::check_piece(std::size_t rank, std::size_t slot, std::size_t bytes,
+                                         TensorParallelPiece piece) const {
+    check_slot(rank, slot, 0);
+    if (piece.index >= kPieces || piece.offset < 0 ||
+        static_cast<std::size_t>(piece.offset) * sizeof(float) + bytes > slot_bytes_) {
+        throw std::invalid_argument("a tensor-parallel piece lies outside its slot");
+    }
+}
+
+std::int64_t TensorParallelExchange::inbox_offset(TensorParallelPiece piece,
+                                                  TensorParallelForm form) const noexcept {
+    if (form != TensorParallelForm::Scatter) { return piece.offset; }
+    const auto n = static_cast<std::int64_t>(ranks_.size());
+    return (piece.offset + n * 64 - 1) / (n * 64) * 64 +
+           static_cast<std::int64_t>(piece.index) * kPieceInboxStep;
+}
+
+TensorParallelRoute TensorParallelExchange::piece_route(std::size_t bytes, TensorParallelSum sum,
+                                                        TensorParallelPiece piece) const {
+    const TensorParallelRoute chosen = route(bytes, sum);
+    if (piece.index == 0 && piece.offset == 0) { return chosen; }
+    if (chosen.form == TensorParallelForm::Words) {
+        throw std::logic_error("a tensor-parallel piece cannot be exchanged as words");
+    }
+    if (chosen.transport != TensorParallelTransport::PeerWrite) { return chosen; }
+    // Every owner's range of the piece, at the piece's place, within an inbox row.
+    const auto values = static_cast<std::int64_t>(bytes / sizeof(float));
+    std::int64_t widest = values;
+    if (chosen.form == TensorParallelForm::Scatter) {
+        const ValueRange first = scatter_range(0, ranks_.size(), values);
+        widest                 = first.end - first.begin;
+    }
+    if (inbox_offset(piece, chosen.form) + widest <= static_cast<std::int64_t>(inbox_values_)) {
+        return chosen;
+    }
+    return {TensorParallelTransport::PeerRead, TensorParallelForm::Whole};
 }
 
 void TensorParallelExchange::publish_on(TensorParallelRoute route, std::size_t rank,
                                         std::size_t slot, std::size_t bytes, void* out,
-                                        cudaStream_t stream, TensorParallelSum sum) {
+                                        cudaStream_t stream, TensorParallelSum sum,
+                                        TensorParallelPiece piece) {
     Rank& self = ranks_[rank];
     DeviceBinding bind(self.device);
-    self.output[slot]        = out;
-    self.reduced_ready[slot] = false;
+    self.output[slot][piece.index]        = out;
+    self.reduced_ready[slot][piece.index] = false;
     // Words leave the slot where it is: the reduce's kernel stores them itself. PeerRead leaves it
     // for the others to read.
-    const auto values = static_cast<std::int64_t>(bytes / sizeof(float));
+    const auto values  = static_cast<std::int64_t>(bytes / sizeof(float));
+    float* const local = self.device_slot[slot] + piece.offset;
     if (bytes != 0 && route.transport == TensorParallelTransport::Host &&
         route.form != TensorParallelForm::Words) {
         // A reduce-scatter's own range of the partial stays on the device, since no other rank
@@ -1110,8 +1198,8 @@ void TensorParallelExchange::publish_on(TensorParallelRoute route, std::size_t r
             own_begin              = static_cast<std::size_t>(range.begin) * sizeof(float);
             own_end                = static_cast<std::size_t>(range.end) * sizeof(float);
         }
-        auto* host         = reinterpret_cast<unsigned char*>(self.host_slot[slot]);
-        const auto* device = reinterpret_cast<const unsigned char*>(self.device_slot[slot]);
+        auto* host         = reinterpret_cast<unsigned char*>(self.host_slot[slot] + piece.offset);
+        const auto* device = reinterpret_cast<const unsigned char*>(local);
         if (own_begin != 0) {
             check(cudaMemcpyAsync(host, device, own_begin, cudaMemcpyDeviceToHost, stream),
                   "publish copy");
@@ -1129,26 +1217,27 @@ void TensorParallelExchange::publish_on(TensorParallelRoute route, std::size_t r
         std::array<void*, kMaxRanks> destinations{};
         std::array<const void*, kMaxRanks> sources{};
         std::array<std::int64_t, kMaxRanks> sizes{};
-        std::size_t copies = 0;
+        std::size_t copies       = 0;
+        const std::int64_t place = inbox_offset(piece, route.form);
         for (std::size_t other = 0; other < ranks_.size(); ++other) {
             if (other == rank) { continue; }
             const ValueRange range = route.form == TensorParallelForm::Scatter
                                          ? scatter_range(other, ranks_.size(), values)
                                          : ValueRange{0, values};
-            destinations[copies] = inbox_row(other, rank, slot);
-            sources[copies]      = self.device_slot[slot] + range.begin;
+            destinations[copies] = inbox_row(other, rank, slot) + place;
+            sources[copies]      = local + range.begin;
             sizes[copies]        = (range.end - range.begin) * static_cast<std::int64_t>(sizeof(float));
             ++copies;
         }
         copy_rows(destinations.data(), sources.data(), sizes.data(), copies, stream);
     }
-    check(cudaEventRecord(self.published[slot], stream), "publish fence");
+    check(cudaEventRecord(self.published[slot][piece.index], stream), "publish fence");
 }
 
 void TensorParallelExchange::reduce_on(TensorParallelRoute route, std::size_t rank,
                                        std::size_t slot, void* out, std::int64_t count,
                                        std::size_t contributors, cudaStream_t stream,
-                                       TensorParallelSum sum) {
+                                       TensorParallelSum sum, TensorParallelPiece piece) {
     Rank& self = ranks_[rank];
     DeviceBinding bind(self.device);
     if (route.form == TensorParallelForm::Words) {
@@ -1180,34 +1269,36 @@ void TensorParallelExchange::reduce_on(TensorParallelRoute route, std::size_t ra
     const bool scatter     = route.form == TensorParallelForm::Scatter;
     const ValueRange range = scatter ? scatter_range(rank, ranks_.size(), count)
                                      : ValueRange{0, count};
+    const std::int64_t place = inbox_offset(piece, route.form);
     std::array<const float*, kMaxRanks> parts{};
     std::array<std::int64_t, kMaxRanks> firsts{};
     for (std::size_t r = 0; r < ranks_.size(); ++r) {
         if (r == rank) {
-            parts[r] = self.device_slot[slot];
+            parts[r] = self.device_slot[slot] + piece.offset;
             continue;
         }
-        check(cudaStreamWaitEvent(stream, ranks_[r].published[slot], 0), "reduce wait");
+        check(cudaStreamWaitEvent(stream, ranks_[r].published[slot][piece.index], 0),
+              "reduce wait");
         switch (route.transport) {
         case TensorParallelTransport::PeerRead:
-            parts[r] = ranks_[r].device_slot[slot];
+            parts[r] = ranks_[r].device_slot[slot] + piece.offset;
             break;
         case TensorParallelTransport::PeerWrite:
-            parts[r]  = inbox_row(rank, r, slot);
+            parts[r]  = inbox_row(rank, r, slot) + place;
             firsts[r] = range.begin;
             break;
         default:
-            parts[r] = ranks_[r].host_slot[slot];
+            parts[r] = ranks_[r].host_slot[slot] + piece.offset;
             break;
         }
     }
     reduce_values(out, parts.data(), firsts.data(), contributors, range.begin, range.end, stream,
                   sum);
     if (!scatter) { return; }
-    if (out != self.output[slot]) {
+    if (out != self.output[slot][piece.index]) {
         throw std::logic_error("a tensor-parallel reduce writes another output than its publish named");
     }
-    self.reduced_ready[slot] = true;
+    self.reduced_ready[slot][piece.index] = true;
     const std::size_t size   = output_bytes(sum);
     const auto begin         = static_cast<std::size_t>(range.begin);
     const auto length        = static_cast<std::size_t>(range.end - range.begin);
@@ -1219,7 +1310,8 @@ void TensorParallelExchange::reduce_on(TensorParallelRoute route, std::size_t ra
         std::size_t copies = 0;
         for (std::size_t other = 0; other < ranks_.size(); ++other) {
             if (other == rank) { continue; }
-            destinations[copies] = static_cast<unsigned char*>(ranks_[other].output[slot]) + begin * size;
+            destinations[copies] =
+                static_cast<unsigned char*>(ranks_[other].output[slot][piece.index]) + begin * size;
             sources[copies]      = static_cast<const unsigned char*>(out) + begin * size;
             sizes[copies]        = static_cast<std::int64_t>(length * size);
             ++copies;
@@ -1227,18 +1319,18 @@ void TensorParallelExchange::reduce_on(TensorParallelRoute route, std::size_t ra
         copy_rows(destinations.data(), sources.data(), sizes.data(), copies, stream);
     }
     if (length != 0 && route.transport == TensorParallelTransport::Host) {
-        check(cudaMemcpyAsync(reinterpret_cast<unsigned char*>(self.host_slot[slot]) +
-                                  begin * sizeof(float),
+        check(cudaMemcpyAsync(self.host_slot[slot] + piece.offset + range.begin,
                               static_cast<const unsigned char*>(out) + begin * size, length * size,
                               cudaMemcpyDeviceToHost, stream),
               "reduce copy");
     }
-    check(cudaEventRecord(self.reduced[slot], stream), "reduce fence");
+    check(cudaEventRecord(self.reduced[slot][piece.index], stream), "reduce fence");
 }
 
 void TensorParallelExchange::complete_on(TensorParallelRoute route, std::size_t rank,
                                          std::size_t slot, void* out, std::int64_t count,
-                                         cudaStream_t stream, TensorParallelSum sum) {
+                                         cudaStream_t stream, TensorParallelSum sum,
+                                         TensorParallelPiece piece) {
     if (route.form != TensorParallelForm::Scatter) { return; }
     DeviceBinding bind(ranks_[rank].device);
     const std::size_t size = output_bytes(sum);
@@ -1250,16 +1342,17 @@ void TensorParallelExchange::complete_on(TensorParallelRoute route, std::size_t 
         const ValueRange range = scatter_range(owner, ranks_.size(), count);
         if (owner == rank || range.end == range.begin) { continue; }
         const Rank& from = ranks_[owner];
-        if (!from.reduced_ready[slot]) {
+        if (!from.reduced_ready[slot][piece.index]) {
             throw std::logic_error("tensor-parallel complete before every rank's reduce");
         }
-        check(cudaStreamWaitEvent(stream, from.reduced[slot], 0), "complete wait");
+        check(cudaStreamWaitEvent(stream, from.reduced[slot][piece.index], 0), "complete wait");
         if (route.transport == TensorParallelTransport::PeerWrite) { continue; }
         const auto begin = static_cast<std::size_t>(range.begin);
         sources[copies]  = route.transport == TensorParallelTransport::PeerRead
-                               ? static_cast<const unsigned char*>(from.output[slot]) + begin * size
-                               : reinterpret_cast<const unsigned char*>(from.host_slot[slot]) +
-                                    begin * sizeof(float);
+                               ? static_cast<const unsigned char*>(from.output[slot][piece.index]) +
+                                    begin * size
+                               : static_cast<const void*>(from.host_slot[slot] + piece.offset +
+                                                          range.begin);
         offsets[copies] = range.begin * static_cast<std::int64_t>(size);
         bytes[copies]   = (range.end - range.begin) * static_cast<std::int64_t>(size);
         ++copies;
@@ -1287,7 +1380,7 @@ void TensorParallelExchange::gather(std::size_t rank, std::size_t slot, std::siz
             parts[r] = ranks_[r].device_slot[slot];
             continue;
         }
-        check(cudaStreamWaitEvent(stream, ranks_[r].published[slot], 0), "gather wait");
+        check(cudaStreamWaitEvent(stream, ranks_[r].published[slot][0], 0), "gather wait");
         parts[r] = route.transport == TensorParallelTransport::PeerRead ? ranks_[r].device_slot[slot]
                    : route.transport == TensorParallelTransport::PeerWrite
                        ? inbox_row(rank, r, slot)
