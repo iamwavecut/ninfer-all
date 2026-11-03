@@ -71,7 +71,9 @@ struct Q4KSplitStorage {
 // KWarps / TilesPerWarp / Stages: the warp layout (ops/common/small_t_layout.cuh) and the depth
 // of the cp.async ring. RowPolicy maps one sixteen-row MMA tile to weight rows and names how many
 // output rows the tile produces; a CTA covers SmallTLayout::kRowTiles consecutive tiles, so the
-// grid is output rows / (RowPolicy::kOutputRowsPerTile * kRowTiles).
+// grid is output rows / (RowPolicy::kOutputRowsPerTile * kRowTiles). A geometry of zero input rows
+// reads K from `input_rows` (a runtime shape, such as a tensor-parallel rank's share), a whole
+// number of K groups with unpadded rows.
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4KSplitStoreEpilogue,
           class RowPolicy = Q4KSplitIdentityRows, bool MaskedColumns = false, int KWarps = 8,
           int Stages = 1, int TilesPerWarp = 1,
@@ -81,22 +83,23 @@ __launch_bounds__(256, resident_ctas_bound(256, MinBlocks)) __global__
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ scales,
                                __nv_bfloat16* __restrict__ out, Epilogue epilogue = {},
-                               RowPolicy row_policy = {}, int columns = ActiveCols) {
+                               RowPolicy row_policy = {}, int columns = ActiveCols,
+                               int input_rows = Geometry::kInputRows) {
     using Layout                = SmallTLayout<KWarps, TilesPerWarp>;
     constexpr int kTpw          = TilesPerWarp;
-    constexpr int kHidden       = Geometry::kInputRows;
+    const int hidden            = Geometry::kInputRows > 0 ? Geometry::kInputRows : input_rows;
     constexpr int kTileK        = 64;
     constexpr int kKWarps       = Layout::kKWarps;
     constexpr int kRowTiles     = Layout::kRowTiles;
     constexpr int kRowsPerCta   = Layout::kRowsPerCta;
     constexpr int kGroupK       = Layout::kGroupK;
-    constexpr int kGroups       = kHidden / kGroupK;
-    constexpr int kCodeRowBytes = kHidden / 2;
+    const int groups            = hidden / kGroupK;
+    const int code_row_bytes    = hidden / 2;
     constexpr int kTileCols     = TileCols;
     constexpr int kNt           = kTileCols / 8;
     static_assert(kTileCols >= 8 && kTileCols <= 32 && (kTileCols % 8) == 0);
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols && ActiveCols > kTileCols - 8);
-    static_assert((kHidden % kGroupK) == 0);
+    static_assert((Geometry::kInputRows % kGroupK) == 0);
     static_assert(RowPolicy::kOutputRowsPerTile <= 16);
     static_assert(Stages >= 1 && Stages <= 4);
 
@@ -132,7 +135,7 @@ __launch_bounds__(256, resident_ctas_bound(256, MinBlocks)) __global__
             const int col   = item / kChunksPerCol;
             const int chunk = item - col * kChunksPerCol;
             cp_async<16>(&stage.activations[chunk / 8][col][(chunk % 8) * 8],
-                         &x[static_cast<std::int64_t>(col) * kHidden + group_k0 + chunk * 8]);
+                         &x[static_cast<std::int64_t>(col) * hidden + group_k0 + chunk * 8]);
         }
     };
 
@@ -151,7 +154,7 @@ __launch_bounds__(256, resident_ctas_bound(256, MinBlocks)) __global__
                 (tile0 + row / 16) * RowPolicy::kOutputRowsPerTile, row % 16);
             cp_async<16, Q4KSplitMmaSchedule::kCodeCache>(
                 &stage.codes[row][chunk * 16],
-                codes + static_cast<std::int64_t>(weight_row) * kCodeRowBytes + group_k0 / 2 +
+                codes + static_cast<std::int64_t>(weight_row) * code_row_bytes + group_k0 / 2 +
                     chunk * 16);
         }
         if (tid < kRowsPerCta) {
@@ -159,8 +162,7 @@ __launch_bounds__(256, resident_ctas_bound(256, MinBlocks)) __global__
             const int weight_row = row_policy.weight_row(
                 (tile0 + row / 16) * RowPolicy::kOutputRowsPerTile, row % 16);
             cp_async<2 * kKWarps>(&stage.scales[row][0],
-                                  scales + (static_cast<std::int64_t>(weight_row) *
-                                                Geometry::kGroupsPerRow +
+                                  scales + (static_cast<std::int64_t>(weight_row) * (hidden / 64) +
                                             group_k0 / 64) *
                                                2);
         }
@@ -170,7 +172,7 @@ __launch_bounds__(256, resident_ctas_bound(256, MinBlocks)) __global__
     // dependency wait, and its activations and every later group follow it.
     constexpr bool kPrefetchWeights = std::is_empty_v<RowPolicy>;
     const auto issue_group          = [&](int group_index) {
-        if (group_index < kGroups) {
+        if (group_index < groups) {
             Stage& stage = shared.stages[group_index % Stages];
             if (!kPrefetchWeights || group_index != 0) {
                 stage_weight(group_index * kGroupK, stage);
@@ -189,7 +191,7 @@ __launch_bounds__(256, resident_ctas_bound(256, MinBlocks)) __global__
     for (int prefetch = 0; prefetch < Stages - 1; ++prefetch) { issue_group(prefetch); }
 
 #pragma unroll 1
-    for (int group_index = 0; group_index < kGroups; ++group_index) {
+    for (int group_index = 0; group_index < groups; ++group_index) {
         issue_group(group_index + Stages - 1);
         cp_wait<Stages - 1>();
         __syncthreads();
@@ -378,7 +380,7 @@ template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4KSpli
 void q4_ksplit_mma_launch(int blocks, cudaStream_t stream, const __nv_bfloat16* x,
                            const std::uint8_t* codes, const std::uint8_t* scales,
                            __nv_bfloat16* out, Epilogue epilogue = {}, RowPolicy row_policy = {},
-                           int columns = ActiveCols) {
+                           int columns = ActiveCols, int input_rows = Geometry::kInputRows) {
     constexpr int kBytes  = Q4KSplitStorage<KWarps, TileCols, Stages, TilesPerWarp>::kBytes;
     constexpr auto kernel = q4_ksplit_mma_kernel<Geometry, TileCols, ActiveCols, Epilogue,
                                                   RowPolicy, MaskedColumns, KWarps, Stages,
@@ -386,7 +388,7 @@ void q4_ksplit_mma_launch(int blocks, cudaStream_t stream, const __nv_bfloat16* 
     static_assert(kBytes <= 48 * 1024, "small-T MMA stages must fit static shared memory");
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(static_cast<unsigned>(blocks)), dim3(SmallTLayout<KWarps>::kThreads), 0, stream},
-        kernel, x, codes, scales, out, epilogue, row_policy, columns));
+        kernel, x, codes, scales, out, epilogue, row_policy, columns, input_rows));
 }
 
 } // namespace ninfer::ops::detail

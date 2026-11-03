@@ -43,7 +43,7 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         return entry.select(t);
     }
-    return select_q4_general_launch(t, DType::BF16);
+    return select_q4_general_launch(n, k, t, DType::BF16);
 }
 
 Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
@@ -56,7 +56,7 @@ Q4Launch select_q4_fp32_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         if (entry.n != n || entry.k != k || entry.fp32 == nullptr) continue;
         if (const Q4Launch launch = entry.fp32(t)) { return launch; }
     }
-    return select_q4_general_launch(t, DType::FP32);
+    return select_q4_general_launch(n, k, t, DType::FP32);
 }
 
 void q4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,

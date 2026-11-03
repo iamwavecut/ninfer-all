@@ -1,9 +1,7 @@
 #pragma once
 
-// Epilogue for the Q4 and Q5 small-T MMA kernels (q4_ksplit_mma.cuh, q5_small_t_mma.cuh) when one
-// weight matrix feeds two column-major outputs: rows [0, split) go to `head`, rows [split, rows)
-// to `tail`, each with its own leading dimension. split == rows makes it a plain strided store.
-// A lane stores v.x = (row, col0), v.y = (row, col0 + 1), v.z = (row + 8, col0) and
+// Epilogues for the Q4 and Q5 small-T MMA kernels (q4_ksplit_mma.cuh, q5_small_t_mma.cuh). A lane
+// stores v.x = (row, col0), v.y = (row, col0 + 1), v.z = (row + 8, col0) and
 // v.w = (row + 8, col0 + 1), skipping columns at or past `columns`.
 
 #include <cuda_bf16.h>
@@ -12,6 +10,9 @@
 
 namespace ninfer::ops::detail {
 
+// One weight matrix feeding two column-major outputs: rows [0, split) go to `head`, rows
+// [split, rows) to `tail`, each with its own leading dimension. split == rows makes it a plain
+// strided store.
 struct SmallTSplitStore {
     __nv_bfloat16* head;
     __nv_bfloat16* tail;
@@ -41,6 +42,30 @@ struct SmallTSplitStore {
     }
 
     // The Q4 kernel's epilogue call carries its compile-time column tile.
+    template <int ActiveCols>
+    __device__ __forceinline__ void store(int row, int col0, float4 v) const {
+        store(row, col0, v);
+    }
+};
+
+// The unrounded FP32 products, column-major [rows, columns] (a tensor-parallel rank's partial sum,
+// or each parent of a two-parent SwiGLU).
+struct SmallTFp32Store {
+    float* out;
+    std::int32_t rows;
+    int columns;
+
+    __device__ __forceinline__ void store(int row, int col0, float4 v) const {
+        if (col0 < columns) {
+            out[static_cast<std::int64_t>(col0) * rows + row]     = v.x;
+            out[static_cast<std::int64_t>(col0) * rows + row + 8] = v.z;
+        }
+        if (col0 + 1 < columns) {
+            out[static_cast<std::int64_t>(col0 + 1) * rows + row]     = v.y;
+            out[static_cast<std::int64_t>(col0 + 1) * rows + row + 8] = v.w;
+        }
+    }
+
     template <int ActiveCols>
     __device__ __forceinline__ void store(int row, int col0, float4 v) const {
         store(row, col0, v);

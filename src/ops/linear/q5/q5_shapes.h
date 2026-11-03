@@ -5,7 +5,8 @@
 namespace ninfer::ops::detail {
 
 // Any shape no table below names, writing BF16 or FP32 (q5_general.cu).
-[[nodiscard]] Q5Launch select_q5_general_launch(std::int32_t tokens, DType out);
+[[nodiscard]] Q5Launch select_q5_general_launch(std::int32_t rows, std::int32_t k,
+                                                std::int32_t tokens, DType out);
 
 [[nodiscard]] Q5Launch select_q5_n1024_k5120(std::int32_t tokens);
 [[nodiscard]] Q5Launch select_q5_n6144_k5120(std::int32_t tokens);

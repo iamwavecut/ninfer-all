@@ -338,6 +338,15 @@ one the table routes to:
 ./build/bench/ninfer_benches ninfer_linear_schedule_bench q8:2048x16384 --tokens 24,32,40,48 --only k32,mma
 ```
 
+A tensor-parallel share has no shape table; `ninfer_tp_share_linear_bench` times the Q4/Q5
+runtime-shape routes against the other small-T schedules at a share's rows and K, into BF16 or an
+FP32 partial:
+
+```bash
+./build/bench/ninfer_benches ninfer_tp_share_linear_bench q4 4352 5120 fp32 --tokens 1,2,3,4,8 --repeat 21
+./build/bench/ninfer_benches ninfer_tp_share_linear_bench q5 5120 1536 fp32 --tokens 1,4,8
+```
+
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
 allocation:
 

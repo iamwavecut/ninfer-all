@@ -434,7 +434,9 @@ families](#expert-parallelism-of-the-other-moe-families)).
   drafters (DFlash, DFlash2: rank 0's replica after each layer is the residual one device taps),
   grafted prefixes (each rank appends its KV heads) and Vision (on rank 0). A share's projections have no tuned shapes, so they take Linear's
   runtime-shape routes (the shape tables' kernel templates with the rows and K read from the
-  operands; on `120a` NVFP4 shares that allow A4 run W4A4 from 9 tokens and FP8 shares that allow A8
+  operands; up to 8 tokens, Q4 and Q5 shares whose K is whole 256- or 512-column slabs run the
+  small-T MMA of the full shapes, `bench/ops/tp_share_linear_bench.cu` comparing it with the other
+  templates at a share's shape; on `120a` NVFP4 shares that allow A4 run W4A4 from 9 tokens and FP8 shares that allow A8
   run W8A8 from 17 tokens, A16 below, on the tile whose CTAs fill the fewest weighted waves of the
   card's multiprocessors): the GDN input projection as parts,
   one Linear per piece into the q/k/v and z planes; gate and up as two FP32 products that SwiGLU
