@@ -245,6 +245,239 @@ __global__ void tensor_parallel_words_kernel(WordsArgs a) {
     }
 }
 
+// The blocks of a scatter-flags kernel, at every size: on four RTX 5060 Ti without peer access
+// (2026-11-03) two or three took 40.5-41.9 us at 80 KiB and 202-204 us at 640 KiB, one 49.0 and
+// 255.8 us, a block per 4096 values (up to 16) 46.0 and 228.3 us, and Scatter 50 and 220 us; the
+// reads across the bus go no faster from more blocks, which only raise and poll more flags.
+constexpr int kFlagBlocks = 2;
+
+// A scatter-flags area (Rank::scatter_flags) holds per slot a row of the rank's finished outputs,
+// `row` floats long, then the flags of both phases: one per slot and block.
+__device__ __forceinline__ unsigned char* flags_finished_row(unsigned char* area, std::int64_t row,
+                                                             std::int64_t slot) {
+    return area + slot * row * static_cast<std::int64_t>(sizeof(float));
+}
+
+__device__ __forceinline__ std::uint32_t* flags_of(unsigned char* area, std::int64_t row,
+                                                   int phase, std::int64_t slot) {
+    auto* flags = reinterpret_cast<std::uint32_t*>(
+        area + static_cast<std::int64_t>(TensorParallelExchange::kSlots) * row *
+                   static_cast<std::int64_t>(sizeof(float)));
+    return flags + (phase * static_cast<std::int64_t>(TensorParallelExchange::kSlots) + slot) *
+                       kFlagBlocks;
+}
+
+struct ScatterFlagsArgs {
+    void* out;
+    // Every rank's partial: this rank's in its device slot, the others' in their host slots.
+    const float* parts[kMaxRanks];
+    // Every rank's mapped host area, this rank's at `rank`.
+    unsigned char* areas[kMaxRanks];
+    std::uint32_t* epoch;
+    // Every rank's range of the values.
+    std::int64_t begin[kMaxRanks];
+    std::int64_t end[kMaxRanks];
+    std::int64_t row;
+    int ranks;
+    int rank;
+    int contributors;
+    // `out` is aligned to 16 bytes; the slots and areas always are.
+    bool vector;
+};
+
+// Block `block` of `blocks`' part of the values [begin, end): whole 64-value blocks, as even as
+// they divide, so every part starts aligned.
+__device__ __forceinline__ void block_part(std::int64_t begin, std::int64_t end, int block,
+                                           int blocks, std::int64_t& from, std::int64_t& to) {
+    const std::int64_t step = ((end - begin + blocks - 1) / blocks + 63) / 64 * 64;
+    from                    = begin + block * step < end ? begin + block * step : end;
+    to                      = from + step < end ? from + step : end;
+}
+
+// Thread r of the block waits until rank r's flag of this block in `phase` carries `epoch`, for
+// every rank r in `ranks`; then every thread of the block may read what those ranks stored before
+// raising their flags.
+__device__ __forceinline__ void await_flags(unsigned char* const* areas, std::int64_t row,
+                                            int phase, std::int64_t slot, std::uint32_t epoch,
+                                            unsigned ranks) {
+    const unsigned r = threadIdx.x;
+    if (r < kMaxRanks && ((ranks >> r) & 1U) != 0) {
+        const volatile std::uint32_t* flag = flags_of(areas[r], row, phase, slot) + blockIdx.x;
+        const unsigned long long begun     = words_clock();
+        for (std::uint32_t spins = 0; *flag != epoch;) {
+            // A poll is a read across the bus; spaced out, the polls leave it to the data
+            // (41.0-41.9 us at 80 KiB against 42.5-43.0 without the pause).
+            __nanosleep(200);
+            if ((++spins & 1023U) == 0 &&
+                words_clock() - begun > TensorParallelExchange::kWordsTimeoutNs) {
+                printf("ninfer: a tensor-parallel exchange waited %llu s for epoch %u\n",
+                       TensorParallelExchange::kWordsTimeoutNs / 1'000'000'000ULL, epoch);
+                __trap();
+            }
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+}
+
+// Raises this block's flag in `phase` once every thread's stores before it have reached host
+// memory.
+__device__ __forceinline__ void raise_flag(unsigned char* area, std::int64_t row, int phase,
+                                           std::int64_t slot, std::uint32_t epoch) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        // Cumulative: it orders every thread's stores before the barrier.
+        __threadfence_system();
+        *reinterpret_cast<volatile std::uint32_t*>(flags_of(area, row, phase, slot) + blockIdx.x) =
+            epoch;
+    }
+}
+
+// Values [begin, end) of `Size` bytes each from host memory into `to`, fetched past every cache,
+// sixteen bytes at a time where `vector` allows.
+template <int Size>
+__device__ __forceinline__ void block_fetch(unsigned char* to, const unsigned char* from,
+                                            std::int64_t begin, std::int64_t end, bool vector) {
+    const std::int64_t first = begin * Size;
+    const std::int64_t last  = end * Size;
+    std::int64_t tail        = first;
+    if (vector) {
+        const std::int64_t lines = (last - first) / 16;
+        for (std::int64_t q = threadIdx.x; q < lines; q += blockDim.x) {
+            *reinterpret_cast<uint4*>(to + first + 16 * q) =
+                __ldcv(reinterpret_cast<const uint4*>(from + first + 16 * q));
+        }
+        tail = first + 16 * lines;
+    }
+    for (std::int64_t b = tail + Size * static_cast<std::int64_t>(threadIdx.x); b < last;
+         b += Size * static_cast<std::int64_t>(blockDim.x)) {
+        if constexpr (Size == 2) {
+            *reinterpret_cast<unsigned short*>(to + b) =
+                __ldcv(reinterpret_cast<const unsigned short*>(from + b));
+        } else {
+            *reinterpret_cast<unsigned int*>(to + b) =
+                __ldcv(reinterpret_cast<const unsigned int*>(from + b));
+        }
+    }
+}
+
+// Value i's sum stored into the output as store_sum stores it, and into the finished row.
+template <TensorParallelSum Sum>
+__device__ __forceinline__ void finish_sum(void* out, unsigned char* finished, std::int64_t i,
+                                           float sum) {
+    if constexpr (Sum == TensorParallelSum::StoreFp32) {
+        static_cast<float*>(out)[i]           = sum;
+        reinterpret_cast<float*>(finished)[i] = sum;
+    } else {
+        auto* values = static_cast<__nv_bfloat16*>(out);
+        const __nv_bfloat16 value =
+            Sum == TensorParallelSum::AddBf16 ? __float2bfloat16(__bfloat162float(values[i]) + sum)
+                                              : __float2bfloat16(sum);
+        values[i]                                     = value;
+        reinterpret_cast<__nv_bfloat16*>(finished)[i] = value;
+    }
+}
+
+// Four values' sums from a multiple of four, as finish_sum stores them.
+template <TensorParallelSum Sum>
+__device__ __forceinline__ void finish_sum4(void* out, unsigned char* finished, std::int64_t i,
+                                            float4 sum) {
+    if constexpr (Sum == TensorParallelSum::StoreFp32) {
+        *reinterpret_cast<float4*>(static_cast<float*>(out) + i)           = sum;
+        *reinterpret_cast<float4*>(reinterpret_cast<float*>(finished) + i) = sum;
+    } else {
+        auto* residual = reinterpret_cast<Bf16x4*>(static_cast<__nv_bfloat16*>(out) + i);
+        Bf16x4 word;
+        if constexpr (Sum == TensorParallelSum::AddBf16) {
+            word      = *residual;
+            word.v[0] = __float2bfloat16(__bfloat162float(word.v[0]) + sum.x);
+            word.v[1] = __float2bfloat16(__bfloat162float(word.v[1]) + sum.y);
+            word.v[2] = __float2bfloat16(__bfloat162float(word.v[2]) + sum.z);
+            word.v[3] = __float2bfloat16(__bfloat162float(word.v[3]) + sum.w);
+        } else {
+            word = Bf16x4{{__float2bfloat16(sum.x), __float2bfloat16(sum.y),
+                           __float2bfloat16(sum.z), __float2bfloat16(sum.w)}};
+        }
+        *residual                                                                  = word;
+        *reinterpret_cast<Bf16x4*>(reinterpret_cast<__nv_bfloat16*>(finished) + i) = word;
+    }
+}
+
+// One rank's scatter-flags exchange; block b of every rank handles part b of every range (see
+// ScatterFlags in core/tensor_parallel.h). The publish's copy of a contributor's partial into its
+// host slot ended before the kernel began, so every block raises its first flag at once; the rank
+// then sums its own part from the contributors' partials in rank order into `out` and its finished
+// row, raises its second flag, and fetches the other ranks' finished parts into `out`.
+template <TensorParallelSum Sum>
+__global__ void tensor_parallel_scatter_flags_kernel(ScatterFlagsArgs a) {
+    constexpr int kSize = Sum == TensorParallelSum::StoreFp32 ? 4 : 2;
+    const std::uint32_t epoch =
+        next_words_epoch(*reinterpret_cast<const volatile std::uint32_t*>(a.epoch));
+    const auto slot           = static_cast<std::int64_t>(epoch & 1U);
+    const int blocks          = static_cast<int>(gridDim.x);
+    const int block           = static_cast<int>(blockIdx.x);
+    unsigned char* const area = a.areas[a.rank];
+    std::int64_t from         = 0;
+    std::int64_t to           = 0;
+    if (a.rank < a.contributors && threadIdx.x == 0) {
+        *reinterpret_cast<volatile std::uint32_t*>(flags_of(area, a.row, 0, slot) + blockIdx.x) =
+            epoch;
+    }
+    unsigned contributors = 0;
+    unsigned others       = 0;
+    for (int r = 0; r < a.ranks; ++r) {
+        if (r == a.rank) { continue; }
+        others |= 1U << r;
+        if (r < a.contributors) { contributors |= 1U << r; }
+    }
+    await_flags(a.areas, a.row, 0, slot, epoch, contributors);
+    block_part(a.begin[a.rank], a.end[a.rank], block, blocks, from, to);
+    unsigned char* const finished = flags_finished_row(area, a.row, slot);
+    const std::int64_t quads      = a.vector ? (to - from) / 4 : 0;
+    for (std::int64_t q = threadIdx.x; q < quads; q += blockDim.x) {
+        const std::int64_t i = from + 4 * q;
+        float4 sum{};
+        for (int r = 0; r < a.contributors; ++r) {
+            const auto* at    = reinterpret_cast<const float4*>(a.parts[r] + i);
+            const float4 part = r == a.rank ? *at : __ldcv(at);
+            if (r == 0) {
+                sum = part;
+            } else {
+                sum.x += part.x;
+                sum.y += part.y;
+                sum.z += part.z;
+                sum.w += part.w;
+            }
+        }
+        finish_sum4<Sum>(a.out, finished, i, sum);
+    }
+    for (std::int64_t i = from + 4 * quads + threadIdx.x; i < to; i += blockDim.x) {
+        float sum = 0.0F;
+        for (int r = 0; r < a.contributors; ++r) {
+            const float part = r == a.rank ? a.parts[r][i] : __ldcv(a.parts[r] + i);
+            sum = r == 0 ? part : sum + part;
+        }
+        finish_sum<Sum>(a.out, finished, i, sum);
+    }
+    raise_flag(area, a.row, 1, slot, epoch);
+    await_flags(a.areas, a.row, 1, slot, epoch, others);
+    for (int o = 0; o < a.ranks; ++o) {
+        if (o == a.rank) { continue; }
+        block_part(a.begin[o], a.end[o], block, blocks, from, to);
+        block_fetch<kSize>(static_cast<unsigned char*>(a.out),
+                           flags_finished_row(a.areas[o], a.row, slot), from, to, a.vector);
+    }
+    // As in the words kernel: the last block to finish advances the count.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        if (atomicAdd(a.epoch + 1, 1U) + 1U == gridDim.x) {
+            a.epoch[1] = 0;
+            a.epoch[0] = epoch;
+        }
+    }
+}
+
 // Values [begin, end).
 struct ValueRange {
     std::int64_t begin = 0;
@@ -412,6 +645,42 @@ void exchange_words(const WordsArgs& args, cudaStream_t stream, TensorParallelSu
     check(cudaGetLastError(), "words exchange launch");
 }
 
+void exchange_scatter_flags(const ScatterFlagsArgs& args, cudaStream_t stream,
+                            TensorParallelSum sum) {
+    constexpr int kBlock = 256;
+    const auto grid      = static_cast<unsigned>(kFlagBlocks);
+    switch (sum) {
+    case TensorParallelSum::AddBf16:
+        tensor_parallel_scatter_flags_kernel<TensorParallelSum::AddBf16>
+            <<<grid, kBlock, 0, stream>>>(args);
+        break;
+    case TensorParallelSum::StoreBf16:
+        tensor_parallel_scatter_flags_kernel<TensorParallelSum::StoreBf16>
+            <<<grid, kBlock, 0, stream>>>(args);
+        break;
+    case TensorParallelSum::StoreFp32:
+        tensor_parallel_scatter_flags_kernel<TensorParallelSum::StoreFp32>
+            <<<grid, kBlock, 0, stream>>>(args);
+        break;
+    }
+    check(cudaGetLastError(), "scatter flags exchange launch");
+}
+
+// Floats of one scatter-flags row: whole 64-value blocks, so every row starts aligned.
+std::size_t flags_row(std::size_t values) { return (values + 63) / 64 * 64; }
+
+// Bytes of one rank's scatter-flags area.
+std::size_t flags_area_bytes(std::size_t row) {
+    return TensorParallelExchange::kSlots * row * sizeof(float) +
+           2 * TensorParallelExchange::kSlots * kFlagBlocks * sizeof(std::uint32_t);
+}
+
+// Whether a form's reduce is one kernel that waits on the other ranks itself, with nothing to
+// complete.
+bool one_kernel(TensorParallelForm form) {
+    return form == TensorParallelForm::Words || form == TensorParallelForm::ScatterFlags;
+}
+
 const TensorParallelBand& band_of(const std::vector<TensorParallelBand>& bands, std::size_t bytes) {
     for (const TensorParallelBand& band : bands) {
         if (bytes <= band.bytes) { return band; }
@@ -447,7 +716,8 @@ std::string size_text(std::size_t bytes) {
 }
 
 constexpr TensorParallelForm kForms[] = {TensorParallelForm::Words, TensorParallelForm::Whole,
-                                         TensorParallelForm::Scatter};
+                                         TensorParallelForm::Scatter,
+                                         TensorParallelForm::ScatterFlags};
 
 } // namespace
 
@@ -473,6 +743,8 @@ const char* tensor_parallel_form_name(TensorParallelForm form) noexcept {
         return "whole";
     case TensorParallelForm::Scatter:
         return "scatter";
+    case TensorParallelForm::ScatterFlags:
+        return "scatter-flags";
     }
     return "unknown";
 }
@@ -613,6 +885,8 @@ TensorParallelExchange::TensorParallelExchange(const DeviceContext& context,
         }
     }
     words_values_ = own_cards ? words_values(options.words_bytes, slot_bytes_) : 0;
+    scatter_flags_values_ =
+        own_cards ? std::min(kScatterFlagsBytes, slot_bytes_) / sizeof(float) : 0;
     inbox_values_ = inbox_values(slot_bytes_ / sizeof(float), context.size());
     ranks_.resize(context.size());
     try {
@@ -716,9 +990,11 @@ void TensorParallelExchange::release() noexcept {
         if (rank.host_words != nullptr) { (void)cudaFreeHost(rank.host_words); }
         if (rank.peer_words != nullptr) { (void)cudaFree(rank.peer_words); }
         if (rank.epoch != nullptr) { (void)cudaFree(rank.epoch); }
-        rank.host_words = nullptr;
-        rank.peer_words = nullptr;
-        rank.epoch      = nullptr;
+        if (rank.scatter_flags != nullptr) { (void)cudaFreeHost(rank.scatter_flags); }
+        rank.host_words    = nullptr;
+        rank.peer_words    = nullptr;
+        rank.epoch         = nullptr;
+        rank.scatter_flags = nullptr;
     }
     ranks_.clear();
 }
@@ -733,6 +1009,9 @@ bool TensorParallelExchange::legal(TensorParallelRoute route, std::size_t bytes)
                bytes <= inbox_values_ * sizeof(float);
     case TensorParallelForm::Scatter:
         return true;
+    case TensorParallelForm::ScatterFlags:
+        return route.transport == TensorParallelTransport::Host && scatter_flags_values_ != 0 &&
+               bytes <= scatter_flags_values_ * sizeof(float);
     }
     return false;
 }
@@ -741,6 +1020,10 @@ TensorParallelExchange::Needs
 TensorParallelExchange::needs(const std::vector<TensorParallelBand>& bands) const noexcept {
     Needs out;
     for (const TensorParallelBand& band : bands) {
+        if (band.route.form == TensorParallelForm::ScatterFlags &&
+            band.route.transport == TensorParallelTransport::Host && scatter_flags_values_ != 0) {
+            out.scatter_flags = true;
+        }
         const bool words = band.route.form == TensorParallelForm::Words && words_values_ != 0;
         if (band.route.transport == TensorParallelTransport::Host) {
             (words ? out.host_words : out.host_slots) = true;
@@ -791,6 +1074,21 @@ void TensorParallelExchange::provide(Needs needs) {
                                       tensor_parallel_words_kernel<TensorParallelSum::StoreBf16>,
                                       tensor_parallel_words_kernel<TensorParallelSum::StoreFp32>}) {
                 check(cudaFuncGetAttributes(&attributes, kernel), "words kernel");
+            }
+        }
+        if (needs.scatter_flags && rank.scatter_flags == nullptr) {
+            const std::size_t bytes = flags_area_bytes(flags_row(scatter_flags_values_));
+            check(cudaHostAlloc(reinterpret_cast<void**>(&rank.scatter_flags), bytes,
+                                cudaHostAllocMapped | cudaHostAllocPortable),
+                  "cudaHostAlloc");
+            // Zeroed flags carry epoch 0, which no exchange waits for.
+            std::fill_n(rank.scatter_flags, bytes, static_cast<unsigned char>(0));
+            cudaFuncAttributes attributes{};
+            for (const auto kernel :
+                 {tensor_parallel_scatter_flags_kernel<TensorParallelSum::AddBf16>,
+                  tensor_parallel_scatter_flags_kernel<TensorParallelSum::StoreBf16>,
+                  tensor_parallel_scatter_flags_kernel<TensorParallelSum::StoreFp32>}) {
+                check(cudaFuncGetAttributes(&attributes, kernel), "scatter flags kernel");
             }
         }
     }
@@ -1036,6 +1334,10 @@ void TensorParallelExchange::measure(const std::vector<TensorParallelTransport>&
             check(cudaFree(rank.peer_words), "cudaFree");
             rank.peer_words = nullptr;
         }
+        if (!keep.scatter_flags && rank.scatter_flags != nullptr) {
+            check(cudaFreeHost(rank.scatter_flags), "cudaFreeHost");
+            rank.scatter_flags = nullptr;
+        }
     }
 }
 
@@ -1060,7 +1362,8 @@ TensorParallelRoute TensorParallelExchange::route(std::size_t bytes,
                                                   TensorParallelSum sum) const noexcept {
     const TensorParallelRoute chosen = band_of(bands_, bytes).route;
     // Two ranks storing an FP32 sum reduce whole (see Scatter above).
-    const bool fp32_pair = chosen.form == TensorParallelForm::Scatter &&
+    const bool fp32_pair = (chosen.form == TensorParallelForm::Scatter ||
+                            chosen.form == TensorParallelForm::ScatterFlags) &&
                            sum == TensorParallelSum::StoreFp32 && ranks_.size() == 2;
     if (!fp32_pair && legal(chosen, bytes)) { return chosen; }
     return gather_route(bytes);
@@ -1156,11 +1459,9 @@ std::int64_t TensorParallelExchange::inbox_offset(TensorParallelPiece piece,
 
 TensorParallelRoute TensorParallelExchange::piece_route(std::size_t bytes, TensorParallelSum sum,
                                                         TensorParallelPiece piece) const {
-    const TensorParallelRoute chosen = route(bytes, sum);
+    TensorParallelRoute chosen = route(bytes, sum);
     if (piece.index == 0 && piece.offset == 0) { return chosen; }
-    if (chosen.form == TensorParallelForm::Words) {
-        throw std::logic_error("a tensor-parallel piece cannot be exchanged as words");
-    }
+    if (one_kernel(chosen.form)) { chosen = gather_route(bytes); }
     if (chosen.transport != TensorParallelTransport::PeerWrite) { return chosen; }
     // Every owner's range of the piece, at the piece's place, within an inbox row.
     const auto values = static_cast<std::int64_t>(bytes / sizeof(float));
@@ -1193,7 +1494,7 @@ void TensorParallelExchange::publish_on(TensorParallelRoute route, std::size_t r
         // reads it.
         std::size_t own_begin = bytes;
         std::size_t own_end   = bytes;
-        if (route.form == TensorParallelForm::Scatter) {
+        if (route.form != TensorParallelForm::Whole) {
             const ValueRange range = scatter_range(rank, ranks_.size(), values);
             own_begin              = static_cast<std::size_t>(range.begin) * sizeof(float);
             own_end                = static_cast<std::size_t>(range.end) * sizeof(float);
@@ -1211,7 +1512,7 @@ void TensorParallelExchange::publish_on(TensorParallelRoute route, std::size_t r
         }
     }
     if (bytes != 0 && route.transport == TensorParallelTransport::PeerWrite &&
-        route.form != TensorParallelForm::Words) {
+        !one_kernel(route.form)) {
         // The whole partial into the rank's row of every other inbox, or each owner's range of it
         // into the rank's row of the owner's.
         std::array<void*, kMaxRanks> destinations{};
@@ -1264,6 +1565,25 @@ void TensorParallelExchange::reduce_on(TensorParallelRoute route, std::size_t ra
         args.rank         = static_cast<int>(rank);
         args.contributors = static_cast<int>(contributors);
         exchange_words(args, stream, sum);
+        return;
+    }
+    if (route.form == TensorParallelForm::ScatterFlags) {
+        ScatterFlagsArgs args{};
+        args.out = out;
+        for (std::size_t r = 0; r < ranks_.size(); ++r) {
+            const ValueRange range = scatter_range(r, ranks_.size(), count);
+            args.parts[r]          = r == rank ? self.device_slot[slot] : ranks_[r].host_slot[slot];
+            args.areas[r]          = ranks_[r].scatter_flags;
+            args.begin[r]          = range.begin;
+            args.end[r]            = range.end;
+        }
+        args.epoch        = self.epoch;
+        args.row          = static_cast<std::int64_t>(flags_row(scatter_flags_values_));
+        args.ranks        = static_cast<int>(ranks_.size());
+        args.rank         = static_cast<int>(rank);
+        args.contributors = static_cast<int>(contributors);
+        args.vector       = aligned(out, 16);
+        exchange_scatter_flags(args, stream, sum);
         return;
     }
     const bool scatter     = route.form == TensorParallelForm::Scatter;

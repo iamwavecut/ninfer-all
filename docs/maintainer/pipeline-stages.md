@@ -378,7 +378,7 @@ families](#expert-parallelism-of-the-other-moe-families)).
   others' copies; works between any cards), by reading the other cards' memory (`peer-read`), or by
   writing into it (`peer-write`: a rank stores what another rank sums into that rank's memory, so
   every kernel reads only its own card). The two peer transports need peer access between every pair
-  of cards. Each moves an exchange in one of three forms. Words, for partials of up to 32 KiB (a
+  of cards. Each moves an exchange in one of four forms. Words, for partials of up to 32 KiB (a
   decode step or a short verification) with every rank on its own card: each rank's reduce kernel
   stores its FP32 values with the exchange's epoch as 8-byte words, into its own mapped host row or
   into its row in every other card's memory, and polls the others' words, with no copy and no
@@ -388,8 +388,16 @@ families](#expert-parallelism-of-the-other-moe-families)).
   of the values, whole 64-value blocks, and the other ranks' finished BF16 ranges then reach its
   replica; every value is still the same rank-order sum, and a rank moves 1/N of each other rank's
   partial and (N-1)/N of a replica instead of N-1 whole partials. Through host memory a publish
-  copies only the ranges the other ranks read, and an owner copies its finished range there; by
-  peer writes the owner stores its finished range straight into the other replicas.
+  copies only the ranges the other ranks read, and an owner copies its finished range there; by peer
+  writes the owner stores its finished range straight into the other replicas. Scatter flags,
+  through host memory with every rank on its own card and for partials of up to 1 MiB: the
+  reduce-scatter's publish copies as above, but one kernel per rank (two blocks) sums its range,
+  stores the finished values into its own mapped host row and reads the others', waiting on flags in
+  host memory that each rank's blocks raise once their copies and stores have reached it, instead of
+  on fences between the cards; a flag carries the exchange's epoch from the words' count. On four
+  RTX 5060 Ti an exchange of a four-column verification (80 KiB) took 43.0 us against 51.2 for the
+  reduce-scatter with fences, and one of 640 KiB 203 us against 220; a decode round of Qwen3.8-27B
+  with three drafts took 22.4-22.6 ms against 23.6-23.8, with the same text.
 - **Choosing a route.** Which route is fastest depends on the partial's size, the number of cards
   and the platform. On a 4x RTX 5060 Ti box with the community peer-access driver host memory beat
   peer reads (#170); on a 4x RTX A4000 box peer reads beat host memory, on four of its cards peer

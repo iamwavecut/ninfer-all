@@ -33,9 +33,9 @@ set_target_properties(ninfer-tp-probe PROPERTIES
 
 # Times the engine's own tensor-parallel exchange (core/tensor_parallel.cu) over the ranks of a
 # device list: every route (host memory, peer reads, peer writes; words, whole reduces, the
-# reduce-scatter and all-gather) at every size, and the bands the exchange measures for itself. The
-# exchange only includes core/device.h and a public enum header, so it is compiled in with the
-# device sources, as for ninfer-multi-gpu-probe, instead of linking the core.
+# reduce-scatter and all-gather, scatter flags) at every size, and the bands the exchange measures
+# for itself. The exchange only includes core/device.h and a public enum header, so it is compiled
+# in with the device sources, as for ninfer-multi-gpu-probe, instead of linking the core.
 add_executable(ninfer-tp-exchange-bench
   tp_exchange_bench.cu
   ${CMAKE_SOURCE_DIR}/src/core/tensor_parallel.cu
