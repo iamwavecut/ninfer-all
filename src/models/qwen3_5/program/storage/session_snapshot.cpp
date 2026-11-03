@@ -42,8 +42,9 @@ namespace {
 
 constexpr char kSessionSnapshotMagic[8]         = {'N', 'I', 'N', 'F', 'S', 'E', 'S', '1'};
 // Version 3 binds the RoPE scaling profile and the text KV planes' sizes in the configuration
-// block; version 4 stores the word-wise prefix shortlist digests.
-constexpr std::uint32_t kSessionSnapshotVersion = 4;
+// block; version 4 stores the word-wise prefix shortlist digests; version 5 the LoRA adapter key
+// the session ran under.
+constexpr std::uint32_t kSessionSnapshotVersion = 5;
 constexpr std::size_t kMaximumModelBindingBytes = 4096;
 constexpr std::uint32_t kMaximumSnapshotAnchors = 64;
 
@@ -596,6 +597,8 @@ SessionSnapshot ProgramImpl::save_continuation(const ContinuationHandle& continu
     }
     write_vision_items(writer, identity.vision_items());
     write_vector(writer, identity.rewrite_execution_frontiers());
+    writer.pod<std::uint64_t>(identity.lora_key()[0]);
+    writer.pod<std::uint64_t>(identity.lora_key()[1]);
     write_vector(writer, digests.image());
 
     writer.pod<std::uint8_t>(sequence.rewrite_checkpoint.valid ? 1 : 0);
@@ -838,6 +841,9 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
     std::vector<VisionItem> vision_items = read_vision_items(reader, session.tokens);
     std::vector<std::uint32_t> rewrite_frontiers =
         read_vector<std::uint32_t>(reader, session.tokens, "rewrite frontier");
+    std::array<std::uint64_t, 2> lora_key{};
+    lora_key[0] = reader.pod<std::uint64_t>();
+    lora_key[1] = reader.pod<std::uint64_t>();
     std::vector<std::array<std::uint64_t, 2>> digest_image =
         read_vector<std::array<std::uint64_t, 2>>(
             reader, static_cast<std::size_t>(session.tokens) + 1U, "shortlist digest");
@@ -1057,7 +1063,8 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
 
         sequence.ledger.assign(ledger.begin(), ledger.end());
         sequence.prefix_identity.restore(std::move(token_types), std::move(positions),
-                                         std::move(vision_items), std::move(rewrite_frontiers));
+                                         std::move(vision_items), std::move(rewrite_frontiers),
+                                         lora_key);
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1U);
         sequence.prefix_digests.restore(std::move(digest_image));
         sequence.prefix_digests.reserve(static_cast<std::size_t>(capacity) + 1U);

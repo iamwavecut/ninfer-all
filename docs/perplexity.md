@@ -39,7 +39,11 @@ DeepSeek-V4.1 and Qwen3.8-Flash-Next, its Qwen3.8-Flash-Next n-gram options (`--
 `--ngram-lock`, `--no-ngram-table`; DeepSeek-V4.1's Engram table takes all but `ram-hot` and
 `--ngram-hot-profile`) and `--kv-resident` (streamed sparse-attention KV), and its
 precision options (`--prefill-cublas`, `--lm-head-q4/q6`, `--embedding-q4/q6`, `--gdn-state-fp16`,
-`--mlp-a8-decode`, `--no-prefill-a8`).
+`--mlp-a8-decode`, `--no-prefill-a8`), and the
+[adapter and control vector options](serving.md#lora-adapters-and-control-vectors) of a Qwen3.5-core
+model (`--lora`, `--lora-scaled`, `--lora-init-without-apply`, `--control-vector`,
+`--control-vector-scaled`, `--control-vector-layer-range`), scoring with every adapter at its startup
+scale.
 
 ```bash
 ./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \

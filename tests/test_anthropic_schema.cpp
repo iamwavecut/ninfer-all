@@ -968,6 +968,19 @@ int test_graft_extension() {
     return failures;
 }
 
+int test_lora_extension() {
+    Json body       = base_request();
+    body["lora"]    = Json::array({{{"id", 2}, {"scale", 0.25}}});
+    const auto lora = parse(body).generation.lora;
+    int failures    = check(lora && lora->size() == 1 && lora->front().id == 2 &&
+                                lora->front().scale == 0.25F,
+                            "Messages lora was not parsed");
+    body["lora"] = Json::array({{{"scale", 1}}});
+    failures += check(api_param([&] { (void)parse(body); }) == "lora",
+                      "a Messages lora entry without an id was accepted");
+    return failures;
+}
+
 // Every remainder class of the Base64 codec, plus multi-byte UTF-8 and control bytes.
 int test_hidden_reasoning_signature() {
     int failures = 0;
@@ -1076,6 +1089,7 @@ int test_hidden_reasoning_round_trip() {
 int main() {
     int failures = 0;
     failures += test_graft_extension();
+    failures += test_lora_extension();
     failures += test_envelope_and_field_policy();
     failures += test_message_normalization();
     failures += test_attribution_system_block();

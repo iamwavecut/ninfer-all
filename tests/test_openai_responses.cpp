@@ -1622,11 +1622,28 @@ int test_graft_extension() {
     return failures;
 }
 
+int test_lora_extension() {
+    Json body = {{"model", "m"},
+                 {"input", "hello"},
+                 {"lora", Json::array({{{"id", 0}, {"scale", 1.5}}})}};
+    const auto lora = parse_openai_responses_create_request(body, limits()).prompt.generation.lora;
+    int failures    = check(lora && lora->size() == 1 && lora->front().id == 0 &&
+                                lora->front().scale == 1.5F,
+                            "Responses lora was not parsed");
+    body["lora"] = Json::object();
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(body, limits());
+                      }).param == "lora",
+                      "a non-array Responses lora was accepted");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += test_graft_extension();
+    failures += test_lora_extension();
     failures += test_thinking_budget_extension();
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();

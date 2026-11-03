@@ -317,6 +317,9 @@ struct LoadSummary {
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;
+    // SHA-256 (hex) over the control vectors every request runs with (EngineOptions::
+    // control_vectors), their scales and layer range; empty without control vectors.
+    std::string control_vectors_digest;
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;

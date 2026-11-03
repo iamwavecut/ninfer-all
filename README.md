@@ -25,6 +25,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Use one short line per entry. Link to details inline when useful. -->
 
+- **2026-11-03:** llama.cpp [control vectors and direction LoRA adapters](docs/serving.md#lora-adapters-and-control-vectors) for Qwen3.5-core models, with per-request adapter scales.
 - **2026-11-02:** [Tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism) selects exchange routes by size from startup timings, including peer writes.
 - **2026-10-31:** [Automatic tensor splits](docs/maintainer/pipeline-stages.md#tensor-parallelism) adjust GPU shares using free memory after the first load.
 - **2026-10-30:** [Bundled media libraries](docs/release-archive-linux.md#media-libraries), [pre-Blackwell NVFP4](docs/cli.md#common-options), Qwen3.5 FP32 logits, attention kernel preload, and [prefill pacing](docs/serving.md#execution-behavior).
@@ -461,6 +462,10 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   `--models-preset`, `ninfer-serve` is a router with llama.cpp's model API; with `--model-suspend` a
   model sleeps instead of unloading: two 27B models on one 24 GB RTX 3090 swap in 1.8 s instead of
   an 11.6 s cold load ([several models](docs/serving.md#several-models-router)).
+- **Control vectors and direction LoRA adapters.** Qwen3.5-core models load llama.cpp control
+  vectors and the rank-one LoRA adapters that abliteration tools write, such as AtomicChat's for
+  Ternary Bonsai 2 27B; a request sets adapter scales through llama.cpp's `lora` field
+  ([LoRA adapters and control vectors](docs/serving.md#lora-adapters-and-control-vectors)).
 - `GET /stats` and a [monitoring dashboard](tools/monitor/README.md), request logs with rotation,
   and llama.cpp's WebUI, built into the Linux packages and the Docker images.
 

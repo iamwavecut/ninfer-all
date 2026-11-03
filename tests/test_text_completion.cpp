@@ -88,6 +88,12 @@ void controls() {
                       "logit_bias": [], "samplers": ["top_k"], "n_keep": 4, "id_slot": -1})")
                .empty(),
            "neutral llama.cpp controls are accepted");
+    const auto scaled = parse(R"({"prompt": "x", "lora": [{"id": 0, "scale": 0.5}]})");
+    expect(scaled.generation.lora && scaled.generation.lora->size() == 1 &&
+               scaled.generation.lora->front().scale == 0.5F,
+           "llama.cpp's lora scales are parsed");
+    expect(!refusal(R"({"prompt": "x", "lora": [{"id": "0", "scale": 1}]})").empty(),
+           "a lora entry with a string id is refused");
     expect(refusal(R"({"prompt": "x", "repeat_penalty": 1.1})") == "repeat_penalty_not_supported",
            "a repeat penalty is refused");
     expect(refusal(R"({"prompt": "x", "mirostat": 2})") == "mirostat_not_supported",

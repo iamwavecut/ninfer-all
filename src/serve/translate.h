@@ -29,6 +29,8 @@ struct ResolvedPromptSemantics {
     std::optional<bool> requested_preserve_thinking;
     std::string chat_template_kwargs_json;
     std::string graft;
+    // The request's `lora`, each id a loaded adapter's.
+    std::optional<std::vector<ninfer::LoraScale>> lora;
 };
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,

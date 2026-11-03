@@ -1585,6 +1585,31 @@ int test_graft_extension() {
     return failures;
 }
 
+// llama.cpp's per-request LoRA scales: [{id, scale}], ids checked against the loaded adapters later.
+int test_lora_extension() {
+    Json body    = base_request();
+    int failures = check(!parse(body).generation.lora, "absent lora was not left unset");
+    body["lora"] = Json::array({{{"id", 1}, {"scale", 0.5}}, {{"id", 0}, {"scale", -1}}});
+    const auto lora = parse(body).generation.lora;
+    failures += check(lora && lora->size() == 2 && (*lora)[0].id == 1 &&
+                          (*lora)[0].scale == 0.5F && (*lora)[1].id == 0 &&
+                          (*lora)[1].scale == -1.0F,
+                      "lora entries were not parsed in order");
+    body["lora"] = Json::array();
+    failures += check(parse(body).generation.lora && parse(body).generation.lora->empty(),
+                      "an empty lora list did not select no adapter");
+    for (const Json& invalid : {Json(5), Json::array({{{"id", 0}}}),
+                                Json::array({{{"id", -1}, {"scale", 1}}}),
+                                Json::array({{{"id", 8}, {"scale", 1}}}),
+                                Json::array({{{"id", 0.5}, {"scale", 1}}}),
+                                Json::array({{{"id", 0}, {"scale", "1"}}})}) {
+        body["lora"] = invalid;
+        failures += check(api_error([&] { (void)parse(body); }).param == "lora",
+                          "invalid lora was accepted: " + invalid.dump());
+    }
+    return failures;
+}
+
 } // namespace
 
 int test_assistant_continuation_mode() {
@@ -1677,6 +1702,7 @@ int main() {
     int failures = 0;
     failures += test_prompt_cache_key_grants_long_anchor();
     failures += test_graft_extension();
+    failures += test_lora_extension();
     failures += test_thinking_budget_extension();
     failures += test_request_envelope_and_sampling();
     failures += test_structured_output();

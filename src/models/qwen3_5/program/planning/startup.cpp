@@ -392,6 +392,41 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
             "sampling config");
     }
+    if (plan.steering_adapters != 0 || plan.steering_vectors) {
+        // Every rank edits its replica or stage residual itself, so each holds its own copy.
+        const auto hidden  = dimension(config.hidden_size);
+        const auto columns = checked_i32(stage_boundary_columns(plan),
+                                         "steering pass columns exceed int32");
+        const auto adapters = static_cast<std::int32_t>(plan.steering_adapters);
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            LayoutBuilder& rank_builder = *builder_pointers[rank];
+            SteeringRankLayout& layout  = out.steering.emplace_back();
+            if (adapters != 0) {
+                layout.directions   = add_tensor(rank_builder, DType::FP32, {hidden, adapters},
+                                                 "LoRA adapter directions");
+                layout.site_factors = add_tensor(
+                    rank_builder, DType::FP32,
+                    {adapters, static_cast<std::int32_t>(steering_sites(config.num_hidden_layers))},
+                    "LoRA adapter site factors");
+                layout.lane_scales =
+                    add_tensor(rank_builder, DType::FP32,
+                               {adapters, static_cast<std::int32_t>(plan.max_concurrency)},
+                               "LoRA adapter lane scales");
+                layout.measures = add_tensor(rank_builder, DType::FP32, {adapters, columns},
+                                             "LoRA adapter residual measures");
+                if (rank == 0) {
+                    layout.column_rows = add_tensor(rank_builder, DType::I32, {columns},
+                                                    "LoRA adapter column rows");
+                }
+            }
+            if (plan.steering_vectors) {
+                layout.vectors = add_tensor(
+                    rank_builder, DType::FP32,
+                    {hidden, static_cast<std::int32_t>(config.num_hidden_layers)},
+                    "control vectors");
+            }
+        }
+    }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     for (std::size_t rank = 1; rank < ranks; ++rank) {
         out.extra_rank_bytes.push_back(builders[rank].finish(
@@ -1264,6 +1299,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
+    impl->steering_adapters   = inputs.steering_adapters;
+    impl->steering_vectors    = inputs.steering_vectors;
     impl->persistent          = persistent_layout(*impl);
     if (impl->context_cache.enabled && impl->context_cache.mode == ContextCacheMode::Hybrid) {
         // The whole Host budget is the hybrid slab pool that KV blocks and state snapshots share
@@ -1578,6 +1615,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .context_cache              = options.context_cache,
         .resident_main_pages        = resident_main_pages,
         .peer_access                = device.peer_access(),
+        .steering_adapters          = static_cast<std::uint32_t>(options.lora_adapters.size()),
+        .steering_vectors           = !options.control_vectors.empty(),
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     // Injected graft prefixes hold their Main pages for good, on top of what requests use.

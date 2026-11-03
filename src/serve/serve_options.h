@@ -6,6 +6,7 @@
 #include "ninfer/model_enums.h"
 #include "ninfer/request.h"
 #include "product/logging/logging.h"
+#include "product/steering_options.h"
 #include "serve/request.h"
 
 #include <cstddef>
@@ -160,6 +161,10 @@ struct ServeOptions {
     // --default-graft NAME: graft applied to a request that states none ("graft": "" opts out).
     // Empty means no default; otherwise it names an entry of `grafts`.
     std::string default_graft;
+    // --lora, --lora-scaled, --lora-init-without-apply, --control-vector, --control-vector-scaled
+    // and --control-vector-layer-range: the adapters a request's `lora` names by index, and the
+    // control vectors every request runs with.
+    product::SteeringFlags steering;
     std::optional<std::uint32_t> default_thinking_budget;
     // --reasoning-loop off|stop|conclude: the reasoning-loop guard for every thinking request,
     // constrained ones included (off by default).

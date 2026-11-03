@@ -9,6 +9,7 @@
 #include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/processor.h"
+#include "models/qwen3_5/frontend/steering.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
@@ -965,7 +966,7 @@ public:
           automatic_long_anchors(options.automatic_long_anchors),
           long_anchor_min_spacing_tokens(options.long_anchor_min_spacing_tokens),
           progress_anchor_tokens(options.progress_anchor_tokens),
-          grafts(std::move(options.grafts)) {
+          grafts(std::move(options.grafts)), steering(std::move(options.steering)) {
         if (progress_anchor_tokens != 0 && progress_anchor_tokens < kMinimumProgressAnchorTokens) {
             throw std::invalid_argument("progress anchors need a stride of at least " +
                                         std::to_string(kMinimumProgressAnchorTokens) + " tokens");
@@ -1172,6 +1173,18 @@ public:
     std::uint32_t long_anchor_min_spacing_tokens = 0;
     std::uint32_t progress_anchor_tokens         = 0;
     std::vector<PromptGraft> grafts;
+    std::shared_ptr<const Steering> steering;
+
+    // The request's adapter scales and their cache identity; before the prompt's block keys,
+    // which carry that identity.
+    void assign_lora(PreparedPromptData& prompt,
+                     const std::optional<std::vector<LoraScale>>& lora) const {
+        static const Steering kNone;
+        const Steering& loaded          = steering ? *steering : kNone;
+        const std::vector<float> scales = resolve_lora_scales(loaded, lora);
+        std::copy(scales.begin(), scales.end(), prompt.lora_scales.begin());
+        prompt.lora_key = lora_identity(loaded, scales);
+    }
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -1408,6 +1421,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
+    impl_->assign_lora(result, options.lora);
     // A request that does not draft reads one token: it needs no proposal sources or index.
     const bool drafts_ngrams = impl_->ngram_sources_enabled && options.speculative_drafting;
     if (drafts_ngrams) {
@@ -1635,7 +1649,8 @@ MediaCacheSummary Frontend::media_cache_summary() const {
 }
 
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity,
-                                        bool anchor_prompt_end, bool speculative_drafting) const {
+                                        bool anchor_prompt_end, bool speculative_drafting,
+                                        const std::optional<std::vector<LoraScale>>& lora) const {
     const auto start = Clock::now();
     if (token_ids.size() > impl_->max_context) {
         throw_context_length_exceeded(impl_->max_context);
@@ -1650,6 +1665,7 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
+    impl_->assign_lora(result, lora);
     if (impl_->ngram_sources_enabled && speculative_drafting) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         build_ngram_index(result);

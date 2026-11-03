@@ -191,6 +191,7 @@ std::string usage_text(const char* argv0) {
            std::string(ninfer::product::kTensorAttentionHelp) +
            std::string(ninfer::product::kTensorParallelTransportHelp) +
            std::string(ninfer::product::kInvariantAttentionHelp) +
+           std::string(ninfer::product::kSteeringHelp) +
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
            "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
@@ -379,6 +380,10 @@ Options parse_options(int argc, char** argv) {
             return argv[i];
         };
 
+        if (ninfer::product::parse_steering_flag(
+                arg, [&]() -> const char* { return value(arg); }, options.steering)) {
+            continue;
+        }
         if (arg == "--prompt") {
             options.prompt = value(arg);
         } else if (arg == "--chat-template") {

@@ -3,6 +3,7 @@
 #include "core/device_snapshot.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/frontend/steering.h"
 #include "models/qwen3_5/program/runtime_types.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
@@ -22,6 +23,9 @@ struct ModelInstance {
 
     std::unique_ptr<models::qwen3_5::Model> model;
     const models::qwen3_5::execution::Parameters parameters;
+    // EngineOptions::lora_adapters and ::control_vectors, read against the model; null without
+    // either.
+    const std::shared_ptr<const models::qwen3_5::Steering> steering;
     models::qwen3_5::Frontend frontend;
     KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;

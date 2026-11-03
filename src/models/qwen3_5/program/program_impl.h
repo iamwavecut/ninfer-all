@@ -15,6 +15,7 @@
 #include "core/decode_graph.h"
 #include "models/qwen3_5/execution/expert_runtime.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/frontend/steering.h"
 #include "models/qwen3_5/program/graft_injection.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
@@ -704,7 +705,8 @@ public:
 
     ProgramImpl(const execution::Parameters& parameters, const SequencePlanImpl& plan,
                 DeviceContext& device, const StartupObserver& startup_observer,
-                std::unique_ptr<execution::NativeExpertRuntime> experts);
+                std::unique_ptr<execution::NativeExpertRuntime> experts,
+                const Steering* steering);
     ~ProgramImpl() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -1037,6 +1039,8 @@ public:
 
     // Declared before Graphs so all graph users die before the delivery tables and service.
     std::unique_ptr<execution::NativeExpertRuntime> experts;
+    // LoRA adapters and control vectors on every rank; null without either.
+    std::unique_ptr<execution::SteeringView> steering;
     ExpertDeliveryStats expert_startup_stats;
     // One device with host or disk experts: free KV pages fund the elastic expert cache. Declared
     // after the arena, the decoder's pools and the experts, whose recall hooks it clears first.
@@ -1773,6 +1777,13 @@ private:
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
+    // Writes the adapter scales `prompt` runs under to the lane scales of the sequence's KV table
+    // row on every rank, ahead of its passes; a no-op without adapters.
+    void write_lane_scales(const SequenceState& sequence, const PreparedPromptData& prompt);
+    // Binds and uploads the loaded adapters and control vectors on every rank, before the graphs
+    // that read them are captured.
+    void bind_steering(const SequencePlanImpl& plan, const Steering* source,
+                       std::span<const DeviceSpan> backings);
     // Enables the device logprob gather for the next round when one of its rows asked for it.
     void arm_logprobs(bool any);
     // Copies the first `rows` gathered records to the host, ordered after the enqueued round.

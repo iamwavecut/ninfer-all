@@ -68,6 +68,17 @@ EngineOptions with_family_embedding(EngineOptions options) {
     return options;
 }
 
+// LoRA adapters and control vectors edit the Qwen3.5 text layers' residual.
+EngineOptions with_family_steering(EngineOptions options) {
+    if ((!options.lora_adapters.empty() || !options.control_vectors.empty()) &&
+        own_family_artifact(options.artifact_path)) {
+        throw std::invalid_argument(
+            "--lora and --control-vector apply to Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM "
+            "artifacts");
+    }
+    return options;
+}
+
 // Position-split and invariant attention are Qwen3.5 Program schedules over its paged cache. The
 // partial-sum exchange is the Qwen3.5 Program's and Flash-Next's; the other families divide only
 // their routed experts and sum them their own way.
@@ -335,8 +346,9 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 
 namespace {
 
-// What a session snapshot binds to: the model, its weight formats and quantization, and the
-// artifact size, since the prefill signature describes weight geometry but not weight values.
+// What a session snapshot binds to: the model, its weight formats and quantization, the artifact
+// size, since the prefill signature describes weight geometry but not weight values, and the
+// control vectors every request runs with.
 std::string slot_model_binding(const EngineOptions& options, const LoadSummary& load) {
     std::string binding = load.architecture + '\n' + load.model_name + '\n';
     for (const std::string& format : load.weight_formats) { binding += format + ','; }
@@ -344,6 +356,9 @@ std::string slot_model_binding(const EngineOptions& options, const LoadSummary& 
     std::error_code size_error;
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, size_error);
     binding += size_error ? std::string("?") : std::to_string(size);
+    if (!load.control_vectors_digest.empty()) {
+        binding += "\ncontrol=" + load.control_vectors_digest;
+    }
     return binding;
 }
 
@@ -398,9 +413,9 @@ public:
                               std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(with_family_speculation(
-              with_family_context_cache(
-                  with_family_attention(with_family_embedding(std::move(engine_options))))))),
+        : options(runtime::normalize_engine_options(
+              with_family_speculation(with_family_context_cache(with_family_attention(
+                  with_family_steering(with_family_embedding(std::move(engine_options)))))))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         report_gpu_clock_floor(options, clock_floor);
@@ -776,7 +791,8 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity,
-                                      bool anchor_prompt_end, bool speculative_drafting) const {
+                                      bool anchor_prompt_end, bool speculative_drafting,
+                                      const std::optional<std::vector<LoraScale>>& lora) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -785,7 +801,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids, bool allow
                            context_capacity_error(token_ids.size(), impl_->capacity()));
     }
     auto prepared = impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity,
-                                                     anchor_prompt_end, speculative_drafting);
+                                                     anchor_prompt_end, speculative_drafting, lora);
     PromptSummary info = prepared.summary();
     if (info.prompt_tokens > impl_->capacity()) {
         throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");

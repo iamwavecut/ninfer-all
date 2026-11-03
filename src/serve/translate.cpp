@@ -262,6 +262,16 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         }
         result.graft = graft;
     }
+    if (request.lora) {
+        for (const ninfer::LoraScale& entry : *request.lora) {
+            if (entry.id >= server.steering.lora_adapters.size()) {
+                invalid_prompt_option("lora id " + std::to_string(entry.id) +
+                                          " is not an adapter loaded on this server",
+                                      "lora", "unknown_lora_adapter");
+            }
+        }
+        result.lora = request.lora;
+    }
     if (!request.tool_choice.forced_name.empty() && result.enable_thinking != false) {
         // The call opener is written into the generation prompt, and a thinking prompt ends
         // inside the reasoning block, where the opener has no place. Reasoning that only a
@@ -381,6 +391,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking                = semantics.preserve_thinking;
     input.options.chat_template_kwargs_json        = semantics.chat_template_kwargs_json;
     input.options.graft                            = semantics.graft;
+    input.options.lora                             = semantics.lora;
     input.options.add_vision_id                    = false;
     input.options.speculative_drafting             = request.speculative_drafting;
     const std::vector<const ToolDefinition*> tools = effective_tools(request);

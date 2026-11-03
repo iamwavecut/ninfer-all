@@ -675,6 +675,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
         card.set_expert_runtime(state.execution.experts);
+        card.set_steering(state.execution.steering);
         card.set_rope_yarn(state.execution.rope_yarn);
         DFlashFeatureSink sink =
             batch_feature_sink_impl(state, active_lanes, valid_columns, width, batch_size);

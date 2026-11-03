@@ -487,6 +487,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --default-graft NAME          apply a loaded graft to every request that names\n"
            "                                none; a request opts out with \"graft\": \"\"\n"
            "\n"
+           "STEERING (a request's \"lora\": [{\"id\": N, \"scale\": S}] sets its scales)\n" +
+           std::string(product::kSteeringHelp) +
+           "\n"
            "API BEHAVIOR\n"
            "  --structured-output           enforce response formats (JSON, JSON Schema,\n"
            "                                regex, choice, GBNF) and strict tool arguments;\n"
@@ -1563,6 +1566,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.grafts.push_back(GraftSource{.name = std::string(spec.substr(0, equals)),
                                                  .path = std::string(spec.substr(equals + 1))});
+            continue;
+        }
+        if (product::parse_steering_flag(
+                arg, [&]() -> const char* { return require_value(arg.c_str()); },
+                options.steering)) {
             continue;
         }
         if (arg == "--default-graft") {

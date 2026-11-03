@@ -6,6 +6,7 @@
 #include "ninfer/model_enums.h"
 #include "ninfer/request.h"
 #include "product/logging/logging.h"
+#include "product/steering_options.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -82,6 +83,8 @@ struct Options {
     std::optional<std::uint32_t> thinking_budget;
     ninfer::ReasoningLoopAction reasoning_loop = ninfer::ReasoningLoopAction::Off;
     std::optional<ReasoningEffort> reasoning_effort;
+    // LoRA adapters (at their scales) and control vectors the run steers with.
+    ninfer::product::SteeringFlags steering;
 
     std::vector<TokenId> stop_token_ids;
     std::vector<StopString> stop_strings;

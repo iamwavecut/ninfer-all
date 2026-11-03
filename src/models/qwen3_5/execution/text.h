@@ -17,6 +17,8 @@
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/stage_runtime.h"
+#include "models/qwen3_5/execution/steering.h"
+#include "ninfer/ops/steer_residual.h"
 
 #include <array>
 #include <cstddef>
@@ -155,6 +157,10 @@ public:
     // Present when the model is split over several devices; see StageRuntime.
     void set_stage_runtime(StageRuntime* runtime) noexcept { stage_runtime_ = runtime; }
 
+    // Present when LoRA adapters or control vectors are loaded: the text layers then edit the
+    // residual after the embedding and after each write to it (ops::steer_residual).
+    void set_steering(const SteeringView* steering) noexcept { steering_ = steering; }
+
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
     }
@@ -255,6 +261,11 @@ private:
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);
+    // The main model's token embedding of `ids` into x, with the adapters' edit of it.
+    void embed_input(const Tensor& ids, Tensor& x, cudaStream_t stream);
+    // One steering step over x on the rank the context is bound to: `site` names the adapters'
+    // factors (frontend/steering.h); `layer` adds that layer's control vector to a Write, -1 none.
+    void steer(ops::SteerResidualStep step, std::uint32_t site, std::int32_t layer, Tensor& x);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
 
     // Per-request width of a bound sequence batch; an unbatched call is one row of all columns.
@@ -382,6 +393,9 @@ private:
     std::int32_t active_sequence_width_                                            = 0;
     // Non-empty during prefill_final_batch: a prefill pass's sequences, column range by range.
     std::span<const SegmentBinding> active_segments_;
+    // During prefill_final_batch: each column's KV table row, the lane its steering scales are read
+    // from.
+    const Tensor* active_column_rows_                                              = nullptr;
     std::int32_t rope_delta_                                                       = 0;
     std::int32_t linear_state_source_slot_                                         = 0;
     std::int32_t linear_state_destination_slot_                                    = 0;
@@ -405,6 +419,7 @@ private:
     std::uint32_t mtp_attention_window_         = 0;
     const MtpParameters* mtp_                   = nullptr;
     StageRuntime* stage_runtime_                = nullptr;
+    const SteeringView* steering_               = nullptr;
     // A tensor-parallel pass: the rank whose share is being issued, and where its output
     // projections write their FP32 partial instead of adding to the residual.
     std::size_t tensor_rank_  = 0;

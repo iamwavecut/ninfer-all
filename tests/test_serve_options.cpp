@@ -1863,5 +1863,76 @@ int main() {
         }
     }
 
+    {
+        // llama.cpp's adapter and control vector flags; FNAME:SCALE splits at the last colon.
+        const ServeOptions steered =
+            parse({"ninfer-serve", "model.ninfer", "--lora", "a.gguf,b.gguf", "--lora-scaled",
+                   "C:/adapters/c.gguf:0.5", "--control-vector", "v.gguf",
+                   "--control-vector-scaled", "w.gguf:-1.5,x.gguf:2",
+                   "--control-vector-layer-range", "2", "10"});
+        const auto& flags = steered.steering;
+        failures += check(flags.lora_adapters.size() == 3 &&
+                              flags.lora_adapters[1].path == "b.gguf" &&
+                              flags.lora_adapters[1].scale == 1.0F &&
+                              flags.lora_adapters[2].path == "C:/adapters/c.gguf" &&
+                              flags.lora_adapters[2].scale == 0.5F &&
+                              !flags.lora_init_without_apply,
+                          "--lora and --lora-scaled were not parsed in order");
+        failures += check(flags.control_vectors.size() == 3 &&
+                              flags.control_vectors[0].scale == 1.0F &&
+                              flags.control_vectors[1].path == "w.gguf" &&
+                              flags.control_vectors[1].scale == -1.5F &&
+                              flags.control_vectors[2].scale == 2.0F &&
+                              flags.control_vector_layers &&
+                              flags.control_vector_layers->first == 2 &&
+                              flags.control_vector_layers->last == 10,
+                          "the control vector flags were not parsed");
+        ninfer::EngineOptions engine;
+        parse({"ninfer-serve", "model.ninfer", "--lora-scaled", "a.gguf:0.5",
+               "--lora-init-without-apply"})
+            .steering.apply(engine);
+        failures += check(engine.lora_adapters.size() == 1 &&
+                              engine.lora_adapters[0].scale == 0.0F,
+                          "--lora-init-without-apply did not start the adapters at scale 0");
+        for (const std::vector<std::string>& invalid : {
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--lora-scaled",
+                                          "a.gguf"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--lora-scaled",
+                                          "a.gguf:x"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--lora", "a.gguf,"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer",
+                                          "--control-vector-layer-range", "0", "3"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer",
+                                          "--control-vector-layer-range", "5", "3"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer",
+                                          "--control-vector-layer-range", "5"}}) {
+            bool rejected = false;
+            try {
+                (void)parse(invalid);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "malformed steering flags were accepted");
+        }
+
+        GenerationRequest request;
+        request.max_tokens = 1;
+        request.lora = std::vector<ninfer::LoraScale>{{.id = 2, .scale = 0.25F}};
+        const auto semantics = resolve_prompt_semantics(request, steered);
+        const auto forwarded = to_prompt_input(request, semantics, {}).options.lora;
+        failures += check(semantics.lora && semantics.lora->front().id == 2 && forwarded &&
+                              forwarded->size() == 1 && forwarded->front().id == 2 &&
+                              forwarded->front().scale == 0.25F,
+                          "a request's lora scales did not reach the Engine prompt options");
+        request.lora = std::vector<ninfer::LoraScale>{{.id = 3, .scale = 1.0F}};
+        std::string unknown_code;
+        try {
+            (void)resolve_prompt_semantics(request, steered);
+        } catch (const ApiException& error) { unknown_code = error.error().code; }
+        failures += check(unknown_code == "unknown_lora_adapter",
+                          "a lora id past the loaded adapters was accepted");
+        request.lora = std::vector<ninfer::LoraScale>{};
+        failures += check(resolve_prompt_semantics(request, defaults).lora->empty(),
+                          "an empty lora list was refused on a server without adapters");
+    }
+
     return failures == 0 ? 0 : 1;
 }

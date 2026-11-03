@@ -42,6 +42,17 @@ struct DFlashPersistentLayout {
     }
 };
 
+// The residual edits' device data on one rank (execution::SteeringRank); a part that is not
+// loaded is absent.
+struct SteeringRankLayout {
+    std::optional<TensorLayout> directions;
+    std::optional<TensorLayout> site_factors;
+    std::optional<TensorLayout> lane_scales;
+    std::optional<TensorLayout> measures;
+    std::optional<TensorLayout> column_rows;
+    std::optional<TensorLayout> vectors;
+};
+
 struct PersistentLayout {
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
@@ -55,6 +66,8 @@ struct PersistentLayout {
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
     std::optional<TensorLayout> grammar_masks;
+    // One per rank with LoRA adapters or control vectors; empty without.
+    std::vector<SteeringRankLayout> steering;
     // Pinned Host cost of one complete Main Text KV page group, taken from the same planned
     // geometry the Device pool binds. The Host RAM budget compares one StateImage against the Main
     // pages a re-prefill of the gap it covers would pin, and that comparison is denominated in
@@ -131,6 +144,9 @@ struct SequencePlanningInputs {
     std::uint32_t resident_main_pages = 0;
     // Whether every pair of devices has peer access, which a tensor-parallel exchange may use.
     bool peer_access = false;
+    // Loaded LoRA adapters, and whether control vectors are loaded.
+    std::uint32_t steering_adapters = 0;
+    bool steering_vectors           = false;
 };
 
 } // namespace ninfer::models::qwen3_5::detail
@@ -165,6 +181,8 @@ struct SequencePlanImpl {
     bool structured_output = false;
     int device             = 0;
     ContextCacheOptions context_cache;
+    std::uint32_t steering_adapters = 0;
+    bool steering_vectors           = false;
     PersistentLayout persistent;
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;

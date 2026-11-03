@@ -165,11 +165,33 @@ prefix_cache::CacheCostModel hybrid_cache_cost(const ContextMachineCostModel& mo
     return cost;
 }
 
+// The LoRA adapters a request runs are part of its prompt's cache keys; the control vectors every
+// request runs are not, so what a persisted cache holds depends on them: their digest in hex, or
+// empty without control vectors.
+std::string control_vectors_digest(const models::qwen3_5::Steering* steering) {
+    if (steering == nullptr || steering->layer_vectors.empty()) { return {}; }
+    std::string out;
+    for (const std::uint8_t byte : steering->control_digest) {
+        char hex[3];
+        std::snprintf(hex, sizeof(hex), "%02x", static_cast<unsigned>(byte));
+        out += hex;
+    }
+    return out;
+}
+
+std::shared_ptr<const models::qwen3_5::Steering>
+load_engine_steering(const EngineOptions& options, const models::qwen3_5::TextConfig& text) {
+    if (options.lora_adapters.empty() && options.control_vectors.empty()) { return nullptr; }
+    return std::make_shared<const models::qwen3_5::Steering>(models::qwen3_5::load_steering(
+        options.lora_adapters, options.control_vectors, options.control_vector_layers, text));
+}
+
 // Everything the bytes of a persisted hybrid Host tier depend on besides its geometry (which the
 // file records itself): the exact artifact, its execution signature, the KV and speculative
-// formats, RoPE scaling and the product binary's build identity. Any difference makes the saved
-// state meaningless, so the file is ignored.
-std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature) {
+// formats, RoPE scaling, the control vectors and the product binary's build identity. Any
+// difference makes the saved state meaningless, so the file is ignored.
+std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature,
+                                     const std::string& control_vectors) {
     std::error_code error;
     const auto size = std::filesystem::file_size(options.artifact_path, error);
     const auto time = std::filesystem::last_write_time(options.artifact_path, error);
@@ -184,6 +206,7 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";interpolation=" + std::to_string(options.rope_scaling_factor) + "@" +
            std::to_string(options.rope_scaling_original_context);
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
+    if (!control_vectors.empty()) { out += ";control=" + control_vectors; }
     return out;
 }
 
@@ -225,9 +248,11 @@ std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device,
 }
 
 // Disk-tier pages are keyed by token digests, which say nothing about the weights that produced
-// them: each artifact gets its own directory so one model can never restore another's KV.
+// them: each artifact, and each set of control vectors run with it, gets its own directory so one
+// model can never restore another's KV.
 EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
-                                        const artifact::ArtifactId& artifact) {
+                                        const artifact::ArtifactId& artifact,
+                                        const std::string& control_vectors) {
     EngineOptions scoped = options;
     if (scoped.context_cache.disk_kv_path.empty()) { return scoped; }
     std::string name = "artifact_";
@@ -236,6 +261,7 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
         std::snprintf(hex, sizeof(hex), "%02x", static_cast<unsigned>(byte));
         name += hex;
     }
+    if (!control_vectors.empty()) { name += "_control_" + control_vectors; }
     scoped.context_cache.disk_kv_path /= name;
     return scoped;
 }
@@ -286,6 +312,21 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     // Injected grafts stay resident for the life of the Engine, each in a StateImage and a
     // shared-prefix slot of its own, so the pools grow by that many beyond what requests use.
     const std::uint32_t direct_grafts = models::qwen3_5::count_direct_grafts(options.grafts);
+    if (options.lora_adapters.size() > kMaximumLoraAdapters) {
+        throw std::invalid_argument("at most " + std::to_string(kMaximumLoraAdapters) +
+                                    " LoRA adapters can be loaded");
+    }
+    // A direct graft's stored KV was computed by the unedited model, and a request's adapter
+    // scales are part of the prefix identity it would resume from.
+    const bool edits_residual =
+        !options.lora_adapters.empty() || !options.control_vectors.empty();
+    if (direct_grafts != 0 && edits_residual) {
+        throw std::invalid_argument(
+            "direct grafts cannot be loaded with LoRA adapters or control vectors");
+    }
+    if (options.control_vector_layers && options.control_vectors.empty()) {
+        throw std::invalid_argument("a control vector layer range needs a control vector");
+    }
     if (!cache.enabled && direct_grafts != 0) {
         throw std::invalid_argument(
             "direct grafts are held in the context cache, which is disabled");
@@ -440,6 +481,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
+      steering(load_engine_steering(options, model->config().text)),
       frontend(models::qwen3_5::make_frontend(
           model->resources(),
           {.chat_template_path       = options.chat_template_path,
@@ -459,7 +501,8 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                    : 0U,
            .long_anchor_min_spacing_tokens = options.context_cache.long_anchor_min_spacing_tokens,
            .progress_anchor_tokens         = options.context_cache.progress_anchor_tokens,
-           .grafts = models::qwen3_5::load_prompt_grafts(options.grafts, model->config().text)})),
+           .grafts = models::qwen3_5::load_prompt_grafts(options.grafts, model->config().text),
+           .steering = steering})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;
@@ -751,7 +794,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         }
         planner.emplace(models::qwen3_5::make_sequence_planner(
             instance->parameters, device,
-            artifact_scoped_disk_tier(options, instance->model->info().artifact_id),
+            artifact_scoped_disk_tier(options, instance->model->info().artifact_id,
+                                      control_vectors_digest(instance->steering.get())),
             graft_main_pages));
         free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
@@ -891,9 +935,9 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     instance->kv_capacity_resolution = resolution;
     planning->complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                        device, options.startup_observer,
-                                                        std::move(experts));
+    instance->program = models::qwen3_5::create_program(
+        instance->parameters, std::move(sequence), device, options.startup_observer,
+        std::move(experts), instance->steering.get());
     if (const std::string routes = instance->program->tensor_parallel_routes(); !routes.empty()) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "%s",
                            routes.c_str());
@@ -909,7 +953,10 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         if (!file.empty()) {
             const models::qwen3_5::HybridCachePersistence loaded =
                 instance->program->attach_hybrid_cache_file(
-                    file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
+                    file,
+                    hybrid_cache_fingerprint(options, signature,
+                                             control_vectors_digest(instance->steering.get())),
+                    options.startup_observer);
             restore = LoadSummary::PrefixCacheRestore{
                 .attempted           = true,
                 .restored            = loaded.ok,
@@ -934,6 +981,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);
     summary.model_name   = instance->model->info().name;
     summary.prefill_signature = signature;
+    summary.control_vectors_digest = control_vectors_digest(instance->steering.get());
     std::set<std::string> formats;
     for (const auto& weight : instance->model->weight_data()) {
         for (const auto& part : weight.view.parts) {
