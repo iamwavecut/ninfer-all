@@ -4,19 +4,21 @@
 // partials summed in rank order, added to the BF16 residual in FP32, rounded once. Only adds
 // appear, so the host evaluates the same IEEE operations and the comparison is exact. Every rank's
 // replica must also equal every other rank's. Ranks share device 0, as in the stage-link test,
-// where every transport runs (peer access holds within one card) and words fall back to whole
-// reduces; with two or more devices the ranks are also dealt over them, so the transports cross
-// cards, and ranks on cards of their own exchange words. Each case names one route for every size:
-// every transport the devices allow in every form, at a decode column, a verify window, an odd size,
-// a size whose scatter ranges end in a partial block or leave some ranks without one, and a prompt
-// chunk past PeerWrite's whole reduces. A captured sequence of exchanges with changed inputs
-// between replays checks that the protocol holds inside one graph spanning every rank's stream and
-// reuses a slot within it. Ranks on two and on four cards then interleave bands of different
-// transports and forms over both slots, with all ranks or only rank 0 contributing, so host and peer
-// words share one epoch, and run words exchanges across the wrap of their count, widening past what
-// the epochs before the wrap stored. A prompt chunk's exchanges then run in pieces on the ranks'
-// side streams, under every transport and form, including PeerWrite pieces that outgrow an inbox
-// row and read instead. Last, an exchange measures its routes and runs on what it chose.
+// where every transport runs (peer access holds within one card) and words and scatter flags fall
+// back to whole reduces; with two or more devices the ranks are also dealt over them, so the
+// transports cross cards, and ranks on cards of their own exchange words and scatter flags,
+// including parts that end short of 16 bytes and ranks without a range. Each case names one route
+// for every size: every transport the devices allow in every form, at a decode column, a verify
+// window, an odd size, a size whose scatter ranges end in a partial block or leave some ranks
+// without one, and a prompt chunk past PeerWrite's whole reduces. A captured sequence of exchanges
+// with changed inputs between replays checks that the protocol holds inside one graph spanning
+// every rank's stream and reuses a slot within it. Ranks on two and on four cards then interleave
+// bands of different transports and forms over both slots, with all ranks or only rank 0
+// contributing, so host words, peer words and scatter flags share one epoch, and run words and
+// scatter flags across the wrap of their count, widening past what the epochs before the wrap
+// stored. A prompt chunk's exchanges then run in pieces on the ranks' side streams, under every
+// transport and form, including PeerWrite pieces that outgrow an inbox row and read instead. Last,
+// an exchange measures its routes and runs on what it chose.
 //
 // The host writes the inputs with blocking copies from pageable memory, which may return before
 // the data reaches the device; the rank streams do not wait for them (they are non-blocking), so
@@ -68,9 +70,10 @@ struct Case {
 };
 
 // The route an exchange of `bytes` whose slot is `bytes` takes when its one band names `asked`:
-// words only between ranks on their own cards, up to 32 KiB and not by reading; two ranks storing an
-// FP32 sum reduce whole; PeerWrite reduces a partial that fills its slot whole up to 1 MiB and
-// reads past it.
+// words only between ranks on their own cards, up to 32 KiB and not by reading; scatter flags only
+// through host memory between ranks on their own cards, up to 1 MiB; two ranks storing an FP32 sum
+// reduce whole; PeerWrite reduces a partial that fills its slot whole up to 1 MiB and reads past
+// it.
 TensorParallelRoute expected_route(TensorParallelRoute asked, std::size_t bytes, std::size_t ranks,
                                    bool own_cards, TensorParallelSum sum) {
     TensorParallelRoute route = asked;
@@ -79,8 +82,13 @@ TensorParallelRoute expected_route(TensorParallelRoute asked, std::size_t bytes,
          bytes > (32U << 10U))) {
         route.form = TensorParallelForm::Whole;
     }
-    if (route.form == TensorParallelForm::Scatter && sum == TensorParallelSum::StoreFp32 &&
-        ranks == 2) {
+    if (route.form == TensorParallelForm::ScatterFlags &&
+        (route.transport != TensorParallelTransport::Host || !own_cards || bytes > (1U << 20U))) {
+        route.form = TensorParallelForm::Whole;
+    }
+    if ((route.form == TensorParallelForm::Scatter ||
+         route.form == TensorParallelForm::ScatterFlags) &&
+        sum == TensorParallelSum::StoreFp32 && ranks == 2) {
         route.form = TensorParallelForm::Whole;
     }
     if (route.form == TensorParallelForm::Whole &&
@@ -382,7 +390,8 @@ int run_sequence(ninfer::TensorParallelExchange& exchange, ninfer::DeviceContext
 // A chunk's exchanges in pieces of `widths` values each (see Pieces in core/tensor_parallel.h), every
 // piece handed from the rank's stream to its side stream and back by the piece events, as a prompt
 // pass does: over both slots and the first again, with every rank contributing and then rank 0
-// alone, under every transport the cards allow in both forms.
+// alone, under every transport the cards allow in both forms, and through host memory with a band
+// of scatter flags, which a first piece small enough takes and the later pieces reduce whole.
 int run_pieces(std::size_t ranks, int devices, std::span<const std::int64_t> widths,
                std::mt19937& rng, const char* label) {
     bool own_cards             = false;
@@ -406,7 +415,12 @@ int run_pieces(std::size_t ranks, int devices, std::span<const std::int64_t> wid
     int failures = 0;
     for (const TensorParallelTransport transport : transports) {
         for (const TensorParallelForm form :
-             {TensorParallelForm::Whole, TensorParallelForm::Scatter}) {
+             {TensorParallelForm::Whole, TensorParallelForm::Scatter,
+              TensorParallelForm::ScatterFlags}) {
+            if (form == TensorParallelForm::ScatterFlags &&
+                transport != TensorParallelTransport::Host) {
+                continue;
+            }
             ninfer::TensorParallelExchange exchange(
                 ctx, {.slot_bytes = bytes,
                       .routes     = {{.bytes = bytes, .route = {transport, form}}}});
@@ -481,7 +495,7 @@ int run_pieces(std::size_t ranks, int devices, std::span<const std::int64_t> wid
 }
 
 // `ranks` ranks on as many cards: bands of different transports and forms interleaved over both
-// slots. With peer access, host words and peer words take turns on one epoch.
+// slots. Host words and scatter flags, and with peer access peer words, take turns on one epoch.
 int run_mixed(int ranks, std::mt19937& rng) {
     std::vector<int> ids(static_cast<std::size_t>(ranks));
     for (int r = 0; r < ranks; ++r) { ids[static_cast<std::size_t>(r)] = r; }
@@ -493,14 +507,16 @@ int run_mixed(int ranks, std::mt19937& rng) {
         routes = {
             {16U << 10U, {TensorParallelTransport::Host, TensorParallelForm::Words}},
             {32U << 10U, {TensorParallelTransport::PeerWrite, TensorParallelForm::Words}},
-            {40U << 10U, {TensorParallelTransport::PeerWrite, TensorParallelForm::Whole}},
+            {40U << 10U, {TensorParallelTransport::Host, TensorParallelForm::ScatterFlags}},
             {60U << 10U, {TensorParallelTransport::Host, TensorParallelForm::Scatter}},
             {kSlot, {TensorParallelTransport::PeerWrite, TensorParallelForm::Scatter}},
         };
     } else {
         routes = {
-            {32U << 10U, {TensorParallelTransport::Host, TensorParallelForm::Words}},
+            {16U << 10U, {TensorParallelTransport::Host, TensorParallelForm::Words}},
+            {32U << 10U, {TensorParallelTransport::Host, TensorParallelForm::ScatterFlags}},
             {40U << 10U, {TensorParallelTransport::Host, TensorParallelForm::Whole}},
+            {60U << 10U, {TensorParallelTransport::Host, TensorParallelForm::ScatterFlags}},
             {kSlot, {TensorParallelTransport::Host, TensorParallelForm::Scatter}},
         };
         try {
@@ -524,22 +540,26 @@ int run_mixed(int ranks, std::mt19937& rng) {
 }
 
 // `ranks` ranks on as many cards exchanging words across the wrap of their count, under every
-// words transport the cards allow: narrow exchanges up to the wrap, then wider ones, whose words
-// past the narrow width no epoch before the wrap stored.
+// words route the cards allow: narrow exchanges up to the wrap, then wider ones, whose words past
+// the narrow width no epoch before the wrap stored.
 int run_wrap(int ranks, std::mt19937& rng) {
     std::vector<int> ids(static_cast<std::size_t>(ranks));
     for (int r = 0; r < ranks; ++r) { ids[static_cast<std::size_t>(r)] = r; }
     ninfer::DeviceContext ctx(std::span<const int>(ids.data(), ids.size()));
     constexpr std::size_t kSlot = 5120 * sizeof(float);
-    std::vector<TensorParallelTransport> transports{TensorParallelTransport::Host};
-    if (ctx.peer_access()) { transports.push_back(TensorParallelTransport::PeerWrite); }
+    std::vector<TensorParallelRoute> routes{
+        {TensorParallelTransport::Host, TensorParallelForm::Words},
+        {TensorParallelTransport::Host, TensorParallelForm::ScatterFlags}};
+    if (ctx.peer_access()) {
+        routes.push_back({TensorParallelTransport::PeerWrite, TensorParallelForm::Words});
+    }
     int failures = 0;
-    for (const TensorParallelTransport transport : transports) {
+    for (const TensorParallelRoute route : routes) {
         ninfer::TensorParallelExchange exchange(
             ctx, {.slot_bytes  = kSlot,
-                  .routes      = {{.bytes = kSlot, .route = {transport, TensorParallelForm::Words}}},
+                  .routes      = {{.bytes = kSlot, .route = route}},
                   .words_count = 0xFFFFFFFFU - 3U});
-        failures += expect(exchange.route(kSlot).form == TensorParallelForm::Words,
+        failures += expect(exchange.route(kSlot) == route,
                            "ranks on their own cards exchange words");
         const std::int64_t sizes[] = {100, 100, 100, 5120, 5120, 100, 5120, 5120};
         const auto all             = static_cast<std::size_t>(ranks);
@@ -577,6 +597,11 @@ int run_measured(int devices, std::mt19937& rng) {
             failures += expect(band.route.form != TensorParallelForm::Words ||
                                    (own_cards && band.bytes <= (32U << 10U)),
                                "words only between cards, up to their size");
+            failures += expect(band.route.form != TensorParallelForm::ScatterFlags ||
+                                   (own_cards && band.bytes <= (1U << 20U) &&
+                                    band.route.transport == TensorParallelTransport::Host),
+                               "scatter flags only through host memory between cards, up to "
+                               "their size");
         }
         for (const auto& band : exchange.whole_bands()) {
             failures += expect(band.route.form == TensorParallelForm::Whole,
@@ -624,6 +649,12 @@ int run() {
                 for (const std::int64_t values : {5120LL, 1031LL, 100LL}) {
                     failures += run_case(
                         {ranks, values, devices, {transport, TensorParallelForm::Words}}, rng);
+                }
+                // Scatter flags up to their 1 MiB and past it.
+                for (const std::int64_t values : {5120LL, 5120LL * 4, 1031LL, 100LL, 5120LL * 64}) {
+                    failures += run_case(
+                        {ranks, values, devices, {transport, TensorParallelForm::ScatterFlags}},
+                        rng);
                 }
             }
         }

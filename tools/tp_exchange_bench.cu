@@ -1,16 +1,18 @@
 // Times TensorParallelExchange, the all-reduce of tensor parallelism, at the partial sizes of
 // decode steps, verifications and prompt chunks. For every rank count the device list allows (2, 4,
 // 8 and the whole list), it times every route the devices allow (host memory, and with peer access
-// between every pair of cards peer reads and peer writes; words, whole reduces and reduce-scatters)
-// at every size, then builds an exchange that measures its own routes as the engine does at startup
-// and prints what it measured, the bands it chose and the time of each size on them.
+// between every pair of cards peer reads and peer writes; words, whole reduces, reduce-scatters and
+// scatter flags) at every size, then builds an exchange that measures its own routes as the engine
+// does at startup and prints what it measured, the bands it chose and the time of each size on
+// them.
 //
 // Each measurement captures `--exchanges` back-to-back exchanges of every rank's partial on every
 // rank's stream into one graph, forked from rank 0's stream and joined back as a pass is, replays
 // it `--replays` times and divides the time on rank 0's stream by the exchanges replayed. Partials
 // and replicas hold zeros: the time does not depend on the values, which tests/test_tensor_parallel
-// qualifies. A route a size cannot take (words past 32 KiB or between ranks on one card, a whole
-// PeerWrite reduce past its inbox rows, a reduce-scatter of two ranks storing FP32 sums) shows "-".
+// qualifies. A route a size cannot take (words past 32 KiB, scatter flags past 1 MiB or by peer
+// access, either between ranks on one card, a whole PeerWrite reduce past its inbox rows, a
+// reduce-scatter of two ranks storing FP32 sums) shows "-".
 //
 // `--sum` picks what a reduce does with the sum: adds it to a BF16 replica (`add`, the Qwen3.5-core
 // residual), or stores it as BF16 (`bf16`) or FP32 (`fp32`, Qwen3.8-Flash-Next's routed experts).
@@ -201,7 +203,8 @@ void run_group(const std::vector<int>& ids, const Options& options) {
     std::vector<std::vector<double>> times;
     for (const TensorParallelTransport transport : transports) {
         for (const TensorParallelForm form :
-             {TensorParallelForm::Words, TensorParallelForm::Whole, TensorParallelForm::Scatter}) {
+             {TensorParallelForm::Words, TensorParallelForm::Whole, TensorParallelForm::Scatter,
+              TensorParallelForm::ScatterFlags}) {
             const TensorParallelRoute route{transport, form};
             ninfer::TensorParallelExchange exchange(
                 ctx, {.slot_bytes = slot_bytes, .routes = {{.bytes = slot_bytes, .route = route}}});

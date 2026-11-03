@@ -85,15 +85,32 @@ namespace ninfer {
 //            of it before, and read by its own kernels only after its `complete`. The caller issues
 //            `complete` for every rank after `reduce` for every rank, since a wait issued before its
 //            event's record would see an earlier record.
+//   ScatterFlags  Scatter under Host, with every rank on its own card and at most
+//            kScatterFlagsBytes per partial, whose reduce and complete are one kernel per rank that
+//            waits on the other ranks through flags in host memory instead of cross-device fences.
+//            A publish copies the partial as Scatter's does. Block b of every rank's kernel handles
+//            part b of every rank's range (whole 64-value blocks), so a block waits only on the
+//            same block of the other ranks: it raises its first flag at once (its rank's copy ended
+//            before the kernel began), waits for the contributors' first flags, sums its part of
+//            the rank's own range in rank order as above into the output and into a finished row of
+//            its rank's mapped host area, raises its second flag once those stores have reached
+//            host memory, waits for every other rank's second flag and reads their finished parts
+//            into its output. A flag carries the exchange's epoch from the count Words keeps, and
+//            finished rows and flags alternate by its parity. Every block waits, in every exchange,
+//            for a flag every other rank's same block raised in it, which that rank raises only
+//            after its kernel of the exchange before ended: so no rank overwrites a host slot, row
+//            or flag another is still reading, and Words and ScatterFlags share the count. Two
+//            ranks storing an FP32 sum reduce whole, as for Scatter.
 //
 // Pieces. A prompt's exchange may run as up to kPieces pieces, each a contiguous range of the
 // partial's values (`TensorParallelPiece`) with fences of its own, so a piece's exchange crosses on
 // a rank's side stream (`side_stream`) while its compute stream runs the next piece. Each piece is
 // an exchange as above over its own values: its route is its own size's, its reduce-scatter divides
 // its own values, and under PeerWrite an inbox row holds every piece's range at a place of its own;
-// a later piece whose range would pass the row's end reduces whole by peer reads instead. Words
-// take no pieces. The slot alternation holds piece by piece: a rank writes piece p of a slot
-// again only after its own reduce and complete of piece p in the exchange in between.
+// a later piece whose range would pass the row's end reduces whole by peer reads instead. Neither
+// Words nor ScatterFlags takes pieces: a later piece whose band names one reduces whole. The slot
+// alternation holds piece by piece: a rank writes piece p of a slot again only after its own reduce
+// and complete of piece p in the exchange in between.
 //
 // Routes. Which transport and form is fastest depends on the partial's size, the number of ranks
 // and the platform's links, and no fixed choice holds everywhere: on one host peer reads beat host
@@ -103,7 +120,7 @@ namespace ninfer {
 // of these sizes a route's time is taken on the line through its two times, at sixteenths of the
 // step, and an exchange takes the fastest route at the smallest of all these sizes that holds it
 // (`bands`). The measurement then frees the buffers of the routes it did not choose.
-enum class TensorParallelForm : std::uint8_t { Words, Whole, Scatter };
+enum class TensorParallelForm : std::uint8_t { Words, Whole, Scatter, ScatterFlags };
 
 struct TensorParallelRoute {
     TensorParallelTransport transport = TensorParallelTransport::Host;
@@ -154,6 +171,8 @@ public:
     static constexpr std::size_t kSlots                 = 2;
     static constexpr std::size_t kPieces                = 4;
     static constexpr unsigned long long kWordsTimeoutNs = 300'000'000'000ULL;
+    // Largest partial exchanged as scatter flags.
+    static constexpr std::size_t kScatterFlagsBytes = 1U << 20U;
     // A PeerWrite inbox row holds an owner's range of a full slot or this much, whichever is more
     // (never more than the slot): the largest partial PeerWrite reduces whole.
     static constexpr std::size_t kPeerWriteWholeBytes = 1U << 20U;
@@ -188,8 +207,9 @@ public:
     [[nodiscard]] std::string describe() const;
 
     // The route an exchange of `bytes` per partial whose reduce does `sum` takes: its band's, with
-    // the form a whole reduce where the band's cannot hold it (words past `words_bytes` or between
-    // ranks on one card, a reduce-scatter of two ranks storing an FP32 sum), from the whole bands.
+    // the form a whole reduce where the band's cannot hold it (words past `words_bytes`, scatter
+    // flags past kScatterFlagsBytes, either between ranks on one card, a reduce-scatter of two
+    // ranks storing an FP32 sum), from the whole bands.
     [[nodiscard]] TensorParallelRoute route(
         std::size_t bytes, TensorParallelSum sum = TensorParallelSum::AddBf16) const noexcept;
     // The route of a `publish_whole` and `gather` of `bytes`.
@@ -256,14 +276,18 @@ private:
         unsigned long long* host_words = nullptr;
         unsigned long long* peer_words = nullptr;
         std::uint32_t* epoch           = nullptr;
+        // ScatterFlags: the rank's mapped host area, per slot a row of its finished outputs, then
+        // the flags of both phases per slot and block.
+        unsigned char* scatter_flags = nullptr;
     };
 
     // Which buffers the bands need.
     struct Needs {
-        bool host_slots = false;
-        bool host_words = false;
-        bool inbox      = false;
-        bool peer_words = false;
+        bool host_slots    = false;
+        bool host_words    = false;
+        bool inbox         = false;
+        bool peer_words    = false;
+        bool scatter_flags = false;
     };
 
     void release() noexcept;
@@ -292,11 +316,12 @@ private:
                      TensorParallelPiece piece = {});
 
     std::vector<Rank> ranks_;
-    std::size_t slot_bytes_   = 0;
-    bool peer_                = false;
-    std::size_t words_values_ = 0; // 0 where ranks share a card
-    std::size_t inbox_values_ = 0; // floats per inbox row
-    bool measured_            = false;
+    std::size_t slot_bytes_           = 0;
+    bool peer_                        = false;
+    std::size_t words_values_         = 0; // 0 where ranks share a card
+    std::size_t scatter_flags_values_ = 0; // 0 where ranks share a card
+    std::size_t inbox_values_         = 0; // floats per inbox row
+    bool measured_                    = false;
     std::vector<TensorParallelBand> bands_;
     std::vector<TensorParallelBand> whole_bands_;
     std::vector<TensorParallelBand> timings_;
@@ -311,7 +336,7 @@ private:
 // Each rank's free device memory now, shared evenly by the ranks one card holds.
 [[nodiscard]] std::vector<std::uint64_t> rank_free_bytes(const DeviceContext& context);
 
-// "host", "peer-read", "peer-write" (Auto: "auto"); "words", "whole", "scatter".
+// "host", "peer-read", "peer-write" (Auto: "auto"); "words", "whole", "scatter", "scatter-flags".
 [[nodiscard]] const char* tensor_parallel_transport_name(TensorParallelTransport transport) noexcept;
 [[nodiscard]] const char* tensor_parallel_form_name(TensorParallelForm form) noexcept;
 
