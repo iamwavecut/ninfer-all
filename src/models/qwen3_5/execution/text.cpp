@@ -2412,6 +2412,9 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
         tensor_rank_ = 0;
     };
     // One exchange: ranks [0, contributors) project into their partials, every replica adds them.
+    // A prompt chunk's partials cross host memory as `--tensor-parallel-prompt-partials` says.
+    const TensorParallelPartials partials =
+        ph == Phase::Prefill ? tp.prompt_partials : TensorParallelPartials::Fp32;
     std::size_t& next_exchange = tp.next_exchange;
     const auto exchange_step   = [&](std::size_t contributors, const auto& share) {
         const std::size_t exchange_slot = next_exchange;
@@ -2427,18 +2430,21 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                     residual_partial_ = nullptr;
                 }
                 exchange.publish(rank, exchange_slot, contributes ? partial_bytes : 0,
-                                 replica.data, ctx_.stream);
+                                 replica.data, ctx_.stream, TensorParallelSum::AddBf16, {},
+                                 partials);
             });
         }
         for (std::size_t rank = 0; rank < ranks; ++rank) {
             on_rank(rank, [&](Tensor& replica) {
                 exchange.reduce(rank, exchange_slot, static_cast<__nv_bfloat16*>(replica.data),
-                                values, contributors, ctx_.stream);
+                                values, contributors, ctx_.stream, TensorParallelSum::AddBf16, {},
+                                partials);
             });
         }
         for (std::size_t rank = 0; rank < ranks; ++rank) {
             on_rank(rank, [&](Tensor& replica) {
-                exchange.complete(rank, exchange_slot, replica.data, values, ctx_.stream);
+                exchange.complete(rank, exchange_slot, replica.data, values, ctx_.stream,
+                                  TensorParallelSum::AddBf16, {}, partials);
             });
         }
     };
@@ -2553,7 +2559,7 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                 exchange.publish(rank, exchange_slot,
                                  contributes ? static_cast<std::size_t>(piece_values) * sizeof(float)
                                              : 0,
-                                 sub.data, side, TensorParallelSum::AddBf16, fence);
+                                 sub.data, side, TensorParallelSum::AddBf16, fence, partials);
             }
             for (std::size_t rank = 0; rank < ranks; ++rank) {
                 std::optional<ScopedDeviceRank> device_guard;
@@ -2561,7 +2567,7 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                 exchange.reduce(rank, exchange_slot,
                                 static_cast<__nv_bfloat16*>(replicas[rank].x.data) + offset,
                                 piece_values, contributors, exchange.side_stream(rank),
-                                TensorParallelSum::AddBf16, fence);
+                                TensorParallelSum::AddBf16, fence, partials);
             }
             for (std::size_t rank = 0; rank < ranks; ++rank) {
                 std::optional<ScopedDeviceRank> device_guard;
@@ -2569,7 +2575,7 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
                 const cudaStream_t side = exchange.side_stream(rank);
                 exchange.complete(rank, exchange_slot,
                                   static_cast<__nv_bfloat16*>(replicas[rank].x.data) + offset,
-                                  piece_values, side, TensorParallelSum::AddBf16, fence);
+                                  piece_values, side, TensorParallelSum::AddBf16, fence, partials);
                 CUDA_CHECK(cudaEventRecord(exchange.piece_done(rank, index), side));
             }
         }

@@ -147,6 +147,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                by each card's measured bandwidth and free memory)\n" +
            std::string(product::kTensorAttentionHelp) +
            std::string(product::kTensorParallelTransportHelp) +
+           std::string(product::kTensorParallelPartialsHelp) +
            std::string(product::kInvariantAttentionHelp) +
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
@@ -1184,6 +1185,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 require_value("--tensor-parallel-transport"));
             continue;
         }
+        if (arg == "--tensor-parallel-prompt-partials") {
+            options.tensor_parallel_prompt_partials = product::parse_tensor_parallel_partials(
+                require_value("--tensor-parallel-prompt-partials"));
+            continue;
+        }
         if (arg == "--invariant-attention") {
             options.invariant_attention = true;
             continue;
@@ -1805,6 +1811,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     product::check_tensor_attention(options.tensor_attention, options.tensor_parallel);
     product::check_tensor_parallel_transport(options.tensor_parallel_transport,
                                              options.tensor_parallel);
+    product::check_tensor_parallel_partials(options.tensor_parallel_prompt_partials,
+                                            options.tensor_parallel);
     if (options.request_log_max_mib != 0 && options.request_log_jsonl.empty()) {
         throw std::invalid_argument("--request-log-max-mib requires --request-log-jsonl");
     }

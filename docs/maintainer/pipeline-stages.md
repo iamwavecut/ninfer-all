@@ -451,6 +451,23 @@ families](#expert-parallelism-of-the-other-moe-families)).
   1,087 on four RTX 5060 Ti (host transport), and at 1,615 against 1,492 and 1,510 against 1,330 on
   four RTX A4000s (peer-write, capped at 110 W). A pieces build's text can differ from an unpieced
   one's as one prompt-chunk width's differs from another's.
+- **Rounded prompt partials** (`--tensor-parallel-prompt-partials bf16`; Rounded partials in
+  `core/tensor_parallel.h`). Where host transfers bound prefill, a prompt chunk's exchanges can
+  move each rank's partial rounded to BF16: a publish rounds the partial into a device copy and
+  copies half the bytes into host memory, and a reduce adds the rounded partials in FP32 in rank
+  order, so the replicas stay identical. Only a prompt chunk's whole reduces and reduce-scatters
+  through host memory round; decode, verification, the MTP layer, words, scatter flags and the
+  peer transports keep FP32. The rounding adds one BF16 rounding of each share's output to every
+  projection a prompt runs, so prompt outputs differ slightly from FP32 partials'. On four RTX 5060
+  Ti on PCIe 3.0 x8 (host transport; Qwen3.8-27B, int8 KV, MTP, even split), where a reduce-scatter
+  of 20 MiB took 6.1 ms and prefill ran at 1,170 tok/s with or without pieces, BF16 partials
+  prefilled a 6,773-token prompt at 1,472 tok/s against 1,167-1,169 and a 994-token one at
+  1,370-1,372 against 1,106-1,109, with the same decode speed, accepted drafts and greedy texts of
+  all three prompts (384 tokens of the 989-token one). Perplexity of 8,188 tokens in 2,048-token
+  windows went from 9.0615 to 9.0650 (mean NLL +0.0004), scored at 1,263 tok/s against 1,026. Two
+  RTX 3090s, whose host reduce-scatter is about twice as fast, gained less: 1,428-1,439 tok/s
+  against 1,363-1,375 (6,773 tokens) and 1,471-1,476 against 1,442-1,454 (989 tokens), and there
+  the 989-token prompt's greedy text left FP32's after 1,219 characters.
 - **Numerics.** Against one device the order of the FP32 additions of a projection's output
   differs: the shares' partial sums are added, then rounded once, where one device rounds the full
   sum. On `120a` NVFP4 and FP8 shares quantize their activations for W4A4 and W8A8 routes (under

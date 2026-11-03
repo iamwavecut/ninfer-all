@@ -473,6 +473,10 @@ struct EngineOptions {
     // With tensor parallelism over a Qwen3.5-core model or Qwen3.8-Flash-Next, how the devices
     // exchange their partial sums (TensorParallelTransport).
     TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
+    // With tensor parallelism over a Qwen3.5-core model, how a prompt chunk's partial sums cross
+    // pinned host memory (TensorParallelPartials): BF16 moves half their bytes and rounds each
+    // device's partial once more, so prompt outputs differ from FP32 partials' slightly.
+    TensorParallelPartials tensor_parallel_prompt_partials = TensorParallelPartials::Fp32;
     // Qwen3.5-core models: attention reductions that do not depend on the call's width, batch or
     // split schedule. Every call of up to 16 columns per sequence takes the split-KV routes with
     // splits of a fixed key count for the context, so a token's attention output is the same

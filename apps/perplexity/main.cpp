@@ -65,6 +65,8 @@ struct Options {
     ninfer::TensorAttention tensor_attention = ninfer::TensorAttention::Heads;
     ninfer::TensorParallelTransport tensor_parallel_transport =
         ninfer::TensorParallelTransport::Auto;
+    ninfer::TensorParallelPartials tensor_parallel_prompt_partials =
+        ninfer::TensorParallelPartials::Fp32;
     bool invariant_attention                 = false;
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
@@ -111,6 +113,7 @@ std::string usage_text() {
            "       [--tensor-parallel] [--tensor-split A,B,...]\n"
            "       [--tensor-attention heads|positions] [--invariant-attention]\n"
            "       [--tensor-parallel-transport auto|host|peer-read|peer-write]\n"
+           "       [--tensor-parallel-prompt-partials fp32|bf16]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
            "       [--expert-dma-share F] [--expert-cpu-threads N] [--expert-cache-adaptive]\n"
            "       [--expert-misses staged|mapped] [--expert-tail-skip N]\n"
@@ -260,6 +263,9 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--tensor-parallel-transport") {
             out.tensor_parallel_transport = ninfer::product::parse_tensor_parallel_transport(
                 value("--tensor-parallel-transport"));
+        } else if (option == "--tensor-parallel-prompt-partials") {
+            out.tensor_parallel_prompt_partials = ninfer::product::parse_tensor_parallel_partials(
+                value("--tensor-parallel-prompt-partials"));
         } else if (option == "--invariant-attention") {
             out.invariant_attention = true;
         } else if (option == "--expert-residency") {
@@ -328,6 +334,8 @@ Options parse_options(int argc, char** argv) {
     ninfer::product::check_tensor_attention(out.tensor_attention, out.tensor_parallel);
     ninfer::product::check_tensor_parallel_transport(out.tensor_parallel_transport,
                                                      out.tensor_parallel);
+    ninfer::product::check_tensor_parallel_partials(out.tensor_parallel_prompt_partials,
+                                                    out.tensor_parallel);
     return out;
 }
 
@@ -434,6 +442,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.tensor_split                  = options.tensor_split;
     engine_options.tensor_attention              = options.tensor_attention;
     engine_options.tensor_parallel_transport     = options.tensor_parallel_transport;
+    engine_options.tensor_parallel_prompt_partials = options.tensor_parallel_prompt_partials;
     engine_options.invariant_attention           = options.invariant_attention;
     engine_options.expert_residency              = options.expert_residency;
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
