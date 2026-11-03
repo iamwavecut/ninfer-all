@@ -160,7 +160,8 @@ DecoderStateLayout plan_decoder_state(std::span<LayoutBuilder* const> builders,
                                 spec.kv_storage, spec.kv_table_rows,
                                 spec.text_physical_page_groups, spec.invariant_attention);
     if (spec.enable_mtp) {
-        layout.mtp_kv = plan_cache(builders.first(1), {}, {}, 0, spec.mtp_layers, spec.capacity,
+        layout.mtp_kv = plan_cache(spec.mtp_kv_head_shares.empty() ? builders.first(1) : builders,
+                                   {}, spec.mtp_kv_head_shares, 0, spec.mtp_layers, spec.capacity,
                                    spec.kv_heads, spec.attention_head_dim, spec.kv_storage,
                                    spec.kv_table_rows, spec.mtp_physical_page_groups, false);
     }

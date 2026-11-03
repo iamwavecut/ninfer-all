@@ -86,11 +86,15 @@ WeightId bind_replica(Bindings& b, const std::string& name, const artifact::Shap
     return b.piece(name, shape, inputs, format, rank, whole);
 }
 
+} // namespace
+
 // A norm every rank reads.
 WeightId bind_norm_replica(Bindings& b, const std::string& name, std::uint64_t width,
                            std::size_t rank) {
     return bind_replica(b, name, {width}, {}, QType::BF16, rank);
 }
+
+namespace {
 
 // A rank's share of a GDN mixer: its value heads, the key heads they read, and their convolution
 // channels; the output projection takes the matching input columns. The gated norm is per head,
@@ -327,6 +331,39 @@ std::vector<DenseWeights> bind_dense_shares(Bindings& b, std::uint64_t hidden,
     return out;
 }
 
+std::vector<AttentionWeights> bind_attention_shares(Bindings& b, const TextConfig& config,
+                                                    const std::string& prefix,
+                                                    std::span<const TensorShare> shares) {
+    if (shares.size() < 2 || shares.front().attention_positions) { return {}; }
+    const auto& a      = config.attention.value();
+    const auto h       = config.hidden_size;
+    const auto q       = a.query_width();
+    const auto k       = a.key_width();
+    const auto group   = a.num_attention_heads / a.num_key_value_heads;
+    const auto query   = b.row_ends(prefix + "attention/query", {q, h});
+    const auto gate    = b.row_ends(prefix + "attention/gate", {q, h});
+    const auto key     = b.row_ends(prefix + "attention/key", {k, h});
+    const auto value   = b.row_ends(prefix + "attention/value", {k, h});
+    const auto output  = b.column_ends(prefix + "attention/output", {h, q},
+                                       {prefix + "attention/gated_output"});
+    std::size_t ranks = 0;
+    while (ranks < shares.size() && shares[ranks].kv_head_end > shares[ranks].kv_head_begin) {
+        ++ranks;
+    }
+    if (ranks < 2) { return {}; }
+    for (std::size_t rank = 0; rank + 1 < ranks; ++rank) {
+        const std::uint64_t heads = shares[rank].kv_head_end;
+        const std::uint64_t rows  = heads * group * a.head_dim;
+        const std::uint64_t kv    = heads * a.head_dim;
+        if (!query[rows] || !gate[rows] || !output[rows] || !key[kv] || !value[kv]) { return {}; }
+    }
+    std::vector<AttentionWeights> out;
+    for (std::size_t rank = 0; rank < ranks; ++rank) {
+        out.push_back(bind_attention_share(b, config, prefix, rank, shares[rank]));
+    }
+    return out;
+}
+
 std::vector<WeightId> layer_weights(const BlockWeights& block) {
     std::vector<WeightId> out{block.input_norm, block.post_attention_norm};
     if (const auto* attention = std::get_if<AttentionWeights>(&block.mixer)) {
@@ -354,11 +391,14 @@ std::vector<WeightId> layer_weights(const BlockWeights& block) {
 }
 
 BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string& p,
-                        MixerKind mixer, const DenseWeights* ffn) {
+                        MixerKind mixer, const DenseWeights* ffn,
+                        const AttentionWeights* attention) {
     BlockWeights out;
     out.input_norm          = b.direct(p + "input_norm", {config.hidden_size});
     out.post_attention_norm = b.direct(p + "post_attention_norm", {config.hidden_size});
-    if (mixer == MixerKind::FullAttention) {
+    if (attention != nullptr) {
+        out.mixer = *attention;
+    } else if (mixer == MixerKind::FullAttention) {
         out.mixer = bind_attention(b, config, p);
     } else {
         out.mixer = bind_gdn(b, config, p);

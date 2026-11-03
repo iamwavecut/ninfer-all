@@ -25,8 +25,7 @@ struct DecoderStateSpec {
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
-    // The rank holding each full-attention layer's KV planes; empty puts every layer on rank 0. The
-    // MTP cache always lives on rank 0.
+    // The rank holding each full-attention layer's KV planes; empty puts every layer on rank 0.
     std::vector<std::size_t> text_layer_rank;
     // Tensor parallelism: how many of every full-attention layer's KV heads each rank holds, in
     // rank order (ranks [0, size) each hold a non-empty contiguous run). Empty keeps every head of
@@ -36,6 +35,9 @@ struct DecoderStateSpec {
     // planes on ranks [0, size), each holding every KV head of the physical pages p with
     // p % size == its rank. Zero (or one) keeps the head shares or layer ranks above.
     std::uint32_t text_kv_position_ranks = 0;
+    // Tensor parallelism dividing MTP's attention: how many of its KV heads each rank holds, as
+    // `text_kv_head_shares`. Empty keeps the MTP cache whole on rank 0.
+    std::vector<std::int32_t> mtp_kv_head_shares;
     // Invariant attention reductions over the text cache (--invariant-attention): its attention
     // calls split their keys into fixed segments for the capacity
     // (ops::causal_attention_invariant_segment_keys).

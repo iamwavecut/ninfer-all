@@ -129,7 +129,7 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
 
 WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
                          const std::vector<std::string>& inputs, std::optional<QType> exact_format,
-                         std::size_t rank, const ParameterPiece& piece) {
+                         std::size_t rank, const ParameterPiece& piece, const std::string& label) {
     const auto found = binder.reader().directory().bindings.find(name);
     if (found == binder.reader().directory().bindings.end()) {
         throw artifact::ArtifactError("missing logical parameter " + name);
@@ -235,7 +235,8 @@ WeightId Bindings::piece(const std::string& name, const artifact::Shape& shape,
         throw artifact::ArtifactError(name + ": a tensor-parallel piece leaves the parameter");
     }
     PendingWeight pending;
-    pending.reference = {name + "@" + std::to_string(rank), std::move(piece_shape),
+    pending.reference = {label.empty() ? name + "@" + std::to_string(rank) : label,
+                         std::move(piece_shape),
                          std::move(binding), artifact::Residency::Device};
     add_uses(pending, name, inputs, piece.cut == ParameterPiece::Cut::Rows, false);
     for (WeightUse& use : pending.uses) {

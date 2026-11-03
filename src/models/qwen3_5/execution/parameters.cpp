@@ -516,6 +516,36 @@ public:
         out.input_norm          = tensor(w.layer.input_norm);
         out.post_attention_norm = tensor(w.layer.post_attention_norm);
         out.final_norm          = tensor(w.final_norm);
+        out.ffn                 = ffn(w.layer.ffn);
+        for (const DenseWeights& share : w.rank_ffn) { out.rank_ffn.push_back(ffn(share)); }
+        out.output_head        = head(w.output_head_use);
+        out.output_head_shares = head_shares(w.output_head_shares);
+        if (!w.rank_attention.empty()) {
+            // Divided: each rank projects its heads through the text layers' attention form.
+            const auto share = [&](const AttentionWeights& s) {
+                return AttentionParameters{
+                    ops::prepare_attn_input_proj_weights(model_.input(s.query),
+                                                         model_.input(s.key),
+                                                         model_.input(s.gate),
+                                                         model_.input(s.value)),
+                    tensor(s.query_norm), tensor(s.key_norm), linear(s.output)};
+            };
+            out.rank_attention.push_back(share(a));
+            for (const AttentionWeights& s : w.rank_attention) {
+                out.rank_attention.push_back(share(s));
+            }
+            out.query_norm  = tensor(a.query_norm);
+            out.key_norm    = tensor(a.key_norm);
+            out.whole_key   = linear(w.whole_key);
+            out.whole_value = linear(w.whole_value);
+            out.rank_input_norm.push_back(out.input_norm);
+            out.rank_post_attention_norm.push_back(out.post_attention_norm);
+            for (std::size_t rank = 0; rank < w.rank_input_norm.size(); ++rank) {
+                out.rank_input_norm.push_back(tensor(w.rank_input_norm[rank]));
+                out.rank_post_attention_norm.push_back(tensor(w.rank_post_attention_norm[rank]));
+            }
+            return out;
+        }
         // A bank whose parts share no contiguous parent -- GGUF parts of different block types, or
         // mixed formats such as Q8 K/V beside BF16 Q/gate -- has no packed form, and the dense
         // rows below serve alone.
@@ -536,10 +566,6 @@ public:
         out.output      = linear(a.output);
         nvfp4_w4a16_route(out.output, 5120, 6144);
         nvfp4_int8_route(out.output, 5120, 6144);
-        out.ffn         = ffn(w.layer.ffn);
-        for (const DenseWeights& share : w.rank_ffn) { out.rank_ffn.push_back(ffn(share)); }
-        out.output_head = head(w.output_head_use);
-        out.output_head_shares = head_shares(w.output_head_shares);
         return out;
     }
 

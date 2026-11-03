@@ -46,12 +46,12 @@ public:
                                   QType format                  = QType::BF16,
                                   artifact::Residency residency = artifact::Residency::Device);
 
-    // Binds `piece` of a parameter as a device weight of its own on `rank`, named `name@rank`.
-    // The stored objects behind the parameter get no device demand from this.
+    // Binds `piece` of a parameter as a device weight of its own on `rank`, named `name@rank`
+    // or `label`. The stored objects behind the parameter get no device demand from this.
     [[nodiscard]] WeightId piece(const std::string& name, const artifact::Shape& shape,
                                  const std::vector<std::string>& inputs,
                                  std::optional<QType> exact_format, std::size_t rank,
-                                 const ParameterPiece& piece);
+                                 const ParameterPiece& piece, const std::string& label = {});
 
     // A parameter that joint_piece binds on a rank.
     struct JointPart {
@@ -135,11 +135,12 @@ private:
 [[nodiscard]] DenseWeights bind_dense(Bindings& bindings, std::uint64_t hidden,
                                       std::uint64_t intermediate, const std::string& prefix,
                                       bool draft = false);
-// `ffn`, where given, is the block's FFN already bound (a tensor-parallel rank 0's share) in place
-// of the whole one.
+// `ffn` and `attention`, where given, are the block's FFN and attention already bound (a
+// tensor-parallel rank 0's shares) in place of the whole ones.
 [[nodiscard]] BlockWeights bind_block(Bindings& bindings, const TextConfig& config,
                                       const std::string& prefix, MixerKind mixer,
-                                      const DenseWeights* ffn = nullptr);
+                                      const DenseWeights* ffn             = nullptr,
+                                      const AttentionWeights* attention = nullptr);
 // `stages` decides which device holds each whole layer; its identity form (one stage) binds exactly
 // what a single-GPU load always bound.
 [[nodiscard]] TextWeights bind_text(Bindings& bindings, const TextConfig& config,
@@ -161,6 +162,15 @@ private:
                                                           std::uint64_t intermediate,
                                                           const std::string& prefix,
                                                           std::span<const TensorShare> shares);
+// Every share of an attention mixer bound at `prefix` for the ranks holding KV heads (a prefix of
+// `shares`, one per rank), or none where fewer than two ranks hold them, the ranks split positions
+// instead, or its stored runs do not cut at every share's heads.
+[[nodiscard]] std::vector<AttentionWeights>
+bind_attention_shares(Bindings& bindings, const TextConfig& config, const std::string& prefix,
+                      std::span<const TensorShare> shares);
+// A copy of a norm for `rank`: rank 0 binds it as it is, another rank a piece that covers it.
+[[nodiscard]] WeightId bind_norm_replica(Bindings& bindings, const std::string& name,
+                                         std::uint64_t width, std::size_t rank);
 [[nodiscard]] MtpWeights bind_mtp(Bindings& bindings, const TextConfig& config,
                                   const TextWeights& target);
 [[nodiscard]] DraftWeights bind_draft(Bindings& bindings, const DraftConfig& config,
