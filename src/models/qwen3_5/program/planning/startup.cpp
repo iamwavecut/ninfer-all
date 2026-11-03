@@ -208,6 +208,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         }
     }
 
+    // A divided MTP attention keeps each rank's KV heads of its cache on that rank, as a text
+    // layer's.
+    std::vector<std::int32_t> mtp_kv_head_shares;
+    if (plan.features.mtp() && parameters.mtp && !parameters.mtp->rank_attention.empty()) {
+        mtp_kv_head_shares = kv_head_shares;
+    }
     PersistentLayout out;
     out.decoder = qwen3_5::plan_decoder_state(
         builder_pointers, qwen3_5::DecoderStateSpec{
@@ -224,6 +230,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                               .text_layer_rank           = std::move(attention_layer_rank),
                               .text_kv_head_shares       = std::move(kv_head_shares),
                               .text_kv_position_ranks    = kv_position_ranks,
+                              .mtp_kv_head_shares        = std::move(mtp_kv_head_shares),
                               .invariant_attention       = plan.invariant_attention,
                           });
     // The Program binds this pool's own planned geometry, so the Host page cost the RAM budget
@@ -703,10 +710,86 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace::mtp_stem(layout, config, tokens, !preembedded);
         linear_scratch(layout, parameters.mtp->input_projection, 1, tokens);
     };
+    // A divided MTP attention (TextContext::mtp_divided_layer): the packed control tensors (cache
+    // and rope positions of up to three axes, table rows and valid columns), every other rank's
+    // copy of the stem output and of them and each rank's sums; then each rank's normalized input
+    // with its share's attention (`attend`) and output partial, and its FFN rows or rank 0's whole
+    // FFN. Every rank's scratch has rank 0's size, so one layout holds the largest share's needs.
+    const bool mtp_divided = plan.features.mtp() && !parameters.mtp->rank_attention.empty();
+    std::vector<TextConfig> mtp_shares;
+    if (mtp_divided) {
+        for (const auto& share : parameters.text.tensor_shares) {
+            mtp_shares.push_back(qwen3_5::tensor_parallel_share(config, share));
+        }
+    }
+    const auto mtp_divided_layer = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
+                                       std::int32_t columns, const auto& attend) {
+        auto scope = layout.scope();
+        const std::int32_t control =
+            4 * tokens + 2 * static_cast<std::int32_t>(plan.max_concurrency) + 8;
+        matrix(layout, DType::I32, control, 1);
+        matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
+        matrix(layout, DType::I32, control, 1);
+        if (columns != 0) { matrix(layout, DType::BF16, dimension(config.hidden_size), columns); }
+        {
+            auto step = layout.scope();
+            matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
+            for (std::size_t rank = 0; rank < parameters.mtp->rank_attention.size(); ++rank) {
+                auto share = layout.scope();
+                const execution::AttentionParameters& p = parameters.mtp->rank_attention[rank];
+                attend(layout, mtp_shares.at(rank), p);
+                if (columns != 0) { linear_scratch(layout, p.output, columns, columns); }
+            }
+        }
+        if (columns == 0) { return; }
+        auto step = layout.scope();
+        matrix(layout, DType::BF16, dimension(config.hidden_size), columns);
+        if (parameters.mtp->rank_ffn.empty()) {
+            scratch(layout,
+                    execution::ffn_workspace_bytes(parameters.mtp->ffn, columns, columns, true));
+            return;
+        }
+        std::size_t share = execution::ffn_workspace_bytes(parameters.mtp->ffn, columns, columns,
+                                                           false, false, false, true);
+        for (const auto& rank_ffn : parameters.mtp->rank_ffn) {
+            share = std::max(share, execution::ffn_workspace_bytes(rank_ffn, columns, columns,
+                                                                   false, false, false, true));
+        }
+        scratch(layout, share);
+    };
+    // A divided decode attention: a rank's projections, normalized q and k, windowed table and
+    // attention, as mtp_full_core's below for its heads.
+    const auto mtp_divided_decode = [&](WorkspaceLayoutBuilder& layout, std::int32_t width,
+                                        std::int32_t batch,
+                                        ops::CausalAttentionExecutionEnvelope envelope) {
+        const std::int32_t tokens = width * batch;
+        mtp_divided_layer(layout, tokens, tokens,
+                          [&](WorkspaceLayoutBuilder& share_layout, const TextConfig& share,
+                              const execution::AttentionParameters& p) {
+            (void)workspace::mtp_attention_projection(share_layout, share, tokens);
+            scratch(share_layout,
+                    execution::attention_projection_workspace_bytes(p, tokens, tokens));
+            (void)workspace::mtp_attention_results(share_layout, share, tokens);
+            if (plan.mtp_attention_window != 0) {
+                (void)workspace::paged_kv_window(
+                    share_layout, static_cast<std::int32_t>(page_count(plan.capacity)), width,
+                    batch);
+            }
+            scratch(share_layout, ops::causal_softmax_attention_workspace_capacity_bytes(
+                                      {dimension(share.attention->head_dim),
+                                       dimension(share.attention->num_attention_heads),
+                                       dimension(share.attention->num_key_value_heads)},
+                                      plan.kv_storage, envelope, batch, width, width));
+        });
+    };
     const auto mtp_full_core = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
                                    ops::CausalAttentionExecutionEnvelope envelope) {
         auto core = layout.scope();
         mtp_stem(layout, tokens, false);
+        if (mtp_divided) {
+            mtp_divided_decode(layout, tokens, 1, envelope);
+            return;
+        }
         (void)workspace::mtp_attention_projection(layout, config, tokens);
         scratch(layout, execution::mtp_projection_workspace_bytes(parameters.mtp->projection,
                                                                   tokens, tokens));
@@ -737,6 +820,38 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto mtp_prefill_chunk = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                        std::int32_t last, bool preembedded) {
         auto call = layout.scope();
+        if (mtp_divided) {
+            // Rank 0's whole K/V of the chunk with its normalized keys and the pack of a rank's
+            // heads (every other rank receives no more); then the last column's rope positions and
+            // its layer on every rank, the final norm's output being the caller's.
+            mtp_stem(layout, last, preembedded);
+            {
+                auto kv = layout.scope();
+                matrix(layout, DType::BF16, dimension(config.attention->key_width()), last);
+                matrix(layout, DType::BF16, dimension(config.attention->key_width()), last);
+                scratch(layout, execution::mtp_kv_rows_workspace_bytes(
+                                    parameters.mtp->whole_key, parameters.mtp->whole_value, first,
+                                    last));
+                matrix(layout, DType::BF16, dimension(config.attention->key_width()), last);
+                matrix(layout, DType::BF16, 2 * dimension(config.attention->key_width()), last);
+            }
+            matrix(layout, DType::I32, 3, 1);
+            mtp_divided_layer(layout, 1, 1,
+                              [&](WorkspaceLayoutBuilder& share_layout, const TextConfig& share,
+                                  const execution::AttentionParameters& p) {
+                (void)workspace::mtp_attention_projection(share_layout, share, 1);
+                scratch(share_layout, execution::attention_projection_workspace_bytes(p, 1, 1));
+                matrix(share_layout, DType::BF16, dimension(share.attention->query_width()), 1);
+                matrix(share_layout, DType::BF16, dimension(share.attention->query_width()), 1);
+                scratch(share_layout, ops::causal_softmax_attention_workspace_capacity_bytes(
+                                          {dimension(share.attention->head_dim),
+                                           dimension(share.attention->num_attention_heads),
+                                           dimension(share.attention->num_key_value_heads)},
+                                          plan.kv_storage, text_envelope, 1, 1, 1));
+            });
+            proposal_scratch(layout, 1);
+            return;
+        }
         matrix(layout, DType::BF16, dimension(config.hidden_size), 1);
         matrix(layout, DType::BF16, dimension(config.hidden_size), 1);
         {
@@ -881,6 +996,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 const std::int32_t tokens = batch * width;
                 auto core                 = layout.scope();
                 mtp_stem(layout, tokens, false);
+                if (mtp_divided) {
+                    mtp_divided_decode(layout, width, batch, verify_envelope);
+                    return;
+                }
                 (void)workspace::mtp_attention_projection(layout, config, tokens);
                 scratch(layout, execution::mtp_projection_workspace_bytes(
                                     parameters.mtp->projection, tokens, tokens));

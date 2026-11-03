@@ -209,12 +209,14 @@ std::uint64_t parameter_bytes(const artifact::Reader& reader, const loading::Bin
 // The device bytes of what the head stage (rank 0 under tensor parallelism) holds beside its layers
 // or its share: the embedding, the head and the final norm, and as selected a resident Vision
 // tower, MTP's layer, a DFlash drafter's own weights and the proposal head the drafts project onto.
-// Binds them into `bindings` only to size them. `mtp_ffn` takes the part of MTP's layer that is a
-// dense FFN, which tensor parallelism divides.
+// Binds them into `bindings` only to size them. `mtp_ffn` and `mtp_attention` take the parts of
+// MTP's layer that are a dense FFN and the attention's query, gate and output projections, which
+// tensor parallelism divides; it divides the K and V rows too, which rank 0 keeps whole besides.
 std::uint64_t head_stage_bytes(const artifact::Reader& reader, loading::Bindings& bindings,
                                const Config& config, const TextWeights& weights,
                                const LoadOptions& options, std::uint64_t* proposal_head = nullptr,
-                               std::uint64_t* mtp_ffn = nullptr) {
+                               std::uint64_t* mtp_ffn = nullptr,
+                               std::uint64_t* mtp_attention = nullptr) {
     const auto& text       = config.text;
     std::uint64_t out      = parameter_bytes(reader, bindings, weights.token_embedding) +
                              parameter_bytes(reader, bindings, weights.output_head) +
@@ -242,6 +244,13 @@ std::uint64_t head_stage_bytes(const artifact::Reader& reader, loading::Bindings
             *mtp_ffn = parameter_bytes(reader, bindings, dense->gate) +
                        parameter_bytes(reader, bindings, dense->up) +
                        parameter_bytes(reader, bindings, dense->down);
+        }
+        if (mtp_attention != nullptr) {
+            const auto& attention = std::get<AttentionWeights>(mtp.layer.mixer);
+            *mtp_attention = 0;
+            for (const WeightId id : {attention.query, attention.gate, attention.output}) {
+                *mtp_attention += parameter_bytes(reader, bindings, id);
+            }
         }
     }
     if (config.draft && options.masked_draft()) {
@@ -433,18 +442,27 @@ SplitSizes split_sizes(const artifact::Reader& reader, LoadOptions options,
     if (text.attention) {
         out.divided += attention_kv_bytes(text, sizing, text.attention->num_key_value_heads);
     }
-    // Rank 0 also holds the head stage's parts and MTP's KV, whose heads stay whole there.
+    // Rank 0 also holds the head stage's parts.
     std::uint64_t proposal_head = 0;
     std::uint64_t mtp_ffn       = 0;
+    std::uint64_t mtp_attention = 0;
     out.first += head_stage_bytes(reader, bindings, config, weights, options, &proposal_head,
-                                  &mtp_ffn) +
-                 sizing.kv_tokens * mtp_kv_bytes_per_token(config, sizing.kv_storage);
+                                  &mtp_ffn, &mtp_attention);
     // Every rank holds its rows of the heads besides, which decode projects divided, and of MTP's
-    // dense FFN instead of rank 0 the whole.
+    // dense FFN instead of rank 0 the whole. Its attention and KV divide as a text layer's do;
+    // position-split attention keeps them whole on rank 0. (The divided K and V rows rank 0 keeps
+    // whole besides are small and not counted.)
     if (!options.lm_head_q4 && !options.lm_head_q6) { out.divided += bytes(weights.output_head); }
     out.divided += proposal_head;
     out.first -= mtp_ffn;
     out.divided += mtp_ffn;
+    const std::uint64_t mtp_kv = sizing.kv_tokens * mtp_kv_bytes_per_token(config, sizing.kv_storage);
+    if (options.tensor_attention == TensorAttention::Positions) {
+        out.first += mtp_kv;
+    } else {
+        out.first -= mtp_attention;
+        out.divided += mtp_attention + mtp_kv;
+    }
     return out;
 }
 
@@ -465,10 +483,17 @@ RankBytes rank_bytes(const artifact::Reader& reader, const LoadOptions& options,
     const auto& text    = plan.config().text;
     RankBytes out;
     out.shares = plan.weights().text.tensor_shares;
+    // MTP's KV divides with its attention, by the same heads.
+    const bool mtp_divided = plan.weights().mtp && !plan.weights().mtp->rank_attention.empty();
+    const std::uint64_t mtp_kv_head =
+        mtp_divided ? sizing.kv_tokens * mtp_kv_bytes_per_token(plan.config(), sizing.kv_storage) /
+                          text.attention->num_key_value_heads
+                    : 0;
     for (std::size_t rank = 0; rank < out.shares.size(); ++rank) {
         const TensorShare& share = out.shares[rank];
         const TextConfig part    = tensor_parallel_share(text, share);
-        out.kv.push_back(attention_kv_bytes(text, sizing, share.kv_head_end - share.kv_head_begin));
+        out.kv.push_back(attention_kv_bytes(text, sizing, share.kv_head_end - share.kv_head_begin) +
+                         mtp_kv_head * (share.kv_head_end - share.kv_head_begin));
         out.bytes.push_back(plan.materialization().device_capacity(rank) +
                             gdn_state_bytes(part, options, sizing.state_slots) + out.kv.back());
     }

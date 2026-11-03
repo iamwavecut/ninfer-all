@@ -142,9 +142,18 @@ struct MtpProjectionParameters {
 struct MtpParameters {
     LinearParameters input_projection;
     Tensor embedding_norm, hidden_norm, input_norm, post_attention_norm, final_norm;
+    // The whole attention on rank 0; empty where `rank_attention` divides it.
     MtpProjectionParameters projection;
     Tensor query_norm, key_norm;
     LinearParameters output;
+    // Tensor parallelism: the attention's share of each rank holding KV heads, rank 0's first (its
+    // KV heads, the query heads that read them, and those query heads' columns of the output), and
+    // every rank's copy of the input and post-attention norms, rank 0's first
+    // (TextContext::mtp_divided_layer). Empty where rank 0 runs the whole attention.
+    std::vector<AttentionParameters> rank_attention;
+    std::vector<Tensor> rank_input_norm, rank_post_attention_norm;
+    // Divided: rank 0's whole K and V rows, which project a prompt chunk's keys and values.
+    LinearParameters whole_key, whole_value;
     // Rank 0's rows of the FFN where `rank_ffn` holds the other ranks' (TextContext::mtp_ffn), the
     // whole FFN otherwise.
     FfnParameters ffn;

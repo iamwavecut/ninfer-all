@@ -321,14 +321,29 @@ private:
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
 
+    // `ah`, where given, takes the attention's input; a divided attention normalizes on each rank.
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
-                          Tensor& x, Tensor& ah);
+                          Tensor& x, Tensor* ah);
     void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                           const Tensor& rope_positions,
                           ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden);
     // Adds the MTP layer's FFN of `mh` [hidden, T] to its residual `x`. Under tensor parallelism
     // with the FFN divided (MtpParameters::rank_ffn), every rank projects its rows of it.
     void mtp_ffn(const Tensor& mh, Tensor& x);
+    // Under tensor parallelism with the attention divided (MtpParameters::rank_attention): the MTP
+    // layer after its stem output `x` [hidden, T], over its last `columns` columns (none: only the
+    // attention's K/V). `control` are rank 0's int32 tensors the attention reads, which every rank
+    // receives; `attend(rank, share, ah, control)` runs on the rank's device and returns its gated
+    // attention output [its query width, columns] for input `ah`.
+    template <class Attend>
+    void mtp_divided_layer(Tensor& x, std::span<const Tensor* const> control,
+                           std::int32_t columns, const Attend& attend);
+    // The divided keys and values of an MTP prompt chunk `ah` [hidden, T] (mtp_prefill_chunk).
+    void mtp_divided_prefill_kv(const Tensor& ah, const Tensor& positions,
+                                const Tensor& rope_positions);
+    // The divided decode attention of mtp_forward_tail.
+    void mtp_divided_tail(Tensor& x, const Tensor& positions, const Tensor& rope_positions,
+                          ops::CausalAttentionExecutionEnvelope envelope);
     void window_mtp_attention(PagedKVBatchLayerView& view, Tensor& table_rows, Tensor& positions,
                               const Tensor& valid_columns);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,

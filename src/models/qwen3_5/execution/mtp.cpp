@@ -18,18 +18,39 @@ bool unpacked(const MtpProjectionParameters& parameters) {
     return parameters.rows && parameters.packed.weight.qdata == nullptr;
 }
 
-bool gguf_rows(const MtpProjectionParameters& parameters) {
-    return parameters.rows && is_gguf((*parameters.rows)[1].weight.qtype);
-}
-
-std::size_t row_bytes(const MtpProjectionParameters& parameters, std::size_t index,
-                      std::int32_t first, std::int32_t last) {
-    const auto& p = (*parameters.rows)[index];
+std::size_t linear_bytes(const LinearParameters& p, std::int32_t first, std::int32_t last) {
     const auto& w = p.weight;
     return ops::linear_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first, last);
 }
 
+std::size_t row_bytes(const MtpProjectionParameters& parameters, std::size_t index,
+                      std::int32_t first, std::int32_t last) {
+    return linear_bytes((*parameters.rows)[index], first, last);
+}
+
 } // namespace
+
+std::size_t mtp_kv_rows_workspace_bytes(const LinearParameters& key, const LinearParameters& value,
+                                        std::int32_t first, std::int32_t last) {
+    if (is_gguf(key.weight.qtype)) {
+        return std::max(linear_bytes(key, first, last), linear_bytes(value, first, last));
+    }
+    return ops::linear_pair_workspace_capacity_bytes(key.weight, value.weight, first, last);
+}
+
+void mtp_kv_rows_projection(const Tensor& hidden, const LinearParameters& key,
+                            const LinearParameters& value, Tensor& key_out, Tensor& value_out,
+                            WorkspaceArena& workspace, cudaStream_t stream) {
+    if (is_gguf(key.weight.qtype)) {
+        {
+            auto scope = workspace.scope();
+            ops::linear(hidden, key.weight, key_out, key.policy, workspace, stream);
+        }
+        ops::linear(hidden, value.weight, value_out, value.policy, workspace, stream);
+        return;
+    }
+    ops::linear_pair(hidden, key.weight, value.weight, key_out, value_out, stream);
+}
 
 std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
                                            std::int32_t first, std::int32_t last) {
@@ -53,12 +74,9 @@ std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parame
 std::size_t mtp_kv_workspace_bytes(const MtpProjectionParameters& parameters,
                                    const AttentionConfig& config, std::int32_t first,
                                    std::int32_t last) {
-    if (gguf_rows(parameters)) {
-        return std::max(row_bytes(parameters, 1, first, last), row_bytes(parameters, 3, first, last));
-    }
     if (parameters.rows) {
-        return ops::linear_pair_workspace_capacity_bytes((*parameters.rows)[1].weight,
-                                                         (*parameters.rows)[3].weight, first, last);
+        return mtp_kv_rows_workspace_bytes((*parameters.rows)[1], (*parameters.rows)[3], first,
+                                           last);
     }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {dimension(config.query_width()), last});
@@ -121,19 +139,9 @@ void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& paramet
 void mtp_kv_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                        const AttentionConfig& config, Tensor& key, Tensor& value,
                        WorkspaceArena& workspace, cudaStream_t stream) {
-    if (gguf_rows(parameters)) {
-        const auto& k = (*parameters.rows)[1];
-        const auto& v = (*parameters.rows)[3];
-        {
-            auto scope = workspace.scope();
-            ops::linear(hidden, k.weight, key, k.policy, workspace, stream);
-        }
-        ops::linear(hidden, v.weight, value, v.policy, workspace, stream);
-        return;
-    }
     if (parameters.rows) {
-        ops::linear_pair(hidden, (*parameters.rows)[1].weight, (*parameters.rows)[3].weight, key,
-                         value, stream);
+        mtp_kv_rows_projection(hidden, (*parameters.rows)[1], (*parameters.rows)[3], key, value,
+                               workspace, stream);
         return;
     }
     auto scope   = workspace.scope();
