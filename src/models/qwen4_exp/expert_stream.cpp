@@ -129,7 +129,10 @@ struct Slot {
 };
 
 struct Pool {
-    DeviceBuffer storage;
+    // The slots from the first, then grow's after them.
+    DeviceBuffer storage, grown;
+    std::size_t rank = 0;
+    bool own         = false; // a layer's own slots, sized to its widest call
     std::uint64_t slot_bytes = 0;
     std::array<std::uint64_t, 3> offset{};
     std::vector<Slot> slots;
@@ -161,6 +164,7 @@ struct ExpertStream::Impl {
     std::size_t cursor       = 0; // bytes used in it
     cudaStream_t half_stream = nullptr;
     std::uint64_t call       = 0;
+    bool grew                = false;
     ExpertStreamStats stats;
     ReadPool reads{kReadThreads - 1}; // the caller reads too
 
@@ -176,7 +180,8 @@ struct ExpertStream::Impl {
     std::vector<Copy> batch_copies;
 
     Impl(DeviceContext& d, const std::vector<std::filesystem::path>& paths,
-         std::vector<ExpertStreamLayer> specs, std::span<const std::uint64_t> bytes_by_rank)
+         std::vector<ExpertStreamLayer> specs, std::span<const std::uint64_t> bytes_by_rank,
+         bool grows)
         : device(d) {
         for (const auto& path : paths) { files.push_back(std::make_unique<File>(path)); }
         for (auto& spec : specs) {
@@ -194,6 +199,13 @@ struct ExpertStream::Impl {
         }
         for (const auto& [rank, members] : on_rank) {
             const std::uint64_t budget = rank < bytes_by_rank.size() ? bytes_by_rank[rank] : 0;
+            // The slots a pool starts with: all of the budget's, or with `grows` those of half the
+            // budget (`first`), at least its widest call.
+            const std::uint64_t first = grows ? budget / 2 : budget;
+            const auto start = [](std::uint64_t count, std::uint64_t bytes, std::uint64_t slot,
+                                  std::uint64_t widest) {
+                return std::min(count, std::max(widest, bytes / slot));
+            };
             // A layer with slots of its own takes as many as its widest call routes to, wider
             // than the shared slots; the shared slots must still hold the widest call of the
             // others. Otherwise every layer of the rank shares slots fitting the widest.
@@ -213,11 +225,20 @@ struct ExpertStream::Impl {
                 split = split && slot_shape({i}).first > shared_slot;
             }
             if (!split) {
-                add_pool(rank, members, budget / slot_shape(members).first);
+                const std::uint64_t slot = slot_shape(members).first;
+                std::uint64_t widest     = 0;
+                for (const std::size_t i : members) { widest = std::max(widest, call_slots(i)); }
+                add_pool(rank, members, start(budget / slot, first, slot, widest));
                 continue;
             }
-            for (const std::size_t i : own) { add_pool(rank, {i}, call_slots(i)); }
-            add_pool(rank, shared, (budget - own_bytes) / shared_slot);
+            for (const std::size_t i : own) {
+                add_pool(rank, {i}, call_slots(i));
+                pools.back().own = true;
+            }
+            add_pool(rank, shared,
+                     start((budget - own_bytes) / shared_slot,
+                           first > own_bytes ? first - own_bytes : 0, shared_slot,
+                           widest_shared_call));
         }
         staging = std::make_unique<PinnedHostBuffer>(2 * kStagingHalf);
         for (auto& event : half_done) {
@@ -252,6 +273,7 @@ struct ExpertStream::Impl {
     void add_pool(std::size_t rank, const std::vector<std::size_t>& members, std::uint64_t count) {
         const auto [slot_bytes, offset] = slot_shape(members);
         Pool pool;
+        pool.rank       = rank;
         pool.slot_bytes = slot_bytes;
         pool.offset     = offset;
         pool.slots.resize(static_cast<std::size_t>(count));
@@ -264,6 +286,32 @@ struct ExpertStream::Impl {
         stats.slots += static_cast<std::uint32_t>(pool.slots.size());
         for (const std::size_t i : members) { layers[i].pool = pools.size(); }
         pools.push_back(std::move(pool));
+    }
+
+    std::vector<std::uint64_t> grow(std::span<const std::uint64_t> bytes_by_rank) {
+        if (grew) { throw std::logic_error("expert stream: the pools have grown already"); }
+        grew = true;
+        std::vector<std::uint64_t> added(device.size(), 0);
+        for (Pool& pool : pools) {
+            if (pool.own || pool.slots.empty() || pool.rank >= bytes_by_rank.size()) { continue; }
+            const std::size_t count =
+                (bytes_by_rank[pool.rank] - added[pool.rank]) / pool.slot_bytes;
+            if (count == 0) { continue; }
+            RankBinding bind(device, pool.rank);
+            pool.grown = DeviceBuffer(count * pool.slot_bytes);
+            CUDA_CHECK(cudaMemset(pool.grown.p, 0, pool.grown.bytes));
+            pool.slots.resize(pool.slots.size() + count);
+            stats.slots += static_cast<std::uint32_t>(count);
+            added[pool.rank] += pool.grown.bytes;
+        }
+        return added;
+    }
+
+    // Slot `s` of `pool`: its own block's, then grow's.
+    static std::byte* slot_base(const Pool& pool, std::size_t s) {
+        const std::size_t first = pool.storage.bytes / pool.slot_bytes;
+        return s < first ? static_cast<std::byte*>(pool.storage.p) + s * pool.slot_bytes
+                         : static_cast<std::byte*>(pool.grown.p) + (s - first) * pool.slot_bytes;
     }
 
     ~Impl() {
@@ -418,7 +466,7 @@ struct ExpertStream::Impl {
             const std::size_t s = victim(pool);
             Slot& slot          = pool.slots[s];
             if (slot.expert >= 0) { layers[slot.layer].slot_of[slot.expert] = -1; }
-            auto* base = static_cast<std::byte*>(pool.storage.p) + s * pool.slot_bytes;
+            auto* base = slot_base(pool, s);
             for (int k = 0; k < 3; ++k) {
                 const ExpertLocation& location = layer.spec.experts[k][expert];
                 std::byte* buffer              = stage(location.bytes, layer.spec.rank, stream);
@@ -463,8 +511,8 @@ struct ExpertStream::Impl {
 
 ExpertStream::ExpertStream(DeviceContext& device, const std::vector<std::filesystem::path>& files,
                            std::vector<ExpertStreamLayer> layers,
-                           std::span<const std::uint64_t> bytes_by_rank)
-    : impl_(std::make_unique<Impl>(device, files, std::move(layers), bytes_by_rank)) {}
+                           std::span<const std::uint64_t> bytes_by_rank, bool grows)
+    : impl_(std::make_unique<Impl>(device, files, std::move(layers), bytes_by_rank, grows)) {}
 
 ExpertStream::~ExpertStream() = default;
 
@@ -475,10 +523,25 @@ void ExpertStream::prepare(std::size_t layer, std::span<const std::int32_t> ids,
 
 ExpertStreamStats ExpertStream::stats() const noexcept { return impl_->stats; }
 
-std::pair<std::uintptr_t, std::uintptr_t> ExpertStream::storage(std::size_t layer) const {
-    const auto& pool = impl_->pools.at(impl_->layers.at(layer).pool);
-    const auto begin = reinterpret_cast<std::uintptr_t>(pool.storage.p);
-    return {begin, begin + pool.storage.bytes};
+ExpertStream::Ranges ExpertStream::storage(std::size_t layer) const {
+    const auto& pool  = impl_->pools.at(impl_->layers.at(layer).pool);
+    const auto range = [](const DeviceBuffer& block) {
+        const auto begin = reinterpret_cast<std::uintptr_t>(block.p);
+        return std::pair<std::uintptr_t, std::uintptr_t>{begin, begin + block.bytes};
+    };
+    return {range(pool.storage), range(pool.grown)};
+}
+
+std::vector<std::uint64_t> ExpertStream::grow(std::span<const std::uint64_t> bytes_by_rank) {
+    return impl_->grow(bytes_by_rank);
+}
+
+std::uint64_t ExpertStream::pool_bytes(std::size_t rank) const {
+    std::uint64_t bytes = 0;
+    for (const auto& pool : impl_->pools) {
+        if (pool.rank == rank) { bytes += pool.storage.bytes + pool.grown.bytes; }
+    }
+    return bytes;
 }
 
 } // namespace ninfer::models::qwen4_exp

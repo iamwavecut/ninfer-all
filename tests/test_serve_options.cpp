@@ -32,8 +32,15 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
-    failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.draft_min_p == 0,
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).speculative.draft_min_p,
                       "draft confidence must be opt-in");
+    // Without --spec the floor is kept for the MTP the Engine chooses, zero included.
+    for (const auto* floor : {"0", "0.3"}) {
+        const auto automatic = parse({"ninfer-serve", "model.ninfer", "--draft-min-p", floor});
+        failures += check(automatic.speculative.automatic &&
+                              automatic.speculative.draft_min_p == std::stof(floor),
+                          "server did not keep draft confidence for automatic speculation");
+    }
     for (const auto* floor : {"0", "0.3", "1"}) {
         failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
                                 "--draft-tokens", "4", "--draft-min-p", floor})
@@ -48,7 +55,7 @@ int main() {
              {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "0.3x"},
              {"--spec", "dflash", "--draft-tokens", "4", "--draft-min-p", "0.3"},
              {"--spec", "dflash2", "--draft-tokens", "4", "--draft-min-p", "0.3"},
-             {"--draft-min-p", "0.3"}}) {
+             {"--spec", "none", "--draft-min-p", "0.3"}}) {
         std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
         full.insert(full.end(), args.begin(), args.end());
         bool rejected = false;

@@ -45,8 +45,8 @@ int run_tests() {
                           }),
                           "--gpu-clock-floor accepted 0, 5001 or a word");
     }
-    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
-                          .speculative.draft_min_p == 0, "draft confidence must be opt-in");
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                           .speculative.draft_min_p, "draft confidence must be opt-in");
     for (const auto* floor : {"0", "0.3", "1"}) {
         failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
                                 "--draft-tokens", "4", "--draft-min-p", floor})
@@ -65,8 +65,17 @@ int run_tests() {
                          "--draft-tokens", "4", "--draft-min-p", "0.3"});
         }), "CLI accepted draft confidence outside MTP");
     }
+    // Without --spec the floor is kept for the MTP the Engine chooses, zero included.
+    for (const auto* floor : {"0", "0.3"}) {
+        const auto automatic =
+            parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--draft-min-p", floor});
+        failures += check(automatic.speculative.automatic &&
+                              automatic.speculative.draft_min_p == std::stof(floor),
+                          "CLI did not keep draft confidence for automatic speculation");
+    }
     failures += check(rejects([] {
-        (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--draft-min-p", "0.3"});
+        (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "none",
+                     "--draft-min-p", "0.3"});
     }), "CLI accepted draft confidence without MTP");
     {
         // DeepSeek's DSpark drafter: its whole block without --draft-tokens, no copy drafts beside

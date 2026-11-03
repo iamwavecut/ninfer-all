@@ -51,8 +51,11 @@ struct MissLayer {
     bool admit = false;
 };
 
+// The most tokens one call can take (MissOptions::token_capacity).
+inline constexpr std::uint32_t kMaxMissTokens = 64;
+
 struct MissOptions {
-    std::uint32_t token_capacity = 8;    // tokens of one call
+    std::uint32_t token_capacity = 8;    // tokens of one call, at most kMaxMissTokens
     double cpu_share             = 0.0;  // share of a request's missing experts the CPU computes
     // Instead of a fixed share, each request gives the CPU the experts that make its copies and
     // its CPU products end soonest, by times fitted to the earlier requests.
@@ -101,11 +104,6 @@ public:
     [[nodiscard]] Call begin(std::size_t layer, const Tensor& ids, const Tensor& m,
                              std::int32_t tokens, const ops::GgufMoeWeights& banks,
                              cudaStream_t stream);
-    // Enqueued, any token count: the pairs of `ids` (I32 [10, tokens]) whose expert is cached,
-    // the others -1, and their `weights` (FP32 [10, tokens]) renormalized per token to its whole
-    // routed sum: for a layer whose output only steers drafts, which verification checks.
-    void drop_missing(std::size_t layer, const Tensor& ids, const Tensor& weights,
-                      Tensor& kept_ids, Tensor& kept_weights, cudaStream_t stream);
     // Enqueued: waits until the request's experts are staged and its CPU products written.
     void await(std::size_t layer, cudaStream_t stream);
     // Keeps the service (and the CPU workers) spinning for the next half second; a pass calls it

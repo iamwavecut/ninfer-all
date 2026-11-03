@@ -41,8 +41,9 @@ struct SpeculativeOptions {
     // Startup-fixed K: MTP, DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     // Flash-Next MTP: end drafting and verification at the first draft whose absolute probability
-    // is at or below this floor. Zero keeps the full window.
-    float draft_min_p = 0;
+    // is at or below this floor. Zero keeps the full window. Unset keeps it with --spec mtp, and
+    // is kAutomaticDraftMinP when the Engine chooses MTP (automatic).
+    std::optional<float> draft_min_p;
     // DeepSeek-V4.1 DSpark: verify a round's drafts up to the first its confidence head scores below
     // this, in [0,1]; 0 keeps every draft. Unset keeps the drafter's default floor (0.5).
     std::optional<float> draft_confidence;
@@ -54,7 +55,8 @@ struct SpeculativeOptions {
     // head is weakest -- output that repeats the input. Used as a draft source alongside the
     // configured backend, preferred whenever it finds a match.
     std::uint32_t lookup_ngram = 0;
-    // MTP only; Adaptive verifies 1..draft_tokens drafts per round.
+    // MTP only; Adaptive verifies 1..draft_tokens drafts per round (Qwen3.8-Flash-Next: a lone
+    // request's round; a round of several drafts up to kAutomaticDraftTokens).
     MtpDraftPolicy mtp_policy = MtpDraftPolicy::Fixed;
     // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
@@ -67,12 +69,12 @@ struct SpeculativeOptions {
     // its query instead of the whole history; target verification keeps full attention, so the
     // committed tokens do not depend on it. Zero reads the whole history.
     std::uint32_t mtp_attention_window = 0;
-    // The backend was left to the Engine (no --spec): a MoE model with host or disk experts whose
-    // artifact carries its MTP block or assistant (Qwen3.8-Flash-Next, Gemma 4) drafts with it,
-    // kAutomaticDraftTokens a round, since a verification window's routes share the layer's
-    // missing experts (Flash-Next ending a round's drafting at its first draft at or below
-    // kAutomaticDraftMinP); others run without drafts. The Engine's options() report the resolved
-    // backend.
+    // The backend was left to the Engine (no --spec): a MoE model whose artifact carries its MTP
+    // block or assistant drafts with it, kAutomaticDraftTokens a round, since a verification
+    // window's routes share the layer's missing experts: Qwen3.8-Flash-Next with host experts
+    // (ending a round's drafting at its first draft at or below kAutomaticDraftMinP), Gemma 4
+    // with host or disk experts; others run without drafts. The Engine's options() report the
+    // resolved backend.
     bool automatic = false;
     static constexpr std::uint32_t kAutomaticDraftTokens = 3;
     static constexpr float kAutomaticDraftMinP           = 0.5F;
@@ -538,7 +540,8 @@ struct EngineOptions {
     // Decode rounds that run before a prefill chunk while other requests generate, proportionally
     // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode
     // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves
-    // decoding streams a token per chunk; 0 is prefill_chunk / 64.
+    // decoding streams a token per chunk; 0 is prefill_chunk / 64. Qwen3.8-Flash-Next counts a
+    // speculative round as the tokens its requests fed on average.
     std::uint32_t decode_rounds_per_prefill = 0;
     // While another request generates, a prefill step is cut so the prefill cost model, scaled by
     // the ratio of observed to predicted step times, predicts it to take at most this many

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -24,7 +25,9 @@ struct HybridExpertLayer {
 };
 
 // Program-owned native expert cache, bounded DMA staging and CPU workers. One sequence may
-// execute at a time. GPU slots and CPU workspaces are allocated at construction, never by Ops.
+// execute at a time. GPU slots and CPU workspaces are allocated at construction (and by grow),
+// never by Ops. The automatic cache (`cache_bytes` ~0) starts at half of what each device has
+// free less a margin.
 class HybridExperts {
 public:
     HybridExperts(DeviceContext& device, std::vector<HybridExpertLayer> layers,
@@ -47,6 +50,10 @@ public:
     [[nodiscard]] ExpertRouteCounts route_counts() const;
     [[nodiscard]] ExpertCacheStats stats() const noexcept;
     [[nodiscard]] std::uint64_t cache_bytes(std::size_t rank) const;
+    // Once startup's allocations are done, before the first run: more slots for every layer
+    // from `bytes_by_rank`, shared by a rank's layers as at construction, which take the most
+    // routed experts the cache lacks. Returns the bytes each rank gave. At most once.
+    std::vector<std::uint64_t> grow(std::span<const std::uint64_t> bytes_by_rank);
     [[nodiscard]] std::uint64_t working_bytes(std::size_t rank) const;
     [[nodiscard]] std::string execution_profile() const;
 

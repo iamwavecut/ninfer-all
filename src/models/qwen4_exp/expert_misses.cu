@@ -151,36 +151,6 @@ __global__ void wait_kernel(Mailbox* box, const std::uint32_t* need) {
     while (Atomic(box->prepared).load(cuda::memory_order_acquire) != sequence) { __nanosleep(128); }
 }
 
-// One thread per token: its pairs whose expert is cached keep their id, with the token's weights
-// renormalized to its whole routed sum; the others become -1 with weight 0.
-__global__ void drop_missing_kernel(const std::int32_t* __restrict__ ids,
-                                    const float* __restrict__ weights, int tokens, int experts,
-                                    const void* const* __restrict__ gate,
-                                    const std::uintptr_t* __restrict__ ranges,
-                                    std::int32_t* __restrict__ kept_ids,
-                                    float* __restrict__ kept_weights) {
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= tokens) { return; }
-    bool resident[kTop];
-    float all = 0.0f, kept = 0.0f;
-#pragma unroll
-    for (int j = 0; j < kTop; ++j) {
-        const int e = ids[t * kTop + j];
-        resident[j] = false;
-        if (e >= 0 && e < experts) {
-            resident[j] = in_ranges(reinterpret_cast<std::uintptr_t>(gate[e]), ranges);
-        }
-        all += weights[t * kTop + j];
-        kept += resident[j] ? weights[t * kTop + j] : 0.0f;
-    }
-    const float scale = kept > 0.0f ? all / kept : 0.0f;
-#pragma unroll
-    for (int j = 0; j < kTop; ++j) {
-        kept_ids[t * kTop + j]     = resident[j] ? ids[t * kTop + j] : -1;
-        kept_weights[t * kTop + j] = resident[j] ? weights[t * kTop + j] * scale : 0.0f;
-    }
-}
-
 // A device table entry change of an admission: `expert` now reads `at`.
 struct TablePatch {
     std::int32_t expert = -1;
@@ -343,9 +313,9 @@ struct ExpertMisses::Impl {
     Impl(DeviceContext& d, std::vector<MissLayer> l, std::vector<std::filesystem::path> paths,
          MissOptions o, ExpertCache* c)
         : device(d), layers(std::move(l)), cache(c), options(o), ranks(d.size()) {
-        if (options.token_capacity == 0 || options.token_capacity > 64 || layers.empty() ||
-            !std::isfinite(options.cpu_share) || options.cpu_share < 0 || options.cpu_share > 1 ||
-            (options.cpu_balance && options.cpu_share != 0) ||
+        if (options.token_capacity == 0 || options.token_capacity > kMaxMissTokens ||
+            layers.empty() || !std::isfinite(options.cpu_share) || options.cpu_share < 0 ||
+            options.cpu_share > 1 || (options.cpu_balance && options.cpu_share != 0) ||
             options.tail_skip_rank >= std::uint32_t(kTop)) {
             throw std::invalid_argument("expert misses: invalid capacity, CPU share or tail skip");
         }
@@ -903,18 +873,6 @@ struct ExpertMisses::Impl {
         }
     }
 
-    void drop_missing(std::size_t index, const Tensor& ids, const Tensor& weights,
-                      Tensor& kept_ids, Tensor& kept_weights, cudaStream_t stream) {
-        const MissLayer& layer = layers.at(index);
-        const int tokens       = ids.ne[1];
-        drop_missing_kernel<<<(tokens + 127) / 128, 128, 0, stream>>>(
-            static_cast<const std::int32_t*>(ids.data), static_cast<const float*>(weights.data),
-            tokens, int(layer.experts), layer.gate_table,
-            static_cast<const std::uintptr_t*>(ranges.at(index).p),
-            static_cast<std::int32_t*>(kept_ids.data), static_cast<float*>(kept_weights.data));
-        CUDA_CHECK(cudaGetLastError());
-    }
-
     Call begin(std::size_t index, const Tensor& ids, const Tensor& m, std::int32_t tokens,
                const ops::GgufMoeWeights& banks, cudaStream_t stream) {
         keep_alive();
@@ -999,10 +957,6 @@ ExpertMisses::Call ExpertMisses::begin(std::size_t layer, const Tensor& ids, con
                                        std::int32_t tokens, const ops::GgufMoeWeights& banks,
                                        cudaStream_t stream) {
     return impl_->begin(layer, ids, m, tokens, banks, stream);
-}
-void ExpertMisses::drop_missing(std::size_t layer, const Tensor& ids, const Tensor& weights,
-                                Tensor& kept_ids, Tensor& kept_weights, cudaStream_t stream) {
-    impl_->drop_missing(layer, ids, weights, kept_ids, kept_weights, stream);
 }
 void ExpertMisses::await(std::size_t layer, cudaStream_t stream) { impl_->await(layer, stream); }
 void ExpertMisses::keep_alive() { impl_->keep_alive(); }

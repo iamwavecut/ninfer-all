@@ -385,6 +385,21 @@ void profile(DeviceContext& device) {
     const auto stats = cache.stats();
     require(stats.admitted == 28 && stats.copied_bytes == 8 * 10240 + 20 * 5632,
             "seeding counts its copies");
+
+    // Growth continues the ranking where construction stopped: half of layer 0's share first,
+    // then the rest of the budget, gives each layer what the whole budget gave above.
+    Model fresh;
+    ExpertCache halves(device, fresh.layers(device), std::vector<std::uint64_t>{4 * 10496},
+                       &counts);
+    require(halves.stats().slots == 4, "the first part takes layer 0's top experts");
+    const auto added = halves.grow(std::vector<std::uint64_t>{2 * 102400 - 4 * 10496});
+    const auto zero_block = halves.storage(0)[1];
+    const auto one_block  = halves.storage(1)[1];
+    require(added.size() == 1 && added[0] == 4 * 10496 + 20 * 5888 &&
+                halves.stats().slots == 8 + 20 &&
+                zero_block.second - zero_block.first == 4 * 10496 &&
+                one_block.second - one_block.first == 20 * 5888,
+            "growth continues a profile's ranking: " + std::to_string(halves.stats().slots));
 }
 
 } // namespace

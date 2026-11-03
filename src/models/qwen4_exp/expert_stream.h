@@ -49,9 +49,12 @@ struct ExpertStreamStats {
 
 class ExpertStream {
 public:
+    // With `grows` (the automatic cache) the pools are laid out as `bytes_by_rank` lays them, but
+    // start at half of it, or at the widest call of their layers if that is more; grow() adds to
+    // them once startup is done.
     ExpertStream(DeviceContext& device, const std::vector<std::filesystem::path>& files,
                  std::vector<ExpertStreamLayer> layers,
-                 std::span<const std::uint64_t> bytes_by_rank);
+                 std::span<const std::uint64_t> bytes_by_rank, bool grows = false);
     ~ExpertStream();
     ExpertStream(const ExpertStream&)            = delete;
     ExpertStream& operator=(const ExpertStream&) = delete;
@@ -64,8 +67,16 @@ public:
     // their last chunk's experts while the later layers of the span read theirs.
     void prepare(std::size_t layer, std::span<const std::int32_t> ids, bool release_others);
     [[nodiscard]] ExpertStreamStats stats() const noexcept;
-    // The device memory of `layer`'s slots: a table entry inside it is a resident expert.
-    [[nodiscard]] std::pair<std::uintptr_t, std::uintptr_t> storage(std::size_t layer) const;
+    // The device memory of `layer`'s slots, its pool's own block and grow's (empty until then):
+    // a table entry inside either is a resident expert.
+    using Ranges = std::array<std::pair<std::uintptr_t, std::uintptr_t>, 2>;
+    [[nodiscard]] Ranges storage(std::size_t layer) const;
+    // Once startup's allocations are done: more empty slots for the pool of each rank that the
+    // budget sizes (not a layer's own slots, which hold its widest call), from `bytes_by_rank`,
+    // taken before any slot that holds an expert. Returns the bytes each rank gave. At most once.
+    std::vector<std::uint64_t> grow(std::span<const std::uint64_t> bytes_by_rank);
+    // The device memory the pools of `rank` hold.
+    [[nodiscard]] std::uint64_t pool_bytes(std::size_t rank) const;
 
 private:
     struct Impl;

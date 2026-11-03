@@ -134,7 +134,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         throw std::invalid_argument(
             "DeepSeek-V4.1: --lookup-ngram verifies 1 to 7 drafts (--draft-tokens)");
     }
-    if (speculative.draft_min_p != 0 || speculative.mtp_attention_window != 0 ||
+    if (speculative.draft_min_p.value_or(0.0F) != 0 || speculative.mtp_attention_window != 0 ||
         speculative.ngram_draft_tokens != 0 || speculative.ngram_archive_bytes != 0 ||
         speculative.proposal_head != ProposalHead::Auto ||
         speculative.mtp_policy == MtpDraftPolicy::Adaptive) {

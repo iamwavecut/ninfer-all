@@ -96,8 +96,8 @@ public:
     using Ranges = std::array<std::pair<std::uintptr_t, std::uintptr_t>, 4>;
     [[nodiscard]] Ranges storage(std::size_t layer) const;
     // Once startup's allocations are done: more slots for every layer that is not full, from
-    // `bytes_by_rank`, as free slots, shared as at construction. Returns the bytes each rank gave.
-    // At most once.
+    // `bytes_by_rank`, as free slots, shared as at construction (a profile's ranking continues
+    // where construction stopped). Returns the bytes each rank gave. At most once.
     std::vector<std::uint64_t> grow(std::span<const std::uint64_t> bytes_by_rank);
 
     // Device buffers of a rank that wide calls write between decode passes.
@@ -163,6 +163,7 @@ private:
     // The last round's swaps that no pass has started yet, best gain first.
     std::vector<ExpertTier::Swap> queued_;
     std::size_t mtp_ = ~std::size_t{0}; // the MTP block's layer, which the draft reads
+    std::vector<std::vector<std::uint64_t>> profile_; // construction's, which grow continues
     std::vector<cudaEvent_t> spare_;    // events of landed copies, reused
     // By rank: whether the cache holds its lent buffers, and the event a reclaim's transfer
     // stream (or a give_back's compute stream) waits on.

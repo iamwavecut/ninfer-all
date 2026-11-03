@@ -56,10 +56,13 @@ inline void apply_automatic_speculation(SpeculativeOptions& options, bool backen
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
-    if (!std::isfinite(options.draft_min_p) || options.draft_min_p < 0 ||
-        options.draft_min_p > 1 ||
-        (options.draft_min_p != 0 && options.backend != SpeculativeBackend::Mtp)) {
-        throw std::invalid_argument("--draft-min-p requires --spec mtp and a finite value in [0,1]");
+    // The floor applies to MTP the command line names or the Engine chooses (no --spec).
+    if (options.draft_min_p &&
+        (!std::isfinite(*options.draft_min_p) || *options.draft_min_p < 0 ||
+         *options.draft_min_p > 1 ||
+         (options.backend != SpeculativeBackend::Mtp && !options.automatic))) {
+        throw std::invalid_argument(
+            "--draft-min-p requires --spec mtp or no --spec, and a finite value in [0,1]");
     }
     if (options.draft_confidence &&
         (!std::isfinite(*options.draft_confidence) || *options.draft_confidence < 0 ||
