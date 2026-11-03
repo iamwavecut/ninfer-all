@@ -61,7 +61,9 @@ namespace ninfer {
 //            after its kernel of the exchange in between, which waited for every other rank's word
 //            of that exchange, which each rank stores only after its own earlier kernel ended: no
 //            rank overwrites words another is still reading. One count serves both kinds of rows,
-//            since that order holds whichever rows the exchange in between used. A wait that
+//            since that order holds whichever rows the exchange in between used. Rows start
+//            zeroed, as if carrying epoch 0, so after 2^32 - 1 exchanges the count goes on at 2,
+//            which no unwritten word matches and which keeps the parity alternating. A wait that
 //            outlasts kWordsTimeoutNs traps the context. Ranks that share a card exchange no words,
 //            since two spinning kernels on one device need not run together.
 //   Whole    every rank reduces every value.
@@ -126,6 +128,8 @@ struct TensorParallelExchangeOptions {
     std::vector<TensorParallelBand> routes;
     // Largest partial exchanged as words.
     std::size_t words_bytes = 32U << 10U;
+    // How many exchanges every rank has already counted (tests: an epoch close to the wrap).
+    std::uint32_t words_count = 0;
 };
 
 class TensorParallelExchange {

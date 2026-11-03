@@ -369,9 +369,11 @@ families](#expert-parallelism-of-the-other-moe-families)).
   route's time is read off the line through its two times, at sixteenths of the step, since one
   octave apart a crossover could be off by half the size; an exchange takes the fastest route at the
   smallest of all these sizes that holds it. `--tensor-parallel-transport host|peer-read|peer-write`
-  keeps every exchange to one transport (its forms still measured); a peer transport without peer
-  access refuses to start. The startup log names the pairs without peer access (`peer access: none
-  between CUDA devices 0-1; ...`), or says every pair reads peer memory, and then the routes chosen
+  keeps every exchange to one transport (its forms still measured), except that under peer-write a
+  two-rank FP32 sum too large for an inbox row reduces whole by peer reads; a peer transport
+  without peer access refuses to start. The startup log names the pairs without peer access
+  (`peer access: none between CUDA devices 0-1; ...`), or says every pair reads peer memory, and
+  then the routes chosen
   with their times (`tensor-parallel exchange, 4 ranks, measured at startup: peer-write words to 32
   KiB (14.0 us), peer-write whole to 100 KiB (29.1 us), peer-write scatter to 40 MiB (3837.0 us)`).
   `tools/tp_exchange_bench.cu` prints what the exchange measured at startup and every route at every
