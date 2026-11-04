@@ -5,7 +5,10 @@
 // operand is exactly an FP16 value and in FP32 otherwise. The cases cover random tiles, the exact
 // edges of the FP16-representable exponent window on both sides, out-of-window values in every lane
 // or in a single lane (the warp has to agree on one route), subnormals, signed zeros and
-// non-finite values.
+// non-finite values. E4M3 m16n8k32 is the FP8 form of the same shape: it runs only where the
+// instruction exists (Ada sm_89 and Blackwell, which mma.cuh reaches through its block-scale form)
+// and is skipped elsewhere; its operands are finite-only, since e4m3fn has no infinity and its
+// top two encodings are NaN.
 #include "ops/common/mma.cuh"
 #include "ops/op_tester.h"
 
@@ -72,6 +75,27 @@ __device__ unsigned frag_b_s8(const std::int8_t* bt, int lane, int r) {
     return pack8(bt, 32, g, 4 * t + 16 * r);
 }
 
+// m16n8k32 .e4m3: the same fragment layout as .s8 (Ada's plain instruction and the Blackwell
+// block-scale form share it), so the GEMM's ldmatrix.b16 loads of the byte-packed tiles are the
+// instruction's operands with no repack.
+__device__ unsigned pack8u(const std::uint8_t* m, int stride, int row, int col) {
+    unsigned v = 0;
+    for (int i = 0; i < 4; ++i) {
+        v |= unsigned(m[row * stride + col + i]) << (8 * i);
+    }
+    return v;
+}
+
+__device__ unsigned frag_a_e4m3(const std::uint8_t* a, int lane, int r) {
+    const int g = lane / 4, t = lane % 4;
+    return pack8u(a, 32, g + 8 * (r & 1), 4 * t + 16 * (r >> 1));
+}
+
+__device__ unsigned frag_b_e4m3(const std::uint8_t* bt, int lane, int r) {
+    const int g = lane / 4, t = lane % 4;
+    return pack8u(bt, 32, g, 4 * t + 16 * r);
+}
+
 // m16n8k8 .tf32 A: a0 (row g, k t), a1 (row g + 8, k t), a2 (row g, k t + 4),
 // a3 (row g + 8, k t + 4). B: b0 (k t, column g), b1 (k t + 4, column g).
 __device__ unsigned frag_a_tf32(const std::uint32_t* a, int lane, int r) {
@@ -90,20 +114,21 @@ __device__ int frag_c_index(int lane, int i) {
     return (g + 8 * (i >> 1)) * kN + 2 * t + (i & 1);
 }
 
-enum class Kind { bf16, f16, f16_f16acc, tf32, s8 };
+enum class Kind { bf16, f16, f16_f16acc, tf32, s8, e4m3 };
 
 struct Tiles {
-    std::vector<std::uint16_t> a16, b16t; // 16-bit operands, A [16][16], B^T [8][16]
-    std::vector<std::uint32_t> a32, b32t; // TF32 operands, A [16][8], B^T [8][8]
-    std::vector<std::int8_t> a8, b8t;     // INT8 operands, A [16][32], B^T [8][32]
-    std::vector<float> c;                 // [16][8] accumulator input
+    std::vector<std::uint16_t> a16, b16t;  // 16-bit operands, A [16][16], B^T [8][16]
+    std::vector<std::uint32_t> a32, b32t;  // TF32 operands, A [16][8], B^T [8][8]
+    std::vector<std::int8_t> a8, b8t;      // INT8 operands, A [16][32], B^T [8][32]
+    std::vector<std::uint8_t> af8, bf8t;   // E4M3 operands, A [16][32], B^T [8][32]
+    std::vector<float> c;                  // [16][8] accumulator input
     std::vector<int> ci;
 };
 
 __global__ void run(Kind kind, int tiles, const std::uint16_t* a16, const std::uint16_t* b16t,
                     const std::uint32_t* a32, const std::uint32_t* b32t, const std::int8_t* a8,
-                    const std::int8_t* b8t, const float* c_in, const int* ci_in, float* c_out,
-                    int* ci_out) {
+                    const std::int8_t* b8t, const std::uint8_t* af8, const std::uint8_t* bf8t,
+                    const float* c_in, const int* ci_in, float* c_out, int* ci_out) {
     const int tile = blockIdx.x;
     const int lane = threadIdx.x;
     if (tile >= tiles) { return; }
@@ -140,6 +165,13 @@ __global__ void run(Kind kind, int tiles, const std::uint16_t* a16, const std::u
                                    frag_a_tf32(a, lane, 1), frag_a_tf32(a, lane, 2),
                                    frag_a_tf32(a, lane, 3), frag_b_tf32(b, lane, 0),
                                    frag_b_tf32(b, lane, 1));
+    } else if (kind == Kind::e4m3) {
+        const std::uint8_t* a = af8 + tile * 16 * 32;
+        const std::uint8_t* b = bf8t + tile * 8 * 32;
+        ninfer::ops::mma_fp8_e4m3(d[0], d[1], d[2], d[3], frag_a_e4m3(a, lane, 0),
+                                  frag_a_e4m3(a, lane, 1), frag_a_e4m3(a, lane, 2),
+                                  frag_a_e4m3(a, lane, 3), frag_b_e4m3(b, lane, 0),
+                                  frag_b_e4m3(b, lane, 1));
     } else {
         const std::int8_t* a = a8 + tile * 16 * 32;
         const std::int8_t* b = b8t + tile * 8 * 32;
@@ -165,6 +197,20 @@ float f16_value(std::uint16_t bits) { return __half2float(std::bit_cast<__half>(
 // The value a TF32 operand represents: its low 13 mantissa bits are not part of it.
 float tf32_value(std::uint32_t bits) { return std::bit_cast<float>(bits & 0xffffe000u); }
 
+// The value one E4M3 byte represents (e4m3fn: bias 7; exponent field 15 is NaN unless the
+// mantissa is zero, then infinity).
+float e4m3_value(std::uint8_t bits) {
+    const int s = bits >> 7, e = (bits >> 3) & 0xF, m = bits & 0x7;
+    if (e == 15) {
+        return m == 0
+                   ? (s ? -std::numeric_limits<float>::infinity()
+                        : std::numeric_limits<float>::infinity())
+                   : std::nanf("");
+    }
+    const float v = std::ldexp(e == 0 ? float(m) : 8.0F + float(m), e == 0 ? -9 : e - 8);
+    return s ? -v : v;
+}
+
 std::uint16_t f16_bits(float v) { return std::bit_cast<std::uint16_t>(__float2half_rn(v)); }
 
 // A value with the given unbiased exponent and random significand bits; the sign is random.
@@ -183,7 +229,14 @@ struct Case {
 double reference(const Tiles& t, Kind kind, int tile, int row, int col, double& magnitude) {
     double sum = 0.0;
     magnitude  = 0.0;
-    if (kind == Kind::tf32) {
+    if (kind == Kind::e4m3) {
+        for (int k = 0; k < 32; ++k) {
+            const double p = double(e4m3_value(t.af8[(tile * 16 + row) * 32 + k])) *
+                             double(e4m3_value(t.bf8t[(tile * 8 + col) * 32 + k]));
+            sum += p;
+            magnitude += std::fabs(p);
+        }
+    } else if (kind == Kind::tf32) {
         for (int k = 0; k < 8; ++k) {
             const double p = double(tf32_value(t.a32[(tile * 16 + row) * 8 + k])) *
                              double(tf32_value(t.b32t[(tile * 8 + col) * 8 + k]));
@@ -213,6 +266,8 @@ int check_case(const Case& test, int tiles, std::mt19937& rng) {
     t.b32t.assign(std::size_t(tiles) * 8 * 8, 0);
     t.a8.assign(std::size_t(tiles) * 16 * 32, 0);
     t.b8t.assign(std::size_t(tiles) * 8 * 32, 0);
+    t.af8.assign(std::size_t(tiles) * 16 * 32, 0);
+    t.bf8t.assign(std::size_t(tiles) * 8 * 32, 0);
     t.c.assign(std::size_t(tiles) * kM * kN, 0.0F);
     t.ci.assign(std::size_t(tiles) * kM * kN, 0);
     for (int tile = 0; tile < tiles; ++tile) { test.fill(rng, tile, t, std::size_t(tile)); }
@@ -225,19 +280,22 @@ int check_case(const Case& test, int tiles, std::mt19937& rng) {
                    "upload");
         return device;
     };
-    auto* da16  = upload(t.a16);
-    auto* db16  = upload(t.b16t);
-    auto* da32  = upload(t.a32);
-    auto* db32  = upload(t.b32t);
-    auto* da8   = upload(t.a8);
-    auto* db8   = upload(t.b8t);
-    auto* dc    = upload(t.c);
-    auto* dci   = upload(t.ci);
+    auto* da16 = upload(t.a16);
+    auto* db16 = upload(t.b16t);
+    auto* da32 = upload(t.a32);
+    auto* db32 = upload(t.b32t);
+    auto* da8  = upload(t.a8);
+    auto* db8  = upload(t.b8t);
+    auto* daf8 = upload(t.af8);
+    auto* dbf8 = upload(t.bf8t);
+    auto* dc   = upload(t.c);
+    auto* dci  = upload(t.ci);
     float* dout = nullptr;
     int* dciout = nullptr;
     cuda_check(cudaMalloc(&dout, t.c.size() * sizeof(float)), "cudaMalloc out");
     cuda_check(cudaMalloc(&dciout, t.ci.size() * sizeof(int)), "cudaMalloc int out");
-    run<<<tiles, 32>>>(test.kind, tiles, da16, db16, da32, db32, da8, db8, dc, dci, dout, dciout);
+    run<<<tiles, 32>>>(test.kind, tiles, da16, db16, da32, db32, da8, db8, daf8, dbf8, dc, dci,
+                       dout, dciout);
     cuda_check_last_launch(test.name.c_str());
     std::vector<float> out(t.c.size());
     std::vector<int> iout(t.ci.size());
@@ -247,8 +305,8 @@ int check_case(const Case& test, int tiles, std::mt19937& rng) {
                "download int");
     for (void* p : {static_cast<void*>(da16), static_cast<void*>(db16), static_cast<void*>(da32),
                     static_cast<void*>(db32), static_cast<void*>(da8), static_cast<void*>(db8),
-                    static_cast<void*>(dc), static_cast<void*>(dci), static_cast<void*>(dout),
-                    static_cast<void*>(dciout)}) {
+                    static_cast<void*>(daf8), static_cast<void*>(dbf8), static_cast<void*>(dc),
+                    static_cast<void*>(dci), static_cast<void*>(dout), static_cast<void*>(dciout)}) {
         cuda_check(cudaFree(p), "cudaFree");
     }
 
@@ -340,6 +398,20 @@ template <class Pick>
 void fill32(Tiles& t, std::size_t tile, std::mt19937& rng, Pick pick) {
     for (int i = 0; i < 16 * 8; ++i) { t.a32[tile * 128 + i] = pick(rng, i); }
     for (int i = 0; i < 8 * 8; ++i) { t.b32t[tile * 64 + i] = pick(rng, 128 + i); }
+}
+
+// A finite E4M3 value: the exponent field 0..14 spans the whole finite range (2^-9 .. 448)
+// including subnormals; exponent field 15 is NaN or infinity and is never produced.
+std::uint8_t random_e4m3(std::mt19937& rng) {
+    const std::uint8_t e = std::uint8_t(rng() % 15);
+    const std::uint8_t m = std::uint8_t(rng() % 8);
+    return std::uint8_t((rng() % 2) << 7 | e << 3 | m);
+}
+
+template <class Pick>
+void fill8f(Tiles& t, std::size_t tile, std::mt19937& rng, Pick pick) {
+    for (int i = 0; i < 16 * 32; ++i) { t.af8[tile * 512 + i] = pick(rng, i); }
+    for (int i = 0; i < 8 * 32; ++i) { t.bf8t[tile * 256 + i] = pick(rng, 512 + i); }
 }
 
 std::vector<Case> cases() {
@@ -474,6 +546,20 @@ std::vector<Case> cases() {
         for (int i = 0; i < 8 * 32; ++i) { t.b8t[s * 256 + i] = std::int8_t(rng()); }
         for (int i = 0; i < kM * kN; ++i) { t.ci[s * kM * kN + i] = int(rng() % 200001u) - 100000; }
     });
+    // E4M3: random over the whole finite range (subnormals through 448, both signs), and a tile
+    // holding the range corners so every fragment mixes the extreme exponents in one k-sum.
+    add("e4m3 random finite", Kind::e4m3, [](Rng& rng, int, Tiles& t, std::size_t s) {
+        fill8f(t, s, rng, [](Rng& r, int) { return random_e4m3(r); });
+        fill_c(rng, t, s, 4.0F);
+    });
+    add("e4m3 range corners", Kind::e4m3, [](Rng& rng, int, Tiles& t, std::size_t s) {
+        // +0, -0, +-2^-9 (smallest subnormal), +-2^-6 (smallest normal), +-0.5, +-1,
+        // +-448 (the maximum): 12 corners cycling over the 512-byte A tile.
+        const std::uint8_t corners[] = {0x00, 0x80, 0x01, 0x81, 0x08, 0x88, 0x30, 0xB0, 0x38,
+                                        0xB8, 0x7E, 0xFE};
+        fill8f(t, s, rng, [&corners](Rng&, int i) { return corners[i % 12]; });
+        fill_c(rng, t, s, 4.0F);
+    });
     return all;
 }
 
@@ -531,8 +617,9 @@ int check_neighbor_independence(Kind kind, std::mt19937& rng) {
     int* dciout = nullptr;
     cuda_check(cudaMalloc(&dout, t.c.size() * sizeof(float)), "cudaMalloc out");
     cuda_check(cudaMalloc(&dciout, t.ci.size() * sizeof(int)), "cudaMalloc int out");
-    run<<<2 * kPairs, 32>>>(kind, 2 * kPairs, da16, db16, da32, db32, da8, db8, dc, dci, dout,
-                            dciout);
+    // The neighbor-independence cases are bf16/tf32 only; the E4M3 pointers stay null.
+    run<<<2 * kPairs, 32>>>(kind, 2 * kPairs, da16, db16, da32, db32, da8, db8, nullptr, nullptr,
+                            dc, dci, dout, dciout);
     cuda_check_last_launch("neighbor independence");
     std::vector<float> out(t.c.size());
     cuda_check(cudaMemcpy(out.data(), dout, out.size() * sizeof(float), cudaMemcpyDeviceToHost),
@@ -569,9 +656,19 @@ int check_neighbor_independence(Kind kind, std::mt19937& rng) {
 int main() {
     try {
         if (cuda_unavailable()) { return 77; }
+        int major = 0, minor = 0;
+        cuda_check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0), "cc major");
+        cuda_check(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0), "cc minor");
+        const int cc = major * 10 + minor;
         std::mt19937 rng(20261010);
         int failed = 0;
-        for (const Case& test : cases()) { failed += check_case(test, 512, rng); }
+        for (const Case& test : cases()) {
+            if (test.kind == Kind::e4m3 && cc < 89) {
+                std::cout << test.name << ": SKIP (no E4M3 m16n8k32 on sm_" << cc << ")\n";
+                continue;
+            }
+            failed += check_case(test, 512, rng);
+        }
         failed += check_neighbor_independence(Kind::bf16, rng);
         failed += check_neighbor_independence(Kind::tf32, rng);
         if (failed != 0) {

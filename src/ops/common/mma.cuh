@@ -128,11 +128,25 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
 // On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
 // UE8M0 0x7f is exactly 1: preserve the raw E4M3 dot product and keep the callers'
 // existing row scales in FP32 after the MMA. No operand repacking is needed.
+//
+// sm_89 (Ada, RTX 40 series) has no block-scale form; it has the plain instruction. Its
+// m16n8k32 data-operand layout is the one the .s8/.e4m3 fragments in tests/ops/test_mma_fragments.cu
+// document, which the GEMM's ldmatrix loads already produce, so the registers pass through
+// unchanged and the same delayed FP32 row scaling applies. (Qualified on sm_89 against an
+// FP32 oracle; see that test's e4m3 cases.)
 __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                              unsigned b0, unsigned b1) {
 #if defined(NINFER_PRE_BLACKWELL_DEVICE)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 890
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    // No E4M3 tensor-core instruction on sm_80 or older.
     __trap();
+#endif
 #else
     constexpr unsigned kUnitScale8          = 0x7Fu;
     constexpr unsigned short kScaleBlockId  = 0;
