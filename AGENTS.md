@@ -33,7 +33,9 @@ optional layer pipeline across several GPUs on Linux. It implements
 use the same architecture, binding and execution path. Native MoE routed experts may reside
 on the GPU, in pinned host memory, or in the artifact's files, brought into whole-layer device
 banks beside an optional persistent device cache (`--expert-residency host|disk`). Router and
-shared experts remain resident; all model arithmetic runs on the GPU, including the MTP MoE.
+shared experts remain resident; the GPU runs all model arithmetic, including the MTP MoE, except
+the share of a decode call's host or disk expert misses that CPU threads compute
+(`--expert-dma-share`), bit for bit as the GPU would.
 Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`,
 `src/models/qwen4_exp`) is a second, explicit family with its own load, executor and Engine core
 (`runtime/engine/qwen4_exp_core`); it shares the Qwen3.5 frontend and Vision tower, runs up to
@@ -44,8 +46,8 @@ routes to them (`--expert-residency disk`). Its n-gram table is stored in the mo
 in a separate table artifact the model names by digest (`--ngram-table`); it stays in that file,
 read a row at a time, unless `--ngram-residency ram` loads it. A model with PLE requires its table
 unless `--no-ngram-table` overrides that; a qualification layer slice without PLE needs no table.
-Native Qwen MoE, Gemma MoE and Flint also support host/disk expert placements, with all expert
-arithmetic on the GPU and whole-layer device banks beside the optional persistent cache.
+Native Qwen MoE, Gemma MoE and Flint also support host/disk expert placements, with whole-layer
+device banks beside the optional persistent cache and the same CPU share of decode misses.
 Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditionalGeneration`;
 `src/models/gemma4`, `runtime/engine/gemma4_core`) is a third explicit family converted from
 Google's QAT GGUF (or a mixed-format GGUF of the same model) with its ggml blocks kept as stored.
