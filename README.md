@@ -44,6 +44,10 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
   two RTX 3090s decoded 8-9% faster (MTP 5%) and prefilled 4% faster; one RTX 3090 with host experts decoded 2.5-3% faster.
   A [tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) Qwen MoE gives the first GPU fewer routed experts beside its shared expert, and Flash-Next's shared expert follows each GPU's routed experts:
   Qwen3.6-35B-A3B on four RTX 5060 Ti decoded 0.5-0.8% faster with 1.7 GiB more free on the first GPU, and its MTP, which failed to start under tensor parallelism, decodes at 261-300 tok/s.
+  Tensor-parallel Flash-Next runs prompts in chunks of 2,048 tokens whose [pieces of 1,024](docs/maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next) exchange while the next piece computes:
+  two RTX 3090s prefilled 13-17% faster in every KV format with the same tokens as before.
+  DeepSeek-V4.1's later index sources score only the [blocks the first one keeps](docs/deepseek-v41.md#long-prompts) once a query sees more than 16,384 positions:
+  a 58,117-token prompt prefilled 1.0-1.3% faster on an RTX 3090 with the same tokens.
 - **2026-11-03:** Qwen3.5-core models speed up [tensor-parallel decode](docs/maintainer/pipeline-stages.md#tensor-parallelism)
   by splitting vocabulary heads across GPUs.
   Eligible Q4 and Q5 projection shares use the same small-T MMA routes as whole projections.

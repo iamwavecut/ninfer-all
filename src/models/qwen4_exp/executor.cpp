@@ -66,6 +66,15 @@ namespace {
 constexpr std::int32_t kAlign = 256;
 // Calls wider than this run their experts through the matrix kernel, from device memory.
 constexpr std::int32_t kVectorTokens = 8;
+// Tensor parallelism: a prompt chunk wider than this runs in pieces of this many columns from its
+// first, the last one the rest, so that one piece's exchanges cross while the next piece computes
+// (run_tensor_pieces) and the chunk computes what chunks of this width do. Pieces of 512 lost more
+// to their narrower projections and expert calls than the overlap gained.
+constexpr std::int32_t kTensorPieceColumns = 1024;
+// The widest prompt chunk, cut into at most TensorParallelExchange::kPieces pieces.
+constexpr std::uint32_t kMaxChunk = 4096;
+static_assert((kMaxChunk + kTensorPieceColumns - 1) / kTensorPieceColumns <=
+              TensorParallelExchange::kPieces);
 // The family name of Flash-Next's built-in routing profiles (models/expert_profile.h).
 constexpr std::string_view kExpertProfileFamily = "qwen3.8-flash-next";
 // Zero bytes after every device slot's down matrix (see expert_stream.cpp and moe_experts_gguf).
@@ -563,6 +572,9 @@ struct RankState {
     void* mixed             = nullptr; // BF16 [H, T]
     float* inject           = nullptr; // [4, T]
     void* y                 = nullptr; // BF16 or FP32 [H, T]
+    // Tensor parallelism: BF16 [H, T], a prompt piece's exchanged mixer output, which the experts'
+    // exchange of an earlier piece (into y) must not overwrite before the piece's MoE reads it.
+    void* mixer_out         = nullptr;
     void* a                 = nullptr; // generic planes
     void* b                 = nullptr;
     void* c                 = nullptr;
@@ -912,7 +924,7 @@ struct Executor::Impl {
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(std::move(o)), config(m.config()),
           ngram(derive_ngram_hash_constants(config.ngram)) {
-        if (options.prefill_chunk == 0 || options.prefill_chunk > 4096 || options.sequences == 0 ||
+        if (options.prefill_chunk == 0 || options.prefill_chunk > kMaxChunk || options.sequences == 0 ||
             options.max_context == 0) {
             throw std::invalid_argument("qwen4_exp executor: chunk must be in [1, 4096]");
         }
@@ -1556,6 +1568,10 @@ struct Executor::Impl {
 
     void allocate_ranks() {
         const std::uint64_t t     = options.prefill_chunk;
+        // Prompt pieces (tensor_pieces) exchange FP32 prompt partials; BF16 and 8-bit partials
+        // cross the bus fast enough that a whole chunk prefilled faster than its pieces.
+        const bool pieces = tensor() && t > std::uint64_t(kTensorPieceColumns) &&
+                            options.tensor_parallel_prompt_partials == TensorParallelPartials::Fp32;
         const std::uint64_t h     = config.hidden_size;
         const std::uint64_t width = std::uint64_t(config.hc_count) * h;
         const std::uint64_t plane = std::max<std::uint64_t>(width, 6144); // widest BF16 plane rows
@@ -1586,6 +1602,7 @@ struct Executor::Impl {
                 {&rank.mixed, h * t * 2},
                 {reinterpret_cast<void**>(&rank.inject), std::uint64_t(config.hc_count) * t * 4},
                 {&rank.y, h * t * 4},
+                {&rank.mixer_out, pieces ? h * t * 2 : 0},
                 {&rank.a, plane * t * 2},
                 {&rank.b, plane * t * 2},
                 {&rank.c, plane * t * 2},
@@ -1617,6 +1634,10 @@ struct Executor::Impl {
             for (const auto& [slot, bytes] : planes) {
                 *slot = static_cast<std::byte*>(rank.activations.p) + offset;
                 offset += round_up(bytes);
+            }
+            // Without prompt pieces (tensor_pieces) there is no exchanged mixer output plane.
+            if (!pieces) {
+                rank.mixer_out = nullptr;
             }
             rank.workspace = std::make_unique<DeviceArena>(workspace_bytes(r));
             std::vector<std::int32_t> identity(std::max<std::uint32_t>(pages, options.sequences));
@@ -2903,6 +2924,17 @@ struct Executor::Impl {
         return static_cast<std::byte*>(plane) + std::size_t(rows) * std::size_t(column) * bytes;
     }
 
+    // The columns from the parts' first to the end of their last: what a mixer's steps over every
+    // column of the call take (a tensor-parallel prompt piece is a part of its own).
+    [[nodiscard]] static ColumnRun covered(std::span<const Part> parts) {
+        std::int32_t first = parts.front().column, end = first;
+        for (const Part& part : parts) {
+            first = std::min(first, part.column);
+            end   = std::max(end, part.column + part.count);
+        }
+        return {.column = first, .count = end - first};
+    }
+
     // A verification's record row of the part: its position among the verified sequences.
     [[nodiscard]] std::int32_t record_row(const Part& part) const {
         const auto at = std::find(verified.begin(), verified.end(), part.sequence);
@@ -3009,9 +3041,13 @@ struct Executor::Impl {
         project_columns(g.z, rank.mixed, p.z, parts, ws, s);
         project_columns(g.a, rank.mixed, p.a, parts, ws, s);
         project_columns(g.b, rank.mixed, p.b, parts, ws, s);
-        const auto nv = g.value_heads;
-        const Tensor ga(p.a, DType::BF16, {nv, t}), gb(p.b, DType::BF16, {nv, t});
-        Tensor gate(p.gate, DType::FP32, {nv, t}), beta(p.beta, DType::FP32, {nv, t});
+        const auto nv        = g.value_heads;
+        const ColumnRun span = covered(parts);
+        const std::size_t at = std::size_t(nv) * std::size_t(span.column);
+        const Tensor ga(columns(p.a, nv, span.column, 2), DType::BF16, {nv, span.count}),
+            gb(columns(p.b, nv, span.column, 2), DType::BF16, {nv, span.count});
+        Tensor gate(p.gate + at, DType::FP32, {nv, span.count}),
+            beta(p.beta + at, DType::FP32, {nv, span.count});
         ops::gdn_gating(ga, gb, g.a_log, g.dt_bias, gate, beta, s);
     }
 
@@ -3085,12 +3121,14 @@ struct Executor::Impl {
         const GdnPlanes p    = gdn_planes(g, rank, t);
         const auto nv        = g.value_heads;
         const auto dh = static_cast<std::int32_t>(config.linear_value_head_dim);
-        const Tensor rows_o(p.o, DType::BF16, {dh, nv * t});
-        const Tensor rows_z(p.z, DType::BF16, {dh, nv * t});
-        Tensor gated_rows(p.gated, DType::BF16, {dh, nv * t});
+        const auto vd = nv * dh;
+        const ColumnRun span = covered(parts);
+        const Tensor rows_o(columns(p.o, vd, span.column, 2), DType::BF16, {dh, nv * span.count});
+        const Tensor rows_z(columns(p.z, vd, span.column, 2), DType::BF16, {dh, nv * span.count});
+        Tensor gated_rows(columns(p.gated, vd, span.column, 2), DType::BF16,
+                          {dh, nv * span.count});
         ops::gated_rmsnorm(rows_o, g.norm, rows_z, ops::GateActivation::Sigmoid,
                            config.rms_norm_eps, gated_rows, s);
-        const auto vd = nv * dh;
         for (const ColumnRun& group : projection_groups(parts, gguf_only(g.output))) {
             const Tensor gated(columns(p.gated, vd, group.column, 2), DType::BF16,
                                {vd, group.count});
@@ -3202,9 +3240,12 @@ struct Executor::Impl {
         project_columns(a.key, rank.mixed, p.k, parts, ws, s);
         project_columns(a.value, rank.mixed, p.v, parts, ws, s);
         project_columns(a.index, rank.mixed, p.index, parts, ws, s);
-        Tensor q3(p.q, DType::BF16, {d, nq, t}), k3(p.k, DType::BF16, {d, nk, t});
-        Tensor qo(p.qo, DType::BF16, {d, nq, t});
-        Tensor ko(p.ko, DType::BF16, {d, nk, t});
+        // The parts' columns; a media prompt's three-axis positions hold every column of the pass.
+        const ColumnRun span = mrope ? ColumnRun{.column = 0, .count = t} : covered(parts);
+        Tensor q3(columns(p.q, d * nq, span.column, 2), DType::BF16, {d, nq, span.count});
+        Tensor k3(columns(p.k, d * nk, span.column, 2), DType::BF16, {d, nk, span.count});
+        Tensor qo(columns(p.qo, d * nq, span.column, 2), DType::BF16, {d, nq, span.count});
+        Tensor ko(columns(p.ko, d * nk, span.column, 2), DType::BF16, {d, nk, span.count});
         const ops::RopeYarn& yarn = options.rope_yarn;
         // A tensor-parallel share of the heads leaves the fused norm and rotation's head counts.
         const bool share = nk != static_cast<std::int32_t>(config.num_key_value_heads);
@@ -3214,7 +3255,8 @@ struct Executor::Impl {
             // too: the fused norm and rotation fixes the unscaled one, so the rotation is its own
             // Op, one tensor at a time (its YaRN forms cover 24 query and 2 key heads that way).
             const Tensor axes(rank.mrope, DType::I32, {t, 3});
-            const Tensor line(const_cast<std::int32_t*>(rope), DType::I32, {t});
+            const Tensor line(const_cast<std::int32_t*>(rope) + span.column, DType::I32,
+                              {span.count});
             const int rotary = static_cast<int>(float(d) * config.partial_rotary_factor);
             ops::rmsnorm(q3, a.query_norm, config.rms_norm_eps, true, qo, s);
             ops::rmsnorm(k3, a.key_norm, config.rms_norm_eps, true, ko, s);
@@ -3225,7 +3267,8 @@ struct Executor::Impl {
                 ops::rope(mrope ? axes : line, rotary, config.rope_theta, qo, ko, s);
             }
         } else {
-            const Tensor line(const_cast<std::int32_t*>(rope), DType::I32, {t});
+            const Tensor line(const_cast<std::int32_t*>(rope) + span.column, DType::I32,
+                              {span.count});
             ops::rmsnorm_rope(line, a.query_norm, a.key_norm, q3, k3, qo, ko, s);
         }
     }
@@ -3312,8 +3355,9 @@ struct Executor::Impl {
         const cudaStream_t s = rank.stream;
         const QsaPlanes p    = qsa_planes(a, rank, t, nullptr);
         const auto width     = static_cast<std::int32_t>(config.head_dim) * query_heads(a);
-        const Tensor gate(p.gate, DType::BF16, {width, t});
-        Tensor flat(p.attention, DType::BF16, {width, t});
+        const ColumnRun span = covered(parts);
+        const Tensor gate(columns(p.gate, width, span.column, 2), DType::BF16, {width, span.count});
+        Tensor flat(columns(p.attention, width, span.column, 2), DType::BF16, {width, span.count});
         ops::sigmoid_mul(gate, flat, s);
         for (const ColumnRun& group : projection_groups(parts, gguf_only(a.output))) {
             const Tensor in(columns(p.attention, width, group.column, 2), DType::BF16,
@@ -3842,6 +3886,10 @@ struct Executor::Impl {
     // so a captured segment spans every rank.
     void run_tensor_segment(std::span<const Part> parts, const Segment& segment, std::int32_t t,
                             std::uint32_t logit_rows) {
+        if (const std::vector<ColumnRun> pieces = tensor_pieces(parts, t); !pieces.empty()) {
+            run_tensor_pieces(parts.front(), segment, t, logit_rows, pieces);
+            return;
+        }
         const auto h                     = static_cast<std::int32_t>(config.hidden_size);
         const auto hc                    = static_cast<std::int32_t>(config.hc_count);
         const std::size_t n              = this->parts();
@@ -3969,7 +4017,8 @@ struct Executor::Impl {
             }
             exchange_step(n, TensorParallelSum::StoreFp32,
                           [&](std::size_t r, RankState& rank, float* partial) {
-                              run_moe_share(plan_of(r, i), rank, t, i, partial);
+                              run_moe_share(plan_of(r, i), rank, i, partial,
+                                            ColumnRun{.column = 0, .count = t});
                           });
             pending = true;
             if (taps(i)) {
@@ -4007,33 +4056,276 @@ struct Executor::Impl {
         }
     }
 
-    // A rank's share of a layer's experts under tensor parallelism. Every rank routes the whole
-    // call itself from the same MoE input, runs the routed pairs of its experts and its run of the
-    // shared expert into a 2^-32 fixed-point part, and stores the part in its FP32 `partial`.
-    void run_moe_share(const LayerPlan& plan, RankState& rank, std::int32_t t, std::size_t index,
-                       float* partial) {
+    // The pieces of a tensor-parallel pass over one prompt chunk of `t` columns: kTensorPieceColumns
+    // each from the chunk's first column, the last one the rest. None for a chunk no wider than one
+    // piece, BF16 or 8-bit prompt partials (no mixer_out plane), several parts, a verification, a
+    // branch pass or a media prompt (whose three-axis positions hold the whole chunk).
+    [[nodiscard]] std::vector<ColumnRun> tensor_pieces(std::span<const Part> parts,
+                                                       std::int32_t t) const {
+        if (parts.size() != 1 || verifying || branch_origin != nullptr ||
+            branch_capture != nullptr || mrope || ranks.front().mixer_out == nullptr ||
+            t <= kTensorPieceColumns) {
+            return {};
+        }
+        std::vector<ColumnRun> pieces;
+        for (std::int32_t column = 0; column < t; column += kTensorPieceColumns) {
+            pieces.push_back(
+                {.column = column, .count = std::min(kTensorPieceColumns, t - column)});
+        }
+        return pieces;
+    }
+
+    // run_tensor_segment over one prompt chunk in `pieces` (tensor_pieces): each exchange crosses a
+    // piece at a time on the ranks' side streams while their compute streams run the next piece
+    // (Pieces in core/tensor_parallel.h), and a rank's next step on a piece first takes back that
+    // piece's exchange. A piece runs as a prompt chunk of its own columns does: its mixers carry the
+    // Gated DeltaNet, convolution and indexer states and the PLE history on to the next piece, its
+    // sparse attention reads the keys up to its own last position, and its experts route and run its
+    // own tokens; so the chunk gives what chunks of the pieces' widths give. The mixer's exchange
+    // stores into rank.mixer_out, the experts' into rank.y, which a later piece's mixer output
+    // there would overlap.
+    void run_tensor_pieces(const Part& whole, const Segment& segment, std::int32_t t,
+                           std::uint32_t logit_rows, std::span<const ColumnRun> pieces) {
+        const auto h                     = static_cast<std::int32_t>(config.hidden_size);
+        const auto hc                    = static_cast<std::int32_t>(config.hc_count);
+        const std::size_t n              = this->parts();
+        TensorParallelExchange& exchange = *tensor_exchange;
+        const auto on = [&](std::size_t r, const auto& f) {
+            RankBinding bind(device, r);
+            f(ranks[r]);
+        };
+        std::vector<Part> parts;
+        for (const ColumnRun& run : pieces) {
+            parts.push_back(Part{.sequence = whole.sequence,
+                                 .column   = run.column,
+                                 .count    = run.count,
+                                 .offset   = whole.offset + std::uint32_t(run.column)});
+        }
+        const auto stack_of = [&](RankState& rank, const ColumnRun& run) {
+            return Tensor(rank.stack + std::size_t(hc) * std::size_t(h) * std::size_t(run.column),
+                          DType::FP32, {h, hc, run.count});
+        };
+        const auto mixed_of = [&](RankState& rank, const ColumnRun& run) {
+            return Tensor(columns(rank.mixed, h, run.column, 2), DType::BF16, {h, run.count});
+        };
+        const auto inject_of = [&](RankState& rank, const ColumnRun& run) {
+            return Tensor(rank.inject + std::size_t(hc) * std::size_t(run.column), DType::FP32,
+                          {hc, run.count});
+        };
+        const auto moe_out_of = [&](RankState& rank, const ColumnRun& run) {
+            return Tensor(static_cast<float*>(rank.y) + std::size_t(h) * std::size_t(run.column),
+                          DType::FP32, {h, run.count});
+        };
+        const auto mixer_out_of = [&](RankState& rank, const ColumnRun& run) {
+            return Tensor(columns(rank.mixer_out, h, run.column, 2), DType::BF16, {h, run.count});
+        };
+        on(0, [&](RankState& rank) { CUDA_CHECK(cudaEventRecord(rank.fork, rank.stream)); });
+        for (std::size_t r = 1; r < n; ++r) {
+            on(r, [&](RankState& rank) {
+                CUDA_CHECK(cudaStreamWaitEvent(rank.stream, ranks[0].fork, 0));
+            });
+        }
+        // Whether the pieces' last exchanges may still be crossing.
+        bool crossing        = false;
+        const auto take_back = [&](std::size_t r, RankState& rank, std::size_t p) {
+            if (crossing) {
+                CUDA_CHECK(cudaStreamWaitEvent(rank.stream, exchange.piece_done(r, p), 0));
+            }
+        };
+        // One exchange in pieces: every rank takes back piece p's last exchange and runs
+        // `compute(r, rank, p, partial)`, ranks [0, contributors) their share into `partial`, then
+        // hands the piece to its side stream, which publishes, reduces and completes it into the
+        // piece's columns of `out(rank, run)`, the output plane.
+        const TensorParallelPartials partials =
+            prompt_pass ? options.tensor_parallel_prompt_partials : TensorParallelPartials::Fp32;
+        const auto piece_step = [&](std::size_t contributors, TensorParallelSum sum,
+                                    const auto& out, const auto& compute) {
+            const std::size_t slot = exchange_next;
+            exchange_next ^= 1U;
+            for (std::size_t p = 0; p < pieces.size(); ++p) {
+                const ColumnRun& run      = pieces[p];
+                const std::int64_t values = std::int64_t(h) * run.count;
+                const TensorParallelPiece fence{.index  = p,
+                                                .offset = std::int64_t(h) * run.column};
+                for (std::size_t r = 0; r < n; ++r) {
+                    on(r, [&](RankState& rank) {
+                        take_back(r, rank, p);
+                        const bool contributes = r < contributors;
+                        compute(r, rank, p, contributes ? exchange.partial(r, slot) : nullptr);
+                        const cudaStream_t side = exchange.side_stream(r);
+                        CUDA_CHECK(cudaEventRecord(exchange.piece_ready(r, p), rank.stream));
+                        CUDA_CHECK(cudaStreamWaitEvent(side, exchange.piece_ready(r, p), 0));
+                        exchange.publish(r, slot, contributes ? std::size_t(values) * 4 : 0,
+                                         out(rank, run), side, sum, fence, partials);
+                    });
+                }
+                for (std::size_t r = 0; r < n; ++r) {
+                    on(r, [&](RankState& rank) {
+                        exchange.reduce(r, slot, out(rank, run), values, contributors,
+                                        exchange.side_stream(r), sum, fence, partials);
+                    });
+                }
+                for (std::size_t r = 0; r < n; ++r) {
+                    on(r, [&](RankState& rank) {
+                        const cudaStream_t side = exchange.side_stream(r);
+                        exchange.complete(r, slot, out(rank, run), values, side, sum, fence,
+                                          partials);
+                        CUDA_CHECK(cudaEventRecord(exchange.piece_done(r, p), side));
+                    });
+                }
+            }
+            crossing = true;
+        };
+        const auto mixer_plane = [&](RankState& rank, const ColumnRun& run) -> void* {
+            return mixer_out_of(rank, run).data;
+        };
+        const auto moe_plane = [&](RankState& rank, const ColumnRun& run) -> void* {
+            return moe_out_of(rank, run).data;
+        };
+        if (segment.embed) {
+            for (std::size_t r = 0; r < n; ++r) {
+                on(r, [&](RankState& rank) {
+                    Tensor mixed(rank.mixed, DType::BF16, {h, t});
+                    Tensor stack(rank.stack, DType::FP32, {h, hc, t});
+                    embed(rank, t, mixed);
+                    ops::hyper_connection_expand(mixed, stack, rank.stream);
+                });
+            }
+        }
+        // Every piece's experts' output, which the next layer's read writes into its stack unless
+        // the PLE comes between.
+        bool pending = false;
+        for (std::size_t i = segment.begin; i < segment.end; ++i) {
+            // Every rank runs its key heads of a Gated DeltaNet layer; the ranks holding KV heads
+            // of a sparse-attention layer run those.
+            const std::size_t mixers = layers[i].gdn ? n : model.attention_ranks();
+            piece_step(
+                mixers, TensorParallelSum::StoreBf16, mixer_plane,
+                [&](std::size_t r, RankState& rank, std::size_t p, float* partial) {
+                    const ColumnRun& run  = pieces[p];
+                    const LayerPlan& plan = plan_of(r, i);
+                    Tensor stack          = stack_of(rank, run);
+                    Tensor mixed          = mixed_of(rank, run);
+                    Tensor inject         = inject_of(rank, run);
+                    bool write_read       = pending;
+                    if (plan.ple) {
+                        if (pending) {
+                            ops::hyper_connection_write(stack, moe_out_of(rank, run), inject,
+                                                        rank.stream);
+                        }
+                        write_read = false;
+                        run_ple(plan, state_of(*whole.sequence, r, i), rank, parts[p]);
+                    }
+                    {
+                        auto scope = rank.workspace->scope();
+                        if (write_read) {
+                            ops::hyper_connection_write_read(
+                                stack, moe_out_of(rank, run), inject, plan.attn_hc.weights(),
+                                config.rms_norm_eps, *rank.workspace, mixed, &inject, rank.stream);
+                        } else {
+                            ops::hyper_connection_read(stack, plan.attn_hc.weights(),
+                                                       config.rms_norm_eps, *rank.workspace, mixed,
+                                                       &inject, rank.stream);
+                        }
+                    }
+                    if (partial == nullptr) { return; }
+                    run_mixer(plan, i, rank, std::span<const Part>(&parts[p], 1), t,
+                              state_slot(i, r),
+                              [&](const Part& part) -> LayerState& {
+                                  return state_of(*part.sequence, r, i);
+                              },
+                              partial);
+                });
+            piece_step(n, TensorParallelSum::StoreFp32, moe_plane,
+                       [&](std::size_t r, RankState& rank, std::size_t p, float* partial) {
+                           const ColumnRun& run = pieces[p];
+                           Tensor stack         = stack_of(rank, run);
+                           Tensor mixed         = mixed_of(rank, run);
+                           Tensor inject        = inject_of(rank, run);
+                           {
+                               auto scope = rank.workspace->scope();
+                               ops::hyper_connection_write_read(
+                                   stack, mixer_out_of(rank, run), inject,
+                                   plan_of(r, i).mlp_hc.weights(), config.rms_norm_eps,
+                                   *rank.workspace, mixed, &inject, rank.stream);
+                           }
+                           run_moe_share(plan_of(r, i), rank, i, partial, run);
+                       });
+            pending = true;
+            if (taps(i)) {
+                // Every replica completes its stack; rank 0, the head rank, keeps the features.
+                for (std::size_t p = 0; p < pieces.size(); ++p) {
+                    for (std::size_t r = 0; r < n; ++r) {
+                        on(r, [&](RankState& rank) {
+                            take_back(r, rank, p);
+                            Tensor stack  = stack_of(rank, pieces[p]);
+                            Tensor inject = inject_of(rank, pieces[p]);
+                            ops::hyper_connection_write(stack, moe_out_of(rank, pieces[p]), inject,
+                                                        rank.stream);
+                        });
+                    }
+                }
+                pending = false;
+                on(0, [&](RankState& rank) { capture_tap(rank, rank.stack, i); });
+            }
+        }
+        // Each compute stream takes its pieces' last exchanges back before the segment ends.
+        for (std::size_t p = 0; p < pieces.size(); ++p) {
+            for (std::size_t r = 0; r < n; ++r) {
+                on(r, [&](RankState& rank) {
+                    take_back(r, rank, p);
+                    if (!pending) { return; }
+                    Tensor stack  = stack_of(rank, pieces[p]);
+                    Tensor inject = inject_of(rank, pieces[p]);
+                    ops::hyper_connection_write(stack, moe_out_of(rank, pieces[p]), inject,
+                                                rank.stream);
+                });
+            }
+        }
+        const std::span<const Part> chunk(&whole, 1);
+        if (segment.head && prompt_pass && logit_rows > std::uint32_t(head_columns)) {
+            on(0, [&](RankState& rank) { run_whole_head(chunk, rank, t, logit_rows); });
+        } else if (segment.head) {
+            run_divided_head(chunk, t, logit_rows);
+        }
+        for (std::size_t r = 1; r < n; ++r) {
+            on(r, [&](RankState& rank) { CUDA_CHECK(cudaEventRecord(rank.join, rank.stream)); });
+            on(0, [&](RankState& rank) {
+                CUDA_CHECK(cudaStreamWaitEvent(rank.stream, ranks[r].join, 0));
+            });
+        }
+    }
+
+    // A rank's share of a layer's experts under tensor parallelism, for the pass's columns `run`
+    // (every column, or a prompt piece's). Every rank routes the call itself from the same MoE
+    // input, runs the routed pairs of its experts and its run of the shared expert into a 2^-32
+    // fixed-point part, and stores the part in those columns of its FP32 `partial` [hidden, t].
+    void run_moe_share(const LayerPlan& plan, RankState& rank, std::size_t index, float* partial,
+                       const ColumnRun& run) {
         const MoePlan& m     = plan.moe;
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
         const auto h         = static_cast<std::int32_t>(config.hidden_size);
         const auto top       = static_cast<std::int32_t>(config.num_experts_per_tok);
         const bool first     = rank.rank == 0;
-        const Tensor mixed(rank.mixed, DType::BF16, {h, t});
+        const std::int32_t n = run.count;
+        const Tensor mixed(columns(rank.mixed, h, run.column, 2), DType::BF16, {h, n});
         // Rank 0's routes are the ones the route records keep.
-        Tensor ids(first ? route_records[index] : static_cast<void*>(rank.route_ids), DType::I32,
-                   {top, t});
-        Tensor weights(rank.route_weights, DType::FP32, {top, t});
-        Tensor shared(rank.route_shared, DType::FP32, {t});
+        Tensor ids(columns(first ? route_records[index] : static_cast<void*>(rank.route_ids), top,
+                           run.column, 4),
+                   DType::I32, {top, n});
+        Tensor weights(columns(rank.route_weights, top, run.column, 4), DType::FP32, {top, n});
+        Tensor shared(rank.route_shared + run.column, DType::FP32, {n});
         {
             auto scope = ws.scope();
             ops::moe_route(mixed, m.router, m.shared_gate, ws, ids, weights, shared, s);
         }
         auto scope   = ws.scope();
-        Tensor fixed = ws.alloc(DType::I64, {h, t});
+        Tensor fixed = ws.alloc(DType::I64, {h, n});
         ops::moe_experts_gguf_part(
             mixed, ids, weights, &shared, m.banks(), static_cast<std::int32_t>(m.expert_begin),
             static_cast<std::int32_t>(m.expert_end), ws, fixed, s, &rank.side);
-        Tensor y(partial, DType::FP32, {h, t});
+        Tensor y(partial + std::size_t(h) * std::size_t(run.column), DType::FP32, {h, n});
         ops::moe_experts_gguf_combine(std::span<const Tensor>(&fixed, 1), y, s);
     }
 
