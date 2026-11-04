@@ -50,6 +50,8 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
   a 58,117-token prompt prefilled 1.0-1.3% faster on an RTX 3090 with the same tokens.
   DeepSeek-V4.1 with host experts divided over several GPUs runs prompts in [spans](docs/deepseek-v41.md#prompt-spans) as on one GPU:
   two RTX 3090s prefilled a 9,672-token prompt 1.49 times as fast with the same tokens.
+  Flash-Next's mixers quantize each input once for all of their GGUF projections:
+  one RTX 3090 with host experts decoded 0.4-2.0% faster with DFlash2 drafts and 0.2-0.7% faster without, with the same tokens.
 - **2026-11-03:** Qwen3.5-core models speed up [tensor-parallel decode](docs/maintainer/pipeline-stages.md#tensor-parallelism)
   by splitting vocabulary heads across GPUs.
   Eligible Q4 and Q5 projection shares use the same small-T MMA routes as whole projections.
