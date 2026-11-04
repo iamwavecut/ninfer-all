@@ -63,6 +63,14 @@ enum class SnapshotKind : std::uint8_t {
     Boundary,
 };
 
+// What moved past a superseded snapshot (§9.3).
+enum class Supersession : std::uint8_t {
+    // A request that resumed from it publishes a deeper snapshot on its path.
+    Resumed,
+    // The request that captured it as a tap captures a later tap of the same prompt.
+    NextTap,
+};
+
 struct PrefixIndexConfig {
     // Upper bound of simultaneously indexed nodes. Every indexed node holds a device page bundle
     // or a host slab, so device pages + host slabs is sufficient.
@@ -154,6 +162,7 @@ struct SnapshotView {
     SnapshotKind kind  = SnapshotKind::Tap;
     std::uint32_t hits = 0;
     bool superseded    = false;
+    bool branch_point  = false;
     std::span<const TokenId> tail;
 };
 
@@ -210,15 +219,18 @@ public:
     [[nodiscard]] AdmissionChoice choose(const MatchResult& match,
                                          std::uint32_t prompt_tokens) const;
     // Records a hit on the snapshot selected for an admission. A hit on a superseded snapshot
-    // shows it still serves requests: it is retained again until its new lineage moves on.
+    // shows it still serves requests. A tap that a later tap of its own prompt superseded, hit by
+    // a request that diverged from that prompt after it (another question about the same
+    // document, an edit), is a branch point and is never superseded again. Any other superseded
+    // snapshot is retained again until its new lineage moves on.
     void note_hit(SnapshotRef snapshot);
     // A lineage that resumed from `snapshot`, or captured it as a tap, has published a deeper
     // snapshot on the same path, so its next request resumes from that one: `snapshot` now serves
     // only requests that diverge before it. Superseded snapshots are evicted before every retained
     // one, oldest supersession first, and retained snapshots are valued against their nearest
-    // retained ancestor. A Boundary snapshot is superseded only while no other conversation has
-    // continued from it (the tree below it is a single chain).
-    void supersede(SnapshotRef snapshot);
+    // retained ancestor. A branch point is never superseded, and a Boundary snapshot only while
+    // no other conversation has continued from it (the tree below it is a single chain).
+    void supersede(SnapshotRef snapshot, Supersession cause);
 
     // ---- pins -----------------------------------------------------------------------------
     // `path` is a root path (path[i] is the parent of path[i+1], path[0] a root child).
@@ -315,7 +327,7 @@ public:
                                                                   std::uint64_t extra);
     [[nodiscard]] std::optional<SnapshotRef>
     restore_host_snapshot(NodeRef anchor, std::uint32_t frontier, std::span<const TokenId> tail,
-                          SnapshotKind kind, std::uint32_t hits);
+                          SnapshotKind kind, std::uint32_t hits, bool branch_point);
 
     // ---- views
     // ------------------------------------------------------------------------------------
@@ -372,6 +384,11 @@ private:
         std::uint64_t last_hit_tick   = 0;
         bool superseded               = false;
         std::uint64_t superseded_tick = 0;
+        // Superseded by a later tap of the prompt that captured it: no request has resumed from
+        // it since, so a hit comes from a request that diverged from that prompt after it.
+        bool superseded_by_next_tap = false;
+        // Such a hit happened: requests branch here, so it is never superseded again.
+        bool branch_point = false;
         // Nearest snapshot above this one on its path (kNoId: none), whatever its state, and the
         // snapshots whose nearest one this is.
         std::uint32_t ancestor = kNoId;
@@ -421,7 +438,8 @@ private:
 
     [[nodiscard]] bool take_free_slabs(std::uint32_t count, std::vector<std::uint32_t>& out);
     // Evicts dead KV, superseded snapshots, then retained snapshots in GDSF order until `count`
-    // slabs are free, but no retained snapshot with a priority above `claim`.
+    // slabs are free, but no retained snapshot with a priority above `claim`. A snapshot still
+    // complete on the Device gives up only its Host copy.
     [[nodiscard]] bool allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
                                       std::uint32_t protect_snapshot,
                                       double claim = std::numeric_limits<double>::infinity());

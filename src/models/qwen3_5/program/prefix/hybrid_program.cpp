@@ -1393,7 +1393,7 @@ void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t f
         !index.valid(lane.resume_snapshot)) {
         return;
     }
-    index.supersede(lane.resume_snapshot);
+    index.supersede(lane.resume_snapshot, pc::Supersession::Resumed);
     lane.resume_snapshot = {};
 }
 
@@ -1403,7 +1403,7 @@ void ProgramImpl::hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t fron
         !index.valid(lane.tap_snapshot)) {
         return;
     }
-    index.supersede(lane.tap_snapshot);
+    index.supersede(lane.tap_snapshot, pc::Supersession::NextTap);
     lane.tap_snapshot = {};
 }
 

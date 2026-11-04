@@ -453,6 +453,9 @@ void test_persistence_roundtrip() {
     for (const NodeRef node : path) { backup_node(source, node); }
     const SnapshotRef backed = publish_tap(source, path[1]);
     backup_snapshot(source, backed);
+    // A branch point stays one across a restart.
+    source.supersede(backed, Supersession::NextTap);
+    source.note_hit(backed);
     const auto tail_tokens      = make_tokens(10, 41);
     const auto slot             = source.acquire_device_slot();
     const std::uint32_t tail_id = backend.allocate();
@@ -492,11 +495,14 @@ void test_persistence_roundtrip() {
     }
     for (const SnapshotRef snapshot : snapshots) {
         const SnapshotView view = source.snapshot(snapshot);
-        require(restored
-                    .restore_host_snapshot(mapped(view.anchor), view.frontier, view.tail, view.kind,
-                                           view.hits)
-                    .has_value(),
-                "a persisted snapshot did not restore");
+        const auto copy         = restored.restore_host_snapshot(
+            mapped(view.anchor), view.frontier, view.tail, view.kind, view.hits, view.branch_point);
+        require(copy.has_value(), "a persisted snapshot did not restore");
+        require(restored.snapshot(*copy).branch_point == (snapshot == backed),
+                "a restored snapshot must keep its branch point flag");
+        restored.supersede(*copy, Supersession::Resumed);
+        require(restored.snapshot(*copy).superseded == (snapshot != backed),
+                "a restored branch point must not be superseded");
     }
     restored.check_invariants();
 
@@ -605,8 +611,9 @@ void test_device_slots() {
 
 void test_supersession() {
     RecordingBackend backend;
-    // 20 slabs: a tail-less image takes 4, an image with a tail 5.
-    PrefixCacheIndex index(small_config(20, 8), backend);
+    // 20 slabs: a tail-less image takes 4, an image with a tail 5. Five Device slots, one per
+    // snapshot below.
+    PrefixCacheIndex index(small_config(20, 5), backend);
     const auto tokens = make_tokens(64 * 12 + 1, 30);
     const auto path   = insert_sequence(index, backend, tokens);
     const SnapshotRef shared =
@@ -621,16 +628,18 @@ void test_supersession() {
     const auto suffix = make_tokens(64 * 4 + 1, 31);
     other.insert(other.end(), suffix.begin(), suffix.end());
     const auto other_path = insert_sequence(index, backend, other);
-    index.supersede(shared);
+    index.supersede(shared, Supersession::Resumed);
     require(!index.snapshot(shared).superseded,
             "a boundary another conversation continued from must not be superseded");
-    index.supersede(first);
+    index.supersede(first, Supersession::Resumed);
     require(index.snapshot(first).superseded, "the resumed snapshot must be superseded");
     index.note_hit(first);
-    require(!index.snapshot(first).superseded, "a hit must retain a superseded snapshot again");
+    require(!index.snapshot(first).superseded && !index.snapshot(first).branch_point,
+            "a hit must retain a superseded snapshot again, until its new lineage moves on");
     // Hits make `first` the most valuable snapshot by GDSF; superseding it must still put it first.
     for (int hit = 0; hit < 4; ++hit) { index.note_hit(first); }
-    index.supersede(first);
+    index.supersede(first, Supersession::Resumed);
+    require(index.snapshot(first).superseded, "the new lineage moving on must supersede it again");
     index.check_invariants();
 
     // The second branch hangs below `first`, whose tail lies in a shared block.
@@ -643,11 +652,32 @@ void test_supersession() {
     require(index.stats().host_free_slabs == 1, "the Host tier must be nearly full");
     const SnapshotRef tip = publish_at(index, backend, path, tokens, 64 * 11, SnapshotKind::Tap);
     backup_snapshot(index, tip);
-    require(!index.valid(first), "the superseded snapshot must be evicted first, entirely");
+    require(index.valid(first) && index.snapshot(first).host == CopyState::Absent &&
+                index.snapshot(first).device_slot != kNoId,
+            "the superseded snapshot must give up its Host copy first, and only that while it is "
+            "complete on the Device");
     require(index.stats().superseded_evictions == 1 && index.stats().host_snapshot_evictions == 1,
             "exactly one superseded eviction");
-    require(index.valid(shared) && index.valid(second) && index.valid(branch) && index.valid(tip),
-            "retained snapshots must survive");
+    for (const SnapshotRef snapshot : {shared, second, branch, tip}) {
+        require(index.valid(snapshot) && index.snapshot(snapshot).host == CopyState::Resident,
+                "retained snapshots must keep their Host copies");
+    }
+    // A new snapshot takes the superseded owner's Device slot first, and without a Host copy the
+    // superseded snapshot is gone.
+    const auto slot = index.acquire_device_slot();
+    require(slot.has_value() && !index.valid(first),
+            "the superseded snapshot must give up its Device slot first");
+    index.release_device_slot(*slot);
+
+    // A tap that only its own prompt's next tap moved past, hit by a request that diverged from
+    // that prompt after it, is a branch point: nothing supersedes it again.
+    index.supersede(tip, Supersession::NextTap);
+    index.note_hit(tip);
+    require(index.snapshot(tip).branch_point && !index.snapshot(tip).superseded,
+            "a hit on a tap its prompt's next tap superseded must make it a branch point");
+    index.supersede(tip, Supersession::Resumed);
+    index.supersede(tip, Supersession::NextTap);
+    require(!index.snapshot(tip).superseded, "a branch point must never be superseded");
     index.release_path(path);
     index.release_path(other_path);
     index.check_invariants();
@@ -763,7 +793,7 @@ void test_unshared_boundary() {
     const auto path   = insert_sequence(index, backend, tokens);
     const SnapshotRef boundary =
         publish_at(index, backend, path, tokens, 64 * 2 + 5, SnapshotKind::Boundary);
-    index.supersede(boundary);
+    index.supersede(boundary, Supersession::Resumed);
     require(index.snapshot(boundary).superseded,
             "a boundary no other conversation shares must be superseded like any snapshot");
     index.note_hit(boundary);
@@ -796,7 +826,7 @@ void test_lineage_under_pressure() {
         index.note_hit(resume);
         const SnapshotRef tip =
             publish_at(index, backend, path, tokens, frontier, SnapshotKind::Endpoint);
-        index.supersede(resume);
+        index.supersede(resume, Supersession::Resumed);
         backup_snapshot(index, tip);
         // Other traffic writes to the Host tier before this conversation's next turn arrives (a
         // short new conversation here): that allocation used to evict the newest endpoint.
@@ -818,6 +848,98 @@ void test_lineage_under_pressure() {
     require(index.stats().superseded_evictions >= 6, "superseded endpoints must make the room");
     index.release_path(path);
     index.check_invariants();
+}
+
+// Questions about one long document (issue #222): every request sends the document with a
+// different short question, one request at a time. The first request's deepest ladder tap serves
+// every later question; each question's own tap holds the question in its tail and serves nobody
+// else. The tap must survive the first request's block write-through into a Host tier too small
+// for its blocks, and then stay a branch point however many questions resume from it.
+void test_questions_about_one_document() {
+    RecordingBackend backend;
+    // 20 slabs hold four tail-less images and one with a tail (21) only after one is evicted, and
+    // the 14 blocks need more than is left. Three Device slots: two lanes and one more, as with a
+    // Host tier.
+    PrefixCacheIndex index(small_config(20, 3), backend);
+    const auto document                     = make_tokens(64 * 14 + 10, 70);
+    const std::vector<std::uint32_t> ladder = {64 * 4, 64 * 8, 64 * 10, 64 * 12};
+    const std::uint32_t question_tap        = 64 * 14 + 20;
+    std::vector<SnapshotRef> first_taps;
+    // One request as the hybrid program serves it: resume from the chosen snapshot, capture the
+    // planned taps past it (each superseding the snapshot it resumed from and the lane's previous
+    // tap), write each image through to the Host tier when it fits, then at release the lane's
+    // blocks, and unpin its path. Returns the tokens reused.
+    const auto serve = [&](std::uint32_t question) {
+        auto prompt      = document;
+        const auto words = make_tokens(30, 1000 + question);
+        prompt.insert(prompt.end(), words.begin(), words.end());
+        const auto hashes            = block_lookup_hashes(prompt, {});
+        const auto n                 = static_cast<std::uint32_t>(prompt.size());
+        const MatchResult match      = index.match(prompt, hashes, {}, n);
+        const AdmissionChoice choice = index.choose(match, n);
+        SnapshotRef resume;
+        std::uint32_t reused = 0;
+        if (choice.candidate) {
+            resume = match.candidates[*choice.candidate].snapshot;
+            reused = match.candidates[*choice.candidate].frontier;
+            index.note_hit(resume);
+        }
+        const auto path = insert_sequence(index, backend, prompt);
+        SnapshotRef previous;
+        std::uint32_t base                   = reused;
+        std::vector<std::uint32_t> frontiers = ladder;
+        frontiers.push_back(question_tap);
+        for (const std::uint32_t frontier : frontiers) {
+            if (frontier <= reused) { continue; }
+            if (resume.valid()) {
+                index.supersede(resume, Supersession::Resumed);
+                resume = {};
+            }
+            if (previous.valid()) { index.supersede(previous, Supersession::NextTap); }
+            const std::uint32_t tail = frontier % kBlockTokens;
+            const auto slot =
+                index.acquire_device_slot(index.estimate_priority(base, frontier, tail != 0));
+            if (!slot) { continue; }
+            std::optional<std::uint32_t> tail_id;
+            if (tail != 0) { tail_id = backend.allocate(); }
+            const PublishResult published = index.publish_snapshot(
+                path[frontier / kBlockTokens - 1], frontier,
+                std::span<const TokenId>(prompt.data() + frontier - tail, tail), tail_id, *slot,
+                SnapshotKind::Tap);
+            require(published.created, "a tap of a new question must be new");
+            index.pin_snapshot(published.snapshot);
+            if (index.begin_snapshot_host_fill(published.snapshot)) {
+                index.complete_snapshot_host_fill(published.snapshot);
+            }
+            index.unpin_snapshot(published.snapshot);
+            if (question == 0) { first_taps.push_back(published.snapshot); }
+            previous = published.snapshot;
+            base     = frontier;
+        }
+        for (const NodeRef node : path) {
+            if (index.node(node).host != CopyState::Absent) { continue; }
+            index.pin_node(node);
+            const bool written = index.begin_host_fill(node).has_value();
+            if (written) { index.complete_host_fill(node); }
+            index.unpin_node(node);
+            if (!written) { break; }
+        }
+        index.release_path(path);
+        index.check_invariants();
+        return reused;
+    };
+    require(serve(0) == 0, "the first question has nothing to resume from");
+    require(index.stats().host_free_slabs < 4, "the blocks must fill the Host tier");
+    require(!index.valid(first_taps[0]) && !index.valid(first_taps[1]),
+            "superseded taps without a Device copy must make the room");
+    require(index.valid(first_taps[3]) && index.snapshot(first_taps[3]).device_slot != kNoId,
+            "the deepest ladder tap keeps its Device copy");
+    for (std::uint32_t question = 1; question <= 8; ++question) {
+        require(serve(question) == 64 * 12,
+                "question " + std::to_string(question) + " must resume from the ladder tap");
+        require(!index.snapshot(first_taps[3]).superseded,
+                "a tap that later questions resume from must stay retained");
+    }
 }
 
 void test_image_only_host_tier() {
@@ -1070,7 +1192,8 @@ void test_random_stress() {
                     published_snapshots[rng() % published_snapshots.size()];
                 if (index.valid(snapshot)) {
                     if (rng() % 2U) {
-                        index.supersede(snapshot);
+                        index.supersede(snapshot,
+                                        rng() % 2U ? Supersession::Resumed : Supersession::NextTap);
                     } else {
                         index.note_hit(snapshot);
                     }
@@ -1278,6 +1401,7 @@ int main() {
         test_device_slots();
         test_supersession();
         test_lineage_under_pressure();
+        test_questions_about_one_document();
         test_unbacked_slot_values();
         test_refusals_age_owners();
         test_host_write_admission();

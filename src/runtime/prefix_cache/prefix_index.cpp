@@ -234,9 +234,14 @@ void PrefixCacheIndex::note_hit(SnapshotRef snapshot) {
         update_priority(snapshot.index);
         return;
     }
-    // Resumed from again (a retry, or a second branch): retained until this lineage moves on.
-    entry.superseded      = false;
-    entry.superseded_tick = 0;
+    // A tap that only its own prompt's next tap moved past is resumed from by a request that
+    // diverged from that prompt after it: requests branch here, and each branch would supersede
+    // it again. Anything else resumed from again (a retry, or a second branch) is retained until
+    // this lineage moves on.
+    entry.branch_point           = entry.superseded_by_next_tap;
+    entry.superseded             = false;
+    entry.superseded_tick        = 0;
+    entry.superseded_by_next_tap = false;
     adjust_retained(entry.anchor, +1);
     std::vector<std::uint32_t> dependents;
     collect_retained_dependents(snapshot.index, dependents);
@@ -264,17 +269,19 @@ bool PrefixCacheIndex::shared_below(const Snapshot& snapshot) const noexcept {
     return false;
 }
 
-void PrefixCacheIndex::supersede(SnapshotRef snapshot) {
+void PrefixCacheIndex::supersede(SnapshotRef snapshot, Supersession cause) {
     Snapshot& entry = require(snapshot);
     // A boundary serves the conversations that share it, so it is superseded only while the tree
     // shows no other conversation below it: until then it is just this lineage's snapshot.
-    if (entry.superseded || (entry.kind == SnapshotKind::Boundary && shared_below(entry))) {
+    if (entry.superseded || entry.branch_point ||
+        (entry.kind == SnapshotKind::Boundary && shared_below(entry))) {
         return;
     }
     std::vector<std::uint32_t> dependents;
     collect_retained_dependents(snapshot.index, dependents);
-    entry.superseded      = true;
-    entry.superseded_tick = ++tick_;
+    entry.superseded             = true;
+    entry.superseded_tick        = ++tick_;
+    entry.superseded_by_next_tap = cause == Supersession::NextTap;
     adjust_retained(entry.anchor, -1);
     // Its retained dependents now value what lies between them and the retained ancestor above.
     revalue_around(snapshot.index, dependents);
@@ -676,26 +683,28 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
         const std::uint32_t victim = pick_victim(true, protect_snapshot);
         if (victim == kNoId) { return false; }
         Snapshot& chosen = snapshots_[victim];
-        // A retained snapshot only yields its slabs to something worth at least as much: GDSF
-        // never inserts what it would evict next. Time still advances as if it had inserted and
-        // evicted the claimant; otherwise a tier full of once-hit snapshots refuses every new one
-        // for good, since nothing is ever evicted to raise L.
-        if (!chosen.superseded && chosen.priority > claim) {
-            if (std::isfinite(claim)) { inflation_ = std::max(inflation_, claim); }
-            return false;
-        }
         if (chosen.superseded) {
-            // Only requests diverging before its lineage's newer snapshot could use it: both
-            // copies go, and GDSF time does not advance.
-            remove_snapshot(victim);
+            // Only requests diverging before its lineage's newer snapshot could use it: it goes
+            // first, and GDSF time does not advance.
             ++counters_.superseded_evictions;
-            ++counters_.host_snapshot_evictions;
-            continue;
+        } else {
+            // A retained snapshot only yields its slabs to something worth at least as much: GDSF
+            // never inserts what it would evict next. Time still advances as if it had inserted
+            // and evicted the claimant; otherwise a tier full of once-hit snapshots refuses every
+            // new one for good, since nothing is ever evicted to raise L.
+            if (chosen.priority > claim) {
+                if (std::isfinite(claim)) { inflation_ = std::max(inflation_, claim); }
+                return false;
+            }
+            inflation_ = std::max(inflation_, chosen.priority);
         }
-        inflation_ = std::max(inflation_, chosen.priority);
         if (chosen.device_slot != kNoId &&
             (chosen.tail_len == 0 || chosen.tail_device_copy == CopyState::Resident)) {
-            // Still complete on the Device: only its host copy yields its slabs.
+            // Still complete on the Device: only its host copy yields its slabs, and the Device
+            // tier reclaims its slot on its own terms, superseded owners first. So a lane writing
+            // its blocks through to a small Host tier keeps the superseded taps of its prompt that
+            // a request diverging after them (the next question about the same document) resumes
+            // from.
             for (const std::uint32_t slab : chosen.host_slabs) { free_slab(slab); }
             chosen.host_slabs.clear();
             chosen.host = CopyState::Absent;
@@ -957,14 +966,16 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
     snapshot.tail_device_copy = tail.empty() ? CopyState::Absent : CopyState::Resident;
     snapshot.device_slot      = device_slot;
     snapshot.host_slabs.clear();
-    snapshot.host            = CopyState::Absent;
-    snapshot.pins            = 0;
-    snapshot.kind            = kind;
-    snapshot.hits            = 0;
-    snapshot.last_hit_tick   = ++tick_;
-    snapshot.priority_base   = inflation_;
-    snapshot.superseded      = false;
-    snapshot.superseded_tick = 0;
+    snapshot.host                   = CopyState::Absent;
+    snapshot.pins                   = 0;
+    snapshot.kind                   = kind;
+    snapshot.hits                   = 0;
+    snapshot.last_hit_tick          = ++tick_;
+    snapshot.priority_base          = inflation_;
+    snapshot.superseded             = false;
+    snapshot.superseded_tick        = 0;
+    snapshot.superseded_by_next_tap = false;
+    snapshot.branch_point           = false;
     set_slot(device_slot, SlotState::Owned);
     slot_owner_[device_slot] = index;
     anchored.push_back(index);
@@ -1170,8 +1181,10 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
         adjust_retained(snapshot.anchor, -1);
     }
     unlink_snapshot(index);
-    snapshot.superseded      = false;
-    snapshot.superseded_tick = 0;
+    snapshot.superseded             = false;
+    snapshot.superseded_tick        = 0;
+    snapshot.superseded_by_next_tap = false;
+    snapshot.branch_point           = false;
     backend_->release_snapshot(ref_of_snapshot(index));
     std::vector<std::uint32_t>& anchored =
         snapshot.anchor != kNoId ? nodes_[snapshot.anchor].snapshots : root_snapshots_;
@@ -1286,6 +1299,7 @@ SnapshotView PrefixCacheIndex::snapshot(SnapshotRef ref) const {
     view.kind             = snapshot.kind;
     view.hits             = snapshot.hits;
     view.superseded       = snapshot.superseded;
+    view.branch_point     = snapshot.branch_point;
     view.tail             = std::span<const TokenId>(snapshot.tail.data(), snapshot.tail_len);
     return view;
 }
@@ -1386,11 +1400,10 @@ std::optional<RestoredBlock> PrefixCacheIndex::restore_host_block(NodeRef parent
     return RestoredBlock{ref_of_node(index), slab.front()};
 }
 
-std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef anchor,
-                                                                   std::uint32_t frontier,
-                                                                   std::span<const TokenId> tail,
-                                                                   SnapshotKind kind,
-                                                                   std::uint32_t hits) {
+std::optional<SnapshotRef>
+PrefixCacheIndex::restore_host_snapshot(NodeRef anchor, std::uint32_t frontier,
+                                        std::span<const TokenId> tail, SnapshotKind kind,
+                                        std::uint32_t hits, bool branch_point) {
     if (!config_.host_blocks || tail.size() >= kBlockTokens) {
         throw std::invalid_argument("prefix cache restored snapshot is inconsistent");
     }
@@ -1423,18 +1436,20 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
     snapshot.frontier  = frontier;
     snapshot.tail_len  = static_cast<std::uint32_t>(tail.size());
     std::copy(tail.begin(), tail.end(), snapshot.tail.begin());
-    snapshot.tail_device      = kNoId;
-    snapshot.tail_device_copy = CopyState::Absent;
-    snapshot.device_slot      = kNoId;
-    snapshot.host_slabs       = std::move(slabs);
-    snapshot.host             = CopyState::Resident;
-    snapshot.pins             = 0;
-    snapshot.kind             = kind;
-    snapshot.hits             = hits;
-    snapshot.last_hit_tick    = ++tick_;
-    snapshot.priority_base    = inflation_;
-    snapshot.superseded       = false;
-    snapshot.superseded_tick  = 0;
+    snapshot.tail_device            = kNoId;
+    snapshot.tail_device_copy       = CopyState::Absent;
+    snapshot.device_slot            = kNoId;
+    snapshot.host_slabs             = std::move(slabs);
+    snapshot.host                   = CopyState::Resident;
+    snapshot.pins                   = 0;
+    snapshot.kind                   = kind;
+    snapshot.hits                   = hits;
+    snapshot.last_hit_tick          = ++tick_;
+    snapshot.priority_base          = inflation_;
+    snapshot.superseded             = false;
+    snapshot.superseded_tick        = 0;
+    snapshot.superseded_by_next_tap = false;
+    snapshot.branch_point           = branch_point;
     anchored.push_back(index);
     ++snapshot_count_;
     if (anchor.valid()) {
@@ -1595,6 +1610,12 @@ void PrefixCacheIndex::check_invariants() const {
         if (!snapshot.occupied) { continue; }
         ++occupied_snapshots;
         if (!snapshot_valid(snapshot)) { invariant("indexed snapshot is not valid"); }
+        if (snapshot.branch_point && snapshot.superseded) {
+            invariant("a branch point snapshot is superseded");
+        }
+        if (snapshot.superseded_by_next_tap && !snapshot.superseded) {
+            invariant("a retained snapshot records a supersession");
+        }
         for (std::uint32_t current = snapshot.anchor; current != kNoId;
              current               = nodes_[current].parent) {
             ++live[current];
