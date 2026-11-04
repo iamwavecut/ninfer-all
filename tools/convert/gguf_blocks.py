@@ -227,13 +227,19 @@ def quantize_q8_0(values: np.ndarray) -> np.ndarray:
 
 
 def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Tensor:
-    blocks = gguf.read_blocks(tensor, first, last)
+    return _dequantize_rows(gguf, tensor, gguf.read_blocks(tensor, first, last))
+
+
+def _dequantize_rows(gguf: GGUFFile, tensor: str, blocks: np.ndarray) -> torch.Tensor:
+    """Values of encoded rows ``blocks`` (``uint8 [rows, row bytes]``) of a stored block matrix."""
+
+    rows = blocks.shape[0]
     local = {GGML_Q2_0: dequantize_q2_0, GGML_Q8_0: dequantize_q8_0}.get(
         gguf.info(tensor).type_id
     )
     if local is not None:
         values = local(blocks)
-        return torch.from_numpy(np.ascontiguousarray(values)).reshape(last - first, -1)
+        return torch.from_numpy(np.ascontiguousarray(values)).reshape(rows, -1)
     try:
         from gguf import GGMLQuantizationType
         from gguf.quants import dequantize
@@ -244,9 +250,7 @@ def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Ten
         ) from error
     kind = GGMLQuantizationType(gguf.info(tensor).type_id)
     values = dequantize(np.ascontiguousarray(blocks), kind)
-    return torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)).reshape(
-        last - first, -1
-    )
+    return torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)).reshape(rows, -1)
 
 
 def block_source(
@@ -276,20 +280,11 @@ def block_source(
         logical = torch.from_numpy(np.argsort(columns))
 
     def encoded(begin: int, end: int) -> EncodedRows:
-        index = select(begin, end)
-        low, high = int(index.min()), int(index.max()) + 1
-        blocks = gguf.read_blocks(tensor, low, high)
-        return EncodedRows(
-            format,
-            torch.from_numpy(np.ascontiguousarray(blocks[index - low])),
-            empty,
-            input_columns=gather,
-        )
+        blocks = gguf.read_rows(tensor, select(begin, end))
+        return EncodedRows(format, torch.from_numpy(blocks), empty, input_columns=gather)
 
     def values(first: int, last: int) -> torch.Tensor:
-        index = select(first, last)
-        low, high = int(index.min()), int(index.max()) + 1
-        stored = _dequantize(gguf, tensor, low, high)[torch.from_numpy(index - low)]
+        stored = _dequantize_rows(gguf, tensor, gguf.read_rows(tensor, select(first, last)))
         return stored if logical is None else stored[:, logical]
 
     return LogicalSource(
@@ -298,10 +293,10 @@ def block_source(
 
 
 def bf16_source(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
-    """A stored BF16 matrix as its exact words, read a run of rows at a time from the mapped file."""
+    """A stored BF16 matrix as its exact words, read a run of rows at a time."""
 
     def values(first: int, last: int) -> torch.Tensor:
-        words = np.array(gguf.read_bf16_words(tensor)[first:last], copy=True)
+        words = gguf.read_bf16_words(tensor, first, last)
         return torch.from_numpy(words.view(np.int16)).view(torch.bfloat16)
 
     return LogicalSource(shape, f"{tensor}[BF16]{list(shape)}", _flat(values, shape[1]))
@@ -350,9 +345,7 @@ def q2_native_source(
     groups, padded_groups = k // 64, ((k + 127) // 128) * 2
 
     def encoded(begin: int, end: int) -> EncodedRows:
-        index = select(begin, end)
-        low, high = int(index.min()), int(index.max()) + 1
-        blocks = gguf.read_blocks(tensor, low, high)[index - low].reshape(end - begin, groups, 18)
+        blocks = gguf.read_rows(tensor, select(begin, end)).reshape(end - begin, groups, 18)
         scale_words = np.zeros((end - begin, padded_groups), dtype="<u2")
         scale_words[:, :groups] = np.ascontiguousarray(blocks[..., :2]).view("<u2").squeeze(-1)
         scales = scale_words.view("<f2")
@@ -383,9 +376,7 @@ def q8_native_source(
     groups, padded_groups = shape[1] // 32, ((shape[1] + 127) // 128) * 4
 
     def encoded(begin: int, end: int) -> EncodedRows:
-        index = select(begin, end)
-        low, high = int(index.min()), int(index.max()) + 1
-        blocks = gguf.read_blocks(tensor, low, high)[index - low].reshape(end - begin, groups, 34)
+        blocks = gguf.read_rows(tensor, select(begin, end)).reshape(end - begin, groups, 34)
         raw_words = np.ascontiguousarray(blocks[..., :2]).view("<u2").squeeze(-1)
         raw_scales = raw_words.view("<f2")
         raw_codes = blocks[..., 2:]
