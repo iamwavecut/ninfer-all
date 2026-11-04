@@ -6,6 +6,7 @@
 #include <immintrin.h>
 
 #include <cstring>
+#include <type_traits>
 
 // The scalar products' arithmetic (gguf_expert_cpu.cpp) eight slices at a time. Group g holds
 // slices 8 g .. 8 g + 7, which are GPU lanes 8 (g mod 4) .. 8 (g mod 4) + 7: one vector of each
@@ -72,8 +73,64 @@ inline __m256i iq4_values(const std::uint8_t* q) {
 // zeroes its activation, adding nothing).
 struct Group {
     __m256i magnitude[8], sign[8];
-    alignas(32) float factor[2][8];
+    __m256 factor[2];
 };
+
+// Eight unsigned 8-bit or 16-bit values at `p` as eight int32 lanes.
+inline __m256i u8x8(const std::uint8_t* p) {
+    return _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)));
+}
+inline __m256i u16x8(const std::uint8_t* p) {
+    return _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+}
+
+// float(2 s + 1) of eight int32 lanes, exactly.
+inline __m256 odd_floats(__m256i s) {
+    return _mm256_cvtepi32_ps(_mm256_add_epi32(_mm256_slli_epi32(s, 1), _mm256_set1_epi32(1)));
+}
+
+// Lanes i < live set (all bits), the others clear.
+inline __m256i live_mask(int live) {
+    return _mm256_cmpgt_epi32(_mm256_set1_epi32(live), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+}
+
+// Eight slices' binary16 multipliers as floats (_mm256_cvtph_ps converts each exactly, as half_at
+// does): slice i's at `p + (i >> shift) * stride` for i < live, zero past it. Built in a register:
+// eight narrow stores read back as one vector would stall the load.
+inline __m256 halves_at(const std::uint8_t* p, std::size_t stride, int shift, int live) {
+    const auto word = [&](int i) -> std::uint32_t {
+        std::uint16_t bits;
+        std::memcpy(&bits, p + std::size_t(i) * stride, 2);
+        return bits;
+    };
+    if (live == 8) {
+        // Two words to a lane: slices 2 j, 2 j + 1, or (shift 1) word j for both.
+        if (shift == 1) {
+            const __m128i four = _mm_setr_epi32(int(word(0) | word(1) << 16), int(word(2) | word(3) << 16), 0, 0);
+            return _mm256_cvtph_ps(_mm_unpacklo_epi16(four, four));
+        }
+        return _mm256_cvtph_ps(_mm_setr_epi32(int(word(0) | word(1) << 16), int(word(2) | word(3) << 16),
+                                              int(word(4) | word(5) << 16), int(word(6) | word(7) << 16)));
+    }
+    const auto h = [&](int i) -> short { return i < live ? static_cast<short>(word(i >> shift)) : short(0); };
+    return _mm256_cvtph_ps(_mm_setr_epi16(h(0), h(1), h(2), h(3), h(4), h(5), h(6), h(7)));
+}
+
+// Eight 4-bit fields of the 32-bit word at `p`, lane i bits 4 i .. 4 i + 3.
+inline __m256i nibbles8(const std::uint8_t* p) {
+    return _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(static_cast<int>(load32(p))),
+                                              _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28)),
+                            _mm256_set1_epi32(15));
+}
+
+// The second 32-bit word of each of eight 8-byte records from `p`.
+inline __m256i odd_words(const std::uint8_t* p) {
+    const __m256 a = _mm256_loadu_ps(reinterpret_cast<const float*>(p));
+    const __m256 b = _mm256_loadu_ps(reinterpret_cast<const float*>(p + 32));
+    // Records 0, 1, 4, 5 in the low half and 2, 3, 6, 7 in the high one; the permute orders them.
+    const __m256 odd_lanes = _mm256_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1));
+    return _mm256_permute4x64_epi64(_mm256_castps_si256(odd_lanes), _MM_SHUFFLE(3, 1, 2, 0));
+}
 
 // The integer dots of a group's eight slices for one token, lane i slice i's: its first 16 values
 // and its last 16 (IQ2_S's and Q6_K's halves, which have their own factors), or its whole dot.
@@ -107,16 +164,12 @@ inline float butterfly8(const __m256* lanes) {
 // group of a 640-value row holds four).
 inline __m256 live_floats(const float* from, int live) {
     if (live == 8) { return _mm256_loadu_ps(from); }
-    alignas(32) float to[8];
-    for (int i = 0; i < 8; ++i) { to[i] = i < live ? from[i] : 0.0F; }
-    return _mm256_load_ps(to);
+    return _mm256_maskload_ps(from, live_mask(live));
 }
 
 inline __m256i live_ints(const std::int32_t* from, int live) {
     if (live == 8) { return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(from)); }
-    alignas(32) std::int32_t to[8];
-    for (int i = 0; i < 8; ++i) { to[i] = i < live ? from[i] : 0; }
-    return _mm256_load_si256(reinterpret_cast<const __m256i*>(to));
+    return _mm256_maskload_epi32(reinterpret_cast<const int*>(from), live_mask(live));
 }
 
 constexpr int kMaxTokens = 16;
@@ -127,18 +180,64 @@ constexpr int kMaxTokens = 16;
 // f0 fma(a, dot, f1 s), s the activation's value sum.
 enum class Form { Whole, Halves, SixK, Minimum, Delta };
 
+// Token t's products of group g's slices from their integer dots `d` (Dots for the halves'
+// forms, else the whole dots) and the group's factors.
+template <Form kForm, class D>
+inline __m256 slice_products(const GgufCpuActivation& x, int t, int g, int live, const Group& group,
+                             const D& d) {
+    const __m256 a = live_floats(x.scales(t) + 8 * g, live);
+    if constexpr (kForm == Form::Halves) {
+        const __m256 inner = _mm256_fmadd_ps(group.factor[0], _mm256_cvtepi32_ps(d.first),
+                                             _mm256_mul_ps(group.factor[1], _mm256_cvtepi32_ps(d.second)));
+        return _mm256_mul_ps(a, inner);
+    } else if constexpr (kForm == Form::Delta) {
+        const __m256 sums = live_floats(x.value_sums(t) + 8 * g, live);
+        return _mm256_mul_ps(group.factor[0], _mm256_fmadd_ps(a, _mm256_cvtepi32_ps(d),
+                                                              _mm256_mul_ps(group.factor[1], sums)));
+    } else if constexpr (kForm == Form::SixK) {
+        const __m256 low  = _mm256_mul_ps(group.factor[0], _mm256_cvtepi32_ps(d.first));
+        const __m256 high = _mm256_mul_ps(group.factor[1], _mm256_cvtepi32_ps(d.second));
+        return _mm256_mul_ps(a, _mm256_add_ps(low, high));
+    } else {
+        const __m256 product = _mm256_mul_ps(_mm256_mul_ps(group.factor[0], a), _mm256_cvtepi32_ps(d));
+        if constexpr (kForm == Form::Minimum) {
+            return _mm256_sub_ps(product,
+                                 _mm256_mul_ps(group.factor[1], live_floats(x.value_sums(t) + 8 * g, live)));
+        } else {
+            return product;
+        }
+    }
+}
+
 // Every format's rows: `decode(row, g, live, group)` fills group g's slices (live of them) and
 // `dot(t, g, live, group)` gives token t's integer dots of them (Dots for the halves' forms, else
-// the whole dots).
-template <Form kForm, class Decode, class Dot>
+// the whole dots). With one token, `single(row, g, live, group)` (if given) fills only the factors
+// and returns that token's dots, decoding each slice as it goes.
+template <Form kForm, class Decode, class Dot, class Single = std::nullptr_t>
 void rows_in_lane_order(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin,
                         int row_end, float* y, std::size_t y_stride, const Decode& decode,
-                        const Dot& dot) {
+                        const Dot& dot, const Single& single = nullptr) {
     const int tokens = x.tokens();
     const int slices = w.k / 32;
     const int groups = (slices + 7) / 8;
-    __m256 acc[kMaxTokens][4];
     Group group;
+    if constexpr (!std::is_same_v<Single, std::nullptr_t>) {
+        if (tokens == 1) {
+            for (int row = row_begin; row < row_end; ++row) {
+                const std::uint8_t* r = w.data + std::size_t(row) * w.row_bytes;
+                __m256 acc[4]         = {_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps(),
+                                         _mm256_setzero_ps()};
+                for (int g = 0; g < groups; ++g) {
+                    const int live = slices - 8 * g < 8 ? slices - 8 * g : 8;
+                    const auto d   = single(r, g, live, group);
+                    acc[g & 3]     = _mm256_add_ps(acc[g & 3], slice_products<kForm>(x, 0, g, live, group, d));
+                }
+                y[row] = butterfly8(acc);
+            }
+            return;
+        }
+    }
+    __m256 acc[kMaxTokens][4];
     for (int row = row_begin; row < row_end; ++row) {
         const std::uint8_t* r = w.data + std::size_t(row) * w.row_bytes;
         for (int t = 0; t < tokens; ++t) {
@@ -147,46 +246,13 @@ void rows_in_lane_order(const GgufCpuMatrix& w, const GgufCpuActivation& x, int 
         for (int g = 0; g < groups; ++g) {
             const int live = slices - 8 * g < 8 ? slices - 8 * g : 8;
             decode(r, g, live, group);
-            const __m256 factor0 = _mm256_load_ps(group.factor[0]);
             for (int t = 0; t < tokens; ++t) {
-                const __m256 a = live_floats(x.scales(t) + 8 * g, live);
-                __m256 product;
-                if constexpr (kForm == Form::Halves) {
-                    const Dots d       = dot(t, g, live, group);
-                    const __m256 inner = _mm256_fmadd_ps(
-                        factor0, _mm256_cvtepi32_ps(d.first),
-                        _mm256_mul_ps(_mm256_load_ps(group.factor[1]), _mm256_cvtepi32_ps(d.second)));
-                    product = _mm256_mul_ps(a, inner);
-                } else if constexpr (kForm == Form::Delta) {
-                    const __m256 sums = live_floats(x.value_sums(t) + 8 * g, live);
-                    product           = _mm256_mul_ps(
-                        factor0, _mm256_fmadd_ps(a, _mm256_cvtepi32_ps(dot(t, g, live, group)),
-                                                 _mm256_mul_ps(_mm256_load_ps(group.factor[1]), sums)));
-                } else if constexpr (kForm == Form::SixK) {
-                    const Dots d      = dot(t, g, live, group);
-                    const __m256 low  = _mm256_mul_ps(factor0, _mm256_cvtepi32_ps(d.first));
-                    const __m256 high = _mm256_mul_ps(_mm256_load_ps(group.factor[1]), _mm256_cvtepi32_ps(d.second));
-                    product           = _mm256_mul_ps(a, _mm256_add_ps(low, high));
-                } else {
-                    product = _mm256_mul_ps(_mm256_mul_ps(factor0, a),
-                                            _mm256_cvtepi32_ps(dot(t, g, live, group)));
-                    if constexpr (kForm == Form::Minimum) {
-                        product = _mm256_sub_ps(product, _mm256_mul_ps(_mm256_load_ps(group.factor[1]),
-                                                                       live_floats(x.value_sums(t) + 8 * g, live)));
-                    }
-                }
-                acc[t][g & 3] = _mm256_add_ps(acc[t][g & 3], product);
+                acc[t][g & 3] =
+                    _mm256_add_ps(acc[t][g & 3], slice_products<kForm>(x, t, g, live, group, dot(t, g, live, group)));
             }
         }
         for (int t = 0; t < tokens; ++t) { y[std::size_t(t) * y_stride + row] = butterfly8(acc[t]); }
     }
-}
-
-// Four IQ1 grid rows' 32 values (-1..1) plus one: the codes 0..2 in value order.
-inline __m256i iq1_codes(std::uint64_t g0, std::uint64_t g1, std::uint64_t g2, std::uint64_t g3) {
-    return _mm256_add_epi8(_mm256_set_epi64x(static_cast<long long>(g3), static_cast<long long>(g2),
-                                             static_cast<long long>(g1), static_cast<long long>(g0)),
-                           _mm256_set1_epi8(1));
 }
 
 // IQ1_M's block multiplier: a nibble of each of its four scale words.
@@ -198,109 +264,155 @@ inline float iq1m_multiplier(const std::uint8_t* block) {
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)));
 }
 
-// An i-quant group is one 256-value block.
+// An i-quant block's eight slices' factors, decode_slice's products in its order.
 template <QType F>
-inline void decode_iq(const std::uint8_t* block, Group& out) {
-    const float d = F == QType::GGUF_IQ1_M ? iq1m_multiplier(block) : half_at(block);
-    for (int sub = 0; sub < 8; ++sub) {
-        if constexpr (F == QType::GGUF_IQ1_S) {
-            const std::uint8_t* qs = block + 2 + 4 * sub;
-            std::uint16_t qh;
-            std::memcpy(&qh, block + 34 + 2 * sub, 2);
-            out.magnitude[sub] = iq1_codes(iq1s_grid[qs[0] | ((unsigned(qh) << 8) & 0x700U)],
-                                           iq1s_grid[qs[1] | ((unsigned(qh) << 5) & 0x700U)],
-                                           iq1s_grid[qs[2] | ((unsigned(qh) << 2) & 0x700U)],
-                                           iq1s_grid[qs[3] | ((unsigned(qh) >> 1) & 0x700U)]);
-            out.factor[0][sub] = d * float(2 * ((qh >> 12) & 7U) + 1);
-            out.factor[1][sub] = (qh & 0x8000U) != 0 ? -1.125F : -0.875F;
-        } else if constexpr (F == QType::GGUF_IQ1_M) {
-            const std::uint8_t* qs = block + 4 * sub;
-            std::uint16_t sc;
-            std::memcpy(&sc, block + 48 + 2 * (sub / 2), 2);
-            const unsigned tmp = unsigned(sc) >> (6 * (sub % 2));
-            std::uint64_t grid[4];
-            long long offsets[4];
-            for (int l = 0; l < 4; ++l) {
-                const unsigned qhl = unsigned(block[32 + 2 * sub + l / 2]) >> (4 * (l % 2));
-                grid[l]    = iq1s_grid[qs[l] | ((qhl & 7U) << 8)];
-                offsets[l] = (qhl & 8U) != 0 ? 0x0909090909090909LL : 0x0707070707070707LL;
-            }
-            // Eight times each code (at most 16: no bit leaves its byte) less 7 or 9.
-            const __m256i value = _mm256_sub_epi8(
-                _mm256_slli_epi16(iq1_codes(grid[0], grid[1], grid[2], grid[3]), 3),
-                _mm256_set_epi64x(offsets[3], offsets[2], offsets[1], offsets[0]));
-            out.magnitude[sub] = _mm256_sign_epi8(value, value);
-            out.sign[sub]      = value; // never zero
-            out.factor[0][sub] = d * float(2 * (tmp & 7U) + 1) * 0.125F;
-            out.factor[1][sub] = d * float(2 * ((tmp >> 3) & 7U) + 1) * 0.125F;
-        } else if constexpr (F == QType::GGUF_IQ2_XXS) {
-            const std::uint8_t* qs  = block + 2 + 8 * sub;
-            const std::uint32_t aux = load32(block + 6 + 8 * sub);
-            out.magnitude[sub]      = _mm256_set_epi64x(
+inline void iq_factors(const std::uint8_t* block, Group& out) {
+    const __m256 d = _mm256_set1_ps(F == QType::GGUF_IQ1_M ? iq1m_multiplier(block) : half_at(block));
+    const auto times = [](__m256 a, __m256 b) { return _mm256_mul_ps(a, b); };
+    const __m256 eighth = _mm256_set1_ps(0.125F);
+    if constexpr (F == QType::GGUF_IQ1_S) {
+        const __m256i qh = u16x8(block + 34);
+        out.factor[0] = times(d, odd_floats(_mm256_and_si256(_mm256_srli_epi32(qh, 12), _mm256_set1_epi32(7))));
+        // Bit 15 of qh as the sign bit picks -1.125.
+        out.factor[1] = _mm256_blendv_ps(_mm256_set1_ps(-0.875F), _mm256_set1_ps(-1.125F),
+                                         _mm256_castsi256_ps(_mm256_slli_epi32(qh, 16)));
+    } else if constexpr (F == QType::GGUF_IQ1_M) {
+        // Slice s's six bits at bit 6 (s mod 2) of scale word s / 2.
+        const __m128i words = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(block + 48));
+        const __m256i tmp   = _mm256_srlv_epi32(_mm256_cvtepu16_epi32(_mm_unpacklo_epi16(words, words)),
+                                                _mm256_setr_epi32(0, 6, 0, 6, 0, 6, 0, 6));
+        const __m256i seven = _mm256_set1_epi32(7);
+        out.factor[0] = times(times(d, odd_floats(_mm256_and_si256(tmp, seven))), eighth);
+        out.factor[1] = times(times(d, odd_floats(_mm256_and_si256(_mm256_srli_epi32(tmp, 3), seven))), eighth);
+    } else if constexpr (F == QType::GGUF_IQ2_XXS) {
+        out.factor[0] = times(times(d, odd_floats(_mm256_srli_epi32(odd_words(block + 2), 28))), eighth);
+    } else if constexpr (F == QType::GGUF_IQ2_S) {
+        const __m256i scale = u8x8(block + 74);
+        out.factor[0] = times(times(d, odd_floats(_mm256_and_si256(scale, _mm256_set1_epi32(15)))), eighth);
+        out.factor[1] = times(times(d, odd_floats(_mm256_srli_epi32(scale, 4))), eighth);
+    } else if constexpr (F == QType::GGUF_IQ3_XXS) {
+        const __m256i aux = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block + 66));
+        out.factor[0] = times(times(d, odd_floats(_mm256_srli_epi32(aux, 28))), _mm256_set1_ps(0.25F));
+    } else if constexpr (F == QType::GGUF_IQ3_S) {
+        out.factor[0] = times(d, odd_floats(nibbles8(block + 106)));
+    } else {
+        static_assert(F == QType::GGUF_IQ4_XS);
+        std::uint16_t high;
+        std::memcpy(&high, block + 2, 2);
+        const __m256i top = _mm256_and_si256(
+            _mm256_srlv_epi32(_mm256_set1_epi32(high), _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14)),
+            _mm256_set1_epi32(3));
+        const __m256i scale = _mm256_sub_epi32(_mm256_or_si256(nibbles8(block + 4), _mm256_slli_epi32(top, 4)),
+                                               _mm256_set1_epi32(32));
+        out.factor[0] = times(d, _mm256_cvtepi32_ps(scale));
+    }
+}
+
+inline __m128i u8x4(const std::uint8_t* p) {
+    return _mm_cvtepu8_epi32(_mm_cvtsi32_si128(static_cast<int>(load32(p))));
+}
+
+// IQ1_M forms its grid indices in a register: a slice's two qh bytes hold a nibble a grid row,
+// the index's top three bits and the row's offset (the other i-quants form theirs one at a time,
+// which measured faster for them). The qh nibbles of slice `sub`, lane l the l-th row's.
+inline __m128i iq1m_nibbles(const std::uint8_t* block, int sub) {
+    std::uint16_t qh;
+    std::memcpy(&qh, block + 32 + 2 * sub, 2);
+    return _mm_srlv_epi32(_mm_set1_epi32(qh), _mm_setr_epi32(0, 4, 8, 12));
+}
+inline __m128i iq1m_index(const std::uint8_t* block, int sub, __m128i nibbles) {
+    return _mm_or_si128(u8x4(block + 4 * sub), _mm_slli_epi32(_mm_and_si128(nibbles, _mm_set1_epi32(7)), 8));
+}
+// IQ1_M's codes from its grid rows: eight times each (at most 16: no bit leaves its byte) less 7,
+// or 9 where the row's nibble has bit 3.
+inline __m256i iq1m_values(__m256i rows, __m128i nibbles) {
+    const __m256i nine = _mm256_cmpeq_epi64(_mm256_cvtepi32_epi64(_mm_and_si128(nibbles, _mm_set1_epi32(8))),
+                                            _mm256_set1_epi64x(8));
+    const __m256i offsets = _mm256_add_epi8(_mm256_set1_epi8(7), _mm256_and_si256(nine, _mm256_set1_epi8(2)));
+    return _mm256_sub_epi8(_mm256_slli_epi16(_mm256_add_epi8(rows, _mm256_set1_epi8(1)), 3), offsets);
+}
+// IQ1_M's four grid rows by loads, row l at index lane l (stored, then read back as scalars).
+inline __m256i load64_rows(const std::uint64_t* table, __m128i index) {
+    alignas(16) std::int32_t at[4];
+    _mm_store_si128(reinterpret_cast<__m128i*>(at), index);
+    return _mm256_setr_epi64x(static_cast<long long>(table[at[0]]), static_cast<long long>(table[at[1]]),
+                              static_cast<long long>(table[at[2]]), static_cast<long long>(table[at[3]]));
+}
+
+// Slice `sub` of an i-quant block: its magnitudes and signs.
+template <QType F>
+inline void iq_slice(const std::uint8_t* block, int sub, __m256i& magnitude, __m256i& sign) {
+    if constexpr (F == QType::GGUF_IQ1_S) {
+        const std::uint8_t* qs = block + 2 + 4 * sub;
+        std::uint16_t qh;
+        std::memcpy(&qh, block + 34 + 2 * sub, 2);
+        // Index l: qs[l] and bits 3 l .. 3 l + 2 of qh at bit 8; the codes 0..2 are the grid's
+        // values plus one.
+        magnitude = _mm256_add_epi8(
+            _mm256_setr_epi64x(static_cast<long long>(iq1s_grid[qs[0] | ((unsigned(qh) << 8) & 0x700U)]),
+                               static_cast<long long>(iq1s_grid[qs[1] | ((unsigned(qh) << 5) & 0x700U)]),
+                               static_cast<long long>(iq1s_grid[qs[2] | ((unsigned(qh) << 2) & 0x700U)]),
+                               static_cast<long long>(iq1s_grid[qs[3] | ((unsigned(qh) >> 1) & 0x700U)])),
+            _mm256_set1_epi8(1));
+    } else if constexpr (F == QType::GGUF_IQ1_M) {
+        const __m128i nibbles = iq1m_nibbles(block, sub);
+        const __m256i value   = iq1m_values(load64_rows(iq1s_grid, iq1m_index(block, sub, nibbles)), nibbles);
+        magnitude             = _mm256_sign_epi8(value, value);
+        sign                  = value; // never zero
+    } else if constexpr (F == QType::GGUF_IQ2_XXS || F == QType::GGUF_IQ3_XXS) {
+        const std::uint8_t* qs = block + 2 + 8 * sub;
+        std::uint32_t aux;
+        if constexpr (F == QType::GGUF_IQ2_XXS) {
+            aux       = load32(block + 6 + 8 * sub);
+            magnitude = _mm256_set_epi64x(
                 static_cast<long long>(iq2xxs_grid[qs[3]]), static_cast<long long>(iq2xxs_grid[qs[2]]),
                 static_cast<long long>(iq2xxs_grid[qs[1]]), static_cast<long long>(iq2xxs_grid[qs[0]]));
-            const std::uint32_t bits = std::uint32_t(ksigns_iq2xs[aux & 127U]) |
-                                       std::uint32_t(ksigns_iq2xs[(aux >> 7) & 127U]) << 8 |
-                                       std::uint32_t(ksigns_iq2xs[(aux >> 14) & 127U]) << 16 |
-                                       std::uint32_t(ksigns_iq2xs[(aux >> 21) & 127U]) << 24;
-            out.sign[sub]      = sign_bytes(bits);
-            out.factor[0][sub] = d * float(2 * (aux >> 28) + 1) * 0.125F;
-            out.factor[1][sub] = 0.0F;
-        } else if constexpr (F == QType::GGUF_IQ2_S) {
-            const std::uint8_t* qs = block + 2 + 4 * sub;
-            const unsigned qh      = block[66 + sub];
-            const unsigned scale   = block[74 + sub];
-            out.magnitude[sub]     = _mm256_set_epi64x(
-                static_cast<long long>(iq2s_grid[qs[3] | ((qh << 2) & 0x300U)]),
-                static_cast<long long>(iq2s_grid[qs[2] | ((qh << 4) & 0x300U)]),
-                static_cast<long long>(iq2s_grid[qs[1] | ((qh << 6) & 0x300U)]),
-                static_cast<long long>(iq2s_grid[qs[0] | ((qh << 8) & 0x300U)]));
-            out.sign[sub]      = sign_bytes(load32(block + 34 + 4 * sub));
-            out.factor[0][sub] = d * float(2 * (scale & 15U) + 1) * 0.125F;
-            out.factor[1][sub] = d * float(2 * (scale >> 4) + 1) * 0.125F;
-        } else if constexpr (F == QType::GGUF_IQ3_XXS) {
-            const std::uint8_t* qs  = block + 2 + 8 * sub;
-            const std::uint32_t aux = load32(block + 66 + 4 * sub);
-            out.magnitude[sub]      = _mm256_set_epi32(
+        } else {
+            aux       = load32(block + 66 + 4 * sub);
+            magnitude = _mm256_set_epi32(
                 static_cast<int>(iq3xxs_grid[qs[7]]), static_cast<int>(iq3xxs_grid[qs[6]]),
                 static_cast<int>(iq3xxs_grid[qs[5]]), static_cast<int>(iq3xxs_grid[qs[4]]),
                 static_cast<int>(iq3xxs_grid[qs[3]]), static_cast<int>(iq3xxs_grid[qs[2]]),
                 static_cast<int>(iq3xxs_grid[qs[1]]), static_cast<int>(iq3xxs_grid[qs[0]]));
-            const std::uint32_t bits = std::uint32_t(ksigns_iq2xs[aux & 127U]) |
-                                       std::uint32_t(ksigns_iq2xs[(aux >> 7) & 127U]) << 8 |
-                                       std::uint32_t(ksigns_iq2xs[(aux >> 14) & 127U]) << 16 |
-                                       std::uint32_t(ksigns_iq2xs[(aux >> 21) & 127U]) << 24;
-            out.sign[sub]      = sign_bytes(bits);
-            out.factor[0][sub] = d * float(2 * (aux >> 28) + 1) * 0.25F;
-            out.factor[1][sub] = 0.0F;
-        } else if constexpr (F == QType::GGUF_IQ3_S) {
-            const std::uint8_t* qs = block + 2 + 8 * sub;
-            const unsigned qh      = block[66 + sub];
-            const unsigned scale   = (block[106 + sub / 2] >> (4 * (sub & 1))) & 15U;
-            out.magnitude[sub]     = _mm256_set_epi32(
-                static_cast<int>(iq3s_grid[qs[7] | ((qh << 1) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[6] | ((qh << 2) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[5] | ((qh << 3) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[4] | ((qh << 4) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[3] | ((qh << 5) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[2] | ((qh << 6) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[1] | ((qh << 7) & 256U)]),
-                static_cast<int>(iq3s_grid[qs[0] | ((qh << 8) & 256U)]));
-            out.sign[sub]      = sign_bytes(load32(block + 74 + 4 * sub));
-            out.factor[0][sub] = d * float(2 * scale + 1);
-            out.factor[1][sub] = 0.0F;
-        } else {
-            static_assert(F == QType::GGUF_IQ4_XS);
-            std::uint16_t high;
-            std::memcpy(&high, block + 2, 2);
-            const unsigned low  = (block[4 + sub / 2] >> (4 * (sub & 1))) & 15U;
-            const __m256i value = iq4_values(block + 8 + 16 * sub);
-            out.magnitude[sub]  = _mm256_sign_epi8(value, value);
-            out.sign[sub]       = value; // no IQ4_NL value is zero
-            out.factor[0][sub] = d * float(int(low | (((unsigned(high) >> (2 * sub)) & 3U) << 4)) - 32);
-            out.factor[1][sub] = 0.0F;
         }
+        const std::uint32_t bits = std::uint32_t(ksigns_iq2xs[aux & 127U]) |
+                                   std::uint32_t(ksigns_iq2xs[(aux >> 7) & 127U]) << 8 |
+                                   std::uint32_t(ksigns_iq2xs[(aux >> 14) & 127U]) << 16 |
+                                   std::uint32_t(ksigns_iq2xs[(aux >> 21) & 127U]) << 24;
+        sign = sign_bytes(bits);
+    } else if constexpr (F == QType::GGUF_IQ2_S) {
+        const std::uint8_t* qs = block + 2 + 4 * sub;
+        const unsigned qh      = block[66 + sub];
+        magnitude              = _mm256_setr_epi64x(static_cast<long long>(iq2s_grid[qs[0] | ((qh << 8) & 0x300U)]),
+                                                    static_cast<long long>(iq2s_grid[qs[1] | ((qh << 6) & 0x300U)]),
+                                                    static_cast<long long>(iq2s_grid[qs[2] | ((qh << 4) & 0x300U)]),
+                                                    static_cast<long long>(iq2s_grid[qs[3] | ((qh << 2) & 0x300U)]));
+        sign = sign_bytes(load32(block + 34 + 4 * sub));
+    } else if constexpr (F == QType::GGUF_IQ3_S) {
+        const std::uint8_t* qs = block + 2 + 8 * sub;
+        const unsigned qh      = block[66 + sub];
+        magnitude              = _mm256_setr_epi32(static_cast<int>(iq3s_grid[qs[0] | ((qh << 8) & 256U)]),
+                                                   static_cast<int>(iq3s_grid[qs[1] | ((qh << 7) & 256U)]),
+                                                   static_cast<int>(iq3s_grid[qs[2] | ((qh << 6) & 256U)]),
+                                                   static_cast<int>(iq3s_grid[qs[3] | ((qh << 5) & 256U)]),
+                                                   static_cast<int>(iq3s_grid[qs[4] | ((qh << 4) & 256U)]),
+                                                   static_cast<int>(iq3s_grid[qs[5] | ((qh << 3) & 256U)]),
+                                                   static_cast<int>(iq3s_grid[qs[6] | ((qh << 2) & 256U)]),
+                                                   static_cast<int>(iq3s_grid[qs[7] | ((qh << 1) & 256U)]));
+        sign = sign_bytes(load32(block + 74 + 4 * sub));
+    } else {
+        static_assert(F == QType::GGUF_IQ4_XS);
+        const __m256i value = iq4_values(block + 8 + 16 * sub);
+        magnitude           = _mm256_sign_epi8(value, value);
+        sign                = value; // no IQ4_NL value is zero
     }
+}
+
+// An i-quant group is one 256-value block.
+template <QType F>
+inline void decode_iq(const std::uint8_t* block, Group& out) {
+    iq_factors<F>(block, out);
+    for (int sub = 0; sub < 8; ++sub) { iq_slice<F>(block, sub, out.magnitude[sub], out.sign[sub]); }
 }
 
 template <QType F>
@@ -309,16 +421,7 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
     constexpr int bytes   = gguf_block_shape(F).bytes;
     constexpr bool halves = F == QType::GGUF_IQ2_S || F == QType::GGUF_IQ1_M;
     constexpr bool delta  = F == QType::GGUF_IQ1_S; // unsigned codes
-    const auto decode     = [](const std::uint8_t* row, int g, int, Group& group) {
-        decode_iq<F>(row + std::size_t(g) * bytes, group);
-    };
-    const auto dot = [&x](int t, int g, int, const Group& group) {
-        const std::int8_t* a = x.codes(t) + g * 256;
-        __m256i u[8];
-        for (int i = 0; i < 8; ++i) {
-            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32 * i));
-            u[i] = dot_u8s8(group.magnitude[i], delta ? v : _mm256_sign_epi8(v, group.sign[i]));
-        }
+    const auto dots = [](const __m256i* u) {
         const Dots d = halves8(u);
         if constexpr (halves) {
             return d;
@@ -326,8 +429,41 @@ void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
             return _mm256_add_epi32(d.first, d.second);
         }
     };
+    const auto decode = [](const std::uint8_t* row, int g, int, Group& group) {
+        decode_iq<F>(row + std::size_t(g) * bytes, group);
+    };
+    const auto dot = [&x, &dots](int t, int g, int, const Group& group) {
+        const std::int8_t* a = x.codes(t) + g * 256;
+        __m256i u[8];
+        for (int i = 0; i < 8; ++i) {
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32 * i));
+            u[i] = dot_u8s8(group.magnitude[i], delta ? v : _mm256_sign_epi8(v, group.sign[i]));
+        }
+        return dots(u);
+    };
+    // One token: each slice's products as it is decoded, with no group kept for other tokens.
+    [[maybe_unused]] const auto single = [&x, &dots](const std::uint8_t* row, int g, int,
+                                                     Group& group) {
+        const std::uint8_t* block = row + std::size_t(g) * bytes;
+        iq_factors<F>(block, group);
+        const std::int8_t* a = x.codes(0) + g * 256;
+        __m256i u[8];
+        for (int i = 0; i < 8; ++i) {
+            __m256i magnitude, sign;
+            iq_slice<F>(block, i, magnitude, sign);
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32 * i));
+            u[i] = dot_u8s8(magnitude, delta ? v : _mm256_sign_epi8(v, sign));
+        }
+        return dots(u);
+    };
     constexpr Form form = halves ? Form::Halves : delta ? Form::Delta : Form::Whole;
-    rows_in_lane_order<form>(w, x, row_begin, row_end, y, y_stride, decode, dot);
+    if constexpr (F == QType::GGUF_IQ1_S || F == QType::GGUF_IQ1_M) {
+        // IQ1's one-token rows decode each group whole before its products, as wider calls do:
+        // on an EPYC 7K62 its slice-by-slice products were 3-4% slower.
+        rows_in_lane_order<form>(w, x, row_begin, row_end, y, y_stride, decode, dot);
+    } else {
+        rows_in_lane_order<form>(w, x, row_begin, row_end, y, y_stride, decode, dot, single);
+    }
 }
 
 // Q2_0: a 64-value block is two slices, so a group is four blocks. Its 16 code bytes hold values
@@ -340,9 +476,7 @@ void q2_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, 
              float* y, std::size_t y_stride) {
     const auto decode = [](const std::uint8_t* row, int g, int live, Group& group) {
         const __m128i three = _mm_set1_epi8(3);
-        for (int i = 0; i < 8; ++i) {
-            group.factor[0][i] = i < live ? half_at(row + std::size_t(4 * g + i / 2) * 18) : 0.0F;
-        }
+        group.factor[0]     = halves_at(row + std::size_t(4 * g) * 18, 18, 1, live);
         for (int b = 0; 2 * b < live; ++b) {
             const __m128i q =
                 _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + std::size_t(4 * g + b) * 18 + 2));
@@ -401,17 +535,15 @@ void block32_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_be
                   float* y, std::size_t y_stride) {
     constexpr int bytes = gguf_block_shape(F).bytes;
     const auto decode   = [](const std::uint8_t* row, int g, int live, Group& group) {
+        group.factor[0] = halves_at(row + std::size_t(8 * g) * bytes, bytes, 0, live);
         for (int i = 0; i < 8; ++i) {
             if (i >= live) {
-                group.factor[0][i] = 0.0F;
                 group.magnitude[i] = group.sign[i] = _mm256_setzero_si256();
                 continue;
             }
-            const std::uint8_t* block = row + std::size_t(8 * g + i) * bytes;
-            const __m256i codes       = block32_codes<F>(block);
-            group.magnitude[i] = _mm256_sign_epi8(codes, codes);
-            group.sign[i]      = codes;
-            group.factor[0][i] = half_at(block);
+            const __m256i codes = block32_codes<F>(row + std::size_t(8 * g + i) * bytes);
+            group.magnitude[i]  = _mm256_sign_epi8(codes, codes);
+            group.sign[i]       = codes;
         }
     };
     const auto dot = [&x](int t, int g, int live, const Group& group) {
@@ -439,39 +571,44 @@ void k_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, i
     const auto decode   = [](const std::uint8_t* row, int g, int, Group& group) {
         const std::uint8_t* block = row + std::size_t(g) * bytes;
         if constexpr (six) {
-            const float d = half_at(block + 208);
+            // Slice s's two signed scales are bytes 2 s and 2 s + 1 of the 16 at 192.
+            const __m256 d       = _mm256_set1_ps(half_at(block + 208));
+            const __m128i scales = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 192));
+            group.factor[0]      = _mm256_mul_ps(
+                d, _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_srai_epi16(_mm_slli_epi16(scales, 8), 8))));
+            group.factor[1] =
+                _mm256_mul_ps(d, _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm_srai_epi16(scales, 8))));
             for (int sub = 0; sub < 8; ++sub) {
                 const int h = sub / 4, q = sub % 4;
-                const auto* scales  = reinterpret_cast<const std::int8_t*>(block + 192 + 8 * h);
                 const __m256i low   = bits_of(block + 64 * h + 32 * (q & 1), 4 * (q >> 1), 15);
                 const __m256i high  = bits_of(block + 128 + 32 * h, 2 * q, 3);
                 const __m256i codes = _mm256_sub_epi8(
                     _mm256_or_si256(low, _mm256_slli_epi16(high, 4)), _mm256_set1_epi8(32));
                 group.magnitude[sub] = _mm256_sign_epi8(codes, codes);
                 group.sign[sub]      = codes;
-                group.factor[0][sub] = d * float(scales[2 * q]);
-                group.factor[1][sub] = d * float(scales[2 * q + 1]);
             }
         } else {
             constexpr bool five = F == QType::GGUF_Q5_K;
-            const float d = half_at(block), dmin = half_at(block + 2);
-            const std::uint8_t* s6 = block + 4;
+            // The twelve bytes at 4 as eight 6-bit scales and eight 6-bit minimums (ggml's utmp):
+            // slices 0..3 keep the low six bits of bytes 0..3 (scales) and 4..7 (minimums); slices
+            // 4..7 take the low (scales) or high (minimums) nibble of bytes 8..11 and the top two
+            // bits of bytes 0..3 (scales) or 4..7 (minimums).
+            const std::uint32_t u0 = load32(block + 4), u1 = load32(block + 8), u2 = load32(block + 12);
+            const std::uint32_t low6 = 0x3F3F3F3FU, nib = 0x0F0F0F0FU, top2 = 0x03030303U;
+            const std::uint32_t sc_lo = u0 & low6, sc_hi = (u2 & nib) | (((u0 >> 6) & top2) << 4);
+            const std::uint32_t m_lo = u1 & low6, m_hi = ((u2 >> 4) & nib) | (((u1 >> 6) & top2) << 4);
+            const auto widen = [](std::uint32_t lo, std::uint32_t hi) {
+                return _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
+                    _mm_set_epi32(0, 0, static_cast<int>(hi), static_cast<int>(lo))));
+            };
+            group.factor[0] = _mm256_mul_ps(_mm256_set1_ps(half_at(block)), widen(sc_lo, sc_hi));
+            group.factor[1] = _mm256_mul_ps(_mm256_set1_ps(half_at(block + 2)), widen(m_lo, m_hi));
             for (int sub = 0; sub < 8; ++sub) {
-                int sc = 0, m = 0;
-                if (sub < 4) {
-                    sc = s6[sub] & 63;
-                    m  = s6[sub + 4] & 63;
-                } else {
-                    sc = (s6[sub + 4] & 15) | ((s6[sub - 4] >> 6) << 4);
-                    m  = (s6[sub + 4] >> 4) | ((s6[sub] >> 6) << 4);
-                }
                 __m256i codes = bits_of(block + (five ? 48 : 16) + 32 * (sub / 2), 4 * (sub & 1), 15);
                 if constexpr (five) {
                     codes = _mm256_or_si256(codes, _mm256_slli_epi16(bits_of(block + 16, sub, 1), 4));
                 }
                 group.magnitude[sub] = codes;
-                group.factor[0][sub] = d * float(sc);
-                group.factor[1][sub] = dmin * float(m);
             }
         }
     };

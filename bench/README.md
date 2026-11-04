@@ -347,6 +347,17 @@ FP32 partial:
 ./build/bench/ninfer_benches ninfer_tp_share_linear_bench q5 5120 1536 fp32 --tokens 1,4,8
 ```
 
+`ninfer_gguf_cpu_rows_bench` times the host CPU's GGUF expert rows (`ops::gguf_cpu_rows`, the CPU
+share of host or disk experts' misses) on random stored blocks in a working set far larger than the
+caches, read in row order by one thread or by several that split the rows. It reports rows a
+second, stored bytes a second and nanoseconds a row for each format, token count and thread count;
+`test_gguf_expert_cpu` checks the products:
+
+```bash
+./build/bench/ninfer_benches ninfer_gguf_cpu_rows_bench --formats IQ3_S,IQ1_M,Q2_0 --tokens 1,2,8 --threads 1,16
+./build/bench/ninfer_benches ninfer_gguf_cpu_rows_bench --formats IQ4_NL,Q2_0 --k 640 --backend scalar
+```
+
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
 allocation:
 
