@@ -2,8 +2,11 @@
 
 NInfer runs DeepSeek's [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
 (`DeepseekV41ForCausalLM`) from IST Austria's
-[GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) (IQ1_M),
-its Engram table GGUF (IQ4_NL) and its vision tower (the repository's BF16 mmproj). It is its own
+[GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) (IQ1_M)
+or its expert-pruned
+[Coder build](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF) (192
+of the 384 experts a block), with the Engram table GGUF (IQ4_NL) and the vision tower (the
+repository's BF16 mmproj). It is its own
 model family next to Qwen3.5, Flash-Next, Gemma 4 and Flint: its own executor
 (`src/models/deepseek_v41`) and Engine core
 (`src/runtime/engine/deepseek_v41_core`), sharing the Qwen3.5 frontend for tokenization, chat
@@ -167,9 +170,10 @@ revision `54229d38d588a66d1c6cff08af7b281b9326c656`) keeps 192 of the 384 routed
 and comes only in llama.cpp's layout. It converts with the same command, its first shard as
 `--source gguf` and the base release's config; the converter takes the expert count from the GGUF.
 Its repository's Engram GGUF and mmproj are the base repository's files, so it uses the same Engram
-table. The model is one file of 71.9 GiB. 11 of its 80 expert banks, in 10 of its 40 blocks, are
-IQ2_XS, which CPU threads do not compute: in those blocks the GPU copies every miss whatever
-`--expert-dma-share` says.
+table. The model is one file of 71.9 GiB, published with the STQ drafter and the vision tower
+([running](#running)). 11 of its 80 expert banks, in 10 of its 40 blocks, are IQ2_XS, which CPU
+threads do not compute: in those blocks the GPU copies every miss whatever `--expert-dma-share`
+says.
 
 The model reads the Engram GGUF only for the table's digest, and of the STQ pack only its config,
 its index and its six drafter files (3.85 GB), checking that the pack states the release's model and
@@ -202,13 +206,16 @@ Its text and vision objects are the same bytes as with the STQ drafter; the file
 
 ## Running
 
-Both artifacts are published: the model, with the STQ drafter and the vision tower, as
-[WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3)
-and its table as
+Three artifacts are published: the model, with the STQ drafter and the vision tower, as
+[WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3),
+ISTA-DASLab's Coder build with the same drafter and tower as
+[WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-NInfer-v3](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-NInfer-v3),
+and the table both read as
 [WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3).
 
 ```bash
 M=models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer
+# Or the Coder build: M=models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-ninfer-v3.ninfer
 T=models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer
 # A chat server for two concurrent requests over 32K-token contexts, experts in pinned host memory.
 ninfer-serve $M --ngram-table $T --model-id deepseek-v4.1-flash \
@@ -832,6 +839,37 @@ every visible position, and now score only the blocks that block 20 keeps; a cel
 - **Decode** after the long prompts rose by 0.3 to 4.2% per run. The short answer never sees more
   than 2,048 blocks, so its difference of -1.1 to +2.0% between the builds is the spread of runs.
 - **Outputs.** Both builds produced the same tokens in every run.
+
+### Coder build
+
+November 4, 2026, ISTA-DASLab's Coder build ([converting](#converting)) on one rented host: an RTX
+4090 (450 W, PCIe 4.0 x16), a 64-core EPYC 7B13 in a container of 61 CPUs, 503 GiB of RAM, the
+sm_89 build of `379c0d999`. `ninfer-serve --max-context 16384 --max-concurrency 1`, one sequence,
+greedy decoding, thinking off: a 25-token code request answered with 256 tokens and a summary of a
+7,775-token C++ file in 128 tokens. The disk row ran after the model file was read into the page
+cache. The model has 7,680 routed experts:
+
+| experts | device cache | decode, code answer | decode after 7,775 tokens | prefill of 7,775 tokens | ready to serve |
+|---|---:|---:|---:|---:|---:|
+| pinned RAM | 1,429 | 37.2 tok/s | 39.2 tok/s | 1,040 tok/s | 22 s |
+| pinned RAM, `--spec dspark` | 979 | 47.9 tok/s | 44.3 tok/s | 1,020 tok/s | 22 s |
+| disk, page cache warm | 1,444 | 15.7 tok/s | 17.8 tok/s | 774 tok/s | 9 s |
+
+- **Placements and drafts agree.** The three servers gave the same answers. The DSpark drafter,
+  trained for the unpruned model, accepted 192 of 250 and 75 of 101 drafts.
+- **The CPU share.** With the CLI and its default context the code request decoded at 31.7 tok/s
+  with every miss copied, 37.5 with half of them on 30 CPU threads and 37.3 with the automatic
+  share (11% of the routed experts on the CPU), with the same tokens; disk experts decoded it at
+  16.1 tok/s. In the 10 blocks with an IQ2_XS bank the GPU copies every miss.
+- **The cache.** The built-in routing profile is the unpruned model's, so the cache fills from the
+  first requests; it served 70 to 72% of the code request's routed experts.
+- **Memory.** The CLI peaked at 62.2 GiB of resident host memory with host experts and 0.8 GiB with
+  disk experts.
+- **Images.** With `--vision` the model read the title, the red circles and the shapes' order in
+  `examples/cli/media/visual_chart.png` and described `natural_scene.png` correctly, with the same
+  text from the resident and the streamed tower.
+
+One run per row. These runs share no host, build or prompt with the IQ1_M rows above.
 
 ## Numerical checks
 
