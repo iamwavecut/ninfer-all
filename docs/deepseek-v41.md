@@ -256,8 +256,9 @@ cache and its rounds):
   bank laid out like the resident bank; two banks let the next layer arrive while the current one
   computes. `--expert-cache-mib` (default: what is free after startup) holds the experts decode
   routes most, filled at startup from a routing profile (`--expert-profile`, else the built-in
-  DeepSeek-V4.1 profile, recorded on summaries of four corpora and on chat, code and reasoning
-  requests).
+  one for the model's experts a block: the release's, recorded on summaries of four corpora and on
+  chat, code and reasoning requests, or the [Coder build's](#coder-build), recorded on 48 coding,
+  agent and reasoning requests).
 - **CPU share.** With host experts, CPU threads compute a share of a decode or verification
   call's misses from the pinned copy while the GPU copies and runs the rest
   ([below](#the-cpu-share)). Prompt chunks and spans copy every miss.
@@ -861,8 +862,21 @@ cache. The model has 7,680 routed experts:
   with every miss copied, 37.5 with half of them on 30 CPU threads and 37.3 with the automatic
   share (11% of the routed experts on the CPU), with the same tokens; disk experts decoded it at
   16.1 tok/s. In the 10 blocks with an IQ2_XS bank the GPU copies every miss.
-- **The cache.** The built-in routing profile is the unpruned model's, so the cache fills from the
-  first requests; it served 70 to 72% of the code request's routed experts.
+- **The cache.** These runs filled it from the first requests: the code request hit 70 to 72% of
+  its routed experts. The build now starts it from the Coder build's own routing profile, recorded
+  on 48 coding, agent and reasoning requests. On November 4, on another RTX 4090 host (450 W, a
+  32-core EPYC 7542 in a container of 31 CPUs), the CLI with host experts answered three held-out
+  requests (code, code with reasoning, prose; two runs each) with the same tokens from either
+  start. With the profile they hit 75.4, 80.6 and 76.3% of their routed experts against 71.4, 75.5
+  and 74.8%, copied 5.4, 7.1 and 1.8% fewer bytes, and decoded within -0.6 to +0.9% of the empty
+  start. Disk experts in the page cache hit 76.3% against 72.3% on the code request and decoded at
+  11.1 against 10.7 tok/s, one run each. Seeding adds 0.5 s to startup with host experts and 1.6 s
+  with disk experts.
+- **The profile in `ninfer-serve`.** The server's warmup request fills an empty cache as well
+  (1,809 of 1,821 slots), so over ten server starts at 2,048 and 16,384 tokens of context each
+  request hit within 0.3 points as often from either start (the short ones 74.0 to 77.3% of their
+  routed experts). Decode differed by -3.7 to +3.7% per request, and the profile delayed the first
+  answer by 40 to 120 ms.
 - **Memory.** The CLI peaked at 62.2 GiB of resident host memory with host experts and 0.8 GiB with
   disk experts.
 - **Images.** With `--vision` the model read the title, the red circles and the shapes' order in
