@@ -25,6 +25,11 @@ update the affected contracts and implementation together instead of treating th
 as an immutable prohibition. Skills provide task-specific methods, not additional deliverables or
 approval requirements beyond the user's instructions and the actual execution environment.
 
+Every change follows the [engineering rules](CONTRIBUTING.md#engineering-rules): lossless by
+default, every model family, every platform, the best measured default, comparable measurements,
+documentation of the current state, and the test and tooling conventions. When a task cannot meet a
+rule, its report names the rule and the reason.
+
 ## Product and architecture
 
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance, with an
@@ -169,11 +174,8 @@ Keep stable requirements in their existing active reference. Temporary plans are
 active work; remove them when completed or abandoned. Maintain one current authority rather than
 parallel `final`, `v2`, or `new-design` documents.
 
-README's What's New is a changelog with one short line per date. The line lists what shipped that
-day in a few words per item and links each item inline to the document with its details.
-Descriptions, mechanisms, measurements and hardware belong in the linked documents, not in What's
-New. Internal changes and small fixes get no item. A later change of the same date adds an item to
-that line or extends an existing item.
+Documentation rules, including README's What's New, are in
+[CONTRIBUTING.md](CONTRIBUTING.md#documentation-describes-the-current-state).
 
 ## Verification and completion
 
@@ -255,6 +257,7 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 
 | Decision | Entry point |
 |---|---|
+| Engineering rules for every change: lossless, families, platforms, defaults, measurements, docs, tests | `CONTRIBUTING.md` |
 | Product capabilities and exact commands | `README.md`, executable `--help`; `docs/cli.md`, `docs/serving.md`, `docs/perplexity.md` |
 | Execution, model/runtime ownership, scheduling, transactions, graphs | `docs/maintainer/engine-architecture.md` |
 | Context resources, checkpoints, replicas; physical KV | `docs/maintainer/resource-scheduling-and-context-cache.md`; `docs/maintainer/paged-kv-cache.md` |
@@ -278,10 +281,10 @@ Select model artifacts by explicit path, never glob order, modification time, or
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.
 
-Compilation needs no GPU. Executing CUDA tests, benchmarks or perplexity runs needs a free GPU; GPU
-work runs on rented hosts through `scripts/pods` ([pods](scripts/pods/README.md)).
+Compilation needs no GPU. Executing CUDA tests, benchmarks or perplexity runs needs a free GPU; the
+[pods harness](scripts/pods/README.md) runs them on rented hosts.
 
 ## Commits
 
-Create commits only when requested. Use Conventional Commit subjects with concise lowercase types
-such as `feat`, `fix`, `perf`, `bench`, `test`, `build`, `refactor`, `docs`, or `chore`.
+Create commits only when requested. Commit subjects follow the
+[tests and tooling rules](CONTRIBUTING.md#tests-and-tooling).
