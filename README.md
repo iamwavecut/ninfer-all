@@ -23,45 +23,10 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 ## What's New
 
-<!-- Use one entry per date. Add changes to that date's entry and link to details. -->
+<!-- One line per date. List what shipped, a few words per item, and link each item to the document with its details. Keep descriptions, measurements and hardware out of this list. -->
 
-- **2026-11-04:** Tensor-parallel prefill without peer access can move prompt exchanges as [BF16 or 8-bit partials](docs/maintainer/pipeline-stages.md#tensor-parallelism) (`--tensor-parallel-prompt-partials bf16|int8`), for Qwen3.5-core models and Flash-Next.
-  Qwen3.8-27B prefilled 18-26% faster with BF16 on four RTX 5060 Ti on PCIe 3.0 and 2-5% faster on two RTX 3090s; Flash-Next 10-15% faster with either.
-  Under [tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next) every GPU runs a part of Flash-Next's shared expert and projects its rows of the head and of MTP's drafts:
-  on four RTX 5060 Ti it decoded 8-9% faster, and 12-13% faster with MTP.
-  GPUs of one model divide tensor-parallel work by one measured speed, so the same request gives the same result from one start to the next.
-  [Expert-parallel](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families) Gemma 4, Flint and DeepSeek-V4.1 divide the vocabulary head across GPUs too,
-  and DeepSeek-V4.1 sizes its host-expert shares by each GPU's cache room and bus: on two RTX 3090s Gemma 4 decoded 4-5% faster (MTP 3%) and Flint 2.5-2.8%.
-  Flash-Next's batched rounds run every request's [mixer projections](docs/qwen3-8-flash-next.md#sequences-kv-and-the-context-cache) at once:
-  eight requests on an RTX 3090 with host experts finished 2.0-4.2% faster with MTP and 11.5% faster without drafts.
-  With host or disk experts, Flash-Next [packs the prompt steps](docs/qwen3-8-flash-next.md#sequences-kv-and-the-context-cache) of requests that prefill together into one span:
-  eight requests on an RTX 3090 with host experts got their last first token after 6-10 s instead of 19-24 s and finished 1.8-1.9 times as fast.
-  Flash-Next's host experts take [prompt chunks of up to 64 tokens](docs/qwen3-8-flash-next.md#the-cpu-share) through the CPU share:
-  a 39-token prompt's first token came after 0.23-0.27 s instead of 0.42-0.44 s on an RTX 3090.
-  Flash-Next decodes with incoai's [DFlash2 drafter](docs/qwen3-8-flash-next.md#dflash2-speculative-decoding) (`--spec dflash2`), which the three Flash-Next releases now carry and host experts use without `--spec`:
-  on an RTX 3090 it decoded 1.06-1.19 times as fast as the MTP block's drafts, and under tensor parallelism over two RTX 3090s 1.21-1.46 times as fast as without drafts.
-  [Expert-parallel](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families) Gemma 4 runs the first GPU's dense MLP while the other GPUs run their experts, and with host experts while the missing experts arrive:
-  two RTX 3090s decoded 8-9% faster (MTP 5%) and prefilled 4% faster; one RTX 3090 with host experts decoded 2.5-3% faster.
-  A [tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) Qwen MoE gives the first GPU fewer routed experts beside its shared expert, and Flash-Next's shared expert follows each GPU's routed experts:
-  Qwen3.6-35B-A3B on four RTX 5060 Ti decoded 0.5-0.8% faster with 1.7 GiB more free on the first GPU, and its MTP, which failed to start under tensor parallelism, decodes at 261-300 tok/s.
-  Tensor-parallel Flash-Next runs prompts in chunks of 2,048 tokens whose [pieces of 1,024](docs/maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next) exchange while the next piece computes:
-  two RTX 3090s prefilled 13-17% faster in every KV format with the same tokens as before.
-  DeepSeek-V4.1's later index sources score only the [blocks the first one keeps](docs/deepseek-v41.md#long-prompts) once a query sees more than 16,384 positions:
-  a 58,117-token prompt prefilled 1.0-1.3% faster on an RTX 3090 with the same tokens.
-  DeepSeek-V4.1 with host experts divided over several GPUs runs prompts in [spans](docs/deepseek-v41.md#prompt-spans) as on one GPU:
-  two RTX 3090s prefilled a 9,672-token prompt 1.49 times as fast with the same tokens.
-  Flash-Next's mixers quantize each input once for all of their GGUF projections:
-  one RTX 3090 with host experts decoded 0.4-2.0% faster with DFlash2 drafts and 0.2-0.7% faster without, with the same tokens.
-- **2026-11-03:** Qwen3.5-core models speed up [tensor-parallel decode](docs/maintainer/pipeline-stages.md#tensor-parallelism)
-  by splitting vocabulary heads across GPUs.
-  Eligible Q4 and Q5 projection shares use the same small-T MMA routes as whole projections.
-  The GPUs also divide MTP's attention, its KV cache and its dense FFN.
-  Without peer access, one kernel per GPU [reduce-scatters](docs/maintainer/pipeline-stages.md#tensor-parallelism) decode exchanges through host memory, synchronized by flags.
-  GPUs can speed up dense text prefill by exchanging one prompt piece while computing the next.
-  Flash-Next [drafts with MTP for several requests at once](docs/qwen3-8-flash-next.md#mtp-with-several-requests).
-  On an RTX 4090 with host experts, automatic drafting ran at 1.01 to 1.16 times the speed without drafts.
-  Qwen3.5-core models support llama.cpp [control vectors and direction LoRA adapters](docs/serving.md#lora-adapters-and-control-vectors)
-  with per-request adapter scales.
+- **2026-11-04:** Flash-Next [DFlash2 drafting](docs/qwen3-8-flash-next.md#dflash2-speculative-decoding), faster Flash-Next [tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next) and [concurrent requests with host experts](docs/qwen3-8-flash-next.md#sequences-kv-and-the-context-cache), [BF16 and 8-bit tensor-parallel prompt partials](docs/maintainer/pipeline-stages.md#tensor-parallelism), and faster [expert parallelism](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families).
+- **2026-11-03:** Faster [tensor-parallel decode and prefill](docs/maintainer/pipeline-stages.md#tensor-parallelism) for Qwen3.5-core models, Flash-Next [MTP for several requests](docs/qwen3-8-flash-next.md#mtp-with-several-requests), and llama.cpp [control vectors and direction LoRA adapters](docs/serving.md#lora-adapters-and-control-vectors).
 - **2026-11-02:** [Tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism) selects exchange routes by size from startup timings, including peer writes.
 - **2026-10-31:** [Automatic tensor splits](docs/maintainer/pipeline-stages.md#tensor-parallelism) adjust GPU shares using free memory after the first load.
 - **2026-10-30:** [Bundled media libraries](docs/release-archive-linux.md#media-libraries), [pre-Blackwell NVFP4](docs/cli.md#common-options), Qwen3.5 FP32 logits, attention kernel preload, and [prefill pacing](docs/serving.md#execution-behavior).

@@ -169,6 +169,12 @@ Keep stable requirements in their existing active reference. Temporary plans are
 active work; remove them when completed or abandoned. Maintain one current authority rather than
 parallel `final`, `v2`, or `new-design` documents.
 
+README's What's New is a changelog with one short line per date. The line lists what shipped that
+day in a few words per item and links each item inline to the document with its details.
+Descriptions, mechanisms, measurements and hardware belong in the linked documents, not in What's
+New. Internal changes and small fixes get no item. A later change of the same date adds an item to
+that line or extends an existing item.
+
 ## Verification and completion
 
 Select evidence to support the changed behavior and material claims. Tests should protect supported
