@@ -77,10 +77,19 @@ CMakeLists requires CUDA >= 12.8. Set CUDACXX yourself if your toolkit lives els
 "@
 }
 
-# vcvars64.bat only exports into its own cmd process, so run it and copy the result back.
+# vcvars64.bat only exports into its own cmd process, so run it and copy the result back. It
+# selects toolset 14.44 (MSVC 19.44), the oldest qualified compiler, also where the installation's
+# default toolset is older: cl 19.38 miscompiles core::wide_add at /O2.
 Write-Host "toolchain: $VcVars"
 Write-Host "toolchain: $Nvcc"
-cmd /c "`"$VcVars`" >nul 2>&1 && set" | ForEach-Object {
+$VcVarsOutput = cmd /c "`"$VcVars`" -vcvars_ver=14.44 >nul 2>&1 && set"
+if ($LASTEXITCODE -ne 0) {
+    throw @"
+$VcVars could not select MSVC toolset 14.44 (MSVC 19.44), the oldest qualified compiler.
+Update Visual Studio 2022 to 17.14, or install its 14.44 build tools in the Visual Studio Installer.
+"@
+}
+$VcVarsOutput | ForEach-Object {
     if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "Env:$($Matches[1])" -Value $Matches[2] }
 }
 $env:CUDACXX = $Nvcc

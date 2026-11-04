@@ -218,6 +218,17 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(MSVC)
+  # MSVC 19.44 (Visual Studio 2022 17.14, toolset 14.44) is the oldest qualified compiler: cl 19.38
+  # folds the overflow flag of core::wide_add wrongly at /O2 when its inputs are constants
+  # (ninfer_wide_math_test fails), and 19.39-19.43 were never qualified. A Visual Studio 2022 whose
+  # default toolset is older selects 14.44 when it is installed: vcvars64.bat -vcvars_ver=14.44.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.44)
+    message(FATAL_ERROR "MSVC ${CMAKE_CXX_COMPILER_VERSION} is older than 19.44, the oldest "
+      "qualified compiler (cl 19.38 miscompiles core::wide_add at /O2). Update Visual Studio 2022 "
+      "to 17.14, or install its 14.44 build tools and configure from an environment opened with "
+      "'vcvars64.bat -vcvars_ver=14.44'; Visual Studio 2026 also qualifies where its CUDA version "
+      "accepts it.")
+  endif()
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
   # /Zc:__cplusplus makes MSVC report the standard it is actually compiling. Without it the macro
   # stays at 199711L even under /std:c++20, and CUDA's <vector_types.h> then hides the constexpr
