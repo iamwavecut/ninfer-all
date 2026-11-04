@@ -52,7 +52,7 @@
 namespace ninfer::runtime {
 namespace {
 
-// Prompt chunks in one prefill step while other requests decode (see prefill_step).
+// Prompt chunks in one prefill step while other requests decode (see prompt_step_tokens).
 constexpr std::uint32_t kPeerSpanChunks = 2;
 
 using Clock = std::chrono::steady_clock;
@@ -1531,9 +1531,20 @@ struct Qwen4ExpCore::Impl {
                 }
             }
             prefilling->prefill_skips = 0;
+            const std::uint32_t lead_tokens = prompt_step_tokens(*prefilling);
+            std::uint32_t tokens            = 0;
             try {
-                prefill_step(prefilling);
+                if (executor.packs_prompts() && plain_prompt(*prefilling)) {
+                    tokens = packed_prefill_step(prefilling);
+                } else {
+                    prefill_step(prefilling);
+                }
             } catch (...) { fail(prefilling, std::current_exception()); }
+            // A packed step computed more than the lead's tokens, which its wait was sized for:
+            // the next prefill step waits for the rest of their decode rounds too.
+            if (decoding && tokens > lead_tokens) {
+                decode_run = -double(decode_rounds_before(tokens) - decode_rounds_before(lead_tokens));
+            }
             return true;
         }
         if (!decoding) { return false; }
@@ -1812,19 +1823,21 @@ struct Qwen4ExpCore::Impl {
         finish(request, reason);
     }
 
-    // Feeds the next chunk of a prompt, which ends at the anchor when one lies ahead, where the
-    // sequence's state is kept for the context cache; at the prompt's end samples the first token.
-    void prefill_step(const std::shared_ptr<Request>& request) {
+    // Readies the request's next prompt step: a cancelled request finishes; a prompt admitted with
+    // nothing to resume may find a prefix another request stored while it waited (the shared state
+    // of reads that arrived together) and starts there; a branched read past its prompt runs its
+    // branch step, and one whose last prompt step opens its branches runs both; a media prompt
+    // runs its tower. The prompt tokens of the step, or nothing when the step has run or ended
+    // the request.
+    std::optional<std::uint32_t> begin_prefill(const std::shared_ptr<Request>& request) {
         Request& r          = *request;
         Slot& slot          = slots[r.slot];
         auto& executor      = *instance.executor;
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
         if (r.cancelled.load(std::memory_order_acquire)) {
             finish_now(request, FinishReason::Cancelled);
-            return;
+            return std::nullopt;
         }
-        // A prompt admitted with nothing to resume may find a prefix another request stored while
-        // it waited (the shared state of reads that arrived together): start there.
         if (reuse_prefixes && r.reusable && r.prefilled == 0) {
             const auto [image, from_store] =
                 find_stored(r.prompt_tokens, drafts_for(r), r.branches != nullptr);
@@ -1844,7 +1857,7 @@ struct Qwen4ExpCore::Impl {
         }
         if (r.branches && r.prefilled == prompt_n) {
             branch_step(request);
-            return;
+            return std::nullopt;
         }
         if (r.media && r.prefilled == 0) {
             // The tower's embeddings stay until another prompt's media replace them; prompts
@@ -1865,14 +1878,21 @@ struct Qwen4ExpCore::Impl {
         const std::uint32_t n = prompt_step_tokens(r);
         if (opens_branches(r, n)) {
             prompt_branch_pass(request, n);
-            return;
+            return std::nullopt;
         }
-        const auto prompt     = std::span<const TokenId>(r.prompt_tokens);
-        const auto chunk      = prompt.subspan(r.prefilled, n);
-        // The next step's table rows are read while this one runs.
-        const auto next = prompt.subspan(r.prefilled + n,
-                                         std::min(executor.prompt_step(), prompt_n - r.prefilled - n));
-        executor.forward(r.slot, chunk, 1, next);
+        return n;
+    }
+
+    // Books a prompt step of `n` tokens that ran for the request, its last token's logits column
+    // `column` of logits(rows): the context cache's images at its frontiers, its progress, and at
+    // the prompt's end its first token.
+    void end_prefill(const std::shared_ptr<Request>& request, std::uint32_t n,
+                     std::uint32_t column, std::uint32_t rows) {
+        Request& r          = *request;
+        Slot& slot          = slots[r.slot];
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const auto chunk    = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         r.prefilled += n;
         if (reuse_prefixes && r.reusable &&
@@ -1889,7 +1909,123 @@ struct Qwen4ExpCore::Impl {
         }
         if (r.prefilled < prompt_n) { return; }
         if (r.branches) { return; } // the next steps run the branches
-        finish_prompt(request);
+        finish_prompt(request, column, rows);
+    }
+
+    // Feeds the next chunk of a prompt, which ends at the anchor when one lies ahead, where the
+    // sequence's state is kept for the context cache; at the prompt's end samples the first token.
+    void prefill_step(const std::shared_ptr<Request>& request) {
+        const std::optional<std::uint32_t> n = begin_prefill(request);
+        if (n) { feed_prompt(request, *n); }
+    }
+
+    // Runs the request's prompt step of `n` tokens alone.
+    void feed_prompt(const std::shared_ptr<Request>& request, std::uint32_t n) {
+        Request& r          = *request;
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const auto prompt   = std::span<const TokenId>(r.prompt_tokens);
+        // The next step's table rows are read while this one runs.
+        const auto next = prompt.subspan(
+            r.prefilled + n, std::min(executor.prompt_step(), prompt_n - r.prefilled - n));
+        executor.forward(r.slot, prompt.subspan(r.prefilled, n), 1, next);
+        end_prefill(request, n, 0, 1);
+    }
+
+    // A prompt without branches or media, whose steps may share a span with other prompts'.
+    [[nodiscard]] static bool plain_prompt(const Request& r) { return !r.branches && !r.media; }
+
+    // A prompt step of `lead` (a plain prompt) that also takes the steps of other plain prompts,
+    // in prefills_before order, as long as they fit one span (two chunks while others decode):
+    // their chunks reach each layer together, so its uncached experts cross the bus once for all
+    // of them. A step that does not end its prompt takes whole chunks, so every prompt runs the
+    // chunks, and each piece the arithmetic, it would alone. A prompt that could start from the
+    // prefix a packed prompt is about to store waits for it. Returns the tokens computed.
+    std::uint32_t packed_prefill_step(const std::shared_ptr<Request>& lead) {
+        auto& executor = *instance.executor;
+        const std::optional<std::uint32_t> lead_n = begin_prefill(lead);
+        if (!lead_n) { return 0; }
+        const std::uint32_t chunk = executor.options().prefill_chunk;
+        const bool decoding       = std::any_of(slots.begin(), slots.end(), [](const Slot& slot) {
+            return slot.request && slot.request->decoding;
+        });
+        const std::uint32_t budget =
+            decoding ? std::min(executor.prompt_step(), kPeerSpanChunks * chunk)
+                     : executor.prompt_step();
+        struct Packed {
+            std::shared_ptr<Request> request;
+            std::uint32_t tokens = 0;
+        };
+        std::vector<Packed> packed{{lead, *lead_n}};
+        std::uint32_t total = *lead_n;
+        std::vector<std::shared_ptr<Request>> candidates;
+        for (const Slot& slot : slots) {
+            if (slot.request && slot.request != lead && !slot.request->decoding &&
+                plain_prompt(*slot.request)) {
+                candidates.push_back(slot.request);
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const auto& a, const auto& b) { return prefills_before(*a, *b); });
+        const auto shares_store = [&](const Request& r) {
+            if (!reuse_prefixes || !r.reusable || r.prefilled != 0 || r.shared_at.empty()) {
+                return false;
+            }
+            const std::uint32_t frontier = r.shared_at.front();
+            return std::any_of(packed.begin(), packed.end(), [&](const Packed& p) {
+                const Request& q = *p.request;
+                return q.prefilled < frontier && q.prompt_tokens.size() >= frontier &&
+                       std::equal(r.prompt_tokens.begin(), r.prompt_tokens.begin() + frontier,
+                                  q.prompt_tokens.begin());
+            });
+        };
+        for (const auto& request : candidates) {
+            if (packed.size() >= executor.max_logit_rows() || budget - total < chunk) { break; }
+            std::optional<std::uint32_t> n;
+            try {
+                n = begin_prefill(request);
+            } catch (...) {
+                fail(request, std::current_exception());
+                continue;
+            }
+            if (!n || *n == 0 || shares_store(*request)) { continue; }
+            if (*n > budget - total) { *n = (budget - total) / chunk * chunk; }
+            packed.push_back({request, *n});
+            request->prefill_skips = 0;
+            total += *n;
+        }
+        if (packed.size() == 1) {
+            feed_prompt(lead, *lead_n);
+            return total;
+        }
+        std::vector<models::qwen4_exp::PromptPiece> pieces;
+        for (const Packed& p : packed) {
+            pieces.push_back(
+                {.sequence = p.request->slot,
+                 .tokens   = std::span<const TokenId>(p.request->prompt_tokens)
+                               .subspan(p.request->prefilled, p.tokens)});
+        }
+        // The last piece's next step's table rows are read while this one runs.
+        const Request& last  = *packed.back().request;
+        const auto last_end  = last.prefilled + packed.back().tokens;
+        const auto next      = std::span<const TokenId>(last.prompt_tokens)
+                              .subspan(last_end, std::min<std::size_t>(
+                                                     executor.prompt_step(),
+                                                     last.prompt_tokens.size() - last_end));
+        try {
+            executor.forward_pieces(pieces, next);
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            for (std::size_t i = 1; i < packed.size(); ++i) { fail(packed[i].request, error); }
+            throw;
+        }
+        const auto rows = static_cast<std::uint32_t>(packed.size());
+        for (std::uint32_t i = 0; i < rows; ++i) {
+            try {
+                end_prefill(packed[i].request, packed[i].tokens, i, rows);
+            } catch (...) { fail(packed[i].request, std::current_exception()); }
+        }
+        return total;
     }
 
     // One step of a branched read: the current branch's next tokens, from the snapshot at the
@@ -2077,9 +2213,10 @@ struct Qwen4ExpCore::Impl {
         finish_prompt(request);
     }
 
-    // The prompt is in (and a branched read's branches): the request takes its first token and
-    // decodes from there.
-    void finish_prompt(const std::shared_ptr<Request>& request) {
+    // The prompt is in (and a branched read's branches): the request takes its first token, from
+    // column `column` of logits(rows), and decodes from there.
+    void finish_prompt(const std::shared_ptr<Request>& request, std::uint32_t column = 0,
+                       std::uint32_t rows = 1) {
         Request& r          = *request;
         auto& executor      = *instance.executor;
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
@@ -2117,16 +2254,20 @@ struct Qwen4ExpCore::Impl {
             accept(request, r.branch_token, &r.branch_record);
             return;
         }
+        const Tensor logits = executor.logits(rows);
         if (!mask_ready(r)) {
-            defer_sample(r, executor.logits(1), 0, ops::kSamplePurposePrefill);
+            defer_sample(r, logits, column, ops::kSamplePurposePrefill);
             return;
         }
         if (!mask_usable(request)) { return; }
         const SampleRow row = sample_row(r);
         TokenId token       = 0;
         runtime::RawTokenLogprob logprob;
+        const Tensor source(static_cast<std::uint8_t*>(logits.data) +
+                                std::size_t(column) * vocab_rows * sizeof(__nv_bfloat16),
+                            DType::BF16, {logits.ne[0], 1});
         sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
-               std::span(&logprob, 1));
+               std::span(&logprob, 1), &source);
         accept(request, token, row.logprobs ? &logprob : nullptr);
         next_mask(request);
     }

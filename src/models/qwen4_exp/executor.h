@@ -91,6 +91,12 @@ struct MediaItem {
     const qwen3_5::VisionItemControl* control = nullptr;
 };
 
+// One sequence's prompt tokens in a packed prompt span (Executor::forward_pieces).
+struct PromptPiece {
+    std::uint32_t sequence = 0;
+    std::span<const std::int32_t> tokens;
+};
+
 struct ExecutorMemory {
     struct Rank {
         std::uint64_t state_bytes        = 0; // the sequences' state of the rank's layers
@@ -193,6 +199,16 @@ public:
     // prompt_step()) are hinted, to be read while the device runs `tokens`.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const std::int32_t> next = {});
+    // Whether forward_pieces() runs: prompt steps are layer-major spans.
+    [[nodiscard]] bool packs_prompts() const noexcept;
+    // The prompt tokens of several distinct sequences in one span (prompt_step() tokens in all,
+    // at most max_logit_rows() pieces), each piece at its sequence's next positions with the
+    // arithmetic forward() gives it, while each layer's uncached experts cross the bus once for
+    // all of them. Leaves the logits of each piece's last token in logits(), one column per piece
+    // in order. A media prompt's tokens run only as a single piece. `next`, as in forward(), are
+    // the known tokens after the last piece.
+    void forward_pieces(std::span<const PromptPiece> pieces,
+                        std::span<const std::int32_t> next = {});
     // Branches of a sequence in one pass, each from the state `at` (a snapshot of the sequence):
     // branch b runs `lengths[b]` of `tokens` (in branch order, at most prefill_chunk in all) at the
     // positions after `at`, its mixers from `at`'s state, while every layer's experts run over all
