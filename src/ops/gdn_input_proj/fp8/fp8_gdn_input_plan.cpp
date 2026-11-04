@@ -43,7 +43,10 @@ std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int
                                                    std::int32_t max_tokens) {
     return capacity_by_table(
         min_tokens, max_tokens,
-        [](std::int32_t width) { return fused_route_table("unified/fp8_gdn_input", width); },
+        [policy](std::int32_t width) {
+            return fused_route_table("unified/fp8_gdn_input", width, fp8_wide_route_table(policy),
+                                     allows_a8(policy));
+        },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
                        ? unified::fp8_gdn_input_workspace_capacity_bytes(policy, first, last)
@@ -69,7 +72,8 @@ void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qk
 
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-    if (fused_route_table("unified/fp8_gdn_input", x.ne[1]) == LinearRouteTable::Unified) {
+    if (fused_route_table("unified/fp8_gdn_input", x.ne[1], fp8_wide_route_table(policy),
+                          allows_a8(policy)) == LinearRouteTable::Unified) {
         unified::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
     }

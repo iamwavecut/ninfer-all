@@ -49,9 +49,11 @@ void launch_fp8_a16_chunks(const Tensor& x, const Weight& weight, Tensor& out,
 template <class Geometry, class Schedule, bool FullTokens>
 void launch_fp8_a8_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace,
                        std::int32_t tokens, cudaStream_t stream) {
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
-    // fp8_mma_kernel emits mma.sync...kind::f8f6f4, a Blackwell-only qualifier, so sm_8x must not
-    // instantiate it. A8 is never admitted there (prepare.cpp maps every stored policy to
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8) && !defined(NINFER_SM89_FP8)
+    // fp8_mma_kernel emits the block-scaled mma.sync...kind::f8f6f4 in a 120a image and the plain
+    // e4m3 m16n8k32 MMA in an sm_89 image; neither instruction exists before sm_89. A build
+    // without 89 and 120a instantiates no image that can run it, so its launcher must not
+    // instantiate the kernel. A8 is never admitted there (prepare.cpp maps every stored policy to
     // A16Only); see fp8_sm86_stubs.cpp.
     (void)weight;
     (void)out;

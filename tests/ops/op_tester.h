@@ -59,17 +59,17 @@ inline void cuda_synchronize(cudaStream_t stream) {
     cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 }
 
-// FP8 A8 and NVFP4 A4 execution issue tensor-core instructions that exist only on sm_100a /
-// sm_120a and have no Ampere fallback, so those translation units are compiled out under
-// NINFER_SM8X_COMPAT and their entry points throw instead. A 120a build on that path still
-// compiles both (NINFER_SM120_FP8, NINFER_SM120_NVFP4); a build of several architectures with
-// 120a runs them on the cards that run its 120a code only, and its entry points throw the same
-// refusal on the others (ops/common/blackwell_routes.h).
+// FP8 A8 execution issues the plain E4M3 m16n8k32 tensor-core MMA on sm_89 and up and the
+// block-scaled Blackwell forms on 120a; NVFP4 A4 runs only on 120a. Builds without the code for
+// a card's family compile the A8/A4 units out under NINFER_SM8X_COMPAT and their entry points
+// throw instead (NINFER_SM89_FP8 / NINFER_SM120_FP8 and NINFER_SM120_NVFP4); a build of several
+// architectures runs them on the cards that run the code they need, and its entry points throw the
+// same refusal on the others (ops/common/blackwell_routes.h).
 inline bool a8_execution_available() {
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8) && !defined(NINFER_SM89_FP8)
     return false;
 #else
-    return ops::current_device_blackwell();
+    return ops::current_device_fp8_mma();
 #endif
 }
 

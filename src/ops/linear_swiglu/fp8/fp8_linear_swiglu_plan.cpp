@@ -69,7 +69,8 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
     return capacity_by_table(
         min_tokens, max_tokens,
         [&](std::int32_t width) {
-            return fused_route_table("unified/fp8_linear_swiglu", width, fp8_wide_route_table(policy));
+            return fused_route_table("unified/fp8_linear_swiglu", width,
+                                     fp8_wide_route_table(policy), allows_a8(policy));
         },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
@@ -82,8 +83,8 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream) {
-    if (fused_route_table("unified/fp8_linear_swiglu", x.ne[1], fp8_wide_route_table(policy)) ==
-        LinearRouteTable::Unified) {
+    if (fused_route_table("unified/fp8_linear_swiglu", x.ne[1], fp8_wide_route_table(policy),
+                          allows_a8(policy)) == LinearRouteTable::Unified) {
         unified::fp8_linear_swiglu_dispatch(x, weight, out, unified_policy(policy), workspace,
                                             stream);
         return;

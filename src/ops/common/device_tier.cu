@@ -85,4 +85,42 @@ DeviceTier current_device_tier() {
     }
 }
 
+namespace {
+
+// 0 is unknown; 1 is no FP8 tensor cores; 2 is FP8 MMA (sm_89 and up).
+std::array<std::atomic<std::uint8_t>, kMaxDevices>& known_fp8_mma() {
+    static std::array<std::atomic<std::uint8_t>, kMaxDevices> fp8{};
+    return fp8;
+}
+
+bool fp8_mma_of(int device) {
+    int major = 0;
+    int minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    // Ada (sm_89) gained the plain E4M3 m16n8k32 MMA; every newer family kept FP8 tensor cores.
+    return major > 8 || (major == 8 && minor >= 9);
+}
+
+} // namespace
+
+bool current_device_fp8_mma() {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        cudaGetLastError();
+        device = 0;
+    }
+    if (device < 0 || device >= kMaxDevices) { return fp8_mma_of(device); }
+    std::atomic<std::uint8_t>& slot = known_fp8_mma()[static_cast<std::size_t>(device)];
+    std::uint8_t value              = slot.load(std::memory_order_relaxed);
+    if (value == 0) {
+        value = static_cast<std::uint8_t>(fp8_mma_of(device) ? 2 : 1);
+        slot.store(value, std::memory_order_relaxed);
+    }
+    return value == 2;
+}
+
 } // namespace ninfer::ops

@@ -42,7 +42,8 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
     return capacity_by_table(
         min_tokens, max_tokens,
         [&](std::int32_t width) {
-            return linear_route_table(LinearRouteFamily::Fp8, width, fp8_wide_route_table(policy));
+            return linear_route_table(LinearRouteFamily::Fp8, width, fp8_wide_route_table(policy),
+                                      allows_a8(policy));
         },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) -> std::size_t {
             const auto& shape = resolve_shape(n, k, policy, table);
@@ -60,7 +61,8 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     if (out.dtype == DType::FP32 && registered) {
         const auto& shape = resolve_shape(
             weight.n, weight.k, policy,
-            linear_route_table(LinearRouteFamily::Fp8, x.ne[1], fp8_wide_route_table(policy)));
+            linear_route_table(LinearRouteFamily::Fp8, x.ne[1], fp8_wide_route_table(policy),
+                               allows_a8(policy)));
         if (shape.a16_fp32 != nullptr) return shape.a16_fp32(x, weight, out, stream);
     }
     if (out.dtype == DType::FP32 || !registered) {
@@ -75,7 +77,7 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     const auto& shape =
         resolve_shape(weight.n, weight.k, policy,
                       linear_route_table(LinearRouteFamily::Fp8, x.ne[1],
-                                         fp8_wide_route_table(policy)));
+                                         fp8_wide_route_table(policy), allows_a8(policy)));
     if (!allows_a8(policy) || !shape.uses_a8(x.ne[1], x.ne[1]))
         return shape.a16(x, weight, out, stream);
     if (workspace == nullptr)

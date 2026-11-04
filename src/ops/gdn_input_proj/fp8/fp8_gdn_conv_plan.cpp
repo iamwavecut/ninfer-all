@@ -113,9 +113,10 @@ Fp8GdnConvPlan fp8_gdn_record_resolve_plan(LinearPolicy policy, std::int32_t wid
 // snapshot keep one arithmetic for the same block.
 constexpr std::int32_t kUnifiedMaxWidth = 16;
 
-bool unified_route(std::int32_t width) {
+bool unified_route(std::int32_t width, LinearPolicy policy) {
     return width <= kUnifiedMaxWidth &&
-           fused_route_table("unified/fp8_gdn_input", width) == LinearRouteTable::Unified;
+           fused_route_table("unified/fp8_gdn_input", width, fp8_wide_route_table(policy),
+                             allows_a8(policy)) == LinearRouteTable::Unified;
 }
 
 } // namespace
@@ -148,8 +149,9 @@ std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy, std::
                                                       std::int32_t max_width) {
     return capacity_by_table(
         min_width, max_width,
-        [](std::int32_t width) {
-            return unified_route(width) ? LinearRouteTable::Unified : LinearRouteTable::Legacy;
+        [policy](std::int32_t width) {
+            return unified_route(width, policy) ? LinearRouteTable::Unified
+                                                : LinearRouteTable::Legacy;
         },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
@@ -177,8 +179,9 @@ std::size_t fp8_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::in
                                                     std::int32_t max_width) {
     return capacity_by_table(
         min_width, max_width,
-        [](std::int32_t width) {
-            return unified_route(width) ? LinearRouteTable::Unified : LinearRouteTable::Legacy;
+        [policy](std::int32_t width) {
+            return unified_route(width, policy) ? LinearRouteTable::Unified
+                                                : LinearRouteTable::Legacy;
         },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
@@ -248,7 +251,7 @@ void fp8_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tens
                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
-    if (unified_route(x.ne[1])) {
+    if (unified_route(x.ne[1], policy)) {
         unified::fp8_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
                                            initial_slot, snapshot_base_slot, query, key, value, z,
                                            policy, workspace, stream);
@@ -264,7 +267,7 @@ void fp8_gdn_record_dispatch(const Tensor& x, const Weight& weight, const Tensor
                              const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
                              Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
                              WorkspaceArena& workspace, cudaStream_t stream) {
-    if (unified_route(x.ne[1])) {
+    if (unified_route(x.ne[1], policy)) {
         unified::fp8_gdn_record_dispatch(x, weight, conv_weight, conv_states, valid_columns,
                                          initial_slot, conv_record, query, key, value, z, policy,
                                          workspace, stream);

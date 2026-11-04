@@ -56,7 +56,10 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
                                                     std::int32_t max_tokens) {
     return capacity_by_table(
         min_tokens, max_tokens,
-        [](std::int32_t width) { return fused_route_table("unified/fp8_attn_input", width); },
+        [policy](std::int32_t width) {
+            return fused_route_table("unified/fp8_attn_input", width, fp8_wide_route_table(policy),
+                                     allows_a8(policy));
+        },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
                        ? unified::fp8_attn_input_workspace_capacity_bytes(policy, first, last)
@@ -67,7 +70,8 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream) {
-    if (fused_route_table("unified/fp8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+    if (fused_route_table("unified/fp8_attn_input", x.ne[1], fp8_wide_route_table(policy),
+                          allows_a8(policy)) == LinearRouteTable::Unified) {
         unified::fp8_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
         return;
     }

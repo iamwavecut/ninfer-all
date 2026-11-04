@@ -95,9 +95,10 @@ template <class Schedule, class Output, class Epilogue, class Rows = Fp8Identity
 void launch_fp8_a8_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
                        cudaStream_t stream, Rows rows = {},
                        pdl::Dependency dependency = pdl::Dependency::Serialized) {
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
-    // The A8 MMA emits mma.sync...kind::f8f6f4, which sm_8x does not have; A8 is never admitted
-    // there (see fp8_sm86_stubs.cpp).
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8) && !defined(NINFER_SM89_FP8)
+    // The A8 MMA emits the block-scaled mma.sync...kind::f8f6f4 in a 120a image and the plain
+    // e4m3 m16n8k32 MMA in an sm_89 image; neither exists before sm_89, and A8 is never admitted
+    // to a build without 89 and 120a (see fp8_sm86_stubs.cpp).
     (void)p;
     (void)output;
     (void)epilogue;

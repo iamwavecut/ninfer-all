@@ -49,6 +49,11 @@ if("80" IN_LIST _ninfer_architectures OR "86" IN_LIST _ninfer_architectures OR
    "89" IN_LIST _ninfer_architectures)
   set(NINFER_ARCH_AMPERE ON)
 endif()
+# 89 (early Ada) is the tier's only architecture with FP8 tensor cores: it runs the plain E4M3
+# m16n8k32 MMA the FP8 A8 unit emits in an sm_89 image.
+if("89" IN_LIST _ninfer_architectures)
+  set(NINFER_ARCH_ADA ON)
+endif()
 if("120a" IN_LIST _ninfer_architectures)
   set(NINFER_ARCH_BLACKWELL ON)
 endif()
@@ -140,6 +145,14 @@ endif()
 # images compile their Blackwell-only instructions as traps that no launch reaches.
 if(NINFER_ARCH_BLACKWELL)
   add_compile_definitions(NINFER_SM120_NVFP4=1 NINFER_SM120_FP8=1)
+endif()
+# A build with 89 keeps the FP8 A8 unit as well: its sm_89 image runs the plain E4M3 m16n8k32
+# MMA, and a 120a image in the same build runs the block-scaled form. NVFP4 stays 120a-only.
+# Every other image in such a build compiles the unit's instructions as traps no launch reaches
+# (ops/common/mma.cuh), and the launchers refuse the call on a card without FP8 tensor cores
+# (ops/common/blackwell_routes.h).
+if(NINFER_ARCH_ADA)
+  add_compile_definitions(NINFER_SM89_FP8=1)
 endif()
 
 # The device code of several architectures outgrows the 2 GiB that 32-bit PC-relative references

@@ -97,6 +97,11 @@ inline constexpr bool kBuildPostVolta = kBuildTuring || kBuildAmpere || kBuildBl
     return current_device_tier() == DeviceTier::Blackwell;
 }
 
+// Whether the current device's tensor cores run FP8 E4M3 MMA at all: sm_89 (Ada, the plain
+// m16n8k32 e4m3 instruction) or newer (Blackwell's block-scaled forms). The tier answer cannot
+// tell sm_86 from sm_89, so this reads the device's compute capability (cached per device).
+[[nodiscard]] bool current_device_fp8_mma();
+
 // Kernel shapes come in two sets. Turing's are sized for its 64 KiB of shared memory per block;
 // every other tier runs the standard set, sized for 99 KiB (sm_86, sm_89 and sm_120 allow that;
 // sm_80 allows more, but its kernels are the sm_86 ones; a Volta card allows 96 KiB and runs the

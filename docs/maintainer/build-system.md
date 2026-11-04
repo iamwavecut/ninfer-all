@@ -108,14 +108,31 @@ tier); those kernels' `mma.m8n8k4` bodies exist in the Volta image only. Its pro
 panel layout on the ranks whose device runs Volta's code (`apply_device_layouts`). Its route
 catalog holds the GDN prefill switches alone.
 
+### Ada FP8 (`89`)
+
+Early Ada (`sm_89`) is the only Ampere-tier architecture with FP8 tensor cores. A build carrying
+`89` (`NINFER_SM89_FP8`) keeps the FP8 A8 units, which the rest of the Ampere tier (sm_80/86)
+leaves out: the A8 MMA runs as the plain `mma.sync...m16n8k32` E4M3 form in the `sm_89` image
+(`ops/common/mma.cuh`, gated by `__CUDA_ARCH__`), and the A8 quantizer and the legacy A8 GEMM
+launch with it. A card running the `89` image keeps a stored A8 permission
+(`apply_rank_policies`); a card running an `80`/`86` image in the same build does not, and the A8
+launchers refuse the call (`ops/common/blackwell_routes.h`). The unified shapes' A8 TMA schedules
+stay `120a`-only (`cp.async.bulk.tensor`, block-scaled MMA); a card without the `120a` image
+routes FP8 A8 through the legacy table's plain schedules at every width
+(`ops/linear/common/route_table.h`). NVFP4 has no `sm_89` path and stays `120a`-only. The
+runtime-shape A8 route (a tensor-parallel rank's share of a projection, `fp8_general_a8`) is the
+unified TMA route alone, so it stays `120a`-only and refuses on the `89` image.
+
 ### Blackwell tier (`120a`)
 
 A card that runs the `120a` code also takes the FP8 A8 and NVFP4 W4A4 routes and the fast NVFP4
 prompt kernel (`NINFER_SM120_FP8`, `NINFER_SM120_NVFP4`: the build carries them). A stored A8 or
 A4 permission is kept only for a weight on such a rank (`apply_rank_policies`); elsewhere the
-weight runs its A16 route. The warp-specialized TMA kernels are compiled for `120a` alone
-(`ninfer_nvfp4_non_rdc`); the other Blackwell-only instructions compile as traps in the other
-images of the build (`NINFER_PRE_BLACKWELL_DEVICE`), which no launch reaches.
+weight runs its A16 route. The FP8 A8 MMA here is the block-scaled `kind::f8f6f4` form, against
+the plain E4M3 `m16n8k32` form the `sm_89` image runs ([Ada FP8](#ada-fp8-89)). The
+warp-specialized TMA kernels are compiled for `120a` alone (`ninfer_nvfp4_non_rdc`); the other
+Blackwell-only instructions compile as traps in the other images of the build
+(`NINFER_PRE_BLACKWELL_DEVICE`), which no launch reaches.
 
 ### Builds of several architectures
 

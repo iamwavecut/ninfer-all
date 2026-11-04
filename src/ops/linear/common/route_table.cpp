@@ -204,15 +204,28 @@ bool is_nvfp4_fused_key(std::string_view key) {
     return key.rfind("nvfp4", 0) == 0;
 }
 
+// The fused FP8 family's keys ("unified/fp8_<op>"). Their A8 schedules are the TMA route in the
+// unified plans and the plain E4M3 m16n8k32 route in the legacy plans.
+bool is_fp8_fused_key(std::string_view key) {
+    constexpr std::string_view kUnifiedPrefix = "unified/";
+    if (key.rfind(kUnifiedPrefix, 0) == 0) key.remove_prefix(kUnifiedPrefix.size());
+    return key.rfind("fp8", 0) == 0;
+}
+
 } // namespace
 
 LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t,
-                                    LinearRouteTable wide) {
+                                    LinearRouteTable wide, bool a8_admitted) {
     const auto forced = forced_route_table();
     if (!unified_linear_routes_here()) return LinearRouteTable::Legacy;
     if (forced) return *forced;
     if (family == LinearRouteFamily::Nvfp4) {
         if (const auto scoped = scoped_nvfp4_table()) return *scoped;
+    }
+    if (family == LinearRouteFamily::Fp8 && a8_admitted && !current_device_blackwell()) {
+        // The unified table's A8 schedule is its TMA route, which runs only in the 120a image;
+        // this card takes the legacy table's plain E4M3 A8 route at every width.
+        return LinearRouteTable::Legacy;
     }
     for (const WidthBand band : family_bands(bands_for(current_device_class()), family)) {
         if (t >= band.first && t <= band.last) return LinearRouteTable::Unified;
@@ -221,12 +234,17 @@ LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t,
 }
 
 LinearRouteTable fused_route_table(std::string_view key, std::int32_t width,
-                                   LinearRouteTable wide) {
+                                   LinearRouteTable wide, bool a8_admitted) {
     const auto forced = forced_route_table();
     if (!unified_linear_routes_here()) return LinearRouteTable::Legacy;
     if (forced) return *forced;
     if (is_nvfp4_fused_key(key)) {
         if (const auto scoped = scoped_nvfp4_table()) return *scoped;
+    }
+    if (is_fp8_fused_key(key) && a8_admitted && !current_device_blackwell()) {
+        // The unified plan's A8 schedule is its TMA route, which runs only in the 120a image;
+        // this card takes the legacy plan's plain E4M3 A8 route at every width.
+        return LinearRouteTable::Legacy;
     }
     if (width > kRouteBandsMeasuredTo && !device_route_measured(key, width)) return wide;
     return device_route_schedule(key, width) == "unified" ? LinearRouteTable::Unified

@@ -55,16 +55,22 @@ inline constexpr std::int32_t kRouteBandsMeasuredTo = 1024;
 // The table for one call: by default the unified table only inside the width bands where it was
 // measured faster on this device's class, `wide` past kRouteBandsMeasuredTo, and the legacy table
 // everywhere else; NINFER_LINEAR_ROUTES=legacy|unified takes one table for every width.
+// An FP8 call whose policy admits A8 (`a8_admitted`) takes the legacy table on a card without the
+// 120a image: the unified table's A8 schedule is its TMA route, which runs only in the 120a code,
+// while the legacy table's A8 route is the plain E4M3 m16n8k32 MMA that sm_89 and up run.
 [[nodiscard]] LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t,
-                                                  LinearRouteTable wide = LinearRouteTable::Legacy);
+                                                  LinearRouteTable wide = LinearRouteTable::Legacy,
+                                                  bool a8_admitted = false);
 
 // The launches a fused projection Op (a Linear with its consumer fused into the epilogue) takes at
 // one width: its own, or upstream's move of the same routes onto the unified templates where the
 // device profile's `key` entry names "unified" for the width; `wide` past kRouteBandsMeasuredTo
 // where the profile has no band. NINFER_LINEAR_ROUTES and force_linear_route_table() force one
-// table here too.
+// table here too. An FP8 family call whose policy admits A8 (`a8_admitted`) takes the legacy plan
+// on a card without the 120a image, where the unified plan's A8 schedule is its TMA route.
 [[nodiscard]] LinearRouteTable fused_route_table(std::string_view key, std::int32_t width,
-                                                 LinearRouteTable wide = LinearRouteTable::Legacy);
+                                                 LinearRouteTable wide = LinearRouteTable::Legacy,
+                                                 bool a8_admitted = false);
 
 // A workspace query over [min_width, max_width] when each width runs on the table `table_of` gives
 // it: the largest of the tables' own queries (`query(table, first, last)`) over the runs of widths

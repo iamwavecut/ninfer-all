@@ -25,7 +25,9 @@ constexpr bool kNvfp4A4Built = true;
 #    else
 constexpr bool kNvfp4A4Built = false;
 #    endif
-#    if defined(NINFER_SM120_FP8)
+// The A8 unit is compiled when the build carries the 120a block-scaled code or the sm_89 plain
+// E4M3 m16n8k32 code (ops/common/mma.cuh gates the instruction by image).
+#    if defined(NINFER_SM120_FP8) || defined(NINFER_SM89_FP8)
 constexpr bool kFp8A8Built = true;
 #    else
 constexpr bool kFp8A8Built = false;

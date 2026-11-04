@@ -17,8 +17,9 @@
 #include <vector>
 
 // The A8 workspace contracts describe the parts that run FP8 A8 (its TMA split-K partials are
-// sized there); an sm_8x build never admits A8 and does not carry those schedules.
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
+// sized there); a build without the 120a block-scaled and the sm_89 plain-E4M3 code never admits
+// A8 and does not carry those schedules.
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8) && !defined(NINFER_SM89_FP8)
 constexpr bool kA8Executable = false;
 #else
 constexpr bool kA8Executable = true;
