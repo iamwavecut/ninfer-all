@@ -102,16 +102,15 @@ parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-f
 ## Converting
 
 The converter reads the weights from the GGUF shards, the Engram GGUF, the drafter of beamster's
-Sushi STQ pack and the vision tower's mmproj, the tokenizer and configuration from the base release,
-and the release's routing bias of image positions (`layers.N.ffn.gate.bias_vl`, which the GGUF
-lacks) by byte range from the release's safetensors shards (`tools/convert/fetch_tensors.py`, 65 KB
-of its 48 shards). The release ships no Jinja chat template; the converter stores its own
-transcription of the release's encoder (`tools/convert/templates/deepseek_v41`).
+Sushi STQ pack and the vision tower's mmproj, and the tokenizer and configuration from the base
+release. The release ships no Jinja chat template; the converter stores its own transcription of
+the release's encoder (`tools/convert/templates/deepseek_v41`).
 
 ```bash
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 config.json tokenizer.json tokenizer_config.json \
   --local-dir models/deepseek-v4.1/hf
 hf download ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
+  --revision 65d53bc8be65123e255ff02f3ded958b6dbf54fd \
   --include 'DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-*.gguf' \
   --include 'DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf' \
   --include 'mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf' --local-dir models/deepseek-v4.1
@@ -119,19 +118,15 @@ hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw \
   --revision 07fec972538639726b868f81e89d9d4f5005fe10 --include config.json \
   --include model.safetensors.index.json --include 'model-mtp-*.safetensors' \
   --local-dir models/deepseek-v4.1/stq
-python -m tools.convert.fetch_tensors deepseek-ai/DeepSeek-V4.1-Flash-1017 \
-  --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
-  --match 'layers.*.ffn.gate.bias_vl' --out models/deepseek-v4.1/bias_vl.safetensors
 
 # The model with its DSpark drafter and vision tower; it names its Engram table by the SHA-256 of
 # the table's rows.
 python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf \
   --components text,dspark,vision \
-  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
+  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00006.gguf \
   --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
   --source dspark=models/deepseek-v4.1/stq \
   --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
-  --source bias_vl=models/deepseek-v4.1/bias_vl.safetensors \
   --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
   --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer --device cpu
 # The Engram table, one artifact for every DeepSeek-V4.1-Flash-1017 conversion.
@@ -141,14 +136,48 @@ python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gg
   --out models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --device cpu
 ```
 
+These are the files in llama.cpp's layout (b11870 and newer), which ISTA-DASLab publishes since
+2026-10-27 (the revision above): five shards, the first holding only metadata, and the Engram GGUF
+as the sixth, which llama.cpp opens through a link named `...-00006-of-00006.gguf`; the converter
+needs no link and takes the file from `--source engram`. GGUFs downloaded earlier (four shards,
+revision `653a9874aa38c356233c5f3cc8c96b19a43b57eb`) convert too, to the same artifact: apart from
+the source paths it records, every object, configuration and resource is the same bytes. They lack
+the routing bias of image positions, so for the vision tower the converter reads the release's
+`layers.N.ffn.gate.bias_vl` by byte range from its safetensors shards
+(`tools/convert/fetch_tensors.py`, 65 KB of its 48 shards):
+
+```bash
+python -m tools.convert.fetch_tensors deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+  --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
+  --match 'layers.*.ffn.gate.bias_vl' --out models/deepseek-v4.1/bias_vl.safetensors
+# As above with the earlier shards, and the bias.
+python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf \
+  --components text,dspark,vision \
+  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
+  --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
+  --source dspark=models/deepseek-v4.1/stq \
+  --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
+  --source bias_vl=models/deepseek-v4.1/bias_vl.safetensors \
+  --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
+  --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer --device cpu
+```
+
+ISTA-DASLab's Coder build (`ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF`, IQ2_XXS,
+revision `54229d38d588a66d1c6cff08af7b281b9326c656`) keeps 192 of the 384 routed experts per block
+and comes only in llama.cpp's layout. It converts with the same command, its first shard as
+`--source gguf` and the base release's config; the converter takes the expert count from the GGUF.
+Its repository's Engram GGUF and mmproj are the base repository's files, so it uses the same Engram
+table. The model is one file of 71.9 GiB. 11 of its 80 expert banks, in 10 of its 40 blocks, are
+IQ2_XS, which CPU threads do not compute: in those blocks the GPU copies every miss whatever
+`--expert-dma-share` says.
+
 The model reads the Engram GGUF only for the table's digest, and of the STQ pack only its config,
 its index and its six drafter files (3.85 GB), checking that the pack states the release's model and
 drafter keys. `--components text,dspark` leaves the vision tower out and `--components text` the
 drafter too; the objects they keep are the same bytes either way. The model with its drafter and
-tower is one file of 125,824,667,392 bytes (117.2 GiB), of which the tower takes 0.90 GiB; the
-table is one of 110,595,294,496 bytes (103.0 GiB). On the 96 threads of a 48-core EPYC 7K62, with a
-download writing to the same disk, the model took 6 min 23 s; on 24 cores of a Threadripper 3960X
-the table took 3 min 29 s.
+tower is one file of 117.2 GiB, of which the tower takes 0.90 GiB; the table is one of 103.0 GiB.
+On the 96 threads of a 48-core EPYC 7K62, with a download writing to the same disk, the model took
+6 min 23 s; on 24 cores of a Threadripper 3960X the table took 3 min 29 s.
 
 The drafter can come from Unsloth's `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` instead, the
 release's drafter in Q8_0 with MXFP4 routed experts, which takes twice the STQ drafter's device
@@ -160,11 +189,10 @@ hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF dspark-DeepSeek-V4.1-Flash-101
 # As above, with the GGUF as the drafter's source.
 python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf \
   --components text,dspark,vision \
-  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
+  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00006.gguf \
   --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
   --source dspark=models/deepseek-v4.1/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
   --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
-  --source bias_vl=models/deepseek-v4.1/bias_vl.safetensors \
   --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
   --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-Unsloth-DSpark-ninfer-v3.ninfer --device cpu
 ```
