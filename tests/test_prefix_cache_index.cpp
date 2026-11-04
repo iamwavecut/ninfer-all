@@ -855,6 +855,113 @@ void test_image_only_host_tier() {
     require(index.stats().host_free_slabs == 8, "the removed snapshot's image slab was leaked");
 }
 
+// A pinned snapshot keeps its anchor path: evicting an unbacked path block would lose the node
+// and every snapshot anchored below it, the pinned one included.
+void test_snapshot_pin_holds_anchor_path() {
+    {
+        // A snapshot Host write in flight after its sequence released the path.
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(64), backend);
+        const auto tokens     = make_tokens(64 * 4, 11);
+        const auto path       = insert_sequence(index, backend, tokens);
+        const SnapshotRef tap = publish_tap(index, path[3]);
+        index.release_path(path);
+        index.pin_snapshot(tap);
+        index.check_invariants();
+        require(index.device_evictable_blocks() == 0, "a pinned snapshot's path is not evictable");
+        require(index.begin_snapshot_host_fill(tap), "no slabs for the snapshot write");
+        require(index.evict_device_blocks(10) == 0, "eviction took a pinned snapshot's path");
+        require(index.valid(tap), "the pinned snapshot was lost");
+        index.complete_snapshot_host_fill(tap);
+        index.unpin_snapshot(tap);
+        index.check_invariants();
+        require(index.evict_device_blocks(10) == 4, "an unpinned path is evictable again");
+        require(!index.valid(tap), "a snapshot whose path lost its last copy is removed");
+        index.check_invariants();
+    }
+    {
+        // An aborted write returns the path to the LRU.
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(64), backend);
+        const auto path       = insert_sequence(index, backend, make_tokens(64 * 2, 12));
+        const SnapshotRef tap = publish_tap(index, path[1]);
+        index.release_path(path);
+        index.pin_snapshot(tap);
+        require(index.begin_snapshot_host_fill(tap), "no slabs for the snapshot write");
+        index.abort_snapshot_host_fill(tap);
+        index.unpin_snapshot(tap);
+        index.check_invariants();
+        require(index.device_evictable_blocks() == 2, "an aborted write keeps no pins");
+    }
+    {
+        // Pins on snapshots sharing ancestors add up, and so do repeated pins of one snapshot.
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(64, 3), backend);
+        const auto path         = insert_sequence(index, backend, make_tokens(64 * 4, 13));
+        const SnapshotRef upper = publish_tap(index, path[1]);
+        const SnapshotRef lower = publish_tap(index, path[3]);
+        index.release_path(path);
+        index.pin_snapshot(upper);
+        index.pin_snapshot(lower);
+        index.pin_snapshot(lower);
+        index.check_invariants();
+        index.unpin_snapshot(lower);
+        require(index.evict_device_blocks(10) == 0, "a twice pinned snapshot lost its path");
+        index.unpin_snapshot(lower);
+        index.check_invariants();
+        require(index.evict_device_blocks(10) == 2, "only the blocks below the pinned one go");
+        require(index.valid(upper) && !index.valid(lower), "the pinned snapshot must survive");
+        index.unpin_snapshot(upper);
+        index.check_invariants();
+        require(index.evict_device_blocks(10) == 2 && !index.valid(upper),
+                "the rest of the path is evictable once unpinned");
+    }
+    {
+        // A root-anchored snapshot pins no node.
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(64), backend);
+        const auto tokens = make_tokens(64 * 2, 14);
+        const auto path   = insert_sequence(index, backend, tokens);
+        const SnapshotRef rooted =
+            publish_at(index, backend, path, tokens, 10, SnapshotKind::Endpoint);
+        index.release_path(path);
+        index.pin_snapshot(rooted);
+        index.check_invariants();
+        require(index.evict_device_blocks(10) == 2, "a root snapshot pins no block");
+        require(index.valid(rooted), "a pinned root snapshot must survive");
+        index.unpin_snapshot(rooted);
+        index.check_invariants();
+    }
+    {
+        // A Host restore in flight pins its restored blocks and its snapshot; the Device-only
+        // anchor below the restored block stays with the snapshot.
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(64), backend);
+        const auto tokens     = make_tokens(64 * 3, 15);
+        const auto path       = insert_sequence(index, backend, tokens);
+        const SnapshotRef tap = publish_tap(index, path[2]);
+        backup_node(index, path[1]);
+        backup_snapshot(index, tap);
+        index.release_path(path);
+        require(index.evict_backed_device_blocks(10) == 1, "only the backed block is evicted");
+        require(index.node(path[1]).device == CopyState::Absent, "the backed block is Host-only");
+        const std::uint32_t page = backend.allocate();
+        index.pin_node(path[1]);
+        index.begin_device_fill(path[1], page);
+        index.pin_snapshot(tap);
+        index.check_invariants();
+        require(index.evict_device_blocks(10) == 0,
+                "eviction took the restoring snapshot's anchor");
+        require(index.valid(tap), "the restoring snapshot was lost");
+        index.complete_device_fill(path[1]);
+        index.unpin_node(path[1]);
+        index.unpin_snapshot(tap);
+        index.check_invariants();
+        require(index.evict_device_blocks(10) == 3, "the restored path is evictable again");
+        index.check_invariants();
+    }
+}
+
 void test_random_stress() {
     std::mt19937 rng(1234);
     for (int round = 0; round < 20; ++round) {
@@ -874,6 +981,18 @@ void test_random_stress() {
         }
         std::vector<std::vector<NodeRef>> held;
         std::vector<SnapshotRef> published_snapshots;
+        // Snapshot Host writes still in flight: pinned across later releases and evictions.
+        std::vector<SnapshotRef> writing;
+        const auto finish_write = [&](std::size_t which) {
+            const SnapshotRef snapshot = writing[which];
+            if (rng() % 4U == 0) {
+                index.abort_snapshot_host_fill(snapshot);
+            } else {
+                index.complete_snapshot_host_fill(snapshot);
+            }
+            index.unpin_snapshot(snapshot);
+            writing.erase(writing.begin() + static_cast<std::ptrdiff_t>(which));
+        };
         for (int step = 0; step < 300; ++step) {
             const int op = static_cast<int>(rng() % 6U);
             if (op <= 1 && held.size() < 3) {
@@ -928,10 +1047,14 @@ void test_random_stress() {
                             }
                             if (published.created && rng() % 2U) {
                                 index.pin_snapshot(published.snapshot);
-                                if (index.begin_snapshot_host_fill(published.snapshot)) {
+                                if (!index.begin_snapshot_host_fill(published.snapshot)) {
+                                    index.unpin_snapshot(published.snapshot);
+                                } else if (writing.size() < 3 && rng() % 2U) {
+                                    writing.push_back(published.snapshot);
+                                } else {
                                     index.complete_snapshot_host_fill(published.snapshot);
+                                    index.unpin_snapshot(published.snapshot);
                                 }
-                                index.unpin_snapshot(published.snapshot);
                             }
                         }
                     }
@@ -954,9 +1077,14 @@ void test_random_stress() {
                 }
             } else {
                 (void)index.evict_device_blocks(1 + rng() % 8U);
+                for (const SnapshotRef snapshot : writing) {
+                    require(index.valid(snapshot), "a snapshot was lost during its Host write");
+                }
+                if (!writing.empty() && rng() % 2U) { finish_write(rng() % writing.size()); }
             }
             index.check_invariants();
         }
+        while (!writing.empty()) { finish_write(writing.size() - 1); }
         for (const auto& path : held) { index.release_path(path); }
         (void)index.evict_device_blocks(1000);
         index.check_invariants();
@@ -1156,6 +1284,7 @@ int main() {
         test_unshared_boundary();
         test_host_only_reattach();
         test_tail_device_fill();
+        test_snapshot_pin_holds_anchor_path();
         test_persistence_roundtrip();
         test_restore_plan();
         test_image_only_host_tier();
