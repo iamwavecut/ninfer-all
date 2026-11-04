@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/executor.h"
 
 #include "core/arena.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/decode_graph.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_worker_pool.h"
@@ -12,6 +13,7 @@
 #include "core/tensor_parallel.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "models/qwen4_exp/dflash2.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/ngram_draft_prefetch.h"
 #include "models/expert_profile.h"
@@ -39,6 +41,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rmsnorm_rope.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/sparse_attention.h"
@@ -459,12 +462,13 @@ struct SequenceState {
     // Tensor parallelism: every rank after the first's state of each layer, [rank - 1][layer]
     // (`layers` is rank 0's).
     std::vector<std::vector<LayerState>> rank_layers;
-    // The MTP block (an executor with drafts), on the head rank: its layer's state, the target's
-    // stack at the sequence's last position (which the next cell pairs with the next token), and
-    // whether the block follows the sequence's tokens, which a media prompt breaks.
+    // The MTP block (an executor with MTP drafts), on the head rank: its layer's state and the
+    // target's stack at the sequence's last position (which the next cell pairs with the next
+    // token). Whether the drafter (the MTP block, or the DFlash2 drafter's context ring) follows
+    // the sequence's tokens, which a media prompt or a branch breaks.
     LayerState mtp;
     DeviceBuffer mtp_pending, mtp_scratch_tail;
-    bool mtp_follows = true;
+    bool drafter_follows = true;
     // The last verify(): the n-gram context before it and the tokens it ran.
     NgramContext verify_context;
     std::vector<std::int32_t> verify_tokens;
@@ -704,6 +708,55 @@ struct Executor::Impl {
     // While a draft chain is captured: its replays count no routes for the expert cache (the
     // catch-up passes after a commit still do).
     bool capturing_draft = false;
+    // DFlash2 speculative decoding (options.dflash2), on the head rank. The drafter's operands
+    // until allocate_dflash2() hands them to it, the head as its final hidden reads it, and each
+    // text layer's tap: its index among the drafter's features, or -1.
+    std::optional<DFlash2Operands> dflash2_operands;
+    std::unique_ptr<DFlash2Drafter> dflash2;
+    Projection dflash2_head;
+    std::vector<std::int32_t> tap_of;
+    // What a pass leaves at the taps: the mean of a tapped layer's four streams of the pass
+    // columns [first, first + count), at feature columns from `column` (BF16 [taps * hidden,
+    // feature_columns]); count 0 takes none. feature_rows regroups a verification's kept columns
+    // sequence by sequence for the ring.
+    struct Capture {
+        std::int32_t first = 0, count = 0, column = 0;
+    };
+    Capture capture;
+    // Committed positions the ring takes: `count` feature columns from `column`, the first at
+    // `position`, into the sequence's lane.
+    struct ContextRun {
+        SequenceState* sequence = nullptr;
+        std::int32_t column     = 0;
+        std::int32_t count      = 0;
+        std::uint32_t position  = 0;
+    };
+    std::uint32_t feature_columns = 0;
+    DeviceBuffer features, feature_rows;
+    // Every sequence's context ring lane (its slot): each drafter layer's K and V of its last
+    // window positions, which a proposal attends to.
+    DeviceBuffer ring_backing;
+    std::unique_ptr<CyclicKVCache> ring;
+    // The proposal's and the context calls' device operands, greedy sampling configs, two pinned
+    // staging halves that alternate between calls (each with the event of its last upload), and
+    // the pinned drafts and confidences a proposal returns.
+    struct DFlash2Io {
+        std::int32_t *anchors = nullptr, *frontiers = nullptr, *valid = nullptr, *lanes = nullptr;
+        std::int32_t *ids = nullptr, *positions = nullptr, *drafts = nullptr;
+        std::int32_t *candidates = nullptr;
+        float *q = nullptr, *confidence = nullptr;
+        std::int32_t *context_positions = nullptr, *context_counts = nullptr;
+        std::int32_t *context_lanes = nullptr;
+    };
+    DFlash2Io io;
+    DeviceBuffer dflash2_io, dflash2_configs;
+    std::array<std::unique_ptr<PinnedHostBuffer>, 2> dflash2_staging;
+    std::array<cudaEvent_t, 2> dflash2_staged{};
+    std::size_t dflash2_next = 0, dflash2_next_half = 0;
+    std::unique_ptr<PinnedHostBuffer> dflash2_readback;
+    // The CUDA Graphs of one sequence's DFlash2 calls (dflash2_replay): a proposal per block
+    // width, a context call per run length.
+    std::array<PassGraphs, 17> dflash2_proposals, dflash2_contexts;
     std::uint32_t pages          = 0; // KV pages per sequence and attention layer
     PagedKVStorageLayout kv_layout;   // the planes of every sparse-attention layer's KV
     std::uint32_t pooled_slots   = 0; // indexer blocks per sequence and attention layer
@@ -869,15 +922,27 @@ struct Executor::Impl {
         max_logit_rows = std::min<std::uint32_t>(options.prefill_chunk, 512);
         if (!std::isfinite(options.draft_min_p) || options.draft_min_p < 0 ||
             options.draft_min_p > 1 || (options.draft_min_p != 0 && options.draft_tokens == 0)) {
-            throw std::invalid_argument("qwen4_exp: draft_min_p needs MTP and a finite value in [0,1]");
+            throw std::invalid_argument(
+                "qwen4_exp: draft_min_p needs drafts and a finite value in [0,1]");
+        }
+        if (options.dflash2 && options.draft_tokens == 0) {
+            throw std::invalid_argument("qwen4_exp: the DFlash2 drafter needs draft_tokens");
         }
         if (options.draft_tokens > 0) {
-            if (!model.mtp_weights()) {
+            if (options.dflash2 && !model.dflash2_weights()) {
+                throw std::invalid_argument("qwen4_exp: DFlash2 drafts need a model loaded with "
+                                            "its drafter");
+            }
+            if (!options.dflash2 && !model.mtp_weights()) {
                 throw std::invalid_argument("qwen4_exp: drafts need a model loaded with its MTP "
                                             "block");
             }
             if (options.draft_tokens > 15) {
-                throw std::invalid_argument("qwen4_exp: an MTP round drafts 1 to 15 tokens");
+                throw std::invalid_argument("qwen4_exp: a speculative round drafts 1 to 15 tokens");
+            }
+            if (options.dflash2 && device.size() > 1 && !model.tensor_parallel()) {
+                throw std::invalid_argument("qwen4_exp: the DFlash2 drafter runs on one device or "
+                                            "under tensor parallelism, not over pipeline stages");
             }
             verify_width = options.draft_tokens + 1;
             if (verify_width * options.sequences > options.prefill_chunk) {
@@ -910,7 +975,11 @@ struct Executor::Impl {
         }
         memory.ranks.resize(device.size());
         plan_weights();
-        if (verify_width > 0) { plan_mtp(); }
+        if (verify_width > 0 && options.dflash2) {
+            plan_dflash2();
+        } else if (verify_width > 0) {
+            plan_mtp();
+        }
         const bool native_host = model.options().experts == ExpertResidency::Host &&
             std::any_of(layers.begin(), layers.end(), [](const auto& layer) { return layer.moe.native.has_value(); });
         if (native_host && options.sequences != 1) {
@@ -954,6 +1023,7 @@ struct Executor::Impl {
         allocate_staging();
         if (verify_width > 0) { allocate_speculation(); }
         allocate_span();
+        if (dflash2_operands) { allocate_dflash2(); }
         allocate_cache();
         memory.streamed_kv = stream_slots != 0;
         for (const auto& rank : memory.ranks) {
@@ -1000,6 +1070,8 @@ struct Executor::Impl {
         };
         reset_chains(draft_graphs);
         reset_chains(step_graphs);
+        reset_chains(dflash2_proposals);
+        reset_chains(dflash2_contexts);
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
             if (rank.staged != nullptr) { cudaEventDestroy(rank.staged); }
@@ -1016,6 +1088,11 @@ struct Executor::Impl {
         if (mtp_staged != nullptr) {
             RankBinding bind(device, model.head_rank());
             cudaEventDestroy(mtp_staged);
+        }
+        for (cudaEvent_t staged : dflash2_staged) {
+            if (staged == nullptr) { continue; }
+            RankBinding bind(device, model.head_rank());
+            cudaEventDestroy(staged);
         }
         for (const StallEvents& events : stall_events) {
             RankBinding bind(device, rows_rank);
@@ -1148,6 +1225,64 @@ struct Executor::Impl {
         plan.layer = make_layer_plan(w.layer, model.head_rank(), model.mtp_config()->num_experts);
         plan.final_mixer = make_hc(model, w.final_mixer, config);
         mtp              = std::move(plan);
+    }
+
+    // The DFlash2 drafter's operands on the head rank (it reads the token embedding there, which
+    // is rank 0's: the drafter runs on one device or under tensor parallelism), its head, and the
+    // text layers it taps.
+    void plan_dflash2() {
+        const DFlash2Weights& w = *model.dflash2_weights();
+        const DFlash2Config& c  = *model.dflash2_config();
+        RankBinding bind(device, model.head_rank());
+        const auto h      = static_cast<std::int32_t>(config.hidden_size);
+        const auto d      = static_cast<std::int32_t>(c.attention.head_dim);
+        const auto linear = [&](WeightId id) { return ops::prepare_linear_weight(model.input(id)); };
+        DFlash2Operands p;
+        p.context_norm         = direct(model, w.context_norm, {h});
+        p.final_norm           = direct(model, w.final_norm, {h});
+        p.feature_projection   = linear(w.feature_projection);
+        p.selector_projection  = linear(w.selector_projection);
+        p.predecessor_codebook = native_weight(model.weight(w.predecessor_codebook).view);
+        p.successor_codebook   = native_weight(model.weight(w.successor_codebook).view);
+        p.embedding            = embedding_table;
+        for (const DFlash2LayerWeights& lw : w.layers) {
+            DFlash2LayerOperands layer;
+            layer.input_norm           = direct(model, lw.input_norm, {h});
+            layer.post_attention_norm  = direct(model, lw.post_attention_norm, {h});
+            layer.query_norm           = direct(model, lw.query_norm, {d});
+            layer.key_norm             = direct(model, lw.key_norm, {d});
+            layer.attention_base       = direct(model, lw.attention_base, {h, 2, 2});
+            layer.mlp_base             = direct(model, lw.mlp_base, {h, 2, 2});
+            layer.query                = linear(lw.query);
+            layer.key                  = linear(lw.key);
+            layer.value                = linear(lw.value);
+            layer.context_key          = linear(lw.context_key);
+            layer.context_value        = linear(lw.context_value);
+            layer.output               = linear(lw.output);
+            layer.gate                 = linear(lw.gate);
+            layer.up                   = linear(lw.up);
+            layer.down                 = linear(lw.down);
+            layer.attention_projection = linear(lw.attention_projection);
+            layer.mlp_projection       = linear(lw.mlp_projection);
+            p.layers.push_back(std::move(layer));
+        }
+        dflash2_head = make_projection(
+            std::vector{model.input(model.weights().output_head, "dflash2/final_hidden")});
+        tap_of.assign(layers.size(), -1);
+        for (std::size_t t = 0; t < c.target_layer_ids.size(); ++t) {
+            tap_of.at(c.target_layer_ids[t]) = static_cast<std::int32_t>(t);
+        }
+        dflash2_operands = std::move(p);
+    }
+
+    // The feature columns a pass captures: a verification of every sequence, and each sequence's
+    // last window positions of the widest prompt call (a chunk, or a span packing every sequence's
+    // prompt), whose context the ring takes.
+    [[nodiscard]] std::uint32_t planned_feature_columns() const {
+        const std::uint32_t window = *model.dflash2_config()->sliding_window;
+        const std::uint32_t prompt = std::max(options.prefill_chunk, planned_span_tokens());
+        return std::max(verify_width * options.sequences,
+                        std::min(prompt, window * options.sequences));
     }
 
     // A layer's operands on its rank; `experts` its routed experts (the MTP block may keep more
@@ -1405,6 +1540,17 @@ struct Executor::Impl {
             bytes = std::max(bytes,
                              projection_workspace(head, static_cast<std::int32_t>(max_logit_rows)));
         }
+        if (dflash2_operands && rank == model.head_rank()) {
+            const auto masks = static_cast<std::int32_t>(options.draft_tokens * options.sequences);
+            bytes = std::max(bytes, DFlash2Drafter::workspace_bytes(
+                                        *dflash2_operands, *model.dflash2_config(),
+                                        config.hidden_size, config.vocab_size,
+                                        static_cast<std::int32_t>(options.sequences),
+                                        static_cast<std::int32_t>(verify_width),
+                                        static_cast<std::int32_t>(planned_feature_columns()),
+                                        options.max_context,
+                                        projection_workspace(dflash2_head, masks)));
+        }
         return bytes + (16U << 20);
     }
 
@@ -1600,7 +1746,8 @@ struct Executor::Impl {
         sequence.media_rope    = std::move(rope_positions);
         sequence.rope_delta    = rope_delta;
         // The MTP block drafts from text cells only; the sequence stops drafting until a reset.
-        sequence.mtp_follows = false;
+        // The DFlash2 ring takes the media positions' features as any others.
+        if (mtp) { sequence.drafter_follows = false; }
         CUDA_CHECK(cudaStreamSynchronize(ranks[0].stream));
         // Under tensor parallelism every rank embeds the prompt itself, from its own copy.
         for (std::size_t r = 1; r <= rank_vision_embeddings.size(); ++r) {
@@ -1873,13 +2020,17 @@ struct Executor::Impl {
         }
         const std::size_t head = model.head_rank();
         RankBinding bind(device, head);
-        const std::uint64_t cells = std::max<std::uint64_t>(
-            options.prefill_chunk, std::uint64_t(verify_width) * options.sequences);
-        mtp_ids       = DeviceBuffer(cells * 4);
-        mtp_positions = DeviceBuffer(cells * 4);
-        mtp_staging   = std::make_unique<PinnedHostBuffer>(cells * 8);
-        if (options.draft_min_p > 0) {
-            mtp_logprobs = DeviceBuffer(std::uint64_t(options.draft_tokens) * options.sequences * 4);
+        if (mtp) {
+            const std::uint64_t cells = std::max<std::uint64_t>(
+                options.prefill_chunk, std::uint64_t(verify_width) * options.sequences);
+            mtp_ids       = DeviceBuffer(cells * 4);
+            mtp_positions = DeviceBuffer(cells * 4);
+            mtp_staging   = std::make_unique<PinnedHostBuffer>(cells * 8);
+            if (options.draft_min_p > 0) {
+                mtp_logprobs =
+                    DeviceBuffer(std::uint64_t(options.draft_tokens) * options.sequences * 4);
+            }
+            CUDA_CHECK(cudaEventCreateWithFlags(&mtp_staged, cudaEventDisableTiming));
         }
         if (table && options.ngram_read.residency != NgramResidency::Ram) {
             draft_prefetch = std::make_unique<NgramDraftPrefetch>(
@@ -1888,13 +2039,95 @@ struct Executor::Impl {
             ngram_prefetch_tokens = DeviceBuffer(2 * std::uint64_t(options.sequences) *
                                                   verify_width * sizeof(std::int32_t));
         }
-        CUDA_CHECK(cudaEventCreateWithFlags(&mtp_staged, cudaEventDisableTiming));
         // Each sequence's MTP tail as the draft steps advance it (a catch-up redoes those cells).
         for (SequenceState& sequence : sequences) {
-            sequence.mtp_scratch_tail = DeviceBuffer(sequence.mtp.tail.bytes);
+            if (mtp) { sequence.mtp_scratch_tail = DeviceBuffer(sequence.mtp.tail.bytes); }
         }
         memory.ranks[head].workspace_bytes += mtp_ids.bytes + mtp_positions.bytes + mtp_logprobs.bytes + ngram_prefetch_tokens.bytes +
                                               sequences.size() * sequences.front().mtp.tail.bytes;
+    }
+
+    // Bytes of one region of the DFlash2 operands that holds `count` words.
+    [[nodiscard]] static std::size_t io_region(std::size_t count) { return round_up(count * 4); }
+
+    // The DFlash2 drafter on the head rank: its context ring (every sequence a lane, zeroed once,
+    // so that a lane's slots hold finite values before its positions reach them), the captured
+    // features, the proposal's and context calls' operands with their staging, and the drafter.
+    void allocate_dflash2() {
+        const DFlash2Config& c = *model.dflash2_config();
+        const std::size_t head = model.head_rank();
+        RankBinding bind(device, head);
+        const std::size_t s    = options.sequences;
+        const std::size_t k    = options.draft_tokens;
+        const std::size_t w    = verify_width;
+        const std::size_t rows = c.target_layer_ids.size() * std::size_t(config.hidden_size);
+        feature_columns        = planned_feature_columns();
+        features               = DeviceBuffer(rows * feature_columns * 2);
+        feature_rows           = DeviceBuffer(rows * w * s * 2);
+        LayoutBuilder builder;
+        const auto layout = plan_cyclic_kv_cache(
+            builder, c.num_hidden_layers, *c.sliding_window,
+            static_cast<std::int32_t>(c.attention.num_key_value_heads),
+            static_cast<std::int32_t>(c.attention.head_dim), static_cast<std::int32_t>(s));
+        ring_backing = DeviceBuffer(builder.finish(256, "DFlash2 context ring"));
+        ring_backing.fill(0);
+        ring = std::make_unique<CyclicKVCache>(DeviceSpan{ring_backing.p, ring_backing.bytes},
+                                               layout);
+        // Proposal: anchors, frontiers, live widths and lanes (one region each, staged together),
+        // ids and positions [W, S], drafts [K, S], candidates and their probabilities [16, K, S],
+        // confidences [K, S]; context calls: positions, then counts and lanes (staged together).
+        const std::size_t r = io_region(s);
+        const std::array<std::size_t, 13> regions{
+            r, r, r, r, io_region(w * s), io_region(w * s), io_region(k * s),
+            io_region(16 * k * s), io_region(16 * k * s), io_region(k * s),
+            io_region(feature_columns), r, r};
+        std::size_t total = 0;
+        for (const std::size_t bytes : regions) { total += bytes; }
+        dflash2_io = DeviceBuffer(total);
+        std::array<std::byte*, 13> at{};
+        std::size_t offset = 0;
+        for (std::size_t i = 0; i < regions.size(); ++i) {
+            at[i] = static_cast<std::byte*>(dflash2_io.p) + offset;
+            offset += regions[i];
+        }
+        const auto words = [&](std::size_t i) { return reinterpret_cast<std::int32_t*>(at[i]); };
+        io = {.anchors           = words(0),
+              .frontiers         = words(1),
+              .valid             = words(2),
+              .lanes             = words(3),
+              .ids               = words(4),
+              .positions         = words(5),
+              .drafts            = words(6),
+              .candidates        = words(7),
+              .q                 = reinterpret_cast<float*>(at[8]),
+              .confidence        = reinterpret_cast<float*>(at[9]),
+              .context_positions = words(10),
+              .context_counts    = words(11),
+              .context_lanes     = words(12)};
+        // Greedy drafts: the default sampling config draws the highest edge.
+        const std::vector<ops::SamplingConfig> greedy(s);
+        dflash2_configs = DeviceBuffer(s * sizeof(ops::SamplingConfig));
+        dflash2_configs.copy_from_host(greedy.data(), dflash2_configs.bytes);
+        const std::size_t half = 4 * r + io_region(feature_columns) + 2 * r;
+        for (std::size_t i = 0; i < 2; ++i) {
+            dflash2_staging[i] = std::make_unique<PinnedHostBuffer>(half);
+            CUDA_CHECK(cudaEventCreateWithFlags(&dflash2_staged[i], cudaEventDisableTiming));
+        }
+        dflash2_readback = std::make_unique<PinnedHostBuffer>(2 * k * s * 4);
+        std::vector<CyclicKVCacheLayerView> views;
+        for (std::uint32_t l = 0; l < ring->layer_count(); ++l) {
+            views.push_back(ring->layer_view(l));
+        }
+        dflash2 = std::make_unique<DFlash2Drafter>(
+            std::move(*dflash2_operands), c, config.hidden_size, config.vocab_size, domain,
+            std::move(views), options.max_context,
+            [this](const Tensor& hidden, Tensor& logits, WorkspaceArena& ws, cudaStream_t stream) {
+                project(dflash2_head, hidden, logits, ws, stream);
+            });
+        dflash2_operands.reset();
+        memory.ranks[head].state_bytes += ring_backing.bytes;
+        memory.ranks[head].workspace_bytes +=
+            features.bytes + feature_rows.bytes + dflash2_io.bytes + dflash2_configs.bytes;
     }
 
     // The layers whose experts the route records, the expert cache and the expert stream serve:
@@ -2397,7 +2630,7 @@ struct Executor::Impl {
         sequence.media_columns.clear();
         sequence.media_rope.clear();
         sequence.rope_delta  = 0;
-        sequence.mtp_follows = true;
+        sequence.drafter_follows = true;
         for (std::size_t i = 0; i < layers.size(); ++i) {
             each_part(sequence, i, [&](std::size_t r, const LayerPlan&, LayerState& state) {
                 RankBinding bind(device, r);
@@ -3440,9 +3673,39 @@ struct Executor::Impl {
             }
             run_moe(plan, rank, t, i);
             pending = true;
+            if (taps(i)) {
+                // The DFlash2 tap reads the completed stack, which takes the deferred write's
+                // rounding now.
+                ops::hyper_connection_write(stack, moe_out, inject, rank.stream);
+                pending = false;
+                capture_tap(rank, rank.stack, i);
+            }
         }
         if (pending) { ops::hyper_connection_write(stack, moe_out, inject, rank.stream); }
         if (segment.head) { run_head(parts, rank, t, logit_rows); }
+    }
+
+    // Whether the pass captures layer i's DFlash2 features.
+    [[nodiscard]] bool taps(std::size_t i) const {
+        return dflash2 && capture.count > 0 && tap_of[i] >= 0;
+    }
+
+    // Layer i's DFlash2 features of the pass columns `capture` names, from the completed stack at
+    // `stack` (FP32 [hidden, hc_count, columns]): the mean of each column's four streams, into the
+    // tap's rows of the feature columns from capture.column.
+    void capture_tap(RankState& rank, const float* stack, std::size_t i) {
+        const auto h           = static_cast<std::int32_t>(config.hidden_size);
+        const auto hc          = static_cast<std::int32_t>(config.hc_count);
+        const std::size_t rows = std::size_t(dflash2->taps()) * config.hidden_size;
+        const Tensor columns(const_cast<float*>(stack) + std::size_t(capture.first) * hc * h,
+                             DType::FP32, {h, hc, capture.count});
+        Tensor out(static_cast<std::uint16_t*>(features.p) + std::size_t(capture.column) * rows +
+                       std::size_t(tap_of[i]) * config.hidden_size,
+                   DType::BF16, {h, capture.count});
+        out.nb[1] = std::int64_t(rows) * 2;
+        out.nb[2] = out.nb[1] * capture.count;
+        out.nb[3] = out.nb[2];
+        ops::hyper_connection_stream_mean(columns, out, rank.stream);
     }
 
     // The logits of the last `logit_rows` columns of the head rank's stack, or of each branch's
@@ -3709,6 +3972,19 @@ struct Executor::Impl {
                               run_moe_share(plan_of(r, i), rank, t, i, partial);
                           });
             pending = true;
+            if (taps(i)) {
+                // Every replica completes its stack; rank 0, the head rank, keeps the features.
+                for (std::size_t r = 0; r < n; ++r) {
+                    on(r, [&](RankState& rank) {
+                        Tensor stack  = stack_of(rank);
+                        Tensor inject = inject_of(rank);
+                        ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}),
+                                                    inject, rank.stream);
+                    });
+                }
+                pending = false;
+                on(0, [&](RankState& rank) { capture_tap(rank, rank.stack, i); });
+            }
         }
         for (std::size_t r = 0; r < n && pending; ++r) {
             on(r, [&](RankState& rank) {
@@ -4205,6 +4481,42 @@ struct Executor::Impl {
             if (narrow_chunk(chunks[k].count)) { calls.push_back({k, k + 1}); }
         }
         const SpanChunk& recorded = chunks[calls.back().last - 1];
+        // DFlash2: each following sequence's last window positions of the span, chunk by chunk;
+        // their features take consecutive columns, sequence after sequence.
+        std::vector<Capture> span_capture(chunks.size());
+        std::vector<ContextRun> span_runs;
+        if (dflash2) {
+            const auto window = static_cast<std::int32_t>(*model.dflash2_config()->sliding_window);
+            std::int32_t column = 0;
+            std::vector<SequenceState*> seen;
+            for (const SpanChunk& chunk : chunks) {
+                SequenceState* sequence = chunk.sequence;
+                if (!sequence->drafter_follows ||
+                    std::find(seen.begin(), seen.end(), sequence) != seen.end()) {
+                    continue;
+                }
+                seen.push_back(sequence);
+                std::int32_t total = 0;
+                std::uint32_t end  = 0;
+                for (const SpanChunk& other : chunks) {
+                    if (other.sequence != sequence) { continue; }
+                    total += other.count;
+                    end = other.first + std::uint32_t(other.count);
+                }
+                const std::int32_t keep = std::min(total, window);
+                std::int32_t skip       = total - keep;
+                span_runs.push_back({sequence, column, keep, end - std::uint32_t(keep)});
+                for (std::size_t k = 0; k < chunks.size(); ++k) {
+                    if (chunks[k].sequence != sequence) { continue; }
+                    const std::int32_t skipped = std::min(skip, chunks[k].count);
+                    skip -= skipped;
+                    const std::int32_t count = chunks[k].count - skipped;
+                    if (count == 0) { continue; }
+                    span_capture[k] = {.first = skipped, .count = count, .column = column};
+                    column += count;
+                }
+            }
+        }
         void* const own_mixed   = rank.mixed;
         float* const own_inject = rank.inject;
         // Chunk k's MoE input and injection, kept between a layer's two phases.
@@ -4307,6 +4619,15 @@ struct Executor::Impl {
                         }
                     }
                 }
+                // Every chunk's stack has completed the layer: its DFlash2 features.
+                if (dflash2 && tap_of[i] >= 0) {
+                    for (std::size_t k = 0; k < chunks.size(); ++k) {
+                        if (span_capture[k].count == 0) { continue; }
+                        capture = span_capture[k];
+                        capture_tap(rank, chunk_stack(k), i);
+                    }
+                    capture = {};
+                }
             }
             span_hold   = false;
             span_last   = false;
@@ -4335,6 +4656,7 @@ struct Executor::Impl {
                 chunk.sequence->position = chunk.first + std::uint32_t(chunk.count);
             }
             record_routes(std::uint32_t(recorded.count));
+            if (!span_runs.empty()) { dflash2_context(span_runs, nullptr, 0); }
             // The MTP block catches up chunk by chunk over each chunk's own final stacks; the
             // next pass's MTP cells of each sequence start from its last chunk's stack, which it
             // copied.
@@ -4376,15 +4698,29 @@ struct Executor::Impl {
         const std::uint32_t position = sequence.position;
         const Part part{
             .sequence = &sequence, .column = 0, .count = static_cast<std::int32_t>(tokens.size())};
+        // DFlash2: the chunk's last window positions, which the ring keeps. A one-token pass
+        // runs the decode graphs, which capture its column whether or not the drafter follows.
+        const std::int32_t kept =
+            dflash2 ? std::min(part.count, static_cast<std::int32_t>(
+                                               *model.dflash2_config()->sliding_window))
+                    : 0;
+        capture     = {.first = part.count - kept, .count = kept, .column = 0};
         prompt_pass = true;
         try {
             pass(std::span(&part, 1), tokens, logit_rows);
         } catch (...) {
+            capture     = {};
             prompt_pass = false;
             throw;
         }
+        capture     = {};
         prompt_pass = false;
         hint_next(sequence, next);
+        if (kept > 0 && sequence.drafter_follows) {
+            const ContextRun run{&sequence, 0, kept,
+                                 position + std::uint32_t(part.count - kept)};
+            dflash2_context(std::span(&run, 1), nullptr, 0);
+        }
         if (mtp) {
             const Committed committed{&sequence, 0, part.count, position, tokens};
             mtp_catch_up(std::span(&committed, 1));
@@ -4428,7 +4764,7 @@ struct Executor::Impl {
         // The pass advanced the position by every branch; the state is the last branch's, which
         // the MTP block did not follow.
         sequences.at(s).position    = at.position + lengths.back();
-        sequences.at(s).mtp_follows = false;
+        sequences.at(s).drafter_follows = false;
     }
 
     void forward_prompt_branches(std::uint32_t s, std::uint32_t prompt, SequenceSnapshot& at,
@@ -4487,9 +4823,9 @@ struct Executor::Impl {
         }
         synchronize_ranks();
         at.position          = position + prompt;
-        at.mtp_follows       = false;
+        at.drafter_follows       = false;
         sequence.position    = at.position + lengths.back();
-        sequence.mtp_follows = false;
+        sequence.drafter_follows = false;
     }
 
     // Each part after a branch pass's first starts a layer from the origin's state of it: its
@@ -4541,11 +4877,23 @@ struct Executor::Impl {
             parts.push_back({.sequence = sequence, .column = std::int32_t(j), .count = 1});
         }
         std::vector<Committed> committed;
+        std::vector<ContextRun> runs;
         for (const Part& part : parts) {
             committed.push_back({part.sequence, part.column, 1, part.sequence->position,
                                  tokens.subspan(std::size_t(part.column), 1)});
+            runs.push_back({part.sequence, part.column,
+                            part.sequence->drafter_follows ? 1 : 0, part.sequence->position});
         }
-        pass(parts, tokens, static_cast<std::uint32_t>(tokens.size()));
+        // The decode graphs capture every column's DFlash2 features.
+        capture = {.first = 0, .count = dflash2 ? static_cast<std::int32_t>(parts.size()) : 0};
+        try {
+            pass(parts, tokens, static_cast<std::uint32_t>(tokens.size()));
+        } catch (...) {
+            capture = {};
+            throw;
+        }
+        capture = {};
+        if (dflash2) { dflash2_context(runs, features.p, 1); }
         if (mtp) { mtp_catch_up(committed); }
     }
 
@@ -4571,15 +4919,17 @@ struct Executor::Impl {
         // Every graph a single sequence's passes may run is captured now, so that requests take
         // no device memory for them: the decode step's, a verification's at each width up to
         // kVectorTokens, and the draft's chains by step count, or its steps under a probability
-        // floor. Each shape's first run is eager (the decode step's was prefill(1)) and its second
-        // captures; the device memory the second runs take is the graphs'. The first run also
-        // verifies the wider widths, which stay eager, and commits a token.
+        // floor, or DFlash2's proposal and its context calls by run length. Each shape's first run
+        // is eager (the decode step's was prefill(1)) and its second captures; the device memory
+        // the second runs take is the graphs'. The first run also verifies the wider widths, which
+        // stay eager, and commits a token.
         const std::uint32_t sequence = 0;
         const auto fits = [&](std::uint32_t s, std::uint32_t count) {
             return sequences.at(s).position + count <= options.max_context;
         };
         // Room for both runs: the commit and the decode step between them take a position each.
-        const bool drafting = mtp && can_draft(sequence) && fits(sequence, verify_width + 2);
+        const bool drafting =
+            (mtp || dflash2) && can_draft(sequence) && fits(sequence, verify_width + 2);
         const auto widest   = std::min<std::uint32_t>(verify_width, kVectorTokens);
         std::vector<std::int32_t> drafts(options.draft_tokens);
         std::vector<std::uint32_t> extents(1);
@@ -4592,7 +4942,17 @@ struct Executor::Impl {
                 const std::uint32_t kept = 1;
                 commit(std::span(&sequence, 1), std::span(&kept, 1));
             }
-            if (options.draft_min_p > 0) {
+            if (dflash2) {
+                // One proposal runs every column at once. A commit's context call runs its run
+                // length's graph; the verifications above left features in every column, and the
+                // reset after the warm-up drops what these calls put in the ring.
+                draft(std::span(&sequence, 1), std::span(tokens).first(1), drafts, extents);
+                SequenceState& state = sequences.at(sequence);
+                for (std::uint32_t count = 1; count <= verify_width; ++count) {
+                    const ContextRun run{&state, 0, std::int32_t(count), state.position};
+                    dflash2_context(std::span(&run, 1), nullptr, 0);
+                }
+            } else if (options.draft_min_p > 0) {
                 every_step = true;
                 draft(std::span(&sequence, 1), std::span(tokens).first(1), drafts, extents);
                 every_step = false;
@@ -4636,7 +4996,7 @@ struct Executor::Impl {
                 decode(batch, std::vector<std::int32_t>(batch.size(), kToken));
             }
         }
-        const bool round = batch.size() > 1 && mtp &&
+        const bool round = batch.size() > 1 && (mtp || dflash2) &&
                            std::all_of(batch.begin(), batch.end(), [&](std::uint32_t s) {
                                return can_draft(s) && fits(s, verify_width);
                            });
@@ -4714,8 +5074,8 @@ struct Executor::Impl {
 
     // ---- MTP speculative decoding ------------------------------------------------------------
 
-    void require_mtp(const char* what) const {
-        if (!mtp) {
+    void require_drafts(const char* what) const {
+        if (!mtp && !dflash2) {
             throw std::logic_error(std::string("qwen4_exp ") + what +
                                    ": the executor has no drafts");
         }
@@ -4723,7 +5083,194 @@ struct Executor::Impl {
 
     [[nodiscard]] bool can_draft(std::uint32_t s) const {
         const SequenceState& sequence = sequences.at(s);
-        return mtp && sequence.mtp_follows && sequence.position > 0;
+        return (mtp || dflash2) && sequence.drafter_follows && sequence.position > 0;
+    }
+
+    // ---- DFlash2 ------------------------------------------------------------------------------
+
+    // The next pinned staging half, once the upload that last read it is done.
+    std::int32_t* dflash2_stage() {
+        const std::size_t half = std::exchange(dflash2_next, dflash2_next ^ 1U);
+        CUDA_CHECK(cudaEventSynchronize(dflash2_staged[half]));
+        dflash2_next_half = half;
+        return static_cast<std::int32_t*>(dflash2_staging[half]->data());
+    }
+
+    // Runs one sequence's DFlash2 call on the head rank's stream from its shape's graph: the first
+    // run of a shape is eager, so every lazy initialization of its ops happens outside a capture,
+    // and the second captures it. Its operands are the staged planes and the ring lanes they name,
+    // so one graph serves every sequence.
+    template <class Body> void dflash2_replay(PassGraphs& shape, const Body& body) {
+        RankState& rank = ranks[model.head_rank()];
+        if (!options.cuda_graphs || (shape.graphs.empty() && shape.runs++ == 0)) {
+            body();
+            return;
+        }
+        if (shape.graphs.empty()) {
+            DecodeGraphDefinition definition;
+            definition.capture(rank.stream, body);
+            shape.graphs.emplace_back().instantiate(definition);
+        }
+        shape.graphs.front().launch(rank.stream);
+    }
+
+    // Uploads `bytes` of the half dflash2_stage() returned to `to` on the head rank's stream.
+    void dflash2_upload(void* to, std::size_t bytes) {
+        RankState& rank = ranks[model.head_rank()];
+        CUDA_CHECK(cudaMemcpyAsync(to, dflash2_staging[dflash2_next_half]->data(), bytes,
+                                   cudaMemcpyHostToDevice, rank.stream));
+        CUDA_CHECK(cudaEventRecord(dflash2_staged[dflash2_next_half], rank.stream));
+    }
+
+    // Projects committed positions' features into their sequences' ring lanes. With `width`,
+    // one context call reads the runs as rows of `width` columns from `base` (run j at column
+    // j * width, its other columns inert); else one call per run reads its columns of `features`.
+    void dflash2_context(std::span<const ContextRun> runs, const void* base, std::int32_t width) {
+        if (runs.empty()) { return; }
+        RankBinding bind(device, model.head_rank());
+        RankState& rank        = ranks[model.head_rank()];
+        const std::size_t r    = io_region(options.sequences) / 4;
+        const std::size_t rows = std::size_t(dflash2->taps()) * config.hidden_size;
+        const std::size_t positions_words = io_region(feature_columns) / 4;
+        std::int32_t* host     = dflash2_stage();
+        std::int32_t* counts   = host + positions_words;
+        std::int32_t* lanes    = counts + r;
+        std::size_t at         = 0;
+        std::uint32_t min_count = ~0U, max_count = 0;
+        for (std::size_t j = 0; j < runs.size(); ++j) {
+            const ContextRun& run = runs[j];
+            const std::int32_t columns = width > 0 ? width : run.count;
+            for (std::int32_t i = 0; i < columns; ++i) {
+                host[at + std::size_t(i)] = static_cast<std::int32_t>(run.position) + i;
+            }
+            at += std::size_t(columns);
+            counts[j] = run.count;
+            lanes[j]  = static_cast<std::int32_t>(run.sequence->slot);
+            min_count = std::min(min_count, std::uint32_t(run.count));
+            max_count = std::max(max_count, std::uint32_t(run.count));
+        }
+        dflash2_upload(io.context_positions, (positions_words + 2 * r) * 4);
+        if (width > 0) {
+            if (max_count == 0) { return; }
+            const auto b = static_cast<std::int32_t>(runs.size());
+            const DFlash2ContextCall call{
+                .features  = Tensor(const_cast<void*>(base), DType::BF16,
+                                    {static_cast<std::int32_t>(rows), width, b}),
+                .positions = Tensor(io.context_positions, DType::I32, {width, b}),
+                .counts    = Tensor(io.context_counts, DType::I32, {b}),
+                .lanes     = Tensor(io.context_lanes, DType::I32, {b}),
+                .min_count = min_count,
+                .max_count = max_count};
+            dflash2->materialize(call, *rank.workspace, rank.stream);
+            return;
+        }
+        at = 0;
+        for (std::size_t j = 0; j < runs.size(); ++j) {
+            const ContextRun& run = runs[j];
+            if (run.count > 0) {
+                const DFlash2ContextCall call{
+                    .features =
+                        Tensor(static_cast<std::uint16_t*>(features.p) +
+                                   std::size_t(run.column) * rows,
+                               DType::BF16, {static_cast<std::int32_t>(rows), run.count, 1}),
+                    .positions = Tensor(io.context_positions + at, DType::I32, {run.count, 1}),
+                    .counts    = Tensor(io.context_counts + j, DType::I32, {1}),
+                    .lanes     = Tensor(io.context_lanes + j, DType::I32, {1}),
+                    .min_count = std::uint32_t(run.count),
+                    .max_count = std::uint32_t(run.count)};
+                const auto body = [&] { dflash2->materialize(call, *rank.workspace, rank.stream); };
+                // A lone run from the first feature column (a verification's or a decode step's
+                // commit) replays its length's graph.
+                if (runs.size() == 1 && run.column == 0 &&
+                    std::size_t(run.count) < dflash2_contexts.size()) {
+                    dflash2_replay(dflash2_contexts[std::size_t(run.count)], body);
+                } else {
+                    body();
+                }
+            }
+            at += std::size_t(run.count);
+        }
+    }
+
+    // One DFlash2 proposal for each of `drafting` (their anchors `anchors`): the block of the
+    // anchor and draft_tokens masks against each ring lane, greedy; the first `k` drafts of each
+    // row into `out` (rows `stride` long) and, with `extents`, each row's length up to its first
+    // draft whose selector probability is at or below the floor.
+    void draft_dflash2(std::span<SequenceState* const> drafting,
+                       std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
+                       std::span<std::uint32_t> extents, std::size_t k) {
+        RankBinding bind(device, model.head_rank());
+        RankState& rank        = ranks[model.head_rank()];
+        const std::size_t b    = drafting.size();
+        const std::size_t kk   = options.draft_tokens;
+        const auto w           = static_cast<std::int32_t>(verify_width);
+        const std::size_t r    = io_region(options.sequences) / 4;
+        std::int32_t* host     = dflash2_stage();
+        for (std::size_t j = 0; j < b; ++j) {
+            host[j]         = anchors[j];
+            host[r + j]     = static_cast<std::int32_t>(drafting[j]->position);
+            host[2 * r + j] = w;
+            host[3 * r + j] = static_cast<std::int32_t>(drafting[j]->slot);
+        }
+        dflash2_upload(io.anchors, 4 * r * 4);
+        const auto n  = static_cast<std::int32_t>(b);
+        const auto ki = static_cast<std::int32_t>(kk);
+        const DFlash2ProposalCall call{
+            .anchors       = Tensor(io.anchors, DType::I32, {n}),
+            .frontiers     = Tensor(io.frontiers, DType::I32, {n}),
+            .valid_columns = Tensor(io.valid, DType::I32, {n}),
+            .lanes         = Tensor(io.lanes, DType::I32, {n}),
+            .configs       = static_cast<const ops::SamplingConfig*>(dflash2_configs.p),
+            .batch         = n,
+            .width         = w,
+            .ids           = Tensor(io.ids, DType::I32, {w, n}),
+            .positions     = Tensor(io.positions, DType::I32, {w, n}),
+            .drafts        = Tensor(io.drafts, DType::I32, {ki, n}),
+            .candidates    = Tensor(io.candidates, DType::I32, {16, ki, n}),
+            .proposal_q    = Tensor(io.q, DType::FP32, {16, ki, n}),
+            .confidence    = Tensor(io.confidence, DType::FP32, {ki, n})};
+        const auto body = [&] { dflash2->propose(call, *rank.workspace, rank.stream); };
+        if (b == 1) {
+            dflash2_replay(dflash2_proposals.at(std::size_t(w)), body);
+        } else {
+            body();
+        }
+        auto* drafts      = static_cast<std::int32_t*>(dflash2_readback->data());
+        auto* confidences = reinterpret_cast<float*>(drafts + kk * b);
+        CUDA_CHECK(cudaMemcpyAsync(drafts, io.drafts, kk * b * 4, cudaMemcpyDeviceToHost,
+                                   rank.stream));
+        CUDA_CHECK(cudaMemcpyAsync(confidences, io.confidence, kk * b * 4,
+                                   cudaMemcpyDeviceToHost, rank.stream));
+        // The expert cache takes the last verification's routes while the device drafts.
+        settle_routes();
+        CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+        const std::size_t stride = options.draft_tokens;
+        for (std::size_t j = 0; j < b; ++j) {
+            std::uint32_t length = static_cast<std::uint32_t>(k);
+            for (std::size_t i = 0; i < k; ++i) {
+                out[j * stride + i] = drafts[j * kk + i];
+                const float p       = confidences[j * kk + i];
+                if (!std::isfinite(p)) {
+                    throw std::runtime_error("qwen4_exp: non-finite DFlash2 draft confidence");
+                }
+                if (options.draft_min_p > 0 && length == k && p <= options.draft_min_p) {
+                    length = static_cast<std::uint32_t>(i + 1);
+                }
+            }
+            for (std::size_t i = k; i < stride; ++i) { out[j * stride + i] = -1; }
+            if (!extents.empty()) { extents[j] = length; }
+        }
+        if (draft_prefetch) {
+            // The verification's n-gram rows of the anchors and the drafts it can verify: up to
+            // the longest row's floor.
+            std::vector<NgramContext> contexts;
+            for (const auto* sequence : drafting) { contexts.push_back(sequence->context); }
+            const std::size_t hinted =
+                extents.empty() ? k : *std::max_element(extents.begin(), extents.end());
+            draft_prefetch->begin(std::move(contexts), anchors);
+            draft_prefetch->hint(std::span<const std::int32_t>(out.data(), out.size()), stride,
+                                 hinted);
+        }
     }
 
     // Uploads an MTP pass's token ids and cell positions to the head rank's chain buffers, at the
@@ -5006,7 +5553,7 @@ struct Executor::Impl {
         std::int32_t n = 0;
         for (const Committed& c : committed) {
             SequenceState& sequence = *c.sequence;
-            if (!sequence.mtp_follows || c.count == 0) { continue; }
+            if (!sequence.drafter_follows || c.count == 0) { continue; }
             // A sequence's first position has no stack before it.
             const bool kept           = c.position > 0;
             const std::int32_t cells  = c.count - (kept ? 0 : 1);
@@ -5026,7 +5573,7 @@ struct Executor::Impl {
         }
         // The stacks the next cells start from, once the casts above have read the old ones.
         for (const Committed& c : committed) {
-            if (!c.sequence->mtp_follows || c.count == 0) { continue; }
+            if (!c.sequence->drafter_follows || c.count == 0) { continue; }
             CUDA_CHECK(cudaMemcpyAsync(c.sequence->mtp_pending.p,
                                        rank.stack + width * std::size_t(c.column + c.count - 1),
                                        width * 4, cudaMemcpyDeviceToDevice, rank.stream));
@@ -5040,7 +5587,7 @@ struct Executor::Impl {
     std::uint32_t draft(std::span<const std::uint32_t> batch, std::span<const std::int32_t> anchors,
                         std::span<std::int32_t> out, std::span<std::uint32_t> extents = {},
                         std::uint32_t steps = 0) {
-        require_mtp("draft");
+        require_drafts("draft");
         const std::size_t b      = batch.size();
         const std::size_t stride = options.draft_tokens;
         const std::size_t k      = steps == 0 ? stride : steps;
@@ -5055,7 +5602,7 @@ struct Executor::Impl {
                 throw std::invalid_argument("qwen4_exp draft: a sequence appears twice");
             }
             if (!can_draft(batch[j])) {
-                throw std::invalid_argument("qwen4_exp draft: the sequence's MTP state does not "
+                throw std::invalid_argument("qwen4_exp draft: the sequence's drafter does not "
                                             "follow its tokens");
             }
             if (sequence->position + verify_width > options.max_context) {
@@ -5065,6 +5612,10 @@ struct Executor::Impl {
                 throw std::invalid_argument("qwen4_exp draft: anchor outside the vocabulary");
             }
             drafting.push_back(sequence);
+        }
+        if (dflash2) {
+            draft_dflash2(drafting, anchors, out, extents, k);
+            return static_cast<std::uint32_t>(k);
         }
         RankBinding bind(device, model.head_rank());
         RankState& rank = ranks[model.head_rank()];
@@ -5211,7 +5762,7 @@ struct Executor::Impl {
 
     void verify(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens,
                 std::span<const std::uint32_t> widths = {}) {
-        require_mtp("verify");
+        require_drafts("verify");
         const std::size_t b = batch.size();
         std::vector<std::uint32_t> row_widths(widths.begin(), widths.end());
         if (row_widths.empty() && b != 0) {
@@ -5252,6 +5803,9 @@ struct Executor::Impl {
             column += width;
         }
         verifying = true;
+        // The verification graphs capture every column's DFlash2 features; commit() takes the
+        // kept ones into the ring.
+        capture = {.first = 0, .count = dflash2 ? static_cast<std::int32_t>(tokens.size()) : 0};
         try {
             pass(parts, tokens, static_cast<std::uint32_t>(tokens.size()));
             if (draft_prefetch) {
@@ -5271,15 +5825,17 @@ struct Executor::Impl {
                 draft_prefetch->join(rank.stream);
             }
         } catch (...) {
+            capture   = {};
             verifying = false;
             verified.clear();
             throw;
         }
+        capture   = {};
         verifying = false;
     }
 
     void commit(std::span<const std::uint32_t> batch, std::span<const std::uint32_t> kept) {
-        require_mtp("commit");
+        require_drafts("commit");
         const std::uint32_t w = active_verify_width;
         if (batch.size() != verified.size() || kept.size() != batch.size()) {
             throw std::invalid_argument("qwen4_exp commit: the last verification's sequences");
@@ -5371,16 +5927,40 @@ struct Executor::Impl {
             sequence.position += kept[j];
         }
         verified.clear();
-        mtp_catch_up(committed);
+        if (dflash2) {
+            std::vector<ContextRun> runs;
+            for (const Committed& c : committed) {
+                runs.push_back({c.sequence, c.column, c.sequence->drafter_follows ? c.count : 0,
+                                c.position});
+            }
+            if (runs.size() == 1) {
+                dflash2_context(runs, nullptr, 0);
+            } else {
+                // Each sequence's kept columns as a row of the verification's width.
+                RankBinding bind(device, model.head_rank());
+                const cudaStream_t stream = ranks[model.head_rank()].stream;
+                const std::size_t rows = std::size_t(dflash2->taps()) * config.hidden_size;
+                for (std::size_t j = 0; j < runs.size(); ++j) {
+                    if (runs[j].count == 0) { continue; }
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        static_cast<std::uint16_t*>(feature_rows.p) + j * w * rows,
+                        static_cast<const std::uint16_t*>(features.p) +
+                            std::size_t(runs[j].column) * rows,
+                        std::size_t(runs[j].count) * rows * 2, cudaMemcpyDeviceToDevice, stream));
+                }
+                dflash2_context(runs, feature_rows.p, static_cast<std::int32_t>(w));
+            }
+        }
+        if (mtp) { mtp_catch_up(committed); }
     }
 
     void snapshot(std::uint32_t s, SequenceSnapshot& out) {
         SequenceState& sequence = sequences.at(s);
         size_snapshot(sequence, out);
         copy_state(sequence, out, true);
-        out.position    = sequence.position;
-        out.context     = sequence.context;
-        out.mtp_follows = mtp && sequence.mtp_follows;
+        out.position        = sequence.position;
+        out.context         = sequence.context;
+        out.drafter_follows = (mtp || dflash2) && sequence.drafter_follows;
     }
 
     // Gives `out` its buffers, sized as `sequence`'s regions, unless it has them.
@@ -5405,6 +5985,11 @@ struct Executor::Impl {
             out.mtp.emplace_back(sequence.mtp.tail.bytes);
             out.mtp.emplace_back(sequence.mtp_pending.bytes);
         }
+        if (dflash2 && out.ring.bytes == 0) {
+            RankBinding bind(device, model.head_rank());
+            const auto lane = ring->slot_view(0);
+            out.ring = DeviceBuffer((lane.k_layer_bytes + lane.v_layer_bytes) * lane.layers);
+        }
     }
 
     void restore(std::uint32_t s, const SequenceSnapshot& from) {
@@ -5415,8 +6000,10 @@ struct Executor::Impl {
         copy_state(sequence, const_cast<SequenceSnapshot&>(from), false);
         sequence.position = from.position;
         sequence.context  = from.context;
-        // A snapshot taken before the MTP block followed the sequence leaves it behind.
-        sequence.mtp_follows = mtp && !from.mtp.empty() && from.mtp_follows;
+        // A snapshot taken before the drafter followed the sequence leaves it behind.
+        sequence.drafter_follows =
+            ((mtp && !from.mtp.empty()) || (dflash2 && from.ring.bytes != 0)) &&
+            from.drafter_follows;
         // Snapshots hold text prompts only: a media prompt is not reused.
         sequence.media_columns.clear();
         sequence.media_rope.clear();
@@ -5472,6 +6059,36 @@ struct Executor::Impl {
             out.push_back({at != nullptr ? at->mtp[1].p : sequence.mtp_pending.p,
                            sequence.mtp_pending.bytes, head});
         }
+        if (dflash2) {
+            // The ring lane's slots of the positions before `position` (all of them past the
+            // window), each layer's K then V, head by head while they are partly written.
+            const std::size_t head = model.head_rank();
+            const auto lane        = ring->slot_view(static_cast<std::int32_t>(sequence.slot));
+            const std::uint32_t used = std::min(position, ring->capacity());
+            const std::size_t row    = std::size_t(ring->head_dim()) * 2;
+            const std::size_t pitch  = row * ring->padded_capacity();
+            auto* kept               = at != nullptr ? static_cast<std::byte*>(at->ring.p) : nullptr;
+            for (std::uint32_t l = 0; l < lane.layers; ++l) {
+                const std::array<std::pair<std::byte*, std::size_t>, 2> planes{{
+                    {static_cast<std::byte*>(lane.k_layer0.data) + l * lane.k_layer_pitch_bytes,
+                     lane.k_layer_bytes},
+                    {static_cast<std::byte*>(lane.v_layer0.data) + l * lane.v_layer_pitch_bytes,
+                     lane.v_layer_bytes},
+                }};
+                for (const auto& [live, bytes] : planes) {
+                    std::byte* base = kept != nullptr ? kept : live;
+                    if (kept != nullptr) { kept += bytes; }
+                    if (used == ring->capacity()) {
+                        out.push_back({base, bytes, head});
+                        continue;
+                    }
+                    for (std::int32_t h = 0; h < ring->num_kv_heads(); ++h) {
+                        if (used == 0) { break; }
+                        out.push_back({base + std::size_t(h) * pitch, used * row, head});
+                    }
+                }
+            }
+        }
         return out;
     }
 
@@ -5517,15 +6134,17 @@ struct Executor::Impl {
     SequenceImage save_image(std::uint32_t s, const SequenceSnapshot* at,
                              std::span<std::byte* const> pages, std::size_t page_bytes) {
         const SequenceState& sequence = sequences.at(s);
-        if (at != nullptr && (at->layers.size() != state_count() || (mtp && at->mtp.size() != 2))) {
+        if (at != nullptr && (at->layers.size() != state_count() || (mtp && at->mtp.size() != 2) ||
+                              (dflash2 && at->ring.bytes == 0))) {
             throw std::invalid_argument("qwen4_exp image: the snapshot holds no state");
         }
         const std::uint32_t position = at != nullptr ? at->position : sequence.position;
         copy_image(image_regions(sequence, at, position), pages, page_bytes, true);
         return SequenceImage{.position = position,
                              .context  = at != nullptr ? at->context : sequence.context,
-                             .mtp_follows =
-                                 mtp && (at != nullptr ? at->mtp_follows : sequence.mtp_follows)};
+                             .drafter_follows = (mtp || dflash2) &&
+                                                (at != nullptr ? at->drafter_follows
+                                                               : sequence.drafter_follows)};
     }
 
     void load_image(std::uint32_t s, const SequenceImage& image,
@@ -5538,7 +6157,7 @@ struct Executor::Impl {
         forget_streamed_kv(sequence);
         sequence.position    = image.position;
         sequence.context     = image.context;
-        sequence.mtp_follows = mtp && image.mtp_follows;
+        sequence.drafter_follows = (mtp || dflash2) && image.drafter_follows;
         sequence.media_columns.clear();
         sequence.media_rope.clear();
         sequence.rope_delta = 0;
@@ -5570,6 +6189,26 @@ struct Executor::Impl {
             const cudaStream_t stream = ranks[model.head_rank()].stream;
             copy(sequence.mtp.tail.p, snapshot.mtp[0], stream);
             copy(sequence.mtp_pending.p, snapshot.mtp[1], stream);
+        }
+        if (dflash2 && snapshot.ring.bytes != 0) {
+            // The ring lane, whose slots the positions past the snapshot overwrite.
+            RankBinding bind(device, model.head_rank());
+            const cudaStream_t stream = ranks[model.head_rank()].stream;
+            const auto lane = ring->slot_view(static_cast<std::int32_t>(sequence.slot));
+            auto* kept      = static_cast<std::byte*>(snapshot.ring.p);
+            for (std::uint32_t l = 0; l < lane.layers; ++l) {
+                const std::array<std::pair<std::byte*, std::size_t>, 2> planes{{
+                    {static_cast<std::byte*>(lane.k_layer0.data) + l * lane.k_layer_pitch_bytes,
+                     lane.k_layer_bytes},
+                    {static_cast<std::byte*>(lane.v_layer0.data) + l * lane.v_layer_pitch_bytes,
+                     lane.v_layer_bytes},
+                }};
+                for (const auto& [live, bytes] : planes) {
+                    CUDA_CHECK(cudaMemcpyAsync(save ? kept : live, save ? live : kept, bytes,
+                                               cudaMemcpyDeviceToDevice, stream));
+                    kept += bytes;
+                }
+            }
         }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
@@ -5678,13 +6317,13 @@ void Executor::set_media(std::uint32_t sequence, std::span<const MediaItem> item
 bool Executor::vision() const noexcept { return impl_->vision_context != nullptr; }
 
 std::uint32_t Executor::draft_tokens() const noexcept {
-    return impl_->mtp ? impl_->options.draft_tokens : 0;
+    return impl_->mtp || impl_->dflash2 ? impl_->options.draft_tokens : 0;
 }
 
 bool Executor::can_draft(std::uint32_t sequence) const { return impl_->can_draft(sequence); }
 
 void Executor::stop_drafting(std::uint32_t sequence) {
-    impl_->sequences.at(sequence).mtp_follows = false;
+    impl_->sequences.at(sequence).drafter_follows = false;
 }
 
 std::uint32_t Executor::draft(std::span<const std::uint32_t> sequences,

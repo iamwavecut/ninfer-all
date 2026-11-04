@@ -117,20 +117,30 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     const SpeculativeOptions& speculative = options.speculative;
     if (speculative.backend == SpeculativeBackend::DFlash ||
-        speculative.backend == SpeculativeBackend::DFlash2 ||
         speculative.backend == SpeculativeBackend::DSpark) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next drafts with its MTP block (--spec mtp) "
+                                    "or its DFlash2 drafter (--spec dflash2)");
+    }
+    const bool mtp     = speculative.backend == SpeculativeBackend::Mtp;
+    const bool dflash2 = speculative.backend == SpeculativeBackend::DFlash2;
+    const bool drafts  = mtp || dflash2;
+    const float floor  = speculative.draft_min_p.value_or(0.0F);
+    if (!std::isfinite(floor) || floor < 0 || floor > 1 || (!drafts && floor != 0)) {
         throw std::invalid_argument(
-            "Qwen3.8-Flash-Next drafts with its MTP block only (--spec mtp)");
+            "--draft-min-p requires --spec mtp or dflash2 and a finite value in [0,1]");
     }
-    const bool mtp    = speculative.backend == SpeculativeBackend::Mtp;
-    const float floor = speculative.draft_min_p.value_or(0.0F);
-    if (!std::isfinite(floor) || floor < 0 || floor > 1 || (!mtp && floor != 0)) {
-        throw std::invalid_argument("--draft-min-p requires MTP and a finite value in [0,1]");
+    if (drafts && (speculative.draft_tokens == 0 || speculative.draft_tokens > 15)) {
+        throw std::invalid_argument("--spec mtp and --spec dflash2 require --draft-tokens in "
+                                    "[1,15]");
     }
-    if (mtp && (speculative.draft_tokens == 0 || speculative.draft_tokens > 15)) {
-        throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,15]");
+    // The drafter predicts a block of eight positions, the last token and seven masks: incoai's
+    // drafter was trained on such blocks (its config's block_size), and a wider round verifies
+    // more than eight columns on a slower route.
+    if (dflash2 && speculative.draft_tokens > 7) {
+        throw std::invalid_argument("--spec dflash2 drafts 1 to 7 tokens a round: the drafter "
+                                    "predicts blocks of 8 positions");
     }
-    if (!mtp && speculative.ngram_draft_tokens != 0) {
+    if (!drafts && speculative.ngram_draft_tokens != 0) {
         throw std::invalid_argument("n-gram copy proposals are not available for "
                                     "Qwen3.8-Flash-Next");
     }
@@ -139,8 +149,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("Qwen3.8-Flash-Next's MTP drafting has no "
                                     "--mtp-attention-window, --lm-head-draft or n-gram archive");
     }
-    if (speculative.lookup_ngram != 0 && !mtp) {
-        throw std::invalid_argument("--lookup-ngram requires --spec mtp");
+    if (speculative.lookup_ngram != 0 && !drafts) {
+        throw std::invalid_argument("--lookup-ngram requires --spec mtp or dflash2");
     }
     if (speculative.mtp_policy == MtpDraftPolicy::Adaptive && !mtp) {
         throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
@@ -220,9 +230,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.experts      = options.expert_residency;
     load.vision       = options.enable_vision;
     load.mtp          = mtp;
+    load.dflash2      = dflash2;
     // Tensor parallelism: every layer's mixer heads, routed experts and shared expert divided over
-    // the devices, and the head's rows; the MTP block and Vision on the first. Without
-    // --tensor-split each device takes a share of its speed that fits beside what it holds.
+    // the devices, and the head's rows; the MTP block, the DFlash2 drafter and Vision on the first.
+    // Without --tensor-split each device takes a share of its speed that fits beside what it holds.
     if (options.tensor_parallel) {
         load.tensor_split = options.tensor_split;
         if (load.tensor_split.empty()) {
@@ -260,7 +271,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     models::qwen4_exp::ExecutorOptions executor;
     executor.max_context     = options.max_context;
     executor.sequences       = options.max_concurrency;
-    executor.draft_tokens    = mtp ? speculative.draft_tokens : 0;
+    executor.draft_tokens    = drafts ? speculative.draft_tokens : 0;
+    executor.dflash2         = dflash2;
     executor.draft_min_p     = speculative.draft_min_p.value_or(0.0F);
     // The rotation past the native window, as every family resolves it (rope_scaling.h): YaRN
     // reaches every rotation this model makes (sparse attention, its indexer, the MTP block);
@@ -375,14 +387,15 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                            "Qwen3.8-Flash-Next: the CPU computes missing experts (%s; %s)",
                            cpu.c_str(), share.c_str());
     }
-    if (mtp) {
+    if (drafts) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "Qwen3.8-Flash-Next: MTP speculative decoding, %u drafts a round",
-                           speculative.draft_tokens);
+                           "Qwen3.8-Flash-Next: %s speculative decoding, %u drafts a round",
+                           dflash2 ? "DFlash2" : "MTP", speculative.draft_tokens);
         if (speculative.ngram_draft_tokens != 0) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                               "Qwen3.8-Flash-Next drafts with its MTP block only; n-gram copy "
-                               "proposals (--ngram-draft-tokens) are not available for it");
+                               "Qwen3.8-Flash-Next drafts with its %s only; n-gram copy "
+                               "proposals (--ngram-draft-tokens) are not available for it",
+                               dflash2 ? "DFlash2 drafter" : "MTP block");
         }
     }
     if (executor.rope_yarn.active()) {
@@ -1027,8 +1040,9 @@ struct Qwen4ExpCore::Impl {
     // ---- The context cache's store ------------------------------------------------------------
 
     // The disk tier's directory for this model and execution profile: an image holds the KV in its
-    // storage format and the MTP block's state only when the block runs. Verify width changes
-    // reductions; disabling PLE changes every layer's recurrent/KV state. Each needs its own store.
+    // storage format and the drafter's state (the MTP block's, or the DFlash2 ring lane's) only
+    // when it runs. Verify width changes reductions; disabling PLE changes every layer's
+    // recurrent/KV state. Each needs its own store.
     [[nodiscard]] std::string profile_name(const EngineOptions& options) const {
         std::string id;
         for (const std::byte b : instance.model->info().artifact_id) {
@@ -1037,8 +1051,9 @@ struct Qwen4ExpCore::Impl {
             id += hex;
         }
         return "qwen4_exp-image1-" + id + "-kv" +
-               std::to_string(static_cast<int>(options.kv_cache)) + "-drafts" +
-               std::to_string(drafts) + "-draft-min-p" +
+               std::to_string(static_cast<int>(options.kv_cache)) +
+               (options.speculative.backend == SpeculativeBackend::DFlash2 ? "-dflash2" : "") +
+               "-drafts" + std::to_string(drafts) + "-draft-min-p" +
                std::to_string(
                    std::bit_cast<std::uint32_t>(options.speculative.draft_min_p.value_or(0.0F))) +
                "-ngram" + std::to_string(options.ngram_table.disabled ? 0 : 1) + "-experts-" +
@@ -1048,7 +1063,7 @@ struct Qwen4ExpCore::Impl {
     struct FileHeader {
         char magic[8]                = {'N', 'F', 'N', 'X', 'I', 'M', 'G', '1'};
         std::uint32_t position       = 0;
-        std::uint32_t mtp_follows    = 0;
+        std::uint32_t drafter_follows = 0;
         std::uint32_t context_tokens = 0;
         std::uint32_t prompt_tokens  = 0;
         std::uint32_t path           = 0;
@@ -1084,7 +1099,7 @@ struct Qwen4ExpCore::Impl {
             }
             Stored image;
             image.header.position    = header.position;
-            image.header.mtp_follows = header.mtp_follows != 0;
+            image.header.drafter_follows = header.drafter_follows != 0;
             image.header.context.previous.resize(header.context_tokens);
             image.tokens.resize(header.prompt_tokens);
             if (!file.read(reinterpret_cast<char*>(image.header.context.previous.data()),
@@ -1109,7 +1124,7 @@ struct Qwen4ExpCore::Impl {
         std::pair<std::size_t, std::uint32_t> best{0, 0};
         for (std::size_t i = 0; i < stored.size(); ++i) {
             if (stored[i].pages.empty() && !disk_restore) { continue; }
-            if (drafting && !stored[i].header.mtp_follows) { continue; }
+            if (drafting && !stored[i].header.drafter_follows) { continue; }
             const std::uint32_t length = prefix_reuse(stored[i].tokens, prompt, whole);
             if (length > best.second) { best = {i, length}; }
         }
@@ -1147,7 +1162,7 @@ struct Qwen4ExpCore::Impl {
         }
         FileHeader header;
         header.position       = image.header.position;
-        header.mtp_follows    = image.header.mtp_follows ? 1 : 0;
+        header.drafter_follows = image.header.drafter_follows ? 1 : 0;
         header.context_tokens = static_cast<std::uint32_t>(image.header.context.previous.size());
         header.prompt_tokens  = static_cast<std::uint32_t>(image.tokens.size());
         header.path           = static_cast<std::uint32_t>(image.path);
@@ -1410,7 +1425,7 @@ struct Qwen4ExpCore::Impl {
             const std::uint32_t live     = drafting && !executor.can_draft(s)
                                                ? 0
                                                : prefix_reuse(slot.fed, r.prompt_tokens, whole);
-            const std::uint32_t anchored = drafting && !slot.snapshot.mtp_follows
+            const std::uint32_t anchored = drafting && !slot.snapshot.drafter_follows
                                                ? 0
                                                : prefix_reuse(slot.anchor, r.prompt_tokens, whole);
             const auto [image, from_store] = find_stored(r.prompt_tokens, drafting, whole);

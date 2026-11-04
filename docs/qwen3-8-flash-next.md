@@ -165,6 +165,19 @@ build's 256; its norms drop their stored `1 + w`, and its hyper-connection matri
 `shared-Q8_0` file's Q8_0 blocks, which their kernels read. The `shared-Q8_0` block adds 2.8 GB to
 the model.
 
+The DFlash2 drafter ([DFlash2 speculative decoding](#dflash2-speculative-decoding)) is appended to
+a converted artifact as its `dflash2` component, from [nazeshinjite's Q4_0 GGUF](https://huggingface.co/nazeshinjite/Qwen3.8-Flash-Next-DFlash2-GGUF)
+of [incoai's drafter](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) and incoai's
+`config.json`. The artifact's other objects keep their bytes; the drafter keeps its Q4_0 blocks
+and adds 339 MB:
+
+```bash
+python3.11 scripts/pods/attach_dflash2.py --base models/flash-next-q2_0.ninfer \
+  --gguf /path/to/Qwen3.8-Flash-Next-DFlash2-Q4_0.gguf \
+  --config /path/to/Qwen3.8-Flash-Next-DFlash2/config.json \
+  --output models/flash-next-q2_0-dflash2.ninfer
+```
+
 Every matrix keeps the block type the release chose (see [GGUF block formats](gguf.md)); the expert
 banks keep the exporter's expert-major layout, so one expert is one contiguous range of bytes. The
 recipe undoes llama.cpp's exporter conventions as the Qwen3.8-27B GGUF recipe does (grouped GDN
@@ -556,9 +569,10 @@ MTP is enabled. A fresh text-only request can use MTP again after the media requ
 ([Convert](#convert)); without the block the engine refuses to start. Without `--spec`, an artifact
 with the block and host experts drafts up to three tokens a round with `--draft-min-p 0.5` (a
 verification window's routes share the layer's missing experts, which the CPU computes while the
-cached ones run); with disk experts it decodes without drafts ([below](#mtp-with-several-requests)),
-and `--spec none` decodes without drafts. Text-only decoding requests then
-runs rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
+cached ones run), unless it also carries the DFlash2 drafter, which then drafts
+([DFlash2](#dflash2-speculative-decoding)); with disk experts it decodes without drafts
+([below](#mtp-with-several-requests)), and `--spec none` decodes without drafts. Text-only
+decoding requests then run rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
 final mixer and the model's head) drafts N tokens from the stack the model left at the request's
 last position (the head's argmax at each step), the model verifies the last sampled token and the N
 drafts in one pass, and the acceptance keeps the drafts while they equal the model's own draw at
@@ -651,6 +665,40 @@ With disk experts a layer reads the experts its cache lacks before it runs, and 
 drafts route to experts of their own: three drafts every round gave 0.91, 0.82 and 0.64 times the
 speed without drafts at one, two and eight requests, so the Engine drafts for disk experts only
 under `--spec mtp`.
+
+### DFlash2 speculative decoding
+
+`--spec dflash2 --draft-tokens N` (1 to 7) decodes with the DFlash2 drafter of an artifact that
+carries it ([Convert](#convert)); without it the engine refuses to start, and the MTP block, if the
+artifact has one, is not loaded. The drafter is five sliding-window layers of the model's width
+conditioned on the model's own states: after each of blocks 5, 15, 25, 35 and 45 the mean of the
+four hyper-connection streams is kept for every committed position and projected into each
+layer's ring of the last 2,048 positions (40 MiB a request). A round proposes all N drafts in one
+pass over the last token and N masks, through the model's head and a selector that walks the 16
+likeliest tokens of each position. The model verifies them as it verifies MTP's drafts, with the
+same acceptance, so every committed token is the model's own draw. `--draft-min-p P` verifies up
+to the first draft whose selector confidence (its weight among the 16) is at or below P. A single
+request's proposal and its commits run from CUDA Graphs captured at startup. `--lookup-ngram N`
+proposes from the context in place of the drafter as it does under MTP; `--adaptive-mtp` needs
+`--spec mtp`, and pipeline stages are refused. The drafter's mathematics is in
+[DFlash and DFlash2](maintainer/dflash.md#qwen38-flash-next).
+
+Without `--spec`, an artifact with the drafter and host experts drafts four tokens a round with
+`--draft-min-p 0.7`. On an RTX 3090 with host experts (EPYC 7K62, 96 CPUs; 256 greedy tokens after
+a code prompt and after a prose prompt, and the answer to a 144-token prompt; the mean of two runs)
+that decoded 92.3, 77.9 and 58.2 tokens per second with the IQ3_S release, 1.10, 1.06 and 1.17
+times the MTP block's automatic drafting, and 122.4, 93.7 and 113.8 with the Coder IQ1_M release,
+1.19, 1.09 and 1.15 times MTP and 1.72, 1.31 and 1.59 times without drafts. Every answer matched
+decoding without drafts. Seven drafts with the floor 0.8 decoded within 5% of four (1.13 times MTP
+in geometric mean, as four) while verifying 68-73% more drafts. With two requests at once (IQ3_S, 256
+tokens each), four drafts gave 1.09 and 1.05 times the aggregate speed without drafts on the code
+and prose prompts (MTP 1.18 and 0.97), with four 1.04 and 0.93 (MTP 0.89 and 0.89); concurrent
+answers to one prompt differ from run to run with or without drafts. `--lookup-ngram 3` beside
+seven drafts decoded 85.9, 76.4 and 49.5 tokens per second on IQ3_S, below the drafter alone.
+Under tensor parallelism over two RTX 3090s (Q2_0, device experts, which draft only under
+`--spec`), four drafts with the floor 0.7 decoded 1.46, 1.21 and 1.24 times as fast as without
+drafts after the three prompts and 1.43 times after a 9,741-token document (MTP's three drafts
+1.47, 1.18, 0.98 and 1.26), and every answer matched decoding without drafts, where MTP's did not.
 
 ## Execution
 

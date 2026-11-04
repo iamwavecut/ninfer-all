@@ -30,6 +30,9 @@ public:
     // Capturable: both candidates are device I32 [batch], immutable until join() completes.
     void enqueue(std::size_t step, const std::int32_t* first, const std::int32_t* second,
                   cudaStream_t compute);
+    // On the host, after begin(): hints the rows of `steps` drafts of each sequence, which
+    // `drafts` holds sequence-major in rows of `stride` (a drafter that proposes them at once).
+    void hint(std::span<const std::int32_t> drafts, std::size_t stride, std::size_t steps);
     // Prefix and candidates are sequence-major, each sequence's columns packed at its own width
     // (`widths`, each in [1, steps + 1], summing to the prefix's length). Each column's candidates
     // follow that prefix column; neither candidate changes the following column's context.

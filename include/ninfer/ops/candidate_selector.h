@@ -2,6 +2,7 @@
 
 #include "core/tensor.h"
 #include "core/arena.h"
+#include "core/weight.h"
 #include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
@@ -49,5 +50,41 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
                              cudaStream_t stream);
+
+/**
+ * The same Op over codebooks stored as ggml Q4_0 rows (a GGUF drafter's, kept as stored): each
+ * Weight is GGUF_Q4_0 with n=248320 rows of k=256 values, a row 8 blocks of 18 bytes (a binary16
+ * scale d and 16 bytes of codes; value j of a block is d * (q_j - 8), q_j the low nibble of byte j
+ * for j<16 and the high nibble of byte j-16). Every codebook value enters the formula above as that
+ * exact FP32 product; the rest of the contract is unchanged. With `confidence`, contiguous FP32
+ * [K,B], the Op also stores at [i,b] the selected candidate's probability under the FP32 softmax of
+ * edge at temperature 1, whatever the row's temperature.
+ */
+void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
+                             const Tensor& projected_hidden, const Tensor& anchors,
+                             const Weight& predecessor_codebook, const Weight& successor_codebook,
+                             const Tensor& base_positions, const SamplingConfig* configs,
+                             Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
+                             cudaStream_t stream, Tensor* confidence = nullptr);
+
+// Transient bytes candidate_topk() needs for U columns.
+[[nodiscard]] std::size_t candidate_topk_workspace_capacity_bytes(std::int32_t columns);
+
+/**
+ * Op: candidate_topk
+ *
+ * The selector's candidates from dense logits (a head that the fused linear_topk does not take):
+ * for each column u of logits, contiguous BF16 or FP32 [rows,U], the 16 rows v < valid_rows with
+ * the largest logits[v,u], in descending order with the lower id first on a tie, as candidate_ids
+ * I32 and their logits as candidate_scores FP32, each any contiguous tensor of 16 x U elements
+ * with 16 fastest ([16,K,B] for U = K B). A NaN logit takes no part; a slot that no logit fills
+ * holds id 0 and score -inf. valid_rows is in [16,rows].
+ *
+ * Exact: the scores are the represented logits. Inputs are unchanged and both outputs completely
+ * overwritten; inputs, outputs and workspace are pairwise non-overlapping. The workspace is
+ * call-scoped, candidate_topk_workspace_capacity_bytes(U) bytes.
+ */
+void candidate_topk(const Tensor& logits, std::int32_t valid_rows, Tensor& candidate_ids,
+                    Tensor& candidate_scores, WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

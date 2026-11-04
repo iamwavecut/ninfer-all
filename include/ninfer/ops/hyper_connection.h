@@ -85,4 +85,12 @@ void hyper_connection_expand(const Tensor& x, Tensor& stack, cudaStream_t stream
 void hyper_connection_expand(const Tensor& x, const Tensor& streams, Tensor& stack,
                              cudaStream_t stream);
 
+// A DFlash2 drafter's target feature (docs/maintainer/dflash.md): the streams' mean of a completed
+// block's stack, out[d, t] = bf16((sum_c stack[c, d, t]) / streams), the sum in FP32 in stream
+// order. stack is contiguous FP32 [hidden, streams, tokens]; out is BF16 [hidden, tokens] with
+// contiguous columns of any even pitch of at least `hidden` elements (a row slice of a wider
+// feature matrix). The oracle is the FP64 mean of the stored FP32 values; out is compared after its
+// BF16 store. Nothing else is written.
+void hyper_connection_stream_mean(const Tensor& stack, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops

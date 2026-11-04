@@ -10,12 +10,15 @@
 // from none to all): fixed-mode repeats must match; differences from plain
 // decode or another batch composition are reported. After plain steps of two sequences at once,
 // which advance the MTP block by its catch-up alone, drafts must survive at least half as often
-// as after the prompts. Prompts of several sequences packed in one span (host or disk experts on
-// one device) must leave each piece the logits it gets alone, bit for bit. The context cache's
-// sequence images (live and at a snapshot) must continue as the sequence they were taken from.
+// as after the prompts. An artifact with its DFlash2 drafter takes the same checks with the
+// DFlash2 block proposing the drafts from its ring of committed target features. Prompts of
+// several sequences packed in one span (host or disk experts on one device) must leave each piece
+// the logits it gets alone, bit for bit. The context cache's sequence images (live and at a
+// snapshot) must continue as the sequence they were taken from.
 //
 //   NINFER_QWEN4_EXP_ARTIFACT  the model's .ninfer (required; skips without it)
 //   NINFER_QWEN4_EXP_DRAFTS    MTP drafts a round (default 3; 0 skips the speculative check)
+//   NINFER_QWEN4_EXP_DFLASH2_DRAFTS  DFlash2 drafts a round (default 7; 0 skips its check)
 //   NINFER_QWEN4_EXP_DEVICES   comma-separated device ids, one pipeline stage each (default 0)
 //   NINFER_QWEN4_EXP_EXPERTS   device | host | disk (default device)
 //   NINFER_QWEN4_EXP_NGRAM_TABLE  the n-gram table artifact of a model stored without its table
@@ -398,10 +401,10 @@ int check_packed_prompts(const Model& model, DeviceContext& device, ExecutorOpti
 }
 
 // Greedy tokens of one speculative round per step for `sequences` (prefilled, their first tokens
-// in `rows`), until each row holds `steps` tokens: the MTP block drafts from each row's last
-// token, the target verifies the anchor and the drafts, the drafts up to the first that differs
-// from the verification's argmax are accepted with the argmax after them, and the commit keeps the
-// tokens fed up to there. Counts the drafts proposed and accepted.
+// in `rows`), until each row holds `steps` tokens: the drafter (the MTP block or DFlash2) drafts
+// from each row's last token, the target verifies the anchor and the drafts, the drafts up to the
+// first that differs from the verification's argmax are accepted with the argmax after them, and
+// the commit keeps the tokens fed up to there. Counts the drafts proposed and accepted.
 // With `wrong`, one draft of each round (a different one each round) is replaced by another
 // token, so rounds keep every number of tokens from one to all. With `packed`, sequence j
 // verifies (round + j) % (k + 1) of its drafts in round `round`, the rows packed at their own
@@ -813,6 +816,10 @@ int run(const char* artifact_path) {
     const std::uint32_t drafts =
         drafts_env != nullptr ? static_cast<std::uint32_t>(std::stoul(drafts_env)) : 3;
     load.mtp   = drafts > 0 && reader.directory().components.contains("mtp");
+    const char* dflash2_env = std::getenv("NINFER_QWEN4_EXP_DFLASH2_DRAFTS");
+    const std::uint32_t dflash2_drafts =
+        dflash2_env != nullptr ? static_cast<std::uint32_t>(std::stoul(dflash2_env)) : 7;
+    load.dflash2 = dflash2_drafts > 0 && reader.directory().components.contains("dflash2");
     auto model = load_model(reader, load, device);
     device.synchronize();
     const auto loaded = Clock::now();
@@ -893,6 +900,15 @@ int run(const char* artifact_path) {
         failures += check_speculative(*model, device, speculative, prompts, replayed);
     } else {
         std::cout << "speculative decoding: not checked (no MTP block, or no drafts)\n";
+    }
+    if (load.dflash2) {
+        std::cout << "DFlash2 drafts:\n";
+        ExecutorOptions speculative = options;
+        speculative.draft_tokens    = dflash2_drafts;
+        speculative.dflash2         = true;
+        failures += check_speculative(*model, device, speculative, prompts, replayed);
+    } else {
+        std::cout << "DFlash2 speculative decoding: not checked (no drafter, or no drafts)\n";
     }
     if (load.experts != ExpertResidency::Disk) {
         std::cout << "eager decode (no CUDA graphs):\n";
