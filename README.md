@@ -40,6 +40,10 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
   a 39-token prompt's first token came after 0.23-0.27 s instead of 0.42-0.44 s on an RTX 3090.
   Flash-Next decodes with incoai's [DFlash2 drafter](docs/qwen3-8-flash-next.md#dflash2-speculative-decoding) (`--spec dflash2`), which the three Flash-Next releases now carry and host experts use without `--spec`:
   on an RTX 3090 it decoded 1.06-1.19 times as fast as the MTP block's drafts, and under tensor parallelism over two RTX 3090s 1.21-1.46 times as fast as without drafts.
+  [Expert-parallel](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families) Gemma 4 runs the first GPU's dense MLP while the other GPUs run their experts, and with host experts while the missing experts arrive:
+  two RTX 3090s decoded 8-9% faster (MTP 5%) and prefilled 4% faster; one RTX 3090 with host experts decoded 2.5-3% faster.
+  A [tensor-parallel](docs/maintainer/pipeline-stages.md#tensor-parallelism) Qwen MoE gives the first GPU fewer routed experts beside its shared expert, and Flash-Next's shared expert follows each GPU's routed experts:
+  Qwen3.6-35B-A3B on four RTX 5060 Ti decoded 0.5-0.8% faster with 1.7 GiB more free on the first GPU, and its MTP, which failed to start under tensor parallelism, decodes at 261-300 tok/s.
 - **2026-11-03:** Qwen3.5-core models speed up [tensor-parallel decode](docs/maintainer/pipeline-stages.md#tensor-parallelism)
   by splitting vocabulary heads across GPUs.
   Eligible Q4 and Q5 projection shares use the same small-T MMA routes as whole projections.

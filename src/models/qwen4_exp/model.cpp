@@ -244,6 +244,47 @@ std::vector<std::uint64_t> common_ends(std::uint64_t count, const TextConfig& c,
     return out;
 }
 
+// The shared expert's middle rows each rank takes so that every rank's expert work per token, its
+// routed experts' share of num_experts_per_tok * moe_intermediate_size rows and its run of the
+// shared expert, is as even as the rows allow: filled from the rank with the least routed work up
+// (water filling). A rank whose routed work alone passes the level takes none, which split_shares
+// rounds to one allowed run.
+std::vector<double> shared_runs(const TextConfig& c, std::span<const std::uint64_t> experts) {
+    const std::size_t ranks = experts.size() - 1;
+    const double width      = c.shared_expert_intermediate_size;
+    const double routed     = double(c.num_experts_per_tok) * c.moe_intermediate_size;
+    std::vector<double> work(ranks);
+    for (std::size_t r = 0; r < ranks; ++r) {
+        work[r] = routed * double(experts[r + 1] - experts[r]) / double(c.num_experts);
+    }
+    std::vector<bool> open(ranks, true);
+    double level = 0.0;
+    for (;;) {
+        double sum         = width;
+        std::size_t filled = 0;
+        for (std::size_t r = 0; r < ranks; ++r) {
+            if (open[r]) {
+                sum += work[r];
+                ++filled;
+            }
+        }
+        level       = sum / double(filled);
+        bool closed = false;
+        for (std::size_t r = 0; r < ranks; ++r) {
+            if (open[r] && work[r] > level) {
+                open[r] = false;
+                closed  = true;
+            }
+        }
+        if (!closed) { break; }
+    }
+    std::vector<double> out(ranks);
+    for (std::size_t r = 0; r < ranks; ++r) {
+        out[r] = std::max(open[r] ? level - work[r] : 0.0, width * 1e-6);
+    }
+    return out;
+}
+
 // Each rank's runs of every layer, by `split`: its Gated DeltaNet key heads and routed experts, and
 // its sparse-attention KV heads, which go to as many of the first ranks as the two heads allow, in
 // proportion to their weights. A run ends only where every layer's projections cut whole stored
@@ -283,10 +324,14 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& c,
         });
     // The shared expert's middle ends where every layer's gate and up rows and down columns cut
     // whole stored runs, at whole 128-row tiles of the expert matrix kernel where every rank gets
-    // one. It divides evenly over the ranks whatever the split: each rank rounds its run's dot of
-    // the down rows on its own, so the sum depends on the runs, and a split measured at startup
-    // moves from one start to the next (two ranks at an even split hold two and a half of its five
-    // tiles, which rounded to three or two by the measurement's noise).
+    // one. Its runs even out each rank's expert work, counted in middle rows a token runs: a rank's
+    // routed experts give it num_experts_per_tok * moe_intermediate_size rows per token in
+    // proportion to their count, so a rank with fewer experts (rank 0 when its room caps it) takes
+    // more of the shared expert (shared_runs). The runs follow the expert ranges, not the split's
+    // weights: each rank rounds its run's dot of the down rows on its own, so the sum depends on
+    // the runs, and weights measured at startup move from one start to the next (two ranks at an
+    // even split hold two and a half of its five tiles, which rounded to three or two by the
+    // measurement's noise).
     const std::uint64_t width = c.shared_expert_intermediate_size;
     const std::uint64_t tile  = width / 128 >= split.size() ? 128 : 1;
     std::vector<bool> shared_allowed(width + 1, true);
@@ -304,9 +349,9 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& c,
         if (shared_allowed[at]) { shared_ends.push_back(at); }
     }
     const std::size_t ranks    = split.size();
-    const auto shared          = split_shares(width, shared_ends, std::vector<double>(ranks, 1.0));
-    const auto key_heads       = split_shares(c.linear_num_key_heads, key_ends, split);
     const auto experts         = expert_ends(c.num_experts, split);
+    const auto shared          = split_shares(width, shared_ends, shared_runs(c, experts));
+    const auto key_heads       = split_shares(c.linear_num_key_heads, key_ends, split);
     const std::size_t kv_ranks = std::min(ranks, kv_ends.size() + 1);
     const auto kv_heads        = split_shares(c.num_key_value_heads, kv_ends, split.first(kv_ranks));
     std::vector<TensorShare> out(ranks);

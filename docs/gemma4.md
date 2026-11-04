@@ -573,9 +573,13 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
   layers copy every miss.
   An expert the CPU computed takes no slot; the cache's rounds decide whether it enters.
-- **Calls.** Vector decode and verification run the cached pairs while the rest arrive, then the
-  rest; both add to one fixed-point sum, so outputs equal resident execution bit for bit. Prompt
-  chunks wait for their experts and run the existing matrix path.
+- **Calls.** Vector decode and verification run the cached pairs, then the block's dense MLP
+  while the rest arrive, then the rest; both expert stages add to one fixed-point sum, so outputs
+  equal resident execution bit for bit. A prompt chunk runs the dense MLP while its experts
+  arrive, then the existing matrix path. On one RTX 3090 with a 4 GiB cache, running the dense MLP
+  in that gap instead of before the routing raised decode from 70.5-71.1 to 72.6-72.9 tok/s after
+  a 1,032-token prompt and from 71.9-72.3 to 73.8-74.2 after a 6,906-token one, with the same
+  text (2026-11-04).
 - **Growing KV.** With an automatic cache, the full-attention blocks' value planes and a prompt
   chunk's derived keys, F16 values and mask are backed only as far as their sequences reach (in
   256-position tiles, on devices with CUDA virtual memory management), and the cache takes the rest

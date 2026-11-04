@@ -281,7 +281,14 @@ families](#expert-parallelism-of-the-other-moe-families)).
   its paths, the shared one on rank 0, as its partial for the FFN exchange. The adaptive prefill
   band (47 to 52 tokens) takes the plain prefill route under a share. The experts divide at any
   expert; the automatic split counts the experts as divided weights, the router as held by every
-  rank and the shared expert as rank 0's. Experts in host memory or on disk
+  rank and the shared expert as rank 0's. Rank 0 runs the shared expert beside its routed ones,
+  so it takes fewer of them (`shares_beside_first`): a token's routed work is
+  `num_experts_per_tok * moe_intermediate_size` rows, the shared expert adds its own rows to rank
+  0's, and the expert ranges make every rank's rows over its weight the same (Qwen3.6-35B-A3B on
+  four even ranks: 40, 72, 72 and 72 of the 256 experts; on four RTX 5060 Ti it decodes at 179.2
+  and 174.8-175.3 tok/s after a 989- and a 6,768-token prompt against 177.7-178.0 and 173.9-174.3
+  with 64 each, prefills 0.2% to 0.8% faster and leaves rank 0 1.67 GiB more free memory, int8 KV,
+  two runs each, 2026-11-04). Experts in host memory or on disk
   (`--expert-residency host|disk`) and NVFP4 expert banks have no share and are refused.
 - **Divided expert columns.** Two ranks of about equal weight (each 40% to 60% of the split)
   divide every expert's 512 intermediate columns in halves instead, routed and shared alike, where
@@ -721,11 +728,15 @@ every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.
   experts, a contiguous range per rank of the GGUF banks on the devices. The shared expert divides
   by its 640-wide middle: each rank holds a run of it, those rows of its gate and up and those
   values of every down row, in whole 128-row tiles of the expert matrix kernel where every rank
-  gets one. Its runs are even whatever the split, rank 0 taking the smaller on a tie: each rank
-  rounds the dot of its run on its own, so the sum depends on the runs, and a split measured at
-  startup moves between starts (two ranks at an even split hold two and a half of the five tiles,
-  which then rounded to three or two from one start to the next and changed greedy texts). The
-  startup log lists every rank's runs and head rows. Every rank holds the token embedding, the hyper-connection mixers, the final mixer, the
+  gets one. Its runs even out each rank's expert rows per token (`shared_runs`): a rank's routed
+  experts give it 10 x 640 rows per token in proportion to their count, and the shared expert's
+  640 fill up from the rank with the fewest, so a rank 0 whose room caps its experts (241 of 512
+  on two RTX 3090s with MTP) takes four of the five tiles. The runs follow the expert ranges, not
+  the split's weights: each rank rounds the dot of its run on its own, so the sum depends on the
+  runs, and weights measured at startup move between starts (two ranks at an even split hold two
+  and a half of the five tiles, which then rounded to three or two from one start to the next and
+  changed greedy texts); a run moves only when the experts move by about five. The startup log
+  lists every rank's runs and head rows. Every rank holds the token embedding, the hyper-connection mixers, the final mixer, the
   router, the shared expert's score and the PLE, and a contiguous range of the head's rows; the
   whole head, the MTP block and Vision stay on rank 0 too. A share ends on whole stored blocks (`Bindings::row_ends`, `Bindings::column_ends`) and whole tiles of its
   Linear route; without `--tensor-split` the shares follow each card's copy bandwidth within its
@@ -771,9 +782,10 @@ every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.
   follows that stream's work alone, while each rank uploads its inputs of the pass (token ids,
   positions, PLE rows) on its own stream, so rank 0's stream first waits for every other rank's
   uploads (`fence_uploads`); without the wait a replay could read the previous step's inputs. With
-  the wait, even shared-expert runs and one bandwidth per card model, four RTX 5060 Ti gave one
-  greedy text of two prompts in three starts and one perplexity in five, and two RTX 3090s the
-  same log probabilities of a prompt's first 16 tokens in five starts, three of them eager. A snapshot, a sequence image and a branch pass
+  the wait, shared-expert runs that do not follow measured weights and one bandwidth per card
+  model, four RTX 5060 Ti gave one greedy text of two prompts in three starts and one perplexity in
+  five, and two RTX 3090s the same log probabilities of a prompt's first 16 tokens in five starts,
+  three of them eager; with the runs by expert work, two starts of each box gave one text. A snapshot, a sequence image and a branch pass
   keep every rank's state of each layer, layer by layer and rank by rank.
 - **Numerics.** The replicas run the same kernels on the same values, so on cards of one model they
   stay equal. The divided output projections, each rank's dot over its run of the shared expert's
@@ -802,6 +814,15 @@ every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.
   117.3-117.4 and 113.1-113.2, and with MTP at 188.7-188.8 against 176.5-176.6 on the short
   prompt but 140.3-140.6 against 142.5-142.8 on the long one (233 accepted drafts against 237).
   Prefill changes by -1.6% (the 3090s with MTP) to +1.3% (the 5060 Ti).
+  Shared-expert runs by expert work against even runs (2026-11-04, same workload, two runs each):
+  with MTP rank 0's room caps its experts (241 of 512 on the 3090s, 112 on the 5060 Ti) and it
+  takes four or two of the five tiles. A draft round takes 17.83-17.88 and 18.34-18.36 ms against
+  17.98 and 18.44-18.48 on the 3090s, 22.17-22.21 and 22.62-22.68 against 22.31-22.42 and
+  22.69-22.79 on the 5060 Ti (-0.3% to -0.8%). Tokens per second follow the drafts the changed
+  sums accept: 185.2-185.7 and 144.3-144.4 against 192.4 and 137.6-137.9 on the 3090s (116 and
+  145 rounds against 111 and 151), 151.6-152.0 and 117.6-117.9 against 153.0-153.7 and
+  115.4-115.9 on the 5060 Ti. Without MTP the experts divide evenly, the runs stay even and
+  decode is unchanged; prefill moves by -0.3% to +0.3%.
 
 ### Expert parallelism of the other MoE families
 
@@ -816,8 +837,11 @@ router, the shared expert, the head, the drafters and Vision, as one device does
   with the ids and weights to every other rank over a stage link. Each rank keeps the pairs routed to
   its own experts (`moe_keep_experts`; ids of other ranks' experts become -1, which
   `moe_sort_routes` leaves out), runs them on its own stream and workspace, and sends back their
-  weighted sum as a 2^-32 fixed-point part (I64 [T][H]). Rank 0 runs its own part meanwhile, adds the
-  parts as integers and hands the sum to the block's combine. The exchange is a pair of StageLinks
+  weighted sum as a 2^-32 fixed-point part (I64 [T][H]). Rank 0 runs its own part meanwhile, then
+  the block's work that reads only the block's input (Gemma 4's dense MLP, Flint's and DeepSeek's
+  shared expert), adds the parts as integers and hands the sum to the block's combine: the
+  exchange's round trip to the other ranks and their experts take place behind that work. The
+  exchange is a pair of StageLinks
   per peer (peer copies or mapped pinned host memory), legal eagerly and inside the decode graphs,
   whose capture the peers' streams join.
 - **Numerics.** Each pair's contribution is computed and rounded exactly as on one device and integer
@@ -875,6 +899,14 @@ pair the exchange costs more decode time than the divided experts save:
   6,940 tokens (BF16 caches) is 16.359 against 16.407 (-0.29%), the same for `--tensor-split 3,1`. The long answer matched one
   card's; the short ones part after 2 to 88 characters, from prompts the pair prefilled with the
   fixed-point weighting. Host and disk experts on the pair gave the same five answers.
+- **Rank 0's dense MLP behind the exchange** (Gemma 4, 2x RTX 3090, 2026-11-04, int8 KV, a
+  1,032- and a 6,906-token prompt, two runs each, against the MLP before the routing): decode
+  180.6-180.9 and 175.1 tok/s against 166.0-166.5 and 161.7-161.9 (+8.2% to +9.0%), prefill
+  3,041-3,048 and 3,463-3,464 against 2,920-2,927 and 3,329-3,331 (+4%), with `--spec mtp
+  --draft-tokens 2` 293.2 and 246.8 against 277.8 and 235.0, with the same texts and accepted
+  drafts. Fewer experts on rank 0, which also runs the attention and the dense MLP, did not pay:
+  with 35% to 45% of them Gemma 4 decoded 0.1% to 1.1% slower than with half and Flint 0.3% to
+  1.6% slower, so the shares stay those of the cards' bandwidth and room.
 
 What the transport costs was measured before this was built:
 
