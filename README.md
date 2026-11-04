@@ -33,6 +33,8 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
   eight requests on an RTX 3090 with host experts finished 2.0-4.2% faster with MTP and 11.5% faster without drafts.
   With host or disk experts, Flash-Next [packs the prompt steps](docs/qwen3-8-flash-next.md#sequences-kv-and-the-context-cache) of requests that prefill together into one span:
   eight requests on an RTX 3090 with host experts got their last first token after 6-10 s instead of 19-24 s and finished 1.8-1.9 times as fast.
+  Flash-Next's host experts take [prompt chunks of up to 64 tokens](docs/qwen3-8-flash-next.md#the-cpu-share) through the CPU share:
+  a 39-token prompt's first token came after 0.23-0.27 s instead of 0.42-0.44 s on an RTX 3090.
 - **2026-11-03:** Qwen3.5-core models speed up [tensor-parallel decode](docs/maintainer/pipeline-stages.md#tensor-parallelism)
   by splitting vocabulary heads across GPUs.
   Eligible Q4 and Q5 projection shares use the same small-T MMA routes as whole projections.

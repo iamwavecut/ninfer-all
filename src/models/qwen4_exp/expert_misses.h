@@ -56,6 +56,10 @@ inline constexpr std::uint32_t kMaxMissTokens = 64;
 
 struct MissOptions {
     std::uint32_t token_capacity = 8;    // tokens of one call, at most kMaxMissTokens
+    // The widest decode or verification call: wider calls are prompt chunks, whose copy and CPU
+    // times the balance fits apart, so that their many pairs per expert leave the narrow calls'
+    // lines alone.
+    std::uint32_t verify_tokens  = 8;
     double cpu_share             = 0.0;  // share of a request's missing experts the CPU computes
     // Instead of a fixed share, each request gives the CPU the experts that make its copies and
     // its CPU products end soonest, by times fitted to the earlier requests.
