@@ -313,8 +313,9 @@ std::string difference(const std::vector<__nv_bfloat16>& a, const std::vector<__
 // Prompts of several sequences in one span, as the Engine packs prompt steps with host or disk
 // experts on one device: each piece's logits must equal those of its prompt fed alone bit for bit,
 // and each sequence must then decode as it did alone. The pieces take one to two chunks, one is a
-// few tokens (the decode form of the experts) between others, and one stops at a chunk boundary of
-// its prompt, whose rest is fed alone after the span.
+// few tokens (the decode form of the experts) between others, one ends in a chunk of 37 tokens
+// (which the staged misses take when the CPU shares them), and one stops at a chunk boundary of its
+// prompt, whose rest is fed alone after the span.
 int check_packed_prompts(const Model& model, DeviceContext& device, ExecutorOptions options) {
     options.sequences = 4;
     Executor executor(model, device, options);
@@ -323,7 +324,7 @@ int check_packed_prompts(const Model& model, DeviceContext& device, ExecutorOpti
         return 0;
     }
     const std::uint32_t c = options.prefill_chunk;
-    const std::array<std::size_t, 4> lengths = {c + c / 2 + 3, 2 * c + c / 3, c / 2 + 1, 6};
+    const std::array<std::size_t, 4> lengths = {c + 37, 2 * c + c / 3, c / 2 + 1, 6};
     std::vector<std::vector<std::int32_t>> prompts;
     for (std::size_t s = 0; s < lengths.size(); ++s) {
         std::string text = "<|im_start|>user\nWhich room was warmest? Answer with its number.\n";

@@ -254,7 +254,7 @@ struct ExpertMisses::Impl {
         cudaEvent_t copied     = nullptr; // after them (timed for the balance)
         std::uint32_t served   = 0;
         // Balance: this device's copy and CPU times.
-        ExpertSplit split;
+        ExpertSplit split, prompt_split; // narrow calls', and prompt chunks' (verify_tokens)
     };
 
     DeviceContext& device;
@@ -594,12 +594,12 @@ struct ExpertMisses::Impl {
     }
 
     // The CPU's count of a request's missing experts, the last of `order` (most pairs first).
-    static std::size_t balance(Rank& rank, const MissLayer& layer,
+    static std::size_t balance(ExpertSplit& split, const MissLayer& layer,
                                const std::vector<std::pair<int, std::int32_t>>& order) {
         std::vector<int> pairs;
         pairs.reserve(order.size());
         for (const auto& [uses, expert] : order) { pairs.push_back(uses); }
-        return rank.split.cpu_count(pairs, expert_megabytes(layer));
+        return split.cpu_count(pairs, expert_megabytes(layer));
     }
 
     void serve_request(Rank& rank, std::uint32_t sequence) {
@@ -615,6 +615,7 @@ struct ExpertMisses::Impl {
         auto* tables           = static_cast<const void**>(rank.tables->data());
         auto* missing_ids      = static_cast<std::int32_t*>(rank.missing_ids->data());
         const std::uint32_t pairs = tokens * kTop;
+        ExpertSplit& split        = tokens > options.verify_tokens ? rank.prompt_split : rank.split;
         // Requests of a rank come one at a time: a layer's request is posted only after the stage
         // two of the one before has run on the same stream, so both staging halves are free.
         const std::uint32_t half = sequence & 1U;
@@ -635,7 +636,7 @@ struct ExpertMisses::Impl {
         std::size_t cpu_count = 0;
         if (cpu_capable(layer)) {
             cpu_count = options.cpu_balance
-                            ? balance(rank, layer, order)
+                            ? balance(split, layer, order)
                             : std::min(order.size(), std::size_t(std::lround(
                                                          double(order.size()) * options.cpu_share)));
         }
@@ -796,7 +797,7 @@ struct ExpertMisses::Impl {
             }
             const double microseconds =
                 disk ? compute_cpu(layer, rank, [] {}) : compute_cpu(layer, rank, issue);
-            if (options.cpu_balance) { rank.split.computed(cpu_work_done, microseconds); }
+            if (options.cpu_balance) { split.computed(cpu_work_done, microseconds); }
         } else {
             issue();
             if (rank.product_count) { *static_cast<std::int32_t*>(rank.product_count->data()) = 0; }
@@ -805,7 +806,7 @@ struct ExpertMisses::Impl {
         if (options.cpu_balance && gpu_count > 0 && staged_bytes > 0 && mapped == 0) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, rank.copying, rank.copied));
-            rank.split.copied(double(staged_bytes) / 1e6, 1e3 * double(milliseconds));
+            split.copied(double(staged_bytes) / 1e6, 1e3 * double(milliseconds));
         }
         Atomic(box.prepared).store(sequence, cuda::memory_order_release);
         const double seconds =

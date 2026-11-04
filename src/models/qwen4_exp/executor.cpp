@@ -713,7 +713,11 @@ struct Executor::Impl {
     // GGUF host or disk experts: a decode or verification call's missing experts, staged (or
     // computed by the CPU) while its cached ones run.
     std::unique_ptr<ExpertMisses> misses;
-    std::uint32_t miss_tokens = 0; // the widest call the misses take
+    std::uint32_t miss_tokens = 0; // the widest verification the misses take
+    // The widest prompt chunk the misses take, 0 for none: with a CPU share, a chunk this narrow
+    // has its missing experts split between the CPU and copies as a decode step does, instead of
+    // copying every routed expert into the slot pool.
+    std::uint32_t prompt_miss_tokens = 0;
     // Each expert layer's routes of the current pass, [layer][10 * prefill_chunk] in one block per
     // rank (a stage's layers are consecutive), so one copy brings a rank's text layers home.
     std::vector<DeviceBuffer> route_blocks; // by rank
@@ -764,6 +768,11 @@ struct Executor::Impl {
     // is full, so a thread of their own (pool_copier) issues them: the layers between keep being
     // launched.
     static constexpr std::int32_t kPrefetchTokens = 256;
+    // With a CPU share, prompt chunks of up to this many tokens take the staged misses
+    // (served_by_misses): narrower than a prefetched group, within one call's capacity.
+    static constexpr std::uint32_t kPromptMissTokens = 64;
+    static_assert(kPromptMissTokens < std::uint32_t(kPrefetchTokens) &&
+                  kPromptMissTokens <= kMaxMissTokens);
     struct PoolPrefetch {
         // Per pool buffer: the layer whose experts it holds or receives, its copies' completion
         // and the completion of the last call that read it, and the copier's task that issues
@@ -1983,19 +1992,23 @@ struct Executor::Impl {
             out.push_back(std::move(layer));
         }
         // Every decode step, and every verification up to the calls' limit, the joint one of all
-        // sequences included.
-        const std::uint32_t joint = verify_width * options.sequences;
-        miss_tokens = std::min(kMaxMissTokens, std::max<std::uint32_t>(kVectorTokens, joint));
+        // sequences included; with a CPU share (and no lossy tail skip), prompt chunks of up to
+        // kPromptMissTokens too.
         MissOptions miss;
-        miss.token_capacity = miss_tokens;
         miss.cpu_balance    = !options.hybrid_experts.dma_share && !options.hybrid_experts.mapped_misses;
         miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share.value_or(1.0F));
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
+        const bool prompts  = (miss.cpu_balance || miss.cpu_share > 0.0) && miss.tail_skip_rank == 0;
+        const std::uint32_t joint = verify_width * options.sequences;
+        miss_tokens = std::min(kMaxMissTokens, std::max<std::uint32_t>(kVectorTokens, joint));
+        miss.verify_tokens  = miss_tokens;
+        miss.token_capacity = prompts ? std::max(miss_tokens, kPromptMissTokens) : miss_tokens;
         misses              = std::make_unique<ExpertMisses>(
             device, std::move(out),
             stream ? model.files() : std::vector<std::filesystem::path>{}, miss, cache.get());
+        prompt_miss_tokens  = prompts && misses->cpu_enabled() ? kPromptMissTokens : 0;
         for (auto& rank : memory.ranks) { rank.workspace_bytes += kStagingBytes; }
     }
 
@@ -3653,11 +3666,18 @@ struct Executor::Impl {
         if (served_by_misses(t)) { synchronize_ranks(); }
     }
 
-    // Whether the staged misses serve a pass of `t` tokens: a decode step, or a verification up to
-    // their widest call, the joint one of all sequences included. A wider pass, a prompt chunk,
-    // copies its layers' missing experts into the slot pools instead.
+    // Whether the staged misses serve a pass of `t` tokens: a decode step, a verification up to
+    // their widest call, the joint one of all sequences included, or a prompt chunk up to
+    // prompt_miss_tokens. A wider pass copies its layers' missing experts into the slot pools
+    // instead.
     [[nodiscard]] bool served_by_misses(std::int32_t t) const {
-        return misses && (t <= kVectorTokens || (verifying && std::uint32_t(t) <= miss_tokens));
+        return misses && (t <= kVectorTokens || (verifying && std::uint32_t(t) <= miss_tokens) ||
+                          std::uint32_t(t) <= prompt_miss_tokens);
+    }
+
+    // Whether a prompt chunk of `t` tokens takes the staged misses rather than the slot pool.
+    [[nodiscard]] bool narrow_chunk(std::int32_t t) const {
+        return t <= kVectorTokens || std::uint32_t(t) <= prompt_miss_tokens;
     }
 
     void synchronize_ranks() {
@@ -3742,15 +3762,15 @@ struct Executor::Impl {
 
     // The chunk after the expert group that starts at chunk `first` of a span. A group needs the
     // full pool and kPrefetchTokens or more, so that it runs from the layer's prefetched pool copy;
-    // a chunk of kVectorTokens or fewer runs alone, as forward() runs it.
+    // a narrow chunk (narrow_chunk) runs alone, as forward() runs it.
     [[nodiscard]] std::size_t group_end(std::span<const SpanChunk> chunks, std::size_t first) const {
         if (span_group == 1 || slot_pools.empty() || slot_pools[0].slots < config.num_experts ||
-            chunks[first].count <= kVectorTokens) {
+            narrow_chunk(chunks[first].count)) {
             return first + 1;
         }
         std::size_t last = std::min<std::size_t>(chunks.size(), first + span_group);
         for (std::size_t j = first + 1; j < last; ++j) {
-            if (chunks[j].count <= kVectorTokens) {
+            if (narrow_chunk(chunks[j].count)) {
                 last = j;
                 break;
             }
@@ -3945,21 +3965,21 @@ struct Executor::Impl {
         }
         // The next step's rows are read while the device runs this span.
         if (hinted != nullptr) { hint_next(*hinted, next); }
-        // The span's expert calls, the same in every layer: the groups and the chunks wider than
-        // kVectorTokens in span order, then the narrower chunks, whose misses enter cache slots
-        // that the layer's pool table may name for the wider calls' experts.
+        // The span's expert calls, the same in every layer: the groups and the wider chunks in span
+        // order, then the narrow ones (narrow_chunk), whose misses enter cache slots that the
+        // layer's pool table may name for the wider calls' experts.
         struct ExpertCall {
             std::size_t first = 0, last = 0;
         };
         std::vector<ExpertCall> calls;
         for (std::size_t k = 0; k < chunks.size();) {
             const std::size_t last = group_end(chunks, k);
-            if (chunks[k].count > kVectorTokens) { calls.push_back({k, last}); }
+            if (!narrow_chunk(chunks[k].count)) { calls.push_back({k, last}); }
             k = last;
         }
         const std::size_t wide = calls.size();
         for (std::size_t k = 0; k < chunks.size(); ++k) {
-            if (chunks[k].count <= kVectorTokens) { calls.push_back({k, k + 1}); }
+            if (narrow_chunk(chunks[k].count)) { calls.push_back({k, k + 1}); }
         }
         const SpanChunk& recorded = chunks[calls.back().last - 1];
         void* const own_mixed   = rank.mixed;
