@@ -213,14 +213,15 @@ def main(argv=None):
                     "text" in components and "gguf" not in paths) or (
                     ("dspark" in components) != ("dspark" in paths)) or (
                     ("vision" in components) != ("vision" in paths)) or (
-                    ("vision" in paths) != ("bias_vl" in paths)):
+                    "bias_vl" in paths and "vision" not in paths):
                 raise ValueError("DeepSeek-V4.1 converts its text component from --source "
                                  "gguf=SHARD1.gguf, its Engram table from --source "
                                  "engram=ENGRAM.gguf, with --components ...,dspark its "
                                  "drafter from --source dspark=DRAFTER.gguf (or an STQ pack "
                                  "directory) and with "
                                  "--components ...,vision its vision tower from --source "
-                                 "vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors")
+                                 "vision=MMPROJ.gguf, for an earlier-layout GGUF with "
+                                 "--source bias_vl=BIAS_VL.safetensors")
             gguf = (stack.enter_context(GGUFShards(paths["gguf"]))
                     if "text" in components else None)
             engram = stack.enter_context(GGUFFile(paths["engram"]))
@@ -233,7 +234,7 @@ def main(argv=None):
             vision = (stack.enter_context(GGUFFile(paths["vision"]))
                       if "vision" in components else None)
             bias_vl = (stack.enter_context(SafetensorsSource(paths["bias_vl"]))
-                       if "vision" in components else None)
+                       if "bias_vl" in paths else None)
             model = build_deepseek_v41(base, gguf, components=components, dspark=dspark,
                                        vision=vision, bias_vl=bias_vl,
                                        resource_overrides=overrides)
