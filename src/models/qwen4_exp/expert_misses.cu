@@ -828,16 +828,27 @@ struct ExpertMisses::Impl {
             .count();
     }
 
+    [[nodiscard]] bool any_requested() const {
+        for (const auto& rank : ranks) {
+            if (!rank.used) { continue; }
+            const std::uint32_t sequence =
+                Atomic(rank.box->requested).load(cuda::memory_order_acquire);
+            if (sequence != rank.served) { return true; }
+        }
+        return false;
+    }
+
     void serve() {
         bool awake = false;
         while (!stopping.load(std::memory_order_acquire)) {
-            if (now_ns() > deadline.load(std::memory_order_acquire)) {
+            if (!any_requested() && now_ns() > deadline.load(std::memory_order_acquire)) {
                 if (awake && pool) { pool->spin(false); }
                 awake = false;
                 std::unique_lock lock(wake_mutex);
                 sleeping.store(true, std::memory_order_release);
                 wake.wait(lock, [this] {
                     return now_ns() <= deadline.load(std::memory_order_acquire) ||
+                           any_requested() ||
                            stopping.load(std::memory_order_acquire);
                 });
                 sleeping.store(false, std::memory_order_release);
@@ -921,7 +932,9 @@ struct ExpertMisses::Impl {
             CUDA_CHECK(cudaStreamSynchronize(stream));
             const std::uint32_t sequence = *static_cast<volatile std::uint32_t*>(rank.need->data());
             if (sequence != 0) {
+                keep_alive();
                 while (Atomic(rank.box->prepared).load(cuda::memory_order_acquire) != sequence) {
+                    keep_alive();
                     std::this_thread::yield();
                     std::lock_guard lock(failure_mutex);
                     if (failure) { std::rethrow_exception(failure); }
@@ -941,10 +954,8 @@ struct ExpertMisses::Impl {
     void keep_alive() {
         raise_failure();
         deadline.store(now_ns() + 500'000'000, std::memory_order_release);
-        if (sleeping.load(std::memory_order_acquire)) {
-            std::lock_guard lock(wake_mutex);
-            wake.notify_all();
-        }
+        std::lock_guard lock(wake_mutex);
+        wake.notify_all();
     }
 };
 
