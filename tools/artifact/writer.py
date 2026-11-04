@@ -168,8 +168,8 @@ class ArtifactWriter:
                 )
                 self._fds.append(fd)
                 self._temporary.append(Path(temporary))
-                start = self.payload_offset if index == 0 else PAYLOAD_ALIGNMENT
-                os.ftruncate(fd, integer(start + file.payload_bytes, "file bytes"))
+                # Writes extend each file; finish() sets the final length. Extending it here
+                # would zero-fill the whole file on Windows before a single object is written.
                 header = HEADER.pack(
                     MAGIC if index == 0 else PART_MAGIC,
                     len(encoded) if index == 0 else index,
@@ -261,6 +261,10 @@ class ArtifactWriter:
             for index, fd in enumerate(self._fds):
                 start = self.payload_offset if index == 0 else PAYLOAD_ALIGNMENT
                 expected = start + self.directory.files[index].payload_bytes
+                # A part file may end inside the alignment padding before the next object,
+                # which no write reaches.
+                if os.fstat(fd).st_size < expected:
+                    os.ftruncate(fd, expected)
                 if os.fstat(fd).st_size != expected:
                     raise ArtifactError(
                         f"file {index}: output length does not match directory"

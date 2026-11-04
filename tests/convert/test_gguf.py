@@ -60,6 +60,27 @@ def test_gguf_source_reads_full_and_partial_ranges(tmp_path):
     assert names == {"matrix": (6, 4), "vector": (5,)}
 
 
+def test_gguf_source_reads_quantized_rows_from_the_file(tmp_path):
+    values = np.random.default_rng(3).standard_normal((5, 64)).astype(np.float32)
+    kind = gguf.GGMLQuantizationType.Q8_0
+    stored = gguf.quants.quantize(values, kind)
+    path = tmp_path / "q8.gguf"
+    writer = gguf.GGUFWriter(str(path), "test")
+    writer.add_tensor("q8", stored, raw_dtype=kind)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    expected = gguf.quants.dequantize(stored, kind).reshape(-1)
+
+    with GGUFSource(path) as source:
+        assert source.describe("q8").shape == (5, 64)
+        assert torch.equal(source.read_flat("q8"), torch.from_numpy(expected))
+        assert torch.equal(source.read_flat("q8", 70, 200), torch.from_numpy(expected[70:200]))
+    with pytest.raises(ValueError, match="closed"):
+        source.read_flat("q8", 0, 1)
+
+
 def test_gguf_source_empty_range_returns_empty_tensor(tmp_path):
     path = tmp_path / "model.gguf"
     _write_gguf(path, {"vector": np.arange(4, dtype=np.float32)})

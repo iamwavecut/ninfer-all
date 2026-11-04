@@ -1,10 +1,11 @@
 """Minimal GGUF v3 reader and the PrismML ternary block decoders.
 
-Only what the ternary Bonsai 2 converter needs: the key/value header, the
-tensor directory, memory-mapped tensor bytes, exact decoders for the ``PQ2_0``
-and ``PTQ1_0`` ternary block formats, and the direct F32/F16/BF16 words. The
-reader has no gguf-py dependency and tolerates a truncated data section, so the
-saved header sample of a large file can be inspected without the whole file.
+Only what the GGUF converters need: the key/value header, the tensor
+directory, bounded reads of tensor bytes, exact decoders for the ``PQ2_0`` and
+``PTQ1_0`` ternary block formats, and the direct F32/F16/BF16 words. The reader
+has no gguf-py dependency and tolerates a truncated data section, so the saved
+header sample of a large file can be inspected without the whole file. It reads
+and never maps the file (``tools/artifact/file_io.py``).
 
 Ternary blocks are 128 weights wide with one binary16 scale ``d``. ``PQ2_0``
 stores two bits per weight (``00=-1, 01=0, 10=+1``; ``11`` is not ternary);
@@ -22,12 +23,15 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from tools.artifact.file_io import discard_cached_pages, pread_into
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
 
 GGUF_MAGIC = b"GGUF"
 GGUF_VERSION = 3
 DEFAULT_ALIGNMENT = 32
+# read_rows reads through a gap of at most this many bytes between two selected rows.
+ROW_GAP_BYTES = 1024 * 1024
 
 TYPE_F32 = 0
 TYPE_F16 = 1
@@ -177,7 +181,11 @@ class _Cursor:
 
 
 class GGUFFile:
-    """Parse the header of a GGUF v3 file and expose memory-mapped tensor bytes."""
+    """Parse the header of a GGUF v3 file and read its tensor bytes on request.
+
+    Every read returns a fresh array of exactly the requested bytes and then drops them from the
+    page cache, so a pass over a file larger than RAM holds one request at a time.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -215,13 +223,18 @@ class GGUFFile:
         self.alignment = int(kv.get("general.alignment", DEFAULT_ALIGNMENT))
         self.header_bytes = cursor.position
         self.data_offset = align_up(self.header_bytes, self.alignment)
-        self._map = np.memmap(self.path, dtype=np.uint8, mode="r")
+        self._file = open(self.path, "rb", buffering=0)
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
     def __enter__(self) -> GGUFFile:
         return self
 
     def __exit__(self, *_exc) -> None:
-        self._map = None
+        self.close()
 
     @property
     def data_bytes_available(self) -> int:
@@ -249,7 +262,13 @@ class GGUFFile:
                 f"{name}: bytes [{byte_begin},{end}) are past the end of the file "
                 f"({self.file_bytes} bytes; the data section may be truncated)"
             )
-        return self._map[start:stop]
+        if self._file is None:
+            raise ValueError(f"{self.path}: the file is closed")
+        out = np.empty(stop - start, dtype=np.uint8)
+        fd = self._file.fileno()
+        pread_into(fd, out, start)
+        discard_cached_pages(fd, start, stop - start)
+        return out
 
     def _row_bytes(self, info: TensorInfo) -> int:
         if len(info.shape) < 2:
@@ -278,13 +297,25 @@ class GGUFFile:
             raise ValueError(f"{name}: {info.type_name} is not a direct format")
         return np.ascontiguousarray(values.reshape(info.shape))
 
-    def read_bf16_words(self, name: str) -> np.ndarray:
+    def read_bf16_words(
+        self, name: str, row_begin: int = 0, row_end: int | None = None
+    ) -> np.ndarray:
+        """BF16 words of rows ``[row_begin, row_end)``, the leading dimension's rows: the whole
+        tensor in its shape by default."""
+
         info = self.info(name)
         if info.type_id != TYPE_BF16:
             raise ValueError(f"{name}: expected BF16, got {info.type_name}")
-        return np.ascontiguousarray(
-            np.frombuffer(self.tensor_bytes(name), dtype="<u2").reshape(info.shape)
-        )
+        rows = info.shape[0] if info.shape else 1
+        end = rows if row_end is None else row_end
+        if not 0 <= row_begin <= end <= rows:
+            raise ValueError(f"{name}: row range [{row_begin},{end}) is outside {rows}")
+        row_bytes = info.nbytes // rows
+        raw = self.tensor_bytes(name, row_begin * row_bytes, end * row_bytes)
+        shape = info.shape if info.shape else ()
+        if row_begin != 0 or end != rows:
+            shape = (end - row_begin, *info.shape[1:])
+        return np.frombuffer(raw, dtype="<u2").reshape(shape)
 
     def read_blocks(
         self, name: str, row_begin: int = 0, row_end: int | None = None
@@ -304,7 +335,37 @@ class GGUFFile:
             raise ValueError(f"{name}: row range [{row_begin},{end}) is outside {rows}")
         row_bytes = self._row_bytes(info)
         raw = self.tensor_bytes(name, row_begin * row_bytes, end * row_bytes)
-        return np.asarray(raw).reshape(end - row_begin, row_bytes)
+        return raw.reshape(end - row_begin, row_bytes)
+
+    def read_rows(self, name: str, index: np.ndarray) -> np.ndarray:
+        """Rows ``index`` (flattened as in read_blocks; any order, repeats allowed) of a ggml
+        block matrix as ``uint8 [len(index), row_bytes]``.
+
+        Selected rows are read in runs, through gaps of at most ROW_GAP_BYTES, so a sparse
+        selection reads about its own size instead of the whole span between its first and
+        last row.
+        """
+
+        info = self.info(name)
+        if info.type_id not in BLOCK_FORMATS:
+            raise ValueError(f"{name}: {info.type_name} is not a stored block format")
+        rows = prod(info.shape[:-1])
+        row_bytes = self._row_bytes(info)
+        index = np.asarray(index, dtype=np.int64).reshape(-1)
+        if index.size == 0:
+            return np.empty((0, row_bytes), dtype=np.uint8)
+        if int(index.min()) < 0 or int(index.max()) >= rows:
+            raise ValueError(f"{name}: selected rows are outside [0, {rows})")
+        unique, inverse = np.unique(index, return_inverse=True)
+        # Two selected rows share a read when the rows between them span at most ROW_GAP_BYTES.
+        splits = np.flatnonzero(np.diff(unique) > ROW_GAP_BYTES // row_bytes + 1) + 1
+        out = np.empty((unique.size, row_bytes), dtype=np.uint8)
+        for begin, end in zip((0, *splits.tolist()), (*splits.tolist(), unique.size)):
+            first, last = int(unique[begin]), int(unique[end - 1]) + 1
+            out[begin:end] = self.read_blocks(name, first, last)[unique[begin:end] - first]
+        if unique.size == index.size and np.array_equal(unique, index):
+            return out
+        return out[inverse.reshape(-1)]
 
     def read_ternary(
         self, name: str, row_begin: int = 0, row_end: int | None = None
@@ -320,7 +381,7 @@ class GGUFFile:
             raise ValueError(f"{name}: row range [{row_begin},{end}) is outside {rows}")
         row_bytes = self._row_bytes(info)
         raw = self.tensor_bytes(name, row_begin * row_bytes, end * row_bytes)
-        blocks = np.asarray(raw).reshape(end - row_begin, columns // TERNARY_GROUP, -1)
+        blocks = raw.reshape(end - row_begin, columns // TERNARY_GROUP, -1)
         if info.type_id == TYPE_PQ2_0:
             return decode_pq2_0(blocks)
         return decode_ptq1_0(blocks)
@@ -537,6 +598,7 @@ __all__ = [
     "BLOCK_GEOMETRY",
     "DEFAULT_ALIGNMENT",
     "GGUFFile",
+    "ROW_GAP_BYTES",
     "TERNARY_GROUP",
     "TERNARY_TYPES",
     "TYPE_BF16",

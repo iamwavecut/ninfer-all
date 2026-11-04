@@ -131,6 +131,39 @@ def test_shards_use_recorded_names_and_open_only_when_needed(tmp_path):
             reader.read_range(8200, 10)
 
 
+def test_a_part_ending_in_alignment_padding_gets_its_directory_length(tmp_path):
+    # The tensor starts at the next 256-byte boundary after the 4000-byte resource; the entry
+    # file's 4096 payload bytes end in that padding, which no write reaches.
+    path = tmp_path / "gap.ninfer"
+    template = bytes(range(250)) * 16
+    weights = bytes(range(256)) * 16
+    with ArtifactWriter(
+        path,
+        [ResourceSpec("template", 4000), TensorSpec("w", (2048,), "bf16", "contiguous_le_v1")],
+        components={
+            "text": {
+                "config": {"architectures": ["Qwen3_5ForCausalLM"], "hidden_size": 2},
+                "resources": {"chat_template.jinja": "template"},
+            }
+        },
+        bindings={"text/weight": {"object": "w"}},
+        max_file_bytes=8192,
+    ) as writer:
+        # Construction writes the framing only; writes extend the files.
+        temporary = list(tmp_path.glob(".gap.ninfer*.tmp"))
+        assert len(temporary) == 2 and all(p.stat().st_size <= 4096 for p in temporary)
+        writer.write_object("template", template)
+        writer.write_object("w", weights)
+        directory = writer.directory.to_json()
+    assert [f["payload_bytes"] for f in directory["files"]] == [4096, 4096]
+    assert path.stat().st_size == 8192
+    assert (tmp_path / directory["files"][1]["path"]).stat().st_size == 8192
+    with Artifact(path) as reader:
+        assert reader.read_object("template") == template
+        assert reader.read_object("w") == weights
+        assert reader.read_range(4000, 96) == bytes(96)
+
+
 @pytest.mark.parametrize("failure", ["missing", "producer"])
 def test_incomplete_or_failed_output_is_not_published(tmp_path, failure):
     path = tmp_path / "failed.ninfer"

@@ -746,6 +746,11 @@ such as `models/my_qwen.ninfer` plus `my_qwen.ninfer.part-0001`, `my_qwen.ninfer
 in the same directory, each at most N bytes including framing. Pass only the entry path to NInfer and
 keep all its recorded parts together.
 
+Conversion reads its Safetensors and GGUF sources in bounded pieces and never maps them, so its
+memory use does not grow with the size of a source, on Windows too. On Linux each piece leaves the
+page cache once read, and the output is synced and dropped from it every 64 MiB; elsewhere the
+output is synced once, when the artifact is complete.
+
 Conversion writes `models/my_qwen.ninfer.conversion.json` alongside the artifact, recording sources,
 methods, formats, component configs, files and timing. Existing output files are not overwritten.
 The report is useful for reproducing a recipe; the Engine reads the artifact itself.
