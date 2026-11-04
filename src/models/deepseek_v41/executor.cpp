@@ -249,6 +249,11 @@ struct Pass {
     bool seed = true;
     const std::int32_t* visible = nullptr;
     int extra_window = 0;
+    // A decode or verification pass's listed candidate blocks (candidate_lists, a row alone a
+    // group), which its candidate source lists for the later index sources; a chunk lists its own
+    // rows' at each of them.
+    std::int32_t* candidate_list   = nullptr;
+    std::int32_t* candidate_counts = nullptr;
 };
 
 } // namespace
@@ -328,6 +333,7 @@ struct Executor::Impl {
     int capacity_rows = 0;   // the largest compressed cache, a decode pass's score width
     int candidate_words = 0; // words of a row's candidate mask
     int candidate_keep = 0, candidate_block = 0;
+    int candidate_rows = 0; // the positions a row's candidate mask covers
     // The Engram: the hash, each sequence's history, and the rows of a pass (pinned ids and rows,
     // then on the device: [Engram block][rows of the pass][columns] rows of 144 bytes).
     EngramHasher hasher;
@@ -565,6 +571,7 @@ struct Executor::Impl {
                 candidate_keep  = int(config.candidate_blocks);
                 const int blocks = (p.rows + candidate_block - 1) / candidate_block;
                 candidate_words  = (blocks + kCandidateBits - 1) / kCandidateBits;
+                candidate_rows   = p.rows;
             }
             layers.push_back(std::move(p));
         }
@@ -1300,8 +1307,10 @@ struct Executor::Impl {
         };
         const std::size_t mixes = config.hc_mixes();
         const std::size_t sites = 2 * (2 * s + s * s) * 4;
+        // A decode or verification pass's listed candidate blocks (index_block) beside its masks.
+        const std::size_t listed = std::size_t(std::max(candidate_keep, 0));
         std::size_t pass = sum({t * s * h * 4, t * sites, t * mixes * 4, t * std::size_t(index_topk) * 4,
-                                t * std::size_t(candidate_words) * 4});
+                                t * std::size_t(candidate_words) * 4, t * listed * 4, t * 4});
         if (n > t) { pass = std::max(pass, span_buffers(n) + sum({t * mixes * 4})); }
         const std::size_t columns = std::size_t(config.engram.columns()) * config.engram.head_dim;
         const std::size_t engram_bytes = sum({t * columns * 2, t * 4, t * (s + 1) * h * 4});
@@ -1321,7 +1330,8 @@ struct Executor::Impl {
             // indexer
             t * std::size_t(index_heads) * kIndexDim * 4, t * std::size_t(index_heads) * kIndexDim * 2,
             t * std::size_t(index_heads) * 4, scores, scores / 8 + 4096,
-            partial});
+            // a chunk's listed candidate blocks, four rows a group
+            (t + 3) * listed * 4, t * 4, partial});
         const std::size_t ffn =
             sum({t * h * 2, t * h * 4, t * 4, t * h * 4, t * std::size_t(experts) * 4, pairs * 4,
                  pairs * 4, gguf::moe_routing_bytes(experts, int(pairs)), pairs * 2 * w * 4,
@@ -1818,8 +1828,21 @@ struct Executor::Impl {
         kernels::latent_post(l, stream);
     }
 
+    // The listed blocks one group of a pass's rows (a decode or verification row alone, a chunk's
+    // rows in fours) keeps at most where its rows see `width` positions, or 0 where a row keeps every
+    // block it sees, so that a later index source scores every visible position.
+    [[nodiscard]] int listed_capacity(int width, bool chunk) const {
+        if (candidate_keep <= 0) { return 0; }
+        const int blocks = (width + candidate_block - 1) / candidate_block;
+        if (blocks <= candidate_keep) { return 0; }
+        return std::min((chunk ? 4 : 1) * candidate_keep, blocks);
+    }
+
     // An index source: each row's index_topk compressed positions (topk), and at the candidate
-    // source the candidate blocks the later index sources keep to.
+    // source the candidate blocks the later index sources keep to. Where the rows see more blocks
+    // than they keep (listed_capacity), a later index source scores only the blocks its rows' group
+    // keeps, in a row of those blocks' positions (candidate_lists), and selects among them: every
+    // other position of the row would score -inf, which the selection never takes.
     void index_block(const LayerPlan& p, const LayerPlan& source, const float* qr32,
                      const float* x32, int t, const Pass& s, std::int32_t* topk,
                      std::uint32_t* candidates) {
@@ -1835,15 +1858,27 @@ struct Executor::Impl {
         kernels::gemm_f32(index_heads, t, hidden, p.index_weights, x32, weights, stream);
         const int width = s.chunk ? std::max(1, int(s.first + std::uint32_t(t)) / p.ratio)
                                   : source.rows;
+        const int group    = s.chunk ? 4 : 1;
+        // A decode pass's rows list their blocks against the mask's every position.
+        const int capacity = listed_capacity(s.chunk ? width : candidate_rows, s.chunk);
+        const bool listed  = p.uses_candidates && capacity > 0 &&
+                            (s.chunk || s.candidate_list != nullptr);
+        // A row of scores: every visible position, or the listed blocks' positions.
+        const int columns = listed ? capacity * candidate_block : width;
         int sub = t;
         if (s.chunk) {
-            sub = int(std::clamp<std::size_t>(kScoreBudget / (std::size_t(width) * 4), 4, std::size_t(t)));
+            sub = int(std::clamp<std::size_t>(kScoreBudget / (std::size_t(columns) * 4), 4, std::size_t(t)));
             sub = std::max(4, sub / 4 * 4);
         }
-        auto* scores = alloc<float>(std::size_t(std::min(sub, t)) * width);
+        auto* scores = alloc<float>(std::size_t(std::min(sub, t)) * columns);
         float* maxima = p.candidate_source
                             ? alloc<float>(std::size_t(std::min(sub, t)) * candidate_words * kCandidateBits)
                             : nullptr;
+        // A chunk's groups list their blocks here, a decode pass's rows at its candidate source.
+        const int list_groups = (std::min(sub, t) + group - 1) / group;
+        std::int32_t* list    = listed && s.chunk ? alloc<std::int32_t>(std::size_t(list_groups) * capacity)
+                                                  : nullptr;
+        std::int32_t* counts  = listed && s.chunk ? alloc<std::int32_t>(std::size_t(list_groups)) : nullptr;
         for (int r0 = 0; r0 < t; r0 += sub) {
             const int n = std::min(sub, t - r0);
             kernels::ScoreArgs a;
@@ -1853,26 +1888,49 @@ struct Executor::Impl {
             a.heads        = index_heads;
             a.tokens       = n;
             a.ratio        = p.ratio;
-            a.width        = width;
-            a.group        = s.chunk ? 4 : 1;
+            a.width        = columns;
+            a.group        = group;
             a.positions    = pos + r0;
             a.sequences    = seq != nullptr ? seq + r0 : nullptr;
             a.sequence     = int(s.sequence);
             a.keys         = static_cast<const __nv_bfloat16*>(source.keys.p);
             a.key_seq_stride = std::int64_t(source.rows) * kIndexDim;
+            kernels::ListedRows rows;
             if (p.uses_candidates) {
                 a.candidates      = candidates + std::int64_t(r0) * candidate_words;
                 a.candidate_words = candidate_words;
                 a.block           = candidate_block;
+                if (listed) {
+                    rows = kernels::ListedRows{
+                        .list     = s.chunk ? list : s.candidate_list + std::int64_t(r0) * capacity,
+                        .counts   = s.chunk ? counts : s.candidate_counts + r0,
+                        .capacity = capacity,
+                        .group    = group,
+                        .block    = candidate_block};
+                    if (s.chunk) {
+                        kernels::candidate_lists(a.candidates, candidate_words, n, group, capacity,
+                                                 list, counts, stream);
+                    }
+                    a.list     = rows.list;
+                    a.counts   = rows.counts;
+                    a.capacity = capacity;
+                }
             }
             a.out = scores;
             kernels::index_scores(a, stream);
             if (p.candidate_source) {
+                std::uint32_t* mask = candidates + std::int64_t(r0) * candidate_words;
                 kernels::select_candidates(scores, width, n, pos + r0, p.ratio, candidate_block,
-                                           candidate_keep, candidates + std::int64_t(r0) * candidate_words,
-                                           candidate_words, maxima, stream);
+                                           candidate_keep, mask, candidate_words, maxima, stream);
+                // A decode or verification pass lists its rows' blocks once, for every later
+                // index source.
+                if (!s.chunk && s.candidate_list != nullptr && capacity > 0) {
+                    kernels::candidate_lists(mask, candidate_words, n, 1, capacity,
+                                             s.candidate_list + std::int64_t(r0) * capacity,
+                                             s.candidate_counts + r0, stream);
+                }
             }
-            kernels::select_topk(scores, width, n, pos + r0, p.ratio, index_topk,
+            kernels::select_topk(scores, columns, n, pos + r0, p.ratio, index_topk, rows,
                                  topk + std::int64_t(r0) * index_topk, stream);
         }
     }
@@ -2434,6 +2492,15 @@ struct Executor::Impl {
         auto* topk        = alloc<std::int32_t>(std::size_t(t) * index_topk);
         auto* candidates  = candidate_words > 0 ? alloc<std::uint32_t>(std::size_t(t) * candidate_words)
                                                 : nullptr;
+        // A decode or verification pass's rows list their candidate blocks once.
+        Pass listed = s;
+        if (const int capacity = candidates != nullptr && !s.chunk
+                                     ? listed_capacity(candidate_rows, false)
+                                     : 0;
+            capacity > 0) {
+            listed.candidate_list   = alloc<std::int32_t>(std::size_t(t) * capacity);
+            listed.candidate_counts = alloc<std::int32_t>(std::size_t(t));
+        }
         const float* pre = nullptr; // the first block reads stream 0
         // With the drafter, the pass's last rows (a window at most) tap its target blocks.
         const int tapped = drafter ? std::min(t, window) : 0;
@@ -2442,7 +2509,7 @@ struct Executor::Impl {
             if (tapped > 0) { tap(l, h + std::size_t(t - tapped) * streams * hidden, tapped, 0); }
             if (p.engram >= 0) { engram_block(p, h, t, s); }
             mixes(p.hc_attention, h, t, mix_scratch, attention_site);
-            attention(p, h, pre, t, s, topk, candidates, attention_site);
+            attention(p, h, pre, t, listed, topk, candidates, attention_site);
             mixes(p.hc_ffn, h, t, mix_scratch, ffn_site);
             ffn(p, h, attention_site.pre, t, ffn_site);
             pre = ffn_site.pre;

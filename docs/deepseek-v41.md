@@ -19,7 +19,10 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   window of 128 positions; blocks 2 to 19 also attend over latents compressed two tokens to one,
   blocks 20 to 39 over one compressed latent per token, of which an indexer (32 heads of 128) keeps
   the best 512 for each query; block 20 first keeps each query's best 2048 blocks of eight latents,
-  and the later blocks rank only inside those. The MoE routes each token to 6 of 384 experts
+  and the later blocks rank only inside those: once a query sees more than 2,048 blocks they read
+  and score only the kept blocks' keys and select among their scores (four consecutive prompt
+  positions share one list of the blocks any of them keeps), which gives the selection of scoring
+  every position. The MoE routes each token to 6 of 384 experts
   (sqrt-softplus scores, SwiGLU of width 2304 with its gate clamped at 10 and its up projection
   within ±10) beside a shared expert. Blocks 1 and 14 add Engram rows, the 2- to 4-grams ending
   at each position hashed into a table and gated by the stream. A 129,280-token head.
@@ -776,6 +779,24 @@ release archive). Beside the two layer banks (7.1 GiB) the expert cache keeps 38
 - **Placements agree.** Host and disk experts produced the same tokens on each card.
 
 Rows give one run, or the range of two; no spread is measured.
+
+### Long prompts
+
+November 4, 2026, one RTX 3090 of a host with a 48-core EPYC 7K62 and the 610.43.03 driver, the
+sm_86 build with experts in pinned RAM, `--no-ngram-table` (the Engram table was not on the host),
+`--max-context 65536`, one sequence, greedy decoding. The index sources of blocks 21 to 39 scored
+every visible position, and now score only the blocks that block 20 keeps; a cell lists each run:
+
+| index sources after block 20 | prefill of 27,264 tokens | decode after them | prefill of 58,117 tokens | decode after them | decode, short answer |
+|---|---:|---:|---:|---:|---:|
+| every position | 635 tok/s | 22.0 tok/s | 645, 632, 631 tok/s | 21.8, 22.1, 20.7 tok/s | 27.0, 27.8, 26.0 tok/s |
+| the kept blocks | 638 tok/s | 22.6 tok/s | 653, 639, 639 tok/s | 22.7, 22.1, 21.2 tok/s | 27.5, 27.5, 26.5 tok/s |
+
+- **Prefill** of the 58,117-token prompt rose by 1.0 to 1.3% and of the 27,264-token prompt by
+  0.4%: scoring the whole context was a small part of a prompt chunk's time.
+- **Decode** after the long prompts rose by 0.3 to 4.2% per run. The short answer never sees more
+  than 2,048 blocks, so its difference of -1.1 to +2.0% between the builds is the spread of runs.
+- **Outputs.** Both builds produced the same tokens in every run.
 
 ## Numerical checks
 
