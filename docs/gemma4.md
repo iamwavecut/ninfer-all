@@ -527,10 +527,11 @@ dominate a small one. A follow-up turn over the same picture reuses it without e
 ## Expert residency
 
 `--expert-residency device` keeps the routed GGUF banks on the GPU. `host` keeps them in pinned host
-memory and `disk` in the artifact's files, read through the OS page cache. Both run all expert
-arithmetic on the GPU with the resident kernels and outputs: top-8 GeGLU, the 704-wide middle, the
-dense branch and the sandwich norms. A 12 GB card runs the model this way; the GPU holds 1.7 GiB of
-other weights instead of 13.7 GiB.
+memory and `disk` in the artifact's files, read through the OS page cache. Both run the experts
+with the resident kernels and outputs (top-8 GeGLU, the 704-wide middle, the dense branch and the
+sandwich norms) on the GPU, except the share of decode and verification misses that CPU threads
+compute (the CPU share below). A 12 GB card runs the model this way; the GPU holds 1.7 GiB of other
+weights instead of 13.7 GiB.
 
 ```sh
 ninfer /models/gemma4.ninfer --expert-residency host

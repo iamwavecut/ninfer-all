@@ -243,8 +243,9 @@ scales such rows by a power of two before quantizing them:
 ## Expert residency
 
 `--expert-residency device` keeps the routed GGUF banks on the GPU. `host` keeps them in pinned host
-memory and `disk` in the artifact's files, read through the OS page cache. Both run all expert
-arithmetic on the GPU with the resident kernels, through the transport Gemma 4 uses
+memory and `disk` in the artifact's files, read through the OS page cache. Both run the experts
+with the resident kernels on the GPU, except the share of decode and verification misses that CPU
+threads compute, through the transport Gemma 4 uses
 ([Gemma 4's expert residency](gemma4.md#expert-residency) describes the layer banks, the cache, its
 rounds and the growing KV):
 
