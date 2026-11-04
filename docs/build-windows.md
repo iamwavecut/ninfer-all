@@ -31,11 +31,17 @@ CUDA 13.4 on an RTX 5070 Ti, and `89` builds with CUDA 13.4 on RTX 4090s
 ## Requirements
 
 - Windows 11 x64 and a recent NVIDIA driver;
-- Visual Studio 2022 (MSVC v143) with CUDA 12.8 or newer for `75`, `86` and `89`, or Visual Studio
-  2026 with CUDA 13.1 or newer for `120a`;
+- Visual Studio 2022 with MSVC 19.44 (toolset 14.44, Visual Studio 17.14) and CUDA 12.8 or newer
+  for `75`, `86` and `89`, or Visual Studio 2026 with CUDA 13.1 or newer for `120a`;
 - CMake, Ninja and [vcpkg](https://github.com/microsoft/vcpkg), which provides FFmpeg and curl
   through `vcpkg.json`;
 - the Microsoft Visual C++ runtime to run the executables, and a `.ninfer` artifact.
+
+Configure stops on an MSVC older than 19.44: cl 19.38 (Visual Studio 17.8) computes the overflow
+flag of `core::wide_add` wrongly at `/O2` when its inputs are constants, so `ninfer_wide_math_test`
+fails, and 19.39 to 19.43 were never qualified. Update Visual Studio 2022 to 17.14, or install its
+14.44 build tools beside an older default toolset and open the environment with
+`vcvars64.bat -vcvars_ver=14.44`, as `scripts\build.ps1` does.
 
 CUDA 12.8 refuses MSVC v145 (`C1189: unsupported Microsoft Visual Studio version!`), the compiler
 of Visual Studio 2026, and `nvcc` takes whatever `cl.exe` comes first on `PATH`. With both Visual
