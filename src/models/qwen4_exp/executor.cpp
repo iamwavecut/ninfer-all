@@ -520,6 +520,12 @@ struct Part {
     std::uint32_t offset = 0;
 };
 
+// Columns [column, column + count) of a pass, which one or more parts hold.
+struct ColumnRun {
+    std::int32_t column = 0;
+    std::int32_t count  = 0;
+};
+
 // What one device holds for the layers it runs: activation planes sized for a full chunk and a
 // scoped workspace.
 struct RankState {
@@ -2547,21 +2553,126 @@ struct Executor::Impl {
         return static_cast<std::int32_t>(at - verified.begin());
     }
 
-    // The layer's output into the part's columns of rank.y (BF16), or under tensor parallelism of
-    // the rank's FP32 `partial` [hidden, *] of the exchange; the heads are the plan's.
-    void run_gdn(const LayerPlan& plan, std::size_t index, LayerState& state, RankState& rank,
-                 const Part& part, float* partial = nullptr) {
+    // Columns that one call of a mixer projection takes: consecutive parts of up to kVectorTokens
+    // tokens together, kVectorTokens columns at most and every part whole, a wider part alone. A
+    // GGUF projection's vector products give a column the same bits at any width up to
+    // kVectorTokens, so each part gets what a call of its own gives it, and a batch of decode steps
+    // reads the weights once instead of once a sequence; `together` false (a projection of another
+    // format) keeps a call per part.
+    [[nodiscard]] static std::vector<ColumnRun> projection_groups(std::span<const Part> parts,
+                                                                  bool together) {
+        std::vector<ColumnRun> groups;
+        for (const Part& part : parts) {
+            if (together && !groups.empty()) {
+                ColumnRun& last = groups.back();
+                if (last.column + last.count == part.column &&
+                    last.count + part.count <= kVectorTokens) {
+                    last.count += part.count;
+                    continue;
+                }
+            }
+            groups.push_back({.column = part.column, .count = part.count});
+        }
+        return groups;
+    }
+
+    [[nodiscard]] static bool gguf_only(const Projection& p) {
+        return std::all_of(p.pieces.begin(), p.pieces.end(), [](const Projection::Piece& piece) {
+            return is_gguf(piece.weight.weight.qtype);
+        });
+    }
+
+    // The parts' columns of `out` (BF16 [p.rows, *]) <- p's projection of those of `x` (BF16
+    // [p.k, *]), a call per group of projection_groups.
+    static void project_columns(const Projection& p, void* x, void* out,
+                                std::span<const Part> parts, WorkspaceArena& ws, cudaStream_t s) {
+        for (const ColumnRun& group : projection_groups(parts, gguf_only(p))) {
+            const Tensor in(columns(x, p.k, group.column, 2), DType::BF16, {p.k, group.count});
+            Tensor o(columns(out, p.rows, group.column, 2), DType::BF16, {p.rows, group.count});
+            project(p, in, o, ws, s);
+        }
+    }
+
+    // A mixer's output into the columns of rank.y (BF16), or under tensor parallelism of the rank's
+    // FP32 `partial` [hidden, *] of the exchange.
+    [[nodiscard]] Tensor mixer_output(RankState& rank, const ColumnRun& run, float* partial) const {
+        const auto h = static_cast<std::int32_t>(config.hidden_size);
+        if (partial != nullptr) {
+            return Tensor(partial + std::size_t(h) * std::size_t(run.column), DType::FP32,
+                          {h, run.count});
+        }
+        return Tensor(columns(rank.y, h, run.column, 2), DType::BF16, {h, run.count});
+    }
+
+    // Where a Gated DeltaNet layer keeps a pass's `t` columns in a rank's planes; a part's columns
+    // are its own columns of every plane. The heads are the plan's.
+    struct GdnPlanes {
+        void* qkv   = nullptr;
+        void* z     = nullptr;
+        void* a     = nullptr;
+        void* b     = nullptr;
+        void* q     = nullptr;
+        void* k     = nullptr;
+        void* v     = nullptr;
+        void* o     = nullptr;
+        void* gated = nullptr;
+        float* gate = nullptr;
+        float* beta = nullptr;
+    };
+
+    [[nodiscard]] GdnPlanes gdn_planes(const GdnPlan& g, const RankState& rank,
+                                       std::int32_t t) const {
+        const auto kd = g.key_heads * static_cast<std::int32_t>(config.linear_key_head_dim);
+        const std::uint64_t nv = std::uint64_t(g.value_heads);
+        auto* c = static_cast<std::byte*>(rank.c);
+        auto* d = static_cast<std::byte*>(rank.d);
+        auto* f = static_cast<std::byte*>(rank.g);
+        return {.qkv   = rank.a,
+                .z     = rank.b,
+                .a     = c,
+                .b     = c + round_up(nv * std::uint64_t(t) * 2),
+                .q     = d,
+                .k     = d + round_up(std::uint64_t(kd) * std::uint64_t(t) * 2),
+                .v     = rank.e,
+                .o     = rank.f,
+                .gated = rank.a,
+                .gate  = reinterpret_cast<float*>(f),
+                .beta  = reinterpret_cast<float*>(f + round_up(nv * std::uint64_t(t) * 4))};
+    }
+
+    // A Gated DeltaNet layer runs in three steps over a pass of `t` columns, `parts` holding them:
+    // gdn_project, its projections and gates over every column (projection_groups); gdn_part, the
+    // convolution and recurrence of one part, which read and advance its sequence's state; and
+    // gdn_output, the gated norm and the output projection over every column.
+    void gdn_project(const GdnPlan& g, RankState& rank, std::span<const Part> parts,
+                     std::int32_t t) {
+        WorkspaceArena& ws   = *rank.workspace;
+        const cudaStream_t s = rank.stream;
+        const GdnPlanes p    = gdn_planes(g, rank, t);
+        project_columns(g.qkv, rank.mixed, p.qkv, parts, ws, s);
+        project_columns(g.z, rank.mixed, p.z, parts, ws, s);
+        project_columns(g.a, rank.mixed, p.a, parts, ws, s);
+        project_columns(g.b, rank.mixed, p.b, parts, ws, s);
+        const auto nv = g.value_heads;
+        const Tensor ga(p.a, DType::BF16, {nv, t}), gb(p.b, DType::BF16, {nv, t});
+        Tensor gate(p.gate, DType::FP32, {nv, t}), beta(p.beta, DType::FP32, {nv, t});
+        ops::gdn_gating(ga, gb, g.a_log, g.dt_bias, gate, beta, s);
+    }
+
+    void gdn_part(const LayerPlan& plan, std::size_t index, LayerState& state, RankState& rank,
+                  const Part& part, std::int32_t t) {
         const GdnPlan& g     = *plan.gdn;
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
-        const auto t         = part.count;
-        const auto h         = static_cast<std::int32_t>(config.hidden_size);
+        const GdnPlanes p    = gdn_planes(g, rank, t);
+        const auto n         = part.count;
+        const auto column    = part.column;
         const auto nk        = g.key_heads;
         const auto nv        = g.value_heads;
         const auto kd = nk * static_cast<std::int32_t>(config.linear_key_head_dim);
         const auto vd = nv * static_cast<std::int32_t>(config.linear_value_head_dim);
         const auto dh = static_cast<std::int32_t>(config.linear_value_head_dim);
-        const Tensor mixed(columns(rank.mixed, h, part.column, 2), DType::BF16, {h, t});
+        Tensor qkv(columns(p.qkv, g.qkv.rows, column, 2), DType::BF16, {g.qkv.rows, n});
         // A verification records its raw projection, the transitions and the gates for the fold
         // that commits a prefix, and leaves the sequence's states as they were. The record rows
         // are the round's widest width apart; a narrower row fills the first columns of its own.
@@ -2571,71 +2682,75 @@ struct Executor::Impl {
             const auto all = rank.records->layer(static_cast<std::int32_t>(gdn_local[index]),
                                                  static_cast<std::int32_t>(verified.size()),
                                                  static_cast<std::int32_t>(active_verify_width));
-            record = GdnReplayRecordLayer{all.conv.slice(2, row, 1).slice(1, 0, t),
-                                          all.key.slice(3, row, 1).slice(2, 0, t),
-                                          all.value.slice(3, row, 1).slice(2, 0, t),
-                                          all.gate.slice(3, row, 1).slice(2, 0, t)};
+            record = GdnReplayRecordLayer{all.conv.slice(2, row, 1).slice(1, 0, n),
+                                          all.key.slice(3, row, 1).slice(2, 0, n),
+                                          all.value.slice(3, row, 1).slice(2, 0, n),
+                                          all.gate.slice(3, row, 1).slice(2, 0, n)};
+            CUDA_CHECK(cudaMemcpyAsync(record->conv.data, qkv.data,
+                                       std::size_t(g.qkv.rows) * std::size_t(n) * 2,
+                                       cudaMemcpyDeviceToDevice, s));
+            qkv = Tensor(record->conv.data, DType::BF16, {g.qkv.rows, n});
         }
-        Tensor qkv = record ? Tensor(record->conv.data, DType::BF16, {g.qkv.rows, t})
-                            : Tensor(rank.a, DType::BF16, {g.qkv.rows, t});
-        Tensor z(rank.b, DType::BF16, {vd, t});
-        Tensor ga(rank.c, DType::BF16, {nv, t});
-        Tensor gb(static_cast<std::byte*>(rank.c) + round_up(std::uint64_t(nv) * t * 2),
-                  DType::BF16, {nv, t});
-        project(g.qkv, mixed, qkv, ws, s);
-        project(g.z, mixed, z, ws, s);
-        project(g.a, mixed, ga, ws, s);
-        project(g.b, mixed, gb, ws, s);
-        // Convolution in place of the projections' q/k/v planes.
-        auto* conv_out = static_cast<std::byte*>(rank.d);
-        Tensor q(conv_out, DType::BF16, {kd, t});
-        Tensor k(conv_out + round_up(std::uint64_t(kd) * t * 2), DType::BF16, {kd, t});
-        Tensor v(rank.e, DType::BF16, {vd, t});
+        // Convolution of the projections' q/k/v planes into the part's columns of its own planes.
+        Tensor q(columns(p.q, kd, column, 2), DType::BF16, {kd, n});
+        Tensor k(columns(p.k, kd, column, 2), DType::BF16, {kd, n});
+        Tensor v(columns(p.v, vd, column, 2), DType::BF16, {vd, n});
         const auto window = static_cast<std::int32_t>(config.linear_conv_kernel_dim - 1);
         Tensor conv_state(state.conv.data, DType::BF16, {g.qkv.rows, window});
         Tensor conv_next =
             record ? Tensor(rank.conv_scratch.p, DType::BF16, {g.qkv.rows, window}) : conv_state;
         ops::causal_conv1d_silu_split(qkv, g.convolution, conv_state, conv_next, q, k, v, s);
-        Tensor gate(rank.g, DType::FP32, {nv, t});
-        Tensor beta(static_cast<std::byte*>(rank.g) + round_up(std::uint64_t(nv) * t * 4),
-                    DType::FP32, {nv, t});
-        ops::gdn_gating(ga, gb, g.a_log, g.dt_bias, gate, beta, s);
-        Tensor q3(q.data, DType::BF16, {dh, nk, t}), k3(k.data, DType::BF16, {dh, nk, t});
-        Tensor v3(v.data, DType::BF16, {dh, nv, t});
-        Tensor o(rank.f, DType::BF16, {dh, nv, t});
+        const Tensor gate(p.gate + std::size_t(nv) * std::size_t(column), DType::FP32, {nv, n});
+        const Tensor beta(p.beta + std::size_t(nv) * std::size_t(column), DType::FP32, {nv, n});
+        Tensor q3(q.data, DType::BF16, {dh, nk, n}), k3(k.data, DType::BF16, {dh, nk, n});
+        Tensor v3(v.data, DType::BF16, {dh, nv, n});
+        Tensor o(columns(p.o, vd, column, 2), DType::BF16, {dh, nv, n});
         const float scale = 1.0F / std::sqrt(float(dh));
         if (record) {
             const Tensor states = rank.gdn->layer_view(gdn_local[index]).recurrent;
             const Tensor slot(static_cast<std::int32_t*>(rank.slot_ids.p) + part.sequence->slot,
                               DType::I32, {1});
-            Tensor o4 = o.view({dh, nv, t, 1});
-            ops::gated_delta_net_replay_record(q3.view({dh, nk, t, 1}), k3.view({dh, nk, t, 1}),
-                                               v3.view({dh, nv, t, 1}), gate.view({nv, t, 1}),
-                                               beta.view({nv, t, 1}), scale, states, Tensor{}, slot,
+            Tensor o4 = o.view({dh, nv, n, 1});
+            ops::gated_delta_net_replay_record(q3.view({dh, nk, n, 1}), k3.view({dh, nk, n, 1}),
+                                               v3.view({dh, nv, n, 1}), gate.view({nv, n, 1}),
+                                               beta.view({nv, n, 1}), scale, states, Tensor{}, slot,
                                                record->key, record->value, record->gate, o4, s);
         } else {
             Tensor ssm(state.ssm.data, DType::FP32, {dh, dh, nv});
             auto scope = ws.scope();
             ops::gated_delta_net(q3, k3, v3, gate, beta, scale, true, ws, ssm, o, s);
         }
-        Tensor rows_o(rank.f, DType::BF16, {dh, nv * t});
-        Tensor rows_z(rank.b, DType::BF16, {dh, nv * t});
-        Tensor gated_rows(rank.a, DType::BF16, {dh, nv * t});
-        ops::gated_rmsnorm(rows_o, g.norm, rows_z, ops::GateActivation::Sigmoid,
-                           config.rms_norm_eps, gated_rows, s);
-        const Tensor gated(rank.a, DType::BF16, {vd, t});
-        Tensor y = mixer_output(rank, part, partial);
-        project(g.output, gated, y, ws, s);
     }
 
-    // Where a mixer writes the part's output: rank.y as BF16, or an FP32 exchange partial.
-    [[nodiscard]] Tensor mixer_output(RankState& rank, const Part& part, float* partial) const {
-        const auto h = static_cast<std::int32_t>(config.hidden_size);
-        if (partial != nullptr) {
-            return Tensor(partial + std::size_t(h) * std::size_t(part.column), DType::FP32,
-                          {h, part.count});
+    void gdn_output(const GdnPlan& g, RankState& rank, std::span<const Part> parts, std::int32_t t,
+                    float* partial) {
+        WorkspaceArena& ws   = *rank.workspace;
+        const cudaStream_t s = rank.stream;
+        const GdnPlanes p    = gdn_planes(g, rank, t);
+        const auto nv        = g.value_heads;
+        const auto dh = static_cast<std::int32_t>(config.linear_value_head_dim);
+        const Tensor rows_o(p.o, DType::BF16, {dh, nv * t});
+        const Tensor rows_z(p.z, DType::BF16, {dh, nv * t});
+        Tensor gated_rows(p.gated, DType::BF16, {dh, nv * t});
+        ops::gated_rmsnorm(rows_o, g.norm, rows_z, ops::GateActivation::Sigmoid,
+                           config.rms_norm_eps, gated_rows, s);
+        const auto vd = nv * dh;
+        for (const ColumnRun& group : projection_groups(parts, gguf_only(g.output))) {
+            const Tensor gated(columns(p.gated, vd, group.column, 2), DType::BF16,
+                               {vd, group.count});
+            Tensor y = mixer_output(rank, group, partial);
+            project(g.output, gated, y, ws, s);
         }
-        return Tensor(columns(rank.y, h, part.column, 2), DType::BF16, {h, part.count});
+    }
+
+    // One part's Gated DeltaNet in a pass of its own.
+    void run_gdn(const LayerPlan& plan, std::size_t index, LayerState& state, RankState& rank,
+                 const Part& part) {
+        const std::span<const Part> parts(&part, 1);
+        const std::int32_t t = part.column + part.count;
+        gdn_project(*plan.gdn, rank, parts, t);
+        gdn_part(plan, index, state, rank, part, t);
+        gdn_output(*plan.gdn, rank, parts, t, nullptr);
     }
 
     // Where a sparse-attention layer finds its positions and keeps its indexer state. By default
@@ -2650,19 +2765,26 @@ struct Executor::Impl {
         std::uint32_t first           = 0;       // the first position, as the host knows it
     };
 
+    // A verification's indexer record of sparse-attention layer `index` from column `column` of
+    // the pass, else null (the rank's plane).
+    [[nodiscard]] void* indexer_records(std::size_t index, const RankState& rank,
+                                        std::int32_t column) const {
+        if (!verifying) { return nullptr; }
+        const std::uint64_t rows =
+            std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
+        const std::uint64_t columns = std::uint64_t(verify_width) * options.sequences;
+        return static_cast<std::byte*>(rank.index_records.p) +
+               (qsa_local[index] * columns + std::uint64_t(column)) * rows * 2;
+    }
+
     [[nodiscard]] AttentionInputs target_inputs(std::size_t index, LayerState& state,
                                                 RankState& rank, const Part& part) {
         AttentionInputs in{.positions = rank.positions + part.column,
                            .rope      = rank.rope + part.column,
-                           .index     = nullptr,
+                           .index     = indexer_records(index, rank, part.column),
                            .tail      = state.tail.p,
                            .first     = part.sequence->position + part.offset};
         if (verifying) {
-            const std::uint64_t rows =
-                std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
-            const std::uint64_t columns = std::uint64_t(verify_width) * options.sequences;
-            in.index = static_cast<std::byte*>(rank.index_records.p) +
-                       (qsa_local[index] * columns + std::uint64_t(part.column)) * rows * 2;
             CUDA_CHECK(cudaMemcpyAsync(rank.tail_scratch.p, state.tail.p, state.tail.bytes,
                                        cudaMemcpyDeviceToDevice, rank.stream));
             in.tail = rank.tail_scratch.p;
@@ -2670,37 +2792,63 @@ struct Executor::Impl {
         return in;
     }
 
-    void run_qsa(const LayerPlan& plan, LayerState& state, RankState& rank, const Part& part,
-                 const AttentionInputs& in, float* partial = nullptr) {
-        const QsaPlan& a     = *plan.qsa;
+    // Where a sparse-attention layer keeps a pass's `t` columns in a rank's planes, its indexer
+    // projection at `index` (a verification's records) or in the rank's plane; a part's columns
+    // are its own columns of every plane. A tensor-parallel rank's KV heads with their query
+    // heads.
+    struct QsaPlanes {
+        void* q         = nullptr;
+        void* gate      = nullptr;
+        void* k         = nullptr;
+        void* v         = nullptr;
+        void* index     = nullptr;
+        void* qo        = nullptr;
+        void* ko        = nullptr;
+        void* attention = nullptr;
+    };
+
+    [[nodiscard]] QsaPlanes qsa_planes(const QsaPlan& a, const RankState& rank, std::int32_t t,
+                                       void* index) const {
+        const std::uint64_t kv_bytes =
+            round_up(std::uint64_t(config.head_dim) * std::uint64_t(a.kv_heads) * std::uint64_t(t) * 2);
+        auto* kv = static_cast<std::byte*>(rank.c);
+        return {.q         = rank.a,
+                .gate      = rank.b,
+                .k         = kv,
+                .v         = kv + kv_bytes,
+                .index     = index != nullptr ? index : kv + 2 * kv_bytes,
+                .qo        = rank.d,
+                .ko        = rank.e,
+                .attention = rank.f};
+    }
+
+    [[nodiscard]] std::int32_t query_heads(const QsaPlan& a) const {
+        return a.kv_heads *
+               static_cast<std::int32_t>(config.num_attention_heads / config.num_key_value_heads);
+    }
+
+    // A sparse-attention layer runs in three steps over a pass of `t` columns, `parts` holding
+    // them: qsa_project, its projections and the query and key norms and rotation over every
+    // column (projection_groups), from the 1-D RoPE positions at `rope` (the pass's first column)
+    // or a media prompt's; qsa_part, the KV append, indexer and attention of one part, which read
+    // and advance its sequence's state; and qsa_output, the output gate and projection over every
+    // column.
+    void qsa_project(const QsaPlan& a, RankState& rank, std::span<const Part> parts,
+                     std::int32_t t, void* index, const std::int32_t* rope) {
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
-        const auto t         = part.count;
+        const QsaPlanes p    = qsa_planes(a, rank, t, index);
         const auto d         = static_cast<std::int32_t>(config.head_dim);
-        // A tensor-parallel rank's KV heads with their query heads.
-        const auto nk = a.kv_heads;
-        const auto nq = nk * static_cast<std::int32_t>(config.num_attention_heads /
-                                                       config.num_key_value_heads);
-        const auto h  = static_cast<std::int32_t>(config.hidden_size);
-        const Tensor mixed(columns(rank.mixed, h, part.column, 2), DType::BF16, {h, t});
-        Tensor q(rank.a, DType::BF16, {d * nq, t});
-        Tensor gate(rank.b, DType::BF16, {d * nq, t});
-        auto* kv = static_cast<std::byte*>(rank.c);
-        Tensor k(kv, DType::BF16, {d * nk, t});
-        Tensor v(kv + round_up(std::uint64_t(d) * nk * t * 2), DType::BF16, {d * nk, t});
-        Tensor index(in.index != nullptr ? in.index
-                                         : kv + 2 * round_up(std::uint64_t(d) * nk * t * 2),
-                     DType::BF16, {a.index.rows, t});
-        project(a.query, mixed, q, ws, s);
-        project(a.gate, mixed, gate, ws, s);
-        project(a.key, mixed, k, ws, s);
-        project(a.value, mixed, v, ws, s);
-        project(a.index, mixed, index, ws, s);
-        Tensor q3(rank.a, DType::BF16, {d, nq, t}), k3(k.data, DType::BF16, {d, nk, t});
-        Tensor qo(rank.d, DType::BF16, {d, nq, t});
-        Tensor ko(rank.e, DType::BF16, {d, nk, t});
-        auto* const part_positions = const_cast<std::int32_t*>(in.positions);
-        const Tensor positions(part_positions, DType::I32, {t});
+        const auto nk        = a.kv_heads;
+        const auto nq        = query_heads(a);
+        project_columns(a.query, rank.mixed, p.q, parts, ws, s);
+        project_columns(a.gate, rank.mixed, p.gate, parts, ws, s);
+        project_columns(a.key, rank.mixed, p.k, parts, ws, s);
+        project_columns(a.value, rank.mixed, p.v, parts, ws, s);
+        project_columns(a.index, rank.mixed, p.index, parts, ws, s);
+        Tensor q3(p.q, DType::BF16, {d, nq, t}), k3(p.k, DType::BF16, {d, nk, t});
+        Tensor qo(p.qo, DType::BF16, {d, nq, t});
+        Tensor ko(p.ko, DType::BF16, {d, nk, t});
         const ops::RopeYarn& yarn = options.rope_yarn;
         // A tensor-parallel share of the heads leaves the fused norm and rotation's head counts.
         const bool share = nk != static_cast<std::int32_t>(config.num_key_value_heads);
@@ -2710,7 +2858,7 @@ struct Executor::Impl {
             // too: the fused norm and rotation fixes the unscaled one, so the rotation is its own
             // Op, one tensor at a time (its YaRN forms cover 24 query and 2 key heads that way).
             const Tensor axes(rank.mrope, DType::I32, {t, 3});
-            const Tensor line(const_cast<std::int32_t*>(in.rope), DType::I32, {t});
+            const Tensor line(const_cast<std::int32_t*>(rope), DType::I32, {t});
             const int rotary = static_cast<int>(float(d) * config.partial_rotary_factor);
             ops::rmsnorm(q3, a.query_norm, config.rms_norm_eps, true, qo, s);
             ops::rmsnorm(k3, a.key_norm, config.rms_norm_eps, true, ko, s);
@@ -2721,9 +2869,29 @@ struct Executor::Impl {
                 ops::rope(mrope ? axes : line, rotary, config.rope_theta, qo, ko, s);
             }
         } else {
-            const Tensor rope(const_cast<std::int32_t*>(in.rope), DType::I32, {t});
-            ops::rmsnorm_rope(rope, a.query_norm, a.key_norm, q3, k3, qo, ko, s);
+            const Tensor line(const_cast<std::int32_t*>(rope), DType::I32, {t});
+            ops::rmsnorm_rope(line, a.query_norm, a.key_norm, q3, k3, qo, ko, s);
         }
+    }
+
+    void qsa_part(const QsaPlan& a, LayerState& state, RankState& rank, const Part& part,
+                  std::int32_t t, const AttentionInputs& in) {
+        WorkspaceArena& ws   = *rank.workspace;
+        const cudaStream_t s = rank.stream;
+        const QsaPlanes p    = qsa_planes(a, rank, t, nullptr);
+        const auto n         = part.count;
+        const auto column    = part.column;
+        const auto d         = static_cast<std::int32_t>(config.head_dim);
+        const auto nk        = a.kv_heads;
+        const auto nq        = query_heads(a);
+        const Tensor qo(columns(p.qo, d * nq, column, 2), DType::BF16, {d, nq, n});
+        const Tensor ko(columns(p.ko, d * nk, column, 2), DType::BF16, {d, nk, n});
+        const Tensor v3(columns(p.v, d * nk, column, 2), DType::BF16, {d, nk, n});
+        Tensor index(in.index != nullptr ? in.index : columns(p.index, a.index.rows, column, 2),
+                     DType::BF16, {a.index.rows, n});
+        auto* const part_positions = const_cast<std::int32_t*>(in.positions);
+        const Tensor positions(part_positions, DType::I32, {n});
+        const ops::RopeYarn& yarn = options.rope_yarn;
         // The paged KV: device pages, or a streamed layer's host copy. A streamed layer's call of
         // at most stream_width tokens reads its device pool once kv_stream_resolve has made the
         // call's blocks resident there; a wider call (a prompt chunk) reads the rank's staging
@@ -2733,8 +2901,7 @@ struct Executor::Impl {
             kv_view([&](std::size_t i) { return state.kv[i].p; }, kPagedKVPageSize, paged_count,
                     rank.block_table.p, paged_count, nk);
         const bool streamed = state.map.table != nullptr;
-        const bool pooled_read = streamed && t <= static_cast<std::int32_t>(stream_width);
-        const Tensor v3(v.data, DType::BF16, {d, nk, t});
+        const bool pooled_read = streamed && n <= static_cast<std::int32_t>(stream_width);
         ops::kv_cache_append(ko, v3, positions, cache, s);
         PagedKVLayerView read = cache;
         if (pooled_read) {
@@ -2747,7 +2914,7 @@ struct Executor::Impl {
             read = kv_view([&](std::size_t i) { return rank.kv_staging[i].p; }, kPagedKVPageSize,
                            paged_count, rank.block_table.p, paged_count);
             ops::kv_cache_append(ko, v3, positions, read, s);
-            rank.kv_staged_end = in.first + std::uint32_t(t);
+            rank.kv_staged_end = in.first + std::uint32_t(n);
         }
         const auto di = static_cast<std::int32_t>(config.indexer_head_dim);
         Tensor pooled(state.pooled.p, DType::FP32, {di, static_cast<std::int32_t>(pooled_slots)});
@@ -2758,8 +2925,8 @@ struct Executor::Impl {
         const Tensor first(part_positions, DType::I32, {1});
         ops::qsa_indexer_append(index, first, iw, config.rms_norm_eps, yarn, pooled, tail, s);
         Tensor selected(rank.selected, DType::I32,
-                        {static_cast<std::int32_t>(config.indexer_block_budget()), t});
-        Tensor counts(rank.counts, DType::I32, {t});
+                        {static_cast<std::int32_t>(config.indexer_block_budget()), n});
+        Tensor counts(rank.counts, DType::I32, {n});
         {
             auto scope = ws.scope();
             ops::qsa_indexer_select(index, first, iw, config.rms_norm_eps, yarn, pooled, ws,
@@ -2768,7 +2935,7 @@ struct Executor::Impl {
         if (pooled_read) {
             ops::kv_stream_resolve(state.map, first, selected, counts, cache, read, s);
         }
-        Tensor attention(rank.f, DType::BF16, {d, nq, t});
+        Tensor attention(columns(p.attention, d * nq, column, 2), DType::BF16, {d, nq, n});
         {
             auto scope = ws.scope();
             ops::sparse_softmax_attention(qo, first, selected, counts, read,
@@ -2779,12 +2946,73 @@ struct Executor::Impl {
                 return static_cast<std::int32_t>(position / ops::kKvStreamPageTokens);
             };
             ops::kv_stream_evict(state.map, block(in.first),
-                                 block(in.first + std::uint32_t(t) - 1) + 1, s);
+                                 block(in.first + std::uint32_t(n) - 1) + 1, s);
         }
-        Tensor flat(rank.f, DType::BF16, {d * nq, t});
+    }
+
+    void qsa_output(const QsaPlan& a, RankState& rank, std::span<const Part> parts,
+                    std::int32_t t, float* partial) {
+        WorkspaceArena& ws   = *rank.workspace;
+        const cudaStream_t s = rank.stream;
+        const QsaPlanes p    = qsa_planes(a, rank, t, nullptr);
+        const auto width     = static_cast<std::int32_t>(config.head_dim) * query_heads(a);
+        const Tensor gate(p.gate, DType::BF16, {width, t});
+        Tensor flat(p.attention, DType::BF16, {width, t});
         ops::sigmoid_mul(gate, flat, s);
-        Tensor y = mixer_output(rank, part, partial);
-        project(a.output, flat, y, ws, s);
+        for (const ColumnRun& group : projection_groups(parts, gguf_only(a.output))) {
+            const Tensor in(columns(p.attention, width, group.column, 2), DType::BF16,
+                            {width, group.count});
+            Tensor y = mixer_output(rank, group, partial);
+            project(a.output, in, y, ws, s);
+        }
+    }
+
+    // One part's sparse attention in a pass of its own.
+    void run_qsa(const LayerPlan& plan, LayerState& state, RankState& rank, const Part& part,
+                 const AttentionInputs& in) {
+        const std::span<const Part> parts(&part, 1);
+        const std::int32_t t = part.column + part.count;
+        // The pass's indexer plane, which the part's columns continue.
+        void* index = in.index == nullptr
+                          ? nullptr
+                          : static_cast<std::byte*>(in.index) -
+                                std::size_t(plan.qsa->index.rows) * std::size_t(part.column) * 2;
+        qsa_project(*plan.qsa, rank, parts, t, index, in.rope - part.column);
+        qsa_part(*plan.qsa, state, rank, part, t, in);
+        qsa_output(*plan.qsa, rank, parts, t, nullptr);
+    }
+
+    // Layer `i`'s mixer over the pass's `parts` (its `t` columns), part k reading and advancing
+    // the state `state_of(part)`: the projections and the steps without state over every column at
+    // once, the others part by part. In a branch pass the first branch continues the state its
+    // sequence holds and leaves a copy in `slot`, from which each later branch starts the layer.
+    // Under tensor parallelism into the rank's FP32 `partial`.
+    template <typename StateOf>
+    void run_mixer(const LayerPlan& plan, std::size_t i, RankState& rank,
+                   std::span<const Part> parts, std::int32_t t, std::size_t slot,
+                   const StateOf& state_of, float* partial) {
+        const std::size_t first_branch = branch_capture != nullptr ? 1 : 0;
+        if (plan.gdn) {
+            gdn_project(*plan.gdn, rank, parts, t);
+        } else {
+            qsa_project(*plan.qsa, rank, parts, t, indexer_records(i, rank, 0), rank.rope);
+        }
+        for (std::size_t k = 0; k < parts.size(); ++k) {
+            const Part& part  = parts[k];
+            LayerState& state = state_of(part);
+            if (k > first_branch) { restore_branch_layer(state, slot, rank, kMixerRegions); }
+            if (plan.gdn) {
+                gdn_part(plan, i, state, rank, part, t);
+            } else {
+                qsa_part(*plan.qsa, state, rank, part, t, target_inputs(i, state, rank, part));
+            }
+            if (k == 0) { capture_branch_layer(state, slot, rank, kMixerRegions); }
+        }
+        if (plan.gdn) {
+            gdn_output(*plan.gdn, rank, parts, t, partial);
+        } else {
+            qsa_output(*plan.qsa, rank, parts, t, partial);
+        }
     }
 
     void run_ple(const LayerPlan& plan, LayerState& state, RankState& rank, const Part& part) {
@@ -3078,21 +3306,9 @@ struct Executor::Impl {
                 }
                 pending = false;
             }
-            for (std::size_t k = 0; k < parts.size(); ++k) {
-                const Part& part  = parts[k];
-                LayerState& state = part.sequence->layers[i];
-                if (k > first_branch) {
-                    restore_branch_layer(state, state_slot(i, rank.rank), rank, kMixerRegions);
-                }
-                if (plan.gdn) {
-                    run_gdn(plan, i, state, rank, part);
-                } else {
-                    run_qsa(plan, state, rank, part, target_inputs(i, state, rank, part));
-                }
-                if (k == 0) {
-                    capture_branch_layer(state, state_slot(i, rank.rank), rank, kMixerRegions);
-                }
-            }
+            run_mixer(plan, i, rank, parts, t, state_slot(i, rank.rank),
+                      [&](const Part& part) -> LayerState& { return part.sequence->layers[i]; },
+                      nullptr);
             {
                 auto scope = rank.workspace->scope();
                 ops::hyper_connection_write_read(
@@ -3251,24 +3467,11 @@ struct Executor::Impl {
             const std::size_t mixers = layers[i].gdn ? n : model.attention_ranks();
             exchange_step(mixers, TensorParallelSum::StoreBf16,
                           [&](std::size_t r, RankState& rank, float* partial) {
-                              const LayerPlan& plan = plan_of(r, i);
-                              const std::size_t slot = state_slot(i, r);
-                              for (std::size_t k = 0; k < parts.size(); ++k) {
-                                  const Part& part  = parts[k];
-                                  LayerState& state = state_of(*part.sequence, r, i);
-                                  if (k > first_branch) {
-                                      restore_branch_layer(state, slot, rank, kMixerRegions);
-                                  }
-                                  if (plan.gdn) {
-                                      run_gdn(plan, i, state, rank, part, partial);
-                                  } else {
-                                      run_qsa(plan, state, rank, part,
-                                              target_inputs(i, state, rank, part), partial);
-                                  }
-                                  if (k == 0) {
-                                      capture_branch_layer(state, slot, rank, kMixerRegions);
-                                  }
-                              }
+                              run_mixer(plan_of(r, i), i, rank, parts, t, state_slot(i, r),
+                                        [&](const Part& part) -> LayerState& {
+                                            return state_of(*part.sequence, r, i);
+                                        },
+                                        partial);
                           });
             for (std::size_t r = 0; r < n; ++r) {
                 on(r, [&](RankState& rank) {
@@ -4269,16 +4472,22 @@ struct Executor::Impl {
         }
         // MTP cells rotate on the one text axis.
         const bool media = std::exchange(mrope, false);
+        std::vector<Part> cells;
         for (const MtpPart& part : parts) {
-            SequenceState& sequence = *part.sequence;
-            const Part cells{.sequence = &sequence, .column = part.column, .count = part.count};
-            run_qsa(plan, sequence.mtp, rank, cells,
-                    {.positions = positions + part.column,
-                     .rope      = positions + part.column,
-                     .index     = nullptr,
-                     .tail      = drafting ? sequence.mtp_scratch_tail.p : sequence.mtp.tail.p,
-                     .first     = part.first});
+            cells.push_back({.sequence = part.sequence, .column = part.column, .count = part.count});
         }
+        qsa_project(*plan.qsa, rank, cells, n, nullptr, positions);
+        for (std::size_t k = 0; k < parts.size(); ++k) {
+            const MtpPart& part     = parts[k];
+            SequenceState& sequence = *part.sequence;
+            qsa_part(*plan.qsa, sequence.mtp, rank, cells[k], n,
+                     {.positions = positions + part.column,
+                      .rope      = positions + part.column,
+                      .index     = nullptr,
+                      .tail      = drafting ? sequence.mtp_scratch_tail.p : sequence.mtp.tail.p,
+                      .first     = part.first});
+        }
+        qsa_output(*plan.qsa, rank, cells, n, nullptr);
         mrope = media;
         {
             auto scope = ws.scope();
