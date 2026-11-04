@@ -24,7 +24,7 @@ namespace ninfer::runtime::prefix_cache {
 //
 // Pins are path-wide: pinning a node pins it and every ancestor, so an unpinned node always has an
 // unpinned subtree. Every active sequence pins its whole mapped path, every in-flight transfer
-// pins the path of the node it touches.
+// pins the path of the node it touches, and pinning a snapshot pins its anchor path.
 
 inline constexpr std::uint32_t kNoId = std::numeric_limits<std::uint32_t>::max();
 
@@ -229,6 +229,7 @@ public:
     // Pins one node and its ancestors (in-flight transfer of that node).
     void pin_node(NodeRef node);
     void unpin_node(NodeRef node);
+    // Pins one snapshot and its anchor path, so neither is evicted while it is pinned.
     void pin_snapshot(SnapshotRef snapshot);
     void unpin_snapshot(SnapshotRef snapshot);
 

@@ -997,7 +997,8 @@ F(s)  = 1 + hits(s)                             // hits since publication
   affected snapshot. Snapshot count is bounded by `host_cache_bytes / image_bytes` (about 1,300
   for a 230 GiB Host tier with 27B DFlash2 images), so the policy is independent of the tier size:
   a small tier reaches step 2 and 3 often, a large one rarely.
-- Pinned objects (`restore_pins`, `active_refs`, in-flight fills) are never evicted.
+- Pinned objects (`restore_pins`, `active_refs`, in-flight fills) are never evicted. Pinning a
+  snapshot also pins its anchor path, so the path nodes keep their copies while it is pinned.
 
 ### 9.4 Losing the last copy
 

@@ -334,8 +334,12 @@ void PrefixCacheIndex::unpin_node(NodeRef node) {
     unpin_path_from(node.index, true);
 }
 
+// A snapshot pin also pins its anchor path: a pinned snapshot is never removed, and losing a
+// path node's last copy would remove every snapshot anchored below it (§9.4).
 void PrefixCacheIndex::pin_snapshot(SnapshotRef snapshot) {
-    ++require(snapshot).pins;
+    Snapshot& entry = require(snapshot);
+    ++entry.pins;
+    if (entry.anchor != kNoId) { pin_path_from(entry.anchor); }
     refresh_tail(snapshot.index);
 }
 
@@ -343,6 +347,7 @@ void PrefixCacheIndex::unpin_snapshot(SnapshotRef snapshot) {
     Snapshot& entry = require(snapshot);
     if (entry.pins == 0) { invariant("prefix cache snapshot unpinned without a pin"); }
     --entry.pins;
+    if (entry.anchor != kNoId) { unpin_path_from(entry.anchor, true); }
     refresh_tail(snapshot.index);
 }
 
@@ -1583,6 +1588,7 @@ void PrefixCacheIndex::check_invariants() const {
     }
     std::uint32_t occupied_snapshots = 0;
     std::vector<std::uint32_t> retained(nodes_.size(), 0);
+    std::vector<std::uint32_t> pinned_below(nodes_.size(), 0);
     std::uint32_t top_level = 0;
     for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
         const Snapshot& snapshot = snapshots_[i];
@@ -1593,6 +1599,7 @@ void PrefixCacheIndex::check_invariants() const {
              current               = nodes_[current].parent) {
             ++live[current];
             if (!snapshot.superseded) { ++retained[current]; }
+            pinned_below[current] += snapshot.pins;
         }
         if (snapshot.ancestor != find_ancestor(i)) {
             invariant("snapshot ancestor is not the nearest snapshot above it");
@@ -1628,6 +1635,9 @@ void PrefixCacheIndex::check_invariants() const {
         }
         if (nodes_[i].occupied && nodes_[i].retained_below != retained[i]) {
             invariant("retained snapshot count is inconsistent");
+        }
+        if (nodes_[i].occupied && nodes_[i].pins < pinned_below[i]) {
+            invariant("pinned snapshot has an unpinned anchor path");
         }
     }
     for (const std::uint32_t slab : free_slabs_) { ++slab_uses[slab]; }
