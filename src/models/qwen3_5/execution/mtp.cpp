@@ -32,7 +32,7 @@ std::size_t row_bytes(const MtpProjectionParameters& parameters, std::size_t ind
 
 std::size_t mtp_kv_rows_workspace_bytes(const LinearParameters& key, const LinearParameters& value,
                                         std::int32_t first, std::int32_t last) {
-    if (is_gguf(key.weight.qtype)) {
+    if (!ops::linear_pair_admits(key.weight, value.weight)) {
         return std::max(linear_bytes(key, first, last), linear_bytes(value, first, last));
     }
     return ops::linear_pair_workspace_capacity_bytes(key.weight, value.weight, first, last);
@@ -41,7 +41,9 @@ std::size_t mtp_kv_rows_workspace_bytes(const LinearParameters& key, const Linea
 void mtp_kv_rows_projection(const Tensor& hidden, const LinearParameters& key,
                             const LinearParameters& value, Tensor& key_out, Tensor& value_out,
                             WorkspaceArena& workspace, cudaStream_t stream) {
-    if (is_gguf(key.weight.qtype)) {
+    // The pair Op takes one fixed K/V geometry (27B's 1024 rows); other widths, such as
+    // 35B-A3B's 512, and other formats project row by row.
+    if (!ops::linear_pair_admits(key.weight, value.weight)) {
         {
             auto scope = workspace.scope();
             ops::linear(hidden, key.weight, key_out, key.policy, workspace, stream);

@@ -305,6 +305,22 @@ int run_q8_a16_shape(std::string_view label, const ShapeCase& shape) {
     const Weight second_weight = ops::prepare_linear_weight({second_view}).weight;
 
     int failures = 0;
+    // The Op takes this pair and no narrower one, such as 35B-A3B's 512 K/V rows, whose callers
+    // project row by row.
+    const auto narrow = [](const WeightParent& storage, std::uint64_t row) {
+        const auto k    = storage.geometry.shape[1];
+        const auto rows = static_cast<std::uint64_t>(kOutputRows / 2);
+        const WeightView view{{rows, k}, {{&storage, row * k, (row + rows) * k}}};
+        return ops::prepare_linear_weight({view}).weight;
+    };
+    const Weight narrow_first  = narrow(first_parent, fixture.first_row);
+    const Weight narrow_second = narrow(fixture.shared_payload ? first_parent : second_parent,
+                                        fixture.second_row);
+    if (!ops::linear_pair_admits(first_weight, second_weight) ||
+        ops::linear_pair_admits(narrow_first, narrow_second)) {
+        std::cerr << label << " [1024," << shape.k << "]: linear_pair_admits disagrees\n";
+        ++failures;
+    }
     for (const std::int32_t t : tokens) {
         const std::size_t output_words = checked_elements(kOutputRows, t, "output");
         test::GuardedDeviceBuffer first_output(output_words * sizeof(std::uint16_t));
