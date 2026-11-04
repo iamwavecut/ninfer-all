@@ -645,7 +645,12 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& confi
             rows    = {0, half, m.moe_intermediate_size};
             experts = {0, count, count};
         } else {
-            experts = split_shares(count, unit_positions(count, 1), weights);
+            // Whole experts: rank 0 also runs the shared expert, so it takes fewer of the routed
+            // ones, which a token reaches num_experts_per_tok at a time.
+            const double shared = double(m.shared_expert_intermediate_size) /
+                                  (double(m.num_experts_per_tok) * m.moe_intermediate_size);
+            experts = split_shares(count, unit_positions(count, 1),
+                                   shares_beside_first(weights, shared));
         }
     }
     std::vector<TensorShare> out;

@@ -1,7 +1,8 @@
-// How tensor-parallel ranks divide a dimension (split_shares), the work by speed and room
-// (fill_shares) and delivered experts by cache room and bus (delivery_shares). The expected splits
-// are worked out by hand from the stated rule: every inner end is the allowed position nearest its
-// weight's target, the lower one on a tie, leaving each later share a position.
+// How tensor-parallel ranks divide a dimension (split_shares), the work by speed beside rank 0's
+// own work (shares_beside_first) and by speed and room (fill_shares), and delivered experts by
+// cache room and bus (delivery_shares). The expected splits are worked out by hand from the stated
+// rule: every inner end is the allowed position nearest its weight's target, the lower one on a
+// tie, leaving each later share a position.
 
 #include "core/tensor_split.h"
 
@@ -82,6 +83,29 @@ void split_cases() {
                  "a position at the end");
 }
 
+void beside_first_cases() {
+    // Four equal ranks, rank 0 also running an eighth of the divided work (a shared expert of
+    // 512 rows beside 8 routed experts of 512): (s + 1/8) on rank 0 and s on the others meet at
+    // 9/32, so rank 0 takes 9/32 - 1/8 = 5/32.
+    check(near(ninfer::shares_beside_first(std::vector<double>{1, 1, 1, 1}, 0.125),
+               {5.0 / 32.0, 9.0 / 32.0, 9.0 / 32.0, 9.0 / 32.0}),
+          "rank 0 sheds its own work");
+    // A faster rank 0 keeps more: speeds 2 and 1, first 0.5, level 1.5 / 3 = 0.5 per unit of speed.
+    check(near(ninfer::shares_beside_first(std::vector<double>{2, 1}, 0.5), {0.5, 0.5}),
+          "speeds weigh the level");
+    check(near(ninfer::shares_beside_first(std::vector<double>{3, 1}, 0.0), {0.75, 0.25}),
+          "no own work follows speed");
+    // Rank 0's own work alone outlasts the others' shares: it keeps almost nothing.
+    const std::vector<double> lone = ninfer::shares_beside_first(std::vector<double>{1, 1}, 2.0);
+    check(lone[0] > 0.0 && lone[0] < 1e-5 && std::abs(lone[1] - 1.0) < 1e-12,
+          "own work past the others' shares");
+    check(near(ninfer::shares_beside_first(std::vector<double>{1}, 0.25), {1.0}), "one rank");
+    check_throws([] { (void)ninfer::shares_beside_first(std::vector<double>{1, 1}, -0.1); },
+                 "negative own work");
+    check_throws([] { (void)ninfer::shares_beside_first(std::vector<double>{0, 1}, 0.1); },
+                 "a zero speed beside own work");
+}
+
 void fill_cases() {
     // Room everywhere: in proportion to speed.
     check(near(ninfer::fill_shares(std::vector<double>{3, 1}, std::vector<double>{9, 9}),
@@ -155,6 +179,7 @@ void delivery_cases() {
 int run_tensor_split_test() {
     try {
         split_cases();
+        beside_first_cases();
         fill_cases();
         delivery_cases();
     } catch (const std::exception& error) {
