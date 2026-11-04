@@ -61,6 +61,11 @@ using Clock = std::chrono::steady_clock;
 // what requests still allocate: kernels the warm-up did not reach and library workspaces.
 constexpr std::uint64_t kGrowthMargin = 384ULL << 20;
 
+// Tensor parallelism without --prefill-chunk: prompt chunks of this many tokens where every device
+// has the room. The executor runs them in pieces of 1024 whose exchanges cross while the next
+// piece computes, so a chunk computes what chunks of 1024 do.
+constexpr std::uint32_t kTensorPrefillChunk = 2048;
+
 std::uint64_t elapsed_ns(Clock::time_point from, Clock::time_point to) {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
@@ -281,9 +286,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         options, text.max_position_embeddings, runtime::kQwen4ExpRopeScaling);
     executor.rope_yarn       = rope.yarn;
     // A chunk also holds a verification of every sequence at once.
-    const std::uint32_t requested_chunk = options.prefill_chunk ? options.prefill_chunk : 1024;
-    executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(requested_chunk, 64, 4096),
-                                        (executor.draft_tokens + 1) * executor.sequences);
+    const auto chunk_of = [&](std::uint32_t requested) {
+        return std::max(std::clamp<std::uint32_t>(requested, 64, 4096),
+                        (executor.draft_tokens + 1) * executor.sequences);
+    };
+    executor.prefill_chunk = chunk_of(options.prefill_chunk ? options.prefill_chunk : 1024);
     executor.ngram           = std::move(ngram);
     executor.ngram_read      = std::move(ngram_read);
     executor.expert_cache_bytes =
@@ -298,6 +305,24 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.tensor_parallel_transport       = options.tensor_parallel_transport;
     executor.tensor_parallel_prompt_partials = options.tensor_parallel_prompt_partials;
     instance->executor = std::make_unique<models::qwen4_exp::Executor>(*model, device, executor);
+    // Tensor parallelism takes chunks of kTensorPrefillChunk when every device keeps room for them:
+    // a chunk's buffers grow at most in proportion to it, so by at most the narrower chunk's
+    // workspace, beside the margin requests still allocate.
+    if (options.tensor_parallel && options.prefill_chunk == 0 &&
+        executor.prefill_chunk < chunk_of(kTensorPrefillChunk)) {
+        const models::qwen4_exp::ExecutorMemory memory = instance->executor->memory();
+        const std::vector<std::uint64_t> free          = rank_free_bytes(device);
+        bool room                                      = true;
+        for (std::size_t r = 0; r < free.size(); ++r) {
+            room = room && free[r] >= memory.ranks.at(r).workspace_bytes + kGrowthMargin;
+        }
+        if (room) {
+            instance->executor.reset();
+            executor.prefill_chunk = chunk_of(kTensorPrefillChunk);
+            instance->executor =
+                std::make_unique<models::qwen4_exp::Executor>(*model, device, executor);
+        }
+    }
     device.synchronize();
     program.complete();
     if (const std::string routes = instance->executor->tensor_parallel_routes(); !routes.empty()) {
@@ -335,10 +360,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                           : "read from " + file + io + ", row cache capacity " + resident;
     }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "Qwen3.8-Flash-Next: %zu stage(s), experts in %s memory, n-gram table "
-                       "%s, state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB, CUDA "
-                       "Graphs %.0f MiB",
-                       model->stages().stages(),
+                       "Qwen3.8-Flash-Next: %zu stage(s), prompt chunks of %u tokens, experts in "
+                       "%s memory, n-gram table %s, state %.0f MiB, workspace %.0f MiB, expert "
+                       "cache %.0f MiB, CUDA Graphs %.0f MiB",
+                       model->stages().stages(), executor.prefill_chunk,
                        options.expert_residency == ExpertResidency::Host   ? "host"
                        : options.expert_residency == ExpertResidency::Disk ? "the artifact's files"
                                                                            : "device",

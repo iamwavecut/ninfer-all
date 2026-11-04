@@ -776,6 +776,30 @@ every layer over it (`Executor::run_tensor_segment`, `models/qwen4_exp/executor.
   draft projects the head the same way
   (`run_divided_mtp_head`): rank 0 sends its read of the block's stack to every other rank over a
   stage link, and the ranks project their rows of it.
+- **Prompt pieces** (`Executor::run_tensor_pieces`). Without `--prefill-chunk` a prompt runs in
+  chunks of 2,048 tokens when every device keeps room for them (the free memory after an executor
+  of chunks of 1,024 covers that executor's workspace again and a margin of 384 MiB; on two RTX
+  3090s the wider chunk takes 0.4 GiB more on each), else of 1,024. A text prompt chunk wider than
+  1,024 tokens runs in pieces of 1,024 from its first column, the last one the rest (at most four,
+  the pieces of `TensorParallelExchange`). Each exchange crosses one piece at a time on the ranks'
+  side streams while their compute streams run the next piece, and a rank's next step on a piece
+  first takes that piece's exchange back. A piece runs as a chunk of its own columns does: its
+  mixers carry the Gated DeltaNet, convolution and indexer states and the PLE history on to the
+  next piece, its sparse attention reads the keys up to its own last position, and its experts
+  route and run its own tokens. A chunk therefore gives what chunks of 1,024 give, and the default
+  chunk of 2,048 the tokens of the former default of 1,024. The mixer's exchange stores into a plane
+  of its own, which the experts' exchange of the piece before cannot overwrite. A media prompt, a
+  verification, a branch pass and a chunk exchanged in BF16 or 8-bit prompt partials
+  (`--tensor-parallel-prompt-partials`) run whole: those partials cross the bus fast enough that
+  with BF16 the pieces prefilled 1.6-2.0% slower than whole chunks of 2,048. Measured
+  (2026-11-04, two RTX 3090s without peer access, GSQ-RCO Q2_0, BF16 KV, two runs each): a
+  9,741-token prompt prefilled at 2,618-2,633 tok/s against 2,232-2,254 with whole chunks of 1,024
+  and a 31,869-token prompt at 2,564-2,582 against 2,188-2,213 (+17%), with the same tokens,
+  including a 256-token answer; decode runs no pieces and stayed within its spread between starts.
+  Pieces of 512 in chunks of 1,024 or 2,048 prefilled 1.3-2.1% slower than whole chunks: their
+  narrower projections and expert calls lost more than the overlap gained. With the other
+  eight KV formats (one run of the 9,741-token prompt each) prefill rose 13-17%, with the same
+  tokens.
 - **Graphs and branches.** A segment forks the other ranks' streams from rank 0's and joins them
   back, so the decode and verification graphs capture every rank's work; each segment makes an
   even number of exchanges and starts in slot 0. A replay is launched on rank 0's stream and
