@@ -48,6 +48,8 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
   two RTX 3090s prefilled 13-17% faster in every KV format with the same tokens as before.
   DeepSeek-V4.1's later index sources score only the [blocks the first one keeps](docs/deepseek-v41.md#long-prompts) once a query sees more than 16,384 positions:
   a 58,117-token prompt prefilled 1.0-1.3% faster on an RTX 3090 with the same tokens.
+  DeepSeek-V4.1 with host experts divided over several GPUs runs prompts in [spans](docs/deepseek-v41.md#prompt-spans) as on one GPU:
+  two RTX 3090s prefilled a 9,672-token prompt 1.49 times as fast with the same tokens.
 - **2026-11-03:** Qwen3.5-core models speed up [tensor-parallel decode](docs/maintainer/pipeline-stages.md#tensor-parallelism)
   by splitting vocabulary heads across GPUs.
   Eligible Q4 and Q5 projection shares use the same small-T MMA routes as whole projections.

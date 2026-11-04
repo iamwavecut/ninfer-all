@@ -322,7 +322,9 @@ struct Executor::Impl {
     // cache lacks once per span instead of once per chunk. span_tokens is 0 when spans are off.
     // Beside an elastic expert cache a span borrows its streams, coefficients and selections from
     // the cache (span_buffers) and gives them back after it, so decode keeps the whole cache; a
-    // fixed cache leaves them in the workspace.
+    // fixed cache leaves them in the workspace. Under expert parallelism the span's buffers stay on
+    // rank 0 and its MoE calls keep the chunk's width, so every rank's delivery fills its banks once
+    // per block of the span.
     static constexpr std::uint32_t kSpanChunks = 8;
     std::uint32_t span_tokens = 0;
     std::size_t span_borrow_bytes = 0;
@@ -991,7 +993,7 @@ struct Executor::Impl {
         return out;
     }
 
-    // The most tokens one MoE call takes (spans are off under expert parallelism).
+    // The most tokens one MoE call takes (a span's calls take a chunk at a time).
     [[nodiscard]] int max_moe_tokens() const {
         return std::max<int>(int(options.prefill_chunk), gguf::kMaxVectorColumns);
     }
@@ -1056,13 +1058,13 @@ struct Executor::Impl {
         return std::max<std::size_t>(std::max(options.prefill_chunk, span_tokens), options.sequences);
     }
 
-    // The tokens of a prompt span (0: spans off): with host or disk experts on this device, the
-    // most chunks (kSpanChunks, 4 or 2, within max_context) whose span buffers (in the workspace,
-    // or borrowed from an elastic cache for each span) and staging take no more than the memory
-    // the expert cache would get beside two layer banks, and at most an eighth of that memory and
-    // the banks together, so the cache keeps most of its slots while a span runs.
+    // The tokens of a prompt span (0: spans off): with host or disk experts, the most chunks
+    // (kSpanChunks, 4 or 2, within max_context) whose span buffers (in rank 0's workspace, or
+    // borrowed from its elastic cache for each span) and staging take no more than the memory
+    // rank 0's expert cache would get beside two whole-layer banks, and at most an eighth of that
+    // memory and the banks together, so the cache keeps most of its slots while a span runs.
     [[nodiscard]] std::uint32_t plan_span() const {
-        if (model.expert_banks().empty() || !expert_ranges.empty()) { return 0; }
+        if (model.expert_banks().empty()) { return 0; }
         const std::uint64_t chunk = plan_workspace(0), bank = bank_bytes();
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));

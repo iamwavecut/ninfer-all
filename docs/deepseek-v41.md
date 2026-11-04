@@ -94,8 +94,9 @@ and n-gram copy drafts, DSpark drafts while several requests decode, rotation sc
 and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool, the
 disk tier and session slots. Several GPUs divide the routed experts instead (`--devices 0,1
 --tensor-parallel` with host or disk experts: each device its own banks, cache and copies, no CPU
-share; without `--tensor-split` the first device, which also holds the model, serves fewer experts,
-so that every device's misses take the same time over its bus; [expert
+share, prompts in [spans](#prompt-spans) as on one device; without `--tensor-split` the first
+device, which also holds the model, serves fewer experts, so that every device's misses take the
+same time over its bus; [expert
 parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
 ## Converting
@@ -272,6 +273,12 @@ experts. With host or disk experts the executor runs a prompt's chunks block by 
   cache may lend to, down to chunk by chunk. With a fixed
   `--expert-cache-mib` they stay in the workspace. The Engram rows of a span's tokens are staged
   on the card (about 95 MiB more than for one chunk).
+- **Several GPUs.** With `--tensor-parallel` the span's buffers stay on the first device, which
+  also sizes the span, and each MoE call still takes one chunk: every device's delivery fills its
+  bank of a block once for all of the span's chunks. Measured on two RTX 3090s without peer
+  access (2026-11-04, IQ1_M with host experts, one run each): a 9,672-token prompt prefilled at
+  670.9 tok/s against 451.4 chunk by chunk (one RTX 3090 with spans: 576.5), with the same
+  tokens; decode did not change (30.3 tok/s after that prompt, 41.4-41.7 on a short one).
 
 ## The Engram table
 

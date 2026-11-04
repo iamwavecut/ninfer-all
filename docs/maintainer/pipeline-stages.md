@@ -888,9 +888,11 @@ router, the shared expert, the head, the drafters and Vision, as one device does
   measured at startup, `rank_host_copy_bandwidth`), so with `B` bytes of experts in all each rank
   takes `(room_r + t * bus_r) / B` with `t = (B - sum room) / sum bus`. Rank 0, which also holds
   the model, takes fewer experts; when the caches together hold every expert the shares follow the
-  cards' copy bandwidth within that room. Refused: Gemma 4's and Flint's host or disk experts,
-  DeepSeek's device experts and its CPU share (`--expert-dma-share`, `--expert-cpu-threads`);
-  DeepSeek's prompt spans are off.
+  cards' copy bandwidth within that room. DeepSeek runs a prompt in spans as on one device
+  ([prompt spans](../deepseek-v41.md#prompt-spans)): the span's buffers stay on rank 0, every MoE
+  call keeps a chunk's width, and each rank's delivery fills a block's bank once for all of the
+  span's chunks. Refused: Gemma 4's and Flint's host or disk experts, DeepSeek's device experts
+  and its CPU share (`--expert-dma-share`, `--expert-cpu-threads`).
 
 Measured on 2x RTX 3090 (Vast, PCIe 4.0 x16, no peer access, so the mapped host transport;
 2026-10-26; `scripts/pods/serve_ab.py`, greedy, four short prompts of 256 tokens and a prompt of
