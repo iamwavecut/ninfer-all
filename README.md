@@ -29,6 +29,8 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
   Qwen3.8-27B prefilled 24-26% faster on four RTX 5060 Ti on PCIe 3.0 and 2-5% faster on two RTX 3090s.
   [Expert-parallel](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families) Gemma 4, Flint and DeepSeek-V4.1 divide the vocabulary head across GPUs too,
   and DeepSeek-V4.1 sizes its host-expert shares by each GPU's cache room and bus: on two RTX 3090s Gemma 4 decoded 4-5% faster (MTP 3%) and Flint 2.5-2.8%.
+  Flash-Next's batched rounds run every request's [mixer projections](docs/qwen3-8-flash-next.md#sequences-kv-and-the-context-cache) at once:
+  eight requests on an RTX 3090 with host experts finished 2.0-4.2% faster with MTP and 11.5% faster without drafts.
 - **2026-11-03:** Qwen3.5-core models speed up [tensor-parallel decode](docs/maintainer/pipeline-stages.md#tensor-parallelism)
   by splitting vocabulary heads across GPUs.
   Eligible Q4 and Q5 projection shares use the same small-T MMA routes as whole projections.

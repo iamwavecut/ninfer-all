@@ -465,9 +465,17 @@ since they wait for the whole step. Before a step, while requests are decoding, 
 for each chunk's worth of prompt the step computes, at least one, so a short prompt gets in after
 one round and the streams keep their share during a long one; each round is one batched pass whose
 experts read their weights once for the whole batch, so the batch costs little more than one token
-while the experts dominate the step. A speculative round counts as the tokens its requests fed on
-average, so drafting streams get as many tokens per chunk as plain ones and hold a prompt back no
-longer.
+while the experts dominate the step. The mixers' projections and the steps without state (the
+Gated DeltaNet and sparse-attention input projections, gates, norms and rotation, and their output
+gates and projections) also run over every request's columns at once, in calls of up to eight
+columns; only the convolution, recurrence, KV append, indexer and attention run request by
+request, on each request's own state. A vector product gives a column the same bits at any width
+up to eight, so a batched round computes what the requests' separate rounds would. On an RTX 3090
+with host experts (IQ3_S, 2026-11-04), eight requests released at once (about 1,100 prompt tokens
+and 128 answer tokens each) finished 2.0-4.2% faster with MTP over the nine `--kv-dtype` formats,
+and 11.5% faster without drafts (BF16 KV). A speculative round counts as the tokens
+its requests fed on average, so drafting streams get as many tokens per chunk as plain ones and
+hold a prompt back no longer.
 
 With the context cache on (the default), a sequence keeps its state when its request ends, and a
 snapshot of its recurrent state where the prompt's last user turn closes (or at the prompt's end
