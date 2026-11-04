@@ -46,6 +46,7 @@
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/sparse_attention.h"
 #include "ninfer/ops/weight_input.h"
+#include "ops/linear/gguf/gguf_linear.h"
 
 #include <algorithm>
 #include <array>
@@ -154,6 +155,62 @@ void project(const Projection& p, const Tensor& x, Tensor& out, WorkspaceArena& 
                                      std::size_t(piece.rows) * 2, std::size_t(piece.rows) * 2,
                                      tokens, cudaMemcpyDeviceToDevice, stream));
     }
+}
+
+// One of several projections of one input and the BF16 [p.rows, T] it writes (project_together).
+struct ProjectionInto {
+    const Projection* projection = nullptr;
+    Tensor* out                  = nullptr;
+};
+
+[[nodiscard]] bool gguf_projection(const Projection& p) {
+    return std::all_of(p.pieces.begin(), p.pieces.end(), [](const Projection::Piece& piece) {
+        return is_gguf(piece.weight.weight.qtype);
+    });
+}
+
+// Each out <- its projection of x (BF16 [k, T]). GGUF projections run as one gguf_project, which
+// quantizes x to q8_1 once for all of their parts and gives each part's rows what a call of its
+// own gives them; any other format keeps a call per projection.
+void project_together(std::span<const ProjectionInto> list, const Tensor& x,
+                      WorkspaceArena& workspace, cudaStream_t stream) {
+    const bool gguf = std::all_of(list.begin(), list.end(), [](const ProjectionInto& into) {
+        return gguf_projection(*into.projection);
+    });
+    if (!gguf) {
+        for (const ProjectionInto& into : list) {
+            project(*into.projection, x, *into.out, workspace, stream);
+        }
+        return;
+    }
+    std::vector<ops::detail::GgufProduct> products;
+    for (const ProjectionInto& into : list) {
+        if (into.projection->k != x.ne[0]) {
+            throw std::invalid_argument("projections of one input read its width");
+        }
+        for (const auto& piece : into.projection->pieces) {
+            products.push_back(
+                {.weight = &piece.weight.weight, .out = into.out, .row = piece.row});
+        }
+    }
+    ops::detail::gguf_project(x, products, workspace, stream);
+}
+
+// The workspace project_together needs for these projections at up to `tokens` columns.
+std::size_t projections_workspace(std::initializer_list<const Projection*> list,
+                                  std::int32_t tokens) {
+    std::size_t bytes = 0;
+    bool gguf         = true;
+    std::vector<ops::detail::GgufShape> shapes;
+    for (const Projection* p : list) {
+        bytes = std::max(bytes, projection_workspace(*p, tokens));
+        gguf  = gguf && gguf_projection(*p);
+        for (const auto& piece : p->pieces) {
+            shapes.push_back({piece.weight.weight.qtype, piece.rows, p->k});
+        }
+    }
+    return gguf ? std::max(bytes, ops::detail::gguf_project_workspace_bytes(shapes, 1, tokens))
+                : bytes;
 }
 
 Tensor direct(const Model& model, WeightId id, std::initializer_list<std::int32_t> shape,
@@ -1500,10 +1557,11 @@ struct Executor::Impl {
                 bytes = std::max(bytes, ops::moe_experts_native_workspace_bytes(t));
             }
             if (plan.gdn) {
-                for (const Projection* p : {&plan.gdn->qkv, &plan.gdn->z, &plan.gdn->a,
-                                            &plan.gdn->b, &plan.gdn->output}) {
-                    bytes = std::max(bytes, projection_workspace(*p, t));
-                }
+                bytes = std::max({bytes,
+                                  projections_workspace({&plan.gdn->qkv, &plan.gdn->z,
+                                                         &plan.gdn->a, &plan.gdn->b},
+                                                        t),
+                                  projection_workspace(plan.gdn->output, t)});
                 bytes =
                     std::max(bytes, ops::gated_delta_net_workspace_capacity_bytes(
                                         static_cast<std::int32_t>(config.linear_num_key_heads),
@@ -1511,19 +1569,20 @@ struct Executor::Impl {
                                         true, 1, t));
             }
             if (plan.qsa) {
-                for (const Projection* p :
-                     {&plan.qsa->query, &plan.qsa->gate, &plan.qsa->key, &plan.qsa->value,
-                      &plan.qsa->index, &plan.qsa->output}) {
-                    bytes = std::max(bytes, projection_workspace(*p, t));
-                }
+                bytes = std::max({bytes,
+                                  projections_workspace({&plan.qsa->query, &plan.qsa->gate,
+                                                         &plan.qsa->key, &plan.qsa->value,
+                                                         &plan.qsa->index},
+                                                        t),
+                                  projection_workspace(plan.qsa->output, t)});
                 bytes = std::max({bytes,
                                   ops::qsa_indexer_select_workspace_bytes(
                                       t, static_cast<std::int32_t>(pooled_slots)),
                                   ops::sparse_softmax_attention_workspace_bytes(t)});
             }
             if (plan.ple) {
-                bytes = std::max({bytes, projection_workspace(plan.ple->key, t),
-                                  projection_workspace(plan.ple->value, t),
+                bytes = std::max({bytes,
+                                  projections_workspace({&plan.ple->key, &plan.ple->value}, t),
                                   ops::ple_inject_workspace_bytes(t)});
             }
         }
@@ -2964,11 +3023,7 @@ struct Executor::Impl {
         return groups;
     }
 
-    [[nodiscard]] static bool gguf_only(const Projection& p) {
-        return std::all_of(p.pieces.begin(), p.pieces.end(), [](const Projection::Piece& piece) {
-            return is_gguf(piece.weight.weight.qtype);
-        });
-    }
+    [[nodiscard]] static bool gguf_only(const Projection& p) { return gguf_projection(p); }
 
     // The parts' columns of `out` (BF16 [p.rows, *]) <- p's projection of those of `x` (BF16
     // [p.k, *]), a call per group of projection_groups.
@@ -2978,6 +3033,43 @@ struct Executor::Impl {
             const Tensor in(columns(x, p.k, group.column, 2), DType::BF16, {p.k, group.count});
             Tensor o(columns(out, p.rows, group.column, 2), DType::BF16, {p.rows, group.count});
             project(p, in, o, ws, s);
+        }
+    }
+
+    // Several projections of one input x (BF16 [k, *]) into their planes, over the parts'
+    // columns: GGUF projections share each column group's q8_1 activation (project_together),
+    // others take project_columns one at a time.
+    struct ColumnsInto {
+        const Projection* projection = nullptr;
+        void* out                    = nullptr;
+    };
+    static void project_columns(std::initializer_list<ColumnsInto> list, void* x,
+                                std::span<const Part> parts, WorkspaceArena& ws, cudaStream_t s) {
+        if (!std::all_of(list.begin(), list.end(),
+                         [](const ColumnsInto& into) { return gguf_only(*into.projection); })) {
+            for (const ColumnsInto& into : list) {
+                project_columns(*into.projection, x, into.out, parts, ws, s);
+            }
+            return;
+        }
+        const std::int32_t k = list.begin()->projection->k;
+        std::vector<Tensor> outs;
+        std::vector<ProjectionInto> into;
+        outs.reserve(list.size());
+        into.reserve(list.size());
+        for (const ColumnRun& group : projection_groups(parts, true)) {
+            const Tensor in(columns(x, k, group.column, 2), DType::BF16, {k, group.count});
+            outs.clear();
+            into.clear();
+            for (const ColumnsInto& c : list) {
+                const std::int32_t rows = c.projection->rows;
+                outs.push_back(Tensor(columns(c.out, rows, group.column, 2), DType::BF16,
+                                      {rows, group.count}));
+            }
+            for (std::size_t i = 0; i < outs.size(); ++i) {
+                into.push_back({(list.begin() + i)->projection, &outs[i]});
+            }
+            project_together(into, in, ws, s);
         }
     }
 
@@ -3037,10 +3129,8 @@ struct Executor::Impl {
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
         const GdnPlanes p    = gdn_planes(g, rank, t);
-        project_columns(g.qkv, rank.mixed, p.qkv, parts, ws, s);
-        project_columns(g.z, rank.mixed, p.z, parts, ws, s);
-        project_columns(g.a, rank.mixed, p.a, parts, ws, s);
-        project_columns(g.b, rank.mixed, p.b, parts, ws, s);
+        project_columns({{&g.qkv, p.qkv}, {&g.z, p.z}, {&g.a, p.a}, {&g.b, p.b}}, rank.mixed, parts,
+                        ws, s);
         const auto nv        = g.value_heads;
         const ColumnRun span = covered(parts);
         const std::size_t at = std::size_t(nv) * std::size_t(span.column);
@@ -3235,11 +3325,12 @@ struct Executor::Impl {
         const auto d         = static_cast<std::int32_t>(config.head_dim);
         const auto nk        = a.kv_heads;
         const auto nq        = query_heads(a);
-        project_columns(a.query, rank.mixed, p.q, parts, ws, s);
-        project_columns(a.gate, rank.mixed, p.gate, parts, ws, s);
-        project_columns(a.key, rank.mixed, p.k, parts, ws, s);
-        project_columns(a.value, rank.mixed, p.v, parts, ws, s);
-        project_columns(a.index, rank.mixed, p.index, parts, ws, s);
+        project_columns({{&a.query, p.q},
+                         {&a.gate, p.gate},
+                         {&a.key, p.k},
+                         {&a.value, p.v},
+                         {&a.index, p.index}},
+                        rank.mixed, parts, ws, s);
         // The parts' columns; a media prompt's three-axis positions hold every column of the pass.
         const ColumnRun span = mrope ? ColumnRun{.column = 0, .count = t} : covered(parts);
         Tensor q3(columns(p.q, d * nq, span.column, 2), DType::BF16, {d, nq, span.count});
@@ -3432,8 +3523,8 @@ struct Executor::Impl {
         ops::ngram_embed_rows(rows, options.ngram->format, heads, embedding, s);
         Tensor key(rank.g, DType::BF16, {width, t});
         Tensor value(rank.b, DType::BF16, {h, t});
-        project(p.key, embedding, key, ws, s);
-        project(p.value, embedding, value, ws, s);
+        const ProjectionInto both[] = {{&p.key, &key}, {&p.value, &value}};
+        project_together(both, embedding, ws, s);
         Tensor history(state.history.p, DType::FP32,
                        {width, static_cast<std::int32_t>((config.ple_conv_kernel_size - 1) *
                                                          config.ngram.ngram_size)});
