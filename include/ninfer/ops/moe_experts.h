@@ -69,6 +69,11 @@ struct GgufMoeWeights {
     std::int32_t experts = 512;
     // Every entry in device memory, zeros past each down bank (see above).
     bool device_resident = false;
+    // The shared expert's width: its 640 middle values, or under tensor parallelism a device's
+    // run of them, a multiple of 32 (the rows of its gate and up tables and the values of each down
+    // row, whose rows are then `shared_down.row_bytes` apart). A narrower shared expert takes the
+    // vector products at decode widths.
+    std::int32_t shared_width = 640;
 };
 
 [[nodiscard]] std::size_t moe_experts_gguf_workspace_bytes(std::int32_t tokens);
@@ -163,7 +168,11 @@ void moe_experts_gguf_decode_finish(const GgufMoeDecode& state, const Tensor& id
  * and m are the whole call's, the same on every device. With parts whose ranges partition the
  * routed experts and the shared expert in exactly one, moe_experts_gguf_combine stores the y
  * moe_experts_gguf stores, bit for bit: each contribution is computed and rounded on its own, and
- * the parts add as integers. `parts` of combine are device memory of the stream's device.
+ * the parts add as integers. A part may instead hold a run of the shared expert's width
+ * (`shared_width`: its gate and up rows, the matching values of every down row), each part its own
+ * run; the middle values are then the whole expert's, and each part rounds its down rows' dot over
+ * its run on its own, so the combined y is close to the whole call's, not identical. `parts` of
+ * combine are device memory of the stream's device.
  */
 [[nodiscard]] std::size_t moe_experts_gguf_part_workspace_bytes(std::int32_t tokens);
 void moe_experts_gguf_part(const Tensor& m, const Tensor& ids, const Tensor& weights,

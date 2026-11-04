@@ -81,8 +81,10 @@ struct ExecutorOptions {
     // YaRN past the model's native window (a factor above one), for the sparse-attention layers'
     // RoPE, their indexer's and the MTP block's alike; inactive keeps the unscaled rotation.
     ops::RopeYarn rope_yarn;
-    // With tensor parallelism, how the ranks' exchanges travel (TensorParallelExchange).
+    // With tensor parallelism, how the ranks' exchanges travel (TensorParallelExchange), and
+    // whether a prompt chunk's partials cross rounded to BF16 (Rounded partials there).
     TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
+    TensorParallelPartials tensor_parallel_prompt_partials = TensorParallelPartials::Fp32;
 };
 
 // One media item of a prompt for the Vision tower: its patches and the frontend's control.

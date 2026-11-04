@@ -220,9 +220,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.experts      = options.expert_residency;
     load.vision       = options.enable_vision;
     load.mtp          = mtp;
-    // Tensor parallelism: every layer's mixer heads and routed experts divided over the devices,
-    // the shared expert, the head and the MTP block on the first. Without --tensor-split each
-    // device takes a share of its speed that fits beside what it holds.
+    // Tensor parallelism: every layer's mixer heads, routed experts and shared expert divided over
+    // the devices, and the head's rows; the MTP block and Vision on the first. Without
+    // --tensor-split each device takes a share of its speed that fits beside what it holds.
     if (options.tensor_parallel) {
         load.tensor_split = options.tensor_split;
         if (load.tensor_split.empty()) {
@@ -283,7 +283,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // Host and disk experts trade device KV for expert slots by default.
     executor.kv_resident = options.kv_resident_positions.value_or(
         options.expert_residency == ExpertResidency::Device ? 0 : kDefaultKvResidentPositions);
-    executor.tensor_parallel_transport = options.tensor_parallel_transport;
+    executor.tensor_parallel_transport       = options.tensor_parallel_transport;
+    executor.tensor_parallel_prompt_partials = options.tensor_parallel_prompt_partials;
     instance->executor = std::make_unique<models::qwen4_exp::Executor>(*model, device, executor);
     device.synchronize();
     program.complete();
@@ -335,23 +336,28 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0,
                        double(instance->executor->graph_bytes()) / 1048576.0);
     if (model->tensor_parallel()) {
-        std::string keys, kv, experts;
-        const auto range = [](std::string& out, std::size_t rank, std::uint32_t begin,
-                              std::uint32_t end) {
+        std::string keys, kv, experts, shared, head;
+        const auto range = [](std::string& out, std::size_t rank, std::uint64_t begin,
+                              std::uint64_t end) {
             out += (rank == 0 ? "" : ", ") +
                    (begin == end ? std::string("none")
                                  : std::to_string(begin) + "-" + std::to_string(end - 1));
         };
+        const auto& head_rows = model->weights().head_rows;
         for (std::size_t rank = 0; rank < device.size(); ++rank) {
             const auto share = model->share(rank);
             range(keys, rank, share.key_head_begin, share.key_head_end);
             range(kv, rank, share.kv_head_begin, share.kv_head_end);
             range(experts, rank, share.expert_begin, share.expert_end);
+            range(shared, rank, share.shared_begin, share.shared_end);
+            range(head, rank, head_rows.at(rank), head_rows.at(rank + 1));
         }
-        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "Qwen3.8-Flash-Next: tensor parallelism, by device Gated DeltaNet key "
-                           "heads %s, sparse-attention KV heads %s, routed experts %s",
-                           keys.c_str(), kv.c_str(), experts.c_str());
+        publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Info,
+            "Qwen3.8-Flash-Next: tensor parallelism, by device Gated DeltaNet key "
+            "heads %s, sparse-attention KV heads %s, routed experts %s, shared-expert "
+            "middle %s, head rows %s",
+            keys.c_str(), kv.c_str(), experts.c_str(), shared.c_str(), head.c_str());
     }
     if (const auto memory = instance->executor->memory(); memory.streamed_kv) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,

@@ -97,10 +97,11 @@ EngineOptions with_family_attention(EngineOptions options) {
             "and Qwen4ExpForCausalLM artifacts");
     }
     if (options.tensor_parallel_prompt_partials != TensorParallelPartials::Fp32 &&
-        own_family_artifact(options.artifact_path)) {
+        own_family_artifact(options.artifact_path) &&
+        !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
         throw std::invalid_argument(
-            "--tensor-parallel-prompt-partials applies to Qwen3_5ForCausalLM and "
-            "Qwen3_5MoeForCausalLM artifacts");
+            "--tensor-parallel-prompt-partials applies to Qwen3_5ForCausalLM, "
+            "Qwen3_5MoeForCausalLM and Qwen4ExpForCausalLM artifacts");
     }
     return options;
 }

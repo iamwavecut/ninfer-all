@@ -609,6 +609,11 @@ int run_tests() {
                               .tensor_parallel_prompt_partials ==
                           ninfer::TensorParallelPartials::Bf16,
                       "--tensor-parallel-prompt-partials did not reach the options");
+    failures +=
+        check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                     "--tensor-parallel", "--tensor-parallel-prompt-partials", "int8"})
+                      .tensor_parallel_prompt_partials == ninfer::TensorParallelPartials::Int8,
+              "--tensor-parallel-prompt-partials int8 did not reach the options");
     failures += check(rejects([&] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
                                        "--tensor-parallel-prompt-partials", "bf16"});
