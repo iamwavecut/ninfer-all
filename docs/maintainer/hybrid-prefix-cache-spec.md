@@ -351,6 +351,7 @@ struct Snapshot {
     uint32_t restore_pins;
     SnapshotKind kind;                  // Tap | Endpoint | OutputBoundary | Boundary (§9.3)
     bool superseded;                    // §9.3
+    bool branch_point;                  // §9.3
     // Host eviction (GDSF)
     double   gdsf_h; uint32_t freq;
     uint64_t last_hit_tick;
@@ -424,8 +425,9 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   (absolute artifact path, size and modification time, prefill signature, KV storage, speculative
   backend, RoPE scaling, the control vectors' digest, and the product binary's identity — build id plus executable size and
   time, so any rebuild invalidates it) and its Host geometry equal the running Engine's, and its
-  size matches its tables. The file (format 3) holds the header, the block table, the snapshot
-  table and only then the slab bytes, so the loader chooses before it reads any slab. A Host tier
+  size matches its tables. The file (format 4) holds the header, the block table, the snapshot
+  table (each snapshot's anchor, tail, kind, hits and branch-point flag, §9.3) and only then the
+  slab bytes, so the loader chooses before it reads any slab. A Host tier
   that holds the whole file restores all of it. A smaller one restores whole snapshots, greedily
   by the GDSF density of §9.3 without its time-dependent base — (1 + hits) × the prefill a
   restore saves from the root, per byte of image, tail and anchor path — each with the path
@@ -941,22 +943,31 @@ previous tap it captured in the same prompt when the new snapshot is a tap, befo
 takes a Device slot or Host slabs: only a request diverging before the newer snapshot (a retry, an
 edit) can still use them. The endpoint leaves the prompt's last tap retained, since a next turn
 whose template re-renders the reply (stripped thinking) resumes from that tap. A hit on a superseded
-snapshot retains it again, until that lineage moves on. A `Boundary` snapshot (a tap at a client
-breakpoint or structural boundary, or at the divergence of coalesced requests, §12.2) may be shared
-by conversations, so it is superseded only while no other conversation has continued from it: while
-the tree below it is a single chain. Until then it is just its lineage's snapshot. A request with
-`CacheRetentionHint::Disposable` (the decision endpoints' reads) has no lineage, since no request
-continues it, and supersedes nothing it resumed from. The first of several reads that share a
-boundary would otherwise supersede it with its endpoint, so far the only branch below the boundary,
-and the boundary would then give up its Device slot and Host slabs first while the other reads
-still wait to resume from it.
+snapshot retains it again, until that lineage moves on: the hit is as likely the same conversation
+coming back, such as the next turn after a retry that resumed from the same tap. A tap that only the
+next tap of its own prompt superseded is different. No request has resumed from it, so a hit on it
+comes from a request that diverged from that prompt after the tap (another question about the same
+document, an edit). Requests branch there, and each branch would supersede it again as it moves on,
+so the hit makes the tap a *branch point*: nothing supersedes it, and GDSF alone values it (§5.5
+saves the flag). A `Boundary` snapshot (a tap at a client breakpoint or structural boundary, or at
+the divergence of coalesced requests, §12.2) may be shared by conversations, so it is superseded
+only while no other conversation has continued from it: while the tree below it is a single chain.
+Until then it is just its lineage's snapshot. A request with `CacheRetentionHint::Disposable` (the
+decision endpoints' reads) has no lineage, since no request continues it, and supersedes nothing it
+resumed from. The first of several reads that share a boundary would otherwise supersede it with its
+endpoint, so far the only branch below the boundary, and the boundary would then give up its Device
+slot and Host slabs first while the other reads still wait to resume from it.
 
 Allocation of `k` slabs:
 
 1. **Dead KV sweep**: pop host-resident nodes with `live_snapshots_below == 0`,
    `active_refs == 0` and no pins, leaves first. These can never produce a hit.
-2. Otherwise evict the oldest superseded snapshot entirely (both copies; `L` is unchanged), then
-   repeat step 1.
+2. Otherwise the oldest superseded snapshot gives up its host copy (`L` is unchanged), then
+   repeat step 1. One still complete on the Device keeps that copy, whose slot goes first when a
+   new snapshot needs one (§9.2); any other is deleted. Deleting the Device copy here too would let
+   a lane's block write-through into a small Host tier at release delete the superseded taps of
+   its prompt, and with them every snapshot the next question about the same document could resume
+   from.
 3. Otherwise evict the retained snapshot with minimum `H`, then repeat step 1 (its exclusive path
    has just become dead). Update `L := H(victim)`. A victim still complete on the Device (image in
    a device slot and tail resident) only gives up its host copy and stays restorable.
@@ -1160,6 +1171,9 @@ The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache
   - `L` is monotonic.
 - **Supersession and admission**
   - a lineage's previous snapshot is superseded, and a hit retains it again;
+  - a hit on a tap that only its prompt's next tap superseded makes it a branch point, and
+    questions about one document keep resuming from the first request's ladder tap through a Host
+    tier its blocks overflow;
   - a `Boundary` snapshot is superseded only while no other conversation continued below it;
   - Device slots go to superseded owners, then to the least valuable Device-only owner for a new
     snapshot worth as much, then to the least recently hit Host-backed owner;
