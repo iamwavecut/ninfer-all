@@ -571,8 +571,12 @@ __global__ void __launch_bounds__(kScoreKeys) index_scores_kernel(ScoreArgs a) {
         visible[r] = r < rows ? (a.positions[t0 + r] + 1) / a.ratio : 0;
         most       = max(most, visible[r]);
     }
-    const int j0 = blockIdx.x * kScoreKeys;
-    if (j0 >= most) { return; }
+    // Listed rows: column s of group blockIdx.y stands for the position its list gives.
+    const bool listed = a.list != nullptr;
+    const std::int32_t* list = listed ? a.list + std::int64_t(blockIdx.y) * a.capacity : nullptr;
+    const int columns = listed ? a.counts[blockIdx.y] * a.block : most;
+    const int s0      = blockIdx.x * kScoreKeys;
+    if (s0 >= columns) { return; }
     for (int r = 0; r < rows; ++r) {
         const auto* src = reinterpret_cast<const uint4*>(a.q + std::int64_t(t0 + r) * a.heads * kIndex);
         auto* dst       = reinterpret_cast<uint4*>(q_s[r]);
@@ -582,8 +586,28 @@ __global__ void __launch_bounds__(kScoreKeys) index_scores_kernel(ScoreArgs a) {
         }
     }
     __syncthreads();
-    const int j = j0 + threadIdx.x;
+    const int s = s0 + threadIdx.x;
+    if (s >= columns) { return; }
+    const int j = listed ? list[s / a.block] * a.block + s % a.block : s;
     if (j >= most) { return; }
+    // Rows that do not keep the position's block take -inf; the key is read only for a row that
+    // does.
+    bool needed = false;
+#pragma unroll
+    for (int r = 0; r < G; ++r) {
+        if (j >= visible[r]) { continue; }
+        if (a.candidates != nullptr) {
+            const int b = j / a.block;
+            const std::uint32_t word =
+                a.candidates[std::int64_t(t0 + r) * a.candidate_words + b / 32];
+            if (((word >> (b % 32)) & 1U) == 0) {
+                a.out[std::int64_t(t0 + r) * a.width + s] = -INFINITY;
+                continue;
+            }
+        }
+        needed = true;
+    }
+    if (!needed) { return; }
     const int seq = a.sequences != nullptr ? a.sequences[t0] : a.sequence;
     __nv_bfloat162 k[kIndex / 2];
     {
@@ -605,10 +629,7 @@ __global__ void __launch_bounds__(kScoreKeys) index_scores_kernel(ScoreArgs a) {
         if (a.candidates != nullptr) {
             const int b = j / a.block;
             const std::uint32_t word = a.candidates[std::int64_t(t) * a.candidate_words + b / 32];
-            if (((word >> (b % 32)) & 1U) == 0) {
-                a.out[std::int64_t(t) * a.width + j] = -INFINITY;
-                continue;
-            }
+            if (((word >> (b % 32)) & 1U) == 0) { continue; }
         }
         float acc = 0.0f;
         for (int h = 0; h < a.heads; ++h) {
@@ -623,7 +644,7 @@ __global__ void __launch_bounds__(kScoreKeys) index_scores_kernel(ScoreArgs a) {
             }
             acc = fmaf(fmaxf(d0 + d1, 0.0f), w_s[r][h], acc);
         }
-        a.out[std::int64_t(t) * a.width + j] = acc;
+        a.out[std::int64_t(t) * a.width + s] = acc;
     }
 }
 
@@ -727,23 +748,47 @@ __device__ __forceinline__ bool chosen(float v, bool in_range, unsigned threshol
     return ok && (key > threshold || (same && before < equal));
 }
 
+// How many of the listed columns (`blocks` ascending blocks of `block` positions) stand for
+// positions below n: a prefix of them, through the last listed block that starts below n.
+__device__ int listed_below(const std::int32_t* list, int blocks, int block, int n) {
+    __shared__ int s_last;
+    if (threadIdx.x == 0) { s_last = -1; }
+    __syncthreads();
+    for (int i = threadIdx.x; i < blocks; i += kSelectThreads) {
+        if (list[i] * block < n && (i + 1 == blocks || list[i + 1] * block >= n)) { s_last = i; }
+    }
+    __syncthreads();
+    const int last = s_last;
+    __syncthreads();
+    return last < 0 ? 0 : last * block + min(block, n - list[last] * block);
+}
+
 __global__ void __launch_bounds__(kSelectThreads)
     select_topk_kernel(const float* __restrict__ scores, int width, const std::int32_t* positions,
-                       int ratio, int k, std::int32_t* __restrict__ out) {
+                       int ratio, int k, ListedRows listed, std::int32_t* __restrict__ out) {
     const int t      = blockIdx.x;
     const int n      = (positions[t] + 1) / ratio;
     const float* row = scores + std::int64_t(t) * width;
+    // Listed rows: the columns that stand for visible positions, and the positions they stand for.
+    const std::int32_t* list =
+        listed.list != nullptr ? listed.list + std::int64_t(t / listed.group) * listed.capacity
+                               : nullptr;
+    const int columns =
+        list != nullptr ? listed_below(list, listed.counts[t / listed.group], listed.block, n) : n;
     unsigned threshold = 0;
     int equal          = 0;
-    radix_threshold(row, n, k, threshold, equal);
+    radix_threshold(row, columns, k, threshold, equal);
     int equal_seen = 0, written = 0;
-    for (int base = 0; base < n; base += kSelectThreads) {
+    for (int base = 0; base < columns; base += kSelectThreads) {
         const int i   = base + threadIdx.x;
-        const float v = i < n ? row[i] : -INFINITY;
-        const bool c  = chosen(v, i < n, threshold, equal, equal_seen);
+        const float v = i < columns ? row[i] : -INFINITY;
+        const bool c  = chosen(v, i < columns, threshold, equal, equal_seen);
         int total     = 0;
         const int at  = block_scan(c ? 1 : 0, total) + written;
-        if (c && at < k) { out[std::int64_t(t) * k + at] = i; }
+        if (c && at < k) {
+            out[std::int64_t(t) * k + at] =
+                list != nullptr ? list[i / listed.block] * listed.block + i % listed.block : i;
+        }
         written += total;
     }
     for (int i = written + threadIdx.x; i < k; i += kSelectThreads) {
@@ -779,6 +824,30 @@ __global__ void __launch_bounds__(kSelectThreads)
             atomicOr(bits + b / 32, 1U << (b % 32));
         }
     }
+}
+
+// Group blockIdx.x's listed blocks: the set bits of its rows' masks, in ascending order.
+__global__ void __launch_bounds__(kSelectThreads)
+    candidate_lists_kernel(const std::uint32_t* __restrict__ mask, int words, int tokens, int group,
+                           int capacity, std::int32_t* __restrict__ list,
+                           std::int32_t* __restrict__ counts) {
+    const int g    = blockIdx.x;
+    const int t0   = g * group;
+    const int rows = min(group, tokens - t0);
+    std::int32_t* own = list + std::int64_t(g) * capacity;
+    int written       = 0;
+    for (int base = 0; base < words; base += kSelectThreads) {
+        const int w        = base + threadIdx.x;
+        std::uint32_t bits = 0;
+        for (int r = 0; w < words && r < rows; ++r) { bits |= mask[std::int64_t(t0 + r) * words + w]; }
+        int total = 0;
+        int at    = block_scan(__popc(bits), total) + written;
+        for (; bits != 0; bits &= bits - 1U, ++at) {
+            if (at < capacity) { own[at] = w * 32 + __ffs(int(bits)) - 1; }
+        }
+        written += total;
+    }
+    if (threadIdx.x == 0) { counts[g] = min(written, capacity); }
 }
 
 // ---- Sparse attention ---------------------------------------------------------------------------
@@ -1444,7 +1513,15 @@ void index_scores(const ScoreArgs& args, cudaStream_t stream) {
     if (args.heads > kScoreHeads || (args.group != 1 && args.group != 4)) {
         throw std::invalid_argument("deepseek_v41 index_scores: at most 32 heads, groups of 1 or 4");
     }
-    const dim3 grid(blocks_for(args.width, kScoreKeys), blocks_for(args.tokens, args.group));
+    if (args.list != nullptr &&
+        (args.candidates == nullptr || args.counts == nullptr || args.capacity <= 0 ||
+         std::int64_t(args.capacity) * args.block > args.width)) {
+        throw std::invalid_argument("deepseek_v41 index_scores: listed rows need candidates and "
+                                    "a width of their capacity");
+    }
+    const std::int64_t columns =
+        args.list != nullptr ? std::int64_t(args.capacity) * args.block : args.width;
+    const dim3 grid(blocks_for(columns, kScoreKeys), blocks_for(args.tokens, args.group));
     if (args.group == 4) {
         index_scores_kernel<4><<<grid, kScoreKeys, 0, stream>>>(args);
     } else {
@@ -1462,10 +1539,32 @@ void select_candidates(const float* scores, int width, int tokens, const std::in
     check_launch("select_candidates");
 }
 
+void candidate_lists(const std::uint32_t* mask, int words, int tokens, int group, int capacity,
+                     std::int32_t* list, std::int32_t* counts, cudaStream_t stream) {
+    if (tokens <= 0) { return; }
+    if (group <= 0 || capacity <= 0) {
+        throw std::invalid_argument("deepseek_v41 candidate_lists: a positive group and capacity");
+    }
+    candidate_lists_kernel<<<blocks_for(tokens, group), kSelectThreads, 0, stream>>>(
+        mask, words, tokens, group, capacity, list, counts);
+    check_launch("candidate_lists");
+}
+
 void select_topk(const float* scores, int width, int tokens, const std::int32_t* positions,
                  int ratio, int k, std::int32_t* out, cudaStream_t stream) {
+    select_topk(scores, width, tokens, positions, ratio, k, ListedRows{}, out, stream);
+}
+
+void select_topk(const float* scores, int width, int tokens, const std::int32_t* positions,
+                 int ratio, int k, const ListedRows& listed, std::int32_t* out,
+                 cudaStream_t stream) {
     if (tokens <= 0) { return; }
-    select_topk_kernel<<<tokens, kSelectThreads, 0, stream>>>(scores, width, positions, ratio, k, out);
+    if (listed.list != nullptr && (listed.counts == nullptr || listed.group <= 0 ||
+                                   listed.block <= 0 || listed.capacity <= 0)) {
+        throw std::invalid_argument("deepseek_v41 select_topk: listed rows need their counts");
+    }
+    select_topk_kernel<<<tokens, kSelectThreads, 0, stream>>>(scores, width, positions, ratio, k,
+                                                              listed, out);
     check_launch("select_topk");
 }
 
