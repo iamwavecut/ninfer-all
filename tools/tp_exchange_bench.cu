@@ -9,16 +9,19 @@
 // Each measurement captures `--exchanges` back-to-back exchanges of every rank's partial on every
 // rank's stream into one graph, forked from rank 0's stream and joined back as a pass is, replays
 // it `--replays` times and divides the time on rank 0's stream by the exchanges replayed. Partials
-// and replicas hold zeros: the time does not depend on the values, which tests/test_tensor_parallel
-// qualifies. A route a size cannot take (words past 32 KiB, scatter flags past 1 MiB or by peer
-// access, either between ranks on one card, a whole PeerWrite reduce past its inbox rows, a
-// reduce-scatter of two ranks storing FP32 sums) shows "-".
+// hold ones and replicas zeros: the time does not depend on the values, which
+// tests/test_tensor_parallel qualifies. A route a size cannot take (words past 32 KiB, scatter
+// flags past 1 MiB or by peer access, either between ranks on one card, a whole PeerWrite reduce
+// past its inbox rows, a reduce-scatter of two ranks storing FP32 sums) shows "-".
 //
 // `--sum` picks what a reduce does with the sum: adds it to a BF16 replica (`add`, the Qwen3.5-core
 // residual), or stores it as BF16 (`bf16`) or FP32 (`fp32`, Qwen3.8-Flash-Next's routed experts).
+// `--partials` moves the partials as computed (`fp32`) or rounded (`bf16`, `int8`), as
+// `--tensor-parallel-prompt-partials` does a prompt chunk's; words and scatter flags keep FP32.
 //
 // Run: ninfer-tp-exchange-bench --devices 0,1,2,3 [--hidden 5120] [--sum add|bf16|fp32]
-//          [--columns 1,2,4,8,13,16,32,64,128,256,512,1024,2048] [--exchanges 16] [--replays 10]
+//          [--partials fp32|bf16|int8] [--columns 1,2,4,8,13,16,32,64,128,256,512,1024,2048]
+//          [--exchanges 16] [--replays 10]
 #include "core/device.h"
 #include "core/tensor_parallel.h"
 
@@ -58,6 +61,7 @@ struct Options {
     std::vector<int> devices;
     long long hidden              = 5120;
     ninfer::TensorParallelSum sum = ninfer::TensorParallelSum::AddBf16;
+    ninfer::TensorParallelPartials partials = ninfer::TensorParallelPartials::Fp32;
     std::vector<long long> columns{1, 2, 4, 8, 13, 16, 32, 64, 128, 256, 512, 1024, 2048};
     int exchanges = 16;
     int replays   = 10;
@@ -146,14 +150,16 @@ double time_exchanges(ninfer::TensorParallelExchange& exchange, const ninfer::De
     for (int e = 0; e < options.exchanges; ++e) {
         const auto slot = static_cast<std::size_t>(e) % ninfer::TensorParallelExchange::kSlots;
         for (std::size_t r = 0; r < n; ++r) {
-            exchange.publish(r, slot, bytes, buffers.replica[r], ctx.rank(r).stream, options.sum);
+            exchange.publish(r, slot, bytes, buffers.replica[r], ctx.rank(r).stream, options.sum,
+                             {}, options.partials);
         }
         for (std::size_t r = 0; r < n; ++r) {
-            exchange.reduce(r, slot, buffers.replica[r], values, n, ctx.rank(r).stream,
-                            options.sum);
+            exchange.reduce(r, slot, buffers.replica[r], values, n, ctx.rank(r).stream, options.sum,
+                            {}, options.partials);
         }
         for (std::size_t r = 0; r < n; ++r) {
-            exchange.complete(r, slot, buffers.replica[r], values, ctx.rank(r).stream, options.sum);
+            exchange.complete(r, slot, buffers.replica[r], values, ctx.rank(r).stream, options.sum,
+                              {}, options.partials);
         }
     }
     for (std::size_t r = 1; r < n; ++r) {
@@ -169,12 +175,16 @@ double time_exchanges(ninfer::TensorParallelExchange& exchange, const ninfer::De
     return ms * 1000.0 / (static_cast<double>(options.replays) * options.exchanges);
 }
 
-void zero_partials(ninfer::TensorParallelExchange& exchange, const ninfer::DeviceContext& ctx,
+// Ones in every partial, so an 8-bit rounding divides as it does real values.
+void fill_partials(ninfer::TensorParallelExchange& exchange, const ninfer::DeviceContext& ctx,
                    std::size_t slot_bytes) {
+    const std::vector<float> ones(slot_bytes / sizeof(float), 1.0F);
     for (std::size_t r = 0; r < ctx.size(); ++r) {
         ninfer::RankBinding bind(ctx, r);
         for (std::size_t slot = 0; slot < ninfer::TensorParallelExchange::kSlots; ++slot) {
-            ck(cudaMemset(exchange.partial(r, slot), 0, slot_bytes), "partial zero");
+            ck(cudaMemcpy(exchange.partial(r, slot), ones.data(), slot_bytes,
+                          cudaMemcpyHostToDevice),
+               "partial fill");
         }
     }
 }
@@ -190,8 +200,12 @@ void run_group(const std::vector<int>& ids, const Options& options) {
     const char* sum = options.sum == ninfer::TensorParallelSum::AddBf16     ? "add"
                       : options.sum == ninfer::TensorParallelSum::StoreBf16 ? "bf16"
                                                                             : "fp32";
-    std::printf("\ndevices %s, %zu ranks, %s peer access, hidden %lld, sum %s\n", list.c_str(), n,
-                ctx.peer_access() ? "with" : "without", options.hidden, sum);
+    const char* partials = options.partials == ninfer::TensorParallelPartials::Bf16   ? "bf16"
+                           : options.partials == ninfer::TensorParallelPartials::Int8 ? "int8"
+                                                                                      : "fp32";
+    std::printf("\ndevices %s, %zu ranks, %s peer access, hidden %lld, sum %s, partials %s\n",
+                list.c_str(), n, ctx.peer_access() ? "with" : "without", options.hidden, sum,
+                partials);
 
     std::vector<TensorParallelTransport> transports{TensorParallelTransport::Host};
     if (ctx.peer_access()) {
@@ -207,14 +221,16 @@ void run_group(const std::vector<int>& ids, const Options& options) {
               TensorParallelForm::ScatterFlags}) {
             const TensorParallelRoute route{transport, form};
             ninfer::TensorParallelExchange exchange(
-                ctx, {.slot_bytes = slot_bytes, .routes = {{.bytes = slot_bytes, .route = route}}});
-            zero_partials(exchange, ctx, slot_bytes);
+                ctx, {.slot_bytes       = slot_bytes,
+                      .routes           = {{.bytes = slot_bytes, .route = route}},
+                      .rounded_partials = options.partials});
+            fill_partials(exchange, ctx, slot_bytes);
             std::vector<double> row;
             bool any = false;
             for (const long long columns : options.columns) {
                 const auto values = static_cast<std::int64_t>(columns * options.hidden);
                 const auto bytes  = static_cast<std::size_t>(values) * sizeof(float);
-                if (exchange.route(bytes, options.sum) != route) {
+                if (exchange.route(bytes, options.sum, options.partials) != route) {
                     row.push_back(-1.0);
                     continue;
                 }
@@ -228,8 +244,9 @@ void run_group(const std::vector<int>& ids, const Options& options) {
         }
     }
 
-    ninfer::TensorParallelExchange automatic(ctx, {.slot_bytes = slot_bytes});
-    zero_partials(automatic, ctx, slot_bytes);
+    ninfer::TensorParallelExchange automatic(
+        ctx, {.slot_bytes = slot_bytes, .rounded_partials = options.partials});
+    fill_partials(automatic, ctx, slot_bytes);
     std::printf("%s\n", automatic.describe().c_str());
     // What the exchange measured at startup, by probe size, in the columns of the table below.
     std::printf("%18s", "startup probe");
@@ -275,7 +292,8 @@ void run_group(const std::vector<int>& ids, const Options& options) {
             best = best < 0.0 ? row[i] : std::min(best, row[i]);
         }
         const double chosen = time_exchanges(automatic, ctx, buffers, values, options);
-        std::printf(" %20s %10.1f %8.3f\n", route_name(automatic.route(bytes, options.sum)).c_str(),
+        std::printf(" %20s %10.1f %8.3f\n",
+                    route_name(automatic.route(bytes, options.sum, options.partials)).c_str(),
                     chosen, chosen / best);
     }
     release(ctx, buffers);
@@ -309,10 +327,20 @@ int main(int argc, char** argv) {
         } else if (arg == "--sum" && has_value && std::string(argv[i + 1]) == "fp32") {
             options.sum = ninfer::TensorParallelSum::StoreFp32;
             ++i;
+        } else if (arg == "--partials" && has_value && std::string(argv[i + 1]) == "fp32") {
+            options.partials = ninfer::TensorParallelPartials::Fp32;
+            ++i;
+        } else if (arg == "--partials" && has_value && std::string(argv[i + 1]) == "bf16") {
+            options.partials = ninfer::TensorParallelPartials::Bf16;
+            ++i;
+        } else if (arg == "--partials" && has_value && std::string(argv[i + 1]) == "int8") {
+            options.partials = ninfer::TensorParallelPartials::Int8;
+            ++i;
         } else {
             std::fprintf(stderr,
                          "usage: %s --devices 0,1[,...] [--hidden N] [--sum add|bf16|fp32] "
-                         "[--columns 1,2,...] [--exchanges N] [--replays N]\n",
+                         "[--partials fp32|bf16|int8] [--columns 1,2,...] [--exchanges N] "
+                         "[--replays N]\n",
                          argv[0]);
             return 2;
         }

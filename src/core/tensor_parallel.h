@@ -30,9 +30,9 @@ namespace ninfer {
 // exchange, one outside the contributors with zero bytes. Two slots alternate between exchanges. A
 // rank writes a slot (its own, or its row of another rank's) again two exchanges later, after its
 // reduce of the exchange in between, which waits for every other rank's publish of that exchange,
-// which each rank issues after its own reduce and complete of the earlier one: so no rank overwrites
-// a slot another is still reading. Consecutive passes are separate in the same way as long as a
-// pass ends in a synchronize, as every round does.
+// which each rank issues after its own reduce and complete of the earlier one: so no rank
+// overwrites a slot another is still reading. Consecutive passes are separate in the same way as
+// long as a pass ends in a synchronize, as every round does.
 //
 // Records and waits pair within one exchange, so the protocol is legal eagerly and inside one
 // capture that spans every rank's stream.
@@ -71,25 +71,26 @@ namespace ninfer {
 //            they divide. A rank's reduce sums only its own range of the contributors' partials, in
 //            rank order as above, into its output; its `complete` brings in every other rank's
 //            finished range. Each value is still evaluated once, by the same expression on the same
-//            operands, so every output is bit-identical to a whole reduce, while a rank moves 1/N of
-//            each other rank's FP32 partial and (N-1)/N of an output instead of N-1 whole partials.
-//            Two ranks storing an FP32 sum would move half a partial and half an output, as many
-//            bytes as a whole partial, so they reduce whole. Under Host a publish leaves the rank's
-//            own range of its partial on the device, since no other rank reads it, the owner copies
-//            its finished range into that range of its host slot, and `complete` reads the others'
-//            ranges there; under PeerRead `complete` reads them from the owners' outputs; under
-//            PeerWrite a publish stores each owner's range of the partial into its row of that
-//            owner's inbox, and the owner stores its finished range straight into every other
-//            rank's output, which a publish names: `complete` only waits for it. A rank's output
-//            is written by others only after its publish of the exchange, which follows every read
-//            of it before, and read by its own kernels only after its `complete`. The caller issues
-//            `complete` for every rank after `reduce` for every rank, since a wait issued before its
-//            event's record would see an earlier record.
-//   ScatterFlags  Scatter under Host, with every rank on its own card and at most
-//            kScatterFlagsBytes per partial, whose reduce and complete are one kernel per rank that
-//            waits on the other ranks through flags in host memory instead of cross-device fences.
-//            A publish copies the partial as Scatter's does. Block b of every rank's kernel handles
-//            part b of every rank's range (whole 64-value blocks), so a block waits only on the
+//            operands, so every output is bit-identical to a whole reduce, while a rank moves 1/N
+//            of each other rank's FP32 partial and (N-1)/N of an output instead of N-1 whole
+//            partials. Two ranks storing an FP32 sum would move half a partial and half an output,
+//            as many bytes as a whole partial, so they reduce whole. Under Host a publish leaves
+//            the rank's own range of its partial on the device, since no other rank reads it, the
+//            owner copies its finished range into that range of its host slot, and `complete` reads
+//            the others' ranges there; under PeerRead `complete` reads them from the owners'
+//            outputs; under PeerWrite a publish stores each owner's range of the partial into its
+//            row of that owner's inbox, and the owner stores its finished range straight into every
+//            other rank's output, which a publish names: `complete` only waits for it. A rank's
+//            output is written by others only after its publish of the exchange, which follows
+//            every read of it before, and read by its own kernels only after its `complete`. The
+//            caller issues `complete` for every rank after `reduce` for every rank, since a wait
+//            issued before its event's record would see an earlier record.
+//   ScatterFlags  Scatter with every rank on its own card and at most kScatterFlagsBytes per
+//            partial, whose reduce and complete are one kernel per rank that waits on the other
+//            ranks through flags instead of cross-device fences. Under Host the flags lie in host
+//            memory and a publish copies the partial as Scatter's does. Block b of every rank's
+//            kernel handles part b of every rank's range (whole 64-value blocks), so a block waits
+//            only on the
 //            same block of the other ranks: it raises its first flag at once (its rank's copy ended
 //            before the kernel began), waits for the contributors' first flags, sums its part of
 //            the rank's own range in rank order as above into the output and into a finished row of
@@ -99,8 +100,23 @@ namespace ninfer {
 //            finished rows and flags alternate by its parity. Every block waits, in every exchange,
 //            for a flag every other rank's same block raised in it, which that rank raises only
 //            after its kernel of the exchange before ended: so no rank overwrites a host slot, row
-//            or flag another is still reading, and Words and ScatterFlags share the count. Two
-//            ranks storing an FP32 sum reduce whole, as for Scatter.
+//            or flag another is still reading, and Words and ScatterFlags share the count. Under a
+//            peer transport a publish moves nothing, and the flags lie in each rank's device
+//            memory, raised by the other ranks' stores, so a rank polls only its own card: block b
+//            raises its first flag in every other rank's memory, under PeerWrite after storing part
+//            b of every other owner's range of its partial into its row of that owner's inbox;
+//            waits for its own flags from the contributors (under PeerWrite from every rank, which
+//            has then begun its kernel and stopped reading its output); sums its part of its rank's
+//            range in rank order, reading the others' partials across the link (PeerRead) or from
+//            its inbox (PeerWrite), into the output and either every other rank's output
+//            (PeerWrite) or a finished row in its own memory (PeerRead); raises its second flag
+//            everywhere, waits for every other rank's, and under PeerRead reads their finished
+//            parts across the link. A rank's kernel in the same slot two exchanges later begins
+//            only after its kernel in between saw every other rank's second flag of that exchange,
+//            which each rank raises only after its own kernel of this one ended: so no rank
+//            overwrites a partial, finished row, inbox row or flag another is still reading, nor
+//            writes an output another is still reading. Two ranks storing an FP32 sum reduce
+//            whole, as for Scatter.
 //
 // Pieces. A prompt's exchange may run as up to kPieces pieces, each a contiguous range of the
 // partial's values (`TensorParallelPiece`) with fences of its own, so a piece's exchange crosses on
@@ -112,25 +128,40 @@ namespace ninfer {
 // alternation holds piece by piece: a rank writes piece p of a slot again only after its own reduce
 // and complete of piece p in the exchange in between.
 //
-// Rounded partials (TensorParallelPartials::Bf16, a prompt chunk's exchanges by choice). Under
-// Host, a Whole or Scatter exchange whose sum is BF16 can move its partials rounded to BF16: a
-// publish rounds the rank's whole partial into a device copy (`bf16_partials` allocates it) and
-// copies that into its host slot, the values from the slot's start, and a reduce adds the
-// contributors' rounded partials, its own from the device copy, in FP32 in rank order. Every rank
-// sums the same rounded values, so the replicas stay identical; the sum differs from the FP32
-// partials' by one BF16 rounding of each. A Scatter owner's finished range lies in the upper half
-// of its host slot, past every rounded partial. Words, ScatterFlags, the peer transports and FP32
-// sums take the partials as computed whatever the call asks, and every rank of an exchange asks the
-// same.
+// Rounded partials (TensorParallelPartials::Bf16 or Int8, a prompt chunk's exchanges by choice). A
+// Whole or Scatter exchange can move its partials rounded, in fewer bytes: to BF16, half of them,
+// or to 8-bit blocks, 9/32 of them: each 32 values from a multiple of 32 as an FP32 scale (their
+// largest magnitude over 127) and 32 signed codes (each value over the scale, rounded to the
+// nearest integer), a value being its code times the scale. A publish rounds the rank's whole
+// partial into a device copy (`rounded_partials` allocates it) and moves that as the transport
+// moves partials (Host: into its host slot, the values from the slot's start; PeerWrite: into the
+// inbox rows, the rounded values of a range at the byte its place gives them; PeerRead: nothing,
+// the others read the device copy), and a reduce adds the contributors' rounded partials, its own
+// from the device copy, in FP32 in rank order, into the output the sum asks for. Every rank sums
+// the same rounded values, so the replicas stay identical; the sum differs from the FP32
+// partials' by one rounding of each. 8-bit partials need every piece offset and every range to
+// start on a multiple of 32 values, which reduce-scatter ranges (multiples of 64) and pieces of
+// whole columns of a hidden width that is a multiple of 32 do. Under Host a Scatter owner's
+// finished range lies past the slot's first half, which holds every rounded partial; host slots
+// are half a slot longer for an FP32 output.
+// Words and ScatterFlags take the partials as computed whatever the call asks, and every rank of
+// an exchange asks the same.
 //
 // Routes. Which transport and form is fastest depends on the partial's size, the number of ranks
 // and the platform's links, and no fixed choice holds everywhere: on one host peer reads beat host
-// memory at every size, on another the reverse. Unless `routes` names them, the exchange times every
-// route `transport` and the topology allow, in captured graphs on every rank at once (each rank
-// contributing, a BF16 residual), at partial sizes from 4 KiB doubling up to its slot. Between two
-// of these sizes a route's time is taken on the line through its two times, at sixteenths of the
-// step, and an exchange takes the fastest route at the smallest of all these sizes that holds it
-// (`bands`). The measurement then frees the buffers of the routes it did not choose.
+// memory at every size, on another the reverse. Unless `routes` names them, the exchange times
+// every route `transport` and the topology allow, in captured graphs on every rank at once (each
+// rank contributing, a BF16 residual), at partial sizes from 4 KiB doubling up to its slot and at
+// the last size of each route that stops short of it (words, scatter flags, PeerWrite's whole
+// reduce into its inbox rows). Between two of these sizes a route's time is taken on the line
+// through its two times, at sixteenths of the step, and an exchange takes the fastest route at the
+// smallest of all these sizes that holds it (`bands`). Rounded partials move fewer bytes, so their
+// fastest route can differ (two ranks reducing 8-bit partials over peer writes: whole, where FP32
+// partials take a reduce-scatter): an exchange that holds rounded copies also times its Whole and
+// Scatter routes with partials rounded as `rounded_partials` names, and an exchange of rounded
+// partials takes its route from those bands (`rounded_bands`; Words and ScatterFlags keep their
+// FP32 times there, since they move the partials as computed). The measurement then frees the
+// buffers of the routes it did not choose.
 enum class TensorParallelForm : std::uint8_t { Words, Whole, Scatter, ScatterFlags };
 
 struct TensorParallelRoute {
@@ -175,8 +206,10 @@ struct TensorParallelExchangeOptions {
     std::size_t words_bytes = 32U << 10U;
     // How many exchanges every rank has already counted (tests: an epoch close to the wrap).
     std::uint32_t words_count = 0;
-    // Each rank's device copy of its slots in BF16, which exchanges of rounded partials need.
-    bool bf16_partials = false;
+    // The rounded partials prompt exchanges ask for, Bf16 or Int8 (Fp32: none). Each rank then
+    // holds a device copy of its slots, rounded, which exchanges of either rounded format need, and
+    // the measurement times the routes of partials rounded so (see Routes).
+    TensorParallelPartials rounded_partials = TensorParallelPartials::Fp32;
 };
 
 class TensorParallelExchange {
@@ -200,10 +233,10 @@ public:
 
     // Device memory one rank's exchange of `slot_bytes` slots takes at most while it is built, over
     // `ranks` ranks that do (`peer`) or do not all have peer access, with `transport` and, where
-    // `bf16_partials`, the BF16 copies of its slots.
+    // `rounded_partials`, the rounded copies of its slots.
     [[nodiscard]] static std::size_t device_bytes(std::size_t slot_bytes, std::size_t ranks,
                                                   bool peer, TensorParallelTransport transport,
-                                                  bool bf16_partials = false);
+                                                  bool rounded_partials = false);
 
     [[nodiscard]] std::size_t ranks() const noexcept { return ranks_.size(); }
     [[nodiscard]] std::size_t slot_bytes() const noexcept { return slot_bytes_; }
@@ -214,7 +247,15 @@ public:
     [[nodiscard]] const std::vector<TensorParallelBand>& whole_bands() const noexcept {
         return whole_bands_;
     }
-    // Every route timed at every size, in the order measured; empty where nothing was timed.
+
+    // The bands an exchange of rounded partials chooses from: the bands themselves where nothing
+    // was measured or the exchange holds no rounded copies.
+    [[nodiscard]] const std::vector<TensorParallelBand>& rounded_bands() const noexcept {
+        return rounded_bands_.empty() ? bands_ : rounded_bands_;
+    }
+
+    // Every route timed at every size, in the order measured, FP32 partials; empty where nothing
+    // was timed.
     [[nodiscard]] const std::vector<TensorParallelBand>& timings() const noexcept {
         return timings_;
     }
@@ -224,9 +265,10 @@ public:
     // The route an exchange of `bytes` per partial whose reduce does `sum` takes: its band's, with
     // the form a whole reduce where the band's cannot hold it (words past `words_bytes`, scatter
     // flags past kScatterFlagsBytes, either between ranks on one card, a reduce-scatter of two
-    // ranks storing an FP32 sum), from the whole bands.
-    [[nodiscard]] TensorParallelRoute route(
-        std::size_t bytes, TensorParallelSum sum = TensorParallelSum::AddBf16) const noexcept;
+    // ranks storing an FP32 sum), from the whole bands. Rounded `partials` take the rounded bands.
+    [[nodiscard]] TensorParallelRoute
+    route(std::size_t bytes, TensorParallelSum sum = TensorParallelSum::AddBf16,
+          TensorParallelPartials partials = TensorParallelPartials::Fp32) const noexcept;
     // The route of a `publish_whole` and `gather` of `bytes`.
     [[nodiscard]] TensorParallelRoute gather_route(std::size_t bytes) const noexcept;
 
@@ -275,8 +317,9 @@ private:
         int device = 0;
         std::array<float*, kSlots> device_slot{};
         std::array<float*, kSlots> host_slot{};
-        // The rank's partial rounded to BF16, per slot (`bf16_partials`).
-        std::array<__nv_bfloat16*, kSlots> rounded{};
+        // The rank's partial rounded, per slot (`rounded_partials`): half a slot of bytes, BF16
+        // values or 8-bit blocks.
+        std::array<unsigned char*, kSlots> rounded{};
         // PeerWrite: [ranks - 1][inbox_values_] partials, or owners' ranges of them, the other
         // ranks stored here, in rank order without the rank itself.
         std::array<float*, kSlots> inbox{};
@@ -299,6 +342,9 @@ private:
         // ScatterFlags: the rank's mapped host area, per slot a row of its finished outputs, then
         // the flags of both phases per slot and block.
         unsigned char* scatter_flags = nullptr;
+        // ScatterFlags under a peer transport: the rank's area in its device memory, per slot a
+        // row of its finished outputs, then the flags the other ranks raise in it.
+        unsigned char* peer_flags = nullptr;
     };
 
     // Which buffers the bands need.
@@ -308,6 +354,7 @@ private:
         bool inbox         = false;
         bool peer_words    = false;
         bool scatter_flags = false;
+        bool peer_flags    = false;
     };
 
     void release() noexcept;
@@ -318,32 +365,45 @@ private:
     [[nodiscard]] Needs needs(const std::vector<TensorParallelBand>& bands) const noexcept;
     void provide(Needs needs);
     void measure(const std::vector<TensorParallelTransport>& transports);
+    // PeerWrite's copies by the copy engines rather than one kernel from which size
+    // (`engine_bytes_`), timed on rank 0's rows of the other ranks' inboxes.
+    void measure_engine_bytes();
     [[nodiscard]] float* inbox_row(std::size_t rank, std::size_t sender, std::size_t slot) const;
     // Where in an inbox row a piece's values begin (see Pieces), and the route of its exchange.
     [[nodiscard]] std::int64_t inbox_offset(TensorParallelPiece piece,
                                             TensorParallelForm form) const noexcept;
     [[nodiscard]] TensorParallelRoute piece_route(std::size_t bytes, TensorParallelSum sum,
-                                                  TensorParallelPiece piece) const;
+                                                  TensorParallelPiece piece,
+                                                  TensorParallelPartials partials) const;
+    // The whole route of `bytes`, for `partials`: PeerRead past PeerWrite's inbox rows.
+    [[nodiscard]] TensorParallelRoute whole_route(std::size_t bytes,
+                                                  TensorParallelPartials partials) const noexcept;
 
-    // Whether an exchange on `route` reducing to `sum` moves the partials rounded, as `partials`
-    // asks (see Rounded partials).
-    [[nodiscard]] bool rounds(TensorParallelRoute route, TensorParallelSum sum,
-                              TensorParallelPartials partials) const;
-    // Under Host, where `owner`'s finished output from value `begin` of a reduce-scatter lies in
-    // its host slot.
+    // How an exchange on `route` moves the partials, as `partials` asks (see Rounded partials):
+    // Fp32 where the route keeps them as computed.
+    [[nodiscard]] TensorParallelPartials moved(TensorParallelRoute route,
+                                               TensorParallelPartials partials) const;
+    // Under Host, where `owner`'s finished output from value `begin` of a reduce-scatter, of
+    // `size` bytes a value, lies in its host slot.
     [[nodiscard]] unsigned char* finished_host(std::size_t owner, std::size_t slot,
                                                TensorParallelPiece piece, std::int64_t begin,
-                                               bool rounded) const noexcept;
+                                               bool rounded, std::size_t size) const noexcept;
+    // Bytes of a host slot: half a slot more where partials may be rounded, for an FP32 output
+    // past them.
+    [[nodiscard]] std::size_t host_slot_bytes() const noexcept;
 
     void publish_on(TensorParallelRoute route, std::size_t rank, std::size_t slot,
                     std::size_t bytes, void* out, cudaStream_t stream, TensorParallelSum sum,
-                    TensorParallelPiece piece = {}, bool rounded = false);
+                    TensorParallelPiece piece       = {},
+                    TensorParallelPartials partials = TensorParallelPartials::Fp32);
     void reduce_on(TensorParallelRoute route, std::size_t rank, std::size_t slot, void* out,
                    std::int64_t count, std::size_t contributors, cudaStream_t stream,
-                   TensorParallelSum sum, TensorParallelPiece piece = {}, bool rounded = false);
+                   TensorParallelSum sum, TensorParallelPiece piece = {},
+                   TensorParallelPartials partials = TensorParallelPartials::Fp32);
     void complete_on(TensorParallelRoute route, std::size_t rank, std::size_t slot, void* out,
                      std::int64_t count, cudaStream_t stream, TensorParallelSum sum,
-                     TensorParallelPiece piece = {}, bool rounded = false);
+                     TensorParallelPiece piece       = {},
+                     TensorParallelPartials partials = TensorParallelPartials::Fp32);
 
     std::vector<Rank> ranks_;
     std::size_t slot_bytes_           = 0;
@@ -351,16 +411,25 @@ private:
     std::size_t words_values_         = 0; // 0 where ranks share a card
     std::size_t scatter_flags_values_ = 0; // 0 where ranks share a card
     std::size_t inbox_values_         = 0; // floats per inbox row
+    // PeerWrite copies of at least this many bytes per row go by the copy engines, smaller ones by
+    // one kernel: measured with the routes, or 1 MiB, which four RTX A4000 favoured (2026-11-02).
+    std::int64_t engine_bytes_        = 1 << 20;
+    bool engine_measured_             = false;
     bool measured_                    = false;
+    TensorParallelPartials rounded_   = TensorParallelPartials::Fp32;
     std::vector<TensorParallelBand> bands_;
     std::vector<TensorParallelBand> whole_bands_;
+    // Measured with rounded partials; empty where they are the bands above.
+    std::vector<TensorParallelBand> rounded_bands_;
+    std::vector<TensorParallelBand> rounded_whole_bands_;
     std::vector<TensorParallelBand> timings_;
 };
 
 // Each rank's speed for dividing work by: the device-to-device copy bandwidth of its card in bytes
 // per second, shared evenly by the ranks one card holds (`--devices 0,0`). A decode step reads every
 // weight once, so a rank's share of the weights takes time in proportion to this. Measured with a
-// short copy on each card.
+// short copy on each card; cards of one model (name, memory, multiprocessors, capability) take the
+// mean of theirs, so the shares they divide stay the same from start to start.
 [[nodiscard]] std::vector<double> rank_copy_bandwidth(const DeviceContext& context);
 
 // Each rank's bus speed: the bandwidth of a copy from pinned host memory to its card in bytes per

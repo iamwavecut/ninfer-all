@@ -281,7 +281,30 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& c,
                    b.row_ends(a + "value", {kv, h})[heads * c.head_dim] &&
                    b.column_ends(a + "output", {h, q}, {a + "gated_output"})[rows];
         });
+    // The shared expert's middle ends where every layer's gate and up rows and down columns cut
+    // whole stored runs, at whole 128-row tiles of the expert matrix kernel where every rank gets
+    // one. It divides evenly over the ranks whatever the split: each rank rounds its run's dot of
+    // the down rows on its own, so the sum depends on the runs, and a split measured at startup
+    // moves from one start to the next (two ranks at an even split hold two and a half of its five
+    // tiles, which rounded to three or two by the measurement's noise).
+    const std::uint64_t width = c.shared_expert_intermediate_size;
+    const std::uint64_t tile  = width / 128 >= split.size() ? 128 : 1;
+    std::vector<bool> shared_allowed(width + 1, true);
+    for (std::uint32_t layer = 0; layer < c.num_hidden_layers; ++layer) {
+        const std::string m  = "text/layers/" + std::to_string(layer) + "/moe/";
+        const auto gate_rows = b.row_ends(m + "shared/gate", {width, h});
+        const auto up_rows   = b.row_ends(m + "shared/up", {width, h});
+        const auto down      = b.column_ends(m + "shared/down", {h, width}, {m + "shared/product"});
+        for (std::uint64_t at = 0; at <= width; ++at) {
+            shared_allowed[at] = shared_allowed[at] && gate_rows[at] && up_rows[at] && down[at];
+        }
+    }
+    std::vector<std::uint64_t> shared_ends;
+    for (std::uint64_t at = tile; at < width; at += tile) {
+        if (shared_allowed[at]) { shared_ends.push_back(at); }
+    }
     const std::size_t ranks    = split.size();
+    const auto shared          = split_shares(width, shared_ends, std::vector<double>(ranks, 1.0));
     const auto key_heads       = split_shares(c.linear_num_key_heads, key_ends, split);
     const auto experts         = expert_ends(c.num_experts, split);
     const std::size_t kv_ranks = std::min(ranks, kv_ends.size() + 1);
@@ -292,6 +315,8 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& c,
         out[r].key_head_end   = static_cast<std::uint32_t>(key_heads[r + 1]);
         out[r].expert_begin   = static_cast<std::uint32_t>(experts[r]);
         out[r].expert_end     = static_cast<std::uint32_t>(experts[r + 1]);
+        out[r].shared_begin   = static_cast<std::uint32_t>(shared[r]);
+        out[r].shared_end     = static_cast<std::uint32_t>(shared[r + 1]);
         if (r < kv_ranks) {
             out[r].kv_head_begin = static_cast<std::uint32_t>(kv_heads[r]);
             out[r].kv_head_end   = static_cast<std::uint32_t>(kv_heads[r + 1]);
@@ -438,13 +463,17 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
         out.up.push_back(b.parameter(x + "up", {w, h}, {input}, {}, storage("up")));
         out.down.push_back(b.parameter(x + "down", {h, w}, {x + "product"}, {}, storage("down")));
     }
-    const std::uint64_t s = c.shared_expert_intermediate_size;
-    out.shared_gate       = b.parameter(m + "shared/gate", {s, h}, {input});
-    out.shared_up         = b.parameter(m + "shared/up", {s, h}, {input});
-    out.shared_down       = b.parameter(m + "shared/down", {h, s}, {m + "shared/product"});
+    // Under expert parallelism each rank binds its run of the shared expert (bind_shared_run).
+    std::vector<WeightId> downs;
+    if (split.empty()) {
+        const std::uint64_t s = c.shared_expert_intermediate_size;
+        out.shared_gate       = b.parameter(m + "shared/gate", {s, h}, {input});
+        out.shared_up         = b.parameter(m + "shared/up", {s, h}, {input});
+        out.shared_down       = b.parameter(m + "shared/down", {h, s}, {m + "shared/product"});
+        downs.push_back(out.shared_down);
+    }
     // The expert matrix kernel reads a down row's 640 values in three 256-value steps, past the end
     // of each bank's last row: zeros follow every down bank in device memory.
-    std::vector<WeightId> downs{out.shared_down};
     if (residency == ExpertResidency::Device) {
         downs.insert(downs.end(), out.down.begin(), out.down.end());
     }
@@ -456,6 +485,25 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
         }
     }
     return out;
+}
+
+// Tensor parallelism: rank `rank`'s run of layer `p`'s shared expert (TensorShare): those rows of
+// its gate and up, those values of every down row, and the zeros the expert matrix kernel reads
+// past the down piece's last row.
+void bind_shared_run(Bindings& b, const TextConfig& c, const std::string& p,
+                     const TensorShare& share, std::size_t rank, MoeWeights& out) {
+    const std::uint64_t h = c.hidden_size, s = c.shared_expert_intermediate_size;
+    const std::string m = p + "moe/", input = p + "ffn_input";
+    const Range run{share.shared_begin, share.shared_end};
+    out.shared_gate = b.piece(m + "shared/gate", {s, h}, {input}, {}, rank, row_piece(run));
+    out.shared_up   = b.piece(m + "shared/up", {s, h}, {input}, {}, rank, row_piece(run));
+    out.shared_down =
+        b.piece(m + "shared/down", {h, s}, {m + "shared/product"}, {}, rank, column_piece({run}));
+    for (const auto& part : b.at(out.shared_down).reference.binding.parts) {
+        if (is_gguf(b.binder.geometry(part.object).format)) {
+            b.binder.device_tail(part.object, kExpertTail);
+        }
+    }
 }
 
 PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& p) {
@@ -706,6 +754,26 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
     std::vector<std::string> head_uses{"text/final_hidden"};
     if (mtp_config) { head_uses.emplace_back("mtp/final_hidden"); }
+    if (tensor_parallel) {
+        // Every rank projects its rows of the head, for the text and for the MTP block's drafts,
+        // in proportion to the split and ending on the head's stored row bounds and on whole
+        // 128-row tiles of a GGUF head's matrix product. A prompt pass with logits of hundreds of
+        // positions projects them with the whole head on rank 0 instead (below): gathering the
+        // other ranks' rows of them through host memory costs more than their share saves.
+        const Shape shape{config.vocab_size, config.hidden_size};
+        const std::vector<bool> allowed = b.row_ends("text/output_head", shape);
+        std::vector<std::uint64_t> ends;
+        for (std::uint64_t row = 128; row < config.vocab_size; row += 128) {
+            if (allowed[row]) { ends.push_back(row); }
+        }
+        weights.head_rows = split_shares(config.vocab_size, ends, options.tensor_split);
+        for (std::size_t rank = 0; rank < options.ranks; ++rank) {
+            weights.head_shares.push_back(
+                b.piece("text/output_head", shape, head_uses, {}, rank,
+                        row_piece({weights.head_rows[rank], weights.head_rows[rank + 1]})));
+        }
+        head_uses = {"text/final_hidden"};
+    }
     weights.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
                                       std::move(head_uses));
     weights.final_mixer = bind_hc(b, config, "text/final_mixer/", false);
@@ -730,6 +798,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                                           : bind_attention(b, config, p);
         }
         layer.moe = bind_moe(b, config, p, options.experts, options.tensor_split);
+        if (tensor_parallel) { bind_shared_run(b, config, p, shares[0], 0, layer.moe); }
         if (ple_layer(i)) { layer.ple = bind_ple(b, config, p); }
         weights.layers.push_back(std::move(layer));
     }
@@ -738,6 +807,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         const TensorShare& share = shares[rank];
         weights.rank_embeddings.push_back(
             replica(b, "text/token_embedding", {config.vocab_size, config.hidden_size}, {}, {}, rank));
+        weights.rank_final_mixers.push_back(
+            bind_hc_replica(b, config, "text/final_mixer/", false, rank));
         std::vector<LayerWeights> layers;
         for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
             const std::string p = "text/layers/" + std::to_string(i) + "/";
@@ -756,6 +827,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                 replica(b, m + "router", {config.num_experts, config.hidden_size}, {input}, {}, rank);
             layer.moe.shared_score =
                 replica(b, m + "shared_score", {1, config.hidden_size}, {input}, {}, rank);
+            bind_shared_run(b, config, p, share, rank, layer.moe);
             if (ple_layer(i)) { layer.ple = bind_ple_replica(b, config, p, rank); }
             layers.push_back(std::move(layer));
         }

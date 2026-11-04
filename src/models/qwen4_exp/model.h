@@ -67,6 +67,7 @@ struct MoeWeights {
     // One per expert; empty when the experts stay in the files, which `located` then describes.
     std::vector<WeightId> gate, up, down;
     std::vector<ExpertLocation> located_gate, located_up, located_down;
+    // The shared expert, or under tensor parallelism the rank's run of it (TensorShare).
     WeightId shared_gate, shared_up, shared_down;
 };
 
@@ -88,18 +89,28 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
     // Tensor parallelism: what every rank after the first holds, [rank - 1]: its replica of the
     // token embedding and its part of each layer (its MoE weights are the router's and the shared
-    // score's replicas; `layers` lists every rank's routed experts).
+    // score's replicas and its run of the shared expert; `layers` lists every rank's routed
+    // experts).
     std::vector<WeightId> rank_embeddings;
     std::vector<std::vector<LayerWeights>> rank_layers;
+    // Tensor parallelism: rank r projects rows [head_rows[r], head_rows[r + 1]) of the head with
+    // head_shares[r], for the text from its own stack, read through its final mixer
+    // (rank_final_mixers[r - 1] after the first), and for the MTP block's drafts from rank 0's
+    // read of the block's stack; rank 0 also holds `output_head` whole, for prompt passes.
+    std::vector<std::uint64_t> head_rows;
+    std::vector<WeightId> head_shares;
+    std::vector<HyperConnectionWeights> rank_final_mixers;
 };
 
 // Tensor parallelism: the runs of every layer one rank holds. A rank holds the value heads of its
 // Gated DeltaNet key heads and the 12 query heads of each of its sparse-attention KV heads; the
-// ranks holding KV heads are a prefix of the ranks.
+// ranks holding KV heads are a prefix of the ranks. Each rank also holds a run of the shared
+// expert's 640-wide middle: those rows of its gate and up and those values of its down rows.
 struct TensorShare {
     std::uint32_t key_head_begin = 0, key_head_end = 0;
     std::uint32_t kv_head_begin = 0, kv_head_end = 0;
     std::uint32_t expert_begin = 0, expert_end = 0;
+    std::uint32_t shared_begin = 0, shared_end = 0;
 };
 
 // The MTP block (vLLM Qwen4ExpMultiTokenPredictor): the two input norms and projections, one
@@ -129,8 +140,8 @@ struct LoadOptions {
     // positive weight per rank; empty for none. Each rank holds a run of every Gated DeltaNet
     // layer's heads, of the sparse-attention layers' KV heads (as far as the two allow) and of the
     // routed experts, and replicas of the token embedding, the hyper-connections, the routers and
-    // the PLE layer; rank 0 also the shared experts, the final mixer, the head, the MTP block and
-    // the Vision tower. One stage; the experts must be device resident.
+    // the PLE layer, a run of each shared expert and of the head's rows; rank 0 also the MTP block
+    // and the Vision tower. One stage; the experts must be device resident.
     std::vector<double> tensor_split;
 };
 

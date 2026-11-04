@@ -176,10 +176,10 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
         }
         tp.prompt_partials = plan.features.tensor_parallel_prompt_partials;
         tp.exchange        = std::make_unique<TensorParallelExchange>(
-            device, TensorParallelExchangeOptions{
-                        .slot_bytes    = tensor_parallel_slot_bytes(plan),
-                        .transport     = plan.features.tensor_parallel_transport,
-                        .bf16_partials = tp.prompt_partials == TensorParallelPartials::Bf16});
+            device,
+            TensorParallelExchangeOptions{.slot_bytes = tensor_parallel_slot_bytes(plan),
+                                          .transport  = plan.features.tensor_parallel_transport,
+                                          .rounded_partials = tp.prompt_partials});
         for (std::size_t rank = 1; rank < stages; ++rank) { tp.joined.emplace_back(device.rank(rank)); }
         // A divided head's rows come back to rank 0, each rank's logits over its own link.
         if (const std::size_t head_bytes = divided_head_link_bytes(plan); head_bytes != 0) {

@@ -1602,7 +1602,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             ? TensorParallelExchange::device_bytes(
                   tensor_parallel_slot_bytes(*impl), text.rank_count, inputs.peer_access,
                   inputs.features.tensor_parallel_transport,
-                  inputs.features.tensor_parallel_prompt_partials == TensorParallelPartials::Bf16)
+                  inputs.features.tensor_parallel_prompt_partials != TensorParallelPartials::Fp32)
             : 0U;
     impl->device_reservation_bytes =
         checked_add(impl->device_reservation_bytes, exchange_bytes, "tensor-parallel exchange");

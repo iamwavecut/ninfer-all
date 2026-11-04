@@ -25,8 +25,11 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Use one entry per date. Add changes to that date's entry and link to details. -->
 
-- **2026-11-04:** Tensor-parallel prefill without peer access can move prompt exchanges as [BF16 partials](docs/maintainer/pipeline-stages.md#tensor-parallelism) (`--tensor-parallel-prompt-partials bf16`).
-  Qwen3.8-27B prefilled 24-26% faster on four RTX 5060 Ti on PCIe 3.0 and 2-5% faster on two RTX 3090s.
+- **2026-11-04:** Tensor-parallel prefill without peer access can move prompt exchanges as [BF16 or 8-bit partials](docs/maintainer/pipeline-stages.md#tensor-parallelism) (`--tensor-parallel-prompt-partials bf16|int8`), for Qwen3.5-core models and Flash-Next.
+  Qwen3.8-27B prefilled 18-26% faster with BF16 on four RTX 5060 Ti on PCIe 3.0 and 2-5% faster on two RTX 3090s; Flash-Next 10-15% faster with either.
+  Under [tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next) every GPU runs a part of Flash-Next's shared expert and projects its rows of the head and of MTP's drafts:
+  on four RTX 5060 Ti it decoded 8-9% faster, and 12-13% faster with MTP.
+  GPUs of one model divide tensor-parallel work by one measured speed, so the same request gives the same result from one start to the next.
   [Expert-parallel](docs/maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families) Gemma 4, Flint and DeepSeek-V4.1 divide the vocabulary head across GPUs too,
   and DeepSeek-V4.1 sizes its host-expert shares by each GPU's cache room and bus: on two RTX 3090s Gemma 4 decoded 4-5% faster (MTP 3%) and Flint 2.5-2.8%.
   Flash-Next's batched rounds run every request's [mixer projections](docs/qwen3-8-flash-next.md#sequences-kv-and-the-context-cache) at once:
