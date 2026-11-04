@@ -477,6 +477,17 @@ and 11.5% faster without drafts (BF16 KV). A speculative round counts as the tok
 its requests fed on average, so drafting streams get as many tokens per chunk as plain ones and
 hold a prompt back no longer.
 
+With host or disk experts on one GPU, a step of a prompt without media or branched reads also
+takes the next chunks of the other such prompts that are prefilling, in the same order, while they
+fit the span: their chunks reach each layer together, so the layer's uncached experts cross the
+bus once for all of them. A step that does not end its prompt takes whole chunks, so each prompt
+runs the chunks it would run alone and computes the same bits. A prompt that would resume from a
+prefix another prompt of the step is about to keep waits for it. On the RTX 3090 above (host
+experts), eight requests got their last first token after 6.2-6.7 s instead of 19.3-20.9 s
+(9.5-9.7 instead of 22.8-23.7 s with BF16 KV) and finished 1.77-1.94 times as fast with MTP over
+the nine formats and 1.78 times as fast without drafts; two and four requests finished 1.37 and
+1.50-1.56 times as fast (BF16 KV).
+
 With the context cache on (the default), a sequence keeps its state when its request ends, and a
 snapshot of its recurrent state where the prompt's last user turn closes (or at the prompt's end
 when the template marks no turn), 74 MiB on the device: a later prompt that continues what the
@@ -614,6 +625,11 @@ automatic drafting gave 1.16, 1.08, 1.07, 1.01 and 1.08 times the speed without 
 two, three, four and eight requests, and three drafts every round without the floor 1.19, 1.09,
 1.00, 1.00 and 1.03 times.
 
+Greedy answers of four or eight drafting requests, whose rounds can verify more than eight columns
+at once, are not reproducible bit for bit: on an RTX 3090 with IQ3_S host experts, 4 to 8 of
+eight 128-token answers differed between two runs of one build. With one or two requests, or
+without drafts, every answer matched.
+
 With `--adaptive-mtp` the controller picks the width of a lone request's round. A batch drafts
 until each of its requests has reached the floor or the round's width, so a round of more requests
 with the controller's widths (up to eight drafts, the floor 0.5) ran nearly every step for all of
@@ -651,7 +667,8 @@ under `--spec mtp`.
   wider prompt call first copies the routed experts the cache does not hold into a device pool on
   each GPU (0.7 GB for Q2_0), a bank per projection laid out as the host's, so experts adjacent on
   the host cross the bus in one copy and each expert crosses it once per chunk; zeros follow each
-  run of copied downs. On one GPU a prompt longer than a chunk runs in spans of up to eight chunks
+  run of copied downs. On one GPU a prompt longer than a chunk, or the steps of several prompts
+  prefilling at once, run in spans of up to eight chunks
   layer by layer: each layer runs its attention over every chunk of the span, then its experts over
   every chunk, so the layer's uncached experts cross the bus once per span, during the attention
   phase that precedes them, and a span's short last chunk runs from the same pool (a 5,669-token
@@ -659,7 +676,8 @@ under `--spec mtp`.
   pool and the two phases then took a 9,297-token Q2_0 prompt from 1.12-1.18k to 1.35k tokens/s from
   a cold expert cache). The expert phase runs up to 4,096 tokens of consecutive chunks in one call,
   each chunk routed on its own, so the matrix kernel takes 128-column tiles rather than the 32 of a
-  1,024-token chunk; a last chunk of eight tokens or fewer runs alone (with IQ3_S, a 31,860-token
+  1,024-token chunk; a last chunk of eight tokens or fewer runs alone, after the layer's wider calls,
+  since it may copy experts into cache slots those calls read (with IQ3_S, a 31,860-token
   prompt's expert matrix products took 4.47 instead of 6.52 s on an RTX 3090). With two prefill
   buffers (the default with the automatic expert cache, `--expert-prefill-buffers`) the pool has two
   buffers that consecutive layers alternate between: each layer's copies start as soon as the layer

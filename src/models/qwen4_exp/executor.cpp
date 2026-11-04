@@ -804,10 +804,11 @@ struct Executor::Impl {
     static constexpr std::uint32_t kGroupTokens = 4096;
     std::uint32_t span_group = 1;
     DeviceBuffer span_ids, span_weights, span_shared, span_y;
-    // A span's chunk before its last runs a layer's experts: the pool keeps that layer's experts.
+    // A span's expert call that a wider call of the same layer follows: the pool keeps that
+    // layer's experts.
     bool span_hold = false;
-    // A span's last chunk runs a layer's experts: the disk cache releases the layer's experts the
-    // span's earlier chunks read and this one does not route to.
+    // A span's last expert call of a layer: the disk cache releases the layer's experts the span's
+    // earlier calls read and this one does not route to.
     bool span_last = false;
 
     // Vision (a model loaded with its tower), on rank 0 beside the token embedding: the encoder's
@@ -3728,26 +3729,42 @@ struct Executor::Impl {
         memory.ranks[0].workspace_bytes += bytes;
     }
 
-    // The chunk after the expert group of a span's `n` tokens that starts at chunk `first` of
-    // `chunks` (c tokens each but the last). A group needs the full pool and kPrefetchTokens or
-    // more, so that it runs from the layer's prefetched pool copy; a last chunk of
-    // kVectorTokens or fewer runs alone, as forward() runs it.
-    [[nodiscard]] std::size_t group_end(std::size_t first, std::size_t chunks, std::size_t n,
-                                        std::size_t c) const {
-        if (span_group == 1 || slot_pools.empty() || slot_pools[0].slots < config.num_experts) {
+    // One chunk of a prompt span: `count` tokens of `sequence` from its position `first`, kept from
+    // token `at` of the span planes. A span holds its chunks one after another, those of one
+    // sequence in order.
+    struct SpanChunk {
+        SequenceState* sequence = nullptr;
+        std::size_t at          = 0;
+        std::int32_t count      = 0;
+        std::uint32_t first     = 0;
+        std::span<const std::int32_t> tokens;
+    };
+
+    // The chunk after the expert group that starts at chunk `first` of a span. A group needs the
+    // full pool and kPrefetchTokens or more, so that it runs from the layer's prefetched pool copy;
+    // a chunk of kVectorTokens or fewer runs alone, as forward() runs it.
+    [[nodiscard]] std::size_t group_end(std::span<const SpanChunk> chunks, std::size_t first) const {
+        if (span_group == 1 || slot_pools.empty() || slot_pools[0].slots < config.num_experts ||
+            chunks[first].count <= kVectorTokens) {
             return first + 1;
         }
-        std::size_t last = std::min<std::size_t>(chunks, first + span_group);
-        if (last > first + 1 && n - (last - 1) * c <= std::size_t(kVectorTokens)) { --last; }
-        return std::min(last * c, n) - first * c >= std::size_t(kPrefetchTokens) ? last
-                                                                                 : first + 1;
+        std::size_t last = std::min<std::size_t>(chunks.size(), first + span_group);
+        for (std::size_t j = first + 1; j < last; ++j) {
+            if (chunks[j].count <= kVectorTokens) {
+                last = j;
+                break;
+            }
+        }
+        const std::size_t tokens = chunks[last - 1].at + std::size_t(chunks[last - 1].count) -
+                                   chunks[first].at;
+        return tokens >= std::size_t(kPrefetchTokens) ? last : first + 1;
     }
 
     // The experts of a span's chunks first..last-1 in one wide call through the pool, into
     // span_y. rank.mixed holds the first chunk's MoE input and the others' follow it. Each chunk
     // is routed on its own, as forward() routes it, into the group's route planes.
-    void run_group(const LayerPlan& plan, RankState& rank, std::size_t index, std::size_t first,
-                   std::size_t last, std::size_t n, std::size_t c) {
+    void run_group(const LayerPlan& plan, RankState& rank, std::size_t index,
+                   std::span<const SpanChunk> chunks, std::size_t first, std::size_t last) {
         const MoePlan& m      = plan.moe;
         const cudaStream_t st = rank.stream;
         const auto h          = static_cast<std::int32_t>(config.hidden_size);
@@ -3756,8 +3773,8 @@ struct Executor::Impl {
         auto* const weights_p = static_cast<float*>(span_weights.p);
         auto* const shared_p  = static_cast<float*>(span_shared.p);
         for (std::size_t j = first; j < last; ++j) {
-            const auto t         = static_cast<std::int32_t>(std::min(c, n - j * c));
-            const std::size_t at = (j - first) * c;
+            const auto t         = chunks[j].count;
+            const std::size_t at = chunks[j].at - chunks[first].at;
             const Tensor mixed(static_cast<std::byte*>(rank.mixed) + at * std::size_t(h) * 2,
                                DType::BF16, {h, t});
             Tensor ids(ids_p + at * std::size_t(top), DType::I32, {top, t});
@@ -3767,7 +3784,9 @@ struct Executor::Impl {
             ops::moe_route(mixed, m.router, m.shared_gate, *rank.workspace, ids, weights, shared,
                            st);
         }
-        const auto t = static_cast<std::int32_t>(std::min(last * c, n) - first * c);
+        const auto t = static_cast<std::int32_t>(chunks[last - 1].at +
+                                                 std::size_t(chunks[last - 1].count) -
+                                                 chunks[first].at);
         Tensor ids(ids_p, DType::I32, {top, t});
         Tensor weights(weights_p, DType::FP32, {top, t});
         Tensor shared(shared_p, DType::FP32, {t});
@@ -3784,25 +3803,86 @@ struct Executor::Impl {
         if (!pooled) { throw std::logic_error("qwen4_exp: a span group ran outside the pool"); }
     }
 
-    // A prompt span of several chunks, layer by layer: every chunk passes a layer before any passes
-    // the next, so a wide call's pool copy of the layer's uncached experts serves every chunk. The
-    // arithmetic of each chunk is that of forward(); the logits are the last chunk's.
+    // A prompt span of one sequence's chunks (prompt_step() tokens at most), layer by layer.
     void forward_span(std::uint32_t s, std::span<const std::int32_t> tokens,
                       std::uint32_t logit_rows, std::span<const std::int32_t> next) {
-        const std::size_t n = tokens.size();
         const std::size_t c = options.prefill_chunk;
-        if (span_tokens == 0 || n > span_tokens) {
+        if (span_tokens == 0 || tokens.size() > span_tokens) {
             throw std::invalid_argument("qwen4_exp forward: tokens exceed the prompt span");
         }
         SequenceState& sequence = sequences.at(s);
-        const std::uint32_t start = sequence.position;
-        if (start + n > options.max_context) {
+        if (sequence.position + tokens.size() > options.max_context) {
             throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
         }
-        const std::size_t chunks = (n + c - 1) / c;
-        const auto last_count    = static_cast<std::uint32_t>(n - (chunks - 1) * c);
-        check_tokens(tokens.subspan((chunks - 1) * c), logit_rows);
-        for (std::size_t k = 0; k + 1 < chunks; ++k) { check_tokens(tokens.subspan(k * c, c), 1); }
+        std::vector<SpanChunk> chunks;
+        for (std::size_t at = 0; at < tokens.size(); at += c) {
+            const auto t = static_cast<std::int32_t>(std::min(c, tokens.size() - at));
+            chunks.push_back({.sequence = &sequence,
+                              .at       = at,
+                              .count    = t,
+                              .first    = sequence.position + std::uint32_t(at),
+                              .tokens   = tokens.subspan(at, std::size_t(t))});
+            check_tokens(chunks.back().tokens, at + c >= tokens.size() ? logit_rows : 1);
+        }
+        const std::size_t last = chunks.size() - 1;
+        run_span(chunks, std::span(&last, 1), logit_rows, &sequence, next);
+    }
+
+    // Several sequences' prompt tokens in one span (Executor::forward_pieces).
+    void forward_pieces(std::span<const PromptPiece> pieces, std::span<const std::int32_t> next) {
+        const std::size_t c = options.prefill_chunk;
+        if (span_tokens == 0) {
+            throw std::invalid_argument("qwen4_exp forward_pieces: prompt spans are off");
+        }
+        if (pieces.empty() || pieces.size() > max_logit_rows) {
+            throw std::invalid_argument("qwen4_exp forward_pieces: 1..max_logit_rows pieces");
+        }
+        std::size_t total = 0;
+        std::vector<SpanChunk> chunks;
+        std::vector<std::size_t> lasts;
+        for (const PromptPiece& piece : pieces) {
+            SequenceState& sequence = sequences.at(piece.sequence);
+            for (const PromptPiece& other : pieces) {
+                if (&other != &piece && other.sequence == piece.sequence) {
+                    throw std::invalid_argument("qwen4_exp forward_pieces: a sequence in two pieces");
+                }
+            }
+            if (piece.tokens.empty() || sequence.position + piece.tokens.size() > options.max_context) {
+                throw std::invalid_argument(
+                    "qwen4_exp forward_pieces: a piece is empty or exceeds max_context");
+            }
+            const std::size_t prompt = sequence.media_rope.size() / 3;
+            if (pieces.size() > 1 && prompt != 0 && sequence.position < prompt) {
+                throw std::invalid_argument(
+                    "qwen4_exp forward_pieces: a media prompt prefills in a span of its own");
+            }
+            for (std::size_t at = 0; at < piece.tokens.size(); at += c) {
+                const auto t = static_cast<std::int32_t>(std::min(c, piece.tokens.size() - at));
+                chunks.push_back({.sequence = &sequence,
+                                  .at       = total + at,
+                                  .count    = t,
+                                  .first    = sequence.position + std::uint32_t(at),
+                                  .tokens   = piece.tokens.subspan(at, std::size_t(t))});
+                check_tokens(chunks.back().tokens, 1);
+            }
+            total += piece.tokens.size();
+            lasts.push_back(chunks.size() - 1);
+        }
+        if (total > span_tokens || next.size() > prompt_step()) {
+            throw std::invalid_argument("qwen4_exp forward_pieces: tokens exceed the prompt span");
+        }
+        run_span(chunks, lasts, 1, &sequences.at(pieces.back().sequence), next);
+    }
+
+    // A prompt span, layer by layer: every chunk passes a layer before any passes the next, so a
+    // wide call's pool copy of the layer's uncached experts serves every chunk. The arithmetic of
+    // each chunk is that of forward() over its sequence. The logits are the last `logit_rows` rows
+    // of each chunk `lasts` names, the chunk's columns in order, chunk after chunk (several chunks
+    // take one row each); `hinted` then hints the rows of `next`.
+    void run_span(std::span<const SpanChunk> chunks, std::span<const std::size_t> lasts,
+                  std::uint32_t logit_rows, const SequenceState* hinted,
+                  std::span<const std::int32_t> next) {
+        const std::size_t n = chunks.back().at + std::size_t(chunks.back().count);
         RankBinding bind(device, 0);
         RankState& rank      = ranks[0];
         const cudaStream_t st = rank.stream;
@@ -3810,10 +3890,7 @@ struct Executor::Impl {
         const auto hc        = static_cast<std::int32_t>(config.hc_count);
         const std::size_t width = std::size_t(hc) * std::size_t(h);
         const auto chunk_stack  = [&](std::size_t k) {
-            return static_cast<float*>(span_stack.p) + k * c * width;
-        };
-        const auto count_of = [&](std::size_t k) {
-            return static_cast<std::int32_t>(std::min(c, n - k * c));
+            return static_cast<float*>(span_stack.p) + chunks[k].at * width;
         };
         settle_routes();
         forget_prefetches();
@@ -3828,33 +3905,38 @@ struct Executor::Impl {
         const std::size_t heads = config.ngram_heads();
         if (reads_rows) { span_row_ids.resize(n * heads); }
         // Which chunks of a media prompt rotate at its three-axis positions (span_mrope).
-        std::vector<char> chunk_mrope(chunks, 0);
-        for (std::size_t k = 0; k < chunks; ++k) {
-            const std::int32_t t = count_of(k);
-            const Part part{.sequence = &sequence, .column = 0, .count = t};
-            stage_inputs(std::span(&part, 1), tokens.subspan(k * c, std::size_t(t)), false);
+        std::vector<char> chunk_mrope(chunks.size(), 0);
+        for (std::size_t k = 0; k < chunks.size(); ++k) {
+            const SpanChunk& chunk = chunks[k];
+            const std::int32_t t   = chunk.count;
+            const std::size_t at   = chunk.at;
+            const Part part{.sequence = chunk.sequence, .column = 0, .count = t};
+            chunk.sequence->position = chunk.first;
+            stage_inputs(std::span(&part, 1), chunk.tokens, false);
             if (reads_rows) {
                 std::copy(row_ids.begin(), row_ids.end(),
-                          span_row_ids.begin() + std::ptrdiff_t(k * c * heads));
+                          span_row_ids.begin() + std::ptrdiff_t(at * heads));
             }
             Tensor mixed(rank.mixed, DType::BF16, {h, t});
             embed(rank, t, mixed);
             Tensor stack(chunk_stack(k), DType::FP32, {h, hc, t});
             ops::hyper_connection_expand(mixed, stack, st);
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_positions.p) + k * c,
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_positions.p) + at,
                                        rank.positions, std::size_t(t) * 4,
                                        cudaMemcpyDeviceToDevice, st));
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_rope.p) + k * c, rank.rope,
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_rope.p) + at, rank.rope,
                                        std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
             if (mrope) {
-                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_mrope.p) + 3 * k * c,
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_mrope.p) + 3 * at,
                                            rank.mrope, 3 * std::size_t(t) * 4,
                                            cudaMemcpyDeviceToDevice, st));
                 chunk_mrope[k] = 1;
             }
-            sequence.position += std::uint32_t(t);
         }
-        sequence.position = start;
+        // Each sequence stands at its first chunk's position until the span ends.
+        for (std::size_t k = chunks.size(); k-- > 0;) {
+            chunks[k].sequence->position = chunks[k].first;
+        }
         if (reads_rows) {
             table->submit(span_row_ids,
                           std::span(static_cast<std::uint8_t*>(span_host_rows->data()),
@@ -3862,13 +3944,30 @@ struct Executor::Impl {
             rows_waited = false;
         }
         // The next step's rows are read while the device runs this span.
-        hint_next(sequence, next);
+        if (hinted != nullptr) { hint_next(*hinted, next); }
+        // The span's expert calls, the same in every layer: the groups and the chunks wider than
+        // kVectorTokens in span order, then the narrower chunks, whose misses enter cache slots
+        // that the layer's pool table may name for the wider calls' experts.
+        struct ExpertCall {
+            std::size_t first = 0, last = 0;
+        };
+        std::vector<ExpertCall> calls;
+        for (std::size_t k = 0; k < chunks.size();) {
+            const std::size_t last = group_end(chunks, k);
+            if (chunks[k].count > kVectorTokens) { calls.push_back({k, last}); }
+            k = last;
+        }
+        const std::size_t wide = calls.size();
+        for (std::size_t k = 0; k < chunks.size(); ++k) {
+            if (chunks[k].count <= kVectorTokens) { calls.push_back({k, k + 1}); }
+        }
+        const SpanChunk& recorded = chunks[calls.back().last - 1];
         void* const own_mixed   = rank.mixed;
         float* const own_inject = rank.inject;
         // Chunk k's MoE input and injection, kept between a layer's two phases.
         const auto chunk_planes = [&](std::size_t k) {
-            rank.mixed  = static_cast<std::byte*>(span_mixed.p) + k * c * std::size_t(h) * 2;
-            rank.inject = static_cast<float*>(span_inject.p) + k * c * std::size_t(hc);
+            rank.mixed  = static_cast<std::byte*>(span_mixed.p) + chunks[k].at * std::size_t(h) * 2;
+            rank.inject = static_cast<float*>(span_inject.p) + chunks[k].at * std::size_t(hc);
         };
         try {
             // Each layer runs in two phases: attention over every chunk of the span, then the
@@ -3876,31 +3975,33 @@ struct Executor::Impl {
             // attention phase runs, so its first expert call rarely waits for them.
             for (std::size_t i = 0; i < layers.size(); ++i) {
                 const LayerPlan& plan = layers[i];
-                LayerState& state     = sequence.layers[i];
                 if (plan.ple && !rows_waited) {
                     await_rows(rank);
                     CUDA_CHECK(cudaMemcpyAsync(span_rows.p, span_host_rows->data(),
                                                n * span_row_bytes, cudaMemcpyHostToDevice, st));
                 }
-                for (std::size_t k = 0; k < chunks; ++k) {
-                    const std::int32_t t = count_of(k);
-                    const Part part{.sequence = &sequence, .column = 0, .count = t};
+                for (std::size_t k = 0; k < chunks.size(); ++k) {
+                    const SpanChunk& chunk = chunks[k];
+                    const std::int32_t t   = chunk.count;
+                    LayerState& state      = chunk.sequence->layers[i];
+                    const Part part{.sequence = chunk.sequence, .column = 0, .count = t};
                     CUDA_CHECK(cudaMemcpyAsync(rank.positions,
-                                               static_cast<std::int32_t*>(span_positions.p) + k * c,
+                                               static_cast<std::int32_t*>(span_positions.p) +
+                                                   chunk.at,
                                                std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
                     CUDA_CHECK(cudaMemcpyAsync(rank.rope,
-                                               static_cast<std::int32_t*>(span_rope.p) + k * c,
+                                               static_cast<std::int32_t*>(span_rope.p) + chunk.at,
                                                std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
                     mrope = chunk_mrope[k] != 0;
                     if (mrope) {
                         CUDA_CHECK(cudaMemcpyAsync(
-                            rank.mrope, static_cast<std::int32_t*>(span_mrope.p) + 3 * k * c,
+                            rank.mrope, static_cast<std::int32_t*>(span_mrope.p) + 3 * chunk.at,
                             3 * std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
                     }
                     if (plan.ple) {
                         CUDA_CHECK(cudaMemcpyAsync(rank.rows,
                                                    static_cast<std::byte*>(span_rows.p) +
-                                                       k * c * span_row_bytes,
+                                                       chunk.at * span_row_bytes,
                                                    std::size_t(t) * span_row_bytes,
                                                    cudaMemcpyDeviceToDevice, st));
                     }
@@ -3919,9 +4020,9 @@ struct Executor::Impl {
                     if (plan.gdn) {
                         run_gdn(plan, i, state, rank, part);
                     } else {
-                        // The span holds the sequence at its start; chunk k begins k chunks on.
+                        // The sequence stands at its first chunk; this chunk begins at its own.
                         AttentionInputs in = target_inputs(i, state, rank, part);
-                        in.first           = start + std::uint32_t(k * c);
+                        in.first           = chunk.first;
                         run_qsa(plan, state, rank, part, in);
                     }
                     {
@@ -3932,13 +4033,14 @@ struct Executor::Impl {
                             &inject, st);
                     }
                 }
-                for (std::size_t k = 0; k < chunks;) {
-                    const std::size_t last = group_end(k, chunks, n, c);
-                    const auto t = static_cast<std::int32_t>(std::min(last * c, n) - k * c);
+                for (std::size_t c = 0; c < calls.size(); ++c) {
+                    const auto [k, last] = calls[c];
+                    const auto t         = static_cast<std::int32_t>(
+                        chunks[last - 1].at + std::size_t(chunks[last - 1].count) - chunks[k].at);
                     rank.stack = chunk_stack(k);
                     chunk_planes(k);
-                    span_hold = last < chunks;
-                    span_last = last == chunks;
+                    span_hold = c + 1 < wide;
+                    span_last = c + 1 == calls.size();
                     Tensor stack(rank.stack, DType::FP32, {h, hc, t});
                     Tensor inject(rank.inject, DType::FP32, {hc, t});
                     if (last == k + 1) {
@@ -3946,53 +4048,60 @@ struct Executor::Impl {
                         ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}),
                                                     inject, st);
                     } else {
-                        run_group(plan, rank, i, k, last, n, c);
+                        run_group(plan, rank, i, chunks, k, last);
                         ops::hyper_connection_write(stack, Tensor(span_y.p, DType::FP32, {h, t}),
                                                     inject, st);
-                        if (last == chunks) {
-                            // record_routes() reads the last chunk's routes from the layer's
-                            // record, where run_moe() leaves them.
+                        if (span_last) {
+                            // record_routes() reads the last call's last chunk's routes from the
+                            // layer's record, where run_moe() leaves them.
                             const auto top = std::size_t(config.num_experts_per_tok);
                             CUDA_CHECK(cudaMemcpyAsync(
                                 route_records[i],
-                                static_cast<std::int32_t*>(span_ids.p) + (chunks - 1 - k) * c * top,
-                                top * std::size_t(count_of(chunks - 1)) * 4,
-                                cudaMemcpyDeviceToDevice, st));
+                                static_cast<std::int32_t*>(span_ids.p) +
+                                    (recorded.at - chunks[k].at) * top,
+                                top * std::size_t(recorded.count) * 4, cudaMemcpyDeviceToDevice,
+                                st));
                         }
                     }
-                    k = last;
                 }
             }
             span_hold   = false;
             span_last   = false;
             rank.mixed  = own_mixed;
             rank.inject = own_inject;
-            // The head reads the last chunk's last rows.
-            rank.stack       = chunk_stack(chunks - 1);
+            // The head reads the last rows of each named chunk, chunk after chunk, so that each
+            // gets the logits forward() leaves for it.
             const auto rows  = static_cast<std::int32_t>(logit_rows);
-            const Tensor last(rank.stack + width * std::size_t(std::int32_t(last_count) - rows),
-                              DType::FP32, {h, hc, rows});
-            Tensor head_mixed(rank.mixed, DType::BF16, {h, rows});
-            {
-                auto scope = rank.workspace->scope();
-                ops::hyper_connection_read(last, final_mixer.weights(), config.rms_norm_eps,
-                                           *rank.workspace, head_mixed, nullptr, st);
+            const auto vocab = static_cast<std::int32_t>(config.vocab_size);
+            for (std::size_t p = 0; p < lasts.size(); ++p) {
+                const SpanChunk& chunk = chunks[lasts[p]];
+                const Tensor last(chunk_stack(lasts[p]) + width * std::size_t(chunk.count - rows),
+                                  DType::FP32, {h, hc, rows});
+                Tensor head_mixed(rank.mixed, DType::BF16, {h, rows});
+                {
+                    auto scope = rank.workspace->scope();
+                    ops::hyper_connection_read(last, final_mixer.weights(), config.rms_norm_eps,
+                                               *rank.workspace, head_mixed, nullptr, st);
+                }
+                Tensor logits(static_cast<std::byte*>(rank.logits) +
+                                  p * std::size_t(rows) * std::size_t(vocab) * 2,
+                              DType::BF16, {vocab, rows});
+                project(head, head_mixed, logits, *rank.workspace, st);
             }
-            Tensor logits(rank.logits, DType::BF16,
-                          {static_cast<std::int32_t>(config.vocab_size), rows});
-            project(head, head_mixed, logits, *rank.workspace, st);
-            sequence.position = start + std::uint32_t(n);
-            record_routes(last_count);
-            // The MTP block catches up chunk by chunk over each chunk's own final stacks.
+            for (const SpanChunk& chunk : chunks) {
+                chunk.sequence->position = chunk.first + std::uint32_t(chunk.count);
+            }
+            record_routes(std::uint32_t(recorded.count));
+            // The MTP block catches up chunk by chunk over each chunk's own final stacks; the
+            // next pass's MTP cells of each sequence start from its last chunk's stack, which it
+            // copied.
             if (mtp) {
-                for (std::size_t k = 0; k < chunks; ++k) {
+                for (std::size_t k = 0; k < chunks.size(); ++k) {
                     rank.stack = chunk_stack(k);
-                    const auto t = count_of(k);
-                    const Committed committed{&sequence, 0, t, start + std::uint32_t(k * c),
-                                              tokens.subspan(k * c, std::size_t(t))};
+                    const Committed committed{chunks[k].sequence, 0, chunks[k].count,
+                                              chunks[k].first, chunks[k].tokens};
                     mtp_catch_up(std::span(&committed, 1));
                 }
-                // The next pass's MTP cells start from the last chunk's stack, which it copied.
             }
         } catch (...) {
             rank.stack  = own_stack;
@@ -5173,6 +5282,13 @@ std::uint32_t Executor::position(std::uint32_t sequence) const {
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                        std::uint32_t logit_rows, std::span<const std::int32_t> next) {
     impl_->forward(sequence, tokens, logit_rows, next);
+}
+
+bool Executor::packs_prompts() const noexcept { return impl_->span_tokens != 0; }
+
+void Executor::forward_pieces(std::span<const PromptPiece> pieces,
+                              std::span<const std::int32_t> next) {
+    impl_->forward_pieces(pieces, next);
 }
 
 void Executor::forward_branches(std::uint32_t sequence, const SequenceSnapshot& at,

@@ -10,7 +10,8 @@
 // from none to all): fixed-mode repeats must match; differences from plain
 // decode or another batch composition are reported. After plain steps of two sequences at once,
 // which advance the MTP block by its catch-up alone, drafts must survive at least half as often
-// as after the prompts. The context cache's
+// as after the prompts. Prompts of several sequences packed in one span (host or disk experts on
+// one device) must leave each piece the logits it gets alone, bit for bit. The context cache's
 // sequence images (live and at a snapshot) must continue as the sequence they were taken from.
 //
 //   NINFER_QWEN4_EXP_ARTIFACT  the model's .ninfer (required; skips without it)
@@ -290,6 +291,108 @@ int check_batch_and_snapshot(const Model& model, DeviceContext& device, Executor
     const bool same  = before == after && before == alone[0];
     std::cout << (same ? "OK   " : "FAIL ") << "restored sequence continues as before\n";
     failures += same ? 0 : 1;
+    return failures;
+}
+
+// How two logit vectors differ: the positions that differ and the largest difference.
+std::string difference(const std::vector<__nv_bfloat16>& a, const std::vector<__nv_bfloat16>& b) {
+    std::size_t count = 0;
+    float largest     = 0.0F;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const float x = __bfloat162float(a[i]);
+        const float y = __bfloat162float(b[i]);
+        if (std::memcmp(&a[i], &b[i], 2) != 0) {
+            ++count;
+            largest = std::max(largest, std::fabs(x - y));
+        }
+    }
+    return " (" + std::to_string(count) + " logits differ, by up to " + std::to_string(largest) +
+           ")";
+}
+
+// Prompts of several sequences in one span, as the Engine packs prompt steps with host or disk
+// experts on one device: each piece's logits must equal those of its prompt fed alone bit for bit,
+// and each sequence must then decode as it did alone. The pieces take one to two chunks, one is a
+// few tokens (the decode form of the experts) between others, and one stops at a chunk boundary of
+// its prompt, whose rest is fed alone after the span.
+int check_packed_prompts(const Model& model, DeviceContext& device, ExecutorOptions options) {
+    options.sequences = 4;
+    Executor executor(model, device, options);
+    if (!executor.packs_prompts()) {
+        std::cout << "packed prompts: not checked (no prompt spans)\n";
+        return 0;
+    }
+    const std::uint32_t c = options.prefill_chunk;
+    const std::array<std::size_t, 4> lengths = {c + c / 2 + 3, 2 * c + c / 3, c / 2 + 1, 6};
+    std::vector<std::vector<std::int32_t>> prompts;
+    for (std::size_t s = 0; s < lengths.size(); ++s) {
+        std::string text = "<|im_start|>user\nWhich room was warmest? Answer with its number.\n";
+        for (std::size_t i = 0; i < lengths[1] / 8 + 16; ++i) {
+            text += "Reading " + std::to_string(s * 1000 + i) + ": room " +
+                    std::to_string((s * 7 + i * 3) % 23) + " stood at " +
+                    std::to_string((s * 13 + i * 37) % 41) + " degrees.\n";
+        }
+        const auto ids = model.resources().tokenizer->encode(text, {.parse_added_tokens = true});
+        if (ids.size() < lengths[s]) { throw std::runtime_error("packed prompts: short fixture"); }
+        prompts.emplace_back(ids.begin(), ids.begin() + std::ptrdiff_t(lengths[s]));
+    }
+    constexpr int kSteps = 8;
+    const std::size_t vocab = model.config().vocab_size;
+    std::vector<__nv_bfloat16> logits(vocab);
+    std::vector<std::vector<__nv_bfloat16>> alone_logits;
+    std::vector<std::vector<int>> alone;
+    for (std::uint32_t s = 0; s < prompts.size(); ++s) {
+        executor.reset(s);
+        executor.forward(s, prompts[s], 1);
+        read_logits(executor, logits);
+        alone_logits.push_back(logits);
+        alone.push_back(decode_alone(executor, model, s,
+                                     argmax(logits, model.resources().public_token_count), kSteps,
+                                     logits));
+    }
+    // Sequence 2 (one chunk), 3 (six tokens), 0 (two chunks) and the first two chunks of 1.
+    for (std::uint32_t s = 0; s < prompts.size(); ++s) { executor.reset(s); }
+    const std::array<std::uint32_t, 4> order = {2, 3, 0, 1};
+    std::vector<PromptPiece> pieces;
+    for (const std::uint32_t s : order) {
+        const std::size_t n = s == 1 ? 2 * std::size_t(c) : prompts[s].size();
+        pieces.push_back({.sequence = s, .tokens = std::span(prompts[s]).first(n)});
+    }
+    executor.forward_pieces(pieces);
+    std::vector<__nv_bfloat16> packed(vocab * pieces.size());
+    if (cudaStreamSynchronize(executor.head_stream()) != cudaSuccess ||
+        cudaMemcpy(packed.data(), executor.logits(std::uint32_t(pieces.size())).data,
+                   packed.size() * 2, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        throw std::runtime_error("reading the packed logits failed");
+    }
+    const std::size_t domain = model.resources().public_token_count;
+    int failures = 0;
+    std::array<int, 4> firsts{};
+    for (std::size_t p = 0; p < order.size(); ++p) {
+        const std::uint32_t s = order[p];
+        const std::vector<__nv_bfloat16> column(packed.begin() + std::ptrdiff_t(p * vocab),
+                                                packed.begin() + std::ptrdiff_t((p + 1) * vocab));
+        firsts[s] = argmax(column, domain);
+        if (s == 1) { continue; }
+        const bool same = std::memcmp(column.data(), alone_logits[s].data(), vocab * 2) == 0;
+        std::cout << (same ? "OK   " : "FAIL ") << "packed piece logits equal alone, sequence "
+                  << s << ", " << prompts[s].size() << " tokens"
+                  << (same ? std::string() : difference(column, alone_logits[s])) << '\n';
+        failures += same ? 0 : 1;
+    }
+    executor.forward(1, std::span(prompts[1]).subspan(2 * std::size_t(c)), 1);
+    read_logits(executor, logits);
+    const bool rest = std::memcmp(logits.data(), alone_logits[1].data(), vocab * 2) == 0;
+    std::cout << (rest ? "OK   " : "FAIL ") << "prompt continued after a packed piece equals alone"
+              << (rest ? std::string() : difference(logits, alone_logits[1])) << '\n';
+    failures += rest ? 0 : 1;
+    firsts[1] = argmax(logits, domain);
+    for (std::uint32_t s = 0; s < prompts.size(); ++s) {
+        const bool same = decode_alone(executor, model, s, firsts[s], kSteps, logits) == alone[s];
+        std::cout << (same ? "OK   " : "FAIL ") << "sequence " << s
+                  << " decodes after a packed prompt as alone\n";
+        failures += same ? 0 : 1;
+    }
     return failures;
 }
 
@@ -781,6 +884,7 @@ int run(const char* artifact_path) {
     int failures = 0;
     const auto replayed = generate(*model, device, options, prompts, failures);
     failures += check_batch_and_snapshot(*model, device, options);
+    failures += check_packed_prompts(*model, device, options);
     failures += check_images(*model, device, options, prompts, replayed);
     if (load.mtp) {
         ExecutorOptions speculative = options;
