@@ -1,5 +1,6 @@
 // Captured per-step hints consume replay-time tokens, report host failures after the GPU join,
-// and recover on the next window without changing committed contexts or demand-read counters.
+// and recover on the next window without changing committed contexts or demand-read counters; a
+// host hint of a row's drafts at once (DFlash2) reads only the drafts it is given.
 #include "models/qwen4_exp/ngram_draft_prefetch.h"
 
 #include "core/decode_graph.h"
@@ -148,6 +149,28 @@ void run() {
                 require(rejected == invalid, "verification hint did not consume this replay's inputs");
                 value = saved;
             }
+            }
+            // A drafter that proposes a row's drafts at once (DFlash2) hints them on the host.
+            {
+                constexpr std::size_t stride = 7;
+                std::vector<std::int32_t> drafts(batch * stride);
+                for (std::size_t i = 0; i < drafts.size(); ++i) {
+                    drafts[i] = i % 4 == 0 ? eos : static_cast<std::int32_t>((5 * i) % 63);
+                }
+                prefetch.begin(contexts, anchors);
+                prefetch.hint(drafts, stride, stride);
+                prefetch.begin(contexts, anchors);
+                prefetch.hint(drafts, stride, 3);
+                for (const bool short_rows : {true, false}) {
+                    bool refused = false;
+                    try {
+                        prefetch.hint(std::span<const std::int32_t>(drafts).first(
+                                          short_rows ? drafts.size() - 1 : drafts.size()),
+                                      stride, short_rows ? 3 : stride + 1);
+                    } catch (const std::invalid_argument&) { refused = true; }
+                    require(refused, short_rows ? "hint read past the drafts it was given"
+                                                : "hint took more steps than a row holds");
+                }
             }
             // Return to a draft window after the verification layout used the same slots.
             stage();

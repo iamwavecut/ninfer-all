@@ -9,6 +9,7 @@ target_sources(ninfer_model_loading PRIVATE
 )
 target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/executor.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/dflash2.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/ngram_draft_prefetch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/hybrid_experts.cpp"

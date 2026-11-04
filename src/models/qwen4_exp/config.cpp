@@ -1,5 +1,8 @@
 #include "models/qwen4_exp/config.h"
 
+#include "models/qwen3_5/draft_config.h"
+
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -197,6 +200,30 @@ MtpConfig parse_mtp_config(const Json& value, const TextConfig& text) {
     if (out.num_experts < text.num_experts_per_tok || out.num_experts > 512) {
         throw ArtifactError("the MTP block keeps " + std::to_string(out.num_experts) +
                             " experts; this engine implements 10 to 512");
+    }
+    return out;
+}
+
+DFlash2Config parse_dflash2_config(const Json& value, const TextConfig& text) {
+    DFlash2Config out = qwen3_5::parse_draft_config(
+        value, {text.hidden_size, text.vocab_size, text.num_hidden_layers}, true);
+    const auto& extra = out.dflash2.value();
+    // The drafter's Ops: sliding-window attention of 32 query and 8 KV heads of 128 over a window
+    // of 2048 or 4096, the conditional selector's 16 candidates of rank 256 over this vocabulary,
+    // the dynamic convolution's two taps in groups of 16, and a ring per local layer.
+    const bool local = std::all_of(out.layer_types.begin(), out.layer_types.end(), [](auto kind) {
+        return kind == qwen3_5::DraftAttentionKind::SlidingAttention;
+    });
+    if (!local || !out.sliding_window ||
+        (*out.sliding_window != 2048 && *out.sliding_window != 4096) ||
+        out.attention.head_dim != 128 || out.attention.num_attention_heads != 32 ||
+        out.attention.num_key_value_heads != 8 || extra.conv_kernel_size != 2 ||
+        extra.conv_group_size != 16 || extra.selector_rank != 256 || extra.selector_top_k != 16 ||
+        text.vocab_size != 248320 || out.num_hidden_layers == 0 || out.num_hidden_layers > 8) {
+        throw ArtifactError("Qwen4Exp DFlash2 config: the drafter's geometry is outside the one "
+                            "this engine implements (1-8 sliding-window layers of 32x8 heads of "
+                            "128 over 2048 or 4096 positions, 2-tap convolutions in groups of 16, "
+                            "a 16-candidate selector of rank 256)");
     }
     return out;
 }

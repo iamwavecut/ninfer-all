@@ -59,12 +59,15 @@ int run_tests() {
                          "--draft-tokens", "4", "--draft-min-p", floor});
         }), "CLI accepted invalid draft confidence");
     }
-    for (const auto* backend : {"dflash", "dflash2"}) {
-        failures += check(rejects([&] {
-            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", backend,
-                         "--draft-tokens", "4", "--draft-min-p", "0.3"});
-        }), "CLI accepted draft confidence outside MTP");
-    }
+    failures += check(rejects([&] {
+        (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dflash",
+                     "--draft-tokens", "4", "--draft-min-p", "0.3"});
+    }), "CLI accepted draft confidence outside MTP and DFlash2");
+    // Qwen3.8-Flash-Next's DFlash2 drafter verifies through its first draft at or below the floor.
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dflash2",
+                             "--draft-tokens", "4", "--draft-min-p", "0.3"})
+                              .speculative.draft_min_p == 0.3f,
+                      "CLI did not preserve the DFlash2 confidence floor");
     // Without --spec the floor is kept for the MTP the Engine chooses, zero included.
     for (const auto* floor : {"0", "0.3"}) {
         const auto automatic =

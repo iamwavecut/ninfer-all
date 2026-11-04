@@ -376,12 +376,15 @@ void hybrid_test(const char* artifact) {
 
 // At floor one, a wider draft chain must stop after, and verify exactly, the same first draft as
 // K=1. Repeated requests exercise the per-step graphs' capture and replay, width-specific
-// verification graphs, logprob strides and recovery. Without --spec, host experts draft
-// kAutomaticDraftTokens a round with the floor kAutomaticDraftMinP, or the one --draft-min-p sets
-// (zero: the whole chain).
+// verification graphs, logprob strides and recovery. Without --spec, host experts draft with the
+// DFlash2 drafter of an artifact that carries one, kAutomaticDFlash2Tokens a round with the floor
+// kAutomaticDFlash2MinP, else with the MTP block, kAutomaticDraftTokens a round with the floor
+// kAutomaticDraftMinP; --draft-min-p sets another floor (zero: the whole window). DFlash2 drafts
+// at most seven tokens a round.
 void draft_confidence_test(const char* artifact) {
     const auto input = tokens(128, 47);
     std::vector<ninfer::TokenId> one_draft;
+    bool carries_dflash2 = false;
     struct Case {
         unsigned drafts;
         std::optional<float> floor;
@@ -402,10 +405,16 @@ void draft_confidence_test(const char* artifact) {
         const unsigned drafts = resolved.draft_tokens;
         const float floor     = resolved.draft_min_p.value_or(0.0F);
         if (c.automatic) {
-            check(resolved.backend == ninfer::SpeculativeBackend::Mtp &&
-                      drafts == ninfer::SpeculativeOptions::kAutomaticDraftTokens &&
-                      floor == c.floor.value_or(ninfer::SpeculativeOptions::kAutomaticDraftMinP),
-                  "host experts draft with the automatic width, and its floor unless one is set");
+            using ninfer::SpeculativeOptions;
+            const bool dflash2 = resolved.backend == ninfer::SpeculativeBackend::DFlash2;
+            carries_dflash2    = carries_dflash2 || dflash2;
+            check((dflash2 || resolved.backend == ninfer::SpeculativeBackend::Mtp) &&
+                      drafts == (dflash2 ? SpeculativeOptions::kAutomaticDFlash2Tokens
+                                         : SpeculativeOptions::kAutomaticDraftTokens) &&
+                      floor == c.floor.value_or(dflash2 ? SpeculativeOptions::kAutomaticDFlash2MinP
+                                                        : SpeculativeOptions::kAutomaticDraftMinP),
+                  "host experts draft with the automatic drafter's width, and its floor unless "
+                  "one is set");
         }
         auto r = request(64);
         r.execution.logprobs = true;
@@ -419,7 +428,7 @@ void draft_confidence_test(const char* artifact) {
             check(result.generated_token_ids == expected && expected.size() == 64 &&
                       result.finish_reason == ninfer::FinishReason::OutputLimit,
                   "draft confidence repeats with width-specific graphs");
-            check(result.speculative.rounds > 0, "confidence check actually ran MTP");
+            check(result.speculative.rounds > 0, "confidence check actually drafted");
             if (floor == 1) {
                 check(result.generated_token_ids == one_draft,
                       "floor one agrees with K=1 including committed recurrent/MTP state");
@@ -446,6 +455,19 @@ void draft_confidence_test(const char* artifact) {
             check(engine.generate(engine.prepare_tokens(input), r).generated_token_ids == expected,
                   "variable-width generation recovers after cancellation");
         }
+    }
+    if (carries_dflash2) {
+        auto o                = options(artifact, 8);
+        o.devices             = {0};
+        o.expert_residency    = ninfer::ExpertResidency::Host;
+        o.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
+        bool refused          = false;
+        try {
+            ninfer::Engine invalid(o);
+        } catch (const std::exception& error) {
+            refused = std::string_view(error.what()).find("1 to 7") != std::string_view::npos;
+        }
+        check(refused, "--spec dflash2 refuses eight drafts a round");
     }
     // Different confidence prefixes and output budgets verify their rows packed at their own
     // widths, down to the anchor alone; a request that gathers logprobs keeps every row at the
@@ -596,7 +618,7 @@ void draft_confidence_test(const char* artifact) {
                 o.context_cache.enabled = true;
                 ninfer::Engine engine(o);
                 const bool drafting =
-                    engine.options().speculative.backend == ninfer::SpeculativeBackend::Mtp;
+                    engine.options().speculative.backend != ninfer::SpeculativeBackend::None;
                 check(drafting == (!disk || run.drafts > 0),
                       "the Engine drafts for host experts, for disk experts only under --spec");
                 const auto startup = engine.memory_summary();

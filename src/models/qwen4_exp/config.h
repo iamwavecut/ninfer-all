@@ -5,6 +5,7 @@
 // required, and the shapes this engine implements are the only ones accepted.
 
 #include "artifact/schema.h"
+#include "models/qwen3_5/config.h"
 #include "models/qwen4_exp/ngram_hash.h"
 
 #include <array>
@@ -75,9 +76,15 @@ struct MtpConfig {
     std::uint32_t num_experts = 0;
 };
 
+// The DFlash2 drafter (the artifact's `dflash2` component, docs/maintainer/dflash.md): Qwen3.5's
+// draft config, conditioned on this model's completed blocks (the mean of their four streams).
+using DFlash2Config = qwen3_5::DraftConfig;
+
 // Throws artifact::ArtifactError naming the field that is missing, malformed or outside the
 // implemented geometry.
 [[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
 [[nodiscard]] MtpConfig parse_mtp_config(const artifact::Json& value, const TextConfig& text);
+[[nodiscard]] DFlash2Config parse_dflash2_config(const artifact::Json& value,
+                                                 const TextConfig& text);
 
 } // namespace ninfer::models::qwen4_exp

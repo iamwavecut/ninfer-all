@@ -1,6 +1,7 @@
 #include "models/qwen3_5/config.h"
 
 #include "artifact/schema.h"
+#include "models/qwen3_5/draft_config.h"
 
 #include <algorithm>
 #include <cmath>
@@ -208,7 +209,7 @@ VisionConfig vision(const Json& value) {
     return out;
 }
 
-DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
+DraftConfig draft(const Json& value, const DraftTarget& target, bool dflash2) {
     require_members(value,
                     {"architectures", "model_type", "intermediate_size", "num_attention_heads",
                      "num_key_value_heads", "head_dim", "num_hidden_layers",
@@ -284,6 +285,10 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
 }
 
 } // namespace
+
+DraftConfig parse_draft_config(const Json& value, const DraftTarget& target, bool dflash2) {
+    return draft(value, target, dflash2);
+}
 
 VisionConfig parse_vision_config(const artifact::Directory& directory) {
     return vision(directory.component("vision").config);
@@ -385,7 +390,9 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (options.speculative == SpeculativeBackend::DFlash ||
             options.speculative == SpeculativeBackend::DFlash2) {
             out.draft = draft(companion(directory, options.speculative_component()).config,
-                              out.text, options.speculative == SpeculativeBackend::DFlash2);
+                              {out.text.hidden_size, out.text.vocab_size,
+                               out.text.num_hidden_layers},
+                              options.speculative == SpeculativeBackend::DFlash2);
         }
         return out;
     } catch (const std::exception& error) {

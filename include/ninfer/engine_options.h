@@ -40,9 +40,11 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP, DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
-    // Flash-Next MTP: end drafting and verification at the first draft whose absolute probability
-    // is at or below this floor. Zero keeps the full window. Unset keeps it with --spec mtp, and
-    // is kAutomaticDraftMinP when the Engine chooses MTP (automatic).
+    // Qwen3.8-Flash-Next: MTP ends drafting and verification at the first draft whose absolute
+    // probability is at or below this floor; DFlash2 verifies through the first draft whose
+    // selector confidence is at or below it. Zero keeps the full window. Unset keeps it with
+    // --spec, and is kAutomaticDraftMinP when the Engine chooses MTP (automatic) and
+    // kAutomaticDFlash2MinP when it chooses DFlash2.
     std::optional<float> draft_min_p;
     // DeepSeek-V4.1 DSpark: verify a round's drafts up to the first its confidence head scores below
     // this, in [0,1]; 0 keeps every draft. Unset keeps the drafter's default floor (0.5).
@@ -69,15 +71,19 @@ struct SpeculativeOptions {
     // its query instead of the whole history; target verification keeps full attention, so the
     // committed tokens do not depend on it. Zero reads the whole history.
     std::uint32_t mtp_attention_window = 0;
-    // The backend was left to the Engine (no --spec): a MoE model whose artifact carries its MTP
-    // block or assistant drafts with it, kAutomaticDraftTokens a round, since a verification
-    // window's routes share the layer's missing experts: Qwen3.8-Flash-Next with host experts
-    // (ending a round's drafting at its first draft at or below kAutomaticDraftMinP), Gemma 4
-    // with host or disk experts; others run without drafts. The Engine's options() report the
+    // The backend was left to the Engine (no --spec): a MoE model whose artifact carries a drafter
+    // drafts with it, since a verification window's routes share the layer's missing experts:
+    // Qwen3.8-Flash-Next with host experts with its DFlash2 drafter, kAutomaticDFlash2Tokens a
+    // round verified through the first draft at or below kAutomaticDFlash2MinP, or without one
+    // with its MTP block, kAutomaticDraftTokens a round ending at the first draft at or below
+    // kAutomaticDraftMinP; Gemma 4 with host or disk experts with its assistant,
+    // kAutomaticDraftTokens a round; others run without drafts. The Engine's options() report the
     // resolved backend.
     bool automatic = false;
-    static constexpr std::uint32_t kAutomaticDraftTokens = 3;
-    static constexpr float kAutomaticDraftMinP           = 0.5F;
+    static constexpr std::uint32_t kAutomaticDraftTokens   = 3;
+    static constexpr float kAutomaticDraftMinP             = 0.5F;
+    static constexpr std::uint32_t kAutomaticDFlash2Tokens = 4;
+    static constexpr float kAutomaticDFlash2MinP           = 0.7F;
 };
 
 enum class DiagnosticLevel : std::uint8_t {

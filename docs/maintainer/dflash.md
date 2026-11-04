@@ -3,8 +3,9 @@
 DFlash backends propose several tokens with one masked-block forward, conditioned on committed
 target hidden features. The target verifies the proposal causally and remains the output authority.
 NInfer implements DFlash and DFlash2 as optional components of the
-[Qwen3.5 model](qwen3_5-model.md). Their private config and bindings select the stored weights;
-startup chooses one backend, draft width and proposal head.
+[Qwen3.5 model](qwen3_5-model.md), and DFlash2 as one of
+[Qwen3.8-Flash-Next](qwen4-exp-model.md) ([below](#qwen38-flash-next)). Their private config and
+bindings select the stored weights; startup chooses one backend, draft width and proposal head.
 
 This reference owns model mathematics, proposal distributions and backend state. Scheduling,
 publication and common transactions are defined by [Engine architecture](engine-architecture.md).
@@ -297,6 +298,59 @@ Device fork, turn checkpoints, Host replicas and restore carry the backend conte
 target state and continuation metadata. Their coverage must agree. These rules are shared with
 [context scheduling](resource-scheduling-and-context-cache.md) and
 [ReplaySSM](replayssm-gdn.md).
+
+## Qwen3.8-Flash-Next
+
+Qwen3.8-Flash-Next carries its DFlash2 drafter as an optional `dflash2` component beside the text
+model, which `--spec dflash2` loads and drafts with. The drafter shares the mathematics above with
+this geometry:
+
+| Quantity | Flash-Next DFlash2 |
+|---|---:|
+| Hidden width H | 2560 (the target's) |
+| Draft layers | 5, all local |
+| Intermediate width | 7680 |
+| Q heads / KV heads / head dimension | 32 / 8 / 128 |
+| Target block IDs | `[5,15,25,35,45]` |
+| Sliding-window scalar S | 2048 |
+| Norm epsilon / RoPE theta | `1e-6` / `1e4` |
+| Dynamic convolution | Two taps, group width 16 |
+| Candidate selector | Top-16 conditional path, rank 256 |
+
+The target's residual is a hyper-connection stack of four FP32 streams. The feature of block l at
+position t is the streams' mean once block l's MoE output is written into them, rounded to BF16
+(`hyper_connection_stream_mean`); the five blocks' features are concatenated in recorded order. The
+published drafter, nazeshinjite's Q4_0 GGUF of incoai's release, keeps every matrix in its stored
+Q4_0 blocks, which Linear runs as stored; its norms and convolution bases are BF16 (the GGUF's F32
+words are BF16 values) and its codebooks are Q4_0 rows the selector gathers
+([`candidate_selector.h`](../../include/ninfer/ops/candidate_selector.h)). Each layer's context
+K/V projections bind the layer's own K/V objects. `scripts/pods/attach_dflash2.py` appends the
+component to a converted artifact without changing its other bytes. The config accepts one to eight
+local layers over a window of 2048 or 4096 with the heads, convolution and selector listed.
+
+The executor ([`executor.cpp`](../../src/models/qwen4_exp/executor.cpp)) owns the features, the
+rings and every input word; [`dflash2.cpp`](../../src/models/qwen4_exp/dflash2.cpp) holds the
+operands and the two calls:
+
+- A pass captures each tapped block's features for the columns it may commit: a prompt chunk's last
+  S positions, a decode step's and a verification's columns. A commit materializes the kept
+  columns' context K/V into the sequence's ring lane at once, so no features stay pending across a
+  round; a span of several prompts materializes each sequence's last S positions after the span.
+- Each draft layer has one ring of every sequence's lane: 5 layers * (2-byte K + 2-byte V) * 8 heads
+  * 128 * 2048 = 40 MiB a sequence. Snapshots and context images carry the lane beside the target
+  state; a restored sequence drafts again only with its lane.
+- A round's proposal runs the masked block of K + 1 columns at positions F..F+K for every drafting
+  sequence at once (K at most 7: incoai's drafter predicts blocks of 8 positions, its config's
+  `block_size`, and a wider round verifies more than eight columns on a slower route; ten drafts on
+  two RTX 3090s decoded at 74 tok/s against 177 with seven), the target's head over the K mask
+  columns, the logits' top 16 (`candidate_topk`) and the selector's greedy walk. The acceptance is
+  the coupled one MTP uses, so every committed token is the target's own draw at any temperature,
+  and q is not read. `--draft-min-p P` verifies through the first draft whose selector confidence
+  (its candidate's weight in the softmax of its 16 edges at temperature 1) is at or below P.
+- A single sequence's proposal replays the CUDA Graph of its block width, and a commit's context
+  call the graph of its run length; the warm-up captures both, so a request takes no device memory
+  for them. A round of several sequences runs both calls eagerly.
+- Pipeline stages are refused. With tensor parallelism the drafter runs on the head's device.
 
 ## Execution flow
 

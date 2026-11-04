@@ -116,4 +116,35 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
                                      Tensor& residual, WorkspaceArena& workspace,
                                      cudaStream_t stream);
 
+/**
+ * Op: dynamic_grouped_conv
+ *
+ * One side of the dynamic grouped convolution over coefficients a separate Linear call projected
+ * (a drafter whose projections are not the fused routes' Q8, docs/maintainer/dflash.md). For hidden
+ * width H = 16 G, h = 16 g + j, block columns i of W and rows b of B, and side s:
+ *
+ *     y[h,i,b] = (base_kernel[h,0,s] + coefficients[(2 s + 0) G + g, i, b]) * x[h,i,b]
+ *              + I(i>0) * (base_kernel[h,1,s] + coefficients[(2 s + 1) G + g, i, b]) * x[h,i-1,b]
+ *
+ * Side 0 writes out[h,i,b] = bf16(y), the branch's prepared input; side 1 adds y to the residual
+ * in place, out[h,i,b] = bf16(out[h,i,b] + y). Position zero has no previous tap: the Op never reads
+ * another row or an earlier round.
+ *
+ * Logical shapes / supported domain:
+ *   H is a positive multiple of 16, W is in [1,16] and B in [1,8]. x is contiguous BF16 or FP32
+ *   [H,W,B]; coefficients is contiguous FP32 or BF16 [4G,W,B] (rows (2 s + t) G + g, as the kernel
+ *   projection's rows are stored); base_kernel is contiguous BF16 [H,2,2] with axes
+ *   [channel,tap,side]; out is contiguous BF16 [H,W,B] and overlaps no input.
+ *
+ * Numeric:
+ *   The oracle evaluates y (and the side-1 sum) in FP64 from the represented inputs; out is
+ *   compared after its BF16 store. The FP32 evaluation order is the implementation's.
+ *
+ * Effects:
+ *   Writes every element of out (side 0) or updates it (side 1); inputs are unchanged. No
+ *   workspace or persistent state.
+ */
+void dynamic_grouped_conv(const Tensor& x, const Tensor& coefficients, const Tensor& base_kernel,
+                          std::int32_t side, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops

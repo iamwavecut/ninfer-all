@@ -122,6 +122,23 @@ struct MtpWeights {
     HyperConnectionWeights final_mixer;
 };
 
+// The DFlash2 drafter (docs/maintainer/dflash.md): the feature projection with its context norm,
+// the sliding-window layers (each with the query block's projections, the context's K/V uses of
+// the same matrices, the q/k norms, the dense SwiGLU and a dynamic convolution around each branch)
+// and the conditional selector. The token embedding and the head are the text model's.
+struct DFlash2LayerWeights {
+    WeightId input_norm, post_attention_norm;
+    WeightId query, key, value, context_key, context_value, query_norm, key_norm, output;
+    WeightId gate, up, down;
+    WeightId attention_base, attention_projection, mlp_base, mlp_projection;
+};
+
+struct DFlash2Weights {
+    WeightId feature_projection, context_norm, final_norm;
+    WeightId selector_projection, predecessor_codebook, successor_codebook;
+    std::vector<DFlash2LayerWeights> layers;
+};
+
 struct LoadOptions {
     // The artifact's entry file; its part files sit next to it.
     std::filesystem::path artifact;
@@ -136,6 +153,9 @@ struct LoadOptions {
     // Loads the MTP block the artifact carries (its `mtp` component) onto the last stage's device,
     // beside the head it shares; its experts take the text layers' residency.
     bool mtp = false;
+    // Loads the DFlash2 drafter the artifact carries (its `dflash2` component) onto the device of
+    // the head, which it reads, as it reads the token embedding.
+    bool dflash2 = false;
     // Tensor parallelism (`--tensor-parallel`): each rank's relative share of every layer, one
     // positive weight per rank; empty for none. Each rank holds a run of every Gated DeltaNet
     // layer's heads, of the sparse-attention layers' KV heads (as far as the two allow) and of the
@@ -195,6 +215,15 @@ public:
         return mtp_weights_;
     }
 
+    // The DFlash2 drafter when the model was loaded with it.
+    [[nodiscard]] const std::optional<DFlash2Config>& dflash2_config() const noexcept {
+        return dflash2_config_;
+    }
+
+    [[nodiscard]] const std::optional<DFlash2Weights>& dflash2_weights() const noexcept {
+        return dflash2_weights_;
+    }
+
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
 
     // The artifact's files, in its order (disk-resident experts are read from them).
@@ -238,6 +267,8 @@ private:
     std::optional<qwen3_5::VisionWeights> vision_weights_;
     std::optional<MtpConfig> mtp_config_;
     std::optional<MtpWeights> mtp_weights_;
+    std::optional<DFlash2Config> dflash2_config_;
+    std::optional<DFlash2Weights> dflash2_weights_;
     std::vector<TensorShare> shares_; // by rank under tensor parallelism
 };
 

@@ -46,7 +46,7 @@ bool overlaps(const Range& lhs, const Range& rhs) {
 
 void require_nonoverlap(const Tensor& candidate_ids, const Tensor& unary_scores,
                         const Tensor& projected_hidden, const Tensor& anchors,
-                        const Tensor& predecessor_codebook, const Tensor& successor_codebook,
+                        const detail::SelectorCodebooks& codebooks,
                         const Tensor& base_positions, const SamplingConfig* configs,
                         const Tensor& drafts, const Tensor& proposal_q) {
     const std::array<Range, 10> ranges{{
@@ -54,8 +54,8 @@ void require_nonoverlap(const Tensor& candidate_ids, const Tensor& unary_scores,
         {unary_scores.data, unary_scores.bytes(), "unary_scores"},
         {projected_hidden.data, projected_hidden.bytes(), "projected_hidden"},
         {anchors.data, anchors.bytes(), "anchors"},
-        {predecessor_codebook.data, predecessor_codebook.bytes(), "predecessor_codebook"},
-        {successor_codebook.data, successor_codebook.bytes(), "successor_codebook"},
+        {codebooks.predecessor, codebooks.bytes, "predecessor_codebook"},
+        {codebooks.successor, codebooks.bytes, "successor_codebook"},
         {base_positions.data, base_positions.bytes(), "base_positions"},
         {configs, static_cast<std::size_t>(candidate_ids.ne[2]) * sizeof(SamplingConfig),
          "configs"},
@@ -90,12 +90,13 @@ std::size_t candidate_selector_path_workspace_capacity_bytes(int min_steps, int 
     return layout.peak_bytes();
 }
 
-void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
-                             const Tensor& projected_hidden, const Tensor& anchors,
-                             const Tensor& predecessor_codebook, const Tensor& successor_codebook,
-                             const Tensor& base_positions, const SamplingConfig* configs,
-                             Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                             cudaStream_t stream) {
+namespace {
+
+void select_path(const Tensor& candidate_ids, const Tensor& unary_scores,
+                 const Tensor& projected_hidden, const Tensor& anchors,
+                 const detail::SelectorCodebooks& codebooks, const Tensor& base_positions,
+                 const SamplingConfig* configs, Tensor& drafts, Tensor& proposal_q,
+                 Tensor* confidence, WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t batch_size = candidate_ids.ne[2];
     const std::int32_t kSteps     = candidate_ids.ne[1];
     if (kSteps < 1 || kSteps > 15)
@@ -107,22 +108,75 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
     require_tensor(unary_scores, DType::FP32, kCandidates, kSteps, batch_size, 1, "unary_scores");
     require_tensor(projected_hidden, DType::BF16, kRank, kSteps, batch_size, 1, "projected_hidden");
     require_tensor(anchors, DType::I32, batch_size, 1, 1, 1, "anchors");
-    require_tensor(predecessor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
-                   "predecessor_codebook");
-    require_tensor(successor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
-                   "successor_codebook");
     require_tensor(base_positions, DType::I32, batch_size, 1, 1, 1, "base_positions");
     require_tensor(drafts, DType::I32, kSteps, batch_size, 1, 1, "drafts");
     require_tensor(proposal_q, DType::FP32, kCandidates, kSteps, batch_size, 1, "proposal_q");
     if (!aligned_to(configs, alignof(SamplingConfig))) {
         throw std::invalid_argument("candidate_selector_path: invalid configs");
     }
-    require_nonoverlap(candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
-                       successor_codebook, base_positions, configs, drafts, proposal_q);
+    require_nonoverlap(candidate_ids, unary_scores, projected_hidden, anchors, codebooks,
+                       base_positions, configs, drafts, proposal_q);
+    if (confidence != nullptr) {
+        require_tensor(*confidence, DType::FP32, kSteps, batch_size, 1, 1, "confidence");
+        const Range out{confidence->data, confidence->bytes(), "confidence"};
+        for (const Tensor* other : {&candidate_ids, &unary_scores, &projected_hidden, &anchors,
+                                    &base_positions, static_cast<const Tensor*>(&drafts),
+                                    static_cast<const Tensor*>(&proposal_q)}) {
+            if (overlaps(out, Range{other->data, other->bytes(), "operand"})) {
+                throw std::invalid_argument("candidate_selector_path: confidence overlaps an operand");
+            }
+        }
+    }
 
     detail::candidate_selector_path_dispatch(
-        candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
-        successor_codebook, base_positions, configs, drafts, proposal_q, workspace, stream);
+        candidate_ids, unary_scores, projected_hidden, anchors, codebooks, base_positions, configs,
+        drafts, proposal_q, confidence != nullptr ? static_cast<float*>(confidence->data) : nullptr,
+        workspace, stream);
+}
+
+void require_q4_codebook(const Weight& codebook, const char* label) {
+    constexpr std::uint64_t kRowBytes = kRank / 32 * 18;
+    if (codebook.qtype != QType::GGUF_Q4_0 || codebook.n != kCodebookRows || codebook.k != kRank ||
+        codebook.qdata == nullptr || codebook.payload_bytes < kRowBytes * kCodebookRows ||
+        codebook.input_columns != nullptr || !aligned_to(codebook.qdata, 2)) {
+        throw std::invalid_argument(std::string("candidate_selector_path: invalid ") + label);
+    }
+}
+
+} // namespace
+
+void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
+                             const Tensor& projected_hidden, const Tensor& anchors,
+                             const Tensor& predecessor_codebook, const Tensor& successor_codebook,
+                             const Tensor& base_positions, const SamplingConfig* configs,
+                             Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
+                             cudaStream_t stream) {
+    require_tensor(predecessor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+                   "predecessor_codebook");
+    require_tensor(successor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+                   "successor_codebook");
+    if (predecessor_codebook.bytes() != successor_codebook.bytes()) {
+        throw std::invalid_argument("candidate_selector_path: codebooks differ in size");
+    }
+    const detail::SelectorCodebooks codebooks{predecessor_codebook.data, successor_codebook.data,
+                                              predecessor_codebook.bytes(), false};
+    select_path(candidate_ids, unary_scores, projected_hidden, anchors, codebooks, base_positions,
+                configs, drafts, proposal_q, nullptr, workspace, stream);
+}
+
+void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
+                             const Tensor& projected_hidden, const Tensor& anchors,
+                             const Weight& predecessor_codebook, const Weight& successor_codebook,
+                             const Tensor& base_positions, const SamplingConfig* configs,
+                             Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
+                             cudaStream_t stream, Tensor* confidence) {
+    require_q4_codebook(predecessor_codebook, "predecessor_codebook");
+    require_q4_codebook(successor_codebook, "successor_codebook");
+    const detail::SelectorCodebooks codebooks{predecessor_codebook.qdata,
+                                              successor_codebook.qdata,
+                                              std::size_t(kRank / 32 * 18) * kCodebookRows, true};
+    select_path(candidate_ids, unary_scores, projected_hidden, anchors, codebooks, base_positions,
+                configs, drafts, proposal_q, confidence, workspace, stream);
 }
 
 } // namespace ninfer::ops

@@ -41,11 +41,13 @@ int main() {
                               automatic.speculative.draft_min_p == std::stof(floor),
                           "server did not keep draft confidence for automatic speculation");
     }
-    for (const auto* floor : {"0", "0.3", "1"}) {
-        failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
-                                "--draft-tokens", "4", "--draft-min-p", floor})
-                              .speculative.draft_min_p == std::stof(floor),
-                          "server did not preserve draft confidence");
+    for (const auto* backend : {"mtp", "dflash2"}) {
+        for (const auto* floor : {"0", "0.3", "1"}) {
+            failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", backend,
+                                    "--draft-tokens", "4", "--draft-min-p", floor})
+                                  .speculative.draft_min_p == std::stof(floor),
+                              "server did not preserve draft confidence");
+        }
     }
     for (const auto& args : std::vector<std::vector<std::string>>{
              {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "-0.1"},
@@ -54,7 +56,6 @@ int main() {
              {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "inf"},
              {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "0.3x"},
              {"--spec", "dflash", "--draft-tokens", "4", "--draft-min-p", "0.3"},
-             {"--spec", "dflash2", "--draft-tokens", "4", "--draft-min-p", "0.3"},
              {"--spec", "none", "--draft-min-p", "0.3"}}) {
         std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
         full.insert(full.end(), args.begin(), args.end());

@@ -569,6 +569,68 @@ std::vector<WeightId> layer_weights(const LayerWeights& layer, bool with_experts
     return out;
 }
 
+DFlash2Weights bind_dflash2(Bindings& b, const TextConfig& c, const DFlash2Config& d) {
+    const auto h = std::uint64_t(c.hidden_size);
+    const auto q = std::uint64_t(d.attention.query_width());
+    const auto k = std::uint64_t(d.attention.key_width());
+    const auto i = std::uint64_t(d.intermediate_size);
+    const auto& extra   = d.dflash2.value();
+    const auto rows     = 2ULL * extra.conv_kernel_size * (h / extra.conv_group_size);
+    const std::string n = "dflash2/";
+    DFlash2Weights out;
+    out.feature_projection =
+        b.parameter(n + "feature_projection", {h, d.target_layer_ids.size() * h},
+                    {n + "target_features"});
+    out.context_norm = b.direct(n + "context_norm", {h});
+    out.final_norm   = b.direct(n + "final_norm", {h});
+    for (std::uint32_t l = 0; l < d.num_hidden_layers; ++l) {
+        const std::string p = n + "layers/" + std::to_string(l) + "/";
+        DFlash2LayerWeights layer;
+        layer.input_norm          = b.direct(p + "input_norm", {h});
+        layer.post_attention_norm = b.direct(p + "post_attention_norm", {h});
+        layer.query = b.parameter(p + "attention/query", {q, h}, {p + "query_projection_input"});
+        layer.key   = b.parameter(p + "attention/key", {k, h}, {p + "query_projection_input"});
+        layer.value = b.parameter(p + "attention/value", {k, h}, {p + "query_projection_input"});
+        layer.context_key =
+            b.parameter(p + "attention/context_key", {k, h}, {n + "context_input"});
+        layer.context_value =
+            b.parameter(p + "attention/context_value", {k, h}, {n + "context_input"});
+        layer.query_norm = b.direct(p + "attention/query_norm", {d.attention.head_dim});
+        layer.key_norm   = b.direct(p + "attention/key_norm", {d.attention.head_dim});
+        layer.output = b.parameter(p + "attention/output", {h, q}, {p + "attention_output"});
+        layer.gate   = b.parameter(p + "mlp/gate", {i, h}, {p + "mlp_input"});
+        layer.up     = b.parameter(p + "mlp/up", {i, h}, {p + "mlp_input"});
+        layer.down   = b.parameter(p + "mlp/down", {h, i}, {p + "mlp_product"});
+        layer.attention_base = b.direct(p + "attention_conv/base_kernel", {2, 2, h});
+        layer.attention_projection = b.parameter(p + "attention_conv/kernel_projection", {rows, h},
+                                                 {p + "attention_conv_input"});
+        layer.mlp_base       = b.direct(p + "mlp_conv/base_kernel", {2, 2, h});
+        layer.mlp_projection = b.parameter(p + "mlp_conv/kernel_projection", {rows, h},
+                                           {p + "mlp_conv_input"});
+        out.layers.push_back(layer);
+    }
+    out.selector_projection = b.parameter(n + "candidate_selector/hidden_projection",
+                                          {extra.selector_rank, h}, {n + "final_hidden"});
+    // The codebooks are rows the selector gathers, BF16 or as a GGUF drafter stores them.
+    out.predecessor_codebook = b.parameter(n + "candidate_selector/predecessor_codebook",
+                                           {c.vocab_size, extra.selector_rank});
+    out.successor_codebook   = b.parameter(n + "candidate_selector/successor_codebook",
+                                           {c.vocab_size, extra.selector_rank});
+    return out;
+}
+
+std::vector<WeightId> dflash2_parameters(const DFlash2Weights& d) {
+    std::vector<WeightId> out{d.feature_projection,  d.context_norm,         d.final_norm,
+                              d.selector_projection, d.predecessor_codebook, d.successor_codebook};
+    for (const auto& l : d.layers) {
+        out.insert(out.end(),
+                   {l.input_norm, l.post_attention_norm, l.query, l.key, l.value, l.context_key,
+                    l.context_value, l.query_norm, l.key_norm, l.output, l.gate, l.up, l.down,
+                    l.attention_base, l.attention_projection, l.mlp_base, l.mlp_projection});
+    }
+    return out;
+}
+
 std::vector<WeightId> mtp_parameters(const MtpWeights& mtp, bool with_experts) {
     std::vector<WeightId> out = layer_weights(mtp.layer, with_experts);
     out.insert(out.end(), {mtp.embedding_norm, mtp.hidden_norm, mtp.fc_embedding, mtp.fc_hidden,
@@ -659,6 +721,7 @@ std::vector<double> default_tensor_split(const artifact::Reader& reader, const L
         reader,
         [&](std::string_view name) {
             return name.starts_with("text/") || (options.mtp && name.starts_with("mtp/")) ||
+                   (options.dflash2 && name.starts_with("dflash2/")) ||
                    (options.vision && name.starts_with("vision/"));
         },
         [](std::string_view name) {
@@ -746,6 +809,16 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         }
         mtp_config = parse_mtp_config(reader.directory().component("mtp").config, config);
     }
+    std::optional<DFlash2Config> dflash2_config;
+    if (options.dflash2) {
+        const auto& components = reader.directory().components;
+        if (!components.contains("dflash2")) {
+            throw std::invalid_argument("DFlash2 needs an artifact converted with its drafter "
+                                        "(--components text,dflash2)");
+        }
+        dflash2_config = parse_dflash2_config(reader.directory().component("dflash2").config,
+                                              config);
+    }
     FrontendResources resources = bind_resources(binder, config, options.vision);
     Bindings b(binder);
 
@@ -774,6 +847,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         }
         head_uses = {"text/final_hidden"};
     }
+    // DFlash2 drafts project through the whole head, on the first device under tensor parallelism.
+    if (dflash2_config) { head_uses.emplace_back("dflash2/final_hidden"); }
     weights.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
                                       std::move(head_uses));
     weights.final_mixer = bind_hc(b, config, "text/final_mixer/", false);
@@ -835,6 +910,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     }
     std::optional<MtpWeights> mtp_weights;
     if (mtp_config) { mtp_weights = bind_mtp(b, config, *mtp_config, options.experts, {}); }
+    std::optional<DFlash2Weights> dflash2_weights;
+    if (dflash2_config) { dflash2_weights = bind_dflash2(b, config, *dflash2_config); }
     // The tower stays on rank 0, with the token embedding its output joins.
     std::optional<qwen3_5::VisionWeights> vision_weights;
     if (vision_config) {
@@ -865,6 +942,10 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                 const auto mtp = mtp_parameters(*mtp_weights, device_experts);
                 last.insert(last.end(), mtp.begin(), mtp.end());
             }
+            if (dflash2_weights) {
+                const auto drafter = dflash2_parameters(*dflash2_weights);
+                last.insert(last.end(), drafter.begin(), drafter.end());
+            }
             stages = balanced_stages(layer_bytes, stored_bytes(b, first, seen),
                                      stored_bytes(b, last, seen), options.ranks);
         }
@@ -880,6 +961,10 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         if (mtp_weights) {
             const auto mtp = mtp_parameters(*mtp_weights, device_experts);
             head.insert(head.end(), mtp.begin(), mtp.end());
+        }
+        if (dflash2_weights) {
+            const auto drafter = dflash2_parameters(*dflash2_weights);
+            head.insert(head.end(), drafter.begin(), drafter.end());
         }
         for (const WeightId id : head) { b.place(id, stages.stages() - 1); }
     } else if (options.ranks == 1 && !options.stage_layers.empty()) {
@@ -909,6 +994,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     model->vision_weights_ = std::move(vision_weights);
     model->mtp_config_     = std::move(mtp_config);
     model->mtp_weights_    = std::move(mtp_weights);
+    model->dflash2_config_  = std::move(dflash2_config);
+    model->dflash2_weights_ = std::move(dflash2_weights);
     model->shares_         = std::move(shares);
     return model;
 }

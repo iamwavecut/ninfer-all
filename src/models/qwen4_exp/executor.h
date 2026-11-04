@@ -73,9 +73,12 @@ struct ExecutorOptions {
     // what one decode or verification call reads), the ones the indexer selected most recently.
     // A prompt chunk reads one layer's KV from a staging copy on the device.
     std::uint32_t kv_resident = 0;
-    // MTP drafts per speculative round (1..15), for a model loaded with its MTP block; 0 runs
-    // without speculation.
+    // Drafts per speculative round (1..15), for a model loaded with its MTP block (or with
+    // `dflash2`, its DFlash2 drafter); 0 runs without speculation.
     std::uint32_t draft_tokens = 0;
+    // The drafts come from the DFlash2 drafter the model was loaded with (one masked block over
+    // a context ring of the target's features) instead of the MTP block.
+    bool dflash2 = false;
     // Absolute greedy-draft probability floor; zero disables confidence computation.
     float draft_min_p = 0;
     // YaRN past the model's native window (a factor above one), for the sparse-attention layers'
@@ -130,7 +133,9 @@ struct SequenceSnapshot {
     std::vector<Layer> layers;
     // The MTP block: its indexer tail and the stack its next cell starts from.
     std::vector<DeviceBuffer> mtp;
-    bool mtp_follows       = false;
+    // The DFlash2 drafter: the sequence's context ring lane (every layer's K, then its V).
+    DeviceBuffer ring;
+    bool drafter_follows   = false;
     std::uint32_t position = 0;
     NgramContext context;
 };
@@ -142,7 +147,7 @@ struct SequenceSnapshot {
 struct SequenceImage {
     std::uint32_t position = 0;
     NgramContext context;
-    bool mtp_follows = false;
+    bool drafter_follows = false;
 };
 
 class Executor {
@@ -260,23 +265,28 @@ public:
                    std::vector<std::int32_t> rope_positions, std::int32_t rope_delta);
     [[nodiscard]] bool vision() const noexcept;
 
-    // MTP speculative decoding; every call needs an executor with drafts.
+    // Speculative decoding with the MTP block or the DFlash2 drafter; every call needs an
+    // executor with drafts.
     [[nodiscard]] std::uint32_t draft_tokens() const noexcept;
-    // Whether the sequence's MTP state follows its tokens, which a media prompt breaks until the
-    // sequence is reset; a sequence drafts only from a position past its first.
+    // Whether the sequence's drafter follows its tokens (the MTP block's state, which a media
+    // prompt breaks until the sequence is reset, or the DFlash2 context ring); a sequence drafts
+    // only from a position past its first.
     [[nodiscard]] bool can_draft(std::uint32_t sequence) const;
-    // The sequence's MTP state stops following its tokens until a reset or a restore of a state
-    // that follows them: its passes skip the MTP block's catch-up, for a request that never drafts.
+    // The sequence's drafter stops following its tokens until a reset or a restore of a state
+    // that follows them: its passes skip the MTP block's catch-up or the ring's context, for a
+    // request that never drafts.
     void stop_drafting(std::uint32_t sequence);
     // Drafts `steps` tokens (1..draft_tokens(); 0 means draft_tokens()) for each of `sequences`
-    // (distinct) from its next position: the MTP block runs its anchor (the token it sampled last
-    // and has not fed) and then its own drafts, greedily. `out` receives them sequence-major, each
+    // (distinct) from its next position. The MTP block runs its anchor (the token it sampled last
+    // and has not fed) and then its own drafts, greedily; the DFlash2 drafter proposes all of them
+    // in one block from the anchor and the ring. `out` receives them sequence-major, each
     // sequence's row draft_tokens() long; returns once they are on the host, with the number of
     // steps run. Optional `extents` receives one length per sequence, up to the first draft at or
-    // below the probability floor. Without a floor or `extents` the whole chain of `steps` runs,
-    // captured once per step count; with both, each step runs from its own graph and the chain
-    // ends at the first step after which every sequence has drafted at or below the floor (the
-    // row's entries past the steps run are -1).
+    // below the probability floor (DFlash2: the selector's probability of its draft). Without a
+    // floor or `extents` an MTP chain of `steps` runs whole, captured once per step count; with
+    // both, each step runs from its own graph and the chain ends at the first step after which
+    // every sequence has drafted at or below the floor (the row's entries past the steps run are
+    // -1).
     std::uint32_t draft(std::span<const std::uint32_t> sequences,
                         std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
                         std::span<std::uint32_t> extents = {}, std::uint32_t steps = 0);
@@ -289,7 +299,8 @@ public:
                 std::span<const std::uint32_t> widths = {});
     // Keeps the first `columns[i]` (1..its verified width) tokens of the last verify() of
     // `sequences[i]`, which lists the verified sequences in their order: each sequence's state is
-    // then what feeding those tokens would have left, and its MTP block has run their cells.
+    // then what feeding those tokens would have left, and its MTP block has run their cells (or
+    // its DFlash2 ring holds their context).
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> columns);
 
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
