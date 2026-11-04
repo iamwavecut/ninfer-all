@@ -66,9 +66,21 @@ void ExpertParallelExchange::reply(std::size_t rank, std::size_t bytes, std::siz
 
 std::vector<void*> ExpertParallelExchange::collect(std::size_t bytes, std::size_t slot,
                                                    cudaStream_t stream) {
+    const std::vector<std::size_t> each(peers_.size() - 1, bytes);
+    return collect(each, slot, stream);
+}
+
+std::vector<void*> ExpertParallelExchange::collect(std::span<const std::size_t> bytes,
+                                                   std::size_t slot, cudaStream_t stream) {
+    if (bytes.size() + 1 != peers_.size()) {
+        throw std::invalid_argument("expert-parallel collect needs a size per peer");
+    }
     std::vector<void*> out;
     for (std::size_t r = 1; r < peers_.size(); ++r) {
-        peers_[r].up->recv(peers_[r].received.p, bytes, slot, stream);
+        if (bytes[r - 1] > part_bytes_) {
+            throw std::invalid_argument("expert-parallel part exceeds its slot");
+        }
+        peers_[r].up->recv(peers_[r].received.p, bytes[r - 1], slot, stream);
         out.push_back(peers_[r].received.p);
     }
     return out;

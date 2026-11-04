@@ -1,6 +1,7 @@
 #include "core/tensor_parallel.h"
 
 #include <algorithm>
+#include <cstring>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
@@ -820,11 +821,16 @@ std::vector<std::uint64_t> rank_free_bytes(const DeviceContext& context) {
     return out;
 }
 
-std::vector<double> rank_copy_bandwidth(const DeviceContext& context) {
+namespace {
+
+// Each rank's copy bandwidth from a buffer on its card (from_host false: the card's memory) or in
+// pinned host memory (from_host true: its bus), shared evenly by the ranks one card holds.
+std::vector<double> measured_copy_bandwidth(const DeviceContext& context, bool from_host) {
     // Large enough to stream past the L2 of every supported card, small enough to fit beside a
     // CUDA context on any of them.
-    constexpr std::size_t kBytes  = 128ULL << 20;
-    constexpr int kTimedCopies    = 3;
+    const std::size_t kBytes   = from_host ? 64ULL << 20 : 128ULL << 20;
+    constexpr int kTimedCopies = 3;
+    const cudaMemcpyKind kind  = from_host ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice;
     std::vector<double> out(context.size(), 0.0);
     for (std::size_t rank = 0; rank < context.size(); ++rank) {
         std::size_t first = rank;
@@ -848,29 +854,34 @@ std::vector<double> rank_copy_bandwidth(const DeviceContext& context) {
             if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
             if (start != nullptr) { (void)cudaEventDestroy(start); }
             if (stop != nullptr) { (void)cudaEventDestroy(stop); }
-            if (source != nullptr) { (void)cudaFree(source); }
+            if (source != nullptr) {
+                (void)(from_host ? cudaFreeHost(source) : cudaFree(source));
+            }
             if (destination != nullptr) { (void)cudaFree(destination); }
         };
         try {
-            check(cudaMalloc(&source, kBytes), "bandwidth cudaMalloc");
+            if (from_host) {
+                check(cudaHostAlloc(&source, kBytes, cudaHostAllocPortable), "bandwidth cudaHostAlloc");
+                std::memset(source, 0, kBytes);
+            } else {
+                check(cudaMalloc(&source, kBytes), "bandwidth cudaMalloc");
+            }
             check(cudaMalloc(&destination, kBytes), "bandwidth cudaMalloc");
             check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "bandwidth stream");
             check(cudaEventCreate(&start), "bandwidth event");
             check(cudaEventCreate(&stop), "bandwidth event");
-            check(cudaMemsetAsync(source, 0, kBytes, stream), "bandwidth memset");
-            check(cudaMemcpyAsync(destination, source, kBytes, cudaMemcpyDeviceToDevice, stream),
-                  "bandwidth warm-up");
+            if (!from_host) { check(cudaMemsetAsync(source, 0, kBytes, stream), "bandwidth memset"); }
+            check(cudaMemcpyAsync(destination, source, kBytes, kind, stream), "bandwidth warm-up");
             check(cudaEventRecord(start, stream), "bandwidth record");
             for (int copy = 0; copy < kTimedCopies; ++copy) {
-                check(cudaMemcpyAsync(destination, source, kBytes, cudaMemcpyDeviceToDevice, stream),
-                      "bandwidth copy");
+                check(cudaMemcpyAsync(destination, source, kBytes, kind, stream), "bandwidth copy");
             }
             check(cudaEventRecord(stop, stream), "bandwidth record");
             check(cudaEventSynchronize(stop), "bandwidth synchronize");
             float milliseconds = 0.0F;
             check(cudaEventElapsedTime(&milliseconds, start, stop), "bandwidth elapsed");
-            // A copy reads and writes every byte.
-            const double moved = 2.0 * static_cast<double>(kBytes) * kTimedCopies;
+            // A device copy reads and writes every byte; a host copy crosses the bus once.
+            const double moved = (from_host ? 1.0 : 2.0) * static_cast<double>(kBytes) * kTimedCopies;
             out[rank] = moved / (std::max(static_cast<double>(milliseconds), 1e-3) * 1e-3);
         } catch (...) {
             release();
@@ -886,6 +897,16 @@ std::vector<double> rank_copy_bandwidth(const DeviceContext& context) {
         out[rank] /= static_cast<double>(sharing);
     }
     return out;
+}
+
+} // namespace
+
+std::vector<double> rank_copy_bandwidth(const DeviceContext& context) {
+    return measured_copy_bandwidth(context, false);
+}
+
+std::vector<double> rank_host_copy_bandwidth(const DeviceContext& context) {
+    return measured_copy_bandwidth(context, true);
 }
 
 std::size_t TensorParallelExchange::device_bytes(std::size_t slot_bytes, std::size_t ranks,

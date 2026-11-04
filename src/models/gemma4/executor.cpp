@@ -3,12 +3,14 @@
 #include "core/decode_graph.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
+#include "core/tensor_parallel.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
 #include "models/gemma4/cpu_experts.h"
 #include "models/gemma4/kernels.h"
 #include "models/gemma4/vision.h"
 #include "models/gemma4/vision_kernels.h"
+#include "models/divided_head.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
@@ -210,6 +212,9 @@ struct Executor::Impl {
     std::vector<ExpertPeer> expert_peers; // by rank; rank 0's is unused
     std::unique_ptr<ExpertParallelExchange> expert_exchange;
     DeviceBuffer expert_pack; // a call's packed input, on rank 0
+    // The head and the assistant's head divided over the ranks for calls of up to
+    // kMaxVectorColumns columns (divide_heads()); null keeps a head whole on rank 0.
+    std::unique_ptr<models::DividedHead> divided_head, divided_draft_head;
     mutable std::mutex expert_stats_mutex;
     ExpertDeliveryStats expert_startup_stats;
     Weight head; // tied token table
@@ -858,6 +863,8 @@ struct Executor::Impl {
             expert_peers[r].workspace.reset();
             cudaStreamDestroy(expert_peers[r].stream);
         }
+        divided_head.reset();
+        divided_draft_head.reset();
     }
     Impl(const Impl&)            = delete;
     Impl& operator=(const Impl&) = delete;
@@ -1055,6 +1062,49 @@ struct Executor::Impl {
             CUDA_CHECK(cudaStreamCreateWithFlags(&expert_peers[r].stream, cudaStreamNonBlocking));
             expert_peers[r].workspace = std::make_unique<WorkspaceArena>(expert_part_bytes(t));
         }
+        divide_heads();
+    }
+
+    // Decode, verification and draft calls of up to kMaxVectorColumns columns project the head
+    // (and the assistant's) divided over the ranks, which otherwise wait for rank 0: each rank a
+    // range of its rows in proportion to its copy bandwidth, where every other rank has room for
+    // its range beside a margin for the CUDA graphs.
+    void divide_heads() {
+        const int columns = gguf::kMaxVectorColumns;
+        const auto speed  = rank_copy_bandwidth(device);
+        const auto free   = rank_free_bytes(device);
+        double speeds = 0;
+        for (const double v : speed) { speeds += v; }
+        // A rank's rows, an FP32 plane and two BF16 copies of them per column, and the input.
+        const auto fits = [&](const Weight& w, std::size_t input) {
+            if (!models::DividedHead::divides(w, device.size())) { return false; }
+            for (std::size_t r = 1; r < device.size(); ++r) {
+                const double rows = double(w.n) * speed[r] / speeds;
+                const double need = rows * double(row_bytes(w) + 8 * columns) + double(input) +
+                                    double(kHeadRoom);
+                if (double(free[r]) < need) { return false; }
+            }
+            return true;
+        };
+        const std::size_t input = gguf::vector_activation_bytes(hidden, columns);
+        if (fits(head, input)) {
+            divided_head = std::make_unique<models::DividedHead>(device, head, row_bytes(head),
+                                                                 speed, input, columns);
+        }
+        if (drafting()) {
+            const std::size_t draft_input = gguf::vector_activation_bytes(draft_hidden, columns);
+            if (fits(draft_head, draft_input)) {
+                divided_draft_head = std::make_unique<models::DividedHead>(
+                    device, draft_head, row_bytes(draft_head), speed, draft_input, columns);
+            }
+        }
+    }
+    static constexpr std::size_t kHeadRoom = std::size_t(512) << 20;
+
+    [[nodiscard]] std::vector<cudaStream_t> rank_streams() const {
+        std::vector<cudaStream_t> out{stream};
+        for (std::size_t r = 1; r < expert_peers.size(); ++r) { out.push_back(expert_peers[r].stream); }
+        return out;
     }
 
     // One rank's part of a MoE call of block `p`: the call's pairs routed to the experts the rank
@@ -1473,6 +1523,23 @@ struct Executor::Impl {
     // The head of the last `rows` of t <= kMaxVectorColumns final-normed q8_1 rows into
     // logits_bf16 columns [0, rows).
     void head_logits_q8(const Q8Act& x, int t, int rows) {
+        if (divided_head) {
+            const float cap = config.final_logit_softcapping;
+            divided_head->project(
+                x.base, gguf::vector_activation_bytes(hidden, t), rows,
+                static_cast<__nv_bfloat16*>(logits_bf16.p), rank_streams(),
+                [&](std::size_t, const void* input, const Weight& piece, int, float* plane,
+                    __nv_bfloat16* out, cudaStream_t on) {
+                    gguf::VectorOutput o;
+                    o.f32           = plane;
+                    o.column_stride = piece.n;
+                    gguf::vector_product(ops::detail::gguf_type(piece.qtype), piece.qdata,
+                                         row_bytes(piece), piece.n, piece.k, input, t, o, on);
+                    kernels::softcap(plane + std::int64_t(t - rows) * piece.n,
+                                     std::int64_t(rows) * piece.n, cap, out, on);
+                });
+            return;
+        }
         auto scope  = workspace->scope();
         auto* plane = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * vocab * 4).data);
         gguf::VectorOutput o;
@@ -2165,11 +2232,24 @@ struct Executor::Impl {
                 draft_layer(li, n, h, xq);
             }
             // xq now holds the final-normed rows: the head's argmax is the draft.
-            gguf::VectorOutput head_out;
-            head_out.bf16          = draft_logits;
-            head_out.column_stride = vocab;
-            gguf::vector_product(ops::detail::gguf_type(draft_head.qtype), draft_head.qdata,
-                                 row_bytes(draft_head), vocab, a, xq.base, n, head_out, stream);
+            if (divided_draft_head) {
+                divided_draft_head->project(
+                    xq.base, gguf::vector_activation_bytes(a, n), n, draft_logits, rank_streams(),
+                    [&](std::size_t, const void* input, const Weight& piece, int, float*,
+                        __nv_bfloat16* out, cudaStream_t on) {
+                        gguf::VectorOutput o;
+                        o.bf16          = out;
+                        o.column_stride = piece.n;
+                        gguf::vector_product(ops::detail::gguf_type(piece.qtype), piece.qdata,
+                                             row_bytes(piece), piece.n, a, input, n, o, on);
+                    });
+            } else {
+                gguf::VectorOutput head_out;
+                head_out.bf16          = draft_logits;
+                head_out.column_stride = vocab;
+                gguf::vector_product(ops::detail::gguf_type(draft_head.qtype), draft_head.qdata,
+                                     row_bytes(draft_head), vocab, a, xq.base, n, head_out, stream);
+            }
             auto* drafted = static_cast<std::int32_t*>(d_drafts.p) + std::int64_t(step) * n;
             const Tensor logits(draft_logits, DType::BF16, {vocab, n});
             Tensor tokens(drafted, DType::I32, {n});

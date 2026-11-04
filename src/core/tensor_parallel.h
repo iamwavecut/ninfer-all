@@ -363,6 +363,10 @@ private:
 // short copy on each card.
 [[nodiscard]] std::vector<double> rank_copy_bandwidth(const DeviceContext& context);
 
+// Each rank's bus speed: the bandwidth of a copy from pinned host memory to its card in bytes per
+// second, shared evenly by the ranks one card holds. Measured with a short copy on each card.
+[[nodiscard]] std::vector<double> rank_host_copy_bandwidth(const DeviceContext& context);
+
 // Each rank's free device memory now, shared evenly by the ranks one card holds.
 [[nodiscard]] std::vector<std::uint64_t> rank_free_bytes(const DeviceContext& context);
 

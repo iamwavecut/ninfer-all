@@ -51,6 +51,9 @@ public:
     // rank 0.
     [[nodiscard]] std::vector<void*> collect(std::size_t bytes, std::size_t slot,
                                              cudaStream_t stream);
+    // The same with a size per peer: bytes[r - 1] from rank r.
+    [[nodiscard]] std::vector<void*> collect(std::span<const std::size_t> bytes, std::size_t slot,
+                                             cudaStream_t stream);
 
     // Device bytes the exchange holds on `rank`.
     [[nodiscard]] std::size_t device_bytes(std::size_t rank) const;

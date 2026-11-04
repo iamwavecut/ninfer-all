@@ -49,6 +49,11 @@ ninfer_add_test(ninfer_expert_profile_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_profile.cpp"
   LIBRARIES ninfer_model_runtime)
 
+ninfer_add_test(ninfer_divided_head_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_divided_head.cu"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_divided_head_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_qwen4_exp_ngram_draft_prefetch_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_draft_prefetch.cpp"
   LIBRARIES ninfer_model_runtime)

@@ -79,7 +79,8 @@ struct ExecutorOptions {
     std::uint32_t vision_max_patches = 0;
     // Expert parallelism (two or more device ranks): each rank's relative share of every block's
     // routed experts, which it serves from host memory or the files through a delivery and device
-    // cache of its own; everything else stays on rank 0. Empty for one device.
+    // cache of its own; everything else stays on rank 0. Empty with several ranks: shares that give
+    // every rank's misses the same bus time from the memory left for its cache (delivery_shares).
     std::vector<double> expert_split;
 };
 

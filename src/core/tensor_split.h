@@ -38,4 +38,14 @@ namespace ninfer {
 [[nodiscard]] std::vector<double>
 fill_shares(std::span<const double> speed, std::span<const double> capacity, bool shrinks = false);
 
+// The fractions of the routed experts (`bytes` of weights in all) each rank takes when it serves its
+// share from host memory or the files through a device cache of its own: rank r's cache holds
+// room[r] bytes of its share and its bus copies the rest at bus[r] bytes per second, so the
+// fractions give every rank's copies the same time, and a rank with more room or a faster bus takes
+// more experts. When the caches together hold every expert nothing is copied, and the fractions
+// follow `speed` within the room (fill_shares). The fractions add up to one.
+[[nodiscard]] std::vector<double> delivery_shares(std::span<const double> room,
+                                                  std::span<const double> bus, double bytes,
+                                                  std::span<const double> speed);
+
 } // namespace ninfer
