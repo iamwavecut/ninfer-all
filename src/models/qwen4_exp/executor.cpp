@@ -338,9 +338,18 @@ struct ExpertTable {
     std::int32_t rows      = 0;
     std::vector<const void*> pointers; // each expert's rows where the artifact put them
     DeviceBuffer table;
+    bool aligned16 = false;
+
+    void seal() {
+        aligned16 = row_bytes % 16 == 0 && !pointers.empty() &&
+                    std::all_of(pointers.begin(), pointers.end(), [](const void* pointer) {
+                        return pointer != nullptr &&
+                               reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0;
+                    });
+    }
 
     [[nodiscard]] ops::GgufExpertTable view() const {
-        return {format, static_cast<const void* const*>(table.p), row_bytes};
+        return {format, static_cast<const void* const*>(table.p), row_bytes, aligned16};
     }
 };
 
@@ -368,6 +377,7 @@ ExpertTable make_table(const Model& model, std::span<const WeightId> ids) {
     out.table = DeviceBuffer(pointers.size() * sizeof(void*));
     out.table.copy_from_host(pointers.data(), pointers.size() * sizeof(void*));
     out.pointers = std::move(pointers);
+    out.seal();
     return out;
 }
 
@@ -397,6 +407,7 @@ ExpertTable make_rank_table(const Model& model, std::span<const WeightId> ids, s
     out.table = DeviceBuffer(pointers.size() * sizeof(void*));
     out.table.copy_from_host(pointers.data(), pointers.size() * sizeof(void*));
     out.pointers = std::move(pointers);
+    out.seal();
     return out;
 }
 

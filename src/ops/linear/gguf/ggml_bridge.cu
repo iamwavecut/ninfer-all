@@ -1179,7 +1179,8 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
     case GgmlType::NAME:                                                                           \
         detail::moe_matrix_product_impl<GGML_TYPE_##NAME>(table.experts, table.row_bytes,          \
                                                           table.rows, table.k, routing,            \
-                                                          max_active, pairs, tail, activation,     \
+                                                          max_active, pairs, tail,                 \
+                                                          table.aligned16, activation,             \
                                                           out, stream);                            \
         return
     switch (type) {

@@ -1,5 +1,5 @@
 {"schema": "ninfer.device-route-profiles", "schema_version": 2, "devices": [
-    {"hardware_class": "nvidia-geforce-rtx-3090-sm86", "multiprocessors": 82, "origin": "built in: RTX 3090 at 390 W, 2026-09-25; unified routes and two-stage GDN at 420 W, 2026-09-27; cuBLAS prefill gate at 350 W, 2026-10-18; GGUF Q4_K/Q6_K vector loads at 350 W, 2026-10-24; GGUF MoE Q6_K loads at 350 W, 2026-10-25; Q6 head and Q4 residual projections at 350 W, 2026-10-30",
+    {"hardware_class": "nvidia-geforce-rtx-3090-sm86", "multiprocessors": 82, "origin": "built in: RTX 3090 at 390 W, 2026-09-25; unified routes and two-stage GDN at 420 W, 2026-09-27; cuBLAS prefill gate at 350 W, 2026-10-18; GGUF Q4_K/Q6_K vector loads at 350 W, 2026-10-24; GGUF MoE Q6_K loads at 350 W, 2026-10-25; Q6 head and Q4 residual projections at 350 W, 2026-10-30; Q4_K matrix and MoE async tiles at 350 W, 2026-11-04 and 2026-11-05",
      "routes": {
         "attn_i8_small/h24/int8/w3": [[1048576, "8x2x32q"]],
         "attn_i8_small/h24/int8/w4": [[1048576, "8x2x32q"]],
@@ -40,6 +40,8 @@
         "attn_pv_f16": [[1, "on"]],
         "gdn_two_stage/h32": [[2147483647, "on"]],
         "gdn_two_stage/h48": [[2147483647, "on"]],
+        "gguf_matrix/q4_k": [[4096, "async"]],
+        "gguf_moe_matrix/q4_k": [[1024, "async"]],
         "gguf_moe_up/q6_k": [[2, ""], [4, "cooperative"]],
         "gguf_moe_vector/q6_k": [[4, "cooperative"], [8, ""]],
         "gguf_vector/q4_k": [[1, "cooperative"], [8, ""]],

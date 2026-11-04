@@ -197,8 +197,8 @@ Error compare(const std::vector<float>& got, const std::vector<double>& want) {
 int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
     constexpr std::int32_t kRows = 256;
     const std::int32_t kK        = k;
-    const std::int32_t widths[]  = {1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130};
-    const std::int32_t max_t     = 130;
+    const std::int32_t widths[]  = {1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130, 257};
+    const std::int32_t max_t     = 257;
     std::mt19937 rng(seed);
     int failures = 0;
 
@@ -520,6 +520,18 @@ int main() {
                     const int f = run_type(c, seed++, k);
                     std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
                               << (schedule.empty() ? "" : " ") << schedule << '\n';
+                    failures += f;
+                }
+            }
+        }
+        for (const std::string_view schedule : {"", "async"}) {
+            ops::DeviceRouteForce force("gguf_matrix/q4_k", std::string(schedule));
+            for (const auto& c : cases()) {
+                if (c.qtype != QType::GGUF_Q4_K) { continue; }
+                for (const std::int32_t k : {2560, 5120}) {
+                    const int f = run_type(c, seed++, k);
+                    std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
+                              << " matrix " << (schedule.empty() ? "compiled" : schedule) << '\n';
                     failures += f;
                 }
             }
