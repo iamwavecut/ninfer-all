@@ -21,7 +21,7 @@ spelling and defaults.
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md) | converting the GSQ-RCO GGUF releases and their n-gram table; experts on one or several GPUs, in host memory or on disk; measurements |
 | [Gemma 4 26B-A4B](gemma4.md) | converting Google's QAT GGUF release with its MTP assistant and vision tower, what runs, speculative decoding, images and video, the defaults, measurements against llama.cpp and the numerical checks |
 | [Flint](flint.md) | converting a GGUF of Recursive's Flint, what runs, reasoning and GLM-4.7 tool calls, expert residency, measurements against llama.cpp and the numerical checks |
-| [DeepSeek-V4.1-Flash](deepseek-v41.md) | converting the GSQ-RCO IQ1_M GGUF and its Engram table, what runs, reasoning and DSML tool calls, host and disk experts, the Engram table's residency, measurements and the numerical checks |
+| [DeepSeek-V4.1-Flash](deepseek-v41.md) | converting the GSQ-RCO IQ1_M and Coder GGUFs and their Engram table, what runs, reasoning and DSML tool calls, host and disk experts, the Engram table's residency, measurements and the numerical checks |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [Device profiles](device-profiles.md) | per-GPU route profiles: the built-in RTX 3090/4090/5090/PRO 6000/TITAN RTX/Tesla V100 table, calibration at first start, `ninfer-calibrate` |
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090 with Qwen3.8-27B or Qwen3.6-35B-A3B, from measurements |

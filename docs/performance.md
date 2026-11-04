@@ -955,6 +955,18 @@ That build ran prompts chunk by chunk. [Prompt spans](deepseek-v41.md#prompt-spa
 8,086 tokens at 906 tok/s with host experts and 390 with disk experts on an RTX 4090 host of the
 same type (EPYC 7K62), with the same decode rates.
 
+ISTA-DASLab's expert-pruned Coder build
+([artifact](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-NInfer-v3)),
+November 4, the sm_89 build of `379c0d999` on an RTX 4090 host with a 64-core EPYC 7B13 (a container
+of 61 CPUs): a 25-token code request answered with 256 tokens and a 7,775-token summary request
+([the Coder build](deepseek-v41.md#coder-build)):
+
+| Experts | Drafts | Decode, code answer | after 7,775 tokens | Prefill of 7,775 tokens |
+|---|---|---:|---:|---:|
+| host | none | 37.2 | 39.2 | 1,040 |
+| host | `--spec dspark` | 47.9 | 44.3 | 1,020 |
+| disk, page cache warm | none | 15.7 | 17.8 | 774 |
+
 DeepSeek-V4.1-Flash has no pipeline stages; several GPUs divide only its routed experts
 ([expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 [DeepSeek-V4.1-Flash's measurements](deepseek-v41.md#measurements) add the hosts, the device
