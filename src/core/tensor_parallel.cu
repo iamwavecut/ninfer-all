@@ -2042,7 +2042,7 @@ void TensorParallelExchange::publish(std::size_t rank, std::size_t slot, std::si
                                      void* out, cudaStream_t stream, TensorParallelSum sum,
                                      TensorParallelPiece piece, TensorParallelPartials partials) {
     check_piece(rank, slot, bytes, piece);
-    const TensorParallelRoute route = piece_route(bytes, sum, piece, partials);
+    const TensorParallelRoute route = piece_route(rank, slot, bytes, sum, piece, partials);
     publish_on(route, rank, slot, bytes, out, stream, sum, piece, moved(route, partials));
 }
 
@@ -2056,7 +2056,8 @@ void TensorParallelExchange::reduce(std::size_t rank, std::size_t slot, void* ou
         throw std::invalid_argument(
             "tensor-parallel reduce needs values and one to all ranks as contributors");
     }
-    const TensorParallelRoute route = piece_route(bytes, sum, piece, partials);
+    const TensorParallelRoute route = piece_route(rank, slot, bytes, sum, piece, partials);
+    ranks_[rank].piece_route[slot][piece.index] = route;
     reduce_on(route, rank, slot, out, count, contributors, stream, sum, piece,
               moved(route, partials));
 }
@@ -2067,7 +2068,7 @@ void TensorParallelExchange::complete(std::size_t rank, std::size_t slot, void* 
                                       TensorParallelPartials partials) {
     const auto bytes = static_cast<std::size_t>(count) * sizeof(float);
     check_piece(rank, slot, bytes, piece);
-    const TensorParallelRoute route = piece_route(bytes, sum, piece, partials);
+    const TensorParallelRoute route = piece_route(rank, slot, bytes, sum, piece, partials);
     complete_on(route, rank, slot, out, count, stream, sum, piece, moved(route, partials));
 }
 
@@ -2103,21 +2104,35 @@ std::int64_t TensorParallelExchange::inbox_offset(TensorParallelPiece piece,
            static_cast<std::int64_t>(piece.index) * kPieceInboxStep;
 }
 
-TensorParallelRoute TensorParallelExchange::piece_route(std::size_t bytes, TensorParallelSum sum,
+TensorParallelRoute TensorParallelExchange::piece_route(std::size_t rank, std::size_t slot,
+                                                        std::size_t bytes, TensorParallelSum sum,
                                                         TensorParallelPiece piece,
                                                         TensorParallelPartials partials) const {
     TensorParallelRoute chosen = route(bytes, sum, partials);
     if (piece.index == 0 && piece.offset == 0) { return chosen; }
     if (one_kernel(chosen.form)) { chosen = whole_route(bytes, partials); }
     if (chosen.transport != TensorParallelTransport::PeerWrite) { return chosen; }
-    // Every owner's range of the piece, at the piece's place, within an inbox row.
+    // A reduce-scatter's place lies below the values of an earlier piece reduced whole over peer
+    // writes, so after one every later piece reduces whole too.
+    if (chosen.form == TensorParallelForm::Scatter) {
+        const auto& earlier = ranks_[rank].piece_route[slot];
+        const TensorParallelRoute whole{TensorParallelTransport::PeerWrite,
+                                        TensorParallelForm::Whole};
+        if (std::find(earlier.begin(), earlier.begin() + static_cast<std::ptrdiff_t>(piece.index),
+                      whole) != earlier.begin() + static_cast<std::ptrdiff_t>(piece.index)) {
+            chosen = whole;
+        }
+    }
+    // Every owner's range of the piece, at the piece's place, within an inbox row, in the bytes
+    // the partials move as: rounded, fewer than their FP32 values.
     const auto values = static_cast<std::int64_t>(bytes / sizeof(float));
     std::int64_t widest = values;
     if (chosen.form == TensorParallelForm::Scatter) {
         const ValueRange first = scatter_range(0, ranks_.size(), values);
         widest                 = first.end - first.begin;
     }
-    if (inbox_offset(piece, chosen.form) + widest <= static_cast<std::int64_t>(inbox_values_)) {
+    if (partial_bytes(moved(chosen, partials), inbox_offset(piece, chosen.form) + widest) <=
+        inbox_values_ * sizeof(float)) {
         return chosen;
     }
     return {TensorParallelTransport::PeerRead, TensorParallelForm::Whole};

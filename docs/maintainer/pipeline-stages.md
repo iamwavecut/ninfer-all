@@ -486,10 +486,15 @@ families](#expert-parallelism-of-the-other-moe-families)).
   and 7.0981 with 8-bit, scored at 1,107, 1,223 and 1,321 tok/s; over its first 16 KB on the four
   5060 Ti 5.0702, 5.0686 and 5.0684, at 1,060, 1,206 and 1,100 tok/s; Qwen3.8-Flash-Next over the
   slice (int8 KV, 4,096-token windows) on the two 3090s 6.4854, 6.4937 and 6.4638, at 1,001-1,005,
-  1,150 and 1,246 tok/s. Where the peers write each other's memory
-  the transfers do not bound prefill and rounding does not pay: on two RTX A4000s (peer-write)
-  Qwen3.8-27B prefilled the 989-token prompt at 913-925 tok/s with FP32 partials, 911-918 with
-  BF16 and 870-877 with 8-bit, and the 6,768-token one at 927-978, 918-958 and 877-919.
+  1,150 and 1,246 tok/s. A prompt piece's rounded partials take their rounded bytes in a
+  peer-write inbox row, so the later pieces of a chunk fit where their FP32 values would not and
+  reduce on the route the measurement chose (on two RTX A4000s 8-bit partials of a piece's size
+  reduce whole by peer writes). Where the peers write each other's memory the transfers
+  do not bound prefill and rounding does not pay: on two RTX A4000s (peer-write, 140 W, plain
+  decode, two runs each) Qwen3.8-27B prefilled a 1,006-token prompt at 1,014-1,021 tok/s with FP32
+  partials, 1,009-1,010 with BF16 and 1,005-1,006 with 8-bit, and a 6,786-token one at
+  1,076-1,081, 1,068-1,069 and 1,066; a 706-token prompt, one chunk without pieces, at 870-897,
+  896-899 and 900-904.
 - **Numerics.** Against one device the order of the FP32 additions of a projection's output
   differs: the shares' partial sums are added, then rounded once, where one device rounds the full
   sum. On `120a` NVFP4 and FP8 shares quantize their activations for W4A4 and W8A8 routes (under

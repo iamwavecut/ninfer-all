@@ -20,9 +20,10 @@
 // transport and form, including PeerWrite pieces that outgrow an inbox row and read instead.
 // Rounded partials have their own oracle: each partial rounded on the host first (to BF16, or to
 // 8-bit blocks by the same correctly rounded divisions), then the same sum; they run whole and in
-// pieces under every transport, between FP32 exchanges in the other slot, while the forms and sums
-// that ignore them must give the FP32 oracle. Last, an exchange measures its routes and runs on
-// what it chose.
+// pieces under every transport (as reduce-scatters, whole reduces past an inbox row's FP32 values,
+// and whole reduces followed by a narrow reduce-scatter piece), between FP32 exchanges in the other
+// slot, while the forms and sums that ignore them must give the FP32 oracle. Last, an exchange
+// measures its routes and runs on what it chose.
 //
 // The host writes the inputs with blocking copies from pageable memory, which may return before
 // the data reaches the device; the rank streams do not wait for them (they are non-blocking), so
@@ -36,6 +37,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -671,29 +673,50 @@ int run_rounded(std::size_t ranks, int devices, std::mt19937& rng) {
             }
         }
     }
-    // A chunk in pieces of a reduce-scatter, rounded: four pieces of one slot.
+    // A chunk in pieces, rounded: four pieces of one slot as a reduce-scatter; whole, the last
+    // piece past an inbox row's FP32 values but within its rounded bytes; and whole while the pieces
+    // are wide, then a narrow last piece whose band names a reduce-scatter.
+    struct PieceCase {
+        TensorParallelForm wide;
+        TensorParallelForm narrow;
+        std::array<std::int64_t, 4> widths;
+    };
+    const PieceCase piece_cases[] = {
+        {TensorParallelForm::Scatter, TensorParallelForm::Scatter,
+         {5120 * 16, 5120 * 16, 5120 * 16, 5120 * 16}},
+        {TensorParallelForm::Whole, TensorParallelForm::Whole,
+         {5120 * 16, 5120 * 16, 5120 * 16, 5120 * 16}},
+        {TensorParallelForm::Whole, TensorParallelForm::Scatter,
+         {5120 * 20, 5120 * 20, 5120 * 20, 5120 * 4}},
+    };
     for (const TensorParallelTransport transport : transports) {
-        for (const TensorParallelPartials how :
-             {TensorParallelPartials::Bf16, TensorParallelPartials::Int8}) {
-            ninfer::TensorParallelExchange exchange(
-                ctx, {.slot_bytes       = slot_bytes,
-                      .routes           = {{.bytes = slot_bytes,
-                                            .route = {transport, TensorParallelForm::Scatter}}},
-                      .rounded_partials = how});
-            const std::int64_t values = 5120 * 64;
-            std::vector<__nv_bfloat16> residual;
-            std::vector<std::vector<float>> partials;
-            load(exchange, 1, values, residual, partials);
-            const std::int64_t widths[] = {5120 * 16, 5120 * 16, 5120 * 16, 5120 * 16};
-            std::int64_t offset         = 0;
-            for (std::size_t index = 0; index < std::size(widths); ++index) {
-                exchange_rounded(exchange, 1, replica, widths[index], TensorParallelSum::AddBf16,
-                                 how,
-                                 ninfer::TensorParallelPiece{.index = index, .offset = offset});
-                offset += widths[index];
+        for (const PieceCase& pieces : piece_cases) {
+            for (const TensorParallelPartials how :
+                 {TensorParallelPartials::Bf16, TensorParallelPartials::Int8}) {
+                const std::size_t narrow_bytes =
+                    static_cast<std::size_t>(pieces.widths.back()) * sizeof(float);
+                ninfer::TensorParallelExchange exchange(
+                    ctx, {.slot_bytes       = slot_bytes,
+                          .routes           = {{.bytes = narrow_bytes,
+                                                .route = {transport, pieces.narrow}},
+                                               {.bytes = slot_bytes,
+                                                .route = {transport, pieces.wide}}},
+                          .rounded_partials = how});
+                const std::int64_t values = 5120 * 64;
+                std::vector<__nv_bfloat16> residual;
+                std::vector<std::vector<float>> partials;
+                load(exchange, 1, values, residual, partials);
+                std::int64_t offset = 0;
+                for (std::size_t index = 0; index < pieces.widths.size(); ++index) {
+                    exchange_rounded(exchange, 1, replica, pieces.widths[index],
+                                     TensorParallelSum::AddBf16, how,
+                                     ninfer::TensorParallelPiece{.index = index, .offset = offset});
+                    offset += pieces.widths[index];
+                }
+                failures +=
+                    compare_replicas(replica, values, oracle(residual, rounded(partials, how)),
+                                     "rounded pieces match the rounded rank-order sum");
             }
-            failures += compare_replicas(replica, values, oracle(residual, rounded(partials, how)),
-                                         "rounded pieces match the rounded rank-order sum");
         }
     }
     // An exchange that measures its routes with rounded partials too: its rounded bands cover the
