@@ -50,6 +50,10 @@ struct ExecutorOptions {
     // skipped, which is what an all-zero table would give.
     std::optional<NgramTableSource> ngram;
     NgramReadOptions ngram_read;
+    // GGUF IQ1_M routed experts of a wide call over device banks: the integer matrix kernel once
+    // the call routes enough rows to each expert (gguf::iq1m_moe_matrix_pays), or (false) the
+    // vector products.
+    bool iq1m_matrix = true;
     // Host- or disk-resident experts: device memory lent to the expert cache, split evenly over
     // the ranks; kAutoExpertCache starts at half of what each device has free less a margin,
     // which grow_expert_cache completes once startup has allocated the rest; 0 none (host

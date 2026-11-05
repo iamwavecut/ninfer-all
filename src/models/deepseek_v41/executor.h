@@ -22,6 +22,12 @@
 // With the model's vision tower (vision_max_patches), encode_image() turns an image's patches into
 // its span's rows, and a prompt call's image rows take the place of their tokens' embeddings: they
 // route with the image routing bias, and the Engram neither adds to them nor looks back past them.
+//
+// The blocks after the last kv source block (the decoder blocks) keep no compressed state: each
+// reads that block's caches and its own window ring. Under a prefill tail (ExecutorOptions::
+// prefill_tail) a prompt call runs them only over the rows that the state at the caller's next kept
+// position (forward's state_at) and the call's logit rows depend on; their first rows attend no
+// further back than the run's first position (the window floor).
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -30,6 +36,7 @@
 #include "models/deepseek_v41/model.h"
 #include "models/expert_profile.h"
 #include "models/qwen4_exp/ngram_table.h"
+#include "ninfer/model_enums.h"
 
 #include <cuda_runtime.h>
 
@@ -52,6 +59,16 @@ struct InsufficientMemory : std::runtime_error {
 struct ExecutorOptions {
     std::uint32_t max_context   = 32768;
     std::uint32_t prefill_chunk = 2048; // prompt tokens per forward()
+    // The rows of a prompt call the decoder blocks run (Rows: the last prefill_tail_rows, at least
+    // the window, before each kept position).
+    PrefillTail prefill_tail        = PrefillTail::Full;
+    std::uint32_t prefill_tail_rows = 0;
+    // GGUF IQ1_M routed experts of a call wider than eight tokens: the integer matrix kernel once
+    // the call routes enough rows to each expert (gguf::iq1m_moe_matrix_pays; the vector kernel in
+    // groups of eight columns below), or (false) always the vector kernel. Both multiply 8-bit
+    // activations, the matrix route's scales in FP32 and the vector route's in binary16; the sums
+    // differ in rounding.
+    bool iq1m_matrix = true;
     std::uint32_t sequences     = 1;
     bool cuda_graphs            = true;
     // Proposed tokens a verification may carry per sequence after its anchor (0: no
@@ -74,6 +91,9 @@ struct ExecutorOptions {
     // non-standard mode that degrades the output).
     std::optional<qwen4_exp::NgramTableLayout> engram_table;
     qwen4_exp::NgramReadOptions engram_read;
+    // A prompt call given its sequence's next prompt call (forward's `next`) reads that call's
+    // Engram rows into a second pinned buffer while it computes.
+    bool engram_read_ahead = true;
     // Prompt calls may carry images (a model loaded with its vision tower): the most patches an
     // image has, which sizes the tower's scratch. 0: text only.
     std::uint32_t vision_max_patches = 0;
@@ -89,6 +109,13 @@ struct ExecutorOptions {
 struct ImageRows {
     std::uint32_t row = 0;
     std::span<const std::uint16_t> embeddings;
+};
+
+// The prompt call that will follow a prompt call of the same sequence: its tokens, and a flag for
+// each of its rows an image takes (empty: none).
+struct NextPromptCall {
+    std::span<const std::int32_t> tokens;
+    std::span<const std::uint8_t> image_rows;
 };
 
 struct ExecutorMemory {
@@ -158,10 +185,25 @@ public:
     // layer by layer so that each block's missing experts cross the bus once for all of them.
     [[nodiscard]] std::uint32_t prompt_step() const noexcept;
     // Runs up to prompt_step() tokens at the sequence's next positions and leaves the logits of
-    // the last `logit_rows` (at most kMaxLogitRows) in logits(). `images` (in row order, apart)
-    // replace their rows' embeddings.
+    // the last `logit_rows` (at most kMaxLogitRows; 0: none) in logits(). `images` (in row order,
+    // apart) replace their rows' embeddings. `state_at` (0: the call's end) is the position of the
+    // next state the caller keeps or resumes from (an anchor, a stored prefix, the prompt's end),
+    // at or past the call's end; every prompt call up to it passes the same one. Under a prefill
+    // tail a call that ends before it may leave a state that only those calls continue
+    // (resumable() false); one whose rows a later call needs but an earlier call skipped throws
+    // std::logic_error. `next`, when the caller knows it, is the sequence's next prompt call
+    // (ExecutorOptions::engram_read_ahead).
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows, std::span<const ImageRows> images = {});
+                 std::uint32_t logit_rows, std::span<const ImageRows> images = {},
+                 std::uint32_t state_at = 0, NextPromptCall next = {});
+    // Whether the sequence's state at its position is complete. Decode, verify, draft, snapshot()
+    // and save_image() of the live state need a complete state; reset(), restore() and
+    // load_image() leave one.
+    [[nodiscard]] bool resumable(std::uint32_t sequence) const;
+    // The rows of a prompt before a position that decide its decoder blocks' state there (the
+    // decoder blocks times window - 1, plus one), and the rows a prefill tail runs (0: every row).
+    [[nodiscard]] std::uint32_t exact_tail_rows() const noexcept;
+    [[nodiscard]] std::uint32_t prefill_tail_rows() const noexcept;
     // Whether prompt calls may carry images.
     [[nodiscard]] bool vision() const noexcept;
     // The span rows of an image of grid_w x grid_h patches (BF16 [grid_h * grid_w][patch features]

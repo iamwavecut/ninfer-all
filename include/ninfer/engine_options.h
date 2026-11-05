@@ -424,8 +424,9 @@ struct HybridExpertOptions {
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
 };
 
-// The n-gram table of Qwen3.8-Flash-Next's per-layer embedding: the model artifact's own rows, or
-// a separate table artifact holding the table the model names by digest.
+// The n-gram table of Qwen3.8-Flash-Next's per-layer embedding or DeepSeek-V4.1-Flash's Engram: the
+// model artifact's own rows, or a separate table artifact holding the table the model names by
+// digest.
 struct NgramTableOptions {
     // A table artifact to read the rows from; empty takes the model artifact's own.
     std::filesystem::path path;
@@ -440,6 +441,13 @@ struct NgramTableOptions {
     bool lock = false;
     // Row reads in flight at once.
     std::uint32_t io_depth = 64;
+    // A pass that addresses one row several times (a repeated n-gram, image positions) reads it from
+    // the file once and copies it to the others. The rows are the file's either way.
+    bool dedupe = true;
+    // DeepSeek-V4.1-Flash: while a prompt call computes, the rows of the sequence's next prompt call
+    // are read into a second pinned buffer, if the Engine knows that call's tokens. The rows are
+    // the same either way.
+    bool read_ahead = true;
     // Runs the model without its table: a non-standard, experimental mode that badly degrades the
     // output, since the model was trained with the table.
     bool disabled = false;
@@ -546,8 +554,25 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     // Prompt tokens per prefill chunk; 0 is automatic: 1024, or 4096 for a native Qwen3.5-family MoE
     // whose routed experts live in host memory or files (each chunk carries the whole expert bank
-    // across the bus once). Gemma 4 and Flint choose their own chunk.
+    // across the bus once). Gemma 4 and Flint choose their own chunk; DeepSeek-V4.1-Flash takes
+    // 2048 by default and at most 4096, and the widest of 2048, 1024 and 512 below that where the
+    // device lacks room for its workspace.
     std::uint32_t prefill_chunk        = 0;
+    // DeepSeek-V4.1-Flash: the prompt rows its decoder blocks (those after the last key-value source
+    // block) run (PrefillTail). Exact leaves out only rows that decide nothing the Engine keeps or
+    // returns, on the prefill chunk grid, so the output is a full run's bit for bit. Rows keeps the
+    // last prefill_tail_rows (128 at least, the attention window) before each position whose state
+    // the Engine keeps, from that row: a lossy mode whose products round differently from Full's,
+    // and below the exact count (2,414) the kept state also loses rows it depends on.
+    PrefillTail prefill_tail        = PrefillTail::Exact;
+    std::uint32_t prefill_tail_rows = 0;
+    // GGUF IQ1_M routed experts of a call wider than eight tokens (DeepSeek-V4.1-Flash and
+    // Qwen3.8-Flash-Next): the integer matrix kernel once the call routes more than 16 rows to
+    // each expert on average for gate and up products, 6 for down products (the vector kernel
+    // below), or (false) always the vector kernel in groups of eight columns. Both multiply 8-bit
+    // activations; their sums differ in rounding. Gemma 4 and Flint run every call wider than
+    // eight tokens on the matrix kernel.
+    bool iq1m_expert_matrix = true;
     // Decode rounds that run before a prefill chunk while other requests generate, proportionally
     // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode
     // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves

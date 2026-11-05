@@ -369,6 +369,27 @@ int main() {
         failures += check(kv_help.find(flag) != std::string::npos,
                           "serve help omits an accepted prefill or drafting control");
     }
+    // The prompt routes and the n-gram reads: lossless ones on by default, each reaching the Engine.
+    failures += check(default_engine.prefill_tail == ninfer::PrefillTail::Exact &&
+                          default_engine.prefill_tail_rows == 0 &&
+                          default_engine.iq1m_expert_matrix && default_engine.ngram_table.dedupe &&
+                          default_engine.ngram_table.read_ahead,
+                      "the exact prefill tail, IQ1_M matrix route or n-gram read savings are off "
+                      "by default in serving");
+    const ninfer::EngineOptions plain = make_engine_options(
+        parse({"ninfer-serve", "model.ninfer", "--prefill-tail", "full", "--iq1m-experts", "vector",
+               "--ngram-dedupe", "off", "--ngram-read-ahead", "off"}));
+    failures += check(plain.prefill_tail == ninfer::PrefillTail::Full && !plain.iq1m_expert_matrix &&
+                          !plain.ngram_table.dedupe && !plain.ngram_table.read_ahead,
+                      "the prompt-route or n-gram read flags did not reach the Engine options");
+    const ninfer::EngineOptions rows =
+        make_engine_options(parse({"ninfer-serve", "model.ninfer", "--prefill-tail", "512"}));
+    failures += check(rows.prefill_tail == ninfer::PrefillTail::Rows && rows.prefill_tail_rows == 512,
+                      "--prefill-tail N did not reach the Engine options");
+    for (const char* flag : {"--prefill-tail", "--iq1m-experts", "--ngram-dedupe", "--ngram-read-ahead"}) {
+        failures += check(kv_help.find(flag) != std::string::npos,
+                          "serve help omits a prompt-route or n-gram read flag");
+    }
 
     // rk8v4 still parses to its storage value; the engine rejects it in
     // target_kv_cache_profile so the failure names the unported feature rather than an

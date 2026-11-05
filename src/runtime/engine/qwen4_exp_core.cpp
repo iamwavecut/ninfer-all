@@ -169,7 +169,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (table.disabled &&
         (!table.path.empty() || table.residency != defaults.residency || table.io != defaults.io ||
          table.ram_budget_bytes || !table.hot_profile.empty() || table.lock ||
-         table.io_depth != defaults.io_depth)) {
+         table.io_depth != defaults.io_depth || table.dedupe != defaults.dedupe)) {
         throw std::invalid_argument("--no-ngram-table excludes the other n-gram table options");
     }
     if (table.residency != NgramResidency::RamHot && !table.hot_profile.empty()) {
@@ -205,7 +205,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         .budget_bytes = table.ram_budget_bytes.value_or(
             table.residency == NgramResidency::RamHot ? std::uint64_t{4} << 30U : 0),
         .lock         = table.lock,
-        .depth        = table.io_depth};
+        .depth        = table.io_depth,
+        .dedupe       = table.dedupe};
     if (!table.disabled && has_ple) {
         ngram = models::qwen4_exp::ngram_table_source(
             reader, options.artifact_path, text, table.path,
@@ -293,6 +294,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.prefill_chunk = chunk_of(options.prefill_chunk ? options.prefill_chunk : 1024);
     executor.ngram           = std::move(ngram);
     executor.ngram_read      = std::move(ngram_read);
+    executor.iq1m_matrix     = options.iq1m_expert_matrix;
     executor.expert_cache_bytes =
         options.expert_cache_bytes.value_or(models::qwen4_exp::ExecutorOptions::kAutoExpertCache);
     executor.cuda_graphs = options.use_cuda_graph;

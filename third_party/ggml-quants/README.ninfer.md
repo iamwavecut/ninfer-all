@@ -6,6 +6,10 @@ commit [`a25c9865fe03c954c93fd755b5d79ae86ba99750`](https://github.com/ggml-org/
 marked `NInfer:` in the source. Q4_0's DP4A matrix product (`mmq-vec-dot.cuh`, the route of GPUs
 without integer tensor cores such as Tesla V100) takes its -8 offset term from the quantized
 activation instead of the block's FP16 sum, which overflows once 32 activations sum past 65504.
+IQ1_M, which llama.cpp multiplies on its vector kernels only, has a matrix tile loader
+(`mmq-load-tiles.cuh`) and Ampere-config entries copied from IQ2_S's: each row of eight grid
+values g with its ±1/8 shift becomes the int8 values 8g ± 1, each 16 values' scale d(2s + 1)/8,
+as in NInfer's own vector kernel. NInfer runs it for routed experts only.
 
 NInfer compiles ggml's integer tensor-core matrix multiplication (`ggml-cuda/mmq.cuh`) and its
 dequantizers through the bridge in `src/ops/linear/gguf/`, as a separate archive, and keeps only the

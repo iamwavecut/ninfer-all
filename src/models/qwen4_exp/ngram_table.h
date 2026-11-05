@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp {
@@ -47,6 +48,9 @@ struct NgramReadOptions {
     std::vector<std::uint32_t> hot_rows;
     bool lock           = false; // keep the resident rows in physical memory
     std::uint32_t depth = 64;    // reads in flight
+    // A batch's rows that the files serve are read once each however often the batch addresses
+    // them (repeated n-grams, image positions); the others get copies.
+    bool dedupe = true;
 };
 
 class NgramTableReader {
@@ -73,8 +77,8 @@ public:
 
     // Starts copying the rows `row_ids` addresses, in order, into `out` (row_ids.size() *
     // row_bytes); the resident rows are copied before it returns. Both spans stay untouched by
-    // the caller until wait(). One batch at a time. A row id past the table throws
-    // std::out_of_range.
+    // the caller until wait(), which also copies a row the batch repeats (options().dedupe). One
+    // batch at a time. A row id past the table throws std::out_of_range.
     void submit(std::span<const std::uint64_t> row_ids, std::span<std::uint8_t> out);
     // Waits for the batch submit() started, reading with the pool, and rethrows a failed read as
     // std::runtime_error.
@@ -125,8 +129,13 @@ private:
     std::unique_ptr<Lookahead> lookahead_;
     std::unique_ptr<Hints> hints_;
 
-    // The batch in flight: the rows the files serve (index into the batch), and its start.
+    // The batch in flight: the rows the files serve (index into the batch), with dedupe the
+    // batch's repeats of them (index, the index whose row it copies), and its start.
     std::vector<std::uint32_t> misses_;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> copies_;
+    // Dedupe's (row, index) pairs, and its radix sort's scratch.
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> order_, order_scratch_;
+    std::vector<std::uint32_t> radix_counts_;
     std::vector<std::uint32_t> admissions_;
     std::span<const std::uint64_t> batch_ids_;
     std::span<std::uint8_t> batch_out_;

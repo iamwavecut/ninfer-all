@@ -5,12 +5,14 @@
 // error; on a Tesla V100 the matrix kernel's FP16 route (FP16 activations and weights) stays well
 // within it. Up to eight tokens take the vector kernel; wider calls over device-resident banks
 // (each matrix followed by 256 zero bytes, which the matrix kernel's last K step of a 640-value
-// down row reads) take the matrix kernel wherever the block type has one (IQ1_M and MXFP4 stay on
-// the vector kernel), with one or several column tiles per expert, and the same calls over banks
-// that are not declared device resident take the vector kernel. Where the CPU has the bank's block
-// types, the decode form's second stage also comes from CPU products (gguf_expert_cpu, its
-// automatically selected backend), as a miss service with a CPU share supplies it, and the sum must
-// equal the GPU's bit for bit. Expert-parallel parts over tables that hold only their own experts
+// down row reads) take the matrix kernel wherever the block type has one (MXFP4 stays on the
+// vector kernel, and IQ1_M gate and up products until a call routes more than 16 rows to each
+// expert: 260 tokens stay on the vector kernel, 820 take the matrix kernel's 32-wide column tiles),
+// with one or several column tiles per expert, and the same calls over banks that are not declared
+// device resident take the vector kernel. Where the CPU has the bank's block types, the decode
+// form's second stage also comes from CPU products (gguf_expert_cpu, its automatically selected
+// backend), as a miss service with a CPU share supplies it, and the sum must equal the GPU's bit
+// for bit. Expert-parallel parts over tables that hold only their own experts
 // (the others null) combine to the whole call's y bit for bit; parts that also hold a run of the
 // shared expert's width each combine close to it and within the oracle's bounds.
 
@@ -727,7 +729,7 @@ int main() {
              Q::GGUF_IQ3_XXS,
              Q::GGUF_IQ4_NL,
              4,
-             {1, 4, 16},
+             {1, 4, 16, 260, 820},
              kExperts},
             // The GSQ-RCO IQ3_S release's routed types on the matrix path: its IQ3_S layers, and
             // routes concentrated on a few experts (several columns per expert) in the IQ3_XXS

@@ -195,6 +195,7 @@ struct LayerPlan {
     int experts = 0, top_k = 0; // the block's routed experts and how many a row takes
     bool kv_source = false, index_source = false, candidate_source = false, uses_candidates = false;
     int kv_from = -1; // the kv source whose caches the block reads
+    bool decoder = false; // after the last kv source: the prefill tail may skip its rows
     Site hc_attention, hc_ffn;
     std::vector<Weight> query_kv; // [query_a; kv] as one parent, or the two
     Weight query_b, output_a, output_b, shared_down;
@@ -254,6 +255,9 @@ struct Pass {
     // rows' at each of them.
     std::int32_t* candidate_list   = nullptr;
     std::int32_t* candidate_counts = nullptr;
+    // A prompt call's first row the decoder blocks run (t: none, under a prefill tail), and its
+    // first row the drafter taps (-1: its last window of rows).
+    int decoder_row = 0, tap_row = -1;
 };
 
 } // namespace
@@ -311,6 +315,16 @@ struct Executor::Impl {
     DeviceBuffer group_routes;
     std::vector<std::size_t> group_routes_at;
     std::vector<std::uint32_t> positions;
+    // The prefill tail (ExecutorOptions::prefill_tail): the first decoder block, the rows before a
+    // position that decide the decoder blocks' state there (exact_rows), the rows a prompt call
+    // runs before its kept state (tail_rows, 0: every row) and the rows after which a run's state
+    // counts as complete. Per sequence: the first position of its decoder blocks' current run, the
+    // window floor of their chunks (0: a complete state), and whether a prompt call left them
+    // behind its position.
+    int decoder_block = 0;
+    std::uint32_t exact_rows = 0, tail_rows = 0, complete_rows = 0;
+    std::vector<std::uint32_t> decoder_from;
+    std::vector<std::uint8_t> decoder_behind;
     DeviceBuffer d_tokens, d_positions, d_sequences;
     std::unique_ptr<PinnedHostBuffer> h_staging;
     std::unique_ptr<CudaCompletionEvent> staged;
@@ -342,10 +356,26 @@ struct Executor::Impl {
     std::unique_ptr<qwen4_exp::NgramTableReader> engram;
     std::vector<EngramHasher::History> histories;
     std::vector<std::vector<std::int32_t>> verified; // a verification's tokens until commit
-    std::unique_ptr<PinnedHostBuffer> h_engram_ids, h_engram_rows;
-    std::unique_ptr<CudaCompletionEvent> engram_copied;
+    // A pass's ids and rows go through one of two pinned sets (the second only with
+    // ExecutorOptions::engram_read_ahead), each with its last copy to the device; engram_set is
+    // the set the passes read into, the other the read-ahead's.
+    struct EngramSet {
+        std::unique_ptr<PinnedHostBuffer> ids, rows;
+        std::unique_ptr<CudaCompletionEvent> copied;
+    };
+    std::array<EngramSet, 2> engram_sets;
+    int engram_set = 0;
     DeviceBuffer d_engram;
     std::vector<std::uint64_t> engram_scratch;
+    // The read-ahead: a batch in the reader (pending) or read (ready) for the prompt call of
+    // `sequence` at `first` with these tokens, image flags and history before them.
+    struct EngramAhead {
+        bool pending = false, ready = false;
+        std::uint32_t sequence = 0, first = 0;
+        std::vector<std::int32_t> tokens;
+        std::vector<std::uint8_t> dead;
+        EngramHasher::History history;
+    } ahead;
     // One sequence's rings and tails, the state a branch pass returns to.
     DeviceBuffer branch_state;
     // The vision tower, and a prompt step's images: their rows' flags (pinned, then on the
@@ -577,6 +607,7 @@ struct Executor::Impl {
             }
             layers.push_back(std::move(p));
         }
+        plan_prefill_tail();
         if (model.dspark()) { plan_drafter(ring_bytes, branch_bytes); }
         staging = DeviceBuffer(std::size_t(prefill_ring) * kLatent * 2);
         staging.fill(0);
@@ -606,10 +637,12 @@ struct Executor::Impl {
             const std::size_t engram_rows = rows * hasher.rows_per_token();
             engram = std::make_unique<qwen4_exp::NgramTableReader>(*options.engram_table,
                                                                    options.engram_read);
-            h_engram_ids  = std::make_unique<PinnedHostBuffer>(engram_rows * 8);
-            h_engram_rows = std::make_unique<PinnedHostBuffer>(engram_rows * kEngramRowBytes);
-            d_engram      = DeviceBuffer(engram_rows * kEngramRowBytes);
-            engram_copied = std::make_unique<CudaCompletionEvent>(device);
+            for (int i = 0; i < (options.engram_read_ahead ? 2 : 1); ++i) {
+                engram_sets[i].ids    = std::make_unique<PinnedHostBuffer>(engram_rows * 8);
+                engram_sets[i].rows   = std::make_unique<PinnedHostBuffer>(engram_rows * kEngramRowBytes);
+                engram_sets[i].copied = std::make_unique<CudaCompletionEvent>(device);
+            }
+            d_engram = DeviceBuffer(engram_rows * kEngramRowBytes);
             engram_scratch.resize(engram_rows);
         }
         if (options.vision_max_patches > 0) { plan_vision(rows); }
@@ -1085,6 +1118,117 @@ struct Executor::Impl {
         return 0;
     }
 
+    // ---- The prefill tail ----------------------------------------------------------------------
+
+    // The blocks after the last kv source keep no compressed state: each reads that source's
+    // caches and its own window ring, so the state they leave at a position depends on their rows
+    // within decoder blocks x (window - 1) + 1 before it, and a call's logit row on as many before
+    // it.
+    void plan_prefill_tail() {
+        int last_source = -1;
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            if (layers[l].kv_source) { last_source = int(l); }
+        }
+        decoder_block = last_source + 1;
+        for (std::size_t l = std::size_t(decoder_block); l < layers.size(); ++l) {
+            layers[l].decoder = true;
+        }
+        const auto decoders = std::uint32_t(int(layers.size()) - decoder_block);
+        exact_rows          = decoders == 0 ? 0 : decoders * std::uint32_t(window - 1) + 1;
+        switch (options.prefill_tail) {
+        case PrefillTail::Full: tail_rows = 0; break;
+        case PrefillTail::Exact: tail_rows = exact_rows; break;
+        case PrefillTail::Rows:
+            if (options.prefill_tail_rows < std::uint32_t(window)) {
+                throw std::invalid_argument("DeepSeek-V4.1: a prefill tail of " +
+                                            std::to_string(options.prefill_tail_rows) +
+                                            " rows is shorter than the attention window (" +
+                                            std::to_string(window) + ")");
+            }
+            tail_rows = options.prefill_tail_rows;
+            break;
+        }
+        if (decoders == 0) { tail_rows = 0; }
+        complete_rows = std::min(tail_rows, exact_rows);
+        decoder_from.assign(options.sequences, 0);
+        decoder_behind.assign(options.sequences, 0);
+    }
+
+    // The first of a prompt call's t rows (at positions first..) that the decoder blocks run: under
+    // the tail, the rows from need = min(state_at, the first logit row + 1) - tail_rows on, from the
+    // chunk boundary of the call at or below it (Exact: every chunk keeps a full run's shapes) or
+    // from that row (Rows); t when the call needs none of its rows there. Sets the run's window
+    // floor: a run starts where the call needs rows past its first, or where the decoder blocks are
+    // behind the call's first position, which only a need from there on allows.
+    int decoder_start(std::uint32_t sequence, std::uint32_t first, int t, std::uint32_t logit_rows,
+                      std::uint32_t state_at) {
+        const std::uint32_t end = first + std::uint32_t(t);
+        if (state_at != 0 && state_at < end) {
+            throw std::invalid_argument("deepseek_v41 forward: a kept state before the call's end");
+        }
+        int row          = 0;
+        std::int64_t need = 0;
+        if (tail_rows != 0) {
+            std::uint32_t at = state_at == 0 ? end : state_at;
+            if (logit_rows > 0) { at = std::min(at, end - logit_rows + 1); }
+            need = std::int64_t(at) - std::int64_t(tail_rows);
+            if (need >= std::int64_t(end)) {
+                row = t;
+            } else if (need > std::int64_t(first)) {
+                row = int(need - std::int64_t(first));
+                if (options.prefill_tail == PrefillTail::Exact) {
+                    const int c = int(options.prefill_chunk);
+                    row         = row / c * c;
+                }
+            }
+        }
+        if (row < t && decoder_behind[sequence]) {
+            if (need < std::int64_t(first)) {
+                throw std::logic_error("deepseek_v41: a prompt call needs decoder rows that an "
+                                       "earlier call of its prefill tail skipped");
+            }
+            decoder_from[sequence] = first + std::uint32_t(row);
+        } else if (row > 0 && row < t) {
+            decoder_from[sequence] = first + std::uint32_t(row);
+        }
+        return row;
+    }
+
+    // After a prompt call whose decoder blocks ran its rows from `row` on (t: none).
+    void decoder_ran(std::uint32_t sequence, std::uint32_t end, int row, int t) {
+        if (row >= t) {
+            decoder_behind[sequence] = 1;
+            return;
+        }
+        decoder_behind[sequence] = 0;
+        if (decoder_from[sequence] != 0 && end - decoder_from[sequence] >= complete_rows) {
+            decoder_from[sequence] = 0;
+        }
+    }
+
+    [[nodiscard]] bool resumable(std::uint32_t sequence) const {
+        return decoder_behind.at(sequence) == 0 && decoder_from.at(sequence) == 0;
+    }
+
+    void require_resumable(std::uint32_t sequence, const char* what) const {
+        if (!resumable(sequence)) {
+            throw std::logic_error(std::string("deepseek_v41 ") + what +
+                                   ": the sequence's state is mid-way through a prefill tail");
+        }
+    }
+
+    // The first row of a prompt call at `first` that the drafter taps: its rows within the window
+    // before the state the caller keeps (the call's end by default).
+    [[nodiscard]] int tap_start(std::uint32_t first, int t, std::uint32_t state_at) const {
+        const std::int64_t at = state_at == 0 ? std::int64_t(first) + t : std::int64_t(state_at);
+        return int(std::clamp<std::int64_t>(at - window - std::int64_t(first), 0, t));
+    }
+
+    void reset_decoder(std::uint32_t sequence) {
+        decoder_from.at(sequence)   = 0;
+        decoder_behind.at(sequence) = 0;
+    }
+
     // ---- Growing caches -------------------------------------------------------------------------
 
     [[nodiscard]] std::size_t unbacked() const {
@@ -1205,6 +1349,7 @@ struct Executor::Impl {
     }
 
     ~Impl() {
+        settle_ahead(); // the reader's threads write no more into the pinned sets
         if (delivery || growing) { cudaStreamSynchronize(stream); }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
@@ -1524,9 +1669,8 @@ struct Executor::Impl {
                      std::span<EngramHasher::History> history_of, bool advance,
                      std::span<const std::uint8_t> dead = {}) {
         if (!engram) { return; }
-        const std::size_t t = tokens.size();
-        const std::uint32_t per = hasher.rows_per_token(), columns = hasher.columns();
-        const std::size_t blocks = per / columns;
+        const std::size_t t     = tokens.size();
+        const std::uint32_t per = hasher.rows_per_token();
         for (std::size_t r = 0; r < t;) {
             // Consecutive rows of one sequence hash together.
             std::size_t end = r + 1;
@@ -1535,19 +1679,92 @@ struct Executor::Impl {
                         advance, dead.empty() ? dead : dead.subspan(r, end - r));
             r = end;
         }
-        engram_copied->synchronize();
-        auto* ids = static_cast<std::uint64_t*>(h_engram_ids->data());
-        for (std::size_t b = 0; b < blocks; ++b) {
+        settle_ahead();
+        EngramSet& set = engram_sets[std::size_t(engram_set)];
+        set.copied->synchronize();
+        auto* ids = static_cast<std::uint64_t*>(set.ids->data());
+        engram_ids(t, ids);
+        const std::size_t n = t * per;
+        engram->read_rows({ids, n}, {static_cast<std::uint8_t*>(set.rows->data()), n * kEngramRowBytes});
+        CUDA_CHECK(cudaMemcpyAsync(d_engram.p, set.rows->data(), n * kEngramRowBytes,
+                                   cudaMemcpyHostToDevice, stream));
+        set.copied->record(stream);
+    }
+
+    // The table rows of t hashed positions (engram_scratch, [position][block][column]) in the order
+    // the blocks read them: [block][position][column].
+    void engram_ids(std::size_t t, std::uint64_t* ids) const {
+        const std::uint32_t per = hasher.rows_per_token(), columns = hasher.columns();
+        for (std::size_t b = 0; b < per / columns; ++b) {
             for (std::size_t r = 0; r < t; ++r) {
                 std::memcpy(ids + (b * t + r) * columns, engram_scratch.data() + r * per + b * columns,
                             columns * 8);
             }
         }
-        const std::size_t n = t * per;
-        engram->read_rows({ids, n}, {static_cast<std::uint8_t*>(h_engram_rows->data()), n * kEngramRowBytes});
-        CUDA_CHECK(cudaMemcpyAsync(d_engram.p, h_engram_rows->data(), n * kEngramRowBytes,
+    }
+
+    // Completes a read-ahead batch in flight; its rows stay for the call they were read for. A
+    // read that failed leaves none, and that call then reads (and reports) its rows itself.
+    void settle_ahead() {
+        if (!ahead.pending) { return; }
+        ahead.pending = false;
+        try {
+            engram->wait();
+            ahead.ready = true;
+        } catch (const std::runtime_error&) { ahead.ready = false; }
+    }
+
+    // Starts reading the Engram rows of `next`, the prompt call of `sequence` at `first` that
+    // follows the current one (whose tokens have advanced the sequence's history), into the set
+    // the passes do not read into.
+    void read_ahead(std::uint32_t sequence, std::uint32_t first, NextPromptCall next) {
+        if (!engram || !options.engram_read_ahead || next.tokens.empty()) { return; }
+        const std::size_t t = next.tokens.size();
+        if (t > staging_rows() || (!next.image_rows.empty() && next.image_rows.size() != t)) {
+            throw std::invalid_argument("deepseek_v41 forward: invalid next prompt call");
+        }
+        settle_ahead();
+        ahead.ready    = false;
+        EngramSet& set = engram_sets[std::size_t(1 - engram_set)];
+        set.copied->synchronize();
+        EngramHasher::History history = histories[sequence];
+        ahead.history                 = history;
+        hasher.rows(history, next.tokens, engram_scratch.data(), false, next.image_rows);
+        auto* ids = static_cast<std::uint64_t*>(set.ids->data());
+        engram_ids(t, ids);
+        const std::size_t n = t * hasher.rows_per_token();
+        engram->submit({ids, n}, {static_cast<std::uint8_t*>(set.rows->data()), n * kEngramRowBytes});
+        ahead.pending  = true;
+        ahead.sequence = sequence;
+        ahead.first    = first;
+        ahead.tokens.assign(next.tokens.begin(), next.tokens.end());
+        ahead.dead.assign(next.image_rows.begin(), next.image_rows.end());
+    }
+
+    // Whether the read-ahead holds the rows of this prompt call of `sequence` (its tokens, image
+    // flags `dead`, position and history): then they go to the device from its set, which the
+    // passes read into from now on.
+    bool use_ahead(std::uint32_t sequence, std::span<const std::int32_t> tokens,
+                   std::span<const std::uint8_t> dead) {
+        settle_ahead();
+        const EngramHasher::History& history = histories[sequence];
+        const bool dead_matches = dead.empty()
+                                      ? std::find(ahead.dead.begin(), ahead.dead.end(), 1) == ahead.dead.end()
+                                      : std::equal(dead.begin(), dead.end(), ahead.dead.begin(), ahead.dead.end());
+        if (!ahead.ready || ahead.sequence != sequence || ahead.first != positions[sequence] ||
+            !std::equal(tokens.begin(), tokens.end(), ahead.tokens.begin(), ahead.tokens.end()) ||
+            !dead_matches || ahead.history.count != history.count ||
+            !std::equal(history.ids, history.ids + history.count, ahead.history.ids)) {
+            return false;
+        }
+        ahead.ready         = false;
+        engram_set          = 1 - engram_set;
+        EngramSet& set      = engram_sets[std::size_t(engram_set)];
+        const std::size_t n = tokens.size() * hasher.rows_per_token();
+        CUDA_CHECK(cudaMemcpyAsync(d_engram.p, set.rows->data(), n * kEngramRowBytes,
                                    cudaMemcpyHostToDevice, stream));
-        engram_copied->record(stream);
+        set.copied->record(stream);
+        return true;
     }
 
     void advance_history(std::uint32_t sequence, std::span<const std::int32_t> tokens,
@@ -1695,6 +1912,8 @@ struct Executor::Impl {
         a.window_seq_stride = s.chunk ? 0 : ring_stride;
         a.ring              = s.chunk ? prefill_ring : kRing;
         a.window_size       = window + s.extra_window;
+        // A prefill tail's run: its chunks' decoder blocks read no window position before it.
+        a.window_floor      = s.chunk && p.decoder ? int(decoder_from[s.sequence]) : 0;
         a.sinks             = p.sinks;
         a.scale             = 1.0f / std::sqrt(float(kLatent));
         a.splits            = s.chunk ? 1 : decode_splits;
@@ -1937,6 +2156,20 @@ struct Executor::Impl {
         }
     }
 
+    // Whether a wide call of t tokens runs block p's routed experts of `type`, their gate and up
+    // (`gate_up`) or their down products, on the integer matrix kernel (else the vector kernel in
+    // groups of eight columns): IQ1_M's only with ExecutorOptions::iq1m_matrix and once the call
+    // routes enough rows to each expert (gguf::iq1m_moe_matrix_pays).
+    [[nodiscard]] bool matrix_route(const LayerPlan& p, bool gate_up, gguf::GgmlType type,
+                                    int rows, int k, int t) const {
+        if (type == gguf::GgmlType::IQ1_M &&
+            (!options.iq1m_matrix ||
+             !gguf::iq1m_moe_matrix_pays(gate_up, std::int64_t(t) * p.top_k, p.experts))) {
+            return false;
+        }
+        return gguf::moe_matrix_supported(type, rows, k, true);
+    }
+
     // The block's MoE: routed experts and the shared expert into y, added to the streams.
     void ffn(const LayerPlan& p, float* h, const float* pre, int t, const Coefficients& c) {
         auto scope = workspace->scope();
@@ -2034,7 +2267,7 @@ struct Executor::Impl {
             return;
         }
         from.await(on);
-        if (gguf::moe_matrix_supported(p.gate_up_type, 2 * w, hidden, true)) {
+        if (matrix_route(p, true, p.gate_up_type, 2 * w, hidden, t)) {
             void* act = take(gguf::moe_matrix_activation_bytes(hidden, pairs));
             gguf::quantize_moe_matrix_activation(p.gate_up_type, xb, hidden, routing, pairs, k, act,
                                                  on);
@@ -2050,7 +2283,7 @@ struct Executor::Impl {
         }
         kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k, middle, w, on);
         auto* rows = static_cast<float*>(take(std::size_t(pairs) * hidden * 4));
-        if (gguf::moe_matrix_supported(p.down_type, hidden, w, true)) {
+        if (matrix_route(p, false, p.down_type, hidden, w, t)) {
             void* act = take(gguf::moe_matrix_activation_bytes(w, pairs));
             gguf::quantize_moe_matrix_activation(p.down_type, middle, w, routing, pairs, 1, act,
                                                  on);
@@ -2260,7 +2493,7 @@ struct Executor::Impl {
         }
         shared();
         if (call) { delivery->await(stream); }
-        if (gguf::moe_matrix_supported(p.gate_up_type, 2 * w, hidden, true)) {
+        if (matrix_route(p, true, p.gate_up_type, 2 * w, hidden, t)) {
             void* act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
             gguf::quantize_moe_matrix_activation(p.gate_up_type, xb, hidden, routing, pairs, k, act,
                                                  stream);
@@ -2277,7 +2510,7 @@ struct Executor::Impl {
         kernels::clamped_swiglu(gu, 2 * w, pairs, w, config.swiglu_limit, scale, k, middle, w,
                                 stream);
         auto* rows = alloc<float>(std::size_t(pairs) * hidden);
-        if (gguf::moe_matrix_supported(p.down_type, hidden, w, true)) {
+        if (matrix_route(p, false, p.down_type, hidden, w, t)) {
             void* act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(w, pairs)).data;
             gguf::quantize_moe_matrix_activation(p.down_type, middle, w, routing, pairs, 1, act,
                                                  stream);
@@ -2454,6 +2687,7 @@ struct Executor::Impl {
             confidence.size() != std::size_t(b) || anchor < 0 || anchor >= vocab) {
             throw std::invalid_argument("deepseek_v41 draft: invalid call");
         }
+        require_resumable(sequence, "draft");
         const std::uint32_t first = positions[sequence];
         if (first + std::uint32_t(b) > options.max_context) {
             throw std::invalid_argument("deepseek_v41 draft: context capacity exceeded");
@@ -2504,20 +2738,45 @@ struct Executor::Impl {
             listed.candidate_counts = alloc<std::int32_t>(std::size_t(t));
         }
         const float* pre = nullptr; // the first block reads stream 0
-        // With the drafter, the pass's last rows (a window at most) tap its target blocks.
-        const int tapped = drafter ? std::min(t, window) : 0;
+        // With the drafter, the pass's last rows (a window at most, or a prompt call's within the
+        // window before the state its caller keeps) tap its target blocks.
+        const int tap_row = !drafter ? t : s.tap_row >= 0 ? s.tap_row : t - std::min(t, window);
+        const int tapped  = t - tap_row;
+        const auto rows_of = [&](const Coefficients& co, int row) {
+            return Coefficients{co.pre + std::size_t(row) * streams, co.post + std::size_t(row) * streams,
+                                co.comb + std::size_t(row) * streams * streams};
+        };
+        const std::uint8_t* const images = image_mask;
         for (std::size_t l = 0; l < layers.size(); ++l) {
             const LayerPlan& p = layers[l];
-            if (tapped > 0) { tap(l, h + std::size_t(t - tapped) * streams * hidden, tapped, 0); }
-            if (p.engram >= 0) { engram_block(p, h, t, s); }
-            mixes(p.hc_attention, h, t, mix_scratch, attention_site);
-            attention(p, h, pre, t, listed, topk, candidates, attention_site);
-            mixes(p.hc_ffn, h, t, mix_scratch, ffn_site);
-            ffn(p, h, attention_site.pre, t, ffn_site);
+            // A prompt call under a prefill tail runs its decoder blocks over its rows from
+            // decoder_row on; every other block, and every other pass, over all of them.
+            const int r = p.decoder ? s.decoder_row : 0;
+            if (r >= t) { continue; }
+            if (tapped > 0) { tap(l, h + std::size_t(tap_row) * streams * hidden, tapped, 0); }
+            Pass part = listed;
+            if (r > 0) {
+                part.t      = t - r;
+                part.row    = s.row + r;
+                part.staged = s.staged != 0 ? s.staged : t;
+                part.first  = s.first + std::uint32_t(r);
+            }
+            float* hr            = h + std::size_t(r) * streams * hidden;
+            const Coefficients a = rows_of(attention_site, r), f = rows_of(ffn_site, r);
+            image_mask           = images == nullptr ? nullptr : images + r;
+            if (p.engram >= 0) { engram_block(p, hr, part.t, part); }
+            mixes(p.hc_attention, hr, part.t, mix_scratch, a);
+            attention(p, hr, pre == nullptr ? nullptr : pre + std::size_t(r) * streams, part.t, part,
+                      topk + std::size_t(r) * index_topk,
+                      candidates == nullptr ? nullptr : candidates + std::size_t(r) * candidate_words,
+                      a);
+            mixes(p.hc_ffn, hr, part.t, mix_scratch, f);
+            ffn(p, hr, a.pre, part.t, f);
             pre = ffn_site.pre;
         }
+        image_mask = images;
         if (tapped > 0 && s.seed) {
-            const int from = s.row + t - tapped;
+            const int from = s.row + tap_row;
             seed(tapped, 0, static_cast<const std::int32_t*>(d_positions.p) + from,
                  s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p) + from, s.sequence);
         }
@@ -2570,6 +2829,19 @@ struct Executor::Impl {
         image_staged->record(stream);
     }
 
+    // A flag for each of t rows an image of `images` takes (empty: none does).
+    [[nodiscard]] std::vector<std::uint8_t> image_flags(std::span<const ImageRows> images,
+                                                        std::size_t t) const {
+        std::vector<std::uint8_t> flags;
+        for (const ImageRows& piece : images) {
+            if (flags.empty()) { flags.assign(t, 0); }
+            const std::size_t from  = std::min<std::size_t>(piece.row, t);
+            const std::size_t count = piece.embeddings.size() / std::size_t(hidden);
+            std::fill_n(flags.begin() + std::ptrdiff_t(from), std::min(count, t - from), std::uint8_t(1));
+        }
+        return flags;
+    }
+
     // The pieces of `images` within rows [begin, end), rows counted from begin.
     std::vector<ImageRows> slice_images(std::span<const ImageRows> images, std::size_t begin,
                                         std::size_t end) const {
@@ -2588,10 +2860,11 @@ struct Executor::Impl {
 
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::uint32_t logit_column = 0,
-                 std::span<const ImageRows> images = {}) {
+                 std::span<const ImageRows> images = {}, std::uint32_t state_at = 0,
+                 NextPromptCall next = {}) {
         const int t = int(tokens.size());
         if (std::uint32_t(t) > options.prefill_chunk && logit_column == 0) {
-            forward_span(sequence, tokens, logit_rows, images);
+            forward_span(sequence, tokens, logit_rows, images, state_at, next);
             return;
         }
         if (sequence >= options.sequences || t <= 0 || std::uint32_t(t) > options.prefill_chunk ||
@@ -2603,13 +2876,16 @@ struct Executor::Impl {
         if (first + std::uint32_t(t) > options.max_context) {
             throw std::invalid_argument("deepseek_v41 forward: context capacity exceeded");
         }
+        const int decoder_row = decoder_start(sequence, first, t, logit_rows, state_at);
         back(sequence, first + std::uint32_t(t));
         std::vector<std::int32_t> pos(t);
         for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
         StepImages kept{*this};
         stage(tokens, pos, {});
         stage_images(images, t);
-        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(t), sequence), true, step_dead);
+        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(t), sequence), true, step_dead,
+                         true);
+        read_ahead(sequence, first + std::uint32_t(t), next);
         Pass s;
         s.t            = t;
         s.chunk        = true;
@@ -2617,7 +2893,10 @@ struct Executor::Impl {
         s.first        = first;
         s.logit_rows   = int(logit_rows);
         s.logit_column = int(logit_column);
+        s.decoder_row  = decoder_row;
+        s.tap_row      = tap_start(first, t, state_at);
         run(s);
+        decoder_ran(sequence, first + std::uint32_t(t), decoder_row, t);
         positions[sequence] = first + std::uint32_t(t);
     }
 
@@ -2628,7 +2907,8 @@ struct Executor::Impl {
     // blocks in memory borrowed from an elastic expert cache (borrow_span), else in the workspace;
     // each chunk's arithmetic is forward()'s, and the logits are the span's last rows.
     void forward_span(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                      std::uint32_t logit_rows, std::span<const ImageRows> images = {}) {
+                      std::uint32_t logit_rows, std::span<const ImageRows> images = {},
+                      std::uint32_t state_at = 0, NextPromptCall next = {}) {
         const int n = int(tokens.size()), c = int(options.prefill_chunk);
         if (sequence >= options.sequences || std::uint32_t(n) > span_tokens ||
             logit_rows > std::min<std::uint32_t>(n, kMaxLogitRows)) {
@@ -2648,11 +2928,20 @@ struct Executor::Impl {
                 const int half = (n / 2 + c - 1) / c * c;
                 const auto first_images = slice_images(images, 0, std::size_t(half));
                 const auto last_images  = slice_images(images, std::size_t(half), std::size_t(n));
-                forward(sequence, tokens.first(std::size_t(half)), 0, 0, first_images);
-                forward(sequence, tokens.subspan(std::size_t(half)), logit_rows, 0, last_images);
+                const auto last_flags   = image_flags(last_images, std::size_t(n - half));
+                forward(sequence, tokens.first(std::size_t(half)), 0, 0, first_images,
+                        state_at != 0 ? state_at : first + std::uint32_t(n),
+                        {tokens.subspan(std::size_t(half)), last_flags});
+                forward(sequence, tokens.subspan(std::size_t(half)), logit_rows, 0, last_images,
+                        state_at, next);
                 return;
             }
         }
+        // The span's rows the decoder blocks run (all of them but under a prefill tail) and the
+        // rows the drafter taps: those within the window before the state the caller keeps.
+        const int decoder_row = decoder_start(sequence, first, n, logit_rows, state_at);
+        const int tap_row     = drafter ? tap_start(first, n, state_at) : n;
+        const int tapped      = n - tap_row;
         std::size_t taken = 0;
         // The span's buffers: from the borrowed memory (in span_buffers' order), else the workspace.
         const auto span_alloc = [&](std::size_t bytes) -> void* {
@@ -2666,7 +2955,9 @@ struct Executor::Impl {
         StepImages kept{*this};
         stage(tokens, pos, {});
         stage_images(images, n);
-        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(n), sequence), true, step_dead);
+        read_engram_rows(tokens, std::vector<std::uint32_t>(std::size_t(n), sequence), true, step_dead,
+                         true);
+        read_ahead(sequence, first + std::uint32_t(n), next);
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(span_alloc(std::size_t(n) * streams * hidden * 4));
@@ -2688,37 +2979,40 @@ struct Executor::Impl {
             return Coefficients{co.pre + std::size_t(row) * streams, co.post + std::size_t(row) * streams,
                                 co.comb + std::size_t(row) * streams * streams};
         };
-        const int tapped = drafter ? std::min(n, window) : 0; // the span's last rows the drafter taps
         for (std::size_t l = 0; l < layers.size(); ++l) {
             const LayerPlan& p = layers[l];
+            const int from     = p.decoder ? decoder_row : 0;
             for (int row = 0; row < n; row += c) {
+                // A chunk's rows from `from` on (under the Exact tail, whole chunks).
+                const int lo = std::max(row, from), hi = std::min(row + c, n);
+                if (lo >= hi) { continue; }
                 Pass s;
-                s.t        = std::min(c, n - row);
+                s.t        = hi - lo;
                 s.chunk    = true;
-                s.row      = row;
+                s.row      = lo;
                 s.staged   = n;
                 s.sequence = sequence;
-                s.first    = first + std::uint32_t(row);
-                float* hc  = h + std::size_t(row) * streams * hidden;
-                if (const int lo = std::max(row, n - tapped); tapped > 0 && lo < row + s.t) {
-                    tap(l, h + std::size_t(lo) * streams * hidden, row + s.t - lo, lo - (n - tapped));
+                s.first    = first + std::uint32_t(lo);
+                float* hc  = h + std::size_t(lo) * streams * hidden;
+                if (const int at = std::max(lo, tap_row); tapped > 0 && at < hi) {
+                    tap(l, h + std::size_t(at) * streams * hidden, hi - at, at - tap_row);
                 }
-                const Coefficients a = rows_of(attention_site, row), f = rows_of(ffn_site, row);
+                const Coefficients a = rows_of(attention_site, lo), f = rows_of(ffn_site, lo);
                 image_mask = step_images.empty()
                                  ? nullptr
-                                 : static_cast<const std::uint8_t*>(d_image.p) + row;
+                                 : static_cast<const std::uint8_t*>(d_image.p) + lo;
                 if (p.engram >= 0) { engram_block(p, hc, s.t, s); }
                 mixes(p.hc_attention, hc, s.t, mix_scratch, a);
                 // The first block reads stream 0; a later one the previous block's ffn site.
                 attention(p, hc, l == 0 ? nullptr : f.pre, s.t, s,
-                          topk + std::size_t(row) * index_topk,
-                          candidates ? candidates + std::size_t(row) * candidate_words : nullptr, a);
+                          topk + std::size_t(lo) * index_topk,
+                          candidates ? candidates + std::size_t(lo) * candidate_words : nullptr, a);
                 mixes(p.hc_ffn, hc, s.t, mix_scratch, f);
                 ffn(p, hc, a.pre, s.t, f);
             }
         }
         if (tapped > 0) {
-            seed(tapped, 0, static_cast<const std::int32_t*>(d_positions.p) + (n - tapped), nullptr,
+            seed(tapped, 0, static_cast<const std::int32_t*>(d_positions.p) + tap_row, nullptr,
                  sequence);
         }
         if (logit_rows > 0) {
@@ -2731,13 +3025,21 @@ struct Executor::Impl {
             head_logits(static_cast<const __nv_bfloat16*>(x.data), int(logit_rows), 0);
         }
         give_back(borrowed);
+        decoder_ran(sequence, first + std::uint32_t(n), decoder_row, n);
         positions[sequence] = first + std::uint32_t(n);
     }
 
     // The Engram rows of a pass whose row r belongs to owners[r], from that sequence's history.
     void read_engram_rows(std::span<const std::int32_t> tokens, std::span<const std::uint32_t> owners,
-                          bool advance, std::span<const std::uint8_t> dead = {}) {
+                          bool advance, std::span<const std::uint8_t> dead = {}, bool prompt = false) {
         if (!engram) { return; }
+        if (prompt && use_ahead(owners.front(), tokens, dead)) {
+            for (std::size_t i = 0; i < tokens.size(); ++i) {
+                advance_history(owners[i], tokens.subspan(i, 1),
+                                dead.empty() ? dead : dead.subspan(i, 1));
+            }
+            return;
+        }
         std::vector<EngramHasher::History> view(tokens.size());
         // Each run of rows of one sequence continues that sequence's history; a verification's
         // rows hash from a copy (advance false) and commit() advances the history.
@@ -2772,6 +3074,7 @@ struct Executor::Impl {
             if (positions[sequences[i]] + 1 > options.max_context) {
                 throw std::invalid_argument("deepseek_v41 decode: context capacity exceeded");
             }
+            require_resumable(sequences[i], "decode");
             pos[i] = std::int32_t(positions[sequences[i]]);
             seq[i] = std::int32_t(sequences[i]);
         }
@@ -2836,6 +3139,7 @@ struct Executor::Impl {
             if (positions[s] + w > options.max_context) {
                 throw std::invalid_argument("deepseek_v41 verify: context capacity exceeded");
             }
+            require_resumable(s, "verify");
             verify_starts[j] = at;
             verified[s].assign(tokens.begin() + at, tokens.begin() + at + w);
             for (std::uint32_t i = 0; i < w; ++i, ++at) {
@@ -2940,14 +3244,18 @@ struct Executor::Impl {
         }
         const std::uint32_t position         = positions[sequence];
         const EngramHasher::History history  = histories[sequence];
+        const std::uint32_t from             = decoder_from[sequence];
+        const std::uint8_t behind            = decoder_behind[sequence];
         copy_branch_state(sequence, true);
         std::size_t at = 0;
         for (std::size_t b = 0; b < lengths.size(); ++b) {
             forward(sequence, tokens.subspan(at, lengths[b]), 1, std::uint32_t(b));
             at += lengths[b];
             copy_branch_state(sequence, false);
-            positions[sequence] = position;
-            histories[sequence] = history;
+            positions[sequence]      = position;
+            histories[sequence]      = history;
+            decoder_from[sequence]   = from;
+            decoder_behind[sequence] = behind;
         }
     }
 
@@ -3019,6 +3327,7 @@ struct Executor::Impl {
         positions.at(sequence) = 0;
         histories.at(sequence) = {};
         verified.at(sequence).clear();
+        reset_decoder(sequence);
     }
 
     // ---- Snapshots and images ----------------------------------------------------------------------
@@ -3068,6 +3377,7 @@ struct Executor::Impl {
 
     SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
                              std::span<std::byte* const> pages, std::size_t page_bytes) {
+        if (at == nullptr) { require_resumable(sequence, "save_image"); }
         const std::uint32_t position = at != nullptr ? at->position : positions.at(sequence);
         copy_image(sequence, position, pages, page_bytes, true, at != nullptr);
         return {position, at != nullptr ? at->history : histories.at(sequence)};
@@ -3083,10 +3393,12 @@ struct Executor::Impl {
         positions.at(sequence) = image.position;
         histories.at(sequence) = image.history;
         verified.at(sequence).clear();
+        reset_decoder(sequence);
     }
 
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
         if (!options.checkpoints) { throw std::logic_error("deepseek_v41: an executor without checkpoints"); }
+        require_resumable(sequence, "snapshot");
         copy_state(sequence, true, false);
         out.position = positions[sequence];
         out.history  = histories[sequence];
@@ -3098,6 +3410,7 @@ struct Executor::Impl {
         positions[sequence] = from.position;
         histories[sequence] = from.history;
         verified[sequence].clear();
+        reset_decoder(sequence); // a snapshot holds a complete state
     }
 };
 
@@ -3195,10 +3508,16 @@ std::string Executor::expert_cpu_description() const {
 std::uint32_t Executor::prompt_step() const noexcept { return impl_->prompt_step(); }
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                       std::uint32_t logit_rows, std::span<const ImageRows> images) {
-    if (logit_rows == 0) { throw std::invalid_argument("deepseek_v41 forward: no logit rows"); }
-    impl_->forward(sequence, tokens, logit_rows, 0, images);
+                       std::uint32_t logit_rows, std::span<const ImageRows> images,
+                       std::uint32_t state_at, NextPromptCall next) {
+    impl_->forward(sequence, tokens, logit_rows, 0, images, state_at, next);
 }
+
+bool Executor::resumable(std::uint32_t sequence) const { return impl_->resumable(sequence); }
+
+std::uint32_t Executor::exact_tail_rows() const noexcept { return impl_->exact_rows; }
+
+std::uint32_t Executor::prefill_tail_rows() const noexcept { return impl_->tail_rows; }
 
 bool Executor::vision() const noexcept { return impl_->tower != nullptr; }
 

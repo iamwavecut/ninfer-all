@@ -222,6 +222,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1`; the CPU computes the rest from RAM while the GPU runs the cached ones. `auto` (the default) gives each call of GGUF experts the split whose copies and CPU products end soonest by the times measured on earlier calls, and copies every miss of native experts. Decode steps, verifications of up to 64 tokens and prompt chunks of up to 64 tokens use the CPU; GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
 | `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into; `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. Default: `2` with the automatic cache, where both buffers hold cache slots between prompts, else `1`; with an explicit `--expert-cache-mib` the buffers take memory beside the cache. On an RTX 4090 with IQ3_S host experts the second buffer prefilled a 31,865-token prompt at 3,430 instead of 2,683 tokens/s and decoded within 2.4% of the one-buffer speed (one run each); on an RTX 3090 with Q2_0, before the buffers became cache slots, 8.5-10.5% faster at 5,462 tokens and 1.9-2.3% at 31,860 |
+| `--iq1m-experts matrix\|vector` | GGUF IQ1_M experts of calls past eight tokens: ggml's integer matrix kernel once a call routes more than 16 rows to each expert on average for gate and up products and 6 for down products, the vector kernel below (default), or always the vector kernel in groups of eight columns; the two round the sums differently ([IQ1_M experts](deepseek-v41.md#iq1_m-experts-in-prompt-chunks)) |
 | `--expert-cpu-threads N` | host or disk experts with a CPU share: `1..256` CPU threads, the calling one included; default is one per physical core the process may use (its affinity mask), at most half its CPUs (the mask and a container CPU quota); the rest stay with the threads that drive the GPU and serve requests ([the CPU share on one RTX 4090](#the-cpu-share-on-one-rtx-4090)). Each thread is pinned to a physical core and spins while requests decode |
 | `--expert-cache-adaptive` | replace cold cached native experts between calls; off by default because it changes the CPU/GPU arithmetic partition |
 | `--expert-profile PATH` | fill the expert cache at startup from counts recorded for the same artifact (`--expert-profile-out`); default: the built-in profile of the model family and its bank widths, where the build has one |
@@ -230,6 +231,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--ngram-residency disk\|ram\|ram-hot` | where the n-gram rows come from: the table's file, 16 rows a token (default); the whole 28.8 GB table in RAM; or the rows a hot-row profile ranks first in RAM and the rest from the file ([the n-gram rows](#the-n-gram-rows)) |
 | `--ngram-io buffered\|direct\|mmap` | how rows are read from the file: positioned reads through the OS page cache (default), reads past it (`O_DIRECT`, `FILE_FLAG_NO_BUFFERING`), or copies out of a mapping |
 | `--ngram-io-depth N` | row reads in flight (1 to 1024, default 64) |
+| `--ngram-dedupe on\|off` | read a row that a pass addresses several times (a repeated n-gram) once and copy it to its other places (default `on`); the rows are the same either way |
 | `--ngram-hot-profile PATH` | `ram-hot`: override the selected table's embedded profile with a `ninfer-ngram-profile` file |
 | `--ngram-ram-mib N` | `disk`: cached rows and their index (default `0`, off); `ram-hot`: resident profile rows and their index (default 4096 MiB) |
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`; needs the memlock limit or the privilege) |
@@ -350,7 +352,13 @@ the read takes longer. A prompt span reads the rows of all its chunks in one bat
 while every chunk passes block 0. `--ngram-io` chooses how the file is read. `buffered` (the default) goes
 through the OS page cache, which then keeps a 4 KiB page for each row it read; `direct` bypasses the
 OS page cache, so every row-cache miss reads from the drive; `mmap` copies the rows out
-of a read-only mapping of the file.
+of a read-only mapping of the file. A row the pass addresses several times (a repeated n-gram) is
+read once and copied to its other places (`--ngram-dedupe off` reads every place); the pass then
+reads its rows in file order. On an RTX 4090 with the Coder IQ1_M release's experts in host memory,
+the table dropped from the page cache before each server started and four rounds, a 29,613-token
+prompt read 28.8 MiB of rows instead of 40.7 MiB in 29% fewer read calls, an image's prompt 0.1 MiB
+instead of 0.6 MiB in 87% fewer, and prompts of 92 to 29,615 tokens prefilled 0.2 to 2.1% faster
+than with `--ngram-dedupe off`, within the spread of the rounds.
 
 `disk` keeps recently read rows in a four-way CLOCK cache. `--ngram-ram-mib` bounds its
 allocation including row tags and CLOCK state, independent of the table's size. The cache is off
@@ -712,9 +720,10 @@ drafts after the three prompts and 1.43 times after a 9,741-token document (MTP'
   pass over each selected expert's rows for all of its tokens, through device tables of expert base
   pointers: an expert is read wherever the table points, in device memory, a cache slot or the
   pinned host block. Up to eight tokens run vector products; wider calls run ggml's integer
-  tensor-core matrix kernel over the routed pairs from device memory, one CTA per row tile and per
-  column tile that holds pairs (the sort that groups the pairs lists those tiles for each tile
-  width), rather than one per expert and possible column tile (on an RTX 3090 with IQ3_S host
+  tensor-core matrix kernel (IQ1_M experts once a call routes more than 16 rows to each expert,
+  unless `--iq1m-experts vector`) over the routed pairs from device memory, one CTA per row tile
+  and per column tile that holds pairs (the sort that groups the pairs lists those tiles for each
+  tile width), rather than one per expert and possible column tile (on an RTX 3090 with IQ3_S host
   experts, a 31,865-token prompt prefilled at 1.71k instead of 1.61k tokens/s). That kernel reads a
   640-value down row in 256-value steps, so it decodes the bytes after a down matrix as the down's
   blocks: in a bank they are the next expert's down or zeros after the last one, and every cache or

@@ -41,6 +41,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [b1231227](https://github.com/b1231227) | a BF16 output head in the dense GGUF recipe, and the native re-quantisation of a GGUF that exposed `ssm_out`'s stored column order ([#185](https://github.com/iamwavecut/ninfer-all/pull/185)) |
 | [13thblade/ninfer-all-nvfp4](https://github.com/13thblade/ninfer-all-nvfp4) (13thblade) | NVFP4 weights on GPUs without FP4 tensor cores: the wide W4A16 kernels and the W4A8 int8 routes (`--nvfp4-w4a8-int`, `--nvfp4-w4a16`) with their tensor-parallel shares, and the integer E2M1/E4M3 expansions of the NVFP4 and FP8 KV caches |
 | [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090) (AshAlliants) | the prefill stall budget (`--prefill-stall-budget-ms`) |
+| [ahostbr](https://github.com/ahostbr) | the DeepSeek-V4.1 prefill proposals behind the decoder blocks' prompt tail, the IQ1_M matrix route of routed experts and the Engram rows read once and ahead ([#238](https://github.com/iamwavecut/ninfer-all/issues/238), [#239](https://github.com/iamwavecut/ninfer-all/issues/239), [#240](https://github.com/iamwavecut/ninfer-all/issues/240)) |
 
 ## Pull requests to Neroued/ninfer ported here
 

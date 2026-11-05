@@ -167,10 +167,13 @@ std::string usage_text(const char* argv0) {
            "  --max-context N               context ceiling in tokens (default 2048)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024; 4096 for native MoE experts\n"
-           "                                in host memory or files); with an int8 or\n"
-           "                                rk* KV cache a Qwen3.5-core model runs the\n"
-           "                                nearby multiple of 128 that best fills the\n"
-           "                                GPU's attention waves (up to 256 more)\n"
+           "                                in host memory or files; 2048 for\n"
+           "                                DeepSeek-V4.1); with an int8 or rk* KV cache\n"
+           "                                a Qwen3.5-core model runs the nearby multiple\n"
+           "                                of 128 that best fills the GPU's attention\n"
+           "                                waves (up to 256 more)\n" +
+           std::string(ninfer::product::kPrefillTailHelp) +
+           std::string(ninfer::product::kIq1mExpertsHelp) +
            "  --max-new N                   cap on generated tokens (default 128)\n"
            "  --device N                    CUDA device index (default 0)\n"
            "  --devices A,B,...             one pipeline stage per listed GPU, each owning\n"
@@ -386,6 +389,10 @@ Options parse_options(int argc, char** argv) {
 
         if (ninfer::product::parse_steering_flag(
                 arg, [&]() -> const char* { return value(arg); }, options.steering)) {
+            continue;
+        }
+        if (ninfer::product::parse_prompt_route_option(arg, options.prompt_routes,
+                                                       [&] { return value(arg); })) {
             continue;
         }
         if (arg == "--prompt") {

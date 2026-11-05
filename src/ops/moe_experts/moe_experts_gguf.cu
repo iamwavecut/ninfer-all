@@ -165,10 +165,18 @@ struct Plan {
     std::int32_t pairs  = 0;
 };
 
-bool matrix_path(std::int32_t tokens, bool device_resident, const GgufExpertTable& table, int rows,
-                 int k) {
+// Whether a call of `tokens` routing `pairs` rows over `experts` runs a table's gate or up
+// (`gate_up`) or down products on the matrix kernel: past the vector kernel's widths over
+// device-resident banks where the type has a matrix kernel, IQ1_M's only with `iq1m_matrix` and
+// once the call routes enough rows to each expert (gguf::iq1m_moe_matrix_pays).
+bool matrix_path(std::int32_t tokens, std::int32_t pairs, std::int32_t experts,
+                 bool device_resident, bool iq1m_matrix, bool gate_up,
+                 const GgufExpertTable& table, int rows, int k) {
+    const auto type = detail::gguf_type(table.format);
     return tokens > kVectorTokens && device_resident &&
-           gguf::moe_matrix_supported(detail::gguf_type(table.format), rows, k, true);
+           (type != gguf::GgmlType::IQ1_M ||
+            (iq1m_matrix && gguf::iq1m_moe_matrix_pays(gate_up, pairs, experts))) &&
+           gguf::moe_matrix_supported(type, rows, k, true);
 }
 
 // One bank's pass: the middle of every pair, then its weighted down product into `fixed`. The
@@ -176,7 +184,7 @@ bool matrix_path(std::int32_t tokens, bool device_resident, const GgufExpertTabl
 void run_bank(const Tensor& routing_ids, std::int32_t pairs, std::int32_t experts, int per_token,
               const float* pair_weights, const __nv_bfloat16* m, const void* activation,
               std::int32_t tokens, const GgufExpertTable& gate, const GgufExpertTable& up,
-              const GgufExpertTable& down, int width, bool device_resident,
+              const GgufExpertTable& down, int width, bool device_resident, bool iq1m_matrix,
               WorkspaceArena& workspace, unsigned long long* fixed, cudaStream_t stream) {
     auto scope           = workspace.scope();
     Tensor routing_bytes = workspace.alloc(
@@ -190,8 +198,11 @@ void run_bank(const Tensor& routing_ids, std::int32_t pairs, std::int32_t expert
     auto* middle_p                  = static_cast<__nv_bfloat16*>(middle.data);
     const gguf::MoeTable gate_table = table(gate, width, kHidden);
     const gguf::MoeTable up_table   = table(up, width, kHidden);
-    if (matrix_path(tokens, device_resident, gate, width, kHidden) &&
-        matrix_path(tokens, device_resident, up, width, kHidden)) {
+    const auto matrix = [&](const GgufExpertTable& t, bool gate_up, int rows, int k) {
+        return matrix_path(tokens, pairs, experts, device_resident, iq1m_matrix, gate_up, t, rows,
+                           k);
+    };
+    if (matrix(gate, true, width, kHidden) && matrix(up, true, width, kHidden)) {
         // Each projection's pairs gathered in routing order and quantized for its schedule; an
         // expert receives at most one pair per token.
         auto planes          = workspace.scope();
@@ -235,7 +246,7 @@ void run_bank(const Tensor& routing_ids, std::int32_t pairs, std::int32_t expert
                                  gguf::MoeOutput{.bf16 = middle_p, .gate = gate_p}, chunk, stream);
     }
     const auto down_type = detail::gguf_type(down.format);
-    if (matrix_path(tokens, device_resident, down, kHidden, width)) {
+    if (matrix(down, false, kHidden, width)) {
         // The middle in routing order, its values padded to whole 256-value steps.
         Tensor middle_x = workspace.alloc(
             DType::U8,
@@ -397,7 +408,7 @@ void moe_experts_gguf_add(const GgufMoeStage& stage, const Tensor& m, const Tens
     const auto* m_p           = static_cast<const __nv_bfloat16*>(m.data);
     run_bank(ids, tokens * kTopK, banks.experts, kTopK, static_cast<const float*>(weights.data),
              m_p, stage.activation, tokens, banks.gate, banks.up, banks.down, kWidth,
-             banks.device_resident, workspace, stage.fixed, stream);
+             banks.device_resident, banks.iq1m_matrix, workspace, stage.fixed, stream);
     if (shared != nullptr) {
         require(shared->dtype == DType::FP32 && shared->is_contiguous() &&
                     shared->numel() == tokens,
@@ -408,7 +419,8 @@ void moe_experts_gguf_add(const GgufMoeStage& stage, const Tensor& m, const Tens
         CUDA_CHECK(cudaMemsetAsync(shared_ids.data, 0, shared_ids.bytes(), stream));
         run_bank(shared_ids, tokens, 1, 1, static_cast<const float*>(shared->data), m_p,
                  stage.activation, tokens, banks.shared_gate, banks.shared_up, banks.shared_down,
-                 banks.shared_width, banks.device_resident, workspace, stage.fixed, stream);
+                 banks.shared_width, banks.device_resident, banks.iq1m_matrix, workspace,
+                 stage.fixed, stream);
     }
 }
 

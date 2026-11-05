@@ -280,6 +280,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
     options.steering.apply(engine_options);
+    options.prompt_routes.apply(engine_options);
     engine_options.vision_residency         = options.vision_residency;
     engine_options.vision_max_merged_tokens = options.vision_max_merged_tokens;
     engine_options.use_cuda_graph           = options.use_cuda_graph;

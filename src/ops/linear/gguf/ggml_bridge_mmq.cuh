@@ -325,6 +325,13 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
 
 } // namespace ninfer::ops::gguf::detail
 
+// The routed experts' matrix product alone, for a type whose dense products take a BF16 GEMM.
+#define NINFER_GGUF_MOE_MATRIX_INSTANCE(TYPE)                                                      \
+    template bool ninfer::ops::gguf::detail::moe_matrix_fits_impl<TYPE>(int, int, bool);           \
+    template void ninfer::ops::gguf::detail::moe_matrix_product_impl<TYPE>(                        \
+        const void* const*, std::int64_t, int, int, const ninfer::ops::gguf::MoeRouting&, int,     \
+        int, bool, const void*, float*, cudaStream_t)
+
 #define NINFER_GGUF_MATRIX_INSTANCE(TYPE)                                                          \
     template std::size_t ninfer::ops::gguf::detail::matrix_fixup_bytes_impl<TYPE>(int, int);       \
     template void ninfer::ops::gguf::detail::matrix_product_impl<TYPE>(                            \
@@ -336,7 +343,4 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
     template void ninfer::ops::gguf::detail::matrix_product_impl<TYPE, __nv_bfloat16, true>(     \
         const void*, std::int64_t, int, int, const void*, int, __nv_bfloat16*, std::int64_t, void*, \
         cudaStream_t, bool, float*);                                                              \
-    template bool ninfer::ops::gguf::detail::moe_matrix_fits_impl<TYPE>(int, int, bool);           \
-    template void ninfer::ops::gguf::detail::moe_matrix_product_impl<TYPE>(                        \
-        const void* const*, std::int64_t, int, int, const ninfer::ops::gguf::MoeRouting&, int,     \
-        int, bool, const void*, float*, cudaStream_t)
+    NINFER_GGUF_MOE_MATRIX_INSTANCE(TYPE)

@@ -1,9 +1,11 @@
 // NgramTableReader returns the file's bytes for the rows a batch addresses in every residency (the
 // file, all of it in RAM, a profile's hot rows in RAM and the rest from the file) and every I/O
 // mode (buffered, direct, mapped), from a table in one file or split across two inside a row, and
-// counts the rows RAM served. It refuses a short file, a row past the table, a hot-row budget below
-// its index, and a profile naming a row twice or past the table; a row read that fails raises
-// FileReadError. A hot-row profile reads back as written and is refused for other hash constants.
+// counts the rows RAM served, whether the files serve a row the batch repeats once (dedupe) or each
+// time, also for a batch of thousands of rows from a table of more than 2^17 rows. It refuses a
+// short file, a row past the table, a hot-row budget below its index, and a profile naming a row
+// twice or past the table; a row read that fails raises FileReadError. A hot-row profile reads
+// back as written and is refused for other hash constants.
 // Hints, including the batches of many pages a worker thread issues, leave demand reads unchanged.
 #include "core/file_read_error.h"
 #include "models/qwen4_exp/ngram_hash.h"
@@ -91,6 +93,8 @@ int run() {
     ids.push_back(kRows - 1);
     ids.push_back(2500);        // the row the split cuts
     ids.push_back(ids.front()); // a repeat
+    for (int i = 0; i < 40; ++i) ids.push_back(ids[std::size_t(i % 7)]); // repeats of a few rows
+    ids.push_back(2500);
     std::vector<std::uint8_t> expected;
     for (const auto id : ids) {
         expected.insert(expected.end(), payload.begin() + static_cast<std::ptrdiff_t>(id * kRowBytes),
@@ -110,15 +114,18 @@ int run() {
     for (const auto io : {NgramIo::Buffered, NgramIo::Direct, NgramIo::Mapped})
         for (const auto residency :
              {NgramResidency::Disk, NgramResidency::Ram, NgramResidency::RamHot})
-            for (const NgramTableLayout* table : {&layout, &split_layout}) {
-                NgramReadOptions options{.residency = residency, .io = io, .depth = 5};
+            for (const NgramTableLayout* table : {&layout, &split_layout})
+            for (const bool dedupe : {true, false}) {
+                NgramReadOptions options{
+                    .residency = residency, .io = io, .depth = 5, .dedupe = dedupe};
                 if (residency == NgramResidency::RamHot) {
                     options.budget_bytes = kIndexBytes + kHot * kRowBytes + kRowBytes - 1;
                     options.hot_rows     = profile;
                 }
                 const std::string name = "io " + std::to_string(int(io)) + ", residency " +
                                          std::to_string(int(residency)) + ", " +
-                                         std::to_string(table->segments.size()) + " file(s)";
+                                         std::to_string(table->segments.size()) + " file(s)" +
+                                         (dedupe ? ", dedupe" : "");
                 std::unique_ptr<NgramTableReader> reader;
                 try {
                     reader = std::make_unique<NgramTableReader>(*table, options);
@@ -326,6 +333,48 @@ int run() {
                                    "no reads in flight");
     std::filesystem::remove(path);
     std::filesystem::remove(second);
+
+    // A batch of thousands of rows that repeats some of them, from a table of more than 2^17
+    // rows: dedupe orders such a batch in more than one radix pass. The rows match the file's in
+    // every I/O mode, with and without dedupe.
+    {
+        constexpr std::uint32_t kWideRowBytes = 4;
+        constexpr std::uint64_t kWideRows     = (std::uint64_t{1} << 17) + 5;
+        const auto wide_path = directory / ("ninfer_ngram_table_wide_" +
+                                            std::to_string(std::random_device{}()) + ".bin");
+        std::vector<std::uint8_t> wide(kWideRows * kWideRowBytes);
+        for (auto& byte : wide) byte = static_cast<std::uint8_t>(random());
+        {
+            std::ofstream file(wide_path, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(wide.data()),
+                       static_cast<std::streamsize>(wide.size()));
+        }
+        const NgramTableLayout wide_layout{
+            {{wide_path, 0, kWideRows * kWideRowBytes}}, kWideRowBytes, kWideRows};
+        std::vector<std::uint64_t> batch;
+        for (int i = 0; i < 3000; ++i) batch.push_back(random() % kWideRows);
+        for (int i = 0; i < 1500; ++i) batch.push_back(batch[random() % batch.size()]);
+        batch.push_back(kWideRows - 1);
+        batch.push_back(0);
+        std::shuffle(batch.begin(), batch.end(), random);
+        std::vector<std::uint8_t> want;
+        for (const auto id : batch) {
+            want.insert(want.end(), wide.begin() + static_cast<std::ptrdiff_t>(id * kWideRowBytes),
+                        wide.begin() + static_cast<std::ptrdiff_t>((id + 1) * kWideRowBytes));
+        }
+        for (const auto io : {NgramIo::Buffered, NgramIo::Direct, NgramIo::Mapped}) {
+            if (io == NgramIo::Direct && direct_skipped) { continue; }
+            for (const bool dedupe : {true, false}) {
+                NgramTableReader reader(wide_layout, {.io = io, .depth = 5, .dedupe = dedupe});
+                std::vector<std::uint8_t> got(batch.size() * kWideRowBytes);
+                reader.read_rows(batch, got);
+                const std::string what = "io " + std::to_string(int(io)) + ", a wide batch" +
+                                         (dedupe ? ", dedupe" : "");
+                require(got == want, what + ": rows differ from the file");
+            }
+        }
+        std::filesystem::remove(wide_path);
+    }
 
     // A profile reads back as written and belongs to the hash it was counted for.
     const NgramHashConstants constants =
