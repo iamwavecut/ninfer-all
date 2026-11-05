@@ -122,11 +122,15 @@ namespace ninfer {
 // partial's values (`TensorParallelPiece`) with fences of its own, so a piece's exchange crosses on
 // a rank's side stream (`side_stream`) while its compute stream runs the next piece. Each piece is
 // an exchange as above over its own values: its route is its own size's, its reduce-scatter divides
-// its own values, and under PeerWrite an inbox row holds every piece's range at a place of its own;
-// a later piece whose range would pass the row's end reduces whole by peer reads instead. Neither
-// Words nor ScatterFlags takes pieces: a later piece whose band names one reduces whole. The slot
-// alternation holds piece by piece: a rank writes piece p of a slot again only after its own reduce
-// and complete of piece p in the exchange in between.
+// its own values, and under PeerWrite an inbox row holds every piece's range at a place of its own,
+// in the bytes its partials move as (rounded ones take fewer); a later piece whose range would pass
+// the row's end reduces whole by peer reads instead. A whole reduce's place is the piece's offset,
+// past every earlier piece's range, while a reduce-scatter's lies lower, among an earlier whole
+// piece's values: after a piece reduced whole over peer writes, every later piece of the exchange
+// reduces whole too. A rank publishes a piece after its reduce of every earlier piece, whose routes
+// it keeps. Neither Words nor ScatterFlags takes pieces: a later piece whose band names one reduces
+// whole. The slot alternation holds piece by piece: a rank writes piece p of a slot again only
+// after its own reduce and complete of piece p in the exchange in between.
 //
 // Rounded partials (TensorParallelPartials::Bf16 or Int8, a prompt chunk's exchanges by choice). A
 // Whole or Scatter exchange can move its partials rounded, in fewer bytes: to BF16, half of them,
@@ -329,6 +333,8 @@ private:
         std::array<std::array<void*, kPieces>, kSlots> output{};
         std::array<std::array<bool, kPieces>, kSlots> reduced_ready{};
         std::array<std::array<cudaEvent_t, kPieces>, kSlots> reduced{};
+        // Per slot and piece: the route the rank's last reduce of that piece took.
+        std::array<std::array<TensorParallelRoute, kPieces>, kSlots> piece_route{};
         // Pieces: the side stream and the hand-over events (see `piece_ready`).
         cudaStream_t side = nullptr;
         std::array<cudaEvent_t, kPieces> piece_ready{};
@@ -369,10 +375,12 @@ private:
     // (`engine_bytes_`), timed on rank 0's rows of the other ranks' inboxes.
     void measure_engine_bytes();
     [[nodiscard]] float* inbox_row(std::size_t rank, std::size_t sender, std::size_t slot) const;
-    // Where in an inbox row a piece's values begin (see Pieces), and the route of its exchange.
+    // Where in an inbox row a piece's values begin (see Pieces), and the route of `rank`'s
+    // exchange of it in `slot`, which follows the routes its earlier pieces took.
     [[nodiscard]] std::int64_t inbox_offset(TensorParallelPiece piece,
                                             TensorParallelForm form) const noexcept;
-    [[nodiscard]] TensorParallelRoute piece_route(std::size_t bytes, TensorParallelSum sum,
+    [[nodiscard]] TensorParallelRoute piece_route(std::size_t rank, std::size_t slot,
+                                                  std::size_t bytes, TensorParallelSum sum,
                                                   TensorParallelPiece piece,
                                                   TensorParallelPartials partials) const;
     // The whole route of `bytes`, for `partials`: PeerRead past PeerWrite's inbox rows.
