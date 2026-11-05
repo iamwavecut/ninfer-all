@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from copy import deepcopy
+from heapq import heappop, heappush
 from pathlib import Path
 import os
 import re
@@ -33,6 +34,9 @@ from .schema import (
 )
 
 ZERO_CHUNK_BYTES = 1024 * 1024
+# Windows file systems (NTFS, exFAT) fill the range between a file's written data and a later write
+# with zeros before that write. There each object's regions reach its file in ascending order.
+ASCENDING_WRITES = os.name == "nt"
 
 
 def free_bytes(directory: str | Path) -> int | None:
@@ -203,6 +207,8 @@ class ArtifactWriter:
         )
         self.artifact_id = uuid4().bytes
         self._coverage = {obj.id: _Coverage() for obj in self.objects}
+        # Per object: the length of its written prefix and the regions waiting past it.
+        self._prefix: dict[str, tuple[int, list[tuple[int, bytes]]]] = {}
         self._prefixes = [0]
         for file in self.directory.files:
             self._prefixes.append(self._prefixes[-1] + file.payload_bytes)
@@ -333,10 +339,34 @@ class ArtifactWriter:
             return
         try:
             self._coverage[object_id].add(offset, end, object_id)
-            self._write_range(obj.offset + offset, view)
+            if ASCENDING_WRITES:
+                self._write_ascending(obj, offset, view)
+            else:
+                self._write_range(obj.offset + offset, view)
         except BaseException:
             self._failed = True
             raise
+
+    def _write_ascending(self, obj: ArtifactObject, offset: int, view: memoryview) -> None:
+        """Write an object's regions in ascending order: a region past the object's written
+        prefix waits in memory until the prefix reaches it.
+
+        A row-split, FP8-row or NVFP4 object gets its later planes (high bits, scales) with its
+        first rows, so they wait until its first plane is complete: up to 36% of a Q6 object.
+        Written at once, they made Windows write such an object twice, first as zeros."""
+
+        written, waiting = self._prefix.get(obj.id, (0, []))
+        if offset > written:
+            heappush(waiting, (offset, bytes(view)))
+            self._prefix[obj.id] = (written, waiting)
+            return
+        self._write_range(obj.offset + offset, view)
+        written = offset + len(view)
+        while waiting and waiting[0][0] == written:
+            start, data = heappop(waiting)
+            self._write_range(obj.offset + start, memoryview(data))
+            written = start + len(data)
+        self._prefix[obj.id] = (written, waiting)
 
     def write_zeros(self, object_id: str, offset: int, length: int) -> None:
         integer(length, f"{object_id} zero length")
@@ -365,6 +395,8 @@ class ArtifactWriter:
             for obj in self.objects:
                 if self._coverage[obj.id].ranges != [(0, obj.bytes)]:
                     raise ArtifactError(f"{obj.id}: output coverage is incomplete")
+                if self._prefix.get(obj.id, (obj.bytes, []))[1]:
+                    raise ArtifactError(f"{obj.id}: output regions were never written")
             for index, fd in enumerate(self._fds):
                 expected = self._file_start(index) + self.directory.files[index].payload_bytes
                 # A part file may end inside the alignment padding before the next object,

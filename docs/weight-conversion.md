@@ -757,6 +757,12 @@ page cache once read, and the output is synced and dropped from it every 64 MiB.
 output is synced every 512 MiB, which bounds the written data that the cache still holds; on macOS
 it is synced once, when the artifact is complete.
 
+Windows file systems fill the range between a file's written data and a later write with zeros
+before that write. On Windows conversion therefore writes each object in file order: the later
+planes of a row-split, FP8 row or NVFP4 object, its high bits and scales, wait in memory until its
+first plane is written. They take up to 36% of a Q6 object, 358 MB for the Q6 vocabulary of
+Qwen3.6-27B.
+
 Before it writes, conversion checks that the output directory's file system has room for every
 file of the artifact and stops if it has not. Each file is written under a hidden temporary name,
 such as `.my_qwen.ninfer.k3x9q0zb.tmp`, and gets its own name when the whole artifact is complete.

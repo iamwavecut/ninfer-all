@@ -338,3 +338,55 @@ def test_an_artifact_is_one_file_unless_a_limit_splits_it():
     assert same_start == start and len(directory.files) == 1
     with pytest.raises(ArtifactError):
         layout_directory("small.ninfer", description, 1 << 64)
+
+
+def test_on_windows_an_object_with_several_planes_reaches_its_file_in_ascending_order(
+    tmp_path, monkeypatch
+):
+    # Each chunk brings codes and scales; the scale plane waits until the codes plane is written.
+    import numpy as np
+    import torch
+
+    from tools.artifact import writer as writer_module
+    from tools.artifact.layouts import row_split_geometry
+    from tools.artifact.tensor_output import TensorOutput
+
+    writes = []
+    real = writer_module.pwrite
+
+    def recording(fd, data, offset):
+        writes.append((offset, len(data)))
+        return real(fd, data, offset)
+
+    monkeypatch.setattr(writer_module, "pwrite", recording)
+    monkeypatch.setattr(writer_module, "ASCENDING_WRITES", True)
+    rows, k = 512, 4096
+    rng = np.random.default_rng(3)
+    codes = rng.integers(0, 255, size=(rows, k), dtype=np.uint8)
+    codes[codes == 0x80] = 0
+    scales = rng.uniform(0.5, 1.0, size=(rows, k // 32)).astype(np.float16)
+    path = tmp_path / "planes.ninfer"
+    with ArtifactWriter(
+        path,
+        [TensorSpec("w", (rows, k), "q8_g32_fp16", "row_split_k128_v1")],
+        components={"text": {"config": {}}},
+        bindings={},
+    ) as writer:
+        output = TensorOutput(writer, "w")
+        for row in range(0, rows, 128):
+            output.write_codes(
+                row,
+                torch.from_numpy(codes[row : row + 128]),
+                torch.from_numpy(scales[row : row + 128]),
+                packed=True,
+            )
+        start = writer.payload_offset
+    payload = [(offset - start, count) for offset, count in writes if offset >= start]
+    assert payload[0][0] == 0
+    assert all(a + n == b for (a, n), (b, _) in zip(payload, payload[1:]))
+    geometry = row_split_geometry("q8_g32_fp16", (rows, k))
+    assert payload[-1][0] + payload[-1][1] == geometry.payload_bytes
+    with Artifact(path) as reader:
+        stored = reader.read_object("w")
+    assert stored[: geometry.base_bytes] == codes.tobytes()
+    assert stored[geometry.scale_offset :] == scales.tobytes()
