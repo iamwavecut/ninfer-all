@@ -44,9 +44,32 @@ constexpr std::uint64_t kThreadBounce = 64 * 1024;
 // A batch of at most this many rows reads those the page cache holds on the submitting thread
 // (about a microsecond each); a prompt chunk's thousands go to the threads.
 constexpr std::size_t kInlineRows = 1024;
+// Dedupe orders a batch of at least this many rows with radix_sort, a smaller one with std::sort.
+constexpr std::size_t kRadixRows = 2048;
 
 std::string mib(std::uint64_t bytes) {
     return std::to_string((bytes + (1ULL << 19)) >> 20) + " MiB";
+}
+
+// Sorts the (row, index) pairs by row and keeps the order of a row's pairs: a least-significant-
+// digit radix sort over the row's low `bits`, up to 16 bits a pass. Its time is linear in the
+// pairs, which takes a prompt pass's tens of thousands of rows off the submitting thread's path.
+void radix_sort(std::vector<std::pair<std::uint64_t, std::uint32_t>>& pairs,
+                std::vector<std::pair<std::uint64_t, std::uint32_t>>& scratch,
+                std::vector<std::uint32_t>& counts, unsigned bits) {
+    const unsigned passes    = std::max(1U, (bits + 15) / 16);
+    const unsigned digit     = (bits + passes - 1) / passes;
+    const std::uint64_t mask = (std::uint64_t{1} << digit) - 1;
+    counts.resize(std::size_t{1} << digit);
+    scratch.resize(pairs.size());
+    for (unsigned shift = 0; shift < bits; shift += digit) {
+        std::fill(counts.begin(), counts.end(), 0U);
+        for (const auto& pair : pairs) { ++counts[(pair.first >> shift) & mask]; }
+        std::uint32_t sum = 0;
+        for (auto& count : counts) { sum += std::exchange(count, sum); }
+        for (const auto& pair : pairs) { scratch[counts[(pair.first >> shift) & mask]++] = pair; }
+        pairs.swap(scratch);
+    }
 }
 
 #ifndef _WIN32
@@ -828,6 +851,7 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
     batch_start_ = std::chrono::steady_clock::now();
     misses_.clear();
     admissions_.clear();
+    copies_.clear();
     std::uint64_t hits = 0;
     for (std::size_t i = 0; i < row_ids.size(); ++i) {
         if (cache_ && cache_->copy(row_ids[i], out.data() + i * rb)) {
@@ -847,12 +871,31 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
         }
         if (slot < 0) {
             misses_.push_back(static_cast<std::uint32_t>(i));
-            if (cache_) { admissions_.push_back(static_cast<std::uint32_t>(i)); }
             continue;
         }
         std::memcpy(out.data() + i * rb, resident_->data() + std::uint64_t(slot) * rb, rb);
         ++hits;
     }
+    if (options_.dedupe && misses_.size() > 1) {
+        // Each row the files serve once, in file order; its repeats copy it in wait().
+        order_.clear();
+        for (const auto i : misses_) { order_.emplace_back(row_ids[i], i); }
+        if (order_.size() < kRadixRows) {
+            std::sort(order_.begin(), order_.end());
+        } else {
+            radix_sort(order_, order_scratch_, radix_counts_,
+                       static_cast<unsigned>(std::bit_width(layout_.rows - 1)));
+        }
+        misses_.clear();
+        for (std::size_t m = 0; m < order_.size(); ++m) {
+            if (m > 0 && order_[m].first == order_[m - 1].first) {
+                copies_.emplace_back(order_[m].second, misses_.back());
+            } else {
+                misses_.push_back(order_[m].second);
+            }
+        }
+    }
+    if (cache_) { admissions_.insert(admissions_.end(), misses_.begin(), misses_.end()); }
     if (queue_) {
         reads_.clear();
         for (const auto i : misses_) {
@@ -922,6 +965,13 @@ void NgramTableReader::wait() {
     try {
         pool_->finish();
     } catch (...) { failure = std::current_exception(); }
+    if (!failure) {
+        const std::size_t rb = layout_.row_bytes;
+        for (const auto& [index, source] : copies_) {
+            std::memcpy(batch_out_.data() + std::size_t(index) * rb,
+                        batch_out_.data() + std::size_t(source) * rb, rb);
+        }
+    }
     if (!failure && cache_) {
         for (const std::size_t i : admissions_) {
             cache_->insert(batch_ids_[i], batch_out_.data() + i * layout_.row_bytes);

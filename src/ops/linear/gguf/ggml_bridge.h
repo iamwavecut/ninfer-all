@@ -46,8 +46,9 @@ struct BlockShape {
 // Streaming multiprocessors of the current device (cached per device).
 [[nodiscard]] int multiprocessor_count();
 
-// Whether the integer tensor-core prefill kernel exists for the type. IQ1_M has none (nor does it in
-// llama.cpp), and MXFP4 none here: their wide products dequantize and take a BF16 GEMM.
+// Whether the integer tensor-core prefill kernel exists for the type's dense products. IQ1_M's and
+// MXFP4's wide dense products dequantize and take a BF16 GEMM; IQ1_M's routed experts do have one
+// (moe_matrix_supported), off sm_70.
 [[nodiscard]] bool has_matrix_kernel(GgmlType type);
 
 // Columns the vector kernel takes in one launch; wider products take the matrix kernel.
@@ -342,6 +343,20 @@ void moe_decode_down(GgmlType type, const MoeDecodeDownArgs& args, int chunk, cu
 // step reads into the next row. A type without an integer kernel, or a geometry no tile fits
 // (rows a whole number of row tiles), is not supported and stays on moe_vector_product.
 [[nodiscard]] bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail);
+// Whether a wide call's IQ1_M routed experts take the matrix kernel rather than the vector kernel
+// in groups of eight columns: their gate and up products (`gate_up`) once the call's `pairs`
+// routed rows average more than 16 for each of the `experts`, where moe_matrix_product's column
+// tiles become 32 wide, their down products from 6. With fewer rows most of the matrix kernel's
+// tile columns stay empty, and it gathers and quantizes a row for every pair. In DeepSeek-V4.1's
+// prompt steps on an RTX 4090, gate and up products on 16-wide tiles ran at 0.89 to 1.02 times
+// the vector kernel's speed and at 1.37 times on 32-wide ones, down products at 1.30 times from
+// 7.3 rows. ninfer_gguf_moe_matrix_bench, which times the products alone over uniform routes, puts
+// the matrix kernel further ahead; its down crossovers on an RTX 2080 Ti, 3090, 4090 and 5090 lie
+// at or below 6 rows.
+[[nodiscard]] constexpr bool iq1m_moe_matrix_pays(bool gate_up, std::int64_t pairs,
+                                                  std::int64_t experts) {
+    return gate_up ? pairs > 16 * experts : pairs >= 6 * experts;
+}
 void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
                         int max_active, int pairs, bool tail, const void* activation, float* out,
                         cudaStream_t stream);

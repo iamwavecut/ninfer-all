@@ -118,10 +118,13 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024; 4096 for native MoE experts\n"
-           "                                in host memory or files); with an int8 or\n"
-           "                                rk* KV cache a Qwen3.5-core model runs the\n"
-           "                                nearby multiple of 128 that best fills the\n"
-           "                                GPU's attention waves (up to 256 more)\n"
+           "                                in host memory or files; 2048 for\n"
+           "                                DeepSeek-V4.1); with an int8 or rk* KV cache\n"
+           "                                a Qwen3.5-core model runs the nearby multiple\n"
+           "                                of 128 that best fills the GPU's attention\n"
+           "                                waves (up to 256 more)\n" +
+           std::string(ninfer::product::kPrefillTailHelp) +
+           std::string(ninfer::product::kIq1mExpertsHelp) +
            "  --decode-rounds-per-prefill N decode rounds after each prefill chunk while\n"
            "                                others generate (0: chunk / 64; 1 alternates)\n"
            "  --prefill-stall-budget-ms N   cut a prefill step to about N ms while others\n"
@@ -1580,6 +1583,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (product::parse_steering_flag(
                 arg, [&]() -> const char* { return require_value(arg.c_str()); },
                 options.steering)) {
+            continue;
+        }
+        if (product::parse_prompt_route_option(arg, options.prompt_routes,
+                                               [&] { return require_value(arg.c_str()); })) {
             continue;
         }
         if (arg == "--default-graft") {

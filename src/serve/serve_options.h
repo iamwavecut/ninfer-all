@@ -6,6 +6,7 @@
 #include "ninfer/model_enums.h"
 #include "ninfer/request.h"
 #include "product/logging/logging.h"
+#include "product/prompt_route_options.h"
 #include "product/steering_options.h"
 #include "serve/request.h"
 
@@ -166,6 +167,8 @@ struct ServeOptions {
     // and --control-vector-layer-range: the adapters a request's `lora` names by index, and the
     // control vectors every request runs with.
     product::SteeringFlags steering;
+    // --prefill-tail and --iq1m-experts.
+    product::PromptRouteFlags prompt_routes;
     std::optional<std::uint32_t> default_thinking_budget;
     // --reasoning-loop off|stop|conclude: the reasoning-loop guard for every thinking request,
     // constrained ones included (off by default).

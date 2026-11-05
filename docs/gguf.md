@@ -32,15 +32,20 @@ those of `ggml-quants.c`.
   words and dots it with every column. A warp owns two rows; a `[gate; up]` pair of one type is one
   launch that writes `silu(gate) * up`.
 - **More columns** (prompts) take llama.cpp's integer tensor-core kernel (`mul_mat_q`, vendored
-  unmodified in `third_party/ggml-quants` under its MIT license) with its Ampere tile table.
-  `IQ1_M` has no such kernel; its wide products dequantize to BF16 and run cuBLAS.
+  in `third_party/ggml-quants` under its MIT license with the changes its `README.ninfer.md`
+  lists) with its Ampere tile table. `IQ1_M` has no such kernel for dense matrices, whose wide
+  products dequantize to BF16 and run cuBLAS; routed experts in `IQ1_M` take that kernel with
+  NInfer's tile loader for the format once a call routes more than 16 rows to each expert on
+  average for gate and up products and 6 for down products, the vector kernel in groups of eight
+  columns below that (`--iq1m-experts`,
+  [DeepSeek-V4.1](deepseek-v41.md#iq1_m-experts-in-prompt-chunks)).
 - **Token table** rows are dequantized exactly.
 
 The scales of `IQ2_XXS`, `IQ2_XS`, `IQ2_S` and `IQ3_XXS` are applied in FP32 where llama.cpp's
 vector kernels round an integer rescale, and the vector kernels round each step of the formats the
 CPU share also computes in a fixed order (`IQ1_M` with integer codes eight times its values), so a
 decode step's logits can differ from llama.cpp's in the last bits; prompts use llama.cpp's own
-arithmetic.
+arithmetic, and `IQ1_M` experts NInfer's tile loader.
 
 ## Serving
 

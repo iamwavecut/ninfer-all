@@ -20,7 +20,8 @@
 //    blocks against the same rows over every visible position, bit for bit.
 //  - sparse_attention over the window rings and the selected latents: window-only blocks, one to
 //    40 splits (empty ones among them), a round's rows of one sequence, a chunk's staging ring,
-//    1024 latents, sinks far below and above the scores; attention_output in both layouts.
+//    a chunk's rows over a window floor (a prefill tail's first rows), 1024 latents, sinks far
+//    below and above the scores; attention_output in both layouts.
 //  - the grouped output projection of one to eight tokens as one vector product over the groups:
 //    every value the bits of its group's own vector product (Q5_K).
 //  - route (ties to the lower id, the softplus branch past 20, image rows by the image routing
@@ -1190,6 +1191,7 @@ struct AttentionCase {
     int sequence = 0, ring = kRing, topk = 0, ratio = 2, splits = 1;
     float sink_offset = 0.0f;
     int window = kWindow; // a draft block's rows see the window and the block
+    int floor  = 0;       // a prefill tail's first position: no window position below it
 };
 
 void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
@@ -1234,6 +1236,7 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     a.window_seq_stride     = chunk ? 0 : std::int64_t(c.ring) * kLatent;
     a.ring                  = c.ring;
     a.window_size           = c.window;
+    a.window_floor          = c.floor;
     a.compressed            = c.topk > 0 ? as<bf16>(dc) : nullptr;
     a.compressed_seq_stride = std::int64_t(rows) * kLatent;
     a.topk                  = as<std::int32_t>(dt);
@@ -1250,7 +1253,7 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     for (int r = 0; r < t; ++r) {
         const int p  = c.positions[std::size_t(r)];
         const int s  = chunk ? c.sequence : c.sequences[std::size_t(r)];
-        const int lo = std::max(0, p - c.window + 1);
+        const int lo = std::max(std::max(0, std::min(c.floor, p)), p - c.window + 1);
         std::vector<const bf16*> keys;
         for (int j = lo; j <= p; ++j) {
             keys.push_back(window.data() +
@@ -2301,6 +2304,9 @@ int main() {
                           4},
                          rng);
         sparse_attention({"a chunk's staging ring", range(200, 6), {}, 1, 768, 512, 1, 1}, rng);
+        sparse_attention({"a chunk's rows over a window floor", range(150, 140), {}, 1, 768, 512, 1, 1,
+                          0.0f, kWindow, 150},
+                         rng);
         sparse_attention({"1024 latents", {9000}, {0}, 0, kRing, 1024, 2, 3}, rng);
         sparse_attention({"1024 latents, empty splits", {9000}, {0}, 0, kRing, 1024, 2, 40}, rng);
         sparse_attention({"sinks far below", {5000, 77}, {0, 1}, 0, kRing, 512, 2, 4, -40.0f}, rng);

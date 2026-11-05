@@ -35,6 +35,10 @@ inline constexpr const char* kNgramTableHelp =
     "  --ngram-ram-mib N             disk, ram-hot: RAM for rows and their index\n"
     "                                (disk default 0/off; ram-hot default 4096)\n"
     "  --ngram-lock                  ram, ram-hot: lock the rows in physical memory\n"
+    "  --ngram-dedupe on|off         read a row a pass addresses several times from\n"
+    "                                the file once (default on)\n"
+    "  --ngram-read-ahead on|off     DeepSeek-V4.1: read a prompt call's Engram rows\n"
+    "                                while the call before it computes (default on)\n"
     "  --no-ngram-table              run Qwen3.8-Flash-Next without its n-gram table,\n"
     "                                DeepSeek-V4.1 without its Engram table.\n"
     "                                Non-standard experimental mode: the model was\n"
@@ -98,6 +102,12 @@ bool parse_ngram_table_option(std::string_view option, NgramTableOptions& out, V
             << 20U;
     } else if (option == "--ngram-lock") {
         out.lock = true;
+    } else if (option == "--ngram-dedupe" || option == "--ngram-read-ahead") {
+        const std::string state(value());
+        if (state != "on" && state != "off") {
+            throw std::invalid_argument(std::string(option) + " must be on or off");
+        }
+        (option == "--ngram-dedupe" ? out.dedupe : out.read_ahead) = state == "on";
     } else {
         return false;
     }

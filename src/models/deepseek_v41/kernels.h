@@ -210,9 +210,9 @@ void select_topk(const float* scores, int width, int tokens, const std::int32_t*
                  int ratio, int k, const ListedRows& listed, std::int32_t* out,
                  cudaStream_t stream);
 
-// Sparse attention of each row's heads over its window (positions p - window_size + 1 .. p, from
-// slot position % ring of the window cache, window_size at most the ring and, beside k selected
-// latents, 1152 - k) and its selected compressed latents
+// Sparse attention of each row's heads over its window (positions p - window_size + 1 .. p, none
+// below window_floor, from slot position % ring of the window cache, window_size at most the ring
+// and, beside k selected latents, 1152 - k) and its selected compressed latents
 // (compressed[topk[t][i]] for the leading entries that are not negative), every latent its own key
 // and value; each head's sink logit joins the softmax denominator:
 //   out = sum_j e^(s_j - m) v_j / (sum_j e^(s_j - m) + e^(sink - m)),  s_j = scale q . k_j.
@@ -226,6 +226,7 @@ struct AttentionArgs {
     const __nv_bfloat16* window = nullptr;
     std::int64_t window_seq_stride = 0;
     int ring = 0, window_size = 0;
+    int window_floor = 0; // the lowest window position a row reads (a prefill tail's first row)
     const __nv_bfloat16* compressed = nullptr; // [N][512] per sequence, or null
     std::int64_t compressed_seq_stride = 0;
     const std::int32_t* topk = nullptr; // [T][k]

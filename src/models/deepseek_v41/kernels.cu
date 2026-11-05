@@ -878,7 +878,7 @@ __device__ __forceinline__ float key_reduce16(float (&v)[16], int lane) {
 __device__ int attention_keys(const AttentionArgs& a, int t, int* keys) {
     __shared__ int s_compressed;
     const int p   = a.positions[t];
-    const int lo  = max(0, p - a.window_size + 1);
+    const int lo  = max(max(0, min(a.window_floor, p)), p - a.window_size + 1);
     const int win = p + 1 - lo;
     for (int i = threadIdx.x; i < win; i += blockDim.x) { keys[i] = (lo + i) % a.ring; }
     if (threadIdx.x == 0) { s_compressed = 0; }

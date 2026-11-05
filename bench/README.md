@@ -358,6 +358,21 @@ second, stored bytes a second and nanoseconds a row for each format, token count
 ./build/bench/ninfer_benches ninfer_gguf_cpu_rows_bench --formats IQ4_NL,Q2_0 --k 640 --backend scalar
 ```
 
+`ninfer_gguf_moe_matrix_bench` times a wide call's routed experts at DeepSeek-V4.1-Flash's shapes
+(or those `--hidden`, `--width`, `--top-k` and `--experts` give) on the integer matrix kernel and on
+the vector kernel in groups of eight columns, for each block type `--formats` lists (`all`: every
+type with both routes), each projection with its activation's quantization, over random routes to
+distinct experts. It reports both times, the active experts' weight bytes a second and the ratio;
+`ninfer_linear_gguf_moe_iq1m_test` checks IQ1_M's products on both routes. In one process a format
+timed after another can run its matrix kernel slower: on an RTX 4090 with 384 experts, IQ1_M's gate
+and up took 5,167 µs at 256 tokens alone and 6,426 µs after IQ1_S, and 5,359 and 6,631 µs at 544
+tokens; with 192 experts and 2048 tokens they took 6,644 µs alone and 6,567 µs after IQ2_XS and
+IQ2_XXS (both runs traced by Nsight Systems). Time one format per process:
+
+```bash
+./build/bench/ninfer_benches ninfer_gguf_moe_matrix_bench --formats IQ1_M --tokens 64,512,2048
+```
+
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
 allocation:
 

@@ -475,6 +475,7 @@ struct MoePlan {
     // entries of its tables that are set; the shared expert's tables hold the rank's run of it.
     bool share = false;
     std::uint32_t expert_begin = 0, expert_end = 0;
+    bool iq1m_matrix = true; // ExecutorOptions::iq1m_matrix
 
     [[nodiscard]] ops::GgufMoeWeights banks() const {
         return {gate.view(),
@@ -485,7 +486,8 @@ struct MoePlan {
                 shared_down_table.view(),
                 static_cast<std::int32_t>(gate.pointers.size()),
                 device_resident,
-                shared_gate_table.rows > 0 ? shared_gate_table.rows : 640};
+                shared_gate_table.rows > 0 ? shared_gate_table.rows : 640,
+                iq1m_matrix};
     }
 };
 
@@ -1425,6 +1427,7 @@ struct Executor::Impl {
         const auto h    = static_cast<std::int32_t>(config.hidden_size);
         plan.moe.router = direct(model, lw.moe.router, {h, static_cast<std::int32_t>(experts)});
         plan.moe.shared_gate = direct(model, lw.moe.shared_score, {h});
+        plan.moe.iq1m_matrix = options.iq1m_matrix;
         if (banks != nullptr) {
             plan.moe.share           = true;
             plan.moe.expert_begin    = share.expert_begin;

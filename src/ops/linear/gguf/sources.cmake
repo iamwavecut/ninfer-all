@@ -9,6 +9,7 @@ add_library(ninfer_ggml_quants ${_ninfer_ggml_library_type}
   "${CMAKE_CURRENT_LIST_DIR}/ggml_bridge.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_fattn.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq1_s.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq1_m.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2_s.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2_xs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/ggml_mmq_iq2_xxs.cu"
