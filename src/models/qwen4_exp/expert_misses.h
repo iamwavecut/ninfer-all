@@ -4,10 +4,11 @@
 // the cached ones run. After a layer's routing a kernel splits its pairs: the cached ones run at once
 // from the device tables; the missing experts are posted to pinned host memory (one "doorbell" per
 // device) without any host synchronization, so the whole pass can replay as one CUDA graph. A host
-// thread picks the request up immediately and, for each missing expert, either copies it into a
-// device staging region (or, when the cache's expert tier admits it, straight into a slot) by the
-// copy engine, or has the CPU compute its pairs from the bytes in RAM (host experts) or from the
-// file (disk experts); an expert the CPU computes crosses no bus and takes no slot. The second
+// thread picks the request up at once while passes keep it spinning (keep_alive), within
+// milliseconds once it sleeps, and, for each missing expert, either copies it into a device
+// staging region (or, when the cache's expert tier admits it, straight into a slot) by the copy
+// engine, or has the CPU compute its pairs from the bytes in RAM (host experts) or from the file
+// (disk experts); an expert the CPU computes crosses no bus and takes no slot. The second
 // stage of the layer waits for the request on the GPU, then runs the staged experts and adds the
 // CPU's products. The staged experts are reached through a second table that only the second
 // stage reads, so the resident stage needs no host at all.
@@ -20,6 +21,7 @@
 #include "ninfer/ops/moe_experts.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -53,6 +55,9 @@ struct MissLayer {
 
 // The most tokens one call can take (MissOptions::token_capacity).
 inline constexpr std::uint32_t kMaxMissTokens = 64;
+
+// How long keep_alive() and each served request keep the service and its CPU workers spinning.
+inline constexpr std::chrono::milliseconds kMissKeepAlive{500};
 
 struct MissOptions {
     std::uint32_t token_capacity = 8;    // tokens of one call, at most kMaxMissTokens
@@ -108,10 +113,13 @@ public:
     [[nodiscard]] Call begin(std::size_t layer, const Tensor& ids, const Tensor& m,
                              std::int32_t tokens, const ops::GgufMoeWeights& banks,
                              cudaStream_t stream);
-    // Enqueued: waits until the request's experts are staged and its CPU products written.
+    // Enqueued: waits until the request's experts are staged and its CPU products written. Eager
+    // (the stream not capturing), it waits on the host and wakes the service first: the device may
+    // post the request long after begin() was enqueued.
     void await(std::size_t layer, cudaStream_t stream);
-    // Keeps the service (and the CPU workers) spinning for the next half second; a pass calls it
-    // before its first layer. Rethrows a service failure.
+    // Keeps the service (and the CPU workers) spinning for kMissKeepAlive; a pass calls it before
+    // its first layer. Rethrows a service failure. Asleep, the service still looks for requests
+    // every few milliseconds, as no host call wakes it for a request a replayed layer posts.
     void keep_alive();
     // Rethrows a failure the service recorded while serving a call. A failed call released the
     // GPU with its missing experts left out, so a pass checks this once it has completed, before
