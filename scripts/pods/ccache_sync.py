@@ -95,8 +95,11 @@ def push(directory: Path, remote: str) -> None:
     if not directory.is_dir():
         report(ccache="not pushed", reason="no local cache", path=str(directory))
         return
+    # build.sh raises the size limit to 40G; without it ccache's default of 5 GB would evict most
+    # of the cache before it is pushed.
     subprocess.run(["ccache", "--cleanup"], check=False, stdout=subprocess.DEVNULL,
-                   env={**os.environ, "CCACHE_DIR": str(directory)})
+                   env={**os.environ, "CCACHE_DIR": str(directory),
+                        "CCACHE_MAXSIZE": os.environ.get("CCACHE_MAXSIZE", "40G")})
     started = time.monotonic()
     archive = directory.parent / (directory.name + ".tar")
     with tarfile.open(archive, "w") as package:
