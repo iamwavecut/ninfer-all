@@ -755,8 +755,11 @@ drafts after the three prompts and 1.43 times after a 9,741-token document (MTP'
   into the cached experts, which run at once, and the missing ones, which it posts to a host service
   through mapped memory, without a host synchronization; the service copies each missing expert
   into the slot of the layer's least recently used expert of the lowest frequency tier (or the CPU
-  computes its share), the
-  layer waits for it on the device, and the second stage runs it. The decode form of the expert
+  computes its share), the layer waits for it (on the device in a replayed graph, on the host in
+  an eager pass such as a prompt chunk's), and the second stage runs it. The service spins for
+  half a second after each pass start, call and served request; asleep, it still looks for
+  requests every 10 ms, since a replayed layer posts its request from the device and no host call
+  wakes the service for it. The decode form of the expert
   kernels needs no sort or memset: one small kernel lists each slot's pairs, quantizes the tokens'
   inputs once and zeroes the sum; a block of the fused gate/up kernel takes 32 rows of one
   expert and quantizes its piece of the middle for the down kernel itself; one token's down runs
