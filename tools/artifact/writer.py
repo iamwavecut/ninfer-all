@@ -4,11 +4,20 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from copy import deepcopy
+from heapq import heappop, heappush
 from pathlib import Path
 import os
+import re
+import shutil
+import sys
 import tempfile
 from typing import Iterable, Sequence
 from uuid import uuid4
+
+try:
+    import fcntl
+except ImportError:  # Windows: an open file cannot be deleted, which serves as its lock
+    fcntl = None
 
 from .framing import HEADER, MAGIC, PART_MAGIC, PAYLOAD_ALIGNMENT
 from .layouts import align_up
@@ -25,6 +34,61 @@ from .schema import (
 )
 
 ZERO_CHUNK_BYTES = 1024 * 1024
+# Windows file systems (NTFS, exFAT) fill the range between a file's written data and a later write
+# with zeros before that write. There each object's regions reach its file in ascending order.
+ASCENDING_WRITES = os.name == "nt"
+
+
+def free_bytes(directory: str | Path) -> int | None:
+    """Bytes this process can still write on the file system that holds `directory`, or None when
+    the file system reports no capacity."""
+
+    if hasattr(os, "statvfs"):
+        stat = os.statvfs(directory)
+        if not stat.f_blocks:
+            return None
+        # Root may also fill the blocks that a file system reserves for it.
+        blocks = stat.f_bfree if os.geteuid() == 0 else stat.f_bavail
+        return blocks * stat.f_frsize
+    usage = shutil.disk_usage(directory)
+    return usage.free if usage.total else None
+
+
+def _hold(fd: int) -> bool:
+    """Lock the open file `fd` until it is closed; False when another open file holds it."""
+
+    if fcntl is None:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _remove_unless_held(path: Path) -> bool:
+    """Delete the temporary file `path` unless a live writer holds it."""
+
+    if fcntl is None:
+        try:
+            path.unlink()
+        except PermissionError:
+            return False
+        return True
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        try:
+            taken = _hold(fd)
+        except OSError as error:
+            raise ArtifactError(
+                f"{path}: this file system has no file locks to tell whether a conversion "
+                "still writes the file; delete it if none does"
+            ) from error
+        if taken:
+            path.unlink()
+        return taken
+    finally:
+        os.close(fd)
 
 
 def layout_directory(
@@ -143,6 +207,8 @@ class ArtifactWriter:
         )
         self.artifact_id = uuid4().bytes
         self._coverage = {obj.id: _Coverage() for obj in self.objects}
+        # Per object: the length of its written prefix and the regions waiting past it.
+        self._prefix: dict[str, tuple[int, list[tuple[int, bytes]]]] = {}
         self._prefixes = [0]
         for file in self.directory.files:
             self._prefixes.append(self._prefixes[-1] + file.payload_bytes)
@@ -159,6 +225,17 @@ class ArtifactWriter:
         self._finished = False
         self._failed = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._remove_stale_temporaries()
+        needed = sum(
+            self._file_start(index) + file.payload_bytes
+            for index, file in enumerate(self.directory.files)
+        )
+        free = free_bytes(self.path.parent)
+        if free is not None and free < needed:
+            raise ArtifactError(
+                f"{self.path}: the artifact needs {needed:,} bytes and its file system has "
+                f"{free:,} bytes free"
+            )
         try:
             for index, (target, file) in enumerate(
                 zip(self._destinations, self.directory.files)
@@ -168,6 +245,12 @@ class ArtifactWriter:
                 )
                 self._fds.append(fd)
                 self._temporary.append(Path(temporary))
+                # Held until the file is published, so that another writer of this artifact does
+                # not take it for a leftover.
+                try:
+                    _hold(fd)
+                except OSError:
+                    pass  # no file locks on this file system
                 # Writes extend each file; finish() sets the final length. Extending it here
                 # would zero-fill the whole file on Windows before a single object is written.
                 header = HEADER.pack(
@@ -181,6 +264,36 @@ class ArtifactWriter:
         except BaseException:
             self.abort()
             raise
+
+    def _file_start(self, index: int) -> int:
+        return self.payload_offset if index == 0 else PAYLOAD_ALIGNMENT
+
+    def _remove_stale_temporaries(self) -> None:
+        """Delete the temporary files that an interrupted writer of this artifact left behind;
+        refuse to start while a live writer holds one."""
+
+        name = re.compile(
+            rf"\.{re.escape(self.path.name)}(?:\.part-\d{{4,}})?\.[a-z0-9_]{{8}}\.tmp"
+        )
+        with os.scandir(self.path.parent) as entries:
+            stale = sorted(
+                Path(entry.path)
+                for entry in entries
+                if name.fullmatch(entry.name) and entry.is_file(follow_symlinks=False)
+            )
+        for path in stale:
+            try:
+                size = path.stat().st_size
+                removed = _remove_unless_held(path)
+            except FileNotFoundError:
+                continue  # another writer of this artifact removed it first
+            if not removed:
+                raise ArtifactError(f"{path}: another conversion is writing {self.path.name}")
+            print(
+                f"removed {path} ({size:,} bytes), left by an interrupted conversion",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _write_file(self, fd: int, offset: int, data: bytes | memoryview) -> None:
         view = memoryview(data).cast("B")
@@ -226,10 +339,34 @@ class ArtifactWriter:
             return
         try:
             self._coverage[object_id].add(offset, end, object_id)
-            self._write_range(obj.offset + offset, view)
+            if ASCENDING_WRITES:
+                self._write_ascending(obj, offset, view)
+            else:
+                self._write_range(obj.offset + offset, view)
         except BaseException:
             self._failed = True
             raise
+
+    def _write_ascending(self, obj: ArtifactObject, offset: int, view: memoryview) -> None:
+        """Write an object's regions in ascending order: a region past the object's written
+        prefix waits in memory until the prefix reaches it.
+
+        A row-split, FP8-row or NVFP4 object gets its later planes (high bits, scales) with its
+        first rows, so they wait until its first plane is complete: up to 36% of a Q6 object.
+        Written at once, they made Windows write such an object twice, first as zeros."""
+
+        written, waiting = self._prefix.get(obj.id, (0, []))
+        if offset > written:
+            heappush(waiting, (offset, bytes(view)))
+            self._prefix[obj.id] = (written, waiting)
+            return
+        self._write_range(obj.offset + offset, view)
+        written = offset + len(view)
+        while waiting and waiting[0][0] == written:
+            start, data = heappop(waiting)
+            self._write_range(obj.offset + start, memoryview(data))
+            written = start + len(data)
+        self._prefix[obj.id] = (written, waiting)
 
     def write_zeros(self, object_id: str, offset: int, length: int) -> None:
         integer(length, f"{object_id} zero length")
@@ -258,9 +395,10 @@ class ArtifactWriter:
             for obj in self.objects:
                 if self._coverage[obj.id].ranges != [(0, obj.bytes)]:
                     raise ArtifactError(f"{obj.id}: output coverage is incomplete")
+                if self._prefix.get(obj.id, (obj.bytes, []))[1]:
+                    raise ArtifactError(f"{obj.id}: output regions were never written")
             for index, fd in enumerate(self._fds):
-                start = self.payload_offset if index == 0 else PAYLOAD_ALIGNMENT
-                expected = start + self.directory.files[index].payload_bytes
+                expected = self._file_start(index) + self.directory.files[index].payload_bytes
                 # A part file may end inside the alignment padding before the next object,
                 # which no write reaches.
                 if os.fstat(fd).st_size < expected:
@@ -270,14 +408,15 @@ class ArtifactWriter:
                         f"file {index}: output length does not match directory"
                     )
             self._writeback.flush()
-            while self._fds:
-                os.close(self._fds.pop())
+            # Publish while the temporary files are still held (_hold), then release them.
             for index in [*range(1, len(self._temporary)), 0]:
                 target = self._destinations[index]
                 os.link(self._temporary[index], target)
                 self._published.append(target)
+            while self._fds:
+                os.close(self._fds.pop())
             for temporary in self._temporary:
-                temporary.unlink()
+                temporary.unlink(missing_ok=True)
             self._temporary.clear()
             self._finished = True
             return self.directory

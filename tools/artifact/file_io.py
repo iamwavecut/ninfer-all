@@ -12,7 +12,13 @@ import os
 import threading
 
 IO_CHUNK_BYTES = 8 * 1024 * 1024
+# Linux syncs the output and drops it from the page cache every WRITEBACK_BYTES. Windows syncs it
+# every WINDOWS_WRITEBACK_BYTES, which bounds the written data its cache holds: with one sync at
+# the end, 3.8 GiB of a 4.25 GiB artifact waited in the cache of a 16 GiB machine. Each Windows sync
+# also flushes the disk's own cache; a sync every 64 MiB halved the write speed of a Windows 11
+# machine (80 against 155 MB/s). macOS syncs the output once, when the artifact is complete.
 WRITEBACK_BYTES = 64 * 1024 * 1024
+WINDOWS_WRITEBACK_BYTES = 512 * 1024 * 1024
 _PAGE_BYTES = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 # Emulated positional I/O moves the shared file offset; serialize it within this process.
 _SEEK_LOCK = threading.Lock()
@@ -79,23 +85,26 @@ def discard_cached_pages(fd: int, offset: int = 0, count: int | None = None) -> 
         os.posix_fadvise(fd, begin, end - begin, os.POSIX_FADV_DONTNEED)
 
 
-class Writeback:
-    """Bound dirty output across all open shards; release clean pages after writeback.
+def _writeback_bytes() -> int | None:
+    if hasattr(os, "posix_fadvise"):
+        return WRITEBACK_BYTES
+    return WINDOWS_WRITEBACK_BYTES if os.name == "nt" else None
 
-    The periodic sync exists to drop the written pages from the page cache. Without
-    posix_fadvise (Windows, macOS) it cannot, and each sync only stalls the writer, so there the
-    output is synced once, by the final flush()."""
+
+class Writeback:
+    """Bound dirty output across all open shards; release clean pages after writeback."""
 
     def __init__(self) -> None:
         self._bytes = 0
         self._fds: set[int] = set()
+        self._limit = _writeback_bytes()
 
     def written(self, fd: int, count: int) -> None:
         self._fds.add(fd)
-        if not hasattr(os, "posix_fadvise"):
+        if self._limit is None:
             return
         self._bytes += count
-        if self._bytes >= WRITEBACK_BYTES:
+        if self._bytes >= self._limit:
             self.flush()
 
     def flush(self) -> None:
