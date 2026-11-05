@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,23 +27,31 @@ def test_pread_into_fills_the_buffer_or_refuses_a_short_file(tmp_path, monkeypat
         os.close(fd)
 
 
-def test_writeback_syncs_periodically_only_where_it_can_drop_the_pages(monkeypatch):
+@pytest.mark.parametrize(
+    "system, interval",
+    [
+        (SimpleNamespace(name="posix", posix_fadvise=None), file_io.WRITEBACK_BYTES),
+        (SimpleNamespace(name="nt"), file_io.WINDOWS_WRITEBACK_BYTES),
+        (SimpleNamespace(name="posix"), None),
+    ],
+    ids=["linux", "windows", "macos"],
+)
+def test_writeback_syncs_the_output_at_each_platform_interval(monkeypatch, system, interval):
     synced = []
+    monkeypatch.setattr(file_io, "os", system)
     monkeypatch.setattr(file_io, "datasync", synced.append)
     monkeypatch.setattr(file_io, "discard_cached_pages", lambda fd, *args: None)
-
-    monkeypatch.delattr(file_io.os, "posix_fadvise", raising=False)
     writeback = file_io.Writeback()
-    writeback.written(7, file_io.WRITEBACK_BYTES)
-    writeback.written(8, file_io.WRITEBACK_BYTES)
-    assert synced == []
+    if interval is None:
+        writeback.written(7, file_io.WINDOWS_WRITEBACK_BYTES)
+        writeback.written(8, file_io.WINDOWS_WRITEBACK_BYTES)
+        assert synced == []
+    else:
+        writeback.written(7, interval - 1)
+        assert synced == []
+        writeback.written(8, 1)
+        assert sorted(synced) == [7, 8]
+        synced.clear()
+        writeback.written(9, 1)
     writeback.flush()
-    assert sorted(synced) == [7, 8]
-
-    synced.clear()
-    monkeypatch.setattr(file_io.os, "posix_fadvise", lambda *args: None, raising=False)
-    writeback = file_io.Writeback()
-    writeback.written(7, file_io.WRITEBACK_BYTES - 1)
-    assert synced == []
-    writeback.written(8, 1)
-    assert sorted(synced) == [7, 8]
+    assert sorted(synced) == ([7, 8] if interval is None else [9])

@@ -753,8 +753,15 @@ keep all its recorded parts together.
 
 Conversion reads its Safetensors and GGUF sources in bounded pieces and never maps them, so its
 memory use does not grow with the size of a source, on Windows too. On Linux each piece leaves the
-page cache once read, and the output is synced and dropped from it every 64 MiB; elsewhere the
-output is synced once, when the artifact is complete.
+page cache once read, and the output is synced and dropped from it every 64 MiB. On Windows the
+output is synced every 512 MiB, which bounds the written data that the cache still holds; on macOS
+it is synced once, when the artifact is complete.
+
+Before it writes, conversion checks that the output directory's file system has room for every
+file of the artifact and stops if it has not. Each file is written under a hidden temporary name,
+such as `.my_qwen.ninfer.k3x9q0zb.tmp`, and gets its own name when the whole artifact is complete.
+A conversion that was killed leaves these files behind; the next conversion of the same artifact
+deletes them, and refuses to start while another conversion is still writing them.
 
 Conversion writes `models/my_qwen.ninfer.conversion.json` alongside the artifact, recording sources,
 methods, formats, component configs, files and timing. Existing output files are not overwritten.

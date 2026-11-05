@@ -6,9 +6,17 @@ from bisect import bisect_left, bisect_right
 from copy import deepcopy
 from pathlib import Path
 import os
+import re
+import shutil
+import sys
 import tempfile
 from typing import Iterable, Sequence
 from uuid import uuid4
+
+try:
+    import fcntl
+except ImportError:  # Windows: an open file cannot be deleted, which serves as its lock
+    fcntl = None
 
 from .framing import HEADER, MAGIC, PART_MAGIC, PAYLOAD_ALIGNMENT
 from .layouts import align_up
@@ -25,6 +33,58 @@ from .schema import (
 )
 
 ZERO_CHUNK_BYTES = 1024 * 1024
+
+
+def free_bytes(directory: str | Path) -> int | None:
+    """Bytes this process can still write on the file system that holds `directory`, or None when
+    the file system reports no capacity."""
+
+    if hasattr(os, "statvfs"):
+        stat = os.statvfs(directory)
+        if not stat.f_blocks:
+            return None
+        # Root may also fill the blocks that a file system reserves for it.
+        blocks = stat.f_bfree if os.geteuid() == 0 else stat.f_bavail
+        return blocks * stat.f_frsize
+    usage = shutil.disk_usage(directory)
+    return usage.free if usage.total else None
+
+
+def _hold(fd: int) -> bool:
+    """Lock the open file `fd` until it is closed; False when another open file holds it."""
+
+    if fcntl is None:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _remove_unless_held(path: Path) -> bool:
+    """Delete the temporary file `path` unless a live writer holds it."""
+
+    if fcntl is None:
+        try:
+            path.unlink()
+        except PermissionError:
+            return False
+        return True
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        try:
+            taken = _hold(fd)
+        except OSError as error:
+            raise ArtifactError(
+                f"{path}: this file system has no file locks to tell whether a conversion "
+                "still writes the file; delete it if none does"
+            ) from error
+        if taken:
+            path.unlink()
+        return taken
+    finally:
+        os.close(fd)
 
 
 def layout_directory(
@@ -159,6 +219,17 @@ class ArtifactWriter:
         self._finished = False
         self._failed = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._remove_stale_temporaries()
+        needed = sum(
+            self._file_start(index) + file.payload_bytes
+            for index, file in enumerate(self.directory.files)
+        )
+        free = free_bytes(self.path.parent)
+        if free is not None and free < needed:
+            raise ArtifactError(
+                f"{self.path}: the artifact needs {needed:,} bytes and its file system has "
+                f"{free:,} bytes free"
+            )
         try:
             for index, (target, file) in enumerate(
                 zip(self._destinations, self.directory.files)
@@ -168,6 +239,12 @@ class ArtifactWriter:
                 )
                 self._fds.append(fd)
                 self._temporary.append(Path(temporary))
+                # Held until the file is published, so that another writer of this artifact does
+                # not take it for a leftover.
+                try:
+                    _hold(fd)
+                except OSError:
+                    pass  # no file locks on this file system
                 # Writes extend each file; finish() sets the final length. Extending it here
                 # would zero-fill the whole file on Windows before a single object is written.
                 header = HEADER.pack(
@@ -181,6 +258,36 @@ class ArtifactWriter:
         except BaseException:
             self.abort()
             raise
+
+    def _file_start(self, index: int) -> int:
+        return self.payload_offset if index == 0 else PAYLOAD_ALIGNMENT
+
+    def _remove_stale_temporaries(self) -> None:
+        """Delete the temporary files that an interrupted writer of this artifact left behind;
+        refuse to start while a live writer holds one."""
+
+        name = re.compile(
+            rf"\.{re.escape(self.path.name)}(?:\.part-\d{{4,}})?\.[a-z0-9_]{{8}}\.tmp"
+        )
+        with os.scandir(self.path.parent) as entries:
+            stale = sorted(
+                Path(entry.path)
+                for entry in entries
+                if name.fullmatch(entry.name) and entry.is_file(follow_symlinks=False)
+            )
+        for path in stale:
+            try:
+                size = path.stat().st_size
+                removed = _remove_unless_held(path)
+            except FileNotFoundError:
+                continue  # another writer of this artifact removed it first
+            if not removed:
+                raise ArtifactError(f"{path}: another conversion is writing {self.path.name}")
+            print(
+                f"removed {path} ({size:,} bytes), left by an interrupted conversion",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _write_file(self, fd: int, offset: int, data: bytes | memoryview) -> None:
         view = memoryview(data).cast("B")
@@ -259,8 +366,7 @@ class ArtifactWriter:
                 if self._coverage[obj.id].ranges != [(0, obj.bytes)]:
                     raise ArtifactError(f"{obj.id}: output coverage is incomplete")
             for index, fd in enumerate(self._fds):
-                start = self.payload_offset if index == 0 else PAYLOAD_ALIGNMENT
-                expected = start + self.directory.files[index].payload_bytes
+                expected = self._file_start(index) + self.directory.files[index].payload_bytes
                 # A part file may end inside the alignment padding before the next object,
                 # which no write reaches.
                 if os.fstat(fd).st_size < expected:
@@ -270,14 +376,15 @@ class ArtifactWriter:
                         f"file {index}: output length does not match directory"
                     )
             self._writeback.flush()
-            while self._fds:
-                os.close(self._fds.pop())
+            # Publish while the temporary files are still held (_hold), then release them.
             for index in [*range(1, len(self._temporary)), 0]:
                 target = self._destinations[index]
                 os.link(self._temporary[index], target)
                 self._published.append(target)
+            while self._fds:
+                os.close(self._fds.pop())
             for temporary in self._temporary:
-                temporary.unlink()
+                temporary.unlink(missing_ok=True)
             self._temporary.clear()
             self._finished = True
             return self.directory

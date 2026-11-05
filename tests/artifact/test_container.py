@@ -131,13 +131,16 @@ def test_shards_use_recorded_names_and_open_only_when_needed(tmp_path):
             reader.read_range(8200, 10)
 
 
-def test_a_part_ending_in_alignment_padding_gets_its_directory_length(tmp_path):
-    # The tensor starts at the next 256-byte boundary after the 4000-byte resource; the entry
-    # file's 4096 payload bytes end in that padding, which no write reaches.
-    path = tmp_path / "gap.ninfer"
-    template = bytes(range(250)) * 16
-    weights = bytes(range(256)) * 16
-    with ArtifactWriter(
+TEMPLATE = bytes(range(250)) * 16
+WEIGHTS = bytes(range(256)) * 16
+
+
+def _two_files(path: Path) -> ArtifactWriter:
+    """An artifact of two 8192-byte files. The tensor starts at the next 256-byte boundary after
+    the 4000-byte resource; the entry file's 4096 payload bytes end in that padding, which no write
+    reaches."""
+
+    return ArtifactWriter(
         path,
         [ResourceSpec("template", 4000), TensorSpec("w", (2048,), "bf16", "contiguous_le_v1")],
         components={
@@ -148,20 +151,103 @@ def test_a_part_ending_in_alignment_padding_gets_its_directory_length(tmp_path):
         },
         bindings={"text/weight": {"object": "w"}},
         max_file_bytes=8192,
-    ) as writer:
+    )
+
+
+def _write_two_files(writer: ArtifactWriter) -> None:
+    writer.write_object("template", TEMPLATE)
+    writer.write_object("w", WEIGHTS)
+
+
+def test_a_part_ending_in_alignment_padding_gets_its_directory_length(tmp_path):
+    path = tmp_path / "gap.ninfer"
+    with _two_files(path) as writer:
         # Construction writes the framing only; writes extend the files.
         temporary = list(tmp_path.glob(".gap.ninfer*.tmp"))
         assert len(temporary) == 2 and all(p.stat().st_size <= 4096 for p in temporary)
-        writer.write_object("template", template)
-        writer.write_object("w", weights)
+        _write_two_files(writer)
         directory = writer.directory.to_json()
     assert [f["payload_bytes"] for f in directory["files"]] == [4096, 4096]
     assert path.stat().st_size == 8192
     assert (tmp_path / directory["files"][1]["path"]).stat().st_size == 8192
     with Artifact(path) as reader:
-        assert reader.read_object("template") == template
-        assert reader.read_object("w") == weights
+        assert reader.read_object("template") == TEMPLATE
+        assert reader.read_object("w") == WEIGHTS
         assert reader.read_range(4000, 96) == bytes(96)
+
+
+def test_the_writer_starts_only_with_room_for_every_file(tmp_path, monkeypatch):
+    from tools.artifact import writer as writer_module
+
+    path = tmp_path / "room.ninfer"
+    monkeypatch.setattr(writer_module, "free_bytes", lambda directory: 16383)
+    with pytest.raises(ArtifactError, match="needs 16,384 bytes"):
+        _two_files(path)
+    assert list(tmp_path.iterdir()) == []
+    monkeypatch.setattr(writer_module, "free_bytes", lambda directory: 16384)
+    with _two_files(path) as writer:
+        _write_two_files(writer)
+    assert sum(file.stat().st_size for file in tmp_path.iterdir()) == 16384
+    # A file system that reports no capacity is not checked.
+    monkeypatch.setattr(writer_module, "free_bytes", lambda directory: None)
+    with _two_files(tmp_path / "unknown.ninfer") as writer:
+        _write_two_files(writer)
+
+
+def test_free_bytes_counts_what_this_process_may_fill(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from tools.artifact import writer as writer_module
+
+    assert writer_module.free_bytes(tmp_path) > 0
+    if not hasattr(writer_module.os, "statvfs"):
+        return
+    stat = SimpleNamespace(f_blocks=100, f_bfree=50, f_bavail=40, f_frsize=4096)
+    monkeypatch.setattr(writer_module.os, "statvfs", lambda directory: stat)
+    monkeypatch.setattr(writer_module.os, "geteuid", lambda: 1000)
+    assert writer_module.free_bytes(tmp_path) == 40 * 4096
+    # Root may also fill the blocks reserved for it.
+    monkeypatch.setattr(writer_module.os, "geteuid", lambda: 0)
+    assert writer_module.free_bytes(tmp_path) == 50 * 4096
+    stat.f_blocks = 0
+    assert writer_module.free_bytes(tmp_path) is None
+
+
+def test_the_writer_removes_temporaries_that_an_interrupted_writer_left(tmp_path, capsys):
+    path = tmp_path / "room.ninfer"
+    stale = [
+        tmp_path / ".room.ninfer.ab12cd_3.tmp",
+        tmp_path / ".room.ninfer.part-0001.zz9yx8wv.tmp",
+        tmp_path / ".room.ninfer.part-0007.q1w2e3r4.tmp",
+    ]
+    unrelated = [
+        tmp_path / ".room.ninfer.notes.tmp",
+        tmp_path / ".other.ninfer.ab12cd34.tmp",
+        tmp_path / "room.ninfer.ab12cd34.tmp",
+    ]
+    for file in stale + unrelated:
+        file.write_bytes(bytes(100))
+    with _two_files(path) as writer:
+        _write_two_files(writer)
+    assert [file.exists() for file in stale] == [False] * 3
+    assert [file.exists() for file in unrelated] == [True] * 3
+    assert capsys.readouterr().err.count("left by an interrupted conversion") == 3
+    with Artifact(path) as reader:
+        assert reader.read_object("w") == WEIGHTS
+
+
+def test_a_second_writer_of_the_same_artifact_refuses_to_start(tmp_path):
+    path = tmp_path / "busy.ninfer"
+    with _two_files(path) as first:
+        temporary = sorted(tmp_path.glob(".busy.ninfer*.tmp"))
+        assert len(temporary) == 2
+        with pytest.raises(ArtifactError, match="another conversion is writing busy.ninfer"):
+            _two_files(path)
+        assert sorted(tmp_path.glob(".busy.ninfer*.tmp")) == temporary
+        _write_two_files(first)
+    with Artifact(path) as reader:
+        assert reader.read_object("template") == TEMPLATE
+    assert sorted(tmp_path.iterdir()) == [path, tmp_path / "busy.ninfer.part-0001"]
 
 
 @pytest.mark.parametrize("failure", ["missing", "producer"])
