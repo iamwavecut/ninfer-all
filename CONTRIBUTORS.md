@@ -19,7 +19,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [iamwavecut](https://github.com/iamwavecut) | swscale destination-alignment JPEG safety fix | [#11](https://github.com/Don-Chad/ninfer-3090/pull/11) |
 | [nasedkinpv](https://github.com/nasedkinpv) | Tool-call parser crash fix | [#12](https://github.com/Don-Chad/ninfer-3090/pull/12) |
 | [wmehanna](https://github.com/wmehanna) | In-place system-turn rendering for Claude Code prefix reuse | [#13](https://github.com/Don-Chad/ninfer-3090/pull/13) |
-| [mgscreativa](https://github.com/mgscreativa) | Thinking-budget boundary fix; premature KV-loan race diagnosis and gate fix behind a vision `std::bad_alloc` | [#156](https://github.com/ashalliants/ninfer-3090/pull/156), [#138](https://github.com/ashalliants/ninfer-3090/pull/138) (kept in [#145](https://github.com/ashalliants/ninfer-3090/pull/145)) |
+| [mgscreativa](https://github.com/mgscreativa) | Thinking-budget boundary fix; premature KV-loan race diagnosis and gate fix behind a vision `std::bad_alloc`; the lost wakeup that hung Flash-Next's long prefills with host experts | [#156](https://github.com/ashalliants/ninfer-3090/pull/156), [#138](https://github.com/ashalliants/ninfer-3090/pull/138) (kept in [#145](https://github.com/ashalliants/ninfer-3090/pull/145)), [#243](https://github.com/iamwavecut/ninfer-all/pull/243) |
 
 ## Work carried from other forks
 
