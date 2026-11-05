@@ -65,10 +65,14 @@ enum class SnapshotKind : std::uint8_t {
 
 // What moved past a superseded snapshot (§9.3).
 enum class Supersession : std::uint8_t {
-    // A request that resumed from it publishes a deeper snapshot on its path.
+    // A request that resumed from it publishes a deeper tap on its path.
     Resumed,
     // The request that captured it as a tap captures a later tap of the same prompt.
     NextTap,
+    // A request that resumed from it publishes its endpoint. Only an endpoint is superseded this
+    // way: a next turn whose template re-renders the reply diverges from the new endpoint before
+    // its end, so it resumes from the tap or boundary this request resumed from.
+    Endpoint,
 };
 
 struct PrefixIndexConfig {
@@ -160,6 +164,8 @@ struct SnapshotView {
     std::span<const std::uint32_t> host_slabs; // image slabs, then the tail slab when tail_len>0
     std::uint32_t pins = 0;
     SnapshotKind kind  = SnapshotKind::Tap;
+    // Hits GDSF counts now (§9.3): none once a third of the index's block capacity was published
+    // since the last hit or publication.
     std::uint32_t hits = 0;
     bool superseded    = false;
     bool branch_point  = false;
@@ -218,19 +224,23 @@ public:
                                     std::uint32_t prompt_tokens) const;
     [[nodiscard]] AdmissionChoice choose(const MatchResult& match,
                                          std::uint32_t prompt_tokens) const;
-    // Records a hit on the snapshot selected for an admission. A hit on a superseded snapshot
-    // shows it still serves requests. A tap that a later tap of its own prompt superseded, hit by
-    // a request that diverged from that prompt after it (another question about the same
-    // document, an edit), is a branch point and is never superseded again. Any other superseded
-    // snapshot is retained again until its new lineage moves on.
+    // Records a hit on the snapshot selected for an admission. The hit counts on top of the hits
+    // still counted (§9.3). A hit on a superseded snapshot shows it still serves requests. A tap
+    // that a later tap of its own prompt superseded, hit by a request that diverged from that
+    // prompt after it (another question about the same document, an edit), is a branch point and
+    // is never superseded again. Any other superseded snapshot is retained again until its new
+    // lineage moves on.
     void note_hit(SnapshotRef snapshot);
     // A lineage that resumed from `snapshot`, or captured it as a tap, has published a deeper
     // snapshot on the same path, so its next request resumes from that one: `snapshot` now serves
     // only requests that diverge before it. Superseded snapshots are evicted before every retained
     // one, oldest supersession first, and retained snapshots are valued against their nearest
-    // retained ancestor. A branch point is never superseded, and a Boundary snapshot only while
-    // no other conversation has continued from it (the tree below it is a single chain).
-    void supersede(SnapshotRef snapshot, Supersession cause);
+    // retained ancestor. A branch point is never superseded, a Boundary snapshot only while no
+    // other conversation has continued from it (the tree below it is a single chain), and only an
+    // endpoint by Supersession::Endpoint. Returns the hits the superseded snapshot still counted,
+    // which the lineage carries on to the snapshots it publishes next (0 when nothing was
+    // superseded).
+    std::uint32_t supersede(SnapshotRef snapshot, Supersession cause);
 
     // ---- pins -----------------------------------------------------------------------------
     // `path` is a root path (path[i] is the parent of path[i+1], path[0] a root child).
@@ -274,8 +284,9 @@ public:
 
     // ---- host residency (§9.3)
     // ------------------------------------------------------------------- Allocates a slab for a
-    // device-resident pinned node (write-through destination). Absent when no slab can be freed.
-    [[nodiscard]] std::optional<std::uint32_t> begin_host_fill(NodeRef node);
+    // device-resident pinned node (write-through destination), evicting anything but `keep` (the
+    // writing lane's newest superseded tap, §9.3). Absent when no slab can be freed.
+    [[nodiscard]] std::optional<std::uint32_t> begin_host_fill(NodeRef node, SnapshotRef keep = {});
     void complete_host_fill(NodeRef node);
     void abort_host_fill(NodeRef node);
     // Allocates image slabs (+1 tail slab) for a pinned snapshot. Absent when they cannot be freed.
@@ -298,18 +309,22 @@ public:
     [[nodiscard]] std::optional<std::uint32_t>
     acquire_device_slot(double claim = std::numeric_limits<double>::infinity());
     // GDSF priority of a new snapshot at `frontier` whose nearest retained snapshot on its path
-    // is at `base_frontier` and which alone keeps the blocks between them (§9.3).
+    // is at `base_frontier` and which alone keeps the blocks between them, carrying `hits` of its
+    // lineage (§9.3).
     [[nodiscard]] double estimate_priority(std::uint32_t base_frontier, std::uint32_t frontier,
-                                           bool tail) const noexcept;
+                                           bool tail, std::uint32_t hits = 0) const noexcept;
     void release_device_slot(std::uint32_t slot);
     // Publishes a snapshot whose image is in staging slot `device_slot`. frontier must equal
     // 64 * (anchor depth + 1) + tail.size() (tail.size() for the root anchor). A tail requires
-    // `tail_device_id`. For a duplicate (same anchor and tail) the staging slot is freed, the tail
-    // device id is released and the existing snapshot is returned with created=false.
+    // `tail_device_id`. A new snapshot starts with `hits`: those its lineage carries on from the
+    // snapshot it superseded (§9.3). For a duplicate (same anchor and tail) the staging slot is
+    // freed, the tail device id is released and the existing snapshot is returned with
+    // created=false.
     [[nodiscard]] PublishResult publish_snapshot(NodeRef anchor, std::uint32_t frontier,
                                                  std::span<const TokenId> tail,
                                                  std::optional<std::uint32_t> tail_device_id,
-                                                 std::uint32_t device_slot, SnapshotKind kind);
+                                                 std::uint32_t device_slot, SnapshotKind kind,
+                                                 std::uint32_t hits = 0);
 
     // ---- persistence ---------------------------------------------------------------------------
     // What a saved Host tier keeps: every Host-resident snapshot whose anchor path is Host-resident
@@ -378,8 +393,10 @@ private:
         CopyState host                = CopyState::Absent;
         std::uint32_t pins            = 0;
         SnapshotKind kind             = SnapshotKind::Tap;
+        // Hits counted at hit_clock; none once hit_window_ has passed since (counted_hits).
         std::uint32_t hits            = 0;
-        double priority               = 0.0; // GDSF H = priority_base + F * C / Z
+        std::uint64_t hit_clock       = 0; // clock_ at the last publication or hit
+        double value                  = 0.0; // GDSF C / Z
         double priority_base          = 0.0; // GDSF inflation at the last publication or hit
         std::uint64_t last_hit_tick   = 0;
         bool superseded               = false;
@@ -473,7 +490,12 @@ private:
     // reports stay O(1): the Engine publishes statistics after every decode round.
     void set_device(Node& node, CopyState state) noexcept;
     void set_slot(std::uint32_t slot, SlotState state) noexcept;
+    // Recomputes the snapshot's GDSF value C / Z.
     void update_priority(std::uint32_t snapshot);
+    // Hits GDSF counts now: none once hit_window_ has passed since the last hit or publication.
+    [[nodiscard]] std::uint32_t counted_hits(const Snapshot& snapshot) const noexcept;
+    // GDSF H = L at the last publication or hit + (1 + counted hits) * C / Z.
+    [[nodiscard]] double priority(const Snapshot& snapshot) const noexcept;
 
     PrefixIndexConfig config_;
     PrefixIndexBackend* backend_ = nullptr;
@@ -504,6 +526,11 @@ private:
     std::uint32_t device_resident_ = 0;
     std::uint32_t free_slots_      = 0;
     std::uint64_t tick_            = 0;
+    // Cache time for hits (§9.3): blocks the index has published, an image counting as
+    // image_slabs blocks. A hit counts while less than hit_window_ (a third of the block
+    // capacity, Device pages plus Host slabs) has passed since.
+    std::uint64_t clock_           = 0;
+    std::uint64_t hit_window_      = 1;
     double inflation_              = 0.0;
     PrefixIndexStats counters_;
 };

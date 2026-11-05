@@ -154,8 +154,7 @@ private:
 struct HybridPrefixCacheOptions {
     // Device StateImage slots holding inactive snapshots (and tap/endpoint staging). Total Device
     // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
-    // lane plus one staging slot with a Host tier, plus two without one (Device slots are then
-    // the only snapshot storage).
+    // lane plus two (a staging slot and one for a shared prefix or another conversation).
     std::optional<std::uint32_t> device_snapshot_slots;
     // New prefill state snapshots one request may create. Default 8 with a Host tier, 2 without.
     std::optional<std::uint32_t> max_new_taps;

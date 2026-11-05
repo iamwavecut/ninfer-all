@@ -389,7 +389,7 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
     return true;
 }
 
-void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
+void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes, SnapshotRef keep,
                                                 cudaStream_t producer, cudaStream_t transfer) {
     if (!host_tier()) { return; }
     PendingWrite write;
@@ -406,7 +406,7 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes,
             const NodeView view = index_->node(node);
             if (view.device != CopyState::Resident || view.host != CopyState::Absent) { continue; }
             index_->pin_node(node);
-            const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node);
+            const std::optional<std::uint32_t> slab_id = index_->begin_host_fill(node, keep);
             if (!slab_id) {
                 // Everything left on the Host tier is pinned or filling; retry at a later release.
                 index_->unpin_node(node);
