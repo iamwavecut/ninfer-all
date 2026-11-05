@@ -4911,10 +4911,12 @@ struct Executor::Impl {
             rank.inject = static_cast<float*>(span_inject.p) + chunks[k].at * std::size_t(hc);
         };
         try {
+            if (misses) { misses->keep_alive(); }
             // Each layer runs in two phases: attention over every chunk of the span, then the
             // experts over every chunk. The next layer's experts are copied into the pool while its
             // attention phase runs, so its first expert call rarely waits for them.
             for (std::size_t i = 0; i < layers.size(); ++i) {
+                if (misses) { misses->keep_alive(); }
                 const LayerPlan& plan = layers[i];
                 if (plan.ple && !rows_waited) {
                     await_rows(rank);
