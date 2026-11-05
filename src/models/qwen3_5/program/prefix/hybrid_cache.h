@@ -152,10 +152,12 @@ public:
     // no Host tier or no slabs could be freed. The snapshot is pinned until the copy completes.
     bool start_snapshot_host_write(runtime::prefix_cache::SnapshotRef snapshot,
                                    cudaStream_t producer, cudaStream_t transfer);
-    // Copies every Device-only node of `nodes` to a Host slab in one batch. Nodes are pinned until
-    // the copy completes. Stops early when the Host tier cannot free a slab.
+    // Copies every Device-only node of `nodes` to a Host slab in one batch, evicting anything but
+    // `keep` (the lane's newest superseded tap, §9.3). Nodes are pinned until the copy completes.
+    // Stops early when the Host tier cannot free a slab.
     void start_block_host_writes(std::span<const runtime::prefix_cache::NodeRef> nodes,
-                                 cudaStream_t producer, cudaStream_t transfer);
+                                 runtime::prefix_cache::SnapshotRef keep, cudaStream_t producer,
+                                 cudaStream_t transfer);
     // Publishes every completed Host write. Non-blocking.
     void poll();
 

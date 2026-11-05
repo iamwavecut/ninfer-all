@@ -802,6 +802,102 @@ void test_unshared_boundary() {
     index.check_invariants();
 }
 
+// Hits count only while they are recent (§9.3): once a third of the block capacity (Device pages
+// plus Host slabs) has been published since a snapshot's last hit, GDSF values it as never hit.
+// A document asked about nine times and then left must not outrank the conversations that follow
+// it for good (issue #222), while one still being asked about keeps its rank.
+void test_hits_expire() {
+    for (const bool expired : {false, true}) {
+        RecordingBackend backend;
+        // 8 slabs: two tail-less images. max_nodes 256: hits expire after 85 published blocks.
+        PrefixCacheIndex index(small_config(8, 4), backend);
+        const auto doc      = make_tokens(64 * 4, 80);
+        const auto doc_path = insert_sequence(index, backend, doc);
+        const SnapshotRef document =
+            publish_at(index, backend, doc_path, doc, 64 * 4, SnapshotKind::Tap);
+        for (int hit = 0; hit < 9; ++hit) { index.note_hit(document); }
+        require(index.snapshot(document).hits == 9, "hits count while recent");
+        const auto chat      = make_tokens(64 * 4, 81);
+        const auto chat_path = insert_sequence(index, backend, chat);
+        const SnapshotRef conversation =
+            publish_at(index, backend, chat_path, chat, 64 * 4, SnapshotKind::Endpoint);
+        backup_snapshot(index, document);
+        backup_snapshot(index, conversation);
+        if (expired) {
+            // Other traffic publishes 72 blocks: the document's hits, published at clock 8, still
+            // count at 88 and expire when the next snapshot brings the clock to 96 (8 + 85 <= 96).
+            const auto other      = make_tokens(64 * 72, 82);
+            const auto other_path = insert_sequence(index, backend, other);
+            require(index.snapshot(document).hits == 9, "the window has not passed yet");
+            index.release_path(other_path);
+        }
+        const auto next      = make_tokens(64 * 4, 83);
+        const auto next_path = insert_sequence(index, backend, next);
+        const SnapshotRef fresh =
+            publish_at(index, backend, next_path, next, 64 * 4, SnapshotKind::Endpoint);
+        require(index.snapshot(document).hits == (expired ? 0U : 9U),
+                expired ? "hits must expire once the window has passed"
+                        : "hits must still count within the window");
+        backup_snapshot(index, fresh);
+        // Equal C / Z: the nine hits decide while they count, and recency once they expired.
+        require(index.snapshot(document).host == (expired ? CopyState::Absent : CopyState::Resident) &&
+                    index.snapshot(conversation).host ==
+                        (expired ? CopyState::Resident : CopyState::Absent),
+                expired ? "a document nobody asks about any more must yield its Host copy"
+                        : "a document still asked about must keep its Host copy");
+        index.note_hit(document);
+        require(index.snapshot(document).hits == (expired ? 1U : 10U),
+                "a hit counts on top of the hits still counted");
+        index.release_path(doc_path);
+        index.release_path(chat_path);
+        index.release_path(next_path);
+        index.check_invariants();
+    }
+}
+
+// A conversation is resumed once per turn, and each turn publishes new snapshots: they carry the
+// hits the snapshot they superseded still counted, so the lineage keeps its rank turn after turn
+// (§9.3). Only an endpoint gives way to an endpoint: a client that re-renders the reply resumes
+// its next turn from the tap again.
+void test_lineage_hits() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 6), backend);
+    const auto tokens = make_tokens(64 * 12 + 1, 90);
+    const auto path   = insert_sequence(index, backend, tokens);
+    SnapshotRef resume = publish_at(index, backend, path, tokens, 64 * 2, SnapshotKind::Tap);
+    for (std::uint32_t turn = 1; turn <= 3; ++turn) {
+        index.note_hit(resume);
+        const std::uint32_t carried = index.supersede(resume, Supersession::Resumed);
+        require(carried == turn, "a superseded snapshot passes on the hits it counted");
+        require(index.estimate_priority(64 * 2 * turn, 64 * 2 * (turn + 1), false, carried) >
+                    index.estimate_priority(64 * 2 * turn, 64 * 2 * (turn + 1), false),
+                "a lineage's hits raise the claim of its next snapshot");
+        const auto slot = index.acquire_device_slot();
+        require(slot.has_value(), "no slot for the next turn's tap");
+        resume = index
+                     .publish_snapshot(path[2 * (turn + 1) - 1], 64 * 2 * (turn + 1), {},
+                                       std::nullopt, *slot, SnapshotKind::Tap, carried)
+                     .snapshot;
+        require(index.snapshot(resume).hits == turn, "the next turn's tap starts with them");
+    }
+    // A turn that publishes only its endpoint leaves the tap it resumed from retained.
+    index.note_hit(resume);
+    const SnapshotRef endpoint =
+        publish_at(index, backend, path, tokens, 64 * 9 + 7, SnapshotKind::Endpoint);
+    require(index.supersede(resume, Supersession::Endpoint) == 0 &&
+                !index.snapshot(resume).superseded,
+            "an endpoint must not supersede the tap a re-rendering client resumes from");
+    // An echoing client resumes from the endpoint, and its next endpoint moves past it.
+    index.note_hit(endpoint);
+    require(index.supersede(endpoint, Supersession::Endpoint) == 1 &&
+                index.snapshot(endpoint).superseded,
+            "an endpoint must supersede the endpoint its lineage resumed from");
+    require(index.supersede(endpoint, Supersession::Endpoint) == 0,
+            "a superseded snapshot passes on nothing again");
+    index.release_path(path);
+    index.check_invariants();
+}
+
 // The production failure: a conversation resuming turn after turn under Host pressure, next to a
 // deep stale conversation. Each turn resumes from the previous turn's endpoint and publishes a
 // deeper one; the new endpoint must always survive to serve the next turn.
@@ -858,8 +954,7 @@ void test_lineage_under_pressure() {
 void test_questions_about_one_document() {
     RecordingBackend backend;
     // 20 slabs hold four tail-less images and one with a tail (21) only after one is evicted, and
-    // the 14 blocks need more than is left. Three Device slots: two lanes and one more, as with a
-    // Host tier.
+    // the 14 blocks need more than is left. Three Device slots.
     PrefixCacheIndex index(small_config(20, 3), backend);
     const auto document                     = make_tokens(64 * 14 + 10, 70);
     const std::vector<std::uint32_t> ladder = {64 * 4, 64 * 8, 64 * 10, 64 * 12};
@@ -940,6 +1035,86 @@ void test_questions_about_one_document() {
         require(!index.snapshot(first_taps[3]).superseded,
                 "a tap that later questions resume from must stay retained");
     }
+}
+
+// The first question about a new document when other conversations hold the Device slots (here
+// one slot): each tap of the prompt takes the slot of the tap before it, which keeps only its Host
+// copy. The lane's block write-through at release evicts superseded taps first, but not the newest
+// one: the next question resumes from it, and the blocks being written are its own (§9.3).
+void test_write_through_keeps_superseded_tap() {
+    RecordingBackend backend;
+    // 20 slabs: three images and the question tap's tail (13) leave 7 for the 14 blocks.
+    PrefixCacheIndex index(small_config(20, 1), backend);
+    const auto document = make_tokens(64 * 14 + 10, 71);
+    SnapshotRef early_tap;
+    SnapshotRef ladder_tap;
+    const auto serve = [&](std::uint32_t question) {
+        auto prompt      = document;
+        const auto words = make_tokens(30, 2000 + question);
+        prompt.insert(prompt.end(), words.begin(), words.end());
+        const auto hashes            = block_lookup_hashes(prompt, {});
+        const auto n                 = static_cast<std::uint32_t>(prompt.size());
+        const MatchResult match      = index.match(prompt, hashes, {}, n);
+        const AdmissionChoice choice = index.choose(match, n);
+        SnapshotRef resume;
+        std::uint32_t reused = 0;
+        if (choice.candidate) {
+            resume = match.candidates[*choice.candidate].snapshot;
+            reused = match.candidates[*choice.candidate].frontier;
+            index.note_hit(resume);
+        }
+        const auto path = insert_sequence(index, backend, prompt);
+        SnapshotRef previous;
+        SnapshotRef superseded;
+        for (const std::uint32_t frontier : {64U * 8U, 64U * 12U, 64U * 14U + 20U}) {
+            if (frontier <= reused) { continue; }
+            if (resume.valid()) {
+                index.supersede(resume, Supersession::Resumed);
+                resume = {};
+            }
+            if (previous.valid()) {
+                index.supersede(previous, Supersession::NextTap);
+                superseded = previous;
+            }
+            const std::uint32_t tail = frontier % kBlockTokens;
+            const auto slot          = index.acquire_device_slot();
+            require(slot.has_value(), "a tap takes the slot of the tap before it");
+            std::optional<std::uint32_t> tail_id;
+            if (tail != 0) { tail_id = backend.allocate(); }
+            const SnapshotRef tap =
+                index
+                    .publish_snapshot(
+                        path[frontier / kBlockTokens - 1], frontier,
+                        std::span<const TokenId>(prompt.data() + frontier - tail, tail), tail_id,
+                        *slot, SnapshotKind::Tap)
+                    .snapshot;
+            index.pin_snapshot(tap);
+            const bool backed = index.begin_snapshot_host_fill(tap);
+            if (backed) { index.complete_snapshot_host_fill(tap); }
+            index.unpin_snapshot(tap);
+            require(backed || question != 0, "the first question's taps fit the Host tier");
+            if (question == 0 && frontier == 64U * 8U) { early_tap = tap; }
+            if (question == 0 && frontier == 64U * 12U) { ladder_tap = tap; }
+            previous = tap;
+        }
+        for (const NodeRef node : path) {
+            if (index.node(node).host != CopyState::Absent) { continue; }
+            index.pin_node(node);
+            const bool written = index.begin_host_fill(node, superseded).has_value();
+            if (written) { index.complete_host_fill(node); }
+            index.unpin_node(node);
+            if (!written) { break; }
+        }
+        index.release_path(path);
+        index.check_invariants();
+        return reused;
+    };
+    require(serve(0) == 0, "the first question has nothing to resume from");
+    require(!index.valid(early_tap), "an older superseded tap must make room for the blocks");
+    require(index.valid(ladder_tap) && index.snapshot(ladder_tap).device_slot == kNoId &&
+                index.snapshot(ladder_tap).host == CopyState::Resident,
+            "the write-through must keep the Host copy of the lane's newest superseded tap");
+    require(serve(1) == 64 * 12, "the next question must resume from the ladder tap");
 }
 
 void test_image_only_host_tier() {
@@ -1402,10 +1577,13 @@ int main() {
         test_supersession();
         test_lineage_under_pressure();
         test_questions_about_one_document();
+        test_write_through_keeps_superseded_tap();
         test_unbacked_slot_values();
         test_refusals_age_owners();
         test_host_write_admission();
         test_unshared_boundary();
+        test_hits_expire();
+        test_lineage_hits();
         test_host_only_reattach();
         test_tail_device_fill();
         test_snapshot_pin_holds_anchor_path();

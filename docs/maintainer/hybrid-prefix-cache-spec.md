@@ -379,8 +379,16 @@ struct Snapshot {
   Hybrid mode. Active admission still requires `M ≥ max(L, C)`.
 - **Device state pool**: `C` active slots plus `D = device_snapshot_slots` snapshot slots in the
   existing slot-indexed layout (`ssm_states [128,128,Hv,C+D]` per layer, and so on). Snapshot slots
-  are also the staging destination for taps (§7.4). Default `D = C + 1` with a Host tier (one
-  resident snapshot per live conversation plus one staging slot) and `C + 2` without one.
+  are also the staging destination for taps (§7.4). Default `D = C + 2`, with or without a Host
+  tier: one resident snapshot per live conversation, one staging slot, and one more for a shared
+  prefix or another conversation. A Host tier smaller than the conversations it serves cannot
+  stand in for the last one, since their images take the slabs their blocks need: in the replay of
+  issue #222's workloads (§9.3; two lanes, four conversations of 8,900-token turns, KV k8v4),
+  `C + 1` reused 0 % of the prompt tokens with a 1 GiB Host tier and 1.7 % with 2 GiB, `C + 2`
+  27 % and 71 %. Over the whole replay `C + 2` cut the modelled prefill time by 5.5 %: by 27 % on
+  the cases a 2 GiB tier changed, 8.7 % on those a 4 GiB tier changed (13 faster, 11 slower, by up
+  to 43 %), and within 2 % with 8 and 12 GiB. The slot costs one StateImage of VRAM (about
+  147 MiB for Qwen3.8-27B with MTP), which automatic sizing takes from Device KV.
 - **HostSlabPool**: one pinned allocation of `host_cache_bytes`, divided into slabs. A slab holds
   one block bundle: the Main page packed with its Host page layout, then the backend page at the
   next 4 KiB boundary; `slab_bytes` is that record rounded up to 4 KiB. A snapshot image uses
@@ -426,7 +434,8 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   backend, RoPE scaling, the control vectors' digest, and the product binary's identity — build id plus executable size and
   time, so any rebuild invalidates it) and its Host geometry equal the running Engine's, and its
   size matches its tables. The file (format 4) holds the header, the block table, the snapshot
-  table (each snapshot's anchor, tail, kind, hits and branch-point flag, §9.3) and only then the
+  table (each snapshot's anchor, tail, kind, the hits it still counted and branch-point flag,
+  §9.3) and only then the
   slab bytes, so the loader chooses before it reads any slab. A Host tier
   that holds the whole file restores all of it. A smaller one restores whole snapshots, greedily
   by the GDSF density of §9.3 without its time-dependent base — (1 + hits) × the prefill a
@@ -920,8 +929,9 @@ comes from its own lineage when it can. A tap or endpoint takes a slot in this o
    copy or, without one, is deleted;
 3. a slot owned by a Device-only snapshot (no Host copy: the Host tier is full, disabled or
    evicted it): the one with the lowest GDSF priority (§9.3), and only when the new snapshot's
-   estimated priority (no hits, and the blocks since the sequence's previous snapshot its own) is
-   at least as high. The snapshot is lost, and `L` rises to its priority;
+   estimated priority (the hits its lineage carries, §9.3, and the blocks since the sequence's
+   previous snapshot its own) is at least as high. The snapshot is lost, and `L` rises to its
+   priority;
 4. the least recently hit Host-backed snapshot's slot, which loses only its Device copy.
 
 Otherwise the tap or endpoint is skipped, and `L` rises to its estimated priority, as if it had
@@ -942,7 +952,12 @@ deeper snapshot on its path, the snapshot it resumed from becomes *superseded*, 
 previous tap it captured in the same prompt when the new snapshot is a tap, before the new snapshot
 takes a Device slot or Host slabs: only a request diverging before the newer snapshot (a retry, an
 edit) can still use them. The endpoint leaves the prompt's last tap retained, since a next turn
-whose template re-renders the reply (stripped thinking) resumes from that tap. A hit on a superseded
+whose template re-renders the reply (stripped thinking) resumes from that tap. For the same reason
+an endpoint supersedes the snapshot its request resumed from only when that is an endpoint too (a
+client that echoes the generated text resumes its next turn from the new endpoint): a tap or
+boundary stays retained. A short follow-up turn captures no tap of its own (it is shorter than the
+minimum tap separation), so its endpoint used to supersede the tap a re-rendering client's next
+turn resumes from, and that turn missed under pressure. A hit on a superseded
 snapshot retains it again, until that lineage moves on: the hit is as likely the same conversation
 coming back, such as the next turn after a retry that resumed from the same tap. A tap that only the
 next tap of its own prompt superseded is different. No request has resumed from it, so a hit on it
@@ -967,7 +982,12 @@ Allocation of `k` slabs:
    new snapshot needs one (§9.2); any other is deleted. Deleting the Device copy here too would let
    a lane's block write-through into a small Host tier at release delete the superseded taps of
    its prompt, and with them every snapshot the next question about the same document could resume
-   from.
+   from. For the same reason a lane's block write-through skips the newest tap that a later tap of
+   its prompt superseded: the blocks it writes are that tap's own. When other conversations hold
+   the Device slots, the taps of a new document's first question pass one slot along, each keeping
+   only its Host copy, and the write-through used to evict them for their own blocks; the second
+   question then recomputed the whole document (115,210 tokens after a four-conversation rotation
+   with an 8 GiB Host tier, in the replay of §5.4).
 3. Otherwise evict the retained snapshot with minimum `H`, then repeat step 1 (its exclusive path
    has just become dead). Update `L := H(victim)`. A victim still complete on the Device (image in
    a device slot and tail resident) only gives up its host copy and stays restorable.
@@ -986,7 +1006,7 @@ C(s)  = prefill_seconds(base=F_a, tokens=F_s−F_a) − restore_seconds(image)  
 Z(s)  = image_bytes + tail_bytes + exclusive_path_bytes(s)
         exclusive_path_bytes: host bytes of the nodes on path(s) below which s is the only
         retained snapshot
-F(s)  = 1 + hits(s)                             // hits since publication
+F(s)  = 1 + hits(s)                             // hits counted now, see Hits below
 ```
 
 - Each snapshot records its nearest snapshot above it on its path (`ancestor`) and the snapshots
@@ -1003,7 +1023,30 @@ F(s)  = 1 + hits(s)                             // hits since publication
   stuck resume point, 24 subagent turns prefilled from the root beside a cached 19.8K-token
   shared prefix).
 - `C` uses the same calibrated model as §6.2, so eviction and admission agree about value.
-- Aging comes from `L`, so snapshots that are no longer hit fall behind new ones without timers.
+- **Hits.** A snapshot's hits count only while they are recent. A clock advances by one for every
+  block inserted into the tree and by `image_slabs` for every snapshot published: by the slabs of
+  new content, so the cache turns over once in about `max_nodes` (Device pages plus Host slabs)
+  units. Once a third of that has passed since a snapshot's last hit (or its publication or
+  restore, §5.5), its hits count as zero, and a hit adds one to the hits still counted. When a
+  request supersedes the snapshot it resumed from, that snapshot's counted hits pass to the
+  snapshots the request publishes next and to their claims (§9.2): a conversation is resumed once
+  per turn, but each turn publishes new snapshots, which otherwise start again at `F = 1`.
+- Aging comes from `L` and from the hit window, so snapshots that are no longer hit fall behind new
+  ones without timers. With `F` growing for good, a document hit nine times kept its rank long after
+  its questions stopped (issue #222): a four-conversation rotation that followed it on an
+  RTX 4090 (KV k8v4, 131,072-token cache, 8 GiB Host tier) reused 15 % of its 1,070,925 prompt
+  tokens instead of 83 % on a fresh engine. Replaying that workload and its neighbours through the
+  index (rotations of three to six conversations, documents of 57,741 and 115,210 tokens before or
+  after them, a document asked about in bursts between conversation turns, conversations sharing a
+  system prompt; Host tiers of 0 to 12 GiB), the window of a third, the lineage hits, the endpoint
+  rule above, the write-through rule of step 2 and `D = C + 2` cut the modelled prefill time from
+  83,443 s to 69,306 s in all 248 cases: 113 faster by more than 2 %, 3 slower. A document asked
+  about again after 24 or 32 conversation turns with a 12 GiB Host tier has lost its rank by then
+  and is recomputed once (+18 % and +14 %), and with a 1 GiB Host tier the finished conversations'
+  lineage hits keep them ahead of new conversations sharing a system prompt (+13 %). The other
+  windows tried changed the total by −0.1 % to +0.7 %: the whole capacity and a half slowed 9 and
+  7 cases (by up to 38 % and 21 %), a quarter and a sixth 3 each (by up to 12 % and 15 %).
+  Capping the hits a lineage passes on at 1, 2 or 4 did not help (+1.1 %, +0.1 %, 0 %).
 - Victim selection scans the snapshot table, O(snapshots); valuation walks at most one path per
   affected snapshot. Snapshot count is bounded by `host_cache_bytes / image_bytes` (about 1,300
   for a 230 GiB Host tier with 27B DFlash2 images), so the policy is independent of the tier size:
@@ -1174,6 +1217,12 @@ The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache
   - a hit on a tap that only its prompt's next tap superseded makes it a branch point, and
     questions about one document keep resuming from the first request's ladder tap through a Host
     tier its blocks overflow;
+  - the first question about a document whose taps pass one Device slot along keeps its newest
+    superseded tap through its block write-through, and the next question resumes from it;
+  - hits count until a third of the block capacity has been published since the last hit, and a
+    hit adds to the hits still counted;
+  - a superseded snapshot passes the hits it counted to its lineage's next snapshots and their
+    claims, and an endpoint supersedes only an endpoint;
   - a `Boundary` snapshot is superseded only while no other conversation continued below it;
   - Device slots go to superseded owners, then to the least valuable Device-only owner for a new
     snapshot worth as much, then to the least recently hit Host-backed owner;
@@ -1297,7 +1346,7 @@ prefill_chunk` and a Host tier present when the budget is nonzero:
 | value | default | reason |
 |---|---|---|
 | `host_cache_budget_bytes` | 8 GiB (`kDefaultHybridHostCacheBytes`); 0 disables the Host tier | the Legacy Host KV default |
-| `device_snapshot_slots` | `C + 1` with a Host tier, `C + 2` without | one resident snapshot per live conversation, plus staging; without Host the slots are the only snapshot storage |
+| `device_snapshot_slots` | `C + 2` | one resident snapshot per live conversation, one staging slot, and one for a shared prefix or another conversation, which a small Host tier cannot hold (§5.4) |
 | `max_new_taps` | 8 with a Host tier, 2 without | without Host, taps would evict other conversations' snapshots |
 | `tap_ladder_tokens` | `max(4096, 2·chunk)` | ladder taps land on chunk boundaries; a finer ladder only duplicates them |
 | `tap_min_gap_tokens` | `max(1024, chunk)` | the same |

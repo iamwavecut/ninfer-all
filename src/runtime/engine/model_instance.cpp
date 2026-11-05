@@ -361,10 +361,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
         // One resident snapshot per request lane keeps every live conversation's latest
         // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
-        // their Host copies are written. Without a Host tier these slots are the only snapshot
-        // storage, so one more is kept for shared prefixes.
-        hybrid.device_snapshot_slots =
-            hybrid.device_snapshot_slots.value_or(concurrency + (host_tier ? 1U : 2U));
+        // their Host copies are written, and one more keeps a shared prefix or another
+        // conversation's snapshot. A Host tier smaller than the conversations it serves cannot
+        // stand in for that slot: its images would take the slabs their blocks need.
+        hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(concurrency + 2U);
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
         // Ladder taps are realized on prefill chunk boundaries, so the ladder never refines below

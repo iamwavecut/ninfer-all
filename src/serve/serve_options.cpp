@@ -373,7 +373,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --use-original-prefix-caching the checkpoint catalog instead of the hybrid\n"
            "                                prefix cache\n"
            "  --device-snapshot-slots N     hybrid: device state snapshot slots (default\n"
-           "                                concurrency + 1; + 2 without a Host tier)\n"
+           "                                concurrency + 2)\n"
            "  --cache-taps-per-request N    hybrid: new prefill snapshots per request\n"
            "                                (default 8; 2 without a Host tier)\n"
            "  --cache-tap-ladder N          hybrid: ladder base in tokens for history\n"
