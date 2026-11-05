@@ -26,14 +26,20 @@
         {
           name = "ffmpeg-9.0.2.tar.xz";
           path = pkgs.fetchurl {
-            url = "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz";
+            urls = [
+              "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz"
+              "https://distfiles.gentoo.org/distfiles/62/ffmpeg-9.0.2.tar.xz"
+            ];
             sha256 = "8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e";
           };
         }
         {
           name = "dav1d-1.5.4.tar.xz";
           path = pkgs.fetchurl {
-            url = "https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz";
+            urls = [
+              "https://downloads.videolan.org/pub/videolan/dav1d/1.5.4/dav1d-1.5.4.tar.xz"
+              "https://distfiles.gentoo.org/distfiles/8b/dav1d-1.5.4.tar.xz"
+            ];
             sha256 = "686616b7c69eb88d44459391ab25cac13b6647a3b288835c5784e71c1514a5c5";
           };
         }
