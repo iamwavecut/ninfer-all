@@ -803,13 +803,16 @@ void test_unshared_boundary() {
 }
 
 // Hits count only while they are recent (§9.3): once a third of the block capacity (Device pages
-// plus Host slabs) has been published since a snapshot's last hit, GDSF values it as never hit.
-// A document asked about nine times and then left must not outrank the conversations that follow
-// it for good (issue #222), while one still being asked about keeps its rank.
+// plus Host slabs) has been published since a snapshot's last hit, half of them count, and after
+// two thirds GDSF values it as never hit. A document asked about nine times and then left must not
+// outrank the conversations that follow it for good (issue #222), while one still being asked
+// about keeps its rank even when a round of conversations that missed passes one window between
+// two of its questions (issue #248).
 void test_hits_expire() {
-    for (const bool expired : {false, true}) {
+    enum class Age { Recent, OneWindow, TwoWindows };
+    for (const Age age : {Age::Recent, Age::OneWindow, Age::TwoWindows}) {
         RecordingBackend backend;
-        // 8 slabs: two tail-less images. max_nodes 256: hits expire after 85 published blocks.
+        // 8 slabs: two tail-less images. max_nodes 256: the window is 85 published blocks.
         PrefixCacheIndex index(small_config(8, 4), backend);
         const auto doc      = make_tokens(64 * 4, 80);
         const auto doc_path = insert_sequence(index, backend, doc);
@@ -823,30 +826,33 @@ void test_hits_expire() {
             publish_at(index, backend, chat_path, chat, 64 * 4, SnapshotKind::Endpoint);
         backup_snapshot(index, document);
         backup_snapshot(index, conversation);
-        if (expired) {
-            // Other traffic publishes 72 blocks: the document's hits, published at clock 8, still
-            // count at 88 and expire when the next snapshot brings the clock to 96 (8 + 85 <= 96).
-            const auto other      = make_tokens(64 * 72, 82);
-            const auto other_path = insert_sequence(index, backend, other);
-            require(index.snapshot(document).hits == 9, "the window has not passed yet");
+        if (age != Age::Recent) {
+            // The document's hits, published at clock 8, count fully until 93 (8 + 85) and half
+            // until 178. 72 blocks bring the clock to 88, 157 to 173; the next snapshot adds 8.
+            const std::uint32_t blocks  = age == Age::OneWindow ? 72U : 157U;
+            const auto other            = make_tokens(64 * blocks, 82);
+            const auto other_path       = insert_sequence(index, backend, other);
+            require(index.snapshot(document).hits == (age == Age::OneWindow ? 9U : 4U),
+                    "the window has not passed yet, or half the hits still count");
             index.release_path(other_path);
         }
         const auto next      = make_tokens(64 * 4, 83);
         const auto next_path = insert_sequence(index, backend, next);
         const SnapshotRef fresh =
             publish_at(index, backend, next_path, next, 64 * 4, SnapshotKind::Endpoint);
-        require(index.snapshot(document).hits == (expired ? 0U : 9U),
-                expired ? "hits must expire once the window has passed"
-                        : "hits must still count within the window");
+        const std::uint32_t counted = age == Age::Recent ? 9U : age == Age::OneWindow ? 4U : 0U;
+        require(index.snapshot(document).hits == counted,
+                "all hits count within one window, half within two, none after");
         backup_snapshot(index, fresh);
-        // Equal C / Z: the nine hits decide while they count, and recency once they expired.
-        require(index.snapshot(document).host == (expired ? CopyState::Absent : CopyState::Resident) &&
+        // Equal C / Z: the counted hits decide while there are any, and recency once they expired.
+        const bool kept = age != Age::TwoWindows;
+        require(index.snapshot(document).host == (kept ? CopyState::Resident : CopyState::Absent) &&
                     index.snapshot(conversation).host ==
-                        (expired ? CopyState::Resident : CopyState::Absent),
-                expired ? "a document nobody asks about any more must yield its Host copy"
-                        : "a document still asked about must keep its Host copy");
+                        (kept ? CopyState::Absent : CopyState::Resident),
+                kept ? "a document asked about within two windows must keep its Host copy"
+                     : "a document nobody asks about any more must yield its Host copy");
         index.note_hit(document);
-        require(index.snapshot(document).hits == (expired ? 1U : 10U),
+        require(index.snapshot(document).hits == counted + 1U,
                 "a hit counts on top of the hits still counted");
         index.release_path(doc_path);
         index.release_path(chat_path);

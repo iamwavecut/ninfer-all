@@ -1027,7 +1027,13 @@ F(s)  = 1 + hits(s)                             // hits counted now, see Hits be
   block inserted into the tree and by `image_slabs` for every snapshot published: by the slabs of
   new content, so the cache turns over once in about `max_nodes` (Device pages plus Host slabs)
   units. Once a third of that has passed since a snapshot's last hit (or its publication or
-  restore, §5.5), its hits count as zero, and a hit adds one to the hits still counted. When a
+  restore, §5.5), half its hits count, after two thirds none, and a hit adds one to the hits
+  still counted. The half step keeps a document asked about every round when the working set
+  overflows the cache: conversations that missed are prefilled again and republish their ladder
+  taps, so one round can pass a whole window, and dropping every hit there evicted the document
+  for a conversation that missed anyway (issue #248: a 115,210-token document asked once per
+  round of a four-conversation rotation on an RTX 4090 with an 8 GiB Host tier was recomputed
+  three times out of eight). When a
   request supersedes the snapshot it resumed from, that snapshot's counted hits pass to the
   snapshots the request publishes next and to their claims (§9.2): a conversation is resumed once
   per turn, but each turn publishes new snapshots, which otherwise start again at `F = 1`.
@@ -1219,8 +1225,8 @@ The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache
     tier its blocks overflow;
   - the first question about a document whose taps pass one Device slot along keeps its newest
     superseded tap through its block write-through, and the next question resumes from it;
-  - hits count until a third of the block capacity has been published since the last hit, and a
-    hit adds to the hits still counted;
+  - hits count until a third of the block capacity has been published since the last hit, half of
+    them for another third, and a hit adds to the hits still counted;
   - a superseded snapshot passes the hits it counted to its lineage's next snapshots and their
     claims, and an endpoint supersedes only an endpoint;
   - a `Boundary` snapshot is superseded only while no other conversation continued below it;

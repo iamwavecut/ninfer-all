@@ -1035,7 +1035,13 @@ void PrefixCacheIndex::update_priority(std::uint32_t index) {
 }
 
 std::uint32_t PrefixCacheIndex::counted_hits(const Snapshot& snapshot) const noexcept {
-    return clock_ - snapshot.hit_clock < hit_window_ ? snapshot.hits : 0U;
+    // Half the hits still count for a second window. While the working set overflows the cache,
+    // conversations that missed are prefilled again and republish their ladder taps, and the
+    // clock can pass a whole window between two questions about a document asked every round;
+    // dropping all its hits there evicted it for a conversation that missed anyway (issue #248).
+    const std::uint64_t age = clock_ - snapshot.hit_clock;
+    if (age < hit_window_) { return snapshot.hits; }
+    return age < 2U * hit_window_ ? snapshot.hits / 2U : 0U;
 }
 
 double PrefixCacheIndex::priority(const Snapshot& snapshot) const noexcept {
