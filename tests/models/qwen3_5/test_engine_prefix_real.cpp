@@ -327,8 +327,9 @@ std::optional<RegisteredFrontendGoldens> registered_frontend_goldens(
         return RegisteredFrontendGoldens{16, 18, ninfer::PrefixReusePath::PrivateTurnClosure};
     }
     // The host-restore scenario edits the replayed reply so that it diverges from the endpoint;
-    // Qwen3.8 then restores from the turn closure, as Qwen3.6 does.
-    if (model_name == "qwen3.8-27b") {
+    // Qwen3.8 then restores from the turn closure, as Qwen3.6 does. The -fp8 conversion carries
+    // the same tokenizer and chat template, so it shares the goldens.
+    if (model_name == "qwen3.8-27b" || model_name == "qwen3.8-27b-fp8") {
         return RegisteredFrontendGoldens{58, 18, ninfer::PrefixReusePath::PrivateTurnClosure};
     }
     return std::nullopt;

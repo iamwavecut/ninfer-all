@@ -179,7 +179,7 @@ set_tests_properties(
 
 ninfer_add_test(ninfer_qwen3_5_moe_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_moe_real.cpp"
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_engine ninfer_artifact)
 
 set_tests_properties(
   ninfer_qwen3_5_moe_real_test
@@ -203,7 +203,7 @@ set_tests_properties(
 
 ninfer_add_test(ninfer_qwen3_5_dflash_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash_real.cpp"
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_engine ninfer_artifact)
 
 set_tests_properties(
   ninfer_qwen3_5_dflash_real_test

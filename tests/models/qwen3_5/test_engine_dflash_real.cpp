@@ -1,3 +1,4 @@
+#include "artifact/schema.h"
 #include "guarded_main.h"
 #include "ninfer/engine.h"
 #include "speculative_graft.h"
@@ -7,12 +8,35 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace {
+
+// The fixture needs the `dflash` draft component. Conversions that ship only `dflash2` (or no
+// draft at all) cannot run it, so the fixture skips like a missing artifact instead of failing
+// on the Engine's missing-component fatal.
+bool artifact_has_dflash_component(const char* artifact) {
+    std::ifstream file(artifact, std::ios::binary);
+    if (!file) { return true; }
+    unsigned char header[32];
+    if (!file.read(reinterpret_cast<char*>(header), sizeof header)) { return true; }
+    std::uint64_t length = 0;
+    std::memcpy(&length, header + 8, sizeof length);
+    if (length > (256ULL << 20)) { return true; }
+    std::string text(length, '\0');
+    if (!file.read(text.data(), static_cast<std::streamsize>(length))) { return true; }
+    const auto manifest = ninfer::artifact::parse_json(text, "artifact manifest");
+    if (!manifest.is_object() || !manifest.contains("components") ||
+        !manifest["components"].is_object()) {
+        return true;
+    }
+    return manifest["components"].contains("dflash");
+}
 
 ninfer::EngineOptions base_engine_options(const char* artifact) {
     ninfer::EngineOptions options;
@@ -381,6 +405,10 @@ int run() {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+        return 77;
+    }
+    if (!artifact_has_dflash_component(artifact)) {
+        std::cout << "skip: artifact carries no dflash component\n";
         return 77;
     }
 
