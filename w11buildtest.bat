@@ -132,7 +132,11 @@ if /i "%~1"=="clean" (
 set "NINFER_HEAD_SHA="
 for /f "delims=" %%a in ('git rev-parse HEAD 2^>nul') do set "NINFER_HEAD_SHA=%%a"
 set "NINFER_BUILT_SHA="
-if exist "build-win11\.git-sha" set /p NINFER_BUILT_SHA < "build-win11\.git-sha"
+if exist "build-win11\.git-sha" (
+  REM set /p VAR ^< file is broken on this host's cmd.exe (syntax error for every form);
+  REM for /f reads the file's line into the variable instead.
+  for /f "delims=" %%a in (build-win11\.git-sha) do if not defined NINFER_BUILT_SHA set "NINFER_BUILT_SHA=%%a"
+)
 if not "%NINFER_HEAD_SHA%"=="" (
   if not "%NINFER_HEAD_SHA%"=="%NINFER_BUILT_SHA%" (
     echo HEAD_CHANGED - building incrementally; if it fails on a stale symbol, rerun: w11buildtest.bat clean
@@ -142,7 +146,9 @@ if not "%NINFER_HEAD_SHA%"=="" (
 REM PDB: ProgramDatabase puts /Zi on the C/CXX compile lines; -Xcompiler=/Zi covers the host
 REM code nvcc compiles; CMAKE_EXE_LINKER_FLAGS=/DEBUG makes the linker emit ninfer-*.pdb next
 REM to the exes (CMake 4.4 does NOT add /DEBUG by itself). Codegen is unchanged.
-cmake -S . -B build-win11 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=ON -DNINFER_DIRECTSTORAGE=ON -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=ProgramDatabase -DCMAKE_EXE_LINKER_FLAGS="/DEBUG" -DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler -Xcompiler=/Zc:__cplusplus -Xcompiler=/Zi" > configure.log 2>&1
+rem Python3_EXECUTABLE: the t03-workspace uv venv (Python 3.11, jinja2 + pytest) that the
+rem Python-driven tests launch; recreating it:  uv venv .venv --python 3.11 && uv pip install jinja2 pytest
+cmake -S . -B build-win11 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DBUILD_TESTING=ON -DNINFER_BUILD_BENCHMARKS=ON -DNINFER_DIRECTSTORAGE=ON -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=ProgramDatabase -DCMAKE_EXE_LINKER_FLAGS="/DEBUG" -DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler -Xcompiler=/Zc:__cplusplus -Xcompiler=/Zi" -DPython3_EXECUTABLE="D:\msys64\home\z\src\dsh\t03\.venv\Scripts\python.exe" > configure.log 2>&1
 echo CONFIGURE_EXIT=%ERRORLEVEL%
 if errorlevel 1 (
   echo CONFIGURE_FAILED - see configure.log
@@ -158,6 +164,16 @@ if errorlevel 1 (
   echo BUILD_FAILED - see build.log
   exit /b 1
 )
+
+REM The t03 workspace tree carries the Low Mandatory Level integrity label (inherited by everything
+REM below it), so the test processes launched from build-win11\tests run at Low integrity and
+REM cannot write to the user's %TEMP% (Medium) -- every test using
+REM std::filesystem::temp_directory_path() dies with "Access is denied" on directory creation.
+REM Point TMP/TEMP at a workspace directory instead: temp_directory_path() honors the variables and
+REM a Low-integrity process may write to the Low-labeled workspace.
+if not exist "build-win11\test-tmp" mkdir "build-win11\test-tmp"
+set "TMP=%~dp0build-win11\test-tmp"
+set "TEMP=%~dp0build-win11\test-tmp"
 
 REM Run the CTest suite. Serial on purpose: the GPU integration tests must not overlap each
 REM other. --output-on-failure keeps the full output of any red test in test.log.
