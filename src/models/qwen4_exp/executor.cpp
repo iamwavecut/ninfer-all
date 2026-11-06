@@ -340,11 +340,13 @@ struct ExpertTable {
     DeviceBuffer table;
     bool aligned16 = false;
 
+    // A null entry (another rank's expert) is never read.
     void seal() {
-        aligned16 = row_bytes % 16 == 0 && !pointers.empty() &&
+        aligned16 = row_bytes % 16 == 0 &&
+                    std::any_of(pointers.begin(), pointers.end(),
+                                [](const void* pointer) { return pointer != nullptr; }) &&
                     std::all_of(pointers.begin(), pointers.end(), [](const void* pointer) {
-                        return pointer != nullptr &&
-                               reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0;
+                        return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0;
                     });
     }
 
@@ -499,6 +501,21 @@ struct MoePlan {
                 device_resident,
                 shared_gate_table.rows > 0 ? shared_gate_table.rows : 640,
                 iq1m_matrix};
+    }
+    // A wide call over a slot pool's table ([E] gate, [E] up, [E] down). Its entries are device
+    // cache slots' planes, which start at 256-byte boundaries, or a pool bank's experts, each at
+    // its index from a 256-byte boundary: a row stride of whole 16 bytes aligns every entry.
+    [[nodiscard]] ops::GgufMoeWeights pooled(const void* const* table) const {
+        ops::GgufMoeWeights out   = banks();
+        const std::size_t experts = gate.pointers.size();
+        out.gate.experts          = table;
+        out.up.experts            = table + experts;
+        out.down.experts          = table + 2 * experts;
+        out.gate.aligned16        = gate.row_bytes % 16 == 0;
+        out.up.aligned16          = up.row_bytes % 16 == 0;
+        out.down.aligned16        = down.row_bytes % 16 == 0;
+        out.device_resident       = true;
+        return out;
     }
 };
 
@@ -3586,14 +3603,9 @@ struct Executor::Impl {
             }
             await_prefetch(buffer);
             CUDA_CHECK(cudaStreamWaitEvent(s, buffer.ready, 0));
-            ops::GgufMoeWeights banks = plan.moe.banks();
-            const auto* table_p       = static_cast<const void* const*>(pool.buffers[b].tables.p);
-            const std::size_t experts = plan.moe.gate.pointers.size();
-            banks.gate.experts        = table_p;
-            banks.up.experts          = table_p + experts;
-            banks.down.experts        = table_p + 2 * experts;
-            banks.device_resident     = true;
-            const auto h              = static_cast<std::int32_t>(config.hidden_size);
+            const ops::GgufMoeWeights banks =
+                plan.moe.pooled(static_cast<const void* const*>(pool.buffers[b].tables.p));
+            const auto h = static_cast<std::int32_t>(config.hidden_size);
             const Tensor mixed(rank.mixed, DType::BF16, {h, t});
             Tensor y(rank.y, DType::FP32, {h, t});
             {
@@ -3636,13 +3648,9 @@ struct Executor::Impl {
         stage_pool(pool, pool.buffers[0], index, wanted, entries, s);
         CUDA_CHECK(cudaMemcpyAsync(pool.buffers[0].tables.p, entries, 3 * experts * sizeof(void*),
                                    cudaMemcpyHostToDevice, s));
-        ops::GgufMoeWeights banks = m.banks();
-        const auto* table_p       = static_cast<const void* const*>(pool.buffers[0].tables.p);
-        banks.gate.experts        = table_p;
-        banks.up.experts          = table_p + experts;
-        banks.down.experts        = table_p + 2 * experts;
-        banks.device_resident     = true;
-        const auto h              = static_cast<std::int32_t>(config.hidden_size);
+        const ops::GgufMoeWeights banks =
+            m.pooled(static_cast<const void* const*>(pool.buffers[0].tables.p));
+        const auto h = static_cast<std::int32_t>(config.hidden_size);
         const Tensor mixed(rank.mixed, DType::BF16, {h, t});
         Tensor y(rank.y, DType::FP32, {h, t});
         auto scope = rank.workspace->scope();

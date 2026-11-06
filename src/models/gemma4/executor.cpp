@@ -727,6 +727,17 @@ struct Executor::Impl {
             }
             delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                         std::move(sources), transport);
+            // Aliases 0 to 2 (gate, up, gate_up) point into the gate/up blob, 3 into the down blob.
+            for (auto& p : layers) {
+                if (p.delivery_layer < 0) { continue; }
+                const auto l       = std::size_t(p.delivery_layer);
+                const auto aligned = [&](std::size_t alias) {
+                    return delivery->alias_aligned(l, alias, 16);
+                };
+                p.gate_up_aligned16 =
+                    p.gate_up_row_bytes % 16 == 0 && aligned(0) && aligned(1) && aligned(2);
+                p.down_aligned16 = p.down_row_bytes % 16 == 0 && aligned(3);
+            }
         }
     }
 
@@ -1458,8 +1469,7 @@ struct Executor::Impl {
         }
         const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
                                       : static_cast<const void* const*>(p.tables.p);
-        const bool gate_up_aligned = !delivery && p.gate_up_aligned16;
-        const bool down_aligned    = !delivery && p.down_aligned16;
+        const bool gate_up_aligned = p.gate_up_aligned16, down_aligned = p.down_aligned16;
         const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
         const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
         const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden,

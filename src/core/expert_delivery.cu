@@ -2007,6 +2007,15 @@ void ExpertDelivery::await(cudaStream_t stream) {
 const void* const* ExpertDelivery::tables(std::size_t layer) const {
     return static_cast<const void* const*>(impl_->layers.at(layer).tables.p);
 }
+bool ExpertDelivery::alias_aligned(std::size_t layer, std::size_t alias,
+                                   std::uint64_t bytes) const {
+    if (bytes == 0 || bytes > 256 || (bytes & (bytes - 1)) != 0) {
+        throw std::invalid_argument("expert delivery: an alignment is a power of two up to 256");
+    }
+    const auto& l = impl_->layers.at(layer);
+    const auto& a = l.source.aliases.at(alias);
+    return a.offset % bytes == 0 && l.stride.at(a.blob) % bytes == 0;
+}
 void ExpertDelivery::check() const { impl_->check(); }
 void ExpertDelivery::drain() {
     impl_->quiesce();
