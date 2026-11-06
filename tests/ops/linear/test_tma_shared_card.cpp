@@ -147,6 +147,13 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+#if !defined(NINFER_SM120_FP8)
+    // The TMA A8/A4 routes this probe exercises (runtime-shape FP8 A8, NVFP4 A4) are compiled only
+    // for the sm_120a build; on every other build both shares' routes refuse to run, so there is
+    // no TMA staging to race.
+    std::cout << "SKIP: TMA A8/A4 routes are sm_120a-build only\n";
+    return 77;
+#endif
     try {
         const QType fp8 = QType::FP8_E4M3FN_ROW_BF16;
         int failures    = 0;

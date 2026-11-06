@@ -88,6 +88,14 @@ void cases(const fs::path& root) {
 } // namespace
 
 int run_peer_preflight_test() {
+#if defined(_WIN32)
+    // The cases below fabricate a Linux sysfs PCI tree (bus/pci/devices/0000:01:00.0 plus IOMMU
+    // group files). Windows has no sysfs and cannot name a directory from a colon-bearing PCI
+    // address, so the fixture cannot exist there; the production lookup degrades safely where it
+    // finds no device directory (no facts, no refusal).
+    std::cout << "SKIP: peer preflight fixtures are a Linux sysfs tree\n";
+    return 0;
+#endif
     const fs::path root =
         fs::temp_directory_path() / ("ninfer-peer-preflight-" + std::to_string(std::rand()));
     try {
