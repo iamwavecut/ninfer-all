@@ -1,6 +1,10 @@
-// Cold-cache public Op benchmark for the registered row-scaled FP8 LinearAdd profiles.
+// Cold-cache public Op benchmark for the registered row-scaled FP8 Linear and LinearAdd
+// profiles. (rows, k) = (5120, 6144|17408) runs the fused linear_add; (14336|16384|34816, 5120)
+// runs the plain linear, so the A16 (dequant) prefill curve is measurable for every registered
+// A8 shape when the uses_a8 thresholds are re-measured on the local card.
 
 #include "core/weight.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 
 #include "core/device.h"
@@ -33,6 +37,7 @@ constexpr double kFp8Fp32AccumulatePeak = 419.0;
 
 struct Options {
     std::int32_t k           = 0;
+    std::int32_t rows        = kRows;
     ops::LinearPolicy policy = ops::LinearPolicy::AllowA8;
     std::vector<std::int32_t> t_sweep{1, 2, 4, 8, 16, 20, 21, 22, 24, 25, 32, 48, 1024};
     int warmup   = 5;
@@ -78,6 +83,8 @@ Options parse_options(int argc, char** argv) {
         };
         if (argument == "--k") {
             options.k = std::stoi(std::string(next("--k")));
+        } else if (argument == "--rows") {
+            options.rows = std::stoi(std::string(next("--rows")));
         } else if (argument == "--policy") {
             const std::string_view value = next("--policy");
             if (value == "a16") {
@@ -98,16 +105,24 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out");
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s --k 6144|17408 [--policy a16|a8] [--t-sweep 1,2,...] "
-                        "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
+            std::printf("Usage: %s --k 6144|17408|5120 [--rows 5120|14336|16384|34816] "
+                        "[--policy a16|a8] [--t-sweep 1,2,...] [--warmup N] [--repeat N] "
+                        "[--profile] [--csv-out PATH]\n"
+                        "Supported (rows, k): (5120, 6144) linear_add, (5120, 17408) linear_add, "
+                        "(14336, 5120) linear, (16384, 5120) linear, (34816, 5120) linear\n",
                         argv[0]);
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(argument));
         }
     }
-    if (options.k != 6144 && options.k != 17408) {
-        throw std::invalid_argument("FP8 LinearAdd supports N=5120 and K=6144|17408");
+    const bool valid =
+        (options.rows == 5120 && (options.k == 6144 || options.k == 17408)) ||
+        (options.k == 5120 &&
+         (options.rows == 14336 || options.rows == 16384 || options.rows == 34816));
+    if (!valid) {
+        throw std::invalid_argument("supported (rows, k): (5120, 6144), (5120, 17408), "
+                                    "(14336, 5120), (16384, 5120), (34816, 5120)");
     }
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
@@ -124,7 +139,10 @@ const char* policy_name(ops::LinearPolicy policy) {
 
 bool uses_tensor_cores(const Options& options, std::int32_t tokens) {
     if (options.policy != ops::LinearPolicy::AllowA8) { return false; }
-    return options.k == 6144 ? tokens >= 22 : tokens >= 25;
+    if (options.k == 6144) { return tokens >= 22; }
+    if (options.k == 17408) { return tokens >= 25; }
+    // Display only: the current production A8 admission for the k=5120 shapes.
+    return options.rows == 34816 ? tokens >= 5 : tokens >= 17;
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results,
@@ -136,8 +154,9 @@ void write_csv(const Options& options, const std::vector<Result>& results,
     if (!out) { throw std::runtime_error("failed to open CSV: " + options.csv_out); }
     out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
            "useful_tflops,tensor_peak_percent,warmup,repeat,flush_bytes\n";
+    const char* op_name = options.rows == 5120 ? "linear_add" : "linear";
     for (const Result& result : results) {
-        out << "linear_add,FP8_E4M3FN_ROW_BF16," << policy_name(options.policy) << ',' << kRows
+        out << op_name << ",FP8_E4M3FN_ROW_BF16," << policy_name(options.policy) << ',' << options.rows
             << ',' << options.k << ',' << result.tokens << ',' << weight_bytes << ','
             << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
             << ',' << result.effective_gbs << ',' << result.useful_tflops << ',';
@@ -156,20 +175,29 @@ int main(int argc, char** argv) {
         const std::int32_t min_t = *min_it;
         const std::int32_t max_t = *max_it;
 
+        const bool fused   = options.rows == 5120;
+        const char* op_name = fused ? "linear_add" : "linear";
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);
         DeviceBuffer input    = bench::make_bf16(static_cast<std::size_t>(options.k) * max_t);
-        DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(kRows) * max_t);
-        bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(kRows, options.k);
-        const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, kRows, options.k, options.policy, min_t, max_t);
+        DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(options.rows) * max_t);
+        bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(options.rows, options.k);
+        const std::size_t workspace_capacity = fused
+            ? ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, options.rows,
+                                                       options.k, options.policy, min_t, max_t)
+            : ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, options.rows,
+                                                   options.k, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
             Tensor x(input.p, DType::BF16, {options.k, tokens});
-            Tensor out(residual.p, DType::BF16, {kRows, tokens});
-            ops::linear_add(x, packed.weight, out, options.policy, workspace, launch_stream);
+            Tensor out(residual.p, DType::BF16, {options.rows, tokens});
+            if (fused) {
+                ops::linear_add(x, packed.weight, out, options.policy, workspace, launch_stream);
+            } else {
+                ops::linear(x, packed.weight, out, options.policy, workspace, launch_stream);
+            }
         };
 
         if (options.profile) {
@@ -181,8 +209,8 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaStreamSynchronize(stream));
             bench::flush_l2(flush, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::printf("PROFILE linear_add weight_type=FP8 policy=%s N=%d K=%d T=%d\n",
-                        policy_name(options.policy), kRows, options.k, tokens);
+            std::printf("PROFILE %s weight_type=FP8 policy=%s N=%d K=%d T=%d\n", op_name,
+                        policy_name(options.policy), options.rows, options.k, tokens);
             std::fflush(stdout);
             CUDA_CHECK(cudaProfilerStart());
             launch(tokens, stream);
@@ -202,23 +230,24 @@ int main(int argc, char** argv) {
                 [&](cudaStream_t launch_stream) { launch(tokens, launch_stream); }, flush, stream,
                 options.warmup, options.repeat);
             const double seconds = timing.median_us * 1.0e-6;
-            const double flops   = 2.0 * static_cast<double>(kRows) * options.k * tokens;
+            const double flops   = 2.0 * static_cast<double>(options.rows) * options.k * tokens;
             const double bytes   = static_cast<double>(packed.model_weight_bytes()) +
                                  2.0 * static_cast<double>(options.k) * tokens +
-                                 4.0 * static_cast<double>(kRows) * tokens;
+                                 4.0 * static_cast<double>(options.rows) * tokens;
             const double tflops         = flops / seconds / 1.0e12;
             const double tensor_percent = uses_tensor_cores(options, tokens)
                                               ? 100.0 * tflops / kFp8Fp32AccumulatePeak
                                               : std::numeric_limits<double>::quiet_NaN();
             if (std::isfinite(tensor_percent)) {
                 std::printf("%-4s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f %8.2f\n",
-                            policy_name(options.policy), kRows, options.k, tokens, timing.median_us,
-                            timing.min_us, timing.p95_us, bytes / seconds / 1.0e9, tflops,
-                            tensor_percent);
+                            policy_name(options.policy), options.rows, options.k, tokens,
+                            timing.median_us, timing.min_us, timing.p95_us,
+                            bytes / seconds / 1.0e9, tflops, tensor_percent);
             } else {
                 std::printf("%-4s %8d %8d %6d %11.3f %11.3f %11.3f %10.1f %10.2f %8s\n",
-                            policy_name(options.policy), kRows, options.k, tokens, timing.median_us,
-                            timing.min_us, timing.p95_us, bytes / seconds / 1.0e9, tflops, "-");
+                            policy_name(options.policy), options.rows, options.k, tokens,
+                            timing.median_us, timing.min_us, timing.p95_us,
+                            bytes / seconds / 1.0e9, tflops, "-");
             }
             results.push_back({tokens, timing, bytes / seconds / 1.0e9, tflops, tensor_percent});
         }

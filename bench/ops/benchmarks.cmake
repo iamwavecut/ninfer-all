@@ -70,6 +70,12 @@ ninfer_add_op_bench(ninfer_q8_pair_schedule_bench
 ninfer_add_op_bench(ninfer_bf16_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/bf16_linear_add_bench.cu")
 ninfer_add_op_bench(ninfer_nvfp4_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/nvfp4_linear_add_bench.cu")
 ninfer_add_op_bench(ninfer_fp8_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/fp8_linear_add_bench.cu")
+# The plain-mma A8 schedules only exist in an 89 build that keeps the FP8 A8 unit; the bench
+# compiles the kernels from header, so both gates are needed for it to be buildable and runnable.
+if(NINFER_ARCH_ADA AND NINFER_SM89_FP8)
+  ninfer_add_op_bench(ninfer_fp8_a8_schedule_bench
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/fp8_a8_schedule_bench.cu")
+endif()
 ninfer_add_op_bench(ninfer_causal_softmax_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/causal_softmax_attention_bench.cu")
 ninfer_add_op_bench(ninfer_context_softmax_attention_bench
