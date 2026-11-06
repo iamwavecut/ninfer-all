@@ -393,8 +393,8 @@ private:
         CopyState host                = CopyState::Absent;
         std::uint32_t pins            = 0;
         SnapshotKind kind             = SnapshotKind::Tap;
-        // Hits counted at hit_clock; half once hit_window_ has passed since, none after twice that
-        // (counted_hits).
+        // Hits counted at hit_clock, none once hit_window_ has passed since; a branch point keeps
+        // half of them until twice that (counted_hits).
         std::uint32_t hits            = 0;
         std::uint64_t hit_clock       = 0; // clock_ at the last publication or hit
         double value                  = 0.0; // GDSF C / Z
