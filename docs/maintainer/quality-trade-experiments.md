@@ -84,3 +84,32 @@ kernel, which is faster there. Perplexity scores the prefill phase and never rea
 verify-phase route, so its evidence is the oracle bound and output comparison at eight lanes. The
 kernel's measurements and rejected variants are in the header of
 `src/ops/linear/q4/q4_small_t_mma_i8.cuh`.
+
+## Ada FP8 activations (sm_89)
+
+An `89` build compiles and routes the plain-E4M3 tensor-core A8 prefill route for
+`FP8_E4M3FN_ROW_BF16` weights (the `NINFER_SM89_FP8` option, on by default; `OFF` rebuilds the
+A16-only behavior). There is no runtime flag: the artifact's stored activation policy decides
+per-Op, each of the five registered shapes gates by measured token width, and the TMA A8 route
+stays `120a`-only. The numerics are the 120a path with its `ue8m0` scaling: per-token activation
+scale (amax/448) times the stored row scale, applied in the epilogue in FP32.
+
+Measured on the RTX 4090 with `Qwen3.8-27B-FP8` (all 513 stored A8 permissions exercised),
+`ninfer-perplexity --quick` on `ninfer-ppl-1m-v1` with `int8` KV:
+
+| | A16 route | A8 route | change |
+|---|---:|---:|---:|
+| quick (261,167 tokens) | 4.27347 | 4.28013 | +0.156% |
+| full (1,044,557 tokens) | 4.56226 | 4.56786 | +0.123% |
+
+worst of the four full-corpus domains +0.246% (`chinese_reference`). The gain on that workload:
+1.28k → 2.99k scoring tokens/s (2.33×); at the Op level 1.3–3.4× on the K=5,120 GEMMs from
+T=32 up, and 1.86× at T=5–8 on 34816×5120, where the A16 route is pathologically slow and the
+width gate keeps A8 on (the DFlash2 verify width). The measurements, the per-width schedule
+selections and the width gates are on the
+[RTX 4090 FP8 A8 page](../performance/rtx-4090-fp8-a8-2026-11.md).
+
+Qualification: the e4m3 fragment and codec tests against an independent FP32 accumulator (bound
+2^-10 of magnitude), the five production shapes through their real dispatch against the same
+oracle, and the perplexity A/B above. The A16 build for the comparison is a full reconfigure with
+the option off, verified by the macro's absence from its compile commands.

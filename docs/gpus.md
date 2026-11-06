@@ -34,6 +34,11 @@ and verification status.
   build. The Turing and Volta builds replace the instructions their GPUs lack and shape kernels to
   their shared memory ([Turing](build-linux.md#turing-sm_75),
   [Tesla V100](build-linux.md#tesla-v100-sm_70)).
+- **Ada's FP8 A8 route.** An `89` build (but not an `86` build running on the same card, whose image
+  has no e4m3 tensor-core instructions) compiles and routes the plain-E4M3 tensor-core A8 prefill route
+  for `FP8_E4M3FN_ROW_BF16` weights, behind the `NINFER_SM89_FP8` option (on by default;
+  `-DNINFER_SM89_FP8=OFF` rebuilds the A16-only behavior). Token widths below each shape's measured
+  boundary still run the dequantizing A16 route, and the TMA A8 route stays `120a`-only.
 
 ## What fits by memory
 
@@ -108,6 +113,11 @@ means the card calibrates once at its first start.
 | ⬜ | L40 | 48 GB | Data center | | |
 | ⬜ | L20 | 48 GB | Data center | | |
 | ⬜ | L4 | 24 GB | Data center | ✓ | |
+
+The RTX 4090's e4m3 tensor-core rate is gated by a vendor lock that is volatile: it is lost on a cold
+boot. The 4090 FP8 A8 numbers on the [performance](performance.md) page were measured with the lock
+open; verify the lock by readout before reproducing them (the locked state runs the same numerics at
+a lower rate).
 
 ### Ampere (8.6, build `86`)
 

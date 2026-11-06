@@ -28,7 +28,7 @@ drafts with the tokens committed per verify round in brackets.
 | RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
 | RTX 5070 Ti | 16 GB | `120a` | 300 W | [field report](performance/field-reports.md#rtx-5070-ti-windows-11) |
 | RTX 5060 Ti, two and four | 16 GB each | `120a` | | [field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards) |
-| RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md) |
+| RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [FP8 A8](performance/rtx-4090-fp8-a8-2026-11.md), [field reports](performance/field-reports.md) |
 | L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | A40 | 48 GB | `86` | 300 W | [Flint](flint.md#measurements) |
@@ -968,6 +968,7 @@ cache each card holds, context lookup, startup and what limits each engine.
 | [Tesla V100, October 2026](performance/tesla-v100-2026-10.md) | a `70` build on 16 GB: what fits, engine and server rates of Ternary Bonsai 2, the Qwen3.8-27B releases, Flash-Next and Gemma 4, perplexity against other cards, llama.cpp on the same card | Tesla V100-SXM2-16GB |
 | [TITAN RTX, October 2026](performance/titan-rtx-2026-10.md) | a `75` build on one and two 24 GB cards: every model's prompt and decode rates against an RTX 3090, drafters, KV formats, depth, Flash-Next and the 35B-A3B over two stages, the device profile, where the time goes, perplexity | TITAN RTX, RTX 3090 |
 | [8, 11 and 12 GB cards, October 2026](performance/small-cards-2026-10.md) | the published image on small cards: which models load, CLI rates, the largest context, Flash-Next with host and disk experts | RTX 3060 Ti, RTX 2080 Ti, RTX 3060 |
+| [RTX 4090 FP8 A8 prefill, November 2026](performance/rtx-4090-fp8-a8-2026-11.md) | the sm_89 e4m3 activation A8 route on Qwen3.8-27B-FP8: perplexity against the A16 route, Op-level rates and schedules by width, the width gates, serve load test, test suite | RTX 4090, 48 GB |
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#measurements) | every expert placement of the GSQ-RCO releases, MTP, perplexity against llama.cpp, AIME and GPQA | RTX 3090, 3090 Ti, 4090, 5090, PRO 6000, L40S |
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
