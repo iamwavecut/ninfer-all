@@ -70,7 +70,10 @@ endif()
 if(NINFER_ARCH_BLACKWELL)
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM120_NVFP4=1 NINFER_SM120_FP8=1)
 endif()
-if(NINFER_ARCH_ADA)
+# The target-scoped mirror of the top-level NINFER_SM89_FP8 option (cmake adds it globally there
+# as well); keeping this one option-gated is what makes NINFER_SM89_FP8=OFF rebuild A16-only, since
+# ninfer_ops is PUBLIC and every engine/app translation unit would otherwise carry the definition.
+if(NINFER_ARCH_ADA AND NINFER_SM89_FP8)
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM89_FP8=1)
 endif()
 

@@ -280,6 +280,10 @@ CMake configure command as `-DNAME=VALUE`.
 | `NINFER_MEDIA_NATIVE_PNG=ON` | decodes PNG images natively instead of through FFmpeg, as Windows builds do by default, so that decoder can be tested on Linux |
 | `NINFER_DIRECTSTORAGE=ON` | Windows: fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores |
 
+The one exception to the off-by-default rule is `NINFER_SM89_FP8`, which is on by default for a
+build carrying `89`: it keeps the plain-E4M3 A8 prefill units, and `OFF` rebuilds the
+dequantizing A16-only behavior (the rollback path, verified to change nothing else in the build).
+
 The Windows option compiles against Windows headers but has not been run on this line.
 At run time, `NINFER_CUDA_SYNC=spin|blocking|yield|auto` selects the CUDA synchronization schedule
 (unset keeps CUDA's default) and `NINFER_T2_A8_TILE=off` returns the ternary prefill route to its

@@ -150,9 +150,13 @@ endif()
 # MMA, and a 120a image in the same build runs the block-scaled form. NVFP4 stays 120a-only.
 # Every other image in such a build compiles the unit's instructions as traps no launch reaches
 # (ops/common/mma.cuh), and the launchers refuse the call on a card without FP8 tensor cores
-# (ops/common/blackwell_routes.h).
+# (ops/common/blackwell_routes.h). NINFER_SM89_FP8=OFF rebuilds the A16-only behavior (the
+# rollback before the sm_89 A8 quality gate is met).
 if(NINFER_ARCH_ADA)
-  add_compile_definitions(NINFER_SM89_FP8=1)
+  option(NINFER_SM89_FP8 "On a build carrying 89, compile and route the plain-E4M3 FP8 A8 path" ON)
+  if(NINFER_SM89_FP8)
+    add_compile_definitions(NINFER_SM89_FP8=1)
+  endif()
 endif()
 
 # The device code of several architectures outgrows the 2 GiB that 32-bit PC-relative references
