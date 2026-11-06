@@ -58,9 +58,10 @@ the context cache the shared paged KV pool, the disk tier and session slots. Sev
 the routed experts of the MoE model instead (`--devices 0,1 --tensor-parallel`, experts on the
 devices; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
-The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to the gate/up experts of a Q4_K_M
-release when the bank is device-resident and 16-byte aligned (`MoeTable::aligned16`); the QAT Q4_0
-release and host-delivered experts keep the compiled route.
+The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to the Q4_K gate/up experts of a
+release such as HauhauCS's whose expert tables are 16-byte aligned (`MoeTable::aligned16`): device
+banks, and the delivery's banks and slots that bring host or disk experts to the device. The QAT
+Q4_0 release has no Q4_K experts.
 
 ## Converting
 

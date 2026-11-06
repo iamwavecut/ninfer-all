@@ -20,6 +20,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [nasedkinpv](https://github.com/nasedkinpv) | Tool-call parser crash fix | [#12](https://github.com/Don-Chad/ninfer-3090/pull/12) |
 | [wmehanna](https://github.com/wmehanna) | In-place system-turn rendering for Claude Code prefix reuse | [#13](https://github.com/Don-Chad/ninfer-3090/pull/13) |
 | [mgscreativa](https://github.com/mgscreativa) | Thinking-budget boundary fix; premature KV-loan race diagnosis and gate fix behind a vision `std::bad_alloc`; the lost wakeup that hung Flash-Next's long prefills with host experts | [#156](https://github.com/ashalliants/ninfer-3090/pull/156), [#138](https://github.com/ashalliants/ninfer-3090/pull/138) (kept in [#145](https://github.com/ashalliants/ninfer-3090/pull/145)), [#243](https://github.com/iamwavecut/ninfer-all/pull/243) |
+| [liqlos](https://github.com/liqlos) (Aleksei Bukhalov) | GGUF matrix products that store BF16 after the stream-K reduction, Q4_K and Q6_K vector loads shared across lanes, and Q4_K matrix tiles staged through `cp.async` for dense layers and routed experts | [#127](https://github.com/iamwavecut/ninfer-all/pull/127), [#134](https://github.com/iamwavecut/ninfer-all/pull/134), [#257](https://github.com/iamwavecut/ninfer-all/pull/257) |
 
 ## Work carried from other forks
 
@@ -86,5 +87,5 @@ two-stage GDN prefill, parallel query tiles, MX FP8 MMA and Minnnn's column-band
   `strata-dsv41`.
 - The SiLU shared by the GPU's GGUF expert kernels and the CPU's expert products evaluates e^x with
   the single-precision polynomial of Stephen L. Moshier's Cephes Math Library.
-- llama.cpp's GGUF block kernels are vendored unmodified in `third_party/ggml-quants` under their
-  MIT license.
+- llama.cpp's GGUF block kernels are vendored in `third_party/ggml-quants` under their MIT license;
+  its `README.ninfer.md` lists NInfer's changes to them.

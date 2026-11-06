@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common.cuh"
-#include "cp-async.cuh"
+#include "cp-async.cuh" // NInfer: the asynchronous Q4_K tile loop
 
 #include <climits>
 #include <cstdint>
@@ -905,6 +905,7 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
+// NInfer: the Q4_K tile loop at J = 128 stages its next tiles through cp.async (README.ninfer.md).
 #if defined(CP_ASYNC_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define MMQ_ASYNC_TILES_AVAILABLE
 #endif
@@ -998,7 +999,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
 #if defined(MMQ_ASYNC_TILES_AVAILABLE)
-    if constexpr (async_tiles) {
+    if constexpr (async_tiles) { // NInfer
         int * tile_y_next = tile_x + I*ggml_cuda_mmq_get_sram_stride(type, J, fallback, prec_src1);
         int * x_raw       = tile_y_next + J*MMQ_TILE_Y_K;
 
@@ -1528,6 +1529,7 @@ struct mmq_args {
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
 };
 
+// NInfer: async_tiles adds the asynchronous loop's second activation tile and raw weight tile.
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc, const bool async_tiles = false) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);

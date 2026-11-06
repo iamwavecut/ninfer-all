@@ -62,9 +62,9 @@ stages, and of the context cache the shared paged KV pool, the disk tier and ses
 GPUs divide the routed experts instead (`--devices 0,1 --tensor-parallel`, experts on the devices;
 [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
-The Q4_K async prompt tiles (`gguf_matrix/q4_k`, `gguf_moe_matrix/q4_k`) are not used for Flint's
-routed experts: the UD-Q4_K_XL release stores Q4_K gate/up banks in 3 of 47 blocks; the path was not
-measured there, so Flint builds its expert tables without `MoeTable::aligned16`.
+The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to the Q4_K gate/up experts that the
+UD-Q4_K_XL release stores in 3 of its 47 MoE blocks, on the device or brought to it from host
+memory or disk (16-byte aligned expert tables, `MoeTable::aligned16`).
 
 ## Converting
 
