@@ -94,6 +94,10 @@ ninfer_add_op_test(ninfer_linear_gguf_mmq_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_mmq_store.cu"
   LIBRARIES ninfer_ops)
 
+target_include_directories(ninfer_linear_gguf_mmq_store_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/include"
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+
 ninfer_add_op_test(ninfer_linear_gguf_mmq_limits_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_mmq_limits.cpp")
 

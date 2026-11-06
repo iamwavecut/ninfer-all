@@ -5,6 +5,7 @@
 
 #include "ggml_bridge_internal.cuh"
 #include "mmq_limits.h"
+#include "../../common/device_route.h"
 
 #include <climits>
 #include <mutex>
@@ -22,6 +23,7 @@ struct MatrixLaunch {
     bool stream_k           = false;
     int blocks              = 0;
     bool fixup              = false;
+    bool async              = false;
 };
 
 template <ggml_type type>
@@ -50,6 +52,17 @@ MatrixLaunch select_matrix_launch(int rows, int columns) {
         if (tiles == 1) { break; }
     }
     if (best.J == 0) { throw std::invalid_argument("gguf matrix product: no tile fits this device"); }
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (best.J == 128 && rows % best.I == 0 && ggml_cuda_mmq_async_tiles_available(device.cc) &&
+            device_route_schedule("gguf_matrix/q4_k", columns) == "async") {
+            const std::size_t async_shared = mmq_get_nbytes_shared(
+                ggml_cuda_mmq_get_config(type, best.J, false, device.cc), device.cc, true);
+            if (async_shared <= device.shared_per_block_optin) {
+                best.async  = true;
+                best.shared = async_shared;
+            }
+        }
+    }
     best.row_tiles    = 1 + (rows - 1) / best.I;
     best.column_tiles = 1 + (columns - 1) / best.J;
     const int tiles   = matrix_work_blocks(best.row_tiles, best.column_tiles, 1);
@@ -70,7 +83,7 @@ std::size_t matrix_fixup_bytes_impl(int rows, int columns) {
     return launch.fixup ? std::size_t(launch.blocks) * launch.J * launch.I * sizeof(float) : 0;
 }
 
-template <ggml_type type, int J, typename Dst, bool accumulate>
+template <ggml_type type, int J, typename Dst, bool accumulate, bool async = false>
 void launch_matrix(const MatrixLaunch& launch, const char* weight, int stride_row_blocks, int rows,
                    int k, const int* activation, int columns, Dst* out,
                    std::int64_t out_column_stride, float* fixup, cudaStream_t stream, float* partial) {
@@ -80,12 +93,12 @@ void launch_matrix(const MatrixLaunch& launch, const char* weight, int stride_ro
     int device = 0;
     check(cudaGetDevice(&device), "device");
     std::call_once(raised[device & 15], [&] {
-        check(cudaFuncSetAttribute(mul_mat_q<type, J, false, GGML_PREC_Q8, Dst, accumulate>,
+        check(cudaFuncSetAttribute(mul_mat_q<type, J, false, GGML_PREC_Q8, Dst, accumulate, async>,
                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    static_cast<int>(launch.shared)),
               "matrix shared memory");
         if constexpr (!std::is_same_v<Dst, float>) {
-            check(cudaFuncSetAttribute(mul_mat_q<type, J, false, GGML_PREC_Q8>,
+            check(cudaFuncSetAttribute(mul_mat_q<type, J, false, GGML_PREC_Q8, float, false, async>,
                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                                        static_cast<int>(launch.shared)),
                   "matrix partial shared memory");
@@ -97,7 +110,7 @@ void launch_matrix(const MatrixLaunch& launch, const char* weight, int stride_ro
     const dim3 block_dims(WARP_SIZE, launch.threads / WARP_SIZE, 1);
     const int stride        = static_cast<int>(out_column_stride);
     if (!launch.stream_k) {
-        mul_mat_q<type, J, false, GGML_PREC_Q8, Dst, accumulate>
+        mul_mat_q<type, J, false, GGML_PREC_Q8, Dst, accumulate, async>
             <<<dim3(launch.row_tiles, launch.column_tiles, 1), block_dims, launch.shared, stream>>>(
                 weight, activation, nullptr, nullptr, out, nullptr, nullptr, blocks_fd, rows,
                 columns, stride_row_blocks, columns, stride, one_fd, one_fd, 0, 0, 0, one_fd,
@@ -115,13 +128,13 @@ void launch_matrix(const MatrixLaunch& launch, const char* weight, int stride_ro
         partials_only = launch.fixup && segment < k / qk;
     }
     if (partials_only) {
-        mul_mat_q<type, J, false, GGML_PREC_Q8>
+        mul_mat_q<type, J, false, GGML_PREC_Q8, float, false, async>
             <<<dim3(launch.blocks, 1, 1), block_dims, launch.shared, stream>>>(
             weight, activation, nullptr, nullptr, partial, fixup, nullptr,
             blocks_fd, rows, columns, stride_row_blocks, columns, rows, one_fd, one_fd, 0, 0, 0,
             one_fd, one_fd, 0, 0, 0, ntx_fd);
     } else {
-        mul_mat_q<type, J, false, GGML_PREC_Q8, Dst, accumulate>
+        mul_mat_q<type, J, false, GGML_PREC_Q8, Dst, accumulate, async>
             <<<dim3(launch.blocks, 1, 1), block_dims, launch.shared, stream>>>(
             weight, activation, nullptr, nullptr, out, launch.fixup ? fixup : nullptr, nullptr,
             blocks_fd, rows, columns, stride_row_blocks, columns, stride, one_fd, one_fd, 0, 0, 0,
@@ -171,6 +184,14 @@ void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, i
                                                   out_column_stride, f, stream, partial);
         return;
     case 128:
+        if constexpr (type == GGML_TYPE_Q4_K) {
+            if (launch.async) {
+                launch_matrix<type, 128, Dst, accumulate, true>(launch, x, stride_row, rows, k, y,
+                                                                columns, out, out_column_stride, f,
+                                                                stream, partial);
+                return;
+            }
+        }
         launch_matrix<type, 128, Dst, accumulate>(launch, x, stride_row, rows, k, y, columns, out,
                                                   out_column_stride, f, stream, partial);
         return;
@@ -185,7 +206,7 @@ void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, i
 // or mapped host memory) instead of a fixed stride. Column c of the activation is the routing's
 // c-th pair, and pair p's result row lands at out[p * rows]. The grid's column dimension bounds
 // the list; the CTAs past its length leave at once.
-template <ggml_type type, int J>
+template <ggml_type type, int J, bool async = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false),
                   ggml_cuda_mmq_get_occupancy(type, J, false)) static __global__
     void moe_mul_mat_q(const void* const* __restrict__ experts, const int* __restrict__ y,
@@ -220,7 +241,7 @@ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false),
     const int offset_y     = (col_low + jt * J) * int(sizeof(block_q8_1_mmq) / sizeof(int));
     const int tile_x_max_i = rows - it * I - 1;
     const int tile_y_max_j = col_diff - jt * J - 1;
-    mul_mat_q_process_tile<type, J, false, false, GGML_PREC_Q8>(
+    mul_mat_q_process_tile<type, J, false, false, GGML_PREC_Q8, float, false, async>(
         static_cast<const char*>(experts[expert]), it * I * stride_row_x, y + offset_y,
         ids_dst_shared, dst + it * I, nullptr, nullptr, stride_row_x, ncols_y, rows, tile_x_max_i,
         tile_y_max_j, 0, blocks_per_row.z);
@@ -231,7 +252,7 @@ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false),
 // rows a whole number of row tiles; k a whole number of the kernel's K steps, or of blocks over a
 // 256-value step when zeros follow the bank) or the device.
 template <ggml_type type>
-MatrixLaunch select_moe_launch(int rows, int k, int columns, bool tail) {
+MatrixLaunch select_moe_launch(int rows, int k, int columns, bool tail, bool aligned = false) {
     const DeviceFacts& device = device_facts();
     constexpr int qk          = ggml_cuda_type_traits<type>::qk;
     MatrixLaunch best;
@@ -248,6 +269,18 @@ MatrixLaunch select_moe_launch(int rows, int k, int columns, bool tail) {
         best.shared  = shared;
         if (J >= columns) { break; }
     }
+    if constexpr (type == GGML_TYPE_Q4_K) {
+        if (best.J == 128 && aligned && k % MMQ_ITER_K == 0 &&
+            ggml_cuda_mmq_async_tiles_available(device.cc) &&
+            device_route_schedule("gguf_moe_matrix/q4_k", columns) == "async") {
+            const std::size_t async_shared = mmq_get_nbytes_shared(
+                ggml_cuda_mmq_get_config(type, best.J, false, device.cc), device.cc, true);
+            if (async_shared <= device.shared_per_block_optin) {
+                best.async  = true;
+                best.shared = async_shared;
+            }
+        }
+    }
     return best;
 }
 
@@ -256,7 +289,7 @@ bool moe_matrix_fits_impl(int rows, int k, bool tail) {
     return select_moe_launch<type>(rows, k, 1, tail).J != 0;
 }
 
-template <ggml_type type, int J>
+template <ggml_type type, int J, bool async = false>
 void launch_moe_matrix(const MatrixLaunch& launch, const void* const* experts, int stride_row,
                        int rows, int k, const MoeRouting& routing, int max_active, int pairs,
                        const int* activation, float* out, cudaStream_t stream) {
@@ -264,7 +297,7 @@ void launch_moe_matrix(const MatrixLaunch& launch, const void* const* experts, i
     int device = 0;
     check(cudaGetDevice(&device), "device");
     std::call_once(raised[device & 15], [&] {
-        check(cudaFuncSetAttribute(moe_mul_mat_q<type, J>,
+        check(cudaFuncSetAttribute(moe_mul_mat_q<type, J, async>,
                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    static_cast<int>(launch.shared)),
               "moe matrix shared memory");
@@ -280,7 +313,7 @@ void launch_moe_matrix(const MatrixLaunch& launch, const void* const* experts, i
     }
     const dim3 grid(rows / launch.I, listed, 1);
     const dim3 block(WARP_SIZE, launch.threads / WARP_SIZE, 1);
-    moe_mul_mat_q<type, J><<<grid, block, launch.shared, stream>>>(
+    moe_mul_mat_q<type, J, async><<<grid, block, launch.shared, stream>>>(
         experts, activation, routing.sorted, routing.bounds,
         routing.tiles + std::int64_t(width) * routing.tile_capacity, routing.tile_count + width,
         out, init_fastdiv_values(k / qk), rows, stride_row, pairs);
@@ -290,7 +323,8 @@ void launch_moe_matrix(const MatrixLaunch& launch, const void* const* experts, i
 template <ggml_type type>
 void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes, int rows, int k,
                              const MoeRouting& routing, int max_active, int pairs, bool tail,
-                             const void* activation, float* out, cudaStream_t stream) {
+                             bool aligned, const void* activation, float* out,
+                             cudaStream_t stream) {
     constexpr int block_bytes = ggml_cuda_type_traits<type>::bs;
     constexpr int qk          = ggml_cuda_type_traits<type>::qk;
     if (max_active <= 0 || pairs <= 0 || row_bytes % block_bytes != 0 ||
@@ -298,7 +332,7 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
         throw std::invalid_argument("gguf moe matrix product: invalid geometry");
     }
     const MatrixLaunch launch =
-        select_moe_launch<type>(rows, k, (pairs + max_active - 1) / max_active, tail);
+        select_moe_launch<type>(rows, k, (pairs + max_active - 1) / max_active, tail, aligned);
     if (launch.J == 0) {
         throw std::invalid_argument("gguf moe matrix product: no tile fits this geometry");
     }
@@ -315,6 +349,13 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
         return launch_moe_matrix<type, 64>(launch, experts, stride_row, rows, k, routing,
                                            max_active, pairs, y, out, stream);
     case 128:
+        if constexpr (type == GGML_TYPE_Q4_K) {
+            if (launch.async) {
+                return launch_moe_matrix<type, 128, true>(launch, experts, stride_row, rows, k,
+                                                          routing, max_active, pairs, y, out,
+                                                          stream);
+            }
+        }
         return launch_moe_matrix<type, 128>(launch, experts, stride_row, rows, k, routing,
                                             max_active, pairs, y, out, stream);
     default:
@@ -330,7 +371,7 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
     template bool ninfer::ops::gguf::detail::moe_matrix_fits_impl<TYPE>(int, int, bool);           \
     template void ninfer::ops::gguf::detail::moe_matrix_product_impl<TYPE>(                        \
         const void* const*, std::int64_t, int, int, const ninfer::ops::gguf::MoeRouting&, int,     \
-        int, bool, const void*, float*, cudaStream_t)
+        int, bool, bool, const void*, float*, cudaStream_t)
 
 #define NINFER_GGUF_MATRIX_INSTANCE(TYPE)                                                          \
     template std::size_t ninfer::ops::gguf::detail::matrix_fixup_bytes_impl<TYPE>(int, int);       \

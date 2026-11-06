@@ -1,7 +1,9 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ops/common/device_route.h"
 #include "ops/linear/gguf/ggml_bridge.h"
+#include "ops/linear/gguf/ggml_bridge_mmq.cuh"
 #include "ops/linear/gguf/gguf_linear.h"
 
 #include <cuda_bf16.h>
@@ -314,6 +316,161 @@ void run_public_gather_case(const TypeCase& c, bool accumulate) {
     compare_outputs(c, k, columns, rows, padding, accumulate, initial, expected, actual);
 }
 
+struct RouteRun {
+    std::vector<std::vector<std::uint8_t>> parts;
+    bool async = false;
+    std::size_t fixup_bytes = 0;
+};
+
+std::vector<std::uint8_t> device_bytes(const void* device, std::size_t bytes) {
+    std::vector<std::uint8_t> host(bytes);
+    check(cudaMemcpy(host.data(), device, bytes, cudaMemcpyDeviceToHost), "async route copy");
+    return host;
+}
+
+RouteRun run_route(const char* schedule, const TypeCase& c, int rows, int k, int columns,
+                   const DeviceBuffer& weight, const DeviceBuffer& activation,
+                   const std::vector<__nv_bfloat16>& initial) {
+    const ninfer::ops::DeviceRouteForce force("gguf_matrix/q4_k", schedule);
+    RouteRun run;
+    run.fixup_bytes = gguf::matrix_fixup_bytes(c.type, rows, columns);
+    run.async = gguf::detail::select_matrix_launch<GGML_TYPE_Q4_K>(rows, columns).async;
+    const std::int64_t row_bytes = std::int64_t(k / 256) * 144;
+    const std::size_t plane_bytes = std::size_t(rows) * columns * sizeof(float);
+    const std::size_t fixup_bytes = std::max<std::size_t>(run.fixup_bytes, 1);
+    DeviceBuffer plane(plane_bytes);
+    DeviceBuffer partial(plane_bytes);
+    DeviceBuffer fixup(fixup_bytes);
+    DeviceBuffer stored(initial.size() * sizeof(__nv_bfloat16));
+    DeviceBuffer accumulated(initial.size() * sizeof(__nv_bfloat16));
+    check(cudaMemset(plane.p, 0xA5, plane_bytes), "async route plane");
+    check(cudaMemset(partial.p, 0xA5, plane_bytes), "async route partial");
+    check(cudaMemset(fixup.p, 0xA5, fixup_bytes), "async route fixup");
+    stored.copy_from_host(initial.data(), stored.bytes);
+    accumulated.copy_from_host(initial.data(), accumulated.bytes);
+
+    gguf::matrix_product(c.type, weight.p, row_bytes, rows, k, activation.p, columns,
+                         static_cast<float*>(plane.p), rows, fixup.p, nullptr);
+    check(cudaDeviceSynchronize(), "async route float product");
+    run.parts.push_back(device_bytes(plane.p, plane_bytes));
+    run.parts.push_back(device_bytes(fixup.p, fixup_bytes));
+
+    for (const bool accumulate : {false, true}) {
+        DeviceBuffer& destination = accumulate ? accumulated : stored;
+        gguf::matrix_product_bf16(c.type, weight.p, row_bytes, rows, k, activation.p, columns,
+                                  static_cast<__nv_bfloat16*>(destination.p), rows,
+                                  static_cast<float*>(partial.p), fixup.p, nullptr, accumulate);
+        check(cudaDeviceSynchronize(), "async route BF16 product");
+        run.parts.push_back(device_bytes(destination.p, destination.bytes));
+        run.parts.push_back(device_bytes(partial.p, plane_bytes));
+        run.parts.push_back(device_bytes(fixup.p, fixup_bytes));
+    }
+    return run;
+}
+
+void compare_moe_routes(const TypeCase& c, int pairs, bool expect_async) {
+    constexpr int rows = 640;
+    constexpr int k = 2560;
+    constexpr int experts = 8;
+    constexpr int per_token = 2;
+    std::vector<DeviceBuffer> banks;
+    std::vector<const void*> pointers;
+    for (int expert = 0; expert < experts; ++expert) {
+        const auto host = make_weight(c, rows, k, 0x7C11u + static_cast<unsigned>(expert));
+        banks.emplace_back(host.size());
+        banks.back().copy_from_host(host.data(), host.size());
+        pointers.push_back(banks.back().p);
+    }
+    DeviceBuffer table_storage(experts * sizeof(const void*));
+    table_storage.copy_from_host(pointers.data(), table_storage.bytes);
+    std::vector<std::int32_t> ids(pairs);
+    for (int p = 0; p < pairs; ++p) { ids[p] = (p * 5 + p / experts) % experts; }
+    DeviceBuffer ids_device(ids.size() * sizeof(std::int32_t));
+    ids_device.copy_from_host(ids.data(), ids_device.bytes);
+    DeviceBuffer routing_workspace(gguf::moe_routing_bytes(experts, pairs));
+    const gguf::MoeRouting routing = gguf::moe_sort_routes(
+        static_cast<const std::int32_t*>(ids_device.p), pairs, experts, routing_workspace.p,
+        nullptr);
+    std::mt19937 rng(0x4D0Eu + static_cast<unsigned>(pairs));
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<__nv_bfloat16> input_host(static_cast<std::size_t>(k) * (pairs / per_token));
+    for (auto& v : input_host) { v = __float2bfloat16(normal(rng)); }
+    DeviceBuffer input(input_host.size() * sizeof(__nv_bfloat16));
+    input.copy_from_host(input_host.data(), input.bytes);
+    DeviceBuffer activation(gguf::moe_matrix_activation_bytes(k, pairs));
+    gguf::quantize_moe_matrix_activation(c.type, static_cast<const __nv_bfloat16*>(input.p), k,
+                                         routing, pairs, per_token, activation.p, nullptr);
+    check(cudaDeviceSynchronize(), "moe route activation");
+    const std::int64_t row_bytes = std::int64_t(k / 256) * 144;
+    const std::size_t plane_bytes = std::size_t(rows) * pairs * sizeof(float);
+    std::vector<std::uint8_t> results[2];
+    bool offered[2] = {false, false};
+    int index = 0;
+    for (const char* schedule : {"", "async"}) {
+        const ninfer::ops::DeviceRouteForce force("gguf_moe_matrix/q4_k", schedule);
+        offered[index] =
+            gguf::detail::select_moe_launch<GGML_TYPE_Q4_K>(rows, k, pairs / experts, true, true)
+                .async;
+        DeviceBuffer plane(plane_bytes);
+        check(cudaMemset(plane.p, 0xA5, plane_bytes), "moe route plane");
+        const gguf::MoeTable table{reinterpret_cast<const void* const*>(table_storage.p), row_bytes,
+                                   rows, k, true};
+        gguf::moe_matrix_product(c.type, table, routing, experts, pairs, true, activation.p,
+                                 static_cast<float*>(plane.p), nullptr);
+        check(cudaDeviceSynchronize(), "moe route product");
+        results[index++] = device_bytes(plane.p, plane_bytes);
+    }
+    if (offered[0]) { throw std::runtime_error("the compiled MoE route took the async tiles"); }
+    if (offered[1] != expect_async) {
+        throw std::runtime_error(std::string("the async MoE route was ") +
+                                 (expect_async ? "not offered" : "offered unexpectedly"));
+    }
+    if (results[0] != results[1]) {
+        throw std::runtime_error("the MoE plane differs between the compiled and async routes");
+    }
+    std::cout << "OK GGUF MoE MMQ async pairs=" << pairs << " async=" << offered[1] << '\n';
+}
+
+void compare_routes(const TypeCase& c, const std::vector<std::uint8_t>& host_weight,
+                    int rows, int k, int columns, bool expect_async) {
+    DeviceBuffer weight(host_weight.size());
+    weight.copy_from_host(host_weight.data(), host_weight.size());
+    std::mt19937 rng(0x5A17u + static_cast<unsigned>(k + columns + rows));
+    std::uniform_real_distribution<float> sample(-0.25f, 0.25f);
+    std::vector<__nv_bfloat16> host_input(std::size_t(k) * columns);
+    std::vector<__nv_bfloat16> initial(std::size_t(rows) * columns);
+    for (auto& value : host_input) { value = __float2bfloat16(sample(rng)); }
+    for (auto& value : initial) { value = __float2bfloat16(sample(rng)); }
+    DeviceBuffer input(host_input.size() * sizeof(__nv_bfloat16));
+    input.copy_from_host(host_input.data(), input.bytes);
+    DeviceBuffer activation(gguf::matrix_activation_bytes(k, columns));
+    gguf::quantize_matrix_activation(c.type, static_cast<const __nv_bfloat16*>(input.p), k,
+                                     columns, nullptr, activation.p, nullptr);
+
+    const RouteRun compiled = run_route("", c, rows, k, columns, weight, activation, initial);
+    const RouteRun async = run_route("async", c, rows, k, columns, weight, activation, initial);
+    const std::string label = std::string("rows=") + std::to_string(rows) + " K=" +
+                              std::to_string(k) + " T=" + std::to_string(columns);
+    if (compiled.async) {
+        throw std::runtime_error(label + ": the compiled route took the async tiles");
+    }
+    if (async.async != expect_async) {
+        throw std::runtime_error(label + ": the async route was " +
+                                 (expect_async ? "not offered" : "offered unexpectedly"));
+    }
+    if (compiled.fixup_bytes != async.fixup_bytes) {
+        throw std::runtime_error(label + ": the route changed the stream-K fixup geometry");
+    }
+    for (std::size_t part = 0; part < compiled.parts.size(); ++part) {
+        if (compiled.parts[part] != async.parts[part]) {
+            throw std::runtime_error(label + ": output part " + std::to_string(part) +
+                                     " differs between the compiled and async routes");
+        }
+    }
+    std::cout << "OK GGUF MMQ async " << label << " fixup=" << (compiled.fixup_bytes != 0)
+              << " async=" << async.async << '\n';
+}
+
 }
 
 int main() {
@@ -375,6 +532,39 @@ int main() {
             }
         }
         std::cout << "OK GGUF MMQ BF16 store, sm=" << sm_count << '\n';
+
+        const bool async_offered =
+            gguf::detail::select_matrix_launch<GGML_TYPE_Q4_K>(128, 129).J == 128 &&
+            [] {
+                const ninfer::ops::DeviceRouteForce force("gguf_matrix/q4_k", "async");
+                return gguf::detail::select_matrix_launch<GGML_TYPE_Q4_K>(128, 129).async;
+            }();
+        if (!async_offered) {
+            std::cout << "NOTE: async tiles are not offered on this device; both arms ran the "
+                         "compiled route\n";
+        }
+        bool fixup_seen = false;
+        bool plain_seen = false;
+        for (const auto& shape :
+             {std::pair{128, 5120}, std::pair{17408, 5120}, std::pair{5120, 17408}}) {
+            const int rows = shape.first;
+            const int k = shape.second;
+            const auto host_weight =
+                make_weight(q4, rows, k, 0x3A11u + static_cast<unsigned>(rows));
+            for (const int columns : {64, 65, 128, 129, 256, 1280, 4096}) {
+                const bool fixup = gguf::matrix_fixup_bytes(q4.type, rows, columns) != 0;
+                fixup_seen |= fixup && columns > 64;
+                plain_seen |= !fixup && columns > 64;
+                compare_routes(q4, host_weight, rows, k, columns, async_offered && columns > 64);
+            }
+        }
+        for (const int pairs : {1024, 4096, 8192}) {
+            compare_moe_routes(q4, pairs, async_offered);
+        }
+        if (!fixup_seen || !plain_seen) {
+            throw std::runtime_error(
+                "the async comparison lost its fixup or its plain stream-K shapes");
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "GGUF MMQ BF16 store: " << error.what() << '\n';

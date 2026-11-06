@@ -104,6 +104,9 @@ device, which also holds the model, serves fewer experts, so that every device's
 same time over its bus; [expert
 parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
+The Q4_K async prompt tiles (`gguf_matrix/q4_k`, `gguf_moe_matrix/q4_k`) do not apply to this
+family: its routed experts are IQ1_S, IQ1_M, IQ2_XXS and IQ2_S, none Q4_K.
+
 ## Converting
 
 The converter reads the weights from the GGUF shards, the Engram GGUF, the drafter of beamster's

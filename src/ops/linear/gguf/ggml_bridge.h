@@ -210,6 +210,7 @@ struct MoeTable {
     std::int64_t row_bytes     = 0;
     int rows                   = 0;
     int k                      = 0;
+    bool aligned16             = false;
 };
 
 // Where a product over experts puts pair p's row r.

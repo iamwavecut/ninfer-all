@@ -48,7 +48,7 @@ int chunk_for(std::int64_t pairs, std::int64_t experts) {
 
 gguf::MoeTable table(const GgufExpertTable& bank, int rows, int k) {
     require(bank.experts != nullptr && bank.row_bytes > 0, "an expert table is empty");
-    return gguf::MoeTable{bank.experts, bank.row_bytes, rows, k};
+    return gguf::MoeTable{bank.experts, bank.row_bytes, rows, k, bank.aligned16};
 }
 
 bool fusable(const GgufExpertTable& gate, const GgufExpertTable& up) {

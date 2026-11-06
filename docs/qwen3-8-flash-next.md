@@ -33,6 +33,11 @@ tower), and MTP speculative decoding (`--spec mtp`). The three published NInfer 
 include Unsloth's shared-Q8_0 MTP block. The upstream GSQ-RCO GGUF sources omit it, so new
 conversions must supply it separately; see [MTP](#mtp-speculative-decoding).
 
+The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to Q4_K expert banks whose tables are
+16-byte aligned (`MoeTable::aligned16`): device banks, a rank's share under tensor parallelism, and
+the slot pools that host and disk experts' prompt chunks fill. The published Q2_0, IQ3_S and IQ1_M
+releases have no Q4_K experts.
+
 ## Convert
 
 `--model` needs only the HF checkpoint's configuration and tokenizer files (`config.json`,
