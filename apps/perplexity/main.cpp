@@ -116,7 +116,7 @@ std::string usage_text() {
            "       [--tensor-parallel] [--tensor-split A,B,...]\n"
            "       [--tensor-attention heads|positions] [--invariant-attention]\n"
            "       [--tensor-parallel-transport auto|host|peer-read|peer-write]\n"
-           "       [--tensor-parallel-prompt-partials fp32|bf16]\n"
+           "       [--tensor-parallel-prompt-partials fp32|bf16|int8]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
            "       [--expert-dma-share F] [--expert-cpu-threads N] [--expert-cache-adaptive]\n"
            "       [--expert-misses staged|mapped] [--expert-tail-skip N]\n"
