@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -26,6 +28,7 @@ struct LoadPlan::Impl {
     std::filesystem::path artifact_path;
     ModelWeights weights;
     std::vector<loading::PendingWeight> pending;
+    loading::Bindings::PolicyTally activation_tally;
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
     InstanceInfo info;
@@ -170,8 +173,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
             bindings.use(out->weights.draft->output_head,
                          std::string(options.speculative_component()) + "/final_hidden");
     }
-    out->pending         = std::move(bindings.weights);
-    out->materialization = std::move(binder).finish(
+    out->activation_tally = bindings.policy_tally();
+    out->pending          = std::move(bindings.weights);
+    out->materialization  = std::move(binder).finish(
         options.overlay_vision() ? EvictableWeightPool::kChunkBytes : 1);
     out->info.name       = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));
@@ -743,6 +747,22 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto experts = loading::expert_sources(reader, data->pending, data->weights, backing,
                                             data->options, data->artifact_path);
     auto bound   = loading::resolve_weights(std::move(data->pending), backing);
+#if defined(NINFER_SM8X_COMPAT)
+    if (data->activation_tally.any()) {
+        // One line per load: the activation policy the stored weights actually run with on this
+        // build. "demoted 0" on an 89 build is the FP8 A8 route live; a build without the unit
+        // demotes every stored A8 permission (the NINFER_SM89_FP8=OFF rollback reads that way).
+        // stderr on purpose: the engine's startup log goes to stderr and flushes with it; a
+        // stdout printf here would sit in the block buffer when the serve's output is a file.
+        std::fprintf(
+            stderr,
+            "activation policy: FP8-E4M3 A8 kept %zu use(s), demoted to A16 %zu; "
+            "NVFP4 A4 kept %zu, demoted %zu\n",
+            data->activation_tally.fp8_a8_kept, data->activation_tally.fp8_a8_demoted,
+            data->activation_tally.nvfp4_a4_kept, data->activation_tally.nvfp4_a4_demoted);
+        std::fflush(stderr);
+    }
+#endif
     std::optional<VisionOverlayLayout> vision_overlay;
     if (data->options.overlay_vision()) {
         vision_overlay =

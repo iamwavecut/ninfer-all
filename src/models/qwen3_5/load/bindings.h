@@ -38,6 +38,21 @@ public:
         : binder(binder), expert_residency(options.expert_residency),
           resident_mtp_experts(options.mtp_experts_q4) {}
 
+    // The FP8 A8 and NVFP4 A4 permissions a stored weight asked for, and what this build did with
+    // them: the load prints one line per model so the serve log shows the activation policy that
+    // is live (an 89 build without the plain-mma unit demotes every stored A8 permission to A16).
+    // Counted at the decision point in add_uses.
+    struct PolicyTally {
+        std::size_t fp8_a8_kept      = 0;
+        std::size_t fp8_a8_demoted   = 0;
+        std::size_t nvfp4_a4_kept    = 0;
+        std::size_t nvfp4_a4_demoted = 0;
+        [[nodiscard]] bool any() const noexcept {
+            return fp8_a8_kept || fp8_a8_demoted || nvfp4_a4_kept || nvfp4_a4_demoted;
+        }
+    };
+    [[nodiscard]] const PolicyTally& policy_tally() const noexcept { return tally_; }
+
     [[nodiscard]] WeightId parameter(std::string name, artifact::Shape shape,
                                      std::vector<std::string> inputs   = {},
                                      std::optional<QType> exact_format = {},
@@ -128,6 +143,7 @@ private:
     std::map<std::string, WeightId, std::less<>> signs_;
     std::map<std::string, WeightId, std::less<>> columns_;
     std::map<std::string, WeightId, std::less<>> gather_pieces_;
+    PolicyTally tally_;
 };
 
 [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,

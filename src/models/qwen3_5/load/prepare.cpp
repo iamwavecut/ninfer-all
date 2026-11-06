@@ -561,12 +561,22 @@ void Bindings::add_uses(PendingWeight& pending, const std::string& name,
             break;
         }
 #if defined(NINFER_SM8X_COMPAT)
-        // sm_86/sm_89 have no FP8 or FP4 tensor cores. A stored permission for A8/A4 activations
-        // is an upper bound, not a requirement, so FP8 and NVFP4 weights run their A16 routes,
-        // which dequantize the stored codes before the matmul. A 120a build on this path keeps the
-        // FP8 A8 and NVFP4 W4A4 units, and there such a weight keeps its permission.
-        if (!keeps_permission(binder, pending.reference, result.policy)) {
-            result.policy = ops::LinearPolicy::A16Only;
+        // sm_86 has no FP8 or FP4 tensor cores; early Ada (sm_89) has FP8 but no FP4. A stored
+        // permission for A8/A4 activations is an upper bound, not a requirement, so where the
+        // build lacks the unit FP8 and NVFP4 weights run their A16 routes, which dequantize the
+        // stored codes before the matmul. A 120a build on this path keeps the FP8 A8 and NVFP4
+        // W4A4 units, and an 89 build keeps the FP8 A8 unit; there such a weight keeps its
+        // permission.
+        if (result.policy == ops::LinearPolicy::AllowA8 ||
+            result.policy == ops::LinearPolicy::AllowA4) {
+            if (keeps_permission(binder, pending.reference, result.policy)) {
+                if (result.policy == ops::LinearPolicy::AllowA8) { ++tally_.fp8_a8_kept; }
+                else { ++tally_.nvfp4_a4_kept; }
+            } else {
+                if (result.policy == ops::LinearPolicy::AllowA8) { ++tally_.fp8_a8_demoted; }
+                else { ++tally_.nvfp4_a4_demoted; }
+                result.policy = ops::LinearPolicy::A16Only;
+            }
         }
 #endif
         for (const auto& [role, binding] : use.auxiliaries) {
