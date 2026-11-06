@@ -76,7 +76,7 @@
         "w4_cublas/q4_q5_gdn_input": [[511, "on"], [1500, ""]],
         "w4_cublas/q4_q5_gdn_input/a8": [[384, "on"], [2048, ""]]
      }},
-    {"hardware_class": "nvidia-geforce-rtx-4090-sm89", "multiprocessors": 128, "origin": "built in: RTX 4090 at 450 W, 2026-09-25; unified routes and two-stage GDN at 300 to 450 W, 2026-09-27",
+    {"hardware_class": "nvidia-geforce-rtx-4090-sm89", "multiprocessors": 128, "origin": "built in: RTX 4090 at 450 W, 2026-09-25; unified routes and two-stage GDN at 300 to 450 W, 2026-09-27; Q4_K matrix and MoE async tiles at 450 W, 2026-11-06",
      "routes": {
         "attn_i8_small/h24/int8/w2": [[1048576, "16x1x32"]],
         "attn_i8_small/h24/int8/w3": [[65536, "8x2x32q"], [1048576, "16x1x32"]],
@@ -120,6 +120,8 @@
         "attn_pv_f16": [[1, "on"]],
         "gdn_two_stage/h32": [[2147483647, "on"]],
         "gdn_two_stage/h48": [[2147483647, "on"]],
+        "gguf_matrix/q4_k": [[4096, "async"]],
+        "gguf_moe_matrix/q4_k": [[1024, "async"]],
         "q4_linear_swiglu/34816x17408x5120": [[32, ""], [40, "split_half_pair_c48"], [64, ""]],
         "q4_q5_attn_input/5120x6144x1024": [[32, ""], [64, "pair_r32_c64_s3"]],
         "q4_q5_gdn_input/5120x4096x12288": [[1, "independent_direct"], [6, ""], [7, "independent_direct"], [64, ""]],
@@ -429,7 +431,7 @@
         "t2_i8_small/5120x6144": [[8, "r32c8k4"], [16, "r32c16"], [32, ""]],
         "t2_i8_small/7168+7168x5120": [[3, "r32c8k4"], [14, ""], [16, "r32c16"], [32, ""]]
      }},
-    {"hardware_class": "nvidia-geforce-rtx-5060-ti-sm120", "multiprocessors": 36, "origin": "built in: RTX 5060 Ti at 180 W, 2026-10-16",
+    {"hardware_class": "nvidia-geforce-rtx-5060-ti-sm120", "multiprocessors": 36, "origin": "built in: RTX 5060 Ti at 180 W, 2026-10-16; Q4_K matrix and MoE async tiles at 180 W, 2026-11-06",
      "routes": {
         "attn_i8_small/h24/int8/w1": [[1048576, ""]],
         "attn_i8_small/h24/int8/w2": [[1048576, ""]],
@@ -477,6 +479,8 @@
         "attn_pv_f16": [[1, "on"]],
         "gdn_two_stage/h32": [[2147483647, "on"]],
         "gdn_two_stage/h48": [[2147483647, "on"]],
+        "gguf_matrix/q4_k": [[4096, "async"]],
+        "gguf_moe_matrix/q4_k": [[1024, "async"]],
         "q4_linear_add/5120x17408": [[6, ""], [8, "small_t_c8"], [24, ""], [32, "small_t_c32"]],
         "q4_linear_add/5120x6144": [[7, ""], [8, "small_t_c8"], [24, ""], [32, "small_t_c32"]],
         "q4_linear_swiglu/34816x17408x5120": [[64, ""]],
