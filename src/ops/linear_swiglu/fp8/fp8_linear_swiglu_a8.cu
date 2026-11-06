@@ -18,15 +18,17 @@ namespace ninfer::ops::detail {
 namespace {
 
 using Geometry = Fp8N34816K5120;
-using Schedule = Fp8A8DefaultSchedule;
+using A8Small  = Fp8A8Rows64Schedule;
+using A8Mid    = Fp8A8K256Schedule;
+using A8Large  = Fp8A8Tokens128Schedule;
 
 constexpr int kIntermediate = Geometry::kOutputRows / 2;
-using Rows                  = Fp8SwiGluRows<Schedule::kBlockRows / 2, kIntermediate>;
-static_assert((Schedule::kBlockRows % 2) == 0);
 
-template <bool FullTokens>
+template <class Schedule, bool FullTokens>
 void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std::int32_t tokens,
                 cudaStream_t stream) {
+    static_assert((Schedule::kBlockRows % 2) == 0);
+    using Rows = Fp8SwiGluRows<Schedule::kBlockRows / 2, kIntermediate>;
     constexpr int kRowTiles = Geometry::kOutputRows / Schedule::kBlockRows;
     const int token_tiles   = (tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
     const int blocks        = kRowTiles * token_tiles;
@@ -47,6 +49,16 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <class Schedule>
+void launch_problem(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std::int32_t tokens,
+                    cudaStream_t stream) {
+    if ((tokens % Schedule::kBlockTokens) == 0) {
+        launch_mma<Schedule, true>(weight, out, workspace, tokens, stream);
+    } else {
+        launch_mma<Schedule, false>(weight, out, workspace, tokens, stream);
+    }
+}
+
 } // namespace
 
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
@@ -56,10 +68,18 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
     const Fp8A8Workspace scratch =
         allocate_fp8_a8_workspace(workspace, x.ne[1], Geometry::kInputRows);
     launch_fp8_a8_quantize(x, weight, scratch, stream);
-    if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
-        launch_mma<true>(weight, out, scratch, x.ne[1], stream);
+    // Per-T winners on the unlocked RTX 4090 (bench/ops/fp8_a8_schedule_bench.cu, suite
+    // 20261105-185306, measured on the plain 34816x5120 A8 GEMM this epilogue shares; cold L2,
+    // median of 9): the 64-row 4-stage tile leads T 1-128 (204.8-214.1 us vs the 120a-tuned
+    // default's 229.4-236.5), the 256-deep K tile leads T 129-192 (236.5 vs 245.8) and the
+    // 128-token tile leads from T=256 (280.4/481.3/889.9/1753.1 at T=256/512/1024/2048, the
+    // default at 292.9/518.1/1003.5/1945.6).
+    if (x.ne[1] <= 128) {
+        launch_problem<A8Small>(weight, out, scratch, x.ne[1], stream);
+    } else if (x.ne[1] <= 192) {
+        launch_problem<A8Mid>(weight, out, scratch, x.ne[1], stream);
     } else {
-        launch_mma<false>(weight, out, scratch, x.ne[1], stream);
+        launch_problem<A8Large>(weight, out, scratch, x.ne[1], stream);
     }
 }
 

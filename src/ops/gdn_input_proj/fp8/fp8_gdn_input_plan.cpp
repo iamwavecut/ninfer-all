@@ -22,7 +22,10 @@ Fp8GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 gdn_input_proj: unsupported policy");
     }
-    return tokens >= 17 ? Fp8GdnInputRoute::A8 : Fp8GdnInputRoute::A16;
+    // 4090-measured (fp8_linear_add_bench --rows 16384, forced-policy T-curve): A8 wins from
+    // T=17 (the A16 route is pathologically slow exactly at T=17: 184 us vs A8 100 us), A16
+    // wins by 3-6% at T=20-25, and A8 wins by >= 5% from T=32 (19% at T=48, growing).
+    return (tokens == 17 || tokens >= 32) ? Fp8GdnInputRoute::A8 : Fp8GdnInputRoute::A16;
 }
 
 } // namespace
