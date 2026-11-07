@@ -516,7 +516,8 @@ takes the next chunks of the other such prompts that are prefilling, in the same
 fit the span: their chunks reach each layer together, so the layer's uncached experts cross the
 bus once for all of them. A step that does not end its prompt takes whole chunks, so each prompt
 runs the chunks it would run alone and computes the same bits. A prompt that would resume from a
-prefix another prompt of the step is about to keep waits for it. On the RTX 3090 above (host
+prefix another prompt of the step is about to keep waits for it, and a step that passes a shared
+prefix (below) runs alone. On the RTX 3090 above (host
 experts), eight requests got their last first token after 6.2-6.7 s instead of 19.3-20.9 s
 (9.5-9.7 instead of 22.8-23.7 s with BF16 KV) and finished 1.77-1.94 times as fast with MTP over
 the nine formats and 1.78 times as fast without drafts; two and four requests finished 1.37 and
@@ -540,10 +541,13 @@ What a sequence gives up for a new request (its turn-closure snapshot and the st
 each of 128 tokens or more, the end of a disposable request such as a decision read excepted) is
 kept as an image in host memory, and so is the state where the frontend marks a prefix other
 requests share (the end of the leading system messages, of the tool declarations, a declared
-cache boundary, 128 tokens or more): a prompt step ends there (with host or disk experts one more
-pass that copies the experts, [measured](#media-conversations-on-one-rtx-4090)), and requests with
-the same prefix resume after it on any sequence, also when they arrive together, since a prompt that has not
-started prefilling looks for images again at its first step. An image is the paged KV and pooled keys
+cache boundary, 128 tokens or more): a prompt step ends there, or with host or disk experts on one
+GPU, where the tokens on each side fill more than a narrow chunk (64 tokens with the CPU share, 8
+without), a span runs on past it in the chunks two steps split there would run and keeps the state
+there as it passes, so the experts cross the bus once for both sides
+([measured](#media-conversations-on-one-rtx-4090)). Requests with the same prefix resume after it
+on any sequence, also when they arrive together, since a prompt that has not started prefilling
+looks for images again at its first step. An image is the paged KV and pooled keys
 of its positions, its recurrent state, and the MTP block's, about 114 MB plus 26 KiB a position in
 BF16 KV. The images live in 8 MiB pages of pinned memory that stay pinned for later images: the
 pages of two images of a whole context (within a quarter of the budget) are pinned at startup, and
@@ -1119,32 +1123,48 @@ host-expert work three drafts decode 90-123 tok/s against 87-94 plain (table abo
 
 ### Media conversations on one RTX 4090
 
-One RTX 4090 (450 W) in a Vast container with an EPYC 7713 ran the Q2_0 release with its table and
-`--vision` through `ninfer-serve`, 2026-11-07: host experts, one request at a time, a four-turn chat
-whose system text is the first 24,000 characters of the WikiText stream, a 768x512 image in the
-first and third user turns, greedy answers of up to 128 tokens with thinking off, each turn sending
-the whole history again. Master (`1f793496f`) prefilled every turn from scratch; this build resumes
-each turn past the cached history:
+One RTX 4090 (480 W) in a Vast container with an EPYC 7713 ran the Q2_0 release with its table and
+`--vision` through `ninfer-serve`, 2026-11-07: host experts, one request at a time, the release's
+DFlash2 drafts (the default), a four-turn chat whose system text is the first 24,000 characters of
+the WikiText stream, a 768x512 image in the first and third user turns, greedy answers of up to 128
+tokens with thinking off, each turn sending the whole history again; then a conversation with the
+same system text and another question, and a text conversation with characters 30,000-54,000.
+Three starts of each build, interleaved: before media prompts were cached (`d6a658b8a`), the first
+build that cached them (`0c08dfefd`), and this one, whose first step passes the system text's end:
 
-| Turn | Prompt tokens | Master: prefill | This build: reused, prefill | `--no-prefix-reuse` |
+| Turn | Prompt tokens | `d6a658b8a` | `0c08dfefd`: reused, prefill | This build |
 |---|---:|---:|---:|---:|
-| 1, image | 5,831 | 2.62 s | 0, 5.02 s | 2.58 s |
-| 2 | 5,985 | 1.92 s | 5,958, 0.12 s | 1.92 s |
-| 3, image | 6,422-6,434 | 1.88 s | 6,006, 1.89 s | 1.89 s |
-| 4 | 6,572-6,586 | 1.73 s | 6,548, 0.11 s | 1.73 s |
+| 1, image | 5,831 | 1.55-1.67 s | 0, 2.82-3.17 s | 1.60-1.76 s |
+| 2 | 5,985 | 1.35-1.38 s | 5,958, 0.11-0.15 s | 0.12-0.14 s |
+| 3, image | 6,422-6,434 | 1.45 s | 6,006, 1.03-1.31 s | 1.03-1.15 s |
+| 4 | 6,572-6,586 | 1.48-1.52 s | 6,548, 0.10-0.12 s | 0.11-0.12 s |
+| Same system text | 5,441 | 1.32-1.34 s | 5,417, 0.66-0.88 s | 0.75-0.78 s |
 
-The four turns took 11.0 s on master and 9.7 s here, wall time with the answers. The first turn
-costs 2.4 s more: its step ends at the system text, whose state the store keeps for the next
-conversation, and the image and question after it are a second pass, which with host experts copies
-the experts again; a text prompt of the same shape does the same. The third turn's 416 new tokens
-cost as much as master's whole prompt for the same reason, while the second and fourth resume all
-but their last 24-27 tokens. Answers differ from master's from the first turn on, since the
-prompt's steps end at other places; a second run of each repeated its answers.
+The four turns prefilled in 5.86-6.03 s, 4.07-4.64 s and 2.87-3.14 s. In `0c08dfefd` the first
+turn's step ended at the system text, whose state the store keeps for the next conversation, and
+the image and question after it were a second pass, which with host experts copied the experts
+again; here one span runs both sides and keeps the state at the system text's end as it passes. The
+third turn's 416 new tokens still take one pass that copies the experts. This build's answers are
+`0c08dfefd`'s; `d6a658b8a`'s differ from the first turn on, since its media prompts did not end
+steps at the cache's frontiers (the end of the system text and of the last user message).
 
-With `--spec mtp --draft-tokens 3` the media requests draft. They decoded the four answers at
-135.7, 178.5, 118.6 and 163.7 tok/s, against 70.9, 88.4, 87.6 and 99.2 with `--spec none`, the same
-tokens; master decoded them without drafts at 86.9-102.4 tok/s. By default host experts draft with
-the release's DFlash2 drafter, which master already ran for media requests.
+The text conversation's first turn (6,383 tokens, nothing reused, the same answer in all three
+builds) took 1.60-1.63 s in `d6a658b8a` and 2.57-2.77 s in the later two. The earlier conversations'
+images had taken the host pages pinned at startup (about 1.9 GB here), so storing the next images
+pinned more pages while the request waited; run before the media conversation, it took 1.72-1.89 s
+in all three (one start each). The store pins pages only until it holds its budget (8 GiB by
+default) and reuses them after; `d6a658b8a` stored no media images.
+
+With `--spec mtp --draft-tokens 3` the media requests draft. They decoded the four answers at 135.7,
+178.5, 118.6 and 163.7 tok/s, against 70.9, 88.4, 87.6 and 99.2 with `--spec none`, the same tokens
+(the media cache's first build, one start each, on an earlier rental of the same kind). Without
+drafts the three builds decode at the same rate: over the chat above and the same chat without its
+system text, two starts each with `--spec none`, 78.7, 79.9 and 81.6 tok/s, and `d6a658b8a` with
+`--spec mtp` (which did not draft media requests there) 77.3; this build against `0c08dfefd`, with
+the same answers, 0.90-1.10 a turn. With DFlash2 drafts it decoded the table's answers at 0.78-1.21
+of `0c08dfefd`'s rate a turn, 1.3% and 0.4% below it overall in two sets of three starts; the second
+window of DFlash2 features that a span keeps for one sequence takes 50 MiB of workspace and left the
+expert cache 89 MiB smaller.
 
 ### Hyper-connections in Q8_0
 
