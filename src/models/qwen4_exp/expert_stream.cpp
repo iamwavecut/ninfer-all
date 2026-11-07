@@ -159,8 +159,10 @@ struct ExpertStream::Impl {
     std::vector<Layer> layers;
     std::vector<Pool> pools;
     std::unique_ptr<PinnedHostBuffer> staging;
-    std::array<cudaEvent_t, 2> half_done{};
-    std::array<std::size_t, 3> half_rank{};
+    // Each half's event of every rank: the copies out of a half run on the stream of the rank
+    // that filled it, and CUDA records an event only on a stream of the device it was made on.
+    std::vector<std::array<cudaEvent_t, 2>> half_done;
+    std::array<std::size_t, 2> half_rank{}; // the rank that last filled each half
     std::size_t half         = 0; // the half being filled
     std::size_t cursor       = 0; // bytes used in it
     cudaStream_t half_stream = nullptr;
@@ -242,8 +244,13 @@ struct ExpertStream::Impl {
                            widest_shared_call));
         }
         staging = std::make_unique<PinnedHostBuffer>(2 * kStagingHalf);
-        for (auto& event : half_done) {
-            CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+        half_done.resize(device.size());
+        if (!on_rank.empty()) { half_rank.fill(on_rank.begin()->first); }
+        for (const auto& [rank, members] : on_rank) {
+            RankBinding bind(device, rank);
+            for (auto& event : half_done.at(rank)) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            }
         }
     }
 
@@ -316,21 +323,25 @@ struct ExpertStream::Impl {
     }
 
     ~Impl() {
-        for (auto& event : half_done) {
-            if (event != nullptr) { cudaEventDestroy(event); }
+        for (std::size_t rank = 0; rank < half_done.size(); ++rank) {
+            for (auto& event : half_done[rank]) {
+                if (event == nullptr) { continue; }
+                RankBinding bind(device, rank);
+                cudaEventDestroy(event);
+            }
         }
     }
 
     // Closes the half being filled behind the copies queued from it and starts the other one,
-    // once the copies that last read it have finished.
+    // once the copies that last read it have finished (an event never recorded is complete).
     void switch_half() {
         if (half_stream != nullptr) {
             RankBinding bind(device, half_rank[half]);
-            CUDA_CHECK(cudaEventRecord(half_done[half], half_stream));
+            CUDA_CHECK(cudaEventRecord(half_done.at(half_rank[half])[half], half_stream));
         }
         half   = 1 - half;
         cursor = 0;
-        CUDA_CHECK(ninfer::wait_for_event(half_done[half]));
+        CUDA_CHECK(ninfer::wait_for_event(half_done.at(half_rank[half])[half]));
     }
 
     // Forgets every resident expert: after a failed read some slot holds an expert it was never
