@@ -242,6 +242,12 @@ NINFER_FLASH_NEXT_DEVICES=0,1 \
 ```
 
 `NINFER_FLASH_NEXT_CACHE_ONLY=1` runs the image spill/restore/isolation regression alone.
+`NINFER_FLASH_NEXT_MEDIA_ONLY=1` runs the media prompt cache regression alone (needs an artifact
+with Vision): a follow-up turn resumes past its image without encoding it again, a new image is
+encoded alone after the reused prefix, a changed image is not reused, a restarted Engine restores
+the media prefix from disk and continues as the live one did, and media requests draft with MTP;
+`NINFER_FLASH_NEXT_EXPERTS=host|disk` places the experts. On two 24 GB GPUs the Vision tower does
+not fit beside every expert at the test's options; place the experts on the host there.
 `NINFER_FLASH_NEXT_CONFIDENCE_ONLY=1` runs the draft-confidence checks alone, one request at a time
 on GPU 0 with host experts; `NINFER_FLASH_NEXT_CONFIDENCE_BATCHED=1` adds three concurrent requests
 whose rows verify at their own widths (with logprobs, at the round's width), with host experts when

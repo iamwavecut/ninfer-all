@@ -253,6 +253,139 @@ void cache_test(const char* artifact) {
     std::cout << "disk cache: " << files << " images; failures=" << failures << '\n';
 }
 
+// A PPM image of a gradient that `seed` varies.
+std::vector<std::uint8_t> gradient_ppm(int width, int height, int seed) {
+    const std::string header =
+        "P6\n" + std::to_string(width) + ' ' + std::to_string(height) + "\n255\n";
+    std::vector<std::uint8_t> ppm(header.begin(), header.end());
+    for (int index = 0; index < width * height; ++index) {
+        ppm.push_back(static_cast<std::uint8_t>((index + seed) & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 3 + seed) & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 7) & 0xff));
+    }
+    return ppm;
+}
+
+// A conversation whose user turn i shows images[i] (nothing when it is empty) and asks the turn's
+// question, with the answers so far.
+ninfer::PromptInput media_conversation(const std::vector<std::vector<std::uint8_t>>& images,
+                                       const std::vector<ninfer::GenerationResult>& answers) {
+    static constexpr std::array<const char*, 3> kQuestions{
+        "Describe the colours and the pattern of this image in two sentences.",
+        "Give one more detail about the image.",
+        "Compare the two images."};
+    ninfer::PromptInput input;
+    for (std::size_t turn = 0; turn < images.size(); ++turn) {
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        if (!images[turn].empty()) {
+            ninfer::MessagePart image;
+            image.kind              = ninfer::MessagePartKind::Media;
+            image.media.kind        = ninfer::MediaKind::Image;
+            image.media.bytes       = images[turn];
+            image.media.media_type  = "image/x-portable-pixmap";
+            image.media.source_name = "turn" + std::to_string(turn) + ".ppm";
+            user.parts.push_back(std::move(image));
+        }
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = kQuestions.at(turn), .media = {}});
+        input.messages.push_back(std::move(user));
+        if (turn < answers.size()) {
+            ninfer::ChatMessage assistant;
+            assistant.role              = ninfer::ChatRole::Assistant;
+            assistant.reasoning_content = answers[turn].reasoning;
+            assistant.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = answers[turn].content, .media = {}});
+            input.messages.push_back(std::move(assistant));
+        }
+    }
+    input.options.enable_thinking = false;
+    return input;
+}
+
+// Media prompts in the context cache: a follow-up turn resumes past the image without encoding it
+// again, a new image is encoded alone after the reused prefix, a changed image is not reused, a
+// restarted Engine restores a media prefix from disk as the live one ran, and media requests draft
+// with MTP. NINFER_FLASH_NEXT_EXPERTS=host|disk places the experts.
+void media_cache_test(const char* artifact) {
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("ninfer-flash-media-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directory(directory);
+    auto o = options(artifact, 4);
+    o.enable_vision = true;
+    o.max_concurrency = 1;
+    o.context_cache.enabled = true;
+    // One image fits the host budget, so older ones go to disk.
+    o.context_cache.host_cache_budget_bytes = 192ULL << 20;
+    o.context_cache.disk_kv_path = directory;
+    o.context_cache.disk_kv_restore = true;
+    if (const char* experts = std::getenv("NINFER_FLASH_NEXT_EXPERTS")) {
+        const std::string_view place(experts);
+        if (place == "host") { o.expert_residency = ninfer::ExpertResidency::Host; }
+        if (place == "disk") { o.expert_residency = ninfer::ExpertResidency::Disk; }
+    }
+    const auto r = request(24);
+    const auto a = gradient_ppm(512, 384, 0), b = gradient_ppm(384, 256, 91);
+    auto changed = a;
+    changed[changed.size() - 2] ^= 0x33U;
+    const auto report = [](const char* label, const ninfer::GenerationResult& result) {
+        std::cout << "MEDIA " << label << " prompt=" << result.prompt.prompt_tokens
+                  << " reused=" << result.reused_prompt_tokens
+                  << " vision_s=" << result.timings.vision_seconds
+                  << " prefill_s=" << result.timings.prefill_seconds
+                  << " rounds=" << result.speculative.rounds
+                  << " drafted=" << result.speculative.drafted_tokens
+                  << " accepted=" << result.speculative.accepted_tokens << '\n';
+    };
+    ninfer::GenerationResult first, again;
+    {
+        ninfer::Engine engine(o);
+        first = engine.generate(engine.prepare(media_conversation({a}, {})), r);
+        report("first", first);
+        check(first.prompt.has_media && first.generated_token_ids.size() == 24,
+              "a media request completes");
+        check(first.speculative.rounds > 0, "a media request drafts with MTP");
+        const auto followup = media_conversation({a, {}}, {first});
+        const auto second = engine.generate(engine.prepare(followup), r);
+        report("second", second);
+        check(second.reused_prompt_tokens > 0 && second.timings.vision_seconds == 0.0,
+              "a follow-up turn resumes past its image without encoding it again");
+        again = engine.generate(engine.prepare(followup), r);
+        report("again", again);
+        check(again.reused_prompt_tokens > 0 && again.timings.vision_seconds == 0.0,
+              "the same turn resumes from its own closure");
+        const auto third =
+            engine.generate(engine.prepare(media_conversation({a, {}, b}, {first, second})), r);
+        report("third", third);
+        check(third.reused_prompt_tokens > 0 && third.timings.vision_seconds > 0.0,
+              "a new image is encoded after the reused prefix");
+        const auto miss = engine.generate(
+            engine.prepare(media_conversation({changed, {}, b}, {first, second})), r);
+        report("miss", miss);
+        check(miss.reused_prompt_tokens == 0 && miss.timings.vision_seconds > 0.0,
+              "a changed image is not reused but encoded");
+    }
+    std::size_t files = 0;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(directory)) {
+        files += entry.path().extension() == ".img" ? 1 : 0;
+    }
+    check(files > 0, "media images spill to disk");
+    {
+        ninfer::Engine engine(o);
+        const auto restored = engine.generate(
+            engine.prepare(media_conversation({a, {}}, {first})), r);
+        report("restored", restored);
+        check(restored.reused_prompt_tokens == again.reused_prompt_tokens &&
+                  restored.timings.vision_seconds == 0.0,
+              "a restarted Engine restores the media prefix from disk");
+        check(restored.generated_token_ids == again.generated_token_ids,
+              "the disk-restored media prefix continues as the live one");
+    }
+    std::filesystem::remove_all(directory);
+    std::cout << "MEDIA_CACHE files=" << files << " failures=" << failures << '\n';
+}
+
 void ngram_cache_test(const char* artifact) {
     const auto input = tokens(700, 19); // two prefill chunks; identical shape in every mode
     for (const auto drafts : {0U, 4U}) {
@@ -687,6 +820,11 @@ int run_test() {
     if (const char* cache_only = std::getenv("NINFER_FLASH_NEXT_CACHE_ONLY");
         cache_only && std::string_view(cache_only) == "1") {
         cache_test(artifact);
+        return failures ? 1 : 0;
+    }
+    if (const char* media_only = std::getenv("NINFER_FLASH_NEXT_MEDIA_ONLY");
+        media_only && std::string_view(media_only) == "1") {
+        media_cache_test(artifact);
         return failures ? 1 : 0;
     }
     auto requests = cases();

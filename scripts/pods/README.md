@@ -148,7 +148,7 @@ job script for `start`; the `compare_*.py` scripts read finished jobs' results l
 
 | routines | what they check |
 |---|---|
-| `mtp_assemble_local.sh`, `mtp_qualify.sh`, `mtp_vision.sh`, `mtp_publish.sh`, `mtp_release.sh` | attaching Unsloth's MTP block to the published models without touching their other objects, host/disk MTP repetition, the media fallback, and the verified public update |
+| `mtp_assemble_local.sh`, `mtp_qualify.sh`, `mtp_vision.sh`, `mtp_publish.sh`, `mtp_release.sh` | attaching Unsloth's MTP block to the published models without touching their other objects, host/disk MTP repetition, media requests drafting, and the verified public update |
 | `ngram_corpus_build.py`, `ngram_profile_broad.py`, `ngram_profile_native_check.sh`, `ngram_profile_attach.sh`, `ngram_profile_engine.sh`, `ngram_profile_publish.sh` | the broad hot-row profile: corpus sampling, per-group held-out hits, byte equality with the C++ profiler, attaching it to the table, Engine RAM hits |
 | `ngram_cpu_checks.sh`, `ngram_row_cache_checks.sh`, `ngram_default_check.sh`, `ngram_profile_checks.sh`, `compare_ngram_cache.py` | the row reader's OS queue (io_uring, with the positioned-read fallback), exact rows, failure and eviction, the opt-in row cache; `ngram_cpu_checks.sh` needs no GPU and runs in a plain Linux container |
 | `hc_build.sh`, `hc_oracles.sh`, `hc_checks.sh` | the hyper-connection kernels against their oracles and the paired HC benchmark |

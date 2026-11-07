@@ -104,7 +104,7 @@ def run(candidate, residency, drafts, floor, media_only=False):
             if drafts and not media_only and not any(s["result"]["timings"].get("draft_n_accepted", 0) > 0
                                   for s in record["samples"]):
                 raise RuntimeError(f"{label}: none of the drafts were accepted")
-            # Media uses the existing plain fallback. A fresh text request must resume MTP.
+            # A media request drafts with MTP, and so does the next text request.
             if drafts and floor == 0:
                 record["vision"] = request("/v1/chat/completions", {
                     "model": record["models"]["data"][0]["id"], "temperature": 0, "max_tokens": 32,
@@ -114,8 +114,8 @@ def run(candidate, residency, drafts, floor, media_only=False):
                         {"type": "image_url", "image_url": {"url": image_fixture()}}]}]})
                 if not record["vision"].get("choices"):
                     raise RuntimeError(f"{label}: media request returned no choices")
-                if record['vision'].get('timings', {}).get('draft_n', 0) != 0:
-                    raise RuntimeError(f'{label}: media bypassed the documented plain fallback')
+                if record['vision'].get('timings', {}).get('draft_n', 0) <= 0:
+                    raise RuntimeError(f'{label}: the media request did not draft')
                 answer = record['vision']['choices'][0]['message'].get('content', '').lower()
                 if 'red' not in answer:
                     raise RuntimeError(f'{label}: media answer did not identify the red fixture')
@@ -123,7 +123,7 @@ def run(candidate, residency, drafts, floor, media_only=False):
                     'prompt': PROMPTS[1], 'n_predict': 32, 'temperature': 0,
                     'ignore_eos': True, 'cache_prompt': False, 'return_tokens': True})
                 if record['text_after_vision']['timings'].get('draft_n', 0) <= 0:
-                    raise RuntimeError(f'{label}: the next text request did not resume MTP')
+                    raise RuntimeError(f'{label}: the next text request did not draft')
             record["status"] = "passed"
         except Exception as error:
             record["status"] = "failed"
@@ -166,8 +166,7 @@ def main():
                "checks": [r["label"] for r in records],
                "limitations": ["No physical low-RAM host or RTX 3080 20 GB qualification",
                                 "OS page cache is uncontrolled; disk results are not cold-I/O measurements",
-                                "Output equality is required only within each fixed execution mode",
-                                "Media requests use plain decoding; fresh text requests resume MTP"]}
+                                "Output equality is required only within each fixed execution mode"]}
     name = 'vision-qualification.json' if args.media_only else 'qualification.json'
     (JOB / name).write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({"stage": "MTP_VISION_PASS" if args.media_only else "MTP_QUALIFICATION_PASS",
