@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <span>
@@ -62,8 +63,11 @@ PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false)
     return {.layout = std::move(layout), .bytes = builder.finish(256)};
 }
 
+// cudaMemset runs on the legacy default stream, which the context's non-blocking streams do not
+// wait for: finish it before a copy on them reads the bytes.
 void set_bytes(const ninfer::Tensor& tensor, unsigned char value) {
     CUDA_CHECK(cudaMemset(tensor.data, value, tensor.bytes()));
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void expect_bytes(const ninfer::Tensor& tensor, unsigned char expected, std::string_view label) {
@@ -180,14 +184,19 @@ void test_segmented_roundtrip(bool dflash, ninfer::DeviceContext& device, bool d
     fill_slot(pool, 0, dflash ? 0x31 : 0x47);
     pool.zero_slot(1, device.stream);
 
-    q36::HostStatePool contiguous(planned.layout.host, 1);
-    const auto handle = contiguous.allocate();
-    pool.copy_to_host(0, contiguous.writable_view(*handle), device.stream);
-
     const std::size_t image_bytes   = planned.layout.host.image_bytes;
     const std::size_t segment_bytes = 777;
     const std::size_t segments      = (image_bytes + segment_bytes - 1) / segment_bytes;
+    // Neither copy writes the padding between components, and pinned memory comes uninitialized
+    // (or holds what an earlier allocation left): give both images the same padding.
+    constexpr int kPadding = 0xA5;
+    q36::HostStatePool contiguous(planned.layout.host, 1);
+    const auto handle = contiguous.allocate();
+    std::memset(contiguous.writable_view(*handle).data, kPadding, image_bytes);
+    pool.copy_to_host(0, contiguous.writable_view(*handle), device.stream);
+
     ninfer::PinnedHostBuffer backing(segments * segment_bytes);
+    std::memset(backing.data(), kPadding, backing.size());
     auto* base = static_cast<std::byte*>(backing.data());
     std::vector<std::byte*> scattered;
     for (std::size_t segment = 0; segment < segments; ++segment) {
