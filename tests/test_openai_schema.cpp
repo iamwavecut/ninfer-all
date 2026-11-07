@@ -1107,6 +1107,23 @@ int test_reasoning_and_extensions() {
     resolved                = resolve_prompt_semantics(parse(body).generation, server);
     failures += check(!resolved.reasoning_effort && resolved.enable_thinking == false,
                       "server effort default applied to a non-thinking request");
+    // Chat Completions keeps the thinking switch and the effort coupled: an effort that enables
+    // thinking conflicts with a request that turns it off.
+    for (const auto& disabling :
+         {Json{{"enable_thinking", false}},
+          Json{{"chat_template_kwargs", Json{{"enable_thinking", false}}}}}) {
+        body = base_request();
+        body.update(disabling);
+        body["reasoning_effort"] = "high";
+        failures += check(api_error([&] { (void)semantics(parse(body).generation); }).code ==
+                              "conflicting_template_option",
+                          "disabled thinking with an enabling effort was not refused");
+    }
+    body                     = base_request();
+    body["enable_thinking"]  = false;
+    body["reasoning_effort"] = "none";
+    failures += check(semantics(parse(body).generation).enable_thinking == false,
+                      "disabled thinking with reasoning_effort none was not accepted");
     server.enable_thinking = false;
     resolved               = resolve_prompt_semantics(plain, server);
     failures += check(!resolved.reasoning_effort && resolved.enable_thinking == false,
