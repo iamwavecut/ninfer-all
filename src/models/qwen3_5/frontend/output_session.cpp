@@ -189,6 +189,7 @@ struct HeldLogprob {
 };
 
 struct DecoderState {
+    bool initial_decoder_byte = true;
     std::string utf8_pending;
     std::string think_marker_pending;
     // Gemma: inside a channel's header (`thought\n` after <|channel>), and its bytes so far.
@@ -770,7 +771,12 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const std::uint32_t count          = static_cast<std::uint32_t>(index + 1);
         const TokenId token                = tokens[index];
-        const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        if (impl_->tokenizer->strip_initial_space() && impl_->preview_state.initial_decoder_byte &&
+            !decoded.bytes.empty()) {
+            if (decoded.bytes.front() == ' ') decoded.bytes.remove_prefix(1);
+            impl_->preview_state.initial_decoder_byte = false;
+        }
 
         if (const auto boundary = impl_->preview_prefix_execution.feed(decoded.bytes);
             boundary && *boundary == decoded.bytes.size()) {
@@ -1022,7 +1028,12 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_logprobs.clear();
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const TokenId token                = tokens[index];
-        const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+        if (impl_->tokenizer->strip_initial_space() && impl_->preview_state.initial_decoder_byte &&
+            !decoded.bytes.empty()) {
+            if (decoded.bytes.front() == ' ') decoded.bytes.remove_prefix(1);
+            impl_->preview_state.initial_decoder_byte = false;
+        }
         if (const auto boundary = impl_->preview_prefix_execution.feed(decoded.bytes);
             boundary && *boundary == decoded.bytes.size()) {
             impl_->preview_execution_split_after = static_cast<std::uint32_t>(index + 1U);
