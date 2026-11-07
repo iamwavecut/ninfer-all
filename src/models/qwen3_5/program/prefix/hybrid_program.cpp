@@ -3,6 +3,7 @@
 // block publication, prefill taps and terminal snapshots; the index and physical bindings live in
 // hybrid_cache.{h,cpp}.
 
+#include "core/device_wait.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/context_work.h"
@@ -180,7 +181,7 @@ void ProgramImpl::save_hybrid_cache_for_shutdown() noexcept {
         // are read. Lanes still pinning a path do not matter: the save only reads.
         device.synchronize();
         if (device.transfer_stream != nullptr) {
-            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+            CUDA_CHECK(ninfer::wait_for_stream(device.transfer_stream));
         }
         hybrid_->drain();
         // The product may abandon the save (a Ctrl+C during the stop). It counts as running only

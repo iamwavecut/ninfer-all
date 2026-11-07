@@ -465,6 +465,14 @@ supervisor such as a container restart policy reloads the model instead of keepi
 up. A router instead unloads the failed model once its requests are gone and reports it as failed in
 `GET /models`; its next request loads it again.
 
+A device that stops finishing work raises no CUDA error: the Engine thread that waits for it stays
+in the driver, while `/health` and the other endpoints keep answering. One thread of the process
+watches every Engine thread's waits for the device. When one wait lasts 120 s and no host service
+of that device (host or disk experts, the CPU share of expert products) answers the device in that
+time, the process prints `ninfer: the <thread> has waited <N> s for CUDA device <D> (<wait>) ...`
+on stderr and ends with `SIGABRT`, as it does on a CUDA error. Only a new process recovers the
+device, so run the server under a supervisor that restarts it, such as a container restart policy.
+
 ## Endpoints
 
 | Method and path | Behavior |

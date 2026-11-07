@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/expert_stream.h"
 
+#include "core/device_wait.h"
 #include "core/file_read_error.h"
 #include "models/qwen4_exp/read_pool.h"
 
@@ -281,7 +282,7 @@ struct ExpertStream::Impl {
             // Zeroed, so each slot's tail stays zero: copies write the matrices only.
             RankBinding bind(device, rank);
             pool.storage = DeviceBuffer(pool.slots.size() * pool.slot_bytes);
-            CUDA_CHECK(cudaMemset(pool.storage.p, 0, pool.storage.bytes));
+            CUDA_CHECK(ninfer::fill_and_wait(pool.storage.p, 0, pool.storage.bytes));
         }
         stats.slots += static_cast<std::uint32_t>(pool.slots.size());
         for (const std::size_t i : members) { layers[i].pool = pools.size(); }
@@ -299,7 +300,7 @@ struct ExpertStream::Impl {
             if (count == 0) { continue; }
             RankBinding bind(device, pool.rank);
             pool.grown = DeviceBuffer(count * pool.slot_bytes);
-            CUDA_CHECK(cudaMemset(pool.grown.p, 0, pool.grown.bytes));
+            CUDA_CHECK(ninfer::fill_and_wait(pool.grown.p, 0, pool.grown.bytes));
             pool.slots.resize(pool.slots.size() + count);
             stats.slots += static_cast<std::uint32_t>(count);
             added[pool.rank] += pool.grown.bytes;
@@ -329,7 +330,7 @@ struct ExpertStream::Impl {
         }
         half   = 1 - half;
         cursor = 0;
-        CUDA_CHECK(cudaEventSynchronize(half_done[half]));
+        CUDA_CHECK(ninfer::wait_for_event(half_done[half]));
     }
 
     // Forgets every resident expert: after a failed read some slot holds an expert it was never

@@ -15,6 +15,7 @@ add_executable(ninfer-multi-gpu-probe
   multi_gpu_probe.cu
   ${CMAKE_SOURCE_DIR}/src/core/device.cu
   ${CMAKE_SOURCE_DIR}/src/core/device_launch.cpp
+  ${CMAKE_SOURCE_DIR}/src/core/device_wait.cpp
   ${CMAKE_SOURCE_DIR}/src/core/peer_preflight.cpp)
 target_include_directories(ninfer-multi-gpu-probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # The host compiler needs the toolkit headers for device_launch.cpp; nvcc links the static runtime.
@@ -41,6 +42,7 @@ add_executable(ninfer-tp-exchange-bench
   ${CMAKE_SOURCE_DIR}/src/core/tensor_parallel.cu
   ${CMAKE_SOURCE_DIR}/src/core/device.cu
   ${CMAKE_SOURCE_DIR}/src/core/device_launch.cpp
+  ${CMAKE_SOURCE_DIR}/src/core/device_wait.cpp
   ${CMAKE_SOURCE_DIR}/src/core/peer_preflight.cpp)
 target_include_directories(ninfer-tp-exchange-bench PRIVATE ${CMAKE_SOURCE_DIR}/src
                            ${CMAKE_SOURCE_DIR}/include)

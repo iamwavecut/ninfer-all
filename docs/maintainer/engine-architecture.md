@@ -576,7 +576,14 @@ Worker 捕获的 host 侧异常（CUDA 错误直接终止进程，不会到达�
 ResourceManager 清空，以错误完成 active lanes 与 materializing request，保留尚未触及物理状态的 FIFO
 队列。只有 cleanup 后 Program 没有打开的 transaction、`physical_usage()` 的 Device/Host State 与 KV
 占用全部为零时才继续服务；否则，或连续八次恢复之后的下一次失败时，才锁存为 Engine-wide failure，
-`is_available()` 此后为 false。连续指其间没有 work unit（control batch、prefill step、decode round）
+`is_available()` 此后为 false。
+设备停止完成工作时 CUDA 不报告任何错误，等待它的线程永远停在驱动里。Engine 的 worker 与调用方线程
+（suspend、resume、slot 操作、score）在执行期间持有 `core/device_wait.h` 的 `DeviceWaitWatch`；
+`src/` 中等待设备的代码一律调用 `wait_for_stream`、`wait_for_event`、`wait_for_device`、
+`copy_and_wait`、`fill_and_wait`，而不是对应的 `cudaStreamSynchronize` 等函数。进程内一个线程检查
+所有被监视的线程：一次等待持续 `DeviceWaitWatch::kStallLimit`（120 s），且期间该设备的 host service
+（`CudaHostHandshake` 的应答）没有任何进展时，进程打印线程、设备与等待种类后 `std::abort()`，与
+CUDA 错误的处理相同；只有新进程才能恢复设备。连续指其间没有 work unit（control batch、prefill step、decode round）
 完成，且相邻两次失败相隔不到 30 秒（`runtime/engine/worker_recovery.h` 的 `RecoveryStreak`）：每次恢复
 都经过验证，相隔更久的失败不是该上限要阻止的紧密循环，例如一个客户端反复重发同一个在 admission 时
 耗尽内存的请求。

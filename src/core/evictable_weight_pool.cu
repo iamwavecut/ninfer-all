@@ -1,5 +1,6 @@
 #include "core/evictable_weight_pool.h"
 
+#include "core/device_wait.h"
 #include "core/vmm.h"
 
 #include <algorithm>
@@ -213,7 +214,7 @@ void EvictableWeightPool::capture_window_mirror(std::size_t window_capacity_byte
         CUDA_CHECK(cudaMemcpyAsync(impl.mirror->data(),
                                    reinterpret_cast<void*>(impl.home + impl.mirror_begin),
                                    impl.mirror_extent, cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
     }
     impl.mirror_captured = true;
 }
@@ -238,8 +239,8 @@ EvictableWeightPool::Transaction EvictableWeightPool::evict(std::size_t bytes,
                                     std::to_string(bytes) + " bytes");
     }
     // The borrowed chunks may still be read by in-flight work on either stream.
-    CUDA_CHECK(cudaStreamSynchronize(impl.device.stream));
-    CUDA_CHECK(cudaStreamSynchronize(impl.device.transfer_stream));
+    CUDA_CHECK(ninfer::wait_for_stream(impl.device.stream));
+    CUDA_CHECK(ninfer::wait_for_stream(impl.device.transfer_stream));
 
     const auto start        = Clock::now();
     const std::size_t first = impl.handles.size() - chunks;
@@ -275,7 +276,7 @@ void EvictableWeightPool::restore(Transaction& transaction) noexcept {
                     (evicted_begin - impl.mirror_begin),
                 evicted_end - evicted_begin, cudaMemcpyHostToDevice, transaction.stream_));
         }
-        CUDA_CHECK(cudaStreamSynchronize(transaction.stream_));
+        CUDA_CHECK(ninfer::wait_for_stream(transaction.stream_));
     } catch (const std::exception& error) {
         impl.poisoned = true;
         std::fprintf(stderr,

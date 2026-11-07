@@ -4,6 +4,7 @@
 #include "core/cpu_spin_pool.h"
 #include "core/cuda_host_handshake.h"
 #include "core/cuda_host_handshake.cuh"
+#include "core/device_wait.h"
 #include "core/expert_split.h"
 #include "core/file_read_queue.h"
 #include "core/growable_region.h"
@@ -91,13 +92,13 @@ struct Storage {
                 }
                 std::size_t end = at + g;
                 while (end < growable.bytes() && growable.mapped(end, g)) { end += g; }
-                CUDA_CHECK(cudaMemset(static_cast<std::byte*>(p) + at, 0, end - at));
+                CUDA_CHECK(ninfer::fill_and_wait(static_cast<std::byte*>(p) + at, 0, end - at));
                 at = end;
             }
         } else {
-            CUDA_CHECK(cudaMemset(p, 0, bytes));
+            CUDA_CHECK(ninfer::fill_and_wait(p, 0, bytes));
         }
-        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        CUDA_CHECK(ninfer::wait_for_stream(nullptr));
     }
     [[nodiscard]] std::uint64_t backing_bytes() const noexcept {
         return growable ? growable.mapped_bytes() : region ? region.reserved_bytes() : bytes;
@@ -756,11 +757,11 @@ struct ExpertDelivery::Impl {
     ~Impl() {
         DeviceBinding bind(rank.device);
         // Keep the worker alive until the last graph's waits and consumers finish.
-        cudaStreamSynchronize(rank.stream);
+        ninfer::wait_for_stream(rank.stream);
         stopping.store(true, std::memory_order_release);
         if (service.joinable()) { service.join(); }
-        cudaStreamSynchronize(copies);
-        cudaStreamSynchronize(rounds);
+        ninfer::wait_for_stream(copies);
+        ninfer::wait_for_stream(rounds);
         for (auto event : copied) { cudaEventDestroy(event); }
         for (auto& layer : layers) {
             for (auto event : layer.uploaded) { if (event) { cudaEventDestroy(event); } }
@@ -1038,7 +1039,7 @@ struct ExpertDelivery::Impl {
             if (!layer.dirty) { continue; }
             const int u = layer.next_upload;
             layer.next_upload = 1 - u;
-            CUDA_CHECK(cudaEventSynchronize(layer.uploaded[u]));
+            CUDA_CHECK(ninfer::wait_for_event(layer.uploaded[u]));
             std::memcpy(layer.upload[u]->data(), layer.mirror->data(), layer.mirror->size());
             CUDA_CHECK(cudaMemcpyAsync(layer.tables.p, layer.upload[u]->data(), layer.mirror->size(),
                                        cudaMemcpyHostToDevice, copies));
@@ -1100,7 +1101,7 @@ struct ExpertDelivery::Impl {
 
     void flush_reads() {
         if (batch_reads.empty()) { return; }
-        CUDA_CHECK(cudaEventSynchronize(copied[half]));
+        CUDA_CHECK(ninfer::wait_for_event(copied[half]));
         read_now(batch_reads);
         for (const auto& copy : batch_copies) {
             CUDA_CHECK(cudaMemcpyAsync(copy.target, copy.source, copy.bytes,
@@ -1295,7 +1296,9 @@ struct ExpertDelivery::Impl {
                 (staged + file_bytes > round_staging->size() || staged + file_bytes > kRoundFileBytes)) {
                 break;
             }
-            if (file_bytes != 0 && staged == 0) { CUDA_CHECK(cudaEventSynchronize(round_staged)); }
+            if (file_bytes != 0 && staged == 0) {
+                CUDA_CHECK(ninfer::wait_for_event(round_staged));
+            }
             for (std::size_t b = 0; b < expert.size(); ++b) {
                 const auto& blob = expert[b];
                 std::byte* target = slot_blob(d.slot, b);
@@ -1676,7 +1679,7 @@ struct ExpertDelivery::Impl {
             ranges_dirty = false;
         }
         upload_tables();
-        CUDA_CHECK(cudaStreamSynchronize(copies));
+        CUDA_CHECK(ninfer::wait_for_stream(copies));
         if (timed) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, copies_begun, copies_done));
@@ -1774,7 +1777,7 @@ struct ExpertDelivery::Impl {
                 *static_cast<std::int32_t*>(host_flag->data()) = 0;
             }
         }
-        cudaStreamSynchronize(copies);
+        ninfer::wait_for_stream(copies);
     }
 
     void run() {
@@ -1817,13 +1820,13 @@ struct ExpertDelivery::Impl {
     // post work included, and its copies are done.
     void quiesce() {
         DeviceBinding bind(rank.device);
-        CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+        CUDA_CHECK(ninfer::wait_for_stream(rank.stream));
         while (const auto request = handshake->pending(finished.load(std::memory_order_acquire))) {
             (void)request;
             std::this_thread::yield();
         }
-        CUDA_CHECK(cudaStreamSynchronize(copies));
-        CUDA_CHECK(cudaStreamSynchronize(rounds));
+        CUDA_CHECK(ninfer::wait_for_stream(copies));
+        CUDA_CHECK(ninfer::wait_for_stream(rounds));
     }
 
     // An elastic cache, quiesced and locked: gives back at least `bytes` of whole granules, or
@@ -1886,7 +1889,7 @@ struct ExpertDelivery::Impl {
             pool.count = keep[p];
         }
         upload_tables();
-        CUDA_CHECK(cudaStreamSynchronize(copies));
+        CUDA_CHECK(ninfer::wait_for_stream(copies));
         cache.bytes = 0;
         for (const auto& pool : pools) {
             const std::uint64_t end = std::uint64_t(pool.count) * pool.slot_bytes;
@@ -1937,7 +1940,7 @@ struct ExpertDelivery::Impl {
             std::sort(pool.free.begin(), pool.free.end(), std::greater<>());
             pool.count = want;
         }
-        CUDA_CHECK(cudaStreamSynchronize(copies));
+        CUDA_CHECK(ninfer::wait_for_stream(copies));
         cache.bytes = 0;
         for (const auto& pool : pools) { cache.bytes += backing(pool, pool.count); }
         set_free();
@@ -2164,7 +2167,7 @@ void ExpertDelivery::prime(const std::vector<std::vector<std::uint64_t>>* profil
     }
     p.flush_pieces(delta);
     p.upload_tables();
-    CUDA_CHECK(cudaStreamSynchronize(p.copies));
+    CUDA_CHECK(ninfer::wait_for_stream(p.copies));
     p.set_free();
     p.counters = p.counters + delta;
 }

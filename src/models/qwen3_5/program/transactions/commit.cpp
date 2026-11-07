@@ -1,3 +1,4 @@
+#include "core/device_wait.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -1112,7 +1113,7 @@ ProgramImpl::fail_all_cleanup(ProgramCleanup cleanup) noexcept {
     if (hybrid_) {
         if (cleanup == ProgramCleanup::Shutdown) { save_hybrid_cache_for_shutdown(); }
         if (device.transfer_stream != nullptr) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
+            (void)ninfer::wait_for_stream(device.transfer_stream);
         }
         hybrid_->clear();
     }
@@ -1187,8 +1188,8 @@ bool ProgramImpl::rebuild_context_stores() noexcept {
 
     // Copies still in flight may target pages about to return to the pools.
     for (std::size_t rank = 0; rank < transfer_streams.size(); ++rank) {
-        (void)cudaStreamSynchronize(compute_streams[rank]);
-        (void)cudaStreamSynchronize(transfer_streams[rank]);
+        (void)ninfer::wait_for_stream(compute_streams[rank]);
+        (void)ninfer::wait_for_stream(transfer_streams[rank]);
     }
 
     // Handles into the old stores must not alias objects of the new ones.

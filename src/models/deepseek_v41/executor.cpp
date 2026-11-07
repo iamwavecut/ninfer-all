@@ -1,6 +1,7 @@
 #include "models/deepseek_v41/executor.h"
 
 #include "core/decode_graph.h"
+#include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/tensor_parallel.h"
@@ -1335,14 +1336,14 @@ struct Executor::Impl {
     // After the span: its buffers back to the expert cache, once the span's work is done.
     void give_back(DeviceBuffer& borrowed) {
         if (!borrowed.p) { return; }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         borrowed = DeviceBuffer();
         delivery->grow_cache();
     }
 
     void release(std::uint32_t sequence) {
         if (!growing || sequence_areas.empty() || sequence_areas.front()->backed[sequence] == 0) { return; }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (KvArea* area : sequence_areas) { trim(*area, sequence, 0); }
         count_backed();
         delivery->grow_cache();
@@ -1350,11 +1351,11 @@ struct Executor::Impl {
 
     ~Impl() {
         settle_ahead(); // the reader's threads write no more into the pinned sets
-        if (delivery || growing) { cudaStreamSynchronize(stream); }
+        if (delivery || growing) { ninfer::wait_for_stream(stream); }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
-            cudaStreamSynchronize(expert_peers[r].stream);
+            ninfer::wait_for_stream(expert_peers[r].stream);
             expert_peers[r].delivery.reset();
             expert_peers[r].workspace.reset();
             cudaStreamDestroy(expert_peers[r].stream);
@@ -1636,7 +1637,7 @@ struct Executor::Impl {
                       static_cast<__nv_bfloat16*>(d_image_rows.p), *workspace, stream);
         CUDA_CHECK(cudaMemcpyAsync(rows.data(), d_image_rows.p, rows.size() * 2,
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
     }
 
     // Tokens, positions, and when given sequences, to the device.
@@ -3286,14 +3287,14 @@ struct Executor::Impl {
                 sequences.push_back(b - 1);
                 tokens.push_back(2);
                 decode(sequences, tokens);
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                CUDA_CHECK(ninfer::wait_for_stream(stream));
                 for (const std::uint32_t s : sequences) { reset_state(s); }
             }
             for (const auto& [n, w] : rounds) {
                 const std::vector<std::uint32_t> owners(sequences.begin(), sequences.begin() + n);
                 verify(owners, std::vector<std::int32_t>(std::size_t(n) * w, 2));
                 commit(owners, std::vector<std::uint32_t>(n, 1));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
+                CUDA_CHECK(ninfer::wait_for_stream(stream));
                 for (const std::uint32_t s : owners) { reset_state(s); }
             }
             if (drafter) {

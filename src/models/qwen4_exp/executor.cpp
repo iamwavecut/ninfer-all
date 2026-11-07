@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/decode_graph.h"
+#include "core/device_wait.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_worker_pool.h"
 #include "core/layout.h"
@@ -1859,14 +1860,14 @@ struct Executor::Impl {
         // The MTP block drafts from text cells only; the sequence stops drafting until a reset.
         // The DFlash2 ring takes the media positions' features as any others.
         if (mtp) { sequence.drafter_follows = false; }
-        CUDA_CHECK(cudaStreamSynchronize(ranks[0].stream));
+        CUDA_CHECK(ninfer::wait_for_stream(ranks[0].stream));
         // Under tensor parallelism every rank embeds the prompt itself, from its own copy.
         for (std::size_t r = 1; r <= rank_vision_embeddings.size(); ++r) {
             RankBinding peer(device, r);
             CUDA_CHECK(cudaMemcpyPeerAsync(rank_vision_embeddings[r - 1].p, device.rank(r).device,
                                            vision_embeddings.p, device.rank(0).device,
                                            column * h * 2, ranks[r].stream));
-            CUDA_CHECK(cudaStreamSynchronize(ranks[r].stream));
+            CUDA_CHECK(ninfer::wait_for_stream(ranks[r].stream));
         }
     }
 
@@ -2500,7 +2501,7 @@ struct Executor::Impl {
             pool.buffers.resize(wanted == 2 && 2 * bytes <= free_bytes / 2 ? 2 : 1);
             for (auto& buffer : pool.buffers) {
                 buffer.storage = DeviceBuffer(bytes);
-                CUDA_CHECK(cudaMemset(buffer.storage.p, 0, buffer.storage.bytes));
+                CUDA_CHECK(ninfer::fill_and_wait(buffer.storage.p, 0, buffer.storage.bytes));
                 buffer.tables = DeviceBuffer(3 * experts * sizeof(void*));
                 memory.ranks[r].workspace_bytes += buffer.storage.bytes + buffer.tables.bytes;
             }
@@ -2628,12 +2629,12 @@ struct Executor::Impl {
         auto& target          = state.buffers[b];
         RankBinding bind(device, plan.rank);
         const cudaStream_t t  = device.rank(plan.rank).transfer_stream;
-        CUDA_CHECK(cudaEventSynchronize(target.free));
+        CUDA_CHECK(ninfer::wait_for_event(target.free));
         const MoePlan& m          = plan.moe;
         const std::size_t experts = m.gate.pointers.size();
         const auto source         = std::size_t(state.next);
         state.next ^= 1;
-        CUDA_CHECK(cudaEventSynchronize(state.copied[source]));
+        CUDA_CHECK(ninfer::wait_for_event(state.copied[source]));
         auto* entries = static_cast<const void**>(state.entries[source]->data());
         stage_pool(pool, pool.buffers[b], index, [](std::size_t) { return true; }, entries, t);
         CUDA_CHECK(cudaMemcpyAsync(pool.buffers[b].tables.p, entries, 3 * experts * sizeof(void*),
@@ -2671,7 +2672,7 @@ struct Executor::Impl {
         if (pending_routes == 0 && mtp_routes == 0) { return; }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
-            CUDA_CHECK(cudaEventSynchronize(rank.routes));
+            CUDA_CHECK(ninfer::wait_for_event(rank.routes));
         }
         const std::uint64_t pairs =
             std::uint64_t(config.num_experts_per_tok) * options.prefill_chunk;
@@ -2905,7 +2906,7 @@ struct Executor::Impl {
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
             // The staging buffer is rewritten only once the previous upload has left it.
-            CUDA_CHECK(cudaEventSynchronize(rank.staged));
+            CUDA_CHECK(ninfer::wait_for_event(rank.staged));
             auto* base = static_cast<std::byte*>(rank.staging->data());
             const auto upload = [&](void* target, std::size_t at,
                                     const std::vector<std::int32_t>& values) {
@@ -2982,7 +2983,7 @@ struct Executor::Impl {
     void measure_stall(StallEvents& events, bool block) {
         if (!events.pending) { return; }
         if (block) {
-            CUDA_CHECK(cudaEventSynchronize(events.ready));
+            CUDA_CHECK(ninfer::wait_for_event(events.ready));
         } else {
             const cudaError_t status = cudaEventQuery(events.ready);
             if (status == cudaErrorNotReady) { return; }
@@ -3629,7 +3630,7 @@ struct Executor::Impl {
                                index * std::size_t(top) * options.prefill_chunk;
         CUDA_CHECK(
             cudaMemcpyAsync(routes, ids.data, std::size_t(top) * t * 4, cudaMemcpyDeviceToHost, s));
-        CUDA_CHECK(cudaStreamSynchronize(s));
+        CUDA_CHECK(ninfer::wait_for_stream(s));
         const MoePlan& m          = plan.moe;
         const std::size_t experts = m.gate.pointers.size();
         // The copies below overwrite the first buffer, so no buffer holds a prefetched layer.
@@ -3735,7 +3736,7 @@ struct Executor::Impl {
                          index * std::size_t(top) * options.prefill_chunk;
             CUDA_CHECK(cudaMemcpyAsync(host, ids.data, std::size_t(top) * t * 4,
                                        cudaMemcpyDeviceToHost, s));
-            CUDA_CHECK(cudaStreamSynchronize(s));
+            CUDA_CHECK(ninfer::wait_for_stream(s));
             stream->prepare(index, std::span<const std::int32_t>(host, std::size_t(top) * t),
                             span_last);
         }
@@ -4587,7 +4588,7 @@ struct Executor::Impl {
     void synchronize_ranks() {
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
-            CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+            CUDA_CHECK(ninfer::wait_for_stream(rank.stream));
         }
     }
 
@@ -5371,7 +5372,7 @@ struct Executor::Impl {
             std::vector<std::uint64_t> out(ranks.size());
             for (std::size_t r = 0; r < ranks.size(); ++r) {
                 RankBinding bind(device, r);
-                CUDA_CHECK(cudaDeviceSynchronize());
+                CUDA_CHECK(ninfer::wait_for_device());
                 std::size_t free = 0, total = 0;
                 CUDA_CHECK(cudaMemGetInfo(&free, &total));
                 out[r] = free;
@@ -5414,7 +5415,7 @@ struct Executor::Impl {
         for (const std::uint32_t s : batch) { reset(s); }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
-            CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+            CUDA_CHECK(ninfer::wait_for_stream(rank.stream));
         }
         warming = false;
     }
@@ -5424,7 +5425,7 @@ struct Executor::Impl {
         std::vector<std::uint64_t> bytes(device.size(), 0);
         for (std::size_t r = 0; r < device.size(); ++r) {
             RankBinding bind(device, r);
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(ninfer::wait_for_device());
             std::size_t free_bytes = 0, total = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
             bytes[r] = free_bytes > keep ? free_bytes - keep : 0;
@@ -5496,7 +5497,7 @@ struct Executor::Impl {
     // The next pinned staging half, once the upload that last read it is done.
     std::int32_t* dflash2_stage() {
         const std::size_t half = std::exchange(dflash2_next, dflash2_next ^ 1U);
-        CUDA_CHECK(cudaEventSynchronize(dflash2_staged[half]));
+        CUDA_CHECK(ninfer::wait_for_event(dflash2_staged[half]));
         dflash2_next_half = half;
         return static_cast<std::int32_t*>(dflash2_staging[half]->data());
     }
@@ -5648,7 +5649,7 @@ struct Executor::Impl {
                                    cudaMemcpyDeviceToHost, rank.stream));
         // The expert cache takes the last verification's routes while the device drafts.
         settle_routes();
-        CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+        CUDA_CHECK(ninfer::wait_for_stream(rank.stream));
         const std::size_t stride = options.draft_tokens;
         for (std::size_t j = 0; j < b; ++j) {
             std::uint32_t length = static_cast<std::uint32_t>(k);
@@ -5683,7 +5684,7 @@ struct Executor::Impl {
     void stage_mtp(std::span<const std::int32_t> ids, std::size_t ids_at,
                    std::span<const std::int32_t> positions, std::size_t positions_at) {
         RankState& rank = ranks[model.head_rank()];
-        CUDA_CHECK(cudaEventSynchronize(mtp_staged));
+        CUDA_CHECK(ninfer::wait_for_event(mtp_staged));
         auto* host                 = static_cast<std::int32_t*>(mtp_staging->data());
         const std::size_t capacity = mtp_ids.bytes / 4;
         std::memcpy(host, ids.data(), ids.size() * 4);
@@ -6132,7 +6133,7 @@ struct Executor::Impl {
                 // The expert cache takes the last verification's routes while the first step
                 // runs; the MTP block's table uploads it queues precede the next step.
                 if (i == 0) { settle_routes(); }
-                CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+                CUDA_CHECK(ninfer::wait_for_stream(rank.stream));
                 bool more = false;
                 for (std::size_t j = 0; j < b; ++j) {
                     if (!std::isfinite(logprobs[i * b + j])) {
@@ -6152,7 +6153,7 @@ struct Executor::Impl {
             if (draft_prefetch) { draft_prefetch->join(rank.stream); }
         }
         CUDA_CHECK(cudaMemcpyAsync(host, ids + b, ran * b * 4, cudaMemcpyDeviceToHost, rank.stream));
-        CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+        CUDA_CHECK(ninfer::wait_for_stream(rank.stream));
         if (hybrid) { hybrid->finish(); }
         if (draft_prefetch) { draft_prefetch->check(); }
         for (std::size_t j = 0; j < b; ++j) {
@@ -6256,7 +6257,7 @@ struct Executor::Impl {
             RankBinding bind(device, model.head_rank());
             // Captured events encode graph dependencies; wait on the joined stream before
             // reading host callback state. Host synchronization of a captured event is invalid.
-            CUDA_CHECK(cudaStreamSynchronize(ranks[model.head_rank()].stream));
+            CUDA_CHECK(ninfer::wait_for_stream(ranks[model.head_rank()].stream));
             draft_prefetch->check();
         }
         const auto di = static_cast<std::int32_t>(config.indexer_head_dim);
@@ -6532,7 +6533,7 @@ struct Executor::Impl {
         }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
-            CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+            CUDA_CHECK(ninfer::wait_for_stream(rank.stream));
         }
     }
 
@@ -6617,7 +6618,7 @@ struct Executor::Impl {
         }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
-            CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+            CUDA_CHECK(ninfer::wait_for_stream(rank.stream));
         }
     }
 };

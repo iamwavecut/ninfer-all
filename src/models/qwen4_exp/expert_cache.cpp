@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/expert_cache.h"
 
+#include "core/device_wait.h"
+
 #include <algorithm>
 #include <cstring>
 #include <map>
@@ -244,7 +246,7 @@ ExpertCache::~ExpertCache() {
     for (std::size_t r = 0; r < side_.size(); ++r) {
         if (side_[r] == nullptr) { continue; }
         RankBinding bind(device_, r);
-        cudaStreamSynchronize(side_[r]);
+        ninfer::wait_for_stream(side_[r]);
         cudaStreamDestroy(side_[r]);
         cudaEventDestroy(evicted_[r]);
         cudaEventDestroy(uploaded_[r]);
@@ -453,7 +455,7 @@ void ExpertCache::seed(const std::vector<std::vector<std::uint64_t>>& counts) {
             ++stats_.admitted;
         }
         if (layer.dirty) { upload(layer, layer.banks.stream); }
-        CUDA_CHECK(cudaStreamSynchronize(layer.banks.stream));
+        CUDA_CHECK(ninfer::wait_for_stream(layer.banks.stream));
         tier_->set_free(std::uint32_t(index), std::uint32_t(layer.free_slots.size()));
     }
 }
@@ -626,7 +628,7 @@ std::vector<std::uint64_t> ExpertCache::lend(std::span<const Loan> loans) {
                                       std::vector<const std::vector<std::uint64_t>*>(members.size(), nullptr),
                                       members.size());
         RankBinding bind(device_, loan.rank);
-        CUDA_CHECK(cudaMemset(loan.base, 0, loan.bytes));
+        CUDA_CHECK(ninfer::fill_and_wait(loan.base, 0, loan.bytes));
         auto* at = static_cast<std::byte*>(loan.base);
         for (std::size_t i = 0; i < members.size(); ++i) {
             if (more[i] == 0) { continue; }
@@ -656,7 +658,7 @@ void ExpertCache::reclaim(std::size_t rank, cudaStream_t transfer) {
     if (rank >= holding_.size() || !holding_[rank]) { return; }
     RankBinding bind(device_, rank);
     // A round's copies may be writing lent slots: they land first.
-    CUDA_CHECK(cudaStreamSynchronize(side_[rank]));
+    CUDA_CHECK(ninfer::wait_for_stream(side_[rank]));
     land();
     cudaStream_t compute = nullptr;
     for (std::size_t index = 0; index < layers_.size(); ++index) {

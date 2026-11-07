@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/cuda_host_handshake.h"
+#include "core/device_wait.h"
 #include "models/qwen4_exp/read_pool.h"
 #include "ninfer/ops/residual_add.h"
 
@@ -314,7 +315,7 @@ struct HybridExperts::Impl {
             rank.staged[ring]->record(stream);
             at += n;
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (std::size_t slot = from; slot < layer.expert_of.size(); ++slot) {
             layer.slot_of[layer.expert_of[slot]] = static_cast<std::int32_t>(slot);
         }
@@ -366,7 +367,7 @@ struct HybridExperts::Impl {
             pack(layer.inputs.experts[expert], host, target);
             CUDA_CHECK(cudaMemcpyAsync(target, host, layer.slot_bytes, cudaMemcpyHostToDevice, stream));
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         // Publish residency only after the bytes are ready, and after the old consumer finished.
         const auto victim = layer.expert_of[slot];
         if (victim >= 0) { layer.slot_of[victim] = -1; }
@@ -408,7 +409,7 @@ struct HybridExperts::Impl {
             counters.copied_bytes += n * layer.slot_bytes;
             at += n;
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
     }
 
     void cpu(Layer& layer, std::size_t worker, std::size_t tokens) {
@@ -567,7 +568,7 @@ struct HybridExperts::Impl {
             try {
                 const auto& layer = layers.at(request.tag);
                 RankBinding bind(device, layer.inputs.rank);
-                CUDA_CHECK(cudaStreamSynchronize(device.rank(layer.inputs.rank).transfer_stream));
+                CUDA_CHECK(ninfer::wait_for_stream(device.rank(layer.inputs.rank).transfer_stream));
             } catch (...) { remember_failure(); }
             // If preparation has already been published, parts/tables belong to the GPU until
             // retirement. Otherwise mask every routed lane before letting the graph proceed.

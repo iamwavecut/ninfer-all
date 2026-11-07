@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/expert_misses.h"
 
 #include "core/cpu_spin_pool.h"
+#include "core/device_wait.h"
 #include "core/expert_split.h"
 #include "core/file_read_error.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
@@ -391,7 +392,7 @@ struct ExpertMisses::Impl {
             patch_kernel<<<1, 32, 0, rank.copies>>>(nullptr, nullptr, nullptr, nullptr, 0);
             wait_kernel<<<1, 1, 0, rank.copies>>>(rank.box, static_cast<const std::uint32_t*>(rank.need->data()));
             CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(rank.copies));
+            CUDA_CHECK(ninfer::wait_for_stream(rank.copies));
         }
         if (cpu) {
             // By default one thread per physical core, this service's included; pinned, since the
@@ -428,7 +429,7 @@ struct ExpertMisses::Impl {
             words[2 * i]     = resident[std::size_t(i)].first;
             words[2 * i + 1] = resident[std::size_t(i)].second;
         }
-        CUDA_CHECK(cudaMemcpy(buffer.p, words, sizeof(words), cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(buffer.p, words, sizeof(words), cudaMemcpyHostToDevice));
     }
 
     void remember_failure() noexcept {
@@ -807,7 +808,7 @@ struct ExpertMisses::Impl {
             issue();
             if (rank.product_count) { *static_cast<std::int32_t*>(rank.product_count->data()) = 0; }
         }
-        if (copies) { CUDA_CHECK(cudaEventSynchronize(rank.copied)); }
+        if (copies) { CUDA_CHECK(ninfer::wait_for_event(rank.copied)); }
         if (options.cpu_balance && gpu_count > 0 && staged_bytes > 0 && mapped == 0) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, rank.copying, rank.copied));
@@ -933,7 +934,7 @@ struct ExpertMisses::Impl {
         Rank& rank = ranks.at(layers.at(index).rank);
         if (!capturing(stream)) {
             // Eager: wait on the host, so a lazily loaded kernel never waits behind a GPU spin.
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
             const std::uint32_t sequence = *static_cast<volatile std::uint32_t*>(rank.need->data());
             if (sequence != 0 &&
                 Atomic(rank.box->prepared).load(cuda::memory_order_acquire) != sequence) {

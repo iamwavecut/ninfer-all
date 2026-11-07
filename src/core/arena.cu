@@ -1,5 +1,7 @@
 #include "core/arena.h"
 
+#include "core/device_wait.h"
+
 #include <cuda_runtime.h>
 
 #include <atomic>
@@ -114,11 +116,11 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
 // so make the contract explicit rather than depend on the observation.
 void DeviceBuffer::fill(int byte_value) {
     if (bytes == 0) { return; }
-    const cudaError_t err = cudaMemset(p, byte_value, bytes);
+    const cudaError_t err = ninfer::fill_and_wait(p, byte_value, bytes);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemset failed", err));
     }
-    const cudaError_t sync = cudaStreamSynchronize(nullptr);
+    const cudaError_t sync = ninfer::wait_for_stream(nullptr);
     if (sync != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("fill completion sync failed", sync));
     }
@@ -147,11 +149,12 @@ void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::si
     require_range(byte_offset, count, "host-to-device copy");
     if (count == 0) { return; }
     void* destination     = static_cast<std::uint8_t*>(p) + byte_offset;
-    const cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice);
+    const cudaError_t err =
+        ninfer::copy_and_wait(destination, source, count, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy host-to-device failed", err));
     }
-    const cudaError_t sync = cudaStreamSynchronize(nullptr);
+    const cudaError_t sync = ninfer::wait_for_stream(nullptr);
     if (sync != cudaSuccess) {
         throw std::runtime_error(
             cuda_error_message("host-to-device copy completion sync failed", sync));
@@ -163,7 +166,8 @@ void DeviceBuffer::copy_to_host(void* destination, std::size_t count,
     require_range(byte_offset, count, "device-to-host copy");
     if (count == 0) { return; }
     const void* source    = static_cast<const std::uint8_t*>(p) + byte_offset;
-    const cudaError_t err = cudaMemcpy(destination, source, count, cudaMemcpyDeviceToHost);
+    const cudaError_t err =
+        ninfer::copy_and_wait(destination, source, count, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy device-to-host failed", err));
     }
@@ -212,8 +216,8 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     // Under the evictable budget, commit the pages now so WDDM makes room at startup; the wait
     // orders the fill before uploads on the non-blocking load stream.
     if (core::wddm_evictable_budget()) {
-        const cudaError_t fill = cudaMemset(ptr, 0, capacity_bytes);
-        const cudaError_t done = fill == cudaSuccess ? cudaDeviceSynchronize() : fill;
+        const cudaError_t fill = ninfer::fill_and_wait(ptr, 0, capacity_bytes);
+        const cudaError_t done = fill == cudaSuccess ? ninfer::wait_for_device() : fill;
         if (done != cudaSuccess) {
             log_cuda_error("cudaFree", cudaFree(ptr));
             throw std::runtime_error(cuda_error_message("cudaMemset failed", done));

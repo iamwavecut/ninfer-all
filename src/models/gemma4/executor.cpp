@@ -1,6 +1,7 @@
 #include "models/gemma4/executor.h"
 
 #include "core/decode_graph.h"
+#include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/tensor_parallel.h"
@@ -860,7 +861,7 @@ struct Executor::Impl {
     // remaining sequence reaches, and the expert cache takes what is free beyond its headroom.
     void release(std::uint32_t sequence) {
         if (!growing || sequence_areas.empty() || sequence_areas.front()->backed[sequence] == 0) { return; }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (KvArea* area : sequence_areas) { trim(*area, sequence, 0); }
         std::uint32_t longest = 0;
         for (const std::uint32_t backed : sequence_areas.front()->backed) { longest = std::max(longest, backed); }
@@ -875,13 +876,13 @@ struct Executor::Impl {
     }
 
     ~Impl() {
-        if (delivery || growing) { cudaStreamSynchronize(stream); }
+        if (delivery || growing) { ninfer::wait_for_stream(stream); }
         if (media_begin != nullptr) { cudaEventDestroy(media_begin); }
         if (media_end != nullptr) { cudaEventDestroy(media_end); }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
-            cudaStreamSynchronize(expert_peers[r].stream);
+            ninfer::wait_for_stream(expert_peers[r].stream);
             expert_peers[r].workspace.reset();
             cudaStreamDestroy(expert_peers[r].stream);
         }
@@ -2234,7 +2235,7 @@ struct Executor::Impl {
         auto* host = static_cast<std::int32_t*>(h_drafts->data());
         CUDA_CHECK(cudaMemcpyAsync(host, d_drafts.p, std::size_t(n) * steps * 4,
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (int j = 0; j < n; ++j) {
             for (std::uint32_t i = 0; i < steps; ++i) { out[j * steps + i] = host[i * n + j]; }
         }
@@ -2437,7 +2438,7 @@ struct Executor::Impl {
             }
         }
         std::fill(anchored.begin(), anchored.end(), 0);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         if (delivery) {
             // Drained, so warm-up deliveries and their asynchronous prefetches stay out of the
             // request counters, and the cache starts from the routing profile rather than the
@@ -2647,7 +2648,7 @@ bool Executor::vision() const noexcept { return impl_->vision_media; }
 
 double Executor::last_media_seconds() const {
     if (!impl_->media_timed) { return 0.0; }
-    CUDA_CHECK(cudaEventSynchronize(impl_->media_end));
+    CUDA_CHECK(ninfer::wait_for_event(impl_->media_end));
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, impl_->media_begin, impl_->media_end));
     return double(ms) / 1000.0;
