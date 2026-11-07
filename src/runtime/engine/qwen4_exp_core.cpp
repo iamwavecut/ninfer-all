@@ -53,7 +53,7 @@
 namespace ninfer::runtime {
 namespace {
 
-// Prompt chunks in one prefill step while other requests decode (see prompt_step_tokens).
+// Prompt chunks in one prefill step while other requests decode (see prompt_step).
 constexpr std::uint32_t kPeerSpanChunks = 2;
 
 using Clock = std::chrono::steady_clock;
@@ -562,7 +562,8 @@ struct Qwen4ExpCore::Request {
     runtime::RawTokenLogprob branch_record;
     // Prefixes other prompts are expected to share (a declared cache boundary, the end of the
     // leading system messages or tool declarations), ascending and below anchor_at: with the context
-    // cache on, a prompt step ends at each, and the state there goes to the store for them.
+    // cache on, the state at each goes to the store for them, where a prompt step ends or, with
+    // layer-major spans, as a step passes (prompt_step).
     std::vector<std::uint32_t> shared_at;
 
     // The worker's progress with an admitted request.
@@ -1644,7 +1645,8 @@ struct Qwen4ExpCore::Impl {
         // the streams the tokens plain rounds would and holds a prompt back no longer.
         if (prefilling &&
             (!decoding ||
-             decode_run >= double(decode_rounds_before(prompt_step_tokens(*prefilling))))) {
+             decode_run >=
+                 double(decode_rounds_before(prompt_step(*prefilling, true).tokens)))) {
             decode_run = 0;
             for (const Slot& slot : slots) {
                 if (slot.request && !slot.request->decoding && slot.request != prefilling &&
@@ -1653,7 +1655,7 @@ struct Qwen4ExpCore::Impl {
                 }
             }
             prefilling->prefill_skips = 0;
-            const std::uint32_t lead_tokens = prompt_step_tokens(*prefilling);
+            const std::uint32_t lead_tokens = prompt_step(*prefilling, true).tokens;
             std::uint32_t tokens            = 0;
             try {
                 if (executor.packs_prompts() && plain_prompt(*prefilling)) {
@@ -1681,26 +1683,37 @@ struct Qwen4ExpCore::Impl {
             1, (std::uint64_t(decode_rounds_per_prefill) * tokens + chunk - 1) / chunk));
     }
 
-    // The prompt tokens the request's next prefill step computes: a span where the executor has
-    // them, else a chunk. A span is one step, which with the experts off the GPU lasts seconds,
-    // and the requests that are decoding wait for all of it: while any decodes, a step is two
-    // chunks at most.
-    [[nodiscard]] std::uint32_t prompt_step_tokens(const Request& r) const {
+    // A prompt step: the tokens it computes, and the shared frontier inside it whose state it
+    // keeps in the slot's snapshot as it passes (Executor::forward's cut; 0: none).
+    struct PromptStep {
+        std::uint32_t tokens = 0;
+        std::uint32_t cut    = 0;
+    };
+
+    // The request's next prefill step: a span where the executor has them, else a chunk. A span
+    // is one step, which with the experts off the GPU lasts seconds, and the requests that are
+    // decoding wait for all of it: while any decodes, a step is two chunks at most. With `cuts`
+    // a span may pass a shared frontier (a step that runs alone).
+    [[nodiscard]] PromptStep prompt_step(const Request& r, bool cuts) const {
         const auto& executor             = *instance.executor;
         const auto prompt_n              = static_cast<std::uint32_t>(r.prompt_tokens.size());
         if (r.branches && r.prefilled == prompt_n) {
             const std::size_t left =
                 (*r.branches)[r.branch_results.size()].tokens.size() - r.branch_fed;
-            return static_cast<std::uint32_t>(std::min<std::size_t>(left, executor.prompt_step()));
+            return {static_cast<std::uint32_t>(
+                std::min<std::size_t>(left, executor.prompt_step()))};
         }
         // A step ends where the context cache keeps the state: with host or disk experts every
         // step's wide pass copies the experts, so a prompt the cache does not keep runs whole.
-        std::uint32_t until = prompt_n;
+        // `after` is where the cache keeps the state next past the first frontier ahead.
+        std::uint32_t until = prompt_n, frontier = 0, after = prompt_n;
         if (reuse_prefixes && r.reusable) {
             if (r.prefilled < r.anchor_at) { until = r.anchor_at; }
-            for (const std::uint32_t frontier : r.shared_at) {
-                if (frontier > r.prefilled) {
-                    until = std::min(until, frontier);
+            after = until;
+            for (std::size_t i = 0; i < r.shared_at.size(); ++i) {
+                if (r.shared_at[i] > r.prefilled) {
+                    frontier = r.shared_at[i];
+                    if (i + 1 < r.shared_at.size()) { after = std::min(after, r.shared_at[i + 1]); }
                     break;
                 }
             }
@@ -1712,7 +1725,25 @@ struct Qwen4ExpCore::Impl {
                 return other.request && other.request.get() != &r && other.request->decoding;
             });
         if (peers_decoding) { step = std::min(step, kPeerSpanChunks * chunk_tokens); }
-        return std::min(step, until > r.prefilled ? until - r.prefilled : 0U);
+        if (frontier != 0 && frontier < until) {
+            // A span goes on past the frontier with the chunks the steps from there would run
+            // (to `after`, or whole chunks), so that the experts cross the bus once for both
+            // sides, and keeps the state at the frontier as it passes. Only where each side
+            // starts with a chunk wider than the narrow ones: a step of narrow chunks copies only
+            // the experts it misses, so passing the frontier saves no copy there, and a span
+            // that passed one into a narrow chunk measured slower than the two steps.
+            const std::uint32_t narrow = executor.narrow_prompt_tokens();
+            if (cuts && narrow != 0 && !r.branches && frontier - r.prefilled < step &&
+                frontier - r.prefilled > narrow) {
+                const std::uint32_t room = r.prefilled + step - frontier;
+                const std::uint32_t end  = after - frontier <= room
+                                               ? after
+                                               : frontier + room / chunk_tokens * chunk_tokens;
+                if (end - frontier > narrow) { return {end - r.prefilled, frontier}; }
+            }
+            until = frontier;
+        }
+        return {std::min(step, until > r.prefilled ? until - r.prefilled : 0U)};
     }
 
     // Publishes a committed preview with the logprob records it released, which a streaming
@@ -1948,9 +1979,9 @@ struct Qwen4ExpCore::Impl {
     // nothing to resume may find a prefix another request stored while it waited (the shared state
     // of reads that arrived together) and starts there; a branched read past its prompt runs its
     // branch step, and one whose last prompt step opens its branches runs both; a media prompt
-    // runs its tower. The prompt tokens of the step, or nothing when the step has run or ended
-    // the request.
-    std::optional<std::uint32_t> begin_prefill(const std::shared_ptr<Request>& request) {
+    // runs its tower. The step (prompt_step with `cuts`), or nothing when the step has run or
+    // ended the request.
+    std::optional<PromptStep> begin_prefill(const std::shared_ptr<Request>& request, bool cuts) {
         Request& r          = *request;
         Slot& slot          = slots[r.slot];
         auto& executor      = *instance.executor;
@@ -1999,19 +2030,19 @@ struct Qwen4ExpCore::Impl {
                 r.vision_seconds = seconds(vision_start, Clock::now());
             }
         }
-        const std::uint32_t n = prompt_step_tokens(r);
-        if (opens_branches(r, n)) {
-            prompt_branch_pass(request, n);
+        const PromptStep step = prompt_step(r, cuts);
+        if (opens_branches(r, step.tokens)) {
+            prompt_branch_pass(request, step.tokens);
             return std::nullopt;
         }
-        return n;
+        return step;
     }
 
     // Books a prompt step of `n` tokens that ran for the request, its last token's logits column
-    // `column` of logits(rows): the context cache's images at its frontiers, its progress, and at
-    // the prompt's end its first token.
+    // `column` of logits(rows): the context cache's images at its frontiers (at `cut`, a frontier
+    // it passed, from the slot's snapshot), its progress, and at the prompt's end its first token.
     void end_prefill(const std::shared_ptr<Request>& request, std::uint32_t n,
-                     std::uint32_t column, std::uint32_t rows) {
+                     std::uint32_t column, std::uint32_t rows, std::uint32_t cut = 0) {
         Request& r          = *request;
         Slot& slot          = slots[r.slot];
         auto& executor      = *instance.executor;
@@ -2024,6 +2055,20 @@ struct Qwen4ExpCore::Impl {
             }
         }
         r.prefilled += n;
+        if (cut != 0) {
+            const std::vector<TokenId> prefix(slot.fed.begin(), slot.fed.begin() + cut);
+            std::vector<MediaMark> media;
+            bool whole = true; // no media unit straddles the frontier
+            for (const MediaMark& mark : slot.media) {
+                if (mark.begin >= cut) { continue; }
+                whole = whole && mark.begin + mark.count <= cut;
+                media.push_back(mark);
+            }
+            if (whole) {
+                store_image(r.slot, prefix, media, &slot.snapshot,
+                            PrefixReusePath::SharedStablePrefix);
+            }
+        }
         if (reuse_prefixes && r.reusable &&
             std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
             store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::SharedStablePrefix);
@@ -2045,21 +2090,30 @@ struct Qwen4ExpCore::Impl {
     // Feeds the next chunk of a prompt, which ends at the anchor when one lies ahead, where the
     // sequence's state is kept for the context cache; at the prompt's end samples the first token.
     void prefill_step(const std::shared_ptr<Request>& request) {
-        const std::optional<std::uint32_t> n = begin_prefill(request);
-        if (n) { feed_prompt(request, *n); }
+        const std::optional<PromptStep> step = begin_prefill(request, true);
+        if (step) { feed_prompt(request, *step); }
     }
 
-    // Runs the request's prompt step of `n` tokens alone.
-    void feed_prompt(const std::shared_ptr<Request>& request, std::uint32_t n) {
+    // Runs the request's prompt step alone.
+    void feed_prompt(const std::shared_ptr<Request>& request, PromptStep step) {
         Request& r          = *request;
+        Slot& slot          = slots[r.slot];
         auto& executor      = *instance.executor;
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
         const auto prompt   = std::span<const TokenId>(r.prompt_tokens);
+        const std::uint32_t n = step.tokens;
         // The next step's table rows are read while this one runs.
         const auto next = prompt.subspan(
             r.prefilled + n, std::min(executor.prompt_step(), prompt_n - r.prefilled - n));
-        executor.forward(r.slot, prompt.subspan(r.prefilled, n), 1, next);
-        end_prefill(request, n, 0, 1);
+        models::qwen4_exp::PromptCut cut;
+        if (step.cut != 0) {
+            // The slot's snapshot takes the state at the frontier: the anchor it held goes.
+            slot.anchor.clear();
+            slot.anchor_media.clear();
+            cut = {.tokens = step.cut - r.prefilled, .state = &slot.snapshot};
+        }
+        executor.forward(r.slot, prompt.subspan(r.prefilled, n), 1, next, cut);
+        end_prefill(request, n, 0, 1, step.cut);
     }
 
     // A prompt without branches or media, whose steps may share a span with other prompts'.
@@ -2075,8 +2129,14 @@ struct Qwen4ExpCore::Impl {
     // prefix a packed prompt is about to store waits for it. Returns the tokens computed.
     std::uint32_t packed_prefill_step(const std::shared_ptr<Request>& lead) {
         auto& executor = *instance.executor;
-        const std::optional<std::uint32_t> lead_n = begin_prefill(lead);
-        if (!lead_n) { return 0; }
+        const std::optional<PromptStep> lead_step = begin_prefill(lead, true);
+        if (!lead_step) { return 0; }
+        // A step that passes a frontier runs alone, its state there kept in the slot's snapshot.
+        if (lead_step->cut != 0) {
+            feed_prompt(lead, *lead_step);
+            return lead_step->tokens;
+        }
+        const std::uint32_t lead_n = lead_step->tokens;
         const std::uint32_t chunk = executor.options().prefill_chunk;
         const bool decoding       = std::any_of(slots.begin(), slots.end(), [](const Slot& slot) {
             return slot.request && slot.request->decoding;
@@ -2088,8 +2148,8 @@ struct Qwen4ExpCore::Impl {
             std::shared_ptr<Request> request;
             std::uint32_t tokens = 0;
         };
-        std::vector<Packed> packed{{lead, *lead_n}};
-        std::uint32_t total = *lead_n;
+        std::vector<Packed> packed{{lead, lead_n}};
+        std::uint32_t total = lead_n;
         std::vector<std::shared_ptr<Request>> candidates;
         for (const Slot& slot : slots) {
             if (slot.request && slot.request != lead && !slot.request->decoding &&
@@ -2115,7 +2175,7 @@ struct Qwen4ExpCore::Impl {
             if (packed.size() >= executor.max_logit_rows() || budget - total < chunk) { break; }
             std::optional<std::uint32_t> n;
             try {
-                n = begin_prefill(request);
+                if (const auto step = begin_prefill(request, false)) { n = step->tokens; }
             } catch (...) {
                 fail(request, std::current_exception());
                 continue;
@@ -2127,7 +2187,7 @@ struct Qwen4ExpCore::Impl {
             total += *n;
         }
         if (packed.size() == 1) {
-            feed_prompt(lead, *lead_n);
+            feed_prompt(lead, *lead_step);
             return total;
         }
         std::vector<models::qwen4_exp::PromptPiece> pieces;
@@ -2197,7 +2257,7 @@ struct Qwen4ExpCore::Impl {
             branch_pass(request);
             return;
         }
-        const std::uint32_t n = prompt_step_tokens(r);
+        const std::uint32_t n = prompt_step(r, false).tokens;
         const auto chunk      = std::span<const TokenId>(branch.tokens).subspan(r.branch_fed, n);
         executor.forward(r.slot, chunk, 1);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
