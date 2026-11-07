@@ -185,13 +185,17 @@ feed back into the production cache. Broader test builds can take longer on a co
 
 Each native or CI variant has an 8 GiB local compiler-cache limit. It does not bound a restored
 cache: snapshots omit ccache's counters, and a cleanup decides from the counters it finds before it
-recalculates them. A Linux artifact job whose build finishes therefore evicts, before it saves, every
-entry that no compilation of the job used: a hit renews an entry's modification time, and a restored
-entry keeps the one it was archived with. A cancelled or failed build keeps the restored entries. On
-7 November the master snapshot for CUDA 13.4.3 held 32.4 GiB in 25,842 files, of which its last build
-had used 3.46 GiB in 2,906; the hosted CUDA 12.9.2 job ran out of disk space while it archived such a
-cache for upload. A cleanup of that cache to 8 GiB kept only 1.19 GiB of the used entries: ccache
-does not evict strictly by age. A branch behind master compiles the objects master has since changed.
+recalculates them. A Linux artifact job, Windows object shard or final Windows job whose build
+finishes therefore evicts, before it saves, every entry that no compilation of the job used: a hit
+renews an entry's modification time, and a restored entry keeps the one it was archived with. A
+cancelled or failed build keeps the restored entries. On 7 November the master snapshot for CUDA
+13.4.3 held 32.4 GiB in 25,842 files, of which its last build had used 3.46 GiB in 2,906; the hosted
+CUDA 12.9.2 job ran out of disk space while it archived such a cache for upload. The first evicting
+builds saved 3.4 and 3.5 GiB, and the next restores took 28 and 49 s instead of 3-4 minutes. The
+Windows CUDA 12.9.2 aggregate held 31.7 GiB and each shard 5.5-7.7 GiB; the final job restores all
+nine, which took 1,057-1,801 s of its 30-minute limit that day and timed out once. A cleanup of
+such a cache to 8 GiB kept only 1.19 GiB of the used entries: ccache does not evict strictly by
+age. A branch behind master compiles the objects master has since changed.
 Each native platform/toolkit has its own family, with separate branch prefixes and one current
 snapshot. CI reads the corresponding
 `native-linux-cuda-<toolkit>-shared-v1` family. It takes the latest available verified snapshot without waiting
@@ -205,9 +209,11 @@ Windows uses eight object shards per Toolkit, each with a separate
 `native-windows-cuda-<toolkit>-host-v2-shard-<index>` family. The final Windows job merges those
 snapshots, links and packages the same multiarch executables, and saves the aggregate family
 without the shard suffix. Only shard zero and the subsequent final job write the shared vcpkg
-family. A shard without a snapshot of its own starts from the aggregate, so shard snapshots also
-hold old copies of other shards' entries; where restored snapshots hold the same file, the newer
-copy stays, and an old ccache manifest cannot hide the entry its owner shard added. The reusable Windows
+family. A shard without a snapshot of its own starts from the aggregate; a finished shard build then
+keeps only the entries of its own objects, and the final job keeps those of the whole build. An
+unfinished build keeps old copies of other shards' entries; where restored snapshots hold the same
+file, the newer copy stays, and an old ccache manifest cannot hide the entry its owner shard added.
+The reusable Windows
 workflow remains part of Native release; CI has no cache writer.
 
 CI does not upload compiler caches to HF or Actions Cache. Python dependency caches remain in
