@@ -138,7 +138,8 @@ with `--input`.
 
 `residency_check.sh` (MODEL and TABLE in the environment) scores the first 40 KB of the WikiText
 stream with host and with disk experts and fails unless the two agree exactly. Run it after any
-change to the expert cache, the misses, the slot pool or the prefetch.
+change to the expert cache, the misses, the slot pool or the prefetch; `ARGS='--devices 0,1'` runs
+both on two pipeline stages, which a change to their copy streams or events also needs.
 
 ## Flash-Next qualification routines
 
