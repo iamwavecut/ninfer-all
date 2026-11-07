@@ -112,7 +112,7 @@ EngineOptions with_family_attention(EngineOptions options) {
 // run. Flash-Next's disk experts have no CPU share: a layer reads every expert its cache lacks
 // before it runs, so a verification's drafts multiply the reads. Flash-Next takes its DFlash2
 // drafter where the artifact carries one, which drafted faster than its MTP block, else the block;
-// Gemma 4 its assistant.
+// over pipeline stages, where DFlash2 does not run, the block. Gemma 4 takes its assistant.
 EngineOptions with_family_speculation(EngineOptions options) {
     SpeculativeOptions& speculative = options.speculative;
     if (!speculative.automatic || speculative.backend != SpeculativeBackend::None ||
@@ -126,7 +126,8 @@ EngineOptions with_family_speculation(EngineOptions options) {
         return options;
     }
     const auto& components = artifact::Reader(options.artifact_path).directory().components;
-    if (flash_next && components.contains("dflash2")) {
+    const bool stages = options.devices.size() > 1 && !options.tensor_parallel;
+    if (flash_next && !stages && components.contains("dflash2")) {
         speculative.backend      = SpeculativeBackend::DFlash2;
         speculative.draft_tokens = SpeculativeOptions::kAutomaticDFlash2Tokens;
         // The round verifies through the first draft the selector is unsure of, unless

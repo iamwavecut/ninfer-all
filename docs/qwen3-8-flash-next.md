@@ -582,7 +582,7 @@ MTP is enabled. A fresh text-only request can use MTP again after the media requ
 ([Convert](#convert)); without the block the engine refuses to start. Without `--spec`, an artifact
 with the block and host experts drafts up to three tokens a round with `--draft-min-p 0.5` (a
 verification window's routes share the layer's missing experts, which the CPU computes while the
-cached ones run), unless it also carries the DFlash2 drafter, which then drafts
+cached ones run), unless it also carries the DFlash2 drafter, which then drafts on one device
 ([DFlash2](#dflash2-speculative-decoding)); with disk experts it decodes without drafts
 ([below](#mtp-with-several-requests)), and `--spec none` decodes without drafts. Text-only
 decoding requests then run rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
@@ -696,8 +696,8 @@ proposes from the context in place of the drafter as it does under MTP; `--adapt
 `--spec mtp`, and pipeline stages are refused. The drafter's mathematics is in
 [DFlash and DFlash2](maintainer/dflash.md#qwen38-flash-next).
 
-Without `--spec`, an artifact with the drafter and host experts drafts four tokens a round with
-`--draft-min-p 0.7`. On an RTX 3090 with host experts (EPYC 7K62, 96 CPUs; 256 greedy tokens after
+Without `--spec`, an artifact with the drafter and host experts on one device drafts four tokens a
+round with `--draft-min-p 0.7`; over pipeline stages its MTP block drafts instead. On an RTX 3090 with host experts (EPYC 7K62, 96 CPUs; 256 greedy tokens after
 a code prompt and after a prose prompt, and the answer to a 144-token prompt; the mean of two runs)
 that decoded 92.3, 77.9 and 58.2 tokens per second with the IQ3_S release, 1.10, 1.06 and 1.17
 times the MTP block's automatic drafting, and 122.4, 93.7 and 113.8 with the Coder IQ1_M release,
