@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/device_wait.h"
 #include "core/dtype.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
@@ -154,7 +155,7 @@ SyntheticWeight row_split_weight(QType qtype, std::int32_t n, std::int32_t k) {
     fill_u16_kernel<<<fill_grid(groups), 256>>>(
         reinterpret_cast<std::uint16_t*>(base + scale_offset), groups, 0x3c00);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(ninfer::wait_for_device());
 
     Weight& w           = result.weight;
     w.payload           = base;
@@ -199,7 +200,7 @@ SyntheticWeight block_scale_nvfp4_weight(std::int32_t n, std::int32_t k) {
     CUDA_CHECK(cudaMemsetAsync(base + scale_plane_offset, 0x38, scale_plane_bytes, nullptr));
     fill_f32_kernel<<<fill_grid(1), 256>>>(reinterpret_cast<float*>(base + divisor_offset), 1, 1.0f);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(ninfer::wait_for_device());
 
     Weight& w              = result.weight;
     w.payload              = base;
@@ -249,7 +250,7 @@ public:
                 flush();
                 launch(nullptr);
             }
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(ninfer::wait_for_device());
             std::vector<float> samples;
             samples.reserve(static_cast<std::size_t>(options_.repeat));
             for (int index = 0; index < options_.repeat; ++index) {
@@ -257,7 +258,7 @@ public:
                 CUDA_CHECK(cudaEventRecord(start_, nullptr));
                 launch(nullptr);
                 CUDA_CHECK(cudaEventRecord(stop_, nullptr));
-                CUDA_CHECK(cudaEventSynchronize(stop_));
+                CUDA_CHECK(ninfer::wait_for_event(stop_));
                 float ms = 0.0f;
                 CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_));
                 samples.push_back(ms);
@@ -266,7 +267,7 @@ public:
             return 1000.0 * samples[samples.size() / 2];
         } catch (const std::exception&) {
             cudaGetLastError();
-            cudaDeviceSynchronize();
+            ninfer::wait_for_device();
             return std::numeric_limits<double>::infinity();
         }
     }
@@ -301,7 +302,8 @@ struct Family {
 
 std::vector<float> bf16_host(std::pair<const void*, std::size_t> output) {
     std::vector<std::uint16_t> raw(output.second);
-    CUDA_CHECK(cudaMemcpy(raw.data(), output.first, raw.size() * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(
+        ninfer::copy_and_wait(raw.data(), output.first, raw.size() * 2, cudaMemcpyDeviceToHost));
     std::vector<float> values(raw.size());
     for (std::size_t index = 0; index < raw.size(); ++index) {
         const std::uint32_t bits = static_cast<std::uint32_t>(raw[index]) << 16;
@@ -343,7 +345,7 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
         if (family.output) {
             if (family.reset) { family.reset(); }
             family.run(width, nullptr);
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(ninfer::wait_for_device());
             reference = bf16_host(family.output(width));
         }
         double best_us = compiled;
@@ -355,7 +357,7 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
                 try {
                     if (family.reset) { family.reset(); }
                     family.run(width, nullptr);
-                    CUDA_CHECK(cudaDeviceSynchronize());
+                    CUDA_CHECK(ninfer::wait_for_device());
                 } catch (const std::exception&) {
                     cudaGetLastError();
                     continue;
@@ -655,7 +657,7 @@ void calibrate_gguf_moe_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
             entry.routing, pairs, per_token, entry.activation.p, nullptr);
         prepared.emplace(columns, std::move(entry));
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(ninfer::wait_for_device());
     const ops::gguf::MoeTable table{
         reinterpret_cast<const void* const*>(table_storage.p),
         static_cast<std::int64_t>(k / block.elements) * block.bytes, rows, k, true};
@@ -743,7 +745,7 @@ void calibrate_gguf_moe_vector(ops::DeviceRouteProfile& profile, Timer& timer,
             static_cast<const std::int32_t*>(ids_device.p), pairs, experts, routing_workspace.p,
             nullptr);
         DeviceBuffer output = bf16_buffer(static_cast<std::size_t>(rows) * pairs);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(ninfer::wait_for_device());
         const ops::gguf::MoeTable table{
             reinterpret_cast<const void* const*>(table_storage.p),
             static_cast<std::int64_t>(k / block.elements) * block.bytes, rows, k};
@@ -832,7 +834,7 @@ void calibrate_gguf_moe_up(ops::DeviceRouteProfile& profile, Timer& timer,
         DeviceBuffer ids_device(sizeof(ids));
         ids_device.copy_from_host(ids.data(), sizeof(ids));
         DeviceBuffer output = bf16_buffer(static_cast<std::size_t>(rows) * slots);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(ninfer::wait_for_device());
         ops::gguf::MoeDecodeUpArgs args{};
         args.m = static_cast<const __nv_bfloat16*>(input.p);
         args.k = k;
@@ -947,7 +949,8 @@ void calibrate_ternary(ops::DeviceRouteProfile& profile, Timer& timer,
         };
     };
     const auto reset_residual = [&]() {
-        CUDA_CHECK(cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
     const std::vector<Family> families = {
         {"t2_i8_small/4096+12288x5120", decode_widths(), gdn_pair, view(qkv, 10240), {}},
@@ -1017,7 +1020,8 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
         };
     };
     const auto reset_residual = [&]() {
-        CUDA_CHECK(cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
 
     const std::vector<Family> families = {
@@ -1200,8 +1204,8 @@ void calibrate_nvfp4_fused(ops::DeviceRouteProfile& profile, Timer& timer,
     };
     DeviceBuffer residual_pristine = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
     const auto reset_residual      = [&]() {
-        CUDA_CHECK(
-            cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
 
     const auto attn_run = [&](ops::LinearPolicy policy, std::int32_t cols, cudaStream_t stream) {
@@ -1395,8 +1399,8 @@ void calibrate_cublas_prefill(ops::DeviceRouteProfile& profile, Timer& timer,
         };
     };
     const auto reset_residual = [&]() {
-        CUDA_CHECK(
-            cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
     const auto run_gate_up = [&](std::int32_t cols, cudaStream_t stream) {
         Tensor x = tensor(x_hidden, hidden, cols), o = tensor(swiglu_out, 17408, cols);

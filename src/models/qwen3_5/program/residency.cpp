@@ -3,6 +3,7 @@
 // nothing between requests and is simply released. Every region keeps its addresses, so the
 // tensors bound into it and the CUDA Graphs captured over it stay valid.
 
+#include "core/device_wait.h"
 #include "models/qwen3_5/program/program_impl.h"
 
 #include <algorithm>
@@ -136,7 +137,7 @@ DeviceSnapshot::Stats ProgramImpl::suspend_device_state(DeviceSnapshot& snapshot
     // Every stream of every rank, transfers and Vision included, not only the compute streams.
     for (std::size_t rank = 0; rank < device.size(); ++rank) {
         const RankBinding bound(device, rank);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(ninfer::wait_for_device());
     }
     // Loaned pages have no backing: they return before the live bytes are copied.
     if (kv_expert_loan) { kv_expert_loan->recall_all(); }

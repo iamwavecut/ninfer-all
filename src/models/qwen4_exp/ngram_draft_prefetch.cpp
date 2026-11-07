@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/ngram_draft_prefetch.h"
 
+#include "core/device_wait.h"
+
 #include <stdexcept>
 #include <utility>
 
@@ -27,7 +29,7 @@ NgramDraftPrefetch::~NgramDraftPrefetch() {
     // drain its host nodes. No callback may outlive this object or the referenced table.
     try {
         DeviceBinding bind(device_);
-        cudaDeviceSynchronize();
+        ninfer::wait_for_device();
         cudaStreamDestroy(stream_);
     } catch (...) {}
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/device_wait.h"
 #include "ninfer/observability/resources.h"
 #include "ninfer/observability/snapshot.h"
 #include "runtime/engine/kv_capacity.h"
@@ -11,6 +12,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -31,7 +33,9 @@ public:
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
+            std::optional<DeviceWaitWatch> watched;
             try {
+                watched.emplace(device_, "scoring worker");
                 device_.bind_to_current_thread();
                 startup.set_value();
             } catch (...) {

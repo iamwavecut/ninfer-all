@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/device_wait.h"
 
 #include <cuda_runtime.h>
 
@@ -160,7 +161,7 @@ class TmaDescriptorStaging {
         cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
         CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
         const cudaError_t status =
-            cudaMemcpy(slot, &descriptors, sizeof(Descriptor), cudaMemcpyHostToDevice);
+            ninfer::copy_and_wait(slot, &descriptors, sizeof(Descriptor), cudaMemcpyHostToDevice);
         CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
         CUDA_CHECK(status);
         captured_.emplace(key, slot);

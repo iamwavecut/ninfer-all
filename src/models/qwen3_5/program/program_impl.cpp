@@ -1,3 +1,4 @@
+#include "core/device_wait.h"
 #include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
@@ -789,8 +790,8 @@ void ProgramImpl::bind_steering(const SequencePlanImpl& plan, const Steering* so
         if (tensor.bytes() != values.size_bytes()) {
             throw std::logic_error("planned steering tensor does not match the loaded steering");
         }
-        CUDA_CHECK(cudaMemcpy(tensor.data, values.data(), values.size_bytes(),
-                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(tensor.data, values.data(), values.size_bytes(),
+                                         cudaMemcpyHostToDevice));
     };
     steering                 = std::make_unique<execution::SteeringView>();
     steering->adapters       = static_cast<std::int32_t>(count);
@@ -841,14 +842,14 @@ void ProgramImpl::lend_kv_to_experts() {
 
 void ProgramImpl::synchronize_transfer_streams() const {
     for (std::size_t rank = 0; rank < transfer_streams.size(); ++rank) {
-        (void)cudaStreamSynchronize(transfer_streams[rank]);
+        (void)ninfer::wait_for_stream(transfer_streams[rank]);
     }
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
     for (std::size_t rank = 0; rank < transfer_streams.size(); ++rank) {
-        (void)cudaStreamSynchronize(transfer_streams[rank]);
-        (void)cudaStreamSynchronize(compute_streams[rank]);
+        (void)ninfer::wait_for_stream(transfer_streams[rank]);
+        (void)ninfer::wait_for_stream(compute_streams[rank]);
     }
 }
 

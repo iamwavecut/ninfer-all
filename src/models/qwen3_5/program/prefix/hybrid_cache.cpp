@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 
 #include "core/device.h"
+#include "core/device_wait.h"
 #include "core/paged_kv_cache.h"
 
 #include <algorithm>
@@ -93,12 +94,12 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
 HybridPrefixCache::~HybridPrefixCache() {
     // Stores referenced by the cache may already be gone; only CUDA objects are released here.
     if (restore_stream_ != nullptr) {
-        (void)cudaStreamSynchronize(restore_stream_);
+        (void)ninfer::wait_for_stream(restore_stream_);
         (void)cudaStreamDestroy(restore_stream_);
     }
     for (PendingWrite& write : pending_) {
         if (write.done != nullptr) {
-            (void)cudaEventSynchronize(write.done);
+            (void)ninfer::wait_for_event(write.done);
             (void)cudaEventDestroy(write.done);
         }
     }
@@ -377,7 +378,7 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
         counters_.host_write_bytes += bytes;
     } catch (...) {
         // Copies may be in flight into the slabs; they return to the index only once idle.
-        (void)cudaStreamSynchronize(transfer);
+        (void)ninfer::wait_for_stream(transfer);
         if (!pending_.empty() && pending_.back().snapshot == snapshot) {
             if (pending_.back().done != nullptr) { spare_events_.push_back(pending_.back().done); }
             pending_.pop_back();
@@ -426,7 +427,7 @@ void HybridPrefixCache::start_block_host_writes(std::span<const NodeRef> nodes, 
         write.done = take_event();
         CUDA_CHECK(cudaEventRecord(write.done, transfer));
     } catch (...) {
-        (void)cudaStreamSynchronize(transfer);
+        (void)ninfer::wait_for_stream(transfer);
         if (write.done != nullptr) { spare_events_.push_back(write.done); }
         abort_batch();
         throw;
@@ -470,12 +471,12 @@ void HybridPrefixCache::poll() {
 
 void HybridPrefixCache::drain() {
     while (!pending_.empty()) {
-        CUDA_CHECK(cudaEventSynchronize(pending_.front().done));
+        CUDA_CHECK(ninfer::wait_for_event(pending_.front().done));
         publish_write(pending_.front());
         pending_.pop_front();
     }
     while (!landing_.empty()) {
-        CUDA_CHECK(cudaEventSynchronize(landing_.front().layers.back()));
+        CUDA_CHECK(ninfer::wait_for_event(landing_.front().layers.back()));
         finish_landing(landing_.front());
         landing_.pop_front();
     }
@@ -653,7 +654,7 @@ void HybridPrefixCache::settle_prefetch() {
     // event covers every batch submitted before it.
     for (auto batch = landing_.rbegin(); batch != landing_.rend(); ++batch) {
         if (batch->prefetch) {
-            CUDA_CHECK(cudaEventSynchronize(batch->layers.back()));
+            CUDA_CHECK(ninfer::wait_for_event(batch->layers.back()));
             break;
         }
     }
@@ -702,7 +703,7 @@ void HybridPrefixCache::recycle_events(RestoreBatch& batch) noexcept {
 
 void HybridPrefixCache::abort_restore() noexcept {
     if (!restore_.open) { return; }
-    if (restore_stream_ != nullptr) { (void)cudaStreamSynchronize(restore_stream_); }
+    if (restore_stream_ != nullptr) { (void)ninfer::wait_for_stream(restore_stream_); }
     try {
         for (const NodeRef node : restore_.nodes) {
             if (index_->valid(node) && index_->node(node).device == CopyState::Filling) {
@@ -727,10 +728,10 @@ void HybridPrefixCache::reset_restore() noexcept {
 void HybridPrefixCache::clear() noexcept {
     // Engine-wide recovery: wait for every copy touching cache memory, then release every
     // reference so the stores end empty of cache ownership.
-    if (restore_stream_ != nullptr) { (void)cudaStreamSynchronize(restore_stream_); }
+    if (restore_stream_ != nullptr) { (void)ninfer::wait_for_stream(restore_stream_); }
     for (PendingWrite& write : pending_) {
         if (write.done != nullptr) {
-            (void)cudaEventSynchronize(write.done);
+            (void)ninfer::wait_for_event(write.done);
             spare_events_.push_back(write.done);
         }
     }

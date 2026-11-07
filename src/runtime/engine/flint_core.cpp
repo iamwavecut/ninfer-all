@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/device_wait.h"
 #include "core/host_pages.h"
 #include "core/startup.h"
 #include "core/tensor_parallel.h"
@@ -548,7 +549,8 @@ struct FlintCore::Impl {
         host_logprobs =
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
-        CUDA_CHECK(cudaMemcpy(logprob_flag.p, &enabled, sizeof(enabled), cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(logprob_flag.p, &enabled, sizeof(enabled),
+                                         cudaMemcpyHostToDevice));
         std::size_t workspace = std::max<std::size_t>(
             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
                                                     static_cast<std::int32_t>(rows)),
@@ -579,7 +581,8 @@ struct FlintCore::Impl {
         }
         sample_workspace = std::make_unique<WorkspaceArena>(workspace);
         load_sampling_kernels();
-        worker           = std::thread([this] {
+        worker = std::thread([this] {
+            const DeviceWaitWatch watched(device, "Flint worker");
             device.bind_to_current_thread();
             loop();
         });
@@ -603,8 +606,9 @@ struct FlintCore::Impl {
     void load_sampling_kernels() {
         const cudaStream_t stream = instance.executor->head_stream();
         const ops::SamplingConfig greedy{};
-        CUDA_CHECK(cudaMemcpy(sample_config.p, &greedy, sizeof(greedy), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(sample_position.p, 0, sizeof(std::int32_t)));
+        CUDA_CHECK(ninfer::copy_and_wait(sample_config.p, &greedy, sizeof(greedy),
+                                         cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::fill_and_wait(sample_position.p, 0, sizeof(std::int32_t)));
         const auto* config  = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const auto vocab    = static_cast<std::int32_t>(domain);
         const Tensor flag(logprob_flag.p, DType::I32, {1});
@@ -629,7 +633,7 @@ struct FlintCore::Impl {
         }
         if (drafts > 0) {
             for (DeviceBuffer* plane : {&spec_drafts, &spec_extents, &spec_lengths, &spec_anchors}) {
-                CUDA_CHECK(cudaMemset(plane->p, 0, plane->bytes));
+                CUDA_CHECK(ninfer::fill_and_wait(plane->p, 0, plane->bytes));
             }
             // A round's width is its drafts and the bonus column, one draft to all of them.
             for (std::uint32_t k = 1; k <= drafts; ++k) {
@@ -652,9 +656,9 @@ struct FlintCore::Impl {
                     *sample_workspace, stream);
             }
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         // Each request clears its own row of the counts; the scratch increment leaves no trace.
-        CUDA_CHECK(cudaMemset(token_counts.p, 0, token_counts.bytes));
+        CUDA_CHECK(ninfer::fill_and_wait(token_counts.p, 0, token_counts.bytes));
     }
 
     // A request that neither computes a prompt chunk nor accepts a token for this long fails with
@@ -1262,7 +1266,7 @@ struct FlintCore::Impl {
         }
         CUDA_CHECK(cudaMemcpyAsync(tokens, sample_out.p, n * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         instance.executor->check_experts();
         for (std::size_t b = 0; b < n; ++b) {
             const std::int32_t token = tokens[b];
@@ -1410,7 +1414,7 @@ struct FlintCore::Impl {
             slot.anchor = slot.fed;
         }
         if (r.observation.prompt_progress) {
-            CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
+            CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
             executor.check_experts();
             {
                 std::lock_guard lock(r.mutex);
@@ -1570,7 +1574,7 @@ struct FlintCore::Impl {
         Request& r          = *request;
         auto& executor      = *instance.executor;
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
-        CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
+        CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
         executor.check_experts();
         r.prefill_end = Clock::now();
         {
@@ -2049,7 +2053,7 @@ struct FlintCore::Impl {
             cudaMemcpyAsync(host + b * w, spec_counts.p, b * 4, cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(host + b * w + b, spec_accepted.p, b * 4, cudaMemcpyDeviceToHost,
                                    stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         instance.executor->check_experts();
 
         // The output policy takes its part of each licensed run; the executor then keeps the tokens
@@ -2181,7 +2185,7 @@ struct FlintCore::Impl {
             std::vector<float> host(rows);
             CUDA_CHECK(cudaMemcpyAsync(host.data(), score_out.p, rows * 4, cudaMemcpyDeviceToHost,
                                        stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
             instance.executor->check_experts();
             out.insert(out.end(), host.begin(), host.end());
         }
@@ -2468,6 +2472,8 @@ std::vector<float> FlintCore::score(models::qwen3_5::PreparedPrompt prompt,
             --impl.outstanding;
         }
     } release{*impl_};
+
+    const DeviceWaitWatch watched(impl_->device, "Flint scoring caller");
     impl_->device.bind_to_current_thread();
     return impl_->score(tokens, first_target);
 }

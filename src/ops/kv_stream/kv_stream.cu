@@ -7,6 +7,7 @@
 #include "ninfer/ops/kv_stream.h"
 
 #include "core/device.h"
+#include "core/device_wait.h"
 #include "core/paged_kv_storage.h"
 
 #include <cuda_runtime.h>
@@ -398,7 +399,7 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& map, cudaStream_t stream)
     std::array<std::int32_t, kControlWords> control{};
     CUDA_CHECK(cudaMemcpyAsync(control.data(), map.control, sizeof(control),
                                cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(ninfer::wait_for_stream(stream));
     const auto u64 = [&](int at) {
         return static_cast<std::uint64_t>(static_cast<std::uint32_t>(control[at])) |
                static_cast<std::uint64_t>(static_cast<std::uint32_t>(control[at + 1])) << 32;

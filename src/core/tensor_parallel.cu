@@ -1,5 +1,7 @@
 #include "core/tensor_parallel.h"
 
+#include "core/device_wait.h"
+
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
@@ -1235,7 +1237,7 @@ std::vector<double> measured_copy_bandwidth(const DeviceContext& context, bool f
                 check(cudaMemcpyAsync(destination, source, kBytes, kind, stream), "bandwidth copy");
             }
             check(cudaEventRecord(stop, stream), "bandwidth record");
-            check(cudaEventSynchronize(stop), "bandwidth synchronize");
+            check(ninfer::wait_for_event(stop), "bandwidth synchronize");
             float milliseconds = 0.0F;
             check(cudaEventElapsedTime(&milliseconds, start, stop), "bandwidth elapsed");
             // A device copy reads and writes every byte; a host copy crosses the bus once.
@@ -1384,7 +1386,7 @@ TensorParallelExchange::TensorParallelExchange(const DeviceContext& context,
             check(cudaMalloc(reinterpret_cast<void**>(&rank.epoch), 2 * sizeof(std::uint32_t)),
                   "cudaMalloc");
             const std::uint32_t count[2] = {options.words_count, 0};
-            check(cudaMemcpy(rank.epoch, count, sizeof(count), cudaMemcpyHostToDevice),
+            check(ninfer::copy_and_wait(rank.epoch, count, sizeof(count), cudaMemcpyHostToDevice),
                   "cudaMemcpy");
         }
         if (!options.routes.empty()) {
@@ -1535,7 +1537,7 @@ void TensorParallelExchange::provide(Needs needs) {
         if (peer_words) {
             const std::size_t bytes = ranks_.size() * row * sizeof(unsigned long long);
             check(cudaMalloc(reinterpret_cast<void**>(&rank.peer_words), bytes), "cudaMalloc");
-            check(cudaMemset(rank.peer_words, 0, bytes), "cudaMemset");
+            check(ninfer::fill_and_wait(rank.peer_words, 0, bytes), "cudaMemset");
         }
         if (host_words || peer_words) {
             // Loaded now, so no first launch waits on module loading while a peer spins.
@@ -1565,7 +1567,7 @@ void TensorParallelExchange::provide(Needs needs) {
             const std::size_t bytes = peer_flags_area_bytes(flags_row(scatter_flags_values_));
             check(cudaMalloc(reinterpret_cast<void**>(&rank.peer_flags), bytes), "cudaMalloc");
             // Zeroed flags carry epoch 0, which no exchange waits for.
-            check(cudaMemset(rank.peer_flags, 0, bytes), "cudaMemset");
+            check(ninfer::fill_and_wait(rank.peer_flags, 0, bytes), "cudaMemset");
             cudaFuncAttributes attributes{};
             for (const auto kernel :
                  {tensor_parallel_peer_flags_kernel<TensorParallelSum::AddBf16, false>,
@@ -1757,12 +1759,12 @@ void TensorParallelExchange::measure(const std::vector<TensorParallelTransport>&
         float best = std::numeric_limits<float>::infinity();
         try {
             check(cudaGraphLaunch(executable, streams[0]), "measurement launch");
-            check(cudaStreamSynchronize(streams[0]), "measurement synchronize");
+            check(ninfer::wait_for_stream(streams[0]), "measurement synchronize");
             for (int trial = 0; trial < kTrials; ++trial) {
                 check(cudaEventRecord(start, streams[0]), "measurement record");
                 check(cudaGraphLaunch(executable, streams[0]), "measurement launch");
                 check(cudaEventRecord(stop, streams[0]), "measurement record");
-                check(cudaEventSynchronize(stop), "measurement synchronize");
+                check(ninfer::wait_for_event(stop), "measurement synchronize");
                 float milliseconds = 0.0F;
                 check(cudaEventElapsedTime(&milliseconds, start, stop), "measurement elapsed");
                 best = std::min(best, milliseconds);
@@ -1789,7 +1791,7 @@ void TensorParallelExchange::measure(const std::vector<TensorParallelTransport>&
                 check(cudaMemsetAsync(ranks_[r].device_slot[slot], 0, slot_bytes_, streams[r]),
                       "measurement memset");
             }
-            check(cudaStreamSynchronize(streams[r]), "measurement synchronize");
+            check(ninfer::wait_for_stream(streams[r]), "measurement synchronize");
         }
         {
             DeviceBinding bind(ranks_[0].device);
@@ -1907,7 +1909,7 @@ void TensorParallelExchange::measure_engine_bytes() {
                 copy_rows(destinations.data(), sources.data(), sizes.data(), n - 1, stream,
                           engine_bytes);
                 check(cudaEventRecord(stop, stream), "threshold record");
-                check(cudaEventSynchronize(stop), "threshold synchronize");
+                check(ninfer::wait_for_event(stop), "threshold synchronize");
                 float milliseconds = 0.0F;
                 check(cudaEventElapsedTime(&milliseconds, start, stop), "threshold elapsed");
                 best = std::min(best, milliseconds);

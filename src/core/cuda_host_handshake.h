@@ -50,6 +50,9 @@ private:
     void* host_ = nullptr;
     void* device_ = nullptr;
     std::uint32_t* sequence_ = nullptr;
+    // The CUDA device whose requests this answers: each answer counts as host-service progress
+    // for a wait on that device (note_host_service_progress).
+    int ordinal_ = 0;
 };
 
 } // namespace ninfer

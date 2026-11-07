@@ -4,6 +4,7 @@
 #include "artifact/permute_row_split.h"
 #include "artifact/transcode.h"
 #include "artifact/reader.h"
+#include "core/device_wait.h"
 #include "core/startup.h"
 #include "core/vmm.h"
 
@@ -54,13 +55,13 @@ public:
     [[nodiscard]] std::byte* data() const noexcept { return aligned_data; }
 
     ~Slot() {
-        if (pending) { (void)cudaEventSynchronize(event); }
+        if (pending) { (void)ninfer::wait_for_event(event); }
         if (event) { (void)cudaEventDestroy(event); }
     }
 
     void wait() {
         if (pending) {
-            check_cuda(cudaEventSynchronize(event), "wait for weight staging transfer");
+            check_cuda(ninfer::wait_for_event(event), "wait for weight staging transfer");
             pending = false;
         }
     }
@@ -85,11 +86,11 @@ struct TransferCompletion {
     bool pending = true;
 
     ~TransferCompletion() {
-        if (pending) { (void)cudaStreamSynchronize(stream); }
+        if (pending) { (void)ninfer::wait_for_stream(stream); }
     }
 
     void finish() {
-        check_cuda(cudaStreamSynchronize(stream), "complete weight upload");
+        check_cuda(ninfer::wait_for_stream(stream), "complete weight upload");
         pending = false;
     }
 };
@@ -447,7 +448,7 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
         std::byte* const destination = bases[placement.rank] + placement.offset;
         if (placement.tail != 0) {
             const ScopedRank bound(device, placement.rank);
-            check_cuda(cudaMemset(destination + placement.bytes, 0, placement.tail),
+            check_cuda(ninfer::fill_and_wait(destination + placement.bytes, 0, placement.tail),
                        "zero a device tail");
         }
         if (placement.transcode) {
@@ -467,7 +468,8 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
             }
             if (covered < placement.bytes) {
                 const ScopedRank bound(device, placement.rank);
-                check_cuda(cudaMemset(destination, 0, placement.bytes), "zero a selected piece");
+                check_cuda(ninfer::fill_and_wait(destination, 0, placement.bytes),
+                           "zero a selected piece");
                 zeroed = checked_add(zeroed, placement.bytes - covered, "zeroed bytes");
             }
             for (const SelectedRun& run : runs) {
@@ -500,8 +502,8 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
         transcode_row_split(*placement->transcode,
                             reader.directory().tensor(placement->object).shape, source, encoded);
         const ScopedRank bound(device, placement->rank);
-        check_cuda(cudaMemcpy(bases[placement->rank] + placement->offset, encoded.data(),
-                              encoded.size(), cudaMemcpyHostToDevice),
+        check_cuda(ninfer::copy_and_wait(bases[placement->rank] + placement->offset, encoded.data(),
+                                         encoded.size(), cudaMemcpyHostToDevice),
                    "upload transcoded weight bytes");
         transcoded_bytes = checked_add(transcoded_bytes, encoded.size(), "transcoded bytes");
         phase.progress(done + transcoded_bytes, done + total);
@@ -522,8 +524,8 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
             std::memcpy(bytes.data() + at, &value, sizeof(value));
         }
         const ScopedRank bound(device, placement->rank);
-        check_cuda(cudaMemcpy(bases[placement->rank] + placement->offset, bytes.data(), bytes.size(),
-                              cudaMemcpyHostToDevice),
+        check_cuda(ninfer::copy_and_wait(bases[placement->rank] + placement->offset, bytes.data(),
+                                         bytes.size(), cudaMemcpyHostToDevice),
                    "upload rebased index bytes");
         transcoded_bytes = checked_add(transcoded_bytes, bytes.size(), "rebased bytes");
     }
@@ -673,7 +675,7 @@ UploadTotals upload_device_objects(const Reader& reader,
     for (std::size_t rank = 0; rank < permuted_rank.size(); ++rank) {
         if (!permuted_rank[rank]) { continue; }
         const ScopedRank bound(device, rank);
-        check_cuda(cudaDeviceSynchronize(), "finish the panel permutation");
+        check_cuda(ninfer::wait_for_device(), "finish the panel permutation");
     }
     return totals;
 }
