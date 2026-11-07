@@ -197,7 +197,9 @@ fits the device; its speed there has not been tuned.
 Later checks on real pairs, none with peer access: Ternary Bonsai 2 27B on two RTX 4090s generates
 byte for byte what one GPU does in every row of the stage test, and suspends and resumes with its
 prefix reuse intact; Qwen3.8-Flash-Next runs its experts over two RTX 3090 Ti, two RTX 4090 and two
-RTX 5090 ([measurements](../qwen3-8-flash-next.md#measurements)).
+RTX 5090 ([measurements](../qwen3-8-flash-next.md#measurements)), and its host and disk experts over
+two RTX 4090s, each stage copying and caching its own layers' experts on its own GPU
+([measurements](../qwen3-8-flash-next.md#host-and-disk-experts-over-two-rtx-4090s)).
 
 ### DFlash across stages, measured (2026-10-06)
 

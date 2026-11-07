@@ -243,7 +243,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--no-ngram-table` | run without the n-gram table: see [below](#without-the-n-gram-table) |
 | `--kv-resident N\|all\|auto` | positions of each sparse-attention layer's KV a sequence keeps in device memory; a longer `--max-context` streams those layers ([streamed KV](#streamed-sparse-attention-kv)). `auto` (default): 32,768 with host or disk experts, all with device experts |
 | `--rope-yarn`, `--rope-yarn-factor F` | YaRN past the native 262,144 positions, as for the Qwen3.5 family: at `--max-context` / 262,144 once the window passes it, or at a fixed factor `F` (`1..4`) for every position. It reaches every rotation the model makes, the sparse-attention layers', their indexer's and the MTP block's, and changes every answer, short ones too. Without it positions past 262,144 rotate unscaled. `--rope-scaling-factor` is not available for this model. The startup log names the factor, and the request log's `server_start` record reports the resolved rotation (`engine.rope`) |
-| `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
+| `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides); with host or disk experts each GPU copies and caches the experts of its own stage's layers ([measured](#host-and-disk-experts-over-two-rtx-4090s)) |
 | `--tensor-parallel`, `--tensor-split A,B,...` | with `--devices`: every layer divided over the GPUs, its GDN key heads, its sparse-attention KV heads and its routed experts (GGUF banks on the devices), each GPU keeping the hyper-connection stack, running a run of the shared expert and projecting its rows of the head; MTP and Vision on the first ([tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next)) |
 
 With device experts every expert runs on the GPU. With GGUF host and disk experts, by default the
@@ -582,7 +582,7 @@ MTP is enabled. A fresh text-only request can use MTP again after the media requ
 ([Convert](#convert)); without the block the engine refuses to start. Without `--spec`, an artifact
 with the block and host experts drafts up to three tokens a round with `--draft-min-p 0.5` (a
 verification window's routes share the layer's missing experts, which the CPU computes while the
-cached ones run), unless it also carries the DFlash2 drafter, which then drafts
+cached ones run), unless it also carries the DFlash2 drafter, which then drafts on one device
 ([DFlash2](#dflash2-speculative-decoding)); with disk experts it decodes without drafts
 ([below](#mtp-with-several-requests)), and `--spec none` decodes without drafts. Text-only
 decoding requests then run rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
@@ -696,8 +696,8 @@ proposes from the context in place of the drafter as it does under MTP; `--adapt
 `--spec mtp`, and pipeline stages are refused. The drafter's mathematics is in
 [DFlash and DFlash2](maintainer/dflash.md#qwen38-flash-next).
 
-Without `--spec`, an artifact with the drafter and host experts drafts four tokens a round with
-`--draft-min-p 0.7`. On an RTX 3090 with host experts (EPYC 7K62, 96 CPUs; 256 greedy tokens after
+Without `--spec`, an artifact with the drafter and host experts on one device drafts four tokens a
+round with `--draft-min-p 0.7`; over pipeline stages its MTP block drafts instead. On an RTX 3090 with host experts (EPYC 7K62, 96 CPUs; 256 greedy tokens after
 a code prompt and after a prose prompt, and the answer to a 144-token prompt; the mean of two runs)
 that decoded 92.3, 77.9 and 58.2 tokens per second with the IQ3_S release, 1.10, 1.06 and 1.17
 times the MTP block's automatic drafting, and 122.4, 93.7 and 113.8 with the Coder IQ1_M release,
@@ -925,6 +925,25 @@ Where a decode step goes, from an Nsight Systems trace of the generate test's gr
 between them. A token read about 4 GB of weights when the hyper-connection projections were BF16,
 the largest share (1.27 GB, more than the ten routed experts of every layer, 0.66 GB); they are
 Q8_0 now, 0.67 GB.
+
+### Host and disk experts over two RTX 4090s
+
+Two RTX 4090s (450 W, PCIe without peer access, so the stages' transfers go through host memory)
+in a Vast container with an EPYC 7713 and 503 GB of RAM ran the Q2_0 release with its IQ4_NL table
+on two pipeline stages, 2026-11-07. Host and disk experts scored the first 40 KB of the WikiText
+stream (`scripts/pods/residency_check.sh` with `ARGS='--devices 0,1'`) at perplexity 2.540839
+each, the value one GPU gives with either. Through `ninfer-serve`, one request at a time, 64 greedy
+tokens after a 15-token and after a 5,879-token prompt, each configuration run once:
+
+| Experts | Options | Drafts | Expert cache | Prefill, 5,879 tokens | Decode, short / long |
+|---|---|---|---:|---:|---:|
+| host, one GPU | `--max-context 32768` | DFlash2, 4 | | 2,581 tok/s | 116.8 / 127.4 tok/s |
+| host, two stages | `--max-context 32768` | MTP, 3 | 17.8 + 16.3 GiB | 3,806 tok/s | 204.0 / 208.5 tok/s |
+| disk, two stages | `--ngram-residency disk --max-context 131072 --kv-capacity 131072 --kv-dtype rk8v4` | none | 20.4 + 19.9 GiB | 1,128 tok/s | 44.4 / 104.6 tok/s |
+
+All three gave the same tokens. The two caches together hold nearly every expert, so after its
+first reads the disk run decodes from the GPUs; its short prompt came first, with the caches cold.
+Before this build either placement over stages stopped at the first expert copy of the second GPU.
 
 ### Host experts on one RTX 3090
 
