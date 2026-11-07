@@ -1,5 +1,6 @@
 #include "models/divided_head.h"
 
+#include "core/device_wait.h"
 #include "core/tensor_split.h"
 
 #include <algorithm>
@@ -48,8 +49,9 @@ DividedHead::DividedHead(const DeviceContext& device, const Weight& head, std::i
             rank.own         = DeviceBuffer(std::size_t(columns) * count * 2);
         } else {
             rank.storage = DeviceBuffer(count * std::uint64_t(row_bytes));
-            CUDA_CHECK(cudaMemcpyPeer(rank.storage.p, device.rank(r).device, rows_begin,
-                                      device.rank(0).device, count * std::uint64_t(row_bytes)));
+            CUDA_CHECK(ninfer::copy_between_devices_and_wait(
+                rank.storage.p, device.rank(r).device, rows_begin, device.rank(0).device,
+                count * std::uint64_t(row_bytes)));
             rank.piece.qdata = rank.storage.p;
         }
         rank.piece.payload = rank.piece.qdata;

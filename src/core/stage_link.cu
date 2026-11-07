@@ -1,5 +1,7 @@
 #include "core/stage_link.h"
 
+#include "core/device_wait.h"
+
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -103,12 +105,12 @@ void StageLink::release() noexcept {
             DeviceBinding bind(to_device_);
             for (cudaEvent_t& event : slot.drained) { destroy_event(event); }
             if (slot.data != nullptr && transport_ == LinkTransport::Local) {
-                (void)cudaFree(slot.data);
+                (void)ninfer::free_device_memory(slot.data);
                 slot.data = nullptr;
             }
         }
         if (slot.data != nullptr) {
-            (void)cudaFreeHost(slot.data);
+            (void)ninfer::free_host_memory(slot.data);
             slot.data = nullptr;
         }
     }

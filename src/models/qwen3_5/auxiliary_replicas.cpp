@@ -1,5 +1,7 @@
 #include "models/qwen3_5/auxiliary_replicas.h"
 
+#include "core/device_wait.h"
+
 #include <cstdint>
 
 namespace ninfer::models::qwen3_5 {
@@ -24,8 +26,9 @@ AuxiliaryReplicas::AuxiliaryReplicas(std::span<const BoundWeight> bound, DeviceC
                 const Tensor tensor = auxiliary_tensor(source);
                 RankBinding bind(device, weight.rank);
                 DeviceBuffer copy(tensor.bytes());
-                CUDA_CHECK(cudaMemcpyPeer(copy.p, device.rank(weight.rank).device, tensor.data,
-                                          device.rank(source.rank).device, tensor.bytes()));
+                CUDA_CHECK(ninfer::copy_between_devices_and_wait(
+                    copy.p, device.rank(weight.rank).device, tensor.data,
+                    device.rank(source.rank).device, tensor.bytes()));
                 copies_.emplace(std::pair{auxiliary->index, weight.rank}, std::move(copy));
             }
         }

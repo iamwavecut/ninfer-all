@@ -43,14 +43,14 @@ std::uintptr_t align_up_addr(std::uintptr_t addr, std::size_t align) {
 
 void free_device(void*& ptr) noexcept {
     if (ptr != nullptr) {
-        log_cuda_error("cudaFree", cudaFree(ptr));
+        log_cuda_error("cudaFree", ninfer::free_device_memory(ptr));
         ptr = nullptr;
     }
 }
 
 void free_pinned(void*& ptr) noexcept {
     if (ptr != nullptr) {
-        log_cuda_error("cudaFreeHost", cudaFreeHost(ptr));
+        log_cuda_error("cudaFreeHost", ninfer::free_host_memory(ptr));
         ptr = nullptr;
     }
 }
@@ -219,7 +219,7 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
         const cudaError_t fill = ninfer::fill_and_wait(ptr, 0, capacity_bytes);
         const cudaError_t done = fill == cudaSuccess ? ninfer::wait_for_device() : fill;
         if (done != cudaSuccess) {
-            log_cuda_error("cudaFree", cudaFree(ptr));
+            log_cuda_error("cudaFree", ninfer::free_device_memory(ptr));
             throw std::runtime_error(cuda_error_message("cudaMemset failed", done));
         }
     }
@@ -473,7 +473,7 @@ HostMemoryRegistration::HostMemoryRegistration(void* data, std::size_t bytes, bo
     data_ = data;
 }
 HostMemoryRegistration::~HostMemoryRegistration() {
-    if (data_) { log_cuda_error("cudaHostUnregister", cudaHostUnregister(data_)); }
+    if (data_) { log_cuda_error("cudaHostUnregister", ninfer::unregister_host_memory(data_)); }
 }
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept

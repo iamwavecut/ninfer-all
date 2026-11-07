@@ -84,7 +84,7 @@ bool GrowableRegion::map_granule(std::size_t index) {
 
 void GrowableRegion::unmap_granule(std::size_t index) noexcept {
     if (handles_[index] == 0) { return; }
-    (void)cuMemUnmap(base_ + index * granule_, granule_);
+    (void)vmm::unmap(base_ + index * granule_, granule_);
     (void)cuMemRelease(handles_[index]);
     handles_[index] = 0;
     --mapped_;

@@ -1215,9 +1215,10 @@ std::vector<double> measured_copy_bandwidth(const DeviceContext& context, bool f
             if (start != nullptr) { (void)cudaEventDestroy(start); }
             if (stop != nullptr) { (void)cudaEventDestroy(stop); }
             if (source != nullptr) {
-                (void)(from_host ? cudaFreeHost(source) : cudaFree(source));
+                (void)(from_host ? ninfer::free_host_memory(source)
+                                 : ninfer::free_device_memory(source));
             }
-            if (destination != nullptr) { (void)cudaFree(destination); }
+            if (destination != nullptr) { (void)ninfer::free_device_memory(destination); }
         };
         try {
             if (from_host) {
@@ -1440,10 +1441,16 @@ void TensorParallelExchange::release() noexcept {
                     *event = nullptr;
                 }
             }
-            if (rank.device_slot[slot] != nullptr) { (void)cudaFree(rank.device_slot[slot]); }
-            if (rank.rounded[slot] != nullptr) { (void)cudaFree(rank.rounded[slot]); }
-            if (rank.host_slot[slot] != nullptr) { (void)cudaFreeHost(rank.host_slot[slot]); }
-            if (rank.inbox[slot] != nullptr) { (void)cudaFree(rank.inbox[slot]); }
+            if (rank.device_slot[slot] != nullptr) {
+                (void)ninfer::free_device_memory(rank.device_slot[slot]);
+            }
+            if (rank.rounded[slot] != nullptr) {
+                (void)ninfer::free_device_memory(rank.rounded[slot]);
+            }
+            if (rank.host_slot[slot] != nullptr) {
+                (void)ninfer::free_host_memory(rank.host_slot[slot]);
+            }
+            if (rank.inbox[slot] != nullptr) { (void)ninfer::free_device_memory(rank.inbox[slot]); }
             rank.device_slot[slot] = nullptr;
             rank.rounded[slot]     = nullptr;
             rank.host_slot[slot]   = nullptr;
@@ -1457,11 +1464,11 @@ void TensorParallelExchange::release() noexcept {
         }
         if (rank.side != nullptr) { (void)cudaStreamDestroy(rank.side); }
         rank.side = nullptr;
-        if (rank.host_words != nullptr) { (void)cudaFreeHost(rank.host_words); }
-        if (rank.peer_words != nullptr) { (void)cudaFree(rank.peer_words); }
-        if (rank.epoch != nullptr) { (void)cudaFree(rank.epoch); }
-        if (rank.scatter_flags != nullptr) { (void)cudaFreeHost(rank.scatter_flags); }
-        if (rank.peer_flags != nullptr) { (void)cudaFree(rank.peer_flags); }
+        if (rank.host_words != nullptr) { (void)ninfer::free_host_memory(rank.host_words); }
+        if (rank.peer_words != nullptr) { (void)ninfer::free_device_memory(rank.peer_words); }
+        if (rank.epoch != nullptr) { (void)ninfer::free_device_memory(rank.epoch); }
+        if (rank.scatter_flags != nullptr) { (void)ninfer::free_host_memory(rank.scatter_flags); }
+        if (rank.peer_flags != nullptr) { (void)ninfer::free_device_memory(rank.peer_flags); }
         rank.peer_flags    = nullptr;
         rank.host_words    = nullptr;
         rank.peer_words    = nullptr;
@@ -1706,7 +1713,7 @@ void TensorParallelExchange::measure(const std::vector<TensorParallelTransport>&
             if (streams[r] != nullptr) { (void)cudaStreamDestroy(streams[r]); }
             if (fork[r] != nullptr) { (void)cudaEventDestroy(fork[r]); }
             if (join[r] != nullptr) { (void)cudaEventDestroy(join[r]); }
-            if (replicas[r] != nullptr) { (void)cudaFree(replicas[r]); }
+            if (replicas[r] != nullptr) { (void)ninfer::free_device_memory(replicas[r]); }
         }
         DeviceBinding bind(ranks_[0].device);
         if (start != nullptr) { (void)cudaEventDestroy(start); }
@@ -1758,11 +1765,11 @@ void TensorParallelExchange::measure(const std::vector<TensorParallelTransport>&
         check(instantiated, "measurement instantiate");
         float best = std::numeric_limits<float>::infinity();
         try {
-            check(cudaGraphLaunch(executable, streams[0]), "measurement launch");
+            check(ninfer::launch_graph(executable, streams[0]), "measurement launch");
             check(ninfer::wait_for_stream(streams[0]), "measurement synchronize");
             for (int trial = 0; trial < kTrials; ++trial) {
                 check(cudaEventRecord(start, streams[0]), "measurement record");
-                check(cudaGraphLaunch(executable, streams[0]), "measurement launch");
+                check(ninfer::launch_graph(executable, streams[0]), "measurement launch");
                 check(cudaEventRecord(stop, streams[0]), "measurement record");
                 check(ninfer::wait_for_event(stop), "measurement synchronize");
                 float milliseconds = 0.0F;
@@ -1839,28 +1846,28 @@ void TensorParallelExchange::measure(const std::vector<TensorParallelTransport>&
         DeviceBinding bind(rank.device);
         for (std::size_t slot = 0; slot < kSlots; ++slot) {
             if (!keep.host_slots && rank.host_slot[slot] != nullptr) {
-                check(cudaFreeHost(rank.host_slot[slot]), "cudaFreeHost");
+                check(ninfer::free_host_memory(rank.host_slot[slot]), "cudaFreeHost");
                 rank.host_slot[slot] = nullptr;
             }
             if (!keep.inbox && rank.inbox[slot] != nullptr) {
-                check(cudaFree(rank.inbox[slot]), "cudaFree");
+                check(ninfer::free_device_memory(rank.inbox[slot]), "cudaFree");
                 rank.inbox[slot] = nullptr;
             }
         }
         if (!keep.host_words && rank.host_words != nullptr) {
-            check(cudaFreeHost(rank.host_words), "cudaFreeHost");
+            check(ninfer::free_host_memory(rank.host_words), "cudaFreeHost");
             rank.host_words = nullptr;
         }
         if (!keep.peer_words && rank.peer_words != nullptr) {
-            check(cudaFree(rank.peer_words), "cudaFree");
+            check(ninfer::free_device_memory(rank.peer_words), "cudaFree");
             rank.peer_words = nullptr;
         }
         if (!keep.scatter_flags && rank.scatter_flags != nullptr) {
-            check(cudaFreeHost(rank.scatter_flags), "cudaFreeHost");
+            check(ninfer::free_host_memory(rank.scatter_flags), "cudaFreeHost");
             rank.scatter_flags = nullptr;
         }
         if (!keep.peer_flags && rank.peer_flags != nullptr) {
-            check(cudaFree(rank.peer_flags), "cudaFree");
+            check(ninfer::free_device_memory(rank.peer_flags), "cudaFree");
             rank.peer_flags = nullptr;
         }
     }

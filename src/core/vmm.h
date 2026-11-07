@@ -37,6 +37,10 @@ void set_access(CUdeviceptr va, std::size_t bytes, std::span<const int> devices)
 void map(CUdeviceptr va, std::size_t bytes, CUmemGenericAllocationHandle handle,
          std::span<const int> devices);
 
+// cuMemUnmap, which CUDA documents as synchronous for most uses: a device wait of the calling
+// thread (core/device_wait.h), as is the cuMemSetAccess of set_access().
+CUresult unmap(CUdeviceptr va, std::size_t bytes) noexcept;
+
 } // namespace vmm
 
 #define NINFER_CU_CHECK(expr) ::ninfer::vmm::check((expr), #expr)

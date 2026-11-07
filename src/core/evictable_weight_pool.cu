@@ -118,9 +118,9 @@ EvictableWeightPool::~EvictableWeightPool() {
             const bool away = impl.evicted_pieces != 0 && piece >= pieces - impl.evicted_pieces;
             if (away) {
                 const std::size_t rank = piece - (pieces - impl.evicted_pieces);
-                (void)cuMemUnmap(impl.overlay + rank * kChunkBytes, impl.sizes[piece]);
+                (void)vmm::unmap(impl.overlay + rank * kChunkBytes, impl.sizes[piece]);
             } else {
-                (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+                (void)vmm::unmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
             }
             (void)cuMemRelease(impl.handles[piece]);
         }
@@ -138,7 +138,7 @@ void EvictableWeightPool::release_backing() {
         throw std::logic_error("evictable pool cannot release its backing during a transaction");
     }
     for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
-        (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+        (void)vmm::unmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
         (void)cuMemRelease(impl.handles[piece]);
         impl.handles[piece] = {};
     }
@@ -161,7 +161,7 @@ void EvictableWeightPool::restore_backing() {
         }
     } catch (...) {
         for (std::size_t piece = 0; piece < created; ++piece) {
-            (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+            (void)vmm::unmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
             (void)cuMemRelease(impl.handles[piece]);
         }
         throw;
@@ -246,7 +246,7 @@ EvictableWeightPool::Transaction EvictableWeightPool::evict(std::size_t bytes,
     const std::size_t first = impl.handles.size() - chunks;
     for (std::size_t rank = 0; rank < chunks; ++rank) {
         const std::size_t piece = first + rank;
-        NINFER_CU_CHECK(cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]));
+        NINFER_CU_CHECK(vmm::unmap(impl.home + impl.offsets[piece], impl.sizes[piece]));
         impl.map_overlay(piece, rank);
     }
     impl.evicted_pieces = chunks;
@@ -263,7 +263,7 @@ void EvictableWeightPool::restore(Transaction& transaction) noexcept {
     try {
         for (std::size_t rank = 0; rank < chunks; ++rank) {
             const std::size_t piece = first + rank;
-            NINFER_CU_CHECK(cuMemUnmap(impl.overlay + rank * kChunkBytes, impl.sizes[piece]));
+            NINFER_CU_CHECK(vmm::unmap(impl.overlay + rank * kChunkBytes, impl.sizes[piece]));
             impl.map_home(piece);
         }
         // Only the borrowed chunks were dirtied, and only bytes below arena_bytes hold weights.

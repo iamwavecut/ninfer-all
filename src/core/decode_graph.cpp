@@ -1,6 +1,7 @@
 #include "core/decode_graph.h"
 
 #include "core/device.h"
+#include "core/device_wait.h"
 #include "core/nvtx.h"
 
 #include <cstdio>
@@ -150,7 +151,7 @@ void DecodeGraphExecutable::launch(cudaStream_t stream) {
     // This range executes for every replay; ranges in the captured body execute only at capture.
     nvtx::ScopedRange launch_range(nvtx::Name::CudaGraphLaunch, nvtx::Category::Graph);
     if (!ready()) { throw std::logic_error("cannot launch an empty CUDA Graph executable"); }
-    CUDA_CHECK(cudaGraphLaunch(exec_, stream));
+    CUDA_CHECK(ninfer::launch_graph(exec_, stream));
 }
 
 bool DecodeGraphExecutable::ready() const noexcept { return exec_ != nullptr; }

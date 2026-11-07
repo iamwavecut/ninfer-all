@@ -54,11 +54,11 @@ CudaHostHandshake::CudaHostHandshake(const RankContext& rank, std::uint32_t* seq
         ::new (host_) Mailbox();
         CUDA_CHECK(cudaHostGetDevicePointer(&device_, host_, 0));
     } catch (...) {
-        cudaFreeHost(host_);
+        ninfer::free_host_memory(host_);
         throw;
     }
 }
-CudaHostHandshake::~CudaHostHandshake() { if (host_) { cudaFreeHost(host_); } }
+CudaHostHandshake::~CudaHostHandshake() { if (host_) { ninfer::free_host_memory(host_); } }
 
 handshake::DeviceMailbox CudaHostHandshake::device() const noexcept {
     return {static_cast<Mailbox*>(device_), sequence_};
