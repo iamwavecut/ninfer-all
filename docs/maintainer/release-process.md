@@ -183,9 +183,17 @@ CTest runs without a GPU and device tests skip. Windows host checks also use the
 architecture sets. Test-only objects compile locally and are discarded after CI; they do not
 feed back into the production cache. Broader test builds can take longer on a cold cache.
 
-Each native or CI variant has an 8 GiB local compiler-cache limit. This is a capacity limit, not a
-measured working-set size; ccache can evict older objects. Each native platform/toolkit has its own
-family, with separate branch prefixes and one current snapshot. CI reads the corresponding
+Each native or CI variant has an 8 GiB local compiler-cache limit. It does not bound a restored
+cache: snapshots omit ccache's counters, and a cleanup decides from the counters it finds before it
+recalculates them. A Linux artifact job whose build finishes therefore evicts, before it saves, every
+entry that no compilation of the job used: a hit renews an entry's modification time, and a restored
+entry keeps the one it was archived with. A cancelled or failed build keeps the restored entries. On
+7 November the master snapshot for CUDA 13.4.3 held 32.4 GiB in 25,842 files, of which its last build
+had used 3.46 GiB in 2,906; the hosted CUDA 12.9.2 job ran out of disk space while it archived such a
+cache for upload. A cleanup of that cache to 8 GiB kept only 1.19 GiB of the used entries: ccache
+does not evict strictly by age. A branch behind master compiles the objects master has since changed.
+Each native platform/toolkit has its own family, with separate branch prefixes and one current
+snapshot. CI reads the corresponding
 `native-linux-cuda-<toolkit>-shared-v1` family. It takes the latest available verified snapshot without waiting
 for an artifact build to finish. It tries its branch, then master; a PR starts from its target branch.
 Source commits are not cache-family boundaries. Missing credentials, unavailable storage or rejected
