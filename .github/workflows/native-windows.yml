@@ -51,7 +51,10 @@ jobs:
         shell: pwsh
     steps:
       - name: Reserve time for cache upload
-        run: '"BUILD_DEADLINE=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 19800)" >> $env:GITHUB_ENV'
+        run: |
+          $start = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          "JOB_START=$start" >> $env:GITHUB_ENV
+          "BUILD_DEADLINE=$($start + 19800)" >> $env:GITHUB_ENV
       - uses: actions/checkout@v7
       - name: Parse PowerShell scripts
         run: |
@@ -199,7 +202,10 @@ jobs:
       - name: Prepare completed object cache for upload
         timeout-minutes: 2
         if: always() && steps.compiler-cache.outcome == 'success'
-        run: python .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
+        # A finished build keeps only the entries it used; an unfinished one keeps the restored rest.
+        run: >-
+          python .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
+          ${{ steps.build.outcome == 'success' && '--evict-unused-since "$env:JOB_START"' || '' }}
       - name: Save completed objects even after cancellation
         if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
         timeout-minutes: ${{ job.status == 'cancelled' && 3 || 20 }}
