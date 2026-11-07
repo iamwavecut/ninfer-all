@@ -704,11 +704,19 @@ struct Qwen4ExpCore::Impl {
     // slow where the experts and the page cache fill the host's memory (1.1 s for the image of a
     // 32K-token prompt on an RTX 4090 host, while the next prompt waited; pageable memory faulted
     // in as slowly, and huge pages took minutes), so later images reuse the pages of those the
-    // store let go. host_used counts the pages images hold, within host_budget.
+    // store let go. host_used counts the pages images hold, within host_budget. Startup pins
+    // host_reserve of free pages; while the worker has nothing to run, it pins them back up to
+    // host_reserve a chunk at a time (pin_ahead), so the next request seldom pins its own.
     static constexpr std::size_t kHostPageBytes = std::size_t(8) << 20;
     std::vector<std::unique_ptr<HostPages>> host_chunks;
     std::vector<std::byte*> free_pages;
-    std::uint64_t host_budget = 0, host_used = 0;
+    std::uint64_t host_budget = 0, host_used = 0, host_reserve = 0;
+    // A chunk pinned while idle: a request that arrives meanwhile waits for it to finish. Pinning
+    // starts once the worker has been idle for the grace period, so a client that sends its next
+    // request at once does not wait. A failed pin ends idle pinning; take_pages still pins.
+    static constexpr std::size_t kPinAheadPages = 8;
+    static constexpr auto kPinAheadGrace        = std::chrono::milliseconds(50);
+    bool pin_ahead_failed                       = false;
     std::filesystem::path disk_dir;
     std::uint64_t disk_budget = 0, disk_used = 0;
     bool disk_restore = false;
@@ -811,12 +819,12 @@ struct Qwen4ExpCore::Impl {
             // its sequence ended, what a new request stores first), within a quarter of the
             // budget, pinned now rather than while the request that displaces them waits. Without
             // the memory, the store pins its pages as it needs them.
-            const std::uint64_t reserve = std::min<std::uint64_t>(
+            host_reserve = std::min<std::uint64_t>(
                 host_budget / 4 / kHostPageBytes * kHostPageBytes,
                 2 * page_rounded(i.executor->image_bytes(max_context)));
             try {
-                pin_pages(static_cast<std::size_t>(reserve / kHostPageBytes));
-            } catch (const std::exception&) {}
+                pin_pages(static_cast<std::size_t>(host_reserve / kHostPageBytes));
+            } catch (const std::exception&) { pin_ahead_failed = true; }
             if (!cache.disk_kv_path.empty()) {
                 disk_dir     = cache.disk_kv_path / profile_name(options);
                 disk_budget  = cache.disk_kv_capacity_bytes != 0 ? cache.disk_kv_capacity_bytes
@@ -985,7 +993,13 @@ struct Qwen4ExpCore::Impl {
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex);
-                queue_cv.wait(lock, [&] { return stopping || !pending.empty() || any_active(); });
+                const auto ready = [&] { return stopping || !pending.empty() || any_active(); };
+                if (!ready() && pins_ahead() && !queue_cv.wait_for(lock, kPinAheadGrace, ready)) {
+                    lock.unlock();
+                    pin_ahead();
+                    continue;
+                }
+                queue_cv.wait(lock, ready);
                 if (stopping) {
                     auto waiting = std::move(pending);
                     pending.clear();
@@ -1300,6 +1314,20 @@ struct Qwen4ExpCore::Impl {
         auto* base = static_cast<std::byte*>(chunk->data());
         for (std::size_t i = count; i-- > 0;) { free_pages.push_back(base + i * kHostPageBytes); }
         host_chunks.push_back(std::move(chunk));
+    }
+
+    // Whether the idle worker pins another chunk: the free pages hold less than host_reserve and
+    // one more chunk stays within the budget.
+    [[nodiscard]] bool pins_ahead() const noexcept {
+        const std::uint64_t free_bytes = std::uint64_t(free_pages.size()) * kHostPageBytes;
+        return !pin_ahead_failed && free_bytes < host_reserve &&
+               host_used + free_bytes + kPinAheadPages * kHostPageBytes <= host_budget;
+    }
+
+    void pin_ahead() {
+        try {
+            pin_pages(kPinAheadPages);
+        } catch (const std::exception&) { pin_ahead_failed = true; }
     }
 
     // Pages for an image of `bytes`, pinning more when the free ones fall short; the caller has

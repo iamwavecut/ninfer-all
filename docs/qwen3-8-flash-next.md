@@ -550,13 +550,17 @@ on any sequence, also when they arrive together, since a prompt that has not sta
 looks for images again at its first step. An image is the paged KV and pooled keys
 of its positions, its recurrent state, and the MTP block's, about 114 MB plus 26 KiB a position in
 BF16 KV. The images live in 8 MiB pages of pinned memory that stay pinned for later images: the
-pages of two images of a whole context (within a quarter of the budget) are pinned at startup, and
-the store pins more only when it holds more. Pinning while a request waits is slow where the
+pages of two images of a whole context (within a quarter of the budget) are pinned at startup.
+Once the Engine has had nothing to run for 50 ms, it pins free pages back up to that many in 64 MiB
+chunks, within the budget; a request that arrives meanwhile waits for the chunk in progress (about
+32 ms, [measured](#media-conversations-on-one-rtx-4090)), and the store pins pages itself only when
+the free ones fall short. Pinning while a request waits is slow where the
 experts and the page cache fill the host's memory: on an RTX 4090 host with IQ3_S host experts,
 pinning the two images of a 32K-token prompt held a short prompt after it for 2.3 s, and faulting
 in pageable memory for them 1.8 s; into the pages pinned at startup they copy in 15 ms, and the
 short prompt's first token came 0.45 s after it arrived (2.9 s before). Pinning the startup
-pages (2 GiB with the default 8 GiB budget) adds about 2 s to startup. A prompt that continues a kept prefix further than any free
+pages (2 GiB with the default 8 GiB budget) adds about 2 s to startup. The other families pin
+their whole store at startup and never pin while a request waits. A prompt that continues a kept prefix further than any free
 sequence resumes from its image, copied back into a sequence. `--host-kv-mib` (or `--host-cache-mib`) is the budget, 8 GiB by
 default; past it the least recently used images go to the disk tier with `--disk-kv-path DIR`
 (`--disk-kv-gib`, 64 by default), one file each under a directory per artifact, KV format, MTP
@@ -1130,9 +1134,10 @@ the WikiText stream, a 768x512 image in the first and third user turns, greedy a
 tokens with thinking off, each turn sending the whole history again; then a conversation with the
 same system text and another question, and a text conversation with characters 30,000-54,000.
 Three starts of each build, interleaved: before media prompts were cached (`d6a658b8a`), the first
-build that cached them (`0c08dfefd`), and this one, whose first step passes the system text's end:
+build that cached them (`0c08dfefd`), and `e38464e9b`, whose first step passes the system text's end.
+The client sent each request as soon as the last answer came:
 
-| Turn | Prompt tokens | `d6a658b8a` | `0c08dfefd`: reused, prefill | This build |
+| Turn | Prompt tokens | `d6a658b8a` | `0c08dfefd`: reused, prefill | `e38464e9b` |
 |---|---:|---:|---:|---:|
 | 1, image | 5,831 | 1.55-1.67 s | 0, 2.82-3.17 s | 1.60-1.76 s |
 | 2 | 5,985 | 1.35-1.38 s | 5,958, 0.11-0.15 s | 0.12-0.14 s |
@@ -1144,7 +1149,7 @@ The four turns prefilled in 5.86-6.03 s, 4.07-4.64 s and 2.87-3.14 s. In `0c08df
 turn's step ended at the system text, whose state the store keeps for the next conversation, and
 the image and question after it were a second pass, which with host experts copied the experts
 again; here one span runs both sides and keeps the state at the system text's end as it passes. The
-third turn's 416 new tokens still take one pass that copies the experts. This build's answers are
+third turn's 416 new tokens still take one pass that copies the experts. `e38464e9b`'s answers are
 `0c08dfefd`'s; `d6a658b8a`'s differ from the first turn on, since its media prompts did not end
 steps at the cache's frontiers (the end of the system text and of the last user message).
 
@@ -1153,14 +1158,37 @@ builds) took 1.60-1.63 s in `d6a658b8a` and 2.57-2.77 s in the later two. The ea
 images had taken the host pages pinned at startup (about 1.9 GB here), so storing the next images
 pinned more pages while the request waited; run before the media conversation, it took 1.72-1.89 s
 in all three (one start each). The store pins pages only until it holds its budget (8 GiB by
-default) and reuses them after; `d6a658b8a` stored no media images.
+default) and reuses them after; `d6a658b8a` stored no media images. No request left the Engine the
+50 ms of idle time after which it pins free pages back.
+
+Another RTX 4090 (450 W) host with an EPYC 9334 ran the same chat on 2026-11-08 against
+`e38464e9b` and this build, which pins free pages back while it is idle, with the client pausing
+before each request after the first; three starts of each build, interleaved, the server on the
+GPU's NUMA node (`taskset`). Prompt times as the server reports them, `e38464e9b` / this build:
+
+| Client pause | 0 | 0.1 s | 3 s |
+|---|---:|---:|---:|
+| Text conversation, turn 1 | 2.10-2.21 / 2.14-2.17 s | 2.07-2.10 / 2.06-2.07 s | 2.06-2.08 / 1.49-1.50 s |
+| Text conversation, turn 2 | 0.25-0.30 / 0.29-0.30 s | 0.26 / 0.24-0.25 s | 0.26-0.27 / 0.09-0.10 s |
+| Same system text | 0.43-0.45 / 0.43 s | 0.42-0.44 / 0.27-0.28 s | 0.42-0.45 / 0.13 s |
+| Media turns 2 and 4, client's wall time | 0.23, 0.43-0.44 / 0.23, 0.43-0.44 s | 0.23-0.24, 0.43-0.45 / 0.25-0.26, 0.46 s | 0.24, 0.45 / 0.24-0.25, 0.44-0.45 s |
+
+With 3 s pauses the free pages were pinned back before each request, so storing images no longer
+pinned pages while a request waited: the text conversation's first turn took less than it takes as
+the first request after startup (1.61-1.62 s in both builds, two starts with the text conversation
+first). With 0.1 s pauses about one chunk was pinned before the next request came, and a short turn
+that came during a chunk waited for it, up to 30 ms. Without pauses both builds took the same times.
+A 64 MiB chunk pinned in 32 ms on this host (median of 24, at most 35 ms; 128 MiB took 61 ms). Both
+builds gave the same answers in every turn. This build decoded at 0.999-1.008 of `e38464e9b`'s rate
+a turn without pauses, 0.986-0.998 with 0.1 s pauses and 0.980-1.023 with 3 s pauses (geomeans
+1.003, 0.992 and 0.999); it pins nothing while a request runs.
 
 With `--spec mtp --draft-tokens 3` the media requests draft. They decoded the four answers at 135.7,
 178.5, 118.6 and 163.7 tok/s, against 70.9, 88.4, 87.6 and 99.2 with `--spec none`, the same tokens
 (the media cache's first build, one start each, on an earlier rental of the same kind). Without
 drafts the three builds decode at the same rate: over the chat above and the same chat without its
 system text, two starts each with `--spec none`, 78.7, 79.9 and 81.6 tok/s, and `d6a658b8a` with
-`--spec mtp` (which did not draft media requests there) 77.3; this build against `0c08dfefd`, with
+`--spec mtp` (which did not draft media requests there) 77.3; `e38464e9b` against `0c08dfefd`, with
 the same answers, 0.90-1.10 a turn. With DFlash2 drafts it decoded the table's answers at 0.78-1.21
 of `0c08dfefd`'s rate a turn, 1.3% and 0.4% below it overall in two sets of three starts; the second
 window of DFlash2 features that a span keeps for one sequence takes 50 MiB of workspace and left the
