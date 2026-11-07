@@ -530,6 +530,9 @@ next turn of a chat, which renders the previous answer without its reasoning) re
 snapshot.
 Either way only the new tokens are prefilled; the response's prompt summary reports how many were
 reused. A request goes to the free sequence that holds the longest such prefix of its prompt.
+A prefix with images or video is the same only with the same media at the same places (each
+image's or video's content digest, grid and timestamps); a prompt that resumes past them
+encodes only its media after the prefix.
 `--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
 
 What a sequence gives up for a new request (its turn-closure snapshot and the state it ended in,
@@ -572,9 +575,12 @@ first device, beside the token embedding) and takes images and video as the Qwen
 the frontend renders the media tokens, the tower encodes the prompt's media before its first
 chunk, and their merged embeddings replace those tokens' embeddings. A media prompt rotates its
 positions on the three RoPE axes the frontend computes (text positions on all three, then each
-later token at its index plus the prompt's offset); it prefills in a pass of its own and is not
-kept for reuse by the context cache. Flash-Next media requests use plain decoding even when
-MTP is enabled. A fresh text-only request can use MTP again after the media request finishes.
+later token at its index plus the prompt's offset); it prefills in a pass of its own. The context
+cache keeps media prompts as it keeps text ones: the next turn of a conversation with images
+resumes past them, and the tower encodes only the media after the resumed prefix, whose merged
+tokens are what `--vision-max-merged` limits. The MTP block follows media prompts too, so their
+requests draft: the cell before a media token takes that token's merged embedding, and the cells
+rotate at the target's positions, on the three axes over media.
 
 ### MTP speculative decoding
 
@@ -628,9 +634,9 @@ its prompt is in, a prefix the context cache restores included. Following a toke
 attention, which leaves its KV and indexer state, and its router, whose routes the expert cache
 counts, but not its experts: only a draft reads the stack they leave. Up to eight requests run their
 rounds together, one MTP pass for all of them per draft and one verification pass. A request decodes
-without drafts when its prompt has media, near the end of its context, with one token left in its
-output or thinking budget, and while a `--post-thinking` request still reasons. N-gram copy
-proposals (`--ngram-draft-tokens`) are not available for this model; `--mtp-attention-window` and
+without drafts when its prompt ends with a media token, near the end of its context, with one token
+left in its output or thinking budget, and while a `--post-thinking` request still reasons. N-gram
+copy proposals (`--ngram-draft-tokens`) are not available for this model; `--mtp-attention-window` and
 `--lm-head-draft` are refused.
 
 With `--lookup-ngram N`, a request whose last `N` tokens (the token it feeds next last) appeared
