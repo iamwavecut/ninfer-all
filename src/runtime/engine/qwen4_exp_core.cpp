@@ -561,8 +561,8 @@ struct Qwen4ExpCore::Request {
     TokenId branch_token = 0;
     runtime::RawTokenLogprob branch_record;
     // Prefixes other prompts are expected to share (a declared cache boundary, the end of the
-    // leading system messages or tool declarations), ascending and below anchor_at: a prompt step
-    // ends at each, and the state there goes to the store for them.
+    // leading system messages or tool declarations), ascending and below anchor_at: with the context
+    // cache on, a prompt step ends at each, and the state there goes to the store for them.
     std::vector<std::uint32_t> shared_at;
 
     // The worker's progress with an admitted request.
@@ -1693,11 +1693,16 @@ struct Qwen4ExpCore::Impl {
                 (*r.branches)[r.branch_results.size()].tokens.size() - r.branch_fed;
             return static_cast<std::uint32_t>(std::min<std::size_t>(left, executor.prompt_step()));
         }
-        std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
-        for (const std::uint32_t frontier : r.shared_at) {
-            if (frontier > r.prefilled) {
-                until = std::min(until, frontier);
-                break;
+        // A step ends where the context cache keeps the state: with host or disk experts every
+        // step's wide pass copies the experts, so a prompt the cache does not keep runs whole.
+        std::uint32_t until = prompt_n;
+        if (reuse_prefixes && r.reusable) {
+            if (r.prefilled < r.anchor_at) { until = r.anchor_at; }
+            for (const std::uint32_t frontier : r.shared_at) {
+                if (frontier > r.prefilled) {
+                    until = std::min(until, frontier);
+                    break;
+                }
             }
         }
         const std::uint32_t chunk_tokens = executor.options().prefill_chunk;
