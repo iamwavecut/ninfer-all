@@ -699,6 +699,13 @@ struct RankState {
     std::uint32_t kv_staged_end = 0;
 };
 
+// Where a span keeps a sequence's state (Executor::forward's cut): before chunk `chunk`, the first
+// of its sequence past the cut, into `state`; no cut without a state.
+struct SpanCut {
+    std::size_t chunk       = 0;
+    SequenceSnapshot* state = nullptr;
+};
+
 } // namespace
 
 struct Executor::Impl {
@@ -1377,14 +1384,16 @@ struct Executor::Impl {
         dflash2_operands = std::move(p);
     }
 
-    // The feature columns a pass captures: a verification of every sequence, and each sequence's
+    // The feature columns a pass captures: a verification of every sequence, each sequence's
     // last window positions of the widest prompt call (a chunk, or a span packing every sequence's
-    // prompt), whose context the ring takes.
+    // prompt), whose context the ring takes, and a span's two windows of one sequence, before its
+    // cut and at its end (Executor::forward).
     [[nodiscard]] std::uint32_t planned_feature_columns() const {
         const std::uint32_t window = *model.dflash2_config()->sliding_window;
-        const std::uint32_t prompt = std::max(options.prefill_chunk, planned_span_tokens());
-        return std::max(verify_width * options.sequences,
-                        std::min(prompt, window * options.sequences));
+        const std::uint32_t span   = planned_span_tokens();
+        const std::uint32_t prompt = std::max(options.prefill_chunk, span);
+        return std::max({verify_width * options.sequences,
+                         std::min(prompt, window * options.sequences), std::min(span, 2 * window)});
     }
 
     // A layer's operands on its rank; `experts` its routed experts (the MTP block may keep more
@@ -4748,9 +4757,11 @@ struct Executor::Impl {
         if (!pooled) { throw std::logic_error("qwen4_exp: a span group ran outside the pool"); }
     }
 
-    // A prompt span of one sequence's chunks (prompt_step() tokens at most), layer by layer.
+    // A prompt span of one sequence's chunks (prompt_step() tokens at most), layer by layer; with
+    // a cut, its chunks restart there and cut.state takes the state there (Executor::forward).
     void forward_span(std::uint32_t s, std::span<const std::int32_t> tokens,
-                      std::uint32_t logit_rows, std::span<const std::int32_t> next) {
+                      std::uint32_t logit_rows, std::span<const std::int32_t> next,
+                      PromptCut cut) {
         const std::size_t c = options.prefill_chunk;
         if (span_tokens == 0 || tokens.size() > span_tokens) {
             throw std::invalid_argument("qwen4_exp forward: tokens exceed the prompt span");
@@ -4760,17 +4771,28 @@ struct Executor::Impl {
             throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
         }
         std::vector<SpanChunk> chunks;
-        for (std::size_t at = 0; at < tokens.size(); at += c) {
-            const auto t = static_cast<std::int32_t>(std::min(c, tokens.size() - at));
-            chunks.push_back({.sequence = &sequence,
-                              .at       = at,
-                              .count    = t,
-                              .first    = sequence.position + std::uint32_t(at),
-                              .tokens   = tokens.subspan(at, std::size_t(t))});
-            check_tokens(chunks.back().tokens, at + c >= tokens.size() ? logit_rows : 1);
+        const auto chunk_up = [&](std::size_t begin, std::size_t end) {
+            for (std::size_t at = begin; at < end; at += c) {
+                const auto t = static_cast<std::int32_t>(std::min(c, end - at));
+                chunks.push_back({.sequence = &sequence,
+                                  .at       = at,
+                                  .count    = t,
+                                  .first    = sequence.position + std::uint32_t(at),
+                                  .tokens   = tokens.subspan(at, std::size_t(t))});
+                check_tokens(chunks.back().tokens,
+                             at + std::size_t(t) == tokens.size() ? logit_rows : 1);
+            }
+        };
+        SpanCut span_cut;
+        if (cut.state != nullptr) {
+            chunk_up(0, cut.tokens);
+            span_cut = {.chunk = chunks.size(), .state = cut.state};
+            chunk_up(cut.tokens, tokens.size());
+        } else {
+            chunk_up(0, tokens.size());
         }
         const std::size_t last = chunks.size() - 1;
-        run_span(chunks, std::span(&last, 1), logit_rows, &sequence, next);
+        run_span(chunks, std::span(&last, 1), logit_rows, &sequence, next, span_cut);
     }
 
     // Several sequences' prompt tokens in one span (Executor::forward_pieces).
@@ -4823,11 +4845,19 @@ struct Executor::Impl {
     // wide call's pool copy of the layer's uncached experts serves every chunk. The arithmetic of
     // each chunk is that of forward() over its sequence. The logits are the last `logit_rows` rows
     // of each chunk `lasts` names, the chunk's columns in order, chunk after chunk (several chunks
-    // take one row each); `hinted` then hints the rows of `next`.
+    // take one row each); `hinted` then hints the rows of `next`. A `cut` keeps its sequence's
+    // state between two of its chunks as each layer, the ring and the MTP block pass there.
     void run_span(std::span<const SpanChunk> chunks, std::span<const std::size_t> lasts,
                   std::uint32_t logit_rows, const SequenceState* hinted,
-                  std::span<const std::int32_t> next) {
+                  std::span<const std::int32_t> next, SpanCut cut = {}) {
         const std::size_t n = chunks.back().at + std::size_t(chunks.back().count);
+        if (cut.state != nullptr) {
+            if (cut.chunk == 0 || cut.chunk >= chunks.size() ||
+                chunks[cut.chunk - 1].sequence != chunks[cut.chunk].sequence) {
+                throw std::logic_error("qwen4_exp: a span's cut lies outside its sequence");
+            }
+            size_snapshot(*chunks[cut.chunk].sequence, *cut.state);
+        }
         RankBinding bind(device, 0);
         RankState& rank      = ranks[0];
         const cudaStream_t st = rank.stream;
@@ -4858,6 +4888,9 @@ struct Executor::Impl {
             const Part part{.sequence = chunk.sequence, .column = 0, .count = t};
             chunk.sequence->position = chunk.first;
             stage_inputs(std::span(&part, 1), chunk.tokens, false);
+            if (cut.state != nullptr && k + 1 == cut.chunk) {
+                cut.state->context = chunk.sequence->context;
+            }
             if (reads_rows) {
                 std::copy(row_ids.begin(), row_ids.end(),
                           span_row_ids.begin() + std::ptrdiff_t(at * heads));
@@ -4908,31 +4941,28 @@ struct Executor::Impl {
         }
         const SpanChunk& recorded = chunks[calls.back().last - 1];
         // DFlash2: each following sequence's last window positions of the span, chunk by chunk;
-        // their features take consecutive columns, sequence after sequence.
+        // their features take consecutive columns, sequence after sequence. A cut's sequence
+        // first takes its last window positions before the cut, which the ring holds there.
         std::vector<Capture> span_capture(chunks.size());
         std::vector<ContextRun> span_runs;
+        std::size_t cut_runs = 0; // the runs that end at the cut
         if (dflash2) {
             const auto window = static_cast<std::int32_t>(*model.dflash2_config()->sliding_window);
             std::int32_t column = 0;
-            std::vector<SequenceState*> seen;
-            for (const SpanChunk& chunk : chunks) {
-                SequenceState* sequence = chunk.sequence;
-                if (!sequence->drafter_follows ||
-                    std::find(seen.begin(), seen.end(), sequence) != seen.end()) {
-                    continue;
-                }
-                seen.push_back(sequence);
+            // The last window positions of the sequence's chunks among chunks[begin, end).
+            const auto keep_last = [&](SequenceState* sequence, std::size_t begin,
+                                       std::size_t end) {
                 std::int32_t total = 0;
-                std::uint32_t end  = 0;
-                for (const SpanChunk& other : chunks) {
-                    if (other.sequence != sequence) { continue; }
-                    total += other.count;
-                    end = other.first + std::uint32_t(other.count);
+                std::uint32_t last = 0;
+                for (std::size_t k = begin; k < end; ++k) {
+                    if (chunks[k].sequence != sequence) { continue; }
+                    total += chunks[k].count;
+                    last = chunks[k].first + std::uint32_t(chunks[k].count);
                 }
                 const std::int32_t keep = std::min(total, window);
                 std::int32_t skip       = total - keep;
-                span_runs.push_back({sequence, column, keep, end - std::uint32_t(keep)});
-                for (std::size_t k = 0; k < chunks.size(); ++k) {
+                span_runs.push_back({sequence, column, keep, last - std::uint32_t(keep)});
+                for (std::size_t k = begin; k < end; ++k) {
                     if (chunks[k].sequence != sequence) { continue; }
                     const std::int32_t skipped = std::min(skip, chunks[k].count);
                     skip -= skipped;
@@ -4941,6 +4971,26 @@ struct Executor::Impl {
                     span_capture[k] = {.first = skipped, .count = count, .column = column};
                     column += count;
                 }
+            };
+            std::vector<SequenceState*> seen;
+            if (cut.state != nullptr && chunks[cut.chunk].sequence->drafter_follows) {
+                SequenceState* sequence = chunks[cut.chunk].sequence;
+                seen.push_back(sequence);
+                keep_last(sequence, 0, cut.chunk);
+                cut_runs = span_runs.size();
+                keep_last(sequence, cut.chunk, chunks.size());
+            }
+            for (const SpanChunk& chunk : chunks) {
+                SequenceState* sequence = chunk.sequence;
+                if (!sequence->drafter_follows ||
+                    std::find(seen.begin(), seen.end(), sequence) != seen.end()) {
+                    continue;
+                }
+                seen.push_back(sequence);
+                keep_last(sequence, 0, chunks.size());
+            }
+            if (std::uint32_t(column) > feature_columns) {
+                throw std::logic_error("qwen4_exp: a span's DFlash2 features exceed their columns");
             }
         }
         void* const own_mixed   = rank.mixed;
@@ -5013,6 +5063,10 @@ struct Executor::Impl {
                             plan.mlp_hc.weights(), config.rms_norm_eps, *rank.workspace, mixed,
                             &inject, st);
                     }
+                    // The layer's state at the cut, before the next chunk moves it on.
+                    if (cut.state != nullptr && k + 1 == cut.chunk) {
+                        keep_layer(state, cut.state->layers.at(state_slot(i, 0)), st);
+                    }
                 }
                 for (std::size_t c = 0; c < calls.size(); ++c) {
                     const auto [k, last] = calls[c];
@@ -5082,17 +5136,31 @@ struct Executor::Impl {
                 chunk.sequence->position = chunk.first + std::uint32_t(chunk.count);
             }
             record_routes(std::uint32_t(recorded.count));
-            if (!span_runs.empty()) { dflash2_context(span_runs, nullptr, 0); }
+            // A cut's ring lane is kept once its run before the cut is in.
+            const std::span<const ContextRun> runs(span_runs);
+            dflash2_context(runs.first(cut_runs), nullptr, 0);
+            if (dflash2 && cut.state != nullptr) {
+                copy_ring(*chunks[cut.chunk].sequence, *cut.state, true);
+            }
+            dflash2_context(runs.subspan(cut_runs), nullptr, 0);
             // The MTP block catches up chunk by chunk over each chunk's own final stacks; the
             // next pass's MTP cells of each sequence start from its last chunk's stack, which it
-            // copied.
+            // copied. A cut keeps the block's state after the chunk before it.
             if (mtp) {
                 for (std::size_t k = 0; k < chunks.size(); ++k) {
                     rank.stack = chunk_stack(k);
                     const Committed committed{chunks[k].sequence, 0, chunks[k].count,
                                               chunks[k].first, chunks[k].tokens};
                     mtp_catch_up(std::span(&committed, 1));
+                    if (cut.state != nullptr && k + 1 == cut.chunk) {
+                        copy_mtp(*chunks[k].sequence, *cut.state, true);
+                    }
                 }
+            }
+            if (cut.state != nullptr) {
+                const SequenceState& sequence = *chunks[cut.chunk].sequence;
+                cut.state->position           = chunks[cut.chunk].first;
+                cut.state->drafter_follows    = (mtp || dflash2) && sequence.drafter_follows;
             }
         } catch (...) {
             rank.stack  = own_stack;
@@ -5111,12 +5179,17 @@ struct Executor::Impl {
     }
 
     void forward(std::uint32_t s, std::span<const std::int32_t> tokens, std::uint32_t logit_rows,
-                 std::span<const std::int32_t> next) {
+                 std::span<const std::int32_t> next, PromptCut cut = {}) {
         if (next.size() > prompt_step()) {
             throw std::invalid_argument("qwen4_exp forward: more next tokens than a prompt step");
         }
-        if (tokens.size() > options.prefill_chunk) {
-            forward_span(s, tokens, logit_rows, next);
+        if (cut.state != nullptr &&
+            (span_tokens == 0 || cut.tokens == 0 || cut.tokens >= tokens.size())) {
+            throw std::invalid_argument(
+                "qwen4_exp forward: a cut needs prompt spans and tokens on both of its sides");
+        }
+        if (tokens.size() > options.prefill_chunk || cut.state != nullptr) {
+            forward_span(s, tokens, logit_rows, next, cut);
             return;
         }
         check_tokens(tokens, logit_rows);
@@ -6508,7 +6581,8 @@ struct Executor::Impl {
         sequence.drafter_follows =
             ((mtp && !from.mtp.empty()) || (dflash2 && from.ring.bytes != 0)) &&
             from.drafter_follows;
-        // Snapshots hold text prompts only: a media prompt is not reused.
+        // A media prompt that resumes from the state sets its media again (set_media), which
+        // skips the items the state already holds.
         sequence.media_columns.clear();
         sequence.media_rope.clear();
         sequence.rope_delta = 0;
@@ -6667,6 +6741,55 @@ struct Executor::Impl {
         sequence.rope_delta = 0;
     }
 
+    // A layer's recurrent state into a snapshot's layer, on `stream`.
+    static void keep_layer(const LayerState& state, SequenceSnapshot::Layer& kept,
+                           cudaStream_t stream) {
+        const auto regions = recurrent_regions(state);
+        for (std::size_t k = 0; k < regions.size(); ++k) {
+            if (regions[k].first == nullptr || kept.buffers[k].bytes == 0) { continue; }
+            CUDA_CHECK(cudaMemcpyAsync(kept.buffers[k].p, regions[k].first, kept.buffers[k].bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    // The MTP block's tail and kept stack between a sequence and a snapshot, on the head rank's
+    // stream.
+    void copy_mtp(SequenceState& sequence, SequenceSnapshot& snapshot, bool save) {
+        if (!mtp || snapshot.mtp.size() != 2) { return; }
+        RankBinding bind(device, model.head_rank());
+        const cudaStream_t stream = ranks[model.head_rank()].stream;
+        const std::array<std::pair<void*, DeviceBuffer*>, 2> pairs{
+            {{sequence.mtp.tail.p, &snapshot.mtp[0]}, {sequence.mtp_pending.p, &snapshot.mtp[1]}}};
+        for (const auto& [live, kept] : pairs) {
+            if (live == nullptr || kept->bytes == 0) { continue; }
+            CUDA_CHECK(cudaMemcpyAsync(save ? kept->p : live, save ? live : kept->p, kept->bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    // The sequence's DFlash2 ring lane, whose slots the positions past the snapshot overwrite,
+    // between the sequence and a snapshot, on the head rank's stream.
+    void copy_ring(SequenceState& sequence, SequenceSnapshot& snapshot, bool save) {
+        if (!dflash2 || snapshot.ring.bytes == 0) { return; }
+        RankBinding bind(device, model.head_rank());
+        const cudaStream_t stream = ranks[model.head_rank()].stream;
+        const auto lane = ring->slot_view(static_cast<std::int32_t>(sequence.slot));
+        auto* kept      = static_cast<std::byte*>(snapshot.ring.p);
+        for (std::uint32_t l = 0; l < lane.layers; ++l) {
+            const std::array<std::pair<std::byte*, std::size_t>, 2> planes{{
+                {static_cast<std::byte*>(lane.k_layer0.data) + l * lane.k_layer_pitch_bytes,
+                 lane.k_layer_bytes},
+                {static_cast<std::byte*>(lane.v_layer0.data) + l * lane.v_layer_pitch_bytes,
+                 lane.v_layer_bytes},
+            }};
+            for (const auto& [live, bytes] : planes) {
+                CUDA_CHECK(cudaMemcpyAsync(save ? kept : live, save ? live : kept, bytes,
+                                           cudaMemcpyDeviceToDevice, stream));
+                kept += bytes;
+            }
+        }
+    }
+
     // Copies the recurrent state between a sequence and a snapshot on the layers' streams, and
     // waits for the copies: the paged KV and the indexer's pooled keys stay where they are, since
     // a sequence only writes positions at or past its own. The MTP block's tail and kept stack
@@ -6688,32 +6811,8 @@ struct Executor::Impl {
                 ++kept;
             });
         }
-        if (mtp && snapshot.mtp.size() == 2) {
-            RankBinding bind(device, model.head_rank());
-            const cudaStream_t stream = ranks[model.head_rank()].stream;
-            copy(sequence.mtp.tail.p, snapshot.mtp[0], stream);
-            copy(sequence.mtp_pending.p, snapshot.mtp[1], stream);
-        }
-        if (dflash2 && snapshot.ring.bytes != 0) {
-            // The ring lane, whose slots the positions past the snapshot overwrite.
-            RankBinding bind(device, model.head_rank());
-            const cudaStream_t stream = ranks[model.head_rank()].stream;
-            const auto lane = ring->slot_view(static_cast<std::int32_t>(sequence.slot));
-            auto* kept      = static_cast<std::byte*>(snapshot.ring.p);
-            for (std::uint32_t l = 0; l < lane.layers; ++l) {
-                const std::array<std::pair<std::byte*, std::size_t>, 2> planes{{
-                    {static_cast<std::byte*>(lane.k_layer0.data) + l * lane.k_layer_pitch_bytes,
-                     lane.k_layer_bytes},
-                    {static_cast<std::byte*>(lane.v_layer0.data) + l * lane.v_layer_pitch_bytes,
-                     lane.v_layer_bytes},
-                }};
-                for (const auto& [live, bytes] : planes) {
-                    CUDA_CHECK(cudaMemcpyAsync(save ? kept : live, save ? live : kept, bytes,
-                                               cudaMemcpyDeviceToDevice, stream));
-                    kept += bytes;
-                }
-            }
-        }
+        copy_mtp(sequence, snapshot, save);
+        copy_ring(sequence, snapshot, save);
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
             CUDA_CHECK(ninfer::wait_for_stream(rank.stream));
@@ -6753,11 +6852,17 @@ std::uint32_t Executor::position(std::uint32_t sequence) const {
 }
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                       std::uint32_t logit_rows, std::span<const std::int32_t> next) {
-    impl_->forward(sequence, tokens, logit_rows, next);
+                       std::uint32_t logit_rows, std::span<const std::int32_t> next,
+                       PromptCut cut) {
+    impl_->forward(sequence, tokens, logit_rows, next, cut);
 }
 
 bool Executor::packs_prompts() const noexcept { return impl_->span_tokens != 0; }
+std::uint32_t Executor::narrow_prompt_tokens() const noexcept {
+    return impl_->span_tokens == 0
+               ? 0
+               : std::max(std::uint32_t(kVectorTokens), impl_->prompt_miss_tokens);
+}
 
 void Executor::forward_pieces(std::span<const PromptPiece> pieces,
                               std::span<const std::int32_t> next) {

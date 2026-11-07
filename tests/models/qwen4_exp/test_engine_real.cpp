@@ -386,6 +386,107 @@ void media_cache_test(const char* artifact) {
     std::cout << "MEDIA_CACHE files=" << files << " failures=" << failures << '\n';
 }
 
+// The prompt steps a streaming request reports: the prompt tokens processed after each.
+class PromptSteps final : public ninfer::OutputSink {
+public:
+    void start(ninfer::GenerationStart) override {}
+    void progress(ninfer::PromptProgress progress) override {
+        processed.push_back(progress.processed_prompt_tokens);
+    }
+    void timing(ninfer::GenerationTimingObservation) override {}
+    void publish(ninfer::OutputDelta) override {}
+    std::vector<std::uint32_t> processed;
+};
+
+// A system prompt's state in the context cache: two conversations share a system message of
+// about 1,100 tokens, and the second resumes from the state the first kept at its end and decodes
+// as it does on an Engine that never saw the first. With host or disk experts on one device the
+// first request's step passes the frontier rather than ending there, since its question fills a
+// chunk wider than the narrow ones (more than 64 tokens), so its prompt goes in one step up to its
+// turn's closure; with host experts, whose CPU share takes prompt chunks of up to 64 tokens, the
+// second's short question alone on a fresh Engine is a narrow step of its own after the frontier.
+// NINFER_FLASH_NEXT_EXPERTS=host|disk places the experts.
+void shared_prefix_test(const char* artifact) {
+    auto o = options(artifact, 4);
+    o.max_concurrency = 1;
+    o.context_cache.enabled = true;
+    o.context_cache.host_cache_budget_bytes = 1ULL << 30;
+    bool spans = false, host = false;
+    if (const char* experts = std::getenv("NINFER_FLASH_NEXT_EXPERTS")) {
+        const std::string_view place(experts);
+        if (place == "host") { o.expert_residency = ninfer::ExpertResidency::Host; }
+        if (place == "disk") { o.expert_residency = ninfer::ExpertResidency::Disk; }
+        spans = (place == "host" || place == "disk") && o.devices.size() == 1;
+        host  = spans && place == "host";
+    }
+    std::string system = "You keep the weather log of a mountain station.\n";
+    for (int i = 0; i < 60; ++i) {
+        system += "Day " + std::to_string(i + 1) + ": wind " + std::to_string((i * 7) % 31) +
+                  " km/h from the " + (i % 3 == 0 ? "north" : i % 3 == 1 ? "west" : "south") +
+                  ", " + std::to_string((i * 13) % 17) + " degrees.\n";
+    }
+    const auto conversation = [&](const char* question) {
+        ninfer::PromptInput input;
+        input.messages.push_back(ninfer::ChatMessage{
+            .role  = ninfer::ChatRole::System,
+            .parts = {ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = system}}});
+        input.messages.push_back(ninfer::ChatMessage{
+            .role  = ninfer::ChatRole::User,
+            .parts = {
+                ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = question}}});
+        input.options.enable_thinking = false;
+        return input;
+    };
+    const auto first = conversation(
+        "Go through the log above one day at a time. For every day, compare its wind speed with "
+        "the speeds of the day before it and the day after it, note where the wind came from, "
+        "and keep the temperature in mind. When you have gone through all sixty days, tell me "
+        "which single day had the strongest wind, how strong it was, from which direction it "
+        "came, how warm it was on that day, and whether the day before or the day after was "
+        "calmer. Answer in one plain sentence without a list, and do not repeat the log.");
+    const auto second = conversation("On how many days did the wind come from the west?");
+    auto r = request(24);
+    r.execution.allow_prefix_reuse = true;
+    ninfer::GenerationResult resumed, fresh;
+    PromptSteps steps, fresh_steps;
+    {
+        ninfer::Engine engine(o);
+        auto handle = engine.submit(engine.prepare(first), r, ninfer::OutputConsumerMode::Streaming,
+                                    {.prompt_progress = true});
+        const auto opened = handle.wait(&steps);
+        check(opened.reused_prompt_tokens == 0 && opened.generated_token_ids.size() == 24,
+              "the first conversation prefills from scratch");
+        resumed = engine.generate(engine.prepare(second), r);
+    }
+    {
+        ninfer::Engine engine(o);
+        auto handle = engine.submit(engine.prepare(second), r,
+                                    ninfer::OutputConsumerMode::Streaming,
+                                    {.prompt_progress = true});
+        fresh = handle.wait(&fresh_steps);
+    }
+    const std::uint32_t frontier = resumed.reused_prompt_tokens;
+    check(frontier > 0 &&
+              resumed.prefix_reuse_path == ninfer::PrefixReusePath::SharedStablePrefix,
+          "the second conversation resumes from the system prompt's state");
+    check(fresh.reused_prompt_tokens == 0 &&
+              resumed.generated_token_ids == fresh.generated_token_ids,
+          "the resumed conversation decodes as on a fresh Engine");
+    const auto stops = [&](const PromptSteps& sink) {
+        return std::find(sink.processed.begin(), sink.processed.end(), frontier) !=
+               sink.processed.end();
+    };
+    if (spans) { check(!stops(steps), "the first prompt's step passes the frontier"); }
+    if (host) {
+        check(stops(fresh_steps), "a narrow question after the frontier is a step of its own");
+    }
+    std::cout << "SHARED_PREFIX frontier=" << frontier << " spans=" << spans << " steps=";
+    for (const auto processed : steps.processed) { std::cout << processed << ','; }
+    std::cout << " fresh_steps=";
+    for (const auto processed : fresh_steps.processed) { std::cout << processed << ','; }
+    std::cout << " failures=" << failures << '\n';
+}
+
 void ngram_cache_test(const char* artifact) {
     const auto input = tokens(700, 19); // two prefill chunks; identical shape in every mode
     for (const auto drafts : {0U, 4U}) {
@@ -827,6 +928,11 @@ int run_test() {
         media_cache_test(artifact);
         return failures ? 1 : 0;
     }
+    if (const char* shared_only = std::getenv("NINFER_FLASH_NEXT_SHARED_ONLY");
+        shared_only && std::string_view(shared_only) == "1") {
+        shared_prefix_test(artifact);
+        return failures ? 1 : 0;
+    }
     auto requests = cases();
     std::vector<ninfer::GenerationResult> reference;
     {
@@ -963,6 +1069,7 @@ int run_test() {
         std::cout << "MTP K=" << k << " rounds=" << rounds << " failures=" << failures << '\n';
     }
     cache_test(artifact);
+    shared_prefix_test(artifact);
     std::cout << "ENGINE_QUALIFICATION target_differences=" << target_differences
               << " batch_differences=" << batch_differences << " failures=" << failures << '\n';
     return failures ? 1 : 0;

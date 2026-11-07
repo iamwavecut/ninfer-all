@@ -107,6 +107,15 @@ struct PromptPiece {
     std::span<const std::int32_t> tokens;
 };
 
+struct SequenceSnapshot;
+
+// A place inside a prompt step where Executor::forward keeps the sequence's state: after the
+// first `tokens` of the step, into `state`.
+struct PromptCut {
+    std::uint32_t tokens    = 0;
+    SequenceSnapshot* state = nullptr;
+};
+
 struct ExecutorMemory {
     struct Rank {
         std::uint64_t state_bytes        = 0; // the sequences' state of the rank's layers
@@ -208,11 +217,19 @@ public:
     // logits of the last `logit_rows` of them in logits(), BF16 [vocab, logit_rows] on the head
     // device. Work is queued on the device streams; logits() is ready on head_stream(). Once the
     // table rows of `tokens` are read, the rows of `next` (the known tokens that follow, at most
-    // prompt_step()) are hinted, to be read while the device runs `tokens`.
+    // prompt_step()) are hinted, to be read while the device runs `tokens`. With a `cut` (needs
+    // packs_prompts(); 0 < cut.tokens < tokens.size()), the step's chunks restart at the cut, as
+    // two calls split there would run them, and cut.state takes the sequence's state there, as
+    // snapshot() after the first of those calls would, while the step runs on in one span.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
-                 std::uint32_t logit_rows, std::span<const std::int32_t> next = {});
+                 std::uint32_t logit_rows, std::span<const std::int32_t> next = {},
+                 PromptCut cut = {});
     // Whether forward_pieces() runs: prompt steps are layer-major spans.
     [[nodiscard]] bool packs_prompts() const noexcept;
+    // The widest prompt chunk a span runs alone over the cache and the missed experts rather than
+    // from the layer's copied experts (kPromptMissTokens with a CPU share, else 8 tokens); 0
+    // without spans. A step of such chunks only copies the experts it misses.
+    [[nodiscard]] std::uint32_t narrow_prompt_tokens() const noexcept;
     // The prompt tokens of several distinct sequences in one span (prompt_step() tokens in all,
     // at most max_logit_rows() pieces), each piece at its sequence's next positions with the
     // arithmetic forward() gives it, while each layer's uncached experts cross the bus once for

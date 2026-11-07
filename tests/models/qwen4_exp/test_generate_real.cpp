@@ -13,8 +13,10 @@
 // as after the prompts. An artifact with its DFlash2 drafter takes the same checks with the
 // DFlash2 block proposing the drafts from its ring of committed target features. Prompts of
 // several sequences packed in one span (host or disk experts on one device) must leave each piece
-// the logits it gets alone, bit for bit. The context cache's sequence images (live and at a
-// snapshot) must continue as the sequence they were taken from.
+// the logits it gets alone, bit for bit, and a span that keeps the state at a cut inside it the
+// logits and the state of two calls split there (plain, with MTP and with DFlash2). The context
+// cache's sequence images (live and at a snapshot) must continue as the sequence they were taken
+// from.
 //
 //   NINFER_QWEN4_EXP_ARTIFACT  the model's .ninfer (required; skips without it)
 //   NINFER_QWEN4_EXP_DRAFTS    MTP drafts a round (default 3; 0 skips the speculative check)
@@ -397,6 +399,114 @@ int check_packed_prompts(const Model& model, DeviceContext& device, ExecutorOpti
                   << " decodes after a packed prompt as alone\n";
         failures += same ? 0 : 1;
     }
+    return failures;
+}
+
+// The bytes of a snapshot's device buffers, layer after layer, then the MTP block's and the ring's.
+std::vector<std::byte> snapshot_bytes(const SequenceSnapshot& snapshot) {
+    std::vector<const DeviceBuffer*> buffers;
+    for (const auto& layer : snapshot.layers) {
+        for (const auto& buffer : layer.buffers) { buffers.push_back(&buffer); }
+    }
+    for (const auto& buffer : snapshot.mtp) { buffers.push_back(&buffer); }
+    buffers.push_back(&snapshot.ring);
+    std::vector<std::byte> out;
+    for (const DeviceBuffer* buffer : buffers) {
+        if (buffer->bytes == 0) { continue; }
+        const std::size_t at = out.size();
+        out.resize(at + buffer->bytes);
+        if (cudaMemcpy(out.data() + at, buffer->p, buffer->bytes, cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+            throw std::runtime_error("reading a snapshot failed");
+        }
+    }
+    return out;
+}
+
+// A prompt step that passes a cut (Executor::forward with a PromptCut), as the Engine runs one
+// across a shared prefix with host or disk experts on one device: its logits must equal those of
+// the two calls split at the cut bit for bit, its cut state the snapshot after the first call
+// byte for byte, and that state, restored or saved as an image once the sequence moved on, must
+// continue the prompt as the sequence did. The cut lies inside a chunk past the DFlash2 window,
+// so a drafter's ring is rewritten whole before it, and the step holds more than one window
+// after it.
+int check_prompt_cut(const Model& model, DeviceContext& device, ExecutorOptions options,
+                     const char* label) {
+    options.sequences = 1;
+    Executor executor(model, device, options);
+    if (!executor.packs_prompts()) {
+        std::cout << "prompt cut: not checked (no prompt spans)\n";
+        return 0;
+    }
+    const std::uint32_t c = options.prefill_chunk;
+    const std::size_t cut = 4 * std::size_t(c) + 133, total = 6 * std::size_t(c) + 77;
+    if (total > executor.prompt_step()) {
+        std::cout << "prompt cut: not checked (the span holds fewer than six chunks)\n";
+        return 0;
+    }
+    std::string text = "<|im_start|>system\nThe readings below come from one building.\n";
+    for (std::size_t i = 0; i < total / 8 + 16; ++i) {
+        text += "Reading " + std::to_string(i) + ": room " + std::to_string((i * 3) % 23) +
+                " stood at " + std::to_string((i * 37) % 41) + " degrees.\n";
+    }
+    const auto ids = model.resources().tokenizer->encode(text, {.parse_added_tokens = true});
+    if (ids.size() < total) { throw std::runtime_error("prompt cut: short fixture"); }
+    const std::vector<std::int32_t> prompt(ids.begin(), ids.begin() + std::ptrdiff_t(total));
+    const auto head = std::span(prompt).first(cut), rest = std::span(prompt).subspan(cut);
+    constexpr int kSteps = 8;
+    const std::size_t vocab  = model.config().vocab_size;
+    const std::size_t domain = model.resources().public_token_count;
+    std::vector<__nv_bfloat16> logits(vocab), split_logits(vocab);
+    int failures = 0;
+    const auto report = [&](bool pass, const std::string& what) {
+        std::cout << (pass ? "OK   " : "FAIL ") << "prompt cut (" << label << "): " << what << '\n';
+        failures += pass ? 0 : 1;
+    };
+    // Two calls split at the cut, a snapshot between them.
+    SequenceSnapshot split;
+    executor.reset(0);
+    executor.forward(0, head, 1);
+    executor.snapshot(0, split);
+    const std::vector<std::byte> split_state = snapshot_bytes(split);
+    executor.forward(0, rest, 1);
+    read_logits(executor, split_logits);
+    const auto split_tokens =
+        decode_alone(executor, model, 0, argmax(split_logits, domain), kSteps, logits);
+    // One call with the cut.
+    SequenceSnapshot at;
+    executor.reset(0);
+    executor.forward(0, prompt, 1, {}, {.tokens = std::uint32_t(cut), .state = &at});
+    read_logits(executor, logits);
+    const bool same = std::memcmp(logits.data(), split_logits.data(), vocab * 2) == 0;
+    report(same, "logits equal two calls split at the cut" +
+                     (same ? std::string() : difference(logits, split_logits)));
+    device.synchronize();
+    report(at.position == split.position && at.drafter_follows == split.drafter_follows &&
+               at.context.previous == split.context.previous && snapshot_bytes(at) == split_state,
+           "the cut's state equals the snapshot between the calls");
+    constexpr std::size_t kPage = 7'000'003;
+    const std::size_t count = (executor.image_bytes(at.position) + kPage - 1) / kPage;
+    std::vector<std::byte> bytes(count * kPage);
+    std::vector<std::byte*> pages(count);
+    for (std::size_t i = 0; i < count; ++i) { pages[i] = bytes.data() + i * kPage; }
+    const SequenceImage image = executor.save_image(0, &at, pages, kPage);
+    report(decode_alone(executor, model, 0, argmax(logits, domain), kSteps, logits) == split_tokens,
+           "the sequence decodes on as after the two calls");
+    const auto continues = [&](const char* from) {
+        executor.forward(0, rest, 1);
+        read_logits(executor, logits);
+        const bool same = std::memcmp(logits.data(), split_logits.data(), vocab * 2) == 0;
+        report(same &&
+                   decode_alone(executor, model, 0, argmax(logits, domain), kSteps, logits) ==
+                       split_tokens,
+               std::string("the prompt continues from ") + from + " as after the two calls" +
+                   (same ? std::string() : difference(logits, split_logits)));
+    };
+    executor.reset(0);
+    executor.load_image(0, image, pages, kPage);
+    continues("an image of the cut's state, saved after the step");
+    executor.restore(0, at);
+    continues("the cut's state");
     return failures;
 }
 
@@ -893,10 +1003,12 @@ int run(const char* artifact_path) {
     const auto replayed = generate(*model, device, options, prompts, failures);
     failures += check_batch_and_snapshot(*model, device, options);
     failures += check_packed_prompts(*model, device, options);
+    failures += check_prompt_cut(*model, device, options, "plain");
     failures += check_images(*model, device, options, prompts, replayed);
     if (load.mtp) {
         ExecutorOptions speculative = options;
         speculative.draft_tokens    = drafts;
+        failures += check_prompt_cut(*model, device, speculative, "MTP");
         failures += check_speculative(*model, device, speculative, prompts, replayed);
     } else {
         std::cout << "speculative decoding: not checked (no MTP block, or no drafts)\n";
@@ -906,6 +1018,7 @@ int run(const char* artifact_path) {
         ExecutorOptions speculative = options;
         speculative.draft_tokens    = dflash2_drafts;
         speculative.dflash2         = true;
+        failures += check_prompt_cut(*model, device, speculative, "DFlash2");
         failures += check_speculative(*model, device, speculative, prompts, replayed);
     } else {
         std::cout << "DFlash2 speculative decoding: not checked (no drafter, or no drafts)\n";
