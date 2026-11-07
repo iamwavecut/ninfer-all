@@ -470,8 +470,10 @@ in the driver, while `/health` and the other endpoints keep answering. One threa
 watches every Engine thread's waits for the device. When one wait lasts 120 s and no host service
 of that device (host or disk experts, the CPU share of expert products) answers the device in that
 time, the process prints `ninfer: the <thread> has waited <N> s for CUDA device <D> (<wait>) ...`
-on stderr and ends with `SIGABRT`, as it does on a CUDA error. Only a new process recovers the
-device, so run the server under a supervisor that restarts it, such as a container restart policy.
+on stderr and calls `abort()`, as it does on a CUDA error: the process ends with `SIGABRT`, or, as a
+container's PID 1, which ignores its own `SIGABRT`, with the fault glibc's `abort()` raises next (a
+general-protection fault in libc on x86-64). Only a new process recovers the device, so run the server
+under a supervisor that restarts it, such as a container restart policy.
 
 ## Endpoints
 
