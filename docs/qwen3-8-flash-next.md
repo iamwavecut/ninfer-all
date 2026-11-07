@@ -533,14 +533,16 @@ reused. A request goes to the free sequence that holds the longest such prefix o
 A prefix with images or video is the same only with the same media at the same places (each
 image's or video's content digest, grid and timestamps); a prompt that resumes past them
 encodes only its media after the prefix.
-`--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
+`--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch, without the step ends below
+or at the turn closure.
 
 What a sequence gives up for a new request (its turn-closure snapshot and the state it ended in,
 each of 128 tokens or more, the end of a disposable request such as a decision read excepted) is
 kept as an image in host memory, and so is the state where the frontend marks a prefix other
 requests share (the end of the leading system messages, of the tool declarations, a declared
-cache boundary, 128 tokens or more): a prompt step ends there, and requests with the same prefix
-resume after it on any sequence, also when they arrive together, since a prompt that has not
+cache boundary, 128 tokens or more): a prompt step ends there (with host or disk experts one more
+pass that copies the experts, [measured](#media-conversations-on-one-rtx-4090)), and requests with
+the same prefix resume after it on any sequence, also when they arrive together, since a prompt that has not
 started prefilling looks for images again at its first step. An image is the paged KV and pooled keys
 of its positions, its recurrent state, and the MTP block's, about 114 MB plus 26 KiB a position in
 BF16 KV. The images live in 8 MiB pages of pinned memory that stay pinned for later images: the
@@ -590,8 +592,8 @@ with the block and host experts drafts up to three tokens a round with `--draft-
 verification window's routes share the layer's missing experts, which the CPU computes while the
 cached ones run), unless it also carries the DFlash2 drafter, which then drafts on one device
 ([DFlash2](#dflash2-speculative-decoding)); with disk experts it decodes without drafts
-([below](#mtp-with-several-requests)), and `--spec none` decodes without drafts. Text-only
-decoding requests then run rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
+([below](#mtp-with-several-requests)), and `--spec none` decodes without drafts. Decoding
+requests then run rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
 final mixer and the model's head) drafts N tokens from the stack the model left at the request's
 last position (the head's argmax at each step), the model verifies the last sampled token and the N
 drafts in one pass, and the acceptance keeps the drafts while they equal the model's own draw at
@@ -1114,6 +1116,35 @@ of three drafts, 2.16 tokens a round, and decodes at 91.6 tok/s, no faster than 
 With host experts a verification's four columns route to up to four times as many experts, each
 missing one crossing the bus, so three drafts gained about 12% here; after the October 9
 host-expert work three drafts decode 90-123 tok/s against 87-94 plain (table above).
+
+### Media conversations on one RTX 4090
+
+One RTX 4090 (450 W) in a Vast container with an EPYC 7713 ran the Q2_0 release with its table and
+`--vision` through `ninfer-serve`, 2026-11-07: host experts, one request at a time, a four-turn chat
+whose system text is the first 24,000 characters of the WikiText stream, a 768x512 image in the
+first and third user turns, greedy answers of up to 128 tokens with thinking off, each turn sending
+the whole history again. Master (`1f793496f`) prefilled every turn from scratch; this build resumes
+each turn past the cached history:
+
+| Turn | Prompt tokens | Master: prefill | This build: reused, prefill | `--no-prefix-reuse` |
+|---|---:|---:|---:|---:|
+| 1, image | 5,831 | 2.62 s | 0, 5.02 s | 2.58 s |
+| 2 | 5,985 | 1.92 s | 5,958, 0.12 s | 1.92 s |
+| 3, image | 6,422-6,434 | 1.88 s | 6,006, 1.89 s | 1.89 s |
+| 4 | 6,572-6,586 | 1.73 s | 6,548, 0.11 s | 1.73 s |
+
+The four turns took 11.0 s on master and 9.7 s here, wall time with the answers. The first turn
+costs 2.4 s more: its step ends at the system text, whose state the store keeps for the next
+conversation, and the image and question after it are a second pass, which with host experts copies
+the experts again; a text prompt of the same shape does the same. The third turn's 416 new tokens
+cost as much as master's whole prompt for the same reason, while the second and fourth resume all
+but their last 24-27 tokens. Answers differ from master's from the first turn on, since the
+prompt's steps end at other places; a second run of each repeated its answers.
+
+With `--spec mtp --draft-tokens 3` the media requests draft. They decoded the four answers at
+135.7, 178.5, 118.6 and 163.7 tok/s, against 70.9, 88.4, 87.6 and 99.2 with `--spec none`, the same
+tokens; master decoded them without drafts at 86.9-102.4 tok/s. By default host experts draft with
+the release's DFlash2 drafter, which master already ran for media requests.
 
 ### Hyper-connections in Q8_0
 
