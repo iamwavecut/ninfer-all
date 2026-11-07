@@ -82,7 +82,8 @@ ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../t
 ninfer_add_test(ninfer_device_wait_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device_wait.cu"
   LIBRARIES ninfer_core)
-set_tests_properties(ninfer_device_wait_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+set_tests_properties(ninfer_device_wait_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
+  ENVIRONMENT_MODIFICATION "NINFER_DEVICE_STALL_SECONDS=unset:")
 
 set_tests_properties(ninfer_device_test PROPERTIES
   ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:")

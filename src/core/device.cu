@@ -109,7 +109,7 @@ struct ProbeWords {
         int previous = 0;
         if (cudaGetDevice(&previous) != cudaSuccess) { return; }
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));
-        log_cuda_error("cudaFree", cudaFree(words));
+        log_cuda_error("cudaFree", ninfer::free_device_memory(words));
         log_cuda_error("cudaSetDevice", cudaSetDevice(previous));
     }
     ProbeWords(const ProbeWords&)            = delete;
@@ -142,8 +142,9 @@ std::string probe_peer(int source, int destination) {
         peer_canary_kernel<<<1, 1>>>(remote.words, remote.words + 1, kStored, local.words);
         check_probe(cudaGetLastError(), "peer probe launch");
         check_probe(ninfer::wait_for_device(), "peer probe kernel");
-        check_probe(cudaMemcpyPeer(remote.words + 2, destination, local.words + 1, source,
-                                   sizeof(unsigned long long)),
+        check_probe(ninfer::copy_between_devices_and_wait(remote.words + 2, destination,
+                                                          local.words + 1, source,
+                                                          sizeof(unsigned long long)),
                     "peer probe copy");
         check_probe(
             ninfer::copy_and_wait(&loaded, local.words, sizeof loaded, cudaMemcpyDeviceToHost),
@@ -284,6 +285,12 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
             }
         }
 
+        // A device that stops finishing work ends the process while any context holds it. Each
+        // rank holds under its stream, which is its own and moves with it.
+        for (const RankContext& endpoint : endpoints_) {
+            hold_device_probe(endpoint.device, endpoint.stream);
+        }
+
         // peer_matrix_[from][to]: can `from` DMA into `to`. Ranks on one card need no peer setup:
         // copies between them are ordinary device-to-device, and enabling peer access to self is an
         // error, so they are recorded as reachable.
@@ -332,6 +339,7 @@ DeviceContext::~DeviceContext() { release(); }
 
 void DeviceContext::release() noexcept {
     for (RankContext& endpoint : endpoints_) {
+        release_device_probe(endpoint.stream);
         if (endpoint.stream != nullptr || endpoint.transfer_stream != nullptr ||
             endpoint.vision_stream != nullptr || endpoint.fence != nullptr) {
             log_cuda_error("cudaSetDevice", cudaSetDevice(endpoint.device));

@@ -1,5 +1,7 @@
 #include "core/vmm.h"
 
+#include "core/device_wait.h"
+
 #include <algorithm>
 #include <mutex>
 #include <stdexcept>
@@ -75,7 +77,13 @@ void set_access(CUdeviceptr va, std::size_t bytes, std::span<const int> devices)
         access[index].location.id   = devices[index];
         access[index].flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     }
+    const DeviceWaitScope waiting("a change of memory access");
     NINFER_CU_CHECK(cuMemSetAccess(va, bytes, access.data(), access.size()));
+}
+
+CUresult unmap(CUdeviceptr va, std::size_t bytes) noexcept {
+    const DeviceWaitScope waiting("an unmap");
+    return cuMemUnmap(va, bytes);
 }
 
 void map(CUdeviceptr va, std::size_t bytes, CUmemGenericAllocationHandle handle,
@@ -84,7 +92,7 @@ void map(CUdeviceptr va, std::size_t bytes, CUmemGenericAllocationHandle handle,
     try {
         set_access(va, bytes, devices);
     } catch (...) {
-        (void)cuMemUnmap(va, bytes);
+        (void)vmm::unmap(va, bytes);
         throw;
     }
 }
@@ -170,7 +178,7 @@ void VmmRegion::release_backing() {
     std::size_t offset = 0;
     for (const CUmemGenericAllocationHandle handle : handles_) {
         const std::size_t size = std::min(piece_, reserved_ - offset);
-        (void)cuMemUnmap(base_ + offset, size);
+        (void)vmm::unmap(base_ + offset, size);
         (void)cuMemRelease(handle);
         offset += size;
     }
@@ -199,7 +207,7 @@ void VmmRegion::restore_backing() {
         std::size_t undo = 0;
         for (const CUmemGenericAllocationHandle handle : handles_) {
             const std::size_t size = std::min(piece_, reserved_ - undo);
-            (void)cuMemUnmap(base_ + undo, size);
+            (void)vmm::unmap(base_ + undo, size);
             (void)cuMemRelease(handle);
             undo += size;
         }

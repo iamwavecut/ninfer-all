@@ -881,6 +881,9 @@ struct ExpertMisses::Impl {
                 }
                 rank.served = sequence;
                 worked      = true;
+                // The device may wait for this answer inside a watched wait (core/device_wait.h).
+                note_host_service_progress(
+                    device.rank(static_cast<std::size_t>(&rank - ranks.data())).device);
                 // Activity keeps the service awake: a pass is mid-flight.
                 deadline.store(std::max(deadline.load(std::memory_order_relaxed),
                                         now_ns() + kKeepAliveNs),

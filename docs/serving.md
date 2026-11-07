@@ -465,15 +465,27 @@ supervisor such as a container restart policy reloads the model instead of keepi
 up. A router instead unloads the failed model once its requests are gone and reports it as failed in
 `GET /models`; its next request loads it again.
 
-A device that stops finishing work raises no CUDA error: the Engine thread that waits for it stays
-in the driver, while `/health` and the other endpoints keep answering. One thread of the process
-watches every Engine thread's waits for the device. When one wait lasts 120 s and no host service
-of that device (host or disk experts, the CPU share of expert products) answers the device in that
-time, the process prints `ninfer: the <thread> has waited <N> s for CUDA device <D> (<wait>) ...`
-on stderr and calls `abort()`, as it does on a CUDA error: the process ends with `SIGABRT`, or, as a
-container's PID 1, which ignores its own `SIGABRT`, with the fault glibc's `abort()` raises next (a
-general-protection fault in libc on x86-64). Only a new process recovers the device, so run the server
-under a supervisor that restarts it, such as a container restart policy.
+A device that stops finishing work raises no CUDA error: a thread that waits for it stays in the
+driver, while `/health` and the other endpoints keep answering. The process watches for this in two
+ways, each with a limit of 120 s while no host service of the device (host or disk experts, the CPU
+share of expert products) answers it:
+
+- Every thread's waits for the device. A wait past the limit prints
+  `ninfer: the <name> (thread <TID>) has waited <N> s for CUDA device <D> (<wait>) ...` on stderr;
+  a thread without a name, such as the startup thread that loads the model, is `thread <TID>`.
+- Every device of the server. Every 5 s the process copies 4 bytes to the device, runs a one-thread
+  kernel and copies the word back, on a stream of its own. A probe past the limit prints
+  `ninfer: CUDA device <D> has not finished a probe ...`. This also covers a device that no thread
+  waits for: an idle server, or a thread held inside a kernel launch or a copy from pageable memory.
+  The probe does not see one stream stop while the device still runs the others; the waits do.
+
+Either message is followed by `abort()`, as on a CUDA error: the process ends with `SIGABRT`, or,
+as a container's PID 1, which ignores its own `SIGABRT`, with the fault glibc's `abort()` raises
+next (a general-protection fault in libc on x86-64). Only a new process recovers the device, so run
+the server under a supervisor that restarts it, such as a container restart policy. Time the process
+stands still (a stop signal, a debugger, a paused container) does not count toward the limit.
+[`NINFER_DEVICE_STALL_SECONDS`](cli.md#device-stall-watch) changes the limit or turns both watches
+off.
 
 ## Endpoints
 

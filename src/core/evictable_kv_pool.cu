@@ -80,13 +80,13 @@ struct EvictableKVPool::Impl {
                       bool homeless) noexcept {
         try {
             for (std::size_t done = 0; done < rank; ++done) {
-                NINFER_CU_CHECK(cuMemUnmap(overlay + done * granularity, granularity));
+                NINFER_CU_CHECK(vmm::unmap(overlay + done * granularity, granularity));
                 map_home(granules[done]);
             }
             if (homeless) {
                 // The overlay mapping of this piece may or may not exist, and unmapping a range
                 // that carries nothing is a harmless error here; losing its home mapping is not.
-                (void)cuMemUnmap(overlay + rank * granularity, granularity);
+                (void)vmm::unmap(overlay + rank * granularity, granularity);
                 map_home(granules[rank]);
             }
         } catch (const std::exception& error) {
@@ -167,14 +167,14 @@ EvictableKVPool::~EvictableKVPool() {
     if (impl_ == nullptr || impl_->home == 0) { return; }
     Impl& impl = *impl_;
     for (std::size_t rank = 0; rank < impl.lent.size(); ++rank) {
-        (void)cuMemUnmap(impl.overlay + rank * impl.granularity, impl.granularity);
+        (void)vmm::unmap(impl.overlay + rank * impl.granularity, impl.granularity);
     }
     if (impl.backed) {
         for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
             if (impl.released[piece]) { continue; }
             const bool away =
                 std::find(impl.lent.begin(), impl.lent.end(), piece) != impl.lent.end();
-            if (!away) { (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]); }
+            if (!away) { (void)vmm::unmap(impl.home + impl.offsets[piece], impl.sizes[piece]); }
             (void)cuMemRelease(impl.handles[piece]);
         }
     }
@@ -194,7 +194,7 @@ void EvictableKVPool::release_backing() {
         throw std::logic_error("evictable KV pool cannot release its backing while granules are released");
     }
     for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
-        (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+        (void)vmm::unmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
         (void)cuMemRelease(impl.handles[piece]);
         impl.handles[piece] = {};
     }
@@ -217,7 +217,7 @@ void EvictableKVPool::restore_backing() {
         }
     } catch (...) {
         for (std::size_t piece = 0; piece < created; ++piece) {
-            (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+            (void)vmm::unmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
             (void)cuMemRelease(impl.handles[piece]);
         }
         throw;
@@ -294,7 +294,7 @@ EvictableKVPool::Transaction EvictableKVPool::lease(std::span<const std::size_t>
         for (; rank < granules.size(); ++rank) {
             const std::size_t piece = granules[rank];
             impl.check_fault(rank, LeaseFault::Unmap);
-            NINFER_CU_CHECK(cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]));
+            NINFER_CU_CHECK(vmm::unmap(impl.home + impl.offsets[piece], impl.sizes[piece]));
             homeless = true;
             impl.map_overlay(piece, rank);
             impl.lent.push_back(piece);
@@ -321,7 +321,7 @@ void EvictableKVPool::release_granules(std::span<const std::size_t> granules) {
         }
     }
     for (const std::size_t granule : granules) {
-        NINFER_CU_CHECK(cuMemUnmap(impl.home + impl.offsets[granule], impl.sizes[granule]));
+        NINFER_CU_CHECK(vmm::unmap(impl.home + impl.offsets[granule], impl.sizes[granule]));
         NINFER_CU_CHECK(cuMemRelease(impl.handles[granule]));
         impl.handles[granule]  = {};
         impl.released[granule] = 1;
@@ -352,7 +352,7 @@ void EvictableKVPool::restore_granules(std::span<const std::size_t> granules) {
     } catch (...) {
         for (std::size_t done = 0; done < created; ++done) {
             const std::size_t piece = granules[done];
-            (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+            (void)vmm::unmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
             (void)cuMemRelease(impl.handles[piece]);
             impl.handles[piece] = {};
         }
@@ -379,7 +379,7 @@ void EvictableKVPool::give_back(Transaction& transaction) noexcept {
     const auto start = Clock::now();
     try {
         for (std::size_t rank = 0; rank < impl.lent.size(); ++rank) {
-            NINFER_CU_CHECK(cuMemUnmap(impl.overlay + rank * impl.granularity, impl.granularity));
+            NINFER_CU_CHECK(vmm::unmap(impl.overlay + rank * impl.granularity, impl.granularity));
             impl.map_home(impl.lent[rank]);
         }
     } catch (const std::exception& error) {

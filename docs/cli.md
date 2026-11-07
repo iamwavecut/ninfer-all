@@ -386,6 +386,23 @@ The Engine-ready log reports the selected mode. Empty or unrecognized values, or
 the schedule, fail startup. This controls device scheduling (including stream synchronization);
 it does not override individual CUDA event creation flags.
 
+## Device stall watch
+
+A device that stops finishing work raises no CUDA error, so the CLI, the HTTP server and the tools
+end the process instead: when a wait of any thread for the device, or a probe the process submits
+to every device it uses every 5 s, lasts 120 s while no host service answers the device ([Stop the
+server](serving.md#stop-the-server) shows the messages). `NINFER_DEVICE_STALL_SECONDS` sets that
+limit in whole seconds, and `0` turns the waits' watch and the probes off. Set it under tools that
+slow the device many times over, such as Nsight Compute and compute-sanitizer, where one wait can
+last minutes:
+
+```bash
+NINFER_DEVICE_STALL_SECONDS=0 ncu --set full \
+  ./build/apps/ninfer models/qwen3_8_27b.ninfer --prompt "Hello"
+```
+
+A value that is not a whole number of seconds fails startup.
+
 ## Context and memory
 
 The registered model IDs have a native context limit of 262,144 tokens. `--max-context` accepts up

@@ -103,6 +103,10 @@ compute-sanitizer --tool initcheck --error-exitcode 9 \
   build/tests/ninfer_tests ninfer_softmax_attention_test
 ```
 
+A wait that the sanitizer stretches past 120 s ends the test with the device stall message; set
+`NINFER_DEVICE_STALL_SECONDS=0` ([Device stall watch](../docs/cli.md#device-stall-watch)) for long
+runs.
+
 **Use the compute-sanitizer of the toolkit that built the binary.** With several toolkits installed,
 an older copy (2024.1.0, from CUDA 12.4) was seen to print its banner and `ERROR SUMMARY: 0 errors`,
 exit 0 and **never execute the binary** — a clean report having checked nothing.
