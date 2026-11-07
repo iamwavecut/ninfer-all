@@ -7,6 +7,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/text.h"
@@ -1827,6 +1828,48 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
     };
     for (const std::size_t bytes : planner->minimum->extra_rank_reservation_bytes) {
         planner->curve.extra_ranks.push_back({.minimum_device_reservation_bytes = bytes});
+    }
+    // The Device state slots beyond one per lane: the hybrid cache's snapshot slots (at least one;
+    // a default count yields to the capacity asked for) or the catalog's checkpoint slots that
+    // --device-state-slots sets, beside the ones direct grafts hold for good. A plan with one slot
+    // fewer prices each.
+    const ContextCacheOptions& cache = inputs.context_cache;
+    if (cache.enabled && cache.device_state_slots) {
+        const bool hybrid          = cache.mode == ContextCacheMode::Hybrid;
+        const std::uint32_t slots  = *cache.device_state_slots;
+        const std::uint32_t pinned = hybrid ? 0U : count_direct_grafts(options.grafts);
+        const std::uint32_t fewest = hybrid ? 1U : 0U;
+        if (slots < pinned + fewest) {
+            throw std::logic_error("Qwen3.5 context cache options are not normalized");
+        }
+        runtime::SequenceCapacityCurve& curve = planner->curve;
+        curve.state_slots           = slots - pinned;
+        curve.minimum_state_slots   = fewest;
+        curve.state_slots_automatic = hybrid && cache.hybrid.fit_device_snapshot_slots;
+        curve.state_slot_option     = hybrid ? "--device-snapshot-slots" : "--device-state-slots";
+        if (curve.state_slots > fewest) {
+            SequencePlanningInputs fewer           = inputs;
+            fewer.context_cache.device_state_slots = slots - 1U;
+            if (hybrid) { fewer.context_cache.hybrid.device_snapshot_slots = slots - 1U; }
+            const auto smaller = build_sequence_candidate(fewer, minimum_pages);
+            const auto& larger = *planner->minimum;
+            if (smaller->device_reservation_bytes >= larger.device_reservation_bytes) {
+                throw std::logic_error("Qwen3.5 sequence layout has a nonpositive state slot stride");
+            }
+            curve.bytes_per_state_slot =
+                larger.device_reservation_bytes - smaller->device_reservation_bytes;
+            for (std::size_t rank = 0; rank < curve.extra_ranks.size(); ++rank) {
+                if (smaller->extra_rank_reservation_bytes[rank] >
+                    larger.extra_rank_reservation_bytes[rank]) {
+                    throw std::logic_error(
+                        "Qwen3.5 sequence layout has a negative state slot stride on a further "
+                        "device");
+                }
+                curve.extra_ranks[rank].bytes_per_state_slot =
+                    larger.extra_rank_reservation_bytes[rank] -
+                    smaller->extra_rank_reservation_bytes[rank];
+            }
+        }
     }
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
