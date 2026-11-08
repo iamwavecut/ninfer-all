@@ -1333,8 +1333,12 @@ int run_profile(const CodecProfile& profile, bool streamed = false) {
                     fixture.cpu_share = share;
                     failures += fixture.run(tokens, index == 0 ? 1 : 0, tokens == 8, true, cache);
                     fixture.cpu_share = 0;
-                    // A call of fewer than 16 tokens routes under half the experts: narrow.
+                    // A call of fewer than 16 tokens routes under half the experts: narrow. The
+                    // prefill route passes the CPU no operands (NVFP4 from T=13 on Blackwell),
+                    // so only a Small-T call has a CPU share.
                     if (share == 1.0 && cache == 0 && tokens < 16 &&
+                        !ops::detail::sparse_moe_uses_prefill(tokens, profile.routed_gate_up,
+                                                              profile.routed_down) &&
                         fixture.delivery_->stats().cpu_pairs == 0) {
                         std::cerr << profile.name << " T=" << tokens << ": the CPU computed no pair\n";
                         ++failures;

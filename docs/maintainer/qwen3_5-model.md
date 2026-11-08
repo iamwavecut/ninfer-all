@@ -271,8 +271,9 @@ a narrow call's miss takes a free slot, or the slot of the coldest expert the ca
 when its routes beat that expert's, and every four decode passes a round swaps the most routed
 missing experts in, copied behind the calls. A routing profile (`--expert-profile`, else the
 built-in one of the model family where the build has one) fills the slots at startup. On one
-device the CPU computes a share of a narrow call's misses from their host bytes (a disk expert's
-read for the call) while the GPU runs the cached experts and the copies arrive
+device the CPU computes a share of the misses of a narrow call below the prefill frontier from
+their host bytes (a disk expert's read for the call) while the GPU runs the cached experts and the
+copies arrive
 (`ops/sparse_moe/streamed_cpu`, `--expert-dma-share`, by default the split whose copies and CPU
 products end soonest by earlier calls' times): each product row is the streamed d3/d4 kernels' warp
 arithmetic reproduced lane by lane (fused multiply-adds in lane order, the shfl_down tree,
