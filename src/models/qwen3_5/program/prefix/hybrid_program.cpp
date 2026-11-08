@@ -1304,6 +1304,7 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
         hybrid_->attach_image(published.snapshot, tap.image);
         lane.deepest_snapshot = std::max(lane.deepest_snapshot, tap.frontier);
         ++counters.taps_created;
+        lane.published.push_back(published.snapshot);
         if (!tap.boundary) {
             // A previous tap still pending when this one was captured is superseded here, before
             // the Host write below can take its slabs.
@@ -1311,8 +1312,8 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
             lane.tap_snapshot = published.snapshot;
             lane.tap_frontier = tap.frontier;
         }
-        (void)hybrid_->start_snapshot_host_write(published.snapshot, device.stream,
-                                                 device.transfer_stream);
+        (void)hybrid_->start_snapshot_host_write(published.snapshot, lane.superseded_tap,
+                                                 device.stream, device.transfer_stream);
     }
 }
 
@@ -1437,8 +1438,9 @@ void ProgramImpl::hybrid_release_lane(std::uint32_t lane) noexcept {
             // The lane's blocks become evictable once its pins go: back them on the Host tier
             // first, in one batch, so eviction drops Device copies instead of losing nodes.
             try {
-                hybrid_->start_block_host_writes(state.path, state.superseded_tap, device.stream,
-                                                 device.transfer_stream);
+                hybrid_->start_block_host_writes(state.path, state.superseded_tap,
+                                                 index.retained_priority(state.published),
+                                                 device.stream, device.transfer_stream);
             } catch (...) {}
             index.release_path(state.path);
         }
@@ -1523,11 +1525,13 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                         image_moved    = true;
                         sequence.state = {};
                         ++hybrid_->counters().endpoints_created;
+                        lane_state.published.push_back(published.snapshot);
                         // Superseded first, so the Host write below can take its slabs.
                         hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot,
                                                 pc::Supersession::Endpoint);
-                        (void)hybrid_->start_snapshot_host_write(published.snapshot, device.stream,
-                                                                 device.transfer_stream);
+                        (void)hybrid_->start_snapshot_host_write(
+                            published.snapshot, lane_state.superseded_tap, device.stream,
+                            device.transfer_stream);
                     } else {
                         state_store->thaw(image);
                     }

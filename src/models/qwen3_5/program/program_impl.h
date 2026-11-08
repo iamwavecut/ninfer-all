@@ -392,10 +392,14 @@ struct HybridLaneState {
     // the reply resumes from the prompt-end tap.
     runtime::prefix_cache::SnapshotRef tap_snapshot;
     std::uint32_t tap_frontier = 0;
-    // The newest tap a deeper tap of the same prompt superseded. The block write-through at
-    // release does not evict it (§9.3): a request diverging later in this prompt (the next
-    // question about the same document) resumes from it, and the blocks written are its own.
+    // The newest tap a deeper tap of the same prompt superseded. This sequence's Host writes
+    // (its snapshot images and the block write-through at release) do not evict it (§9.3): a
+    // request diverging later in this prompt (the next question about the same document) resumes
+    // from it, and the blocks written are its own.
     runtime::prefix_cache::SnapshotRef superseded_tap;
+    // Snapshots this sequence published (taps and endpoint). The block write-through at release
+    // displaces no retained snapshot worth more than the most valuable of them still retained.
+    std::vector<runtime::prefix_cache::SnapshotRef> published;
     // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
     // queues behind the restore's per-layer events; releasing the lane queues behind the whole
     // restore if it may still be landing.

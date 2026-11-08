@@ -227,7 +227,11 @@ AdmissionChoice PrefixCacheIndex::choose(const MatchResult& match,
 
 void PrefixCacheIndex::note_hit(SnapshotRef snapshot) {
     Snapshot& entry = require(snapshot);
-    entry.hits      = counted_hits(entry) + 1U;
+    // Requests came back to it after a pause instead of in one burst (§9.3); the hits it counted
+    // before this one are those of what it was until now.
+    const bool returned = 2U * (clock_ - entry.hit_clock) >= hit_window_;
+    entry.hits          = counted_hits(entry) + 1U;
+    entry.periodic      = entry.periodic || returned;
     entry.hit_clock = clock_;
     ++counters_.snapshot_hits;
     entry.last_hit_tick = ++tick_;
@@ -389,8 +393,12 @@ void PrefixCacheIndex::refresh_node(std::uint32_t index) {
 void PrefixCacheIndex::refresh_tail(std::uint32_t index) {
     const Snapshot& snapshot  = snapshots_[index];
     const std::uint32_t entry = config_.max_nodes + index;
+    // A snapshot whose image holds a Device slot keeps its tail on the Device too: without it the
+    // Device image cannot be resumed from, and the snapshot would go whole once its Host copy
+    // yields, although its image is still on the Device (§9.1).
     const bool lru    = snapshot.occupied && snapshot.tail_len != 0 &&
-                        snapshot.tail_device_copy == CopyState::Resident && snapshot.pins == 0;
+                        snapshot.tail_device_copy == CopyState::Resident && snapshot.pins == 0 &&
+                        snapshot.device_slot == kNoId;
     const bool backed = config_.host_blocks && snapshot.host == CopyState::Resident;
     const std::uint8_t list = lru ? (backed ? kBacked : kUnbacked) : kNoList;
     if (lru_links_[entry].list != list) {
@@ -672,7 +680,8 @@ void PrefixCacheIndex::free_slab(std::uint32_t slab) {
 }
 
 bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
-                                      std::uint32_t protect_snapshot, double claim) {
+                                      std::uint32_t protect_snapshot, std::uint32_t keep_snapshot,
+                                      double claim) {
     out.clear();
     if (count > config_.host_slabs) { return false; }
     while (free_slabs_.size() < count) {
@@ -687,7 +696,7 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
             }
             continue;
         }
-        const std::uint32_t victim = pick_victim(true, protect_snapshot);
+        const std::uint32_t victim = pick_victim(true, protect_snapshot, keep_snapshot);
         if (victim == kNoId) { return false; }
         Snapshot& chosen = snapshots_[victim];
         if (chosen.superseded) {
@@ -730,14 +739,18 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
     return true;
 }
 
-std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref, SnapshotRef keep) {
+std::optional<std::uint32_t> PrefixCacheIndex::begin_host_fill(NodeRef ref, SnapshotRef keep,
+                                                               double claim) {
     Node& node = require(ref);
     if (node.device != CopyState::Resident || node.host != CopyState::Absent || node.pins == 0) {
         invariant("prefix cache host fill requires a pinned device-only node");
     }
     if (!config_.host_blocks) { return std::nullopt; }
     std::vector<std::uint32_t> slab;
-    if (!allocate_slabs(1, slab, keep.valid() && valid(keep) ? keep.index : kNoId)) {
+    // The blocks serve the writing lane's snapshots: they displace no retained snapshot worth more
+    // than those (§9.3). A lane's blocks otherwise pushed out another conversation's only resume
+    // point at any value, and a larger Host tier then served a rotation less than a smaller one.
+    if (!allocate_slabs(1, slab, kNoId, keep.valid() && valid(keep) ? keep.index : kNoId, claim)) {
         return std::nullopt;
     }
     Node& filled     = nodes_[ref.index];
@@ -763,7 +776,7 @@ void PrefixCacheIndex::abort_host_fill(NodeRef ref) {
     refresh_node(ref.index);
 }
 
-bool PrefixCacheIndex::begin_snapshot_host_fill(SnapshotRef ref) {
+bool PrefixCacheIndex::begin_snapshot_host_fill(SnapshotRef ref, SnapshotRef keep) {
     Snapshot& snapshot = require(ref);
     if (snapshot.host != CopyState::Absent || snapshot.pins == 0) {
         invariant("prefix cache snapshot host fill requires a pinned device-only snapshot");
@@ -772,8 +785,12 @@ bool PrefixCacheIndex::begin_snapshot_host_fill(SnapshotRef ref) {
         config_.image_slabs + (config_.host_blocks && snapshot.tail_len != 0 ? 1U : 0U);
     std::vector<std::uint32_t> slabs;
     // The image goes to the Host only if it is worth what it displaces; otherwise it stays
-    // Device-only.
-    if (!allocate_slabs(count, slabs, ref.index, priority(snapshot))) { return false; }
+    // Device-only. Like the lane's block write-through, it never displaces the lane's newest
+    // superseded tap: the next question about the same document resumes from it.
+    if (!allocate_slabs(count, slabs, ref.index, keep.valid() && valid(keep) ? keep.index : kNoId,
+                        priority(snapshot))) {
+        return false;
+    }
     Snapshot& filled  = snapshots_[ref.index];
     filled.host_slabs = std::move(slabs);
     filled.host       = CopyState::Filling;
@@ -848,6 +865,7 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
         backend_->drop_snapshot_device_image(ref_of_snapshot(owner));
         snapshots_[owner].device_slot = kNoId;
         slot_owner_[slot]             = kNoId;
+        refresh_tail(owner); // its tail may now leave the Device too
         return take(slot);
     };
     // A superseded owner goes first, backed or not: its lineage resumes from a newer snapshot.
@@ -915,6 +933,16 @@ double PrefixCacheIndex::estimate_priority(std::uint32_t base_frontier, std::uin
         static_cast<double>(exclusive_blocks) * static_cast<double>(config_.block_bytes);
     return inflation_ +
            (1.0 + static_cast<double>(hits)) * std::max(0.0, saved) / std::max(size, 1.0);
+}
+
+double PrefixCacheIndex::retained_priority(std::span<const SnapshotRef> snapshots) const noexcept {
+    double best = -std::numeric_limits<double>::infinity();
+    for (const SnapshotRef ref : snapshots) {
+        if (!valid(ref)) { continue; }
+        const Snapshot& snapshot = snapshots_[ref.index];
+        if (!snapshot.superseded) { best = std::max(best, priority(snapshot)); }
+    }
+    return best;
 }
 
 void PrefixCacheIndex::release_device_slot(std::uint32_t slot) {
@@ -992,6 +1020,7 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
     snapshot.superseded_tick        = 0;
     snapshot.superseded_by_next_tap = false;
     snapshot.branch_point           = false;
+    snapshot.periodic               = false;
     set_slot(device_slot, SlotState::Owned);
     slot_owner_[device_slot] = index;
     anchored.push_back(index);
@@ -1035,16 +1064,16 @@ void PrefixCacheIndex::update_priority(std::uint32_t index) {
 }
 
 std::uint32_t PrefixCacheIndex::counted_hits(const Snapshot& snapshot) const noexcept {
-    // A branch point keeps half its hits for a second window. While the working set overflows the
-    // cache, conversations that missed are prefilled again and republish their ladder taps, and
-    // the clock can pass a whole window between two questions about a document asked every round;
-    // dropping all its hits there evicted it for a conversation that missed anyway (issue #248).
-    // A conversation's own snapshots keep nothing past the window: they are the ones evicted as
-    // the working set overflows, and second-window hits on them only raise L, until a document
-    // asked once in many turns falls below it.
+    // A periodic snapshot keeps half its hits for a second window. While the working set overflows
+    // the cache, conversations that missed are prefilled again and republish their ladder taps,
+    // and the clock can pass a whole window between two questions about a document asked every
+    // round, or between two turns of a conversation; dropping all its hits there evicted it for a
+    // conversation that missed anyway (issue #248). A document asked in one burst gets no second
+    // window: it would hold the cache a window longer than the hits that earned it, against the
+    // conversations that follow (issue #222's order).
     const std::uint64_t age = clock_ - snapshot.hit_clock;
     if (age < hit_window_) { return snapshot.hits; }
-    return snapshot.branch_point && age < 2U * hit_window_ ? snapshot.hits / 2U : 0U;
+    return snapshot.periodic && age < 2U * hit_window_ ? snapshot.hits / 2U : 0U;
 }
 
 double PrefixCacheIndex::priority(const Snapshot& snapshot) const noexcept {
@@ -1177,13 +1206,14 @@ void PrefixCacheIndex::revalue_around(std::uint32_t index,
     if (ancestor != kNoId) { update_priority(ancestor); }
 }
 
-std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t protect) const {
+std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t protect,
+                                            std::uint32_t keep) const {
     std::uint32_t superseded = kNoId;
     std::uint32_t retained   = kNoId;
     double retained_priority = 0.0;
     for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
         const Snapshot& snapshot = snapshots_[i];
-        if (!snapshot.occupied || i == protect || snapshot.pins != 0 ||
+        if (!snapshot.occupied || i == protect || i == keep || snapshot.pins != 0 ||
             (host_resident ? snapshot.host != CopyState::Resident
                            : snapshot.host == CopyState::Filling)) {
             continue;
@@ -1223,6 +1253,7 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
     snapshot.superseded_tick        = 0;
     snapshot.superseded_by_next_tap = false;
     snapshot.branch_point           = false;
+    snapshot.periodic               = false;
     backend_->release_snapshot(ref_of_snapshot(index));
     std::vector<std::uint32_t>& anchored =
         snapshot.anchor != kNoId ? nodes_[snapshot.anchor].snapshots : root_snapshots_;
@@ -1338,6 +1369,7 @@ SnapshotView PrefixCacheIndex::snapshot(SnapshotRef ref) const {
     view.hits             = counted_hits(snapshot);
     view.superseded       = snapshot.superseded;
     view.branch_point     = snapshot.branch_point;
+    view.periodic         = snapshot.periodic;
     view.tail             = std::span<const TokenId>(snapshot.tail.data(), snapshot.tail_len);
     return view;
 }
@@ -1441,7 +1473,7 @@ std::optional<RestoredBlock> PrefixCacheIndex::restore_host_block(NodeRef parent
 std::optional<SnapshotRef>
 PrefixCacheIndex::restore_host_snapshot(NodeRef anchor, std::uint32_t frontier,
                                         std::span<const TokenId> tail, SnapshotKind kind,
-                                        std::uint32_t hits, bool branch_point) {
+                                        std::uint32_t hits, bool branch_point, bool periodic) {
     if (!config_.host_blocks || tail.size() >= kBlockTokens) {
         throw std::invalid_argument("prefix cache restored snapshot is inconsistent");
     }
@@ -1489,6 +1521,7 @@ PrefixCacheIndex::restore_host_snapshot(NodeRef anchor, std::uint32_t frontier,
     snapshot.superseded_tick        = 0;
     snapshot.superseded_by_next_tap = false;
     snapshot.branch_point           = branch_point;
+    snapshot.periodic               = periodic;
     anchored.push_back(index);
     ++snapshot_count_;
     if (anchor.valid()) {
