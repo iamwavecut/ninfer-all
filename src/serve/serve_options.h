@@ -30,6 +30,9 @@ struct ServeOptions {
     // `<VERSION>+<build id>` of this binary, set by ninfer-serve from its build stamp (not a flag):
     // GET /health, the X-NInfer-Version header, /props build_info and the server_start record.
     std::string build_version;
+    // The CUDA compiler release and architectures of this binary (`nvcc 13.4.92, 86`), from the
+    // same stamp: ninfer-serve --version, the startup log and /props build_info.
+    std::string build_toolchain;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";

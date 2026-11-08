@@ -16,7 +16,7 @@ and verification status.
 
 | Architecture | Compute capability | Build | CUDA | Docker tags | Status |
 |---|---|---|---|---|---|
-| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | `cuda13.4` | measured; built-in device profiles |
+| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer, not 13.2.0 or 13.2.1 | `cuda13.4` | measured; built-in device profiles |
 | Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | both, native `89` | measured; built-in device profiles |
 | Ampere | 8.6 | `86` (the default) | 12.8 or newer | both | measured (the reference card); built-in device profiles |
 | Ampere, A100 class | 8.0 | `80` | 12.8 or newer | both | built-in device profiles; not benchmarked |

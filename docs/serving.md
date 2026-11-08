@@ -559,7 +559,7 @@ read-only and fills only the llama.cpp fields NInfer can state truthfully:
    "params": {"n_predict": -1, "max_tokens": -1, "temperature": 1.0, "top_k": 20, "top_p": 0.95,
               "min_p": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "seed": -1}},
  "total_slots": 1, "model_alias": "qwen3.8-27b", "model_path": "models/qwen3_8_27b.ninfer",
- "modalities": {"vision": false, "audio": false}, "build_info": "ninfer 2026-10-25.1+2026-10-25.1-5-gb3402a6fd",
+ "modalities": {"vision": false, "audio": false}, "build_info": "ninfer 2026-10-25.1+2026-10-25.1-5-gb3402a6fd (nvcc 13.4.92, 120a)",
  "endpoint_slots": true, "endpoint_props": true, "endpoint_metrics": true,
  "cors_proxy_enabled": false}
 ```
@@ -572,7 +572,7 @@ cap. The sampler is the loaded model's preset for the default thinking mode (thi
 per request. `seed` is `--seed`, or `-1` when requests draw a fresh random seed. `model_alias` is the
 public model id and `model_path` the artifact path the server was started with.
 `cors_proxy_enabled` reports `--webui-mcp-proxy` (see [WebUI](#webui)). `build_info` is
-`ninfer <version>` (see [Server version](#server-version)). There is no `chat_template` or writable
+`ninfer <version> (<toolchain>)` (see [Server version](#server-version)). There is no `chat_template` or writable
 `POST /props`.
 
 ### Server version
@@ -582,6 +582,11 @@ and `ninfer --version` print it and exit without loading a model; `GET /health` 
 `{"status": "ok", "version": "2026-10-25.1+2026-10-25.1-5-gb3402a6fd"}`; every response,
 the `503` during model load and `401` failures included, carries it in an `X-NInfer-Version`
 header; and the startup log, the `server_start` record and `/props` `build_info` include it.
+`--version`, the startup log line `build ...` and `build_info` add the build's toolchain in
+parentheses: the CUDA compiler release and the architectures, for example
+`(nvcc 13.4.92, 75 80 86 89 120a)`. The same sources can compile wrong with another nvcc release
+([toolkit gates](build-linux.md#cuda-toolkits)), so a report needs both. A portable release
+package's launcher prints only the version; its archive name carries the toolkit.
 The version is the build's release tag (`YYYY-MM-DD.N`): a published release reports the tag it is
 released under; any other build reports the release tag at or before its commit, or `untagged` when
 its checkout has no tags. The build id is `git describe --always --tags` of

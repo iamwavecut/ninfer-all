@@ -98,7 +98,7 @@ reuse published weights and the published IQ4 table when adding MTP. Disk reside
 page cache. An additional application-managed RAM cache of experts is excluded from this delivery
 by the user's decision. Keep the bounded transfer buffers and the device expert cache.
 This line builds for **`sm_86`** (the RTX 30 series; that build also runs the RTX 40 series),
-`sm_89`, `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer) and `sm_75`
+`sm_89`, `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer except 13.2.0 and 13.2.1) and `sm_75`
 (Turing: the TITAN RTX and RTX 20 series, Turing forms of the sm_80 instructions and Turing shapes
 of the kernels past its 64 KiB of shared memory, `docs/maintainer/build-system.md`), with `sm_80`
 (A100 class: device profiles calibrated, not benchmarked) and `sm_70` (Tesla V100, CUDA 12.x only, its own small-T,
@@ -276,7 +276,8 @@ causes failures or interferes with the task, and briefly explain why.
 Use a Python 3.11 interpreter explicitly; the default shell's `python3` may be a different
 version, so check it before relying on it. Build trees, artifacts and profiles live where the host
 keeps them (by convention `build/`, `models/`, `profiles/ncu/`, `profiles/nsys/`,
-`profiles/bench/`); the toolchain is CUDA 12.8 or newer, and 13.1 or newer for `120a`.
+`profiles/bench/`); the toolchain is CUDA 12.8 or newer, and 13.1 or newer for `120a` (not 13.2.0 or
+13.2.1).
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.

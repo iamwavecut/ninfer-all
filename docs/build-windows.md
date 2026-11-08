@@ -32,7 +32,8 @@ CUDA 13.4 on an RTX 5070 Ti, and `89` builds with CUDA 13.4 on RTX 4090s
 
 - Windows 11 x64 and a recent NVIDIA driver;
 - Visual Studio 2022 with MSVC 19.44 (toolset 14.44, Visual Studio 17.14) and CUDA 12.8 or newer
-  for `75`, `86` and `89`, or Visual Studio 2026 with CUDA 13.1 or newer for `120a`;
+  for `75`, `86` and `89`, or Visual Studio 2026 with CUDA 13.1 or newer for `120a` except 13.2.0 and 13.2.1
+  ([CUDA toolkits](build-linux.md#cuda-toolkits));
 - CMake, Ninja and [vcpkg](https://github.com/microsoft/vcpkg), which provides FFmpeg and curl
   through `vcpkg.json`;
 - the Microsoft Visual C++ runtime to run the executables, and a `.ninfer` artifact.

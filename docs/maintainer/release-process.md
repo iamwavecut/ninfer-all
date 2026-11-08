@@ -46,7 +46,7 @@ Each platform builds two variants from the same source commit:
 
 These are the latest CUDA 12 and 13 releases in the
 [NVIDIA archive](https://developer.nvidia.com/cuda-toolkit-archive), checked on 20 October 2026.
-Volta requires CUDA 12. This project's Blackwell kernels require CUDA 13.1 or newer.
+Volta requires CUDA 12. This project's Blackwell kernels require CUDA 13.1 or newer except 13.2.0 and 13.2.1.
 Windows uses the official NVIDIA network installer, VS 2022, Ninja and pinned vcpkg libraries.
 It imports `vcvars64.bat`; setup-msbuild alone does not provide the compiler environment.
 Linux uses Debian 13. CUDA 13 uses NVIDIA's exact Debian 13 Toolkit metapackage. CUDA 12 uses

@@ -232,9 +232,11 @@ int main(int argc, char** argv) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
         return 0;
     }
-    options.build_version = std::string(NINFER_VERSION) + "+" + NINFER_BUILD_ID;
+    options.build_version   = std::string(NINFER_VERSION) + "+" + NINFER_BUILD_ID;
+    options.build_toolchain = NINFER_TOOLCHAIN;
     if (options.version_requested) {
-        std::cout << "ninfer-serve " << options.build_version << '\n';
+        std::cout << "ninfer-serve " << options.build_version << " (" << options.build_toolchain
+                  << ")\n";
         return 0;
     }
     // --log-colours on colours the statistics tokens as well as the levels; off keeps the log plain.
@@ -303,7 +305,7 @@ int main(int argc, char** argv) {
         // has been listenable since bind() either way; the difference is whether a caller arriving
         // during the ten seconds of weight loading gets a documented "still loading" or a hang.
         server.start_serving_during_startup();
-        logger->info("build {}", options.build_version);
+        logger->info("build {} ({})", options.build_version, options.build_toolchain);
 
         if (!options.slot_save_path.empty()) {
             std::error_code directory_error;

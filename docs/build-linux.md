@@ -7,7 +7,7 @@ This guide runs NInfer on Linux from the published container image, or builds it
 |---|---|---|
 | `86` (the default) | RTX 30 series; an `86` build also runs on the RTX 40 series | CUDA 12.8 or newer |
 | `89` | RTX 40 series only | CUDA 12.8 or newer |
-| `120a` | RTX 50 series and RTX PRO 6000 Blackwell | CUDA 13.1 or newer (configure refuses 12.8 and 12.9, which miscompile `sm_120a` kernels) |
+| `120a` | RTX 50 series and RTX PRO 6000 Blackwell | CUDA 13.1 or newer except 13.2.0 and 13.2.1 ([CUDA toolkits](#cuda-toolkits)) |
 | `80` | A100 class (GA100), an unmeasured compatibility target | CUDA 12.8 or newer |
 | `70` | Tesla V100 (Volta) | CUDA 12.8 or 12.9 (CUDA 13 no longer compiles `sm_70`) |
 | `75` | TITAN RTX and RTX 20 series (Turing), through the [Turing tier](maintainer/build-system.md#turing-tier-75) | CUDA 12.8 or newer |
@@ -15,6 +15,51 @@ This guide runs NInfer on Linux from the published container image, or builds it
 An `89` or `120a` build does not run on an RTX 3090, only a `70` build runs on a V100, and only
 a `75` build on a Turing card. See [Turing](#turing-sm_75) and [Tesla V100](#tesla-v100-sm_70) for
 what those builds change.
+
+## CUDA toolkits
+
+Configure refuses the CUDA releases that are known to compile NInfer's kernels wrong for a target:
+
+- `120a` with CUDA 12.8 or 12.9. With 12.8 the PLE convolution reads an address it never computed;
+  with 12.9 the NVFP4 small-T attention kernels read wild addresses (both on an RTX 5090).
+- `120a` with CUDA 13.2.0 or 13.2.1 (nvcc 13.2.51 and 13.2.78). Their `cicc` emits wrong PTX for
+  ggml's IQ1_S, IQ2_S and IQ3_S integer tensor-core products (`ggml_mmq_iq1_s.cu`,
+  `ggml_mmq_iq2_s.cu`, `ggml_mmq_iq3_s.cu`), so an artifact with IQ3_S tensors answers in gibberish
+  ([#255](https://github.com/iamwavecut/ninfer-all/issues/255); llama.cpp sees the same,
+  [ggml-org/llama.cpp#21255](https://github.com/ggml-org/llama.cpp/issues/21255)).
+
+The 13.2 finding was measured on 2026-11-08 with master e38464e9b. `ninfer_linear_gguf_test`
+compares every GGUF format's products with an FP64 oracle. On an RTX 5060 Ti (driver 580.95.05)
+the `120a` build of 13.2.0 fails IQ1_S, IQ2_S and IQ3_S at every tested width from 9 to 257
+columns, and the builds of 13.1.2, 13.2.2, 13.3.1, 13.4.3 and 13.5.0 pass. The
+`75`, `80`, `86` and `89` builds of 13.2.0 pass on an RTX 2080 Ti, A100 SXM4, RTX 3090 and RTX 4090,
+so configure refuses 13.2.0 and 13.2.1 only for `120a`.
+
+The Qwen3.8-27B GSQ-RCO IQ3_S artifact shows the same on the RTX 5060 Ti. It scores the first 40 KB
+of `eval/corpora/perplexity-1m/data/wikitext/00.txt` (`ninfer-perplexity --context 2048 --disjoint
+--kv-dtype bf16`). Each row of the table compiles the named unit with one release and links it into
+the CUDA 13.4.3 build; the rest of that build stays as it is.
+
+| release | nvcc | IQ3_S unit | IQ2_S unit | IQ2_XS unit | all three |
+|---|---|---|---|---|---|
+| 13.1.2 | 13.1.115 | 7.16141 | 7.16141 | 7.16141 | 7.16141 |
+| 13.2.0 | 13.2.51 | 415,444 | 7.28361 | 7.16141 | 397,931 |
+| 13.2.1 | 13.2.78 | 415,444 | 7.28361 | 7.16141 | 397,931 |
+| 13.2.2 | 13.2.86 | 7.16141 | 7.16141 | 7.16141 | 7.16141 |
+| 13.3.0, 13.3.1, 13.4.1, 13.4.3, 13.5.0 | 13.3.33 to 13.5.37 | 7.16141 | 7.16141 | 7.16141 | 7.16141 |
+| 13.2.0 `cicc`, 13.4.3 `ptxas` | — | 415,444 | 7.28361 | 7.16141 | 397,931 |
+
+A whole `120a` build with 13.2.0 scores 356,180 and answers the request `1+1等于几？只回答数字。`
+with `hoto` and tabs until the token limit; the 13.4.3 build scores 7.16141 and answers `2`.
+Whole `120a` builds with 13.1.2, 13.2.2, 13.3.1 and 13.5.0 score 7.16141 and answer `2`. The
+13.4.3 build with the other 447 CUDA objects of the 13.2.0 build linked in also scores 7.16141, and
+on an RTX 3090 (driver 595.84) the `86` builds of 13.2.0 and 13.4.3 both score 7.16584 and answer
+`2`. The artifact has no IQ1_S tensors, so only the test shows that unit's failure.
+
+The binaries print their toolkit beside the build id: `ninfer --version`, `ninfer-serve --version`
+and the startup log line `build ...`, for example `(nvcc 13.4.92, 120a)`. Before using a CUDA
+release that this section does not list, run CTest on the cards you build for;
+`ninfer_linear_gguf_test` is the test that fails on 13.2.0.
 
 ## Container image
 
@@ -46,7 +91,8 @@ the command for each published artifact.
 
 ## Native Ubuntu 24.04 build
 
-Install the CUDA Toolkit from NVIDIA (12.8 or newer, 13.1 or newer for `120a`).
+Install the CUDA Toolkit from NVIDIA (12.8 or newer; for `120a` 13.1 or newer except 13.2.0 and
+13.2.1, see [CUDA toolkits](#cuda-toolkits)).
 Then install the host compiler and build tools:
 
 ```bash

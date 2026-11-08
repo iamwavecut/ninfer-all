@@ -25,7 +25,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- One line per date. List what shipped, a few words per item, and link each item to the document with its details. Keep descriptions, measurements and hardware out of this list. -->
 
-- **2026-11-08:** Flash-Next [pins context-cache pages while idle](docs/qwen3-8-flash-next.md#sequences-kv-and-the-context-cache).
+- **2026-11-08:** Flash-Next [pins context-cache pages while idle](docs/qwen3-8-flash-next.md#sequences-kv-and-the-context-cache); configure refuses [CUDA 13.2.0 and 13.2.1 for `120a` builds](docs/build-linux.md#cuda-toolkits); `--version`, the startup log and `/props` [name the build's toolkit](docs/serving.md#server-version).
 - **2026-11-07:** a [device that stops finishing work](docs/serving.md#stop-the-server) ends the process instead of holding the server, busy or idle, under a [configurable limit](docs/cli.md#device-stall-watch); Flash-Next [host and disk experts over pipeline stages](docs/qwen3-8-flash-next.md#host-and-disk-experts-over-two-rtx-4090s), [media prompts in the context cache](docs/qwen3-8-flash-next.md#media-conversations-on-one-rtx-4090), [one expert pass across a shared prefix](docs/qwen3-8-flash-next.md#sequences-kv-and-the-context-cache) and [MTP drafts for media requests](docs/qwen3-8-flash-next.md#mtp-speculative-decoding).
 - **2026-11-06:** Q4_K [prompt tiles staged through `cp.async`](docs/device-profiles.md#what-is-calibrated) for dense layers and routed experts.
 - **2026-11-05:** DeepSeek-V4.1 [prefill tail](docs/deepseek-v41.md#the-prefill-tail), IQ1_M experts on the [integer matrix kernel](docs/deepseek-v41.md#iq1_m-experts-in-prompt-chunks), and [Engram reads](docs/deepseek-v41.md#the-engram-table) with deduplication and read-ahead; rounded [tensor-parallel prompt partials](docs/maintainer/pipeline-stages.md#tensor-parallelism) keep their measured peer-write route in every prompt piece; [prefix cache retention](docs/maintainer/hybrid-prefix-cache-spec.md#93-host-superseded-snapshots-first-then-gdsf-dead-kv-first) keeps conversations cached after a much-asked document.
@@ -129,7 +129,7 @@ Every card by name, with what has run on it:
 
 | Architecture | Compute capability | Build | CUDA | Docker tags | Status |
 |---|---|---|---|---|---|
-| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | `cuda13.4` | measured; built-in device profiles |
+| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer, not 13.2.0 or 13.2.1 | `cuda13.4` | measured; built-in device profiles |
 | Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | both, native `89` | measured; built-in device profiles |
 | Ampere | 8.6 | `86` (the default) | 12.8 or newer | both | measured (the reference card); built-in device profiles |
 | Ampere, A100 class | 8.0 | `80` | 12.8 or newer | both | built-in device profiles; not benchmarked |
@@ -579,8 +579,9 @@ for a pipeline across cards of different architectures
 <summary><b>Toolchains and options</b> — CUDA versions per target, guides</summary>
 
 `120a` runs the `mma.sync` compatibility path, which the ternary route needs. CUDA 12.8 or newer builds
-`75`, `80`, `86` and `89`, and `70` needs CUDA 12.8 or 12.9. A `120a` build needs CUDA 13.1 or newer, since
-12.8 and 12.9 miscompile sm_120a kernels and configure refuses them. The [Linux](docs/build-linux.md)
+`75`, `80`, `86` and `89`, and `70` needs CUDA 12.8 or 12.9. A `120a` build needs CUDA 13.1 or newer except
+13.2.0 and 13.2.1: those releases, 12.8 and 12.9 miscompile sm_120a kernels, and configure refuses them
+([CUDA toolkits](docs/build-linux.md#cuda-toolkits)). The [Linux](docs/build-linux.md)
 and [Windows](docs/build-windows.md) guides cover dependencies, the opt-in build options and the
 launcher scripts; [tests](tests/README.md) and [benchmarks](bench/README.md) have their own guides.
 

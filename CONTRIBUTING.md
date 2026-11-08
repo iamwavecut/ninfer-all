@@ -141,7 +141,7 @@ and kernels that several families call.
 ### Every platform
 
 A change builds and runs on every supported target: `sm_70`, `sm_75`, `sm_80`, `sm_86`, `sm_89` and
-`120a`; CUDA 12.x and 13.x (`sm_70` builds only with 12.x, `120a` only with 13.1 or newer); Linux
+`120a`; CUDA 12.x and 13.x (`sm_70` builds only with 12.x, `120a` only with 13.1 or newer except 13.2.0 and 13.2.1); Linux
 with GCC and Windows with MSVC ([build system](docs/maintainer/build-system.md),
 [Windows build](docs/build-windows.md)).
 
