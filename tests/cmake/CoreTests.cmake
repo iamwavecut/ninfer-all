@@ -98,6 +98,10 @@ endforeach()
 add_test(NAME ninfer_device_sync_invalid_test COMMAND ${device_test_command} --invalid-sync)
 set_tests_properties(ninfer_device_sync_invalid_test PROPERTIES
   ENVIRONMENT "NINFER_CUDA_SYNC=invalid")
+# Two devices; a process of its own, since every other case makes device 0 current first.
+add_test(NAME ninfer_device_new_thread_binding_test
+  COMMAND ${device_test_command} --new-thread-binding)
+set_tests_properties(ninfer_device_new_thread_binding_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # A present-but-empty NINFER_CUDA_SYNC is only reachable through CTest's ENVIRONMENT property on
 # POSIX. On Windows, CTest sets test-process environment variables the way `_putenv` /

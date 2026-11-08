@@ -3,6 +3,8 @@
 #include "core/device_wait.h"
 #include "core/peer_preflight.h"
 
+#include <cuda.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -181,15 +183,20 @@ DeviceBinding::DeviceBinding(int device) {
         throw std::runtime_error(cuda_error_message("cudaGetDevice failed", get));
     }
     if (previous_ == device) { return; }
+    // A thread with no current context, such as a new service thread, reads device 0 without
+    // having used it. Returning there would create device 0's primary context: a few hundred MiB
+    // on a card the process was not given, and cudaErrorMemoryAllocation when that card is full,
+    // which the destructor can only log and which the next cudaGetLastError() then reports (#279).
+    CUcontext current = nullptr;
+    restore_          = cuCtxGetCurrent(&current) == CUDA_SUCCESS && current != nullptr;
     const cudaError_t set = cudaSetDevice(device);
     if (set != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaSetDevice failed", set));
     }
-    changed_ = true;
 }
 
 DeviceBinding::~DeviceBinding() noexcept {
-    if (changed_) { log_cuda_error("cudaSetDevice", cudaSetDevice(previous_)); }
+    if (restore_) { log_cuda_error("cudaSetDevice", cudaSetDevice(previous_)); }
 }
 
 DeviceContext::DeviceContext(int device_id)
