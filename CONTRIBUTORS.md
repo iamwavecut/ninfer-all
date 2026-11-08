@@ -21,6 +21,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [wmehanna](https://github.com/wmehanna) | In-place system-turn rendering for Claude Code prefix reuse | [#13](https://github.com/Don-Chad/ninfer-3090/pull/13) |
 | [mgscreativa](https://github.com/mgscreativa) | Thinking-budget boundary fix; premature KV-loan race diagnosis and gate fix behind a vision `std::bad_alloc`; the lost wakeup that hung Flash-Next's long prefills with host experts | [#156](https://github.com/ashalliants/ninfer-3090/pull/156), [#138](https://github.com/ashalliants/ninfer-3090/pull/138) (kept in [#145](https://github.com/ashalliants/ninfer-3090/pull/145)), [#243](https://github.com/iamwavecut/ninfer-all/pull/243) |
 | [liqlos](https://github.com/liqlos) (Aleksei Bukhalov) | GGUF matrix products that store BF16 after the stream-K reduction, Q4_K and Q6_K vector loads shared across lanes, and Q4_K matrix tiles staged through `cp.async` for dense layers and routed experts | [#127](https://github.com/iamwavecut/ninfer-all/pull/127), [#134](https://github.com/iamwavecut/ninfer-all/pull/134), [#257](https://github.com/iamwavecut/ninfer-all/pull/257) |
+| [eruca](https://github.com/eruca) | A second window of hits for a document asked about every round, and the Host-tier workloads that showed fewer conversations cached with 4 GiB than with 2 GiB | [#256](https://github.com/iamwavecut/ninfer-all/pull/256) |
 
 ## Work carried from other forks
 
