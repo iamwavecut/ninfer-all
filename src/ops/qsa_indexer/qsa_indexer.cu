@@ -163,6 +163,12 @@ __global__ void __launch_bounds__(kThreads)
 // Four queries (sixteen heads) share each key tile. FP32 operands remain public; TF32 high
 // and residual components are private. Three products omit low*low; qualification checks
 // the resulting selection against the FP64 oracle without reducing stored pooled-key precision.
+// Each 8-dim step starts the high product and the two cross products in zeroed accumulators and
+// adds them to the FP32 total in registers: the tensor cores lose bits when they add products into
+// a larger accumulator. Accumulating all 16 steps in one fragment gave score errors up to 4.7e-7
+// (A100, RTX 3090, RTX 4090) and 6.4e-7 (RTX 5060 Ti) of the products' absolute sum, and on the
+// 5060 Ti a selection outside the contract's 1e-5 tie band; per-step accumulators give at most
+// 5.1e-8 on all four, the scalar route 4.4e-8.
 __global__ void __launch_bounds__(128)
     qsa_mma_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
                         const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
@@ -231,9 +237,15 @@ __global__ void __launch_bounds__(128)
         wmma::load_matrix_sync(al, q_lo, 8);
         wmma::load_matrix_sync(bh, k_hi[warp], 8);
         wmma::load_matrix_sync(bl, k_lo[warp], 8);
-        wmma::mma_sync(sum, ah, bh, sum);
-        wmma::mma_sync(sum, ah, bl, sum);
-        wmma::mma_sync(sum, al, bh, sum);
+        wmma::fragment<wmma::accumulator, 16, 16, 8, float> high_step, cross_step;
+        wmma::fill_fragment(high_step, 0.0f);
+        wmma::fill_fragment(cross_step, 0.0f);
+        wmma::mma_sync(high_step, ah, bh, high_step);
+        wmma::mma_sync(cross_step, ah, bl, cross_step);
+        wmma::mma_sync(cross_step, al, bh, cross_step);
+        // Fragments of one type share their element layout.
+#    pragma unroll
+        for (int i = 0; i < sum.num_elements; ++i) sum.x[i] += high_step.x[i] + cross_step.x[i];
         __syncthreads();
 #endif
     }
