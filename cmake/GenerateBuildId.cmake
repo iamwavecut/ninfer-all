@@ -1,6 +1,9 @@
 # GenerateBuildId.cmake -- write the NInfer build id to a C header at BUILD time.
 #
-# Run as:  cmake -DSRC_DIR=<src> -DOUT=<out header> -P cmake/GenerateBuildId.cmake
+# Run as:  cmake -DSRC_DIR=<src> -DOUT=<out header> [-DTOOLCHAIN=<text>] -P cmake/GenerateBuildId.cmake
+#
+# TOOLCHAIN (the CUDA compiler release and the architectures, from CMakeLists.txt) becomes
+# NINFER_TOOLCHAIN, or `unknown` when it is not given.
 #
 # The id is `<base>[-dirty]`:
 #
@@ -104,8 +107,12 @@ endif()
 
 string(REPLACE "\"" "\\\"" _id_escaped "${_id}")
 string(REPLACE "\"" "\\\"" _version_escaped "${_version}")
+if(NOT TOOLCHAIN)
+  set(TOOLCHAIN "unknown")
+endif()
+string(REPLACE "\"" "\\\"" _toolchain_escaped "${TOOLCHAIN}")
 # Single string (not a list) so file(WRITE) does not inject a ';' list separator.
-set(_content "// Auto-generated at build time by cmake/GenerateBuildId.cmake -- do not edit.\n#define NINFER_BUILD_ID \"${_id_escaped}\"\n#define NINFER_VERSION \"${_version_escaped}\"\n")
+set(_content "// Auto-generated at build time by cmake/GenerateBuildId.cmake -- do not edit.\n#define NINFER_BUILD_ID \"${_id_escaped}\"\n#define NINFER_VERSION \"${_version_escaped}\"\n#define NINFER_TOOLCHAIN \"${_toolchain_escaped}\"\n")
 
 if(EXISTS "${OUT}")
   file(READ "${OUT}" _existing)
