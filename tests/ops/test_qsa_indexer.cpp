@@ -352,9 +352,14 @@ int main() {
         return 77;
     }
     int failures = run(8100u);
-    for (int tokens : {1, 3, 4, 5, 8, 9, 15, 16, 17, 37, 127, 128, 129, 512}) {
+    // Scalar below 64 tokens (80 on an A100), narrow and wide SIMT tiles or the A100's tensor tile
+    // above, by the device's SM count: each card meets the routes it selects.
+    for (int tokens : {1, 3, 4, 5, 8, 9, 15, 16, 17, 37, 63, 64, 79, 80, 127, 128, 129, 512}) {
         failures += selection_case(tokens, 700, 2050);
     }
+    // Nine 64-block columns: narrow tiles on a card of 19 or more SMs (on an A100 at 80 tokens).
+    failures += selection_case(64, 576, 2200);
+    failures += selection_case(80, 576, 2200);
     failures += selection_case(5, 512, 2047);
     failures += selection_case(5, 700, 2400, true);
     failures += selection_case(128, 700, 2400, true);
@@ -363,7 +368,7 @@ int main() {
     failures += selection_case(512, 32768, 0);
     failures += selection_case(512, 32768, 1800);
     // YaRN at the factor of Flash-Next's 589,824-token window: the whole prefill / decode / verify
-    // flow, both scoring routes, and queries near that window's end.
+    // flow, the scalar and tiled scoring routes, and queries near that window's end.
     const Yarn yarn{2.25, 262144.0};
     failures += run(8200u, yarn);
     failures += selection_case(5, 700, 2050, false, yarn);

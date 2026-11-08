@@ -1246,10 +1246,12 @@ eviction. Each result reports 61 alternating baseline/candidate CUDA Graph sampl
 p95 and graph node counts; restoring identical input stacks and inject weights is outside timing.
 This measures the complete Op composition, not whole-model throughput.
 
-`ninfer_benches ninfer_qsa_indexer_bench` measures the public indexer at T=1/4/8/16/127/128/129/512
-and capacities 700/8192/32768. It records 33 CUDA Graph samples, median and p95 with reused
-inputs and a 64 MiB L2 eviction, including query preparation and top-512 selection. The wider
-route uses TF32 high/residual MMA and preserves FP32 pooled keys. This is an Op measurement;
+`ninfer_benches ninfer_qsa_indexer_bench` measures the public indexer at
+T=1/4/8/16/63/64/80/127/128/129/512/2048 and capacities 700/8192/32768. It records 33 CUDA Graph
+samples, median and p95 with reused inputs and a 64 MiB L2 eviction, including query preparation
+and top-512 selection. Below 64 tokens (80 on an A100) each token scores in CTAs of its own; from
+there FP32 FMA tiles of 16 or 32 tokens score 64 blocks each, and an A100 runs tiles of TF32
+high/residual MMA. Every route reads the FP32 pooled keys as stored. This is an Op measurement;
 the selection oracle is `ninfer_qsa_indexer_test`.
 
 The Section 5 benchmarks cover the complete Qwen3.6-35B pointwise matrix. Default invocation runs
