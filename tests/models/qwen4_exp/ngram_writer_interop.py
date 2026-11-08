@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 # The writer test imports these; without them CTest reports a skip, as it does without CUDA.
-WRITER_MODULES = ("pytest", "safetensors", "torch")
+WRITER_MODULES = ("numpy", "pytest", "safetensors", "torch")
 
 
 def main() -> int:
