@@ -26,7 +26,10 @@ Fp8LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 linear_swiglu admits only A16 or A8");
     }
-    return tokens == 1 || tokens >= 3 ? Fp8LinearSwiGluRoute::A8 : Fp8LinearSwiGluRoute::A16;
+    // P2 decode decision (T-curve suite 20261106-054406): at T=1 and T=2 the A8 MMA route ties
+    // the A16 small-t/gemv route within +-2 us, so T=1/2 keep the A16 route -- exact E4M3-to-BF16
+    // widening with no activation quantization, and one fewer quantize launch per layer.
+    return tokens >= 3 ? Fp8LinearSwiGluRoute::A8 : Fp8LinearSwiGluRoute::A16;
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -58,7 +61,7 @@ static std::size_t fp8_linear_swiglu_workspace_capacity_bytes_own(LinearPolicy p
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
-    const bool interval_uses_a8 = allows_a8(policy) && (min_tokens == 1 || max_tokens >= 3);
+    const bool interval_uses_a8 = allows_a8(policy) && max_tokens >= 3;
     return interval_uses_a8
                ? fp8_a8_workspace_capacity_bytes(max_tokens, Fp8N34816K5120::kInputRows)
                : 0;

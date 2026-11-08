@@ -47,9 +47,18 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
         },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) -> std::size_t {
             const auto& shape = resolve_shape(n, k, policy, table);
-            if (!allows_a8(policy) || !shape.uses_a8(first, last)) { return 0; }
+            if (!allows_a8(policy)) { return 0; }
+            // A shape's A8 widths need not be contiguous: the sm_89 14336/16384 schedules run A8
+            // only at T=17 before T=32, a hole inside the A16 run. The span therefore reserves the
+            // widest A8 width it reaches (the capacity grows with the width), so the interval
+            // envelope still covers every point query inside it.
+            std::int32_t widest = 0;
+            for (std::int32_t width = last; width >= first; --width) {
+                if (shape.uses_a8(width, width)) { widest = width; break; }
+            }
+            if (widest == 0) { return 0; }
             return fp8_a8_workspace_capacity_bytes(
-                last, k, shape.partial_capacity_bytes ? shape.partial_capacity_bytes(last) : 0);
+                widest, k, shape.partial_capacity_bytes ? shape.partial_capacity_bytes(widest) : 0);
         });
 }
 
