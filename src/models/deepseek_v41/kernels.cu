@@ -799,12 +799,13 @@ __global__ void __launch_bounds__(kSelectThreads)
 __global__ void __launch_bounds__(kSelectThreads)
     select_candidates_kernel(const float* __restrict__ scores, int width,
                              const std::int32_t* positions, int ratio, int block, int keep,
-                             std::uint32_t* __restrict__ mask, int words, float* __restrict__ scratch) {
+                             std::uint32_t* __restrict__ mask, int words,
+                             float* __restrict__ scratch, int stride) {
     const int t      = blockIdx.x;
     const int n      = (positions[t] + 1) / ratio;
     const int blocks = (n + block - 1) / block;
     const float* row = scores + std::int64_t(t) * width;
-    float* maxima    = scratch + std::int64_t(t) * words * 32;
+    float* maxima    = scratch + std::int64_t(t) * stride;
     std::uint32_t* bits = mask + std::int64_t(t) * words;
     for (int w = threadIdx.x; w < words; w += kSelectThreads) { bits[w] = 0; }
     for (int b = threadIdx.x; b < blocks; b += kSelectThreads) {
@@ -1532,10 +1533,14 @@ void index_scores(const ScoreArgs& args, cudaStream_t stream) {
 
 void select_candidates(const float* scores, int width, int tokens, const std::int32_t* positions,
                        int ratio, int block, int keep, std::uint32_t* mask, int words,
-                       float* scratch, cudaStream_t stream) {
+                       float* scratch, int stride, cudaStream_t stream) {
     if (tokens <= 0) { return; }
-    select_candidates_kernel<<<tokens, kSelectThreads, 0, stream>>>(scores, width, positions, ratio,
-                                                                    block, keep, mask, words, scratch);
+    if (block <= 0 || stride < (width + block - 1) / block) {
+        throw std::invalid_argument(
+            "deepseek_v41 select_candidates: the scratch stride must hold a row's blocks");
+    }
+    select_candidates_kernel<<<tokens, kSelectThreads, 0, stream>>>(
+        scores, width, positions, ratio, block, keep, mask, words, scratch, stride);
     check_launch("select_candidates");
 }
 

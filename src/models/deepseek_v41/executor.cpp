@@ -1464,6 +1464,15 @@ struct Executor::Impl {
         const std::size_t engram_bytes = sum({t * columns * 2, t * 4, t * (s + 1) * h * 4});
         const std::size_t decode_width = std::size_t(decode_rows()) * std::size_t(capacity_rows) * 4;
         const std::size_t scores = std::max(kScoreBudget, decode_width);
+        // The candidate source's block maxima (index_block): for each row of scores, which holds
+        // the `width` positions the row sees, a row of ceil(width / block) floats, so at most the
+        // scores' bytes over the block and 4 bytes a row (a chunk's or a decode pass's) for the
+        // last block.
+        const std::size_t maxima =
+            candidate_block > 0
+                ? scores / std::size_t(candidate_block) +
+                      4 * std::max(t, std::size_t(decode_rows()))
+                : 0;
         const std::size_t partial =
             kernels::sparse_attention_workspace_floats(decode_rows(), heads, decode_splits) * 4;
         const std::size_t attention = sum({
@@ -1477,7 +1486,7 @@ struct Executor::Impl {
             t * kLatent * 4, t * kLatent * 4, t * kLatent * 4, t * kIndexDim * 4,
             // indexer
             t * std::size_t(index_heads) * kIndexDim * 4, t * std::size_t(index_heads) * kIndexDim * 2,
-            t * std::size_t(index_heads) * 4, scores, scores / 8 + 4096,
+            t * std::size_t(index_heads) * 4, scores, maxima,
             // a chunk's listed candidate blocks, four rows a group
             (t + 3) * listed * 4, t * 4, partial});
         const std::size_t ffn =
@@ -2093,8 +2102,12 @@ struct Executor::Impl {
             sub = std::max(4, sub / 4 * 4);
         }
         auto* scores = alloc<float>(std::size_t(std::min(sub, t)) * columns);
+        // The candidate source's block maxima: a row for each row of scores, as many as the blocks
+        // of the positions this pass sees (not the whole context's mask).
+        const int maxima_stride =
+            p.candidate_source ? (width + candidate_block - 1) / candidate_block : 0;
         float* maxima = p.candidate_source
-                            ? alloc<float>(std::size_t(std::min(sub, t)) * candidate_words * kCandidateBits)
+                            ? alloc<float>(std::size_t(std::min(sub, t)) * maxima_stride)
                             : nullptr;
         // A chunk's groups list their blocks here, a decode pass's rows at its candidate source.
         const int list_groups = (std::min(sub, t) + group - 1) / group;
@@ -2143,7 +2156,8 @@ struct Executor::Impl {
             if (p.candidate_source) {
                 std::uint32_t* mask = candidates + std::int64_t(r0) * candidate_words;
                 kernels::select_candidates(scores, width, n, pos + r0, p.ratio, candidate_block,
-                                           candidate_keep, mask, candidate_words, maxima, stream);
+                                           candidate_keep, mask, candidate_words, maxima,
+                                           maxima_stride, stream);
                 // A decode or verification pass lists its rows' blocks once, for every later
                 // index source.
                 if (!s.chunk && s.candidate_list != nullptr && capacity > 0) {
