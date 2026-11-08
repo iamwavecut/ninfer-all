@@ -476,10 +476,11 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         };
         const std::int32_t groups_per_row = k / 16;
         const std::int32_t k_tiles        = k / 64;
-        // The wide domain walks every reachable scale byte, 0x00 through 0x7F, which covers the
-        // subnormals, the normals and the 0x7F guard the vendor decode maps to zero. The default
-        // set is the eight small bytes the fixture has always used.
-        const std::int32_t scale_table_size = options.wide_scale_range ? 128 : 8;
+        // The wide domain walks every valid scale word, 0x00 through 0x7E: the subnormals and the
+        // normals. 0x7F is the NaN word the format refuses (tensor-formats.md, section 3.3);
+        // Blackwell's vendor decode and block-scaled MMA read it as NaN, the ue4m3 table as zero.
+        // The default set is the eight small bytes the fixture has always used.
+        const std::int32_t scale_table_size = options.wide_scale_range ? 127 : 8;
         for (std::int32_t row = 0; row < n; ++row) {
             const std::int32_t row_tile  = row / 128;
             const std::int32_t row_inner = row % 128;
