@@ -164,8 +164,8 @@ struct SnapshotView {
     std::span<const std::uint32_t> host_slabs; // image slabs, then the tail slab when tail_len>0
     std::uint32_t pins = 0;
     SnapshotKind kind  = SnapshotKind::Tap;
-    // Hits GDSF counts now (§9.3): none once a third of the index's block capacity was published
-    // since the last hit or publication.
+    // Hits GDSF counts now (§9.3): all of them until a third of the index's block capacity was
+    // published since the last hit or publication, half for another third, then none.
     std::uint32_t hits = 0;
     bool superseded    = false;
     bool branch_point  = false;
@@ -393,7 +393,8 @@ private:
         CopyState host                = CopyState::Absent;
         std::uint32_t pins            = 0;
         SnapshotKind kind             = SnapshotKind::Tap;
-        // Hits counted at hit_clock; none once hit_window_ has passed since (counted_hits).
+        // Hits counted at hit_clock, none once hit_window_ has passed since; a branch point keeps
+        // half of them until twice that (counted_hits).
         std::uint32_t hits            = 0;
         std::uint64_t hit_clock       = 0; // clock_ at the last publication or hit
         double value                  = 0.0; // GDSF C / Z
@@ -492,7 +493,8 @@ private:
     void set_slot(std::uint32_t slot, SlotState state) noexcept;
     // Recomputes the snapshot's GDSF value C / Z.
     void update_priority(std::uint32_t snapshot);
-    // Hits GDSF counts now: none once hit_window_ has passed since the last hit or publication.
+    // Hits GDSF counts now: all within hit_window_ of the last hit or publication, half within
+    // twice that, then none.
     [[nodiscard]] std::uint32_t counted_hits(const Snapshot& snapshot) const noexcept;
     // GDSF H = L at the last publication or hit + (1 + counted hits) * C / Z.
     [[nodiscard]] double priority(const Snapshot& snapshot) const noexcept;
@@ -527,8 +529,8 @@ private:
     std::uint32_t free_slots_      = 0;
     std::uint64_t tick_            = 0;
     // Cache time for hits (§9.3): blocks the index has published, an image counting as
-    // image_slabs blocks. A hit counts while less than hit_window_ (a third of the block
-    // capacity, Device pages plus Host slabs) has passed since.
+    // image_slabs blocks. A hit counts fully while less than hit_window_ (a third of the block
+    // capacity, Device pages plus Host slabs) has passed since, and half for another window.
     std::uint64_t clock_           = 0;
     std::uint64_t hit_window_      = 1;
     double inflation_              = 0.0;
