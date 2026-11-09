@@ -61,13 +61,14 @@ and suppresses this insertion. The option cannot be combined with `--no-thinking
 
 `--reasoning-loop off|stop|conclude` (default `off`) ends the reply (`stop`) or closes the thinking
 with the same control span and lets the model answer (`conclude`) when the open thinking keeps
-repeating itself. Every 512 thinking tokens the guard checks two signs: 25 % of the last 2,000
-words lie inside a 12-word passage seen three times, or the last 2,048 characters repeat one
-period of at most 64 characters. `conclude` stops instead when the output left cannot hold the
-control span and one more token; Gemma 4 and Flint have no early-close control, so there it always stops. The
-run summary prints `reasoning loop` when the guard fires. The option cannot be combined with
-`--no-thinking`. The check and its limits are described in
-[serving](serving.md#openai-chat-completions), under `--reasoning-loop`.
+repeating itself. Every 512 thinking tokens the guard checks three signs: 25 % of the last 2,000
+words lie inside a 12-word passage seen three times, the last 2,048 characters repeat one period of
+at most 64 characters, or they do so with their numbers masked while one number of each period
+moves by the same step (a loop that counts, `'time1','time2',...`). `conclude` stops instead when
+the output left cannot hold the control span and one more token; Gemma 4 and Flint have no
+early-close control, so there it always stops. The run summary prints `reasoning loop` when the
+guard fires. The option cannot be combined with `--no-thinking`. The check and its limits are
+described in [serving](serving.md#openai-chat-completions), under `--reasoning-loop`.
 
 `--max-new` counts every committed generated token, including internally inserted control tokens.
 The inserted suffix is never truncated, and a request is never rejected for lacking room for it.

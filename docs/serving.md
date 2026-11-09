@@ -1152,13 +1152,19 @@ model that keeps rewriting the same passages in its thinking, which token penalt
 because every pass varies a little.
 
 - **Check.** Every 512 model-origin thinking tokens, at the end of a decode round that does not
-  end on a `</think>` still waiting for its next byte, the guard tests two signs of a loop. First,
-  the last 2,048 characters of the thinking repeat one period of at most 64 characters, as a loop
-  written without spaces does. Second, the thinking is split into words (a run of letters, digits
-  and `_`, ASCII case folded) and every other non-space character, each a word of its own, and at
-  least 25 % of the last 2,000 words lie inside a 12-word passage that occurs at least three times
-  in the last 30,000 words. A passage repeated twice (a recap) does not count. The measure and thresholds are those of Strata's `reasoning_loop_recovery` and
-  its periodic-tail check (measured on other models; NInfer has not re-tuned them).
+  end on a `</think>` still waiting for its next byte, the guard tests three signs of a loop.
+  First, the last 2,048 characters of the thinking repeat one period of at most 64 characters, as a
+  loop written without spaces does. Second, they do so once every run of digits is read as one
+  number, the period holds a number, and one of its numbers moves by the same nonzero step through
+  at least eight periods, as a loop that counts (`'time1','time2',...`) does; numbers of the tail's
+  first and last runs, which its ends may cut, are not read. Third, the thinking is split into
+  words (a run of letters, digits and `_`, ASCII case folded) and every other non-space character,
+  each a word of its own, and at least 25 % of the last 2,000 words lie inside a 12-word passage
+  that occurs at least three times in the last 30,000 words. A passage repeated twice (a recap) does
+  not count. The word measure and its thresholds are those of Strata's `reasoning_loop_recovery` and
+  its periodic-tail check (measured on other models; NInfer has not re-tuned them). The counting
+  check fired on none of 2,126 s1K-1.1 and 14,866 Bespoke-Stratos-17k reasoning texts of 4,096
+  characters or more, checked every 2,000 bytes.
 - **`stop`** ends the reply there with `finish_reason` `length` (Anthropic `max_tokens`).
 - **`conclude`** commits the same control span a reached thinking budget does (Qwen's early-close
   guidance plus `</think>`), so the model answers from the thinking it has; no prompt is read again.
