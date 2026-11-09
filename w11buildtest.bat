@@ -1,18 +1,22 @@
 @echo off
 REM Win11 build + test: verify (or, on a fresh tree, install) the vcpkg deps from the
 REM vcpkg.json manifest into the prebuilt triplet tree, then configure and build build-win11
-REM (sm_89) with tests and benchmarks enabled, and run the CTest suite. This is the fp8-dev
-REM development variant of w11build.bat.
-REM   w11buildtest.bat          incremental (default)
+REM (sm_89) with tests and benchmarks enabled, and, only with the test argument, run the
+REM CTest suite. This is the fp8-dev development variant of w11build.bat.
+REM   w11buildtest.bat          incremental build only; ctest does NOT run automatically, so a
+REM                          build never competes with the production serve for VRAM
+REM   w11buildtest.bat test     build, then run the CTest suite (needs a free GPU)
 REM   w11buildtest.bat clean    wipe build-win11 first (full rebuild; a pull's header changes are
 REM                          not recompiled incrementally on this host -- see HEAD_CHANGED note)
+REM                          (combinable: w11buildtest.bat clean test)
 REM
 REM Differences from w11build.bat (same build directory build-win11):
 REM  - BUILD_TESTING=ON and NINFER_BUILD_BENCHMARKS=ON (the "dev" CMake preset equivalents), so the
 REM    ninfer_tests bundle, the bench/ops and bench/inference targets are all configured.
 REM  - Builds every target, not just ninfer-serve.
-REM  - Runs ctest --output-on-failure over the whole suite afterwards; the result is logged to
-REM    test.log and a non-zero exit is propagated, so a red suite fails the script.
+REM  - With the test argument, runs ctest --output-on-failure over the whole suite afterwards;
+REM    the result is logged to test.log and a non-zero exit is propagated, so a red suite fails
+REM    the script.
 REM GPU tests run on the local card and are skipped automatically (exit 77) when no CUDA device is
 REM usable. Real-artifact integration tests stay skipped unless NINFER_TEST_ARTIFACT and friends
 REM are set (tests/README.md). The separate Python pytest suites (tests/artifact, tests/convert)
@@ -123,6 +127,8 @@ REM Default is an incremental build; when a pull's first build fails on an old s
 REM stale symbol (observed: flint/model.cpp.obj linked against an old qwen3_5
 REM Bindings::piece), rebuild clean:  w11buildtest.bat clean
 REM Local header-only edits under the same commit have the same hazard.
+set "RUN_TESTS=0"
+for %%A in (%*) do if /i "%%A"=="test" set "RUN_TESTS=1"
 if /i "%~1"=="clean" (
   if exist build-win11 (
     echo CLEAN - wiping build-win11
@@ -163,6 +169,12 @@ echo BUILD_EXIT=%ERRORLEVEL%
 if errorlevel 1 (
   echo BUILD_FAILED - see build.log
   exit /b 1
+)
+REM Without the test argument stop here: the ctest suite exercises the GPU and must not start
+REM while the production serve may be holding the card.
+if "%RUN_TESTS%"=="0" (
+  echo BUILD_ONLY - ctest skipped (rerun with the test argument to run the suite)
+  exit /b 0
 )
 
 REM The t03 workspace tree carries the Low Mandatory Level integrity label (inherited by everything
