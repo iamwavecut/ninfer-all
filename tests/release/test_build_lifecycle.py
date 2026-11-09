@@ -217,3 +217,28 @@ class BuildLifecycleTest(unittest.TestCase):
                         dict(created_at="2026-10-20T12:00:01Z")):
             with self.subTest(changes=changes):
                 self.assertFalse(CANCEL.superseded(run | changes, trigger))
+
+    def test_refused_cancel_accepts_a_run_that_stops_on_its_own(self):
+        # GitHub refuses to cancel a run its concurrency group is already stopping; the run reads
+        # in_progress for a few more seconds (run 42542537066 on 2026-11-09).
+        run = dict(id=7, name="CI")
+        statuses = iter(["in_progress", "in_progress", "completed"])
+        sleeps = []
+        with patch("builtins.print"):
+            CANCEL.cancel(run, lambda path: {"status": next(statuses)},
+                          lambda run_id: "HTTP 409", sleep=sleeps.append)
+        self.assertEqual(sleeps, [5, 5])
+
+    def test_refused_cancel_fails_when_the_run_keeps_going(self):
+        run = dict(id=7, name="CI")
+        sleeps = []
+        with self.assertRaisesRegex(RuntimeError, "Could not cancel CI \\(7\\): HTTP 403"):
+            CANCEL.cancel(run, lambda path: {"status": "in_progress"},
+                          lambda run_id: "HTTP 403", sleep=sleeps.append)
+        self.assertEqual(sum(sleeps), 60)
+
+    def test_accepted_cancel_does_not_poll(self):
+        run = dict(id=7, name="CI")
+        with patch("builtins.print"):
+            CANCEL.cancel(run, lambda path: self.fail("polled"), lambda run_id: "",
+                          sleep=lambda seconds: self.fail("slept"))

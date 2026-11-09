@@ -11,6 +11,7 @@ import urllib.request
 import zipfile
 
 VERSION = "4.14.2"
+ATTEMPTS = 6
 ASSETS = {
     "Windows": ("windows-x86_64.zip", "6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84"),
     "Linux": ("linux-x86_64-musl-static.tar.gz", "d540ba01f160addbd3dd5e18eda9bd34005591b095c09ac8ae9d0a1b655e7ef5"),
@@ -23,7 +24,9 @@ def main():
     root.mkdir(parents=True, exist_ok=True)
     archive = root / suffix
     url = f"https://github.com/ccache/ccache/releases/download/v{VERSION}/ccache-{VERSION}-{suffix}"
-    for attempt in range(3):
+    # GitHub's release downloads answered 504 for over three minutes on 2026-11-09: wait about
+    # five minutes in all before failing the job.
+    for attempt in range(ATTEMPTS):
         try:
             with urllib.request.urlopen(url, timeout=60) as response, archive.open("wb") as output:
                 shutil.copyfileobj(response, output)
@@ -31,10 +34,12 @@ def main():
                 if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
                     raise ValueError("Compiler cache download checksum mismatch")
             break
-        except OSError:
-            if attempt == 2:
+        except OSError as error:
+            if attempt == ATTEMPTS - 1:
                 raise
-            time.sleep(5)
+            delay = 10 * 2 ** attempt
+            print(f"Compiler cache download failed ({error}); retrying in {delay} s", flush=True)
+            time.sleep(delay)
     if suffix.endswith(".zip"):
         with zipfile.ZipFile(archive) as contents:
             contents.extractall(root)
