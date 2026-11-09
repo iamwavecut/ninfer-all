@@ -348,8 +348,8 @@ struct PatternedWeightOptions {
     float input_scale_divisor            = 0.0F;
     // NVFP4 only. The default fixture walks eight small scale bytes (0x00..0x1d), which is a
     // convenient deterministic set but not the domain a production artifact uses: the real planes
-    // reach 0x7E. A gate that only ever saw the small bytes could not arbitrate anything that
-    // depends on the scale's exponent, so this option walks the whole reachable domain instead.
+    // reach 0x7E. A test that only ever saw the small bytes could not arbitrate anything that
+    // depends on the scale's exponent, so this option walks every valid word instead.
     bool wide_scale_range                = false;
 };
 

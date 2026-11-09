@@ -214,6 +214,11 @@ int main() {
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
                                 kA16Cases);
+        // Every valid scale word: the route tables' A16 kernels differ in their K splits, and each
+        // table answers to the oracle on the scales a production artifact uses.
+        failures += run_profile(
+            "LinearSwiGLU NVFP4_A16 valid scale words",
+            {QType::NVFP4, 34816, 5120, 17408, 1809U, ActivationCompute::A16, true}, kA16Cases);
         failures += run_profile("LinearSwiGLU NVFP4_A4",
                                 {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4},
                                 kA4Cases, std::array<std::int32_t, 4>{65, 97, 128, 129});

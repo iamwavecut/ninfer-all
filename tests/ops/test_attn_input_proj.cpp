@@ -427,7 +427,7 @@ int run_bf16_target() {
 
 int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
                           ops::LinearPolicy policy = ops::LinearPolicy::A16Only,
-                          bool omit_divisors       = false) {
+                          bool omit_divisors = false, const char* fixture = "") {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -482,7 +482,7 @@ int run_nvfp4_target_case(DevicePackedWeight& parent, std::int32_t tokens,
         a4 ? kAttnInputProjA4Tolerance : kAttnInputProjA16Tolerance;
     const std::int32_t sample_count = a4 ? kA4SampleRows : 7;
     const std::string suffix =
-        std::string(" NVFP4 ") + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
+        std::string(" NVFP4 ") + fixture + (a4 ? "A4" : "A16") + " T=" + std::to_string(tokens);
     failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
                               tokens, criterion, sample_count);
     failures += verify_output("attn k" + suffix, key, parent.host, kKeyBegin, kKvRows, activation,
@@ -518,6 +518,19 @@ int run_nvfp4_target() {
         failures += run_case_allowing_arch_skip(
             "attn_input_proj NVFP4 A4 T=" + std::to_string(tokens),
             [&] { return run_nvfp4_target_case(parent, tokens, ops::LinearPolicy::AllowA4); });
+    }
+
+    // Every valid scale word, 0x00 through 0x7E, under a divisor that is not a power of two: the
+    // route tables' A16 kernels differ in their K splits, and each table answers to the oracle on
+    // the scales a production artifact uses.
+    options.weight_scale_divisor = 0.1F;
+    options.wide_scale_range     = true;
+    DevicePackedWeight valid_scale_words(
+        quantized_weight::make_patterned_weight(QType::NVFP4, kParentRows, kHidden, 333U, options));
+    for (const std::int32_t tokens :
+         {1, 2, 3, 4, 7, 8, 16, 17, 32, 33, 64, 65, 128, 129, 512, 1024}) {
+        failures += run_nvfp4_target_case(valid_scale_words, tokens, ops::LinearPolicy::A16Only,
+                                          false, "valid scale words ");
     }
     return failures;
 }

@@ -102,8 +102,8 @@ quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
 // reduction order; a non-power-of-two divisor is what makes such a difference observable.
 quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
                                                  std::uint32_t seed, float weight_scale_divisor);
-// Same as above with the scale plane walking the whole reachable E4M3 domain (0x00..0x7F) instead
-// of the eight small bytes the fixture uses by default. A production artifact's scales reach 0x7E,
+// Same as above with the scale plane walking every valid E4M3 scale word (0x00..0x7E) instead of
+// the eight small bytes the fixture uses by default. A production artifact's scales reach 0x7E,
 // so the narrow fixture is a blind spot for anything that depends on the scale's exponent.
 quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
                                                  std::uint32_t seed, float weight_scale_divisor,
