@@ -619,6 +619,15 @@ struct EngineOptions {
     // row-form kernel under either chain. On a native-FP4 card it replaces the A4 permission.
     // Where both this and nvfp4_w4a16 are set, nvfp4_w4a16 wins.
     bool nvfp4_w4a8_int                    = false;
+    // Fold the producer-side RMSNorm into the FP8 A8 activation quantizer (the post-attention norm
+    // feeding the MLP gate_up, and the attention input norm feeding the QKV projection): the
+    // normalized row is quantized without being materialized. Bit-for-bit the two-step
+    // composition, so a latency trade only, on by default; clearing it restores the standalone
+    // rmsnorm + quantize pair.
+    bool fp8_fuse_rmsnorm                    = true;
+    // Same trade for the SiLU-gated RMSNorm feeding the 5120x6144 output projection (the gated
+    // delta net's output norm); bit-for-bit the two-step composition, on by default.
+    bool fp8_fuse_gated_norm                 = true;
     // Largest merged-token count one media item may occupy; larger media is downscaled at
     // preprocessing. Also bounds the overlay window.
     std::uint32_t vision_max_merged_tokens = 16384;

@@ -53,6 +53,17 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 
 } // namespace
 
+bool fp8_linear_swiglu_fused_norm_eligible(LinearPolicy policy, std::int32_t tokens) {
+    if (tokens <= 0 || !allows_a8(policy) || allows_a8_int(policy)) { return false; }
+    // The unified chain's A8 schedule is its TMA route, which the fused entry does not serve;
+    // its own chain's A8 gate is resolve_route's.
+    if (fused_route_table("unified/fp8_linear_swiglu", tokens, fp8_wide_route_table(policy),
+                          allows_a8(policy)) == LinearRouteTable::Unified) {
+        return false;
+    }
+    return tokens >= 3;
+}
+
 static std::size_t fp8_linear_swiglu_workspace_capacity_bytes_own(LinearPolicy policy,
                                                                   std::int32_t min_tokens,
                                                                   std::int32_t max_tokens) {

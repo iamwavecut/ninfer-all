@@ -414,6 +414,8 @@ int main(int argc, char** argv) {
         engine_options.wddm_evictable_budget    = cli.wddm_evictable_budget;
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
         engine_options.prefill_a8               = cli.prefill_a8;
+        engine_options.fp8_fuse_rmsnorm         = cli.fp8_fuse_rmsnorm;
+        engine_options.fp8_fuse_gated_norm      = cli.fp8_fuse_gated_norm;
         engine_options.nvfp4_w4a8_int           = cli.nvfp4_w4a8_int;
         engine_options.nvfp4_w4a16              = cli.nvfp4_w4a16;
         engine_options.prefill_cublas           = cli.prefill_cublas;

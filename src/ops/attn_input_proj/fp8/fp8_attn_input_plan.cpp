@@ -40,6 +40,17 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
 
 } // namespace
 
+bool fp8_attn_input_fused_norm_eligible(LinearPolicy policy, std::int32_t tokens) {
+    if (tokens <= 0 || policy == LinearPolicy::A16Only || !allows_a8(policy)) { return false; }
+    // The unified chain's A8 schedule is its TMA route, which the fused entry does not serve;
+    // its own chain's A8 gate is resolve_route's.
+    if (fused_route_table("unified/fp8_attn_input", tokens, fp8_wide_route_table(policy),
+                          allows_a8(policy)) == LinearRouteTable::Unified) {
+        return false;
+    }
+    return tokens >= 5;
+}
+
 static std::size_t fp8_attn_input_workspace_capacity_bytes_own(LinearPolicy policy,
                                                                std::int32_t min_tokens,
                                                                std::int32_t max_tokens) {

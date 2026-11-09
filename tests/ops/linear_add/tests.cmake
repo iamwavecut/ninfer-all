@@ -32,6 +32,13 @@ ninfer_add_op_test(ninfer_linear_add_fp8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8.cpp"
   LIBRARIES ninfer_ops)
 
+# The A8 route with the SiLU-gated RMSNorm folded into the quantizer, byte-exact against the
+# standalone gated norm + A8 route and the separate quantizer's planes.
+ninfer_add_op_test(ninfer_linear_add_fp8_fused_gated_rmsnorm_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_fused_gated_rmsnorm.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_linear_add_fp8_fused_gated_rmsnorm_test PROPERTIES SKIP_RETURN_CODE 77)
+
 add_test(NAME ninfer_linear_add_fp8_wide_test
   COMMAND ninfer_tests ninfer_linear_add_fp8_test --wide-only)
 set_tests_properties(ninfer_linear_add_fp8_wide_test

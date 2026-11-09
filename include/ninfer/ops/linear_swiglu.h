@@ -128,4 +128,33 @@ void linear_swiglu_fused_rmsnorm_int8(const Tensor& residual, const Tensor& norm
                                       const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
                                       WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * Whether the row-scaled FP8 SwiGLU route takes the fused norm for this gate_up parent at this
+ * width. The answer is the FP8 A8 plan's route: true exactly when the legacy chain answers the
+ * call with its A8 Tensor Core mainloop (T >= 3 under an A8-permitting policy that is not an
+ * integer-A8 policy). A16Only and integer-A8 policies take the A16 route and are not eligible;
+ * the unified chain's A8 is its TMA route, which this entry does not serve. This is a host-side
+ * route predicate. A true result does not validate the weight payload.
+ */
+[[nodiscard]] bool linear_swiglu_fused_rmsnorm_fp8_eligible(const Weight& gate_up_weight,
+                                                             LinearPolicy policy,
+                                                             std::int32_t tokens);
+
+/**
+ * Computes the Offset RMSNorm of `residual` and the SwiGLU projection of the result with one
+ * activation pass: a single kernel turns the residual row into the per-token E4M3 codes and FP32
+ * scale the A8 mainloop then consumes, replacing the caller's separate rmsnorm and this route's
+ * separate quantise. `residual` is BF16 [5120, tokens], `out` BF16 [gate_up.n / 2, tokens], the
+ * parent FP8_E4M3FN_ROW_BF16 [34816,5120], and the policy domain the FP8 A8 route's. The workspace
+ * capacity is the ordinary A8 call's for this width (this entry allocates strictly less: the
+ * caller's BF16 normed row never exists).
+ * Bit-for-bit the composition of Offset rmsnorm() into BF16 storage followed by that route's own
+ * per-token quantiser; the norm half reproduces the D=5120 launcher's pair ownership, accumulation
+ * order, block reduction and single BF16 rounding, and the quantise half applies the per-token
+ * amax/448 scale with SATFINITE E4M3 conversion the standalone quantiser uses.
+ */
+void linear_swiglu_fused_rmsnorm_fp8(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                     const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
+                                     WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace ninfer::ops

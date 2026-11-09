@@ -129,6 +129,8 @@ struct ServeOptions {
     [[nodiscard]] bool router() const noexcept { return models_dir || models_preset; }
     bool mlp_a8_decode      = false;
     bool prefill_a8         = true;
+    bool fp8_fuse_rmsnorm   = true;
+    bool fp8_fuse_gated_norm = true;
     bool nvfp4_w4a8_int     = false;
     bool nvfp4_w4a16        = false;
     bool prefill_cublas     = false;

@@ -305,6 +305,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;
+    engine_options.fp8_fuse_rmsnorm         = options.fp8_fuse_rmsnorm;
+    engine_options.fp8_fuse_gated_norm      = options.fp8_fuse_gated_norm;
     engine_options.nvfp4_w4a8_int           = options.nvfp4_w4a8_int;
     engine_options.nvfp4_w4a16              = options.nvfp4_w4a16;
     engine_options.prefill_cublas           = options.prefill_cublas;

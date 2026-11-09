@@ -76,4 +76,39 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream);
 
+/**
+ * Whether the row-scaled FP8 [5120,6144] projection takes the fused norm for this weight at this
+ * width. The answer is the FP8 A8 plan's route: true exactly when the legacy chain answers the
+ * call with its A8 Tensor Core mainloop (T >= 17 under an A8-permitting policy that is not an
+ * integer-A8 policy). A16Only and integer-A8 policies take the A16 route and are not eligible;
+ * the unified chain's A8 is its TMA route, which this entry does not serve. The 5120x17408 problem
+ * has no fused entry. This is a host-side route predicate. A true result does not validate the
+ * weight payload.
+ */
+[[nodiscard]] bool linear_add_fused_gated_rmsnorm_fp8_eligible(const Weight& weight,
+                                                               LinearPolicy policy,
+                                                               std::int32_t tokens);
+
+/**
+ * Computes the SiLU-gated RMSNorm of `o` and the [5120,6144] projection of the result, adding the
+ * product into `residual`, with one activation pass: a single kernel turns each `o` row into the
+ * per-token E4M3 codes and FP32 scale the A8 mainloop then consumes, replacing the caller's
+ * separate gated_rmsnorm and this route's separate quantise. `o` is BF16 [6144, tokens], `z` its
+ * BF16 [6144, tokens] gate row, `residual` BF16 [5120, tokens], the weight
+ * FP8_E4M3FN_ROW_BF16 [5120,6144], and `norm_weight` the 128 BF16 gain of the row's 128-wide
+ * head: the 6144 row holds 48 heads and each head normalizes itself, x * rsqrt(sum(x*x)/128 +
+ * eps) * norm_weight, then * silu(z) (no unit offset), rounded to BF16 before quantization. The
+ * per-token E4M3 scale spans the whole 6144 row. The workspace capacity is the ordinary A8 call's
+ * for this width (this entry allocates strictly less: the caller's BF16 normed row never exists).
+ * Bit-for-bit the composition of gated_rmsnorm() on the head-grouped view followed by
+ * linear_add() with the same policy: the norm half reproduces the D=128 launcher's per-head pair
+ * ownership, accumulation order, warp reduction and single BF16 rounding, and the quantise half
+ * applies the per-token amax/448 scale with SATFINITE E4M3 conversion the standalone quantiser
+ * uses.
+ */
+void linear_add_fused_gated_rmsnorm_fp8(const Tensor& o, const Tensor& norm_weight, const Tensor& z,
+                                        float eps, const Weight& weight, Tensor& residual,
+                                        LinearPolicy policy, WorkspaceArena& workspace,
+                                        cudaStream_t stream);
+
 } // namespace ninfer::ops

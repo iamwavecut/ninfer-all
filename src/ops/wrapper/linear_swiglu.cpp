@@ -394,4 +394,43 @@ void linear_swiglu_fused_rmsnorm_int8(const Tensor& residual, const Tensor& norm
         detail::Nvfp4Int8Mainloop::Grouped, stream);
 }
 
+bool linear_swiglu_fused_rmsnorm_fp8_eligible(const Weight& gate_up_weight, LinearPolicy policy,
+                                              std::int32_t tokens) {
+    // The chain answer comes from the plan that owns the route, so a caller that skips its
+    // standalone rmsnorm here cannot disagree with the route the projection then takes.
+    return detail::fp8_linear_swiglu_fused_norm_eligible(policy, tokens) &&
+           gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+           gate_up_weight.layout == QuantLayout::RowScale && gate_up_weight.n == 34816 &&
+           gate_up_weight.k == 5120;
+}
+
+void linear_swiglu_fused_rmsnorm_fp8(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                     const Weight& gate_up_weight, Tensor& out, LinearPolicy policy,
+                                     WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = residual.ne[1];
+    if (!linear_swiglu_fused_rmsnorm_fp8_eligible(gate_up_weight, policy, tokens)) {
+        throw std::invalid_argument("fused fp8 linear_swiglu: unsupported route");
+    }
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument("fused fp8 linear_swiglu: eps must be positive and finite");
+    }
+    if (residual.dtype != DType::BF16 || residual.ne[0] != 5120 || residual.ne[2] != 1 ||
+        residual.ne[3] != 1 || !residual.is_contiguous() || !aligned_to(residual.data, 16)) {
+        throw std::invalid_argument("fused fp8 linear_swiglu: invalid residual");
+    }
+    // The gain is read as a scalar bf162; artifact gain slices are 4-byte aligned, not 16.
+    if (norm_weight.dtype != DType::BF16 || norm_weight.ne[0] != 5120 || norm_weight.ne[1] != 1 ||
+        norm_weight.ne[2] != 1 || norm_weight.ne[3] != 1 || !norm_weight.is_contiguous() ||
+        !aligned_to(norm_weight.data, 4)) {
+        throw std::invalid_argument("fused fp8 linear_swiglu: invalid norm weight");
+    }
+    if (out.dtype != DType::BF16 || out.ne[0] != gate_up_weight.n / 2 || out.ne[1] != tokens ||
+        out.ne[2] != 1 || out.ne[3] != 1 || !out.is_contiguous() || !aligned_to(out.data, 16)) {
+        throw std::invalid_argument("fused fp8 linear_swiglu: invalid output");
+    }
+    (void)detail::validate_fp8_weight(gate_up_weight, "fused fp8 linear_swiglu");
+    detail::fp8_linear_swiglu_fused_norm_launch(residual, norm_weight, eps, gate_up_weight, out,
+                                                workspace, stream);
+}
+
 } // namespace ninfer::ops

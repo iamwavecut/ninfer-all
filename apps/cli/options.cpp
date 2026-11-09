@@ -264,6 +264,11 @@ std::string usage_text(const char* argv0) {
            "  --no-prefill-a8               return full prefill tiles to their A16 routes,\n"
            "                                which is how the integer routes are measured on\n"
            "                                a whole request\n"
+           "  --no-fp8-fuse-rmsnorm         stop folding the FP8 A8 producer RMSNorms into the\n"
+           "                                activation quantizer (post-attention and attention\n"
+           "                                input norms); restores the standalone norm + quantize\n"
+           "  --no-fp8-fuse-gated-norm      stop folding the gated delta net's output norm into\n"
+           "                                its A8 output projection's quantizer; same trade\n"
            "  --nvfp4-w4a8-int              NVFP4 weights on int8 tensor cores (W4A8): the\n"
            "                                stored E2M1 codes feed an s8 MMA mainloop, prefill\n"
            "                                and decode alike; the route band picks MMQ (own)\n"
@@ -513,6 +518,10 @@ Options parse_options(int argc, char** argv) {
             options.prefill_a8 = false;
         } else if (arg == "--nvfp4-w4a8-int") {
             options.nvfp4_w4a8_int = true;
+        } else if (arg == "--no-fp8-fuse-rmsnorm") {
+            options.fp8_fuse_rmsnorm = false;
+        } else if (arg == "--no-fp8-fuse-gated-norm") {
+            options.fp8_fuse_gated_norm = false;
         } else if (arg == "--nvfp4-w4a16") {
             options.nvfp4_w4a16 = true;
         } else if (arg == "--lookup-ngram") {

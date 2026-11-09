@@ -225,6 +225,13 @@ ninfer_add_op_test(ninfer_attn_input_proj_fused_rmsnorm_test
   LIBRARIES ninfer_ops)
 set_tests_properties(ninfer_attn_input_proj_fused_rmsnorm_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# The FP8 A8 route with the producer RMSNorm folded into the quantizer, byte-exact against the
+# standalone norm + A8 route and the separate quantizer's planes.
+ninfer_add_op_test(ninfer_attn_input_proj_fused_rmsnorm_fp8_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj_fused_rmsnorm_fp8.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_attn_input_proj_fused_rmsnorm_fp8_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_op_test(ninfer_gdn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
   LIBRARIES ninfer_ops)

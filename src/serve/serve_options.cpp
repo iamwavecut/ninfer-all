@@ -188,6 +188,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                GDN input projections off that route\n"
            "  --no-prefill-a8               prefill every projection on the A16 routes\n"
            "                                instead of the integer-activation ones\n"
+           "  --no-fp8-fuse-rmsnorm         stop folding the FP8 A8 producer RMSNorms into the\n"
+           "                                activation quantizer; restores the standalone\n"
+           "                                norm + quantize\n"
+           "  --no-fp8-fuse-gated-norm      stop folding the gated delta net's output norm into\n"
+           "                                its A8 output projection's quantizer\n"
            "  --nvfp4-w4a8-int              NVFP4 weights on int8 tensor cores (W4A8),\n"
            "                                prefill and decode alike\n"
            "  --nvfp4-w4a16                 native-FP4 cards: NVFP4 weights on the A16\n"
@@ -1526,6 +1531,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
+            continue;
+        }
+        if (arg == "--no-fp8-fuse-rmsnorm") {
+            options.fp8_fuse_rmsnorm = false;
+            continue;
+        }
+        if (arg == "--no-fp8-fuse-gated-norm") {
+            options.fp8_fuse_gated_norm = false;
             continue;
         }
         if (arg == "--nvfp4-w4a8-int") {

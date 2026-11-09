@@ -7,6 +7,7 @@
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_a8_schedule.cuh"
 #include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_fused_norm_quantize.h"
 #include "ops/linear/fp8/fp8_output.cuh"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_output.cuh"
 
@@ -80,6 +81,27 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
         launch_problem<A8Mid>(weight, out, scratch, x.ne[1], stream);
     } else {
         launch_problem<A8Large>(weight, out, scratch, x.ne[1], stream);
+    }
+}
+
+// The A8 route with the Offset RMSNorm folded into the quantize: the fused producer writes the
+// same Fp8A8Workspace the separate launch_fp8_a8_quantize would (bit for bit) and the MMA above
+// runs unchanged, so the result is the composition of rmsnorm() into BF16 storage and this route.
+void fp8_linear_swiglu_fused_norm_launch(const Tensor& residual, const Tensor& norm_weight,
+                                         float eps, const Weight& weight, Tensor& out,
+                                         WorkspaceArena& workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
+    auto scope = workspace.scope();
+    const Fp8A8Workspace scratch =
+        allocate_fp8_a8_workspace(workspace, residual.ne[1], Geometry::kInputRows);
+    launch_fp8_fused_rmsnorm_quantize(residual, norm_weight, eps, Geometry::kInputRows, scratch,
+                                      stream);
+    if (residual.ne[1] <= 128) {
+        launch_problem<A8Small>(weight, out, scratch, residual.ne[1], stream);
+    } else if (residual.ne[1] <= 192) {
+        launch_problem<A8Mid>(weight, out, scratch, residual.ne[1], stream);
+    } else {
+        launch_problem<A8Large>(weight, out, scratch, residual.ne[1], stream);
     }
 }
 

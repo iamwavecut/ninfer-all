@@ -7,6 +7,7 @@
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_a8_schedule.cuh"
 #include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_fused_norm_quantize.h"
 #include "ops/linear/fp8/fp8_output.cuh"
 #include "ops/linear_add/fp8/fp8_linear_add_epilogue.cuh"
 
@@ -117,6 +118,23 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
         break;
     }
     throw std::invalid_argument("fp8 linear_add: unsupported problem");
+}
+
+// The A8 route with the SiLU-gated RMSNorm folded into the quantize: the fused producer writes
+// the same Fp8A8Workspace the separate launch_fp8_a8_quantize would (bit for bit) and the MMA
+// above runs unchanged, so the result is the composition of gated_rmsnorm() into BF16 storage
+// and this route. The 5120x17408 problem has no fused entry.
+void fp8_linear_add_fused_gated_launch(const Tensor& o, const Tensor& norm_weight, const Tensor& z,
+                                       float eps, const Weight& weight, Tensor& residual,
+                                       WorkspaceArena& workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
+    if (resolve_fp8_geometry(weight.n, weight.k) != Fp8GeometryId::N5120K6144) {
+        throw std::invalid_argument("fp8 linear_add fused gated norm: unsupported problem");
+    }
+    auto scope                   = workspace.scope();
+    const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(workspace, o.ne[1], weight.k);
+    launch_fp8_fused_gated_rmsnorm_quantize(o, norm_weight, z, eps, weight.k, scratch, stream);
+    launch_5120_6144(weight, residual, scratch, o.ne[1], stream);
 }
 
 } // namespace ninfer::ops::detail

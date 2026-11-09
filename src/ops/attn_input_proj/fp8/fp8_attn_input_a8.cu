@@ -6,6 +6,7 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
 #include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_fused_norm_quantize.h"
 #include "ops/linear/fp8/fp8_output.cuh"
 
 #include <cuda_bf16.h>
@@ -56,12 +57,10 @@ void run(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
 }
 } // namespace
 
-void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
-                              Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
-    require_fp8_a8_card();
-    launch_fp8_a8_quantize(x, weight, workspace, stream);
-    // This Op owns its tile choices; the generic Linear schedules do not describe four-output
-    // projection's short-column cost. All variants share the same activation representation.
+// This Op owns its tile choices; the generic Linear schedules do not describe four-output
+// projection's short-column cost. All variants share the same activation representation.
+static void run_a8_ladder(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                          Fp8A8Workspace workspace, int tokens, cudaStream_t stream) {
     using Small32   = Fp8MmaSchedule<32, 64, 128, 1, 2, 3, 2, Cache::cg, Cache::cg,
                                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
     using Small64   = Fp8MmaSchedule<64, 64, 128, 2, 2, 3, 2, Cache::cg, Cache::cg,
@@ -74,17 +73,38 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
                                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
     using Prefill   = Fp8MmaSchedule<64, 128, 128, 2, 4, 2, 2, Cache::cg, Cache::cg,
                                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
-    if (x.ne[1] <= 32)
-        run<Small32>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    else if (x.ne[1] <= 64)
-        run<Small64>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    else if (x.ne[1] <= 96)
-        run<ShortTail>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    else if (x.ne[1] <= 128)
-        run<Wide128>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    else if (x.ne[1] <= 144)
-        run<Tail144>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    if (tokens <= 32)
+        run<Small32>(weight, q, gate, k, v, workspace, tokens, stream);
+    else if (tokens <= 64)
+        run<Small64>(weight, q, gate, k, v, workspace, tokens, stream);
+    else if (tokens <= 96)
+        run<ShortTail>(weight, q, gate, k, v, workspace, tokens, stream);
+    else if (tokens <= 128)
+        run<Wide128>(weight, q, gate, k, v, workspace, tokens, stream);
+    else if (tokens <= 144)
+        run<Tail144>(weight, q, gate, k, v, workspace, tokens, stream);
     else
-        run<Prefill>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        run<Prefill>(weight, q, gate, k, v, workspace, tokens, stream);
+}
+
+void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                              Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
+    launch_fp8_a8_quantize(x, weight, workspace, stream);
+    run_a8_ladder(weight, q, gate, k, v, workspace, x.ne[1], stream);
+}
+
+// The A8 route with the Offset RMSNorm folded into the quantize: the fused producer writes the
+// same Fp8A8Workspace the separate launch_fp8_a8_quantize would (bit for bit) and the MMA above
+// runs unchanged, so the result is the composition of rmsnorm() into BF16 storage and this route.
+void fp8_attn_input_fused_norm_launch(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                      const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                                      Tensor& v, WorkspaceArena& workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
+    auto scope = workspace.scope();
+    const Fp8A8Workspace scratch =
+        allocate_fp8_a8_workspace(workspace, residual.ne[1], weight.k);
+    launch_fp8_fused_rmsnorm_quantize(residual, norm_weight, eps, weight.k, scratch, stream);
+    run_a8_ladder(weight, q, gate, k, v, scratch, residual.ne[1], stream);
 }
 } // namespace ninfer::ops::detail

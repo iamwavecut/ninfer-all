@@ -1513,13 +1513,19 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const bool fused_int8 = !fused_nvfp4 && input_basis == InputBasis::Primal && single != nullptr &&
                             ops::attn_input_proj_fused_rmsnorm_int8_eligible(
                                 single->weight, single->policy, T);
+    // The FP8 A8 route carries the same edge: one pass over the residual row produces the per-token
+    // E4M3 codes and scale the A8 mainloop reads. The policies are disjoint from the two above.
+    const bool fused_fp8 = !fused_nvfp4 && !fused_int8 && input_basis == InputBasis::Primal &&
+                           single != nullptr && parameters_.model.options().fp8_fuse_rmsnorm &&
+                           ops::attn_input_proj_fused_rmsnorm_fp8_eligible(
+                               single->weight, single->policy, T);
     Tensor h;
-    if (!fused_nvfp4 && !fused_int8) {
+    if (!fused_nvfp4 && !fused_int8 && !fused_fp8) {
         h = workspace::matrix(work_, DType::BF16, dimension(config_.hidden_size), T);
     }
     if (input_basis == InputBasis::Rotated) {
         ops::rmsnorm_hadamard(x, w.input_norm, config_.rms_norm_eps, true, input_signs, h, s);
-    } else if (!fused_nvfp4 && !fused_int8) {
+    } else if (!fused_nvfp4 && !fused_int8 && !fused_fp8) {
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
     }
 
@@ -1543,6 +1549,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         ops::attn_input_proj_fused_rmsnorm_int8(x, w.input_norm, config_.rms_norm_eps,
                                                 single->weight, q_flat, gate_flat, k_flat, v_flat,
                                                 single->policy, work_, s);
+    } else if (fused_fp8) {
+        ops::attn_input_proj_fused_rmsnorm_fp8(x, w.input_norm, config_.rms_norm_eps,
+                                               single->weight, q_flat, gate_flat, k_flat, v_flat,
+                                               single->policy, work_, s);
     } else {
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s, input_basis);
     }
@@ -1904,9 +1914,27 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         project_residual(normalized, p.output, x, InputBasis::Rotated, false);
         return;
     }
+    const bool wide_verification = wide_residual_verification(ph, row_width(T), row_width(T));
+    const auto output_policy     = residual_projection_policy(p.output, wide_verification);
+    // The FP8 A8 route carries the same fused edge: one pass over the gated delta net's output
+    // row produces the per-token E4M3 codes and scale the A8 mainloop reads, so the gated norm
+    // below is skipped rather than run and then re-read. Wide verification forces A16, so it
+    // stays on the standalone pair.
+    const bool fused_fp8 = residual_partial_ == nullptr &&
+                           parameters_.model.options().fp8_fuse_gated_norm &&
+                           ops::linear_add_fused_gated_rmsnorm_fp8_eligible(p.output.weight,
+                                                                           output_policy, T);
+    if (fused_fp8) {
+        // The projection operand is the head-grouped 3-D view above; the op contract is the
+        // 2-D {value_width, tokens} matrix, the same view the standalone pair consumes.
+        Tensor o2 = o.view({dimension(config.gdn->value_width()), T});
+        Tensor z2 = z.view({dimension(config.gdn->value_width()), T});
+        ops::linear_add_fused_gated_rmsnorm_fp8(o2, p.norm, z2, config.rms_norm_eps,
+                                                p.output.weight, x, output_policy, work_, s);
+        return;
+    }
     ops::gated_rmsnorm(o, p.norm, z, ops::GateActivation::Silu, config.rms_norm_eps, on, s);
-    project_residual(normalized, p.output, x, InputBasis::Primal,
-                     wide_residual_verification(ph, row_width(T), row_width(T)));
+    project_residual(normalized, p.output, x, InputBasis::Primal, wide_verification);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1936,6 +1964,17 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
             dense->gate_up.weight,
             phase == Phase::Verify ? dense->verify_gate_up_policy : dense->gate_up.policy,
             static_cast<std::int32_t>(x.ne[1]));
+    // The FP8 gate_up route carries the same edge as the int8 one: one pass over the residual row
+    // produces the per-token E4M3 codes and scale the A8 mainloop reads, so the rmsnorm below is
+    // skipped rather than run and then re-read. The weight policies are disjoint from the int8
+    // route's, so the predicates never both fire.
+    const bool fused_fp8 =
+        dense != nullptr && !dense->up.has_value() &&
+        parameters_.model.options().fp8_fuse_rmsnorm &&
+        ops::linear_swiglu_fused_rmsnorm_fp8_eligible(
+            dense->gate_up.weight,
+            phase == Phase::Verify ? dense->verify_gate_up_policy : dense->gate_up.policy,
+            static_cast<std::int32_t>(x.ne[1]));
     const bool wide =
         wide_residual_verification(phase, row_width(x.ne[1]), row_width(x.ne[1]));
     if (fused_int8) {
@@ -1943,6 +1982,17 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
         // norm has nowhere to go here. Refuse the combination instead of answering from x.
         if (residual_partial_ != nullptr) {
             throw std::logic_error("FFN: the fused int8 input norm has no tensor-parallel share");
+        }
+        const InputNorm norm{&weights.post_attention_norm, config.rms_norm_eps};
+        ffn(x, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
+            InputBasis::Primal, wide, experts_, &norm, nullptr);
+        return;
+    }
+    if (fused_fp8) {
+        // The share writes the row it is given and the all-reduce sums those shares, so a deferred
+        // norm has nowhere to go here. Refuse the combination instead of answering from x.
+        if (residual_partial_ != nullptr) {
+            throw std::logic_error("FFN: the fused fp8 input norm has no tensor-parallel share");
         }
         const InputNorm norm{&weights.post_attention_norm, config.rms_norm_eps};
         ffn(x, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,

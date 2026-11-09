@@ -2,6 +2,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/fp8_format.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/fp8_a8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8_dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/fp8_fused_norm_quantize.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8_general.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8_general_a8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120.cu"

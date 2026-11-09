@@ -292,7 +292,11 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     {
         auto call = workspace.scope();
         const auto policy = verify ? p.verify_gate_up_policy : p.gate_up.policy;
-        if (input_norm != nullptr) {
+        if (input_norm != nullptr &&
+            ops::linear_swiglu_fused_rmsnorm_fp8_eligible(gu, policy, columns)) {
+            ops::linear_swiglu_fused_rmsnorm_fp8(hidden, *input_norm->weight, input_norm->eps, gu,
+                                                 activation, policy, workspace, stream);
+        } else if (input_norm != nullptr) {
             ops::linear_swiglu_fused_rmsnorm_int8(hidden, *input_norm->weight, input_norm->eps, gu,
                                                   activation, policy, workspace, stream);
         } else {

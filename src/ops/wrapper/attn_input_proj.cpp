@@ -598,6 +598,43 @@ void attn_input_proj_fused_rmsnorm_int8(const Tensor& residual, const Tensor& no
         detail::Nvfp4Int8Mainloop::Grouped, stream);
 }
 
+bool attn_input_proj_fused_rmsnorm_fp8_eligible(const Weight& weight, LinearPolicy policy,
+                                                std::int32_t tokens) {
+    // The chain answer comes from the plan that owns the route, so a caller that skips its
+    // standalone rmsnorm here cannot disagree with the route the projection then takes.
+    return detail::fp8_attn_input_fused_norm_eligible(policy, tokens) &&
+           weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && weight.layout == QuantLayout::RowScale &&
+           weight.n == 14336 && weight.k == 5120;
+}
+
+void attn_input_proj_fused_rmsnorm_fp8(const Tensor& residual, const Tensor& norm_weight,
+                                       float eps, const Weight& projection_weight, Tensor& q,
+                                       Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                                       WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = residual.ne[1];
+    if (!attn_input_proj_fused_rmsnorm_fp8_eligible(projection_weight, policy, tokens)) {
+        throw std::invalid_argument("fused fp8 attn_input_proj: unsupported route");
+    }
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument(
+            "fused fp8 attn_input_proj: eps must be positive and finite");
+    }
+    require_matrix(residual, 5120, tokens, "residual");
+    // The gain is read as a scalar bf162; artifact gain slices are 4-byte aligned, not 16.
+    if (norm_weight.dtype != DType::BF16 || norm_weight.ne[0] != 5120 || norm_weight.ne[1] != 1 ||
+        norm_weight.ne[2] != 1 || norm_weight.ne[3] != 1 || !norm_weight.is_contiguous() ||
+        !aligned_to(norm_weight.data, 4)) {
+        throw std::invalid_argument("fused fp8 attn_input_proj: invalid norm weight");
+    }
+    require_matrix(q, 6144, tokens, "q");
+    require_matrix(gate, 6144, tokens, "gate");
+    require_matrix(k, 1024, tokens, "k");
+    require_matrix(v, 1024, tokens, "v");
+    (void)detail::validate_fp8_weight(projection_weight, "fused fp8 attn_input_proj");
+    detail::fp8_attn_input_fused_norm_launch(residual, norm_weight, eps, projection_weight, q,
+                                             gate, k, v, workspace, stream);
+}
+
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     dispatch_single_parent(x, query_key_gate_value_weight, q, gate, k, v, LinearPolicy::A16Only,

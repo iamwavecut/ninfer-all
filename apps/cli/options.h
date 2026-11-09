@@ -75,6 +75,8 @@ struct Options {
     bool prefill_a8     = true;
     bool nvfp4_w4a8_int = false;
     bool nvfp4_w4a16    = false;
+    bool fp8_fuse_rmsnorm = true;
+    bool fp8_fuse_gated_norm = true;
     bool prefill_cublas = false;
     bool prefill_cublas_projections = true;
 

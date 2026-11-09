@@ -154,6 +154,34 @@ void attn_input_proj_fused_rmsnorm_int8(const Tensor& residual, const Tensor& no
                                         WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * Whether the single-parent row-scaled FP8 [14336,5120] projection takes the fused norm for this
+ * parent at this width. The answer is the FP8 A8 plan's route: true exactly when the legacy chain
+ * answers the call with its A8 Tensor Core mainloop (T >= 5 under an A8-permitting policy).
+ * A16Only takes the A16 route and is not eligible; the unified chain's A8 is its TMA route, which
+ * this entry does not serve. This is a host-side route predicate. A true result does not validate
+ * the weight payload.
+ */
+[[nodiscard]] bool attn_input_proj_fused_rmsnorm_fp8_eligible(const Weight& weight,
+                                                              LinearPolicy policy,
+                                                              std::int32_t tokens);
+
+/**
+ * Computes the Offset RMSNorm and the single-parent row-scaled FP8 Q/K/output-gate/V projection
+ * with one activation pass: a single kernel turns the residual row into the per-token E4M3 codes
+ * and FP32 scale the A8 mainloop then consumes, replacing this route's separate quantise launch
+ * and the model layer's separate rmsnorm. Same shapes, policy domain and workspace capacity as
+ * attn_input_proj(), restricted to the FP8 A8 route.
+ * Bit-for-bit the composition of Offset rmsnorm() into BF16 storage followed by that route's own
+ * per-token quantiser: the norm half reproduces the D=5120 launcher's pair ownership, accumulation
+ * order, reduction and single BF16 rounding, and the quantise half applies the per-token amax/448
+ * scale with SATFINITE E4M3 conversion the standalone quantiser uses. No hidden tensor is written.
+ */
+void attn_input_proj_fused_rmsnorm_fp8(const Tensor& residual, const Tensor& norm_weight, float eps,
+                                       const Weight& projection_weight, Tensor& q, Tensor& gate,
+                                       Tensor& k, Tensor& v, LinearPolicy policy,
+                                       WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
  * Applies the A16-only single-parent Q/K/output-gate/V projection without transient workspace.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

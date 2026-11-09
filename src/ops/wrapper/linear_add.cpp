@@ -22,6 +22,7 @@
 #include "ops/linear_add/q8/q8_linear_add_plan.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -378,6 +379,46 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     }
 
     throw std::invalid_argument("linear_add: unsupported weight format");
+}
+
+bool linear_add_fused_gated_rmsnorm_fp8_eligible(const Weight& weight, LinearPolicy policy,
+                                                 std::int32_t tokens) {
+    // The chain answer comes from the plan that owns the route, so a caller that skips its
+    // standalone gated_rmsnorm here cannot disagree with the route the projection then takes.
+    return detail::fp8_linear_add_fused_gated_eligible(policy, tokens) &&
+           weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && weight.layout == QuantLayout::RowScale &&
+           weight.n == detail::Fp8N5120K6144::kOutputRows &&
+           weight.k == detail::Fp8N5120K6144::kInputRows;
+}
+
+void linear_add_fused_gated_rmsnorm_fp8(const Tensor& o, const Tensor& norm_weight,
+                                        const Tensor& z, float eps, const Weight& weight,
+                                        Tensor& residual, LinearPolicy policy,
+                                        WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = o.ne[1];
+    if (!linear_add_fused_gated_rmsnorm_fp8_eligible(weight, policy, tokens)) {
+        throw std::invalid_argument("fused gated fp8 linear_add: unsupported route");
+    }
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument(
+            "fused gated fp8 linear_add: eps must be positive and finite");
+    }
+    require_tensor(o, DType::BF16, 6144, tokens, "o");
+    require_tensor(z, DType::BF16, 6144, tokens, "z");
+    require_tensor(residual, DType::BF16, 5120, tokens, "residual");
+    if (overlaps(o, residual)) {
+        throw std::invalid_argument("fused gated fp8 linear_add: o and residual must not overlap");
+    }
+    // The 6144 row holds 48 heads of 128; the gain is the head's 128 BF16 vector, read as scalar
+    // bf162 (artifact gain slices are 4-byte aligned, not 16).
+    if (norm_weight.dtype != DType::BF16 || norm_weight.ne[0] != 128 || norm_weight.ne[1] != 1 ||
+        norm_weight.ne[2] != 1 || norm_weight.ne[3] != 1 || !norm_weight.is_contiguous() ||
+        !aligned_to(norm_weight.data, 4)) {
+        throw std::invalid_argument("fused gated fp8 linear_add: invalid norm weight");
+    }
+    (void)detail::validate_fp8_weight(weight, "fused gated fp8 linear_add");
+    detail::fp8_linear_add_fused_gated_launch(o, norm_weight, z, eps, weight, residual, workspace,
+                                              stream);
 }
 
 } // namespace ninfer::ops
