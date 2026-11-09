@@ -393,6 +393,7 @@ struct PressureTargetAssessment {
 struct RankCapacityCurve {
     std::size_t minimum_device_reservation_bytes     = 0;
     std::size_t bytes_per_additional_main_page_group = 0;
+    std::size_t bytes_per_state_slot                 = 0;
 };
 
 struct SequenceCapacityCurve {
@@ -405,6 +406,16 @@ struct SequenceCapacityCurve {
     // explicit capacity asks for them on top of the requested tokens.
     std::uint32_t resident_main_pages = 0;
     std::vector<RankCapacityCurve> extra_ranks;
+    // Device state slots the reservation holds beyond one per request lane (the hybrid cache's
+    // snapshot slots, the catalog's checkpoint slots), the fewest the cache accepts, what each
+    // costs on each device and the option that sets them. With `state_slots_automatic` (the count
+    // is a default) a reservation that does not fit gives up slots, down to the fewest, before it
+    // fails; otherwise a failure names the option. Zero bytes: the curve has no such axis.
+    std::uint32_t state_slots          = 0;
+    std::uint32_t minimum_state_slots  = 0;
+    bool state_slots_automatic         = false;
+    std::size_t bytes_per_state_slot   = 0;
+    const char* state_slot_option      = nullptr;
 
     [[nodiscard]] std::size_t reservation_bytes(std::uint32_t main_page_groups) const;
     // Bytes further device `extra_rank` (0-based, so device 1 is index 0) must hold.
@@ -428,6 +439,9 @@ struct KvCapacityResolution {
     std::size_t available_after_startup_bytes        = 0;
     std::size_t automatic_headroom_bytes             = 0;
     std::size_t planned_slack_bytes                  = 0;
+    // Default state slots given up so the reservation fits; the reservation above is already the
+    // smaller one. The plan is then built again with that many fewer slots.
+    std::uint32_t yielded_state_slots = 0;
 };
 
 } // namespace ninfer::runtime

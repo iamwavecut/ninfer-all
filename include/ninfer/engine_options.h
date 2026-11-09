@@ -156,6 +156,11 @@ struct HybridPrefixCacheOptions {
     // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
     // lane plus two (a staging slot and one for a shared prefix or another conversation).
     std::optional<std::uint32_t> device_snapshot_slots;
+    // Whether startup may lower device_snapshot_slots, down to one, when the KV capacity asked
+    // for (an explicit one, or one --max-context window beside the automatic headroom) would not
+    // fit beside them. Normalization sets it when device_snapshot_slots is not given; a given
+    // count is kept and a capacity that does not fit beside it fails.
+    bool fit_device_snapshot_slots = false;
     // New prefill state snapshots one request may create. Default 8 with a Host tier, 2 without.
     std::optional<std::uint32_t> max_new_taps;
     // Geometric ladder base G: ladder taps target prompt_tokens - G * 2^k. Default

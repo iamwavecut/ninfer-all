@@ -388,7 +388,12 @@ struct Snapshot {
   27 % and 71 %. Over the whole replay `C + 2` cut the modelled prefill time by 5.5 %: by 27 % on
   the cases a 2 GiB tier changed, 8.7 % on those a 4 GiB tier changed (13 faster, 11 slower, by up
   to 43 %), and within 2 % with 8 and 12 GiB. The slot costs one StateImage of VRAM (about
-  147 MiB for Qwen3.8-27B with MTP), which automatic sizing takes from Device KV.
+  147 MiB for Qwen3.8-27B with MTP), which automatic sizing takes from Device KV. A default `D`
+  yields to the KV capacity: when an explicit capacity, or automatic sizing's floor
+  `M = max(L, C)` beside its headroom, does not fit beside `D` slots, the capacity resolver
+  (`runtime/engine/kv_capacity.cpp`, from the per-slot bytes on the target's capacity curve) keeps
+  the largest `D ≥ 1` that fits, the plan is built again with it, and startup logs the change. A
+  given `D` is kept; a capacity that does not fit beside it fails naming `--device-snapshot-slots`.
 - **HostSlabPool**: one pinned allocation of `host_cache_bytes`, divided into slabs. A slab holds
   one block bundle: the Main page packed with its Host page layout, then the backend page at the
   next 4 KiB boundary; `slab_bytes` is that record rounded up to 4 KiB. A snapshot image uses
@@ -1387,6 +1392,7 @@ enum class ContextCacheMode : std::uint8_t { Legacy, Hybrid };
 
 struct HybridPrefixCacheOptions {                           // used only when mode == Hybrid
     std::optional<std::uint32_t> device_snapshot_slots;     // --device-snapshot-slots
+    bool fit_device_snapshot_slots = false;                 // set when the count is a default
     std::optional<std::uint32_t> max_new_taps;              // --cache-taps-per-request
     std::optional<std::uint32_t> tap_ladder_tokens;         // --cache-tap-ladder (G)
     std::optional<std::uint32_t> tap_min_gap_tokens;        // --cache-tap-min-gap

@@ -364,6 +364,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         // their Host copies are written, and one more keeps a shared prefix or another
         // conversation's snapshot. A Host tier smaller than the conversations it serves cannot
         // stand in for that slot: its images would take the slabs their blocks need.
+        // The default yields to a KV capacity that would not fit beside it (kv_capacity.cpp).
+        hybrid.fit_device_snapshot_slots =
+            hybrid.fit_device_snapshot_slots || !hybrid.device_snapshot_slots.has_value();
         hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(concurrency + 2U);
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
@@ -747,6 +750,14 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     std::optional<StartupPhaseScope> planning;
     std::vector<std::size_t> free_by_rank;
     std::size_t overlay_window_bytes = 0;
+    std::uint32_t graft_main_pages   = 0;
+    const auto plan_sequences = [&] {
+        planner.emplace(models::qwen3_5::make_sequence_planner(
+            instance->parameters, device,
+            artifact_scoped_disk_tier(options, instance->model->info().artifact_id,
+                                      control_vectors_digest(instance->steering.get())),
+            graft_main_pages));
+    };
     for (int refits = 0;; ++refits) {
         StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
         auto plan = models::qwen3_5::plan_load(reader, models::load_options(options),
@@ -785,18 +796,14 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             models::qwen3_5::prepare_vision_overlay(instance->parameters, device, options);
         // Each injected graft keeps its text KV pages for good; the pool grows by that many so a
         // request can still use all the capacity that was asked for.
-        std::uint32_t graft_main_pages = 0;
+        graft_main_pages = 0;
         for (const auto& graft : instance->frontend.grafts()) {
             if (graft.kind != models::qwen3_5::GraftKind::PrefillKV) {
                 const auto page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
                 graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
             }
         }
-        planner.emplace(models::qwen3_5::make_sequence_planner(
-            instance->parameters, device,
-            artifact_scoped_disk_tier(options, instance->model->info().artifact_id,
-                                      control_vectors_digest(instance->steering.get())),
-            graft_main_pages));
+        plan_sequences();
         free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
         if (!automatic_split || refits == 2) { break; }
@@ -866,9 +873,43 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto resolution = resolve_kv_capacity(
-        options.kv_capacity, planner->capacity_curve(), free_by_rank.front(),
-        std::span<const std::size_t>(free_by_rank).subspan(1));
+    // A default count of hybrid snapshot slots that yields to the KV capacity is planned again
+    // with that many fewer slots, and the capacity resolved on that plan; arena alignment may
+    // leave it a little off the curve's estimate, so the smaller plan may yield further.
+    const auto resolve_capacity = [&] {
+        const auto extra_free = std::span<const std::size_t>(free_by_rank).subspan(1);
+        ContextCacheOptions& cache = options.context_cache;
+        const std::uint32_t from   = cache.device_state_slots.value_or(0U);
+        const std::size_t per_slot = planner->capacity_curve().bytes_per_state_slot;
+        for (;;) {
+            KvCapacityResolution fitted = resolve_kv_capacity(
+                options.kv_capacity, planner->capacity_curve(), free_by_rank.front(), extra_free);
+            const std::uint32_t slots = cache.device_state_slots.value_or(0U);
+            if (fitted.yielded_state_slots == 0) {
+                if (slots != from) {
+                    publish_diagnostic(
+                        options.diagnostic_observer, DiagnosticLevel::Info,
+                        "device snapshot slots %u -> %u to fit the %s KV capacity (%.1f MiB per "
+                        "slot; --device-snapshot-slots sets them)",
+                        from, slots,
+                        options.kv_capacity.mode == KvCapacityMode::Explicit
+                            ? "requested"
+                            : "--max-context window's",
+                        static_cast<double>(per_slot) / (1024.0 * 1024.0));
+                }
+                return fitted;
+            }
+            if (!cache.enabled || cache.mode != ContextCacheMode::Hybrid ||
+                slots <= fitted.yielded_state_slots) {
+                throw std::logic_error(
+                    "only default hybrid device snapshot slots yield to the KV capacity");
+            }
+            cache.device_state_slots           = slots - fitted.yielded_state_slots;
+            cache.hybrid.device_snapshot_slots = cache.device_state_slots;
+            plan_sequences();
+        }
+    };
+    auto resolution = resolve_capacity();
     std::unique_ptr<models::qwen3_5::execution::NativeExpertRuntime> experts;
     if (!instance->model->expert_sources().layers.empty()) {
         // Price startup with the real allocations before the KV plan is finalized: the delivery
@@ -912,9 +953,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         }
         free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
-        resolution = resolve_kv_capacity(
-            options.kv_capacity, planner->capacity_curve(), free_by_rank.front(),
-            std::span<const std::size_t>(free_by_rank).subspan(1));
+        resolution = resolve_capacity();
     }
     auto sequence   = std::move(*planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
