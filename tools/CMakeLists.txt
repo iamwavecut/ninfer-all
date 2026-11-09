@@ -20,7 +20,9 @@ add_executable(ninfer-multi-gpu-probe
   ${CMAKE_SOURCE_DIR}/src/core/peer_preflight.cpp)
 target_include_directories(ninfer-multi-gpu-probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # The host compiler needs the toolkit headers for device_launch.cpp; nvcc links the static runtime.
-target_link_libraries(ninfer-multi-gpu-probe PRIVATE CUDA::toolkit)
+# DeviceBinding reads the thread's current context through the driver API (cuCtxGetCurrent), as the
+# core does, so the probe links the driver library too.
+target_link_libraries(ninfer-multi-gpu-probe PRIVATE CUDA::toolkit CUDA::cuda_driver)
 set_target_properties(ninfer-multi-gpu-probe PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
@@ -47,7 +49,7 @@ add_executable(ninfer-tp-exchange-bench
   ${CMAKE_SOURCE_DIR}/src/core/peer_preflight.cpp)
 target_include_directories(ninfer-tp-exchange-bench PRIVATE ${CMAKE_SOURCE_DIR}/src
                            ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(ninfer-tp-exchange-bench PRIVATE CUDA::toolkit)
+target_link_libraries(ninfer-tp-exchange-bench PRIVATE CUDA::toolkit CUDA::cuda_driver)
 set_target_properties(ninfer-tp-exchange-bench PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
