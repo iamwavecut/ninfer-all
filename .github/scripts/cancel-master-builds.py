@@ -2,6 +2,7 @@
 import json
 import os
 import subprocess
+import time
 
 
 WORKFLOWS = {
@@ -17,11 +18,37 @@ def superseded(run, trigger):
             and run["created_at"] <= trigger["created_at"])
 
 
+def cancel(run, api, post, sleep=time.sleep, checks=13, interval=5):
+    """Cancel one run, or accept its own end within about a minute.
+
+    CI and Native release also cancel older master runs through their concurrency groups. GitHub
+    refuses a second cancellation of a run it is already stopping, and that run still reads
+    in_progress for a few seconds.
+    """
+    error = post(run["id"])
+    if not error:
+        print(f"Cancellation requested: {run['name']} ({run['id']})", flush=True)
+        return
+    for check in range(checks):
+        if check:
+            sleep(interval)
+        if api(f"actions/runs/{run['id']}")["status"] == "completed":
+            print(f"Already stopped: {run['name']} ({run['id']})", flush=True)
+            return
+    raise RuntimeError(f"Could not cancel {run['name']} ({run['id']}): {error}")
+
+
 def main():
     repo = os.environ["GITHUB_REPOSITORY"]
 
     def api(path):
         return json.loads(subprocess.check_output(["gh", "api", f"repos/{repo}/{path}"], text=True))
+
+    def post(run_id):
+        result = subprocess.run(
+            ["gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{run_id}/cancel", "--silent"],
+            capture_output=True, text=True)
+        return (result.stderr.strip() or f"exit {result.returncode}") if result.returncode else ""
 
     trigger = api(f"actions/runs/{os.environ['GITHUB_RUN_ID']}")
     if api("commits/master")["sha"] != trigger["head_sha"]:
@@ -40,14 +67,7 @@ def main():
             comparison = api(f"compare/{trigger['head_sha']}...{run['head_sha']}")
             if comparison["status"] != "behind":
                 continue
-            result = subprocess.run(
-                ["gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{run['id']}/cancel", "--silent"],
-                capture_output=True, text=True)
-            if result.returncode:
-                if api(f"actions/runs/{run['id']}")["status"] != "completed":
-                    raise RuntimeError(f"Could not cancel {run['name']} ({run['id']})")
-            else:
-                print(f"Cancellation requested: {run['name']} ({run['id']})", flush=True)
+            cancel(run, api, post)
 
 
 if __name__ == "__main__":

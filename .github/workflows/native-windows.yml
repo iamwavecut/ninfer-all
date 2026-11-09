@@ -159,8 +159,15 @@ jobs:
         env:
           ARCHS: ${{ inputs.archs }}
         run: |
-          & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
-          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          # The bootstrap downloads vcpkg.exe from GitHub's releases, which can answer 504 for minutes.
+          foreach ($attempt in 0..5) {
+            & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 5) { throw 'vcpkg bootstrap failed' }
+            $delay = 10 * [math]::Pow(2, $attempt)
+            Write-Host "vcpkg bootstrap failed; retrying in $delay s"
+            Start-Sleep -Seconds $delay
+          }
           $dependencyFamily = ''
           if (${{ inputs.shard }} -eq 0) { $dependencyFamily = 'vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ inputs.cuda }}' }
           python .github/scripts/run-cached-build.py --deadline-env BUILD_DEADLINE `
