@@ -190,12 +190,19 @@ measured on the affected families, card classes and KV formats.
   [CONTRIBUTORS.md](CONTRIBUTORS.md); git history keeps the rest.
 - A user-visible change updates, in the same pull request, the family guide,
   [docs/cli.md](docs/cli.md) and [docs/serving.md](docs/serving.md) where they apply, the
-  executable's `--help`, the README Artifacts table for a new artifact, and What's New.
-- README's What's New is a changelog with one short line per date. The line lists what shipped that
-  day in a few words per item and links each item inline to the document with its details.
-  Descriptions, mechanisms, measurements and hardware belong in the linked documents, not in What's
-  New. Internal changes and small fixes get no item. A later change of the same date adds an item to
-  that line or extends an existing item.
+  executable's `--help`, the README Artifacts table for a new artifact, and What's New when the
+  change is a novelty.
+- README's What's New lists novelties only. A novelty gives users something they did not have
+  before: a new model, family, artifact, platform, option, endpoint, format or mode, or a measured
+  speedup of a path that worked. A fix gets no item, whatever its size. A fix repairs a crash, wrong
+  output, a failed start, a missed case or a regression; a speedup that wins back a slowdown and an
+  option or default that a fix brings along are part of the fix. Guards, refusals, diagnostics,
+  internal changes, CI, build, tests, tooling and documentation get no item either. What's New is
+  not a chronicle of the day's work: a date without a novelty gets no line.
+- Each date with a novelty gets one short line. Each item names the novelty in a few words and
+  links inline to the document with its details. Descriptions, mechanisms, measurements and
+  hardware belong in the linked documents, not in What's New. A later novelty of the same date adds
+  an item to that line or extends an existing item.
 
 ### Tests and tooling
 
