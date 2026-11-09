@@ -31,6 +31,9 @@ struct Profile {
     std::int32_t output_rows;
     std::uint32_t seed;
     ActivationCompute activation_compute;
+    // NVFP4 only: the scale plane walks every valid word, 0x00 through 0x7E, under a divisor that
+    // is not a power of two, instead of the fixture's eight small words.
+    bool valid_scale_words = false;
 };
 
 // A program checks this first and skips (exit 77) without a device: run_profile returns a count
