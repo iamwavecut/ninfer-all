@@ -8,6 +8,7 @@ or against each other as a benchmark. [Send a report](#send-a-report) to add a c
 | Card | OS | Model | Workload | Report |
 |---|---|---|---|---|
 | RTX 5070 Ti, 16 GB | Windows 11 | Qwen3.8-27B GSQ-RCO IQ3_S, Swift 1.5 IQ3_S | single requests to 104K tokens, against llama.cpp | [RTX 5070 Ti](#rtx-5070-ti-windows-11) |
+| RTX 5080, 16 GB | Windows 11, WSL2 | Qwen3.8-27B GSQ-RCO IQ3_S | single requests to 160K tokens, largest windows | [RTX 5080](#rtx-5080-wsl2) |
 | RTX 4090, 24 GB | Windows | Qwen3.8-27B GSQ-RCO IQ3_S, Swift 1.5 IQ3_S | Qwen Code sessions with DFlash2 5 and 7 | [RTX 4090: DFlash2](#rtx-4090-qwen-code-with-dflash2) |
 | RTX 4090, 24 GB | Windows | Swift Qwen3.8 GSQ-RCO IQ3_S | agent traffic with MTP 3, four lanes and the hybrid prefix cache | [RTX 4090: MTP 3](#rtx-4090-agent-traffic-with-mtp-3-and-the-hybrid-prefix-cache) |
 | RTX 4080 and RTX 4090 | Windows 11 | Qwen3.8-27B GSQ-RCO IQ3_S | Hermes Desktop | [RTX 4080 and 4090](#rtx-4080-and-rtx-4090-windows-11) |
@@ -67,6 +68,67 @@ for the stock model (completion tokens over wall time).
 
 **Conversion without CUDA.** A PyTorch without CUDA converts with `--device cpu`; the converter's
 error message names the option.
+
+## RTX 5080, WSL2
+
+Reported by @dzaurov in [iamwavecut/ninfer-all#270](https://github.com/iamwavecut/ninfer-all/issues/270),
+7 November 2026. The server runs daily as a Claude Code backend (`ANTHROPIC_BASE_URL`).
+
+- RTX 5080 16 GB at its default 360 W limit, driver 617.42. The card also drives one 2560x1440
+  desktop, which held 0.3 to 0.8 GB of its memory.
+- Windows 11 Pro (build 26300), Core i7-14700, 32 GB of RAM; WSL2 (kernel 6.18) with Ubuntu 24.04,
+  given 24 GB and 24 threads.
+- `master` at `bdb141f4`, a `120a` build with CUDA 13.3 and GCC 13 from
+  [the Linux instructions](../build-linux.md).
+- ISTA-DASLab `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf`, converted with
+  `--recipe qwen3_8_27b_gguf --components text,vision,mtp,dflash2 --proposal`.
+
+The MTP rows:
+
+```bash
+ninfer-serve qwen3_8_27b_gsq_rco_iq3_s.ninfer --model-id qwen3.8-27b \
+  --max-context 106496 --kv-capacity 106496 --kv-dtype rk4v4 --gdn-state-fp16 \
+  --spec mtp --draft-tokens 3
+```
+
+The rows without a drafter use `--max-context 163840 --kv-capacity 163840` and no `--spec`. The
+method is that of the [RTX 5070 Ti report](#rtx-5070-ti-windows-11), with thinking off and a unique
+nonce at the start of each prompt. The host ran unrelated CPU-heavy test suites during the runs
+(load average 3 to 20). Prompt / decode in tok/s, one cell per run:
+
+| Prompt tokens | MTP 3, 104K window | no drafter, 160K window |
+|---:|---:|---:|
+| 1.3K | 2,708 / 159.3 | 2,687 / 71.5 · 2,677 / 71.4 |
+| 16.9K | 2,789 / 77.1 | 2,799 / 49.7 · 2,791 / 49.6 |
+| 33.5K | 2,655 / 130.0 | 2,666 / 67.8 · 2,662 / 67.9 |
+| 56.2K | 2,202 / 134.1 | 2,195 / 65.9 · 2,207 / 65.7 |
+| 86.1K | 2,120 / 132.1 | |
+| 104.1K | 1,938 / 127.3 | 1,962 / 61.7 · 1,948 / 61.7 |
+| 160.1K | | 1,789 / 42.9 · 1,781 / 42.8 · 1,801 / 56.9 · 1,748 / 57.3 |
+
+**Decode in two groups.** Six more runs at 160K, alternating `master`, `master` with
+`--host-cache-mib 0` and an October build, each decoded at 43 to 44 or at 57 to 59 tok/s for the
+whole answer, every variant in both groups. At 16.9K the groups are about 50 and 70 tok/s. The
+server's `throughput` lines show the slower rate steady after the first window. The reporter
+attributes it to WDDM residency on a nearly full card. MTP acceptance varies with the summary: the
+77.1 at 16.9K is one such run, against 148.9 for the October build at the same length.
+
+**Largest windows**, bisected in 4,096-token steps with `rk4v4`, `--gdn-state-fp16` and the
+desktop attached:
+
+| | `master` at `bdb141f4` | with `--device-snapshot-slots 1` | October build (`d1a0e070`) |
+|---|---:|---:|---:|
+| MTP 3 | 122,880 | 131,072 | 131,072 |
+| no drafter | 184,320 | 192,512 | 196,608 |
+
+The gap is the hybrid prefix cache's default device snapshot slots
+([#266](https://github.com/iamwavecut/ninfer-all/issues/266)); since
+[PR #285](https://github.com/iamwavecut/ninfer-all/pull/285) the default slots give way to a window
+that would not fit beside them. DFlash2 5 fits an 8,192-token window with this artifact.
+
+**WSL.** After `kill -9` of a running server, about 235 MiB of device memory stayed allocated
+inside WSL until `wsl --shutdown`, and later startups failed by that margin. A SIGTERM stop returned
+it.
 
 ## RTX 4090: Qwen Code with DFlash2
 
