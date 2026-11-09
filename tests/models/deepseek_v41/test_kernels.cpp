@@ -15,7 +15,9 @@
 //    positions, nothing for the rows that complete no group.
 //  - index_scores of decode rows and of a chunk's rows in fours, with and without candidate blocks;
 //    select_topk and select_candidates with ties (both zeros among them), -inf and NaN scores,
-//    fewer selectable positions or blocks than chosen, and rows over several 1024-value chunks.
+//    fewer selectable positions or blocks than chosen, and rows over several 1024-value chunks;
+//    select_candidates' block maxima in rows of the blocks a row sees, under masks of a
+//    1,000,000-position context, and its refusal of a shorter scratch row.
 //    candidate_lists against each group's union of masks; index_scores and select_topk over listed
 //    blocks against the same rows over every visible position, bit for bit.
 //  - sparse_attention over the window rings and the selected latents: window-only blocks, one to
@@ -999,15 +1001,21 @@ void select_topk(const std::vector<int>& positions, int ratio, int count, int pa
                            std::to_string(pattern) + "): " + std::to_string(wrong) + " wrong");
 }
 
+// `context` > 0 sizes the masks for a context of that many positions, far past the rows' own (a
+// chunk's rows early in a long context); the block maxima then still take one row of the blocks
+// the rows see, followed by a guard the kernel must not write.
 void select_candidates(const std::vector<int>& positions, int ratio, int keep, int pattern,
-                       std::mt19937& rng) {
+                       std::mt19937& rng, int context = 0) {
     constexpr int block = 8;
     const int t         = int(positions.size());
     std::vector<int> n(static_cast<std::size_t>(t));
     for (int r = 0; r < t; ++r) { n[std::size_t(r)] = (positions[std::size_t(r)] + 1) / ratio; }
     const int most  = *std::max_element(n.begin(), n.end());
     const int width = most + 3;
-    const int words = ((most + block - 1) / block + 31) / 32 + 1;
+    const int words = context > 0 ? ((context / ratio + block - 1) / block + 31) / 32
+                                  : ((most + block - 1) / block + 31) / 32 + 1;
+    const int stride = (width + block - 1) / block;
+    constexpr int kGuard = 256;
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
     std::vector<float> scores(std::size_t(t) * width, 1e30f);
     for (int r = 0; r < t; ++r) {
@@ -1023,13 +1031,19 @@ void select_candidates(const std::vector<int>& positions, int ratio, int keep, i
         std::copy(row.begin(), row.end(), scores.begin() + std::ptrdiff_t(r) * width);
     }
     DeviceBuffer ds = upload(scores), dp = upload(ints(positions)),
-                 mask(std::size_t(t) * words * 4), scratch(std::size_t(t) * words * 32 * 4);
+                 mask(std::size_t(t) * words * 4),
+                 scratch((std::size_t(t) * stride + kGuard) * 4);
     mask.fill(0xFF);
+    scratch.fill(0x5A);
     k::select_candidates(as<float>(ds), width, t, as<std::int32_t>(dp), ratio, block, keep,
-                         as<std::uint32_t>(mask), words, as<float>(scratch), nullptr);
+                         as<std::uint32_t>(mask), words, as<float>(scratch), stride, nullptr);
     sync("select_candidates");
     const auto got    = download<std::uint32_t>(mask, std::size_t(t) * words);
+    const auto tail   = download<std::uint32_t>(scratch, std::size_t(t) * stride + kGuard);
     std::size_t wrong = 0;
+    for (std::size_t i = std::size_t(t) * stride; i < tail.size(); ++i) {
+        wrong += tail[i] != 0x5A5A5A5AU ? 1 : 0;
+    }
     for (int r = 0; r < t; ++r) {
         const float* row = scores.data() + std::size_t(r) * width;
         const int blocks = (n[std::size_t(r)] + block - 1) / block;
@@ -1055,8 +1069,20 @@ void select_candidates(const std::vector<int>& positions, int ratio, int keep, i
     std::string sizes;
     for (const int v : n) { sizes += (sizes.empty() ? "" : ",") + std::to_string(v); }
     report(wrong == 0, "select_candidates " + std::to_string(keep) + " blocks of " + sizes +
-                           " (pattern " + std::to_string(pattern) + "): " + std::to_string(wrong) +
-                           " wrong words");
+                           " (pattern " + std::to_string(pattern) +
+                           (context > 0 ? ", masks of " + std::to_string(context) + " positions"
+                                        : std::string()) +
+                           "): " + std::to_string(wrong) + " wrong words");
+}
+
+// A scratch stride below the blocks of a row's width is refused before any launch.
+void select_candidates_stride() {
+    bool refused = false;
+    try {
+        k::select_candidates(nullptr, 801, 1, nullptr, 1, 8, 2048, nullptr, 4, nullptr, 100,
+                             nullptr);
+    } catch (const std::invalid_argument&) { refused = true; }
+    report(refused, "select_candidates refuses a scratch stride of 100 for 801 positions");
 }
 
 // Rows that see more blocks than they keep: candidate_lists against the union of each group's
@@ -2283,6 +2309,11 @@ int main() {
         select_candidates({99, 39999, 16391}, 1, 2048, 0, rng);
         select_candidates({0, 1, 20001}, 2, 300, 1, rng);
         select_candidates({29999, 4999}, 1, 2048, 2, rng);
+        // A 2048-token chunk's rows early in a 1,000,000-position context (#263): fewer blocks than
+        // kept, masks of 3,907 words, maxima of 1,024 floats a row.
+        select_candidates({0, 2047, 4095, 8191}, 1, 2048, 0, rng, 1000000);
+        select_candidates({999, 8190}, 1, 300, 2, rng, 1000000);
+        select_candidates_stride();
         listed_index("decode rows", {40000, 16500, 70001}, {0, 1, 2}, 1, 2048, rng);
         listed_index("a chunk's rows in fours", range(30000, 14), {}, 4, 2048, rng);
         listed_index("a small keep", range(9000, 9), {}, 4, 64, rng);

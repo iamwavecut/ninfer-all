@@ -189,10 +189,11 @@ void candidate_lists(const std::uint32_t* mask, int words, int tokens, int group
 // The candidate blocks of each row (scores [T][width] of its visible positions): the `keep` blocks
 // of `block` positions with the highest maximum score, the block of its last visible position
 // always among them, blocks without a finite score never (lower block first among equal maxima);
-// a bit per block in mask [T][words]. `scratch` holds [T][words * 32] floats.
+// a bit per block in mask [T][words]. `scratch` holds [T][stride] floats, a row's block maxima;
+// `stride` is at least the blocks of `width` positions.
 void select_candidates(const float* scores, int width, int tokens, const std::int32_t* positions,
                        int ratio, int block, int keep, std::uint32_t* mask, int words,
-                       float* scratch, cudaStream_t stream);
+                       float* scratch, int stride, cudaStream_t stream);
 
 // The k highest finite scores of each row's visible positions (lower position first among equal
 // scores), as positions in ascending order, -1 past the row's count: out [T][k].
