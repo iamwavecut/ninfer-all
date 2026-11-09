@@ -323,7 +323,7 @@ std::string usage_text(std::string_view program) {
         << "  --expert-cpu-threads <N>    host or disk experts: CPU workers (default: automatic)\n"
         << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4>  KV cache storage "
            "(default: bf16)\n"
-        << "  --fast-prefill-kernel       fast INT8-KV prompt kernel, wave-aligned chunks\n"
+        << "  --fast-prefill-kernel       fast INT8/FP8-KV prompt kernel, wave-aligned chunks\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP, DFlash and DFlash2 1..15\n"
         << "  --adaptive-mtp              verify an adaptive 3..K drafts per MTP round\n"

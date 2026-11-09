@@ -67,6 +67,13 @@ allocate_causal_prompt_i8_fast_partials(Allocator& workspace, std::int32_t q_hea
             workspace.alloc(DType::FP32, {2, q_heads, width, splits})};
 }
 
+// Split partial layout for key split s, column c and query head h: the D256 row at
+// ((s * width + c) * q_heads + h) * 256 and its (max, sum) pair at that row index.
+__host__ __device__ __forceinline__ std::int64_t
+causal_prompt_i8_fast_partial_row(int split, int column, int q_head, int width, int q_heads) {
+    return (static_cast<std::int64_t>(split) * width + column) * q_heads + q_head;
+}
+
 inline std::size_t causal_prompt_i8_fast_split_bytes(std::int32_t q_heads, std::int32_t width,
                                                      std::int32_t splits) {
     if (splits <= 1) { return 0; }
