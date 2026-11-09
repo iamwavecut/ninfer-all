@@ -2054,8 +2054,12 @@ ignores `display`. `preserve_thinking` remains a NInfer extension for closed-tur
 history, `graft` selects a [prompt graft](#prompt-grafts), and llama.cpp's `lora` field sets the
 request's [LoRA adapter scales](#lora-adapters-and-control-vectors). `output_config.effort` passes its
 protocol-validated value to the selected template, substituting the nearest value the template
-accepts as described above. `output_config.format` accepts `{"type":"json_schema","schema":{...}}`,
-enforced strictly (see [Structured output](#structured-output)); Count Tokens ignores it.
+accepts as described above. As in the Anthropic API, effort is independent of the Thinking switch:
+with Thinking `disabled` or `between_tools`, a valid effort (which Claude Code sends) is accepted
+and dropped, because the templates apply effort only to a thinking turn, and the request runs
+without reasoning. Without a `thinking` field, an effort other than `none` turns thinking on, as a
+Chat Completions `reasoning_effort` does. `output_config.format` accepts
+`{"type":"json_schema","schema":{...}}`, enforced strictly (see [Structured output](#structured-output)); Count Tokens ignores it.
 
 User-defined tools support `name`, `description`, object `input_schema`, `input_examples`, and
 `strict`, which constrains the tool's input to its schema as described under [Structured

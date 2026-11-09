@@ -926,6 +926,11 @@ void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose pur
         bad_request("output_config.effort is not a recognized effort value",
                     "output_config.effort");
     }
+    // Effort is independent of the thinking switch in the Messages API: with thinking disabled it
+    // still governs overall output spend, and clients such as Claude Code send both. A Qwen or
+    // Gemma template has no effort without thinking, so a validated effort is dropped there rather
+    // than turning thinking back on or conflicting with it.
+    if (request.enable_thinking == false) { return; }
     request.reasoning_effort = *effort;
 }
 
