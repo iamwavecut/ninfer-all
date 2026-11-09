@@ -48,8 +48,9 @@ void raise_dynamic_shared_memory(void (*kernel)(Args...), int bytes) {
 inline constexpr std::size_t kMaxRanks = 8;
 
 // Makes a CUDA device the calling thread's current device for a scope, and restores whatever was
-// current before. It carries no state of its own, so nothing else can be left pointing at the wrong
-// device by an exception or an early return.
+// current before. A thread that had no current context keeps the bound device: restoring the device
+// 0 it read would create that device's context. It carries no state of its own, so nothing else can
+// be left pointing at the wrong device by an exception or an early return.
 class DeviceBinding {
 public:
     explicit DeviceBinding(int device);
@@ -60,7 +61,7 @@ public:
 
 private:
     int previous_ = 0;
-    bool changed_ = false;
+    bool restore_ = false;
 };
 
 // One device's execution resources inside a DeviceContext: its streams, fence and properties.

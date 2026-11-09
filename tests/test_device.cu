@@ -2,14 +2,17 @@
 #include "cuda_availability.h"
 #include "ops/common/device_tier.h"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -126,6 +129,70 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
     return failures;
 }
 
+// Whether device 0's primary context exists, or -1 when the driver cannot say.
+int device0_context_active() {
+    CUdevice device = 0;
+    unsigned int flags = 0;
+    int active         = 0;
+    if (cuInit(0) != CUDA_SUCCESS || cuDeviceGet(&device, 0) != CUDA_SUCCESS ||
+        cuDevicePrimaryCtxGetState(device, &flags, &active) != CUDA_SUCCESS) {
+        return -1;
+    }
+    return active;
+}
+
+// A new thread reads device 0 without having used it. A binding to device 1 there must leave device
+// 0 alone when it ends: returning to it would create its primary context, which on a full card
+// fails with cudaErrorMemoryAllocation and leaves the error for the next cudaGetLastError() (#279).
+// A DeviceContext on device 1 must leave it alone too, with the stall probe's thread, which makes
+// CUDA calls from its first line. A thread that did use device 0 gets it back. Runs in a process of
+// its own, before anything there makes device 0 current.
+int check_new_thread_binding() {
+    const int before = device0_context_active();
+    if (before < 0) { return fail("cuDevicePrimaryCtxGetState failed"); }
+    if (before != 0) {
+        std::cout << "new-thread binding not checked: device 0's context already exists\n";
+        return 0;
+    }
+    int failures = 0;
+    const auto expect = [&failures](bool held, const char* message) {
+        if (!held) {
+            ++failures;
+            std::cerr << message << '\n';
+        }
+    };
+    std::thread([&] {
+        {
+            ninfer::DeviceBinding bind(1);
+            expect(cudaFree(nullptr) == cudaSuccess, "cudaFree on device 1 failed");
+        }
+        int current = -1;
+        expect(cudaGetDevice(&current) == cudaSuccess && current == 1,
+               "a new thread's binding did not keep device 1");
+        expect(cudaGetLastError() == cudaSuccess, "a new thread's binding left a CUDA error");
+    }).join();
+    expect(device0_context_active() == 0, "a new thread's binding created device 0's context");
+    {
+        const ninfer::DeviceContext context(1);
+        // The probe's thread starts with the context and probes after its first 250 ms poll.
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        expect(device0_context_active() == 0,
+               "a DeviceContext on device 1 created device 0's context");
+    }
+    std::thread([&] {
+        expect(cudaSetDevice(0) == cudaSuccess && cudaFree(nullptr) == cudaSuccess,
+               "device 0 did not initialize");
+        {
+            ninfer::DeviceBinding bind(1);
+            expect(cudaFree(nullptr) == cudaSuccess, "cudaFree on device 1 failed");
+        }
+        int current = -1;
+        expect(cudaGetDevice(&current) == cudaSuccess && current == 0,
+               "a binding did not return its thread to device 0");
+    }).join();
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -139,8 +206,6 @@ int main(int argc, char** argv) {
         }
         return fail("invalid sync setting did not fail before CUDA initialization");
     }
-    const unsigned int expected_flags =
-        argc == 2 ? static_cast<unsigned int>(std::stoul(argv[1])) : cudaDeviceScheduleAuto;
     int count                   = 0;
     const cudaError_t count_err = cudaGetDeviceCount(&count);
     if (cuda_unavailable(count_err)) {
@@ -155,6 +220,15 @@ int main(int argc, char** argv) {
         std::cout << "SKIP: no CUDA devices\n";
         return 77;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--new-thread-binding") {
+        if (count < 2) {
+            std::cout << "SKIP: the new-thread binding check needs two CUDA devices\n";
+            return 77;
+        }
+        return check_new_thread_binding() == 0 ? 0 : fail("new-thread binding check failed");
+    }
+    const unsigned int expected_flags =
+        argc == 2 ? static_cast<unsigned int>(std::stoul(argv[1])) : cudaDeviceScheduleAuto;
 
     int failures = 0;
 
