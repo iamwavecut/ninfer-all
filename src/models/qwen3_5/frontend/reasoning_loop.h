@@ -10,7 +10,7 @@
 // A loop can also be written as a single long word, which no word measure can see: Strata's #1753
 // reads a periodic tail as full coverage, and periodic_tail below does the same. A loop that counts
 // ('time1','time2',...) writes a new word every time; counting_tail reads its tail as periodic once
-// the numbers are masked, if a number of every period moves by the same step.
+// the numbers are masked, if every number of the period keeps one step and one of them moves.
 // Ported from Infernix (github.com/wallawalla47/infernix, Apache-2.0).
 
 #include <cstddef>
@@ -56,8 +56,10 @@ void append_tail(std::string_view bytes, std::string& tail);
 
 // True when the last kLoopTailChars characters of `text`, with every run of ASCII digits read as
 // one number, are one period of at most kLoopTailPeriod characters repeated, the period holds a
-// number, and one of its numbers moves by the same nonzero step from each period to the next over
-// at least kLoopCounterSteps periods: a counting loop such as 'time1','time2',... The runs the
+// number, and from each period to the next every number of the period moves by its own constant
+// step, over at least kLoopCounterSteps periods, and one of these steps is nonzero: a counting loop
+// such as 'time1','time2',... or 'item 1 of 50','item 2 of 50',... A counter beside a number that
+// changes otherwise ('step 7 checks value 4821') is an enumeration and does not count. The runs the
 // tail's ends may cut are left out. False while fewer than kLoopTailChars characters have been
 // emitted.
 [[nodiscard]] bool counting_tail(std::string_view text);

@@ -232,24 +232,24 @@ bool counting_tail(std::string_view text) {
         std::count(masked.begin(), masked.begin() + std::ptrdiff_t(period), static_cast<char>(0xff)));
     if (slots == 0) { return false; } // a plain period, which periodic_tail reads
     // Runs i and i + slots are one number of two consecutive periods. The first and the last run
-    // may be cut by the tail's ends, so neither is read.
+    // may be cut by the tail's ends, so neither is read. Every number of the period keeps one step
+    // (a constant's is zero) and one of them moves: a counter beside numbers that change otherwise
+    // is an enumeration of worked values ("step 7 checks value 4821"), not a loop.
+    bool moves = false;
     for (std::size_t first = 1; first <= slots; ++first) {
         std::int64_t step = 0;
         std::size_t steps = 0;
-        bool counting     = true;
         for (std::size_t i = first; i + slots + 1 < numbers.size(); i += slots) {
             const std::int64_t move =
                 std::int64_t(numbers[i + slots]) - std::int64_t(numbers[i]);
             if (steps == 0) { step = move; }
-            if (move == 0 || move != step) {
-                counting = false;
-                break;
-            }
+            if (move != step) { return false; }
             ++steps;
         }
-        if (counting && steps >= kLoopCounterSteps) { return true; }
+        if (steps < kLoopCounterSteps) { return false; }
+        moves = moves || step != 0;
     }
-    return false;
+    return moves;
 }
 
 } // namespace ninfer::models::qwen3_5

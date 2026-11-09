@@ -176,19 +176,31 @@ int main() {
         }
         expect(counting_tail(tail), "counting tail through append_tail");
         expect(!counting_tail(counting("time", 1, 1, 60)), "counting tail below the window");
+        // A counter beside constants still counts, and so do numbers that all keep their steps.
+        std::string of_total, pairs;
+        for (int i = 1; i <= 300; ++i) {
+            of_total += "item " + std::to_string(i) + " of 300, ";
+            pairs += "(" + std::to_string(i) + ", " + std::to_string(3 * i + 1) + ") ";
+        }
+        expect(counting_tail(of_total), "a counter beside a constant");
+        expect(counting_tail(pairs), "two numbers with their own steps");
     }
     // Numbers that do not count stay quiet: varied work, a repeated constant (the plain period's
-    // case), unrelated values in a periodic frame, and squares, whose steps grow.
+    // case), unrelated values in a periodic frame, squares, whose steps grow, and an enumeration:
+    // a counter beside values that change otherwise.
     {
         expect(!counting_tail(varied(400)), "varied work with numbers");
-        std::string constant, unrelated, squares, cases;
+        std::string constant, unrelated, squares, cases, enumeration;
         unsigned state = 7;
         for (int i = 1; i <= 400; ++i) {
             constant += "x = 5, ";
             state = state * 1103515245U + 12345U;
             unrelated += "'id" + std::to_string((state >> 8) % 100000) + "',";
             squares += std::to_string(i * i) + ", ";
+            enumeration += "step " + std::to_string(i) + " checks value " +
+                           std::to_string((state >> 8) % 9973) + ". ";
         }
+        expect(!counting_tail(enumeration), "a counter beside changing values");
         for (int n = 1; n <= 40; ++n) {
             cases += "For n = " + std::to_string(n) + ", the sum is " + std::to_string(n * (n + 1) / 2) +
                      ((n % 3) == 0 ? ", which is divisible by 3. " : ", which is not. ");
