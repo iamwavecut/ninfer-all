@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -143,8 +144,9 @@ int device0_context_active() {
 // A new thread reads device 0 without having used it. A binding to device 1 there must leave device
 // 0 alone when it ends: returning to it would create its primary context, which on a full card
 // fails with cudaErrorMemoryAllocation and leaves the error for the next cudaGetLastError() (#279).
-// A thread that did use device 0 gets it back. Runs in a process of its own, before anything
-// there makes device 0 current.
+// A DeviceContext on device 1 must leave it alone too, with the stall probe's thread, which makes
+// CUDA calls from its first line. A thread that did use device 0 gets it back. Runs in a process of
+// its own, before anything there makes device 0 current.
 int check_new_thread_binding() {
     const int before = device0_context_active();
     if (before < 0) { return fail("cuDevicePrimaryCtxGetState failed"); }
@@ -170,6 +172,13 @@ int check_new_thread_binding() {
         expect(cudaGetLastError() == cudaSuccess, "a new thread's binding left a CUDA error");
     }).join();
     expect(device0_context_active() == 0, "a new thread's binding created device 0's context");
+    {
+        const ninfer::DeviceContext context(1);
+        // The probe's thread starts with the context and probes after its first 250 ms poll.
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        expect(device0_context_active() == 0,
+               "a DeviceContext on device 1 created device 0's context");
+    }
     std::thread([&] {
         expect(cudaSetDevice(0) == cudaSuccess && cudaFree(nullptr) == cudaSuccess,
                "device 0 did not initialize");

@@ -356,7 +356,11 @@ void fail(Probe& probe) noexcept {
     probe.pending_since.store(0, std::memory_order_release);
 }
 
-void probe_devices(Registry& watched) {
+void probe_devices(Registry& watched, int first) {
+    // A new thread has no current context, so its first CUDA call would create the current
+    // device's: device 0's, on a card the process may not have been given (#279). The device whose
+    // probe started this thread is made current first.
+    (void)cudaSetDevice(first);
     // This thread's calls touch no capture; Relaxed keeps a global-mode capture on another thread
     // from refusing them.
     cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
@@ -503,7 +507,7 @@ void hold_device_probe(int device, const void* holder) {
     ++probe.holders;
     if (!watched.probing) {
         watched.probe_limit_ns.store(to_ns(limit), std::memory_order_release);
-        std::thread([&watched] { probe_devices(watched); }).detach();
+        std::thread([&watched, device] { probe_devices(watched, device); }).detach();
         // Registered after CUDA initialized, so it runs before CUDA's own exit teardown.
         (void)std::atexit(stop_probing);
         watched.probing = true;
