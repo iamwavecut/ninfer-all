@@ -29,6 +29,10 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
     add("gguf_moe_vector/q6_k", {"scalar", "cooperative"});
     add("gguf_moe_up/q4_k", {"scalar", "cooperative"});
     add("gguf_moe_up/q6_k", {"scalar", "cooperative"});
+    if (!volta && !turing_shapes) {
+        add("gguf_matrix/q4_k", {"async"});
+        add("gguf_moe_matrix/q4_k", {"async"});
+    }
 
     if (!volta) {
         // A Volta card runs its own projection, decode-attention and single-row prompt routes

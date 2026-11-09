@@ -1084,7 +1084,9 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         {"model_alias", lease.model()},
         {"model_path", options.artifact_path},
         {"modalities", {{"vision", options.enable_vision}, {"audio", false}}},
-        {"build_info", "ninfer " + options_.build_version},
+        {"build_info",
+         "ninfer " + options_.build_version +
+             (options_.build_toolchain.empty() ? "" : " (" + options_.build_toolchain + ")")},
         {"is_sleeping", service.residency().state == ninfer::ModelResidency::Suspended},
         {"endpoint_slots", true},
         {"endpoint_props", true},

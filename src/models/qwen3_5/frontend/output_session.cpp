@@ -941,9 +941,12 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         !semantic.loop_detected && !holds_semantic_close(semantic) &&
         thinking_tokens >= semantic.loop_next_check) {
         semantic.loop_next_check = (thinking_tokens / kLoopCheckTokens + 1U) * kLoopCheckTokens;
-        // Strata reads a periodic tail as full coverage before its word measure.
+        // Strata reads a periodic tail as full coverage before its word measure; a tail that is
+        // periodic around a counter reads the same.
         const double coverage =
-            periodic_tail(semantic.loop_tail) ? 1.0 : impl_->loop_coverage(semantic.loop_round);
+            periodic_tail(semantic.loop_tail) || counting_tail(semantic.loop_tail)
+                ? 1.0
+                : impl_->loop_coverage(semantic.loop_round);
         if (coverage >= kLoopCoverage) {
             semantic.loop_detected        = true;
             semantic.loop_thinking_tokens = thinking_tokens;

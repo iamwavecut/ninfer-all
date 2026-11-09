@@ -15,10 +15,15 @@
 //    positions, nothing for the rows that complete no group.
 //  - index_scores of decode rows and of a chunk's rows in fours, with and without candidate blocks;
 //    select_topk and select_candidates with ties (both zeros among them), -inf and NaN scores,
-//    fewer selectable positions or blocks than chosen, and rows over several 1024-value chunks.
+//    fewer selectable positions or blocks than chosen, and rows over several 1024-value chunks;
+//    select_candidates' block maxima in rows of the blocks a row sees, under masks of a
+//    1,000,000-position context, and its refusal of a shorter scratch row.
+//    candidate_lists against each group's union of masks; index_scores and select_topk over listed
+//    blocks against the same rows over every visible position, bit for bit.
 //  - sparse_attention over the window rings and the selected latents: window-only blocks, one to
 //    40 splits (empty ones among them), a round's rows of one sequence, a chunk's staging ring,
-//    1024 latents, sinks far below and above the scores; attention_output in both layouts.
+//    a chunk's rows over a window floor (a prefill tail's first rows), 1024 latents, sinks far
+//    below and above the scores; attention_output in both layouts.
 //  - the grouped output projection of one to eight tokens as one vector product over the groups:
 //    every value the bits of its group's own vector product (Q5_K).
 //  - route (ties to the lower id, the softplus branch past 20, image rows by the image routing
@@ -996,15 +1001,21 @@ void select_topk(const std::vector<int>& positions, int ratio, int count, int pa
                            std::to_string(pattern) + "): " + std::to_string(wrong) + " wrong");
 }
 
+// `context` > 0 sizes the masks for a context of that many positions, far past the rows' own (a
+// chunk's rows early in a long context); the block maxima then still take one row of the blocks
+// the rows see, followed by a guard the kernel must not write.
 void select_candidates(const std::vector<int>& positions, int ratio, int keep, int pattern,
-                       std::mt19937& rng) {
+                       std::mt19937& rng, int context = 0) {
     constexpr int block = 8;
     const int t         = int(positions.size());
     std::vector<int> n(static_cast<std::size_t>(t));
     for (int r = 0; r < t; ++r) { n[std::size_t(r)] = (positions[std::size_t(r)] + 1) / ratio; }
     const int most  = *std::max_element(n.begin(), n.end());
     const int width = most + 3;
-    const int words = ((most + block - 1) / block + 31) / 32 + 1;
+    const int words = context > 0 ? ((context / ratio + block - 1) / block + 31) / 32
+                                  : ((most + block - 1) / block + 31) / 32 + 1;
+    const int stride = (width + block - 1) / block;
+    constexpr int kGuard = 256;
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
     std::vector<float> scores(std::size_t(t) * width, 1e30f);
     for (int r = 0; r < t; ++r) {
@@ -1020,13 +1031,19 @@ void select_candidates(const std::vector<int>& positions, int ratio, int keep, i
         std::copy(row.begin(), row.end(), scores.begin() + std::ptrdiff_t(r) * width);
     }
     DeviceBuffer ds = upload(scores), dp = upload(ints(positions)),
-                 mask(std::size_t(t) * words * 4), scratch(std::size_t(t) * words * 32 * 4);
+                 mask(std::size_t(t) * words * 4),
+                 scratch((std::size_t(t) * stride + kGuard) * 4);
     mask.fill(0xFF);
+    scratch.fill(0x5A);
     k::select_candidates(as<float>(ds), width, t, as<std::int32_t>(dp), ratio, block, keep,
-                         as<std::uint32_t>(mask), words, as<float>(scratch), nullptr);
+                         as<std::uint32_t>(mask), words, as<float>(scratch), stride, nullptr);
     sync("select_candidates");
     const auto got    = download<std::uint32_t>(mask, std::size_t(t) * words);
+    const auto tail   = download<std::uint32_t>(scratch, std::size_t(t) * stride + kGuard);
     std::size_t wrong = 0;
+    for (std::size_t i = std::size_t(t) * stride; i < tail.size(); ++i) {
+        wrong += tail[i] != 0x5A5A5A5AU ? 1 : 0;
+    }
     for (int r = 0; r < t; ++r) {
         const float* row = scores.data() + std::size_t(r) * width;
         const int blocks = (n[std::size_t(r)] + block - 1) / block;
@@ -1052,8 +1069,142 @@ void select_candidates(const std::vector<int>& positions, int ratio, int keep, i
     std::string sizes;
     for (const int v : n) { sizes += (sizes.empty() ? "" : ",") + std::to_string(v); }
     report(wrong == 0, "select_candidates " + std::to_string(keep) + " blocks of " + sizes +
-                           " (pattern " + std::to_string(pattern) + "): " + std::to_string(wrong) +
-                           " wrong words");
+                           " (pattern " + std::to_string(pattern) +
+                           (context > 0 ? ", masks of " + std::to_string(context) + " positions"
+                                        : std::string()) +
+                           "): " + std::to_string(wrong) + " wrong words");
+}
+
+// A scratch stride below the blocks of a row's width is refused before any launch.
+void select_candidates_stride() {
+    bool refused = false;
+    try {
+        k::select_candidates(nullptr, 801, 1, nullptr, 1, 8, 2048, nullptr, 4, nullptr, 100,
+                             nullptr);
+    } catch (const std::invalid_argument&) { refused = true; }
+    report(refused, "select_candidates refuses a scratch stride of 100 for 801 positions");
+}
+
+// Rows that see more blocks than they keep: candidate_lists against the union of each group's
+// masks, index_scores over the listed blocks against the same rows over every visible position
+// (bit for bit, -inf where a row does not keep a listed block) and select_topk over the listed rows
+// against select_topk over the whole rows (the same positions).
+void listed_index(const std::string& name, const std::vector<int>& positions,
+                  const std::vector<int>& sequences, int group, int keep, std::mt19937& rng) {
+    constexpr int block = 8;
+    const int t         = int(positions.size());
+    const bool chunk    = sequences.empty();
+    const int seqs = chunk ? 1 : *std::max_element(sequences.begin(), sequences.end()) + 1;
+    std::vector<int> visible(static_cast<std::size_t>(t));
+    for (int r = 0; r < t; ++r) { visible[std::size_t(r)] = positions[std::size_t(r)] + 1; }
+    const int most     = *std::max_element(visible.begin(), visible.end());
+    const int rows     = most + 3;
+    const int width    = chunk ? most : rows;
+    const int blocks   = (width + block - 1) / block;
+    const int words    = (blocks + 31) / 32;
+    const int capacity = std::min(group * keep, blocks);
+    const int groups   = (t + group - 1) / group;
+    // Each row keeps `keep` of its visible blocks at random, its last one among them.
+    std::vector<std::uint32_t> mask(std::size_t(t) * words);
+    for (int r = 0; r < t; ++r) {
+        const int own = (visible[std::size_t(r)] + block - 1) / block;
+        std::vector<int> order(static_cast<std::size_t>(own - 1));
+        std::iota(order.begin(), order.end(), 0);
+        std::shuffle(order.begin(), order.end(), rng);
+        order.resize(std::size_t(std::min(own - 1, keep - 1)));
+        order.push_back(own - 1);
+        for (const int b : order) { mask[std::size_t(r) * words + b / 32] |= 1U << (b % 32); }
+    }
+    const auto keys = random_bf16(std::size_t(seqs) * rows * kIndex, 1.0f, rng);
+    const auto q    = random_bf16(std::size_t(t) * kIndexHeads * kIndex, 1.0f, rng);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> weights(std::size_t(t) * kIndexHeads);
+    for (auto& v : weights) { v = normal(rng); }
+    DeviceBuffer dq = upload(q), dw = upload(weights), dk = upload(keys),
+                 dp = upload(ints(positions)), dseq = upload(ints(sequences)), dm = upload(mask),
+                 dlist(std::size_t(groups) * capacity * 4), dcounts(std::size_t(groups) * 4),
+                 whole(std::size_t(t) * width * 4), listed(std::size_t(t) * capacity * block * 4),
+                 top_whole(std::size_t(t) * 512 * 4), top_listed(std::size_t(t) * 512 * 4);
+    whole.fill(0xFF);
+    listed.fill(0xFF);
+    k::candidate_lists(as<std::uint32_t>(dm), words, t, group, capacity, as<std::int32_t>(dlist),
+                       as<std::int32_t>(dcounts), nullptr);
+    sync("candidate_lists");
+    const auto list   = download<std::int32_t>(dlist, std::size_t(groups) * capacity);
+    const auto counts = download<std::int32_t>(dcounts, std::size_t(groups));
+    std::size_t wrong_lists = 0;
+    for (int g = 0; g < groups; ++g) {
+        std::vector<int> want;
+        for (int b = 0; b < blocks; ++b) {
+            for (int r = g * group; r < std::min(t, (g + 1) * group); ++r) {
+                if ((mask[std::size_t(r) * words + b / 32] >> (b % 32)) & 1U) {
+                    want.push_back(b);
+                    break;
+                }
+            }
+        }
+        wrong_lists += counts[std::size_t(g)] != int(want.size()) ? 1 : 0;
+        for (std::size_t i = 0; i < want.size() && i < std::size_t(capacity); ++i) {
+            wrong_lists += list[std::size_t(g) * capacity + i] != want[i] ? 1 : 0;
+        }
+    }
+    k::ScoreArgs a;
+    a.q               = as<bf16>(dq);
+    a.weights         = as<float>(dw);
+    a.weight_scale    = 1.0f / std::sqrt(float(kIndex)) / std::sqrt(float(kIndexHeads));
+    a.heads           = kIndexHeads;
+    a.tokens          = t;
+    a.width           = width;
+    a.group           = group;
+    a.positions       = as<std::int32_t>(dp);
+    a.sequences       = chunk ? nullptr : as<std::int32_t>(dseq);
+    a.keys            = as<bf16>(dk);
+    a.key_seq_stride  = std::int64_t(rows) * kIndex;
+    a.candidates      = as<std::uint32_t>(dm);
+    a.candidate_words = words;
+    a.block           = block;
+    a.out             = as<float>(whole);
+    k::index_scores(a, nullptr);
+    a.list     = as<std::int32_t>(dlist);
+    a.counts   = as<std::int32_t>(dcounts);
+    a.capacity = capacity;
+    a.width    = capacity * block;
+    a.out      = as<float>(listed);
+    k::index_scores(a, nullptr);
+    sync("index_scores listed");
+    const auto got_whole  = download<std::uint32_t>(whole, std::size_t(t) * width);
+    const auto got_listed = download<std::uint32_t>(listed, std::size_t(t) * capacity * block);
+    std::size_t differ = 0, compared = 0;
+    for (int r = 0; r < t; ++r) {
+        const int g = r / group;
+        for (int s = 0; s < counts[std::size_t(g)] * block; ++s) {
+            const int j = list[std::size_t(g) * capacity + s / block] * block + s % block;
+            if (j >= visible[std::size_t(r)]) { continue; }
+            ++compared;
+            differ += got_listed[std::size_t(r) * capacity * block + s] !=
+                              got_whole[std::size_t(r) * width + j]
+                          ? 1
+                          : 0;
+        }
+    }
+    k::select_topk(as<float>(whole), width, t, as<std::int32_t>(dp), 1, 512,
+                   as<std::int32_t>(top_whole), nullptr);
+    k::select_topk(as<float>(listed), capacity * block, t, as<std::int32_t>(dp), 1, 512,
+                   k::ListedRows{.list     = as<std::int32_t>(dlist),
+                                 .counts   = as<std::int32_t>(dcounts),
+                                 .capacity = capacity,
+                                 .group    = group,
+                                 .block    = block},
+                   as<std::int32_t>(top_listed), nullptr);
+    sync("select_topk listed");
+    const auto want_top = download<std::int32_t>(top_whole, std::size_t(t) * 512);
+    const auto got_top  = download<std::int32_t>(top_listed, std::size_t(t) * 512);
+    std::size_t wrong_top = 0;
+    for (std::size_t i = 0; i < want_top.size(); ++i) { wrong_top += got_top[i] != want_top[i] ? 1 : 0; }
+    report(wrong_lists == 0 && differ == 0 && compared > 0 && wrong_top == 0,
+           "listed index " + name + ": " + std::to_string(wrong_lists) + " wrong list entries, " +
+               std::to_string(differ) + " of " + std::to_string(compared) + " scores differ, " +
+               std::to_string(wrong_top) + " wrong selections");
 }
 
 // ---- Attention ----------------------------------------------------------------------------------
@@ -1066,6 +1217,7 @@ struct AttentionCase {
     int sequence = 0, ring = kRing, topk = 0, ratio = 2, splits = 1;
     float sink_offset = 0.0f;
     int window = kWindow; // a draft block's rows see the window and the block
+    int floor  = 0;       // a prefill tail's first position: no window position below it
 };
 
 void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
@@ -1110,6 +1262,7 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     a.window_seq_stride     = chunk ? 0 : std::int64_t(c.ring) * kLatent;
     a.ring                  = c.ring;
     a.window_size           = c.window;
+    a.window_floor          = c.floor;
     a.compressed            = c.topk > 0 ? as<bf16>(dc) : nullptr;
     a.compressed_seq_stride = std::int64_t(rows) * kLatent;
     a.topk                  = as<std::int32_t>(dt);
@@ -1126,7 +1279,7 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     for (int r = 0; r < t; ++r) {
         const int p  = c.positions[std::size_t(r)];
         const int s  = chunk ? c.sequence : c.sequences[std::size_t(r)];
-        const int lo = std::max(0, p - c.window + 1);
+        const int lo = std::max(std::max(0, std::min(c.floor, p)), p - c.window + 1);
         std::vector<const bf16*> keys;
         for (int j = lo; j <= p; ++j) {
             keys.push_back(window.data() +
@@ -2156,6 +2309,14 @@ int main() {
         select_candidates({99, 39999, 16391}, 1, 2048, 0, rng);
         select_candidates({0, 1, 20001}, 2, 300, 1, rng);
         select_candidates({29999, 4999}, 1, 2048, 2, rng);
+        // A 2048-token chunk's rows early in a 1,000,000-position context (#263): fewer blocks than
+        // kept, masks of 3,907 words, maxima of 1,024 floats a row.
+        select_candidates({0, 2047, 4095, 8191}, 1, 2048, 0, rng, 1000000);
+        select_candidates({999, 8190}, 1, 300, 2, rng, 1000000);
+        select_candidates_stride();
+        listed_index("decode rows", {40000, 16500, 70001}, {0, 1, 2}, 1, 2048, rng);
+        listed_index("a chunk's rows in fours", range(30000, 14), {}, 4, 2048, rng);
+        listed_index("a small keep", range(9000, 9), {}, 4, 64, rng);
 
         sparse_attention({"window only", {0, 50, 3000}, {0, 1, 2}, 0, kRing, 0, 2, 1}, rng);
         sparse_attention({"window only", {0, 50, 3000}, {0, 1, 2}, 0, kRing, 0, 2, 8}, rng);
@@ -2174,6 +2335,9 @@ int main() {
                           4},
                          rng);
         sparse_attention({"a chunk's staging ring", range(200, 6), {}, 1, 768, 512, 1, 1}, rng);
+        sparse_attention({"a chunk's rows over a window floor", range(150, 140), {}, 1, 768, 512, 1, 1,
+                          0.0f, kWindow, 150},
+                         rng);
         sparse_attention({"1024 latents", {9000}, {0}, 0, kRing, 1024, 2, 3}, rng);
         sparse_attention({"1024 latents, empty splits", {9000}, {0}, 0, kRing, 1024, 2, 40}, rng);
         sparse_attention({"sinks far below", {5000, 77}, {0, 1}, 0, kRing, 512, 2, 4, -40.0f}, rng);

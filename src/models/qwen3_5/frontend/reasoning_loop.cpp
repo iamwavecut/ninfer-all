@@ -118,6 +118,23 @@ TailSpan tail_span(std::string_view text, std::size_t limit) {
     return span;
 }
 
+// The shortest period of `tail`, in bytes, of at most kLoopTailPeriod characters, else 0. Strata's
+// period counts characters: the bytes of the tail's first 1..kLoopTailPeriod characters. The tail
+// starts on a character, so a byte shift by a whole number of characters that repeats the tail is
+// exactly a character period.
+std::size_t character_period(std::string_view tail) {
+    std::size_t period = 0;
+    for (std::size_t characters = 1; characters <= kLoopTailPeriod; ++characters) {
+        do {
+            ++period;
+        } while (period < tail.size() &&
+                 (static_cast<unsigned char>(tail[period]) & 0xc0U) == 0x80U);
+        if (period >= tail.size()) { return 0; }
+        if (tail.substr(period) == tail.substr(0, tail.size() - period)) { return period; }
+    }
+    return 0;
+}
+
 } // namespace
 
 void append_words(std::string_view bytes, std::string& partial, std::vector<std::uint64_t>& words) {
@@ -184,20 +201,55 @@ void append_tail(std::string_view bytes, std::string& tail) {
 bool periodic_tail(std::string_view text) {
     const TailSpan span = tail_span(text, kLoopTailChars);
     if (span.characters < kLoopTailChars) { return false; }
-    const std::string_view tail = text.substr(span.begin);
-    // Strata's period counts characters: the bytes of the tail's first 1..kLoopTailPeriod
-    // characters. The tail starts on a character, so a byte shift by a whole number of characters
-    // that repeats the tail is exactly a character period.
-    std::size_t period = 0;
-    for (std::size_t characters = 1; characters <= kLoopTailPeriod; ++characters) {
-        do {
-            ++period;
-        } while (period < tail.size() &&
-                 (static_cast<unsigned char>(tail[period]) & 0xc0U) == 0x80U);
-        if (period >= tail.size()) { return false; }
-        if (tail.substr(period) == tail.substr(0, tail.size() - period)) { return true; }
+    return character_period(text.substr(span.begin)) != 0;
+}
+
+bool counting_tail(std::string_view text) {
+    const TailSpan span = tail_span(text, kLoopTailChars);
+    if (span.characters < kLoopTailChars) { return false; }
+    // Every run of ASCII digits becomes one 0xff byte, which UTF-8 never holds, and its value is
+    // kept, held far above any counter's.
+    constexpr std::uint64_t kHeld = 1'000'000'000'000'000ULL;
+    std::string masked;
+    std::vector<std::uint64_t> numbers;
+    bool digits = false;
+    for (const char raw : text.substr(span.begin)) {
+        if (raw >= '0' && raw <= '9') {
+            if (!digits) {
+                masked.push_back(static_cast<char>(0xff));
+                numbers.push_back(0);
+            }
+            digits         = true;
+            numbers.back() = std::min(numbers.back() * 10U + std::uint64_t(raw - '0'), kHeld);
+            continue;
+        }
+        digits = false;
+        masked.push_back(raw);
     }
-    return false;
+    const std::size_t period = character_period(masked);
+    if (period == 0) { return false; }
+    const auto slots = static_cast<std::size_t>(
+        std::count(masked.begin(), masked.begin() + std::ptrdiff_t(period), static_cast<char>(0xff)));
+    if (slots == 0) { return false; } // a plain period, which periodic_tail reads
+    // Runs i and i + slots are one number of two consecutive periods. The first and the last run
+    // may be cut by the tail's ends, so neither is read. Every number of the period keeps one step
+    // (a constant's is zero) and one of them moves: a counter beside numbers that change otherwise
+    // is an enumeration of worked values ("step 7 checks value 4821"), not a loop.
+    bool moves = false;
+    for (std::size_t first = 1; first <= slots; ++first) {
+        std::int64_t step = 0;
+        std::size_t steps = 0;
+        for (std::size_t i = first; i + slots + 1 < numbers.size(); i += slots) {
+            const std::int64_t move =
+                std::int64_t(numbers[i + slots]) - std::int64_t(numbers[i]);
+            if (steps == 0) { step = move; }
+            if (move != step) { return false; }
+            ++steps;
+        }
+        if (steps < kLoopCounterSteps) { return false; }
+        moves = moves || step != 0;
+    }
+    return moves;
 }
 
 } // namespace ninfer::models::qwen3_5

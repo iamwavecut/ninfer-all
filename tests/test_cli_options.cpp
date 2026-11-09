@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -59,12 +60,15 @@ int run_tests() {
                          "--draft-tokens", "4", "--draft-min-p", floor});
         }), "CLI accepted invalid draft confidence");
     }
-    for (const auto* backend : {"dflash", "dflash2"}) {
-        failures += check(rejects([&] {
-            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", backend,
-                         "--draft-tokens", "4", "--draft-min-p", "0.3"});
-        }), "CLI accepted draft confidence outside MTP");
-    }
+    failures += check(rejects([&] {
+        (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dflash",
+                     "--draft-tokens", "4", "--draft-min-p", "0.3"});
+    }), "CLI accepted draft confidence outside MTP and DFlash2");
+    // Qwen3.8-Flash-Next's DFlash2 drafter verifies through its first draft at or below the floor.
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dflash2",
+                             "--draft-tokens", "4", "--draft-min-p", "0.3"})
+                              .speculative.draft_min_p == 0.3f,
+                      "CLI did not preserve the DFlash2 confidence floor");
     // Without --spec the floor is kept for the MTP the Engine chooses, zero included.
     for (const auto* floor : {"0", "0.3"}) {
         const auto automatic =
@@ -223,6 +227,39 @@ int run_tests() {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--ngram-ram-mib", budget});
         }), "CLI accepted an invalid row-cache budget");
+    }
+    {
+        const auto defaults = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"});
+        failures += check(defaults.ngram_table.dedupe && defaults.ngram_table.read_ahead &&
+                              defaults.prompt_routes.prefill_tail == ninfer::PrefillTail::Exact &&
+                              defaults.prompt_routes.iq1m_expert_matrix,
+                          "CLI did not default to deduplicated, read-ahead Engram rows, the exact "
+                          "prefill tail and IQ1_M experts on the matrix kernel");
+        const auto off = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--ngram-dedupe",
+                                "off", "--ngram-read-ahead", "off", "--prefill-tail", "full",
+                                "--iq1m-experts", "vector"});
+        failures += check(!off.ngram_table.dedupe && !off.ngram_table.read_ahead &&
+                              off.prompt_routes.prefill_tail == ninfer::PrefillTail::Full &&
+                              !off.prompt_routes.iq1m_expert_matrix,
+                          "CLI did not preserve the n-gram read and prompt route switches");
+        const auto rows = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--prefill-tail",
+                                 "512"});
+        failures += check(rows.prompt_routes.prefill_tail == ninfer::PrefillTail::Rows &&
+                              rows.prompt_routes.prefill_tail_rows == 512,
+                          "CLI did not preserve a prefill tail row count");
+    }
+    for (const auto* tail : {"127", "0", "exactly", "-5", "2414x"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--prefill-tail", tail});
+        }), "CLI accepted an invalid prefill tail");
+    }
+    for (const auto& option : {std::pair{"--iq1m-experts", "mmq"},
+                               std::pair{"--ngram-dedupe", "yes"},
+                               std::pair{"--ngram-read-ahead", "1"}}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", option.first,
+                         option.second});
+        }), "CLI accepted an invalid on/off or kernel value");
     }
     for (const auto* backend : {"mtp", "dflash", "dflash2"}) {
         for (unsigned width = 0; width <= 63; ++width) {
@@ -609,6 +646,11 @@ int run_tests() {
                               .tensor_parallel_prompt_partials ==
                           ninfer::TensorParallelPartials::Bf16,
                       "--tensor-parallel-prompt-partials did not reach the options");
+    failures +=
+        check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                     "--tensor-parallel", "--tensor-parallel-prompt-partials", "int8"})
+                      .tensor_parallel_prompt_partials == ninfer::TensorParallelPartials::Int8,
+              "--tensor-parallel-prompt-partials int8 did not reach the options");
     failures += check(rejects([&] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
                                        "--tensor-parallel-prompt-partials", "bf16"});

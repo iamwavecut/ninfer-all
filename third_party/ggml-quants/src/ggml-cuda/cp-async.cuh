@@ -1,3 +1,4 @@
+#pragma once // NInfer: included by mmq.cuh too
 // Simplified API for asynchronous data loading.
 
 #include "common.cuh"

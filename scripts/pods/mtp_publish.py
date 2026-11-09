@@ -40,9 +40,9 @@ def main():
     media_records = [json.loads((media_job / (label + '.json')).read_text())
                      for label in media_qualification['checks']]
     if not media_records or any(r['status'] != 'passed' or
-        r['vision'].get('timings', {}).get('draft_n', 0) != 0 or
+        r['vision'].get('timings', {}).get('draft_n', 0) <= 0 or
         r['text_after_vision']['timings'].get('draft_n', 0) <= 0 for r in media_records):
-        raise RuntimeError('the media fallback or subsequent text MTP check failed')
+        raise RuntimeError('the media or subsequent text MTP check failed')
     audit = {r['repo']: r for r in json.loads(args.audit.read_text())}[repo]
     base, = audit['artifacts']
     model = Path(candidate['model_path'])
@@ -98,10 +98,8 @@ def main():
         '8 GiB device expert cache. All expert arithmetic ran on the GPU. Each mode used two '
         'fixed prompts, three greedy repetitions and 64 generated tokens per request, with prefix '
         'reuse disabled. Each fixed mode repeated exactly and accepted MTP drafts. Image requests '
-        'identified the red test image with thinking disabled. Flash-Next disables MTP for media '
-        'requests and uses plain decoding. A fresh text request resumed MTP after each image check. '
-        'An initial check incorrectly required MTP for media and failed. Source inspection '
-        'confirmed this existing limitation; the engine behavior was not changed.\n\n'
+        'identified the red test image with thinking disabled and drafted with MTP, and so did a '
+        'text request after each image check.\n\n'
         'Samples include the first request. Cache contents are not reset between repetitions. '
         'Other artifacts were being prepared on the same host during this campaign, so these '
         'timings do not isolate the performance effect of MTP.\n\n'

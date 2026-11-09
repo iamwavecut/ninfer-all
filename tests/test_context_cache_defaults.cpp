@@ -229,8 +229,8 @@ int main() {
 
     // Hybrid mode derives every tuning value from the rest of the configuration. With the default
     // Host tier (8 GiB) at concurrency 2 and a 2048-token chunk: one resident snapshot per lane
-    // plus one staging slot = 3, 8 taps, ladder max(4096, 2 * 2048) = 4096 and minimum gap
-    // max(1024, 2048) = 2048. The Legacy catalogs and Host pools are empty.
+    // plus a staging slot and a spare one = 4, which may yield to the KV capacity, 8 taps, ladder max(4096, 2 * 2048) = 4096 and
+    // minimum gap max(1024, 2048) = 2048. The Legacy catalogs and Host pools are empty.
     {
         EngineOptions options;
         options.max_concurrency                = 2;
@@ -240,7 +240,8 @@ int main() {
         const ninfer::ContextCacheOptions& out = normalized.context_cache;
         failures +=
             check(out.host_cache_budget_bytes == ninfer::kDefaultHybridHostCacheBytes &&
-                      out.hybrid.device_snapshot_slots == 3U && out.device_state_slots == 3U &&
+                      out.hybrid.device_snapshot_slots == 4U && out.device_state_slots == 4U &&
+                      out.hybrid.fit_device_snapshot_slots &&
                       out.hybrid.max_new_taps == 8U && out.hybrid.tap_ladder_tokens == 4096U &&
                       out.hybrid.tap_min_gap_tokens == 2048U && out.host_state_slots == 0 &&
                       out.host_kv_capacity_bytes == 0 && out.max_private_continuations == 2U &&
@@ -248,8 +249,9 @@ int main() {
                   "hybrid defaults did not derive from concurrency, chunk and Host tier");
     }
 
-    // Without a Host tier Device slots are the only snapshot storage: two spare slots and a
-    // two-tap budget. A large chunk coarsens the ladder: max(4096, 2 * 8192) and max(1024, 8192).
+    // Without a Host tier Device slots are the only snapshot storage: the same two spare slots and
+    // a two-tap budget. A large chunk coarsens the ladder: max(4096, 2 * 8192) and
+    // max(1024, 8192).
     {
         EngineOptions options;
         options.max_concurrency                       = 8;
@@ -264,7 +266,7 @@ int main() {
                   "Device-only hybrid defaults are wrong");
     }
 
-    // Explicit hybrid overrides are kept verbatim.
+    // Explicit hybrid overrides are kept verbatim, and a given slot count does not yield.
     {
         EngineOptions options;
         options.max_concurrency                            = 4;
@@ -276,7 +278,7 @@ int main() {
         const ninfer::ContextCacheOptions out = normalize_engine_options(options).context_cache;
         failures +=
             check(out.hybrid.device_snapshot_slots == 12U && out.device_state_slots == 12U &&
-                      out.hybrid.max_new_taps == 3U && out.hybrid.tap_ladder_tokens == 8192U &&
+                      !out.hybrid.fit_device_snapshot_slots && out.hybrid.max_new_taps == 3U && out.hybrid.tap_ladder_tokens == 8192U &&
                       out.hybrid.tap_min_gap_tokens == 512U,
                   "explicit hybrid overrides were not preserved");
     }

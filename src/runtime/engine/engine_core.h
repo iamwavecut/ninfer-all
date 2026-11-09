@@ -4,6 +4,7 @@
 
 #include "core/device.h"
 #include "core/device_snapshot.h"
+#include "core/device_wait.h"
 #include "core/nvtx.h"
 #include "ninfer/base.h"
 #include "ninfer/engine_options.h"
@@ -181,7 +182,9 @@ public:
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
+            std::optional<DeviceWaitWatch> watched;
             try {
+                watched.emplace(device_, "Engine worker");
                 device_.bind_to_current_thread();
                 startup.set_value();
             } catch (...) {
@@ -468,6 +471,7 @@ public:
     ResidencyStatus suspend(std::optional<bool> auto_resume) {
         require_suspend_enabled();
         std::scoped_lock lock(execution_mutex_);
+        const DeviceWaitWatch watched(device_, "Engine caller");
         device_.bind_to_current_thread();
         if (suspended_.load(std::memory_order_acquire)) {
             auto_resume_.store(auto_resume.value_or(suspend_options_.auto_resume),
@@ -510,6 +514,7 @@ public:
     ResidencyStatus resume() {
         require_suspend_enabled();
         std::scoped_lock lock(execution_mutex_);
+        const DeviceWaitWatch watched(device_, "Engine caller");
         device_.bind_to_current_thread();
         resume_locked();
         return residency();
@@ -533,6 +538,7 @@ public:
               std::string_view expected_digest, std::string_view session_path,
               const std::function<void()>& claim) {
         std::scoped_lock lock(execution_mutex_);
+        const DeviceWaitWatch watched(device_, "Engine caller");
         device_.bind_to_current_thread();
         ensure_resident_locked();
         require_settled_slot(slot);
@@ -552,6 +558,7 @@ public:
                  std::string_view model_binding, std::string_view session_path,
                  const std::function<void()>& claim) {
         std::scoped_lock lock(execution_mutex_);
+        const DeviceWaitWatch watched(device_, "Engine caller");
         device_.bind_to_current_thread();
         ensure_resident_locked();
         if (!context_cache_enabled_) {
@@ -602,6 +609,7 @@ public:
     std::uint32_t erase_slot(std::uint32_t slot, std::string_view expected_digest,
                              const std::function<void(const std::string&)>& claim) {
         std::scoped_lock lock(execution_mutex_);
+        const DeviceWaitWatch watched(device_, "Engine caller");
         ensure_resident_locked();
         require_settled_slot(slot);
         const auto view = resources_.catalog_slot(slot);

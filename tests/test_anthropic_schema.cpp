@@ -658,7 +658,71 @@ int test_thinking_and_count_tokens() {
     body["thinking"] = Json{{"type", "disabled"}, {"display", "omitted"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "display was accepted with disabled Thinking");
+
+    // Effort is independent of Thinking in the Messages API: disabled Thinking with an effort
+    // (as Claude Code sends) keeps thinking off and drops the effort, which the templates apply
+    // only to a thinking turn.
+    for (const char* mode : {"disabled", "between_tools"}) {
+        for (const char* level : {"low", "high", "max"}) {
+            body                          = base_request();
+            body["thinking"]              = Json{{"type", mode}};
+            body["output_config"]         = Json{{"effort", level}};
+            const GenerationRequest quiet = parse(body).generation;
+            ResolvedPromptSemantics quiet_semantics;
+            const std::string code = api_code([&] { quiet_semantics = semantics(quiet); });
+            failures += check(quiet.enable_thinking == false && !quiet.reasoning_effort &&
+                                  code.empty() && quiet_semantics.enable_thinking == false &&
+                                  !quiet_semantics.reasoning_effort,
+                              std::string("Thinking ") + mode + " with effort " + level +
+                                  " did not run without reasoning");
+        }
+    }
+    body                  = base_request();
+    body["thinking"]      = Json{{"type", "disabled"}};
+    body["output_config"] = Json{{"effort", "future"}};
+    failures += check(api_param([&] { (void)parse(body); }) == "output_config.effort",
+                      "disabled Thinking skipped effort validation");
+    body["output_config"] = Json{{"effort", "high"}};
+    body["tools"] =
+        Json::array({Json{{"name", "probe"}, {"input_schema", Json{{"type", "object"}}}}});
+    body["tool_choice"] = Json{{"type", "tool"}, {"name", "probe"}};
+    failures += check(api_code([&] { (void)semantics(parse(body).generation); }).empty(),
+                      "disabled Thinking with effort refused a forced tool call");
+    {
+        ServeOptions server;
+        server.default_reasoning_effort = RequestedReasoningEffort::Medium;
+        body                            = base_request();
+        body["thinking"]                = Json{{"type", "disabled"}};
+        body["output_config"]           = Json{{"effort", "high"}};
+        const ResolvedPromptSemantics served =
+            resolve_prompt_semantics(parse(body).generation, server);
+        failures += check(served.enable_thinking == false && !served.reasoning_effort,
+                          "disabled Thinking with effort took the server effort default");
+    }
+    body                  = base_request();
+    body["thinking"]      = Json{{"type", "adaptive"}};
+    body["output_config"] = Json{{"effort", "high"}};
+    {
+        const GenerationRequest adaptive          = parse(body).generation;
+        const ResolvedPromptSemantics adaptive_on = semantics(adaptive);
+        failures += check(adaptive.enable_thinking == true &&
+                              adaptive.reasoning_effort == RequestedReasoningEffort::High &&
+                              adaptive_on.enable_thinking == true &&
+                              adaptive_on.reasoning_effort == ninfer::ReasoningEffort::High &&
+                              adaptive_on.requested_reasoning_effort ==
+                                  RequestedReasoningEffort::High,
+                          "adaptive Thinking with effort high did not reach the template");
+    }
+    body.erase("thinking");
+    body["output_config"] = Json{{"effort", "low"}};
+    {
+        const ResolvedPromptSemantics implied = semantics(parse(body).generation, false);
+        failures += check(implied.enable_thinking == true &&
+                              implied.reasoning_effort == ninfer::ReasoningEffort::Low,
+                          "an effort without a thinking field did not enable thinking");
+    }
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
+    body.erase("output_config");
 
     body["max_tokens"]                        = 0;
     body["temperature"]                       = "ignored for counting";

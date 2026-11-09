@@ -67,6 +67,7 @@ struct MoeWeights {
     // One per expert; empty when the experts stay in the files, which `located` then describes.
     std::vector<WeightId> gate, up, down;
     std::vector<ExpertLocation> located_gate, located_up, located_down;
+    // The shared expert, or under tensor parallelism the rank's run of it (TensorShare).
     WeightId shared_gate, shared_up, shared_down;
 };
 
@@ -88,18 +89,28 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
     // Tensor parallelism: what every rank after the first holds, [rank - 1]: its replica of the
     // token embedding and its part of each layer (its MoE weights are the router's and the shared
-    // score's replicas; `layers` lists every rank's routed experts).
+    // score's replicas and its run of the shared expert; `layers` lists every rank's routed
+    // experts).
     std::vector<WeightId> rank_embeddings;
     std::vector<std::vector<LayerWeights>> rank_layers;
+    // Tensor parallelism: rank r projects rows [head_rows[r], head_rows[r + 1]) of the head with
+    // head_shares[r], for the text from its own stack, read through its final mixer
+    // (rank_final_mixers[r - 1] after the first), and for the MTP block's drafts from rank 0's
+    // read of the block's stack; rank 0 also holds `output_head` whole, for prompt passes.
+    std::vector<std::uint64_t> head_rows;
+    std::vector<WeightId> head_shares;
+    std::vector<HyperConnectionWeights> rank_final_mixers;
 };
 
 // Tensor parallelism: the runs of every layer one rank holds. A rank holds the value heads of its
 // Gated DeltaNet key heads and the 12 query heads of each of its sparse-attention KV heads; the
-// ranks holding KV heads are a prefix of the ranks.
+// ranks holding KV heads are a prefix of the ranks. Each rank also holds a run of the shared
+// expert's 640-wide middle: those rows of its gate and up and those values of its down rows.
 struct TensorShare {
     std::uint32_t key_head_begin = 0, key_head_end = 0;
     std::uint32_t kv_head_begin = 0, kv_head_end = 0;
     std::uint32_t expert_begin = 0, expert_end = 0;
+    std::uint32_t shared_begin = 0, shared_end = 0;
 };
 
 // The MTP block (vLLM Qwen4ExpMultiTokenPredictor): the two input norms and projections, one
@@ -109,6 +120,23 @@ struct MtpWeights {
     WeightId embedding_norm, hidden_norm, fc_embedding, fc_hidden;
     LayerWeights layer;
     HyperConnectionWeights final_mixer;
+};
+
+// The DFlash2 drafter (docs/maintainer/dflash.md): the feature projection with its context norm,
+// the sliding-window layers (each with the query block's projections, the context's K/V uses of
+// the same matrices, the q/k norms, the dense SwiGLU and a dynamic convolution around each branch)
+// and the conditional selector. The token embedding and the head are the text model's.
+struct DFlash2LayerWeights {
+    WeightId input_norm, post_attention_norm;
+    WeightId query, key, value, context_key, context_value, query_norm, key_norm, output;
+    WeightId gate, up, down;
+    WeightId attention_base, attention_projection, mlp_base, mlp_projection;
+};
+
+struct DFlash2Weights {
+    WeightId feature_projection, context_norm, final_norm;
+    WeightId selector_projection, predecessor_codebook, successor_codebook;
+    std::vector<DFlash2LayerWeights> layers;
 };
 
 struct LoadOptions {
@@ -125,12 +153,15 @@ struct LoadOptions {
     // Loads the MTP block the artifact carries (its `mtp` component) onto the last stage's device,
     // beside the head it shares; its experts take the text layers' residency.
     bool mtp = false;
+    // Loads the DFlash2 drafter the artifact carries (its `dflash2` component) onto the device of
+    // the head, which it reads, as it reads the token embedding.
+    bool dflash2 = false;
     // Tensor parallelism (`--tensor-parallel`): each rank's relative share of every layer, one
     // positive weight per rank; empty for none. Each rank holds a run of every Gated DeltaNet
     // layer's heads, of the sparse-attention layers' KV heads (as far as the two allow) and of the
     // routed experts, and replicas of the token embedding, the hyper-connections, the routers and
-    // the PLE layer; rank 0 also the shared experts, the final mixer, the head, the MTP block and
-    // the Vision tower. One stage; the experts must be device resident.
+    // the PLE layer, a run of each shared expert and of the head's rows; rank 0 also the MTP block
+    // and the Vision tower. One stage; the experts must be device resident.
     std::vector<double> tensor_split;
 };
 
@@ -184,6 +215,15 @@ public:
         return mtp_weights_;
     }
 
+    // The DFlash2 drafter when the model was loaded with it.
+    [[nodiscard]] const std::optional<DFlash2Config>& dflash2_config() const noexcept {
+        return dflash2_config_;
+    }
+
+    [[nodiscard]] const std::optional<DFlash2Weights>& dflash2_weights() const noexcept {
+        return dflash2_weights_;
+    }
+
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
 
     // The artifact's files, in its order (disk-resident experts are read from them).
@@ -227,6 +267,8 @@ private:
     std::optional<qwen3_5::VisionWeights> vision_weights_;
     std::optional<MtpConfig> mtp_config_;
     std::optional<MtpWeights> mtp_weights_;
+    std::optional<DFlash2Config> dflash2_config_;
+    std::optional<DFlash2Weights> dflash2_weights_;
     std::vector<TensorShare> shares_; // by rank under tensor parallelism
 };
 

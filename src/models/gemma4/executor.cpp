@@ -1,6 +1,7 @@
 #include "models/gemma4/executor.h"
 
 #include "core/decode_graph.h"
+#include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/tensor_parallel.h"
@@ -125,6 +126,7 @@ struct LayerPlan {
     gguf::GgmlType gate_up_type{}, down_type{};
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     DeviceBuffer tables; // pointers: [E] gate, [E] up, [E] gate_up, [E] down
+    bool gate_up_aligned16 = true, down_aligned16 = true;
     // Expert parallelism: rank r's tables (r > 0) in its device memory, entries of the experts it
     // holds (`tables` holds rank 0's); the other entries are null.
     std::vector<DeviceBuffer> peer_tables;
@@ -450,6 +452,16 @@ struct Executor::Impl {
                             table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
                                                std::int64_t(x - first) * hidden * p.down_row_bytes;
                         }
+                        bool gate_up_aligned = p.gate_up_row_bytes % 16 == 0;
+                        bool down_aligned    = p.down_row_bytes % 16 == 0;
+                        for (std::size_t i = 0; i < table.size(); ++i) {
+                            const auto address = reinterpret_cast<std::uintptr_t>(table[i]);
+                            const bool aligned = table[i] == nullptr || address % 16 == 0;
+                            (i < 3 * std::size_t(e) ? gate_up_aligned : down_aligned) &=
+                                aligned;
+                        }
+                        p.gate_up_aligned16 = p.gate_up_aligned16 && gate_up_aligned;
+                        p.down_aligned16    = p.down_aligned16 && down_aligned;
                         DeviceBuffer buffer(table.size() * sizeof(void*));
                         buffer.copy_from_host(table.data(), table.size() * sizeof(void*));
                         return buffer;
@@ -716,6 +728,17 @@ struct Executor::Impl {
             }
             delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                         std::move(sources), transport);
+            // Aliases 0 to 2 (gate, up, gate_up) point into the gate/up blob, 3 into the down blob.
+            for (auto& p : layers) {
+                if (p.delivery_layer < 0) { continue; }
+                const auto l       = std::size_t(p.delivery_layer);
+                const auto aligned = [&](std::size_t alias) {
+                    return delivery->alias_aligned(l, alias, 16);
+                };
+                p.gate_up_aligned16 =
+                    p.gate_up_row_bytes % 16 == 0 && aligned(0) && aligned(1) && aligned(2);
+                p.down_aligned16 = p.down_row_bytes % 16 == 0 && aligned(3);
+            }
         }
     }
 
@@ -838,7 +861,7 @@ struct Executor::Impl {
     // remaining sequence reaches, and the expert cache takes what is free beyond its headroom.
     void release(std::uint32_t sequence) {
         if (!growing || sequence_areas.empty() || sequence_areas.front()->backed[sequence] == 0) { return; }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (KvArea* area : sequence_areas) { trim(*area, sequence, 0); }
         std::uint32_t longest = 0;
         for (const std::uint32_t backed : sequence_areas.front()->backed) { longest = std::max(longest, backed); }
@@ -853,13 +876,13 @@ struct Executor::Impl {
     }
 
     ~Impl() {
-        if (delivery || growing) { cudaStreamSynchronize(stream); }
+        if (delivery || growing) { ninfer::wait_for_stream(stream); }
         if (media_begin != nullptr) { cudaEventDestroy(media_begin); }
         if (media_end != nullptr) { cudaEventDestroy(media_end); }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
-            cudaStreamSynchronize(expert_peers[r].stream);
+            ninfer::wait_for_stream(expert_peers[r].stream);
             expert_peers[r].workspace.reset();
             cudaStreamDestroy(expert_peers[r].stream);
         }
@@ -1124,10 +1147,12 @@ struct Executor::Impl {
         gguf::moe_keep_experts(ids, pairs, int(range.first), int(range.second), mine, on);
         const gguf::MoeRouting routing = gguf::moe_sort_routes(
             mine, pairs, e, space.alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data, on);
-        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden};
-        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width};
+        const bool gate_up_aligned = p.gate_up_aligned16, down_aligned = p.down_aligned16;
+        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden,
+                                     gate_up_aligned};
+        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width, down_aligned};
         const int max_active = std::max(1, std::min(pairs, int(range.second - range.first)));
         auto* middle =
             static_cast<__nv_bfloat16*>(space.alloc_bytes(std::size_t(pairs) * width * 2).data);
@@ -1163,12 +1188,14 @@ struct Executor::Impl {
     }
 
     // Expert parallelism's MoE call after rank 0 has routed it: the input goes to every other
-    // rank, each runs its part while rank 0 runs its own, and the parts' sum lands where `combine`
-    // reads it. Up to 8 tokens this is the sum one device stores, bit for bit; a wider call sums in
-    // the same fixed point where one device weighs FP32 rows in ffn_combine.
+    // rank, each runs its part while rank 0 runs its own and the dense MLP (`mlp`), and the parts'
+    // sum lands where `combine` reads it. Up to 8 tokens this is the sum one device stores, bit for
+    // bit; a wider call sums in the same fixed point where one device weighs FP32 rows in
+    // ffn_combine.
+    template <typename Mlp>
     void experts_parallel(const LayerPlan& p, const __nv_bfloat16* x, const void* act,
                           const std::int32_t* ids, const float* weights, int t,
-                          kernels::FfnCombineArgs& combine) {
+                          kernels::FfnCombineArgs& combine, Mlp&& mlp) {
         const std::size_t pairs  = std::size_t(t) * config.top_k_experts;
         const std::size_t part   = std::size_t(t) * hidden * 8;
         const ExpertInput layout = expert_input(t);
@@ -1196,6 +1223,7 @@ struct Executor::Impl {
         auto* fixed = static_cast<unsigned long long*>(workspace->alloc_bytes(part).data);
         expert_part(p, static_cast<const void* const*>(p.tables.p), model.expert_range(0), act, x,
                     ids, weights, t, fixed, *workspace, stream);
+        mlp();
         std::vector<const unsigned long long*> parts;
         for (void* received : expert_exchange->collect(part, slot, stream)) {
             parts.push_back(static_cast<const unsigned long long*>(received));
@@ -1342,25 +1370,30 @@ struct Executor::Impl {
         kernels::attn_residual(residual, stream);
         const int width = int(config.intermediate_size);
         Tensor middle   = workspace->alloc(DType::BF16, {width, t});
-        if (q8) {
-            gguf::vector_swiglu(ops::detail::gguf_type(p.gate_up.qtype), p.gate_up.qdata,
-                                row_bytes(p.gate_up), width, hidden, mlp_q.base, t,
-                                static_cast<__nv_bfloat16*>(middle.data), width, stream,
-                                gguf::GateActivation::GeluTanh);
-        } else {
-            // The integer matrix kernel takes whole 128-row tiles: the [gate; up] parent at once
-            // (2 x 2112 rows), then GeGLU over its FP32 rows.
-            auto* plane = static_cast<float*>(
-                workspace->alloc_bytes(std::size_t(t) * 2 * width * 4).data);
-            ops::detail::GgufProduct product;
-            product.weight   = &p.gate_up;
-            product.f32      = plane;
-            product.f32_rows = 2 * width;
-            ops::detail::gguf_project(mlp_in, {&product, 1}, *workspace, stream);
-            kernels::geglu_rows(plane, t, width, static_cast<__nv_bfloat16*>(middle.data), stream);
-        }
-        Tensor dense = workspace->alloc(DType::BF16, {hidden, t});
-        project(middle, p.down, dense);
+        Tensor dense    = workspace->alloc(DType::BF16, {hidden, t});
+        // The dense MLP reads only the attention residual: a MoE block runs it while other ranks
+        // run their experts or missing experts are copied in (experts()).
+        const auto mlp = [&] {
+            if (q8) {
+                gguf::vector_swiglu(ops::detail::gguf_type(p.gate_up.qtype), p.gate_up.qdata,
+                                    row_bytes(p.gate_up), width, hidden, mlp_q.base, t,
+                                    static_cast<__nv_bfloat16*>(middle.data), width, stream,
+                                    gguf::GateActivation::GeluTanh);
+            } else {
+                // The integer matrix kernel takes whole 128-row tiles: the [gate; up] parent at
+                // once (2 x 2112 rows), then GeGLU over its FP32 rows.
+                auto* plane = static_cast<float*>(
+                    workspace->alloc_bytes(std::size_t(t) * 2 * width * 4).data);
+                ops::detail::GgufProduct product;
+                product.weight   = &p.gate_up;
+                product.f32      = plane;
+                product.f32_rows = 2 * width;
+                ops::detail::gguf_project(mlp_in, {&product, 1}, *workspace, stream);
+                kernels::geglu_rows(plane, t, width, static_cast<__nv_bfloat16*>(middle.data),
+                                    stream);
+            }
+            project(middle, p.down, dense);
+        };
         kernels::FfnCombineArgs combine;
         combine.h         = h;
         combine.hidden    = hidden;
@@ -1375,14 +1408,18 @@ struct Executor::Impl {
         if (p.moe) {
             combine.w_dense = p.mlp_post_norm;
             combine.w_moe   = p.post_norm;
-            experts(p, residual.moe_in, q8 ? &moe_q : nullptr, residual.router_x, t, combine);
+            experts(p, residual.moe_in, q8 ? &moe_q : nullptr, residual.router_x, t, combine, mlp);
+        } else {
+            mlp();
         }
         kernels::ffn_combine(combine, stream);
     }
 
-    // The routed experts of block `p`; their output lands where `combine` reads it.
+    // The routed experts of block `p` (their output lands where `combine` reads it) and `mlp`, the
+    // dense MLP, run while other ranks run their experts or missing experts are copied in.
+    template <typename Mlp>
     void experts(const LayerPlan& p, const __nv_bfloat16* x, const Q8Act* xq, const float* router_x,
-                 int t, kernels::FfnCombineArgs& combine) {
+                 int t, kernels::FfnCombineArgs& combine, Mlp&& mlp) {
         const int e = int(config.num_experts), k = int(config.top_k_experts);
         const int width = int(config.moe_intermediate_size);
         const int pairs = t * k;
@@ -1419,7 +1456,7 @@ struct Executor::Impl {
             }
         }
         if (model.expert_parallel()) {
-            experts_parallel(p, x, act, ids, weights, t, combine);
+            experts_parallel(p, x, act, ids, weights, t, combine, mlp);
             return;
         }
         std::optional<ExpertDelivery::Call> call;
@@ -1430,14 +1467,15 @@ struct Executor::Impl {
             call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream,
                                    cpu ? std::span<const ExpertDelivery::Input>(inputs)
                                        : std::span<const ExpertDelivery::Input>());
-            if (t > gguf::kMaxVectorColumns) { delivery->await(stream); }
         }
         const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
                                       : static_cast<const void* const*>(p.tables.p);
-        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden};
-        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width};
+        const bool gate_up_aligned = p.gate_up_aligned16, down_aligned = p.down_aligned16;
+        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden,
+                                     gate_up_aligned};
+        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width, down_aligned};
         const int max_active = std::min(pairs, e);
         auto* middle = static_cast<__nv_bfloat16*>(
             workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
@@ -1459,9 +1497,9 @@ struct Executor::Impl {
             };
             if (call) {
                 // Both stages add to the same exact fixed-point sum, zeroed once above, each over
-                // its experts of the call's sorted routes. Quantization reads every pair: the
-                // cached stage finds the other pairs cleared, the missing stage the cached pairs'
-                // middles.
+                // its experts of the call's sorted routes; the dense MLP runs between them, while
+                // the missing experts arrive. Quantization reads every pair: the cached stage finds
+                // the other pairs cleared, the missing stage the cached pairs' middles.
                 const auto stage = [&](const std::int32_t* set) {
                     gguf::MoeRouting part = routing;
                     part.active_count     = set;
@@ -1470,15 +1508,21 @@ struct Executor::Impl {
                 };
                 CUDA_CHECK(cudaMemsetAsync(middle, 0, std::size_t(pairs) * width * 2, stream));
                 compute(stage(call->cached_experts));
+                mlp();
                 delivery->await(stream);
                 compute(stage(call->missing_experts));
                 if (call->cpu != nullptr) {
                     kernels::add_fixed(fixed, call->products, call->cpu, std::int64_t(t) * hidden, stream);
                 }
-            } else { compute(routing); }
+            } else {
+                compute(routing);
+                mlp();
+            }
             combine.moe_fixed = fixed;
             return;
         }
+        mlp();
+        if (delivery) { delivery->await(stream); }
         void* rows_act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
         gguf::quantize_moe_matrix_activation(p.gate_up_type, x, hidden, routing, pairs, k, rows_act,
                                              stream);
@@ -2191,7 +2235,7 @@ struct Executor::Impl {
         auto* host = static_cast<std::int32_t*>(h_drafts->data());
         CUDA_CHECK(cudaMemcpyAsync(host, d_drafts.p, std::size_t(n) * steps * 4,
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (int j = 0; j < n; ++j) {
             for (std::uint32_t i = 0; i < steps; ++i) { out[j * steps + i] = host[i * n + j]; }
         }
@@ -2394,7 +2438,7 @@ struct Executor::Impl {
             }
         }
         std::fill(anchored.begin(), anchored.end(), 0);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         if (delivery) {
             // Drained, so warm-up deliveries and their asynchronous prefetches stay out of the
             // request counters, and the cache starts from the routing profile rather than the
@@ -2604,7 +2648,7 @@ bool Executor::vision() const noexcept { return impl_->vision_media; }
 
 double Executor::last_media_seconds() const {
     if (!impl_->media_timed) { return 0.0; }
-    CUDA_CHECK(cudaEventSynchronize(impl_->media_end));
+    CUDA_CHECK(ninfer::wait_for_event(impl_->media_end));
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, impl_->media_begin, impl_->media_end));
     return double(ms) / 1000.0;

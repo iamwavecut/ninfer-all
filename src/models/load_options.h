@@ -70,7 +70,8 @@ struct LoadOptions {
     TensorAttention tensor_attention = TensorAttention::Heads;
     // How the ranks exchange their partial sums (`--tensor-parallel-transport`).
     TensorParallelTransport tensor_parallel_transport = TensorParallelTransport::Auto;
-    // How a prompt chunk's partial sums cross host memory (`--tensor-parallel-prompt-partials`).
+    // How a prompt chunk's partial sums cross between the devices
+    // (`--tensor-parallel-prompt-partials`).
     TensorParallelPartials tensor_parallel_prompt_partials = TensorParallelPartials::Fp32;
 
     bool operator==(const LoadOptions&) const = default;

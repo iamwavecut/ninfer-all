@@ -75,6 +75,27 @@ std::vector<std::uint64_t> unit_positions(std::uint64_t total, std::uint64_t uni
     return out;
 }
 
+std::vector<double> shares_beside_first(std::span<const double> speed, double first) {
+    if (speed.empty()) { throw std::invalid_argument("shares need one speed per rank"); }
+    require_positive(speed, "rank speeds");
+    if (!std::isfinite(first) || first < 0.0) {
+        throw std::invalid_argument("rank 0's own work must be finite and not negative");
+    }
+    // Rank r runs out[r] (+ first on rank 0) in out[r] / speed[r]: one level for every rank.
+    const double sum = std::accumulate(speed.begin(), speed.end(), 0.0);
+    std::vector<double> out(speed.size());
+    const double level = (1.0 + first) / sum;
+    out[0]             = level * speed[0] - first;
+    if (out[0] > 0.0 || speed.size() == 1) {
+        for (std::size_t rank = 1; rank < speed.size(); ++rank) { out[rank] = level * speed[rank]; }
+    } else {
+        const double rest = sum - speed[0];
+        for (std::size_t rank = 1; rank < speed.size(); ++rank) { out[rank] = speed[rank] / rest; }
+    }
+    out[0] = std::max(out[0], 1e-6);
+    return out;
+}
+
 std::vector<double> fill_shares(std::span<const double> speed, std::span<const double> capacity,
                                 bool shrinks) {
     const std::size_t ranks = speed.size();

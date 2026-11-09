@@ -586,6 +586,24 @@ ResourceManager 清空，以错误完成 active lanes 与 materializing request�
 接缝：`arm_worker_failures(N)` 让随后 N 个 prefill unit 在 Program 执行后抛出，使恢复必须释放持有
 live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxed atomic load。
 
+设备停止完成工作时 CUDA 不报告任何错误，等待它的线程永远停在驱动里。`core/device_wait.h` 用两种监视
+结束这样的进程。其一监视每个线程的设备等待：`src/` 中等待设备的代码一律调用 `wait_for_stream`、
+`wait_for_event`、`wait_for_device`、`copy_and_wait`、`copy_between_devices_and_wait`、`fill_and_wait`；
+可能隐式等待设备的调用经由 `free_device_memory`（`cudaFree`）、`free_host_memory`、
+`unregister_host_memory`、`launch_graph`（launch 队列已满时等待）与 `DeviceWaitScope`（`vmm::unmap`、
+`vmm::set_access`）。Engine 的 worker 与调用方线程（suspend、resume、slot 操作、score）持有
+`DeviceWaitWatch`，以名字出现在消息中；其他线程（例如加载模型的启动线程）以操作系统线程号出现。其二是
+设备探针：`DeviceContext` 的每个 rank 持有其设备的探针，进程内一个线程每 5 s 在独立的最高优先级 stream
+上提交一次 4 字节拷入、单线程 kernel 与拷回。探针不依赖任何线程的等待，因此也覆盖空闲的服务器、因
+launch 队列已满而停在 kernel launch 中的线程，以及 pageable 内存的异步拷贝。探针的 stream、event、内存
+与 kernel 在第一个持有者的线程上创建并先运行一次，此后不再分配或加载任何东西。等待或探针持续停止限值
+（`DeviceWaitWatch::kStallLimit`，120 s；`NINFER_DEVICE_STALL_SECONDS` 可改，0 关闭两者），且期间该设备
+的 host service（`CudaHostHandshake` 与 Flash-Next expert misses 服务的应答）没有任何进展时，进程打印
+线程或设备与等待种类后 `std::abort()`，与 CUDA 错误的处理相同；只有新进程才能恢复设备。检查线程自身
+停顿 2 s 以上（停止信号、调试器、暂停的容器）时，所有等待与探针重新计时。两种监视都看不到的只剩一种
+情形：只有一个 stream 停止，而停在它上面的线程正处于未包装的隐式等待（kernel launch 或 pageable
+拷贝）中。
+
 ---
 
 ## 8. 物理执行的顶层约束

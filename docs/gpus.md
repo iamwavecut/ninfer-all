@@ -16,7 +16,7 @@ and verification status.
 
 | Architecture | Compute capability | Build | CUDA | Docker tags | Status |
 |---|---|---|---|---|---|
-| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | `cuda13.4` | measured; built-in device profiles |
+| Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer, not 13.2.0 or 13.2.1 | `cuda13.4` | measured; built-in device profiles |
 | Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | both, native `89` | measured; built-in device profiles |
 | Ampere | 8.6 | `86` (the default) | 12.8 or newer | both | measured (the reference card); built-in device profiles |
 | Ampere, A100 class | 8.0 | `80` | 12.8 or newer | both | built-in device profiles; not benchmarked |
@@ -50,8 +50,8 @@ Measured, one request; context in tokens is the largest `--max-context` the serv
 | 8 GB | Ternary Bonsai 2 27B (24,576 tokens with `rk4v4`, no MTP); Qwen3.8-Flash-Next with its experts in host memory or on disk | RTX 3060 Ti |
 | 11 GB | Ternary Bonsai 2 27B (200,704 tokens with `rk4v4`; 143,360 with MTP) | RTX 2080 Ti |
 | 12 GB | Ternary Bonsai 2 27B (266,240 tokens); Qwen3.8-27B GSQ-RCO IQ3_S (8,192 tokens, no MTP) | RTX 3060 |
-| 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens; 122,880 with `rk4v4-e8` and 98,304 with MTP on a card that also drives a desktop); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4`; DeepSeek-V4.1-Flash with its experts in host memory or on disk ([16 GB](deepseek-v41.md#16-gb)) | Tesla V100-SXM2-16GB, RTX 5070 Ti ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)); for DeepSeek-V4.1-Flash an RTX 4090 and a Tesla V100-SXM2-32GB held to 16 GB free |
-| 24 GB | the official Qwen3.8-27B (20 GiB) and its MXFP8 tune (17 GiB); Qwen3.6-35B-A3B `groupwise-int` (19.6 GiB of weights) on an RTX 3090, over two cards on the TITAN RTX; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash (6.0 GiB of dense weights) with its 106.7 GiB of experts in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
+| 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens; 122,880 with `rk4v4-e8` and 98,304 with MTP on a card that also drives a desktop); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4`; DeepSeek-V4.1-Flash with its experts in host memory or on disk ([16 GB](deepseek-v41.md#16-gb)) | Tesla V100-SXM2-16GB, RTX 5070 Ti ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)), RTX 5080 ([field report](performance/field-reports.md#rtx-5080-wsl2)); for DeepSeek-V4.1-Flash an RTX 4090 and a Tesla V100-SXM2-32GB held to 16 GB free |
+| 24 GB | the official Qwen3.8-27B (20 GiB) and its MXFP8 tune (17 GiB); Qwen3.6-35B-A3B `groupwise-int` (19.6 GiB of weights) on an RTX 3090, over two cards on the TITAN RTX; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash (6.0 GiB of dense weights) with its 106.7 GiB of experts (61.5 GiB in the Coder build) in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
 | 32 GB | Qwen3.6-35B-A3B NVFP4 (Blackwell only) | RTX 5090 |
 | 48 GB | Flash-Next Q2_0 with every expert on one card | L40S, RTX PRO 6000 |
 
@@ -72,7 +72,7 @@ means the card calibrates once at its first start.
 | ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk) |
 | ⬜ | RTX 5090 D | 32 GB | GeForce | | |
 | ⬜ | RTX 5090 D V2 | 24 GB | GeForce | ✓ | |
-| ⬜ | RTX 5080 | 16 GB | GeForce | ✓ | |
+| ✅ | RTX 5080 | 16 GB | GeForce | ✓ | IQ3_S under WSL2 ([field report](performance/field-reports.md#rtx-5080-wsl2)) |
 | ✅ | RTX 5070 Ti | 16 GB | GeForce | ✓ | IQ3_S, Swift 1.5 IQ3_S ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)) |
 | ⬜ | RTX 5070 | 12 GB | GeForce | ✓ | |
 | ✅ | RTX 5060 Ti | 16 / 8 GB | GeForce | ✓ | Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards ([field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards)) |

@@ -56,7 +56,9 @@ int main() {
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     auto flush = make_f32(16 * 1024 * 1024, 1104);
     for (int capacity : {700, 8192, 32768}) {
-        for (int tokens : {1, 4, 8, 16, 127, 128, 129, 512}) { run(tokens, capacity, stream, flush); }
+        for (int tokens : {1, 4, 8, 16, 63, 64, 80, 127, 128, 129, 512, 2048}) {
+            run(tokens, capacity, stream, flush);
+        }
     }
     CUDA_CHECK(cudaStreamDestroy(stream));
     return 0;

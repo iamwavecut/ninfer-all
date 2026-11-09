@@ -2,6 +2,7 @@ add_library(ninfer_core STATIC
   arena.cu
   device.cu
   device_launch.cpp
+  device_wait.cu
   peer_preflight.cpp
   expert_parallel.cpp
   stage_link.cu

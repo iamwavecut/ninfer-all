@@ -235,6 +235,11 @@ public:
     void await(cudaStream_t stream);
     // Projection-major [aliases][experts], including aliases into the same blob.
     [[nodiscard]] const void* const* tables(std::size_t layer) const;
+    // Whether every entry of alias `alias` in tables(layer) is a multiple of `bytes` (a power of
+    // two up to 256). Cache slots, lent slots and layer banks start at 256-byte boundaries, so the
+    // alias's offset and the bank stride of its blob decide.
+    [[nodiscard]] bool alias_aligned(std::size_t layer, std::size_t alias,
+                                     std::uint64_t bytes) const;
     void check() const;
     // Drain before suspend. Invalidate preserves allocations and graph addresses for restore.
     void drain();

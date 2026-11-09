@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/structured_round.h"
 #include "core/device.h"
+#include "core/device_wait.h"
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -19,7 +20,7 @@ StructuredRound::StructuredRound(Tensor masks, std::uint32_t vocab, std::uint32_
 }
 
 StructuredRound::~StructuredRound() {
-    if (upload_ != nullptr) { cudaStreamSynchronize(upload_); }
+    if (upload_ != nullptr) { ninfer::wait_for_stream(upload_); }
     if (uploaded_ != nullptr) { cudaEventDestroy(uploaded_); }
     if (upload_ != nullptr) { cudaStreamDestroy(upload_); }
 }

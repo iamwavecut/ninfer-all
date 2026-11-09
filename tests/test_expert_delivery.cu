@@ -1019,6 +1019,116 @@ int slot_pools(DeviceContext& device) {
     return failures ? 1 : 0;
 }
 
+// Entries of alias `alias` (of `experts` per alias) that are set and not a multiple of `bytes`.
+__global__ void misaligned(const void* const* table, int alias, int experts, std::uint64_t bytes,
+                           unsigned long long* count) {
+    const int e = threadIdx.x;
+    if (e >= experts) { return; }
+    const void* entry = table[alias * experts + e];
+    if (entry && reinterpret_cast<std::uintptr_t>(entry) % bytes) { atomicAdd(count, 1ull); }
+}
+
+// alias_aligned() against the entries the delivery writes, in its banks (a wide call), cache slots
+// and lent slots (narrow calls): layer 0 has equal 4,096-byte blobs; layer 1 equal 1,028-byte
+// [gate; up] blobs, a bank stride of whole 4 bytes but not of 16; layer 2 its up alias 8 bytes in;
+// layer 3 blobs of unequal sizes that are not whole 16 bytes, which the banks place at a rounded
+// stride.
+int alignment(DeviceContext& device) {
+    constexpr int layer_count = 4, experts = 8, aliases = 4;
+    const auto bytes = [](int layer, int expert, int blob) -> std::uint64_t {
+        if (layer == 1) { return blob ? 2048 : 1028; }
+        if (layer == 3) { return 1000 + 4 * std::uint64_t(expert) + 12 * std::uint64_t(blob); }
+        return 4096;
+    };
+    std::vector<std::unique_ptr<PinnedHostBuffer>> sources;
+    std::vector<ExpertDeliveryLayer> layers(layer_count);
+    for (int l = 0; l < layer_count; ++l) {
+        auto& layer   = layers[std::size_t(l)];
+        layer.aliases = {{0, 0}, {0, l == 2 ? 8u : 512u}, {0, 0}, {1, 0}};
+        for (int b = 0; b < 2; ++b) {
+            std::uint64_t total = 0;
+            for (int e = 0; e < experts; ++e) { total += bytes(l, e, b); }
+            sources.push_back(std::make_unique<PinnedHostBuffer>(std::size_t(total)));
+        }
+        auto* gate_up = static_cast<std::byte*>(sources[sources.size() - 2]->data());
+        auto* down    = static_cast<std::byte*>(sources.back()->data());
+        std::byte* at[2] = {gate_up, down};
+        for (int e = 0; e < experts; ++e) {
+            std::vector<ExpertBlob> expert;
+            for (int b = 0; b < 2; ++b) {
+                std::memset(at[b], 0, bytes(l, e, b));
+                expert.push_back(ExpertBlob{
+                    .pinned        = at[b],
+                    .pinned_region = reinterpret_cast<std::uintptr_t>(b ? down : gate_up),
+                    .bytes         = bytes(l, e, b),
+                    .zero_tail     = 256});
+                at[b] += bytes(l, e, b);
+            }
+            layer.experts.push_back(std::move(expert));
+        }
+    }
+    int failures      = 0;
+    const auto expect = [&](bool condition, const char* what) {
+        if (!condition) {
+            std::printf("alignment: %s\n", what);
+            ++failures;
+        }
+    };
+    ExpertDeliveryOptions options;
+    options.pair_capacity = 64;
+    options.cache_bytes   = 64ULL << 10; // fewer slots than experts: narrow calls also lend banks
+    ExpertDelivery delivery(device.rank(0), {}, layers, options);
+    bool predicted[layer_count][aliases];
+    for (int l = 0; l < layer_count; ++l) {
+        for (int a = 0; a < aliases; ++a) { predicted[l][a] = delivery.alias_aligned(l, a, 16); }
+    }
+    expect(predicted[0][0] && predicted[0][1] && predicted[0][2] && predicted[0][3],
+           "equal 4,096-byte blobs are aligned");
+    expect(!predicted[1][0] && !predicted[1][1] && !predicted[1][2] && predicted[1][3],
+           "a 1,028-byte stride is not, the down blob's 2,048 is");
+    expect(delivery.alias_aligned(1, 0, 4), "a 1,028-byte stride is a whole number of 4 bytes");
+    expect(predicted[2][0] && !predicted[2][1] && predicted[2][2] && predicted[2][3],
+           "an alias 8 bytes in is not");
+    expect(predicted[3][0] && predicted[3][1] && predicted[3][2] && predicted[3][3],
+           "unequal blobs sit at a rounded stride");
+    DeviceBuffer ids(64 * 4), counts(layer_count * aliases * 8);
+    counts.fill();
+    const auto call = [&](int layer, const std::vector<std::int32_t>& routed) {
+        ids.copy_from_host(routed.data(), routed.size() * 4);
+        (void)delivery.begin(std::size_t(layer), static_cast<const std::int32_t*>(ids.p),
+                             std::uint32_t(routed.size()), device.stream);
+        delivery.await(device.stream);
+        for (int a = 0; a < aliases; ++a) {
+            misaligned<<<1, experts, 0, device.stream>>>(
+                delivery.tables(std::size_t(layer)), a, experts, 16,
+                static_cast<unsigned long long*>(counts.p) + layer * aliases + a);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        delivery.drain();
+    };
+    for (int round = 0; round < 3; ++round) {
+        for (int l = 0; l < layer_count; ++l) {
+            call(l, {0, 1, 2, 3, 4, 5, 6, 7}); // wide: the layer bank
+            call(l, {1, 2});                     // narrow: slots
+            call(l, {5, 6, 7});
+        }
+    }
+    unsigned long long count[layer_count][aliases]{};
+    counts.copy_to_host(count, sizeof(count));
+    for (int l = 0; l < layer_count; ++l) {
+        for (int a = 0; a < aliases; ++a) {
+            if (predicted[l][a]) {
+                expect(count[l][a] == 0, "an entry of an aligned alias is not");
+            }
+        }
+    }
+    expect(count[1][0] != 0 && count[2][1] != 0, "the refused aliases do hold unaligned entries");
+    std::printf("alignment unaligned entries: layer 1 gate %llu, layer 2 up %llu %s\n", count[1][0],
+                count[2][1], failures ? "FAIL" : "PASS");
+    return failures ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1040,6 +1150,7 @@ int main(int argc, char** argv) {
         int failures = admission_boundaries(device);
         failures += tier_policy(device);
         failures += slot_pools(device);
+        failures += alignment(device);
         for (bool disk : {false, true}) {
             for (auto cache : {0ULL, 6ULL << 20, 64ULL << 20}) {
                 failures += run(device, disk, cache, path);

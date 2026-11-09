@@ -81,6 +81,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set_tests_properties(ninfer_qwen4_exp_expert_cache_visibility_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+ninfer_add_test(ninfer_qwen4_exp_expert_misses_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_misses.cu"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_qwen4_exp_expert_misses_test PROPERTIES
+  SKIP_RETURN_CODE 77 TIMEOUT 120)
+
 ninfer_add_test(ninfer_qwen4_exp_expert_stream_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_stream.cpp"
   LIBRARIES ninfer_model_runtime)

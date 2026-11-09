@@ -358,6 +358,21 @@ second, stored bytes a second and nanoseconds a row for each format, token count
 ./build/bench/ninfer_benches ninfer_gguf_cpu_rows_bench --formats IQ4_NL,Q2_0 --k 640 --backend scalar
 ```
 
+`ninfer_gguf_moe_matrix_bench` times a wide call's routed experts at DeepSeek-V4.1-Flash's shapes
+(or those `--hidden`, `--width`, `--top-k` and `--experts` give) on the integer matrix kernel and on
+the vector kernel in groups of eight columns, for each block type `--formats` lists (`all`: every
+type with both routes), each projection with its activation's quantization, over random routes to
+distinct experts. It reports both times, the active experts' weight bytes a second and the ratio;
+`ninfer_linear_gguf_moe_iq1m_test` checks IQ1_M's products on both routes. In one process a format
+timed after another can run its matrix kernel slower: on an RTX 4090 with 384 experts, IQ1_M's gate
+and up took 5,167 µs at 256 tokens alone and 6,426 µs after IQ1_S, and 5,359 and 6,631 µs at 544
+tokens; with 192 experts and 2048 tokens they took 6,644 µs alone and 6,567 µs after IQ2_XS and
+IQ2_XXS (both runs traced by Nsight Systems). Time one format per process:
+
+```bash
+./build/bench/ninfer_benches ninfer_gguf_moe_matrix_bench --formats IQ1_M --tokens 64,512,2048
+```
+
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
 allocation:
 
@@ -389,7 +404,10 @@ measured with the configured warmup and repetitions; the benchmark never issues 
 `T=1` launches as a substitute workload.
 
 For NCU, `--profile` performs setup, warmup, and the L2 flush before enabling the profiler, then
-captures exactly one public Linear call. That call may emit one or more production-selected kernel
+captures exactly one public Linear call. Profiling a whole model under NCU can stretch one device
+wait past 120 s; `NINFER_DEVICE_STALL_SECONDS=0` ([Device stall
+watch](../docs/cli.md#device-stall-watch)) keeps the process alive and keeps the stall probe's
+kernel out of the profile. That call may emit one or more production-selected kernel
 launches:
 
 ```bash
@@ -1228,10 +1246,12 @@ eviction. Each result reports 61 alternating baseline/candidate CUDA Graph sampl
 p95 and graph node counts; restoring identical input stacks and inject weights is outside timing.
 This measures the complete Op composition, not whole-model throughput.
 
-`ninfer_benches ninfer_qsa_indexer_bench` measures the public indexer at T=1/4/8/16/127/128/129/512
-and capacities 700/8192/32768. It records 33 CUDA Graph samples, median and p95 with reused
-inputs and a 64 MiB L2 eviction, including query preparation and top-512 selection. The wider
-route uses TF32 high/residual MMA and preserves FP32 pooled keys. This is an Op measurement;
+`ninfer_benches ninfer_qsa_indexer_bench` measures the public indexer at
+T=1/4/8/16/63/64/80/127/128/129/512/2048 and capacities 700/8192/32768. It records 33 CUDA Graph
+samples, median and p95 with reused inputs and a 64 MiB L2 eviction, including query preparation
+and top-512 selection. Below 64 tokens (80 on an A100) each token scores in CTAs of its own; from
+there FP32 FMA tiles of 16 or 32 tokens score 64 blocks each, and an A100 runs tiles of TF32
+high/residual MMA. Every route reads the FP32 pooled keys as stored. This is an Op measurement;
 the selection oracle is `ninfer_qsa_indexer_test`.
 
 The Section 5 benchmarks cover the complete Qwen3.6-35B pointwise matrix. Default invocation runs

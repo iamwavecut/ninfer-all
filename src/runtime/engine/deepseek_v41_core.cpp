@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/reader.h"
 #include "core/arena.h"
+#include "core/device_wait.h"
 #include "core/host_pages.h"
 #include "core/startup.h"
 #include "core/tensor_split.h"
@@ -178,7 +179,8 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     if (table.disabled &&
         (!table.path.empty() || table.residency != defaults.residency || table.io != defaults.io ||
          table.ram_budget_bytes || !table.hot_profile.empty() || table.lock ||
-         table.io_depth != defaults.io_depth)) {
+         table.io_depth != defaults.io_depth || table.dedupe != defaults.dedupe ||
+         table.read_ahead != defaults.read_ahead)) {
         throw std::invalid_argument("--no-ngram-table excludes the other n-gram table options");
     }
     if (table.residency == NgramResidency::RamHot || !table.hot_profile.empty()) {
@@ -287,7 +289,12 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                                    .io           = table.io,
                                    .budget_bytes = table.ram_budget_bytes.value_or(0),
                                    .lock         = table.lock,
-                                   .depth        = table.io_depth};
+                                   .depth        = table.io_depth,
+                                   .dedupe       = table.dedupe};
+    executor.engram_read_ahead  = table.read_ahead;
+    executor.prefill_tail       = options.prefill_tail;
+    executor.prefill_tail_rows  = options.prefill_tail_rows;
+    executor.iq1m_matrix        = options.iq1m_expert_matrix;
     // A span of `budget` positions holds rows x (columns + 1) + 2 of them, so its rows x columns
     // aligner cells, of r x r patches each, are at most budget - 3.
     if (vision_budget >= 4) {
@@ -315,18 +322,35 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     // Causal scoring keeps no context between requests.
     executor.checkpoints = options.context_cache.enabled &&
                            options.purpose == EnginePurpose::Generation;
-    // Prompt chunks of 2048 tokens whatever was requested: the routed experts' matrix kernel fills
-    // its widest tile only at wide chunks, and the staging ring holds the window and one chunk. A
-    // device without room for that chunk's workspace takes the widest of 1024 and 512 that fits.
-    for (const std::uint32_t chunk : {2048u, 1024u, 512u}) {
-        executor.prefill_chunk = chunk;
+    // Prompt chunks of 2048 tokens unless --prefill-chunk asks for another count, at most 4096:
+    // the routed experts' matrix kernel fills its widest tile only at wide chunks, and the staging
+    // ring holds the window and one chunk. A device without room for that chunk's workspace takes
+    // the widest of 2048, 1024 and 512 below it that fits.
+    constexpr std::uint32_t kLargestChunk = 4096;
+    const std::uint32_t asked =
+        options.prefill_chunk != 0 ? std::min(options.prefill_chunk, kLargestChunk) : 2048u;
+    std::vector<std::uint32_t> chunks{asked};
+    for (const std::uint32_t smaller : {2048u, 1024u, 512u}) {
+        if (smaller < asked) { chunks.push_back(smaller); }
+    }
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        executor.prefill_chunk = chunks[i];
         try {
             instance->executor =
                 std::make_unique<models::deepseek_v41::Executor>(*model, device, executor);
             break;
         } catch (const models::deepseek_v41::InsufficientMemory&) {
-            if (chunk == 512) { throw; }
+            if (i + 1 == chunks.size()) { throw; }
         }
+    }
+    const std::uint32_t chunk_tokens = instance->executor->options().prefill_chunk;
+    if (options.prefill_chunk != 0 && chunk_tokens != options.prefill_chunk) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                           "DeepSeek-V4.1: --prefill-chunk %u %s; prompt chunks of %u tokens",
+                           options.prefill_chunk,
+                           chunk_tokens == asked ? "is above the largest chunk"
+                                                 : "has no room for its workspace",
+                           chunk_tokens);
     }
     device.synchronize();
     program.complete();
@@ -340,7 +364,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     instance->vision_budget      = vision_budget;
     const auto memory = instance->executor->memory();
     std::string spans;
-    if (instance->executor->prompt_step() > executor.prefill_chunk) {
+    if (instance->executor->prompt_step() > chunk_tokens) {
         spans = " block by block in spans of " + std::to_string(instance->executor->prompt_step()) +
                 " tokens";
         if (memory.span_borrow_bytes != 0) {
@@ -351,12 +375,35 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "DeepSeek-V4.1: %u sequence(s), prompt chunks of %u tokens%s, BF16 latent "
                        "caches %.0f MiB%s, workspace %.0f MiB",
-                       executor.sequences, executor.prefill_chunk, spans.c_str(),
+                       executor.sequences, chunk_tokens, spans.c_str(),
                        double(memory.kv_bytes) / 1048576.0,
                        memory.kv_grows
                            ? " at most, growing with the sequences beside an elastic expert cache"
                            : "",
                        double(memory.workspace_bytes) / 1048576.0);
+    {
+        const auto& ex          = *instance->executor;
+        const std::uint32_t all = ex.exact_tail_rows();
+        if (ex.prefill_tail_rows() == 0) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "DeepSeek-V4.1: the blocks after the last key-value source run "
+                               "every prompt row (--prefill-tail full)");
+        } else if (executor.prefill_tail == PrefillTail::Exact) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "DeepSeek-V4.1: the blocks after the last key-value source run a "
+                               "prompt step's last %u rows, from the prompt chunk at or below them "
+                               "(--prefill-tail exact)",
+                               all);
+        } else {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                               "DeepSeek-V4.1: the blocks after the last key-value source run a "
+                               "prompt step's last %u rows (--prefill-tail %u, lossy: the output "
+                               "changes%s)",
+                               ex.prefill_tail_rows(), ex.prefill_tail_rows(),
+                               ex.prefill_tail_rows() < all ? "; fewer rows than the state depends on"
+                                                            : "");
+        }
+    }
     if (!executor.expert_split.empty()) {
         const std::uint32_t experts = model->config().num_experts;
         const auto ends = split_shares(experts, unit_positions(experts, 1), executor.expert_split);
@@ -756,7 +803,8 @@ struct DeepSeekV41Core::Impl {
         host_logprobs =
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
-        CUDA_CHECK(cudaMemcpy(logprob_flag.p, &enabled, sizeof(enabled), cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(logprob_flag.p, &enabled, sizeof(enabled),
+                                         cudaMemcpyHostToDevice));
         std::size_t workspace = std::max<std::size_t>(
             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
                                                     static_cast<std::int32_t>(rows)),
@@ -787,7 +835,8 @@ struct DeepSeekV41Core::Impl {
         }
         sample_workspace = std::make_unique<WorkspaceArena>(workspace);
         load_sampling_kernels();
-        worker           = std::thread([this] {
+        worker = std::thread([this] {
+            const DeviceWaitWatch watched(device, "DeepSeek-V4.1 worker");
             device.bind_to_current_thread();
             loop();
         });
@@ -811,8 +860,9 @@ struct DeepSeekV41Core::Impl {
     void load_sampling_kernels() {
         const cudaStream_t stream = instance.executor->head_stream();
         const ops::SamplingConfig greedy{};
-        CUDA_CHECK(cudaMemcpy(sample_config.p, &greedy, sizeof(greedy), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemset(sample_position.p, 0, sizeof(std::int32_t)));
+        CUDA_CHECK(ninfer::copy_and_wait(sample_config.p, &greedy, sizeof(greedy),
+                                         cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::fill_and_wait(sample_position.p, 0, sizeof(std::int32_t)));
         const auto* config  = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const auto vocab    = static_cast<std::int32_t>(domain);
         const Tensor flag(logprob_flag.p, DType::I32, {1});
@@ -837,7 +887,7 @@ struct DeepSeekV41Core::Impl {
         }
         if (drafts > 0) {
             for (DeviceBuffer* plane : {&spec_drafts, &spec_extents, &spec_lengths, &spec_anchors}) {
-                CUDA_CHECK(cudaMemset(plane->p, 0, plane->bytes));
+                CUDA_CHECK(ninfer::fill_and_wait(plane->p, 0, plane->bytes));
             }
             // A round's width is its drafts and the bonus column, one draft to all of them.
             for (std::uint32_t k = 1; k <= drafts; ++k) {
@@ -860,9 +910,9 @@ struct DeepSeekV41Core::Impl {
                     *sample_workspace, stream);
             }
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         // Each request clears its own row of the counts; the scratch increment leaves no trace.
-        CUDA_CHECK(cudaMemset(token_counts.p, 0, token_counts.bytes));
+        CUDA_CHECK(ninfer::fill_and_wait(token_counts.p, 0, token_counts.bytes));
     }
 
     // A request that neither computes a prompt chunk nor accepts a token for this long fails with
@@ -1154,7 +1204,8 @@ struct DeepSeekV41Core::Impl {
             store_image(s, slot.anchor, slot.anchor_media, &slot.snapshot,
                         PrefixReusePath::PrivateTurnClosure);
         }
-        if (slot.fed != slot.anchor && !slot.disposable) {
+        // A request stopped inside a prefill step leaves the decoder blocks' state incomplete.
+        if (slot.fed != slot.anchor && !slot.disposable && instance.executor->resumable(s)) {
             store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
         }
     }
@@ -1169,10 +1220,17 @@ struct DeepSeekV41Core::Impl {
         stats.state_h2d_bytes += image.bytes;
     }
 
-    [[nodiscard]] std::uint32_t reuse(const Slot& slot, const Request& prompt) const {
+    // The tokens of `prompt` that sequence `s` holds: its live state when complete (not stopped
+    // inside a prefill step), or its checkpoint at its last prompt's anchor.
+    [[nodiscard]] std::uint32_t live_reuse(std::uint32_t s, const Request& prompt) const {
+        const Slot& slot = slots[s];
+        return instance.executor->resumable(s) ? prefix_reuse(slot.fed, slot.media, prompt) : 0;
+    }
+
+    [[nodiscard]] std::uint32_t reuse(std::uint32_t s, const Request& prompt) const {
         if (!reuse_prefixes) { return 0; }
-        return std::max(prefix_reuse(slot.fed, slot.media, prompt),
-                        prefix_reuse(slot.anchor, slot.anchor_media, prompt));
+        return std::max(live_reuse(s, prompt),
+                        prefix_reuse(slots[s].anchor, slots[s].anchor_media, prompt));
     }
 
     void admit() {
@@ -1189,8 +1247,8 @@ struct DeepSeekV41Core::Impl {
                         continue;
                     }
                     const Request& prompt = *pending.front();
-                    const auto candidate  = reuse(slots[s], prompt);
-                    const auto current   = reuse(slots[*best], prompt);
+                    const auto candidate  = reuse(s, prompt);
+                    const auto current   = reuse(*best, prompt);
                     if (candidate > current ||
                         (candidate == current && slots[s].last_used < slots[*best].last_used)) {
                         best = s;
@@ -1229,7 +1287,7 @@ struct DeepSeekV41Core::Impl {
         // longest prefix the store keeps; what the sequence held goes to the store first.
         std::uint32_t reused = 0;
         if (reuse_prefixes && r.reusable) {
-            const std::uint32_t live       = prefix_reuse(slot.fed, slot.media, r);
+            const std::uint32_t live       = live_reuse(s, r);
             const std::uint32_t anchored   = prefix_reuse(slot.anchor, slot.anchor_media, r);
             const auto [image, from_store] = find_stored(r);
             if (from_store > std::max(live, anchored)) {
@@ -1342,14 +1400,44 @@ struct DeepSeekV41Core::Impl {
             return static_cast<std::uint32_t>(
                 std::min<std::size_t>(left, instance.executor->options().prefill_chunk));
         }
-        std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
+        return prefill_extent(r, r.prefilled).tokens;
+    }
+
+    // A prompt step from position `from`: the tokens it computes, and the position its run of
+    // steps ends at (the anchor, the next shared prefix or the prompt's end), whose state is kept.
+    struct PrefillExtent {
+        std::uint32_t tokens = 0, until = 0;
+    };
+
+    [[nodiscard]] PrefillExtent prefill_extent(const Request& r, std::uint32_t from) const {
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        std::uint32_t until = from < r.anchor_at ? r.anchor_at : prompt_n;
         for (const std::uint32_t frontier : r.shared_at) {
-            if (frontier > r.prefilled) {
+            if (frontier > from) {
                 until = std::min(until, frontier);
                 break;
             }
         }
-        return std::min(instance.executor->prompt_step(), until - r.prefilled);
+        return {std::min(instance.executor->prompt_step(), until - from), until};
+    }
+
+    // A flag for each prompt position in [begin, end) an image's span takes (empty: none does).
+    [[nodiscard]] static std::vector<std::uint8_t> image_flags(const Request& r, std::uint32_t begin,
+                                                               std::uint32_t end) {
+        std::vector<std::uint8_t> flags;
+        if (r.media.empty()) { return flags; }
+        const auto& data = models::qwen3_5::PreparedPromptAccess::view(r.prompt);
+        for (const auto& item : data.vision_items) {
+            for (const auto& span : item.token_spans) {
+                const std::size_t first = std::max<std::size_t>(span.begin, begin);
+                const std::size_t last  = std::min<std::size_t>(span.begin + span.count, end);
+                if (first >= last) { continue; }
+                if (flags.empty()) { flags.assign(end - begin, 0); }
+                std::fill(flags.begin() + std::ptrdiff_t(first - begin),
+                          flags.begin() + std::ptrdiff_t(last - begin), std::uint8_t(1));
+            }
+        }
+        return flags;
     }
 
     // Decode rounds that run before a prefill step while other requests generate: the configured
@@ -1495,7 +1583,7 @@ struct DeepSeekV41Core::Impl {
         }
         CUDA_CHECK(cudaMemcpyAsync(tokens, sample_out.p, n * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         instance.executor->check_experts();
         for (std::size_t b = 0; b < n; ++b) {
             const std::int32_t token = tokens[b];
@@ -1630,7 +1718,20 @@ struct DeepSeekV41Core::Impl {
             next_branches(r, executor.options().prefill_chunk - n, branch_tokens, lengths);
         }
         if (lengths.empty()) {
-            executor.forward(r.slot, chunk, 1, chunk_images(r, r.prefilled, r.prefilled + n));
+            // Logits at the prompt's end only. The executor runs the blocks past the last key-value
+            // source over the rows the state at `until` depends on (--prefill-tail), and reads the
+            // next step's Engram rows while this one computes.
+            const std::uint32_t after = r.prefilled + n;
+            std::span<const TokenId> next;
+            std::vector<std::uint8_t> next_images;
+            if (after < prompt_n) {
+                const std::uint32_t m = prefill_extent(r, after).tokens;
+                next        = std::span<const TokenId>(r.prompt_tokens).subspan(after, m);
+                next_images = image_flags(r, after, after + m);
+            }
+            executor.forward(r.slot, chunk, after == prompt_n ? 1 : 0,
+                             chunk_images(r, r.prefilled, after), prefill_extent(r, r.prefilled).until,
+                             {next, next_images});
         } else {
             executor.forward_prompt_branches(r.slot, chunk, branch_tokens, lengths);
         }
@@ -1652,7 +1753,7 @@ struct DeepSeekV41Core::Impl {
             slot.anchor_media = slot.media;
         }
         if (r.observation.prompt_progress) {
-            CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
+            CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
             executor.check_experts();
             {
                 std::lock_guard lock(r.mutex);
@@ -1850,7 +1951,7 @@ struct DeepSeekV41Core::Impl {
         Request& r          = *request;
         auto& executor      = *instance.executor;
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
-        CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
+        CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
         executor.check_experts();
         r.prefill_end = Clock::now();
         {
@@ -2390,7 +2491,7 @@ struct DeepSeekV41Core::Impl {
             cudaMemcpyAsync(host + b * w, spec_counts.p, b * 4, cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaMemcpyAsync(host + b * w + b, spec_accepted.p, b * 4, cudaMemcpyDeviceToHost,
                                    stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         instance.executor->check_experts();
 
         // The output policy takes its part of each licensed run; the executor then keeps the tokens
@@ -2532,7 +2633,7 @@ struct DeepSeekV41Core::Impl {
             std::vector<float> host(rows);
             CUDA_CHECK(cudaMemcpyAsync(host.data(), score_out.p, rows * 4, cudaMemcpyDeviceToHost,
                                        stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
             instance.executor->check_experts();
             out.insert(out.end(), host.begin(), host.end());
         }
@@ -2833,6 +2934,8 @@ std::vector<float> DeepSeekV41Core::score(models::qwen3_5::PreparedPrompt prompt
             --impl.outstanding;
         }
     } release{*impl_};
+
+    const DeviceWaitWatch watched(impl_->device, "DeepSeek-V4.1 scoring caller");
     impl_->device.bind_to_current_thread();
     return impl_->score(tokens, first_target);
 }

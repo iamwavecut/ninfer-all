@@ -78,6 +78,13 @@ ninfer_add_test(ninfer_disk_kv_bridge_test
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cu"
   LIBRARIES ninfer_ops)
 
+# Forks a child per case; a child the watch fails to end hangs until the timeout.
+ninfer_add_test(ninfer_device_wait_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device_wait.cu"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_device_wait_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
+  ENVIRONMENT_MODIFICATION "NINFER_DEVICE_STALL_SECONDS=unset:")
+
 set_tests_properties(ninfer_device_test PROPERTIES
   ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:")
 ninfer_bundle_command(device_test_command ninfer_tests ninfer_device_test)
@@ -91,6 +98,10 @@ endforeach()
 add_test(NAME ninfer_device_sync_invalid_test COMMAND ${device_test_command} --invalid-sync)
 set_tests_properties(ninfer_device_sync_invalid_test PROPERTIES
   ENVIRONMENT "NINFER_CUDA_SYNC=invalid")
+# Two devices; a process of its own, since every other case makes device 0 current first.
+add_test(NAME ninfer_device_new_thread_binding_test
+  COMMAND ${device_test_command} --new-thread-binding)
+set_tests_properties(ninfer_device_new_thread_binding_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # A present-but-empty NINFER_CUDA_SYNC is only reachable through CTest's ENVIRONMENT property on
 # POSIX. On Windows, CTest sets test-process environment variables the way `_putenv` /

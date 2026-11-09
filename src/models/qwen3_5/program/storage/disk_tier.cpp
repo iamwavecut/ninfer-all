@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 
 #include "core/device.h"
+#include "core/device_wait.h"
 
 #include <algorithm>
 #include <chrono>
@@ -31,7 +32,7 @@ constexpr auto kShutdownSpillBudget = std::chrono::seconds(60);
 
 void synchronize(const RankStreams& streams) {
     for (std::size_t rank = 0; rank < streams.size(); ++rank) {
-        CUDA_CHECK(cudaStreamSynchronize(streams[rank]));
+        CUDA_CHECK(ninfer::wait_for_stream(streams[rank]));
     }
 }
 

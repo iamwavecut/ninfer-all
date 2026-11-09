@@ -88,7 +88,10 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
     return 1;
 }
 
-int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+// With valid_scale_words the scale plane walks every valid word, 0x00 through 0x7E, under a divisor
+// that is not a power of two, and only the A16 widths run: the route tables' A16 kernels differ in
+// their K splits, and each table answers to the oracle on the scales a production artifact uses.
+int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed, bool valid_scale_words = false) {
     const std::int32_t first_a4 = k == 6144 ? 7 : 8;
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
@@ -132,8 +135,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
             [](const Invocation& a, const Invocation& b) { return a.tokens < b.tokens; })
             ->tokens;
     quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
+    options.weight_scale_divisor = valid_scale_words ? 0.1F : 0.125F;
     options.input_scale_divisor  = 3.5F;
+    options.wide_scale_range     = valid_scale_words;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
     const std::vector<std::int32_t> rows = sampled_indices(n);
@@ -150,6 +154,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
+        if (valid_scale_words && invocation.policy != ops::LinearPolicy::A16Only) { continue; }
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
         output.copy_from_host(initial_residual.data(), output.bytes());
@@ -191,6 +196,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         const bool a4           = invocation.policy == ops::LinearPolicy::AllowA4;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
                                   std::to_string(k) + "] " + (a4 ? "A4" : "A16") +
+                                  (valid_scale_words ? " valid scale words" : "") +
                                   " T=" + std::to_string(invocation.tokens);
         if (workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace query/execution high-water mismatch\n";
@@ -336,6 +342,8 @@ int main() {
     int failures = 0;
     failures += run_shape(5120, 6144, 811U);
     failures += run_shape(5120, 17408, 821U);
+    failures += run_shape(5120, 6144, 831U, true);
+    failures += run_shape(5120, 17408, 833U, true);
     failures += check_residual_cancellation(6144);
     failures += check_residual_cancellation(17408);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " NVFP4 linear_add\n";

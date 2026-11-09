@@ -1,6 +1,7 @@
 #include "core/cuda_host_handshake.h"
 
 #include "core/cuda_host_handshake.cuh"
+#include "core/device_wait.h"
 
 #include <new>
 #include <thread>
@@ -46,18 +47,18 @@ __global__ void retire_request(DeviceMailbox mailbox) {
 } // namespace
 
 CudaHostHandshake::CudaHostHandshake(const RankContext& rank, std::uint32_t* sequence)
-    : sequence_(sequence) {
+    : sequence_(sequence), ordinal_(rank.device) {
     DeviceBinding bind(rank.device);
     CUDA_CHECK(cudaHostAlloc(&host_, sizeof(Mailbox), cudaHostAllocMapped | cudaHostAllocPortable));
     try {
         ::new (host_) Mailbox();
         CUDA_CHECK(cudaHostGetDevicePointer(&device_, host_, 0));
     } catch (...) {
-        cudaFreeHost(host_);
+        ninfer::free_host_memory(host_);
         throw;
     }
 }
-CudaHostHandshake::~CudaHostHandshake() { if (host_) { cudaFreeHost(host_); } }
+CudaHostHandshake::~CudaHostHandshake() { if (host_) { ninfer::free_host_memory(host_); } }
 
 handshake::DeviceMailbox CudaHostHandshake::device() const noexcept {
     return {static_cast<Mailbox*>(device_), sequence_};
@@ -66,7 +67,8 @@ handshake::DeviceMailbox CudaHostHandshake::device() const noexcept {
 void CudaHostHandshake::resume() {
     const auto sequence =
         Atomic(static_cast<Mailbox*>(host_)->requested).load(cuda::memory_order_acquire);
-    CUDA_CHECK(cudaMemcpy(sequence_, &sequence, sizeof(sequence), cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        ninfer::copy_and_wait(sequence_, &sequence, sizeof(sequence), cudaMemcpyHostToDevice));
 }
 
 void CudaHostHandshake::publish(std::uint32_t tag, std::uint32_t width, std::uint32_t flags,
@@ -80,7 +82,7 @@ void CudaHostHandshake::wait_prepared(cudaStream_t stream) {
         // holding its driver lock. A running GPU wait would then block both that load and the
         // worker's DMA calls. Eager execution waits on the host; graph capture loads its whole
         // kernel set before any wait runs.
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         wait_host(*static_cast<Mailbox*>(host_), false);
         return;
     }
@@ -100,7 +102,7 @@ void CudaHostHandshake::retire(cudaStream_t stream) {
     retire_request<<<1, 1, 0, stream>>>(device());
     CUDA_CHECK(cudaGetLastError());
     // No eager GPU wait may remain when the caller first launches another layer's kernels.
-    if (!captured) { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+    if (!captured) { CUDA_CHECK(ninfer::wait_for_stream(stream)); }
 }
 std::optional<CudaHostHandshake::Request> CudaHostHandshake::pending(std::uint32_t last) const noexcept {
     auto& box = *static_cast<Mailbox*>(host_);
@@ -110,15 +112,18 @@ std::optional<CudaHostHandshake::Request> CudaHostHandshake::pending(std::uint32
 }
 void CudaHostHandshake::prepared(std::uint32_t sequence) noexcept {
     Atomic(static_cast<Mailbox*>(host_)->prepared).store(sequence, cuda::memory_order_release);
+    note_host_service_progress(ordinal_);
 }
 void CudaHostHandshake::completed(std::uint32_t sequence) noexcept {
     Atomic(static_cast<Mailbox*>(host_)->completed).store(sequence, cuda::memory_order_release);
+    note_host_service_progress(ordinal_);
 }
 bool CudaHostHandshake::retired(std::uint32_t sequence) const noexcept {
     return Atomic(static_cast<Mailbox*>(host_)->retired).load(cuda::memory_order_acquire) == sequence;
 }
 void CudaHostHandshake::release(std::uint32_t sequence) noexcept {
     Atomic(static_cast<Mailbox*>(host_)->released).store(sequence, cuda::memory_order_release);
+    note_host_service_progress(ordinal_);
 }
 std::size_t CudaHostHandshake::pinned_bytes() const noexcept { return sizeof(Mailbox); }
 

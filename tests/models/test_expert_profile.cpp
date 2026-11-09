@@ -1,10 +1,13 @@
 #include "models/expert_profile.h"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 int main() {
     using namespace ninfer::models;
@@ -36,6 +39,25 @@ int main() {
         }
         std::ofstream(path) << "{\"version\":1,";
         rejects(artifact, widths);
+        // A family's built-in profiles are told apart by their bank widths: DeepSeek-V4.1 has one
+        // for the release's 384 routed experts a block and one for the Coder build's 192.
+        for (const std::size_t experts : {std::size_t{384}, std::size_t{192}}) {
+            const std::vector<std::size_t> geometry(40, experts);
+            const auto profile = builtin_expert_profile("deepseek-v4.1", geometry);
+            if (!profile || profile->size() != geometry.size()) {
+                throw std::runtime_error("no built-in DeepSeek-V4.1 profile for " +
+                                         std::to_string(experts) + " experts a block");
+            }
+            for (const auto& layer : *profile) {
+                const auto unrouted = [](auto count) { return count == 0; };
+                if (layer.size() != experts || std::all_of(layer.begin(), layer.end(), unrouted)) {
+                    throw std::runtime_error("built-in profile layer without routes");
+                }
+            }
+        }
+        if (builtin_expert_profile("deepseek-v4.1", std::vector<std::size_t>(40, 256))) {
+            throw std::runtime_error("built-in profile served a geometry it was not recorded on");
+        }
         std::cout << "EXPERT_PROFILE_CONTRACT_PASS\n";
         return 0;
     } catch (const std::exception& error) {

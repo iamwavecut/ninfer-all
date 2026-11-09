@@ -158,6 +158,9 @@ void latent_post(const LatentArgs& args, cudaStream_t stream);
 // positions, `candidate_words` words per row). Columns past a row's visible ones stay unwritten;
 // `width` is the row stride of out and bounds every row's visible count. `group` consecutive rows
 // of one sequence share a pass over the keys (1 or 4).
+// With `list` (and `candidates`), a row holds only its group's listed blocks (candidate_lists):
+// column s is position list[g][s / block] * block + s % block of group g, -inf where the row does
+// not keep that block, and `width`, at least capacity * block, bounds the listed columns instead.
 struct ScoreArgs {
     const __nv_bfloat16* q = nullptr; // [T][heads][128]
     const float* weights   = nullptr; // [T][heads]
@@ -170,26 +173,47 @@ struct ScoreArgs {
     std::int64_t key_seq_stride = 0;
     const std::uint32_t* candidates = nullptr;
     int candidate_words = 0, block = 8;
+    const std::int32_t* list   = nullptr; // [groups][capacity]
+    const std::int32_t* counts = nullptr; // [groups]
+    int capacity               = 0;
     float* out = nullptr; // [T][width]
 };
 void index_scores(const ScoreArgs& args, cudaStream_t stream);
 
+// The blocks that any row of each group of `group` consecutive rows keeps in mask [T][words] (a
+// bit per block), in ascending order: list [groups][capacity] and their count, counts [groups].
+// `capacity` bounds a group's count (every row keeps at most capacity / group blocks).
+void candidate_lists(const std::uint32_t* mask, int words, int tokens, int group, int capacity,
+                     std::int32_t* list, std::int32_t* counts, cudaStream_t stream);
+
 // The candidate blocks of each row (scores [T][width] of its visible positions): the `keep` blocks
 // of `block` positions with the highest maximum score, the block of its last visible position
 // always among them, blocks without a finite score never (lower block first among equal maxima);
-// a bit per block in mask [T][words]. `scratch` holds [T][words * 32] floats.
+// a bit per block in mask [T][words]. `scratch` holds [T][stride] floats, a row's block maxima;
+// `stride` is at least the blocks of `width` positions.
 void select_candidates(const float* scores, int width, int tokens, const std::int32_t* positions,
                        int ratio, int block, int keep, std::uint32_t* mask, int words,
-                       float* scratch, cudaStream_t stream);
+                       float* scratch, int stride, cudaStream_t stream);
 
 // The k highest finite scores of each row's visible positions (lower position first among equal
 // scores), as positions in ascending order, -1 past the row's count: out [T][k].
 void select_topk(const float* scores, int width, int tokens, const std::int32_t* positions,
                  int ratio, int k, std::int32_t* out, cudaStream_t stream);
 
-// Sparse attention of each row's heads over its window (positions p - window_size + 1 .. p, from
-// slot position % ring of the window cache, window_size at most the ring and, beside k selected
-// latents, 1152 - k) and its selected compressed latents
+// select_topk over rows of listed blocks (index_scores with `list`): row t's columns stand for the
+// listed positions of its group t / group, of which it takes those below its visible count.
+struct ListedRows {
+    const std::int32_t* list   = nullptr; // [groups][capacity]
+    const std::int32_t* counts = nullptr; // [groups]
+    int capacity = 0, group = 1, block = 8;
+};
+void select_topk(const float* scores, int width, int tokens, const std::int32_t* positions,
+                 int ratio, int k, const ListedRows& listed, std::int32_t* out,
+                 cudaStream_t stream);
+
+// Sparse attention of each row's heads over its window (positions p - window_size + 1 .. p, none
+// below window_floor, from slot position % ring of the window cache, window_size at most the ring
+// and, beside k selected latents, 1152 - k) and its selected compressed latents
 // (compressed[topk[t][i]] for the leading entries that are not negative), every latent its own key
 // and value; each head's sink logit joins the softmax denominator:
 //   out = sum_j e^(s_j - m) v_j / (sum_j e^(s_j - m) + e^(sink - m)),  s_j = scale q . k_j.
@@ -203,6 +227,7 @@ struct AttentionArgs {
     const __nv_bfloat16* window = nullptr;
     std::int64_t window_seq_stride = 0;
     int ring = 0, window_size = 0;
+    int window_floor = 0; // the lowest window position a row reads (a prefill tail's first row)
     const __nv_bfloat16* compressed = nullptr; // [N][512] per sequence, or null
     std::int64_t compressed_seq_stride = 0;
     const std::int32_t* topk = nullptr; // [T][k]

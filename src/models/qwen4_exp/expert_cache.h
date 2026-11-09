@@ -143,6 +143,8 @@ private:
     void upload(Layer& layer, cudaStream_t stream);
     // Moves the candidates of landed round copies into their slots' table entries.
     void land();
+    // A spare event of `rank`, or a new one made on its device.
+    cudaEvent_t take_event(std::size_t rank);
     DeviceContext& device_;
     std::vector<Layer> layers_;
     std::unique_ptr<PinnedHostBuffer> staging_;
@@ -164,7 +166,9 @@ private:
     std::vector<ExpertTier::Swap> queued_;
     std::size_t mtp_ = ~std::size_t{0}; // the MTP block's layer, which the draft reads
     std::vector<std::vector<std::uint64_t>> profile_; // construction's, which grow continues
-    std::vector<cudaEvent_t> spare_;    // events of landed copies, reused
+    // By rank: events of landed copies, reused on that rank's side stream (CUDA records an event
+    // only on a stream of the device it was made on).
+    std::vector<std::vector<cudaEvent_t>> spare_;
     // By rank: whether the cache holds its lent buffers, and the event a reclaim's transfer
     // stream (or a give_back's compute stream) waits on.
     std::vector<unsigned char> holding_;

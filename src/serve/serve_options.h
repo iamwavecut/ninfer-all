@@ -6,6 +6,7 @@
 #include "ninfer/model_enums.h"
 #include "ninfer/request.h"
 #include "product/logging/logging.h"
+#include "product/prompt_route_options.h"
 #include "product/steering_options.h"
 #include "serve/request.h"
 
@@ -29,6 +30,9 @@ struct ServeOptions {
     // `<VERSION>+<build id>` of this binary, set by ninfer-serve from its build stamp (not a flag):
     // GET /health, the X-NInfer-Version header, /props build_info and the server_start record.
     std::string build_version;
+    // The CUDA compiler release and architectures of this binary (`nvcc 13.4.92, 86`), from the
+    // same stamp: ninfer-serve --version, the startup log and /props build_info.
+    std::string build_toolchain;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
@@ -168,6 +172,8 @@ struct ServeOptions {
     // and --control-vector-layer-range: the adapters a request's `lora` names by index, and the
     // control vectors every request runs with.
     product::SteeringFlags steering;
+    // --prefill-tail and --iq1m-experts.
+    product::PromptRouteFlags prompt_routes;
     std::optional<std::uint32_t> default_thinking_budget;
     // --reasoning-loop off|stop|conclude: the reasoning-loop guard for every thinking request,
     // constrained ones included (off by default).

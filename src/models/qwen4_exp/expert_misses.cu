@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/expert_misses.h"
 
 #include "core/cpu_spin_pool.h"
+#include "core/device_wait.h"
 #include "core/expert_split.h"
 #include "core/file_read_error.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
@@ -44,6 +45,11 @@ constexpr int kSplitThreads   = kMaxExperts / 2; // two expert flags a thread
 constexpr std::uint64_t kTail = 256;
 constexpr std::uint64_t kAlign = 256;
 constexpr int kRanges          = int(std::tuple_size_v<ExpertCache::Ranges>);
+
+constexpr std::int64_t kKeepAliveNs = std::chrono::nanoseconds(kMissKeepAlive).count();
+// How often a sleeping service looks for a request: a replayed layer posts one from the device,
+// and no host call wakes the service for it.
+constexpr std::chrono::milliseconds kAsleepPoll{10};
 
 std::uint64_t aligned(std::uint64_t value) { return (value + kAlign - 1) / kAlign * kAlign; }
 
@@ -254,7 +260,7 @@ struct ExpertMisses::Impl {
         cudaEvent_t copied     = nullptr; // after them (timed for the balance)
         std::uint32_t served   = 0;
         // Balance: this device's copy and CPU times.
-        ExpertSplit split;
+        ExpertSplit split, prompt_split; // narrow calls', and prompt chunks' (verify_tokens)
     };
 
     DeviceContext& device;
@@ -303,7 +309,7 @@ struct ExpertMisses::Impl {
     mutable std::mutex stats_mutex;
     MissStats counters;
     std::atomic<std::int64_t> deadline{0};
-    std::atomic<bool> sleeping{false}, stopping{false};
+    std::atomic<bool> stopping{false};
     std::mutex wake_mutex;
     std::condition_variable wake;
     std::mutex failure_mutex;
@@ -386,7 +392,7 @@ struct ExpertMisses::Impl {
             patch_kernel<<<1, 32, 0, rank.copies>>>(nullptr, nullptr, nullptr, nullptr, 0);
             wait_kernel<<<1, 1, 0, rank.copies>>>(rank.box, static_cast<const std::uint32_t*>(rank.need->data()));
             CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaStreamSynchronize(rank.copies));
+            CUDA_CHECK(ninfer::wait_for_stream(rank.copies));
         }
         if (cpu) {
             // By default one thread per physical core, this service's included; pinned, since the
@@ -423,7 +429,7 @@ struct ExpertMisses::Impl {
             words[2 * i]     = resident[std::size_t(i)].first;
             words[2 * i + 1] = resident[std::size_t(i)].second;
         }
-        CUDA_CHECK(cudaMemcpy(buffer.p, words, sizeof(words), cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(buffer.p, words, sizeof(words), cudaMemcpyHostToDevice));
     }
 
     void remember_failure() noexcept {
@@ -594,12 +600,12 @@ struct ExpertMisses::Impl {
     }
 
     // The CPU's count of a request's missing experts, the last of `order` (most pairs first).
-    static std::size_t balance(Rank& rank, const MissLayer& layer,
+    static std::size_t balance(ExpertSplit& split, const MissLayer& layer,
                                const std::vector<std::pair<int, std::int32_t>>& order) {
         std::vector<int> pairs;
         pairs.reserve(order.size());
         for (const auto& [uses, expert] : order) { pairs.push_back(uses); }
-        return rank.split.cpu_count(pairs, expert_megabytes(layer));
+        return split.cpu_count(pairs, expert_megabytes(layer));
     }
 
     void serve_request(Rank& rank, std::uint32_t sequence) {
@@ -615,6 +621,7 @@ struct ExpertMisses::Impl {
         auto* tables           = static_cast<const void**>(rank.tables->data());
         auto* missing_ids      = static_cast<std::int32_t*>(rank.missing_ids->data());
         const std::uint32_t pairs = tokens * kTop;
+        ExpertSplit& split        = tokens > options.verify_tokens ? rank.prompt_split : rank.split;
         // Requests of a rank come one at a time: a layer's request is posted only after the stage
         // two of the one before has run on the same stream, so both staging halves are free.
         const std::uint32_t half = sequence & 1U;
@@ -635,7 +642,7 @@ struct ExpertMisses::Impl {
         std::size_t cpu_count = 0;
         if (cpu_capable(layer)) {
             cpu_count = options.cpu_balance
-                            ? balance(rank, layer, order)
+                            ? balance(split, layer, order)
                             : std::min(order.size(), std::size_t(std::lround(
                                                          double(order.size()) * options.cpu_share)));
         }
@@ -796,16 +803,16 @@ struct ExpertMisses::Impl {
             }
             const double microseconds =
                 disk ? compute_cpu(layer, rank, [] {}) : compute_cpu(layer, rank, issue);
-            if (options.cpu_balance) { rank.split.computed(cpu_work_done, microseconds); }
+            if (options.cpu_balance) { split.computed(cpu_work_done, microseconds); }
         } else {
             issue();
             if (rank.product_count) { *static_cast<std::int32_t*>(rank.product_count->data()) = 0; }
         }
-        if (copies) { CUDA_CHECK(cudaEventSynchronize(rank.copied)); }
+        if (copies) { CUDA_CHECK(ninfer::wait_for_event(rank.copied)); }
         if (options.cpu_balance && gpu_count > 0 && staged_bytes > 0 && mapped == 0) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, rank.copying, rank.copied));
-            rank.split.copied(double(staged_bytes) / 1e6, 1e3 * double(milliseconds));
+            split.copied(double(staged_bytes) / 1e6, 1e3 * double(milliseconds));
         }
         Atomic(box.prepared).store(sequence, cuda::memory_order_release);
         const double seconds =
@@ -827,19 +834,29 @@ struct ExpertMisses::Impl {
             .count();
     }
 
+    [[nodiscard]] bool any_requested() const {
+        for (const auto& rank : ranks) {
+            if (!rank.used) { continue; }
+            const std::uint32_t sequence =
+                Atomic(rank.box->requested).load(cuda::memory_order_acquire);
+            if (sequence != rank.served) { return true; }
+        }
+        return false;
+    }
+
     void serve() {
         bool awake = false;
         while (!stopping.load(std::memory_order_acquire)) {
-            if (now_ns() > deadline.load(std::memory_order_acquire)) {
+            if (!any_requested() && now_ns() > deadline.load(std::memory_order_acquire)) {
                 if (awake && pool) { pool->spin(false); }
                 awake = false;
+                // Asleep, the service still looks at the doorbells every kAsleepPoll: the device
+                // may reach a replayed layer long after its pass's keep_alive().
                 std::unique_lock lock(wake_mutex);
-                sleeping.store(true, std::memory_order_release);
-                wake.wait(lock, [this] {
+                wake.wait_for(lock, kAsleepPoll, [this] {
                     return now_ns() <= deadline.load(std::memory_order_acquire) ||
-                           stopping.load(std::memory_order_acquire);
+                           any_requested() || stopping.load(std::memory_order_acquire);
                 });
-                sleeping.store(false, std::memory_order_release);
                 continue;
             }
             if (!awake && pool) { pool->spin(true); }
@@ -864,9 +881,12 @@ struct ExpertMisses::Impl {
                 }
                 rank.served = sequence;
                 worked      = true;
+                // The device may wait for this answer inside a watched wait (core/device_wait.h).
+                note_host_service_progress(
+                    device.rank(static_cast<std::size_t>(&rank - ranks.data())).device);
                 // Activity keeps the service awake: a pass is mid-flight.
                 deadline.store(std::max(deadline.load(std::memory_order_relaxed),
-                                        now_ns() + 500'000'000),
+                                        now_ns() + kKeepAliveNs),
                                std::memory_order_release);
             }
             if (!worked) { spin_hint(); }
@@ -917,9 +937,13 @@ struct ExpertMisses::Impl {
         Rank& rank = ranks.at(layers.at(index).rank);
         if (!capturing(stream)) {
             // Eager: wait on the host, so a lazily loaded kernel never waits behind a GPU spin.
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
             const std::uint32_t sequence = *static_cast<volatile std::uint32_t*>(rank.need->data());
-            if (sequence != 0) {
+            if (sequence != 0 &&
+                Atomic(rank.box->prepared).load(cuda::memory_order_acquire) != sequence) {
+                // The device may have reached this call only now, after a prompt span's attention
+                // and wide calls: the service may have slept since begin()'s keep-alive.
+                keep_alive();
                 while (Atomic(rank.box->prepared).load(cuda::memory_order_acquire) != sequence) {
                     std::this_thread::yield();
                     std::lock_guard lock(failure_mutex);
@@ -939,11 +963,11 @@ struct ExpertMisses::Impl {
 
     void keep_alive() {
         raise_failure();
-        deadline.store(now_ns() + 500'000'000, std::memory_order_release);
-        if (sleeping.load(std::memory_order_acquire)) {
-            std::lock_guard lock(wake_mutex);
-            wake.notify_all();
-        }
+        deadline.store(now_ns() + kKeepAliveNs, std::memory_order_release);
+        // Under the mutex, so that a service between its last look at the deadline and its wait
+        // still gets the notification.
+        std::lock_guard lock(wake_mutex);
+        wake.notify_all();
     }
 };
 

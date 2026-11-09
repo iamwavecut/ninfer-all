@@ -14,6 +14,14 @@ Related Issue:
 
 <!-- Explain the approach, why it was chosen, and relevant limitations or tradeoffs. -->
 
+## Coverage
+
+<!--
+Families, build targets, platforms and KV formats this change covers, and each exclusion with its
+reason. Say whether the change is lossless or an opt-in lossy mode, and whether it changes a default:
+https://github.com/iamwavecut/ninfer-all/blob/master/CONTRIBUTING.md#engineering-rules
+-->
+
 ## Verification
 
 <!--

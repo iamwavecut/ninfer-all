@@ -333,7 +333,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (cli.version_requested) {
-        std::cout << "ninfer " << NINFER_VERSION << '+' << NINFER_BUILD_ID << '\n';
+        std::cout << "ninfer " << NINFER_VERSION << '+' << NINFER_BUILD_ID << " (" << NINFER_TOOLCHAIN
+                  << ")\n";
         return 0;
     }
     if (cli.help_requested) {
@@ -347,7 +348,7 @@ int main(int argc, char** argv) {
          .level        = cli.log_level,
          .presentation = ninfer::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
-    logger->info("build {}", NINFER_BUILD_ID);
+    logger->info("build {} ({})", NINFER_BUILD_ID, NINFER_TOOLCHAIN);
     ninfer::product::StartupLogRenderer startup_log(logging);
 
     try {
@@ -403,6 +404,7 @@ int main(int argc, char** argv) {
         engine_options.embedding_q6             = cli.embedding_q6;
         engine_options.embedding_residency      = cli.embedding_residency;
         cli.steering.apply(engine_options);
+        cli.prompt_routes.apply(engine_options);
         engine_options.mtp_experts_q4           = cli.mtp_experts_q4;
         engine_options.gdn_state_fp16           = cli.gdn_state_fp16;
         engine_options.rope_yarn                = cli.rope_yarn;

@@ -1,6 +1,7 @@
 #include "core/paged_kv_cache.h"
 
 #include "core/device.h"
+#include "core/device_wait.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/request.h"
 
@@ -1224,7 +1225,7 @@ KVExecutionTablePool::~KVExecutionTablePool() {
     // A queued copy may still read the shadow this pool is about to free.
     for (const RowFence& pending : row_fences_) {
         if (pending.event != nullptr && pending.end > pending.begin) {
-            (void)cudaEventSynchronize(pending.event);
+            (void)ninfer::wait_for_event(pending.event);
         }
     }
     destroy_fences();
@@ -1363,7 +1364,7 @@ std::int32_t* KVExecutionTablePool::writable_shadow(KVExecutionRowHandle row_han
         cudaError_t status  = cudaEventQuery(pending.event);
         // The fence tracks one stream; a copy queued on another is settled before the next.
         if (status == cudaErrorNotReady && (overlaps || streams[copy] != pending.stream)) {
-            status = cudaEventSynchronize(pending.event);
+            status = ninfer::wait_for_event(pending.event);
         }
         if (status == cudaSuccess) {
             pending.begin = 0;

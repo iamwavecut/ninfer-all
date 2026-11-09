@@ -194,7 +194,7 @@ jobs:
           $deps = Join-Path $env:RUNNER_TEMP 'deps'
           $tree = Join-Path $deps 'installed\x64-windows'
           New-Item -ItemType Directory -Force -Path $tree | Out-Null
-          Invoke-WebRequest -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip' -OutFile "$deps\ffmpeg.zip"
+          Invoke-WebRequest -MaximumRetryCount 6 -RetryIntervalSec 30 -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip' -OutFile "$deps\ffmpeg.zip"
           Expand-Archive -Path "$deps\ffmpeg.zip" -DestinationPath $deps
           $ffmpeg = Get-ChildItem -Path $deps -Directory -Filter 'ffmpeg-*' | Select-Object -First 1
           Copy-Item -Recurse -Path "$($ffmpeg.FullName)\include", "$($ffmpeg.FullName)\lib" -Destination $tree

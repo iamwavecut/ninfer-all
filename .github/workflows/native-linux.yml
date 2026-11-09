@@ -57,7 +57,9 @@ jobs:
       CUDA_VERSION: ${{ inputs.cuda }}
     steps:
       - name: Reserve time for cache upload
-        run: echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
+        run: |
+          echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+          echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
       - name: Install checkout tools
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
       - name: Check the compiler-cache environment
@@ -97,7 +99,10 @@ jobs:
       - name: Prepare completed object cache for upload
         timeout-minutes: 2
         if: always() && steps.compiler-cache.outcome == 'success'
-        run: python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
+        # A finished build keeps only the entries it used; an unfinished one keeps the restored rest.
+        run: >-
+          python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
+          ${{ steps.build.outcome == 'success' && '--evict-unused-since "$JOB_START"' || '' }}
       - name: Save completed objects even after cancellation
         if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
         timeout-minutes: ${{ job.status == 'cancelled' && 3 || 20 }}

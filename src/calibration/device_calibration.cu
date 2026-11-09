@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/device_wait.h"
 #include "core/dtype.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
@@ -42,6 +43,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -153,7 +155,7 @@ SyntheticWeight row_split_weight(QType qtype, std::int32_t n, std::int32_t k) {
     fill_u16_kernel<<<fill_grid(groups), 256>>>(
         reinterpret_cast<std::uint16_t*>(base + scale_offset), groups, 0x3c00);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(ninfer::wait_for_device());
 
     Weight& w           = result.weight;
     w.payload           = base;
@@ -198,7 +200,7 @@ SyntheticWeight block_scale_nvfp4_weight(std::int32_t n, std::int32_t k) {
     CUDA_CHECK(cudaMemsetAsync(base + scale_plane_offset, 0x38, scale_plane_bytes, nullptr));
     fill_f32_kernel<<<fill_grid(1), 256>>>(reinterpret_cast<float*>(base + divisor_offset), 1, 1.0f);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(ninfer::wait_for_device());
 
     Weight& w              = result.weight;
     w.payload              = base;
@@ -248,7 +250,7 @@ public:
                 flush();
                 launch(nullptr);
             }
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(ninfer::wait_for_device());
             std::vector<float> samples;
             samples.reserve(static_cast<std::size_t>(options_.repeat));
             for (int index = 0; index < options_.repeat; ++index) {
@@ -256,7 +258,7 @@ public:
                 CUDA_CHECK(cudaEventRecord(start_, nullptr));
                 launch(nullptr);
                 CUDA_CHECK(cudaEventRecord(stop_, nullptr));
-                CUDA_CHECK(cudaEventSynchronize(stop_));
+                CUDA_CHECK(ninfer::wait_for_event(stop_));
                 float ms = 0.0f;
                 CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_));
                 samples.push_back(ms);
@@ -265,7 +267,7 @@ public:
             return 1000.0 * samples[samples.size() / 2];
         } catch (const std::exception&) {
             cudaGetLastError();
-            cudaDeviceSynchronize();
+            ninfer::wait_for_device();
             return std::numeric_limits<double>::infinity();
         }
     }
@@ -300,7 +302,8 @@ struct Family {
 
 std::vector<float> bf16_host(std::pair<const void*, std::size_t> output) {
     std::vector<std::uint16_t> raw(output.second);
-    CUDA_CHECK(cudaMemcpy(raw.data(), output.first, raw.size() * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(
+        ninfer::copy_and_wait(raw.data(), output.first, raw.size() * 2, cudaMemcpyDeviceToHost));
     std::vector<float> values(raw.size());
     for (std::size_t index = 0; index < raw.size(); ++index) {
         const std::uint32_t bits = static_cast<std::uint32_t>(raw[index]) << 16;
@@ -342,7 +345,7 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
         if (family.output) {
             if (family.reset) { family.reset(); }
             family.run(width, nullptr);
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(ninfer::wait_for_device());
             reference = bf16_host(family.output(width));
         }
         double best_us = compiled;
@@ -354,7 +357,7 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
                 try {
                     if (family.reset) { family.reset(); }
                     family.run(width, nullptr);
-                    CUDA_CHECK(cudaDeviceSynchronize());
+                    CUDA_CHECK(ninfer::wait_for_device());
                 } catch (const std::exception&) {
                     cudaGetLastError();
                     continue;
@@ -555,6 +558,135 @@ void calibrate_gguf_vector(ops::DeviceRouteProfile& profile, Timer& timer,
     }
 }
 
+void calibrate_gguf_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
+                           const CalibrationOptions& options) {
+    constexpr std::int32_t max_tokens = 4096;
+    const std::vector<std::int32_t> widths = {65,  128,  129,  256,  512,  768,
+                                              1024, 1280, 1536, 2048, 3072, 4096};
+    const std::string key = "gguf_matrix/q4_k";
+    if (!options.only.empty() && key.rfind(options.only, 0) != 0) { return; }
+    SyntheticWeight wide    = gguf_vector_weight(QType::GGUF_Q4_K, 17408, 5120);
+    SyntheticWeight tall    = gguf_vector_weight(QType::GGUF_Q4_K, 5120, 17408);
+    DeviceBuffer wide_input = bf16_buffer(static_cast<std::size_t>(5120) * max_tokens);
+    DeviceBuffer tall_input = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+    DeviceBuffer output     = bf16_buffer(static_cast<std::size_t>(17408 + 5120) * max_tokens);
+    WorkspaceArena workspace(std::max<std::size_t>({
+        ops::linear_workspace_capacity_bytes(QType::GGUF_Q4_K, 17408, 5120,
+                                             ops::LinearPolicy::A16Only, widths.front(),
+                                             max_tokens),
+        ops::linear_workspace_capacity_bytes(QType::GGUF_Q4_K, 5120, 17408,
+                                             ops::LinearPolicy::A16Only, widths.front(),
+                                             max_tokens),
+        256}));
+    const Family family{
+        key,
+        widths,
+        [&](std::int32_t tokens, cudaStream_t stream) {
+            const Tensor wide_x(wide_input.p, DType::BF16, {5120, tokens});
+            const Tensor tall_x(tall_input.p, DType::BF16, {17408, tokens});
+            Tensor wide_out(output.p, DType::BF16, {17408, tokens});
+            Tensor tall_out(static_cast<std::uint8_t*>(output.p) +
+                                static_cast<std::size_t>(17408) * tokens * sizeof(std::uint16_t),
+                            DType::BF16, {5120, tokens});
+            ops::linear(wide_x, wide.weight, wide_out, ops::LinearPolicy::A16Only, workspace,
+                        stream);
+            ops::linear(tall_x, tall.weight, tall_out, ops::LinearPolicy::A16Only, workspace,
+                        stream);
+        },
+        [&](std::int32_t tokens) {
+            return std::pair<const void*, std::size_t>{
+                output.p, static_cast<std::size_t>(17408 + 5120) * tokens};
+        },
+        {}};
+    auto bands = sweep(family, timer, options);
+    if (!bands.empty()) {
+        profile.routes[family.key] = std::move(bands);
+        ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
+    }
+}
+
+__global__ void cast_f32_to_bf16_kernel(const float* __restrict__ in,
+                                        __nv_bfloat16* __restrict__ out, std::size_t count) {
+    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) { out[i] = __float2bfloat16(in[i]); }
+}
+
+void calibrate_gguf_moe_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
+                               const CalibrationOptions& options) {
+    constexpr std::int32_t rows = 640;
+    constexpr std::int32_t k = 2560;
+    constexpr int experts = 64;
+    constexpr int per_token = 2;
+    const std::vector<std::int32_t> widths = {65, 128, 256, 512, 1024};
+    const std::string key = "gguf_moe_matrix/q4_k";
+    if (!options.only.empty() && key.rfind(options.only, 0) != 0) { return; }
+    const GgufBlockShape block = gguf_block_shape(QType::GGUF_Q4_K);
+    std::vector<SyntheticWeight> weights;
+    std::vector<const void*> pointers;
+    weights.reserve(experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        weights.push_back(gguf_vector_weight(QType::GGUF_Q4_K, rows, k,
+                                             0x2f6b91c3U + static_cast<std::uint32_t>(expert)));
+        pointers.push_back(weights.back().storage.p);
+    }
+    DeviceBuffer table_storage(experts * sizeof(const void*));
+    table_storage.copy_from_host(pointers.data(), table_storage.bytes);
+    const std::int32_t max_pairs = widths.back() * experts;
+    std::vector<std::int32_t> ids(max_pairs);
+    for (int p = 0; p < max_pairs; ++p) { ids[p] = p % experts; }
+    DeviceBuffer ids_device(ids.size() * sizeof(std::int32_t));
+    ids_device.copy_from_host(ids.data(), ids_device.bytes);
+    DeviceBuffer input = bf16_buffer(static_cast<std::size_t>(k) * (max_pairs / per_token));
+    DeviceBuffer plane(static_cast<std::size_t>(rows) * max_pairs * sizeof(float));
+    DeviceBuffer output = bf16_buffer(static_cast<std::size_t>(rows) * max_pairs);
+    struct Prepared {
+        DeviceBuffer routing_workspace;
+        ops::gguf::MoeRouting routing;
+        DeviceBuffer activation;
+    };
+    std::map<std::int32_t, Prepared> prepared;
+    for (const std::int32_t columns : widths) {
+        const std::int32_t pairs = columns * experts;
+        Prepared entry{DeviceBuffer(ops::gguf::moe_routing_bytes(experts, pairs)), {},
+                       DeviceBuffer(ops::gguf::moe_matrix_activation_bytes(k, pairs))};
+        entry.routing = ops::gguf::moe_sort_routes(
+            static_cast<const std::int32_t*>(ids_device.p), pairs, experts,
+            entry.routing_workspace.p, nullptr);
+        ops::gguf::quantize_moe_matrix_activation(
+            ops::gguf::GgmlType::Q4_K, static_cast<const __nv_bfloat16*>(input.p), k,
+            entry.routing, pairs, per_token, entry.activation.p, nullptr);
+        prepared.emplace(columns, std::move(entry));
+    }
+    CUDA_CHECK(ninfer::wait_for_device());
+    const ops::gguf::MoeTable table{
+        reinterpret_cast<const void* const*>(table_storage.p),
+        static_cast<std::int64_t>(k / block.elements) * block.bytes, rows, k, true};
+    const Family family{
+        key,
+        widths,
+        [&](std::int32_t columns, cudaStream_t stream) {
+            const std::int32_t pairs = columns * experts;
+            const Prepared& entry = prepared.at(columns);
+            ops::gguf::moe_matrix_product(ops::gguf::GgmlType::Q4_K, table, entry.routing,
+                                          experts, pairs, true, entry.activation.p,
+                                          static_cast<float*>(plane.p), stream);
+            const std::size_t count = static_cast<std::size_t>(rows) * pairs;
+            cast_f32_to_bf16_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0,
+                                      stream>>>(static_cast<const float*>(plane.p),
+                                                static_cast<__nv_bfloat16*>(output.p), count);
+        },
+        [&](std::int32_t columns) {
+            return std::pair<const void*, std::size_t>{
+                output.p, static_cast<std::size_t>(rows) * columns * experts};
+        },
+        {}};
+    auto bands = sweep(family, timer, options);
+    if (!bands.empty()) {
+        profile.routes[family.key] = std::move(bands);
+        ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
+    }
+}
+
 void calibrate_gguf_moe_vector(ops::DeviceRouteProfile& profile, Timer& timer,
                                const CalibrationOptions& options) {
     constexpr std::int32_t rows = 640;
@@ -613,7 +745,7 @@ void calibrate_gguf_moe_vector(ops::DeviceRouteProfile& profile, Timer& timer,
             static_cast<const std::int32_t*>(ids_device.p), pairs, experts, routing_workspace.p,
             nullptr);
         DeviceBuffer output = bf16_buffer(static_cast<std::size_t>(rows) * pairs);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(ninfer::wait_for_device());
         const ops::gguf::MoeTable table{
             reinterpret_cast<const void* const*>(table_storage.p),
             static_cast<std::int64_t>(k / block.elements) * block.bytes, rows, k};
@@ -702,7 +834,7 @@ void calibrate_gguf_moe_up(ops::DeviceRouteProfile& profile, Timer& timer,
         DeviceBuffer ids_device(sizeof(ids));
         ids_device.copy_from_host(ids.data(), sizeof(ids));
         DeviceBuffer output = bf16_buffer(static_cast<std::size_t>(rows) * slots);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(ninfer::wait_for_device());
         ops::gguf::MoeDecodeUpArgs args{};
         args.m = static_cast<const __nv_bfloat16*>(input.p);
         args.k = k;
@@ -817,7 +949,8 @@ void calibrate_ternary(ops::DeviceRouteProfile& profile, Timer& timer,
         };
     };
     const auto reset_residual = [&]() {
-        CUDA_CHECK(cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
     const std::vector<Family> families = {
         {"t2_i8_small/4096+12288x5120", decode_widths(), gdn_pair, view(qkv, 10240), {}},
@@ -887,7 +1020,8 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
         };
     };
     const auto reset_residual = [&]() {
-        CUDA_CHECK(cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
 
     const std::vector<Family> families = {
@@ -1070,8 +1204,8 @@ void calibrate_nvfp4_fused(ops::DeviceRouteProfile& profile, Timer& timer,
     };
     DeviceBuffer residual_pristine = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
     const auto reset_residual      = [&]() {
-        CUDA_CHECK(
-            cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
 
     const auto attn_run = [&](ops::LinearPolicy policy, std::int32_t cols, cudaStream_t stream) {
@@ -1265,8 +1399,8 @@ void calibrate_cublas_prefill(ops::DeviceRouteProfile& profile, Timer& timer,
         };
     };
     const auto reset_residual = [&]() {
-        CUDA_CHECK(
-            cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
     const auto run_gate_up = [&](std::int32_t cols, cudaStream_t stream) {
         Tensor x = tensor(x_hidden, hidden, cols), o = tensor(swiglu_out, 17408, cols);
@@ -1772,6 +1906,10 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
         calibrate_gguf_vector(profile, timer, options);
         calibrate_gguf_moe_vector(profile, timer, options);
         calibrate_gguf_moe_up(profile, timer, options);
+        if (projections && !ops::turing_shapes_here()) {
+            calibrate_gguf_matrix(profile, timer, options);
+            calibrate_gguf_moe_matrix(profile, timer, options);
+        }
     }
     if (projections && options.nvfp4 && !gguf_only) { calibrate_nvfp4_fused(profile, timer, options); }
     if (options.linear_attention && !gguf_only) { calibrate_linear_attention(profile, timer, options); }

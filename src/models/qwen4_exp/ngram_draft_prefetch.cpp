@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/ngram_draft_prefetch.h"
 
+#include "core/device_wait.h"
+
 #include <stdexcept>
 #include <utility>
 
@@ -27,7 +29,7 @@ NgramDraftPrefetch::~NgramDraftPrefetch() {
     // drain its host nodes. No callback may outlive this object or the referenced table.
     try {
         DeviceBinding bind(device_);
-        cudaDeviceSynchronize();
+        ninfer::wait_for_device();
         cudaStreamDestroy(stream_);
     } catch (...) {}
 }
@@ -62,6 +64,21 @@ void NgramDraftPrefetch::issue_candidates(const std::int32_t* first, const std::
                        std::span(rows_).subspan(i * heads, heads));
     }
     table_.prefetch(rows_);
+}
+
+void NgramDraftPrefetch::hint(std::span<const std::int32_t> drafts, std::size_t stride,
+                              std::size_t steps) {
+    if (steps > steps_.size() || drafts.size() < batch_ * stride || steps > stride) {
+        throw std::invalid_argument("n-gram draft prefetch: drafts do not match the batch");
+    }
+    const auto heads = hash_.heads();
+    for (std::size_t i = 0; i < steps; ++i) {
+        for (std::size_t j = 0; j < batch_; ++j) {
+            ngram_row_ids(hash_, drafts.subspan(j * stride + i, 1), eos_, vocab_, contexts_[j],
+                          std::span(rows_).subspan(j * heads, heads));
+        }
+        table_.prefetch(std::span(rows_).first(batch_ * heads));
+    }
 }
 
 void CUDART_CB NgramDraftPrefetch::prefetch(void* data) noexcept {

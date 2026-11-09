@@ -2,8 +2,11 @@
 
 NInfer runs DeepSeek's [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
 (`DeepseekV41ForCausalLM`) from IST Austria's
-[GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) (IQ1_M),
-its Engram table GGUF (IQ4_NL) and its vision tower (the repository's BF16 mmproj). It is its own
+[GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) (IQ1_M)
+or its expert-pruned
+[Coder build](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF) (192
+of the 384 experts a block), with the Engram table GGUF (IQ4_NL) and the vision tower (the
+repository's BF16 mmproj). It is its own
 model family next to Qwen3.5, Flash-Next, Gemma 4 and Flint: its own executor
 (`src/models/deepseek_v41`) and Engine core
 (`src/runtime/engine/deepseek_v41_core`), sharing the Qwen3.5 frontend for tokenization, chat
@@ -19,7 +22,10 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   window of 128 positions; blocks 2 to 19 also attend over latents compressed two tokens to one,
   blocks 20 to 39 over one compressed latent per token, of which an indexer (32 heads of 128) keeps
   the best 512 for each query; block 20 first keeps each query's best 2048 blocks of eight latents,
-  and the later blocks rank only inside those. The MoE routes each token to 6 of 384 experts
+  and the later blocks rank only inside those: once a query sees more than 2,048 blocks they read
+  and score only the kept blocks' keys and select among their scores (four consecutive prompt
+  positions share one list of the blocks any of them keeps), which gives the selection of scoring
+  every position. The MoE routes each token to 6 of 384 experts
   (sqrt-softplus scores, SwiGLU of width 2304 with its gate clamped at 10 and its up projection
   within ±10) beside a shared expert. Blocks 1 and 14 add Engram rows, the 2- to 4-grams ending
   at each position hashed into a table and gated by the stream. A 129,280-token head.
@@ -35,8 +41,10 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   attention output in FP8 before its projection, each scale computed in FP32 as the release does.
   The caches hold those values in BF16.
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
-  tokens (1024 or 512 on a card without room for them) run block by block in spans of up to eight
-  chunks ([below](#prompt-spans)), prefix reuse across turns and requests with
+  tokens (`--prefill-chunk`, at most 4096; narrower on a card without room for them) run block by
+  block in spans of up to eight chunks ([below](#prompt-spans)), the last 19 blocks only over the
+  prompt rows the output depends on ([below](#the-prefill-tail)), prefix reuse across turns and
+  requests with
   host-memory images ([below](#prefix-reuse)), branched reads for
   [typed decisions](serving.md#typed-decisions), structured output, streaming, log probabilities,
   causal scoring (`ninfer-perplexity`; a window that does not start with `<｜begin▁of▁sentence｜>`
@@ -91,23 +99,26 @@ and n-gram copy drafts, DSpark drafts while several requests decode, rotation sc
 and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool, the
 disk tier and session slots. Several GPUs divide the routed experts instead (`--devices 0,1
 --tensor-parallel` with host or disk experts: each device its own banks, cache and copies, no CPU
-share; without `--tensor-split` the first device, which also holds the model, serves fewer experts,
-so that every device's misses take the same time over its bus; [expert
+share, prompts in [spans](#prompt-spans) as on one device; without `--tensor-split` the first
+device, which also holds the model, serves fewer experts, so that every device's misses take the
+same time over its bus; [expert
 parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
+
+The Q4_K async prompt tiles (`gguf_matrix/q4_k`, `gguf_moe_matrix/q4_k`) do not apply to this
+family: its routed experts are IQ1_S, IQ1_M, IQ2_XXS and IQ2_S, none Q4_K.
 
 ## Converting
 
 The converter reads the weights from the GGUF shards, the Engram GGUF, the drafter of beamster's
-Sushi STQ pack and the vision tower's mmproj, the tokenizer and configuration from the base release,
-and the release's routing bias of image positions (`layers.N.ffn.gate.bias_vl`, which the GGUF
-lacks) by byte range from the release's safetensors shards (`tools/convert/fetch_tensors.py`, 65 KB
-of its 48 shards). The release ships no Jinja chat template; the converter stores its own
-transcription of the release's encoder (`tools/convert/templates/deepseek_v41`).
+Sushi STQ pack and the vision tower's mmproj, and the tokenizer and configuration from the base
+release. The release ships no Jinja chat template; the converter stores its own transcription of
+the release's encoder (`tools/convert/templates/deepseek_v41`).
 
 ```bash
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 config.json tokenizer.json tokenizer_config.json \
   --local-dir models/deepseek-v4.1/hf
 hf download ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
+  --revision 65d53bc8be65123e255ff02f3ded958b6dbf54fd \
   --include 'DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-*.gguf' \
   --include 'DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf' \
   --include 'mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf' --local-dir models/deepseek-v4.1
@@ -115,19 +126,15 @@ hf download beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw \
   --revision 07fec972538639726b868f81e89d9d4f5005fe10 --include config.json \
   --include model.safetensors.index.json --include 'model-mtp-*.safetensors' \
   --local-dir models/deepseek-v4.1/stq
-python -m tools.convert.fetch_tensors deepseek-ai/DeepSeek-V4.1-Flash-1017 \
-  --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
-  --match 'layers.*.ffn.gate.bias_vl' --out models/deepseek-v4.1/bias_vl.safetensors
 
 # The model with its DSpark drafter and vision tower; it names its Engram table by the SHA-256 of
 # the table's rows.
 python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf \
   --components text,dspark,vision \
-  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
+  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00006.gguf \
   --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
   --source dspark=models/deepseek-v4.1/stq \
   --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
-  --source bias_vl=models/deepseek-v4.1/bias_vl.safetensors \
   --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
   --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer --device cpu
 # The Engram table, one artifact for every DeepSeek-V4.1-Flash-1017 conversion.
@@ -137,14 +144,49 @@ python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gg
   --out models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --device cpu
 ```
 
+These are the files in llama.cpp's layout (b11870 and newer), which ISTA-DASLab publishes since
+2026-10-27 (the revision above): five shards, the first holding only metadata, and the Engram GGUF
+as the sixth, which llama.cpp opens through a link named `...-00006-of-00006.gguf`; the converter
+needs no link and takes the file from `--source engram`. GGUFs downloaded earlier (four shards,
+revision `653a9874aa38c356233c5f3cc8c96b19a43b57eb`) convert too, to the same artifact: apart from
+the source paths it records, every object, configuration and resource is the same bytes. They lack
+the routing bias of image positions, so for the vision tower the converter reads the release's
+`layers.N.ffn.gate.bias_vl` by byte range from its safetensors shards
+(`tools/convert/fetch_tensors.py`, 65 KB of its 48 shards):
+
+```bash
+python -m tools.convert.fetch_tensors deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+  --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
+  --match 'layers.*.ffn.gate.bias_vl' --out models/deepseek-v4.1/bias_vl.safetensors
+# As above with the earlier shards, and the bias.
+python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf \
+  --components text,dspark,vision \
+  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
+  --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
+  --source dspark=models/deepseek-v4.1/stq \
+  --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
+  --source bias_vl=models/deepseek-v4.1/bias_vl.safetensors \
+  --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
+  --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer --device cpu
+```
+
+ISTA-DASLab's Coder build (`ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF`, IQ2_XXS,
+revision `54229d38d588a66d1c6cff08af7b281b9326c656`) keeps 192 of the 384 routed experts per block
+and comes only in llama.cpp's layout. It converts with the same command, its first shard as
+`--source gguf` and the base release's config; the converter takes the expert count from the GGUF.
+Its repository's Engram GGUF and mmproj are the base repository's files, so it uses the same Engram
+table. The model is one file of 71.9 GiB, published with the STQ drafter and the vision tower
+([running](#running)). 11 of its 80 expert banks, in 10 of its 40 blocks, are IQ2_XS, which CPU
+threads do not compute: in those blocks the GPU copies every miss whatever `--expert-dma-share`
+says.
+
 The model reads the Engram GGUF only for the table's digest, and of the STQ pack only its config,
 its index and its six drafter files (3.85 GB), checking that the pack states the release's model and
 drafter keys. `--components text,dspark` leaves the vision tower out and `--components text` the
 drafter too; the objects they keep are the same bytes either way. The model with its drafter and
-tower is one file of 125,824,667,392 bytes (117.2 GiB), of which the tower takes 0.90 GiB; the
-table is one of 110,595,294,496 bytes (103.0 GiB). On the 96 threads of a 48-core EPYC 7K62, with a
-download writing to the same disk, the model took 6 min 23 s; on 24 cores of a Threadripper 3960X
-the table took 3 min 29 s.
+tower is one file of 117.2 GiB, of which the tower takes 0.90 GiB; the table is one of 103.0 GiB.
+On the 96 threads of a 48-core EPYC 7K62, with a download writing to the same disk, the model took
+6 min 23 s; on 24 cores of a Threadripper 3960X the table took 3 min 29 s.
 
 The drafter can come from Unsloth's `dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf` instead, the
 release's drafter in Q8_0 with MXFP4 routed experts, which takes twice the STQ drafter's device
@@ -156,11 +198,10 @@ hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF dspark-DeepSeek-V4.1-Flash-101
 # As above, with the GGUF as the drafter's source.
 python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf \
   --components text,dspark,vision \
-  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf \
+  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00006.gguf \
   --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
   --source dspark=models/deepseek-v4.1/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \
   --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
-  --source bias_vl=models/deepseek-v4.1/bias_vl.safetensors \
   --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
   --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-Unsloth-DSpark-ninfer-v3.ninfer --device cpu
 ```
@@ -170,13 +211,16 @@ Its text and vision objects are the same bytes as with the STQ drafter; the file
 
 ## Running
 
-Both artifacts are published: the model, with the STQ drafter and the vision tower, as
-[WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3)
-and its table as
+Three artifacts are published: the model, with the STQ drafter and the vision tower, as
+[WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3),
+ISTA-DASLab's Coder build with the same drafter and tower as
+[WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-NInfer-v3](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-NInfer-v3),
+and the table both read as
 [WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3).
 
 ```bash
 M=models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer
+# Or the Coder build: M=models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-ninfer-v3.ninfer
 T=models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer
 # A chat server for two concurrent requests over 32K-token contexts, experts in pinned host memory.
 ninfer-serve $M --ngram-table $T --model-id deepseek-v4.1-flash \
@@ -217,8 +261,9 @@ cache and its rounds):
   bank laid out like the resident bank; two banks let the next layer arrive while the current one
   computes. `--expert-cache-mib` (default: what is free after startup) holds the experts decode
   routes most, filled at startup from a routing profile (`--expert-profile`, else the built-in
-  DeepSeek-V4.1 profile, recorded on summaries of four corpora and on chat, code and reasoning
-  requests).
+  one for the model's experts a block: the release's, recorded on summaries of four corpora and on
+  chat, code and reasoning requests, or the [Coder build's](#coder-build), recorded on 48 coding,
+  agent and reasoning requests).
 - **CPU share.** With host experts, CPU threads compute a share of a decode or verification
   call's misses from the pinned copy while the GPU copies and runs the rest
   ([below](#the-cpu-share)). Prompt chunks and spans copy every miss.
@@ -247,11 +292,36 @@ then adds the CPU's sums to its own:
   ([measurements](#the-cpu-share-on-one-rtx-4090)), so `auto` copies every miss of disk experts; a
   share below `1` still gives the CPU its part.
 
+## IQ1_M experts in prompt chunks
+
+Calls of more than eight tokens run the routed experts on ggml's integer tensor-core matrix kernel,
+the IQ1_M banks (12 in the IQ1_M build, 44 in the Coder build) once a call routes enough rows to
+each expert: 6 on average for their down products and more than 16 for their gate and up products,
+from 384 and 1,025 tokens with 384 experts a block and from 192 and 513 with the Coder build's 192
+(a 2048-token chunk routes 32 or 64). Below that they run on the vector kernel in groups of eight
+columns: the matrix kernel would leave most of its tile columns empty and gather a row for every
+pair, where the vector kernel reads each token's row once for all of its experts. Up to 16 rows an
+expert its column tiles are 16 wide, and in prompt steps on an RTX 4090 it ran gate and up products
+there at 0.89 to 1.02 times the vector kernel's speed
+([IQ1_M routes per card](#iq1_m-routes-per-card)). Causal scoring (`ninfer-perplexity`) runs
+256-token steps: 8 rows an expert with the Coder build's 192 experts, whose down products take the
+matrix kernel and gate and up products the vector kernel, and 4 with 384 experts, all on the vector
+kernel. llama.cpp multiplies IQ1_M on its vector kernels only; NInfer's tile loader unpacks each
+row of eight grid values g, shifted by ±1/8, into the int8 values 8g ± 1 and each 16 values' scale
+into d (2s + 1) / 8, the integers and scales of its own vector kernel. `--iq1m-experts vector` keeps
+every IQ1_M call on the vector kernel. The two routes keep the activation's scale per 32 values in
+FP32 (matrix) or binary16 (vector) and sum in different orders, so their outputs differ slightly;
+`ninfer_linear_gguf_moe_iq1m_test` holds both against FP64 products at the experts' shapes. On the
+Tesla V100 the IQ1_M banks stay on the vector kernel.
+
 ## Prompt spans
 
-A 2048-token chunk routes to nearly every expert of every block, so a prompt run chunk by chunk
-copies nearly all the experts the cache lacks once per chunk: about 100 GiB a chunk with host
-experts. With host or disk experts the executor runs a prompt's chunks block by block instead:
+A prompt runs in chunks of 2048 tokens unless `--prefill-chunk` asks for another multiple of 128
+(at most 4096); a card without room for a chunk's workspace takes the widest of 2048, 1024 and 512
+below it that fits, and the startup log says so. A 2048-token chunk routes to nearly every expert
+of every block, so a prompt run chunk by chunk copies nearly all the experts the cache lacks once
+per chunk: about 100 GiB a chunk with host experts. With host or disk experts the executor runs a
+prompt's chunks block by block instead:
 
 - **One sweep per span.** Every chunk of a span passes a block before any passes the next, so the
   block's bank is filled once for all of them, and the delivery fills the next block's bank while
@@ -269,6 +339,38 @@ experts. With host or disk experts the executor runs a prompt's chunks block by 
   cache may lend to, down to chunk by chunk. With a fixed
   `--expert-cache-mib` they stay in the workspace. The Engram rows of a span's tokens are staged
   on the card (about 95 MiB more than for one chunk).
+- **Several GPUs.** With `--tensor-parallel` the span's buffers stay on the first device, which
+  also sizes the span, and each MoE call still takes one chunk: every device's delivery fills its
+  bank of a block once for all of the span's chunks. Measured on two RTX 3090s without peer
+  access (2026-11-04, IQ1_M with host experts, one run each): a 9,672-token prompt prefilled at
+  670.9 tok/s against 451.4 chunk by chunk (one RTX 3090 with spans: 576.5), with the same
+  tokens; decode did not change (30.3 tok/s after that prompt, 41.4-41.7 on a short one).
+
+## The prefill tail
+
+Blocks 21 to 39 come after block 20, the last block that keeps compressed caches. Each attends over
+block 20's caches and its own window of 128 positions and keeps nothing else, so the state those
+blocks leave at a position, and the logits there, depend only on their rows within 19 × 127 + 1 =
+2,414 positions before it. `--prefill-tail` chooses the prompt rows they run:
+
+- **`exact`** (the default). A prompt step runs blocks 21 to 39 from the row 2,414 positions
+  before the state its run of steps keeps (the prompt's end, the checkpoint where the last user
+  turn closes, a shared prefix), starting at the prompt chunk that holds that row; a step that
+  ends before that chunk leaves them out. Each chunk runs whole or not at all, the rows a step runs
+  read none it left out, and the products keep the shapes of a full run, so tokens, log
+  probabilities and kept states are `full`'s bit for bit.
+- **`full`** runs every row through every block.
+- **`N`** (at least 128, the window) runs the last `N` rows before each kept state, from that row
+  rather than from its chunk: a lossy mode. Its products take other shapes, so they round
+  differently from `full`'s, and below 2,414 the kept states and logits also lose rows they depend
+  on.
+- **A stopped prompt.** A request stopped inside its prompt leaves those blocks behind the rest of
+  the sequence's state. NInfer keeps no image of that state; the next prompt on the sequence starts
+  from its last checkpoint, from the host store or from the beginning.
+- **Scoring.** Causal scoring computes every position's logits, so it runs every row.
+
+Prefill rates, the outputs and the cost of a stopped prompt are
+[measured below](#prefill-tail-iq1_m-experts-and-engram-reads).
 
 ## The Engram table
 
@@ -285,6 +387,16 @@ addresses and copies them to the device:
   (`--ngram-io`, `--ngram-io-depth`, `--ngram-ram-mib` for a row cache), and `ram` holds the whole
   table in RAM (`--ngram-lock` pins it). The table is 103.0 GiB, so `ram` and host experts together
   need about 210 GiB of RAM.
+- **Repeated rows.** A pass that addresses one row several times, as a prompt that repeats its
+  n-grams or an image's positions (which all hash the pad n-grams) do, reads it from the file once
+  and copies it to the other places (`--ngram-dedupe off` reads every place).
+- **Reading ahead.** While a prompt step computes, the rows of the sequence's next prompt step are
+  read into a second pinned buffer, so that step starts without waiting for the file
+  (`--ngram-read-ahead off` reads each step's rows when it starts). The Engine passes the next
+  step's tokens with the current one; a step that does not match them, such as a request stopped in
+  between, reads its own rows. The second buffer takes 114 MiB of pinned memory with spans of
+  16,384 tokens and 14 MiB with chunks of 2048
+  ([measurements](#prefill-tail-iq1_m-experts-and-engram-reads)).
 
 ## The DSpark drafter
 
@@ -500,7 +612,11 @@ keeps instead of prefilling those tokens again:
   (or `--host-cache-mib`) sets the store.
 - **Shared prefixes.** A prompt chunk also ends where the frontend marks a prefix other requests
   share (the end of the leading system messages, of the tool declarations, a declared cache
-  boundary), and the state there goes to an image too.
+  boundary), and the state there goes to an image too. That end also ends a prompt span, so the
+  first prompt with such a prefix copies or reads the experts once more than a prompt without it.
+  Flash-Next keeps the state inside its span instead; here a span keeps one state, the one its
+  prefill tail and drafter taps are planned for (`state_at`), and a second one is not
+  implemented.
 
 A window state cannot be cut back, so a prompt resumes only where a state was kept, not at an
 arbitrary common prefix.
@@ -776,6 +892,218 @@ release archive). Beside the two layer banks (7.1 GiB) the expert cache keeps 38
 - **Placements agree.** Host and disk experts produced the same tokens on each card.
 
 Rows give one run, or the range of two; no spread is measured.
+
+### Long prompts
+
+November 4, 2026, one RTX 3090 of a host with a 48-core EPYC 7K62 and the 610.43.03 driver, the
+sm_86 build with experts in pinned RAM, `--no-ngram-table` (the Engram table was not on the host),
+`--max-context 65536`, one sequence, greedy decoding. The index sources of blocks 21 to 39 scored
+every visible position, and now score only the blocks that block 20 keeps; a cell lists each run:
+
+| index sources after block 20 | prefill of 27,264 tokens | decode after them | prefill of 58,117 tokens | decode after them | decode, short answer |
+|---|---:|---:|---:|---:|---:|
+| every position | 635 tok/s | 22.0 tok/s | 645, 632, 631 tok/s | 21.8, 22.1, 20.7 tok/s | 27.0, 27.8, 26.0 tok/s |
+| the kept blocks | 638 tok/s | 22.6 tok/s | 653, 639, 639 tok/s | 22.7, 22.1, 21.2 tok/s | 27.5, 27.5, 26.5 tok/s |
+
+- **Prefill** of the 58,117-token prompt rose by 1.0 to 1.3% and of the 27,264-token prompt by
+  0.4%: scoring the whole context was a small part of a prompt chunk's time.
+- **Decode** after the long prompts rose by 0.3 to 4.2% per run. The short answer never sees more
+  than 2,048 blocks, so its difference of -1.1 to +2.0% between the builds is the spread of runs.
+- **Outputs.** Both builds produced the same tokens in every run.
+
+### Coder build
+
+November 4, 2026, ISTA-DASLab's Coder build ([converting](#converting)) on one rented host: an RTX
+4090 (450 W, PCIe 4.0 x16), a 64-core EPYC 7B13 in a container of 61 CPUs, 503 GiB of RAM, the
+sm_89 build of `379c0d999`. `ninfer-serve --max-context 16384 --max-concurrency 1`, one sequence,
+greedy decoding, thinking off: a 25-token code request answered with 256 tokens and a summary of a
+7,775-token C++ file in 128 tokens. The disk row ran after the model file was read into the page
+cache. The model has 7,680 routed experts:
+
+| experts | device cache | decode, code answer | decode after 7,775 tokens | prefill of 7,775 tokens | ready to serve |
+|---|---:|---:|---:|---:|---:|
+| pinned RAM | 1,429 | 37.2 tok/s | 39.2 tok/s | 1,040 tok/s | 22 s |
+| pinned RAM, `--spec dspark` | 979 | 47.9 tok/s | 44.3 tok/s | 1,020 tok/s | 22 s |
+| disk, page cache warm | 1,444 | 15.7 tok/s | 17.8 tok/s | 774 tok/s | 9 s |
+
+- **Placements and drafts agree.** The three servers gave the same answers. The DSpark drafter,
+  trained for the unpruned model, accepted 192 of 250 and 75 of 101 drafts.
+- **The CPU share.** With the CLI and its default context the code request decoded at 31.7 tok/s
+  with every miss copied, 37.5 with half of them on 30 CPU threads and 37.3 with the automatic
+  share (11% of the routed experts on the CPU), with the same tokens; disk experts decoded it at
+  16.1 tok/s. In the 10 blocks with an IQ2_XS bank the GPU copies every miss.
+- **The cache.** These runs filled it from the first requests: the code request hit 70 to 72% of
+  its routed experts. The build now starts it from the Coder build's own routing profile, recorded
+  on 48 coding, agent and reasoning requests. On November 4, on another RTX 4090 host (450 W, a
+  32-core EPYC 7542 in a container of 31 CPUs), the CLI with host experts answered three held-out
+  requests (code, code with reasoning, prose; two runs each) with the same tokens from either
+  start. With the profile they hit 75.4, 80.6 and 76.3% of their routed experts against 71.4, 75.5
+  and 74.8%, copied 5.4, 7.1 and 1.8% fewer bytes, and decoded within -0.6 to +0.9% of the empty
+  start. Disk experts in the page cache hit 76.3% against 72.3% on the code request and decoded at
+  11.1 against 10.7 tok/s, one run each. Seeding adds 0.5 s to startup with host experts and 1.6 s
+  with disk experts.
+- **The profile in `ninfer-serve`.** The server's warmup request fills an empty cache as well
+  (1,809 of 1,821 slots), so over ten server starts at 2,048 and 16,384 tokens of context each
+  request hit within 0.3 points as often from either start (the short ones 74.0 to 77.3% of their
+  routed experts). Decode differed by -3.7 to +3.7% per request, and the profile delayed the first
+  answer by 40 to 120 ms.
+- **Memory.** The CLI peaked at 62.2 GiB of resident host memory with host experts and 0.8 GiB with
+  disk experts.
+- **Images.** With `--vision` the model read the title, the red circles and the shapes' order in
+  `examples/cli/media/visual_chart.png` and described `natural_scene.png` correctly, with the same
+  text from the resident and the streamed tower.
+
+One run per row. These runs share no host, build or prompt with the IQ1_M rows above.
+
+### Prefill tail, IQ1_M experts and Engram reads
+
+November 5, 2026, the Coder build with experts in pinned RAM on two rented hosts:
+
+- an RTX 4090 (450 W of its 480 W default, PCIe 4.0 x16), a 32-core EPYC 7542 (64 threads),
+  503 GiB of RAM, driver 595.71.05, the sm_89 builds (CUDA 12.8) of this version and of
+  `6d8dc3c1e`, the version before it;
+- an RTX 3090 (350 W, PCIe 4.0 x16), a 64-core EPYC 7B12 in a container of 61 CPUs, 503 GB of RAM,
+  driver 615.71.09, the sm_86 build of this version.
+
+`ninfer-serve --expert-residency host --max-context 40960 --max-concurrency 1 --vision`, a fresh
+server for each configuration and round, started after the Engram table was dropped from the page
+cache; two rounds, a nonce in every prompt, 16 tokens of answer. "Options off" is
+`--prefill-tail full --iq1m-experts vector --ngram-dedupe off --ngram-read-ahead off`; "IQ1_M
+matrix" is the same with `--iq1m-experts matrix`. These builds took IQ1_M gate and up products to
+the matrix kernel from 8.5 rows an expert; this version waits for more than 16
+([IQ1_M routes per card](#iq1_m-routes-per-card)), which moves those products of the 282- to
+356-token prompts and of the 29,009-token prompts' last chunk to the vector kernel. Prefill in
+tok/s, the mean of the two rounds:
+
+| prompt | RTX 4090, `6d8dc3c1e` | RTX 4090, options off | RTX 4090, defaults | RTX 3090, options off | RTX 3090, IQ1_M matrix | RTX 3090, defaults |
+|---|---:|---:|---:|---:|---:|---:|
+| 77 to 80 tokens | 61.3 | 59.1 | 60.0 | 55.0 | 55.6 | 54.6 |
+| 352 to 356 tokens | 180.3 | 176.0 | 178.6 | 159.7 | 166.0 | 166.8 |
+| an image and its question, 282 to 286 tokens | 119.4 | 116.0 | 116.4 | 113.0 | 114.0 | 114.3 |
+| 5,851 to 5,855 tokens of C++ | 1,133 | 1,126 | 1,447 | 598 | 839 | 981 |
+| 8,085 to 8,090 tokens of prose | 1,144 | 1,155 | 1,637 | 590 | 828 | 1,054 |
+| 29,009 to 29,012 tokens of prose | 1,182 | 1,183 | 2,362 | 573 | 803 | 1,332 |
+
+- **Long prompts.** On the RTX 4090 the defaults prefill 1.28, 1.43 and 2.00 times as fast as
+  `6d8dc3c1e`, and with the options off within -0.6 to +1.0% of it. On the RTX 3090 the IQ1_M
+  matrix kernel alone prefills 1.40 times as fast as the options off and the defaults 1.64 to 2.32
+  times.
+- **Short prompts** have fewer than 2,414 rows, so `exact` runs them whole, and the shortest take
+  the vector kernel. On the RTX 3090 the 352- to 356-token prompts, which these builds ran on the
+  matrix kernel, prefilled 4.0 to 4.5% faster, the two rounds of each configuration within 0.5%. On the RTX 4090
+  the configurations' means differ by -3.6 to -1.0% from `6d8dc3c1e`, while two runs of one
+  configuration differed by up to 8% (112.1 and 120.7 tok/s): no difference is resolved there.
+- **Decode** after each prompt ran at 22.5 to 29.1 tok/s in every configuration on both cards.
+- **Outputs.** On the RTX 4090, greedy with log probabilities, `exact` gave `full`'s tokens and log
+  probabilities bit for bit, and with `--iq1m-experts vector` `6d8dc3c1e`'s, for prompts of 66,
+  342, 1,607 and 6,143 tokens, a second turn after the last of them and two requests that share a
+  system prompt of about 4,400 tokens. With the IQ1_M matrix kernel the greedy tokens of four of
+  the seven left the vector kernel's at answer tokens 2 to 34; the 66-token prompt, too short for
+  the matrix kernel, gave `6d8dc3c1e`'s tokens and log probabilities.
+- **Perplexity.** Over 8,903 tokens of WikiText (40 KB, BF16 KV) this version scores 3.7456 with
+  host and with disk experts and 3.7503 with `--iq1m-experts vector`, as `6d8dc3c1e` does.
+
+The next measurements ran on the same RTX 4090 with a build of this change whose IQ1_M route
+differed only for calls of at most 16 rows an expert:
+
+- **More outputs.** `exact` gave `full`'s tokens and log probabilities bit for bit, and with
+  `--iq1m-experts vector` `6d8dc3c1e`'s, for prompts of 6,048 to 31,752 tokens and a request stopped
+  inside its prompt and sent again; `exact` also gave `full`'s with DSpark drafts and with two
+  concurrent sequences.
+- **A stopped prompt.** A 33,725-token request stopped 4 s into its prompt and sent again after
+  another request prefilled all 33,725 tokens under `exact`, in 14.0 s (18.6 s with
+  `--iq1m-experts vector`). `full` resumed from the state the stopped request left and prefilled
+  17,341 tokens in 12.6 s (15.4 s with the vector kernel, 15.6 s with `6d8dc3c1e`).
+- **Two sequences.** With `--max-concurrency 2` a 22,474-token prompt prefilled at 2,236 tok/s under
+  `exact` against 1,501 under `full`, and at 2,482 against 1,581 beside a 6,147-token prompt,
+  whose own rate rose from 645 to 720 tok/s.
+- **The lossy tail.** On prompts of 22,470 to 31,752 tokens `--prefill-tail 1024` and `512`
+  prefilled 3.1 to 10.2% faster than `exact`, one run each. Their greedy answers to two summary
+  requests left `full`'s at answer tokens 15 to 34; three questions about a passphrase hidden at
+  10, 50 and 90% of a 25,939-token document gave `full`'s answer tokens in both modes.
+
+With `--ngram-io direct`, which reads the Engram rows past the page cache, the two Engram options
+gave these prefill rates and reads from the table per request (two rounds, with a build of this
+change that ordered a pass's rows with `std::sort`, 63 ms for a 16,384-token span's 786,432 rows on
+this host's CPU against 13 ms for the radix sort that replaced it):
+
+| prompt | both off | `--ngram-read-ahead off` | `--ngram-dedupe off` | defaults |
+|---|---:|---:|---:|---:|
+| an image and its question | 161.2 tok/s, 55.5 MiB | 161.9 tok/s | 161.1 tok/s | 161.4 tok/s, 5.7 MiB |
+| 5,852 tokens of C++ | 1,376 tok/s, 1,132 MiB | 1,452 tok/s | 1,347 tok/s | 1,476 tok/s, 443 MiB |
+| 8,085 tokens of prose | 1,632 tok/s, 1,565 MiB | 1,658 tok/s | 1,612 tok/s | 1,638 tok/s, 1,306 MiB |
+| 29,010 tokens of prose | 2,172 tok/s, 5,609 MiB | 2,231 tok/s | 2,324 tok/s | 2,342 tok/s, 4,288 MiB |
+
+Reading ahead acts between a prompt's spans of 16,384 tokens, so of the shorter prompts it reads
+ahead only the few tokens after the last user turn's checkpoint. Through the page cache (the
+default `--ngram-io buffered`), with the table dropped from it before each server started (two
+rounds), reading each repeated row once cut the read calls by 87% for the image, 61% for the C++,
+17% for the 8,085 tokens of prose and 24% for the 29,009 tokens, and changed the prompt time by
+-5.2 to +0.1% (faster for five of the six prompts, where one server of `--ngram-dedupe off` ran
+its three shortest prompts 3 to 12% slower than the other).
+
+### IQ1_M routes per card
+
+November 5, 2026, `ninfer_gguf_moe_matrix_bench --formats IQ1_M` on one rented card of each class
+at its default power limit (the RTX 4090 at 450 W of its 480 W default): the sm_75, sm_86 and
+sm_89 builds with CUDA 12.8 and the 120a build with CUDA 13.1. The benchmark times each projection
+of a call alone, its activation's quantization included, over random routes to distinct experts,
+one format per process. The table gives the vector kernel's time over the matrix kernel's at
+DeepSeek-V4.1's shapes, six experts a token, by the call's routed rows per expert; above 1 the
+matrix kernel is faster:
+
+| card | experts | gate and up: 4 rows | 6 | 7 | 7.5 | 8.5 | down: 1 row | 4 | 5.5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| RTX 2080 Ti | 384 | 0.73 | 0.83 | 0.89 | 0.93 | 1.06 | 0.82 | 0.88 | 0.97 | 1.03 |
+| | 192 | 0.72 | 0.71 | 0.90 | 0.93 | 1.04 | 0.81 | 0.88 | 0.97 | 1.01 |
+| RTX 3090 | 384 | 1.02 | 1.19 | 1.29 | 1.36 | 1.54 | 1.32 | 1.43 | 1.54 | 1.62 |
+| | 192 | 1.02 | 1.15 | 1.29 | 1.33 | 1.49 | 1.31 | 1.41 | 1.53 | 1.59 |
+| RTX 4090 | 384 | 0.82 | 0.93 | 1.03 | 1.06 | 1.20 | 1.15 | 1.21 | 1.32 | 1.39 |
+| | 192 | 0.81 | 0.93 | 1.03 | 1.06 | 1.18 | 1.13 | 1.21 | 1.31 | 1.36 |
+| RTX 5090 | 384 | 0.70 | 0.85 | 0.93 | 0.99 | 1.09 | 0.75 | 0.86 | 0.98 | 1.04 |
+| | 192 | 0.67 | 0.80 | 0.87 | 0.91 | 1.03 | 0.74 | 0.84 | 0.97 | 1.01 |
+
+In prompt steps the matrix kernel keeps less of that lead. On the RTX 4090 (the Coder build with
+host experts, `ninfer` answering two tokens under Nsight Systems, lazy module loading, in a build
+that took gate and up products to the matrix kernel from 8.5 rows), the IQ1_M products of a prompt
+step took these times per call, the mean of its 16 gate-and-up and 28 down calls, in µs:
+
+| prompt | rows an expert | gate and up: matrix | vector | vector/matrix | down: matrix | vector | vector/matrix |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 235 tokens | 7.3 | not run | 2,567 | | 1,443 | 1,880 | 1.30 |
+| 278 tokens | 8.6 | 3,230 | 2,880 | 0.89 | 1,579 | 2,119 | 1.34 |
+| 326 tokens | 10.1 | 3,499 | 3,246 | 0.93 | 1,712 | 2,388 | 1.39 |
+| 388 tokens | 12.0 | 3,849 | 3,701 | 0.96 | 1,877 | 2,729 | 1.45 |
+| 451 tokens | 14.0 | 4,204 | 4,203 | 1.00 | 2,067 | 3,083 | 1.49 |
+| 514 tokens | 16.0 | 4,558 | 4,655 | 1.02 | 2,239 | 3,433 | 1.53 |
+| 635 tokens | 19.7 | 4,048 | 5,553 | 1.37 | 1,997 | 4,098 | 2.05 |
+
+- **The thresholds.** Gate and up products take the matrix kernel past 16 rows an expert, where
+  its column tiles are 32 wide instead of 16. Down products take it from 6 rows, the highest
+  crossing of the benchmark (the RTX 2080 Ti and 5090, between 5.5 and 6 rows). With one rule for
+  every card the RTX 3090 keeps the vector kernel for gate and up products of 4 to 16 rows, where
+  the benchmark has the matrix kernel ahead (1.02 at 4 rows to 1.54 at 8.5); the RTX 3090, 5090 and
+  2080 Ti were not profiled in prompt steps.
+- **The benchmark against prompt steps.** At 256 and 320 tokens the benchmark's vector/matrix
+  ratios were 1.13 and 1.35 for gate and up products and 1.65 and 1.96 for down products, where the
+  prompt steps of 278 and 326 tokens gave 0.89 and 0.93, 1.34 and 1.39. With 2048-token chunks the
+  steps' IQ1_M, IQ2_XXS and IQ2_XS matrix kernels ran within -2 to +4% of the benchmark's times.
+- **Module loading.** With `CUDA_MODULE_LOADING=EAGER` the 326-token step's matrix kernel took
+  2,683 µs for gate and up and 1,323 µs for down, 23% less than with lazy loading; the 278-token
+  step's took 3,197 and 1,561 µs, 1% less. In the benchmark the matrix kernel of a format timed
+  after another ran up to 1.24 times as long ([one format per
+  process](../bench/README.md#linear-op-benchmark)). The cause is not established; the thresholds
+  follow the default lazy loading.
+- **Few rows an expert.** The vector kernel reads each token's activation once for all of its
+  experts; the matrix kernel gathers and quantizes a row for every routed pair and fills a tile of
+  columns for every expert, most of them empty in a short call.
+- **Qwen3.8-Flash-Next's shapes** (2,560 to 640, 512 experts, ten a token): the matrix kernel
+  served gate and up faster from 0.3 rows an expert on the RTX 3090 (1.20) and from 0.6 on the
+  RTX 4090 (1.01); on the RTX 2080 Ti and 5090 it was slower up to 5 rows (0.73 to 0.90) and
+  faster from 7.5 (1.03 to 1.14); 256 experts gave the same crossings. The rule keeps them on the
+  vector kernel up to 16 rows as at DeepSeek-V4.1's shapes: no published Flash-Next artifact has
+  IQ1_M experts, so none of its prompt steps was profiled. Their down products (640 inputs, not a
+  multiple of IQ1_M's 256-value blocks) have no matrix route.
 
 ## Numerical checks
 

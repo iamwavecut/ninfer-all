@@ -1124,9 +1124,9 @@ bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail) {
         NINFER_GGUF_MOE_FITS_CASE(IQ3_XXS);
         NINFER_GGUF_MOE_FITS_CASE(IQ3_S);
         NINFER_GGUF_MOE_FITS_CASE(IQ1_S);
+        NINFER_GGUF_MOE_FITS_CASE(IQ1_M);
         NINFER_GGUF_MOE_FITS_CASE(IQ4_NL);
         NINFER_GGUF_MOE_FITS_CASE(IQ4_XS);
-    case GgmlType::IQ1_M:
     case GgmlType::MXFP4:
         return false;
     }
@@ -1179,7 +1179,8 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
     case GgmlType::NAME:                                                                           \
         detail::moe_matrix_product_impl<GGML_TYPE_##NAME>(table.experts, table.row_bytes,          \
                                                           table.rows, table.k, routing,            \
-                                                          max_active, pairs, tail, activation,     \
+                                                          max_active, pairs, tail,                 \
+                                                          table.aligned16, activation,             \
                                                           out, stream);                            \
         return
     switch (type) {
@@ -1198,9 +1199,9 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
         NINFER_GGUF_MOE_MATRIX_CASE(IQ3_XXS);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ3_S);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ1_S);
+        NINFER_GGUF_MOE_MATRIX_CASE(IQ1_M);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ4_NL);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ4_XS);
-    case GgmlType::IQ1_M:
     case GgmlType::MXFP4:
         break;
     }

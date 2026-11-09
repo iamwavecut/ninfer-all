@@ -5,7 +5,7 @@ NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
 `120a` ([several architectures](#builds-of-several-architectures)); configure refuses anything
 else. CUDA 12.8 or newer builds `75` and the `sm_8x` targets, a build with `70` needs CUDA 12.x
 ([Tesla V100](../build-linux.md#tesla-v100-sm_70)), and a build with `120a` needs CUDA 13.1 or
-newer, so `70` and `120a` cannot share a build.
+newer except 13.2.0 and 13.2.1, so `70` and `120a` cannot share a build.
 
 ## Code tiers
 
@@ -212,8 +212,12 @@ to model media decoding and remains required when apps are disabled. Curl and sp
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
-Python 3.11 describes the maintained environment, not a configuration version gate. The one CUDA
-version gate is 13.1 for a `120a` build: CUDA 12.8 and 12.9 miscompile `sm_120a` kernels.
+Python 3.11 describes the maintained environment, not a configuration version gate. The CUDA
+version gates refuse the releases that miscompile a target's kernels: a `120a` build refuses CUDA
+12.8 and 12.9 and CUDA 13.2.0 and 13.2.1, a build with `70` refuses CUDA 13
+([CUDA toolkits](../build-linux.md#cuda-toolkits) has the measurements). The generated
+`ninfer_build_id.h` records the compiler release and the architectures as `NINFER_TOOLCHAIN`, which
+`--version` and the startup log print.
 Windows builds find vcpkg's FFmpeg without imposing library version floors; Linux builds compile
 the release that `cmake/MediaSources.cmake` pins. Actual language/API support is exercised by
 compilation and tests. The libcurl 7.85 minimum has a concrete API basis:

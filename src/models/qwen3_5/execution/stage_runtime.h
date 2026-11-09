@@ -112,8 +112,8 @@ struct StageRuntime {
         // the MTP layer's divided attention and FFN, so consecutive exchanges in one capture never
         // share a slot.
         std::size_t next_exchange = 0;
-        // How a prompt chunk's partials cross host memory (`--tensor-parallel-prompt-partials`);
-        // every other exchange keeps them in FP32.
+        // How a prompt chunk's partials cross between the devices
+        // (`--tensor-parallel-prompt-partials`); every other exchange keeps them in FP32.
         TensorParallelPartials prompt_partials = TensorParallelPartials::Fp32;
     };
     std::optional<TensorParallel> tensor_parallel;

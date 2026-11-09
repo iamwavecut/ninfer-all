@@ -61,6 +61,8 @@ from typing import Callable
 import numpy as np
 import torch
 
+from tools.artifact.file_io import discard_cached_pages, pread_into
+
 try:
     import gguf
 except ImportError as error:  # pragma: no cover - environment guard
@@ -103,8 +105,11 @@ class GGUFSource:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        # gguf-py parses the header through its own map of the file; tensor data is read from
+        # the file instead (_rows), since Windows keeps every touched page of a map resident.
         self._reader = gguf.GGUFReader(self.path)
         self._tensors = {tensor.name: tensor for tensor in self._reader.tensors}
+        self._file = open(self.path, "rb", buffering=0)
         self.config: dict = {}
         self.bytes_read = 0
 
@@ -140,12 +145,27 @@ class GGUFSource:
             return torch.empty(0, dtype=torch.float32)
         row_width = elements // shape[0] if shape else 1
         row_begin, row_end = begin // row_width, -(-end // row_width)
-        decoded = gguf.dequantize(tensor.data[row_begin:row_end], tensor.tensor_type)
+        decoded = gguf.dequantize(self._rows(tensor, row_begin, row_end), tensor.tensor_type)
         flat = np.ascontiguousarray(decoded.reshape(-1), dtype=np.float32)
         offset = begin - row_begin * row_width
         result = flat[offset : offset + (end - begin)].copy()
         self.bytes_read += result.nbytes
         return torch.from_numpy(result)
+
+    def _rows(self, tensor, row_begin: int, row_end: int) -> np.ndarray:
+        """``tensor.data[row_begin:row_end]`` read from the file: the reader's array supplies
+        only the row shape and dtype, its pages are not touched."""
+
+        if self._file is None:
+            raise ValueError(f"{self.path}: the source is closed")
+        layout = tensor.data
+        out = np.empty((row_end - row_begin, *layout.shape[1:]), dtype=layout.dtype)
+        row_bytes = out.nbytes // max(1, row_end - row_begin)
+        start = int(tensor.data_offset) + row_begin * row_bytes
+        fd = self._file.fileno()
+        pread_into(fd, out, start)
+        discard_cached_pages(fd, start, out.nbytes)
+        return out
 
     def list_tensors(self):
         """Yield (name, shape, ggml_type) for every tensor, for building a name_map."""
@@ -164,7 +184,9 @@ class GGUFSource:
         return result
 
     def close(self) -> None:
-        pass
+        if self._file is not None:
+            self._file.close()
+            self._file = None
 
     def __enter__(self) -> "GGUFSource":
         return self

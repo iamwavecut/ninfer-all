@@ -12,11 +12,21 @@ whole rows only. BF16 and F32 tensors (router, compressor, indexer, hyper-connec
 norms, sinks) become FP32 vectors, exactly; the Engram gate is the FP32 product of its q and k
 weights (exact for BF16 factors).
 
+The GGUFs come in two layouts, told apart by their metadata, and both convert to the same
+artifact. llama.cpp's own (b11870 and newer; ISTA-DASLab's files since 2026-10-27) names the
+Engram hash in metadata (`deepseek41.ple.*`, `deepseek41.engram.token_map`, row offsets into the
+whole table), stores the gate as its product (`engram_gate`) and the image routing bias
+(`exp_probs_b_vl`), and makes the Engram GGUF the split's last shard. The earlier layout of
+ISTA-DASLab's llama.cpp branch keeps the hash in integer tensors, the gate as `engram_q` and
+`engram_k`, and no image routing bias. A build with fewer routed experts than the release (the
+Coder keeps 192 of 384 per block) converts as the release's model with its GGUF's expert count.
+
 The Engram tables (`--source engram=DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`) form the `engram`
 component: one table of IQ4_NL rows, the first Engram block's rows then the second's, which the
-model names by the SHA-256 of its bytes. `--components text,engram` stores the model with its
-table, `text` the model alone (its table read from a table artifact at run time) and `engram` that
-table artifact.
+model names by the SHA-256 of its bytes. Both layouts hold the same bytes: llama.cpp's as one
+`per_layer_token_embd` tensor, the earlier one as a tensor per Engram block. `--components
+text,engram` stores the model with its table, `text` the model alone (its table read from a table
+artifact at run time) and `engram` that table artifact.
 
 The release's DSpark drafter (`--source dspark=dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf`, llama.cpp
 architecture `dflash`) forms the `dspark` component beside `text` (`--components text,engram,dspark`):
@@ -33,15 +43,15 @@ text,engram,vision`): the ViT and the aligner from llama.cpp's `clip` file
 (`--source vision=mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf`, projector `deepseek4v`, the release's
 BF16 weights bit for bit), its matrices BF16, its norms, biases and the three image-span rows
 (start, row end, end) FP32, and the routing bias of image positions, one FP32 row of the router's
-width per block, from the release's `layers.N.ffn.gate.bias_vl` (`--source bias_vl=FILE`, a
-safetensors file that tools/convert/fetch_tensors.py reads out of the release by byte range).
+width per block: the GGUF's `blk.N.exp_probs_b_vl.bias` in llama.cpp's layout; for an earlier-layout
+GGUF the release's `layers.N.ffn.gate.bias_vl` (`--source bias_vl=FILE`, a safetensors file that
+tools/convert/fetch_tensors.py reads out of the release by byte range).
 
     python -m tools.convert --model HF_DIR --recipe deepseek_v41_gguf \\
-        --source gguf=DeepSeek-V4.1-Flash-1017-IQ1_M-00001-of-00004.gguf \\
+        --source gguf=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00006.gguf \\
         --source engram=DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \\
         --source dspark=dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf \\
         --source vision=mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \\
-        --source bias_vl=bias_vl.safetensors \\
         --components text,engram,dspark,vision --out deepseek-v4.1-flash.ninfer
 
 `HF_DIR` holds the base release's `config.json`, `tokenizer.json` and `tokenizer_config.json`
@@ -95,13 +105,40 @@ STQ_PACK_KEYS = ("vocab_size", "hidden_size", "moe_intermediate_size", "num_hidd
                  "num_nextn_predict_layers", "swiglu_limit", "rms_norm_eps", "sliding_window",
                  "hc_mult", "hc_eps", "hc_sinkhorn_iters", "routed_scaling_factor")
 TABLE_FORMAT = "gguf_iq4_nl"
+# The Engram rows: llama.cpp's one tensor of every Engram block's rows, block after block, or the
+# earlier layout's tensor per Engram block.
+TABLE_TENSOR = "per_layer_token_embd.weight"
 ENGRAM_TENSOR = "blk.{}.engram_embd.weight"
 SPLIT_NAME = re.compile(r"(.*)-(\d{5})-of-(\d{5})\.gguf")
+# Metadata of the earlier layout under llama.cpp's names (ISTA-DASLab's convert_ds41_upstream.py).
+UPSTREAM_KEYS = {
+    "attention.candidate_block_size": "attention.indexer.candidate_block_size",
+    "attention.candidate_topk_blocks": "attention.indexer.candidate_top_k_blocks",
+    "attention.candidate_source_layer_id": "attention.indexer.candidate_source_layer",
+    "kv_source_layer_ids": "attention.kv_source_layers",
+    "index_source_layer_ids": "attention.indexer.source_layers",
+    "engram.layer_ids": "ple.layers",
+    "engram_head_dim": "embedding_length_per_layer_input",
+    "engram_n_heads": "ple.heads_per_ngram",
+    "engram_max_ngram_size": "ple.ngram_size",
+    "engram_pad_token_id": "engram.pad_token_id",
+}
+
+
+def upstream_layout(kv: dict) -> bool:
+    """Whether DeepSeek-V4.1 GGUF metadata is in llama.cpp's layout (b11870 and newer), not the
+    earlier layout of ISTA-DASLab's llama.cpp branch."""
+
+    return "deepseek41.attention.kv_source_layers" in kv
 
 
 class GGUFShards:
     """The files of one split GGUF (`NAME-0000k-of-0000n.gguf`) as one set of tensors; the first
-    file's metadata describes the model."""
+    file's metadata describes the model.
+
+    In llama.cpp's DeepSeek-V4.1 layout (`upstream`) the last shard is the shared Engram GGUF,
+    which a download links under the shard's name; without the link the set opens without it, and
+    `--source engram` names the file."""
 
     def __init__(self, first: str | Path) -> None:
         first = Path(first)
@@ -114,11 +151,16 @@ class GGUFShards:
                 raise ValueError(f"{first}: name the first shard of the split GGUF")
             paths = [first.with_name(f"{stem}-{i:05d}-of-{count:05d}.gguf")
                      for i in range(1, count + 1)]
-        self.files = [GGUFFile(path) for path in paths]
+        self.files = [GGUFFile(paths[0])]
         self.kv = self.files[0].kv
-        if int(self.kv.get("split.count", 1)) != len(self.files):
+        self.upstream = upstream_layout(self.kv)
+        for path in paths[1:]:
+            if path == paths[-1] and self.upstream and not path.exists():
+                continue
+            self.files.append(GGUFFile(path))
+        if int(self.kv.get("split.count", 1)) != len(paths):
             raise ValueError(f"{first}: split.count is {self.kv.get('split.count')}, "
-                             f"{len(self.files)} files found")
+                             f"{len(paths)} files named")
         self.path = first
         self.tensors = {}
         self._owner = {}
@@ -224,13 +266,33 @@ def text_config(source: dict) -> dict:
     return out
 
 
+def with_gguf_expert_count(config: dict, gguf: GGUFShards) -> dict:
+    """The text config with the GGUF's routed experts per block: an expert-pruned build (the Coder
+    keeps 192 of the release's 384) is the release's model with fewer experts."""
+
+    count = gguf.kv.get("deepseek41.expert_count")
+    if type(count) is not int or count == config["n_routed_experts"]:
+        return config
+    if not config["num_experts_per_tok"] <= count < config["n_routed_experts"]:
+        raise ValueError(f"{gguf.path}: {count} routed experts per block cannot be a pruning of "
+                         f"the release's {config['n_routed_experts']}")
+    return {**config, "n_routed_experts": count}
+
+
 def validate(gguf: GGUFShards, config: dict) -> None:
-    """The GGUF's architecture metadata against the release's config.json."""
+    """The GGUF's architecture metadata against the release's config.json, under the names of the
+    GGUF's layout."""
 
     kv = gguf.kv
     if kv.get("general.architecture") != "deepseek41":
         raise ValueError(f"{gguf.path}: expected a DeepSeek-V4.1 (deepseek41) GGUF")
     f = "deepseek41."
+    if gguf.upstream:
+        def key_name(key):
+            return f + UPSTREAM_KEYS.get(key, key)
+    else:
+        def key_name(key):
+            return f + key
     layers = config["num_hidden_layers"]
     expected = {
         "block_count": layers,
@@ -266,20 +328,24 @@ def validate(gguf: GGUFShards, config: dict) -> None:
             config["rope_scaling"]["original_max_position_embeddings"],
     }
     for key, value in expected.items():
-        if kv.get(f + key) != value:
-            raise ValueError(f"{gguf.path}: {f + key} is {kv.get(f + key)!r}, the config's "
-                             f"{value!r}")
+        name = key_name(key)
+        if kv.get(name) != value:
+            raise ValueError(f"{gguf.path}: {name} is {kv.get(name)!r}, the config's {value!r}")
     lists = {
         "attention.compress_ratios": config["compress_ratios"],
         "kv_source_layer_ids": config["kv_source_layer_ids"],
         "index_source_layer_ids": config["index_source_layer_ids"],
         "engram.layer_ids": config["engram_layer_ids"],
-        "engram.num_embeddings": config["engram_num_embeddings"],
     }
+    # llama.cpp's layout states each Engram block's rows as its columns' bucket counts
+    # (engram_constants).
+    if not gguf.upstream:
+        lists["engram.num_embeddings"] = config["engram_num_embeddings"]
     for key, value in lists.items():
-        stored = list(kv.get(f + key, []))
+        name = key_name(key)
+        stored = list(kv.get(name, []))
         if stored[:len(value)] != value:
-            raise ValueError(f"{gguf.path}: {f + key} differs from the config")
+            raise ValueError(f"{gguf.path}: {name} differs from the config")
     reals = {
         "expert_weights_scale": config["routed_scaling_factor"],
         "rope.freq_base": config["rope_theta"],
@@ -293,7 +359,8 @@ def validate(gguf: GGUFShards, config: dict) -> None:
     for key, value in reals.items():
         if not np.isclose(float(kv.get(f + key, np.nan)), value, rtol=1e-6, atol=0.0):
             raise ValueError(f"{gguf.path}: {f + key} differs from the config's {value!r}")
-    if kv.get(f + "expert_scoring_func") != "sqrtsoftplus":
+    # llama.cpp's layout states the scores by expert_gating_func alone.
+    if not gguf.upstream and kv.get(f + "expert_scoring_func") != "sqrtsoftplus":
         raise ValueError(f"{gguf.path}: expected sqrt-softplus expert scores")
     for key in ("swiglu_clamp_exp", "swiglu_clamp_shexp"):
         if any(float(v) != config["swiglu_limit"] for v in kv.get(f + key, [])[:layers]):
@@ -477,17 +544,36 @@ def processor_config(vision: dict) -> dict:
 
 
 def engram_constants(gguf: GGUFShards, config: dict) -> dict:
-    """The Engram hash of the release (its integer tensors): the compressed id of every token, a
-    multiplier per (Engram block, look-back) and a prime and a row offset per (Engram block,
-    column), column (n - 2) * heads + head for the n-gram of n tokens."""
+    """The Engram hash of the release: the compressed id of every token, a multiplier per (Engram
+    block, look-back) and a prime and a row offset into the block's table per (Engram block,
+    column), column (n - 2) * heads + head for the n-gram of n tokens. llama.cpp's layout states
+    them in metadata, its offsets into the whole table; the earlier layout in integer tensors."""
 
     layers = len(config["engram_layer_ids"])
     n, heads = config["engram_max_ngram_size"], config["engram_n_heads"]
     columns = (n - 1) * heads
-    token_map = gguf.integers("engram_token_map.weight", "<i4")
-    multipliers = gguf.integers("engram_multipliers.weight", "<i8")
-    primes = gguf.integers("engram_primes.weight", "<i8")
-    offsets = gguf.integers("engram_offsets.weight", "<i8")
+    if gguf.upstream:
+        def values(key, dtype, shape):
+            stored = gguf.kv.get("deepseek41." + key)
+            if not isinstance(stored, list) or len(stored) != int(np.prod(shape)):
+                raise ValueError(f"{gguf.path}: deepseek41.{key} must hold "
+                                 f"{int(np.prod(shape))} integers")
+            return np.array(stored, dtype=dtype).reshape(shape)
+
+        token_map = values("engram.token_map", "<i4", (config["vocab_size"],))
+        multipliers = values("ple.layer_multipliers", "<i8", (layers, n))
+        primes = values("ple.head_vocab_sizes", "<i8", (layers, columns))
+        # A block's table is its columns' buckets; its rows follow the blocks before it.
+        if primes.sum(axis=1).tolist() != list(config["engram_num_embeddings"]):
+            raise ValueError(f"{gguf.path}: the Engram bucket counts differ from the config's "
+                             "table rows")
+        starts = np.cumsum(primes.sum(axis=1)) - primes.sum(axis=1)
+        offsets = values("ple.head_offsets", "<i8", (layers, columns)) - starts[:, None]
+    else:
+        token_map = gguf.integers("engram_token_map.weight", "<i4")
+        multipliers = gguf.integers("engram_multipliers.weight", "<i8")
+        primes = gguf.integers("engram_primes.weight", "<i8")
+        offsets = gguf.integers("engram_offsets.weight", "<i8")
     if token_map.shape != (config["vocab_size"],):
         raise ValueError("engram_token_map must map every token")
     if (multipliers.shape != (layers, n) or primes.shape != (layers, columns)
@@ -639,20 +725,33 @@ def expert_gate_up(gguf: GGUFShards, layer: int, experts: int, width: int,
     return select_rows(both, tuple(spans))
 
 
-def engram_table_source(table: GGUFFile, config: dict) -> LogicalSource:
-    """The Engram GGUF's tables (one per Engram block) as one table of their rows in order."""
+def table_tensors(table: GGUFFile, config: dict) -> list[tuple[str, int]]:
+    """The Engram GGUF's tensors of rows and their row counts, in table order: llama.cpp's one
+    tensor of every Engram block's rows, or the earlier layout's tensor per Engram block."""
 
-    if table.kv.get("general.architecture") != "deepseek41-engram":
-        raise ValueError(f"{table.path}: expected the release's Engram GGUF (deepseek41-engram)")
+    if TABLE_TENSOR in table.tensors:
+        parts = [(TABLE_TENSOR, int(sum(config["engram_num_embeddings"])))]
+    elif table.kv.get("general.architecture") == "deepseek41-engram":
+        parts = [(ENGRAM_TENSOR.format(layer), rows_in_layer) for layer, rows_in_layer in
+                 zip(config["engram_layer_ids"], config["engram_num_embeddings"])]
+    else:
+        raise ValueError(f"{table.path}: expected the release's Engram GGUF ({TABLE_TENSOR}, or "
+                         "deepseek41-engram tables)")
     width = config["engram_head_dim"]
-    parts = []
-    for layer, rows_in_layer in zip(config["engram_layer_ids"], config["engram_num_embeddings"]):
-        name = ENGRAM_TENSOR.format(layer)
+    for name, count in parts:
         info = table.info(name)
-        if info.shape != (rows_in_layer, width) or info.type_name != "IQ4_NL":
+        if info.shape != (count, width) or info.type_name != "IQ4_NL":
             raise ValueError(f"{table.path}: {name} is {info.type_name} {info.shape}; "
-                             f"expected IQ4_NL ({rows_in_layer}, {width})")
-        parts.append(block_source(table, name, (rows_in_layer, width), rows()))
+                             f"expected IQ4_NL ({count}, {width})")
+    return parts
+
+
+def engram_table_source(table: GGUFFile, config: dict) -> LogicalSource:
+    """The Engram GGUF's rows as one table, every Engram block's rows in order."""
+
+    width = config["engram_head_dim"]
+    parts = [block_source(table, name, (count, width), rows())
+             for name, count in table_tensors(table, config)]
     return _stacked(parts, f"{table.path}:engram") if len(parts) > 1 else parts[0]
 
 
@@ -661,12 +760,25 @@ def table_digest(table: GGUFFile, config: dict) -> str:
 
     digest = hashlib.sha256()
     step = 1 << 28
-    for layer in config["engram_layer_ids"]:
-        name = ENGRAM_TENSOR.format(layer)
+    for name, _ in table_tensors(table, config):
         size = table.info(name).nbytes
         for begin in range(0, size, step):
             digest.update(table.tensor_bytes(name, begin, min(begin + step, size)))
     return digest.hexdigest()
+
+
+def gguf_image_router_bias(gguf: GGUFShards, layers: int, experts: int) -> LogicalSource:
+    """The routing bias of image positions, [block][expert] FP32, from the GGUF's
+    `blk.N.exp_probs_b_vl.bias` (llama.cpp's layout)."""
+
+    rows = []
+    for i in range(layers):
+        name = f"blk.{i}.exp_probs_b_vl.bias"
+        info = gguf.info(name)
+        if info.type_name != "F32" or info.shape != (experts,):
+            raise ValueError(f"{name}: {info.type_name} {info.shape}, expected F32 ({experts},)")
+        rows.append(gguf.file(name).read_direct(name))
+    return array_source(torch.from_numpy(np.stack(rows)), "exp_probs_b_vl")
 
 
 def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
@@ -675,7 +787,8 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
     """DeepSeek-V4.1-Flash's text component, every parameter's source the GGUF, the `engram`
     component that describes (and with `engram` selected, stores) its Engram table, with `dspark`
     selected the DSpark drafter from its own GGUF, and with `vision` the vision tower from the
-    mmproj and the image positions' routing bias from the release's bias_vl tensors."""
+    mmproj and the image positions' routing bias from the GGUF (llama.cpp's layout) or the
+    release's bias_vl tensors (the earlier layout)."""
 
     from .model import Model, Parameter
 
@@ -689,9 +802,13 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
                          "and dspark (its drafter) and vision (its vision tower) beside text")
     if ("dspark" in selected) != (dspark is not None):
         raise ValueError("the dspark component converts from --source dspark=DRAFTER.gguf")
-    if ("vision" in selected) != (vision is not None) or (vision is None) != (bias_vl is None):
-        raise ValueError("the vision component converts from --source vision=MMPROJ.gguf and "
-                         "--source bias_vl=BIAS_VL.safetensors")
+    if ("vision" in selected) != (vision is not None):
+        raise ValueError("the vision component converts from --source vision=MMPROJ.gguf")
+    # llama.cpp's layout carries the image routing bias; the earlier one takes the release's.
+    if (vision is not None and gguf is not None and not gguf.upstream) != (bias_vl is not None):
+        raise ValueError("--source bias_vl=BIAS_VL.safetensors gives the vision component of an "
+                         "earlier-layout GGUF its image routing bias; a GGUF in llama.cpp's "
+                         "layout carries it (blk.N.exp_probs_b_vl.bias)")
     config = text_config(base.config)
     records = {"engram": {"config": engram_table_config(config)}}
     if "text" not in selected:
@@ -702,6 +819,7 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
         return model
     if gguf is None:
         raise ValueError("DeepSeek-V4.1 converts its text component from --source gguf=SHARD1")
+    config = with_gguf_expert_count(config, gguf)
     validate(gguf, config)
     constants = engram_constants(gguf, config)
     config["engram"] = {"multipliers": constants["multipliers"], "primes": constants["primes"],
@@ -799,14 +917,19 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
         if i in config["engram_layer_ids"]:
             n = p + "engram/"
             columns = (config["engram_max_ngram_size"] - 1) * config["engram_n_heads"]
-            matrix(n + "projection", g + "engram_wkv.weight",
+            matrix(n + "projection", g + ("engram_kv.weight" if gguf.upstream else
+                                          "engram_wkv.weight"),
                    ((hc + 1) * h, columns * config["engram_head_dim"]), (n + "rows",))
-            q = gguf.file(g + "engram_q.weight").read_direct(g + "engram_q.weight")
-            k = gguf.file(g + "engram_k.weight").read_direct(g + "engram_k.weight")
-            gate = (q.astype(np.float32) * k.astype(np.float32)).reshape(hc, h)
-            vector(n + "gate", None, (hc, h),
-                   array_source(torch.from_numpy(np.ascontiguousarray(gate)),
-                                g + "engram_q*engram_k"))
+            if gguf.upstream:
+                # llama.cpp's converter stores the product of the BF16 factors, exact in F32.
+                vector(n + "gate", g + "engram_gate.weight", (hc, h))
+            else:
+                q = gguf.file(g + "engram_q.weight").read_direct(g + "engram_q.weight")
+                k = gguf.file(g + "engram_k.weight").read_direct(g + "engram_k.weight")
+                gate = (q.astype(np.float32) * k.astype(np.float32)).reshape(hc, h)
+                vector(n + "gate", None, (hc, h),
+                       array_source(torch.from_numpy(np.ascontiguousarray(gate)),
+                                    g + "engram_q*engram_k"))
     if dspark is not None and "stq" in records["dspark"]["config"]:
         _stq_drafter(model, dspark, records["dspark"]["config"], config)
     elif dspark is not None:
@@ -863,9 +986,10 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
         exact("vision/image_newline", "v.image_newline", (h,))
         exact("vision/image_end", "v.token_embd.img_end", (h,))
         layers, experts = config["num_hidden_layers"], config["n_routed_experts"]
-        model.add(Parameter("vision/image_router_bias", (layers, experts),
-                            image_router_bias(bias_vl, layers, experts), direct_format="fp32",
-                            residency="vision"))
+        router_bias = (gguf_image_router_bias(gguf, layers, experts) if gguf.upstream
+                       else image_router_bias(bias_vl, layers, experts))
+        model.add(Parameter("vision/image_router_bias", (layers, experts), router_bias,
+                            direct_format="fp32", residency="vision"))
     if "engram" in selected:
         _engram_table(model)
     return model
@@ -971,7 +1095,7 @@ def configure_engram(model, recipe, table) -> None:
     if source.read_encoded(0, 1).format != TABLE_FORMAT:
         raise ValueError("the Engram GGUF must hold IQ4_NL rows")
     descriptor["format"] = TABLE_FORMAT
-    size = sum(table.info(ENGRAM_TENSOR.format(i)).nbytes for i in descriptor["layers"])
+    size = sum(table.info(name).nbytes for name, _ in table_tensors(table, config))
     print(f"hashing the Engram table ({size / 1e9:.1f} GB)", flush=True)
     descriptor["table_sha256"] = table_digest(table, config)
     if "engram/table" in model.parameters:

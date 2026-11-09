@@ -713,6 +713,20 @@ __global__ void __launch_bounds__(256)
     stack[i]                 = streams == nullptr ? shared : __bfloat162float(streams[i]) + shared;
 }
 
+// out column t (row pitch `pitch` elements) = the streams' mean, summed in stream order in FP32.
+__global__ void __launch_bounds__(256)
+    hc_stream_mean_kernel(const float* __restrict__ stack, __nv_bfloat16* __restrict__ out,
+                          std::int64_t pitch, std::int64_t elements) {
+    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= elements) return;
+    const std::int64_t token = i / kHidden;
+    const std::int64_t d     = i % kHidden;
+    const float* column      = stack + token * kWidth + d;
+    float sum                = column[0];
+    for (int c = 1; c < kStreams; ++c) { sum += column[std::int64_t(c) * kHidden]; }
+    out[token * pitch + d] = __float2bfloat16_rn(sum * (1.0F / kStreams));
+}
+
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("hyper_connection: ") + message); }
 }
@@ -985,6 +999,24 @@ void hyper_connection_expand(const Tensor& x, Tensor& stack, cudaStream_t stream
 void hyper_connection_expand(const Tensor& x, const Tensor& streams, Tensor& stack,
                              cudaStream_t stream) {
     expand(x, &streams, stack, stream);
+}
+
+void hyper_connection_stream_mean(const Tensor& stack, Tensor& out, cudaStream_t stream) {
+    require(stack.dtype == DType::FP32 && stack.is_contiguous() && stack.data != nullptr &&
+                stack.ne[0] == kHidden && stack.ne[1] == kStreams && stack.ne[3] == 1,
+            "stack must be contiguous FP32 [2560, 4, tokens]");
+    const std::int32_t tokens = stack.ne[2];
+    require(tokens > 0, "tokens must be positive");
+    require(out.dtype == DType::BF16 && out.data != nullptr && out.ne[0] == kHidden &&
+                out.ne[1] == tokens && out.ne[2] == 1 && out.ne[3] == 1 && out.nb[0] == 2 &&
+                out.nb[1] >= std::int64_t(kHidden) * 2 && out.nb[1] % 2 == 0,
+            "out must be BF16 [2560, tokens] with contiguous columns");
+    const std::int64_t elements = std::int64_t(kHidden) * tokens;
+    hc_stream_mean_kernel<<<static_cast<unsigned>(div_up(elements, std::int64_t{256})), 256, 0,
+                            stream>>>(static_cast<const float*>(stack.data),
+                                      static_cast<__nv_bfloat16*>(out.data), out.nb[1] / 2,
+                                      elements);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops

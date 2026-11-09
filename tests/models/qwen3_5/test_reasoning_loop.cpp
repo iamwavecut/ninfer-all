@@ -1,6 +1,7 @@
 // The reasoning-loop measure: words split across token boundaries join; a reasoning that keeps
 // rewriting the same verification passes reaches the threshold; varied work, and a short text, stay
-// below it; a passage repeated twice is not a loop.
+// below it; a passage repeated twice is not a loop; a loop that counts is found by its tail, and
+// numbers that do not count are not.
 #include "models/qwen3_5/frontend/reasoning_loop.h"
 
 #include <iostream>
@@ -152,6 +153,62 @@ int main() {
         expect(periodic_tail(cjk(30)), "30-character period of 3-byte characters");
         expect(periodic_tail(cjk(64)), "64-character period of 3-byte characters");
         expect(!periodic_tail(cjk(65)), "65-character period is beyond the limit");
+    }
+    // A loop that counts writes a new word every time (#260): with its numbers masked the tail is
+    // periodic, and one number of each period moves by the same step.
+    {
+        const auto counting = [](const std::string& name, int from, int step, int count) {
+            std::string text = varied(150) + "BiquadFilter types: 'deviceDirection','gain','GPS',";
+            for (int i = 0, v = from; i < count; ++i, v += step) {
+                text += "'" + name + std::to_string(v) + "',";
+            }
+            return text;
+        };
+        const std::string reported = counting("time", 1, 1, 2394);
+        expect(counting_tail(reported), "counting tail");
+        expect(!periodic_tail(reported), "a counting tail has no plain period");
+        expect(counting_tail(counting("x", 1000, 2, 400)), "counting by two");
+        expect(counting_tail(counting("level", 900, -1, 400)), "counting down");
+        // Arriving one token's bytes at a time through the bounded tail changes nothing.
+        std::string tail;
+        for (std::size_t at = 0; at < reported.size(); at += 3) {
+            append_tail(std::string_view(reported).substr(at, 3), tail);
+        }
+        expect(counting_tail(tail), "counting tail through append_tail");
+        expect(!counting_tail(counting("time", 1, 1, 60)), "counting tail below the window");
+        // A counter beside constants still counts, and so do numbers that all keep their steps.
+        std::string of_total, pairs;
+        for (int i = 1; i <= 300; ++i) {
+            of_total += "item " + std::to_string(i) + " of 300, ";
+            pairs += "(" + std::to_string(i) + ", " + std::to_string(3 * i + 1) + ") ";
+        }
+        expect(counting_tail(of_total), "a counter beside a constant");
+        expect(counting_tail(pairs), "two numbers with their own steps");
+    }
+    // Numbers that do not count stay quiet: varied work, a repeated constant (the plain period's
+    // case), unrelated values in a periodic frame, squares, whose steps grow, and an enumeration:
+    // a counter beside values that change otherwise.
+    {
+        expect(!counting_tail(varied(400)), "varied work with numbers");
+        std::string constant, unrelated, squares, cases, enumeration;
+        unsigned state = 7;
+        for (int i = 1; i <= 400; ++i) {
+            constant += "x = 5, ";
+            state = state * 1103515245U + 12345U;
+            unrelated += "'id" + std::to_string((state >> 8) % 100000) + "',";
+            squares += std::to_string(i * i) + ", ";
+            enumeration += "step " + std::to_string(i) + " checks value " +
+                           std::to_string((state >> 8) % 9973) + ". ";
+        }
+        expect(!counting_tail(enumeration), "a counter beside changing values");
+        for (int n = 1; n <= 40; ++n) {
+            cases += "For n = " + std::to_string(n) + ", the sum is " + std::to_string(n * (n + 1) / 2) +
+                     ((n % 3) == 0 ? ", which is divisible by 3. " : ", which is not. ");
+        }
+        expect(!counting_tail(constant), "a repeated constant");
+        expect(!counting_tail(unrelated), "unrelated values in a periodic frame");
+        expect(!counting_tail(squares), "squares");
+        expect(!counting_tail(cases), "worked cases with varied text");
     }
     // The tail stays bounded and keeps its characters however the bytes arrive.
     {

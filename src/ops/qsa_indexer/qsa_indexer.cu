@@ -1,15 +1,18 @@
 // ninfer::ops - the block indexer of Qwen3.8-Flash-Next's sparse attention (contract in
 // include/ninfer/ops/qsa_indexer.h). Pooling runs one CTA per completed block. Selection scores the
-// blocks into workspace with CTAs of 64 blocks each (a grid sized by the capacity, so a graph
-// replays it at any position), then one CTA per query runs a four-pass radix select of the 512th
-// key and two ordered passes that keep ties at the lower block index and write the blocks in
-// increasing order.
+// blocks into workspace, a few tokens with one CTA per token and 64 blocks, prompts in tiles of
+// tokens x blocks (grids sized by the capacity, so a graph replays them at any position), then one
+// CTA per query runs a four-pass radix select of the 512th key and two ordered passes that keep
+// ties at the lower block index and write the blocks in increasing order.
 #include "ninfer/ops/qsa_indexer.h"
 #include "ninfer/ops/rope.h"
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "ops/common/device_multiprocessors.h"
+#include "ops/common/device_tier.h"
 #include "ops/common/math.h"
+#include "ops/common/mma.cuh"
 #include "ops/common/pre_sm80.cuh"
 
 #include <cub/block/block_scan.cuh>
@@ -31,7 +34,18 @@ constexpr int kTopBlocks   = 512;
 constexpr int kProjection  = kHeads * kHeadDim + kHeadDim;
 constexpr int kThreads     = 512;
 constexpr int kScoreBlocks = 64; // blocks one scoring CTA covers
-constexpr int kMmaTokens   = 128;
+// Prompt tiles: queries prepared once per token, then scored in tiles of tokens x blocks.
+constexpr int kTileThreads  = 256;
+constexpr int kTileBlocks   = 64;
+constexpr int kStageDims    = 16;
+constexpr int kWideTokens   = 32;
+constexpr int kNarrowTokens = 16;
+constexpr int kTensorTokens = 32;
+constexpr int kTensorBlocks = 128;
+// Below these token counts the per-token scalar kernel is faster: the tiles' separate query
+// kernel and eight dependent stages cost 9-25 us, which a context of 525-700 blocks does not repay.
+constexpr int kTileMinTokens   = 64;
+constexpr int kTensorMinTokens = 80;
 
 // fl32(1e7^(-2i/64)) for i < 32: the text RoPE frequencies of theta 1e7 over 64 rotary dims.
 __device__ __forceinline__ float rope_frequency(int pair) {
@@ -160,105 +174,300 @@ __global__ void __launch_bounds__(kThreads)
     queries[static_cast<std::int64_t>(t) * kHeads * kHeadDim + tid] = row[tid];
 }
 
-// Four queries (sixteen heads) share each key tile. FP32 operands remain public; TF32 high
-// and residual components are private. Three products omit low*low; qualification checks
-// the resulting selection against the FP64 oracle without reducing stored pooled-key precision.
-__global__ void __launch_bounds__(128)
-    qsa_mma_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
-                        const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
-                        int tokens, int capacity) {
-    namespace wmma = nvcuda::wmma;
-    __shared__ __align__(32) float q_hi[16 * 8], q_lo[16 * 8];
-    __shared__ __align__(32) float k_hi[4][16 * 8], k_lo[4][16 * 8];
-    __shared__ __align__(32) float dots[4][16 * 16];
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int t0 = blockIdx.y * 4, b0 = blockIdx.x * 64;
-    const int start = *first;
-    const int blocks = min((start + min(t0 + 4, tokens)) / kBlock, capacity);
+// Prompt scoring tiles: a 256-thread CTA scores Tok tokens (4 Tok query rows, one per head) against
+// 64 blocks in FP32 FMA, a 16 x 16 thread grid where each thread owns Tok / 16 tokens and four
+// blocks 1 apart. Dims arrive in eight 16-dim stages through double-buffered shared memory, the
+// next stage's loads in flight while the current one is multiplied. Each stage's 16 products run in
+// a fresh partial that is then added to the total: one FMA chain over all 128 dims erred up to
+// 9.8e-8 of the products' absolute sum, the partials 4.6e-8 (the scalar route 4.4e-8) on an RTX
+// 3090, 4090, 5090, 5060 Ti, 2080 Ti, Tesla V100 and A100. GeForce parts multiply FP32 as fast as
+// TF32 on their tensor cores, which need three products for FP32 accuracy: at 512 tokens and 32768
+// blocks the wide tile took 0.28-0.35 of the time of the earlier 3xTF32 MMA route on the RTX 3090,
+// 4090, 5090 and 5060 Ti, and 0.33-0.42 of its FMA form on the 2080 Ti and V100.
+template <int Tok>
+__global__ void __launch_bounds__(kTileThreads, 2)
+    qsa_tile_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
+                          const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
+                          int tokens, int capacity) {
+    constexpr int kTokensPerThread = Tok / 16;
+    constexpr int kRows            = Tok * kHeads;
+    constexpr int kParts           = kStageDims / 4;          // float4 loads per row and stage
+    constexpr int kLines           = kTileThreads / kParts;   // rows one pass of loads covers
+    constexpr int kQueryLoads      = kRows / kLines;
+    constexpr int kKeyLoads        = kTileBlocks / kLines;
+    constexpr int kStages          = kHeadDim / kStageDims;
+    static_assert(Tok % 16 == 0 && kRows % kLines == 0 && kTileBlocks % kLines == 0,
+                  "whole passes of loads");
+    // Rows padded by four floats, which keeps the float4 reads aligned.
+    __shared__ __align__(16) float query_tile[2][kStageDims][kRows + 4];
+    __shared__ __align__(16) float key_tile[2][kStageDims][kTileBlocks + 4];
+    const int tid = threadIdx.x;
+    const int t0 = blockIdx.x * Tok, b0 = blockIdx.y * kTileBlocks;
+    const int start  = *first;
+    const int blocks = min((start + min(t0 + Tok, tokens)) / kBlock, capacity);
     if (blocks <= kTopBlocks || b0 >= blocks) { return; }
-#if defined(NINFER_PRE_SM80_DEVICE)
-    // Volta and Turing have no TF32 tensor cores: each lane sums its eight dots of the warp's
-    // 16 x 16 tile in FP32 directly, the full product the three TF32 terms approximate.
-    float sum[8] = {};
-#else
-    wmma::fragment<wmma::accumulator, 16, 16, 8, float> sum;
-    wmma::fill_fragment(sum, 0.0f);
-#endif
+    const int part = tid % kParts, line = tid / kParts;
+    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float4* query_src[kQueryLoads];
+    bool query_ok[kQueryLoads];
 #pragma unroll
-    for (int base = 0; base < kHeadDim; base += 8) {
-        const int row = tid / 8, d = tid % 8;
-        const int t = t0 + row / kHeads;
-        const bool scored = t < tokens && (start + t + 1) / kBlock > kTopBlocks;
-        const float q = scored ? queries[(static_cast<std::int64_t>(t) * kHeads +
-                                         row % kHeads) * kHeadDim + base + d] : 0.0f;
-#if defined(NINFER_PRE_SM80_DEVICE)
-        q_hi[tid] = q;
-#    pragma unroll
-        for (int i = lane; i < 16 * 8; i += 32) {
-            const int b = b0 + warp * 16 + i / 8;
-            k_hi[warp][i] =
-                b < blocks ? pooled[static_cast<std::int64_t>(b) * kHeadDim + base + i % 8] : 0.0f;
+    for (int l = 0; l < kQueryLoads; ++l) {
+        const int row   = line + kLines * l;
+        const int token = t0 + row / kHeads;
+        query_ok[l]     = token < tokens && (start + token + 1) / kBlock > kTopBlocks;
+        query_src[l]    = reinterpret_cast<const float4*>(
+                           queries + (static_cast<std::int64_t>(t0) * kHeads + row) * kHeadDim) +
+                       part;
+    }
+    const float4* key_src[kKeyLoads];
+    bool key_ok[kKeyLoads];
+#pragma unroll
+    for (int l = 0; l < kKeyLoads; ++l) {
+        const int row = line + kLines * l;
+        key_ok[l]     = b0 + row < blocks;
+        key_src[l]    = reinterpret_cast<const float4*>(
+                         pooled + static_cast<std::int64_t>(b0 + row) * kHeadDim) +
+                     part;
+    }
+    float4 query_v[kQueryLoads], key_v[kKeyLoads];
+    const auto load = [&](int stage) {
+#pragma unroll
+        for (int l = 0; l < kQueryLoads; ++l) {
+            query_v[l] = query_ok[l] ? query_src[l][kParts * stage] : zero;
         }
-        __syncthreads();
-#    pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const int q_row = lane / 16 + 2 * i, key = lane % 16;
-#    pragma unroll
-            for (int dd = 0; dd < 8; ++dd) {
-                sum[i] = fmaf(q_hi[q_row * 8 + dd], k_hi[warp][key * 8 + dd], sum[i]);
+#pragma unroll
+        for (int l = 0; l < kKeyLoads; ++l) {
+            key_v[l] = key_ok[l] ? key_src[l][kParts * stage] : zero;
+        }
+    };
+    const auto put = [&](int buffer) {
+#pragma unroll
+        for (int l = 0; l < kQueryLoads; ++l) {
+            const int row = line + kLines * l;
+            query_tile[buffer][4 * part + 0][row] = query_v[l].x;
+            query_tile[buffer][4 * part + 1][row] = query_v[l].y;
+            query_tile[buffer][4 * part + 2][row] = query_v[l].z;
+            query_tile[buffer][4 * part + 3][row] = query_v[l].w;
+        }
+#pragma unroll
+        for (int l = 0; l < kKeyLoads; ++l) {
+            const int row = line + kLines * l;
+            key_tile[buffer][4 * part + 0][row] = key_v[l].x;
+            key_tile[buffer][4 * part + 1][row] = key_v[l].y;
+            key_tile[buffer][4 * part + 2][row] = key_v[l].z;
+            key_tile[buffer][4 * part + 3][row] = key_v[l].w;
+        }
+    };
+    load(0);
+    put(0);
+    __syncthreads();
+    const int tx = tid & 15, ty = tid >> 4;
+    constexpr int kOwnRows = 4 * kTokensPerThread;
+    float total[kOwnRows][4];
+#pragma unroll
+    for (int i = 0; i < kOwnRows; ++i) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) total[i][j] = 0.0f;
+    }
+#pragma unroll 1
+    for (int stage = 0; stage < kStages; ++stage) {
+        const int buffer = stage & 1;
+        if (stage + 1 < kStages) { load(stage + 1); }
+        float partial[kOwnRows][4];
+#pragma unroll
+        for (int i = 0; i < kOwnRows; ++i) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) partial[i][j] = 0.0f;
+        }
+#pragma unroll
+        for (int d = 0; d < kStageDims; ++d) {
+            float q[kOwnRows];
+#pragma unroll
+            for (int k = 0; k < kTokensPerThread; ++k) {
+                const float4 x =
+                    *reinterpret_cast<const float4*>(&query_tile[buffer][d][4 * (ty + 16 * k)]);
+                q[4 * k + 0] = x.x;
+                q[4 * k + 1] = x.y;
+                q[4 * k + 2] = x.z;
+                q[4 * k + 3] = x.w;
+            }
+            const float4 key = *reinterpret_cast<const float4*>(&key_tile[buffer][d][4 * tx]);
+            const float kv[4] = {key.x, key.y, key.z, key.w};
+#pragma unroll
+            for (int i = 0; i < kOwnRows; ++i) {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) partial[i][j] = fmaf(q[i], kv[j], partial[i][j]);
             }
         }
-        __syncthreads();
-        (void)q_lo;
-        (void)k_lo;
-#else
-        const float high = wmma::__float_to_tf32(q);
-        q_hi[tid] = high;
-        q_lo[tid] = wmma::__float_to_tf32(q - high);
-#    pragma unroll
-        for (int i = lane; i < 16 * 8; i += 32) {
-            const int b = b0 + warp * 16 + i / 8;
-            const float k = b < blocks ? pooled[static_cast<std::int64_t>(b) * kHeadDim +
-                                                 base + i % 8] : 0.0f;
-            const float kh = wmma::__float_to_tf32(k);
-            k_hi[warp][i] = kh;
-            k_lo[warp][i] = wmma::__float_to_tf32(k - kh);
-        }
-        __syncthreads();
-        wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> ah, al;
-        wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> bh, bl;
-        wmma::load_matrix_sync(ah, q_hi, 8);
-        wmma::load_matrix_sync(al, q_lo, 8);
-        wmma::load_matrix_sync(bh, k_hi[warp], 8);
-        wmma::load_matrix_sync(bl, k_lo[warp], 8);
-        wmma::mma_sync(sum, ah, bh, sum);
-        wmma::mma_sync(sum, ah, bl, sum);
-        wmma::mma_sync(sum, al, bh, sum);
-        __syncthreads();
-#endif
-    }
-#if defined(NINFER_PRE_SM80_DEVICE)
-#    pragma unroll
-    for (int i = 0; i < 8; ++i) { dots[warp][(lane / 16 + 2 * i) * 16 + lane % 16] = sum[i]; }
-#else
-    wmma::store_matrix_sync(dots[warp], sum, 16, wmma::mem_row_major);
-#endif
-    __syncwarp();
-    const int column = lane % 16;
-    const int b = b0 + warp * 16 + column;
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-        const int local_t = lane / 16 + 2 * i, t = t0 + local_t;
+        for (int i = 0; i < kOwnRows; ++i) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) total[i][j] += partial[i][j];
+        }
+        if (stage + 1 < kStages) { put(buffer ^ 1); }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int k = 0; k < kTokensPerThread; ++k) {
+        const int t       = t0 + ty + 16 * k;
         const int visible = min((start + t + 1) / kBlock, capacity);
-        if (t < tokens && visible > kTopBlocks && b < visible) {
-            float score = 0.0f;
+        if (t < tokens && visible > kTopBlocks) {
+            unsigned* keys = keys_workspace + static_cast<std::int64_t>(t) * capacity;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int b = b0 + 4 * tx + j;
+                if (b < visible) {
+                    float score = 0.0f;
+#pragma unroll
+                    for (int h = 0; h < kHeads; ++h) score += fmaxf(total[4 * k + h][j], 0.0f);
+                    keys[b] = order_key(score);
+                }
+            }
+        }
+    }
+}
+
+// The A100 class's prompt tile: 32 tokens x 128 blocks per 256-thread CTA in m16n8k8 TF32 MMA,
+// whose TF32 rate there is eight times its FP32 FMA rate (0.63 of the wide SIMT tile's time and
+// 0.39 of the earlier route's at 512 tokens and 32768 blocks). Each FP32 operand splits into a TF32
+// high part and its TF32 residual; three products omit low*low. Each 8-dim step starts the high
+// product and the two cross products in zeroed accumulators and adds them to the FP32 total in
+// registers: the tensor cores lose bits when they add products into a larger accumulator, and one
+// fragment accumulating all 16 steps erred up to 6.7e-7 of the products' absolute sum and selected
+// blocks outside the contract's 1e-5 tie band on an RTX 5060 Ti. Per-step accumulators err at most
+// 4.7e-8. Eight warps: warp & 1 takes tokens 16 (warp & 1) to 16 (warp & 1) + 15, warp >> 1 blocks
+// 32 (warp >> 1) to 32 (warp >> 1) + 31; MMA k index c is dim 2c of the step's eight and c + 4 dim
+// 2c + 1, for queries and keys alike. Only an sm_80 image runs it (tensor_scoring_here); the other
+// images hold a trap in its place.
+__global__ void __launch_bounds__(kTileThreads, 1)
+    qsa_tensor_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
+                            const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
+                            int tokens, int capacity) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ != 800
+    (void)queries, (void)first, (void)pooled, (void)keys_workspace, (void)tokens, (void)capacity;
+    __trap();
+#else
+    namespace wmma = nvcuda::wmma;
+    constexpr int kTiles  = kTensorBlocks / 32; // n8 tiles per warp
+    constexpr int kSteps  = kHeadDim / 8;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, c = lane & 3;
+    const int wm = warp & 1, wn = warp >> 1;
+    const int t0 = blockIdx.x * kTensorTokens, b0 = blockIdx.y * kTensorBlocks;
+    const int start  = *first;
+    const int blocks = min((start + min(t0 + kTensorTokens, tokens)) / kBlock, capacity);
+    if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+    const float* query_base[2];
+    bool query_ok[2];
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int token  = t0 + 16 * wm + g + 8 * half;
+        query_ok[half]   = token < tokens && (start + token + 1) / kBlock > kTopBlocks;
+        query_base[half] = queries + static_cast<std::int64_t>(token) * kHeads * kHeadDim + 2 * c;
+    }
+    const float* key_base[kTiles];
+    bool key_ok[kTiles];
+#pragma unroll
+    for (int n = 0; n < kTiles; ++n) {
+        const int b  = b0 + 8 * kTiles * wn + 8 * n + g;
+        key_ok[n]    = b < blocks;
+        key_base[n]  = pooled + static_cast<std::int64_t>(b) * kHeadDim + 2 * c;
+    }
+    const float2 zero = make_float2(0.0f, 0.0f);
+    const auto load = [&](int step, float2 (&query_v)[2][kHeads], float2 (&key_v)[kTiles]) {
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
 #pragma unroll
             for (int h = 0; h < kHeads; ++h) {
-                score += fmaxf(dots[warp][(local_t * kHeads + h) * 16 + column], 0.0f);
+                query_v[half][h] = query_ok[half] ? *reinterpret_cast<const float2*>(
+                                                        query_base[half] + h * kHeadDim + 8 * step)
+                                                  : zero;
             }
-            keys_workspace[static_cast<std::int64_t>(t) * capacity + b] = order_key(score);
+        }
+#pragma unroll
+        for (int n = 0; n < kTiles; ++n) {
+            key_v[n] = key_ok[n] ? *reinterpret_cast<const float2*>(key_base[n] + 8 * step) : zero;
+        }
+    };
+    const auto split = [](float x, unsigned& high, unsigned& low) {
+        const float h = wmma::__float_to_tf32(x);
+        high          = __float_as_uint(h);
+        low           = __float_as_uint(wmma::__float_to_tf32(x - h));
+    };
+    float2 query_v[2][kHeads], key_v[kTiles];
+    load(0, query_v, key_v);
+    float total[kHeads][kTiles][4];
+#pragma unroll
+    for (int h = 0; h < kHeads; ++h) {
+#pragma unroll
+        for (int n = 0; n < kTiles; ++n) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) total[h][n][e] = 0.0f;
         }
     }
+#pragma unroll 1
+    for (int step = 0; step < kSteps; ++step) {
+        float2 query_next[2][kHeads], key_next[kTiles];
+        if (step + 1 < kSteps) { load(step + 1, query_next, key_next); }
+        unsigned key_high[kTiles][2], key_low[kTiles][2];
+#pragma unroll
+        for (int n = 0; n < kTiles; ++n) {
+            split(key_v[n].x, key_high[n][0], key_low[n][0]);
+            split(key_v[n].y, key_high[n][1], key_low[n][1]);
+        }
+#pragma unroll
+        for (int h = 0; h < kHeads; ++h) {
+            const float x[4] = {query_v[0][h].x, query_v[1][h].x, query_v[0][h].y,
+                                query_v[1][h].y};
+            unsigned high[4], low[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) split(x[i], high[i], low[i]);
+#pragma unroll
+            for (int n = 0; n < kTiles; ++n) {
+                float product[4] = {0.0f, 0.0f, 0.0f, 0.0f}, cross[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                mma_tf32_bits(product[0], product[1], product[2], product[3], high[0], high[1],
+                              high[2], high[3], key_high[n][0], key_high[n][1]);
+                mma_tf32_bits(cross[0], cross[1], cross[2], cross[3], high[0], high[1], high[2],
+                              high[3], key_low[n][0], key_low[n][1]);
+                mma_tf32_bits(cross[0], cross[1], cross[2], cross[3], low[0], low[1], low[2],
+                              low[3], key_high[n][0], key_high[n][1]);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) total[h][n][e] += product[e] + cross[e];
+            }
+        }
+        if (step + 1 < kSteps) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+#pragma unroll
+                for (int h = 0; h < kHeads; ++h) query_v[half][h] = query_next[half][h];
+            }
+#pragma unroll
+            for (int n = 0; n < kTiles; ++n) key_v[n] = key_next[n];
+        }
+    }
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int t       = t0 + 16 * wm + g + 8 * half;
+        const int visible = min((start + t + 1) / kBlock, capacity);
+        if (t < tokens && visible > kTopBlocks) {
+            unsigned* keys = keys_workspace + static_cast<std::int64_t>(t) * capacity;
+#pragma unroll
+            for (int n = 0; n < kTiles; ++n) {
+#pragma unroll
+                for (int e = 0; e < 2; ++e) {
+                    const int b = b0 + 8 * kTiles * wn + 8 * n + 2 * c + e;
+                    if (b < visible) {
+                        float score = 0.0f;
+#pragma unroll
+                        for (int h = 0; h < kHeads; ++h) {
+                            score += fmaxf(total[h][n][2 * half + e], 0.0f);
+                        }
+                        keys[b] = order_key(score);
+                    }
+                }
+            }
+        }
+    }
+#endif
 }
 
 // The scores of blocks [64 x, 64 x + 64) for query y (the 1/sqrt(128) scale does not change the
@@ -441,6 +650,38 @@ void require_pooled(const Tensor& pooled) {
             "pooled must be contiguous FP32 [128, capacity]");
 }
 
+// Scoring routes. The per-token scalar kernel prepares its query in every CTA and reads the keys
+// once per token; the tiles read them once per 16 or 32 tokens after one query kernel.
+enum class ScoreRoute : std::uint8_t { Scalar, Narrow, Wide, Tensor };
+
+// Whether the current device is an A100-class part (compute capability 8.0) running this binary's
+// sm_80 code, whose TF32 tensor cores outrun its FP32 FMA (qsa_tensor_score_kernel).
+bool tensor_scoring_here() {
+    if (current_device_tier() != DeviceTier::Ampere) { return false; }
+    return detail::current_device_compute_capability(0) == 80;
+}
+
+// The route of `tokens` queries over `capacity` blocks. The grid is sized by the capacity (a graph
+// replays it at any position), so the choice is too. Wide tiles halve the key reads of narrow ones
+// and win once their CTAs fill the SMs; narrow tiles keep more CTAs at work below that. The A100's
+// tensor tile wins at half a wave of its CTAs. Measured on the cards of the score kernels' comments
+// at 1-2048 tokens and 700-114688 blocks, full and 525-block contexts.
+ScoreRoute score_route(std::int32_t tokens, std::int32_t capacity) {
+    const std::int64_t multiprocessors = detail::current_device_multiprocessors(82);
+    const auto tiles = [&](int tile_tokens, int tile_blocks) {
+        return static_cast<std::int64_t>((tokens + tile_tokens - 1) / tile_tokens) *
+               ((capacity + tile_blocks - 1) / tile_blocks);
+    };
+    if (tensor_scoring_here()) {
+        if (tokens < kTensorMinTokens) { return ScoreRoute::Scalar; }
+        return 2 * tiles(kTensorTokens, kTensorBlocks) >= multiprocessors ? ScoreRoute::Tensor
+                                                                          : ScoreRoute::Narrow;
+    }
+    if (tokens < kTileMinTokens) { return ScoreRoute::Scalar; }
+    return tiles(kWideTokens, kTileBlocks) >= multiprocessors ? ScoreRoute::Wide
+                                                              : ScoreRoute::Narrow;
+}
+
 QsaRope make_rope(const RopeYarn& yarn) {
     require(!(yarn.interpolation_factor > 1.0F), "linear position interpolation is not supported");
     QsaRope rope{};
@@ -486,7 +727,8 @@ std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t
     require(tokens > 0 && capacity > 0, "tokens and capacity must be positive");
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::I32, {capacity, tokens});
-    if (tokens >= kMmaTokens && capacity > kTopBlocks) {
+    // The prepared queries of a tiled route, on any device (kTensorMinTokens > kTileMinTokens).
+    if (tokens >= kTileMinTokens && capacity > kTopBlocks) {
         (void)layout.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
     }
     return layout.peak_bytes(1);
@@ -510,15 +752,18 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                 counts.ne[0] == tokens,
             "counts must be contiguous I32 [tokens]");
     const std::int32_t capacity = pooled.ne[1];
+    // The tiles' blocks run along the grid's y dimension, at most 65,535 tiles of 64.
+    require(capacity <= 65535 * kTileBlocks, "pooled capacity must be at most 4,194,240 blocks");
     auto scope                  = workspace.scope();
     Tensor keys                 = workspace.alloc(DType::I32, {capacity, tokens});
-    const dim3 score_grid(static_cast<unsigned>((capacity + kScoreBlocks - 1) / kScoreBlocks),
-                          static_cast<unsigned>(tokens));
     if (capacity > kTopBlocks) {
-        if (tokens < kMmaTokens) {
+        const ScoreRoute route = score_route(tokens, capacity);
+        if (route == ScoreRoute::Scalar) {
+            const dim3 grid(static_cast<unsigned>((capacity + kScoreBlocks - 1) / kScoreBlocks),
+                            static_cast<unsigned>(tokens));
             auto* const score_kernel =
                 rope.scaled ? qsa_score_kernel<true> : qsa_score_kernel<false>;
-            score_kernel<<<score_grid, kThreads, 0, stream>>>(
+            score_kernel<<<grid, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
                 static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
                 static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity,
@@ -532,9 +777,18 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                 static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
                 static_cast<float*>(queries.data), rope);
             CUDA_CHECK(cudaGetLastError());
-            qsa_mma_score_kernel<<<dim3((capacity + 63) / 64, (tokens + 3) / 4), 128, 0, stream>>>(
-                static_cast<const float*>(queries.data), first, static_cast<const float*>(pooled.data),
-                static_cast<unsigned*>(keys.data), tokens, capacity);
+            const int tile_tokens = route == ScoreRoute::Narrow ? kNarrowTokens : kWideTokens;
+            const int tile_blocks = route == ScoreRoute::Tensor ? kTensorBlocks : kTileBlocks;
+            const dim3 grid(static_cast<unsigned>((tokens + tile_tokens - 1) / tile_tokens),
+                            static_cast<unsigned>((capacity + tile_blocks - 1) / tile_blocks));
+            auto* const score_kernel = route == ScoreRoute::Tensor ? qsa_tensor_score_kernel
+                                       : route == ScoreRoute::Wide
+                                           ? qsa_tile_score_kernel<kWideTokens>
+                                           : qsa_tile_score_kernel<kNarrowTokens>;
+            score_kernel<<<grid, kTileThreads, 0, stream>>>(
+                static_cast<const float*>(queries.data), first,
+                static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), tokens,
+                capacity);
         }
         CUDA_CHECK(cudaGetLastError());
     }

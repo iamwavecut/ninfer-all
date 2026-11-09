@@ -1,3 +1,4 @@
+#include "core/device_wait.h"
 #include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
@@ -176,10 +177,10 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
         }
         tp.prompt_partials = plan.features.tensor_parallel_prompt_partials;
         tp.exchange        = std::make_unique<TensorParallelExchange>(
-            device, TensorParallelExchangeOptions{
-                        .slot_bytes    = tensor_parallel_slot_bytes(plan),
-                        .transport     = plan.features.tensor_parallel_transport,
-                        .bf16_partials = tp.prompt_partials == TensorParallelPartials::Bf16});
+            device,
+            TensorParallelExchangeOptions{.slot_bytes = tensor_parallel_slot_bytes(plan),
+                                          .transport  = plan.features.tensor_parallel_transport,
+                                          .rounded_partials = tp.prompt_partials});
         for (std::size_t rank = 1; rank < stages; ++rank) { tp.joined.emplace_back(device.rank(rank)); }
         // A divided head's rows come back to rank 0, each rank's logits over its own link.
         if (const std::size_t head_bytes = divided_head_link_bytes(plan); head_bytes != 0) {
@@ -789,8 +790,8 @@ void ProgramImpl::bind_steering(const SequencePlanImpl& plan, const Steering* so
         if (tensor.bytes() != values.size_bytes()) {
             throw std::logic_error("planned steering tensor does not match the loaded steering");
         }
-        CUDA_CHECK(cudaMemcpy(tensor.data, values.data(), values.size_bytes(),
-                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(tensor.data, values.data(), values.size_bytes(),
+                                         cudaMemcpyHostToDevice));
     };
     steering                 = std::make_unique<execution::SteeringView>();
     steering->adapters       = static_cast<std::int32_t>(count);
@@ -841,14 +842,14 @@ void ProgramImpl::lend_kv_to_experts() {
 
 void ProgramImpl::synchronize_transfer_streams() const {
     for (std::size_t rank = 0; rank < transfer_streams.size(); ++rank) {
-        (void)cudaStreamSynchronize(transfer_streams[rank]);
+        (void)ninfer::wait_for_stream(transfer_streams[rank]);
     }
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
     for (std::size_t rank = 0; rank < transfer_streams.size(); ++rank) {
-        (void)cudaStreamSynchronize(transfer_streams[rank]);
-        (void)cudaStreamSynchronize(compute_streams[rank]);
+        (void)ninfer::wait_for_stream(transfer_streams[rank]);
+        (void)ninfer::wait_for_stream(compute_streams[rank]);
     }
 }
 

@@ -19,7 +19,10 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [iamwavecut](https://github.com/iamwavecut) | swscale destination-alignment JPEG safety fix | [#11](https://github.com/Don-Chad/ninfer-3090/pull/11) |
 | [nasedkinpv](https://github.com/nasedkinpv) | Tool-call parser crash fix | [#12](https://github.com/Don-Chad/ninfer-3090/pull/12) |
 | [wmehanna](https://github.com/wmehanna) | In-place system-turn rendering for Claude Code prefix reuse | [#13](https://github.com/Don-Chad/ninfer-3090/pull/13) |
-| [mgscreativa](https://github.com/mgscreativa) | Thinking-budget boundary fix; premature KV-loan race diagnosis and gate fix behind a vision `std::bad_alloc` | [#156](https://github.com/ashalliants/ninfer-3090/pull/156), [#138](https://github.com/ashalliants/ninfer-3090/pull/138) (kept in [#145](https://github.com/ashalliants/ninfer-3090/pull/145)) |
+| [mgscreativa](https://github.com/mgscreativa) | Thinking-budget boundary fix; premature KV-loan race diagnosis and gate fix behind a vision `std::bad_alloc`; the lost wakeup that hung Flash-Next's long prefills with host experts | [#156](https://github.com/ashalliants/ninfer-3090/pull/156), [#138](https://github.com/ashalliants/ninfer-3090/pull/138) (kept in [#145](https://github.com/ashalliants/ninfer-3090/pull/145)), [#243](https://github.com/iamwavecut/ninfer-all/pull/243) |
+| [liqlos](https://github.com/liqlos) (Aleksei Bukhalov) | GGUF matrix products that store BF16 after the stream-K reduction, Q4_K and Q6_K vector loads shared across lanes, and Q4_K matrix tiles staged through `cp.async` for dense layers and routed experts | [#127](https://github.com/iamwavecut/ninfer-all/pull/127), [#134](https://github.com/iamwavecut/ninfer-all/pull/134), [#257](https://github.com/iamwavecut/ninfer-all/pull/257) |
+| [eruca](https://github.com/eruca) | A second window of hits for a document asked about every round, and the Host-tier workloads that showed fewer conversations cached with 4 GiB than with 2 GiB | [#256](https://github.com/iamwavecut/ninfer-all/pull/256) |
+| [dzaurov](https://github.com/dzaurov) | Default device snapshot slots that give way to the KV capacity, `output_config.effort` beside disabled Thinking in the Messages API, the n-gram writer interop test's skip without its Python modules, and the RTX 5080 field report | [#283](https://github.com/iamwavecut/ninfer-all/pull/283), [#284](https://github.com/iamwavecut/ninfer-all/pull/284), [#285](https://github.com/iamwavecut/ninfer-all/pull/285) |
 
 ## Work carried from other forks
 
@@ -41,6 +44,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [b1231227](https://github.com/b1231227) | a BF16 output head in the dense GGUF recipe, and the native re-quantisation of a GGUF that exposed `ssm_out`'s stored column order ([#185](https://github.com/iamwavecut/ninfer-all/pull/185)) |
 | [13thblade/ninfer-all-nvfp4](https://github.com/13thblade/ninfer-all-nvfp4) (13thblade) | NVFP4 weights on GPUs without FP4 tensor cores: the wide W4A16 kernels and the W4A8 int8 routes (`--nvfp4-w4a8-int`, `--nvfp4-w4a16`) with their tensor-parallel shares, and the integer E2M1/E4M3 expansions of the NVFP4 and FP8 KV caches |
 | [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090) (AshAlliants) | the prefill stall budget (`--prefill-stall-budget-ms`) |
+| [ahostbr](https://github.com/ahostbr) | the DeepSeek-V4.1 prefill proposals behind the decoder blocks' prompt tail, the IQ1_M matrix route of routed experts and the Engram rows read once and ahead ([#238](https://github.com/iamwavecut/ninfer-all/issues/238), [#239](https://github.com/iamwavecut/ninfer-all/issues/239), [#240](https://github.com/iamwavecut/ninfer-all/issues/240)) |
 
 ## Pull requests to Neroued/ninfer ported here
 
@@ -85,5 +89,5 @@ two-stage GDN prefill, parallel query tiles, MX FP8 MMA and Minnnn's column-band
   `strata-dsv41`.
 - The SiLU shared by the GPU's GGUF expert kernels and the CPU's expert products evaluates e^x with
   the single-precision polynomial of Stephen L. Moshier's Cephes Math Library.
-- llama.cpp's GGUF block kernels are vendored unmodified in `third_party/ggml-quants` under their
-  MIT license.
+- llama.cpp's GGUF block kernels are vendored in `third_party/ggml-quants` under their MIT license;
+  its `README.ninfer.md` lists NInfer's changes to them.

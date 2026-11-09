@@ -1,6 +1,7 @@
 #include "models/flint/executor.h"
 
 #include "core/decode_graph.h"
+#include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/tensor_parallel.h"
@@ -120,6 +121,7 @@ struct LayerPlan {
     gguf::GgmlType gate_up_type{}, down_type{};
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     DeviceBuffer tables; // pointers: [E] gate, [E] up, [E] gate_up, [E] down
+    bool gate_up_aligned16 = true, down_aligned16 = true;
     // Expert parallelism: rank r's tables (r > 0) in its device memory, entries of the experts it
     // holds (`tables` holds rank 0's); the other entries are null.
     std::vector<DeviceBuffer> peer_tables;
@@ -342,6 +344,16 @@ struct Executor::Impl {
                             table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
                                                std::int64_t(x - first) * hidden * p.down_row_bytes;
                         }
+                        bool gate_up_aligned = p.gate_up_row_bytes % 16 == 0;
+                        bool down_aligned    = p.down_row_bytes % 16 == 0;
+                        for (std::size_t i = 0; i < table.size(); ++i) {
+                            const auto address = reinterpret_cast<std::uintptr_t>(table[i]);
+                            const bool aligned = table[i] == nullptr || address % 16 == 0;
+                            (i < 3 * std::size_t(e) ? gate_up_aligned : down_aligned) &=
+                                aligned;
+                        }
+                        p.gate_up_aligned16 = p.gate_up_aligned16 && gate_up_aligned;
+                        p.down_aligned16    = p.down_aligned16 && down_aligned;
                         DeviceBuffer buffer(table.size() * sizeof(void*));
                         buffer.copy_from_host(table.data(), table.size() * sizeof(void*));
                         return buffer;
@@ -517,6 +529,17 @@ struct Executor::Impl {
         }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
+        // Aliases 0 to 2 (gate, up, gate_up) point into the gate/up blob, 3 into the down blob.
+        for (auto& p : layers) {
+            if (p.delivery_layer < 0) { continue; }
+            const auto l       = std::size_t(p.delivery_layer);
+            const auto aligned = [&](std::size_t alias) {
+                return delivery->alias_aligned(l, alias, 16);
+            };
+            p.gate_up_aligned16 =
+                p.gate_up_row_bytes % 16 == 0 && aligned(0) && aligned(1) && aligned(2);
+            p.down_aligned16 = p.down_row_bytes % 16 == 0 && aligned(3);
+        }
     }
 
     // The startup check's room for the workspace and the CUDA graphs: 1.5 GiB at the full
@@ -634,7 +657,7 @@ struct Executor::Impl {
     // sequence reaches, and the expert cache takes what is free beyond its headroom.
     void release(std::uint32_t sequence) {
         if (!growing || sequence_areas.empty() || sequence_areas.front()->backed[sequence] == 0) { return; }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         for (KvArea* area : sequence_areas) { trim(*area, sequence, 0); }
         std::uint32_t longest = 0;
         for (const std::uint32_t backed : sequence_areas.front()->backed) { longest = std::max(longest, backed); }
@@ -649,11 +672,11 @@ struct Executor::Impl {
     }
 
     ~Impl() {
-        if (delivery || growing) { cudaStreamSynchronize(stream); }
+        if (delivery || growing) { ninfer::wait_for_stream(stream); }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
-            cudaStreamSynchronize(expert_peers[r].stream);
+            ninfer::wait_for_stream(expert_peers[r].stream);
             expert_peers[r].workspace.reset();
             cudaStreamDestroy(expert_peers[r].stream);
         }
@@ -837,10 +860,12 @@ struct Executor::Impl {
         gguf::moe_keep_experts(ids, pairs, int(range.first), int(range.second), mine, on);
         const gguf::MoeRouting routing = gguf::moe_sort_routes(
             mine, pairs, e, space.alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data, on);
-        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden};
-        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width};
+        const bool gate_up_aligned = p.gate_up_aligned16, down_aligned = p.down_aligned16;
+        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden,
+                                     gate_up_aligned};
+        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width, down_aligned};
         const int max_active = std::max(1, std::min(pairs, int(range.second - range.first)));
         auto* middle =
             static_cast<__nv_bfloat16*>(space.alloc_bytes(std::size_t(pairs) * width * 2).data);
@@ -1151,10 +1176,12 @@ struct Executor::Impl {
         }
         const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
                                       : static_cast<const void* const*>(p.tables.p);
-        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden};
-        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden};
-        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width};
+        const bool gate_up_aligned = p.gate_up_aligned16, down_aligned = p.down_aligned16;
+        const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden, gate_up_aligned};
+        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden,
+                                     gate_up_aligned};
+        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width, down_aligned};
         const int max_active = std::min(pairs, e);
         auto* middle = static_cast<__nv_bfloat16*>(
             workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
@@ -1678,7 +1705,7 @@ struct Executor::Impl {
                 positions[0] = 0;
             }
         }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
         if (delivery) {
             // Drained, so warm-up deliveries and their asynchronous prefetches stay out of the
             // request counters, and the cache starts from the routing profile rather than the

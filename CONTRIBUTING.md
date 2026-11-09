@@ -92,14 +92,130 @@ prior agreement, or requires the maintainer to reconstruct its design is not mai
 not be accepted. Use the Issue, not a draft implementation, to resolve architecture and scope; a
 Draft PR is welcome for early measurement and testing once that direction is agreed.
 
-Changes that move numbers or serving behavior (memory residency, KV storage, speculative decoding,
-CUDA Graphs, kernels and their routes, quantization, scheduling) start opt-in behind a flag unless
-the Issue agreed a new default with the evidence for it.
-
 Work ported from a fork or from upstream keeps its author: port it as the original commits or with
 the author recorded, name the source repository and commit, and say whether the change is a clean
 cherry-pick or adapted to this tree. When the same change is still under review upstream, let it
 settle there before porting it.
+
+## Engineering rules
+
+These rules apply to every change, from people and from coding agents. If a change cannot meet a
+rule, its pull request names the rule and gives the reason.
+
+### Lossless by default
+
+An optimization must not change model output. Exact transforms, codecs and expert placements stay
+exact: device, host and disk residency and the CPU share of expert products give the same results.
+Floating-point changes stay within the oracle criterion of each Op
+([Op development](docs/maintainer/op-development.md)).
+
+A change that trades accuracy for speed is lossy. Examples: skipped or truncated experts, tokens or
+vocabulary; approximate attention or sampling; lower precision than the current default in storage,
+accumulation or exchanged partials; early exits. A lossy change needs the maintainer's agreement in
+its Issue. It ships as an option that is off by default, and its pull request reports the quality
+cost (perplexity, task accuracy) next to the speed. Formats that the user selects, such as
+`--kv-dtype` and quantized artifacts, are options of this kind.
+
+After a change to expert residency, slot pools, prefetch or the expert cache, `ninfer-perplexity`
+gives the same value on the same text with `--expert-residency host` and with `disk`. Time a prompt
+of 5K tokens or more as well as short ones, and compare greedy token ids and logprobs with `master`
+on long prompts: a perplexity run does not reach every prompt path.
+
+### Every family
+
+A change to a shared mechanism covers every model family that uses that mechanism: Qwen3.5-core
+(dense and MoE releases), Qwen3.8-Flash-Next, Gemma 4, Flint and DeepSeek-V4.1. Shared mechanisms
+include KV formats, rotary scaling, prompt chunking, CUDA Graphs, concurrency, speculative decoding,
+sampling, expert residency and the CPU share, pipeline stages, tensor parallelism, serving features,
+and kernels that several families call.
+
+- Write the change once where the families share code. A speedup that one checkpoint, shape or
+  family gets while the others could use it is incomplete.
+- A dense change names its MoE counterpart and covers it in the same pull request, and the reverse.
+- A family that does not get the change is named in the pull request and in its guide, with the
+  reason.
+- A new family brings the shared features of the other families: the `--kv-dtype` formats it can
+  store, concurrency above one, CUDA Graphs, 2048-token prompt chunks, grouped Q/K/V projections,
+  `--tensor-parallel`, YaRN, and the serving features in [docs/serving.md](docs/serving.md).
+
+### Every platform
+
+A change builds and runs on every supported target: `sm_70`, `sm_75`, `sm_80`, `sm_86`, `sm_89` and
+`120a`; CUDA 12.x and 13.x (`sm_70` builds only with 12.x, `120a` only with 13.1 or newer except 13.2.0 and 13.2.1); Linux
+with GCC and Windows with MSVC ([build system](docs/maintainer/build-system.md),
+[Windows build](docs/build-windows.md)).
+
+- A kernel that needs newer instructions or more shared memory is gated by compute capability, and
+  the other targets keep a working route. A format, option or artifact that runs on one card class
+  only is not a supported feature.
+- Routes and tuning constants come from measured [device profiles](docs/device-profiles.md). A
+  constant from upstream, another fork or another card is a hypothesis until it is measured on each
+  card that it affects.
+- Add a profile for a GPU model that has no built-in one: calibrate it at its default power limit
+  ([Calibrating by hand](docs/device-profiles.md#calibrating-by-hand)) and add its row to
+  [docs/gpus.md](docs/gpus.md).
+- Memory budgets and defaults follow the free memory of the card and the host. They do not assume
+  one card size: check the smallest card that the change affects.
+
+### Best default
+
+Users get the best configuration without flags. The default is the fastest lossless configuration
+measured on the affected families, card classes and KV formats.
+
+- A lossless change that wins on all of them becomes the default in its pull request, with the
+  measurements.
+- A change that wins on some and loses on others selects itself from measured conditions (device
+  profile, request shape, free memory), or stays behind an option until it can.
+- A lossy mode is never the default.
+
+### Comparable measurements
+
+- A speed claim covers every affected family and card class, and every KV format that each family
+  supports, with at least one point each. One short run per configuration is enough when it
+  separates the arms. Report the worst change and every regression next to the best case.
+- Both arms of an A/B run on the same host with the same build options, artifact and inputs: the
+  same prompt token ids, a unique nonce in each prompt so that the prefix cache cannot reuse a
+  shared prefix, interleaved runs, and no other CPU or GPU load on the host.
+- A comparison with another engine uses that engine's latest release with its fastest documented
+  configuration, on the same host and weights. Record its version and each flag with the reason for
+  it, and show its lossy modes as separate rows. A perplexity comparison with llama.cpp uses the
+  same windows and KV type ([Perplexity](docs/perplexity.md)).
+
+### Documentation describes the current state
+
+- Documents describe what the project is and does now. They contain no dated logs, run or CI
+  histories, retry stories, accounts of what was tried, author host paths, server setups or copies
+  of upstream pages. Measurements are reference tables with their conditions. A rejected approach
+  gets at most one sentence, where it explains a current choice. Credits go to
+  [CONTRIBUTORS.md](CONTRIBUTORS.md); git history keeps the rest.
+- A user-visible change updates, in the same pull request, the family guide,
+  [docs/cli.md](docs/cli.md) and [docs/serving.md](docs/serving.md) where they apply, the
+  executable's `--help`, the README Artifacts table for a new artifact, and What's New when the
+  change is a novelty.
+- README's What's New lists novelties only. A novelty gives users something they did not have
+  before: a new model, family, artifact, platform, option, endpoint, format or mode, or a measured
+  speedup of a path that worked. A fix gets no item, whatever its size. A fix repairs a crash, wrong
+  output, a failed start, a missed case or a regression; a speedup that wins back a slowdown and an
+  option or default that a fix brings along are part of the fix. Guards, refusals, diagnostics,
+  internal changes, CI, build, tests, tooling and documentation get no item either. What's New is
+  not a chronicle of the day's work: a date without a novelty gets no line.
+- Each date with a novelty gets one short line. Each item names the novelty in a few words and
+  links inline to the document with its details. Descriptions, mechanisms, measurements and
+  hardware belong in the linked documents, not in What's New. A later novelty of the same date adds
+  an item to that line or extends an existing item.
+
+### Tests and tooling
+
+- A new kernel gets an independent FP32 or FP64 oracle test at real model shapes and route
+  boundaries, for every schedule it can take, and one `compute-sanitizer` racecheck and synccheck
+  run ([Op development](docs/maintainer/op-development.md)).
+- Tests follow [tests/README.md](tests/README.md). A test that needs a real artifact is skipped when
+  the artifact is absent.
+- Product modes and tuning are command-line or serve options, or device-profile entries.
+  Environment variables only force routes for diagnosis and A/B runs; a mode that users need is
+  never an environment variable.
+- Commit subjects follow Conventional Commits with lowercase types such as `feat`, `fix`, `perf`,
+  `bench`, `test`, `build`, `refactor`, `docs` or `chore`.
 
 ## Engineering and verification
 

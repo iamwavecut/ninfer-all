@@ -1,5 +1,7 @@
 #include "core/device_snapshot.h"
 
+#include "core/device_wait.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -141,7 +143,7 @@ struct StagingSlot {
     // afterwards.
     void settle() {
         if (busy) {
-            CUDA_CHECK(cudaEventSynchronize(event));
+            CUDA_CHECK(ninfer::wait_for_event(event));
             for (const Piece& piece : pieces) {
                 parallel_copy(piece.host, at(piece.offset), piece.bytes);
             }
@@ -305,7 +307,7 @@ void DeviceSnapshot::transfer(DeviceContext& device, bool to_host) {
             slots[current]->busy = true;
         }
         for (const auto& slot : slots) { slot->settle(); }
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
     }
 }
 

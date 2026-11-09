@@ -4,7 +4,7 @@
 // trusted unless the fingerprint (model artifact, KV and state formats, binary) and the Host
 // geometry match; a damaged or foreign file loads nothing.
 //
-// Layout (version 3): the header, the block table (parents first), the snapshot table, then the
+// Layout (version 5): the header, the block table (parents first), the snapshot table, then the
 // slab bytes of every block and of every snapshot in table order, then the footer. The tables come
 // first so a Host tier smaller than the file can choose what to restore before reading any slab.
 
@@ -31,7 +31,7 @@ namespace {
 
 constexpr std::array<char, 8> kMagic  = {'N', 'I', 'N', 'F', 'H', 'P', 'C', '1'};
 constexpr std::array<char, 8> kFooter = {'N', 'I', 'N', 'F', 'E', 'N', 'D', '1'};
-constexpr std::uint32_t kVersion      = 3;
+constexpr std::uint32_t kVersion      = 5;
 constexpr std::int32_t kRootIndex     = -1;
 constexpr std::uint64_t kFooterBytes  = kFooter.size() + 2U * sizeof(std::uint32_t);
 constexpr const char* kSaveAbandoned  = "abandoned; the previous file is kept";
@@ -74,6 +74,8 @@ struct SavedSnapshot {
     std::array<TokenId, pc::kBlockTokens> tail{};
     pc::SnapshotKind kind = pc::SnapshotKind::Tap;
     std::uint32_t hits    = 0;
+    bool branch_point     = false;
+    bool periodic         = false;
     std::uint32_t slabs   = 0;
     // First slab of this snapshot, counted from the start of the slab bytes.
     std::uint64_t first_slab = 0;
@@ -212,6 +214,9 @@ HybridPersistResult HybridPrefixCache::save(const std::filesystem::path& path,
             writer.bytes(view.tail.data(), view.tail.size_bytes());
             writer.value(static_cast<std::uint8_t>(view.kind));
             writer.value(view.hits);
+            // Flags: bit 0 branch point, bit 1 periodic (§9.3).
+            writer.value(static_cast<std::uint8_t>((view.branch_point ? 1U : 0U) |
+                                                   (view.periodic ? 2U : 0U)));
         }
         for (const pc::NodeRef node : nodes) {
             check_abandoned();
@@ -329,10 +334,14 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
             if (kind_byte > static_cast<std::uint8_t>(pc::SnapshotKind::Boundary)) {
                 throw std::runtime_error("prefix cache file snapshot kind is damaged");
             }
-            snapshot.kind       = static_cast<pc::SnapshotKind>(kind_byte);
-            snapshot.hits       = reader.value<std::uint32_t>();
-            snapshot.slabs      = host_layout_.image_slabs + (snapshot.tail_len != 0 ? 1U : 0U);
-            snapshot.first_slab = slabs;
+            snapshot.kind     = static_cast<pc::SnapshotKind>(kind_byte);
+            snapshot.hits     = reader.value<std::uint32_t>();
+            const auto flags = reader.value<std::uint8_t>();
+            if (flags > 3U) { throw std::runtime_error("prefix cache file snapshot is damaged"); }
+            snapshot.branch_point = (flags & 1U) != 0U;
+            snapshot.periodic     = (flags & 2U) != 0U;
+            snapshot.slabs        = host_layout_.image_slabs + (snapshot.tail_len != 0 ? 1U : 0U);
+            snapshot.first_slab   = slabs;
             slabs += snapshot.slabs;
             shapes[index] = pc::SavedSnapshotShape{.anchor   = snapshot.anchor,
                                                    .frontier = snapshot.frontier,
@@ -389,7 +398,8 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
             const std::optional<pc::SnapshotRef> snapshot = index_->restore_host_snapshot(
                 anchor, saved_snapshot.frontier,
                 std::span<const TokenId>(saved_snapshot.tail.data(), saved_snapshot.tail_len),
-                saved_snapshot.kind, saved_snapshot.hits);
+                saved_snapshot.kind, saved_snapshot.hits, saved_snapshot.branch_point,
+                saved_snapshot.periodic);
             if (!snapshot) { continue; }
             reader.seek(payload + saved_snapshot.first_slab * slab_bytes);
             for (const std::uint32_t slab_id : index_->snapshot(*snapshot).host_slabs) {

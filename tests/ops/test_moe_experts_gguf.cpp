@@ -3,15 +3,18 @@
 // distinct banks cover all 512 experts while the routing still groups by expert id. The products
 // quantize their activations to q8_1 as llama.cpp does, so they are held to that arithmetic's
 // error; on a Tesla V100 the matrix kernel's FP16 route (FP16 activations and weights) stays well
-// within it. Up to eight tokens take the vector kernel; wider calls over device-resident banks (each
-// matrix followed by 256 zero bytes, which the matrix kernel's last K step of a 640-value down row
-// reads) take the matrix kernel wherever the block type has one (IQ1_M and MXFP4 stay on the
-// vector kernel), with one or several column tiles per expert, and the same calls over banks that
-// are not declared device resident take the vector kernel. Where the CPU has the bank's block
-// types, the decode form's second stage also comes from CPU products (gguf_expert_cpu, its
-// automatically selected backend), as a miss service with a CPU share supplies it, and the sum must
-// equal the GPU's bit for bit. Expert-parallel parts over tables that hold only their own experts
-// (the others null) combine to the whole call's y bit for bit.
+// within it. Up to eight tokens take the vector kernel; wider calls over device-resident banks
+// (each matrix followed by 256 zero bytes, which the matrix kernel's last K step of a 640-value
+// down row reads) take the matrix kernel wherever the block type has one (MXFP4 stays on the
+// vector kernel, and IQ1_M gate and up products until a call routes more than 16 rows to each
+// expert: 260 tokens stay on the vector kernel, 820 take the matrix kernel's 32-wide column tiles),
+// with one or several column tiles per expert, and the same calls over banks that are not declared
+// device resident take the vector kernel. Where the CPU has the bank's block types, the decode
+// form's second stage also comes from CPU products (gguf_expert_cpu, its automatically selected
+// backend), as a miss service with a CPU share supplies it, and the sum must equal the GPU's bit
+// for bit. Expert-parallel parts over tables that hold only their own experts
+// (the others null) combine to the whole call's y bit for bit; parts that also hold a run of the
+// shared expert's width each combine close to it and within the oracle's bounds.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -291,6 +294,45 @@ int run_case(const Case& c, std::uint32_t seed) {
                       << (device_resident ? " matrix" : " vector") << ": a repeat differs\n";
             ++failures;
         }
+        // The FP64 oracle of every output, and a y's relative L2 and gross error against it.
+        std::vector<double> oracle(std::size_t(kHidden) * tokens, 0.0);
+        for (int t = 0; t < tokens; ++t) {
+            std::vector<float> x(kHidden);
+            for (int i = 0; i < kHidden; ++i) {
+                x[i] = __bfloat162float(m[std::size_t(t) * kHidden + i]);
+            }
+            double* want = oracle.data() + std::size_t(t) * kHidden;
+            // Experts sharing a matrix share its output for this token.
+            std::vector<std::vector<double>> outputs(c.distinct);
+            for (int j = 0; j < kTopK; ++j) {
+                const int e = ids[t * kTopK + j];
+                auto& o     = outputs[e % c.distinct];
+                if (o.empty()) {
+                    o = expert_output(gate.rows_of(e), up.rows_of(e), down.rows_of(e), x);
+                }
+                for (int r = 0; r < kHidden; ++r) { want[r] += weights[t * kTopK + j] * o[r]; }
+            }
+            const auto s = expert_output(sgate.rows_of(0), sup.rows_of(0), sdown.rows_of(0), x);
+            for (int r = 0; r < kHidden; ++r) { want[r] += shared[t] * s[r]; }
+        }
+        const auto against_oracle = [&](const std::vector<float>& y, const std::string& what) {
+            double num = 0, den = 0, worst = 0, scale = 0;
+            for (std::size_t i = 0; i < oracle.size(); ++i) {
+                const double d = double(y[i]) - oracle[i];
+                num += d * d;
+                den += oracle[i] * oracle[i];
+                worst = std::max(worst, std::abs(d));
+                scale = std::max(scale, std::abs(oracle[i]));
+            }
+            const double rms = std::sqrt(num / std::max(den, 1e-30)),
+                         max = worst / std::max(scale, 1e-30);
+            // Two q8_1 activations (the token and the middle) per product chain.
+            const bool ok = std::isfinite(rms) && rms < 4e-2 && max < 1.6e-1;
+            std::cout << (ok ? "OK   " : "FAIL ") << c.name << " T=" << tokens
+                      << (tokens > 8 ? (device_resident ? " matrix" : " vector") : "") << what
+                      << " rms=" << rms << " max=" << max << '\n';
+            return ok ? 0 : 1;
+        };
         {
             // Expert parallelism: parts over range tables, the shared expert in the first, or in
             // a later one, combine to the whole call's y bit for bit.
@@ -338,6 +380,114 @@ int run_case(const Case& c, std::uint32_t seed) {
                           << n << " expert-parallel parts " << (same ? "equal" : "differ from")
                           << " the whole call\n";
                 failures += same ? 0 : 1;
+            }
+        }
+        {
+            // Tensor parallelism: parts that each hold a run of the shared expert's width as banks
+            // of their own (those gate and up rows, those values of every down row, zeros after
+            // the down piece) combine close to the whole call, each part rounding its run's down
+            // dot on its own, and within the oracle's bounds.
+            struct Layout {
+                std::vector<int> experts, shared;
+            };
+
+            const std::vector<Layout> layouts = {{{0, 200, 512}, {0, 256, 640}},
+                                                 {{0, 1, 300, 511, 512}, {0, 128, 256, 384, 640}}};
+            const auto block                  = gguf_block_shape(sdown.format);
+            for (const Layout& layout : layouts) {
+                const std::size_t n = layout.experts.size() - 1;
+                std::vector<DeviceBuffer> buffers, fixed;
+                std::vector<Tensor> parts;
+                WorkspaceArena part_workspace(ops::moe_experts_gguf_part_workspace_bytes(tokens));
+                const auto table_of = [&](const DeviceBuffer& run) {
+                    DeviceBuffer table(sizeof(void*));
+                    table.copy_from_host(&run.p, sizeof(void*));
+                    return table;
+                };
+                const auto view = [](QType format, const DeviceBuffer& table,
+                                     std::int64_t row_bytes) {
+                    return ops::GgufExpertTable{format, static_cast<const void* const*>(table.p),
+                                                row_bytes};
+                };
+                for (std::size_t p = 0; p < n; ++p) {
+                    const int begin = layout.experts[p], end = layout.experts[p + 1];
+                    const int first = layout.shared[p], width = layout.shared[p + 1] - first;
+                    const std::int64_t down_bytes =
+                        std::int64_t(width / block.elements) * block.bytes;
+                    DeviceBuffer gate_run(std::size_t(width) * sgate.row_bytes + kTail),
+                        up_run(std::size_t(width) * sup.row_bytes + kTail),
+                        down_run(std::size_t(kHidden) * down_bytes + kTail);
+                    check(cudaMemset(gate_run.p, 0, std::size_t(width) * sgate.row_bytes + kTail),
+                          "zero a gate run");
+                    check(cudaMemset(up_run.p, 0, std::size_t(width) * sup.row_bytes + kTail),
+                          "zero an up run");
+                    check(cudaMemset(down_run.p, 0, std::size_t(kHidden) * down_bytes + kTail),
+                          "zero a down run");
+                    check(cudaMemcpy(gate_run.p,
+                                     static_cast<const std::uint8_t*>(sgate.matrices[0].p) +
+                                         std::size_t(first) * sgate.row_bytes,
+                                     std::size_t(width) * sgate.row_bytes,
+                                     cudaMemcpyDeviceToDevice),
+                          "copy a gate run");
+                    check(cudaMemcpy(up_run.p,
+                                     static_cast<const std::uint8_t*>(sup.matrices[0].p) +
+                                         std::size_t(first) * sup.row_bytes,
+                                     std::size_t(width) * sup.row_bytes, cudaMemcpyDeviceToDevice),
+                          "copy an up run");
+                    check(cudaMemcpy2D(down_run.p, std::size_t(down_bytes),
+                                       static_cast<const std::uint8_t*>(sdown.matrices[0].p) +
+                                           std::size_t(first / block.elements) * block.bytes,
+                                       std::size_t(sdown.row_bytes), std::size_t(down_bytes),
+                                       kHidden, cudaMemcpyDeviceToDevice),
+                          "copy a down run");
+                    buffers.push_back(gate.range_table(begin, end));
+                    buffers.push_back(up.range_table(begin, end));
+                    buffers.push_back(down.range_table(begin, end));
+                    buffers.push_back(table_of(gate_run));
+                    buffers.push_back(table_of(up_run));
+                    buffers.push_back(table_of(down_run));
+                    const std::size_t base = buffers.size() - 6;
+                    const ops::GgufMoeWeights part_banks{
+                        view(gate.format, buffers[base], gate.row_bytes),
+                        view(up.format, buffers[base + 1], up.row_bytes),
+                        view(down.format, buffers[base + 2], down.row_bytes),
+                        view(sgate.format, buffers[base + 3], sgate.row_bytes),
+                        view(sup.format, buffers[base + 4], sup.row_bytes),
+                        view(sdown.format, buffers[base + 5], down_bytes),
+                        kExperts,
+                        device_resident,
+                        width};
+                    buffers.push_back(std::move(gate_run));
+                    buffers.push_back(std::move(up_run));
+                    buffers.push_back(std::move(down_run));
+                    fixed.emplace_back(std::size_t(kHidden) * tokens * 8);
+                    parts.push_back(Tensor(fixed.back().p, DType::I64, {kHidden, tokens}));
+                    ops::moe_experts_gguf_part(t_m, t_ids, t_w, &t_s, part_banks, begin, end,
+                                               part_workspace, parts.back(), nullptr);
+                    check(cudaDeviceSynchronize(), "a part with a shared run");
+                    if (part_workspace.used() != 0) {
+                        std::cerr << "FAIL " << c.name << " T=" << tokens
+                                  << ": a part's workspace scope leaked\n";
+                        ++failures;
+                    }
+                }
+                ops::moe_experts_gguf_combine(parts, t_y, nullptr);
+                check(cudaDeviceSynchronize(), "parts with shared runs");
+                std::vector<float> combined(got.size());
+                d_y.copy_to_host(combined.data(), combined.size() * 4);
+                double worst = 0, scale = 0;
+                for (std::size_t i = 0; i < got.size(); ++i) {
+                    worst = std::max(worst, std::abs(double(combined[i]) - double(got[i])));
+                    scale = std::max(scale, std::abs(double(got[i])));
+                }
+                const bool close = std::isfinite(worst) && worst <= 1e-4 * scale;
+                std::cout << (close ? "OK   " : "FAIL ") << c.name << " T=" << tokens
+                          << (tokens > 8 ? (device_resident ? " matrix" : " vector") : "") << ": "
+                          << n << " parts with shared runs differ from the whole call by "
+                          << worst / std::max(scale, 1e-30) << " of its largest output\n";
+                failures += close ? 0 : 1;
+                failures +=
+                    against_oracle(combined, ", " + std::to_string(n) + " parts with shared runs,");
             }
         }
         if (ops::moe_experts_gguf_decode_supported(banks, tokens)) {
@@ -511,41 +661,7 @@ int run_case(const Case& c, std::uint32_t seed) {
                       << got.size() << " outputs differ from the GPU's\n";
             failures += differ == 0 ? 0 : 1;
         }
-        double num = 0, den = 0, worst = 0, scale = 0;
-        for (int t = 0; t < tokens; ++t) {
-            std::vector<float> x(kHidden);
-            for (int i = 0; i < kHidden; ++i) {
-                x[i] = __bfloat162float(m[std::size_t(t) * kHidden + i]);
-            }
-            std::vector<double> want(kHidden, 0.0);
-            // Experts sharing a matrix share its output for this token.
-            std::vector<std::vector<double>> outputs(c.distinct);
-            for (int j = 0; j < kTopK; ++j) {
-                const int e = ids[t * kTopK + j];
-                auto& o     = outputs[e % c.distinct];
-                if (o.empty()) {
-                    o = expert_output(gate.rows_of(e), up.rows_of(e), down.rows_of(e), x);
-                }
-                for (int r = 0; r < kHidden; ++r) { want[r] += weights[t * kTopK + j] * o[r]; }
-            }
-            const auto s = expert_output(sgate.rows_of(0), sup.rows_of(0), sdown.rows_of(0), x);
-            for (int r = 0; r < kHidden; ++r) { want[r] += shared[t] * s[r]; }
-            for (int r = 0; r < kHidden; ++r) {
-                const double d = double(got[std::size_t(t) * kHidden + r]) - want[r];
-                num += d * d;
-                den += want[r] * want[r];
-                worst = std::max(worst, std::abs(d));
-                scale = std::max(scale, std::abs(want[r]));
-            }
-        }
-        const double rms = std::sqrt(num / std::max(den, 1e-30)),
-                     max = worst / std::max(scale, 1e-30);
-        // Two q8_1 activations (the token and the middle) per product chain.
-        const bool ok = std::isfinite(rms) && rms < 4e-2 && max < 1.6e-1;
-        std::cout << (ok ? "OK   " : "FAIL ") << c.name << " T=" << tokens
-                  << (tokens > 8 ? (device_resident ? " matrix" : " vector") : "") << " rms=" << rms
-                  << " max=" << max << '\n';
-        failures += ok ? 0 : 1;
+        failures += against_oracle(got, "");
     }
     return failures;
 }
@@ -613,7 +729,7 @@ int main() {
              Q::GGUF_IQ3_XXS,
              Q::GGUF_IQ4_NL,
              4,
-             {1, 4, 16},
+             {1, 4, 16, 260, 820},
              kExperts},
             // The GSQ-RCO IQ3_S release's routed types on the matrix path: its IQ3_S layers, and
             // routes concentrated on a few experts (several columns per expert) in the IQ3_XXS

@@ -41,11 +41,13 @@ int main() {
                               automatic.speculative.draft_min_p == std::stof(floor),
                           "server did not keep draft confidence for automatic speculation");
     }
-    for (const auto* floor : {"0", "0.3", "1"}) {
-        failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
-                                "--draft-tokens", "4", "--draft-min-p", floor})
-                              .speculative.draft_min_p == std::stof(floor),
-                          "server did not preserve draft confidence");
+    for (const auto* backend : {"mtp", "dflash2"}) {
+        for (const auto* floor : {"0", "0.3", "1"}) {
+            failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", backend,
+                                    "--draft-tokens", "4", "--draft-min-p", floor})
+                                  .speculative.draft_min_p == std::stof(floor),
+                              "server did not preserve draft confidence");
+        }
     }
     for (const auto& args : std::vector<std::vector<std::string>>{
              {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "-0.1"},
@@ -54,7 +56,6 @@ int main() {
              {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "inf"},
              {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "0.3x"},
              {"--spec", "dflash", "--draft-tokens", "4", "--draft-min-p", "0.3"},
-             {"--spec", "dflash2", "--draft-tokens", "4", "--draft-min-p", "0.3"},
              {"--spec", "none", "--draft-min-p", "0.3"}}) {
         std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
         full.insert(full.end(), args.begin(), args.end());
@@ -367,6 +368,27 @@ int main() {
     for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
         failures += check(kv_help.find(flag) != std::string::npos,
                           "serve help omits an accepted prefill or drafting control");
+    }
+    // The prompt routes and the n-gram reads: lossless ones on by default, each reaching the Engine.
+    failures += check(default_engine.prefill_tail == ninfer::PrefillTail::Exact &&
+                          default_engine.prefill_tail_rows == 0 &&
+                          default_engine.iq1m_expert_matrix && default_engine.ngram_table.dedupe &&
+                          default_engine.ngram_table.read_ahead,
+                      "the exact prefill tail, IQ1_M matrix route or n-gram read savings are off "
+                      "by default in serving");
+    const ninfer::EngineOptions plain = make_engine_options(
+        parse({"ninfer-serve", "model.ninfer", "--prefill-tail", "full", "--iq1m-experts", "vector",
+               "--ngram-dedupe", "off", "--ngram-read-ahead", "off"}));
+    failures += check(plain.prefill_tail == ninfer::PrefillTail::Full && !plain.iq1m_expert_matrix &&
+                          !plain.ngram_table.dedupe && !plain.ngram_table.read_ahead,
+                      "the prompt-route or n-gram read flags did not reach the Engine options");
+    const ninfer::EngineOptions rows =
+        make_engine_options(parse({"ninfer-serve", "model.ninfer", "--prefill-tail", "512"}));
+    failures += check(rows.prefill_tail == ninfer::PrefillTail::Rows && rows.prefill_tail_rows == 512,
+                      "--prefill-tail N did not reach the Engine options");
+    for (const char* flag : {"--prefill-tail", "--iq1m-experts", "--ngram-dedupe", "--ngram-read-ahead"}) {
+        failures += check(kv_help.find(flag) != std::string::npos,
+                          "serve help omits a prompt-route or n-gram read flag");
     }
 
     // rk8v4 still parses to its storage value; the engine rejects it in
@@ -1209,6 +1231,11 @@ int main() {
                               .tensor_parallel_prompt_partials ==
                           ninfer::TensorParallelPartials::Bf16,
                       "--tensor-parallel-prompt-partials did not reach serving options");
+    failures +=
+        check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1", "--tensor-parallel",
+                     "--tensor-parallel-prompt-partials", "int8"})
+                      .tensor_parallel_prompt_partials == ninfer::TensorParallelPartials::Int8,
+              "--tensor-parallel-prompt-partials int8 did not reach serving options");
     {
         bool rejected = false;
         try {

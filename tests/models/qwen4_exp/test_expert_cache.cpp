@@ -10,7 +10,9 @@
 // are free slots until a wide pass reclaims them: their most routed experts move into colder slots
 // of the cache's own, no entry points inside them while the pass writes them, and they come back
 // zeroed, refilled with the most routed experts outside the cache and free for admissions past
-// those. A round's swaps start over the passes until the next round, a share of them a pass.
+// those. A round's swaps start over the passes until the next round, a share of them a pass. With
+// two devices, rounds that copy into one rank's slots, then the other's, then both, reuse each
+// copy's event on the device it was made on.
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/qwen4_exp/expert_cache.h"
@@ -18,8 +20,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -402,6 +406,86 @@ void profile(DeviceContext& device) {
             "growth continues a profile's ranking: " + std::to_string(halves.stats().slots));
 }
 
+// A layer on each of two devices: a round copies only into the second rank's slots, the next only
+// into the first's (with the second rank's landed event spare), the third into both.
+void two_ranks(int devices) {
+    if (devices < 2) {
+        std::cout << "two ranks skipped: one CUDA device\n";
+        return;
+    }
+    const std::array<int, 2> ids{0, 1};
+    DeviceContext pair(ids);
+    std::mt19937 random{9200u};
+    const std::int64_t sizes[6] = {4096, 4096, 2048, 1536, 3072, 1024};
+    std::vector<std::unique_ptr<Bank>> banks;
+    for (int i = 0; i < 6; ++i) {
+        RankBinding bind(pair, i < 3 ? 0 : 1);
+        banks.push_back(std::make_unique<Bank>(sizes[i], random));
+    }
+    {
+        std::vector<ExpertCacheLayer> layers;
+        for (std::size_t l = 0; l < 2; ++l) {
+            layers.push_back({.rank   = l,
+                              .stream = pair.rank(l).stream,
+                              .gate   = banks[3 * l]->view(),
+                              .up     = banks[3 * l + 1]->view(),
+                              .down   = banks[3 * l + 2]->view()});
+        }
+        // Twelve slots a layer (10,496 and 5,888 bytes a slot).
+        ExpertCache cache(pair, std::move(layers), std::vector<std::uint64_t>{12 * 10496, 12 * 5888});
+        require(cache.stats().slots == 24, "each rank's layer takes its own budget");
+        const auto cached = [&](std::size_t l, const std::string& label) {
+            RankBinding bind(pair, l);
+            const auto gate = banks[3 * l]->verify(label + " gate");
+            require(banks[3 * l + 1]->verify(label + " up") == gate &&
+                        banks[3 * l + 2]->verify(label + " down", 256) == gate,
+                    label + ": a layer's three banks cache the same experts");
+            return gate;
+        };
+        const auto hot = [](std::int32_t a, std::int32_t b) {
+            std::vector<std::int32_t> out;
+            for (std::int32_t t = 0; t < 40; ++t) {
+                out.push_back(a);
+                out.push_back(b);
+                out.push_back(t);
+            }
+            return out;
+        };
+        // Four passes end in a round; its copies land at the pass after them.
+        const auto round = [&](const std::vector<std::int32_t>& first,
+                               const std::vector<std::int32_t>& second) {
+            for (int p = 0; p < 4; ++p) {
+                cache.observe(0, first, true);
+                cache.observe(1, second, true);
+                cache.adapt();
+            }
+            for (std::size_t r = 0; r < 2; ++r) {
+                RankBinding bind(pair, r);
+                require(cudaDeviceSynchronize() == cudaSuccess, "a round's copies");
+            }
+            cache.adapt();
+        };
+        round({}, hot(9, 11));
+        const auto second = cached(1, "the second rank's round");
+        require(cached(0, "an idle first rank").empty() && holds(second, 9) && holds(second, 11),
+                "the second rank's round fills its slots");
+        round(hot(5, 7), {});
+        const auto first = cached(0, "the first rank's round");
+        require(holds(first, 5) && holds(first, 7) && cached(1, "an idle second rank") == second,
+                "the first rank's round fills its slots and leaves the second's");
+        round(hot(50, 51), hot(60, 61));
+        require(holds(cached(0, "both ranks, first"), 50) && holds(cached(1, "both ranks, second"), 60),
+                "a round over both ranks fills both");
+    }
+    for (std::size_t r = 0; r < 2; ++r) {
+        RankBinding bind(pair, r);
+        banks[3 * r].reset();
+        banks[3 * r + 1].reset();
+        banks[3 * r + 2].reset();
+    }
+    std::cout << "two ranks checked\n";
+}
+
 } // namespace
 
 int main() {
@@ -417,6 +501,7 @@ int main() {
         admissions(device);
         profile(device);
         loans(device);
+        two_ranks(devices);
         std::cout << "PASS qwen4_exp expert cache\n";
         return 0;
     } catch (const std::exception& error) {

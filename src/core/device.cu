@@ -1,6 +1,9 @@
 #include "core/device.h"
 
+#include "core/device_wait.h"
 #include "core/peer_preflight.h"
+
+#include <cuda.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -108,7 +111,7 @@ struct ProbeWords {
         int previous = 0;
         if (cudaGetDevice(&previous) != cudaSuccess) { return; }
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));
-        log_cuda_error("cudaFree", cudaFree(words));
+        log_cuda_error("cudaFree", ninfer::free_device_memory(words));
         log_cuda_error("cudaSetDevice", cudaSetDevice(previous));
     }
     ProbeWords(const ProbeWords&)            = delete;
@@ -127,28 +130,32 @@ std::string probe_peer(int source, int destination) {
     {
         DeviceBinding bind(destination);
         const unsigned long long initial[3] = {0, kResident, 0};
-        check_probe(cudaMemcpy(remote.words, initial, sizeof initial, cudaMemcpyHostToDevice),
-                    "peer probe upload");
+        check_probe(
+            ninfer::copy_and_wait(remote.words, initial, sizeof initial, cudaMemcpyHostToDevice),
+            "peer probe upload");
     }
     unsigned long long loaded = 0;
     {
         DeviceBinding bind(source);
         const unsigned long long initial[2] = {0, kCopied};
-        check_probe(cudaMemcpy(local.words, initial, sizeof initial, cudaMemcpyHostToDevice),
-                    "peer probe upload");
+        check_probe(
+            ninfer::copy_and_wait(local.words, initial, sizeof initial, cudaMemcpyHostToDevice),
+            "peer probe upload");
         peer_canary_kernel<<<1, 1>>>(remote.words, remote.words + 1, kStored, local.words);
         check_probe(cudaGetLastError(), "peer probe launch");
-        check_probe(cudaDeviceSynchronize(), "peer probe kernel");
-        check_probe(cudaMemcpyPeer(remote.words + 2, destination, local.words + 1, source,
-                                   sizeof(unsigned long long)),
+        check_probe(ninfer::wait_for_device(), "peer probe kernel");
+        check_probe(ninfer::copy_between_devices_and_wait(remote.words + 2, destination,
+                                                          local.words + 1, source,
+                                                          sizeof(unsigned long long)),
                     "peer probe copy");
-        check_probe(cudaMemcpy(&loaded, local.words, sizeof loaded, cudaMemcpyDeviceToHost),
-                    "peer probe readback");
+        check_probe(
+            ninfer::copy_and_wait(&loaded, local.words, sizeof loaded, cudaMemcpyDeviceToHost),
+            "peer probe readback");
     }
     unsigned long long seen[3] = {};
     {
         DeviceBinding bind(destination);
-        check_probe(cudaMemcpy(seen, remote.words, sizeof seen, cudaMemcpyDeviceToHost),
+        check_probe(ninfer::copy_and_wait(seen, remote.words, sizeof seen, cudaMemcpyDeviceToHost),
                     "peer probe readback");
     }
     if (seen[0] != kStored) { return "a kernel's store into the peer's memory did not arrive"; }
@@ -176,15 +183,20 @@ DeviceBinding::DeviceBinding(int device) {
         throw std::runtime_error(cuda_error_message("cudaGetDevice failed", get));
     }
     if (previous_ == device) { return; }
+    // A thread with no current context, such as a new service thread, reads device 0 without
+    // having used it. Returning there would create device 0's primary context: a few hundred MiB
+    // on a card the process was not given, and cudaErrorMemoryAllocation when that card is full,
+    // which the destructor can only log and which the next cudaGetLastError() then reports (#279).
+    CUcontext current = nullptr;
+    restore_          = cuCtxGetCurrent(&current) == CUDA_SUCCESS && current != nullptr;
     const cudaError_t set = cudaSetDevice(device);
     if (set != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaSetDevice failed", set));
     }
-    changed_ = true;
 }
 
 DeviceBinding::~DeviceBinding() noexcept {
-    if (changed_) { log_cuda_error("cudaSetDevice", cudaSetDevice(previous_)); }
+    if (restore_) { log_cuda_error("cudaSetDevice", cudaSetDevice(previous_)); }
 }
 
 DeviceContext::DeviceContext(int device_id)
@@ -280,6 +292,12 @@ DeviceContext::DeviceContext(std::span<const int> device_ids) {
             }
         }
 
+        // A device that stops finishing work ends the process while any context holds it. Each
+        // rank holds under its stream, which is its own and moves with it.
+        for (const RankContext& endpoint : endpoints_) {
+            hold_device_probe(endpoint.device, endpoint.stream);
+        }
+
         // peer_matrix_[from][to]: can `from` DMA into `to`. Ranks on one card need no peer setup:
         // copies between them are ordinary device-to-device, and enabling peer access to self is an
         // error, so they are recorded as reachable.
@@ -328,6 +346,7 @@ DeviceContext::~DeviceContext() { release(); }
 
 void DeviceContext::release() noexcept {
     for (RankContext& endpoint : endpoints_) {
+        release_device_probe(endpoint.stream);
         if (endpoint.stream != nullptr || endpoint.transfer_stream != nullptr ||
             endpoint.vision_stream != nullptr || endpoint.fence != nullptr) {
             log_cuda_error("cudaSetDevice", cudaSetDevice(endpoint.device));
@@ -531,14 +550,14 @@ void DeviceContext::activate_rank(std::size_t rank) {
 void DeviceContext::synchronize_rank(std::size_t rank) const {
     if (rank >= endpoints_.size()) { throw std::out_of_range("CUDA device rank is out of range"); }
     CUDA_CHECK(cudaSetDevice(endpoints_[rank].device));
-    CUDA_CHECK(cudaStreamSynchronize(endpoints_[rank].stream));
+    CUDA_CHECK(ninfer::wait_for_stream(endpoints_[rank].stream));
     CUDA_CHECK(cudaSetDevice(endpoints_[active_rank_].device));
 }
 
 void DeviceContext::synchronize() const {
     for (const RankContext& endpoint : endpoints_) {
         CUDA_CHECK(cudaSetDevice(endpoint.device));
-        CUDA_CHECK(cudaStreamSynchronize(endpoint.stream));
+        CUDA_CHECK(ninfer::wait_for_stream(endpoint.stream));
     }
     CUDA_CHECK(cudaSetDevice(endpoints_[active_rank_].device));
 }
@@ -632,7 +651,7 @@ float CudaEventTimer::elapsed_ms() const {
 
 float CudaEventTimer::stop_ms() {
     record_stop();
-    CUDA_CHECK(cudaEventSynchronize(stop_));
+    CUDA_CHECK(ninfer::wait_for_event(stop_));
     return elapsed_ms();
 }
 
@@ -686,7 +705,7 @@ bool CudaCompletionEvent::ready() const {
 
 void CudaCompletionEvent::synchronize() const {
     if (event_ == nullptr) { throw std::logic_error("CUDA completion event is empty"); }
-    CUDA_CHECK(cudaEventSynchronize(event_));
+    CUDA_CHECK(ninfer::wait_for_event(event_));
 }
 
 RankFenceSet::RankFenceSet(const DeviceContext& context) {

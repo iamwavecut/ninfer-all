@@ -796,3 +796,219 @@ def test_fetch_tensors_reads_only_the_matching_tensors(tmp_path):
             assert np.array_equal(source.read_flat(name).numpy(), expected[name])
     with pytest.raises(ValueError, match="matches"):
         fetch_tensors.fetch(read, {"weight_map": weight_map}, ["nothing.*"])
+
+
+# The earlier layout's metadata that llama.cpp's layout replaces (ISTA-DASLab's
+# convert_ds41_upstream.py, OLD_KEYS).
+EARLIER_KEYS = ("attention.candidate_block_size", "attention.candidate_topk_blocks",
+                "attention.candidate_source_layer_id", "kv_source_layer_ids",
+                "index_source_layer_ids", "expert_scoring_func", "engram.layer_ids",
+                "engram.num_embeddings", "engram_head_dim", "engram_n_heads",
+                "engram_max_ngram_size", "engram_pad_token_id")
+HASH_TENSORS = ("engram_token_map.weight", "engram_primes.weight", "engram_offsets.weight",
+                "engram_multipliers.weight")
+
+
+def _upstream(tmp_path, first, table, bias, keep=None, link=False, **kv_overrides):
+    """_release's GGUFs in llama.cpp's layout, rewritten as ISTA-DASLab's convert_ds41_upstream.py
+    does: llama.cpp's metadata names and the Engram hash in metadata (offsets into the whole
+    table), `engram_kv`, the gate as the F32 product of its BF16 factors, the image routing bias
+    `exp_probs_b_vl`, a metadata-only first shard, every tensor in the second and the Engram GGUF
+    as the third (linked under the shard's name with `link`). `keep` prunes the routed experts."""
+
+    f = "deepseek41."
+    with deepseek_v41.GGUFShards(first) as old, GGUFFile(table) as engram:
+        tensors = {name: (info, file.tensor_bytes(name).tobytes())
+                   for file in old.files for name, info in file.tensors.items()}
+        integers = {name: np.frombuffer(tensors[name][1],
+                                        dtype="<i4" if name == HASH_TENSORS[0] else "<i8")
+                    for name in HASH_TENSORS}
+        primes = integers["engram_primes.weight"].tolist()
+        kv = {key: value for key, value in old.kv.items()
+              if not key.startswith("split.") and key.removeprefix(f) not in EARLIER_KEYS}
+        kv.update({
+            f + "attention.kv_source_layers": old.kv[f + "kv_source_layer_ids"],
+            f + "attention.indexer.source_layers": old.kv[f + "index_source_layer_ids"],
+            f + "attention.indexer.candidate_source_layer":
+                old.kv[f + "attention.candidate_source_layer_id"],
+            f + "attention.indexer.candidate_top_k_blocks":
+                old.kv[f + "attention.candidate_topk_blocks"],
+            f + "attention.indexer.candidate_block_size":
+                old.kv[f + "attention.candidate_block_size"],
+            f + "ple.layers": old.kv[f + "engram.layer_ids"],
+            f + "ple.ngram_size": old.kv[f + "engram_max_ngram_size"],
+            f + "ple.heads_per_ngram": old.kv[f + "engram_n_heads"],
+            f + "embedding_length_per_layer_input": old.kv[f + "engram_head_dim"],
+            f + "ple.layer_multipliers": integers["engram_multipliers.weight"].tolist(),
+            f + "ple.head_offsets": [sum(primes[:i]) for i in range(len(primes))],
+            f + "ple.head_vocab_sizes": primes,
+            f + "engram.pad_token_id": old.kv[f + "engram_pad_token_id"],
+            f + "engram.token_map": integers["engram_token_map.weight"].tolist(),
+            "split.count": 3,
+        })
+        experts = list(range(EXPERTS)) if keep is None else list(keep)
+        kv[f + "expert_count"] = len(experts)
+        kv.update(kv_overrides)
+        written = []
+        for name, (info, raw) in tensors.items():
+            shape = info.shape
+            if name in HASH_TENSORS or name.endswith((".engram_q.weight", ".engram_k.weight")):
+                continue
+            if name.endswith(("_exps.weight", ".ffn_gate_inp.weight", ".exp_probs_b.bias")):
+                rows = np.frombuffer(raw, dtype=np.uint8).reshape(shape[0], -1)[experts]
+                shape, raw = (len(experts), *shape[1:]), rows.tobytes()
+            written.append((name.replace(".engram_wkv.", ".engram_kv."), shape, info.type_id,
+                            raw))
+        for layer in ENGRAM_LAYERS:
+            g = f"blk.{layer}."
+            words = [np.frombuffer(tensors[g + f"engram_{w}.weight"][1], dtype="<u2")
+                     for w in "qk"]
+            q, k = ((w.astype(np.uint32) << 16).view(np.float32).astype(np.float64)
+                    for w in words)
+            written.append((g + "engram_gate.weight", (HC, HIDDEN), TYPE_F32,
+                            (q * k).astype("<f4").tobytes()))
+        for layer in range(3):
+            row = bias[f"layers.{layer}.ffn.gate.bias_vl"][experts]
+            written.append((f"blk.{layer}.exp_probs_b_vl.bias", (len(experts),), TYPE_F32,
+                            row.astype("<f4").tobytes()))
+        info = engram.info("blk.0.engram_embd.weight")
+        table_rows = engram.tensor_bytes(info.name).tobytes()
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    shard = upstream / "ds-00001-of-00003.gguf"
+    write_gguf(shard, kv, [])
+    write_gguf(upstream / "ds-00002-of-00003.gguf", {"split.no": 1, "split.count": 3}, written)
+    engram_file = upstream / "engram.gguf"
+    write_gguf(engram_file, {"deepseek41.engram.source": "release", "split.no": 2,
+                             "split.count": 3},
+               [("per_layer_token_embd.weight", info.shape, TYPE_IQ4_NL, table_rows)])
+    if link:
+        (upstream / "ds-00003-of-00003.gguf").symlink_to(engram_file.name)
+    return shard, engram_file
+
+
+def _artifact_content(path):
+    from tools.artifact.reader import Artifact
+
+    with Artifact(path) as artifact:
+        return (artifact.directory.to_json(),
+                {obj.id: artifact.read_object(obj.id) for obj in artifact.directory.objects})
+
+
+@pytest.mark.parametrize("link", [False, True])
+def test_both_gguf_layouts_convert_to_the_same_artifact(tmp_path, link):
+    hf, first, table, _ = _release(tmp_path)
+    mmproj, _ = _mmproj(tmp_path)
+    bias_path, bias = _bias_vl(tmp_path)
+    components = ("text", "engram", "vision")
+    earlier = _convert(tmp_path, hf, first, table, components, mmproj=mmproj, bias_vl=bias_path)
+    shard, engram = _upstream(tmp_path, first, table, bias, link=link)
+    with deepseek_v41.GGUFShards(shard) as gguf:
+        assert gguf.upstream and len(gguf.files) == (3 if link else 2)
+    upstream_mmproj, _ = _mmproj(tmp_path / "upstream", projector="deepseek41v")
+    later = _convert(tmp_path / "upstream", hf, shard, engram, components, mmproj=upstream_mmproj)
+    assert _artifact_content(later) == _artifact_content(earlier)
+    # The table alone, from either Engram GGUF.
+    table_only = [_convert(tmp_path / name, hf, None, source, ("engram",))
+                  for name, source in (("upstream", engram), ("", table))]
+    assert _artifact_content(table_only[0]) == _artifact_content(table_only[1])
+
+
+def test_a_pruned_build_converts_with_its_own_expert_count(tmp_path):
+    from tools.artifact.reader import Artifact
+
+    hf, first, table, stored = _release(tmp_path)
+    mmproj, _ = _mmproj(tmp_path)
+    _, bias = _bias_vl(tmp_path)
+    keep = [0, 3]
+    shard, engram = _upstream(tmp_path, first, table, bias, keep=keep)
+    upstream_mmproj, _ = _mmproj(tmp_path / "upstream", projector="deepseek41v")
+    output = _convert(tmp_path / "upstream", hf, shard, engram, ("text", "engram", "vision"),
+                      mmproj=upstream_mmproj)
+    with Artifact(output) as artifact:
+        directory = artifact.directory
+        assert directory.components["text"]["config"]["n_routed_experts"] == len(keep)
+        bindings = directory.bindings
+
+        def stored_bytes(name):
+            return artifact.read_object(bindings[name]["object"])
+
+        for layer in range(3):
+            g, p = f"blk.{layer}.", f"text/layers/{layer}/"
+            gate, up = stored[g + "ffn_gate_exps.weight"], stored[g + "ffn_up_exps.weight"]
+            expected = np.concatenate([np.concatenate([gate[e * WIDTH:(e + 1) * WIDTH],
+                                                       up[e * WIDTH:(e + 1) * WIDTH]])
+                                       for e in keep])
+            assert stored_bytes(p + "moe/gate_up") == expected.tobytes()
+            down = stored[g + "ffn_down_exps.weight"].reshape(EXPERTS, -1)[keep]
+            assert stored_bytes(p + "moe/down") == down.tobytes()
+            router = stored[g + "ffn_gate_inp.weight"].reshape(EXPERTS, -1)[keep]
+            assert np.array_equal(np.frombuffer(stored_bytes(p + "moe/router"), np.float32),
+                                  router.reshape(-1))
+        image_bias = np.frombuffer(stored_bytes("vision/image_router_bias"), np.float32)
+        assert np.array_equal(image_bias, np.concatenate(
+            [bias[f"layers.{i}.ffn.gate.bias_vl"][keep] for i in range(3)]))
+
+
+@pytest.mark.parametrize(("keep", "match"), [([1], "pruning"), ([0, 1, 2, 3, 0], "pruning")])
+def test_an_expert_count_outside_the_release_is_refused(tmp_path, keep, match):
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, first, table, _ = _release(tmp_path)
+    _, bias = _bias_vl(tmp_path)
+    shard, _ = _upstream(tmp_path, first, table, bias, keep=keep)
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(shard) as gguf:
+        with pytest.raises(ValueError, match=match):
+            deepseek_v41.build_model(base, gguf, components=("text",))
+
+
+@pytest.mark.parametrize("bad", [
+    {"deepseek41.ple.ngram_size": 4},
+    {"deepseek41.attention.indexer.candidate_source_layer": 1},
+    {"deepseek41.attention.kv_source_layers": [1]},
+    {"deepseek41.engram.pad_token_id": 3},
+    {"deepseek41.ple.head_vocab_sizes": [5, 7, 11, 14]},
+    {"deepseek41.ple.head_offsets": [0, 5, 12, 24]},
+    {"deepseek41.engram.token_map": [0] * (VOCAB - 1)},
+])
+def test_llama_cpp_metadata_must_match_the_config(tmp_path, bad):
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, first, table, _ = _release(tmp_path)
+    _, bias = _bias_vl(tmp_path)
+    shard, _ = _upstream(tmp_path, first, table, bias, **bad)
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(shard) as gguf:
+        with pytest.raises(ValueError):
+            deepseek_v41.build_model(base, gguf, components=("text",))
+
+
+def test_llama_cpp_engram_offsets_address_the_whole_table():
+    class Shards:
+        path, upstream = "upstream.gguf", True
+        kv = {"deepseek41.engram.token_map": [0, 1, 2, 3],
+              "deepseek41.ple.layer_multipliers": [1, 3, 5, 7, 9, 11],
+              "deepseek41.ple.head_vocab_sizes": [5, 7, 11, 13, 3, 5, 7, 11],
+              "deepseek41.ple.head_offsets": [0, 5, 12, 23, 36, 39, 44, 51]}
+
+    config = {"engram_layer_ids": [1, 14], "engram_max_ngram_size": 3, "engram_n_heads": 2,
+              "vocab_size": 4, "engram_compressed_vocab_size": 4, "engram_pad_token_id": 2,
+              "engram_num_embeddings": [36, 26]}
+    constants = deepseek_v41.engram_constants(Shards(), config)
+    assert constants["primes"] == [[5, 7, 11, 13], [3, 5, 7, 11]]
+    assert constants["offsets"] == [[0, 5, 12, 23], [0, 3, 8, 15]]
+    with pytest.raises(ValueError, match="bucket counts"):
+        deepseek_v41.engram_constants(Shards(), {**config, "engram_num_embeddings": [36, 27]})
+
+
+def test_the_image_routing_bias_source_follows_the_layout(tmp_path):
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, first, table, _ = _release(tmp_path)
+    mmproj, _ = _mmproj(tmp_path)
+    bias_path, bias = _bias_vl(tmp_path)
+    shard, _ = _upstream(tmp_path, first, table, bias)
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(shard) as gguf, \
+            GGUFFile(mmproj) as vision, SafetensorsSource(bias_path) as bias_vl:
+        with pytest.raises(ValueError, match="carries it"):
+            deepseek_v41.build_model(base, gguf, components=("text", "vision"), vision=vision,
+                                     bias_vl=bias_vl)

@@ -12,6 +12,14 @@ struct SelectorWorkspace {
     Tensor edges;
 };
 
+// The two codebooks' rows: BF16, or (q4) ggml Q4_0 rows of 256 values in 8 blocks of 18 bytes.
+struct SelectorCodebooks {
+    const void* predecessor = nullptr;
+    const void* successor   = nullptr;
+    std::size_t bytes       = 0; // each codebook's
+    bool q4                 = false;
+};
+
 SelectorRoute candidate_selector_path_route(int steps, int batch);
 const char* candidate_selector_path_route_name(int steps, int batch);
 const char* selector_route_name(SelectorRoute route);
@@ -27,9 +35,8 @@ SelectorWorkspace allocate_selector_workspace(Allocator& allocator, SelectorRout
 
 void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor& unary_scores,
                                       const Tensor& projected_hidden, const Tensor& anchors,
-                                      const Tensor& predecessor_codebook,
-                                      const Tensor& successor_codebook,
+                                      const SelectorCodebooks& codebooks,
                                       const Tensor& base_positions, const SamplingConfig* configs,
-                                      Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                                      cudaStream_t stream);
+                                      Tensor& drafts, Tensor& proposal_q, float* confidence,
+                                      WorkspaceArena& workspace, cudaStream_t stream);
 } // namespace ninfer::ops::detail

@@ -27,6 +27,12 @@ namespace ninfer {
 // The multiples of `unit` inside (0, total).
 [[nodiscard]] std::vector<std::uint64_t> unit_positions(std::uint64_t total, std::uint64_t unit);
 
+// Weights for dividing work over ranks of `speed` when rank 0 also runs `first` (work counted in
+// fractions of the divided work) while the other ranks run their shares: rank 0's share shrinks so
+// that every rank's work over its speed comes out the same. A rank 0 whose `first` alone outlasts
+// the others' shares keeps a share of almost nothing; `first` = 0 gives the speeds' proportions.
+[[nodiscard]] std::vector<double> shares_beside_first(std::span<const double> speed, double first);
+
 // The fractions of the divided work each rank takes: in proportion to `speed`, except that a rank
 // takes at most `capacity[r]` (a fraction of the divided work it has room for); what a full rank
 // cannot take goes to the others, still in proportion to their speed. The fractions add up to one.

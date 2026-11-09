@@ -229,6 +229,15 @@ ninfer-serve $M --ngram-table $T --model-id deepseek-v4.1-flash \
   --max-context 32768 --expert-residency disk
 ```
 
+ISTA-DASLab's expert-pruned Coder build reads the same table; its routed experts take 61.5 GiB:
+
+```bash
+hf download WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-NInfer-v3 \
+  DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-ninfer-v3.ninfer --local-dir models
+ninfer-serve models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-ninfer-v3.ninfer --ngram-table $T \
+  --model-id deepseek-v4.1-flash-coder --max-context 32768 --expert-residency host
+```
+
 ## Qwen3.6-35B-A3B NVFP4
 
 RTX 50 series and RTX PRO 6000 only.
