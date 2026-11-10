@@ -305,10 +305,24 @@ keeps instead of prefilling those tokens again:
   they arrive together, since a prompt that has not started prefilling looks for images again at
   its first chunk. A disposable request (a decision read) leaves no image of its end.
 
-A sliding-window state cannot be cut back: the rings at a position hold the window before it, and
-each block's window reaches further back through the blocks below. A prompt therefore resumes only
-where a state was kept (a sequence's end, its checkpoint, a stored image), not at an arbitrary
-common prefix.
+A sliding-window state cannot be cut back at will: the rings at a position hold the window before
+it, and each block's window reaches further back through the blocks below. A prompt therefore
+resumes only where a state was kept (a sequence's end, its checkpoint, a stored image), not at an
+arbitrary common prefix.
+
+A turn that a stop string ends is the exception. Its state has read the tokens the cut removed, so
+the sequence goes back to where the stop string's match began, the state its visible text
+continues. With the assistant the rings hold 1,280 positions for a window of 1,024, so that
+position's window is still in them while the sequence has written at most 256 positions past it,
+less a round's drafts. Without the assistant the rings are as wide as the window: from the token
+that begins a match, each decode step first keeps the rows it overwrites (up to 32 steps, 6 MiB a
+sequence in F16), and the turn puts them back when the stop string ends it. The full-attention
+rows are kept by position. The next prompt resumes there when it repeats the reply's tokens, as a
+client that sends token ids does: on an RTX 4090, after a reply of 184 tokens that a stop string
+cut at its 179th, the next request reused 209 of its 217 tokens, as after a reply that its output
+limit ended there, with and without the assistant. A chat request with thinking off, the default,
+renders the reply anew after a generation prompt whose last tokens the history does not carry, so
+the next prompt resumes from the checkpoint at the last user turn whatever ended the reply.
 
 ## Measurements
 

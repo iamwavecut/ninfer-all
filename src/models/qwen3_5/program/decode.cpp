@@ -416,10 +416,12 @@ void ProgramImpl::record_ngram_round(RequestControl& request, const NgramPropose
 
 void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                                 std::span<const std::uint32_t> starts,
-                                                std::span<const std::uint32_t> counts) {
+                                                std::span<const std::uint32_t> counts,
+                                                std::span<const std::int32_t> destinations) {
     if (!is_masked_draft_backend(speculative_backend) || !dflash || !io.dflash_decode ||
         lanes.empty() || lanes.size() > max_concurrency || starts.size() != lanes.size() ||
-        counts.size() != lanes.size()) {
+        counts.size() != lanes.size() ||
+        (!destinations.empty() && destinations.size() != lanes.size())) {
         throw std::logic_error("DFlash context append has invalid membership");
     }
 
@@ -454,7 +456,8 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         dflash_host_ingress->active_lanes[row]            = static_cast<std::int32_t>(lane);
         const StateImageSelectors selectors               = state_selectors(sequence);
         dflash_host_ingress->state_source_slots[row]      = selectors.source;
-        dflash_host_ingress->state_destination_slots[row] = selectors.destination;
+        dflash_host_ingress->state_destination_slots[row] =
+            destinations.empty() ? selectors.destination : destinations[row];
         // Context append writes only the draft caches. Target execution owns Main KV
         // coverage, including any uncommitted suffix that survives until the round is settled.
         // DFlash2 has only fixed cyclic state; DFlash also grows its Full backend KV here.
@@ -1267,7 +1270,7 @@ ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
 runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
     SequenceState& sequence, RequestControl& request, std::uint32_t accepted_tokens, bool terminal,
     std::optional<std::uint32_t> prefix_execution_split_after,
-    runtime::ExecutionTiming* failed_timing) {
+    std::optional<std::uint32_t> stop_hold_after, runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (request.lifecycle != Lifecycle::Pending) {
         throw std::logic_error("pending resolution requires a pending generated round");
@@ -1323,6 +1326,12 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
         settle_state_fork(sequence);
     }
     trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+    // The round's one token begins a stop string's hold: the state has not read it yet.
+    if (stop_hold_after) {
+        timing.resume_submit();
+        stop_hold_copy(sequence);
+        timing.resume_post();
+    }
     if (terminal) { sequence.mtp_draft_count = 0; }
     request.lifecycle = terminal ? Lifecycle::Finishable : Lifecycle::Active;
     request.pending   = {};

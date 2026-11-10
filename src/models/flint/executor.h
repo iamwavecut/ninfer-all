@@ -139,6 +139,11 @@ public:
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
+    // Takes the sequence back `tokens` positions, to the state it had before it read them: false,
+    // changing nothing, when its sliding-window rings no longer hold the window before that
+    // position (they hold it for as many positions as their slots exceed the window and a
+    // round's drafts, and not before the sequence's last prompt, checkpoint or image).
+    bool rewind(std::uint32_t sequence, std::uint32_t tokens);
     // Bytes of an image at `position`.
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
     // Copies the sequence's state into `pages`, pinned host memory that holds image_bytes() of its

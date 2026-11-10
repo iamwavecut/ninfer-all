@@ -558,6 +558,101 @@ int exercise_turns(const char* artifact, std::size_t host_bytes) {
     return failures;
 }
 
+// A turn that a stop string ends leaves its state past the visible text: the model has read the
+// tokens the cut removed. The lane keeps the state from where the stop string's match began, so
+// the next turn, whose prompt repeats the visible text, resumes inside the reply instead of at the
+// previous prompt's end, and answers as an Engine that computes the whole prompt.
+int exercise_stop_string(const char* artifact, ninfer::SpeculativeBackend backend) {
+    const char* name = backend == ninfer::SpeculativeBackend::Mtp ? "stop-string-mtp" : "stop-string";
+    const ninfer::ChatMessage system = text_message(
+        ninfer::ChatRole::System, "You are a storyteller. Write plain prose without lists.");
+    const ninfer::ChatMessage first_user = text_message(
+        ninfer::ChatRole::User,
+        "Tell a long story about a lighthouse keeper who repairs clocks. Use many short sentences.");
+    const ninfer::ChatMessage next_user =
+        text_message(ninfer::ChatRole::User, "Continue the story with what happened at dawn.");
+    const auto options = [&] {
+        ninfer::EngineOptions out = hybrid_options(artifact, backend, 8192, 1ULL << 30, 0);
+        out.context_cache.hybrid.device_snapshot_slots.reset();
+        return out;
+    };
+    const auto request = [](std::uint32_t outputs) {
+        ninfer::RequestOptions out      = greedy(outputs);
+        out.stop.include_model_defaults = true;
+        return out;
+    };
+
+    // The reply without a stop string gives a stop string that first matches three quarters in.
+    std::string whole;
+    {
+        ninfer::Engine engine(options());
+        whole = engine.generate(engine.prepare(conversation({system, first_user})), request(240))
+                    .content;
+    }
+    constexpr std::size_t kStopBytes = 14;
+    std::optional<std::size_t> cut;
+    for (std::size_t at = whole.size() * 3 / 4; at + kStopBytes <= whole.size(); ++at) {
+        const std::string_view candidate = std::string_view(whole).substr(at, kStopBytes);
+        const bool ascii = std::all_of(candidate.begin(), candidate.end(), [](char byte) {
+            return static_cast<unsigned char>(byte) < 0x80U;
+        });
+        if (ascii && whole.find(candidate) == at) {
+            cut = at;
+            break;
+        }
+    }
+    if (!cut) {
+        std::cerr << name << ": the reply of " << whole.size() << " bytes has no usable stop string\n";
+        return 1;
+    }
+    const std::string stop = whole.substr(*cut, kStopBytes);
+
+    ninfer::Engine engine(options());
+    ninfer::RequestOptions stopped = request(240);
+    stopped.stop.strings.push_back(ninfer::StopString{.text = stop});
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(conversation({system, first_user})), stopped);
+    const std::vector<ninfer::ChatMessage> turns{
+        system, first_user, text_message(ninfer::ChatRole::Assistant, first.content), next_user};
+    const ninfer::GenerationResult second =
+        engine.generate(engine.prepare(conversation(turns)), request(12));
+    const ninfer::RuntimeStats stats = engine.runtime_stats();
+
+    ninfer::Engine fresh(options());
+    const ninfer::GenerationResult reference =
+        fresh.generate(fresh.prepare(conversation(turns)), request(12));
+
+    int failures = 0;
+    if (first.finish_reason != ninfer::FinishReason::StopString ||
+        first.content != whole.substr(0, *cut)) {
+        std::cerr << name << ": the first turn did not end at the stop string (" << first.content.size()
+                  << " bytes, expected " << *cut << ")\n";
+        ++failures;
+    }
+    // The checkpoint lies at most one draft window before the cut, and the cut some sixty tokens
+    // before the reply's end: well past the previous prompt's end, where the turn resumed before.
+    const std::uint32_t generated = static_cast<std::uint32_t>(first.generated_token_ids.size());
+    if (generated < 150U ||
+        second.reused_prompt_tokens < first.prompt.prompt_tokens + generated - 24U ||
+        second.reused_prompt_tokens >= second.prompt.prompt_tokens) {
+        std::cerr << name << ": the next turn reused " << second.reused_prompt_tokens << " of "
+                  << second.prompt.prompt_tokens << " tokens after a prompt of "
+                  << first.prompt.prompt_tokens << " and a reply of " << generated << " tokens\n";
+        ++failures;
+    }
+    if (stats.hybrid_endpoints_created == 0) {
+        std::cerr << name << ": the stopped turn published no endpoint\n";
+        ++failures;
+    }
+    if (second.generated_token_ids != reference.generated_token_ids) {
+        std::cerr << name << ": the resumed turn answers differently from a computed prompt\n";
+        ++failures;
+    }
+    std::cout << name << ": reply " << generated << " tokens, next turn reused "
+              << second.reused_prompt_tokens << " of " << second.prompt.prompt_tokens << "\n";
+    return failures;
+}
+
 // Cancels the request once it has generated `tokens` tokens.
 class CancelAfterTokensSink final : public ninfer::OutputSink {
 public:
@@ -1048,7 +1143,9 @@ int main() {
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 16> kScenarios{"all",
+    constexpr std::array<std::string_view, 18> kScenarios{"all",
+                                                          "stop-string",
+                                                          "stop-string-mtp",
                                                           "restore-exact",
                                                           "restore-exact-mtp",
                                                           "restore-exact-dflash2",
@@ -1095,6 +1192,12 @@ int main() {
         if (all || scenario == "turns") { failures += exercise_turns(artifact, 1ULL << 30); }
         if (all || scenario == "turns-device-only") { failures += exercise_turns(artifact, 0); }
         if (all || scenario == "vision") { failures += exercise_vision(artifact); }
+        if (all || scenario == "stop-string") {
+            failures += exercise_stop_string(artifact, ninfer::SpeculativeBackend::None);
+        }
+        if (all || scenario == "stop-string-mtp") {
+            failures += exercise_stop_string(artifact, ninfer::SpeculativeBackend::Mtp);
+        }
         if (all || scenario == "persist") { failures += exercise_persist(artifact); }
         if (all || scenario == "interleaved") { failures += exercise_interleaved(artifact); }
         if (all || scenario == "full-pool") { failures += exercise_full_pool(artifact); }

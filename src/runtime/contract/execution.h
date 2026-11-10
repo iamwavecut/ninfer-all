@@ -46,6 +46,10 @@ struct CommitDecision {
     // Copied unchanged from the corresponding OutputDecision; still relative to this row's
     // accepted span.
     std::optional<std::uint32_t> prefix_execution_split_after;
+    // Copied unchanged from the corresponding OutputDecision; relative to the accepted span.
+    std::optional<std::uint32_t> stop_hold_after;
+    // The row ends at a stop string: the visible text ends before the tokens the hold covers.
+    bool stop_cut = false;
 };
 
 struct BeginSummary {

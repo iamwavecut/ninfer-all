@@ -442,13 +442,22 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             state_images->host_layout(), context_cache.host_state_slots);
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
+    // The pool's last slots are the lanes' stop-string hold images, outside the catalog.
+    stop_hold_slots_ = stop_hold_slots(context_cache, max_concurrency);
+    if (state_images->slot_count() <= 0 ||
+        stop_hold_slots_ >= static_cast<std::uint32_t>(state_images->slot_count())) {
+        throw std::logic_error("Qwen3.5 StateImage pool does not cover its stop-string holds");
+    }
+    const std::uint32_t catalog_state_slots =
+        static_cast<std::uint32_t>(state_images->slot_count()) - stop_hold_slots_;
     const std::uint64_t logical_state_capacity =
-        static_cast<std::uint64_t>(state_images->slot_count()) + context_cache.host_state_slots;
+        static_cast<std::uint64_t>(catalog_state_slots) + context_cache.host_state_slots;
     if (logical_state_capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("Qwen3.5 logical StateImage capacity exceeds uint32");
     }
     state_store = std::make_unique<StateImageStore>(
-        *state_images, host_state_images.get(), static_cast<std::uint32_t>(logical_state_capacity));
+        *state_images, host_state_images.get(), static_cast<std::uint32_t>(logical_state_capacity),
+        catalog_state_slots);
     pressure_private_owner_scratch_.resize(continuation_capacity);
     pressure_shared_owner_scratch_.resize(shared_prefix_capacity);
     pressure_private_drop_scratch_.resize(continuation_capacity);

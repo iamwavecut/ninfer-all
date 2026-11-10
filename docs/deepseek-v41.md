@@ -621,6 +621,17 @@ keeps instead of prefilling those tokens again:
 A window state cannot be cut back, so a prompt resumes only where a state was kept, not at an
 arbitrary common prefix.
 
+A turn that a stop string ends returns to the state where the stop string's match began, the one
+its visible text continues: the live state has read the tokens the cut removed. Each sequence
+holds a second copy of its rings and tails for it, written when a step's sampled token begins a
+match, and by a round's commit when the match begins among the round's tokens (a verification
+writes every row by its position, so the committed bytes also serve the position before the
+match). The round itself is not changed, so the turn produces the tokens it produces without the
+stop string. On an RTX 4090 with the Coder model and host experts, the turn after a reply of 186
+tokens that a stop string cut at its 182nd reused 203 of its 217 prompt tokens, every token the
+two prompts share, as after a reply that its output limit ended there; the same with the DSpark
+drafter, context lookup and neither.
+
 ## Measurements
 
 ### Against Strata on one host

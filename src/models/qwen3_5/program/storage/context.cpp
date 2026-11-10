@@ -103,6 +103,7 @@ void ProgramImpl::invalidate_lane(std::uint32_t lane) noexcept {
     if (lane >= max_concurrency) { return; }
     ++lane_epochs[lane];
     if (lane_epochs[lane] == 0) { ++lane_epochs[lane]; }
+    stop_holds_[lane].reset();
 }
 
 SequenceState& ProgramImpl::active_sequence(std::uint32_t lane) {

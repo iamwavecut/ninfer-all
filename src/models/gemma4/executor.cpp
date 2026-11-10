@@ -144,6 +144,9 @@ struct LayerPlan {
     // A sliding block's checkpoint of every sequence's rings (snapshot()), allocated with the cache:
     // one buffer per ring buffer above (F16: K, V; quantized: K codes, K scales, V codes, V scales).
     std::vector<DeviceBuffer> checkpoint;
+    // A sliding block's rows that the decode steps of a held sequence overwrote (hold()), one
+    // buffer per ring buffer: [sequences][kHoldRows][kv heads][row bytes].
+    std::vector<DeviceBuffer> held;
 };
 
 // Bytes of one cache row of a plane: head_dim / 256 blocks.
@@ -229,6 +232,16 @@ struct Executor::Impl {
     // attention factor, one without YaRN.
     float full_query_scale = 1.0f;
     std::vector<std::uint32_t> positions;
+    // The position at which each sequence's rings last came from a prompt, a checkpoint or an
+    // image: they hold the window before it and what the sequence wrote since (rewind()).
+    std::vector<std::uint32_t> ring_floor;
+    // Rings no wider than the window keep no position's window once a decode step writes past
+    // it. A sequence that may return to a position (hold()) saves the rows its next kHoldRows
+    // decode steps overwrite; hold_base is that position, kNoHold without one.
+    static constexpr std::uint32_t kHoldRows = 32;
+    static constexpr std::uint32_t kNoHold   = ~std::uint32_t{0};
+    std::uint32_t hold_rows = 0;
+    std::vector<std::uint32_t> hold_base;
     // Device staging: tokens, positions, sequences for up to max(prefill_chunk, sequences) rows.
     // d_keys: the assistant's last visible key position per row. d_blocks: a prompt chunk row's
     // media unit (-1: text), d_unit_rows: each unit's first row, for the chunk's media. A branch
@@ -304,6 +317,12 @@ struct Executor::Impl {
         prefill_ring = int(round_up(config.sliding_window + options.prefill_chunk, 256));
         global_slots = int(round_up(options.max_context + 1, 256));
         positions.assign(options.sequences, 0);
+        ring_floor.assign(options.sequences, 0);
+        hold_rows = options.draft_tokens == 0 &&
+                            ring - int(config.sliding_window) < int(kHoldRows)
+                        ? kHoldRows
+                        : 0;
+        hold_base.assign(options.sequences, kNoHold);
         const auto& w = model.weights();
         head          = matrix(model, {w.output_head});
         final_norm    = fp32(model, w.final_norm, hidden);
@@ -357,7 +376,7 @@ struct Executor::Impl {
                     // A prompt chunk's derived keys, and with a quantized cache its values, in F16.
                     chunk_bytes = std::max(chunk_bytes, (kv.quantized() ? 2 : 1) * slots * heads * d * 2);
                 } else {
-                    needed += (options.checkpoints ? 2 : 1) * slots * heads *
+                    needed += ((options.checkpoints ? 2 : 1) * slots + hold_rows) * heads *
                               (plane_row_bytes(kv.key, d) + plane_row_bytes(kv.value, d)) *
                               std::size_t(sequences);
                     staging = std::max(staging, std::size_t(prefill_ring) * 2 * heads * d * 2);
@@ -544,6 +563,18 @@ struct Executor::Impl {
                     (void)ring;
                     p.checkpoint.emplace_back(bytes * sequences);
                     kv_bytes += bytes * sequences;
+                }
+            }
+            if (!p.full && hold_rows != 0) {
+                for (const auto& [start, bytes] : ring_buffers(p, 0)) {
+                    (void)start;
+                    const std::size_t rows = bytes / std::size_t(p.ring) * hold_rows * sequences;
+                    if (rows != 0) {
+                        p.held.emplace_back(rows);
+                    } else {
+                        p.held.emplace_back();
+                    }
+                    kv_bytes += rows;
                 }
             }
             layers.push_back(std::move(p));
@@ -1942,6 +1973,9 @@ struct Executor::Impl {
                     std::size_t(hidden) * 2, cudaMemcpyDeviceToDevice, stream));
             }
             head_logits(rows, int(logit_rows), 0);
+            // The branches' rows took the rings' slots past the sequence's position.
+            ring_floor[sequence] = first + std::uint32_t(t);
+            hold_base[sequence]  = kNoHold;
             return;
         }
         if (drafting()) {
@@ -1959,7 +1993,9 @@ struct Executor::Impl {
                             std::int64_t(t - int(logit_rows)) * hidden,
                         int(logit_rows), 0);
         }
-        positions[sequence] = first + std::uint32_t(t);
+        positions[sequence]  = first + std::uint32_t(t);
+        ring_floor[sequence] = first + std::uint32_t(t);
+        hold_base[sequence]  = kNoHold;
     }
 
     // ---- Decode ---------------------------------------------------------------------------------------
@@ -2135,6 +2171,17 @@ struct Executor::Impl {
             seq[i] = std::int32_t(sequences[i]);
         }
         for (int i = 0; i < b; ++i) { back(sequences[i], positions[sequences[i]] + 1, false); }
+        for (int i = 0; i < b; ++i) {
+            // A held sequence keeps the rows this step overwrites.
+            const std::uint32_t s = sequences[i];
+            if (hold_base[s] == kNoHold) { continue; }
+            const std::uint32_t index = positions[s] - hold_base[s];
+            if (index < hold_rows) {
+                copy_held(s, positions[s], index, true);
+            } else {
+                hold_base[s] = kNoHold;
+            }
+        }
         stage(tokens, pos, seq);
         run_graph(graphs, std::uint32_t(b), [&] { decode_body(b); });
         for (int i = 0; i < b; ++i) {
@@ -2466,6 +2513,30 @@ struct Executor::Impl {
         return {at(p.kq, false), at(p.kq, true), at(p.vq, false), at(p.vq, true)};
     }
 
+    // A held sequence's rows of `position`'s slot in every sliding block's rings: into the hold
+    // buffers' row `index`, or back from it.
+    void copy_held(std::uint32_t sequence, std::uint32_t position, std::uint32_t index, bool save) {
+        for (const LayerPlan& p : layers) {
+            if (p.full) { continue; }
+            const auto rings = ring_buffers(p, sequence);
+            for (std::size_t i = 0; i < rings.size(); ++i) {
+                const std::size_t head = rings[i].second / std::size_t(p.kv_heads);
+                const std::size_t row  = head / std::size_t(p.ring);
+                if (row == 0) { continue; }
+                auto* ring = rings[i].first + std::size_t(position % std::uint32_t(p.ring)) * row;
+                auto* kept = static_cast<std::uint8_t*>(p.held[i].p) +
+                             (std::size_t(sequence) * hold_rows + index) * p.kv_heads * row;
+                if (save) {
+                    CUDA_CHECK(cudaMemcpy2DAsync(kept, row, ring, head, row, std::size_t(p.kv_heads),
+                                                 cudaMemcpyDeviceToDevice, stream));
+                } else {
+                    CUDA_CHECK(cudaMemcpy2DAsync(ring, head, kept, row, row, std::size_t(p.kv_heads),
+                                                 cudaMemcpyDeviceToDevice, stream));
+                }
+            }
+        }
+    }
+
     void copy_rings(std::uint32_t sequence, bool save) {
         if (!options.checkpoints) { throw std::logic_error("gemma4: an executor without checkpoints"); }
         for (const LayerPlan& p : layers) {
@@ -2561,7 +2632,9 @@ struct Executor::Impl {
         }
         back(sequence, image.position, false);
         copy_image(sequence, image.position, pages, page_bytes, false, false);
-        positions.at(sequence) = image.position;
+        positions.at(sequence)  = image.position;
+        ring_floor.at(sequence) = image.position;
+        hold_base.at(sequence)  = kNoHold;
         if (drafting()) { anchored[sequence] = 0; }
     }
 
@@ -2572,9 +2645,41 @@ struct Executor::Impl {
 
     void restore(std::uint32_t sequence, const SequenceSnapshot& from) {
         copy_rings(sequence, false);
-        positions[sequence] = from.position;
+        positions[sequence]  = from.position;
+        ring_floor[sequence] = from.position;
+        hold_base[sequence]  = kNoHold;
         if (drafting()) { anchored[sequence] = 0; }
     }
+
+    // A position's window lies in the rings while the sequence has written fewer positions past
+    // it than the rings hold beyond the window and a round's drafts, and the rings held the
+    // window before it when they last came whole; rings without those slots get back the rows
+    // that the decode steps since hold() overwrote. The full-attention rows are kept by position.
+    // The assistant's hidden is the last token's, so it drafts again after the next prompt.
+    bool rewind(std::uint32_t sequence, std::uint32_t tokens) {
+        const std::uint32_t at = positions.at(sequence);
+        const std::int64_t slack = std::int64_t(ring) - std::int64_t(config.sliding_window) -
+                                   std::int64_t(options.draft_tokens);
+        if (tokens > at || at - tokens < ring_floor[sequence]) { return false; }
+        if (std::int64_t(tokens) > slack) {
+            const std::uint32_t base = hold_base[sequence];
+            if (base == kNoHold || at - tokens < base) { return false; }
+            for (std::uint32_t p = at - tokens; p < at; ++p) {
+                copy_held(sequence, p, p - base, false);
+            }
+        }
+        positions[sequence] = at - tokens;
+        hold_base[sequence] = kNoHold;
+        if (drafting()) { anchored[sequence] = 0; }
+        return true;
+    }
+
+    // The sequence may return to its current position (rewind()) for its next kHoldRows decode
+    // steps; release_hold() ends that.
+    void hold(std::uint32_t sequence) {
+        if (hold_rows != 0) { hold_base.at(sequence) = positions.at(sequence); }
+    }
+    void release_hold(std::uint32_t sequence) { hold_base.at(sequence) = kNoHold; }
 };
 
 Executor::Executor(const Model& model, DeviceContext& device, ExecutorOptions options)
@@ -2609,8 +2714,18 @@ void Executor::load_image(std::uint32_t sequence, const SequenceImage& image,
     impl_->load_image(sequence, image, pages, page_bytes);
 }
 
+bool Executor::rewind(std::uint32_t sequence, std::uint32_t tokens) {
+    return impl_->rewind(sequence, tokens);
+}
+
+void Executor::hold(std::uint32_t sequence) { impl_->hold(sequence); }
+
+void Executor::release_hold(std::uint32_t sequence) { impl_->release_hold(sequence); }
+
 void Executor::reset(std::uint32_t sequence) {
-    impl_->positions.at(sequence) = 0;
+    impl_->positions.at(sequence)  = 0;
+    impl_->ring_floor.at(sequence) = 0;
+    impl_->hold_base.at(sequence)  = Impl::kNoHold;
     if (impl_->drafting()) { impl_->anchored.at(sequence) = 0; }
     impl_->release(sequence);
 }

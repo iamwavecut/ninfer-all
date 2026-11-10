@@ -190,6 +190,9 @@ struct Executor::Impl {
     const float* final_norm = nullptr;
     DeviceBuffer inv_freq;
     std::vector<std::uint32_t> positions;
+    // The position at which each sequence's rings last came from a prompt, a checkpoint or an
+    // image: they hold the window before it and what the sequence wrote since (rewind()).
+    std::vector<std::uint32_t> ring_floor;
     // Device staging: tokens, positions, sequences for up to max(prefill_chunk, sequences) rows. A
     // branch pass's rows: d_slots, the position whose cache slot each takes; d_starts, its branch's
     // first row.
@@ -240,6 +243,7 @@ struct Executor::Impl {
         prefill_ring = int(round_up(config.sliding_window + options.prefill_chunk, 256));
         global_slots = int(round_up(options.max_context + 1, 256));
         positions.assign(options.sequences, 0);
+        ring_floor.assign(options.sequences, 0);
         const auto& w = model.weights();
         embedding     = native_weight(model.weight(w.token_embedding).view);
         head          = matrix(model, {w.output_head});
@@ -1492,7 +1496,8 @@ struct Executor::Impl {
                     std::size_t(hidden) * 2, cudaMemcpyDeviceToDevice, stream));
             }
             head_logits(rows, int(logit_rows), 0);
-            positions[sequence] = first + shared;
+            positions[sequence]  = first + shared;
+            ring_floor[sequence] = first + shared;
             return;
         }
         if (q8) {
@@ -1502,7 +1507,8 @@ struct Executor::Impl {
                             std::int64_t(t - int(logit_rows)) * hidden,
                         int(logit_rows), 0);
         }
-        positions[sequence] = first + std::uint32_t(t);
+        positions[sequence]  = first + std::uint32_t(t);
+        ring_floor[sequence] = first + std::uint32_t(t);
     }
 
     // ---- Decode ---------------------------------------------------------------------------------------
@@ -1586,6 +1592,10 @@ struct Executor::Impl {
         }
         GraphEntry& entry = graphs[key];
         if (!entry.warmed) {
+            // A graph launched before this may still wait on the device for the experts' host
+            // service, and a kernel that loads at its first launch during that wait never
+            // returns: the stream is idle before a body's kernels load.
+            CUDA_CHECK(ninfer::wait_for_stream(stream));
             body();
             entry.warmed = true;
             return;
@@ -1807,7 +1817,8 @@ struct Executor::Impl {
         }
         back(sequence, image.position, false);
         copy_image(sequence, image.position, pages, page_bytes, false, false);
-        positions.at(sequence) = image.position;
+        positions.at(sequence)  = image.position;
+        ring_floor.at(sequence) = image.position;
     }
 
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
@@ -1817,7 +1828,21 @@ struct Executor::Impl {
 
     void restore(std::uint32_t sequence, const SequenceSnapshot& from) {
         copy_rings(sequence, false);
-        positions[sequence] = from.position;
+        positions[sequence]  = from.position;
+        ring_floor[sequence] = from.position;
+    }
+
+    // A position's window lies in the rings while the sequence has written fewer positions past
+    // it than the rings hold beyond the window and a round's drafts, and the rings held the
+    // window before it when they last came whole. The full-attention rows are kept by position.
+    bool rewind(std::uint32_t sequence, std::uint32_t tokens) {
+        const std::uint32_t at = positions.at(sequence);
+        const std::int64_t slack = std::int64_t(ring) - window - std::int64_t(options.draft_tokens);
+        if (tokens > at || at - tokens < ring_floor[sequence] || std::int64_t(tokens) > slack) {
+            return false;
+        }
+        positions[sequence] = at - tokens;
+        return true;
     }
 };
 
@@ -1851,7 +1876,8 @@ void Executor::load_image(std::uint32_t sequence, const SequenceImage& image,
 }
 
 void Executor::reset(std::uint32_t sequence) {
-    impl_->positions.at(sequence) = 0;
+    impl_->positions.at(sequence)  = 0;
+    impl_->ring_floor.at(sequence) = 0;
     impl_->release(sequence);
 }
 
@@ -1932,6 +1958,10 @@ void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
     impl_->restore(sequence, from);
+}
+
+bool Executor::rewind(std::uint32_t sequence, std::uint32_t tokens) {
+    return impl_->rewind(sequence, tokens);
 }
 
 } // namespace ninfer::models::flint

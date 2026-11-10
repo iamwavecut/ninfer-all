@@ -62,7 +62,7 @@ Hybrid mode configures itself: the only capacity a deployment chooses is `--host
 | §7.1 taps | implemented: exact taps (explicit, generation opener, structural) split the chunk; flexible taps (prompt tail, ladder) are realized at chunk boundaries at no extra forward pass |
 | §7.4 tap publication | implemented: deferred until the anchoring blocks commit (a frontier inside a block, or an MTP backend one token behind); exact-frontier tails are copied into cache-owned pages |
 | §7.6 block publication, write-through | implemented: blocks join the tree at every commit; a lane's blocks are written to Host in one batch when it releases them |
-| §7.7 endpoint snapshots at finish and consistent abort | implemented |
+| §7.7 endpoint snapshots at finish and consistent abort | implemented; a turn ended by a stop string publishes the state from where the match began; the catalog returns the sequence to that state before Finish |
 | §6.2 cost model | implemented: the Engine's context-cost coefficients (prefill and Host-to-Device transfer) rank sources and value snapshots |
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
 | §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again; in this line a request is admitted while another prefills with `--concurrent-prefill`, or without it only while every staged prefill is a last chunk that can share a pass, so coalescing needs the option |
@@ -831,6 +831,40 @@ At terminal settlement (Finish, or Cancel after at least one committed unit):
    (§9.1), inserted in **reverse block order**, so deeper blocks are evicted before shallower
    ones.
 3. Free `Duplicate` and growth pages. Release the active state slot.
+
+**A turn that a stop string ends.** The visible text ends where the stop string's match began,
+and a state that has read tokens of the match continues no later prompt. The output session
+reports the round in which a match prefix is first held back and the number of the round's tokens
+before it (`OutputDecision::stop_hold_after`), and whether a finish cuts the output there
+(`stop_cut`; a stop string that stays in the output ends inside the round's last token and cuts
+nothing the state has read).
+
+- The match begins in the round that ends the turn: the Engine commits only the round's tokens
+  before it (`CommitDecision::accepted_tokens`), so `F_end` is that position and step 1 publishes
+  the endpoint as for any turn, with every speculative backend and without the hybrid cache too.
+- The match begins in an earlier round: the lane keeps the state after exactly the tokens before it
+  in a device snapshot slot of its own (`HybridLaneState::hold`), replaced when a later match
+  begins. A round without drafts (or the prompt's last step) has not read the token that begins the
+  match, so the lane's StateImage is copied. An MTP round folds the row's replay records once more,
+  with that many columns and the kept image as destination, before the fold that commits the
+  round, and copies the target's hidden at that column: the same state transition a round ending
+  there commits. At Finish the kept state is published as the turn's `Snapshot{Endpoint}` at its
+  frontier (its tail copied from the lane's page, as a tap's), under the conditions of step 1.
+  The state at `F_end` is not published. Any other finish drops the kept state.
+- A DFlash or DFlash2 round keeps the same folded image and hidden. Its image also carries the
+  drafter's local context, which ends at the round's base until the next round appends the
+  round's target features: the kept image takes a copy of the lane's context and the features of
+  the tokens before the match (`enqueue_dflash_context_append` with the kept image as
+  destination), through the pinned ingress that a terminal row's append uses, so the host waits
+  for it. A row whose image is a pending fork keeps nothing. A round without drafts keeps its
+  image only when the context already ends at the frontier (after a prompt).
+- The checkpoint catalog keeps the same state in a Device StateImage of the lane's own, outside
+  the catalog's slots (`models::stop_hold_slots`, one for each concurrent request;
+  `ContextCacheOptions::stop_hold_images`, dropped at startup when the KV capacity does not fit
+  beside them). The terminal commit copies it back over the lane's image and cuts the ledger, the
+  prefix identity and the KV extents to its frontier, so Finish catalogs an ordinary endpoint
+  there. A checkpoint of the sequence past that frontier, or an image the sequence shares, keeps
+  the turn as it ended.
 
 `Disabled` requests (Serve warmup, `--no-prefix-reuse`) never insert nodes or snapshots.
 Their pages are freed at terminal.

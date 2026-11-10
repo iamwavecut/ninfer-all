@@ -379,6 +379,9 @@ struct Executor::Impl {
     } ahead;
     // One sequence's rings and tails, the state a branch pass returns to.
     DeviceBuffer branch_state;
+    // Every sequence's held state (hold()): its rings and tails, state() order, branch_bytes each.
+    DeviceBuffer hold_state;
+    std::size_t hold_bytes = 0;
     // The vision tower, and a prompt step's images: their rows' flags (pinned, then on the
     // device, one byte per staged row), the pieces of their span rows a step places, the device
     // rows a piece passes through (one image span at most, also the tower's output), the patches
@@ -511,6 +514,12 @@ struct Executor::Impl {
                           std::size_t(window) * model.dspark_config()->target_layers.size() * hidden * 4;
             }
             needed += std::size_t(prefill_ring) * kLatent * 2;
+            if (options.checkpoints) {
+                // The held state (hold()): another copy of every sequence's rings.
+                needed += (config.num_hidden_layers +
+                           (model.dspark() ? model.dspark()->layers.size() : 0)) *
+                          std::size_t(sequences) * kRing * kLatent * 2;
+            }
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
             const std::size_t reserve = start_reserve();
@@ -615,6 +624,11 @@ struct Executor::Impl {
         kv_bytes += staging.bytes;
         branch_state = DeviceBuffer(branch_bytes);
         kv_bytes += branch_state.bytes;
+        if (options.checkpoints) {
+            hold_bytes = branch_bytes;
+            hold_state = DeviceBuffer(branch_bytes * std::size_t(sequences));
+            kv_bytes += hold_state.bytes;
+        }
         for (LayerPlan& p : layers) {
             if (!p.kv_source) { continue; }
             sequence_areas.push_back(&p.latents);
@@ -3174,17 +3188,39 @@ struct Executor::Impl {
         verify_widths = std::move(row_widths);
     }
 
-    void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept) {
-        if (kept.size() != sequences.size() || verify_widths.size() != sequences.size()) {
+    // `hold_after[j]` (0: none), at most kept[j]: `holds[j]` also receives the state after that
+    // many of sequence j's tokens, as hold() keeps it. The verification wrote every row by its
+    // position, so the device state a commit leaves serves each position of the kept rows: a
+    // commit of fewer rows leaves the same bytes. Returns the rows whose state was kept, a bit
+    // each.
+    std::uint32_t commit(std::span<const std::uint32_t> sequences,
+                         std::span<const std::uint32_t> kept,
+                         std::span<const std::uint32_t> hold_after = {},
+                         std::span<SequenceSnapshot* const> holds = {}) {
+        if (kept.size() != sequences.size() || verify_widths.size() != sequences.size() ||
+            hold_after.size() != holds.size() ||
+            (!hold_after.empty() && hold_after.size() != sequences.size())) {
             throw std::invalid_argument("deepseek_v41 commit: invalid call");
         }
+        std::uint32_t held = 0;
         for (std::size_t j = 0; j < sequences.size(); ++j) {
             const std::uint32_t s = sequences[j];
             if (s >= options.sequences || kept[j] < 1 || kept[j] > verify_widths[j] ||
-                verified[s].size() != verify_widths[j]) {
+                verified[s].size() != verify_widths[j] ||
+                (!hold_after.empty() && hold_after[j] > kept[j])) {
                 throw std::invalid_argument("deepseek_v41 commit: invalid row");
             }
-            advance_history(s, std::span<const std::int32_t>(verified[s]).first(kept[j]));
+            const std::span<const std::int32_t> tokens(verified[s]);
+            const std::uint32_t before = hold_after.empty() ? 0 : hold_after[j];
+            if (before != 0 && holds[j] != nullptr && hold_bytes != 0 && resumable(s)) {
+                advance_history(s, tokens.first(before));
+                holds[j]->position = positions[s] + before;
+                holds[j]->history  = histories[s];
+                advance_history(s, tokens.subspan(before, kept[j] - before));
+                held |= 1U << j;
+            } else {
+                advance_history(s, tokens.first(kept[j]));
+            }
             verified[s].clear();
             positions[s] += kept[j];
         }
@@ -3198,7 +3234,11 @@ struct Executor::Impl {
                      static_cast<const std::int32_t*>(d_sequences.p) + row(j), sequences[j]);
             }
         }
+        for (std::size_t j = 0; j < sequences.size(); ++j) {
+            if ((held >> j & 1U) != 0) { copy_hold_state(sequences[j], true); }
+        }
         verify_widths.clear();
+        return held;
     }
 
     // ---- Branches -------------------------------------------------------------------------------
@@ -3233,6 +3273,15 @@ struct Executor::Impl {
         for (std::size_t i = 0; i < from.size(); ++i) {
             CUDA_CHECK(cudaMemcpyAsync(to[i].first, from[i].first, from[i].second,
                                        cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
+    void copy_hold_state(std::uint32_t sequence, bool save) {
+        auto* kept = static_cast<std::uint8_t*>(hold_state.p) + sequence * hold_bytes;
+        for (const auto& [device_state, bytes] : state(sequence, false)) {
+            CUDA_CHECK(cudaMemcpyAsync(save ? kept : device_state, save ? device_state : kept, bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+            kept += bytes;
         }
     }
 
@@ -3427,6 +3476,23 @@ struct Executor::Impl {
         verified[sequence].clear();
         reset_decoder(sequence); // a snapshot holds a complete state
     }
+
+    bool hold(std::uint32_t sequence, SequenceSnapshot& out) {
+        if (hold_bytes == 0 || !resumable(sequence)) { return false; }
+        copy_hold_state(sequence, true);
+        out.position = positions[sequence];
+        out.history  = histories[sequence];
+        return true;
+    }
+
+    void restore_hold(std::uint32_t sequence, const SequenceSnapshot& from) {
+        if (hold_bytes == 0) { throw std::logic_error("deepseek_v41: an executor without checkpoints"); }
+        copy_hold_state(sequence, false);
+        positions[sequence] = from.position;
+        histories[sequence] = from.history;
+        verified[sequence].clear();
+        reset_decoder(sequence);
+    }
 };
 
 Executor::Executor(const Model& model, DeviceContext& device, ExecutorOptions options)
@@ -3582,14 +3648,23 @@ void Executor::verify(std::span<const std::uint32_t> sequences, std::span<const 
     impl_->verify(sequences, tokens, widths);
 }
 
-void Executor::commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept) {
-    impl_->commit(sequences, kept);
+std::uint32_t Executor::commit(std::span<const std::uint32_t> sequences,
+                               std::span<const std::uint32_t> kept,
+                               std::span<const std::uint32_t> hold_after,
+                               std::span<SequenceSnapshot* const> holds) {
+    return impl_->commit(sequences, kept, hold_after, holds);
 }
 
 void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) { impl_->snapshot(sequence, out); }
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
     impl_->restore(sequence, from);
+}
+
+bool Executor::hold(std::uint32_t sequence, SequenceSnapshot& out) { return impl_->hold(sequence, out); }
+
+void Executor::restore_hold(std::uint32_t sequence, const SequenceSnapshot& from) {
+    impl_->restore_hold(sequence, from);
 }
 
 } // namespace ninfer::models::deepseek_v41

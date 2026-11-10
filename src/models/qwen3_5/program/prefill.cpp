@@ -798,18 +798,19 @@ runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bo
         throw std::logic_error("prefill resolution requires a pending prefill token");
     }
     return resolve_non_speculative_pending(active_sequence(lane), requests[lane], 1, terminal,
-                                           std::nullopt, failed_timing);
+                                           std::nullopt, std::nullopt, failed_timing);
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     std::span<const std::uint32_t> lanes, std::span<const std::uint32_t> accepted_tokens,
     std::span<const std::uint8_t> terminal, std::span<const std::uint8_t> cancelled,
     std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
+    std::span<const std::optional<std::uint32_t>> stop_holds,
     runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
     if (lanes.empty() || lanes.size() > max_concurrency || accepted_tokens.size() != lanes.size() ||
         terminal.size() != lanes.size() || cancelled.size() != lanes.size() ||
-        prefix_execution_splits.size() != lanes.size()) {
+        prefix_execution_splits.size() != lanes.size() || stop_holds.size() != lanes.size()) {
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
     }
 
@@ -830,7 +831,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             timing.pause();
             timing.include(resolve_non_speculative_pending(
                 active_sequence(lane), requests[lane], accepted_tokens.front(),
-                terminal.front() != 0, prefix_execution_splits.front(), failed_timing));
+                terminal.front() != 0, prefix_execution_splits.front(), stop_holds.front(),
+                failed_timing));
             timing.resume_post();
         }
         return timing.finish();
@@ -851,7 +853,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 timing.pause();
                 timing.include(resolve_non_speculative_pending(
                     active_sequence(lane), requests[lane], accepted_tokens[row], terminal[row] != 0,
-                    prefix_execution_splits[row], failed_timing));
+                    prefix_execution_splits[row], stop_holds[row], failed_timing));
                 timing.resume_post();
             }
         }
@@ -912,8 +914,94 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     // laid out at the width it verified.
     const std::uint32_t verify_drafts = record_width - 1U;
     const auto tail_started           = Clock::now();
+    // A row whose stop string's hold begins inside the round keeps the state after the tokens
+    // before it: the same fold to a checkpoint image, ahead of the fold that moves the row on.
+    // The other rows fold nothing. A masked-draft backend's image also carries the drafter's
+    // context, which this fold does not write: the image takes a copy of the row's context, and
+    // the round's features of the tokens before the hold are appended to it below, while the
+    // round still has them. The image is the hybrid cache's checkpoint or, with the catalog, the
+    // lane's own (stop_hold_slot).
+    std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> hold_rows{};
+    std::array<std::optional<HybridPendingTap>, kMaximumConcurrency> holds{};
+    std::array<std::optional<std::int32_t>, kMaximumConcurrency> hold_slots{};
+    std::array<std::uint32_t, kMaximumConcurrency> hold_columns{};
+    std::size_t hold_span = 0;
+    const bool mtp_holds  = speculative_backend == SpeculativeBackend::Mtp && io.mtp_decode;
+    const bool draft_holds =
+        is_masked_draft_backend(speculative_backend) && io.dflash_decode && dflash;
+    if (mtp_holds || draft_holds) {
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            SequenceState& sequence             = active_sequence(lanes[row]);
+            const StateImageSelectors selectors = state_selectors(sequence);
+            hold_rows[row] = ops::GdnReplayFoldRow{.source_state_slot      = selectors.source,
+                                                   .destination_state_slot = selectors.destination,
+                                                   .commit_columns         = 0};
+            if (cancelled[row] || !stop_holds[row] || *stop_holds[row] >= accepted_tokens[row]) {
+                continue;
+            }
+            // The context copy reads the row's one image.
+            if (draft_holds &&
+                (sequence.state.fork_pending || sequence.state.read != sequence.state.write)) {
+                continue;
+            }
+            const std::uint32_t columns  = *stop_holds[row] + 1U;
+            const std::uint32_t frontier = requests[lanes[row]].pending.base_E + columns;
+            if (hybrid_) {
+                holds[row] = hybrid_hold_reserve(sequence, frontier);
+                if (holds[row]) {
+                    hold_slots[row] = state_store->physical_slot(holds[row]->image);
+                }
+            } else {
+                hold_slots[row] = stop_hold_slot(sequence, frontier);
+            }
+            if (!hold_slots[row]) { continue; }
+            hold_rows[row].destination_state_slot = *hold_slots[row];
+            hold_rows[row].commit_columns         = static_cast<std::int32_t>(columns);
+            hold_columns[row]                     = columns;
+            hold_span                             = row + 1U;
+        }
+    }
+
     try {
         timing.resume_submit();
+        if (hold_span != 0) {
+            const std::span<const ops::GdnReplayFoldRow> span(hold_rows.data(), hold_span);
+            {
+                RankBinding bind(device, state_images->shard(0).rank);
+                replay_fold->execute(span, static_cast<std::int32_t>(record_width),
+                                     compute_streams[state_images->shard(0).rank]);
+            }
+            for (std::size_t shard = 1; shard < state_images->shard_count(); ++shard) {
+                RankBinding bind(device, state_images->shard(shard).rank);
+                extra_replay_fold[shard - 1]->execute(
+                    span, static_cast<std::int32_t>(record_width),
+                    compute_streams[state_images->shard(shard).rank]);
+            }
+            // The hidden the checkpoint continues from: the target's at its last token.
+            const Tensor target_hidden =
+                mtp_holds ? io.mtp_decode->verification_view(record_width - 1U).target_hidden
+                          : io.dflash_decode->narrowed(verify_drafts).target_hidden;
+            for (std::size_t row = 0; row < hold_span; ++row) {
+                if (!hold_slots[row]) { continue; }
+                const Tensor source = target_hidden
+                                          .slice(2, static_cast<std::int32_t>(row), 1)
+                                          .slice(1, static_cast<std::int32_t>(hold_columns[row] - 1U), 1);
+                const Tensor destination =
+                    state_images->continuation_hidden_slot(*hold_slots[row]);
+                CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, destination.bytes(),
+                                           cudaMemcpyDeviceToDevice, device.stream));
+                // A masked-draft image is whole once its context is (below).
+                if (draft_holds) { continue; }
+                SequenceState& sequence = active_sequence(lanes[row]);
+                if (holds[row]) {
+                    hybrid_hold_keep(sequence, *holds[row]);
+                    holds[row].reset();
+                } else {
+                    stop_hold_keep(sequence, requests[lanes[row]].pending.base_E + hold_columns[row],
+                                   true);
+                }
+            }
+        }
         const std::span<const ops::GdnReplayFoldRow> fold_span(fold_rows.data(), lanes.size());
         {
             // Each state shard folds its own layers on its own device's stream.
@@ -1013,12 +1101,61 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             // round's host preparation instead of waiting for that submission.
             device.flush();
         }
+
+        if (draft_holds && hold_span != 0) {
+            // The hold images' draft context: the row's context, which ends at the round's base,
+            // and the features of the tokens the image has read past it. The append goes through
+            // the pinned ingress like a terminal row's, so the host waits for it as well.
+            std::array<std::uint32_t, kMaximumConcurrency> hold_lanes{};
+            std::array<std::uint32_t, kMaximumConcurrency> hold_starts{};
+            std::array<std::uint32_t, kMaximumConcurrency> hold_counts{};
+            std::array<std::int32_t, kMaximumConcurrency> hold_destinations{};
+            std::size_t hold_size = 0;
+            for (std::size_t row = 0; row < hold_span; ++row) {
+                if (!hold_slots[row]) { continue; }
+                const SequenceState& sequence = active_sequence(lanes[row]);
+                state_images->copy_dflash_local(state_selectors(sequence).source, *hold_slots[row],
+                                                device.stream);
+                hold_lanes[hold_size]        = lanes[row];
+                hold_starts[hold_size]       = requests[lanes[row]].pending.base_E;
+                hold_counts[hold_size]       = hold_columns[row];
+                hold_destinations[hold_size] = *hold_slots[row];
+                ++hold_size;
+            }
+            if (hold_size != 0) {
+                enqueue_dflash_context_append(
+                    std::span<const std::uint32_t>(hold_lanes.data(), hold_size),
+                    std::span<const std::uint32_t>(hold_starts.data(), hold_size),
+                    std::span<const std::uint32_t>(hold_counts.data(), hold_size),
+                    std::span<const std::int32_t>(hold_destinations.data(), hold_size));
+                timing.begin_wait();
+                device.synchronize();
+                timing.end_wait();
+                for (std::size_t row = 0; row < hold_span; ++row) {
+                    if (!hold_slots[row]) { continue; }
+                    SequenceState& sequence = active_sequence(lanes[row]);
+                    const std::uint32_t frontier =
+                        requests[lanes[row]].pending.base_E + hold_columns[row];
+                    if (holds[row]) {
+                        hybrid_hold_keep(sequence, *holds[row]);
+                        holds[row].reset();
+                    } else {
+                        stop_hold_keep(sequence, frontier, true, frontier);
+                    }
+                }
+            }
+        }
         work.reset();
     } catch (...) {
         try {
             device.synchronize();
         } catch (...) {}
         work.reset();
+        for (const std::optional<HybridPendingTap>& hold : holds) {
+            if (!hold) { continue; }
+            (void)state_store->release(hold->image);
+            hybrid_->index().release_device_slot(hold->slot);
+        }
         clear_execution_failure_lanes(lanes);
         throw;
     }

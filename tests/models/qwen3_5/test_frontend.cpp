@@ -2391,19 +2391,63 @@ int test_cross_round_stop(const Frontend& frontend) {
                                                       ninfer::FinishReason::OutputLimit);
     int failures     = check(first_decision.accepted_tokens == 1 && !first_decision.finished(),
                              "cross-round stop ended before the stop string was complete");
+    // The round's only token holds the match prefix: no token of the round precedes the hold.
+    failures += check(first_decision.stop_hold_after == std::optional<std::uint32_t>(0),
+                      "a hold that begins in the round did not report where");
+    failures += check(first_decision.stop_hold_alive, "a held match prefix was not reported alive");
     const auto first = session.commit_preview();
     failures += check(channel_text(first, ninfer::OutputChannel::Content) == "hello",
                       "cross-round stop did not retain the ambiguous suffix");
+    {
+        // A token that does not continue the match ends the hold.
+        auto other   = frontend.make_output_session(prompt, stop);
+        (void)other.preview_model(std::array<ninfer::TokenId, 1>{1}, 3,
+                                  ninfer::FinishReason::OutputLimit);
+        (void)other.commit_preview();
+        const auto released = other.preview_model(std::array<ninfer::TokenId, 1>{32}, 2,
+                                                  ninfer::FinishReason::OutputLimit);
+        failures += check(!released.finished() && !released.stop_hold_alive &&
+                              !released.stop_hold_after,
+                          "a match prefix that the next token ended stayed alive");
+        (void)other.commit_preview();
+    }
 
     const auto second_decision = session.preview_model(std::array<ninfer::TokenId, 1>{2}, 1,
                                                        ninfer::FinishReason::OutputLimit);
     failures += check(second_decision.accepted_tokens == 1 &&
                           second_decision.finish_reason == ninfer::FinishReason::StopString,
                       "cross-round stop did not select the exact terminal token prefix");
+    failures += check(!second_decision.stop_hold_after && second_decision.stop_cut &&
+                          !first_decision.stop_cut,
+                      "a cut whose hold began in an earlier round reported this round");
     const auto second = session.commit_preview();
     failures += check(second.empty(), "stop marker or same-token suffix leaked to output");
     failures += check(session.matched_stop_string() == std::optional<std::string>("STOP"),
                       "terminal output session lost the matched stop declaration");
+    return failures;
+}
+
+// A match that begins and ends inside one round: the hold is the token that begins it, unless
+// the stop string stays in the output, when every token before the last one stays with it.
+int test_stop_hold_in_one_round(const Frontend& frontend) {
+    int failures = 0;
+    for (const bool included : {false, true}) {
+        auto prompt = frontend.prepare_tokens({0});
+        ninfer::StopPolicy stop;
+        stop.strings.push_back(ninfer::StopString{.text = "STOP", .include_in_output = included});
+        auto session        = frontend.make_output_session(prompt, stop);
+        const auto decision = session.preview_model(std::array<ninfer::TokenId, 2>{1, 2}, 4,
+                                                    ninfer::FinishReason::OutputLimit);
+        failures += check(decision.accepted_tokens == 2 &&
+                              decision.finish_reason == ninfer::FinishReason::StopString,
+                          "a stop string across two tokens of a round did not end it");
+        failures += check(included ? !decision.stop_cut && !decision.stop_hold_after
+                                   : decision.stop_cut && decision.stop_hold_after ==
+                                                              std::optional<std::uint32_t>(0),
+                          included ? "a stop string that stays in the output reported a cut"
+                                   : "a cut stop string did not hold at its first token");
+        (void)session.commit_preview();
+    }
     return failures;
 }
 
@@ -2421,6 +2465,8 @@ int test_same_token_stop_priority(const Frontend& frontend) {
     int failures        = check(decision.accepted_tokens == 1 &&
                                     decision.finish_reason == ninfer::FinishReason::StopString,
                                 "same-token stop strings did not select a terminal prefix");
+    failures += check(decision.stop_hold_after == std::optional<std::uint32_t>(0),
+                      "a cut inside the round's first token did not report it");
     const auto output   = session.commit_preview();
     failures += check(output.empty(),
                       "same-token stops did not prefer the earliest byte and declaration order");
@@ -4467,6 +4513,7 @@ int main() {
     failures += test_low_image_detail(frontend);
     failures += test_video_prepare(frontend);
     failures += test_cross_round_stop(frontend);
+    failures += test_stop_hold_in_one_round(frontend);
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();

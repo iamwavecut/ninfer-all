@@ -75,8 +75,8 @@ struct ExecutorOptions {
     // verification); a verification's rows, the anchors and drafts of all its sequences, are at
     // most 8.
     std::uint32_t draft_tokens = 0;
-    // One checkpoint of every sequence's rings and tails (snapshot/restore), allocated with the
-    // caches.
+    // One checkpoint of every sequence's rings and tails (snapshot/restore) and one held state
+    // (hold/restore_hold), allocated with the caches.
     bool checkpoints = true;
     std::optional<std::uint64_t> expert_cache_bytes;
     // Host or disk experts: the cache's first contents, the most routed of these counts
@@ -241,10 +241,22 @@ public:
     void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,
                 std::span<const std::uint32_t> widths = {});
     // Keeps the first kept[j] (1..its width) of sequence j's verified tokens.
-    void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept);
+    // `hold_after[j]` (0: none; at most kept[j]): `holds[j]` also receives the state after that
+    // many of sequence j's tokens, as hold() keeps it and restore_hold() returns to. Returns the
+    // rows whose state was kept, a bit each (none in an executor without checkpoints).
+    std::uint32_t commit(std::span<const std::uint32_t> sequences,
+                         std::span<const std::uint32_t> kept,
+                         std::span<const std::uint32_t> hold_after = {},
+                         std::span<SequenceSnapshot* const> holds = {});
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
+    // A second kept state beside the checkpoint, of an executor with checkpoints: hold() keeps the
+    // sequence's live state (false when it is mid-way through a prefill tail, keeping nothing),
+    // restore_hold() takes the sequence back to it. The engine keeps the state before the token
+    // that begins a stop string's match this way.
+    bool hold(std::uint32_t sequence, SequenceSnapshot& out);
+    void restore_hold(std::uint32_t sequence, const SequenceSnapshot& from);
     // Bytes of an image at `position`.
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
     // Copies the sequence's state into `pages`, pinned host memory that holds image_bytes() of its

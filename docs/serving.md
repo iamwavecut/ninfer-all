@@ -2488,11 +2488,14 @@ without thinking, or one whose reasoning never closes, keeps its original sample
 `request_done` record reports `post_thinking_sampling` when the switch happened.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
-`C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are
-independent startup-fixed pinned-memory capacities; Host KV is shared by Main and the selected
-Backend pool and is consumed in physical page extents. `--no-prefix-reuse` selects root-only Engine
-mode and cannot be combined with any of the seven explicit context-cache capacity flags, including
-zero-valued flags.
+`C` slots guarantee active requests and `H` is a global checkpoint pool. A Qwen3.5-core model keeps
+`C` more images beside the catalog, one for each request: the state where a stop string's match
+began, which a turn returns to when the stop string ends it rounds later, so the next turn resumes
+there. A start whose KV capacity does not fit beside them drops them and logs it; such a turn's next
+turn then resumes from the prompt's checkpoint. Host State and Host KV are independent startup-fixed
+pinned-memory capacities; Host KV is shared by Main and the selected Backend pool and is consumed in
+physical page extents. `--no-prefix-reuse` selects root-only Engine mode and cannot be combined with
+any of the seven explicit context-cache capacity flags, including zero-valued flags.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 

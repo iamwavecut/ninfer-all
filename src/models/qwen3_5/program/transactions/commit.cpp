@@ -522,6 +522,7 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
         std::array<std::uint8_t, kMaximumConcurrency> terminal{};
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         std::array<std::optional<std::uint32_t>, kMaximumConcurrency> prefix_execution_splits{};
+        std::array<std::optional<std::uint32_t>, kMaximumConcurrency> stop_holds{};
         for (std::size_t row = 0; row < row_count; ++row) {
             const std::uint32_t lane                = ContractAccess::lane(members[row]).value;
             lanes[row]                              = lane;
@@ -538,13 +539,20 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
                   (!decision.terminal && decision.accepted_tokens != candidate.produced))) ||
                 (decision.prefix_execution_split_after &&
                  (decision.cancelled || *decision.prefix_execution_split_after == 0 ||
-                  *decision.prefix_execution_split_after > decision.accepted_tokens))) {
+                  *decision.prefix_execution_split_after > decision.accepted_tokens)) ||
+                (decision.stop_hold_after &&
+                 (decision.cancelled || *decision.stop_hold_after >= decision.accepted_tokens)) ||
+                (decision.stop_cut && (decision.cancelled || !decision.terminal))) {
                 throw std::logic_error("pending transaction decision is invalid");
             }
             accepted[row]                = decision.accepted_tokens;
             terminal[row]                = decision.terminal ? 1U : 0U;
             cancelled[row]               = decision.cancelled ? 1U : 0U;
             prefix_execution_splits[row] = decision.prefix_execution_split_after;
+            stop_holds[row]              = decision.stop_hold_after;
+            if (hybrid_ && lane < max_concurrency) {
+                hybrid_lanes_[lane].stop_cut = decision.stop_cut;
+            }
             if (decision.cancelled) {
                 timings[row]     = requests[lane].timings;
                 speculative[row] = std::move(requests[lane].speculative_stats);
@@ -559,9 +567,21 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
                                 std::span<const std::uint8_t>(cancelled.data(), row_count),
                                 std::span<const std::optional<std::uint32_t>>(
                                     prefix_execution_splits.data(), row_count),
+                                std::span<const std::optional<std::uint32_t>>(stop_holds.data(),
+                                                                              row_count),
                                 failed_timing));
         timing.resume_post();
         pending_transaction_.reset();
+        // A catalog turn that a stop string ends in a later round than its match began returns
+        // to the state kept there; the hybrid cache publishes its checkpoint when the lane ends.
+        for (std::size_t row = 0; row < row_count; ++row) {
+            if (decisions[row].cancelled || !decisions[row].terminal) { continue; }
+            if (decisions[row].stop_cut) {
+                stop_hold_rewind(lanes[row]);
+            } else {
+                stop_holds_[lanes[row]].reset();
+            }
+        }
 
         CommitResult out;
         out.row_count          = row_count;
@@ -1187,7 +1207,8 @@ bool ProgramImpl::rebuild_context_stores() noexcept {
                                                           host_kv_extents->descriptor_capacity());
         }
         states = std::make_unique<StateImageStore>(*state_images, host_state_images.get(),
-                                                   state_store->capacity());
+                                                   state_store->capacity(),
+                                                   state_store->device_capacity());
         // A Disk tier write may still read a Host replica of an old store.
         if (disk_kv) { disk_kv->wait_idle(); }
     } catch (...) { return false; }
