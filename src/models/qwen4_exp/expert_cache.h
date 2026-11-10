@@ -15,10 +15,10 @@
 // profile fills the slots at startup and, through the ranking of its counts over every layer, sizes
 // each layer's share of them.
 //
-// Between prompts the cache also holds the device buffers a wide call copies its layer's uncached
-// experts into (lend): a wide pass takes them back (reclaim), keeping the most routed of the
-// experts they held in colder slots of the cache's own, and the next decode pass returns them
-// empty (give_back), to fill as decode routes.
+// Between prompts the cache also holds the device buffers that only wide calls write, those they
+// copy a layer's uncached experts into and a prompt span's stack (lend): a wide pass takes them
+// back (reclaim), keeping the most routed of the experts they held in colder slots of the cache's
+// own, and the next decode pass returns them empty (give_back), to fill as decode routes.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -91,22 +91,22 @@ public:
     void seed(const std::vector<std::vector<std::uint64_t>>& counts);
     // Every route each layer's experts took since startup.
     [[nodiscard]] std::vector<std::vector<std::uint64_t>> totals() const;
-    // The device memory of `layer`'s slots: its own block, grow's and its share of up to two lent
-    // buffers (empty until then). A table entry inside any of them is a cached expert.
-    using Ranges = std::array<std::pair<std::uintptr_t, std::uintptr_t>, 4>;
+    // The device memory of `layer`'s slots: its own block, grow's and its share of up to three
+    // lent buffers (empty until then). A table entry inside any of them is a cached expert.
+    using Ranges = std::array<std::pair<std::uintptr_t, std::uintptr_t>, 5>;
     [[nodiscard]] Ranges storage(std::size_t layer) const;
     // Once startup's allocations are done: more slots for every layer that is not full, from
     // `bytes_by_rank`, as free slots, shared as at construction (a profile's ranking continues
     // where construction stopped). Returns the bytes each rank gave. At most once.
     std::vector<std::uint64_t> grow(std::span<const std::uint64_t> bytes_by_rank);
 
-    // Device buffers of a rank that wide calls write between decode passes.
+    // Device buffers of a rank that only wide calls write, between decode passes.
     struct Loan {
         std::size_t rank = 0;
         void* base       = nullptr;
         std::uint64_t bytes = 0;
     };
-    // After grow, at most once: up to two buffers per rank become free slots of that rank's layers
+    // After grow, at most once: up to three buffers per rank become free slots of that rank's layers
     // that are not full, shared as grow shares; the cache holds them until a reclaim. Returns the
     // bytes of each rank's slots.
     std::vector<std::uint64_t> lend(std::span<const Loan> loans);

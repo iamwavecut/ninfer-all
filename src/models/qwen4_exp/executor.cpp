@@ -947,9 +947,11 @@ struct Executor::Impl {
     };
 
     std::vector<SlotPool> slot_pools; // by rank; empty unless the experts are host resident
-    // With the automatic expert cache the pool buffers are cache slots between prompts
-    // (ExpertCache::lend): a wide pass takes them back, the next decode pass returns them.
+    // With the automatic expert cache the pool buffers and a span's stack (span_stack, which
+    // only run_span writes) are cache slots between prompts (ExpertCache::lend): a wide pass takes
+    // them back, the next decode pass returns them. lent_ranks: the ranks with a lent buffer.
     bool pools_lent = false;
+    std::vector<unsigned char> lent_ranks;
     std::unique_ptr<PinnedHostBuffer> slot_entries;
     // Wide host calls of at least kPrefetchTokens touch nearly every expert of a layer: every
     // expert the cache lacks is copied into the pool on the transfer stream while the layers
@@ -2668,8 +2670,8 @@ struct Executor::Impl {
     // verification pass returns them.
     void place_pools(bool wide) {
         if (!pools_lent) { return; }
-        for (std::size_t r = 0; r < slot_pools.size(); ++r) {
-            if (slot_pools[r].slots == 0) { continue; }
+        for (std::size_t r = 0; r < lent_ranks.size(); ++r) {
+            if (!lent_ranks[r]) { continue; }
             const cudaStream_t transfer = device.rank(r).transfer_stream;
             if (wide) {
                 cache->reclaim(r, transfer);
@@ -5541,7 +5543,12 @@ struct Executor::Impl {
                         {.rank = r, .base = buffer.storage.p, .bytes = buffer.storage.bytes});
                 }
             }
+            if (span_stack.p != nullptr) {
+                loans.push_back({.rank = 0, .base = span_stack.p, .bytes = span_stack.bytes});
+            }
             if (!loans.empty()) {
+                lent_ranks.assign(device.size(), 0);
+                for (const auto& loan : loans) { lent_ranks[loan.rank] = 1; }
                 const auto lent = cache->lend(loans);
                 for (std::size_t r = 0; r < lent.size(); ++r) {
                     memory.ranks[r].expert_cache_bytes += lent[r];

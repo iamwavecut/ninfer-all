@@ -310,6 +310,74 @@ void loans(DeviceContext& device) {
     cudaStreamDestroy(transfer);
 }
 
+// Three lent buffers of a rank (the two pool buffers and a span's stack): their slots follow one
+// another, and a reclaim and a return treat them as one.
+void three_loans(DeviceContext& device) {
+    Model model;
+    ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{4 * 16384});
+    std::array<DeviceBuffer, 3> buffers{DeviceBuffer(2 * 16384), DeviceBuffer(2 * 16384 + 500),
+                                        DeviceBuffer(2 * 16384)};
+    cudaStream_t transfer = nullptr;
+    require(cudaStreamCreateWithFlags(&transfer, cudaStreamNonBlocking) == cudaSuccess, "a stream");
+    std::vector<ExpertCache::Loan> loans;
+    for (const auto& buffer : buffers) { loans.push_back({.rank = 0, .base = buffer.p, .bytes = buffer.bytes}); }
+    const auto lent = cache.lend(loans);
+    require(lent.size() == 1 && lent[0] == 6 * 16384 && cache.stats().slots == 20,
+            "three lent buffers give each layer two slots each: " + std::to_string(cache.stats().slots));
+    const auto which = [&](const void* at) {
+        const auto a = reinterpret_cast<std::uintptr_t>(at);
+        for (int b = 0; b < 3; ++b) {
+            const auto base = reinterpret_cast<std::uintptr_t>(buffers[std::size_t(b)].p);
+            if (a >= base && a < base + buffers[std::size_t(b)].bytes) { return b; }
+        }
+        return -1;
+    };
+    const auto ranges = cache.storage(0);
+    for (int b = 0; b < 3; ++b) {
+        const auto& range = ranges[std::size_t(2 + b)];
+        require(range.second - range.first == 2 * 10496 && which(reinterpret_cast<void*>(range.first)) == b,
+                "layer 0's lent block " + std::to_string(b) + " lies in its buffer");
+    }
+    cache.hand_over(0);
+    std::vector<unsigned char> in_use(kExperts, 0);
+    // Experts 0..3 take the cache's own slots, 4..9 the lent ones, buffer by buffer.
+    for (std::int32_t e = 0; e < 10; ++e) {
+        const auto out = admit(cache, model, 0, e, 1, in_use);
+        require(out.slot[0] != nullptr && which(out.slot[0]) == (e < 4 ? -1 : (e - 4) / 2),
+                "expert " + std::to_string(e) + " takes the next slot in order");
+    }
+    std::vector<std::int32_t> routes;
+    for (int e = 0; e < 10; ++e) { routes.insert(routes.end(), std::size_t(5 * (e + 1)), e); }
+    cache.observe(0, routes, true);
+    cache.adapt();
+    require(model.cached(0, "three lent and filled").size() == 10, "ten slots hold their experts");
+
+    // A wide pass takes the three back: the four most routed stay, in the cache's own slots.
+    cache.reclaim(0, transfer);
+    require(cudaStreamSynchronize(transfer) == cudaSuccess, "the handover");
+    require(model.cached(0, "three reclaimed") == std::vector<int>({6, 7, 8, 9}),
+            "the most routed experts stay in the cache's own slots");
+    for (const auto& buffer : buffers) {
+        require(cudaMemsetAsync(buffer.p, 0xab, buffer.bytes, transfer) == cudaSuccess, "a wide pass writes it");
+    }
+    require(cudaStreamSynchronize(transfer) == cudaSuccess, "the wide pass");
+    require(model.cached(0, "three written").size() == 4, "the buffers' writes reach no cached expert");
+
+    // The next decode pass returns them zeroed, and the six that left come back into them.
+    cache.give_back(0, transfer);
+    require(cudaDeviceSynchronize() == cudaSuccess, "the zeroing and the copies");
+    cache.adapt();
+    const auto refilled = model.cached(0, "three refilled");
+    require(refilled.size() == 10, "the returned slots are refilled: " + std::to_string(refilled.size()));
+    for (std::int32_t e = 0; e < 6; ++e) {
+        require(which(cache.cached(0, 0, e)) >= 0, "a refilled expert lies in a returned slot");
+    }
+    require(which(cache.cached(0, 0, 5)) != which(cache.cached(0, 0, 0)) ||
+                which(cache.cached(0, 0, 5)) != which(cache.cached(0, 0, 3)),
+            "the refill spans more than one buffer");
+    cudaStreamDestroy(transfer);
+}
+
 void admissions(DeviceContext& device) {
     Model model;
     ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{2 * 102400});
@@ -501,6 +569,7 @@ int main() {
         admissions(device);
         profile(device);
         loans(device);
+        three_loans(device);
         two_ranks(devices);
         std::cout << "PASS qwen4_exp expert cache\n";
         return 0;
