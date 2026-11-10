@@ -318,6 +318,32 @@ NINFER_LOGPROBS_ARTIFACT=$PWD/out/qwen3_8_27b.ninfer NINFER_LOGPROBS_SPECULATIVE
   ctest --test-dir build -R ninfer_engine_logprobs_real_test --output-on-failure
 ```
 
+`ninfer_engine_stop_string_real_test` checks, for any model family, that a stop string changes no
+token of the turn it ends, that the next turn resumes from the state where the stop string's match
+began, and that this state is the one a turn limited to the reply's tokens before the match leaves
+(without drafts the next turn's tokens are equal). It measures how far the next prompt repeats the
+turn's tokens: where a template renders the reply anew (Flint and Gemma 4 with thinking off), no
+state of the reply continues it and the test only reports the reuse. `NINFER_STOP_ARTIFACT` names
+the artifact, and the test is skipped without it; `NINFER_STOP_NGRAM_TABLE` names a table artifact,
+`NINFER_STOP_SPECULATIVE=mtp`, `dflash`, `dflash2`, `dspark` or `lookup` decodes the reply in
+speculative rounds (`NINFER_STOP_DRAFTS` tokens), `NINFER_STOP_EXPERTS=host` or `disk` places the
+routed experts, `NINFER_STOP_CONTEXT_CACHE=hybrid` selects the hybrid prefix cache,
+`NINFER_STOP_KV=int8` an int8 KV cache, `NINFER_STOP_DEVICES=0,1` the devices (pipeline stages, or
+tensor parallelism with `NINFER_STOP_TENSOR_PARALLEL=1`),
+`NINFER_STOP_THINKING=1` leaves thinking as the template has it and `on` turns it on, `NINFER_STOP_CONTINUE=1` continues
+the stopped reply as the final assistant message in place of a new user turn,
+`NINFER_STOP_PROMPT` replaces the first user message, `NINFER_STOP_TOKENS` sets the turn's output
+limit (240), `NINFER_STOP_REASONING=1` puts the reply's reasoning in the next request's history,
+`NINFER_STOP_RAW=1` sends the next request as raw tokens (the prompt's, the reply's before the match
+and a few new ones, which repeats the reply under any template) and
+`NINFER_STOP_BYTES` sets the stop string's length (14 bytes; 48 spans several rounds of drafts):
+
+```bash
+NINFER_STOP_ARTIFACT=$PWD/out/qwen3_8_27b.ninfer NINFER_STOP_CONTEXT_CACHE=hybrid \
+  NINFER_STOP_SPECULATIVE=mtp ctest --test-dir build -R ninfer_engine_stop_string_real_test \
+  --output-on-failure
+```
+
 Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration
 tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
 `pressure-resume` or `concurrent`; the default is `all`. These integration checks
