@@ -136,6 +136,18 @@ struct DraftConfig {
         return static_cast<std::uint32_t>(
             std::count(layer_types.begin(), layer_types.begin() + layer, kind));
     }
+
+    // Whether a DFlash2 drafter of this config over a target of width `hidden_size` has the
+    // geometry the fused DFlash2 Ops implement (context_kv_materialize and the two
+    // dynamic-convolution Ops: the official 27B drafter's). A DFlash2 drafter of another geometry
+    // runs the same mathematics composed from the runtime-shape Ops.
+    [[nodiscard]] bool fused_dflash2(std::uint32_t hidden_size) const noexcept {
+        return dflash2.has_value() && hidden_size == 5120 && num_hidden_layers == 5 &&
+               local_layer_count() == 5 && intermediate_size == 17408 &&
+               attention.num_attention_heads == 32 && attention.num_key_value_heads == 8 &&
+               attention.head_dim == 128 && dflash2->conv_kernel_size == 2 &&
+               dflash2->conv_group_size == 16;
+    }
 };
 
 struct Config {

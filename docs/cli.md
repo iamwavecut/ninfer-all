@@ -104,8 +104,8 @@ GPU residency is frozen when the Engine starts:
 - no `--spec` omits MTP/DFlash/DFlash2 weights and state and the optimized proposal head, except
   where the Engine chooses a drafter (Qwen3.8-Flash-Next and Gemma 4 with host experts; see
   `--spec` below);
-- `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B, Qwen3.8-Flash-Next)
-  load only the selected speculative backend;
+- `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B, Qwen3.6-35B-A3B,
+  Qwen3.8-Flash-Next) load only the selected speculative backend;
 - a speculative backend loads the artifact's optimized proposal head when it stores one, unless
   `--full-draft-head` keeps the drafts on the full output head and omits it;
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
@@ -217,6 +217,16 @@ the launchers pass. DFlash2 accepts every draft count from 1 through 15. Both `g
 penalties, and prefix reuse. An artifact without the companion weights reports a missing DFlash2
 component when selected. Vision, MTP and DFlash follow the same rule: their weights are required
 only when that component is enabled at startup.
+
+A Qwen3.6-35B-A3B artifact converted with
+[incoai's DFlash2 drafter](https://huggingface.co/incoai/Qwen3.6-35B-A3B-DFlash2)
+(`--components ...,dflash2 --source dflash2=PATH`) takes the same `--spec dflash2`. That drafter was
+trained on blocks of eight positions, so `--draft-tokens` past 7 asks it for positions it never saw.
+On an RTX 5090 with the NVFP4 artifact resident (400 greedy tokens, 2026-11-10) a code answer
+decoded 403 tokens per second without drafts, 829 with three MTP drafts and 805, 919 and 892 with
+three, five and seven DFlash2 drafts; a prose answer 403, 548 and 465, 420 and 385; the benchmark
+corpus (`ninfer_bench`, 128 tokens) 403, 497 and 427, 350 and 455. Draft with it where the output is
+code; MTP stays ahead elsewhere.
 
 A request that samples (temperature above zero) verifies MTP and DFlash drafts with coupled
 draws: the model draws each verified position with the request's seed and that position as the key,

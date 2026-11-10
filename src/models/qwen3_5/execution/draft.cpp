@@ -155,7 +155,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         ops::rmsnorm(projected, state.execution.parameters.draft->context_norm, config.rms_norm_eps,
                      false, context, state.execution.device.stream);
 
-        if (config.dflash2) {
+        if (config.fused_dflash2(target.hidden_size)) {
             std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
             if (config.num_hidden_layers != layers.size() ||
                 config.local_layer_count() != layers.size() || config.rms_norm_eps != 1e-6F ||
@@ -183,9 +183,10 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                     config.layer_types[layer] == DraftAttentionKind::SlidingAttention;
                 const int layer_width   = local_layer ? local_width : width;
                 const int layer_columns = layer_width * batch;
-                Tensor layer_context    = local_layer && replace_local_window
-                                              ? context.slice(1, local_offset, local_width)
-                                              : context;
+                // A DFlash2 context holds only the window's columns already (projected_width).
+                Tensor layer_context = local_layer && replace_local_window && !config.dflash2
+                                           ? context.slice(1, local_offset, local_width)
+                                           : context;
                 Tensor layer_positions  = local_layer && replace_local_window
                                               ? positions.slice(0, local_offset, local_width)
                                               : positions;
@@ -260,6 +261,40 @@ void finish_dynamic_branch(ExecutionCore& execution, const Tensor& input,
                                          finish_delta, residual, scratch, execution.device.stream);
 }
 
+// The same two steps for a drafter outside the fused Ops' geometry: the branch's normalized input,
+// its convolution's coefficients for both sides (rows (2 s + t) G + g, as the projection stores
+// them) and side 0, the prepared input of the branch's projections.
+void prepare_composed_branch(ExecutionCore& execution, const Tensor& residual, const Tensor& norm,
+                             float eps, const DynamicConvParameters& weights, Tensor& coefficients,
+                             Tensor& prepared) {
+    auto scope        = execution.work.scope();
+    const int hidden  = residual.ne[0];
+    const int columns = residual.ne[1] * residual.ne[2];
+    Tensor normed     = execution.work.alloc(DType::BF16, {hidden, residual.ne[1], residual.ne[2]});
+    Tensor normed_flat = normed.view({hidden, columns});
+    ops::rmsnorm(residual.view({hidden, columns}), norm, eps, false, normed_flat,
+                 execution.device.stream);
+    Tensor flat = coefficients.view({coefficients.ne[0], columns});
+    project(normed_flat, weights.kernel_projection, flat, execution.work, execution.device.stream);
+    ops::dynamic_grouped_conv(normed, coefficients, weights.base_kernel, 0, prepared,
+                              execution.device.stream);
+}
+
+// Side 1: the branch's output projection, convolved into the residual.
+void finish_composed_branch(ExecutionCore& execution, const Tensor& input,
+                            const LinearParameters& projection,
+                            const DynamicConvParameters& weights, const Tensor& coefficients,
+                            Tensor& residual) {
+    auto scope      = execution.work.scope();
+    const int width = input.ne[1], batch = input.ne[2];
+    Tensor projected = execution.work.alloc(DType::BF16, {residual.ne[0], width, batch});
+    Tensor flat      = projected.view({residual.ne[0], width * batch});
+    project(input.view({input.ne[0], width * batch}), projection, flat, execution.work,
+            execution.device.stream);
+    ops::dynamic_grouped_conv(projected, coefficients, weights.base_kernel, 1, residual,
+                              execution.device.stream);
+}
+
 void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame, int batch,
                            int k, DFlashEnvelopes envelopes) {
     if (state.execution.parameters.model.config().draft->dflash2) {
@@ -273,6 +308,10 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
         const int width                = k + 1;
         const int columns              = width * batch;
         const int mask_columns         = k * batch;
+        const bool fused               = config.fused_dflash2(target.hidden_size);
+        const int coefficient_rows     = dimension(
+            2ULL * config.dflash2->conv_kernel_size * target.hidden_size /
+            config.dflash2->conv_group_size);
         auto& work                     = state.execution.work;
         const cudaStream_t stream      = state.execution.device.stream;
         const DraftParameters& weights = *state.execution.parameters.draft;
@@ -296,8 +335,16 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
             {
                 auto scope  = work.scope();
                 auto branch = workspace::dflash2_branch(work, target, config, width, batch);
-                prepare_dynamic_branch(state.execution, residual, layer.input_norm,
-                                       config.rms_norm_eps, *layer.attention_conv, branch);
+                Tensor coefficients;
+                if (fused) {
+                    prepare_dynamic_branch(state.execution, residual, layer.input_norm,
+                                           config.rms_norm_eps, *layer.attention_conv, branch);
+                } else {
+                    coefficients = work.alloc(DType::FP32, {coefficient_rows, width, batch});
+                    prepare_composed_branch(state.execution, residual, layer.input_norm,
+                                            config.rms_norm_eps, *layer.attention_conv,
+                                            coefficients, branch.prepared);
+                }
                 Tensor query = work.alloc(
                     DType::BF16, {dimension(config.attention.head_dim),
                                   dimension(config.attention.num_attention_heads), width, batch});
@@ -327,52 +374,97 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
                     state.dflash.local_layer(static_cast<std::uint32_t>(layer_index)),
                     envelopes.local, work, attention, stream);
-                finish_dynamic_branch(
-                    state.execution,
-                    attention.view({dimension(config.attention.query_width()), width, batch}),
-                    layer.output, *layer.attention_conv, branch.finish_delta, residual);
+                const Tensor attended =
+                    attention.view({dimension(config.attention.query_width()), width, batch});
+                if (fused) {
+                    finish_dynamic_branch(state.execution, attended, layer.output,
+                                          *layer.attention_conv, branch.finish_delta, residual);
+                } else {
+                    finish_composed_branch(state.execution, attended, layer.output,
+                                           *layer.attention_conv, coefficients, residual);
+                }
             }
             {
                 auto scope  = work.scope();
                 auto branch = workspace::dflash2_branch(work, target, config, width, batch);
-                prepare_dynamic_branch(state.execution, residual, layer.post_attention_norm,
-                                       config.rms_norm_eps, *layer.mlp_conv, branch);
+                Tensor coefficients;
+                if (fused) {
+                    prepare_dynamic_branch(state.execution, residual, layer.post_attention_norm,
+                                           config.rms_norm_eps, *layer.mlp_conv, branch);
+                } else {
+                    coefficients = work.alloc(DType::FP32, {coefficient_rows, width, batch});
+                    prepare_composed_branch(state.execution, residual, layer.post_attention_norm,
+                                            config.rms_norm_eps, *layer.mlp_conv, coefficients,
+                                            branch.prepared);
+                }
                 Tensor intermediate =
                     work.alloc(DType::BF16, {dimension(config.intermediate_size), width, batch});
                 Tensor intermediate_flat =
                     intermediate.view({dimension(config.intermediate_size), columns});
                 project_swiglu(branch.prepared.view({dimension(target.hidden_size), columns}),
                                layer.mlp.gate_up, intermediate_flat, work, stream);
-                finish_dynamic_branch(state.execution, intermediate, layer.mlp.down,
-                                      *layer.mlp_conv, branch.finish_delta, residual);
+                if (fused) {
+                    finish_dynamic_branch(state.execution, intermediate, layer.mlp.down,
+                                          *layer.mlp_conv, branch.finish_delta, residual);
+                } else {
+                    finish_composed_branch(state.execution, intermediate, layer.mlp.down,
+                                           *layer.mlp_conv, coefficients, residual);
+                }
             }
         }
         Tensor hidden = work.alloc(DType::BF16, {dimension(target.hidden_size), mask_columns});
-        ops::rmsnorm_pack_tail(residual, weights.final_norm, hidden, stream);
+        if (fused) {
+            ops::rmsnorm_pack_tail(residual, weights.final_norm, hidden, stream);
+        } else {
+            // The mask columns of every block, packed, then the plain final norm.
+            auto scope             = work.scope();
+            const std::size_t rows = std::size_t(target.hidden_size) * dtype_size(DType::BF16);
+            Tensor packed =
+                work.alloc(DType::BF16, {dimension(target.hidden_size), mask_columns});
+            CUDA_CHECK(cudaMemcpy2DAsync(packed.data, rows * std::size_t(k),
+                                         static_cast<const std::byte*>(residual.data) + rows,
+                                         rows * std::size_t(width), rows * std::size_t(k),
+                                         std::size_t(batch), cudaMemcpyDeviceToDevice, stream));
+            ops::rmsnorm(packed, weights.final_norm, config.rms_norm_eps, false, hidden, stream);
+        }
         Tensor candidates = frame.candidate_ids.slice(2, 0, batch);
         Tensor ids_flat =
             candidates.view({dimension(config.dflash2->selector_top_k), mask_columns});
         Tensor scores =
             work.alloc(DType::FP32, {dimension(config.dflash2->selector_top_k), mask_columns});
         // A rotated head reads its own copy: the selector projection below takes the primal hidden.
-        if (state.execution.proposal_head == ProposalHead::Full) {
-            const auto& head        = state.execution.parameters.draft->output_head;
+        const bool optimized = state.execution.proposal_head != ProposalHead::Full;
+        const auto& head     = optimized ? state.execution.parameters.proposal->head
+                                         : state.execution.parameters.draft->output_head;
+        const Tensor* token_ids =
+            optimized && state.execution.parameters.proposal->token_ids
+                ? &*state.execution.parameters.proposal->token_ids
+                : nullptr;
+        const std::int32_t public_tokens =
+            dimension(state.execution.parameters.model.resources().public_token_count);
+        if (fused) {
             const Tensor head_input = rotated_input(hidden, head.hadamard_signs, work, stream);
-            ops::linear_topk(
-                head_input, head.weight,
-                dimension(state.execution.parameters.model.resources().public_token_count),
-                ids_flat, scores, work, stream);
-        } else {
-            const auto& head        = *state.execution.parameters.proposal;
-            const Tensor head_input = rotated_input(hidden, head.head.hadamard_signs, work, stream);
-            if (head.token_ids) {
-                ops::linear_topk(head_input, head.head.weight, *head.token_ids, ids_flat, scores,
-                                 work, stream);
+            if (token_ids != nullptr) {
+                ops::linear_topk(head_input, head.weight, *token_ids, ids_flat, scores, work,
+                                 stream);
             } else {
-                ops::linear_topk(
-                    head_input, head.head.weight,
-                    dimension(state.execution.parameters.model.resources().public_token_count),
-                    ids_flat, scores, work, stream);
+                ops::linear_topk(head_input, head.weight, public_tokens, ids_flat, scores, work,
+                                 stream);
+            }
+        } else {
+            // A head the fused top-k does not take: dense BF16 logits, their sixteen largest a
+            // column, and the shortlist's rows mapped to token ids.
+            auto scope    = work.scope();
+            Tensor logits = work.alloc(DType::BF16, {head.weight.n, mask_columns});
+            project(hidden, head, logits, work, stream);
+            ops::candidate_topk(logits, token_ids != nullptr ? head.weight.n : public_tokens,
+                                ids_flat, scores, work, stream);
+            if (token_ids != nullptr) {
+                Tensor every = ids_flat.view(
+                    {dimension(config.dflash2->selector_top_k) * mask_columns});
+                ops::proposal_remap_token_ids(every,
+                                              static_cast<const std::int32_t*>(token_ids->data),
+                                              head.weight.n, stream);
             }
         }
         Tensor projected =

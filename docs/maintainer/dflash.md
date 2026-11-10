@@ -19,24 +19,36 @@ convolution tap/group dimensions and selector rank/top-k. The hidden width and e
 semantics come from the target. Exact fields are parsed in
 [`config.cpp`](../../src/models/qwen3_5/config.cpp).
 
-| Quantity | Official 35B-A3B DFlash | Official 27B DFlash2 |
-|---|---:|---:|
-| Hidden width H | 2048 | 5120 |
-| Draft layers | 6 | 5 |
-| Intermediate width | 6144 | 17408 |
-| Q heads / KV heads / head dimension | 32 / 8 / 128 | 32 / 8 / 128 |
-| Target block IDs | `[1,6,11,16,22,27,32,37]` | `[5,19,33,47,61]` |
-| Attention pattern | Five local layers, then one full layer | Five local layers |
-| Sliding-window scalar S | 4096 | 2048 |
-| Norm epsilon / RoPE theta | `1e-6` / `1e7` | `1e-6` / `1e7` |
-| Dynamic convolution | — | Two taps, group width 16 |
-| Candidate selector | Per-position argmax | Top-16 conditional path, rank 256 |
+| Quantity | Official 35B-A3B DFlash | Official 27B DFlash2 | incoai 35B-A3B DFlash2 |
+|---|---:|---:|---:|
+| Hidden width H | 2048 | 5120 | 2048 |
+| Draft layers | 6 | 5 | 6 |
+| Intermediate width | 6144 | 17408 | 6144 |
+| Q heads / KV heads / head dimension | 32 / 8 / 128 | 32 / 8 / 128 | 32 / 8 / 128 |
+| Target block IDs | `[1,6,11,16,22,27,32,37]` | `[5,19,33,47,61]` | `[1,6,11,16,22,27,32,37]` |
+| Attention pattern | Five local layers, then one full layer | Five local layers | Six local layers |
+| Sliding-window scalar S | 4096 | 2048 | 2048 |
+| Norm epsilon / RoPE theta | `1e-6` / `1e7` | `1e-6` / `1e7` | `1e-6` / `1e7` |
+| Dynamic convolution | — | Two taps, group width 16 | Two taps, group width 16 |
+| Candidate selector | Per-position argmax | Top-16 conditional path, rank 256 | Top-16 conditional path, rank 256 |
 
 The current Engine accepts startup draft count K in `1..15` and concurrency B in `1..8`. The
 physical block width is `W=K+1`, containing one anchor and K masks. K is a runtime choice, not a
-weight dimension. Geometry representable in config still needs the actual native Op support;
-for example, DFlash2's fused convolution, context materializer and selector implement the listed
-27B geometry.
+weight dimension; the artifact does not carry a drafter's training block, so a count past it (seven
+for [incoai's 35B-A3B drafter](https://huggingface.co/incoai/Qwen3.6-35B-A3B-DFlash2), trained on
+blocks of eight) runs and drafts positions the drafter never saw.
+
+DFlash2 has two execution routes with the same mathematics. The fused Ops (the context materializer
+of five local layers, the fused convolution prepare and finish) implement the official 27B geometry:
+H 5120, intermediate width 17408, five local layers. Any other DFlash2 geometry
+(`DraftConfig::fused_dflash2` is false) runs the composed route: the context through the per-layer
+projections, norms, RoPE and ring appends that DFlash uses, and each convolution branch as
+`rmsnorm`, the kernel projection into FP32 coefficients and `ops::dynamic_grouped_conv`, whose
+contract takes any H that is a multiple of the group width. The two routes place their BF16
+roundings differently: the composed route stores the normalized input and each branch's projected
+output as BF16 tensors and keeps every coefficient in FP32, while the fused Ops keep those two
+private and round the finish delta to BF16. Neither is the other's bit pattern; the target verifies
+every draft either way.
 
 ## Target conditioning and context
 
