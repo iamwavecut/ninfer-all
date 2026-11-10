@@ -59,7 +59,7 @@ Hybrid mode configures itself: the only capacity a deployment chooses is `--host
 | §5.4 unified Host slab pool | implemented: KV blocks, snapshot images (split over slabs) and snapshot tails share one pinned pool; GDSF and the dead-KV sweep decide the split at run time |
 | §6 admission as the Engine's materialization transaction | implemented: staging reserves every Device page and the state slot, Host restores run on a dedicated restore stream, and activation forks the lane at once; its Device work queues behind the copies it reads, layer by layer (§6.4, §6.5, §12.1) |
 | §6.6 prefetching the blocked head | implemented: Host-only path blocks are copied into spare Device cache while the FIFO head waits |
-| §7.1 taps | implemented: exact taps (explicit, generation opener, structural) split the chunk; flexible taps (prompt tail, ladder) are realized at chunk boundaries at no extra forward pass |
+| §7.1 taps | implemented: exact taps (explicit, generation opener, structural) are taken inside the prefill pass (§7.2) or, where it cannot take them, split the chunk; flexible taps (prompt tail, ladder) are realized at chunk boundaries at no extra forward pass |
 | §7.4 tap publication | implemented: deferred until the anchoring blocks commit (a frontier inside a block, or an MTP backend one token behind); exact-frontier tails are copied into cache-owned pages |
 | §7.6 block publication, write-through | implemented: blocks join the tree at every commit; a lane's blocks are written to Host in one batch when it releases them |
 | §7.7 endpoint snapshots at finish and consistent abort | implemented; a turn ended by a stop string publishes the state from where the match began; the catalog returns the sequence to that state before Finish |
@@ -67,7 +67,7 @@ Hybrid mode configures itself: the only capacity a deployment chooses is `--host
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
 | §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again; in this line a request is admitted while another prefills with `--concurrent-prefill`, or without it only while every staged prefill is a last chunk that can share a pass, so coalescing needs the option |
 | reuse-loss attribution | implemented: the request log's `materialization` record carries `cached_prefix_tokens` (longest cached block prefix, reusable or not), and `restored_host_bytes` |
-| §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1) |
+| §7.2 in-pass exact taps | implemented for text chunks on one device without a masked drafter, up to four a chunk; vision chunks, tensor parallelism and DFlash/DFlash2 split the chunk at the tap. Ternary Bonsai 2 27B on an RTX 4090: a 213-token first prompt with a system-block tap prefilled in 47.1 ms instead of 52.8 (47.5 instead of 53.3 with MTP) |
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve moved latency from short to long requests without a net gain, §6.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
@@ -156,13 +156,12 @@ addressable**.
 | LMCache | Layer-wise pipelined KV loading overlapped with compute. |
 | GreedyDual-Size-Frequency (Cherkasova, 1998) | Size- and cost-aware eviction with O(1) aging via an inflation value `L`. |
 
-NInfer-specific additions in the design (1 and 2 are not implemented, §7.2):
+NInfer-specific additions in the design:
 
-1. The GDN **state tap**: chunked GDN already produces the state at every 64-token intra-chunk
-   boundary, so exposing it costs one extra state write.
-2. **Phase alignment** by identity-transition padding, so taps land on absolute page boundaries.
-3. One pinned **slab pool** for both KV and state.
-4. **Dead-KV** accounting: KV that no snapshot can reach has zero reuse value.
+1. The **in-pass tap**: the prefill pass runs each GDN layer's convolution and recurrence up to an
+   exact tap into the snapshot slot and continues from it, so the tap costs no extra pass (§7.2).
+2. One pinned **slab pool** for both KV and state.
+3. **Dead-KV** accounting: KV that no snapshot can reach has zero reuse value.
 
 ---
 
@@ -211,7 +210,6 @@ x8, restores move 24–27 GB/s.
 | H2D snapshot | ≈ 3.9 ms |
 | H2D 100 k tokens INT8 KV (3.38 GB) | ≈ 68 ms |
 | Prefill, 27B, ~121 k context (README median) | ≈ 4.2 k tok/s, so 100 k tokens ≈ 24 s |
-| GDN tap write (144 MiB) inside a chunk (zero-split tap, not implemented) | ≈ 0.09 ms |
 | Write-through rate at 4.2 k tok/s INT8 prefill | ≈ 140 MB/s (0.3 % of PCIe) |
 
 Consequences:
@@ -253,8 +251,9 @@ Ownership against AGENTS.md boundaries:
 
 - **Core** owns physical primitives: the paged KV cache's record-addressed Host copies, which
   copy runs of consecutive pages and slabs as one strided transfer per plane.
-- **Ops** gain nothing: the zero-split GDN tap (§7.2–§7.3) and a KV page transfer kernel (§11.2)
-  are not implemented. Taps are Device copies of the committed StateImage.
+- **Ops** gain nothing: an in-pass tap (§7.2) calls the convolution and recurrence Ops once per
+  piece, and a KV page transfer kernel (§11.2) is not implemented. Flexible taps are Device copies
+  of the committed StateImage.
 - **Program** owns the whole cache: exact identity, physical residency, refs, eviction, taps.
   There is no cross-layer logical/physical split, because the cache's policy decisions are
   local physical facts. In Hybrid mode `ResourceManager`, `MaterializationPlanner`,
@@ -664,8 +663,9 @@ Candidates, in priority order:
 | 4 | `n − 1` ("prompt tail") | flexible | regenerate / retry of the same prompt |
 | 5 | geometric ladder: for k = 0,1,…, `n − G·2^k` (G = `tap_ladder_tokens`), snapped back to a message boundary within the minimum gap | flexible | edits deep in history. Spacing grows with distance, so there are about log2(n/G) taps |
 
-- **Exact** taps split the prefill chunk at `p` (one more forward pass each) and snapshot there.
-  Semantic boundaries are where later prompts diverge, so the exact position is worth the split.
+- **Exact** taps snapshot the state at `p` itself. The prefill pass takes up to four of them
+  inside a chunk (§7.2); elsewhere a tap splits the chunk at `p` (one more forward pass). Semantic
+  boundaries are where later prompts diverge, so the exact position is worth it.
 - **Flexible** taps never split: the snapshot is taken at the end of the chunk that reaches `p`, or
   at the start of the prompt's final chunk when `p` lies in it (the prompt tail always does). A
   chunk boundary costs nothing beyond the snapshot copy.
@@ -677,7 +677,7 @@ Candidates, in priority order:
   candidate redundant: a non-explicit candidate is dropped when an accepted tap, an existing
   snapshot on the path or the base lies at most 64 tokens before it. Ladder candidates keep
   `tap_min_gap` (default `max(1024, chunk)`) on both sides instead. The opener therefore absorbs
-  the prompt tail in chat traffic, leaving one split per request.
+  the prompt tail in chat traffic, leaving one exact tap per request.
 - Only markers with explicit evidence (a client-named breakpoint) are priority 1. Protocol-automatic
   markers (OpenAI default caching, Anthropic automatic `cache_control`) are planned as structural
   boundaries, but they mark the conversation's latest turn rather than a prefix conversations
@@ -707,68 +707,35 @@ Candidates, in priority order:
 Tap placement is a function of the prompt, so it is deterministic. Endpoint snapshots are exact
 (§7.7).
 
-Exact taps are the only prefill splits in Hybrid mode. The chat template's rewrite execution
+Exact taps that the pass cannot take are the only prefill splits in Hybrid mode. The chat template's rewrite execution
 frontiers (after each assistant header, after `<think>`, after the reasoning close) split Legacy
 prefill for its rewrite checkpoints and execution provenance. Hybrid captures nothing there, so a
 Hybrid lane ignores them. Each split is a whole extra pass over the model. A short chat turn used
-to prefill as four passes (reuse point, opener, `<think>`, reasoning close). Now it takes two (to
-the opener, then the rest), or one when the opener is dropped, unless a client breakpoint or
-structural boundary falls inside the new tokens.
+to prefill as four passes (reuse point, opener, `<think>`, reasoning close). Now it takes one, with
+its exact taps inside the pass, or two with a tap the pass cannot take.
 
-### 7.2 Phase-aligned chunked GDN
+### 7.2 In-pass exact taps
 
-**Not implemented** (§7.2 and §7.3 together form the zero-split tap). The implemented tap copies
-the lane's committed StateImage at a chunk boundary (≈0.25 ms D2D), so only exact taps pay a split.
-Build this only if measurement shows the remaining exact-tap split matters.
+A text prefill chunk on one device takes up to four exact taps strictly inside it without ending
+the pass at them (`TextContext::set_gdn_taps`):
 
-The chunked GDN kernel's intra-chunk grid is relative to the call start. To make every internal
-boundary an absolute multiple of 64, the Op gains a `phase = base % 64` parameter:
+- Before the chunk, each tap reserves a staging snapshot slot (as a chunk-boundary tap does, §7.4);
+  a tap without a free slot, inside an exclusion or at most at the lane's last capture ends the
+  chunk at it instead.
+- Every GDN layer runs its causal convolution and its gated delta rule once per piece: from the
+  lane's source slot to the first tap's slot, from each tap's slot to the next, and from the last
+  tap's slot to the destination. Each call starts its chunk grid at the piece's first column, as
+  the pass split at the tap would, so the tapped convolution history and recurrent state equal
+  that pass's. The attention layers, the MLPs and the KV writes run over the whole chunk.
+- The final norm's column `p − 1` is copied into the slot's continuation hidden.
+- After the chunk the taps are published as pending taps (§7.4); a chunk that did not take them
+  (its length or a vision span did not hold them all) releases the slots, and the tap splits the
+  next chunk.
 
-- The kernel treats the call as if it were left-padded by `phase` virtual tokens with
-  `k = 0, v = 0, g = 0, β = 0`. For such a token, `α = exp(0) = 1` exactly and
-  `delta = 0 · (v − αS·k) = 0` exactly, so `S ← 1·S + outer(0, k) = S` **bit-exactly**.
-- Padded outputs are not written.
-- Padding is by predicated loads, with no workspace copy.
-- `phase = 0` is the current behaviour, bit for bit.
-
-Prefill chunks remain `--prefill-chunk` tokens long. The **first** chunk after a non-aligned base
-is `chunk − phase` tokens long, so every later chunk starts page-aligned. This is one boundary
-change in `TextContext::prefill`. In Hybrid mode no `prefill_split_frontier_` or
-`rewrite_execution_frontiers` split is requested (both remain for Legacy).
-
-### 7.3 Tap Op contracts
-
-**Not implemented** (the design of the zero-split tap, with §7.2).
-
-For each prefill unit with taps `T_u = T ∩ (unit_begin, unit_end]`, `|T_u| ≤ taps_per_unit`
-(default 4, bounded by free snapshot slots):
-
-1. **GDN state tap**: `gated_delta_net(..., StateTapSet taps)`. For each tap `j`, the kernel writes
-   the FP32 state after absolute position `p_j` for every value head into
-   `snapshot_slot[j].ssm_state[layer]`.
-   - Stores use `st.global.cs` (streaming) to avoid displacing prefill working sets in L2.
-   - Oracle: the FP64 naive recurrence evaluated to `p_j` (op-development §numerical).
-   - Exactness criterion: the tapped state is **bit-identical** to the final state of a separate
-     call on the same inputs ending at `p_j` with the same phase. Same chunk grid, same
-     arithmetic.
-2. **Conv tap**: per GDN layer, copy the `kernel_width − 1 = 3` pre-conv projected columns
-   `[p_j − 3, p_j)`, taken from the current unit's projection output or the previous conv history
-   when `p_j − unit_begin < 3`, into the slot's conv history. Exact copy, exact oracle.
-3. **Hidden tap**: the continuation hidden at column `p_j − 1`, stored for completeness. It is
-   never used for a full hit (§6.1).
-4. **DFlash/DFlash2 ring tap**: after the unit's context K/V materialisation, and *before* the
-   ring is overwritten, assemble `slot.ring = ring(positions [p_j − S, p_j))`. Each position comes
-   from the pre-unit ring if `< unit_begin`, otherwise from the unit's freshly materialised K/V.
-   The materialiser writes this unit's context K/V to a unit staging buffer first; the ring commit
-   and the tap gathers both read from it. Exact copy.
-   - The DFlash Full (paged) pool is committed through the chunk at unit commit, so its pages
-     belong to the tree like Main pages.
-5. **MTP**: MTP KV is paged. Tap snapshots carry no MTP state. A resume performs the Program's
-   existing MTP bridge from the resumed frontier, as for any Program-resumed frontier today.
-
-If no snapshot slot is free when the unit starts, the tap is skipped and counted
-(`taps_skipped_no_slot`). In practice D2H of a slot (≈4 ms) finishes long before the next unit
-(≥0.3 s).
+Vision chunks, tensor parallelism (whose GDN heads are divided over the ranks) and a masked
+drafter (DFlash, DFlash2: its context ring in the image would have to end at the tap too) split
+the chunk at the tap. MTP needs nothing: tap snapshots carry no MTP state, and a resume runs the
+MTP bridge from the resumed frontier.
 
 ### 7.4 Tap publication
 
@@ -1280,7 +1247,7 @@ Uncalibrated terms keep the index's generic defaults. No separate calibration ru
    - Without speculation: D2D of the active slot at the round boundary.
    - With speculation: a two-segment ReplaySSM Fold, `S0 → slot` over the first `j` records, then
      `slot → active` over the rest. This is bit-identical by the Fold contract. Conv and ring taps
-     are handled as in §7.3.
+     are split as in §7.2.
    - Gate: reuse gain on thinking-stripped agent traces.
 4. **KV-write elision** (not implemented) for the recomputed region (§7.5): map existing pages and send those KV
    writes to a scratch page.
@@ -1353,13 +1320,8 @@ The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache
 
 ### 13.2 Op qualification (op-development.md contract, real 27B and 35B-A3B shapes)
 
-- **GDN tap and phase**
-  - FP64 naive-recurrence oracle at every tap, phases 0..63, T in {1, 63, 64, 65, 2048, 4096};
-  - **bitwise** equality of each tap with a truncated call on the same phase;
-  - `phase > 0` with zero taps matches the unpadded oracle within the existing GDN criterion;
-  - `phase = 0` is bit-identical to the pre-change kernel.
-- **Conv, hidden and ring taps**: exact byte comparison against a host reference gather, including
-  `p − unit_begin < 3` and ring wrap (`p > S`, `unit length > S`).
+- **In-pass taps** call the qualified convolution and GDN Ops once per piece with their state
+  slots, so they need no Op of their own; the real-artifact restores (§13.3) resume from them.
 - **`paged_kv_transfer`**
   - exact bytes for BF16, INT8, FP8, NVFP4 and K8V4, with Main+MTP and Main+DraftFull bundles,
     random page IDs, both directions;
@@ -1471,7 +1433,7 @@ Host pools (`host_state_slots`, `host_kv_capacity_bytes`) are zero in Hybrid mod
 
 | risk | mitigation |
 |---|---|
-| Exact taps cost one prefill split each | Only semantic boundaries are exact (explicit, generation opener, structural); the prompt tail and ladder are flexible and cost no split. The proximity rule leaves one split per chat request, and none after an endpoint resume. The zero-split GDN tap (§7.2–§7.3) removes the rest if measurement shows it matters. |
+| Exact taps cost one prefill split each | Only semantic boundaries are exact (explicit, generation opener, structural); the prompt tail and ladder are flexible and cost no split. The proximity rule leaves one exact tap per chat request, and none after an endpoint resume. The pass takes exact taps inside a text chunk (§7.2); vision chunks, tensor parallelism and DFlash/DFlash2 still split at them. |
 | Snapshots crowd KV out of host memory | GDSF weighs bytes against recompute seconds on the same scale for both. Dead-KV sweep runs first. |
 | Write-through competes with decode | Copy engines only, batched when a lane releases its blocks; decode rounds/s were unchanged with prefetch and write-through active. Write-through can be throttled when decode is active without changing correctness. |
 | Unbacked device eviction deletes subtrees | Only happens with no or full host cache. Backed entries are always preferred. |
