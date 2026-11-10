@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -34,7 +35,11 @@ public:
                   std::uint32_t token_capacity, std::uint64_t cache_bytes,
                   HybridExpertOptions options,
                   // Internal injection point for a delayed-worker cancellation check.
-                  std::function<void()> before_cpu = {});
+                  std::function<void()> before_cpu = {},
+                  // Whether the stream takes the supervisor's operands through mapped memory and a
+                  // kernel instead of a queued copy; unset follows serialized_copy_queue(). A test
+                  // sets it to run either exchange on any driver.
+                  std::optional<bool> mapped_exchange = {});
     ~HybridExperts();
     HybridExperts(const HybridExperts&) = delete;
     HybridExperts& operator=(const HybridExperts&) = delete;
