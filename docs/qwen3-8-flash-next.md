@@ -252,7 +252,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | Option | Meaning |
 |---|---|
 | `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
-| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) starts at half of what each device has free after loading less a margin, and once the warm-up has captured the CUDA Graphs and loaded the kernels requests run, and every sequence's snapshot is in place, adds what is still free beyond 384 MiB (the startup line reports the cache and the graphs); with host experts it also takes the prefill buffers between prompts ([the expert cache](#the-expert-cache)); `N` is the cache's size, which the warm-up leaves alone; `0` disables the host-mode cache (disk mode needs one) |
+| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) starts at half of what each device has free after loading less a margin, and once the warm-up has captured the CUDA Graphs and loaded the kernels requests run, and every sequence's snapshot is in place, adds what is still free beyond 384 MiB (the startup line reports the cache and the graphs); with host experts it also takes the prefill buffers and a prompt span's stack between prompts ([the expert cache](#the-expert-cache)); `N` is the cache's size, which the warm-up leaves alone; `0` disables the host-mode cache (disk mode needs one) |
 | `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks into device memory by the copy engine while the cached ones run, into a cache slot when one is free or when the expert's routes beat the coldest cached expert the call does not route ([the expert cache](#the-expert-cache)), else into staging (`staged`, the default); or its expert kernels read the missing experts across the bus (`mapped`) |
 | `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1`; the CPU computes the rest from RAM while the GPU runs the cached ones. `auto` (the default) gives each call of GGUF experts the split whose copies and CPU products end soonest by the times measured on earlier calls, and copies every miss of native experts. Decode steps, verifications of up to 64 tokens and prompt chunks of up to 64 tokens use the CPU; GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
@@ -306,7 +306,8 @@ every layer, gives each text layer the slots its most routed experts take; the M
 even share. Strata (MIT) measured this tier and its constants on Qwen3.8-Flash-Next.
 
 With the automatic cache and host experts, the device buffers that prompt chunks copy a layer's
-uncached experts into (`--expert-prefill-buffers`) are cache slots between prompts: every layer
+uncached experts into (`--expert-prefill-buffers`) and the stack of a prompt span (40 KiB a span
+token: 0.63 GiB for sixteen 1,024-token chunks) are cache slots between prompts: every layer
 gets the same share of them, free until misses and rounds fill them. A prompt pass takes them
 back: the most routed of the experts they hold move into the slots of colder ones in the cache's
 own memory, the rest leave, and the copies into the buffers wait for the moves. The next decode
@@ -526,7 +527,8 @@ at startup). Requests are admitted
 in arrival order. Prompts prefill a step at a time, each step from the prompt with the fewest tokens
 left, so a short or cached request is not held behind a long prompt for its whole prefill (a prompt
 passed over eight times goes next, and a prompt with media, once begun, finishes first). A step is
-one chunk, or with host or disk experts on one GPU a span of up to eight chunks of the prompt, media
+one chunk, or with host or disk experts on one GPU a span of up to eight chunks of the prompt
+(sixteen under `--max-concurrency 1`, where no other prompt waits behind a step), media
 or not (see [Execution](#execution)); while other requests decode, a span is two chunks at most,
 since they wait for the whole step. Before a step, while requests are decoding, they run
 `--decode-rounds-per-prefill` rounds (by default the chunk size over 64, 16 at the default chunk)
@@ -803,7 +805,11 @@ drafts after the three prompts and 1.43 times after a 9,741-token document (MTP'
   pool has two buffers that consecutive layers alternate between: each layer's copies start as soon
   as the layer two back is done with its buffer, while the layer before it runs. A thread of its own
   issues each layer's copies, hundreds of operations that would otherwise hold the launching thread
-  while the copy queue is full, so the layers in between keep being launched. Weighted expert
+  while the copy queue is full, so the layers in between keep being launched. An engine of one
+  sequence (`--max-concurrency 1`, the CLI) keeps no other prompt waiting behind a step, so its
+  spans take sixteen chunks where the further eight chunks' planes (46 KiB a token) fit 1/24 of
+  the memory the device has free at startup: in a prompt past eight chunks each layer's uncached
+  experts then cross the bus half as often ([Expert placements](#expert-placements)). Weighted expert
   outputs are summed in fixed point, so the result does not depend on the order experts finish in.
 - Decode steps, verifications of up to 64 tokens and prompt chunks of up to 64 tokens (eight
   without a CPU share) of GGUF host experts run in two stages. A kernel splits the call's routes
@@ -868,7 +874,8 @@ drafts after the three prompts and 1.43 times after a 9,741-token document (MTP'
 Greedy decoding, one request, the generate test (`ninfer_qwen4_exp_generate_real`) without drafts.
 Decode is measured over a short answer (78 tokens for Q2_0, 81 or 82 for IQ3_S) and over the first
 five tokens after a 4,463-token prompt; prefill is that prompt in 512-token chunks, which with host
-or disk experts run as a span of eight chunks and a last chunk of 367 tokens. Host memory is
+or disk experts ran as a span of eight chunks and a last chunk of 367 tokens (the span of that
+build; an engine of one sequence now takes the prompt as one span). Host memory is
 the process's peak resident set (with host experts, the pinned bank), device memory the most
 `nvidia-smi` showed in use. With host or disk experts the expert cache takes the memory the GPU has
 free and fills while the requests run.
@@ -901,8 +908,9 @@ the others), the n-gram table as the separate artifact, one run per row:
 | RTX 3090 | IQ3_S | disk, the files' pages evicted every second | 22.1 GiB | 1.7 GiB | 12.3 tok/s | 6.0 tok/s | 179 tok/s |
 
 - **Prompt spans.** With host or disk experts a prompt longer than a chunk prefills in spans of up
-  to eight chunks, so a layer's missing experts cross the host link once per span rather than once
-  per chunk; the chunk still sets each call's width. The CLI with 1,024-token chunks and MTP drafts
+  to eight chunks (sixteen now for one request at a time, below), so a layer's missing experts
+  cross the host link once per span rather than once per chunk; the chunk still sets each call's
+  width. The CLI with 1,024-token chunks and MTP drafts
   on the 7,680-token needle prompt with Q2_0 disk experts, 16 greedy tokens, this build
   against one that ran disk experts chunk by chunk with the MTP block's experts in the text layers'
   slots, interleaved on the same hosts, two runs each:
@@ -923,6 +931,31 @@ the others), the n-gram table as the separate artifact, one run per row:
   chunk keeps its experts, but this prompt ends in a separate 367-token chunk; without the releases
   the RTX 5090 decoded them at the rate chunk by chunk. With host experts they decode 1% slower on
   the RTX 5090, 8% slower on the RTX 4090 and 2% faster on the RTX 3090.
+- **Spans of sixteen chunks.** On November 10, 2026 a rented RTX 5090 (575 W, driver 595.91.07,
+  CUDA 13.4; EPYC 7543, 12.75 CPUs of a host other tenants loaded to 24-56 of its 120 threads) ran
+  the UD-IQ2_XS release from the CLI with host experts, 1,024-token chunks and no drafts, this build
+  against one held at spans of eight chunks, in interleaved pairs. Prefill, tok/s:
+
+  | Prompt | Spans of eight chunks | Sixteen (one request at a time) |
+  |---|---:|---:|
+  | 7,680 tokens, one span either way | 4.20k, 3.89k | 4.26k, 3.75k |
+  | 20,181 tokens | 4.01k, 3.90k | 4.34k, 4.29k |
+  | 32,256 tokens | 4.33k, 4.23k, 4.13k | 5.28k, 5.22k, 5.30k |
+  | 64,512 tokens | 4.77k, 3.83k | 5.31k, 5.23k |
+  | 32,256 tokens, disk experts in the page cache | 1.84k, 1.69k | 2.38k, 2.29k |
+  | 32,235 tokens, the DFlash2 drafter loaded | 4.76k, 3.81k | 5.24k, 5.31k |
+  | 32,235 tokens, `--expert-cache-mib 7000` | 3.13k, 2.90k | 4.30k, 4.33k |
+
+  The answers were the same text. With the span's stack in the automatic cache between prompts
+  the engine started with 23.4 GiB of expert cache (14,544 slots) instead of 23.1 GiB (14,400);
+  with disk experts, which lend nothing, with 23.2 instead of 23.6 GiB. The 256 tokens after a
+  32,235-token prompt decoded at 73.0-80.7 tok/s (median 76.3 of five runs) against 75.1-80.8
+  (77.5). After a 52-token prompt they decoded at 78.1-85.6 (median 82.4 of eight runs) against
+  76.2-86.4 (81.8) on the build before the change; ten pairs against the eight-chunk build of an
+  earlier commit gave 76.5-86.0 (81.4) against 81.2-86.6 (84.7), and that build ran 1.2% ahead of
+  the build before the change as well, so the host's load, not the spans, sets these differences.
+  Not measured: another card, a prompt step between the decode rounds of other requests, and the
+  DeepSeek-V4.1 executor, whose spans are 16,384 tokens already.
 - **NUMA.** Unpinned on another two-socket RTX 3090 host (Xeon E5-2690 v4), Q2_0 decoded the short
   answer 9% slower with host experts and 43% slower with disk experts in the page cache than pinned
   to the GPU's node.
