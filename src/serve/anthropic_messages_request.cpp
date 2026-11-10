@@ -883,11 +883,13 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
 
     if (thinking.contains("display") && !thinking.at("display").is_null()) {
         if (!thinking.at("display").is_string()) {
-            bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
+            bad_request("thinking.display must be 'summarized', 'omitted', or 'updates'",
+                        "thinking");
         }
         const std::string display = thinking.at("display").get<std::string>();
-        if (display != "summarized" && display != "omitted") {
-            bad_request("thinking.display must be 'summarized' or 'omitted'", "thinking");
+        if (display != "summarized" && display != "omitted" && display != "updates") {
+            bad_request("thinking.display must be 'summarized', 'omitted', or 'updates'",
+                        "thinking");
         }
         if (no_thinking) {
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",
@@ -896,10 +898,14 @@ void parse_thinking(const Json& body, GenerationRequest& request) {
     }
 }
 
+// `updates` hides the reasoning as `omitted` does and returns only the progress notes a Claude model
+// writes between tool calls. A Qwen or Gemma template writes no such notes, so the display is
+// `omitted`'s: empty Thinking text, the reasoning in the signature.
 bool thinking_display_omitted(const Json& body) {
     if (!body.contains("thinking") || !body.at("thinking").is_object()) { return false; }
     const Json& thinking = body.at("thinking");
-    return thinking.contains("display") && thinking.at("display") == "omitted";
+    return thinking.contains("display") &&
+           (thinking.at("display") == "omitted" || thinking.at("display") == "updates");
 }
 
 void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose) {

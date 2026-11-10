@@ -2061,7 +2061,10 @@ restores the reasoning from it, so the prompt (and its prefix-cache identity) is
 `summarized` display would give; non-empty `thinking` text takes precedence, any other signature
 stays non-semantic metadata, and a malformed NInfer signature fails with
 `invalid_thinking_signature`. The signature is not encrypted or authenticated: this is a local
-trusted server, and the value is the same reasoning text `summarized` display shows. Count Tokens
+trusted server, and the value is the same reasoning text `summarized` display shows.
+`thinking.display:"updates"` is served as `omitted`: the Anthropic API returns under it only the
+progress notes a Claude model writes between tool calls, which these models' templates do not
+write, so each Thinking block comes back empty with the reasoning in its signature. Count Tokens
 ignores `display`. `preserve_thinking` remains a NInfer extension for closed-turn reasoning
 history, `graft` selects a [prompt graft](#prompt-grafts), and llama.cpp's `lora` field sets the
 request's [LoRA adapter scales](#lora-adapters-and-control-vectors). `output_config.effort` passes its
