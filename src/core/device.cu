@@ -44,10 +44,6 @@ std::string cuda_error_message(const char* prefix, cudaError_t err) {
     return std::string(prefix) + ": " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err);
 }
 
-#if !defined(NINFER_CUDA_ARCHITECTURES)
-#    define NINFER_CUDA_ARCHITECTURES "unknown"
-#endif
-
 // Loaded on a device only where this build has code that runs there: its own architecture's
 // machine code, which also runs on later minor versions of that major (sm_86 code on 8.9, sm_80
 // code on 8.6 and 8.9), or its PTX compiled for a newer device.

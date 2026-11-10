@@ -6,6 +6,62 @@ function(ninfer_internal_includes target)
     ${PROJECT_SOURCE_DIR}/src)
 endfunction()
 
+# Every translation unit under src/ compiles in exactly one target, whose component declares the
+# unit's compile settings and link requirements once; any other target links that target's
+# library. A second target that compiled a copy would have to repeat those requirements by hand,
+# and would build the unit differently or fail to link as soon as the owner changed them (a new
+# driver API call in src/core/device.cu, say). Called once, after every target exists.
+function(ninfer_check_source_owners)
+  set(src_root "${PROJECT_SOURCE_DIR}/src/")
+  set(pending "${PROJECT_SOURCE_DIR}")
+  set(units "")
+  while(pending)
+    list(POP_FRONT pending dir)
+    get_property(subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+    list(APPEND pending ${subdirs})
+    get_property(targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(target IN LISTS targets)
+      get_target_property(target_dir ${target} SOURCE_DIR)
+      get_target_property(sources ${target} SOURCES)
+      if(NOT sources)
+        continue()
+      endif()
+      foreach(source IN LISTS sources)
+        if(source MATCHES "\\$<" OR NOT source MATCHES "\\.(c|cc|cpp|cxx|cu)$")
+          continue()
+        endif()
+        cmake_path(ABSOLUTE_PATH source BASE_DIRECTORY "${target_dir}" NORMALIZE
+          OUTPUT_VARIABLE path)
+        string(FIND "${path}" "${src_root}" at)
+        if(NOT at EQUAL 0)
+          continue()
+        endif()
+        string(MD5 key "${path}")
+        if(NOT DEFINED owners_${key})
+          list(APPEND units "${key}")
+          set(path_${key} "${path}")
+        endif()
+        list(APPEND owners_${key} ${target})
+      endforeach()
+    endforeach()
+  endwhile()
+  set(violations "")
+  foreach(key IN LISTS units)
+    list(REMOVE_DUPLICATES owners_${key})
+    list(LENGTH owners_${key} count)
+    if(count GREATER 1)
+      file(RELATIVE_PATH shown "${PROJECT_SOURCE_DIR}" "${path_${key}}")
+      list(JOIN owners_${key} ", " shown_owners)
+      list(APPEND violations "  ${shown}: ${shown_owners}")
+    endif()
+  endforeach()
+  if(violations)
+    list(JOIN violations "\n" violations)
+    message(FATAL_ERROR "A translation unit under src/ compiles in exactly one target; link that "
+      "target's library instead of compiling the unit again:\n${violations}")
+  endif()
+endfunction()
+
 # Device code is compressed in every fatbin: the INT8-family small-T attention alone instantiates
 # several hundred kernels per query width (route tiers x KV codings x batch and mask forms), and
 # uncompressed the ops archive passed the 2 GiB that a linked image can address with 32-bit
