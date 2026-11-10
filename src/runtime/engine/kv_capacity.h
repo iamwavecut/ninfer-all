@@ -19,6 +19,13 @@ resolve_kv_capacity(const KvCapacityPolicy& policy, const SequenceCapacityCurve&
                     std::size_t available_runtime_bytes,
                     std::span<const std::size_t> extra_rank_available_bytes = {});
 
+// Whether the capacity asked for fits every device: the explicit capacity, or under automatic
+// capacity the smallest reservation beside the headroom.
+[[nodiscard]] bool kv_capacity_fits(const KvCapacityPolicy& policy,
+                                    const SequenceCapacityCurve& curve,
+                                    std::size_t available_runtime_bytes,
+                                    std::span<const std::size_t> extra_rank_available_bytes = {});
+
 // What each device (device 0 first) keeps free beyond the Engine's reservation for the KV cache
 // asked for, negative where it falls short: the explicit capacity, or `automatic_page_groups` Main
 // page groups (and the resident ones) under automatic capacity, which also keeps its headroom free

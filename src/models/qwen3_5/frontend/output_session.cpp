@@ -203,6 +203,11 @@ struct DecoderState {
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
     std::optional<std::uint32_t> matched_stop_order;
+    // Generated tokens fed so far, and how many of them had been fed when no byte was last held
+    // back (a partial code point, a possible close marker, a possible stop string): a stop
+    // string's cut lies in a later token.
+    std::uint32_t tokens_fed   = 0;
+    std::uint32_t clean_tokens = 0;
     // Bytes fed to the content channel after the leading-whitespace strip, and the part of them
     // published; the difference is held for a possible stop string.
     std::uint64_t content_fed       = 0;
@@ -258,6 +263,17 @@ bool holds_semantic_close(const SemanticThinkingState& state) noexcept {
 bool holds_presentation_close(const DecoderState& state) noexcept {
     return state.in_reasoning && !state.exact_close && state.utf8_pending.empty() &&
            std::string_view(state.think_marker_pending).ends_with(kThinkClose);
+}
+
+bool holds_bytes(const DecoderState& state) noexcept {
+    return !state.utf8_pending.empty() || !state.think_marker_pending.empty() ||
+           state.gemma_header || !state.stop_pending[0].empty() || !state.stop_pending[1].empty();
+}
+
+// Counts a fed token; with nothing held after it, every token so far is before any later cut.
+void count_fed_token(DecoderState& state) noexcept {
+    ++state.tokens_fed;
+    if (!holds_bytes(state)) { state.clean_tokens = state.tokens_fed; }
 }
 
 struct StopMatch {
@@ -743,6 +759,9 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
     impl_->preview_output.clear();
     impl_->preview_logprobs.clear();
 
+    std::optional<std::uint32_t> stop_hold;
+    bool stop_cut   = false;
+    bool hold_alive = false;
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               runtime::ContinuationAction continuation =
                                   runtime::ContinuationAction::Decode) {
@@ -764,7 +783,23 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
             .finish_reason                = reason,
             .continuation                 = continuation,
             .prefix_execution_split_after = impl_->preview_execution_split_after,
+            .stop_hold_after              = stop_hold,
+            .stop_cut                     = stop_cut,
+            .stop_hold_alive              = hold_alive,
         };
+    };
+    // The tokens of this round before the earliest held byte, when a stop string can cut and
+    // that byte is in this round (DecoderState::clean_tokens).
+    const std::uint32_t fed_before_round = impl_->state.tokens_fed;
+    const auto note_stop_hold            = [&](bool cut) {
+        const DecoderState& decoder = impl_->preview_state;
+        stop_hold.reset();
+        hold_alive = !cut && !impl_->policy.strings.empty() && holds_bytes(decoder);
+        if (impl_->policy.strings.empty() || decoder.clean_tokens < fed_before_round ||
+            (!cut && !holds_bytes(decoder))) {
+            return;
+        }
+        stop_hold = decoder.clean_tokens - fed_before_round;
     };
 
     for (std::size_t index = 0; index < tokens.size(); ++index) {
@@ -889,6 +924,11 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         }
 
         if (match.found) {
+            // A stop string that stays in the output ends in this token: the tokens before it
+            // all stay. Otherwise the cut lies in a token after the last clean point; this token
+            // is not counted.
+            stop_cut = !impl_->policy.strings[match.declaration_order].include_in_output;
+            if (stop_cut) { note_stop_hold(true); }
             cut_logprobs(impl_->preview_state, match.content_cut, impl_->preview_logprobs);
             impl_->preview_state = terminal_state(std::move(impl_->preview_state));
             impl_->preview_state.matched_stop_order = match.declaration_order;
@@ -906,8 +946,10 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
             release_logprobs(impl_->preview_state, impl_->preview_logprobs);
             return complete(count, FinishReason::StopToken);
         }
+        count_fed_token(impl_->preview_state);
         release_logprobs(impl_->preview_state, impl_->preview_logprobs);
     }
+    note_stop_hold(false);
 
     const auto count = static_cast<std::uint32_t>(tokens.size());
     if (tokens.size() == total_budget_remaining) {
@@ -1043,6 +1085,7 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
                                                                               : decoded.bytes;
         feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
                          impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
+        count_fed_token(impl_->preview_state);
     }
     if (impl_->preview_semantic.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the thinking phase");

@@ -2630,7 +2630,7 @@ detail::PhysicalResources ProgramImpl::admission_capacity() const noexcept {
         .device =
             {
                 .active_lanes     = max_concurrency,
-                .state_slots      = static_cast<std::uint32_t>(state_images->slot_count()),
+                .state_slots      = state_store->device_capacity(),
                 // Pages lent to an overlay Vision window leave admission capacity until returned.
                 .main_kv_pages    = decoder->text_kv.page_pool().usable_pages(),
                 .backend_kv_pages = backend != nullptr ? backend->page_pool().usable_pages() : 0U,

@@ -2,6 +2,7 @@
 
 #include "models/qwen3_5/state/state_image.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -97,15 +98,20 @@ class StateImageStore {
 public:
     StateImageStore(qwen3_5::StateImageDevicePool& device, qwen3_5::HostStatePool* host,
                     std::uint32_t logical_capacity)
+        : StateImageStore(device, host, logical_capacity,
+                          static_cast<std::uint32_t>(std::max(device.slot_count(), 0))) {}
+
+    // The store owns the pool's first `device_slots` slots; the pool's later ones stay with the
+    // Program (the stop-string hold images of a catalog Program).
+    StateImageStore(qwen3_5::StateImageDevicePool& device, qwen3_5::HostStatePool* host,
+                    std::uint32_t logical_capacity, std::uint32_t device_slots)
         : device_(&device), host_(host), objects_(logical_capacity),
-          free_objects_(logical_capacity),
-          free_device_slots_(static_cast<std::size_t>(device.slot_count())),
-          free_object_count_(logical_capacity),
-          free_device_count_(static_cast<std::uint32_t>(device.slot_count())) {
-        if (logical_capacity == 0 || device.slot_count() <= 0 ||
-            logical_capacity < static_cast<std::uint32_t>(device.slot_count()) ||
-            (host != nullptr && logical_capacity < static_cast<std::uint32_t>(device.slot_count()) +
-                                                       host->capacity())) {
+          free_objects_(logical_capacity), free_device_slots_(device_slots),
+          free_object_count_(logical_capacity), free_device_count_(device_slots) {
+        if (logical_capacity == 0 || device_slots == 0 || device.slot_count() <= 0 ||
+            device_slots > static_cast<std::uint32_t>(device.slot_count()) ||
+            logical_capacity < device_slots ||
+            (host != nullptr && logical_capacity < device_slots + host->capacity())) {
             throw std::invalid_argument("StateImageStore capacity is inconsistent");
         }
         for (std::uint32_t index = 0; index < logical_capacity; ++index) {

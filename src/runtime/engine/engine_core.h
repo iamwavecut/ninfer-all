@@ -1795,6 +1795,9 @@ private:
 
         std::array<LaneId, kMaximumConcurrency> lanes{};
         std::array<CommitDecision, kMaximumConcurrency> decisions{};
+        // The tokens each row's output took; its sequence keeps fewer when the turn ends at a
+        // stop string whose match began inside the round.
+        std::array<std::uint32_t, kMaximumConcurrency> output_tokens{};
         std::array<FinishReason, kMaximumConcurrency> finish_reasons{};
         std::array<ContinuationAction, kMaximumConcurrency> continuations{};
         std::array<std::size_t, kMaximumConcurrency> generated_sizes{};
@@ -1917,21 +1920,40 @@ private:
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
                     (decision.prefix_execution_split_after &&
                      (*decision.prefix_execution_split_after == 0 ||
-                      *decision.prefix_execution_split_after > decision.accepted_tokens))) {
+                      *decision.prefix_execution_split_after > decision.accepted_tokens)) ||
+                    (decision.stop_hold_after &&
+                     *decision.stop_hold_after >= decision.accepted_tokens)) {
                     throw std::logic_error("output policy returned an invalid licensed prefix");
                 }
-                decisions[row] = CommitDecision{
-                    .accepted_tokens              = decision.accepted_tokens,
-                    .terminal                     = decision.finished(),
-                    .cancelled                    = false,
-                    .prefix_execution_split_after = decision.prefix_execution_split_after,
+                // A turn that ends at a stop string which leaves the output continues, in a later
+                // prompt, from the state before the token that begins the match. When that token
+                // is in this round the sequence keeps the round's tokens before it and ends
+                // there. When it was in an earlier round the Program has kept that state
+                // (stop_cut). A turn that ends otherwise publishes everything it held.
+                const bool stop_cut = decision.finished() && decision.stop_cut;
+                const bool cut_here = stop_cut && decision.stop_hold_after.has_value();
+                const std::uint32_t kept =
+                    cut_here ? *decision.stop_hold_after + 1U : decision.accepted_tokens;
+                output_tokens[row] = decision.accepted_tokens;
+                decisions[row]     = CommitDecision{
+                        .accepted_tokens = kept,
+                        .terminal        = decision.finished(),
+                        .cancelled       = false,
+                        .prefix_execution_split_after =
+                        decision.prefix_execution_split_after &&
+                                *decision.prefix_execution_split_after <= kept
+                            ? decision.prefix_execution_split_after
+                            : std::nullopt,
+                        .stop_hold_after =
+                        decision.finished() ? std::nullopt : decision.stop_hold_after,
+                        .stop_cut = stop_cut && !cut_here,
                 };
                 finish_reasons[row] = decision.finish_reason;
                 continuations[row]  = decision.continuation;
             }
             generated_staged = true;
             for (std::size_t row = 0; row < row_count; ++row) {
-                const std::uint32_t accepted = decisions[row].accepted_tokens;
+                const std::uint32_t accepted = output_tokens[row];
                 if (accepted == 0) { continue; }
                 const auto& request = slots_[lane_indices[row]];
                 if (request->generated.size() > request->generated.capacity() ||
@@ -2014,7 +2036,7 @@ private:
             cumulative_stats_.decode_row_rounds += row_count;
             for (std::size_t row = 0; row < row_count; ++row) {
                 if (!cancelled[row]) {
-                    cumulative_stats_.committed_decode_tokens += decisions[row].accepted_tokens;
+                    cumulative_stats_.committed_decode_tokens += output_tokens[row];
                 }
             }
         }
@@ -2023,7 +2045,7 @@ private:
             for (std::size_t row = 0; row < row_count; ++row) {
                 const std::uint32_t lane     = lane_indices[row];
                 const auto& request          = slots_[lane];
-                const std::uint32_t accepted = decisions[row].accepted_tokens;
+                const std::uint32_t accepted = output_tokens[row];
                 if (!cancelled[row]) {
                     request->budget->commit(accepted);
                     if (decode_round) { Scheduling::consume_service_work(*request, accepted); }

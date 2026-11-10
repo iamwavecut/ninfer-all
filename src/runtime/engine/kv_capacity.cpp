@@ -324,6 +324,16 @@ std::uint32_t SequenceCapacityCurve::resolved_tokens(std::uint32_t main_page_gro
     return static_cast<std::uint32_t>(tokens);
 }
 
+bool kv_capacity_fits(const KvCapacityPolicy& policy, const SequenceCapacityCurve& curve,
+                      std::size_t available_runtime_bytes,
+                      std::span<const std::size_t> extra_rank_available_bytes) {
+    validate_curve(curve);
+    if (extra_rank_available_bytes.size() != curve.extra_ranks.size()) {
+        throw std::invalid_argument("free memory was not given for every device in the plan");
+    }
+    return reservation_fits(policy, curve, available_runtime_bytes, extra_rank_available_bytes);
+}
+
 KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                                          const SequenceCapacityCurve& curve,
                                          std::size_t available_runtime_bytes,

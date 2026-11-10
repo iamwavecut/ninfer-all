@@ -211,6 +211,12 @@ struct ContextCacheOptions {
     HybridPrefixCacheOptions hybrid;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
+    // Legacy mode, Qwen3.5-core models: one more Device StateImage for each of the C requests,
+    // outside the catalog, keeps the state at the token where a stop string's match began, so a
+    // turn that the stop string ends rounds later resumes its next turn from there. A startup
+    // whose KV capacity does not fit beside them drops them, and Engine::options() reports it.
+    // The hybrid cache keeps that state in a snapshot slot.
+    bool stop_hold_images = true;
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;

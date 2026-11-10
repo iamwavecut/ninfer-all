@@ -722,7 +722,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         split_sizing = models::qwen3_5::StageSizing{
             .kv_storage = options.kv_cache,
             .state_slots =
-                options.max_concurrency + options.context_cache.device_state_slots.value_or(0U),
+                options.max_concurrency + options.context_cache.device_state_slots.value_or(0U) +
+                models::stop_hold_slots(options.context_cache, options.max_concurrency),
             .kv_tokens         = std::uint64_t(options.max_context) * options.max_concurrency,
             .minimum_kv_tokens = options.max_context,
             .automatic_kv      = options.kv_capacity.mode == KvCapacityMode::Automatic,
@@ -737,7 +738,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         const models::qwen3_5::StageSizing sizing{
             .kv_storage = options.kv_cache,
             .state_slots =
-                options.max_concurrency + options.context_cache.device_state_slots.value_or(0U),
+                options.max_concurrency + options.context_cache.device_state_slots.value_or(0U) +
+                models::stop_hold_slots(options.context_cache, options.max_concurrency),
             .automatic_kv      = options.kv_capacity.mode == KvCapacityMode::Automatic,
             .kv_headroom_bytes = options.kv_capacity.automatic_headroom_bytes};
         options.stage_layers = models::qwen3_5::default_stage_layers(
@@ -879,6 +881,19 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     const auto resolve_capacity = [&] {
         const auto extra_free = std::span<const std::size_t>(free_by_rank).subspan(1);
         ContextCacheOptions& cache = options.context_cache;
+        // The catalog's stop-string hold images give way to the capacity asked for.
+        if (models::stop_hold_slots(cache, options.max_concurrency) != 0 &&
+            !kv_capacity_fits(options.kv_capacity, planner->capacity_curve(), free_by_rank.front(),
+                              extra_free)) {
+            cache.stop_hold_images = false;
+            plan_sequences();
+            publish_diagnostic(
+                options.diagnostic_observer, DiagnosticLevel::Info,
+                "stop-string hold images dropped to fit the %s KV capacity: a turn that a stop "
+                "string ends rounds after its match began resumes from the prompt",
+                options.kv_capacity.mode == KvCapacityMode::Explicit ? "requested"
+                                                                     : "--max-context window's");
+        }
         const std::uint32_t from   = cache.device_state_slots.value_or(0U);
         const std::size_t per_slot = planner->capacity_curve().bytes_per_state_slot;
         for (;;) {

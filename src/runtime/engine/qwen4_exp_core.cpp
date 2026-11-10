@@ -372,6 +372,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         // branched read at its shared prefix, is sized now, beside its other state.
         instance->snapshots.resize(executor.sequences);
         for (auto& snapshot : instance->snapshots) { instance->executor->size_snapshot(snapshot); }
+        if (options.context_cache.enabled) {
+            instance->holds.resize(executor.sequences);
+            for (auto& hold : instance->holds) { instance->executor->size_snapshot(hold); }
+        }
         // With --expert-cache-mib auto, what startup left free beyond a margin becomes expert
         // slots; an explicit size is the cache's size.
         if (!options.expert_cache_bytes) { instance->executor->grow_expert_cache(kGrowthMargin); }
@@ -580,6 +584,14 @@ struct Qwen4ExpCore::Request {
     std::shared_ptr<runtime::GrammarMaskJob> mask;
     runtime::GrammarMaskCost mask_cost; // whether its masks are cheap enough to speculate
     bool awaiting_sample          = false;
+    // A stop string's match began at the first token the next step feeds: the step first keeps
+    // the sequence's state (Slot::hold). In a speculative round the sequence keeps the verified
+    // tokens before that one only (commit_tokens), whether the match ends the turn there or is
+    // still open; the next step feeds the rest. And the turn ended at a stop string whose match
+    // began in an earlier round: the sequence goes back to the kept state after the round commits.
+    bool hold_wanted = false;
+    bool stop_rewind = false;
+    std::optional<std::uint32_t> commit_tokens;
     std::int32_t awaiting_purpose = 0;
     // Its last accepted token, which the progress watchdog measures a decoding request from.
     Clock::time_point progress;
@@ -606,6 +618,11 @@ struct Qwen4ExpCore::Impl {
         std::vector<TokenId> anchor;
         std::vector<MediaMark> media, anchor_media;
         models::qwen4_exp::SequenceSnapshot snapshot;
+        // The sequence's state after its first hold_tokens tokens, where a stop string's match
+        // began in the request it serves (0: none): the visible text of a turn the stop string
+        // ends continues that state, not the live one, which has read the tokens the cut removed.
+        models::qwen4_exp::SequenceSnapshot hold;
+        std::uint32_t hold_tokens = 0;
         std::uint64_t last_used = 0;
         bool disposable         = false; // its last request's
     };
@@ -630,6 +647,7 @@ struct Qwen4ExpCore::Impl {
     const std::uint32_t domain;
     const bool structured_output;
     const bool reuse_prefixes;
+    bool holds_ready = false; // every slot's hold snapshot has its buffers
     const std::uint32_t drafts; // MTP drafts a speculative round proposes; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
     const DiagnosticObserver diagnostics;
@@ -745,6 +763,11 @@ struct Qwen4ExpCore::Impl {
             slots[s].snapshot = std::move(i.snapshots[s]);
         }
         i.snapshots.clear();
+        holds_ready = i.holds.size() == slots.size();
+        for (std::size_t s = 0; holds_ready && s < slots.size(); ++s) {
+            slots[s].hold = std::move(i.holds[s]);
+        }
+        i.holds.clear();
         RankBinding bind(device, i.executor->head_rank());
         const std::size_t rows = slots.size();
         // A sampling call's columns per row: one, or a verification's drafts and bonus.
@@ -1087,6 +1110,7 @@ struct Qwen4ExpCore::Impl {
 
     // The slot's sequence holds nothing the context cache can resume from.
     static void forget(Slot& slot) {
+        slot.hold_tokens = 0;
         slot.fed.clear();
         slot.anchor.clear();
         slot.media.clear();
@@ -1628,9 +1652,10 @@ struct Qwen4ExpCore::Impl {
             // The snapshot's prefix is about to be overwritten.
             forget(slot);
         }
-        slot.request    = request;
-        slot.last_used  = ++use_clock;
-        slot.disposable = r.disposable;
+        slot.request     = request;
+        slot.hold_tokens = 0;
+        slot.last_used   = ++use_clock;
+        slot.disposable  = r.disposable;
         r.reused = r.prefilled = reused;
         skip_drafter(r);
         if (drafts_for(r)) {
@@ -2556,8 +2581,31 @@ struct Qwen4ExpCore::Impl {
         if (token < 0) { throw_numerical_failure(*request); }
         (void)accept(request, std::span<const TokenId>(&token, 1),
                      logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
-                                        : std::span<const runtime::RawTokenLogprob>{});
+                                        : std::span<const runtime::RawTokenLogprob>{},
+                     true);
         check_capacity(request);
+    }
+
+    // Keeps the state of a request whose next step feeds the token that begins a stop string's
+    // match: the sequence has read everything before it.
+    void keep_hold(Request& r) {
+        r.hold_wanted = false;
+        Slot& slot    = slots[r.slot];
+        if (!holds_ready || !r.decoding || r.feed.empty()) { return; }
+        instance.executor->snapshot(r.slot, slot.hold);
+        slot.hold_tokens = static_cast<std::uint32_t>(slot.fed.size());
+    }
+
+    // A turn that ended at a stop string whose match began before its last token: the sequence
+    // goes back to the state kept where the match began, which the visible text continues.
+    // Without one it keeps its live state, which no later prompt continues.
+    void rewind_to_hold(Request& r) {
+        r.stop_rewind = false;
+        Slot& slot    = slots[r.slot];
+        if (slot.hold_tokens == 0 || slot.hold_tokens > slot.fed.size()) { return; }
+        instance.executor->restore(r.slot, slot.hold);
+        slot.fed.resize(slot.hold_tokens);
+        slot.hold_tokens = 0;
     }
 
     [[nodiscard]] bool active(const std::shared_ptr<Request>& request) const {
@@ -2574,9 +2622,12 @@ struct Qwen4ExpCore::Impl {
     // The same for a run of sampled tokens (a speculative round's licensed tokens), without the
     // capacity check, which the caller makes once the round's position is known: returns how many
     // of them the policy accepted. The next step feeds the last accepted one (the first when none
-    // was, as a single sampled token is fed whatever the policy decides).
+    // was, as a single sampled token is fed whatever the policy decides), or the accepted ones
+    // from the token that begins a stop string's match.
+    // `committed`: the sequence already holds the state the tokens leave; a speculative round
+    // commits after the policy has decided, the tokens Request::commit_tokens names when set.
     std::uint32_t accept(const std::shared_ptr<Request>& request, std::span<const TokenId> tokens,
-                         std::span<const runtime::RawTokenLogprob> logprobs) {
+                         std::span<const runtime::RawTokenLogprob> logprobs, bool committed) {
         Request& r                    = *request;
         const OutputDecision decision = r.output.preview_model(tokens, r.budget->remaining(),
                                                                r.budget->limit_reason(), logprobs);
@@ -2605,11 +2656,32 @@ struct Qwen4ExpCore::Impl {
             std::lock_guard lock(stats_mutex);
             stats.committed_decode_tokens += decision.accepted_tokens;
         }
+        // The match of a stop string began at accepted token `hold`. A sampled token is not read
+        // yet; of a speculative round's verified tokens (the anchor, then the accepted ones but
+        // the last) the sequence keeps those before it, so its state is where the visible text
+        // may end.
+        const std::optional<std::uint32_t> hold =
+            accepted > 0 && decision.stop_hold_after && *decision.stop_hold_after < accepted
+                ? decision.stop_hold_after
+                : std::nullopt;
+        if (hold && !committed) { r.commit_tokens = *hold + 1; }
         if (decision.finished()) {
+            if (decision.stop_cut && !hold) {
+                if (committed) {
+                    rewind_to_hold(r);
+                } else {
+                    r.stop_rewind = true;
+                }
+            }
             finish(request, decision.finish_reason);
             return accepted;
         }
-        r.feed.assign(1, token);
+        r.hold_wanted = hold.has_value();
+        if (hold) {
+            r.feed.assign(tokens.begin() + *hold, tokens.begin() + accepted);
+        } else {
+            r.feed.assign(1, token);
+        }
         if (decision.continuation == ContinuationAction::ApplyTargetControl) {
             const auto pending_control = r.output.pending_control_tokens();
             const std::vector<TokenId> control(pending_control.begin(), pending_control.end());
@@ -2649,6 +2721,9 @@ struct Qwen4ExpCore::Impl {
     double decode_step() {
         auto& executor = *instance.executor;
         std::vector<std::shared_ptr<Request>> batch, alone, speculative, deferred;
+        for (const Slot& slot : slots) {
+            if (slot.request && slot.request->hold_wanted) { keep_hold(*slot.request); }
+        }
         for (const Slot& slot : slots) {
             // A copy: finishing or failing the request clears its slot.
             const std::shared_ptr<Request> request = slot.request;
@@ -3152,7 +3227,7 @@ struct Qwen4ExpCore::Impl {
                 failed[j] = 1;
             } else {
                 try {
-                    taken = accept(request, run_tokens, records);
+                    taken = accept(request, run_tokens, records, false);
                 } catch (...) {
                     fail(request, std::current_exception());
                     failed[j] = 1;
@@ -3176,7 +3251,15 @@ struct Qwen4ExpCore::Impl {
                 ops::increment_token_counts(ids, row_counts, stream);
             }
         }
-        executor.commit(sequences, kept);
+        // A row whose stop string's match began inside its run keeps the tokens before the match.
+        std::vector<std::uint32_t> committed = kept;
+        for (std::size_t j = 0; j < b; ++j) {
+            if (const auto fewer = std::exchange(batch[j]->commit_tokens, std::nullopt);
+                fewer && !failed[j]) {
+                committed[j] = std::min(*fewer, kept[j]);
+            }
+        }
+        executor.commit(sequences, committed);
         // The controller measures the rounds it picked of MTP drafts only: a lookup changes the
         // round's width. The plan prices the rows verified, whatever proposed them.
         if (adapts) {
@@ -3193,8 +3276,9 @@ struct Qwen4ExpCore::Impl {
             Slot& slot = slots[r.slot];
             // The verification fed the anchor and the drafts; the sequence keeps the first ones.
             slot.fed.insert(slot.fed.end(), tokens.begin() + starts[j],
-                            tokens.begin() + starts[j] + std::ptrdiff_t(kept[j]));
-            r.position += kept[j];
+                            tokens.begin() + starts[j] + std::ptrdiff_t(committed[j]));
+            r.position += committed[j];
+            if (r.stop_rewind) { rewind_to_hold(r); }
             try {
                 check_capacity(batch[j]);
             } catch (...) { fail(batch[j], std::current_exception()); }

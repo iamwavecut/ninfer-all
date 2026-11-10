@@ -39,6 +39,9 @@ struct Qwen4ExpInstance {
     // Each sequence's snapshot buffers (Executor::size_snapshot), sized at startup before the
     // automatic expert cache took the rest; the core's slots take them.
     std::vector<models::qwen4_exp::SequenceSnapshot> snapshots;
+    // With the context cache, a second one per sequence: its state where a stop string's match
+    // began, which a turn the stop string ends goes back to.
+    std::vector<models::qwen4_exp::SequenceSnapshot> holds;
     // Free memory of the primary device once the weights were placed, and after startup.
     std::size_t free_after_weights = 0;
     std::size_t free_after_startup = 0;

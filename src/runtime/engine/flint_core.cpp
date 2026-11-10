@@ -382,6 +382,11 @@ struct FlintCore::Request {
     bool post_thinking         = false;
     std::uint32_t position     = 0;
     std::vector<TokenId> feed;
+    // The tokens its sequence had read before the token that begins a stop string's match, and
+    // whether the turn ended at that stop string inside a speculative round that still commits:
+    // the sequence goes back to that many tokens after it.
+    std::optional<std::size_t> hold_fed;
+    bool stop_rewind = false;
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
@@ -1677,8 +1682,21 @@ struct FlintCore::Impl {
         if (token < 0) { throw_numerical_failure(*request); }
         (void)accept(request, std::span<const TokenId>(&token, 1),
                      logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
-                                        : std::span<const runtime::RawTokenLogprob>{});
+                                        : std::span<const runtime::RawTokenLogprob>{},
+                     true);
         check_capacity(request);
+    }
+
+    // A turn that ended at a stop string: the sequence goes back to what it had read before the
+    // token that begins the match, the state the visible text continues, when its rings still
+    // hold that position's window. Otherwise it keeps its live state, which no later prompt
+    // continues.
+    void rewind_to_hold(Request& r) {
+        r.stop_rewind = false;
+        Slot& slot    = slots[r.slot];
+        if (!r.hold_fed || *r.hold_fed >= slot.fed.size()) { return; }
+        const auto tokens = static_cast<std::uint32_t>(slot.fed.size() - *r.hold_fed);
+        if (instance.executor->rewind(r.slot, tokens)) { slot.fed.resize(*r.hold_fed); }
     }
 
     // A request whose next feed would pass the context finishes.
@@ -1692,8 +1710,10 @@ struct FlintCore::Impl {
     // capacity check, which the caller makes once the round's position is known: returns how many
     // of them the policy accepted. The next step feeds the last accepted one (the first when none
     // was, as a single sampled token is fed whatever the policy decides).
+    // `committed`: the sequence has read what the tokens follow; a speculative round, which has
+    // yet to read its anchor, commits after the policy has decided.
     std::uint32_t accept(const std::shared_ptr<Request>& request, std::span<const TokenId> tokens,
-                         std::span<const runtime::RawTokenLogprob> logprobs) {
+                         std::span<const runtime::RawTokenLogprob> logprobs, bool committed) {
         Request& r                    = *request;
         const OutputDecision decision = r.output.preview_model(tokens, r.budget->remaining(),
                                                                r.budget->limit_reason(), logprobs);
@@ -1721,7 +1741,19 @@ struct FlintCore::Impl {
             std::lock_guard lock(stats_mutex);
             stats.committed_decode_tokens += accepted;
         }
+        // The match of a stop string began at accepted token `stop_hold_after`: the sequence had
+        // read, or will have once the round commits, this many tokens before it.
+        if (accepted > 0 && decision.stop_hold_after && *decision.stop_hold_after < accepted) {
+            r.hold_fed = slots[r.slot].fed.size() + (committed ? 0 : 1) + *decision.stop_hold_after;
+        }
         if (decision.finished()) {
+            if (decision.stop_cut) {
+                if (committed) {
+                    rewind_to_hold(r);
+                } else {
+                    r.stop_rewind = true;
+                }
+            }
             finish(request, decision.finish_reason);
             return accepted;
         }
@@ -2157,7 +2189,7 @@ struct FlintCore::Impl {
                 failed[j] = 1;
             } else {
                 try {
-                    taken = accept(request, run_tokens, records);
+                    taken = accept(request, run_tokens, records, false);
                 } catch (...) {
                     fail(request, std::current_exception());
                     failed[j] = 1;
@@ -2189,6 +2221,7 @@ struct FlintCore::Impl {
             slot.fed.insert(slot.fed.end(), tokens.begin() + starts[j],
                             tokens.begin() + starts[j] + std::ptrdiff_t(kept[j]));
             r.position += kept[j];
+            if (r.stop_rewind) { rewind_to_hold(r); }
             try {
                 check_capacity(batch[j]);
             } catch (...) { fail(batch[j], std::current_exception()); }
