@@ -852,13 +852,13 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         transaction.state.reset();
         sequence.state = ActiveStateBinding{.read = state, .write = state};
         if (reuse == 0) {
-            state_store->activate_reset(state, device.stream);
+            state_store->activate_reset(state, compute_streams);
         } else if (transaction.state_restored) {
             state_store->activate_copied(state);
         } else {
             const StateImageHandle image = hybrid_->image(quote.snapshot);
             state_images->copy_slot(state_store->physical_slot(image),
-                                    state_store->physical_slot(state), device.stream);
+                                    state_store->physical_slot(state), compute_streams);
             state_store->activate_copied(state);
         }
 
@@ -895,9 +895,9 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
                 if (fork.needs_tail_copy()) {
                     pages.physical_pool().copy_page(
                         addresses.page_prefix_fork_tail_source(fork),
-                        addresses.page_prefix_fork_tail_destination(fork), device.stream);
+                        addresses.page_prefix_fork_tail_destination(fork), compute_streams);
                 }
-                addresses.commit_page_prefix_fork(std::move(fork), device.stream);
+                addresses.commit_page_prefix_fork(std::move(fork), compute_streams);
                 return *address;
             } catch (...) {
                 if (addresses.active(*address)) { addresses.deactivate(*address); }
@@ -1221,11 +1221,11 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_copy_tail(const HybridBlockPage
     }
     // Each tail owns its bundle, so evicting any cache entry returns exactly one page per pool.
     text_kv_pages->physical_pool().copy_page(text_kv_pages->physical(source.text),
-                                             text_kv_pages->physical(copy.text), device.stream);
+                                             text_kv_pages->physical(copy.text), compute_streams);
     if (backend_pool) {
         backend_kv_pages->physical_pool().copy_page(backend_kv_pages->physical(*source.backend),
                                                     backend_kv_pages->physical(*copy.backend),
-                                                    device.stream);
+                                                    compute_streams);
     }
     return hybrid_->register_tail_copy(copy, columns);
 }
@@ -1347,7 +1347,7 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
     }
     try {
         state_images->copy_slot(state_store->physical_slot(sequence.state.write),
-                                state_store->physical_slot(*image), device.stream);
+                                state_store->physical_slot(*image), compute_streams);
         state_store->publish_copied_checkpoint(*image);
         lane.pending.push_back(HybridPendingTap{
             .frontier = frontier, .image = *image, .slot = *slot, .boundary = boundary});

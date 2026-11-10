@@ -5,7 +5,9 @@
 #include "core/paged_kv_cache.h"
 
 #include <algorithm>
+#include <array>
 #include <exception>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -33,6 +35,15 @@ std::span<const std::byte* const> const_records(const std::vector<std::byte*>& r
     return {reinterpret_cast<const std::byte* const*>(records.data()), records.size()};
 }
 
+// One stream for every rank's part of a state image. A copy may run on another device's stream,
+// so a snapshot's write or restore stays one ordered sequence that one event marks, also when
+// pipeline stages or tensor parallelism shard the image across devices.
+RankStreams on_every_rank(cudaStream_t stream) {
+    std::array<cudaStream_t, kMaxRanks> streams;
+    streams.fill(stream);
+    return RankStreams(std::span<const cudaStream_t>(streams));
+}
+
 } // namespace
 
 HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlannerConfig taps,
@@ -55,9 +66,17 @@ HybridPrefixCache::HybridPrefixCache(const PrefixIndexConfig& config, TapPlanner
         throw std::invalid_argument("hybrid restore layers do not match the text KV planes");
     }
     planes_per_attention_layer_ = text_planes / attention_layers;
+    // Pipeline stages shard the layers and tensor parallelism the heads, so the image's layers
+    // end where its last shard's do.
+    std::uint32_t linear_layers = 0;
+    for (std::size_t shard = 0; shard < state_pool.shard_count(); ++shard) {
+        linear_layers = std::max(linear_layers,
+                                 state_pool.shard(shard).first_layer +
+                                     static_cast<std::uint32_t>(state_pool.linear(shard).layer_count()));
+    }
     for (const HybridRestoreLayer& layer : layers_) {
         if ((layer.attention && layer.index >= attention_layers) ||
-            (!layer.attention && layer.index >= state_pool.linear().layer_count())) {
+            (!layer.attention && layer.index >= linear_layers)) {
             throw std::invalid_argument("hybrid restore layer index is out of range");
         }
     }
@@ -286,12 +305,13 @@ void HybridPrefixCache::add_copies(PageCopies& copies, const HybridBlockPages& p
 void HybridPrefixCache::enqueue_to_host(const PageCopies& copies, cudaStream_t stream) const {
     if (!copies.text_pages.empty()) {
         text_pages_->physical_pool().copy_to_host_records(
-            copies.text_pages, copies.text_records, copies.text_groups, host_layout_.text, stream);
+            copies.text_pages, copies.text_records, copies.text_groups, host_layout_.text,
+            on_every_rank(stream));
     }
     if (!copies.backend_pages.empty()) {
         backend_pages_->physical_pool().copy_to_host_records(
             copies.backend_pages, copies.backend_records, copies.backend_groups,
-            *host_layout_.backend, stream);
+            *host_layout_.backend, on_every_rank(stream));
     }
 }
 
@@ -299,12 +319,13 @@ void HybridPrefixCache::enqueue_from_host(const PageCopies& copies, cudaStream_t
     if (!copies.text_pages.empty()) {
         text_pages_->physical_pool().copy_from_host_records(const_records(copies.text_records),
                                                             copies.text_groups, copies.text_pages,
-                                                            host_layout_.text, stream);
+                                                            host_layout_.text,
+                                                            on_every_rank(stream));
     }
     if (!copies.backend_pages.empty()) {
         backend_pages_->physical_pool().copy_from_host_records(
             const_records(copies.backend_records), copies.backend_groups, copies.backend_pages,
-            *host_layout_.backend, stream);
+            *host_layout_.backend, on_every_rank(stream));
     }
 }
 
@@ -360,7 +381,8 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, Snapshot
         }
         order_after(producer, transfer);
         state_pool_->copy_to_host_segments(states_->physical_slot(images_[snapshot.index]),
-                                           segments, host_layout_.slab_bytes, transfer);
+                                           segments, host_layout_.slab_bytes,
+                                           on_every_rank(transfer));
         std::uint64_t bytes = host_layout_.image_bytes;
         if (view.tail_len != 0) {
             write_scratch_.clear();
@@ -578,12 +600,13 @@ void HybridPrefixCache::submit_restore() {
     if (!restore_.copies.backend_pages.empty()) {
         backend_pages_->physical_pool().copy_from_host_records(
             const_records(restore_.copies.backend_records), restore_.copies.backend_groups,
-            restore_.copies.backend_pages, *host_layout_.backend, restore_stream_);
+            restore_.copies.backend_pages, *host_layout_.backend, on_every_rank(restore_stream_));
     }
     if (restore_.image) {
         state_pool_->copy_from_host_segments(
             segments, host_layout_.slab_bytes, restore_.image_slot,
-            qwen3_5::StateImagePart{.kind = qwen3_5::StateImagePart::Kind::Rest}, restore_stream_);
+            qwen3_5::StateImagePart{.kind = qwen3_5::StateImagePart::Kind::Rest},
+            on_every_rank(restore_stream_));
     }
     restore_.prelude = record();
     // Then each layer's own state, in forward order, so a pass can start on the first layers
@@ -596,14 +619,14 @@ void HybridPrefixCache::submit_restore() {
                 text_pages_->physical_pool().copy_from_host_records(
                     const_records(restore_.copies.text_records), restore_.copies.text_groups,
                     restore_.copies.text_pages, host_layout_.text, begin,
-                    begin + planes_per_attention_layer_, restore_stream_);
+                    begin + planes_per_attention_layer_, on_every_rank(restore_stream_));
             }
         } else if (restore_.image) {
             state_pool_->copy_from_host_segments(
                 segments, host_layout_.slab_bytes, restore_.image_slot,
                 qwen3_5::StateImagePart{.kind  = qwen3_5::StateImagePart::Kind::LinearLayer,
                                         .layer = layer.index},
-                restore_stream_);
+                on_every_rank(restore_stream_));
         }
         restore_.layers.push_back(record());
     }

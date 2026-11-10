@@ -1322,8 +1322,7 @@ public:
         return pages_->physical(*fork.tail_destination_);
     }
 
-    void commit_page_prefix_fork(KVPagePrefixForkReservation&& fork,
-                                 cudaStream_t stream = nullptr) {
+    void commit_page_prefix_fork(KVPagePrefixForkReservation&& fork, RankStreams stream = {}) {
         require_page_prefix_fork(fork);
         Address& destination               = require(fork.destination_);
         const auto full                    = static_cast<std::uint32_t>(fork.full_pages_.size());
