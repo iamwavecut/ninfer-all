@@ -208,8 +208,8 @@ __device__ __forceinline__ void causal_prompt_softmax(float (&score)[kCausalProm
     const float nm1        = fmaxf(m1, bm1);
     const float nm0_scaled = nm0 * scale_l2;
     const float nm1_scaled = nm1 * scale_l2;
-    const float alpha0     = exp2_approx(__fmaf_rn(m0, scale_l2, -nm0_scaled));
-    const float alpha1     = exp2_approx(__fmaf_rn(m1, scale_l2, -nm1_scaled));
+    const float alpha0     = softmax_history_rescale(m0, scale_l2, nm0_scaled);
+    const float alpha1     = softmax_history_rescale(m1, scale_l2, nm1_scaled);
 
     // P = exp2(S - m), repacked into the PV A-fragment layout, plus local block row-sum.
     float bl0 = 0.0f, bl1 = 0.0f;

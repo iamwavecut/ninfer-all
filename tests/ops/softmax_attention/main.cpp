@@ -22,6 +22,7 @@ int run_softmax_attention_quantized_depth_tests();
 int run_softmax_attention_tensor_share_tests();
 int run_softmax_attention_position_split_tests();
 int run_softmax_attention_invariant_tests();
+int run_softmax_attention_history_rescale_tests();
 
 namespace {
 
@@ -100,13 +101,17 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--invariant-only") {
         return run_guarded("invariant", run_softmax_attention_invariant_tests);
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--history-rescale-only") {
+        return run_guarded("history rescale", run_softmax_attention_history_rescale_tests);
+    }
     if (argc != 1) {
         std::cerr
             << "usage: ninfer_softmax_attention_test "
                "[--dflash2-only|--nvfp4-only|--k8v4-only|--rk4v4-e8-only|--rk2v4-e8-only|"
                "--int8-prompt-only|--prompt-splits-only|--small-t-pipelined-only|--fp8-prompt-only|"
                "--pack-gqa-only|--wide-only|--parallel-tiles-only|--quantized-depth-only|"
-               "--tensor-shares-only|--position-split-only|--invariant-only]\n";
+               "--tensor-shares-only|--position-split-only|--invariant-only|"
+               "--history-rescale-only]\n";
         return 2;
     }
     const int causal = run_guarded("causal cache", run_softmax_attention_causal_cache_tests);

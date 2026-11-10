@@ -522,10 +522,10 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
             const float nm1_scaled = nm1 * scale_l2;
             const float alpha0     = running_m0 == -CUDART_INF_F
                                          ? 0.0f
-                                         : exp2_approx(__fmaf_rn(running_m0, scale_l2, -nm0_scaled));
+                                         : softmax_history_rescale(running_m0, scale_l2, nm0_scaled);
             const float alpha1     = running_m1 == -CUDART_INF_F
                                          ? 0.0f
-                                         : exp2_approx(__fmaf_rn(running_m1, scale_l2, -nm1_scaled));
+                                         : softmax_history_rescale(running_m1, scale_l2, nm1_scaled);
             float bl0              = 0.0f;
             float bl1              = 0.0f;
 #pragma unroll

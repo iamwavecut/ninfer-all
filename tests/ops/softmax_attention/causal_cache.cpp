@@ -242,7 +242,17 @@ struct AttentionCase {
     bool small_prefill      = false;
     // Sets one key element of the new tokens to 2^17, beyond FP16's range (KvCacheStorage cases).
     bool key_beyond_fp16 = false;
+    // Every key, cached and new, is the same vector (kFlatKey in each element), so a query scores
+    // every key the same whatever the storage rounds, and its row maximum holds from the first key
+    // tile on. V is value_scale before the middle position and half of it from there. The exact
+    // output is the mean of the decoded V; a history factor that is not exactly 1 while the maximum
+    // holds compounds over the key tiles and weights the two halves apart (KvCacheStorage cases).
+    bool flat_scores = false;
 };
+
+// AttentionCase::flat_scores: the key element, and the query range [kFlatKey / 2, kFlatKey). The
+// scaled scores are near 2^14.7, where an FP32 product rounds by up to 2^-10.
+constexpr float kFlatKey = 40.0f;
 
 enum class MappingPattern { Identity, Offset, Fragmented };
 
@@ -2610,6 +2620,34 @@ void inject_codec_edges(const Geometry& geometry, std::int32_t tokens, std::vect
     v[kv_input_index(geometry, geometry.kv_heads - 1, 0, tokens - 1)] = 1.0f;
 }
 
+// AttentionCase::flat_scores: V of `tokens` positions from `first`, in the input layout.
+std::vector<float> flat_values(const Geometry& geometry, std::int32_t first, std::int32_t tokens,
+                               std::int32_t middle, float amplitude) {
+    std::vector<float> v(static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * tokens);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        const float value = first + token < middle ? amplitude : 0.5f * amplitude;
+        for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                v[kv_input_index(geometry, head, d, token)] = value;
+            }
+        }
+    }
+    return v;
+}
+
+// AttentionCase::flat_scores: the cached history [0, base), encoded as an append stores it.
+void write_flat_history(HostCache& cache, std::int32_t base, std::int32_t middle,
+                        float amplitude) {
+    if (base == 0) return;
+    const Geometry& geometry = cache.geometry;
+    const std::vector<float> k(static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * base,
+                               kFlatKey);
+    const std::vector<float> v = flat_values(geometry, 0, base, middle, amplitude);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(base));
+    std::iota(positions.begin(), positions.end(), 0);
+    append_cache(cache, k, v, positions);
+}
+
 int run_a1_case(const Geometry& geometry, const CachePlan& plan, const AttentionCase& test_case,
                 MappingPattern mapping) {
     const std::int32_t total       = test_case.base + test_case.tokens;
@@ -2625,7 +2663,13 @@ int run_a1_case(const Geometry& geometry, const CachePlan& plan, const Attention
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
-    inject_codec_edges(geometry, test_case.tokens, k, v);
+    if (test_case.flat_scores) {
+        q = make_bf16_values(q_elements, test_case.seed, 0.5f * kFlatKey, kFlatKey);
+        std::fill(k.begin(), k.end(), kFlatKey);
+        v = flat_values(geometry, test_case.base, test_case.tokens, total / 2, 1.0f);
+    } else {
+        inject_codec_edges(geometry, test_case.tokens, k, v);
+    }
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
@@ -2634,7 +2678,11 @@ int run_a1_case(const Geometry& geometry, const CachePlan& plan, const Attention
         static_cast<std::uint32_t>(total), test_case.envelope_max, test_case.fast_prompt_kernel,
         test_case.wide_verification, test_case.small_prefill};
 
-    const HostCache initial = make_cache(geometry, plan, max_context, test_case.seed + 10u);
+    const HostCache initial = [&] {
+        HostCache history = make_cache(geometry, plan, max_context, test_case.seed + 10u);
+        if (test_case.flat_scores) { write_flat_history(history, test_case.base, total / 2, 1.0f); }
+        return history;
+    }();
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
     const std::vector<double> reference = ideal_attention(q, expected, positions);
@@ -2682,8 +2730,10 @@ int run_a1_case(const Geometry& geometry, const CachePlan& plan, const Attention
         case_label("causal_softmax_attention", geometry, plan, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
-    int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(plan));
+    // A flat case answers to BF16's criterion in every storage (see the KvCacheStorage overload).
+    int failures = verify_attention(
+        label, bf16_bits_to_double(output_bits), reference,
+        test_case.flat_scores ? kAttentionBf16Criterion : attention_criterion(plan));
     failures += verify_cache(label, cache.snapshot(), expected, plan.dtype == DType::BF16);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_input(label + " k unchanged", dk, k_bits);
@@ -2716,7 +2766,14 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u,
                                             -test_case.value_scale, test_case.value_scale);
-    inject_codec_edges(geometry, test_case.tokens, k, v);
+    if (test_case.flat_scores) {
+        q = make_bf16_values(q_elements, test_case.seed, 0.5f * kFlatKey, kFlatKey);
+        std::fill(k.begin(), k.end(), kFlatKey);
+        v = flat_values(geometry, test_case.base, test_case.tokens, total / 2,
+                        test_case.value_scale);
+    } else {
+        inject_codec_edges(geometry, test_case.tokens, k, v);
+    }
     if (test_case.key_beyond_fp16) {
         k[kv_input_index(geometry, 0, 5, test_case.tokens / 2)] = 131072.0f;
     }
@@ -2728,8 +2785,14 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         static_cast<std::uint32_t>(total), test_case.envelope_max, test_case.fast_prompt_kernel,
         test_case.wide_verification, test_case.small_prefill};
 
-    const HostCache initial =
-        make_cache(geometry, storage, max_context, test_case.seed + 10u, test_case.value_scale);
+    const HostCache initial = [&] {
+        HostCache history = make_cache(geometry, storage, max_context, test_case.seed + 10u,
+                                       test_case.value_scale);
+        if (test_case.flat_scores) {
+            write_flat_history(history, test_case.base, total / 2, test_case.value_scale);
+        }
+        return history;
+    }();
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
     const std::vector<double> reference = ideal_attention(q, expected, positions);
@@ -2776,9 +2839,13 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         case_label("causal_softmax_attention", geometry, storage, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
-    int failures =
-        verify_attention(label, unit_value_scale(bf16_bits_to_double(output_bits), test_case),
-                         unit_value_scale(reference, test_case), attention_criterion(storage));
+    // Equal keys make the exact weights uniform however the storage rounds Q and K, so a flat case
+    // answers to BF16's criterion in every storage; a storage's own budget, sized for the rounding
+    // of Q, would hide the drift the case looks for.
+    int failures = verify_attention(
+        label, unit_value_scale(bf16_bits_to_double(output_bits), test_case),
+        unit_value_scale(reference, test_case),
+        test_case.flat_scores ? kAttentionBf16Criterion : attention_criterion(storage));
     failures += verify_cache(label, cache.snapshot(), expected,
                              storage == KvCacheStorage::BFloat16 ||
                                  storage == KvCacheStorage::Nvfp4Group16 ||
@@ -5300,6 +5367,51 @@ int run_softmax_attention_position_split_tests() {
         seed += 10u;
     }
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " position-split attention\n";
+    return failures == 0 ? 0 : 1;
+}
+
+// A row maximum that holds over a long history (AttentionCase::flat_scores): 32,640 cached keys,
+// 510 key tiles, under a prompt-route width. The tiled prompt kernels once took the history factor
+// as exp2(fma(previous, scale, -rn(maximum * scale))), 2^(the product's rounding residual) where
+// the maximum holds, which compounded over the tiles and tilted the weights between the two halves
+// of V. Every storage's standard prompt kernel runs, and the fast kernels of the INT8 family and
+// of NVFP4 (one launch, no key splits at this width).
+int run_softmax_attention_history_rescale_tests() {
+    if (cuda_unavailable()) return 77;
+    const Geometry& geometry = kGeometries[1];
+    const auto flat          = [](bool fast, std::uint32_t seed) {
+        AttentionCase test_case{17, 32640, 32657u, seed};
+        test_case.flat_scores        = true;
+        test_case.fast_prompt_kernel = fast;
+        return test_case;
+    };
+    int failures       = 0;
+    std::uint32_t seed = 7900u;
+    for (const KvCacheStorage storage : kEveryStorage) {
+        // rk8v4 and rk4v4 build their caches from a plan; the other storages by name.
+        const auto run = [&](const AttentionCase& test_case) {
+            if (storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
+                return run_a1_case(geometry, kPlanRk8v4, test_case, MappingPattern::Fragmented);
+            }
+            if (storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
+                return run_a1_case(geometry, kPlanRk4v4, test_case, MappingPattern::Fragmented);
+            }
+            return run_a1_case(geometry, storage, test_case, MappingPattern::Fragmented);
+        };
+        failures += run_case_allowing_arch_skip("history rescale (standard prompt kernel)", [&] {
+            const ops::DeviceRouteForce standard("attn_prompt_fast", "off");
+            return run(flat(false, seed));
+        });
+        if (storage == KvCacheStorage::Int8Group64 ||
+            storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+            storage == KvCacheStorage::Nvfp4Group16) {
+            failures += run_case_allowing_arch_skip("history rescale (fast prompt kernel)", [&] {
+                return run(flat(true, seed + 1u));
+            });
+        }
+        seed += 10u;
+    }
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " history rescale attention\n";
     return failures == 0 ? 0 : 1;
 }
 
