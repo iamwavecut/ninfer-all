@@ -1797,6 +1797,26 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                                               p.convolution, conv_state_in, conv_state_out,
                                               q_segment, k_segment, v_segment, s);
             }
+        } else if (gdn_live_taps_ != 0) {
+            // In-pass taps: the columns before each leave their window in its image, from which
+            // the next columns continue.
+            std::int32_t begin = 0;
+            for (std::size_t tap = 0; tap <= gdn_live_taps_; ++tap) {
+                const bool last = tap == gdn_live_taps_;
+                const std::int32_t end = last ? T : gdn_tap_columns_[tap];
+                const std::int32_t in_slot =
+                    tap == 0 ? linear_state_source_slot_ : gdn_taps_[tap - 1].state_slot;
+                const std::int32_t out_slot =
+                    last ? linear_state_destination_slot_ : gdn_taps_[tap].state_slot;
+                Tensor conv_in  = gdn_pool.pool->conv_slot(gdn_pool.local, in_slot);
+                Tensor conv_out = gdn_pool.pool->conv_slot(gdn_pool.local, out_slot);
+                Tensor q_part   = qc.slice(1, begin, end - begin);
+                Tensor k_part   = kc.slice(1, begin, end - begin);
+                Tensor v_part   = vc.slice(1, begin, end - begin);
+                ops::causal_conv1d_silu_split(qkv.slice(1, begin, end - begin), p.convolution,
+                                              conv_in, conv_out, q_part, k_part, v_part, s);
+                begin = end;
+            }
         } else {
             Tensor conv_state_in =
                 gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_source_slot_);
@@ -1880,6 +1900,29 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     1.0 / std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
                 /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o_segment,
                 s);
+        }
+    } else if (gdn_live_taps_ != 0) {
+        const GdnStateRef recurrent_pool = gdn_state(static_cast<std::uint32_t>(gidx));
+        const float scale                = static_cast<float>(
+            1.0 / std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim)));
+        std::int32_t begin = 0;
+        for (std::size_t tap = 0; tap <= gdn_live_taps_; ++tap) {
+            const bool last        = tap == gdn_live_taps_;
+            const std::int32_t end = last ? T : gdn_tap_columns_[tap];
+            const std::int32_t n   = end - begin;
+            const std::int32_t in_slot =
+                tap == 0 ? linear_state_source_slot_ : gdn_taps_[tap - 1].state_slot;
+            const std::int32_t out_slot =
+                last ? linear_state_destination_slot_ : gdn_taps_[tap].state_slot;
+            auto scope       = work_.scope();
+            Tensor state_in  = recurrent_pool.pool->recurrent_slot(recurrent_pool.local, in_slot);
+            Tensor state_out = recurrent_pool.pool->recurrent_slot(recurrent_pool.local, out_slot);
+            Tensor o_part    = o.slice(2, begin, n);
+            ops::gated_delta_net(q_recurrent.slice(2, begin, n), k_recurrent.slice(2, begin, n),
+                                 vv.slice(2, begin, n), g.slice(1, begin, n),
+                                 beta.slice(1, begin, n), scale, /*normalize_qk=*/true, work_,
+                                 state_in, state_out, o_part, s);
+            begin = end;
         }
     } else {
         const GdnStateRef recurrent_pool = gdn_state(static_cast<std::uint32_t>(gidx));
@@ -2770,6 +2813,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
     int t0          = 0;
     bool token_left = false;
+    bool tapped     = false;
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
         if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
@@ -2786,6 +2830,22 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             len = vision_chunk.length;
         }
         const bool is_last = finalize_at_end && (t0 + len == T);
+        // In-pass taps: a text chunk on one device whose columns hold every frontier, in order.
+        gdn_live_taps_ = 0;
+        if (gdn_tap_count_ != 0 && multimodal == nullptr &&
+            !(stage_runtime_ != nullptr && stage_runtime_->tensor_parallel)) {
+            std::int64_t previous = 0;
+            bool inside           = true;
+            for (std::size_t index = 0; index < gdn_tap_count_; ++index) {
+                const std::int64_t column =
+                    static_cast<std::int64_t>(gdn_taps_[index].frontier) - base64 - t0;
+                inside = inside && column > previous && column < len;
+                gdn_tap_columns_[index] = inside ? static_cast<std::int32_t>(column) : 0;
+                previous              = column;
+            }
+            gdn_live_taps_ = inside ? gdn_tap_count_ : 0;
+        }
+        tapped = gdn_live_taps_ != 0;
         nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                       static_cast<std::uint64_t>(len));
 
@@ -2885,6 +2945,15 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
             ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+            for (std::size_t index = 0; index < gdn_live_taps_; ++index) {
+                Tensor* hidden = gdn_taps_[index].hidden;
+                if (hidden == nullptr) { continue; }
+                require_tensor_shape(*hidden, DType::BF16, {dimension(config_.hidden_size), 1},
+                                     "in-pass tap hidden");
+                const Tensor column = xf.slice(1, gdn_tap_columns_[index] - 1, 1);
+                CUDA_CHECK(cudaMemcpyAsync(hidden->data, column.data, column.bytes(),
+                                           cudaMemcpyDeviceToDevice, s));
+            }
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
@@ -3034,6 +3103,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     }
 
     prefill_split_frontier_ = -1;
+    gdn_tap_count_          = 0;
+    gdn_live_taps_          = 0;
 
     // A token that has left is waited for by the caller; the drafter's work behind it is not.
     if (!token_left) {
@@ -3044,6 +3115,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
                               .finalized        = finalize_at_end && t0 == T,
+                              .tapped           = tapped,
                               .timing           = timing.finish()};
 }
 

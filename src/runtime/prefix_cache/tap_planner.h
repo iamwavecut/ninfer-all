@@ -54,12 +54,14 @@ struct TapExclusion {
 
 // How the prefill loop realizes a tap.
 enum class TapPlacement : std::uint8_t {
-    // Split the prefill chunk at `position` and snapshot there: semantic boundaries where a
-    // later prompt is expected to diverge.
+    // Snapshot exactly at `position`: semantic boundaries where a later prompt is expected to
+    // diverge. A text chunk on one device writes the state there in its pass (up to four taps a
+    // chunk); otherwise the chunk is split at `position`.
     Exact,
     // Snapshot at a prefill chunk boundary instead of splitting: at the end of the chunk that
     // reaches `position`, or at the start of the prompt's final chunk when `position` lies in it.
-    // A split costs one more forward pass, a chunk boundary costs nothing.
+    // A split costs one more forward pass, an in-pass tap one more Gated DeltaNet call a layer,
+    // a chunk boundary nothing.
     Flexible,
 };
 

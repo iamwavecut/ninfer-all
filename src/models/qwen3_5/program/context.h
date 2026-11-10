@@ -99,6 +99,8 @@ struct PrefillContext {
     // Enqueues the first token's copies to the host as soon as a text chunk samples it; the chunk
     // then returns without waiting for the drafter's work behind them. Empty waits for everything.
     std::function<void()> first_token;
+    // Exact prefix-cache taps inside a text chunk (TextContext::set_gdn_taps).
+    std::span<const GdnTap> gdn_taps;
 };
 
 struct OrdinaryBatchContext {

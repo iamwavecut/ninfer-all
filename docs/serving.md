@@ -2787,7 +2787,7 @@ passed over eight times runs next, so a long prompt is not starved. On a Qwen3.5
 that chunk is the last of a text prompt, the last chunks of other staged lanes ride along in the
 same pass, up to `--prefill-chunk` tokens together: one pass over the model instead of one per
 request; a request under a grammar samples its row with its own first mask. A last chunk
-shares a pass unless the prompt has media, a cache snapshot or tap splits the chunk,
+shares a pass unless the prompt has media, an exact cache tap or capture lies in the chunk,
 the speculative drafter works over it (a request that drafts runs its drafter over its prompt; a
 decision read does not), or the model is split over several devices. `/v1/load` and `/stats` count
 these passes as `shared_prefill_passes`. Requests that arrive together share them best:

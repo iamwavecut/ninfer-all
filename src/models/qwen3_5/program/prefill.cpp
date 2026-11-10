@@ -108,6 +108,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    card.set_gdn_taps(state.gdn_taps);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     if (state.first_token) { card.set_first_token_hook(state.first_token); }
     const std::span<const int> prompt(ids.data(), ids.size());
@@ -1330,17 +1331,25 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             return hybrid_lane != nullptr && hybrid_lane->active && hybrid_lane->publish &&
                    hybrid_lane->next_tap < hybrid_lane->taps.size();
         };
-        const auto next_hybrid_split = [&]() -> std::optional<std::uint32_t> {
+        // The first exact tap past `after`.
+        const auto next_hybrid_split =
+            [&](std::uint32_t after) -> std::optional<runtime::prefix_cache::PlannedTap> {
             if (!hybrid_taps_left()) { return std::nullopt; }
             for (std::size_t tap = hybrid_lane->next_tap; tap < hybrid_lane->taps.size(); ++tap) {
                 const runtime::prefix_cache::PlannedTap& planned = hybrid_lane->taps[tap];
                 if (planned.placement == runtime::prefix_cache::TapPlacement::Exact &&
-                    planned.position > staged.cursor) {
-                    return planned.position;
+                    planned.position > after) {
+                    return planned;
                 }
             }
             return std::nullopt;
         };
+        // An exact tap inside a text chunk is taken in the pass (TextContext::set_gdn_tap) instead
+        // of splitting it, on one device and without a masked drafter, whose context in the
+        // image would have to end at the tap too.
+        const bool in_pass_taps =
+            !staged.vision && !is_masked_draft_backend(speculative_backend) &&
+            !(stage_runtime && stage_runtime->tensor_parallel);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
         if (staged.next_capture < staged.capture_groups.size() || hybrid_taps_left()) {
@@ -1450,7 +1459,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 schedule_state.dflash_kv_table_row =
                     sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
                                          : 0;
-                const std::optional<std::uint32_t> hybrid_split = next_hybrid_split();
+                const std::optional<runtime::prefix_cache::PlannedTap> hybrid_split =
+                    next_hybrid_split(staged.cursor);
                 if (staged.next_capture < staged.capture_groups.size() || hybrid_taps_left()) {
                     rewrite_capture_hidden =
                         state_images->continuation_hidden_slot(selectors.destination);
@@ -1482,18 +1492,53 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     (!split_frontier || *rewrite_split < *split_frontier)) {
                     split_frontier = *rewrite_split;
                 }
-                if (hybrid_split && (!split_frontier || *hybrid_split < *split_frontier)) {
-                    split_frontier = *hybrid_split;
-                }
                 if (staged.drafter_frontier && *staged.drafter_frontier > staged.cursor &&
                     *staged.drafter_frontier < staged.prompt_tokens &&
                     (!split_frontier || *staged.drafter_frontier < *split_frontier)) {
                     split_frontier = *staged.drafter_frontier;
                 }
+                // Exact taps inside the chunk are taken in the pass, up to kMaximumGdnTaps; the
+                // chunk ends at the first one that is not, where it is realized as before.
+                std::array<HybridPendingTap, execution::kMaximumGdnTaps> in_pass{};
+                std::array<execution::GdnTap, execution::kMaximumGdnTaps> gdn_taps{};
+                std::array<Tensor, execution::kMaximumGdnTaps> tap_hidden{};
+                std::size_t in_pass_count = 0;
+                if (hybrid_split) {
+                    const std::uint32_t chunk_end =
+                        std::min(staged.cursor + std::min(remaining, prefill_chunk),
+                                 split_frontier.value_or(std::numeric_limits<std::uint32_t>::max()));
+                    std::optional<runtime::prefix_cache::PlannedTap> tap = hybrid_split;
+                    while (in_pass_taps && tap && tap->position < chunk_end &&
+                           in_pass_count < execution::kMaximumGdnTaps) {
+                        const std::optional<HybridPendingTap> reserved =
+                            hybrid_in_pass_reserve(sequence, tap->position, tap->boundary);
+                        if (!reserved) { break; }
+                        const std::int32_t slot = state_store->physical_slot(reserved->image);
+                        tap_hidden[in_pass_count] = state_images->continuation_hidden_slot(slot);
+                        gdn_taps[in_pass_count]   = execution::GdnTap{
+                              .frontier   = reserved->frontier,
+                              .state_slot = slot,
+                              .hidden     = &tap_hidden[in_pass_count]};
+                        in_pass[in_pass_count++] = *reserved;
+                        tap = next_hybrid_split(tap->position);
+                    }
+                    if (tap && (!split_frontier || tap->position < *split_frontier)) {
+                        split_frontier = tap->position;
+                    }
+                }
+                schedule_state.gdn_taps =
+                    std::span<const execution::GdnTap>(gdn_taps.data(), in_pass_count);
+                const auto release_in_pass = [&]() noexcept {
+                    for (std::size_t i = 0; i < in_pass_count; ++i) {
+                        hybrid_in_pass_release(in_pass[i]);
+                    }
+                    in_pass_count = 0;
+                };
                 const bool drafter     = drafter_at(staged.cursor);
                 schedule_state.drafter = drafter;
                 execution::PrefillChunkResult result;
                 timing.pause();
+                try {
                 if (staged.vision) {
                     if (!workspace_plan.vision) {
                         throw std::logic_error("active Vision prefill lost its workspace plan");
@@ -1510,6 +1555,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                         schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
                         remaining, split_frontier, final_candidate);
                 }
+                } catch (...) {
+                    release_in_pass();
+                    throw;
+                }
+                schedule_state.gdn_taps = {};
                 timing.include(result.timing);
                 timing.resume_post();
                 if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
@@ -1530,6 +1580,14 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 // Prompt transitions are canonical immediately. If this was the first write after
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
                 settle_state_fork(sequence);
+                if (result.tapped) {
+                    for (std::size_t i = 0; i < in_pass_count; ++i) {
+                        hybrid_in_pass_keep(sequence, in_pass[i]);
+                    }
+                    in_pass_count = 0;
+                } else {
+                    release_in_pass();
+                }
                 if (hybrid_lane != nullptr && !result.finalized) {
                     // A branched read's frontier is a tap position too (its branches follow it).
                     hybrid_after_prefill_chunk(sequence, staged.cursor,
