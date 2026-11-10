@@ -1483,6 +1483,12 @@ private:
     // Snapshots the lane's committed state at the prefill frontier `frontier`; a boundary tap is
     // published as SnapshotKind::Boundary.
     void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary);
+    // An exact tap taken inside a prefill pass: the image and staging slot the pass writes, kept
+    // as a pending tap once the chunk ran (keep) or given back (release).
+    [[nodiscard]] std::optional<HybridPendingTap>
+    hybrid_in_pass_reserve(SequenceState& sequence, std::uint32_t frontier, bool boundary);
+    void hybrid_in_pass_keep(SequenceState& sequence, const HybridPendingTap& tap);
+    void hybrid_in_pass_release(const HybridPendingTap& tap) noexcept;
     // Realizes the planned taps a completed prefill chunk reached.
     void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
                                     std::uint32_t prompt_tokens);

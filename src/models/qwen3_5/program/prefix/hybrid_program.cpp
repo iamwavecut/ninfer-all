@@ -1542,6 +1542,45 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     hybrid_capture_tap(sequence, cursor, boundary);
 }
 
+std::optional<HybridPendingTap> ProgramImpl::hybrid_in_pass_reserve(SequenceState& sequence,
+                                                                   std::uint32_t frontier,
+                                                                   bool boundary) {
+    if (!hybrid_ || sequence.lane >= max_concurrency) { return std::nullopt; }
+    HybridLaneState& lane       = hybrid_lanes_[sequence.lane];
+    pc::PrefixCacheIndex& index = hybrid_->index();
+    // The conditions hybrid_after_prefill_chunk and hybrid_capture_tap put on an exact tap.
+    if (!lane.active || !lane.publish || sequence.state.fork_pending || frontier == 0 ||
+        pc::inside_exclusion(frontier, lane.exclusions) || frontier <= lane.last_capture) {
+        return std::nullopt;
+    }
+    const std::optional<std::uint32_t> slot = index.acquire_device_slot(index.estimate_priority(
+        lane.last_capture, frontier, frontier % kBlock != 0, lane.lineage_hits));
+    if (!slot) { return std::nullopt; }
+    const std::optional<StateImageHandle> image = state_store->reserve_destination();
+    if (!image) {
+        index.release_device_slot(*slot);
+        return std::nullopt;
+    }
+    return HybridPendingTap{
+        .frontier = frontier, .image = *image, .slot = *slot, .boundary = boundary};
+}
+
+void ProgramImpl::hybrid_in_pass_keep(SequenceState& sequence, const HybridPendingTap& tap) {
+    HybridLaneState& lane = hybrid_lanes_[sequence.lane];
+    hybrid_supersede_resume(lane, tap.frontier, pc::Supersession::Resumed);
+    hybrid_supersede_tap(lane, tap.frontier);
+    state_store->publish_copied_checkpoint(tap.image);
+    lane.pending.push_back(tap);
+    lane.last_capture = tap.frontier;
+    hybrid_publish_pending(sequence, false);
+}
+
+void ProgramImpl::hybrid_in_pass_release(const HybridPendingTap& tap) noexcept {
+    (void)state_store->release(tap.image);
+    hybrid_->index().release_device_slot(tap.slot);
+    ++hybrid_->counters().taps_skipped;
+}
+
 void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier,
                                           pc::Supersession cause) {
     pc::PrefixCacheIndex& index = hybrid_->index();

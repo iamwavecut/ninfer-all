@@ -20,8 +20,10 @@
 #include "models/qwen3_5/execution/steering.h"
 #include "ninfer/ops/steer_residual.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <stdexcept>
 #include <cstdint>
 #include <functional>
 #include <span>
@@ -42,9 +44,21 @@ struct NullTap {
     static constexpr bool enabled = false;
 };
 
+// An exact prefix-cache tap inside a prefill chunk (TextContext::set_gdn_taps): the state after
+// the tokens before `frontier` goes to `state_slot`, and the final-norm hidden of the token before
+// it to `hidden`.
+struct GdnTap {
+    std::uint32_t frontier = 0;
+    std::int32_t state_slot = 0;
+    Tensor* hidden          = nullptr;
+};
+inline constexpr std::size_t kMaximumGdnTaps = 4;
+
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
+    // The chunk wrote the states of the in-pass taps (TextContext::set_gdn_taps).
+    bool tapped = false;
     runtime::ExecutionTiming timing;
 };
 
@@ -172,6 +186,18 @@ public:
 
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
         rewrite_checkpoint_hidden_output_ = output;
+    }
+
+    // Exact prefix-cache taps inside the next chunk, in frontier order, without splitting the
+    // pass: each Gated DeltaNet layer runs its convolution and recurrence up to each frontier into
+    // that tap's slot and continues from there. A text chunk on one device whose columns hold
+    // every frontier takes them all; otherwise it takes none (PrefillChunkResult::tapped).
+    void set_gdn_taps(std::span<const GdnTap> taps) {
+        if (taps.size() > kMaximumGdnTaps) {
+            throw std::invalid_argument("TextContext: too many in-pass taps");
+        }
+        std::copy(taps.begin(), taps.end(), gdn_taps_.begin());
+        gdn_tap_count_ = taps.size();
     }
 
     // One event per model layer: the next pass over the layer stack waits for each layer's event
@@ -429,6 +455,11 @@ private:
     const GdnReplayRecords* replay_records_   = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
+    std::array<GdnTap, kMaximumGdnTaps> gdn_taps_{};
+    std::size_t gdn_tap_count_ = 0;
+    // The running chunk's tap columns; gdn_live_taps_ == 0 runs none.
+    std::array<std::int32_t, kMaximumGdnTaps> gdn_tap_columns_{};
+    std::size_t gdn_live_taps_ = 0;
     std::uint32_t mtp_proposal_extent_        = 0;
     std::span<const cudaEvent_t> layer_ready_;
 
