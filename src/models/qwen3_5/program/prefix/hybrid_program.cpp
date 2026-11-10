@@ -61,17 +61,14 @@ bool root_snapshot_allowed(const std::array<std::uint64_t, 2>& lora_key,
     return anchor_blocks != 0 || lora_key == std::array<std::uint64_t, 2>{};
 }
 
-bool inside_vision(std::uint32_t frontier, std::span<const VisionTokenRange> ranges) noexcept {
-    return std::any_of(ranges.begin(), ranges.end(), [&](const VisionTokenRange& range) {
-        return range.begin < frontier && frontier < range.end;
-    });
-}
-
-bool inside_exclusion(std::uint32_t frontier,
-                      std::span<const pc::TapExclusion> exclusions) noexcept {
-    return std::any_of(exclusions.begin(), exclusions.end(), [&](const pc::TapExclusion& span) {
-        return span.begin < frontier && frontier < span.end;
-    });
+// Where no snapshot of a prompt with these media items may resume or be taken (pc::media_exclusion).
+std::vector<pc::TapExclusion> media_exclusions(std::span<const VisionTokenRange> ranges) {
+    std::vector<pc::TapExclusion> exclusions;
+    exclusions.reserve(ranges.size());
+    for (const VisionTokenRange& range : ranges) {
+        exclusions.push_back(pc::media_exclusion(range.begin, range.end));
+    }
+    return exclusions;
 }
 
 PrefixReusePath reuse_path_for(pc::SnapshotKind kind) noexcept {
@@ -315,10 +312,12 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
             match = index.match(lookup, prompt.block_hashes, prompt.block_extras, lookup_tokens);
         }
         quote->cached_prefix_tokens = static_cast<std::uint32_t>(match.path.size()) * kBlock;
-        const std::vector<VisionTokenRange> ranges =
-            prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
+        const std::vector<pc::TapExclusion> exclusions =
+            prompt.vision_items.empty() ? std::vector<pc::TapExclusion>{}
+                                        : media_exclusions(vision_ranges(prompt));
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
-            return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges) ||
+            return candidate.filling_blocks != 0 ||
+                   pc::inside_exclusion(candidate.frontier, exclusions) ||
                    !root_snapshot_allowed(prompt.lora_key, candidate.path_blocks);
         });
         const pc::AdmissionChoice choice = index.choose(match, lookup_tokens);
@@ -402,10 +401,12 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptDa
     pc::PrefixCacheIndex& index = hybrid_->index();
     pc::MatchResult match =
         index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
-    const std::vector<VisionTokenRange> ranges =
-        prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
+    const std::vector<pc::TapExclusion> exclusions =
+        prompt.vision_items.empty() ? std::vector<pc::TapExclusion>{}
+                                    : media_exclusions(vision_ranges(prompt));
     std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
-        return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges) ||
+        return candidate.filling_blocks != 0 ||
+               pc::inside_exclusion(candidate.frontier, exclusions) ||
                !root_snapshot_allowed(prompt.lora_key, candidate.path_blocks);
     });
     const pc::AdmissionChoice choice = index.choose(match, n);
@@ -531,7 +532,7 @@ bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::ui
                 wait = Wait{.lane = lane, .target = planned.position, .plan_tap = false};
             }
         }
-        if (wait && !inside_exclusion(wait->target, state.exclusions) &&
+        if (wait && !pc::inside_exclusion(wait->target, state.exclusions) &&
             wait->target > state.last_capture) {
             // Waiting saves this request's prefill of the shared tokens, beyond the pass it runs
             // either way; a new tap costs the sibling one split. The sibling's remaining prefill
@@ -1017,11 +1018,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         // Taps are planned before the prompt moves into the prefill state.
         const std::vector<VisionTokenRange> ranges = vision_ranges(prompt);
         const bool publish = quote.summary.publish_continuation && prompt.identity.reusable;
-        std::vector<pc::TapExclusion> exclusions;
-        exclusions.reserve(ranges.size());
-        for (const VisionTokenRange& range : ranges) {
-            exclusions.push_back(pc::TapExclusion{range.begin, range.end});
-        }
+        std::vector<pc::TapExclusion> exclusions = media_exclusions(ranges);
         std::vector<pc::PlannedTap> taps;
         if (publish) {
             // A request that resumed from a previous generation's endpoint proves its client
@@ -1379,7 +1376,7 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
         ++lane.next_tap;
     }
     if (!exact && !flexible) { return; }
-    if (inside_exclusion(cursor, lane.exclusions) || cursor <= lane.last_capture ||
+    if (pc::inside_exclusion(cursor, lane.exclusions) || cursor <= lane.last_capture ||
         (!exact && cursor - lane.last_capture < pc::kMinimumTapSeparation)) {
         ++hybrid_->counters().taps_skipped;
         return;
@@ -1471,7 +1468,7 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                 (!sequence.kv->backend || backend_kv_addresses->can_release_after_deactivate(
                                               *sequence.kv->backend));
             if (endpoint && request.publish_continuation && kv_releasable && backend_caught_up &&
-                frontier != 0 &&
+                frontier != 0 && !pc::inside_exclusion(frontier, lane_state.exclusions) &&
                 root_snapshot_allowed(sequence.prefix_identity.lora_key(), anchor_blocks) &&
                 frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&

@@ -471,8 +471,13 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
    list) whose tail tokens equal `prompt[64·(anchor.depth+1) .. F)`, with **`F ≤ n − 1`**. At
    least one prompt token is always prefilled, so logits, continuation hidden and MTP/DFlash
    bridges come from the normal path. No full-hit path exists.
-3. Frontiers inside a Vision token span are not valid resume points. Tap placement never creates
-   them, and match rejects them defensively.
+3. Frontiers inside a media item's token span are not valid resume points, and neither are
+   frontiers past the item inside the block it begins in (`media_exclusion`). A block's key
+   carries every item that begins before the block's end, while a snapshot's tail is compared as
+   tokens alone and media tokens are placeholders: an item that begins in the frontier's own
+   partial block would be in no key. Taps and endpoints are never placed there (a tap that would
+   be moves to the item's first token), and match rejects such frontiers defensively, which also
+   retires snapshots a file saved before this rule holds.
 
 Complexity is O(k + snapshots on path). A 240 k prompt is 3,750 hash probes and exact 256 B
 compares: tens of microseconds.
@@ -643,10 +648,11 @@ did not fit beside the active sequences while the head waited.
 
 ### 7.1 Tap planning
 
-`plan_taps(n, base F_s, hints, existing frontiers, Vision exclusions)` returns taps sorted by
-position, each `{p, placement}` with `F_s < p ≤ n − 1`, `p` not strictly inside a Vision token span
-(a candidate inside one moves to the span start), and no existing or already-planned snapshot at
-or near `p` on this path.
+`plan_taps(n, base F_s, hints, existing frontiers, media exclusions)` returns taps sorted by
+position, each `{p, placement}` with `F_s < p ≤ n − 1`, `p` not strictly inside a media item's
+exclusion (its token span, extended to the end of the block it begins in, §6.1; a candidate
+inside one moves to the item's first token), and no existing or already-planned snapshot at or
+near `p` on this path.
 
 Candidates, in priority order:
 
@@ -1300,7 +1306,7 @@ The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache
   - exhaustion, reuse and chunked allocation;
   - a slab never crosses chunks.
 - **TapPlanner** (property tests over random prompts and boundaries)
-  - all taps 64-aligned, in `(F_s, n−1]`, outside Vision spans;
+  - all taps 64-aligned, in `(F_s, n−1]`, outside media exclusions;
   - deduplicated against the path;
   - priority order and budget respected;
   - the ladder stays within about log2(n/G) + 1 taps;
