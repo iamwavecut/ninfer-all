@@ -123,7 +123,7 @@ means the card calibrates once at its first start.
 | ✅ | RTX 3060 | 12 GB | GeForce | ✓ | Bonsai 2, IQ3_S, Flash-Next (experts in host memory, on disk) |
 | ⬜ | RTX 3060 | 8 GB | GeForce | the 12 GB card's (28 SMs) | |
 | ⬜ | RTX 3050 | 8 GB | GeForce | | |
-| ⬜ | RTX A6000 | 48 GB | Workstation | | |
+| ✅ | RTX A6000 | 48 GB | Workstation | ✓ | Flash-Next (experts on the GPU, in host memory, on disk) |
 | ⬜ | RTX A5500 | 24 GB | Workstation | | |
 | ⬜ | RTX A5000 | 24 GB | Workstation | ✓ | |
 | ⬜ | RTX A4500 | 20 GB | Workstation | | |
