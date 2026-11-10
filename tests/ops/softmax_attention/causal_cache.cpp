@@ -197,6 +197,8 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return {{DType::FP8_E4M3FN, kHeadDim, DType::FP16, kFp8QuantGroups},
                 {DType::U8, kNvfp4CodeBytes, DType::U8, kNvfp4QuantGroups}};
+    case KvCacheStorage::Bf16Packed:
+        throw std::invalid_argument("bf16p is covered by test_kv_bf16p.cpp");
     }
     throw std::invalid_argument("unsupported test KV storage");
 }
@@ -2507,6 +2509,8 @@ const char* cache_name(KvCacheStorage storage) {
         return "nvfp4-g16";
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }

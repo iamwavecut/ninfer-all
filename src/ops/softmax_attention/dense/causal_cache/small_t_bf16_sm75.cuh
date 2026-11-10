@@ -144,7 +144,23 @@ __device__ __forceinline__ bool sweep(const Split<CacheInput>& s, __nv_bfloat16*
                 const int key   = k0 + key_l;
                 k_raw[j]        = make_int4(0, 0, 0, 0);
                 v_raw[j]        = make_int4(0, 0, 0, 0);
-                if (key >= s.split_start && key < s.load_end) {
+                if constexpr (kCausalPackedInput<CacheInput>) {
+                    if (key >= s.split_start && key < s.load_end) {
+                        const int offset        = key & kPagedKVPageMask;
+                        const std::int64_t row  =
+                            bf16p_row_offset(physical_page, s.kv_head, offset, kv_heads);
+                        const std::int64_t side =
+                            bf16p_side_offset(physical_page, s.kv_head, offset, kv_heads);
+                        const uint4 k_bits = bf16p_decode8(
+                            reinterpret_cast<const std::uint8_t*>(s.cache_k) + row,
+                            s.input.k_side + side, d / 8);
+                        const uint4 v_bits = bf16p_decode8(
+                            reinterpret_cast<const std::uint8_t*>(s.cache_v) + row,
+                            s.input.v_side + side, d / 8);
+                        k_raw[j] = *reinterpret_cast<const int4*>(&k_bits);
+                        v_raw[j] = *reinterpret_cast<const int4*>(&v_bits);
+                    }
+                } else if (key >= s.split_start && key < s.load_end) {
                     const __nv_bfloat16* k_src = s.cache_k;
                     const __nv_bfloat16* v_src = s.cache_v;
                     std::int64_t off = causal_cache_index(physical_page, s.kv_head, d,

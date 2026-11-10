@@ -28,7 +28,7 @@ on 0.0.0.0:8080.
 |---|---|
 | `--model-id` | the public model name in the API |
 | `--max-context`, `--kv-capacity` | each sequence's context ceiling, and the shared KV capacity (`auto` takes what is free after the weights; omitted means `auto` with the default hybrid prefix cache and `--max-context` with the checkpoint catalog) |
-| `--kv-dtype` | KV-cache storage: nine formats from `bf16` to `rk2v4-e8`; `rk8v4` is the all-round choice, `rk4v4` the longest windows ([context and memory](cli.md#context-and-memory)) |
+| `--kv-dtype` | KV-cache storage: ten formats from `bf16` to `rk2v4-e8` and the lossless `bf16p`; `rk8v4` is the all-round choice, `rk4v4` the longest windows ([context and memory](cli.md#context-and-memory)) |
 | `--gdn-state-fp16` | keep the Gated DeltaNet recurrent state in FP16 |
 | `--rope-yarn` | past the native window, YaRN instead of plain RoPE |
 | `--spec`, `--draft-tokens` | the speculative backend (`mtp`, `dflash`, `dflash2`) and the drafts of a round (1 to 15; 1 to 7 for Gemma 4) |

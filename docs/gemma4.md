@@ -25,9 +25,10 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   key norm's gamma, rotated: the cache keeps V (10 KiB per token for the five blocks) and the
   attention derives each key from it as it reads it, with the same rotations the keys were stored
   with.
-- **Every KV-cache format of the engine.** `--kv-dtype` keeps the caches in F16 (`bf16`, the
+- **Every quantized KV-cache format of the engine.** `--kv-dtype` keeps the caches in F16 (`bf16`, the
   default) or in int8, fp8, rk8v4, nvfp4, k8v4, rk4v4, rk4v4-e8 or rk2v4-e8, the engine's own
-  codecs; see [below](#kv-cache-formats).
+  codecs; see [below](#kv-cache-formats). `bf16p` packs BF16 rows, so Gemma, whose plain cache
+  is F16, refuses it.
 - **Speculative decoding with the release's assistant.** The multi-token-prediction drafter Google
   publishes beside the model (`Gemma4AssistantForCausalLM`, four blocks of width 1024 that read the
   target's own KV cache) drafts up to seven tokens a round (`--spec mtp --draft-tokens N`); the

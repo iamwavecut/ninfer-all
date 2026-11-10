@@ -126,7 +126,7 @@ std::string usage_text() {
            "       [--ngram-hot-profile PATH] [--no-ngram-table] [--ngram-dedupe on|off]\n"
            "       [--iq1m-experts matrix|vector]\n"
            "       [--kv-resident N|all|auto]   (Qwen3.8-Flash-Next)\n"
-           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4] [--output "
+           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p] [--output "
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16]\n"
@@ -221,9 +221,11 @@ Options parse_options(int argc, char** argv) {
                 out.kv = ninfer::KvCacheStorage::Nvfp4Group16;
             } else if (dtype == "k8v4") {
                 out.kv = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
+            } else if (dtype == "bf16p") {
+                out.kv = ninfer::KvCacheStorage::Bf16Packed;
             } else {
                 usage_error("--kv-dtype must be bf16, int8, fp8, rk8v4, rk4v4, rk4v4-e8, "
-                            "rk2v4-e8, nvfp4, or k8v4");
+                            "rk2v4-e8, nvfp4, k8v4 or bf16p");
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
@@ -365,6 +367,8 @@ std::string kv_name(ninfer::KvCacheStorage value) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     throw std::logic_error("unknown KV dtype");
 }

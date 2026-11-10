@@ -108,6 +108,10 @@ struct PagedKVStorageLayout {
     case KvCacheStorage::Nvfp4Group16:
         if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::U8, 128, DType::U8, 16}); }
         break;
+    case KvCacheStorage::Bf16Packed:
+        // 384 bytes of codes and exponent nibbles and an 8-byte side record a row.
+        if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::U8, 384, DType::U8, 8}); }
+        break;
     case KvCacheStorage::Fp8KeyNvfp4Value:
         if (head_dim == kD256KVCacheHeadDim) {
             return {storage,

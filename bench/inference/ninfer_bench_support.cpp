@@ -61,8 +61,9 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "rk2v4-e8") { return KvCacheStorage::RotatedE8RootKeyInt4Value; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
+    if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
     throw std::invalid_argument(
-        "--kv-dtype must be bf16, int8, fp8, rk8v4, rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, or k8v4");
+        "--kv-dtype must be bf16, int8, fp8, rk8v4, rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4, or bf16p");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -321,7 +322,7 @@ std::string usage_text(std::string_view program) {
         << "  --expert-dma-share <F|auto> host or disk experts: the GPU's share of a decode call's\n"
            "                              cache misses, the CPU computing the rest (default: auto)\n"
         << "  --expert-cpu-threads <N>    host or disk experts: CPU workers (default: automatic)\n"
-        << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4>  KV cache storage "
+        << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p>  KV cache storage "
            "(default: bf16)\n"
         << "  --fast-prefill-kernel       fast INT8-KV prompt kernel, wave-aligned chunks\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
@@ -1030,6 +1031,8 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "nvfp4";
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }

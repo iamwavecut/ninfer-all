@@ -12,6 +12,7 @@
 #include "core/paged_kv_storage.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/sparse_attention.h"
+#include "ops/kv_bf16p_host.h"
 #include "ops/kv_cache_e8_root_host.h"
 #include "ops/kv_cache_lloyd4_oracle.h"
 #include "ops/op_tester.h"
@@ -64,6 +65,7 @@ const char* storage_name(KvCacheStorage storage) {
     case KvCacheStorage::RotatedLloyd4KeyInt4Value: return "rk4v4";
     case KvCacheStorage::RotatedInt4KeyInt4ValueE8: return "rk4v4-e8";
     case KvCacheStorage::RotatedE8RootKeyInt4Value: return "rk2v4-e8";
+    case KvCacheStorage::Bf16Packed: return "bf16p";
     }
     return "?";
 }
@@ -83,6 +85,11 @@ struct HostPlane {
     std::int32_t leading = 0;
     std::size_t element  = 1;
     int heads            = kKvHeads;
+
+    // Byte offset of a row.
+    std::size_t offset(int page, int head, int slot) const {
+        return ((static_cast<std::size_t>(page) * heads + head) * kPage + slot) * leading * element;
+    }
 
     template <class T>
     T at(int page, int head, int slot, int index) const {
@@ -131,6 +138,10 @@ void decode_row(KvCacheStorage storage, const HostPlane& k, const HostPlane& v,
             key[d] = codec::decode_e2m1(nibble(k.at<std::uint8_t>(page, head, slot, d / 2), d)) *
                      codec::decode_e4m3fn(ks.at<std::uint8_t>(page, head, slot, d / 16));
             break;
+        case S::Bf16Packed:
+            key[d] = double(bf16_to_f32(bf16p::decode(&k.bytes[k.offset(page, head, slot)],
+                                                      &ks.bytes[ks.offset(page, head, slot)], d)));
+            break;
         case S::BFloat16: break;
         }
         switch (storage) {
@@ -154,6 +165,10 @@ void decode_row(KvCacheStorage storage, const HostPlane& k, const HostPlane& v,
             value[d] = codec::decode_e2m1(nibble(v.at<std::uint8_t>(page, head, slot, d / 2), d)) *
                        codec::decode_e4m3fn(vs.at<std::uint8_t>(page, head, slot, d / 16));
             break;
+        case S::Bf16Packed:
+            value[d] = double(bf16_to_f32(bf16p::decode(&v.bytes[v.offset(page, head, slot)],
+                                                        &vs.bytes[vs.offset(page, head, slot)], d)));
+            break;
         case S::BFloat16: break;
         }
     }
@@ -163,7 +178,9 @@ void decode_row(KvCacheStorage storage, const HostPlane& k, const HostPlane& v,
 int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t seed,
         int kv_heads = kKvHeads) {
     const int q_heads = 12 * kv_heads;
+    // A bf16p cache is written by the append and holds the BF16 rows unrotated.
     const bool quantized      = storage != KvCacheStorage::BFloat16;
+    const bool rotated_keys   = quantized && storage != KvCacheStorage::Bf16Packed;
     const bool rotated_values = storage == KvCacheStorage::Nvfp4Group16 ||
                                 storage == KvCacheStorage::Fp8KeyNvfp4Value;
     const int length = first_position + tokens;
@@ -315,7 +332,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
             const int kv = h / 12;
             std::array<double, kDim> query{};
             for (int d = 0; d < kDim; ++d) query[d] = q[(static_cast<std::size_t>(t) * q_heads + h) * kDim + d];
-            if (quantized) hadamard(query.data());
+            if (rotated_keys) hadamard(query.data());
             std::vector<double> logits(positions.size());
             double maximum = -INFINITY;
             for (std::size_t i = 0; i < positions.size(); ++i) {
@@ -373,7 +390,8 @@ int main() {
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::Nvfp4Group16,
           KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::RotatedLloyd4KeyInt4Value,
-          KvCacheStorage::RotatedInt4KeyInt4ValueE8, KvCacheStorage::RotatedE8RootKeyInt4Value}) {
+          KvCacheStorage::RotatedInt4KeyInt4ValueE8, KvCacheStorage::RotatedE8RootKeyInt4Value,
+          KvCacheStorage::Bf16Packed}) {
         failures += run(storage, 0, 1, 9100u);    // one key: the query itself
         failures += run(storage, 5, 4, 9101u);    // short context, tails 2,3,0,1
         failures += run(storage, 2047, 9, 9102u); // across the 512-block edge

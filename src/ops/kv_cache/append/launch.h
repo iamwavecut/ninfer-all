@@ -21,6 +21,14 @@ void kv_cache_append_k8v4_batch_launch(const Tensor& k, const Tensor& v, const T
                                        const Tensor& valid_columns, const Tensor& table_rows,
                                        PagedKVBatchLayerView cache, cudaStream_t stream);
 
+// Packed BF16 rows (KvCacheStorage::Bf16Packed, ops/kv_cache/bf16p_codec.cuh).
+void kv_cache_append_bf16p_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                  PagedKVLayerView cache, cudaStream_t stream);
+
+void kv_cache_append_bf16p_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                        const Tensor& valid_columns, const Tensor& table_rows,
+                                        PagedKVBatchLayerView cache, cudaStream_t stream);
+
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   const Tensor& valid_columns, const Tensor& table_rows,
                                   PagedKVBatchLayerView cache, cudaStream_t stream);

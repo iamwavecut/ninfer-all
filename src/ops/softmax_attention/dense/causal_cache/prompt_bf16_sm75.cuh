@@ -56,6 +56,38 @@ __device__ __forceinline__ bool stage_kv_half(__nv_bfloat16* dst, const __nv_bfl
     return fits;
 }
 
+// stage_kv_half over packed rows (CausalPromptPackedPlane).
+template <typename Geometry>
+__device__ __forceinline__ bool stage_kv_half(__nv_bfloat16* dst, CausalPromptPackedPlane plane,
+                                              int kv_head, int k0, int max_query_abs,
+                                              int physical_page, int tid) {
+    constexpr int D         = kCausalPromptHeadDim;
+    constexpr int Bc        = kCausalPromptBc;
+    constexpr int Threads   = kCausalPromptThreads;
+    constexpr int VecPerRow = D / 8;
+    const int kv_heads      = causal_prompt_q_heads<Geometry>() / Geometry::GroupSize;
+    const int offset0       = k0 & kPagedKVPageMask;
+    bool fits               = true;
+#pragma unroll 4
+    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
+        const int key_l  = chunk >> 5;
+        const int c      = chunk & 31;
+        __nv_bfloat16* p = &dst[key_l * D + causal_prompt_swz(key_l, c << 3)];
+        if ((k0 + key_l) <= max_query_abs) {
+            const int offset = offset0 + key_l;
+            fits = store_bf16x8_as_half(
+                       p, bf16p_decode8(
+                              plane.rows + bf16p_row_offset(physical_page, kv_head, offset, kv_heads),
+                              plane.side + bf16p_side_offset(physical_page, kv_head, offset, kv_heads),
+                              c)) &&
+                   fits;
+        } else {
+            store_vec(p, make_int4(0, 0, 0, 0));
+        }
+    }
+    return fits;
+}
+
 // The CTA's Q rows into q_s, as FP16 roundings (Half; the return says whether every value the
 // thread copied fits FP16) or as BF16.
 template <typename Geometry, bool Half>
@@ -92,10 +124,9 @@ __device__ __forceinline__ bool stage_q(__nv_bfloat16* q_s, const __nv_bfloat16*
 // a value FP16 cannot hold. Exact: tiles as BF16 on mma_bf16_rounded and mma_f16_bf16_rounded,
 // whose products equal the fast sweep's for every operand FP16 holds. The tile math is the sm_80+
 // kernel's (prompt_bf16.cuh).
-template <typename Geometry, bool Exact>
+template <typename Geometry, bool Exact, typename Plane>
 __device__ __forceinline__ bool
-sweep(__nv_bfloat16* q_s, const __nv_bfloat16* __restrict__ cache_k,
-      const __nv_bfloat16* __restrict__ cache_v, const std::int32_t* block_table, int base_pos,
+sweep(__nv_bfloat16* q_s, Plane cache_k, Plane cache_v, const std::int32_t* block_table, int base_pos,
       float scale, __nv_bfloat16* __restrict__ out, int q_head, int q0, int tokens, int width) {
     constexpr int Br      = kCausalPromptBr;
     constexpr int Bc      = kCausalPromptBc;
@@ -140,7 +171,7 @@ sweep(__nv_bfloat16* q_s, const __nv_bfloat16* __restrict__ cache_k,
     int physical_page       = block_table[0];
 
     // Stages one K or V tile into kv_s and publishes it; false (fast sweep) when it does not fit.
-    const auto stage = [&](const __nv_bfloat16* cache, int k0) -> bool {
+    const auto stage = [&](Plane cache, int k0) -> bool {
         if constexpr (Exact) {
             causal_prompt_stage_kv<Geometry>(kv_s, cache, kv_head, k0, max_query_abs, physical_page,
                                              tid);
@@ -181,10 +212,10 @@ sweep(__nv_bfloat16* q_s, const __nv_bfloat16* __restrict__ cache_k,
 
 // The BF16 emulation's sweep, out of line: stages Q as BF16 over q_s and sweeps every key block
 // again, over shared memory nothing else still reads.
-template <typename Geometry>
+template <typename Geometry, typename Plane>
 __device__ __noinline__ void
-sweep_exact(__nv_bfloat16* q_s, const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
-            const __nv_bfloat16* cache_v, const std::int32_t* block_table, int base_pos,
+sweep_exact(__nv_bfloat16* q_s, const __nv_bfloat16* q, Plane cache_k, Plane cache_v,
+            const std::int32_t* block_table, int base_pos,
             float scale, __nv_bfloat16* out, int q_head, int q0, int tokens, int width) {
     const int tid = static_cast<int>(threadIdx.x);
     __syncthreads(); // every warp is done with the fast sweep's q_s and K/V buffer
@@ -202,11 +233,10 @@ sweep_exact(__nv_bfloat16* q_s, const __nv_bfloat16* q, const __nv_bfloat16* cac
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, typename Plane = const __nv_bfloat16*>
 __launch_bounds__(kCausalPromptThreads, 1) __global__
     void causal_attention_prompt_bf16_turing_kernel(const __nv_bfloat16* __restrict__ q,
-                                                    const __nv_bfloat16* __restrict__ cache_k,
-                                                    const __nv_bfloat16* __restrict__ cache_v,
+                                                    Plane cache_k, Plane cache_v,
                                                     Metadata metadata,
                                                     const std::int32_t* __restrict__ positions,
                                                     float scale, __nv_bfloat16* __restrict__ out,

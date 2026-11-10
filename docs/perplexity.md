@@ -20,8 +20,8 @@ English reference text, English long-form text, Chinese reference text, and NInf
 
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
-KV representations are the server's nine: `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`,
-`rk2v4-e8`, `nvfp4`, and `k8v4`. Flint keeps its cache in F16 and DeepSeek-V4.1 in BF16; both are
+KV representations are the server's ten: `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`,
+`rk2v4-e8`, `nvfp4`, `k8v4`, and `bf16p`, which scores as `bf16` does. Flint keeps its cache in F16 and DeepSeek-V4.1 in BF16; both are
 scored with `--kv-dtype bf16`. DeepSeek-V4.1 reads every window from `<｜begin▁of▁sentence｜>`, which
 it puts in front of a window that lacks it; the scored tokens stay the window's own.
 

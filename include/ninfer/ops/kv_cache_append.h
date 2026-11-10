@@ -98,6 +98,12 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * the largest coordinate of u less its projection on the root, with its sign. The exact operation
  * order is ops/kv_cache/e8_root_codec.cuh's; decode yields eight int8 codes times s.
  *
+ * KvCacheStorage::Bf16Packed (bf16p) is exact: each D256 K and V row of BF16 values is stored as
+ * 256 bytes of sign and 7 fraction bits, 128 bytes of 4-bit exponent offsets from the row's base and
+ * an 8-byte side record of the base, the escape count and up to six escaped exponents
+ * (ops/kv_cache/bf16p_codec.cuh). Decoding yields the appended BF16 bits. A row whose exponents need
+ * more escapes is stored as the poison row, which decodes to BF16 NaN everywhere.
+ *
  * V uses represented BF16 source values directly as x under every profile, including rk8v4: values
  * are never rotated, so no inverse preparation is applied to the attention output. For every
  * quantized profile, K is a paired physical representation for causal Attention: its

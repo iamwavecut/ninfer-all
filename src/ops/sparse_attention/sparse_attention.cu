@@ -19,6 +19,7 @@
 #include "core/paged_kv_storage.h"
 #include "ops/common/math.h"
 #include "ops/common/memory.cuh"
+#include "ops/kv_cache/bf16p_codec.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
@@ -201,7 +202,9 @@ __device__ __forceinline__ void decode_value(const KvPlanes& planes, const std::
 
 // The staged tiles hold the cache's own BF16 rows, or a quantized cache's rows decoded to FP16.
 template <KvCacheStorage Storage>
-using TileElement = std::conditional_t<Storage == KvCacheStorage::BFloat16, __nv_bfloat16, __half>;
+using TileElement = std::conditional_t<Storage == KvCacheStorage::BFloat16 ||
+                                           Storage == KvCacheStorage::Bf16Packed,
+                                       __nv_bfloat16, __half>;
 
 __device__ __forceinline__ float2 to_float2(const __nv_bfloat162& pair) {
     return __bfloat1622float2(pair);
@@ -220,7 +223,9 @@ __global__ void __launch_bounds__(kThreads)
                             float* __restrict__ partial, int q_heads) {
     using Element = TileElement<Storage>;
     using Pair    = std::conditional_t<std::is_same_v<Element, __half>, __half2, __nv_bfloat162>;
-    constexpr bool kQuantized = Storage != KvCacheStorage::BFloat16;
+    // bf16p rows decode to the BF16 a bf16 cache holds: neither quantized nor rotated.
+    constexpr bool kPacked    = Storage == KvCacheStorage::Bf16Packed;
+    constexpr bool kQuantized = Storage != KvCacheStorage::BFloat16 && !kPacked;
     // NVFP4 and K8V4 store their values rotated as well as their keys.
     constexpr bool kRotatedValues =
         Storage == KvCacheStorage::Nvfp4Group16 || Storage == KvCacheStorage::Fp8KeyNvfp4Value;
@@ -278,6 +283,38 @@ __global__ void __launch_bounds__(kThreads)
                     key_words[w]   = kw[w];
                     value_words[w] = vw[w];
                 }
+            }
+        } else if constexpr (kPacked) {
+            constexpr int kChunksPerRow = kHeadDim / 8;
+            for (int i = threadIdx.x; i < kTile * kChunksPerRow; i += kThreads) {
+                const int row = i / kChunksPerRow, c = i % kChunksPerRow;
+                const int index = base + row;
+                uint4 kw = make_uint4(0, 0, 0, 0), vw = make_uint4(0, 0, 0, 0);
+                if (index < end) {
+                    const int p = position_at(blocks, count, tail_begin, index);
+                    const std::int64_t row_offset = plane_offset<kBf16pRowBytes, Shift>(
+                        block_table, planes.heads, kv_head, p, 0);
+                    const std::int64_t side_offset = plane_offset<kBf16pSideBytes, Shift>(
+                        block_table, planes.heads, kv_head, p, 0);
+                    kw = bf16p_decode8(static_cast<const std::uint8_t*>(planes.k) + row_offset,
+                                       static_cast<const std::uint8_t*>(planes.k_scale) +
+                                           side_offset,
+                                       c);
+                    vw = bf16p_decode8(static_cast<const std::uint8_t*>(planes.v) + row_offset,
+                                       static_cast<const std::uint8_t*>(planes.v_scale) +
+                                           side_offset,
+                                       c);
+                }
+                auto* key_words   = reinterpret_cast<unsigned*>(&keys[row * kRowStride + 8 * c]);
+                auto* value_words = reinterpret_cast<unsigned*>(&values[row * kRowStride + 8 * c]);
+                key_words[0]      = kw.x;
+                key_words[1]      = kw.y;
+                key_words[2]      = kw.z;
+                key_words[3]      = kw.w;
+                value_words[0]    = vw.x;
+                value_words[1]    = vw.y;
+                value_words[2]    = vw.z;
+                value_words[3]    = vw.w;
             }
         } else {
             const auto* k_pages = static_cast<const __nv_bfloat16*>(planes.k);
@@ -532,6 +569,7 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
         NINFER_SPARSE_ATTENTION_CASE(RotatedLloyd4KeyInt4Value)
         NINFER_SPARSE_ATTENTION_CASE(RotatedInt4KeyInt4ValueE8)
         NINFER_SPARSE_ATTENTION_CASE(RotatedE8RootKeyInt4Value)
+        NINFER_SPARSE_ATTENTION_CASE(Bf16Packed)
 #undef NINFER_SPARSE_ATTENTION_CASE
     }
     require(false, "unsupported cache storage");

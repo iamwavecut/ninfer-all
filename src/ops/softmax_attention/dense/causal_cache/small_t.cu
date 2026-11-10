@@ -216,11 +216,15 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     };
 #if defined(NINFER_TIER_VOLTA)
     if (current_device_volta()) {
-        // Volta's own kernel (small_t_sm70.cuh): same grid, splits and partial outputs.
-        launch(causal_attention_small_t_sm70_bf16_kernel<Geometry, TokenTile, MultiBatch, Masked,
-                                                         CacheInput>,
-               32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::kWarps);
-        return;
+        if constexpr (kCausalPackedInput<CacheInput>) {
+            throw std::invalid_argument("causal_softmax_attention: --kv-dtype bf16p needs sm_75 or newer");
+        } else {
+            // Volta's own kernel (small_t_sm70.cuh): same grid, splits and partial outputs.
+            launch(causal_attention_small_t_sm70_bf16_kernel<Geometry, TokenTile, MultiBatch,
+                                                             Masked, CacheInput>,
+                   32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::kWarps);
+            return;
+        }
     }
 #endif
     if constexpr (kBuildPostVolta) {
@@ -270,7 +274,8 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                 const int wave    = sms - sms / 16;
                 const bool narrow = tokens <= 5;
                 int target_ctas   = wave;
-                if (cache_storage == KvCacheStorage::BFloat16)
+                if (cache_storage == KvCacheStorage::BFloat16 ||
+                    cache_storage == KvCacheStorage::Bf16Packed)
                     target_ctas = narrow || batch_size >= 5 || envelope.max_visible_keys > 4096
                                       ? 2 * wave
                                       : wave;
@@ -321,16 +326,18 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
 #define NINFER_CAUSAL_SMALL_T_DISPATCH(TOKENS, WARPS)                                              \
     do {                                                                                           \
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
-            if (kv_cache_is_int8_family(cache.storage)) {                                          \
-                launch_small_t_i8<Geometry, (TOKENS), CacheInput>(                                 \
-                    MultiBatch, Masked, q, input, pos, scale, cache, invocation, logical_capacity, \
-                    implementation_window, splits, wave_splits, partial_acc, partial_m, partial_l, \
-                    stream);                                                                       \
-            } else {                                                                               \
-                launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
-                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
-                    partial_acc, partial_m, partial_l, stream);                                    \
+            if constexpr (!kCausalPackedInput<CacheInput>) {                                       \
+                if (kv_cache_is_int8_family(cache.storage)) {                                      \
+                    launch_small_t_i8<Geometry, (TOKENS), CacheInput>(                             \
+                        MultiBatch, Masked, q, input, pos, scale, cache, invocation,               \
+                        logical_capacity, implementation_window, splits, wave_splits,              \
+                        partial_acc, partial_m, partial_l, stream);                                \
+                    return;                                                                        \
+                }                                                                                  \
             }                                                                                      \
+            launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(               \
+                q, input, pos, scale, cache, invocation, logical_capacity, splits, partial_acc,    \
+                partial_m, partial_l, stream);                                                     \
         };                                                                                         \
         const bool masked = invocation.valid_columns != nullptr;                                   \
         if (invocation.batch_size == 1) {                                                          \
@@ -450,8 +457,6 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
                                               partial_l, out, stream, partial_out);
         return;
     }
-    const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
-                                  static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
         .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
         .table_rows    = &table_rows,
@@ -462,6 +467,19 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
         .partition     = causal_attention_key_partition(envelope, cache),
         .partial_out   = partial_out,
     };
+    if (cache.storage == KvCacheStorage::Bf16Packed) {
+        // The call's rows were appended before it (causal_softmax_attention).
+        const CausalPackedInput input{static_cast<const std::uint8_t*>(cache.k_scale_pages.data),
+                                      static_cast<const std::uint8_t*>(cache.v_scale_pages.data)};
+        with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+            causal_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
+                                                          envelope, partial_acc, partial_m,
+                                                          partial_l, out, stream, gate);
+        });
+        return;
+    }
+    const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
+                                  static_cast<const __nv_bfloat16*>(v.data)};
     with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
         causal_attention_small_t_launch_for<Geometry>(q, input, pos, scale, cache, invocation,
                                                       envelope, partial_acc, partial_m, partial_l,
@@ -489,7 +507,6 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
                                                      partial_m, partial_l, out, stream);
         return;
     }
-    const CausalCachedInput input{};
     const PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
     const CausalSmallTInvocation invocation{
         .valid_columns = nullptr,
@@ -500,11 +517,19 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
         .batch_size    = 1,
         .partition     = causal_attention_key_partition(envelope, batch_cache),
     };
-    with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
-        causal_attention_small_t_launch_for<Geometry>(q, input, pos, scale, batch_cache, invocation,
-                                                      envelope, partial_acc, partial_m, partial_l,
-                                                      out, stream);
-    });
+    const auto launch = [&](auto input) {
+        with_causal_query_geometry(q.ne[1], [&]<typename Geometry>() {
+            causal_attention_small_t_launch_for<Geometry>(q, input, pos, scale, batch_cache,
+                                                          invocation, envelope, partial_acc,
+                                                          partial_m, partial_l, out, stream);
+        });
+    };
+    if (cache.storage == KvCacheStorage::Bf16Packed) {
+        launch(CausalPackedInput{static_cast<const std::uint8_t*>(cache.k_scale_pages.data),
+                                 static_cast<const std::uint8_t*>(cache.v_scale_pages.data)});
+    } else {
+        launch(CausalCachedInput{});
+    }
 }
 
 void causal_attention_small_t_load_modules(std::int32_t q_heads, std::int32_t kv_heads,

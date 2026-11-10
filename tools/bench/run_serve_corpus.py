@@ -42,6 +42,7 @@ KV_CACHE_NAMES = {
     "rk2v4-e8": "rotated-k2e8g64-v4g32",
     "nvfp4": "nvfp4",
     "k8v4": "k8v4",
+    "bf16p": "bf16p",
 }
 
 SEEDS = (

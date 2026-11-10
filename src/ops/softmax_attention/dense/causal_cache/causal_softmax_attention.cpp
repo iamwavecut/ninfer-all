@@ -45,7 +45,8 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
                                            CausalAttentionExecutionEnvelope envelope) {
     if (causal_attention_model_query_heads(q_heads) == 16) return 6;
     // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
-    if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
+    const bool bf16 = storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Bf16Packed;
+    if (batch_size == 1 && ((bf16 && width >= 9 && width <= 12) ||
                             (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
                              envelope.max_visible_keys > 4096)))
         return (width + 1) / 2;
@@ -449,6 +450,7 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t call_q_heads, s
             std::uint32_t prompt_limit = 0;
             switch (storage) {
             case KvCacheStorage::BFloat16:
+            case KvCacheStorage::Bf16Packed:
                 prompt_limit = width <= 4 ? 128 : width <= 8 ? 256 : 640;
                 break;
             case KvCacheStorage::Int8Group64:
@@ -620,6 +622,9 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
     // Propagate d256_kv_cache_profile's own diagnostic for an unrecognized storage selection
     // rather than folding it into the generic message below.
     (void)d256_kv_cache_profile(cache_storage);
+    if (cache_storage == KvCacheStorage::Bf16Packed && current_device_volta()) {
+        throw std::invalid_argument("--kv-dtype bf16p needs sm_75 or newer");
+    }
     if (batch_size <= 0 || batch_size > kMaximumBatchSize || min_width <= 0 ||
         max_width < min_width || (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
@@ -793,9 +798,20 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             "causal_softmax_attention: a position-split cache needs a valid rank and a partial");
     }
 
+    const bool packed = cache.storage == KvCacheStorage::Bf16Packed;
+    if (packed && cache.page_stride != 1) {
+        throw std::invalid_argument(
+            "causal_softmax_attention: a bf16p KV cache does not take position-split attention");
+    }
+
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
+    // A bf16p cache's small-T kernels read packed rows only: the call's rows are appended first.
+    if (packed && route != detail::CausalAttentionRoute::Prompt) {
+        detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                             stream);
+    }
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         const bool fusable = kv_cache_is_int8_family(cache.storage);
         const bool gated   = launch_chunked_small_t(
@@ -814,8 +830,8 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         // rk4v4-e8, rk2v4-e8). The FP8, NVFP4 and K8V4 storages reach their own reduce kernels, so
         // they take the standalone multiply like the routes that cannot fold it at all; every
         // caller still sees one contract.
-        const bool fusable =
-            cache.storage == KvCacheStorage::BFloat16 || kv_cache_is_int8_family(cache.storage);
+        const bool fusable = cache.storage == KvCacheStorage::BFloat16 || packed ||
+                             kv_cache_is_int8_family(cache.storage);
         detail::causal_attention_small_t_launch(
             q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope, 0, width,
             partial.acc, partial.m, partial.l, out, stream,
