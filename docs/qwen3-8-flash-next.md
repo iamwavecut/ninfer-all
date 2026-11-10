@@ -511,8 +511,9 @@ cache. The residency scheme follows Strata's `kv_stream` (MIT).
 
 ### Sequences, KV and the context cache
 
-`--kv-dtype` stores the KV cache of the 12 sparse-attention layers in any of the nine formats the
-Qwen3.5 family uses. A position costs 24 KiB in `bf16` (the default), 12.4 KiB in `int8`, 12.1 KiB
+`--kv-dtype` stores the KV cache of the 12 sparse-attention layers in any of the ten formats the
+Qwen3.5 family uses. A position costs 24 KiB in `bf16` (the default), 18.4 KiB in the lossless
+`bf16p`, 12.4 KiB in `int8`, 12.1 KiB
 in `fp8`, 9.6 KiB in `rk8v4`, 9.4 KiB in `k8v4`, 6.8 KiB in `nvfp4`, 6.6 KiB in `rk4v4` and
 `rk4v4-e8`, and 5.1 KiB in `rk2v4-e8`; the indexer's pooled keys stay FP32 beside it, another
 1.5 KiB a position in every format. The sparse attention decodes each row it reads, keys in the

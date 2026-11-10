@@ -149,6 +149,10 @@ ninfer_add_op_test(ninfer_kv_cache_append_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_cache_append.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_kv_bf16p_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_bf16p.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_kv_plane_types_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_plane_types.cpp"
   LIBRARIES ninfer_ops)

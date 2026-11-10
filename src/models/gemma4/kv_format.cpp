@@ -26,6 +26,10 @@ KvFormat kv_format(KvCacheStorage storage) {
         return {storage, rot(KvCoding::Int4E8), plain(KvCoding::Int4G32), plain(KvCoding::Int4G32)};
     case KvCacheStorage::RotatedE8RootKeyInt4Value:
         return {storage, rot(KvCoding::RootE8), plain(KvCoding::Int4G32), plain(KvCoding::Int4G32)};
+    case KvCacheStorage::Bf16Packed:
+        // bf16p packs BF16 rows; Gemma's unquantized cache holds FP16.
+        throw std::invalid_argument(
+            "gemma4: --kv-dtype bf16p packs BF16 rows, and Gemma's unquantized KV cache is FP16");
     }
     throw std::invalid_argument("gemma4: unknown KV-cache storage");
 }

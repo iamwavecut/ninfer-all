@@ -32,7 +32,8 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
     const ops::D256KVCacheProfile profile = ops::d256_kv_cache_profile(storage);
-    const bool scaled                     = profile.quant_group != 0;
+    // Scale (or side record) planes: every storage but BF16's; bf16p has a side record and no group.
+    const bool scaled                     = profile.scale_leading_extent != 0;
 
     const std::uint32_t logical_pages = page_count(capacity);
     if (physical_page_groups < logical_pages) {
@@ -203,7 +204,7 @@ std::size_t PagedKVCache::plane_index(std::uint32_t layer, std::size_t rank,
     const std::size_t shares =
         position_ranks_ > 1 ? position_ranks_ : (head_shares_.empty() ? 1 : head_shares_.size());
     if (rank >= shares) { throw std::out_of_range("Paged KV rank holds no heads of the layer"); }
-    const bool scaled        = ops::d256_kv_cache_profile(storage_).quant_group != 0;
+    const bool scaled        = ops::d256_kv_cache_profile(storage_).scale_leading_extent != 0;
     const std::size_t kinds  = scaled ? 4ULL : 2ULL;
     const std::size_t first  = static_cast<std::size_t>(layer) * shares * kinds;
     return position_ranks_ > 1 ? first + kind * shares + rank : first + rank * kinds + kind;
@@ -215,7 +216,7 @@ std::size_t PagedKVCache::layer_rank(std::uint32_t layer) const {
 
 PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, const KVExecutionRowHandle* row,
                                           std::size_t rank) const {
-    const bool scaled      = ops::d256_kv_cache_profile(storage_).quant_group != 0;
+    const bool scaled      = ops::d256_kv_cache_profile(storage_).scale_leading_extent != 0;
     const std::size_t base = plane_index(layer, rank, 0);
     // The layer reads the copy of the table on the rank holding its planes; a kernel cannot follow
     // a pointer into another device's memory.

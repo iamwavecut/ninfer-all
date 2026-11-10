@@ -79,10 +79,11 @@ Speculative backends 在一个 Engine 内互斥，因此当前最多有两个 gr
 | MTP | MTP persistent K/V 与其 code/scale planes | MTP KV frontier |
 | Draft Full | selected draft 的 full-context K/V | draft context frontier |
 
-Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16 或 K8V4
+Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16、K8V4 或 BF16P
 KV profile；Draft Full 使用自己的 BF16 profile。`BFloat16` 名称下的物理 layout 为 BF16 K、BF16 V（对称），
 写入端不做 FP16 转换。K8V4 是封闭的非对称 profile，不是运行时 bit-width 组合：K 固定为
-FP8-E4M3FN-row256，V 固定为 NVFP4-G16。
+FP8-E4M3FN-row256，V 固定为 NVFP4-G16。BF16P 无损打包 BF16：每个 D256 行的 code plane 为 U8
+\(X=384\)，side plane 为 U8 \(X=8\)（`ops/kv_cache/bf16p_codec.cuh`）。
 
 `PagedKVStorageLayout` 将选定的 closed profile 解析为 K/V data/scale plane schema；target planner 按
 layer 展开该 schema 并确定 plane ordinal。Common pool implementation 仍只接收已展开的
@@ -279,6 +280,7 @@ D256 Main/MTP profile 的单 token/head 物理 payload 为：
 | FP8-E4M3FN-row256 | 256 B + 2 B | 256 B + 2 B | 516 B |
 | NVFP4-G16 | 128 B + 16 B | 128 B + 16 B | 288 B |
 | K8V4 | 256 B + 2 B | 128 B + 16 B | 402 B |
+| BF16P | 384 B + 8 B | 384 B + 8 B | 784 B |
 
 K/V 的 code 和 scale planes 具有各自的 dtype、leading extent 和 group size；它们仍共享 page-group
 identity、frontier 和 lifetime。Capacity curve、Device/Host replica、continuation transfer 和 memory

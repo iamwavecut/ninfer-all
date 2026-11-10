@@ -124,6 +124,10 @@ inline constexpr D256KVCacheProfile d256_kv_cache_profile(ninfer::KvCacheStorage
         return {DType::FP8_E4M3FN, DType::U8, kD256KVCacheHeadDim, kD256KVCacheHeadDim / 2,
                 256,               DType::FP16, 1,                  DType::U8,
                 kD256KVCacheHeadDim / 16};
+    case ninfer::KvCacheStorage::Bf16Packed:
+        // A row's 384 bytes of codes and exponent nibbles, and its 8-byte side record as the scale
+        // plane (ops/kv_cache/bf16p_codec.cuh); no quantization group.
+        return {DType::U8, DType::U8, 384, 384, 0, DType::U8, 8, DType::U8, 8};
     }
     throw std::invalid_argument("unknown KV-cache storage profile");
 }

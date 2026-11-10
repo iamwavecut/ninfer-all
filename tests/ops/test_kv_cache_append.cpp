@@ -79,6 +79,8 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
         throw std::invalid_argument("test_cache_layout: rk4v4-e8 uses full_append_case_e8");
     case KvCacheStorage::RotatedE8RootKeyInt4Value:
         throw std::invalid_argument("test_cache_layout: rk2v4-e8 uses full_append_case_e8_root");
+    case KvCacheStorage::Bf16Packed:
+        throw std::invalid_argument("test_cache_layout: bf16p is covered by test_kv_bf16p.cpp");
     }
     throw std::invalid_argument("unsupported test KV storage");
 }

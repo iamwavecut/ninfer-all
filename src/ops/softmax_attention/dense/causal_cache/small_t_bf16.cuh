@@ -9,6 +9,7 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 
+#include "ops/kv_cache/bf16p_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 
 #include <cstdint>
@@ -378,6 +379,60 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                 } else if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
                     physical_page = page_at(k0);
                 }
+                if constexpr (kCausalPackedInput<CacheInput>) {
+                    // Packed rows, decoded to the BF16 the bf16 storage holds; tail slots zeroed.
+                    // Every load of the tile is issued before the first decode (as the bf16
+                    // storage's one cp.async wave); a warp takes one row, lane L its values
+                    // 8 L .. 8 L + 7.
+                    static_assert(kBf16pRowValues == D && D / 8 == 32 && Threads % 32 == 0);
+                    constexpr int Rows = Bc * (D / 8) / Threads;
+                    static_assert(Rows * Threads == Bc * (D / 8));
+                    const auto* rows_k = reinterpret_cast<const std::uint8_t*>(cache_k);
+                    const auto* rows_v = reinterpret_cast<const std::uint8_t*>(cache_v);
+                    const int lane     = tid & 31;
+                    uint2 k_code[Rows], v_code[Rows], k_record[Rows], v_record[Rows];
+                    unsigned k_nib[Rows], v_nib[Rows];
+#    pragma unroll
+                    for (int i = 0; i < Rows; ++i) {
+                        const int key_l = (tid + i * Threads) / (D / 8); // uniform in a warp
+                        const int key   = k0 + key_l;
+                        k_code[i] = v_code[i] = k_record[i] = v_record[i] = make_uint2(0, 0);
+                        k_nib[i] = v_nib[i] = 0;
+                        if (key >= split_start && key < load_end) {
+                            const int offset       = key & kPagedKVPageMask;
+                            const std::int64_t row =
+                                bf16p_row_offset(physical_page, kv_head, offset, kv_heads);
+                            const std::int64_t side =
+                                bf16p_side_offset(physical_page, kv_head, offset, kv_heads);
+                            k_code[i] = *reinterpret_cast<const uint2*>(rows_k + row + 8 * lane);
+                            v_code[i] = *reinterpret_cast<const uint2*>(rows_v + row + 8 * lane);
+                            k_nib[i]  = *reinterpret_cast<const unsigned*>(
+                                rows_k + row + kBf16pNibbles + 4 * lane);
+                            v_nib[i] = *reinterpret_cast<const unsigned*>(
+                                rows_v + row + kBf16pNibbles + 4 * lane);
+                            k_record[i] = *reinterpret_cast<const uint2*>(input.k_side + side);
+                            v_record[i] = *reinterpret_cast<const uint2*>(input.v_side + side);
+                        }
+                    }
+#    pragma unroll
+                    for (int i = 0; i < Rows; ++i) {
+                        const int key_l      = (tid + i * Threads) / (D / 8);
+                        const int key        = k0 + key_l;
+                        const int at         = key_l * D + causal_small_t_tc_swz(key_l, 8 * lane);
+                        __nv_bfloat16* k_dst = &k_s[at];
+                        __nv_bfloat16* v_dst = &v_s[at];
+                        if (key >= split_start && key < load_end) {
+                            store_vec(k_dst,
+                                      bf16p_decode_regs(k_code[i], k_nib[i], k_record[i], lane));
+                            store_vec(v_dst,
+                                      bf16p_decode_regs(v_code[i], v_nib[i], v_record[i], lane));
+                        } else {
+                            store_vec(k_dst, make_int4(0, 0, 0, 0));
+                            store_vec(v_dst, make_int4(0, 0, 0, 0));
+                        }
+                    }
+                    __syncthreads();
+                } else {
             // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
             // Current-step tokens come from k_new/v_new; tail slots are zeroed.
 #    pragma unroll 1
@@ -417,6 +472,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                 ninfer::ops::cp_commit();
                 ninfer::ops::cp_wait<0>();
                 __syncthreads();
+                }
 
                 float score[QKNt][4];
 #    pragma unroll

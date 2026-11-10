@@ -680,6 +680,8 @@ const char* storage_name(KvCacheStorage storage) {
         return "nvfp4";
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case KvCacheStorage::Bf16Packed:
+        return "bf16p";
     }
     return "unknown";
 }

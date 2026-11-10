@@ -17,6 +17,9 @@
 
 #include <math_constants.h>
 
+#include <type_traits>
+
+#include "ops/kv_cache/bf16p_codec.cuh"
 #include "ops/softmax_attention/common/bf16_attention.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
 
@@ -59,6 +62,103 @@ causal_prompt_stage_kv(__nv_bfloat16* dst, const __nv_bfloat16* cache, int kv_he
             } else {
                 store_vec(p, make_int4(0, 0, 0, 0));
             }
+        }
+    }
+}
+
+// A packed cache's K or V plane (KvCacheStorage::Bf16Packed): its rows and their side records.
+struct CausalPromptPackedPlane {
+    const std::uint8_t* rows;
+    const std::uint8_t* side;
+};
+
+// A packed tile in shared memory: Bc rows of kBf16pRowBytes, then their Bc side records. One
+// 64-key tile lies in one page, where a head's rows and side records are each contiguous.
+inline constexpr int kCausalPromptPackedRowsBytes = kCausalPromptBc * kBf16pRowBytes;
+inline constexpr int kCausalPromptPackedBytes =
+    kCausalPromptPackedRowsBytes + kCausalPromptBc * kBf16pSideBytes;
+static_assert(kCausalPromptPackedBytes <= kCausalPromptBc * kCausalPromptHeadDim * 2);
+
+// Starts the cp.async copies of the packed tile at key k0 (a multiple of Bc) into `raw`; the
+// caller commits and waits. Rows past the visible keys are copied too: they lie in the same
+// page, and the decode zeroes them.
+template <typename Geometry>
+__device__ __forceinline__ void causal_prompt_stage_packed(std::uint8_t* raw,
+                                                           CausalPromptPackedPlane plane,
+                                                           int kv_head, int physical_page,
+                                                           int tid) {
+    constexpr int RowChunks  = kCausalPromptPackedRowsBytes / 16;
+    constexpr int SideChunks = kCausalPromptBc * kBf16pSideBytes / 16;
+    const int kv_heads       = causal_prompt_q_heads<Geometry>() / Geometry::GroupSize;
+    const std::uint8_t* rows = plane.rows + bf16p_row_offset(physical_page, kv_head, 0, kv_heads);
+    const std::uint8_t* side = plane.side + bf16p_side_offset(physical_page, kv_head, 0, kv_heads);
+#pragma unroll
+    for (int chunk = tid; chunk < RowChunks + SideChunks; chunk += kCausalPromptThreads) {
+        if (chunk < RowChunks) {
+            cp_async<16, Cache::cg>(raw + 16 * chunk, rows + 16 * chunk);
+        } else {
+            cp_async<16, Cache::cg>(raw + 16 * chunk, side + 16 * (chunk - RowChunks));
+        }
+    }
+}
+
+// Decodes the packed tile at key k0 from `raw` into the swizzled BF16 tile `dst`, zeroing keys
+// past max_query_abs. A warp decodes one row at a time, lane L its values 8 L .. 8 L + 7.
+__device__ __forceinline__ void causal_prompt_decode_packed(__nv_bfloat16* dst,
+                                                            const std::uint8_t* raw, int k0,
+                                                            int max_query_abs, int tid) {
+    constexpr int D       = kCausalPromptHeadDim;
+    constexpr int Bc      = kCausalPromptBc;
+    constexpr int Threads = kCausalPromptThreads;
+    static_assert(kBf16pRowValues == D && D / 8 == 32);
+    const int lane = tid & 31;
+#pragma unroll 4
+    for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
+        const int key_l  = chunk >> 5; // uniform in a warp
+        __nv_bfloat16* p = &dst[key_l * D + causal_prompt_swz(key_l, lane << 3)];
+        if ((k0 + key_l) <= max_query_abs) {
+            const std::uint8_t* row = raw + key_l * kBf16pRowBytes;
+            const uint2 code        = *reinterpret_cast<const uint2*>(row + 8 * lane);
+            const unsigned nib =
+                *reinterpret_cast<const unsigned*>(row + kBf16pNibbles + 4 * lane);
+            const uint2 record = *reinterpret_cast<const uint2*>(
+                raw + kCausalPromptPackedRowsBytes + key_l * kBf16pSideBytes);
+            store_vec(p, bf16p_decode_regs(code, nib, record, lane));
+        } else {
+            store_vec(p, make_int4(0, 0, 0, 0));
+        }
+    }
+}
+
+// causal_prompt_stage_kv over packed rows, for the Turing kernel's exact sweep
+// (prompt_bf16_sm75.cuh): each thread decodes its chunks to the BF16 values the bf16 storage would
+// hold, with plain stores (the caller's barrier publishes them).
+template <typename Geometry>
+__device__ __forceinline__ void causal_prompt_stage_kv(__nv_bfloat16* dst,
+                                                       CausalPromptPackedPlane plane, int kv_head,
+                                                       int k0, int max_query_abs,
+                                                       int physical_page, int tid) {
+    constexpr int D         = kCausalPromptHeadDim;
+    constexpr int Bc        = kCausalPromptBc;
+    constexpr int Threads   = kCausalPromptThreads;
+    constexpr int VecPerRow = D / 8;
+    static_assert(kBf16pRowValues == D);
+    const int kv_heads = causal_prompt_q_heads<Geometry>() / Geometry::GroupSize;
+    const int offset0  = k0 & kPagedKVPageMask;
+#pragma unroll 4
+    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
+        const int key_l  = chunk >> 5;
+        const int c      = chunk & 31;
+        __nv_bfloat16* p = &dst[key_l * D + causal_prompt_swz(key_l, c << 3)];
+        if ((k0 + key_l) <= max_query_abs) {
+            const int offset = offset0 + key_l;
+            const std::uint8_t* row =
+                plane.rows + bf16p_row_offset(physical_page, kv_head, offset, kv_heads);
+            const std::uint8_t* side =
+                plane.side + bf16p_side_offset(physical_page, kv_head, offset, kv_heads);
+            store_vec(p, bf16p_decode8(row, side, c));
+        } else {
+            store_vec(p, make_int4(0, 0, 0, 0));
         }
     }
 }
@@ -348,12 +448,11 @@ inline constexpr int kCausalPromptBf16SmemBytes = kCausalPromptSmemBytes;
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <typename Geometry, typename Metadata>
+// Plane: a BF16 cache's `const __nv_bfloat16*` pages or a packed cache's CausalPromptPackedPlane.
+template <typename Geometry, typename Metadata, typename Plane = const __nv_bfloat16*>
 __launch_bounds__(kCausalPromptThreads, 1) __global__
-    void causal_attention_prompt_bf16_kernel(const __nv_bfloat16* __restrict__ q,
-                                             const __nv_bfloat16* __restrict__ cache_k,
-                                             const __nv_bfloat16* __restrict__ cache_v,
-                                             Metadata metadata,
+    void causal_attention_prompt_bf16_kernel(const __nv_bfloat16* __restrict__ q, Plane cache_k,
+                                             Plane cache_v, Metadata metadata,
                                              const std::int32_t* __restrict__ positions,
                                              float scale, __nv_bfloat16* __restrict__ out,
                                              std::int32_t width) {
@@ -443,41 +542,90 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
     const float scale_l2 = scale * Log2E;
     int physical_page    = block_table[0];
 
-    // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
-    ninfer::ops::cp_commit();
-    causal_prompt_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page, tid);
-    ninfer::ops::cp_commit();
-
-    for (int kb = 0; kb < n_block_max; ++kb) {
-        const int k0                 = kb * Bc;
-        const int next_physical_page = (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
-
-        ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
+    if constexpr (std::is_same_v<Plane, CausalPromptPackedPlane>) {
+        // A packed cache: cp.async brings each tile's packed bytes into v_s while the MMAs run on
+        // k_s, and the decode turns them into k_s's BF16 tile between the MMAs. k_s holds K for
+        // the QK product, then V for the PV product.
+        auto* raw = reinterpret_cast<std::uint8_t*>(v_s);
+        const CausalPromptWarpTiles packed_tiles =
+            causal_prompt_warp_tiles(smem_addr(q_s), smem_addr(k_s), smem_addr(k_s), warp_row0,
+                                     lane);
+        ninfer::ops::cp_commit();
+        causal_prompt_stage_packed<Geometry>(raw, cache_k, kv_head, physical_page, tid);
+        ninfer::ops::cp_commit();
+        ninfer::ops::cp_wait<0>(); // Q and raw K(0)
         __syncthreads();
+        causal_prompt_decode_packed(k_s, raw, 0, max_query_abs, tid);
+        __syncthreads();
+        for (int kb = 0; kb < n_block_max; ++kb) {
+            const int k0 = kb * Bc;
+            causal_prompt_stage_packed<Geometry>(raw, cache_v, kv_head, physical_page, tid);
+            ninfer::ops::cp_commit();
 
-        // Overlap V(kb) load against the QK MMA below.
-        causal_prompt_stage_kv<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs, physical_page,
+            float score[kCausalPromptQKNt][4];
+            causal_prompt_qk(score, packed_tiles, bf16_mma);
+            unsigned p_frag[kCausalPromptPVKs][4];
+            causal_prompt_softmax(score, p_frag, acc, m0, m1, l0, l1, q0, k0, tokens, base_pos,
+                                  scale_l2, warp_row0, lane);
+
+            ninfer::ops::cp_wait<0>(); // raw V(kb) landed
+            __syncthreads();           // and the QK product is done with k_s
+            causal_prompt_decode_packed(k_s, raw, k0, max_query_abs, tid);
+            __syncthreads();
+            if (kb + 1 < n_block_max) {
+                physical_page = block_table[kb + 1];
+                causal_prompt_stage_packed<Geometry>(raw, cache_k, kv_head, physical_page, tid);
+                ninfer::ops::cp_commit();
+            }
+
+            causal_prompt_pv(acc, p_frag, packed_tiles, bf16_mma);
+
+            if (kb + 1 < n_block_max) {
+                ninfer::ops::cp_wait<0>(); // raw K(kb+1) landed
+                __syncthreads();           // and the PV product is done with k_s
+                causal_prompt_decode_packed(k_s, raw, (kb + 1) * Bc, max_query_abs, tid);
+                __syncthreads();
+            }
+        }
+    } else {
+        // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
+        ninfer::ops::cp_commit();
+        causal_prompt_stage_kv<Geometry>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page,
                                          tid);
         ninfer::ops::cp_commit();
 
-        float score[kCausalPromptQKNt][4];
-        causal_prompt_qk(score, tiles, bf16_mma);
-        unsigned p_frag[kCausalPromptPVKs][4];
-        causal_prompt_softmax(score, p_frag, acc, m0, m1, l0, l1, q0, k0, tokens, base_pos,
-                              scale_l2, warp_row0, lane);
+        for (int kb = 0; kb < n_block_max; ++kb) {
+            const int k0                 = kb * Bc;
+            const int next_physical_page =
+                (kb + 1 < n_block_max) ? block_table[kb + 1] : physical_page;
 
-        ninfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
-        __syncthreads();
+            ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
+            __syncthreads();
 
-        // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
-        if (kb + 1 < n_block_max) {
-            physical_page = next_physical_page;
-            causal_prompt_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
+            // Overlap V(kb) load against the QK MMA below.
+            causal_prompt_stage_kv<Geometry>(v_s, cache_v, kv_head, k0, max_query_abs,
                                              physical_page, tid);
             ninfer::ops::cp_commit();
-        }
 
-        causal_prompt_pv(acc, p_frag, tiles, bf16_mma);
+            float score[kCausalPromptQKNt][4];
+            causal_prompt_qk(score, tiles, bf16_mma);
+            unsigned p_frag[kCausalPromptPVKs][4];
+            causal_prompt_softmax(score, p_frag, acc, m0, m1, l0, l1, q0, k0, tokens, base_pos,
+                                  scale_l2, warp_row0, lane);
+
+            ninfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s
+            __syncthreads();
+
+            // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
+            if (kb + 1 < n_block_max) {
+                physical_page = next_physical_page;
+                causal_prompt_stage_kv<Geometry>(k_s, cache_k, kv_head, (kb + 1) * Bc,
+                                                 max_query_abs, physical_page, tid);
+                ninfer::ops::cp_commit();
+            }
+
+            causal_prompt_pv(acc, p_frag, tiles, bf16_mma);
+        }
     }
 
     causal_prompt_store<Geometry>(acc, l0, l1, out, q_head, q0, tokens, width, warp_row0, lane,

@@ -57,6 +57,19 @@ struct CausalCachedInput {
     static constexpr bool writes_cache = false;
 };
 
+// A packed BF16 cache (KvCacheStorage::Bf16Packed): the kernel's K and V planes hold 384-byte rows
+// and these their side records (ops/kv_cache/bf16p_codec.cuh). The call's rows were appended before
+// it, so it only reads.
+struct CausalPackedInput {
+    static constexpr bool writes_cache = false;
+    static constexpr bool packed       = true;
+    const std::uint8_t* k_side;
+    const std::uint8_t* v_side;
+};
+
+template <class CacheInput>
+inline constexpr bool kCausalPackedInput = requires { CacheInput::packed; };
+
 // The indexes below take the call's head counts at run time (geometry.cuh): `kv_heads` KV heads
 // and `q_heads` = kv_heads * GroupSize query heads.
 __device__ __forceinline__ std::int64_t causal_cache_index(int physical_page, int kv_head, int d,

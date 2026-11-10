@@ -125,6 +125,8 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "rk2v4-e8") { return KvCacheStorage::RotatedE8RootKeyInt4Value; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
+    // bf16p: BF16 rows packed losslessly into 392 bytes (bf16p_codec.cuh). Opt-in.
+    if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -218,7 +220,7 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  bf16 (default), int8, fp8, rk8v4, rk4v4,\n"
-           "                                rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n" +
+           "                                rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p\n" +
            std::string(product::kKvResidentHelp) +
            "\n"
            "SPECULATIVE DECODING\n"

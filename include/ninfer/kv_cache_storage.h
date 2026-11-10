@@ -31,6 +31,10 @@ enum class KvCacheStorage : std::uint8_t {
     // a residual axis (two bytes per block) over a group-64 scale, paired with the rk8v4 packed
     // int4 value plane. Opt-in through --kv-dtype rk2v4-e8.
     RotatedE8RootKeyInt4Value,
+    // bf16p: BF16's K and V values packed losslessly to 384 bytes and an 8-byte side record a D256
+    // row (ops/kv_cache/bf16p_codec.cuh), 23% fewer bytes than BFloat16; a row with no packed form
+    // ends its request as one with non-finite logits. Opt-in through --kv-dtype bf16p.
+    Bf16Packed,
 };
 
 } // namespace ninfer

@@ -173,6 +173,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         // share under position-split attention, and its GDN heads' share of every GDN layer's
         // state.
         if (parameters.text.tensor_shares.front().attention_positions) {
+            if (plan.kv_storage == KvCacheStorage::Bf16Packed) {
+                throw std::invalid_argument(
+                    "--kv-dtype bf16p does not take --tensor-attention positions");
+            }
             kv_position_ranks = static_cast<std::uint32_t>(ranks);
         } else {
             for (const auto& share : parameters.text.tensor_shares) {

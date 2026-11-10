@@ -200,6 +200,10 @@ void launch_cyclic(const Tensor& k, const Tensor& v, const Tensor& positions, co
 
 void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                             PagedKVLayerView cache, cudaStream_t stream) {
+    if (cache.storage == KvCacheStorage::Bf16Packed) {
+        kv_cache_append_bf16p_launch(k, v, positions, cache, stream);
+        return;
+    }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
         return;
@@ -218,6 +222,11 @@ void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& posi
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                                   const Tensor& valid_columns, const Tensor& table_rows,
                                   PagedKVBatchLayerView cache, cudaStream_t stream) {
+    if (cache.storage == KvCacheStorage::Bf16Packed) {
+        kv_cache_append_bf16p_batch_launch(k, v, positions, valid_columns, table_rows, cache,
+                                           stream);
+        return;
+    }
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         kv_cache_append_k8v4_batch_launch(k, v, positions, valid_columns, table_rows, cache,
                                           stream);

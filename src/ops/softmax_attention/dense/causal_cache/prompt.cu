@@ -244,24 +244,36 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                                   static_cast<unsigned>(q.ne[1]), 1u);
         // The kernel of the current device's shape set, past the default 48 KiB dynamic-smem
         // ceiling in both.
-        const auto launch = [&](auto kernel, int smem) {
+        const auto launch = [&]<typename Plane>(auto kernel, int smem, Plane plane_k,
+                                                Plane plane_v) {
             raise_dynamic_shared_memory(kernel, smem);
             kernel<<<attention_grid, kCausalPromptThreads, smem, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const __nv_bfloat16*>(cache_k.data),
-                static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
+                static_cast<const __nv_bfloat16*>(q.data), plane_k, plane_v, metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
         };
-        with_shape_set([&]<bool TuringShapes>() {
-            if constexpr (TuringShapes) {
-                launch(causal_attention_prompt_bf16_turing_kernel<Geometry, Metadata>,
-                       kCausalPromptBf16TuringSmemBytes);
-            } else {
-                launch(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
-                       kCausalPromptBf16SmemBytes);
-            }
-        });
+        // A bf16p cache's kernels decode its rows to the BF16 a bf16 cache holds.
+        const auto launch_planes = [&]<typename Plane>(Plane plane_k, Plane plane_v) {
+            with_shape_set([&]<bool TuringShapes>() {
+                if constexpr (TuringShapes) {
+                    launch(causal_attention_prompt_bf16_turing_kernel<Geometry, Metadata, Plane>,
+                           kCausalPromptBf16TuringSmemBytes, plane_k, plane_v);
+                } else {
+                    launch(causal_attention_prompt_bf16_kernel<Geometry, Metadata, Plane>,
+                           kCausalPromptBf16SmemBytes, plane_k, plane_v);
+                }
+            });
+        };
+        if (cache.storage == KvCacheStorage::Bf16Packed) {
+            launch_planes(
+                CausalPromptPackedPlane{static_cast<const std::uint8_t*>(cache_k.data),
+                                        static_cast<const std::uint8_t*>(cache.k_scale_pages.data)},
+                CausalPromptPackedPlane{static_cast<const std::uint8_t*>(cache_v.data),
+                                        static_cast<const std::uint8_t*>(cache.v_scale_pages.data)});
+        } else {
+            launch_planes(static_cast<const __nv_bfloat16*>(cache_k.data),
+                          static_cast<const __nv_bfloat16*>(cache_v.data));
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

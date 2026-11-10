@@ -542,6 +542,10 @@ void with_codings(KvCacheStorage storage, F&& f) {
         return f.template operator()<Coding::Nvfp4, Coding::Nvfp4, true, true>();
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return f.template operator()<Coding::Fp8, Coding::Nvfp4, true, true>();
+    case KvCacheStorage::Bf16Packed:
+        throw std::invalid_argument(
+            "causal_attention_prompt_sm70: a bf16p KV cache takes neither the Volta prompt nor "
+            "position-split attention");
     }
     throw std::invalid_argument("causal_attention_prompt_sm70: unknown KV storage");
 }
