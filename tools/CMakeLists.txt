@@ -1,28 +1,15 @@
 # Standalone CUDA enumeration probe, plus a real DeviceContext construction check.
 #
-# It deliberately does not link ninfer_core. The enumeration half needs to answer "which CUDA
-# indices are the two cards, and can they reach each other" before the model loader is involved,
-# on a machine where the answer is not obvious -- a display GPU commonly takes cuda=0 even when
-# nvidia-smi lists it elsewhere, so the indices for --devices must be read from a CUDA-level
-# enumeration rather than assumed.
-#
-# device.cu, its launch helpers (device_launch.cpp), the device stall watch it starts
-# (device_wait.cu) and the peer preflight it calls (peer_preflight.cpp) are compiled in directly
-# rather than linked from the core. They only include core/device.h, core/device_wait.h,
-# core/peer_preflight.h and standard headers, so this costs four translation units and keeps the
-# probe around 1 MB instead of the ~500 MB a core link would produce -- which matters because this
-# binary gets uploaded to rented hardware to be run there.
-add_executable(ninfer-multi-gpu-probe
-  multi_gpu_probe.cu
-  ${CMAKE_SOURCE_DIR}/src/core/device.cu
-  ${CMAKE_SOURCE_DIR}/src/core/device_launch.cpp
-  ${CMAKE_SOURCE_DIR}/src/core/device_wait.cu
-  ${CMAKE_SOURCE_DIR}/src/core/peer_preflight.cpp)
-target_include_directories(ninfer-multi-gpu-probe PRIVATE ${CMAKE_SOURCE_DIR}/src)
-# The host compiler needs the toolkit headers for device_launch.cpp; nvcc links the static runtime.
-# DeviceBinding reads the thread's current context through the driver API (cuCtxGetCurrent), as the
-# core does, so the probe links the driver library too.
-target_link_libraries(ninfer-multi-gpu-probe PRIVATE CUDA::toolkit CUDA::cuda_driver)
+# The enumeration half needs to answer "which CUDA indices are the two cards, and can they reach
+# each other" before the model loader is involved, on a machine where the answer is not obvious --
+# a display GPU commonly takes cuda=0 even when nvidia-smi lists it elsewhere, so the indices for
+# --devices must be read from a CUDA-level enumeration rather than assumed. It links only the core's
+# device layer (ninfer_core_device), which brings its own link requirements: the CUDA runtime and
+# driver libraries every NInfer program uses. The binary stays under 1 MB, which matters because it
+# gets uploaded to rented hardware to be run there.
+add_executable(ninfer-multi-gpu-probe multi_gpu_probe.cu)
+ninfer_internal_includes(ninfer-multi-gpu-probe)
+target_link_libraries(ninfer-multi-gpu-probe PRIVATE ninfer_core_device)
 set_target_properties(ninfer-multi-gpu-probe PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")
@@ -38,18 +25,11 @@ set_target_properties(ninfer-tp-probe PROPERTIES
 # Times the engine's own tensor-parallel exchange (core/tensor_parallel.cu) over the ranks of a
 # device list: every route (host memory, peer reads, peer writes; words, whole reduces, the
 # reduce-scatter and all-gather, scatter flags) at every size, and the bands the exchange measures
-# for itself. The exchange only includes core/device.h and a public enum header, so it is compiled
-# in with the device sources, as for ninfer-multi-gpu-probe, instead of linking the core.
-add_executable(ninfer-tp-exchange-bench
-  tp_exchange_bench.cu
-  ${CMAKE_SOURCE_DIR}/src/core/tensor_parallel.cu
-  ${CMAKE_SOURCE_DIR}/src/core/device.cu
-  ${CMAKE_SOURCE_DIR}/src/core/device_launch.cpp
-  ${CMAKE_SOURCE_DIR}/src/core/device_wait.cu
-  ${CMAKE_SOURCE_DIR}/src/core/peer_preflight.cpp)
-target_include_directories(ninfer-tp-exchange-bench PRIVATE ${CMAKE_SOURCE_DIR}/src
-                           ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(ninfer-tp-exchange-bench PRIVATE CUDA::toolkit CUDA::cuda_driver)
+# for itself. The exchange belongs to the core's device layer, which this links, as
+# ninfer-multi-gpu-probe does, instead of the whole core.
+add_executable(ninfer-tp-exchange-bench tp_exchange_bench.cu)
+ninfer_internal_includes(ninfer-tp-exchange-bench)
+target_link_libraries(ninfer-tp-exchange-bench PRIVATE ninfer_core_device)
 set_target_properties(ninfer-tp-exchange-bench PROPERTIES
   CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools")

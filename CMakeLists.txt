@@ -383,3 +383,5 @@ endif()
 if(NINFER_SHARED_RUNTIME)
   ninfer_finalize_runtime()
 endif()
+
+ninfer_check_source_owners()

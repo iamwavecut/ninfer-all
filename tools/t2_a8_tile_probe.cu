@@ -22,7 +22,8 @@
 // Build (inside the build container, after the sm120a tree is built):
 //   nvcc -O3 -std=c++20 -arch=sm_120a -DNINFER_SM8X_COMPAT=1 -Iinclude -Isrc -Xptxas -v \
 //        tools/t2_a8_tile_probe.cu build-sm120a/src/ops/libninfer_ops.a \
-//        build-sm120a/src/core/libninfer_core.a -lcublas -L/usr/local/cuda/lib64/stubs -lcuda \
+//        build-sm120a/src/core/libninfer_core.a build-sm120a/src/core/libninfer_core_device.a \
+//        -lcublas -L/usr/local/cuda/lib64/stubs -lcuda \
 //        -o build-sm120a/t2_a8_tile_probe
 // Run: t2_a8_tile_probe [tokens...]   (default 1024 2048 4096)
 

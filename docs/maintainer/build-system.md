@@ -257,7 +257,7 @@ project includes and the two CUDA archive policies.
 
 | Component | Targets |
 |---|---|
-| `core/` | `ninfer_core` |
+| `core/` | `ninfer_core` and its device layer `ninfer_core_device` (device binding, launches, device waits, peer preflight, tensor-parallel exchange), which the standalone tools in `tools/` link alone |
 | `artifact/` | `ninfer_artifact` |
 | `text/` | `ninfer_text`, including bundled utf8proc C source |
 | `media/` | `ninfer_media_decode` |
@@ -278,7 +278,10 @@ Small components list their sources directly. Larger components include local `s
 manifests which use `target_sources(<owner> PRIVATE ...)`. Included manifests anchor file paths
 with `CMAKE_CURRENT_LIST_DIR`; `include()` does not change `CMAKE_CURRENT_SOURCE_DIR`.
 
-- Every implementation under `src/` has one target owner and one explicit registration.
+- Every implementation under `src/` has one target owner and one explicit registration. Any
+  other target links the owner's library and never compiles the unit again: the copy would miss
+  the compile settings and link requirements the owner declares. Configure fails when a unit
+  under `src/` compiles in two targets (`ninfer_check_source_owners`, `cmake/NinferTargets.cmake`).
 - Ops register simple horizontal implementations in `basic_sources.cmake` and larger semantic
   families in their own manifests. A family also registers its files under `wrapper/`.
 - Linear includes one manifest for each of BF16, FP8, NVFP4, Q4, Q5, Q6 and Q8. Each manifest lists
@@ -295,7 +298,7 @@ dispatch remain in C++; CMake only selects translation units.
 
 ## CUDA compilation boundaries
 
-`ninfer_core` and `ninfer_ops` compile whole-program: no relocatable device code (RDC) and no
+`ninfer_core_device`, `ninfer_core` and `ninfer_ops` compile whole-program: no relocatable device code (RDC) and no
 device link. Every device symbol is defined and used in one translation unit. A change that needs a
 device symbol across translation units has to bring RDC back to its target and measure the cost:
 under RDC ptxas lowers a shuffle from a computed lane to an out-of-line call and stops pipelining
@@ -313,7 +316,7 @@ memory after startup does not change.
 `ninfer_nvfp4_non_rdc` explicitly disables separable compilation and device-symbol resolution. It
 contains the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend
 on `setmaxnreg` register transfer, which RDC would discard. Their owning family manifests register
-these sources into that target; host launchers connect them to the normal Ops. All three CUDA
+these sources into that target; host launchers connect them to the normal Ops. All four CUDA
 archive targets retain `-lineinfo`.
 
 Whole-program compilation is not a speed lever on every card. On the RTX 3090 (sm_86, CUDA 12.8, 27B
