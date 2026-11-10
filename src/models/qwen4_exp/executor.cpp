@@ -3783,6 +3783,14 @@ struct Executor::Impl {
         }
         Tensor y(rank.y, DType::FP32, {h, t});
         auto scope = ws.scope();
+        if (ops::moe_experts_gguf_decode_supported(m.banks(), t)) {
+            // The shared expert on the side stream beside the routed pairs, as with staged misses.
+            const auto state = ops::moe_experts_gguf_decode_begin(mixed, ids, shared, m.banks(), ws,
+                                                                  s, &rank.side);
+            ops::moe_experts_gguf_decode_finish(state, ids, nullptr, weights, m.banks(), nullptr,
+                                                nullptr, nullptr, nullptr, y, s);
+            return;
+        }
         ops::moe_experts_gguf(mixed, ids, weights, shared, m.banks(), ws, y, s);
     }
 
