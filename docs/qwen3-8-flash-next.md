@@ -1,14 +1,20 @@
 # Qwen3.8-Flash-Next
 
 NInfer runs Qwen3.8-Flash-Next (`Qwen4ExpForConditionalGeneration`, 125B text parameters, about 6B
-active per token) from ISTA-DASLab's GSQ-RCO GGUF releases, converted without requantization:
+active per token) from ISTA-DASLab's GSQ-RCO GGUF releases and Unsloth's Dynamic v3.1 ones, converted
+without requantization:
 
 - [Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF):
   Q2_0 (37.6 GB), IQ2_XS (39.2 GB), IQ3_XXS (47.0 GB), IQ3_S (54.8 GB);
-- [Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF).
+- [Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF);
+- [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF): UD-IQ2_XS
+  (47.0 GB) and UD-IQ3_XXS (54.8 GB) were converted and run. Of its other sizes, UD-IQ1_M stores
+  IQ2_XS expert blocks, which have no CPU product, and UD-Q4_K_XL and the larger ones store Q5_1
+  tensors, which have no kernel; none of those was converted.
 
-Each release is two GGUF shards: the model, and the 28.8 GB n-gram table of the model's per-layer
-embedding (PLE), byte for byte the same in every release, the Coder build's included. A NInfer
+Each GSQ-RCO release is two GGUF shards: the model, and the 28.8 GB n-gram table of the model's
+per-layer embedding (PLE), byte for byte the same in every release, the Coder build's included. The
+table shard of Unsloth's UD-IQ2_XS release holds the same rows (the same SHA-256 of the rows). A NInfer
 model artifact describes the table it reads in its `ngram` component (the hash constants, the row
 format and the SHA-256 of the rows) and either stores the rows too, as one self-contained file, or
 leaves them to a table artifact of their own that every Flash-Next model can share. Nothing reads
@@ -26,6 +32,8 @@ The published conversions store the models without the table, which is published
 | [Q2_0](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) | 38.49 GiB | Vision and shared-Q8_0 MTP |
 | [IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3) | 54.50 GiB | Vision and shared-Q8_0 MTP |
 | [Coder IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 31.02 GiB | 256 text experts per layer, Vision and shared-Q8_0 MTP |
+| [Unsloth UD-IQ2_XS](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-UD-IQ2_XS-NInfer-v3) | 47.43 GiB | Unsloth Dynamic v3.1, Vision, shared-Q8_0 MTP and the DFlash2 drafter |
+| [Unsloth UD-IQ3_XXS](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-v3) | 54.66 GiB | Unsloth Dynamic v3.1, Vision, shared-Q8_0 MTP and the DFlash2 drafter |
 
 The model runs with up to eight concurrent requests, a context cache of prompt prefixes, structured
 output, images and video through its Vision tower (`--vision`, from an artifact converted with the
