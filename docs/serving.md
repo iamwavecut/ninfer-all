@@ -623,7 +623,11 @@ After startup, a worker out-of-memory failure (and, with `--recover-invariant-fa
 internal invariant) fails only the requests that were running or being admitted, waits for the
 device, releases and if necessary rebuilds the context cache, and keeps serving the queue. A
 Flash-Next model file read that fails (disk experts or n-gram rows) likewise fails only the running
-requests, with `unavailable`. Each
+requests, with `unavailable`. Non-finite logits (a token the sampler cannot name) end only the
+request whose row produced them, with an HTTP 500 `numerical_failure` error or an error event on a
+started stream, and the other requests continue; when they appear at the end of a prompt, a
+Qwen3.5-core model takes the out-of-memory recovery (nothing vouches for what that pass cached), and
+the other families drop the stored prefixes of that prompt. Each
 recovery is counted as a top-level `engine_recoveries` counter on the request log's `throughput`
 event and as `ninfer:engine_recoveries_total` on [Metrics](#metrics). `GET /health` turns `503` for
 good after any other worker failure, when a recovery cannot complete, or after eight recoveries in

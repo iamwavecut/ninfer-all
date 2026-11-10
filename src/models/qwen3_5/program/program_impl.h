@@ -1850,7 +1850,15 @@ private:
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
-    void validate_licensed_tokens(std::span<const TokenId> tokens) const;
+    // Whether every token lies inside the public domain. A token outside it (the sampler's
+    // non-finite marker, or an id past the vocabulary) becomes 0, so nothing downstream reads an
+    // out-of-range id; a decode round marks the row in numerical_faults, a prompt's first token
+    // throws runtime::NumericalFault.
+    [[nodiscard]] bool license_tokens(std::span<TokenId> tokens) const noexcept;
+    // Rows of the decode round whose sampled or licensed tokens left the public domain, in the
+    // round's row order. wrap_pending reports them on the PendingBatch: the Engine ends those
+    // requests and commits the other rows.
+    std::array<bool, kMaximumConcurrency> numerical_faults{};
     // The drafts a lane's round may verify: none for a structured lane whose masks cost more than
     // a verification hides, so its round computes one mask for it.
     [[nodiscard]] static std::uint32_t speculative_extent(const RequestControl& request) noexcept;

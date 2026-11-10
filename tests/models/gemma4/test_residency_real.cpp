@@ -1,10 +1,12 @@
 // Public Engine parity across Gemma's device, pinned host and disk expert delivery.
 // Requires NINFER_GEMMA4_ARTIFACT and NINFER_GEMMA4_TOKENS (JSON token IDs with BOS).
 #include "ninfer/engine.h"
+#include "runtime/engine/worker_fault.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -221,20 +223,127 @@ Result run(const Scenario& scenario, const char* artifact, const std::vector<Tok
     }
     return result;
 }
+// Non-finite logits end one request and leave the Engine serving (the seam of worker_fault.h).
+// While generating, the batch's other row finishes as it does alone. At the end of a prompt, the
+// stored prefixes of that prompt go, so the same prompt computes again from its first token.
+void numerical_failures(const char* artifact, const std::vector<TokenId>& source) {
+    RequestOptions request;
+    request.execution.requested_output_tokens = 16;
+    request.execution.sampling.temperature    = 0.0f;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+    request.output.raw                        = true;
+    // Requests that compute their prompts whole, so their tokens do not depend on what ran before.
+    RequestOptions fresh               = request;
+    fresh.execution.allow_prefix_reuse = false;
+    const auto numerical = [](GenerationHandle& handle, GenerationResult& result) {
+        try {
+            result = handle.wait();
+            return false;
+        } catch (const RequestError& error) {
+            if (error.kind() != RequestErrorKind::NumericalFailure) { throw; }
+            return true;
+        }
+    };
+    std::size_t decode_failed_row = 0;
+    {
+        EngineOptions options;
+        options.artifact_path   = artifact;
+        options.max_context     = 6144;
+        options.max_concurrency = 2;
+        Engine engine(options);
+        const std::array<std::size_t, 2> lengths{17, 18};
+        std::array<GenerationResult, 2> alone;
+        for (std::size_t row = 0; row < 2; ++row) {
+            alone[row] =
+                engine.generate(engine.prepare_tokens(prompt(source, lengths[row]), false), fresh);
+        }
+        runtime::arm_decode_numerical_faults(1);
+        std::array<GenerationHandle, 2> handles{
+            engine.submit(engine.prepare_tokens(prompt(source, lengths[0]), false), fresh),
+            engine.submit(engine.prepare_tokens(prompt(source, lengths[1]), false), fresh)};
+        std::array<GenerationResult, 2> together;
+        std::array<bool, 2> failed{};
+        for (std::size_t row = 0; row < 2; ++row) {
+            failed[row] = numerical(handles[row], together[row]);
+        }
+        runtime::arm_decode_numerical_faults(0);
+        if (failed[0] == failed[1] || engine.has_failed()) {
+            throw std::runtime_error("a decode numerical fault did not end exactly one request");
+        }
+        const std::size_t kept = failed[0] ? 1 : 0;
+        if (together[kept].generated_token_ids != alone[kept].generated_token_ids) {
+            throw std::runtime_error("the row beside a numerical failure changed its tokens");
+        }
+        decode_failed_row = failed[0] ? 0 : 1;
+    }
+
+    // One sequence, so each prompt meets what the one before it left. A conversation's second turn
+    // resumes from the live state; an unrelated prompt then moves that state to the store; a third
+    // turn resumes from the stored image and takes the fault at its prompt's end. The image has
+    // to be gone: the same third turn computes whole.
+    EngineOptions options;
+    options.artifact_path   = artifact;
+    options.max_context     = 6144;
+    options.max_concurrency = 1;
+    Engine engine(options);
+    const auto extend = [&](std::vector<TokenId> tokens, const GenerationResult& answer,
+                            std::size_t offset) {
+        tokens.insert(tokens.end(), answer.generated_token_ids.begin(),
+                      answer.generated_token_ids.end());
+        for (std::size_t i = 0; i < 24; ++i) {
+            tokens.push_back(source[1 + (offset + i) % (source.size() - 1)]);
+        }
+        return tokens;
+    };
+    const std::vector<TokenId> opening = prompt(source, 2305);
+    const auto first                   = engine.generate(engine.prepare_tokens(opening), request);
+    const std::vector<TokenId> turn    = extend(opening, first, 40);
+    const auto second                  = engine.generate(engine.prepare_tokens(turn), request);
+    std::vector<TokenId> unrelated     = prompt(source, 96);
+    std::reverse(unrelated.begin() + 1, unrelated.end());
+    (void)engine.generate(engine.prepare_tokens(unrelated), request);
+    const std::vector<TokenId> next = extend(turn, second, 90);
+    runtime::arm_prefill_numerical_faults(1);
+    GenerationHandle faulted = engine.submit(engine.prepare_tokens(next), request);
+    GenerationResult unused;
+    const bool prompt_failed = numerical(faulted, unused);
+    runtime::arm_prefill_numerical_faults(0);
+    const auto third  = engine.generate(engine.prepare_tokens(next), request);
+    const auto whole  = engine.generate(engine.prepare_tokens(next, false), fresh);
+    const auto stats  = engine.runtime_stats();
+    if (!prompt_failed || engine.has_failed() || second.reused_prompt_tokens == 0 ||
+        third.reused_prompt_tokens != 0 || third.generated_token_ids != whole.generated_token_ids) {
+        throw std::runtime_error(
+            "a prompt numerical fault did not end one request and drop its stored prefixes: failed=" +
+            std::to_string(prompt_failed) + " second turn reused=" +
+            std::to_string(second.reused_prompt_tokens) + " after the fault=" +
+            std::to_string(third.reused_prompt_tokens));
+    }
+    std::cout << nlohmann::json{{"kind", "numerical-failure"}, {"decode_failed_row", decode_failed_row},
+        {"other_row_tokens_equal", true}, {"prompt_failed", true},
+        {"second_turn_reused", second.reused_prompt_tokens},
+        {"state_restores", stats.state_h2d_count},
+        {"reused_after_fault", third.reused_prompt_tokens}, {"engine_available", true}}.dump()
+              << std::endl;
+}
 } // namespace
 
 int main(int argc, char** argv) {
     bool mtp_only = false;
+    bool numerical_only = false;
     std::uint32_t mtp_concurrency = 2;
     for (int i = 1; i < argc; ++i) {
         const std::string_view argument(argv[i]);
         if (argument == "--mtp-only") { mtp_only = true; }
+        else if (argument == "--numerical-only") { numerical_only = true; }
         else if (argument == "--mtp-concurrency" && i + 1 < argc &&
                  std::string_view(argv[i + 1]).size() == 1 &&
                  argv[i + 1][0] >= '1' && argv[i + 1][0] <= '8') {
             mtp_concurrency = static_cast<std::uint32_t>(argv[++i][0] - '0');
         } else {
-            std::cerr << "usage: " << argv[0] << " [--mtp-only] [--mtp-concurrency 1..8]\n";
+            std::cerr << "usage: " << argv[0]
+                      << " [--mtp-only] [--numerical-only] [--mtp-concurrency 1..8]\n";
             return 2;
         }
     }
@@ -245,6 +354,8 @@ int main(int argc, char** argv) {
         std::ifstream file(tokens);
         const auto source = nlohmann::json::parse(file).get<std::vector<TokenId>>();
         if (source.size() < 2) { throw std::runtime_error("prompt needs BOS and one text token"); }
+        numerical_failures(artifact, source);
+        if (numerical_only) { return 0; }
         const std::vector<Scenario> scenarios = {
             {ExpertResidency::Device, 0, true, false, true, 8, "device-graph"},
             {ExpertResidency::Device, 0, false, false, false, 8, "device-eager"},

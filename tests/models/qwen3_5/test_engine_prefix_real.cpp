@@ -2217,6 +2217,77 @@ int exercise_worker_failure_recovery(const char* artifact) {
         }
     }
 
+    // Numerical failures (non-finite logits). During generation only the row's request ends: no
+    // recovery runs and the prefix cache still serves the conversation. At the end of a prompt
+    // nothing vouches for what the pass cached, so the Engine recovers and serves the next request.
+    {
+        const auto numerical = [](ninfer::GenerationHandle& handle) {
+            try {
+                (void)handle.wait();
+                return false;
+            } catch (const ninfer::RequestError& error) {
+                return error.kind() == ninfer::RequestErrorKind::NumericalFailure;
+            } catch (const std::exception&) { return false; }
+        };
+        ninfer::RequestOptions longer                = request;
+        longer.execution.requested_output_tokens     = 8;
+        const ninfer::GenerationResult warm =
+            engine.generate(engine.prepare(conversation(turns[0])), longer);
+        const ninfer::GenerationResult again =
+            engine.generate(engine.prepare(conversation(turns[0])), longer);
+        const std::uint64_t before_decode = engine.runtime_stats().engine_recoveries;
+        ninfer::runtime::arm_decode_numerical_faults(1);
+        ninfer::GenerationHandle decode_fault =
+            engine.submit(engine.prepare(conversation(turns[0])), longer);
+        const bool decode_failed = numerical(decode_fault);
+        ninfer::runtime::arm_decode_numerical_faults(0);
+        const bool decode_available = engine.is_available();
+        const std::uint64_t after_decode = engine.runtime_stats().engine_recoveries;
+        const ninfer::GenerationResult after =
+            engine.generate(engine.prepare(conversation(turns[0])), longer);
+        if (!decode_failed || !decode_available || after_decode != before_decode ||
+            warm.generated_token_ids.size() != 8 ||
+            again.generated_token_ids != warm.generated_token_ids ||
+            after.generated_token_ids != warm.generated_token_ids ||
+            again.reused_prompt_tokens == 0 ||
+            after.reused_prompt_tokens < again.reused_prompt_tokens) {
+            std::cerr << "a numerical failure while generating did not end one request only: "
+                      << "failed=" << decode_failed << " available=" << decode_available
+                      << " recoveries=" << (after_decode - before_decode)
+                      << " reused again=" << again.reused_prompt_tokens
+                      << " after=" << after.reused_prompt_tokens << " same="
+                      << (after.generated_token_ids == warm.generated_token_ids) << "\n";
+            return 1;
+        }
+        ninfer::runtime::arm_prefill_numerical_faults(1);
+        ninfer::GenerationHandle prefill_fault =
+            engine.submit(engine.prepare(conversation(turns[1])), request);
+        const bool prefill_failed = numerical(prefill_fault);
+        ninfer::runtime::arm_prefill_numerical_faults(0);
+        const std::uint64_t after_prefill = engine.runtime_stats().engine_recoveries;
+        ninfer::GenerationHandle served =
+            engine.submit(engine.prepare(conversation(turns[0])), longer);
+        ninfer::GenerationResult recovered;
+        try {
+            recovered = served.wait();
+        } catch (const std::exception&) {}
+        if (!prefill_failed || after_prefill != after_decode + 1U || !engine.is_available() ||
+            recovered.generated_token_ids != warm.generated_token_ids ||
+            recovered.reused_prompt_tokens >= again.reused_prompt_tokens) {
+            std::cerr << "a numerical failure at the end of a prompt did not recover the Engine: "
+                      << "failed=" << prefill_failed
+                      << " recoveries=" << (after_prefill - after_decode)
+                      << " available=" << engine.is_available()
+                      << " reused=" << recovered.reused_prompt_tokens << " same="
+                      << (recovered.generated_token_ids == warm.generated_token_ids) << "\n";
+            return 1;
+        }
+        std::cout << "numerical-failure: decode ended one request (reused "
+                  << after.reused_prompt_tokens << " after it), prompt fault recovered (reused "
+                  << recovered.reused_prompt_tokens << ")\n";
+    }
+    const std::uint64_t before_streak = engine.runtime_stats().engine_recoveries;
+
     // Latch: consecutive failures with no successful unit between them. The first
     // kConsecutiveRecoveries recover; the next latches, and the Engine then refuses work.
     ninfer::runtime::arm_worker_failures(kConsecutiveRecoveries + 1U);
@@ -2227,7 +2298,8 @@ int exercise_worker_failure_recovery(const char* artifact) {
         streak[index] = wait_for(handle);
     }
     ninfer::runtime::arm_worker_failures(0);
-    const std::uint64_t streak_recoveries = engine.runtime_stats().engine_recoveries - recoveries;
+    const std::uint64_t streak_recoveries =
+        engine.runtime_stats().engine_recoveries - before_streak;
     bool recovered_prefix = true;
     for (std::size_t index = 0; index < kConsecutiveRecoveries; ++index) {
         recovered_prefix = recovered_prefix && streak[index] == Outcome::Failed;

@@ -502,6 +502,9 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    // The model's logits came out non-finite, or it selected a token outside its vocabulary: the
+    // request ends, and the Engine goes on serving.
+    NumericalFailure,
 };
 
 class RequestError final : public std::invalid_argument {
