@@ -446,10 +446,10 @@ __global__ __launch_bounds__(
         const float nm1_scaled = nm1 == -CUDART_INF_F ? 0.0f : nm1 * scale_l2;
         tile_alpha0            = running_m0 == -CUDART_INF_F
                                      ? 0.0f
-                                     : exp2_approx(__fmaf_rn(running_m0, scale_l2, -nm0_scaled));
+                                     : softmax_history_rescale(running_m0, scale_l2, nm0_scaled);
         tile_alpha1            = running_m1 == -CUDART_INF_F
                                      ? 0.0f
-                                     : exp2_approx(__fmaf_rn(running_m1, scale_l2, -nm1_scaled));
+                                     : softmax_history_rescale(running_m1, scale_l2, nm1_scaled);
         running_m0             = nm0;
         running_m1             = nm1;
 

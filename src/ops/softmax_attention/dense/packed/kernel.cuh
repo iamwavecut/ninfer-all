@@ -4,6 +4,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/softmax_attention/common/bf16_attention.cuh"
+#include "ops/softmax_attention/common/history_rescale.cuh"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -270,8 +271,8 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
         const float next_m1 = fmaxf(m1, block_max1);
         const float m0_l2   = next_m0 * ScaleLog2E;
         const float m1_l2   = next_m1 * ScaleLog2E;
-        const float alpha0  = exp2_approx(__fmaf_rn(m0, ScaleLog2E, -m0_l2));
-        const float alpha1  = exp2_approx(__fmaf_rn(m1, ScaleLog2E, -m1_l2));
+        const float alpha0  = softmax_history_rescale(m0, ScaleLog2E, m0_l2);
+        const float alpha1  = softmax_history_rescale(m1, ScaleLog2E, m1_l2);
 
         float block_sum0 = 0.0f;
         float block_sum1 = 0.0f;
