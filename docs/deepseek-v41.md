@@ -39,7 +39,10 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   latents in FP8 (E4M3 per 32 values with a power-of-two scale), the indexer's queries and keys in
   FP4 (E2M1 per 32, power-of-two scale), the compressed latents in FP4 (per 16, E4M3 scale) and the
   attention output in FP8 before its projection, each scale computed in FP32 as the release does.
-  The caches hold those values in BF16.
+  The caches hold those values as stored codes and scales: a window row is 512 E4M3 codes and 16
+  E8M0 scales (528 bytes), a compressed latent 256 bytes of E2M1 pairs and 32 E4M3 scales (288
+  bytes), an indexer key 64 bytes of E2M1 pairs and 4 E8M0 scales. Attention and the indexer
+  decode them to the same values.
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens (`--prefill-chunk`, at most 4096; narrower on a card without room for them) run block by
   block in spans of up to eight chunks ([below](#prompt-spans)), the last 19 blocks only over the
@@ -234,7 +237,7 @@ ninfer $M --ngram-table $T --expert-residency host --prompt "Explain how a heat 
 ```
 
 On a 24 GB card with host experts the GPU holds the 6.0 GiB of dense weights, two layer banks
-(7.1 GiB), a 1.3 GiB workspace, the latent caches (133 MiB at 32,768 tokens of context) and an
+(7.1 GiB), a 1.3 GiB workspace, the latent caches (40 MiB at 32,768 tokens of context) and an
 expert cache that takes the rest (7.9 GiB on an RTX 4090, of which a prompt span borrows up to
 1.3 GiB while it runs); the host pins 106.7 GiB of experts. With disk experts the host pins 138 MiB
 of transfer buffers and the experts' pages sit in the OS page cache.
@@ -428,7 +431,7 @@ model:
 - **One request.** The drafter drafts while one request decodes; with more, each round decodes one
   token per request.
 - **Memory.** Unsloth's drafter's weights take 7.4 GiB of device memory, almost all of it its 384
-  MXFP4 experts, and the STQ drafter's 3.58 GiB; the rings take 0.75 MiB per sequence (twice that
+  MXFP4 experts, and the STQ drafter's 3.58 GiB; the rings take 0.39 MiB per sequence (twice that
   with prefix checkpoints) and the tapped streams 7.5 MiB. The expert cache gives up that memory:
   on an RTX 4090 with host experts it keeps 73 experts with Unsloth's drafter and 618 with the STQ
   drafter instead of 1,137, and with Unsloth's drafter prompt spans shorten to 8,192 tokens.

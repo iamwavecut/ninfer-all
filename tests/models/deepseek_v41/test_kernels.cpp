@@ -1,7 +1,8 @@
 // DeepSeek-V4.1-Flash's own kernels against FP64 oracles, at the release's shapes (hidden 5120,
 // four streams, 64 query heads over one 512-value latent with a 64-value rotated tail, a
 // 128-position window, 32 indexer heads of 128 values, 384 experts choosing 6 of width 2304, Engram
-// rows of 256 values):
+// rows of 256 values). The caches hold packed codes and scales (the layouts in kernels.h); the tests
+// decode them on the host and fill read-only caches with random codes:
 //  - gemm_f32 by the GEMV kernel (one to eight rows, whole and partial float4s) and by SGEMM.
 //  - expand_streams; hc_split (pre, post and the Sinkhorn comb after 1, 3 and 20 iterations);
 //    hc_pre_norm with a pre mix and with stream 0; hc_post; rms_rows of strided rows.
@@ -9,8 +10,7 @@
 //    staging ring; rotate_heads of FP32 rows with the indexer's fp4 rounding and of BF16 rows in
 //    place.
 //  - compress of ratio 1 and 2: pairs within the call, the earlier row from the sequence's tail at
-//  a
-//    chunk's odd first position and in decode, rows that complete no group untouched;
+//    a chunk's odd first position and in decode, rows that complete no group untouched;
 //    compress_tail. latent_post: the indexer keys and the compressed latents at their groups' first
 //    positions, nothing for the rows that complete no group.
 //  - index_scores of decode rows and of a chunk's rows in fours, with and without candidate blocks;
@@ -154,6 +154,77 @@ std::vector<bf16> random_bf16(std::size_t n, float sigma, std::mt19937& rng) {
 }
 
 std::vector<std::int32_t> ints(const std::vector<int>& v) { return {v.begin(), v.end()}; }
+
+// ---- Packed caches (kernels.h), decoded here from the formats' definitions ----------------------
+
+constexpr std::uint8_t kSentinelByte = 0xA5; // the bytes of a cache row no kernel writes
+
+float e4m3_of(unsigned c) {
+    const int e = int((c >> 3) & 15U), m = int(c & 7U);
+    const float a = e == 0 ? std::ldexp(float(m), -9) : std::ldexp(float(8 + m), e - 10);
+    return (c & 0x80U) != 0 ? -a : a;
+}
+float e2m1_of(unsigned n) {
+    static constexpr float kMagnitude[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    return (n & 8U) != 0 ? -kMagnitude[n & 7U] : kMagnitude[n & 7U];
+}
+float e8m0_of(unsigned c) { return std::ldexp(1.0f, int(c) - 127); }
+
+// The 512 values of a window row, of a compressed latent row, and the 128 of an indexer key.
+std::vector<float> window_values(const std::uint8_t* row) {
+    std::vector<float> v(kLatent);
+    for (int i = 0; i < kLatent; ++i) {
+        v[std::size_t(i)] = e4m3_of(row[i]) * e8m0_of(row[kLatent + i / 32]);
+    }
+    return v;
+}
+std::vector<float> latent_values(const std::uint8_t* row) {
+    std::vector<float> v(kLatent);
+    for (int i = 0; i < kLatent; ++i) {
+        v[std::size_t(i)] = e2m1_of((row[i / 2] >> (4 * (i & 1))) & 15U) * e4m3_of(row[kLatent / 2 + i / 16]);
+    }
+    return v;
+}
+std::vector<float> key_values(const std::uint8_t* codes, const std::uint8_t* scales) {
+    std::vector<float> v(kIndex);
+    for (int i = 0; i < kIndex; ++i) {
+        v[std::size_t(i)] = e2m1_of((codes[i / 2] >> (4 * (i & 1))) & 15U) * e8m0_of(scales[i / 32]);
+    }
+    return v;
+}
+
+// Random rows of each format: any finite code, scales over a few binades.
+std::vector<std::uint8_t> random_window_rows(std::size_t rows, std::mt19937& rng) {
+    std::vector<std::uint8_t> out(rows * k::kWindowRowBytes);
+    for (std::size_t r = 0; r < rows; ++r) {
+        std::uint8_t* row = out.data() + r * k::kWindowRowBytes;
+        for (int i = 0; i < kLatent; ++i) {
+            const auto c = std::uint8_t(rng());
+            row[i]       = (c & 0x7FU) == 0x7FU ? std::uint8_t(c - 1) : c; // no NaN
+        }
+        for (int g = 0; g < kLatent / 32; ++g) { row[kLatent + g] = std::uint8_t(119 + rng() % 4); }
+    }
+    return out;
+}
+std::vector<std::uint8_t> random_latent_rows(std::size_t rows, std::mt19937& rng) {
+    std::vector<std::uint8_t> out(rows * k::kLatentRowBytes);
+    for (std::size_t r = 0; r < rows; ++r) {
+        std::uint8_t* row = out.data() + r * k::kLatentRowBytes;
+        for (int i = 0; i < kLatent / 2; ++i) { row[i] = std::uint8_t(rng()); }
+        for (int g = 0; g < kLatent / 16; ++g) { row[kLatent / 2 + g] = std::uint8_t(0x18 + rng() % 24); }
+    }
+    return out;
+}
+std::vector<std::uint8_t> random_key_codes(std::size_t rows, std::mt19937& rng) {
+    std::vector<std::uint8_t> out(rows * k::kKeyRowBytes);
+    for (auto& c : out) { c = std::uint8_t(rng()); }
+    return out;
+}
+std::vector<std::uint8_t> random_key_scales(std::size_t rows, std::mt19937& rng) {
+    std::vector<std::uint8_t> out(rows * k::kKeyScaleBytes);
+    for (auto& c : out) { c = std::uint8_t(123 + rng() % 5); }
+    return out;
+}
 
 // Rounded outputs against the oracle's rounding of the exact values: how many differ, and the
 // largest difference in steps of the output format at the oracle's value.
@@ -526,8 +597,8 @@ void kv_post(const KvCase& c, std::mt19937& rng) {
     for (auto& v : qkv) { v = 2.0f * normal(rng); }
     for (auto& v : norm) { v = 1.0f + 0.2f * normal(rng); }
     const auto freq               = frequencies(c.theta);
-    const std::int64_t seq_stride = c.staging ? 0 : std::int64_t(c.ring) * kLatent;
-    std::vector<bf16> cache(std::size_t(seqs) * c.ring * kLatent, sentinel());
+    const std::int64_t seq_stride = c.staging ? 0 : std::int64_t(c.ring) * k::kWindowRowBytes;
+    std::vector<std::uint8_t> cache(std::size_t(seqs) * c.ring * k::kWindowRowBytes, kSentinelByte);
     DeviceBuffer dqkv = upload(qkv), dn = upload(norm), df = upload(freq),
                  dp = upload(ints(c.positions)), dslots = upload(ints(c.slots)),
                  dseq = upload(ints(c.sequences)), dc = upload(cache);
@@ -540,14 +611,14 @@ void kv_post(const KvCase& c, std::mt19937& rng) {
     a.positions  = as<std::int32_t>(dp);
     a.slots      = c.slots.empty() ? nullptr : as<std::int32_t>(dslots);
     a.freq       = as<float>(df);
-    a.cache      = as<bf16>(dc);
+    a.cache      = as<std::uint8_t>(dc);
     a.seq_stride = seq_stride;
     a.sequences  = c.sequences.empty() ? nullptr : as<std::int32_t>(dseq);
     a.sequence   = c.sequence;
     a.ring       = c.ring;
     k::kv_post(a, nullptr);
     sync("kv_post");
-    const auto got = download<bf16>(dc, cache.size());
+    const auto got = download<std::uint8_t>(dc, cache.size());
     std::vector<bool> written(std::size_t(seqs) * c.ring);
     Tally tally;
     for (int r = 0; r < t; ++r) {
@@ -563,16 +634,16 @@ void kv_post(const KvCase& c, std::mt19937& rng) {
         for (int g = 0; g < kLatent / 32; ++g) {
             fp8_round(v.data() + 32 * g, step.data() + 32 * g);
         }
-        const std::size_t at = (std::size_t(s) * c.ring + slot) * kLatent;
+        const auto stored = window_values(got.data() + (std::size_t(s) * c.ring + slot) * k::kWindowRowBytes);
         for (int i = 0; i < kLatent; ++i) {
-            tally.add(val(got[at + i]), v[std::size_t(i)], step[std::size_t(i)]);
+            tally.add(stored[std::size_t(i)], v[std::size_t(i)], step[std::size_t(i)]);
         }
     }
     std::size_t stray = 0;
     for (std::size_t slot = 0; slot < written.size(); ++slot) {
         if (written[slot]) { continue; }
-        for (int i = 0; i < kLatent; ++i) {
-            stray += bits(got[slot * kLatent + i]) != kSentinel ? 1 : 0;
+        for (int i = 0; i < k::kWindowRowBytes; ++i) {
+            stray += got[slot * k::kWindowRowBytes + i] != kSentinelByte ? 1 : 0;
         }
     }
     report(tally.within(1e-3, 2.0) && stray == 0,
@@ -777,11 +848,12 @@ void latent_post(const LatentCase& c, std::mt19937& rng) {
     for (auto& v : key) { v = 2.0f * normal(rng); }
     for (auto& v : key_norm) { v = 1.0f + 0.2f * normal(rng); }
     const auto freq = frequencies(160000.0);
-    std::vector<bf16> index_cache(std::size_t(seqs) * rows * kIndex, sentinel()),
-        kv_cache(std::size_t(seqs) * rows * kLatent, sentinel());
+    std::vector<std::uint8_t> index_cache(std::size_t(seqs) * rows * k::kKeyRowBytes, kSentinelByte),
+        index_scales(std::size_t(seqs) * rows * k::kKeyScaleBytes, kSentinelByte),
+        kv_cache(std::size_t(seqs) * rows * k::kLatentRowBytes, kSentinelByte);
     DeviceBuffer dl = upload(latent), dk = upload(key), dkn = upload(key_norm), df = upload(freq),
                  dp = upload(ints(c.positions)), dseq = upload(ints(c.sequences)),
-                 di = upload(index_cache), dc = upload(kv_cache);
+                 di = upload(index_cache), dis = upload(index_scales), dc = upload(kv_cache);
     k::LatentArgs a;
     a.latent           = as<float>(dl);
     a.key              = as<float>(dk);
@@ -793,14 +865,17 @@ void latent_post(const LatentCase& c, std::mt19937& rng) {
     a.key_norm         = as<float>(dkn);
     a.eps              = kEps;
     a.freq             = as<float>(df);
-    a.index_cache      = as<bf16>(di);
-    a.index_seq_stride = std::int64_t(rows) * kIndex;
-    a.kv_cache         = as<bf16>(dc);
-    a.kv_seq_stride    = std::int64_t(rows) * kLatent;
+    a.index_cache            = as<std::uint8_t>(di);
+    a.index_seq_stride       = std::int64_t(rows) * k::kKeyRowBytes;
+    a.index_scales           = as<std::uint8_t>(dis);
+    a.index_scale_seq_stride = std::int64_t(rows) * k::kKeyScaleBytes;
+    a.kv_cache               = as<std::uint8_t>(dc);
+    a.kv_seq_stride          = std::int64_t(rows) * k::kLatentRowBytes;
     k::latent_post(a, nullptr);
     sync("latent_post");
-    const auto got_index = download<bf16>(di, index_cache.size());
-    const auto got_kv    = download<bf16>(dc, kv_cache.size());
+    const auto got_index  = download<std::uint8_t>(di, index_cache.size());
+    const auto got_scales = download<std::uint8_t>(dis, index_scales.size());
+    const auto got_kv     = download<std::uint8_t>(dc, kv_cache.size());
     std::vector<bool> written(std::size_t(seqs) * rows);
     Tally keys, plain, turned;
     for (int r = 0; r < t; ++r) {
@@ -815,9 +890,11 @@ void latent_post(const LatentCase& c, std::mt19937& rng) {
         for (int q = 0; q < kIndex / 32; ++q) {
             fp4_e8m0_round(kn.data() + 32 * q, step.data() + 32 * q);
         }
-        const std::size_t ki = (std::size_t(s) * rows + j) * kIndex;
+        const std::size_t row = std::size_t(s) * rows + j;
+        const auto stored_key = key_values(got_index.data() + row * k::kKeyRowBytes,
+                                           got_scales.data() + row * k::kKeyScaleBytes);
         for (int i = 0; i < kIndex; ++i) {
-            keys.add(val(got_index[ki + i]), kn[std::size_t(i)], step[std::size_t(i)]);
+            keys.add(stored_key[std::size_t(i)], kn[std::size_t(i)], step[std::size_t(i)]);
         }
         std::vector<float> v(latent.begin() + std::ptrdiff_t(r) * kLatent,
                              latent.begin() + std::ptrdiff_t(r + 1) * kLatent);
@@ -825,20 +902,23 @@ void latent_post(const LatentCase& c, std::mt19937& rng) {
         for (int q = 0; q < kLatent / 16; ++q) {
             fp4_e4m3_round(v.data() + 16 * q, step.data() + 16 * q);
         }
-        const std::size_t kvi = (std::size_t(s) * rows + j) * kLatent;
+        const auto stored = latent_values(got_kv.data() + row * k::kLatentRowBytes);
         for (int i = 0; i < kLatent; ++i) {
             (i < kLatent - kRope ? plain : turned)
-                .add(val(got_kv[kvi + i]), v[std::size_t(i)], step[std::size_t(i)]);
+                .add(stored[std::size_t(i)], v[std::size_t(i)], step[std::size_t(i)]);
         }
     }
     std::size_t stray = 0;
     for (std::size_t row = 0; row < written.size(); ++row) {
         if (written[row]) { continue; }
-        for (int i = 0; i < kIndex; ++i) {
-            stray += bits(got_index[row * kIndex + i]) != kSentinel ? 1 : 0;
+        for (int i = 0; i < k::kKeyRowBytes; ++i) {
+            stray += got_index[row * k::kKeyRowBytes + i] != kSentinelByte ? 1 : 0;
         }
-        for (int i = 0; i < kLatent; ++i) {
-            stray += bits(got_kv[row * kLatent + i]) != kSentinel ? 1 : 0;
+        for (int i = 0; i < k::kKeyScaleBytes; ++i) {
+            stray += got_scales[row * k::kKeyScaleBytes + i] != kSentinelByte ? 1 : 0;
+        }
+        for (int i = 0; i < k::kLatentRowBytes; ++i) {
+            stray += got_kv[row * k::kLatentRowBytes + i] != kSentinelByte ? 1 : 0;
         }
     }
     report(keys.within(1e-3, 2.0) && plain.off == 0 && turned.within(1e-3, 2.0) && stray == 0,
@@ -870,8 +950,9 @@ void index_scores(const ScoreCase& c, std::mt19937& rng) {
     const int rows  = most + 5; // the keys a sequence's cache holds
     const int width = chunk ? std::max(1, most) : rows;
     const int words = ((width + block - 1) / block + 31) / 32;
-    const auto keys = random_bf16(std::size_t(seqs) * rows * kIndex, 1.0f, rng);
-    const auto q    = random_bf16(std::size_t(t) * kIndexHeads * kIndex, 1.0f, rng);
+    const auto key_codes  = random_key_codes(std::size_t(seqs) * rows, rng);
+    const auto key_scales = random_key_scales(std::size_t(seqs) * rows, rng);
+    const auto q          = random_bf16(std::size_t(t) * kIndexHeads * kIndex, 1.0f, rng);
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<float> weights(std::size_t(t) * kIndexHeads),
         out(std::size_t(t) * width, std::numeric_limits<float>::quiet_NaN());
@@ -879,9 +960,9 @@ void index_scores(const ScoreCase& c, std::mt19937& rng) {
     std::vector<std::uint32_t> candidates(std::size_t(t) * words);
     for (auto& v : candidates) { v = std::uint32_t(rng()); }
     const float weight_scale = 1.0f / std::sqrt(float(kIndex)) / std::sqrt(float(kIndexHeads));
-    DeviceBuffer dq = upload(q), dw = upload(weights), dk = upload(keys),
-                 dp = upload(ints(c.positions)), dseq = upload(ints(c.sequences)),
-                 dc = upload(candidates), dout = upload(out);
+    DeviceBuffer dq = upload(q), dw = upload(weights), dk = upload(key_codes),
+                 dks = upload(key_scales), dp = upload(ints(c.positions)),
+                 dseq = upload(ints(c.sequences)), dc = upload(candidates), dout = upload(out);
     k::ScoreArgs a;
     a.q              = as<bf16>(dq);
     a.weights        = as<float>(dw);
@@ -894,8 +975,10 @@ void index_scores(const ScoreCase& c, std::mt19937& rng) {
     a.positions      = as<std::int32_t>(dp);
     a.sequences      = chunk ? nullptr : as<std::int32_t>(dseq);
     a.sequence       = c.sequence;
-    a.keys           = as<bf16>(dk);
-    a.key_seq_stride = std::int64_t(rows) * kIndex;
+    a.keys                 = as<std::uint8_t>(dk);
+    a.key_seq_stride       = std::int64_t(rows) * k::kKeyRowBytes;
+    a.key_scales           = as<std::uint8_t>(dks);
+    a.key_scale_seq_stride = std::int64_t(rows) * k::kKeyScaleBytes;
     if (c.candidates) {
         a.candidates      = as<std::uint32_t>(dc);
         a.candidate_words = words;
@@ -922,13 +1005,15 @@ void index_scores(const ScoreCase& c, std::mt19937& rng) {
                 ++masked;
                 continue;
             }
-            const bf16* kr = keys.data() + (std::size_t(s) * rows + j) * kIndex;
+            const std::size_t key_row = std::size_t(s) * rows + j;
+            const auto kr = key_values(key_codes.data() + key_row * k::kKeyRowBytes,
+                                       key_scales.data() + key_row * k::kKeyScaleBytes);
             double want = 0.0, bound = 0.0;
             for (int h = 0; h < kIndexHeads; ++h) {
                 const bf16* qh = q.data() + (std::size_t(r) * kIndexHeads + h) * kIndex;
                 double d = 0.0, magnitude = 0.0;
                 for (int i = 0; i < kIndex; ++i) {
-                    const double p = double(val(qh[i])) * val(kr[i]);
+                    const double p = double(val(qh[i])) * kr[std::size_t(i)];
                     d += p;
                     magnitude += std::fabs(p);
                 }
@@ -1115,13 +1200,14 @@ void listed_index(const std::string& name, const std::vector<int>& positions,
         order.push_back(own - 1);
         for (const int b : order) { mask[std::size_t(r) * words + b / 32] |= 1U << (b % 32); }
     }
-    const auto keys = random_bf16(std::size_t(seqs) * rows * kIndex, 1.0f, rng);
-    const auto q    = random_bf16(std::size_t(t) * kIndexHeads * kIndex, 1.0f, rng);
+    const auto key_codes  = random_key_codes(std::size_t(seqs) * rows, rng);
+    const auto key_scales = random_key_scales(std::size_t(seqs) * rows, rng);
+    const auto q          = random_bf16(std::size_t(t) * kIndexHeads * kIndex, 1.0f, rng);
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<float> weights(std::size_t(t) * kIndexHeads);
     for (auto& v : weights) { v = normal(rng); }
-    DeviceBuffer dq = upload(q), dw = upload(weights), dk = upload(keys),
-                 dp = upload(ints(positions)), dseq = upload(ints(sequences)), dm = upload(mask),
+    DeviceBuffer dq = upload(q), dw = upload(weights), dk = upload(key_codes),
+                 dks = upload(key_scales), dp = upload(ints(positions)), dseq = upload(ints(sequences)), dm = upload(mask),
                  dlist(std::size_t(groups) * capacity * 4), dcounts(std::size_t(groups) * 4),
                  whole(std::size_t(t) * width * 4), listed(std::size_t(t) * capacity * block * 4),
                  top_whole(std::size_t(t) * 512 * 4), top_listed(std::size_t(t) * 512 * 4);
@@ -1158,8 +1244,10 @@ void listed_index(const std::string& name, const std::vector<int>& positions,
     a.group           = group;
     a.positions       = as<std::int32_t>(dp);
     a.sequences       = chunk ? nullptr : as<std::int32_t>(dseq);
-    a.keys            = as<bf16>(dk);
-    a.key_seq_stride  = std::int64_t(rows) * kIndex;
+    a.keys                 = as<std::uint8_t>(dk);
+    a.key_seq_stride       = std::int64_t(rows) * k::kKeyRowBytes;
+    a.key_scales           = as<std::uint8_t>(dks);
+    a.key_scale_seq_stride = std::int64_t(rows) * k::kKeyScaleBytes;
     a.candidates      = as<std::uint32_t>(dm);
     a.candidate_words = words;
     a.block           = block;
@@ -1228,8 +1316,8 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     const int rings       = chunk ? 1 : seqs;
     const int rows        = *std::max_element(c.positions.begin(), c.positions.end()) / c.ratio + 3;
     const auto q          = random_bf16(std::size_t(t) * kHeads * kLatent, 2.0f, rng);
-    const auto window     = random_bf16(std::size_t(rings) * c.ring * kLatent, 1.0f, rng);
-    const auto compressed = random_bf16(std::size_t(seqs) * rows * kLatent, 1.0f, rng);
+    const auto window     = random_window_rows(std::size_t(rings) * c.ring, rng);
+    const auto compressed = random_latent_rows(std::size_t(seqs) * rows, rng);
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<float> sinks(kHeads);
     for (auto& v : sinks) { v = 2.0f * normal(rng) + c.sink_offset; }
@@ -1258,13 +1346,13 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
     a.positions             = as<std::int32_t>(dp);
     a.sequences             = chunk ? nullptr : as<std::int32_t>(dseq);
     a.sequence              = c.sequence;
-    a.window                = as<bf16>(dw);
-    a.window_seq_stride     = chunk ? 0 : std::int64_t(c.ring) * kLatent;
+    a.window                = as<std::uint8_t>(dw);
+    a.window_seq_stride     = chunk ? 0 : std::int64_t(c.ring) * k::kWindowRowBytes;
     a.ring                  = c.ring;
     a.window_size           = c.window;
     a.window_floor          = c.floor;
-    a.compressed            = c.topk > 0 ? as<bf16>(dc) : nullptr;
-    a.compressed_seq_stride = std::int64_t(rows) * kLatent;
+    a.compressed            = c.topk > 0 ? as<std::uint8_t>(dc) : nullptr;
+    a.compressed_seq_stride = std::int64_t(rows) * k::kLatentRowBytes;
     a.topk                  = as<std::int32_t>(dt);
     a.k                     = c.topk;
     a.sinks                 = as<float>(ds);
@@ -1280,16 +1368,17 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
         const int p  = c.positions[std::size_t(r)];
         const int s  = chunk ? c.sequence : c.sequences[std::size_t(r)];
         const int lo = std::max(std::max(0, std::min(c.floor, p)), p - c.window + 1);
-        std::vector<const bf16*> keys;
+        std::vector<std::vector<float>> keys;
         for (int j = lo; j <= p; ++j) {
-            keys.push_back(window.data() +
-                           (std::size_t(chunk ? 0 : s) * c.ring + std::size_t(j % c.ring)) *
-                               kLatent);
+            keys.push_back(window_values(
+                window.data() + (std::size_t(chunk ? 0 : s) * c.ring + std::size_t(j % c.ring)) *
+                                    k::kWindowRowBytes));
         }
         for (int i = 0; i < c.topk; ++i) {
             const int j = topk[std::size_t(r) * kk + i];
             if (j >= 0) {
-                keys.push_back(compressed.data() + (std::size_t(s) * rows + j) * kLatent);
+                keys.push_back(latent_values(compressed.data() +
+                                             (std::size_t(s) * rows + j) * k::kLatentRowBytes));
             }
         }
         for (int h = 0; h < kHeads; ++h) {
@@ -1298,7 +1387,7 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
             double m = sinks[std::size_t(h)];
             for (std::size_t j = 0; j < keys.size(); ++j) {
                 double d = 0.0;
-                for (int i = 0; i < kLatent; ++i) { d += double(val(qh[i])) * val(keys[j][i]); }
+                for (int i = 0; i < kLatent; ++i) { d += double(val(qh[i])) * keys[j][std::size_t(i)]; }
                 e[j] = d * scale;
                 m    = std::max(m, e[j]);
             }
@@ -1309,7 +1398,7 @@ void sparse_attention(const AttentionCase& c, std::mt19937& rng) {
             }
             for (int i = 0; i < kLatent; ++i) {
                 double o = 0.0;
-                for (std::size_t j = 0; j < keys.size(); ++j) { o += e[j] * val(keys[j][i]); }
+                for (std::size_t j = 0; j < keys.size(); ++j) { o += e[j] * keys[j][std::size_t(i)]; }
                 o /= l;
                 const double err =
                     double(val(got[(std::size_t(r) * kHeads + h) * kLatent + i])) - o;
@@ -1923,33 +2012,31 @@ void column_guard(std::mt19937& rng) {
 }
 
 void copies(std::mt19937& rng) {
-    constexpr int small = 256, large = 768;
-    const auto src = random_bf16(std::size_t(small) * kLatent, 1.0f, rng);
-    std::vector<bf16> dst(std::size_t(large) * kLatent, sentinel());
+    constexpr int small = 256, large = 768, row = k::kWindowRowBytes;
+    const auto src = random_window_rows(small, rng);
+    std::vector<std::uint8_t> dst(std::size_t(large) * row, kSentinelByte);
     DeviceBuffer ds = upload(src), dd = upload(dst),
-                 back = upload(std::vector<bf16>(src.size(), sentinel()));
-    k::ring_copy(as<bf16>(ds), small, as<bf16>(dd), large, 700, 1000, nullptr);
-    k::ring_copy(as<bf16>(dd), large, as<bf16>(back), small, 872, 1000, nullptr);
+                 back = upload(std::vector<std::uint8_t>(src.size(), kSentinelByte));
+    k::ring_copy(as<std::uint8_t>(ds), small, as<std::uint8_t>(dd), large, 700, 1000, nullptr);
+    k::ring_copy(as<std::uint8_t>(dd), large, as<std::uint8_t>(back), small, 872, 1000, nullptr);
     sync("ring_copy");
-    const auto got      = download<bf16>(dd, dst.size());
-    const auto got_back = download<bf16>(back, src.size());
+    const auto got      = download<std::uint8_t>(dd, dst.size());
+    const auto got_back = download<std::uint8_t>(back, src.size());
     std::size_t wrong   = 0;
     for (int slot = 0; slot < large; ++slot) {
         int p = -1;
         for (int q = 700; q < 1000; ++q) { p = q % large == slot ? q : p; }
-        for (int i = 0; i < kLatent; ++i) {
-            const std::uint16_t want =
-                p < 0 ? kSentinel : bits(src[std::size_t(p % small) * kLatent + i]);
-            wrong += bits(got[std::size_t(slot) * kLatent + i]) != want ? 1 : 0;
+        for (int i = 0; i < row; ++i) {
+            const std::uint8_t want = p < 0 ? kSentinelByte : src[std::size_t(p % small) * row + i];
+            wrong += got[std::size_t(slot) * row + i] != want ? 1 : 0;
         }
     }
     for (int slot = 0; slot < small; ++slot) {
         int p = -1;
         for (int q = 872; q < 1000; ++q) { p = q % small == slot ? q : p; }
-        for (int i = 0; i < kLatent; ++i) {
-            const std::uint16_t want =
-                p < 0 ? kSentinel : bits(src[std::size_t(p % small) * kLatent + i]);
-            wrong += bits(got_back[std::size_t(slot) * kLatent + i]) != want ? 1 : 0;
+        for (int i = 0; i < row; ++i) {
+            const std::uint8_t want = p < 0 ? kSentinelByte : src[std::size_t(p % small) * row + i];
+            wrong += got_back[std::size_t(slot) * row + i] != want ? 1 : 0;
         }
     }
     report(wrong == 0,

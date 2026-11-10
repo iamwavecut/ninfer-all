@@ -127,29 +127,119 @@ __device__ __forceinline__ float pow2_ceil(float x) {
     return __uint_as_float(unsigned(e + 127) << 23);
 }
 
-// fp8 (E4M3, ue8m0 scale) of a 32-value group held by 8 aligned lanes, four values each.
-__device__ __forceinline__ float4 fp8_group(float4 v) {
+// fp8 (E4M3, ue8m0 scale) of a 32-value group held by 8 aligned lanes, four values each: the
+// rounded codes' values in `r` and the group's scale in `s`; the result is r * s.
+__device__ __forceinline__ float4 fp8_group(float4 v, float4& r, float& s) {
     const float amax = group_max<8>(amax4(v));
-    const float s    = pow2_ceil(fmaxf(amax, 1e-4f) * (1.0f / 448.0f));
-    const auto q = [s](float x) { return round_e4m3(fminf(fmaxf(x / s, -448.0f), 448.0f)) * s; };
-    return make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    s                = pow2_ceil(fmaxf(amax, 1e-4f) * (1.0f / 448.0f));
+    const float d    = s;
+    const auto q = [d](float x) { return round_e4m3(fminf(fmaxf(x / d, -448.0f), 448.0f)); };
+    r = make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    return make_float4(r.x * s, r.y * s, r.z * s, r.w * s);
+}
+__device__ __forceinline__ float4 fp8_group(float4 v) {
+    float4 r;
+    float s;
+    return fp8_group(v, r, s);
 }
 
 // fp4 (E2M1, E8M0 scale) of a 32-value group held by 8 aligned lanes.
-__device__ __forceinline__ float4 fp4_e8m0_group(float4 v) {
+__device__ __forceinline__ float4 fp4_e8m0_group(float4 v, float4& r, float& s) {
     const float amax = group_max<8>(amax4(v));
-    const float s    = pow2_ceil(fmaxf(amax, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
-    const auto q = [s](float x) { return round_e2m1(fminf(fmaxf(x / s, -6.0f), 6.0f)) * s; };
-    return make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    s                = pow2_ceil(fmaxf(amax, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
+    const float d    = s;
+    const auto q = [d](float x) { return round_e2m1(fminf(fmaxf(x / d, -6.0f), 6.0f)); };
+    r = make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    return make_float4(r.x * s, r.y * s, r.z * s, r.w * s);
+}
+__device__ __forceinline__ float4 fp4_e8m0_group(float4 v) {
+    float4 r;
+    float s;
+    return fp4_e8m0_group(v, r, s);
 }
 
 // fp4 (E2M1, E4M3 scale) of a 16-value group held by 4 aligned lanes.
-__device__ __forceinline__ float4 fp4_e4m3_group(float4 v) {
+__device__ __forceinline__ float4 fp4_e4m3_group(float4 v, float4& r, float& s) {
     const float amax = group_max<4>(amax4(v));
-    const float s =
-        round_e4m3(fminf(fmaxf(amax, 6.0f * 0.001953125f) / 6.0f, 448.0f));
-    const auto q = [s](float x) { return round_e2m1(fminf(fmaxf(x / s, -6.0f), 6.0f)) * s; };
-    return make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    s = round_e4m3(fminf(fmaxf(amax, 6.0f * 0.001953125f) / 6.0f, 448.0f));
+    const float d = s;
+    const auto q = [d](float x) { return round_e2m1(fminf(fmaxf(x / d, -6.0f), 6.0f)); };
+    r = make_float4(q(v.x), q(v.y), q(v.z), q(v.w));
+    return make_float4(r.x * s, r.y * s, r.z * s, r.w * s);
+}
+
+// ---- Packed caches ------------------------------------------------------------------------------
+// The caches keep the codes of the roundings above and their scales; a value is its code's value
+// times its group's scale, exactly the BF16 value the rounding gave (an E4M3 or E2M1 value times a
+// power of two, or an E2M1 value times an E4M3 scale, has at most six significant bits).
+
+// The E4M3 code of an E4M3 value (|r| <= 448), the sign kept for zeros.
+__device__ __forceinline__ unsigned e4m3_code(float r) {
+    const unsigned bits = __float_as_uint(r);
+    const unsigned sign = (bits >> 24) & 0x80u;
+    const float a       = fabsf(r);
+    if (a < 0.015625f) { return sign | unsigned(a * 512.0f); } // subnormal: m * 2^-9
+    const unsigned e = ((bits >> 23) & 0xFFu) - 127u + 7u;
+    return sign | (e << 3) | ((bits >> 20) & 7u);
+}
+__device__ __forceinline__ float e4m3_value(unsigned c) {
+    const unsigned e = (c >> 3) & 15u, m = c & 7u;
+    const float a    = e == 0 ? float(m) * 0.001953125f
+                              : __uint_as_float(((e - 7u + 127u) << 23) | (m << 20));
+    return (c & 0x80u) != 0 ? -a : a;
+}
+
+// The E2M1 code of an E2M1 value (|r| <= 6).
+__device__ __forceinline__ unsigned e2m1_code(float r) {
+    const unsigned bits = __float_as_uint(r);
+    const unsigned sign = (bits >> 28) & 8u;
+    const float a       = fabsf(r);
+    if (a < 1.0f) { return sign | (a == 0.5f ? 1u : 0u); }
+    const unsigned e = ((bits >> 23) & 0xFFu) - 127u + 1u;
+    return sign | (e << 1) | ((bits >> 22) & 1u);
+}
+__device__ __forceinline__ float e2m1_value(unsigned n) {
+    const unsigned e = (n >> 1) & 3u, m = n & 1u;
+    const float a = e == 0 ? (m != 0 ? 0.5f : 0.0f) : __uint_as_float(((e - 1u + 127u) << 23) | (m << 22));
+    return (n & 8u) != 0 ? -a : a;
+}
+
+// A power-of-two scale as its E8M0 code (the float's exponent field) and back.
+__device__ __forceinline__ unsigned e8m0_code(float s) { return __float_as_uint(s) >> 23; }
+__device__ __forceinline__ float e8m0_value(unsigned c) { return __uint_as_float(c << 23); }
+
+__device__ __forceinline__ unsigned e4m3_codes4(float4 r) {
+    return e4m3_code(r.x) | (e4m3_code(r.y) << 8) | (e4m3_code(r.z) << 16) | (e4m3_code(r.w) << 24);
+}
+__device__ __forceinline__ unsigned e2m1_codes4(float4 r) {
+    return e2m1_code(r.x) | (e2m1_code(r.y) << 4) | (e2m1_code(r.z) << 8) | (e2m1_code(r.w) << 12);
+}
+
+// Eight BF16 values of E4M3 codes (two words, value 0 in the low byte) times scale s.
+__device__ __forceinline__ uint4 e4m3_bf16x8(uint2 codes, float s) {
+    uint4 out;
+    unsigned* w = &out.x;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const unsigned word = i < 2 ? codes.x : codes.y;
+        const int shift     = (i & 1) * 16;
+        const __nv_bfloat162 pair = __floats2bfloat162_rn(e4m3_value((word >> shift) & 0xFFu) * s,
+                                                          e4m3_value((word >> (shift + 8)) & 0xFFu) * s);
+        w[i] = *reinterpret_cast<const unsigned*>(&pair);
+    }
+    return out;
+}
+// Eight BF16 values of E2M1 codes (one word, value 0 in the low nibble) times scale s.
+__device__ __forceinline__ uint4 e2m1_bf16x8(unsigned codes, float s) {
+    uint4 out;
+    unsigned* w = &out.x;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const __nv_bfloat162 pair = __floats2bfloat162_rn(e2m1_value((codes >> (8 * i)) & 15u) * s,
+                                                          e2m1_value((codes >> (8 * i + 4)) & 15u) * s);
+        w[i] = *reinterpret_cast<const unsigned*>(&pair);
+    }
+    return out;
 }
 
 // The rotation of four values at offset `at` (a multiple of 4) of a row whose last kRope values of
@@ -457,10 +547,14 @@ __global__ void kv_post_kernel(KvPostArgs a) {
     const int at  = 4 * threadIdx.x;
     float4 v      = latent_norm(ld4(a.kv + t * a.kv_stride + at), a.norm, a.eps);
     v             = bf16r4(rope4(v, at, kLatent, float(a.positions[t]), a.freq, false));
-    v             = fp8_group(v);
+    float4 r;
+    float s;
+    (void)fp8_group(v, r, s);
     const int seq = a.sequences != nullptr ? a.sequences[t] : a.sequence;
     const int pos = a.slots != nullptr ? a.slots[t] : a.positions[t];
-    st_bf16x4(a.cache + seq * a.seq_stride + std::int64_t(pos % a.ring) * kLatent + at, v);
+    std::uint8_t* row = a.cache + seq * a.seq_stride + std::int64_t(pos % a.ring) * kWindowRowBytes;
+    *reinterpret_cast<unsigned*>(row + at) = e4m3_codes4(r);
+    if ((at & 31) == 0) { row[kLatent + at / 32] = std::uint8_t(e8m0_code(s)); }
 }
 
 __device__ __forceinline__ float4 load4(const float* p) { return ld4(p); }
@@ -544,13 +638,25 @@ __global__ void latent_post_kernel(LatentArgs a) {
         const float4 wv = ld4(a.key_norm + at);
         k = bf16r4(make_float4(k.x * inv * wv.x, k.y * inv * wv.y, k.z * inv * wv.z, k.w * inv * wv.w));
         k = bf16r4(rope4(k, at, kIndex, g, a.freq, false));
-        k = fp4_e8m0_group(k);
-        st_bf16x4(a.index_cache + seq * a.index_seq_stride + std::int64_t(j) * kIndex + at, k);
+        float4 r;
+        float s;
+        (void)fp4_e8m0_group(k, r, s);
+        *reinterpret_cast<std::uint16_t*>(a.index_cache + seq * a.index_seq_stride +
+                                          std::int64_t(j) * kKeyRowBytes + at / 2) =
+            std::uint16_t(e2m1_codes4(r));
+        if ((at & 31) == 0) {
+            a.index_scales[seq * a.index_scale_seq_stride + std::int64_t(j) * kKeyScaleBytes + at / 32] =
+                std::uint8_t(e8m0_code(s));
+        }
     }
     float4 v = ld4(a.latent + std::int64_t(t) * kLatent + at);
     v        = bf16r4(rope4(v, at, kLatent, g, a.freq, false));
-    v        = fp4_e4m3_group(v);
-    st_bf16x4(a.kv_cache + seq * a.kv_seq_stride + std::int64_t(j) * kLatent + at, v);
+    float4 r;
+    float s;
+    (void)fp4_e4m3_group(v, r, s);
+    std::uint8_t* row = a.kv_cache + seq * a.kv_seq_stride + std::int64_t(j) * kLatentRowBytes;
+    *reinterpret_cast<std::uint16_t*>(row + at / 2) = std::uint16_t(e2m1_codes4(r));
+    if ((at & 15) == 0) { row[kLatent / 2 + at / 16] = std::uint8_t(e4m3_code(s)); }
 }
 
 // ---- Indexer ------------------------------------------------------------------------------------
@@ -612,14 +718,22 @@ __global__ void __launch_bounds__(kScoreKeys) index_scores_kernel(ScoreArgs a) {
     __nv_bfloat162 k[kIndex / 2];
     {
         const auto* src = reinterpret_cast<const uint4*>(a.keys + seq * a.key_seq_stride +
-                                                         std::int64_t(j) * kIndex);
+                                                         std::int64_t(j) * kKeyRowBytes);
+        const unsigned scales = *reinterpret_cast<const unsigned*>(
+            a.key_scales + seq * a.key_scale_seq_stride + std::int64_t(j) * kKeyScaleBytes);
 #pragma unroll
-        for (int i = 0; i < kIndex / 8; ++i) {
+        for (int i = 0; i < kIndex / 32; ++i) {
             const uint4 w = src[i];
-            k[4 * i]     = *reinterpret_cast<const __nv_bfloat162*>(&w.x);
-            k[4 * i + 1] = *reinterpret_cast<const __nv_bfloat162*>(&w.y);
-            k[4 * i + 2] = *reinterpret_cast<const __nv_bfloat162*>(&w.z);
-            k[4 * i + 3] = *reinterpret_cast<const __nv_bfloat162*>(&w.w);
+            const float s = e8m0_value((scales >> (8 * i)) & 0xFFu);
+            const unsigned words[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint4 v = e2m1_bf16x8(words[q], s);
+                k[16 * i + 4 * q]     = *reinterpret_cast<const __nv_bfloat162*>(&v.x);
+                k[16 * i + 4 * q + 1] = *reinterpret_cast<const __nv_bfloat162*>(&v.y);
+                k[16 * i + 4 * q + 2] = *reinterpret_cast<const __nv_bfloat162*>(&v.z);
+                k[16 * i + 4 * q + 3] = *reinterpret_cast<const __nv_bfloat162*>(&v.w);
+            }
         }
     }
 #pragma unroll
@@ -915,8 +1029,8 @@ __global__ void __launch_bounds__(kAttnThreads) sparse_attention_kernel(Attentio
     const int chunk = ((n + active - 1) / active + kTile - 1) / kTile * kTile;
     const int lo = split * chunk, hi = min(n, lo + chunk);
     const int seq = a.sequences != nullptr ? a.sequences[t] : a.sequence;
-    const __nv_bfloat16* window     = a.window + seq * a.window_seq_stride;
-    const __nv_bfloat16* compressed = a.compressed != nullptr ? a.compressed + seq * a.compressed_seq_stride : nullptr;
+    const std::uint8_t* window     = a.window + seq * a.window_seq_stride;
+    const std::uint8_t* compressed = a.compressed != nullptr ? a.compressed + seq * a.compressed_seq_stride : nullptr;
 
     const int head0 = group * kAttnHeads + 2 * warp;
     float q[2][16], acc[2][16];
@@ -936,19 +1050,39 @@ __global__ void __launch_bounds__(kAttnThreads) sparse_attention_kernel(Attentio
     }
     float mx[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
 
-    // Each thread moves four 16-byte words of a tile: row r = threadIdx.x / 16, words c + 16 i.
+    // Each thread moves four 16-byte words (eight values each) of a tile: row r = threadIdx.x /
+    // 16, words c + 16 i. It loads their codes and scales (a window row's E4M3 codes and E8M0
+    // scales, a compressed row's E2M1 codes and E4M3 scales) and stores their BF16 values.
     constexpr int kWords = kLatent / 8;
     const int r = threadIdx.x / 16, c = threadIdx.x % 16;
-    uint4 next[4];
+    uint2 next[4];
+    unsigned next_scales = 0;
+    int next_kind        = 0; // 0: no row, 1: a window row, 2: a compressed row
     const auto fetch = [&](int tile, int count) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) { next[i] = make_uint4(0, 0, 0, 0); }
+        next_kind = 0;
         if (r < count) {
             const int key = keys[tile + r];
-            const __nv_bfloat16* row = key >= 0 ? window + std::int64_t(key) * kLatent
-                                                : compressed + std::int64_t(-1 - key) * kLatent;
+            if (key >= 0) {
+                const std::uint8_t* row = window + std::int64_t(key) * kWindowRowBytes;
+                next_scales             = 0;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) { next[i] = reinterpret_cast<const uint4*>(row)[c + 16 * i]; }
+                for (int i = 0; i < 4; ++i) {
+                    const int w = c + 16 * i;
+                    next[i]     = *reinterpret_cast<const uint2*>(row + 8 * w);
+                    next_scales |= unsigned(row[kLatent + w / 4]) << (8 * i);
+                }
+                next_kind = 1;
+            } else {
+                const std::uint8_t* row = compressed + std::int64_t(-1 - key) * kLatentRowBytes;
+                next_scales             = 0;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int w = c + 16 * i;
+                    next[i].x   = *reinterpret_cast<const unsigned*>(row + 4 * w);
+                    next_scales |= unsigned(row[kLatent / 2 + w / 2]) << (8 * i);
+                }
+                next_kind = 2;
+            }
         }
     };
     const int lane_key = ((lane & 16) ? 8 : 0) + ((lane & 8) ? 4 : 0) + ((lane & 4) ? 2 : 0) +
@@ -957,7 +1091,13 @@ __global__ void __launch_bounds__(kAttnThreads) sparse_attention_kernel(Attentio
     for (int tile = lo; tile < hi; tile += kTile) {
         const int count = min(kTile, hi - tile);
 #pragma unroll
-        for (int i = 0; i < 4; ++i) { reinterpret_cast<uint4*>(kv_s[r])[c + 16 * i] = next[i]; }
+        for (int i = 0; i < 4; ++i) {
+            const unsigned code = (next_scales >> (8 * i)) & 0xFFu;
+            reinterpret_cast<uint4*>(kv_s[r])[c + 16 * i] =
+                next_kind == 1   ? e4m3_bf16x8(next[i], e8m0_value(code))
+                : next_kind == 2 ? e2m1_bf16x8(next[i].x, e4m3_value(code))
+                                 : make_uint4(0, 0, 0, 0);
+        }
         static_assert(kTile * kWords == 4 * kAttnThreads, "four words per thread and tile");
         __syncthreads();
         if (tile + kTile < hi) { fetch(tile + kTile, min(kTile, hi - tile - kTile)); }
@@ -1255,12 +1395,12 @@ __global__ void unscale_columns_kernel(Out* __restrict__ out, std::int64_t strid
     for (int r = threadIdx.x; r < rows; r += blockDim.x) { scale_value(column[r], s); }
 }
 
-// Block per position, 64 threads: one 16-byte word each.
-__global__ void ring_copy_kernel(const __nv_bfloat16* __restrict__ src, int src_ring,
-                                 __nv_bfloat16* __restrict__ dst, int dst_ring, int begin) {
+// Block per position, one 16-byte word of the packed row per thread.
+__global__ void ring_copy_kernel(const std::uint8_t* __restrict__ src, int src_ring,
+                                 std::uint8_t* __restrict__ dst, int dst_ring, int begin) {
     const int p = begin + blockIdx.x;
-    reinterpret_cast<uint4*>(dst + std::int64_t(p % dst_ring) * kLatent)[threadIdx.x] =
-        reinterpret_cast<const uint4*>(src + std::int64_t(p % src_ring) * kLatent)[threadIdx.x];
+    reinterpret_cast<uint4*>(dst + std::int64_t(p % dst_ring) * kWindowRowBytes)[threadIdx.x] =
+        reinterpret_cast<const uint4*>(src + std::int64_t(p % src_ring) * kWindowRowBytes)[threadIdx.x];
 }
 
 __global__ void f32_to_bf16_kernel(const float* in, __nv_bfloat16* out, std::int64_t n) {
@@ -1685,10 +1825,11 @@ void unscale_columns(__nv_bfloat16* out, std::int64_t out_stride, int out_rows, 
     check_launch("unscale_columns");
 }
 
-void ring_copy(const __nv_bfloat16* src, int src_ring, __nv_bfloat16* dst, int dst_ring, int begin,
+void ring_copy(const std::uint8_t* src, int src_ring, std::uint8_t* dst, int dst_ring, int begin,
                int end, cudaStream_t stream) {
     if (end <= begin) { return; }
-    ring_copy_kernel<<<end - begin, kLatent / 8, 0, stream>>>(src, src_ring, dst, dst_ring, begin);
+    static_assert(kWindowRowBytes % 16 == 0, "whole 16-byte words per window row");
+    ring_copy_kernel<<<end - begin, kWindowRowBytes / 16, 0, stream>>>(src, src_ring, dst, dst_ring, begin);
     check_launch("ring_copy");
 }
 
