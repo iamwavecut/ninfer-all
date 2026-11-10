@@ -2,9 +2,11 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "models/deepseek_v41/dspark_ranking.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/load/bindings.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <stdexcept>
@@ -219,22 +221,30 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     };
     // An STQ matrix of k inputs and n outputs, tiles of `words` words; `count` > 0 leads a set.
     const auto stq = [&](const std::string& name, std::uint64_t k, std::uint64_t n,
-                         std::uint64_t words, std::uint64_t count = 0) {
+                         std::uint64_t words, std::uint64_t count = 0,
+                         artifact::Residency residency = artifact::Residency::Device) {
         artifact::Shape tiles{k / 16, n / 16, words}, in{k}, out{n};
         if (count != 0) {
             for (artifact::Shape* shape : {&tiles, &in, &out}) { shape->insert(shape->begin(), count); }
         }
-        return StqWeights{b.direct(name + "/trellis", std::move(tiles), QType::UINT16),
-                          b.direct(name + "/suh", std::move(in), QType::FP16),
-                          b.direct(name + "/svh", std::move(out), QType::FP16)};
+        return StqWeights{b.direct(name + "/trellis", std::move(tiles), QType::UINT16, residency),
+                          b.direct(name + "/suh", std::move(in), QType::FP16, residency),
+                          b.direct(name + "/svh", std::move(out), QType::FP16, residency)};
     };
+    // `residency` Pinned: the drafter's experts that --draft-experts leaves on the host, of which
+    // the executor copies the kept ones to the device (with the zeros the kernels read past them).
     const auto resident_experts = [&](LayerWeights& layer, const std::string& p,
-                                      std::uint64_t experts) {
+                                      std::uint64_t experts,
+                                      artifact::Residency residency = artifact::Residency::Device) {
         const std::string m = p + "moe/";
-        layer.moe.gate_up = b.parameter(m + "gate_up", {experts * 2 * w, h}, {m + "input"});
-        layer.moe.down    = b.parameter(m + "down", {experts * h, w}, {m + "product"});
-        tail(b, *layer.moe.down);
-        tail(b, *layer.moe.gate_up);
+        layer.moe.gate_up = b.parameter(m + "gate_up", {experts * 2 * w, h}, {m + "input"}, {},
+                                        residency);
+        layer.moe.down    = b.parameter(m + "down", {experts * h, w}, {m + "product"}, {},
+                                        residency);
+        if (residency == artifact::Residency::Device) {
+            tail(b, *layer.moe.down);
+            tail(b, *layer.moe.gate_up);
+        }
     };
     for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
         const std::string p = "text/layers/" + std::to_string(i) + "/";
@@ -287,6 +297,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     }
     std::optional<DSparkConfig> dspark_config;
     std::optional<DSparkWeights> dspark;
+    std::vector<std::vector<std::int32_t>> dspark_kept;
     if (options.dspark) {
         if (!has_dspark(reader)) {
             throw artifact::ArtifactError("the artifact carries no DSpark drafter (convert with "
@@ -310,6 +321,31 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         drafter.markov_head      = b.direct("dspark/markov_head", {config.vocab_size, rank});
         drafter.confidence       = b.direct("dspark/confidence", {h + rank}, QType::FP32);
         const std::uint64_t de   = dspark_config->experts;
+        // Measured with the STQ drafter only (docs/deepseek-v41.md#the-drafters-experts).
+        const std::uint32_t keep =
+            options.draft_experts.value_or(
+                stq_drafter && options.experts != ExpertResidency::Device ? kDefaultDraftExperts : 0U);
+        if (keep != 0 && keep < de) {
+            if (dspark_config->layers != kDSparkExpertRanking.size() ||
+                de != kDSparkExpertRanking[0].size()) {
+                throw artifact::ArtifactError(
+                    "--draft-experts: the expert ranking describes a drafter of 3 blocks of 128 "
+                    "experts");
+            }
+            if (keep < dspark_config->top_k) {
+                throw std::invalid_argument("--draft-experts must keep at least the " +
+                                            std::to_string(dspark_config->top_k) +
+                                            " experts a row routes to");
+            }
+            for (const auto& ranking : kDSparkExpertRanking) {
+                std::vector<std::int32_t> kept(ranking.begin(),
+                                               ranking.begin() + keep);
+                std::sort(kept.begin(), kept.end());
+                dspark_kept.push_back(std::move(kept));
+            }
+        }
+        const auto experts_residency =
+            dspark_kept.empty() ? artifact::Residency::Device : artifact::Residency::Pinned;
         for (std::uint32_t i = 0; i < dspark_config->layers; ++i) {
             const std::string p = "dspark/layers/" + std::to_string(i) + "/";
             LayerWeights layer  = block(p, de, !stq_drafter);
@@ -324,12 +360,12 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                 s.shared_gate = stq(m + "shared_gate", h, w, kTrunkWords);
                 s.shared_up   = stq(m + "shared_up", h, w, kTrunkWords);
                 s.shared_down = stq(m + "shared_down", w, h, kTrunkWords);
-                s.gate        = stq(m + "gate", h, w, kExpertWords, de);
-                s.up          = stq(m + "up", h, w, kExpertWords, de);
-                s.down        = stq(m + "down", w, h, kExpertWords, de);
+                s.gate        = stq(m + "gate", h, w, kExpertWords, de, experts_residency);
+                s.up          = stq(m + "up", h, w, kExpertWords, de, experts_residency);
+                s.down        = stq(m + "down", w, h, kExpertWords, de, experts_residency);
                 drafter.stq_layers.push_back(s);
             } else {
-                resident_experts(layer, p, de);
+                resident_experts(layer, p, de, experts_residency);
             }
             drafter.layers.push_back(std::move(layer));
         }
@@ -408,6 +444,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     model->engram_token_map_ = std::move(token_map);
     model->dspark_config_    = std::move(dspark_config);
     model->dspark_           = std::move(dspark);
+    model->dspark_kept_      = std::move(dspark_kept);
     model->vision_config_    = std::move(vision_config);
     model->vision_           = std::move(vision_weights);
     model->vision_placement_ = options.vision;

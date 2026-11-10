@@ -75,6 +75,23 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "an invalid --prefill-stall-budget-ms was accepted");
     }
+    // The drafter's kept experts: the Engine's default unless set, DSpark only.
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).speculative.draft_experts,
+                      "--draft-experts must default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-experts",
+                             "32"}).speculative.draft_experts == 32U,
+                      "server did not preserve --draft-experts");
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--spec", "mtp", "--draft-tokens", "4", "--draft-experts", "64"},
+             {"--draft-experts", "64"}}) {
+        std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
+        full.insert(full.end(), args.begin(), args.end());
+        bool rejected = false;
+        try {
+            (void)parse(full);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an invalid --draft-experts was accepted");
+    }
     // DSpark's confidence floor: the drafter's default unless set, 0..1, DSpark only.
     failures += check(!parse({"ninfer-serve", "model.ninfer"}).speculative.draft_confidence,
                       "DSpark's floor must default");

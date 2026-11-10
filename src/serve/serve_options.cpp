@@ -404,6 +404,10 @@ std::string serve_usage_text(const char* argv0) {
            "                                chooses MTP, 0.7 when it chooses DFlash2)\n"
            "  --draft-confidence C          dspark: verify drafts while their confidence is\n"
            "                                at least C, 0..1 (default 0.5; 0 keeps every draft)\n"
+           "  --draft-experts N             dspark: each drafter block keeps its N most routed\n"
+           "                                experts on the GPU, 3..128 (0 keeps all; default 64\n"
+           "                                with the STQ drafter and host or disk experts,\n"
+           "                                else all)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
            "                                the artifact must store (the default when it does)\n"
            "  --full-draft-head             draft with the full output head even when the\n"
@@ -1227,6 +1231,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--draft-confidence") {
             options.speculative.draft_confidence =
                 parse_float_in(require_value("--draft-confidence"), "draft-confidence", 0.0F, 1.0F);
+            continue;
+        }
+        if (arg == "--draft-experts") {
+            options.speculative.draft_experts = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--draft-experts"), "draft-experts"));
             continue;
         }
         if (arg == "--ngram-draft-tokens") {

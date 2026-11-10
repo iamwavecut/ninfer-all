@@ -100,6 +100,22 @@ int run_tests() {
             failures += check(rejects([&] { (void)parse(args); }),
                               ("CLI accepted " + tail.front() + " beside --spec dspark").c_str());
         }
+        // The drafter's kept experts: the Engine's default unless set, DSpark only.
+        failures += check(!block.speculative.draft_experts, "--draft-experts must default");
+        for (const auto* kept : {"0", "64"}) {
+            const auto set = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                    "dspark", "--draft-experts", kept});
+            failures += check(set.speculative.draft_experts == std::stoul(kept),
+                              "CLI did not preserve --draft-experts");
+        }
+        for (const std::vector<std::string> tail :
+             {std::vector<std::string>{"--spec", "mtp", "--draft-tokens", "4", "--draft-experts", "64"},
+              {"--draft-experts", "64"}, {"--spec", "dspark", "--draft-experts", "-1"}}) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            failures += check(rejects([&] { (void)parse(args); }),
+                              "CLI accepted an invalid --draft-experts");
+        }
         // The confidence floor: the drafter's default unless set, 0..1, DSpark only.
         failures += check(!block.speculative.draft_confidence, "DSpark's floor must default");
         for (const auto* floor : {"0", "0.65", "1"}) {
