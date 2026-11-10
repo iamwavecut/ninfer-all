@@ -4,7 +4,14 @@ import numpy as np
 import pytest
 
 from tools.convert.sources import gguf as gguf_module
-from tools.convert.sources.gguf import TYPE_BF16, TYPE_F32, GGUFFile, write_gguf
+from tools.convert.sources.gguf import (
+    TYPE_BF16,
+    TYPE_F32,
+    GGUFFile,
+    GGUFSplit,
+    open_gguf,
+    write_gguf,
+)
 
 TYPE_Q8_0 = 8
 ROWS, ROW_BYTES = 40, 2 * 34
@@ -98,3 +105,63 @@ def test_a_truncated_data_section_is_refused_before_reading(tmp_path):
             gguf.read_blocks("q8")
         stored = _stored(path, gguf, "q8", 0, ROW_BYTES)
         assert np.array_equal(gguf.read_blocks("q8", 0, 1), stored.reshape(1, -1))
+
+
+def _split(tmp_path):
+    generator = np.random.default_rng(6)
+    blocks = generator.integers(0, 256, size=(ROWS, ROW_BYTES), dtype=np.uint8)
+    words = generator.integers(0, 2**16, size=(6, 8), dtype=np.uint16)
+    vector = generator.standard_normal(7).astype("<f4")
+    shards = [tmp_path / f"model-{i:05d}-of-00003.gguf" for i in (1, 2, 3)]
+    # llama.cpp's split of a large model: the first shard holds the metadata and no tensor.
+    write_gguf(shards[0], {"general.architecture": "test", "split.count": 3}, [])
+    write_gguf(shards[1], {"split.count": 3},
+               [("q8", (ROWS, 64), TYPE_Q8_0, blocks.tobytes()),
+                ("bf16", (6, 8), TYPE_BF16, words.astype("<u2").tobytes())])
+    write_gguf(shards[2], {"split.count": 3}, [("f32", (7,), TYPE_F32, vector.tobytes())])
+    return shards, blocks, words, vector
+
+
+def test_a_split_reads_each_tensor_from_the_shard_that_holds_it(tmp_path):
+    shards, blocks, words, vector = _split(tmp_path)
+    with open_gguf(shards[0]) as gguf:
+        assert isinstance(gguf, GGUFSplit)
+        assert gguf.kv["general.architecture"] == "test"
+        assert list(gguf.tensors) == ["q8", "bf16", "f32"]
+        assert not gguf.truncated()
+        assert np.array_equal(gguf.read_blocks("q8", 5, 9), blocks[5:9])
+        assert np.array_equal(gguf.read_rows("q8", np.array([31, 2, 2])), blocks[[31, 2, 2]])
+        assert np.array_equal(gguf.read_bf16_words("bf16", 2, 5), words[2:5])
+        assert np.array_equal(gguf.read_direct("f32"), vector)
+        with pytest.raises(KeyError, match="absent"):
+            gguf.tensor_bytes("other")
+    with pytest.raises(ValueError, match="closed"):
+        gguf.tensor_bytes("q8")
+    # Another shard is a file of its own, as a table shard named by its own source is.
+    with open_gguf(shards[2]) as last:
+        assert not isinstance(last, GGUFSplit) and list(last.tensors) == ["f32"]
+
+
+def test_a_split_opens_without_a_missing_shard_and_reports_a_cut_one(tmp_path):
+    shards, blocks, _, _ = _split(tmp_path)
+    shards[2].unlink()
+    with open_gguf(shards[0]) as gguf:
+        assert list(gguf.tensors) == ["q8", "bf16"]
+        assert np.array_equal(gguf.read_blocks("q8"), blocks)
+    data = shards[1].read_bytes()
+    shards[1].write_bytes(data[: len(data) - 16])
+    with open_gguf(shards[0]) as gguf:
+        assert gguf.truncated()
+
+
+def test_a_split_refuses_a_repeated_tensor_and_a_wrong_count(tmp_path):
+    shards, _, _, vector = _split(tmp_path)
+    write_gguf(shards[2], {"split.count": 3}, [("q8", (7,), TYPE_F32, vector.tobytes())])
+    with pytest.raises(ValueError, match="repeats"):
+        open_gguf(shards[0])
+    write_gguf(shards[0], {"general.architecture": "test", "split.count": 4}, [])
+    shards[2].unlink()
+    with pytest.raises(ValueError, match="split.count"):
+        open_gguf(shards[0])
+    with pytest.raises(ValueError, match="first shard"):
+        GGUFSplit(shards[1])

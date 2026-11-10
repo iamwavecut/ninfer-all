@@ -15,8 +15,11 @@ stored ``1 + w`` (every norm but ``ssm_norm``), ``ssm_a`` becomes ``A_log`` agai
 interleaved ``attn_q`` splits into query and gate rows, and the indexer's split projections and the
 squeezed PLE convolution keep the layout the HF adapter (qwen4_exp.py) declares.
 
-The first shard of a release holds the model; the second holds only ``per_layer_token_embd``, the
-n-gram table, which every release shares byte for byte. The MTP block comes from an MTP GGUF of its
+The first shard of a GSQ-RCO release holds the model; the second holds only
+``per_layer_token_embd``, the n-gram table, which every release shares byte for byte. A llama.cpp
+split (Unsloth's releases: the metadata in the first shard, the tensors in the next ones, the table
+in the last) is read as one file from its first shard (``GGUFSplit``), and its last shard is the
+``ngram`` source. The MTP block comes from an MTP GGUF of its
 own (Unsloth's ``MTP/`` folder), block 48 with ``nextn.*`` tensors and no embedding or head. The recipe imports it row for row as the
 ``ngram`` component's table, into the model's artifact or into a table artifact of its own, and
 records the SHA-256 of its bytes, by which a model stored without the table names the one it reads.
@@ -316,8 +319,7 @@ def validate(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None
         info = gguf.tensors[name]
         if info.shape != shape or not _stored(info, kind):
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
-    end = max(info.offset + info.nbytes for info in gguf.tensors.values())
-    if gguf.data_bytes_available < end:
+    if gguf.truncated():
         raise ValueError(f"{gguf.path}: the data section is truncated")
 
 
@@ -342,8 +344,7 @@ def validate_mtp(gguf: GGUFFile, experts: int) -> None:
         info = gguf.tensors[name]
         if info.shape != shape or not _stored(info, kind):
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
-    end = max(info.offset + info.nbytes for info in gguf.tensors.values())
-    if gguf.data_bytes_available < end:
+    if gguf.truncated():
         raise ValueError(f"{gguf.path}: the data section is truncated")
 
 
@@ -684,9 +685,9 @@ def configure_ngram_gguf(model, recipe, table):
 
 
 def qwen3_8_flash_next_gguf(model, recipe, sources):
-    """A Qwen3.8-Flash-Next GSQ-RCO GGUF release in its own block formats: the model shard as
-    `--source gguf=SHARD1.gguf` (for the text component) and the n-gram table shard as
-    `--source ngram=SHARD2.gguf`, which is always read, since the model records the digest of the
+    """A Qwen3.8-Flash-Next GGUF release (GSQ-RCO's two shards or a llama.cpp split) in its own
+    block formats: the first shard as `--source gguf=SHARD1.gguf` (for the text component) and the
+    n-gram table shard, the release's last, as `--source ngram=SHARD.gguf`, which is always read, since the model records the digest of the
     table it reads even when the table's rows go into an artifact of their own. The Vision tower
     comes from the release's BF16 `mmproj` GGUF (`--source vision=mmproj.gguf`) and stays BF16; the
     MTP block from an MTP GGUF (`--source mtp=mtp-*.gguf`), whose matrices keep their blocks. Every
