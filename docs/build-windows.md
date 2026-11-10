@@ -95,7 +95,12 @@ memory, since MSVC cannot pass them by value, and WDDM charges pinned host memor
 card's memory. Every Windows build offers `--wddm-evictable-budget`, which sizes the KV cache against
 the card's memory less the weights and a 512 MiB desktop floor instead of what is free at startup,
 and commits the device arenas at startup. Another process that later takes memory makes WDDM page
-some of this process's memory out, which slows generation until it comes back. A process started
+some of this process's memory out, which slows generation until it comes back. WDDM also queues a
+device's copies behind one another whatever their streams; the one place that put a host-to-device
+copy behind a device-side wait for the host, the exchange of Flash-Next native host experts, uses
+mapped host memory and a copy kernel on Windows and under WSL2
+([native host banks](qwen3-8-flash-next.md#the-expert-cache)). This repository has no Windows or
+WSL2 host: `ninfer_qwen4_exp_hybrid_experts_test` runs both exchanges on Linux. A process started
 by a low-priority parent (a Task Scheduler task at its default priority, a service, some IDE
 terminals) inherits I/O priority Low, and Windows throttles its reads; the Engine raises such a
 priority to normal before it reads the artifact and logs that it did, or warns when Windows refuses

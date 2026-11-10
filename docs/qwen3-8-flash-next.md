@@ -303,7 +303,11 @@ an 8-core EPYC 7302P it decoded 3.1 tok/s at a share of 0 and 5.3 at 0.5 against
 logits stay within top-1 but are not numerically qualified (maximum relative L2 0.32-0.60 against
 resident experts). A GGUF bank, including a GGUF MTP companion beside native text weights, keeps
 its GPU route. Linux registers native weight objects separately; Windows uses pageable weights and
-bounded pinned staging. Use `--max-concurrency 1` for native host execution.
+bounded pinned staging. Use `--max-concurrency 1` for native host execution. Under WDDM (Windows,
+and WSL2, recognised by `/dev/dxg`) a device's copies queue behind one another whatever their
+streams, so the tables, the CPU/GPU partition and the CPU's sum that a decode graph takes after it
+waited for the host reach the device through mapped host memory and a copy kernel; a queued copy
+there would hold back the expert copies that end the wait. The bytes are the same either way.
 
 ### The CPU share
 
