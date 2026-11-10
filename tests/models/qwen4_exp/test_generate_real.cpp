@@ -28,8 +28,9 @@
 //                                     profile NINFER_QWEN4_EXP_NGRAM_PROFILE and 4 GiB of RAM
 //   NINFER_QWEN4_EXP_NGRAM_IO  buffered | direct | mmap (default buffered)
 //   NINFER_QWEN4_EXP_PREFILL_CHUNK  the prefill chunk (default 512); a prompt goes in calls of the
-//                                   executor's prompt_step(), as the Engine feeds it: spans of up
-//                                   to eight chunks with host experts on one device
+//                                   executor's prompt_step(), as the Engine feeds it: with host
+//                                   or disk experts on one device, spans of up to eight chunks,
+//                                   sixteen in an executor of one sequence
 //   NINFER_QWEN4_EXP_EXPERT_CACHE_MIB  host or disk experts: the device expert cache (default: what
 //                                      the devices have free)
 #include "artifact/reader.h"

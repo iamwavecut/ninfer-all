@@ -947,9 +947,11 @@ struct Executor::Impl {
     };
 
     std::vector<SlotPool> slot_pools; // by rank; empty unless the experts are host resident
-    // With the automatic expert cache the pool buffers are cache slots between prompts
-    // (ExpertCache::lend): a wide pass takes them back, the next decode pass returns them.
+    // With the automatic expert cache the pool buffers and a span's stack (span_stack, which
+    // only run_span writes) are cache slots between prompts (ExpertCache::lend): a wide pass takes
+    // them back, the next decode pass returns them. lent_ranks: the ranks with a lent buffer.
     bool pools_lent = false;
+    std::vector<unsigned char> lent_ranks;
     std::unique_ptr<PinnedHostBuffer> slot_entries;
     // Wide host calls of at least kPrefetchTokens touch nearly every expert of a layer: every
     // expert the cache lacks is copied into the pool on the transfer stream while the layers
@@ -987,6 +989,15 @@ struct Executor::Impl {
     // rows while every chunk of a span passes a layer before any passes the next. span_tokens is 0
     // when spans are off.
     static constexpr std::uint32_t kSpanChunks = 8;
+    // An engine of one sequence keeps no other prompt waiting behind a step, so its spans run to
+    // kLoneSpanChunks: a layer's uncached experts then cross the bus half as often in a prompt
+    // past kSpanChunks chunks. The further chunks' planes come out of the expert cache (for good,
+    // or while a prompt runs when the cache takes the stack between prompts), so they may take at
+    // most 1 / kLoneSpanShare of the memory the device has free when the executor starts
+    // (plan_span_chunks).
+    static constexpr std::uint32_t kLoneSpanChunks = 16;
+    static constexpr std::uint64_t kLoneSpanShare  = 24;
+    std::uint32_t span_chunks = kSpanChunks;
     std::uint32_t span_tokens = 0;
     DeviceBuffer span_stack, span_positions, span_rope, span_rows;
     // With the Vision tower: a media prompt's three-axis positions, [3, chunk] per chunk.
@@ -1083,6 +1094,7 @@ struct Executor::Impl {
                                         "the devices (no --kv-resident)");
         }
         memory.ranks.resize(device.size());
+        plan_span_chunks();
         plan_weights();
         if (verify_width > 0 && options.dflash2) {
             plan_dflash2();
@@ -2668,8 +2680,8 @@ struct Executor::Impl {
     // verification pass returns them.
     void place_pools(bool wide) {
         if (!pools_lent) { return; }
-        for (std::size_t r = 0; r < slot_pools.size(); ++r) {
-            if (slot_pools[r].slots == 0) { continue; }
+        for (std::size_t r = 0; r < lent_ranks.size(); ++r) {
+            if (!lent_ranks[r]) { continue; }
             const cudaStream_t transfer = device.rank(r).transfer_stream;
             if (wide) {
                 cache->reclaim(r, transfer);
@@ -4633,8 +4645,27 @@ struct Executor::Impl {
                                           [](const Segment& segment) { return segment.rank == 0; });
         if (model.options().experts == ExpertResidency::Device || native || !one_rank) { return 0; }
         const std::uint32_t tokens =
-            std::min<std::uint32_t>(options.max_context, kSpanChunks * options.prefill_chunk);
+            std::min<std::uint32_t>(options.max_context, span_chunks * options.prefill_chunk);
         return tokens > options.prefill_chunk ? tokens : 0;
+    }
+
+    // The chunks a span takes (span_chunks), before anything is sized by it.
+    void plan_span_chunks() {
+        span_chunks = kSpanChunks;
+        const std::uint64_t further =
+            std::uint64_t(kLoneSpanChunks - kSpanChunks) * options.prefill_chunk;
+        if (options.sequences != 1 ||
+            options.max_context <= kSpanChunks * options.prefill_chunk) {
+            return;
+        }
+        // A token's stack, MoE input and injection: nearly all of its planes (allocate_span).
+        const std::uint64_t token_bytes =
+            std::uint64_t(config.hc_count) * config.hidden_size * 4 + config.hidden_size * 2 +
+            config.hc_count * 4;
+        RankBinding bind(device, 0);
+        std::size_t free_bytes = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
+        if (further * token_bytes <= free_bytes / kLoneSpanShare) { span_chunks = kLoneSpanChunks; }
     }
 
     // The chunks one expert call of a span's expert phase takes: as many as kGroupTokens holds,
@@ -5541,7 +5572,12 @@ struct Executor::Impl {
                         {.rank = r, .base = buffer.storage.p, .bytes = buffer.storage.bytes});
                 }
             }
+            if (span_stack.p != nullptr) {
+                loans.push_back({.rank = 0, .base = span_stack.p, .bytes = span_stack.bytes});
+            }
             if (!loans.empty()) {
+                lent_ranks.assign(device.size(), 0);
+                for (const auto& loan : loans) { lent_ranks[loan.rank] = 1; }
                 const auto lent = cache->lend(loans);
                 for (std::size_t r = 0; r < lent.size(); ++r) {
                     memory.ranks[r].expert_cache_bytes += lent[r];

@@ -25,7 +25,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Novelties only: a new model, family, artifact, platform, option, endpoint, format or mode, or a measured speedup of a path that worked. No fixes of any kind (crashes, wrong output, failed starts, missed cases, regressions and the speedups that win them back, the options and defaults they bring), no guards, diagnostics, internal, CI, build, test or documentation changes, and no chronicle: a date without a novelty gets no line. One line per date, a few words per item, each linked to the document with its details; no descriptions, mechanisms, measurements or hardware. Full rule: CONTRIBUTING.md, "Documentation describes the current state". -->
 
-- **2026-11-10:** [DFlash2 drafting for Qwen3.6-35B-A3B](docs/cli.md#speculative-decoding) and Flash-Next artifacts of [Unsloth's Dynamic v3.1 GGUFs](docs/qwen3-8-flash-next.md#convert).
+- **2026-11-10:** [DFlash2 drafting for Qwen3.6-35B-A3B](docs/cli.md#speculative-decoding), Flash-Next artifacts of [Unsloth's Dynamic v3.1 GGUFs](docs/qwen3-8-flash-next.md#convert), and Flash-Next prompts past 8,192 tokens [prefilling 1.1-1.4 times as fast](docs/qwen3-8-flash-next.md#expert-placements) with host or disk experts.
 - **2026-11-07:** Flash-Next [media prompts in the context cache](docs/qwen3-8-flash-next.md#media-conversations-on-one-rtx-4090) and [MTP drafts for media requests](docs/qwen3-8-flash-next.md#mtp-speculative-decoding).
 - **2026-11-06:** Faster Q4_K [prompts](docs/device-profiles.md#what-is-calibrated) for dense layers and routed experts.
 - **2026-11-05:** Faster DeepSeek-V4.1 [prefill tail](docs/deepseek-v41.md#the-prefill-tail), [IQ1_M expert prompts](docs/deepseek-v41.md#iq1_m-experts-in-prompt-chunks) and [Engram reads](docs/deepseek-v41.md#the-engram-table).
@@ -288,10 +288,11 @@ Prefill of a 4,463-token prompt, in tok/s:
   host had PCIe 5.0 x16, the RTX PRO 6000 and RTX 4090 hosts PCIe 4.0 x16, and the RTX 3090 host
   PCIe 3.0 x16 and two sockets (the test ran pinned to the GPU's node). The host, disk and cold
   columns of the three GeForce cards were measured on October 26, the rest on October 5 and 6.
-- **Prompt spans.** With host or disk experts a prompt prefills in spans of up to eight chunks, so
-  each layer's missing experts cross the bus once per span. From the CLI with Q2_0 disk experts in
-  the page cache, a 7,680-token prompt prefilled at 1,830 tok/s on the RTX 5090 and the answer
-  decoded at 115 tok/s, against 450 and 32 chunk by chunk
+- **Prompt spans.** With host or disk experts a prompt prefills in spans of up to eight chunks
+  (sixteen for one request at a time), so each layer's missing experts cross the bus once per
+  span. From the CLI with Q2_0 disk experts in the page cache, a 7,680-token prompt prefilled at
+  1,830 tok/s on the RTX 5090 and the answer decoded at 115 tok/s, against 450 and 32 chunk by
+  chunk
   ([three cards](docs/qwen3-8-flash-next.md#expert-placements)).
 - **Other releases and cards.** IQ3_S, the Coder IQ1_M build and the 8 and 12 GB cards are in the
   [expert placements](docs/performance.md#expert-placements). Six reasoning requests at once on two
