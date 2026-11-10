@@ -3,6 +3,7 @@
 #include "models/qwen3_5/model.h"
 #include "ninfer/kv_cache_storage.h"
 #include "ninfer/startup.h"
+#include "ninfer/types_fwd.h"
 #include "ops/common/device_tier.h"
 
 #include <cstdint>
@@ -44,6 +45,7 @@ private:
                               std::vector<ops::DeviceTier>);
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*,
+                                                    const DiagnosticObserver*,
                                                     const artifact::MaterializeOptions&);
 };
 
@@ -116,9 +118,11 @@ refit_tensor_split(const artifact::Reader& reader, const LoadOptions& options,
 // `materialize` makes the weight arenas suspendable when asked (see Model::release_device_weights).
 [[nodiscard]] std::unique_ptr<Model>
 materialize_model(LoadPlan&& plan, DeviceContext& device, const StartupObserver* observer = nullptr,
+                  const DiagnosticObserver* diagnostics = nullptr,
                   const artifact::MaterializeOptions& materialize = {});
 [[nodiscard]] std::unique_ptr<Model> load_model(const std::filesystem::path& path,
                                                 LoadOptions options, DeviceContext& device,
-                                                const StartupObserver* observer = nullptr);
+                                                const StartupObserver* observer = nullptr,
+                                                const DiagnosticObserver* diagnostics = nullptr);
 
 } // namespace ninfer::models::qwen3_5

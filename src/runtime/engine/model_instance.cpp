@@ -765,7 +765,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                                                models::qwen3_5::rank_tiers(device));
         binding.complete();
         auto model = models::qwen3_5::materialize_model(
-            std::move(plan), device, &options.startup_observer,
+            std::move(plan), device, &options.startup_observer, &options.diagnostic_observer,
             artifact::MaterializeOptions{
                 .suspendable     = options.suspend.enabled,
                 .retained_reader = options.suspend.enabled ? retained_reader : nullptr});

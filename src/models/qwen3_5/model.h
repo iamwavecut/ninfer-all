@@ -8,6 +8,7 @@
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
 #include "ninfer/ops/weight_input.h"
+#include "ninfer/types_fwd.h"
 
 #include <memory>
 #include <optional>
@@ -106,6 +107,7 @@ public:
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*,
+                                                    const DiagnosticObserver*,
                                                     const artifact::MaterializeOptions&);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
           AuxiliaryReplicas replicas, FrontendResources resources, InstanceInfo info,

@@ -9,12 +9,11 @@
 #include "core/tensor_split.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/load/vision_cpu.h"
+#include "runtime/engine/diagnostics.h"
 
 #include <algorithm>
 #include <cmath>
-#include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -717,6 +716,7 @@ refit_tensor_split(const artifact::Reader& reader, const LoadOptions& options,
 
 std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                          const StartupObserver* observer,
+                                         const DiagnosticObserver* diagnostics,
                                          const artifact::MaterializeOptions& materialize) {
     if (!plan.impl_) { throw artifact::ArtifactError("load plan was already consumed"); }
     auto data = std::move(plan.impl_);
@@ -748,19 +748,16 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                             data->options, data->artifact_path);
     auto bound   = loading::resolve_weights(std::move(data->pending), backing);
 #if defined(NINFER_SM8X_COMPAT)
-    if (data->activation_tally.any()) {
+    if (diagnostics && data->activation_tally.any()) {
         // One line per load: the activation policy the stored weights actually run with on this
         // build. "demoted 0" on an 89 build is the FP8 A8 route live; a build without the unit
         // demotes every stored A8 permission (the NINFER_SM89_FP8=OFF rollback reads that way).
-        // stderr on purpose: the engine's startup log goes to stderr and flushes with it; a
-        // stdout printf here would sit in the block buffer when the serve's output is a file.
-        std::fprintf(
-            stderr,
+        runtime::publish_diagnostic(
+            *diagnostics, DiagnosticLevel::Info,
             "activation policy: FP8-E4M3 A8 kept %zu use(s), demoted to A16 %zu; "
-            "NVFP4 A4 kept %zu, demoted %zu\n",
+            "NVFP4 A4 kept %zu, demoted %zu",
             data->activation_tally.fp8_a8_kept, data->activation_tally.fp8_a8_demoted,
             data->activation_tally.nvfp4_a4_kept, data->activation_tally.nvfp4_a4_demoted);
-        std::fflush(stderr);
     }
 #endif
     std::optional<VisionOverlayLayout> vision_overlay;
@@ -777,10 +774,11 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,
-                                  DeviceContext& device, const StartupObserver* observer) {
+                                  DeviceContext& device, const StartupObserver* observer,
+                                  const DiagnosticObserver* diagnostics) {
     artifact::Reader reader(path);
-    return materialize_model(plan_load(reader, options, path, rank_tiers(device)), device,
-                             observer);
+    return materialize_model(plan_load(reader, options, path, rank_tiers(device)), device, observer,
+                             diagnostics);
 }
 
 } // namespace ninfer::models::qwen3_5
