@@ -4,6 +4,7 @@
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "core/gpu_clock_floor.h"
+#include "core/io_priority.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
@@ -788,6 +789,24 @@ private:
 };
 
 Engine::Engine(EngineOptions options) {
+    // Before the artifact is read: Windows throttles the reads of a process that inherited a low
+    // I/O priority (a Task Scheduler task, a service, some IDE terminals).
+    if (const auto io = raise_low_io_priority()) {
+        if (io->after >= kIoPriorityNormal) {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                        "raised the I/O priority this process inherited (%d, "
+                                        "below normal) to normal: Windows throttles low-priority "
+                                        "reads",
+                                        io->before);
+        } else {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                        "this process inherited I/O priority %d (below normal) "
+                                        "and Windows refused to raise it: model, table and disk "
+                                        "tier reads may be several times slower; start the engine "
+                                        "from a normal-priority process",
+                                        io->before);
+        }
+    }
     StartupObserver startup_observer = options.startup_observer;
     StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
     impl_ = std::make_shared<Impl>(std::move(options));
