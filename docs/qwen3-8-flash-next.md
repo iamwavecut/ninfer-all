@@ -69,6 +69,28 @@ python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
 Every conversion containing PLE reads the table shard once more to hash it (a minute or so for 28.8 GB), since
 the model records the digest of the table it reads whether or not it stores the rows.
 
+A release split by llama.cpp (`llama-gguf-split`) converts the same way. Unsloth's Dynamic v3.1
+files of [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)
+have this layout: the first shard holds the metadata and no tensor, the next one or two hold the
+model, and the last holds the table. `--source gguf=` names the first shard; the converter opens
+the shards beside it that the name counts (`-00001-of-0000N.gguf`) and reads each tensor from the
+shard that stores it. An absent shard is left out, so the table shard may lie elsewhere; a model
+tensor that no present shard stores, a cut shard, a tensor stored twice and a `split.count` that
+differs from the name are refused. The table shard is still the `ngram` source, and any release's
+table shard serves: the rows are the same.
+
+```bash
+# Unsloth UD-IQ2_XS without the table, with the Vision tower and the shared-Q8_0 MTP block.
+python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
+  --recipe qwen3_8_flash_next_gguf --components text,vision,mtp \
+  --source gguf=/path/to/Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf \
+  --source ngram=/path/to/Qwen3.8-Flash-Next-UD-IQ2_XS-00003-of-00003.gguf \
+  --source vision=/path/to/mmproj-BF16.gguf \
+  --source mtp=/path/to/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  --device cpu --rows-per-chunk 65536 \
+  --name qwen3.8-flash-next --out models/flash-next-ud-iq2_xs.ninfer
+```
+
 `--layers A..B` makes a qualification artifact from source layers A through B-1, using zero-based,
 half-open bounds. It supports the HF, GGUF and native-Q2 recipes. The embedding, final mixer and
 head remain; selected blocks and their activation uses are renumbered from zero, while source
