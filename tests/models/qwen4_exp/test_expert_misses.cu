@@ -5,6 +5,11 @@
 // routes one token to ten uncached Q8_0 experts at Flash-Next's shapes; the service stages them (or
 // the CPU computes its share) and releases the call, which must return within seconds. On Linux an
 // idle service and its CPU workers sleep: the process then uses almost no CPU time.
+//
+// A wide call (more than kNarrowMissTokens tokens) brings every missing expert into device memory
+// in rounds that alternate between the staging's halves, with zeros after each down, and the CPU
+// takes no share of it, whatever the misses' CPU share: its products take the matrix kernel, which
+// the CPU's do not reproduce. A narrow call after it is served as before.
 
 #include "models/qwen4_exp/expert_misses.h"
 
@@ -221,6 +226,161 @@ void replay_late(Fixture& f, cudaStream_t stream, bool cpu, const std::string& l
     CUDA_CHECK(cudaGraphDestroy(graph));
 }
 
+// One layer of 16 Q8_0 experts at Flash-Next's shapes, each its own bytes (every byte of expert
+// e's projection k is 1 + 3e + k), behind a staging of two experts a half: a wide call of 16
+// tokens routes all 16 (token j to experts j..j + 9 mod 16), none cached.
+struct WideFixture {
+    static constexpr int kTokens = 16;
+    std::vector<std::unique_ptr<PinnedHostBuffer>> matrices; // [expert][projection]
+    DeviceBuffer gate_table, ids, input;
+    std::unique_ptr<ExpertMisses> misses;
+    std::array<std::int64_t, 3> bytes{};
+
+    WideFixture(DeviceContext& device, double cpu_share) {
+        MissLayer layer;
+        layer.rank    = 0;
+        layer.experts = kExperts;
+        const std::array<int, 3> rows = {kWidth, kWidth, kHidden}, ks = {kHidden, kHidden, kWidth};
+        for (std::size_t p = 0; p < 3; ++p) {
+            auto& projection        = layer.projections[p];
+            projection.format       = QType::GGUF_Q8_0;
+            projection.row_bytes    = std::int64_t(ks[p] / 32) * 34;
+            projection.rows         = rows[p];
+            projection.k            = ks[p];
+            projection.expert_bytes = projection.row_bytes * rows[p];
+            bytes[p]                = projection.expert_bytes;
+        }
+        for (int e = 0; e < kExperts; ++e) {
+            for (std::size_t p = 0; p < 3; ++p) {
+                auto matrix = std::make_unique<PinnedHostBuffer>(std::size_t(bytes[p]));
+                std::memset(matrix->data(), 1 + 3 * e + int(p), matrix->size());
+                layer.projections[p].host.push_back(matrix->data());
+                matrices.push_back(std::move(matrix));
+            }
+        }
+        gate_table = DeviceBuffer(kExperts * sizeof(void*));
+        gate_table.fill(0);
+        layer.gate_table = static_cast<const void* const*>(gate_table.p);
+        std::vector<std::int32_t> routed(std::size_t(kTop) * kTokens);
+        for (int j = 0; j < kTokens; ++j) {
+            for (int i = 0; i < kTop; ++i) { routed[std::size_t(j * kTop + i)] = (j + i) % kExperts; }
+        }
+        ids = DeviceBuffer(routed.size() * 4);
+        ids.copy_from_host(routed.data(), routed.size() * 4);
+        input = DeviceBuffer(std::size_t(kHidden) * 2 * kTokens);
+        input.fill(0);
+        MissOptions options;
+        options.token_capacity = kTokens;
+        options.cpu_share      = cpu_share;
+        options.cpu_threads    = 2;
+        options.staging_bytes  = 0; // the least: two of the largest experts a half
+        std::vector<MissLayer> layers;
+        layers.push_back(std::move(layer));
+        misses = std::make_unique<ExpertMisses>(device, std::move(layers),
+                                                std::vector<std::filesystem::path>{}, options,
+                                                nullptr);
+    }
+};
+
+void wide_call(DeviceContext& device, cudaStream_t stream, double cpu_share,
+               const std::string& label) {
+    WideFixture f(device, cpu_share);
+    const int tokens = WideFixture::kTokens;
+    const MissStats before = f.misses->stats();
+    const Tensor routed(f.ids.p, DType::I32, {kTop, tokens});
+    const Tensor m(f.input.p, DType::BF16, {kHidden, tokens});
+    const auto call = f.misses->begin(0, routed, m, tokens, ops::GgufMoeWeights{}, stream);
+    expect(call.missing_banks.device_resident, label + ": the missing banks are device banks");
+    expect(call.max_products == 0, label + ": the CPU adds no products");
+    std::vector<std::int32_t> cached(std::size_t(kTop) * tokens);
+    std::vector<int> served(std::size_t(kTop) * tokens, 0);
+    std::array<int, kExperts> rounds_of{};
+    int rounds = 0;
+    {
+        Watchdog guard(label + ": the rounds");
+        f.misses->stage_wide(0, stream, [&](const Tensor& missing_ids) {
+            CUDA_CHECK(cudaStreamSynchronize(stream)); // the round's copies have landed
+            std::vector<std::int32_t> round(cached.size());
+            CUDA_CHECK(cudaMemcpy(round.data(), missing_ids.data, round.size() * 4,
+                                  cudaMemcpyDeviceToHost));
+            std::array<bool, kExperts> in_round{};
+            for (std::size_t p = 0; p < round.size(); ++p) {
+                const std::int32_t e = round[p];
+                if (e < 0) { continue; }
+                expect(e == std::int32_t((p / kTop + p % kTop) % kExperts),
+                       label + ": a round's pair keeps its expert");
+                ++served[p];
+                in_round[std::size_t(e)] = true;
+            }
+            for (int e = 0; e < kExperts; ++e) {
+                if (!in_round[std::size_t(e)]) { continue; }
+                ++rounds_of[std::size_t(e)];
+                for (int k = 0; k < 3; ++k) {
+                    const auto* tables = k == 0   ? call.missing_banks.gate.experts
+                                         : k == 1 ? call.missing_banks.up.experts
+                                                  : call.missing_banks.down.experts;
+                    const void* at     = tables[e];
+                    cudaPointerAttributes attributes{};
+                    CUDA_CHECK(cudaPointerGetAttributes(&attributes, at));
+                    expect(attributes.type == cudaMemoryTypeDevice,
+                           label + ": a staged expert sits in device memory");
+                    const auto expected = static_cast<unsigned char>(1 + 3 * e + k);
+                    const std::size_t size = std::size_t(f.bytes[std::size_t(k)]);
+                    std::array<unsigned char, 2> ends{};
+                    CUDA_CHECK(cudaMemcpy(&ends[0], at, 1, cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(&ends[1], static_cast<const unsigned char*>(at) + size - 1,
+                                          1, cudaMemcpyDeviceToHost));
+                    expect(ends[0] == expected && ends[1] == expected,
+                           label + ": a staged projection holds its expert's bytes");
+                    if (k == 2) {
+                        std::array<unsigned char, 256> tail{};
+                        CUDA_CHECK(cudaMemcpy(tail.data(),
+                                              static_cast<const unsigned char*>(at) + size,
+                                              tail.size(), cudaMemcpyDeviceToHost));
+                        bool zero = true;
+                        for (const auto byte : tail) { zero = zero && byte == 0; }
+                        expect(zero, label + ": zeros follow a staged down");
+                    }
+                }
+            }
+            ++rounds;
+        });
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(cached.data(), call.cached_ids.data, cached.size() * 4,
+                          cudaMemcpyDeviceToHost));
+    for (std::size_t p = 0; p < served.size(); ++p) {
+        expect(cached[p] == -1, label + ": no pair is cached");
+        expect(served[p] == 1, label + ": every pair runs in exactly one round");
+    }
+    for (const int count : rounds_of) { expect(count == 1, label + ": an expert takes one round"); }
+    expect(rounds == kExperts / 2, label + ": two experts a round, " + std::to_string(rounds) +
+                                       " rounds");
+    const MissStats after = f.misses->stats();
+    expect(after.requests == before.requests + 1, label + ": the call counts as a request");
+    expect(after.staged == before.staged + kExperts, label + ": every missing expert was staged");
+    expect(after.mapped == before.mapped && after.computed == before.computed,
+           label + ": nothing read across the bus or computed by the CPU");
+    f.misses->raise_failure();
+
+    // A narrow call after the wide one: token 0's ten experts, served by the service.
+    const Tensor one(f.ids.p, DType::I32, {kTop, 1});
+    const Tensor one_m(f.input.p, DType::BF16, {kHidden, 1});
+    const MissStats narrow_before = f.misses->stats();
+    const auto narrow = f.misses->begin(0, one, one_m, 1, ops::GgufMoeWeights{}, stream);
+    {
+        Watchdog guard(label + ": a narrow call after a wide one");
+        f.misses->await(0, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    const MissStats narrow_after = f.misses->stats();
+    expect(!narrow.missing_banks.device_resident, label + ": a narrow call reads its banks as mapped");
+    expect(narrow_after.requests == narrow_before.requests + 1, label + ": the narrow call was served");
+    expect(narrow_after.computed - narrow_before.computed == (cpu_share > 0 ? 5U : 0U),
+           label + ": the CPU takes its share of the narrow call");
+    f.misses->raise_failure();
+}
+
 #ifdef __linux__
 double process_cpu_seconds() {
     rusage usage{};
@@ -261,6 +421,7 @@ int run() {
 #ifdef __linux__
         idle_sleeps(label);
 #endif
+        wide_call(device, stream, cpu ? 0.5 : 0.0, label + ", wide");
     }
     CUDA_CHECK(cudaStreamDestroy(stream));
     if (failures != 0) { return 1; }

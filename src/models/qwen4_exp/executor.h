@@ -227,8 +227,8 @@ public:
     // Whether forward_pieces() runs: prompt steps are layer-major spans.
     [[nodiscard]] bool packs_prompts() const noexcept;
     // The widest prompt chunk a span runs alone over the cache and the missed experts rather than
-    // from the layer's copied experts (kPromptMissTokens with a CPU share, else 8 tokens); 0
-    // without spans. A step of such chunks only copies the experts it misses.
+    // from the layer's copied experts (64 tokens without the lossy tail skip, else 8); 0 without
+    // spans. A step of such chunks only copies the experts it misses.
     [[nodiscard]] std::uint32_t narrow_prompt_tokens() const noexcept;
     // The prompt tokens of several distinct sequences in one span (prompt_step() tokens in all,
     // at most max_logit_rows() pieces), each piece at its sequence's next positions with the
@@ -333,6 +333,9 @@ public:
     [[nodiscard]] std::string expert_execution_profile() const;
     // GGUF host or disk experts with a CPU share: its threads and vector backend; else empty.
     [[nodiscard]] std::string expert_cpu_description() const;
+    // The widest call whose missing experts CPU threads share (kNarrowMissTokens with GGUF host
+    // experts and a CPU share); 0 without a CPU share. Wider calls copy every miss to the GPU.
+    [[nodiscard]] std::uint32_t cpu_share_tokens() const noexcept;
     [[nodiscard]] bool hybrid_experts() const noexcept;
     void save_expert_profile() const;
     // Worker-thread scope only. The owner retains the flag until the eager call returns, then

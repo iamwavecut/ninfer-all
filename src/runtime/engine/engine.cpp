@@ -110,7 +110,8 @@ EngineOptions with_family_attention(EngineOptions options) {
 // Without --spec (SpeculativeOptions::automatic), a Flash-Next artifact with host experts, or a
 // Gemma 4 one with host or disk experts, drafts with the drafter it carries: a verification
 // window's routes share the layer's missing experts, which the CPU computes while the cached ones
-// run. Flash-Next's disk experts have no CPU share: a layer reads every expert its cache lacks
+// run (Flash-Next: in calls of up to eight tokens, so its Engine bounds a round of several
+// requests to them). Flash-Next's disk experts have no CPU share: a layer reads every expert its cache lacks
 // before it runs, so a verification's drafts multiply the reads. Flash-Next takes its DFlash2
 // drafter where the artifact carries one, which drafted faster than its MTP block, else the block;
 // over pipeline stages, where DFlash2 does not run, the block. Gemma 4 takes its assistant.

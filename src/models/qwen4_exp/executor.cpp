@@ -507,15 +507,21 @@ struct MoePlan {
     // cache slots' planes, which start at 256-byte boundaries, or a pool bank's experts, each at
     // its index from a 256-byte boundary: a row stride of whole 16 bytes aligns every entry.
     [[nodiscard]] ops::GgufMoeWeights pooled(const void* const* table) const {
-        ops::GgufMoeWeights out   = banks();
+        ops::GgufMoeWeights out   = cached();
         const std::size_t experts = gate.pointers.size();
         out.gate.experts          = table;
         out.up.experts            = table + experts;
         out.down.experts          = table + 2 * experts;
-        out.gate.aligned16        = gate.row_bytes % 16 == 0;
-        out.up.aligned16          = up.row_bytes % 16 == 0;
-        out.down.aligned16        = down.row_bytes % 16 == 0;
-        out.device_resident       = true;
+        return out;
+    }
+    // A wide call over the expert cache's own tables whose pairs name cached experts only (the
+    // staged misses' first stage): every entry it reads is a cache slot's plane, as in pooled().
+    [[nodiscard]] ops::GgufMoeWeights cached() const {
+        ops::GgufMoeWeights out = banks();
+        out.gate.aligned16      = gate.row_bytes % 16 == 0;
+        out.up.aligned16        = up.row_bytes % 16 == 0;
+        out.down.aligned16      = down.row_bytes % 16 == 0;
+        out.device_resident     = true;
         return out;
     }
 };
@@ -886,13 +892,13 @@ struct Executor::Impl {
     const std::atomic<bool>* cancelled = nullptr;
     // Disk-resident experts: made resident before each layer's experts run.
     std::unique_ptr<ExpertStream> stream;
-    // GGUF host or disk experts: a decode or verification call's missing experts, staged (or
-    // computed by the CPU) while its cached ones run.
+    // GGUF host experts: a decode step's, verification's or short prompt chunk's missing experts,
+    // staged (or, up to kVectorTokens, computed by the CPU) while its cached ones run.
     std::unique_ptr<ExpertMisses> misses;
     std::uint32_t miss_tokens = 0; // the widest verification the misses take
-    // The widest prompt chunk the misses take, 0 for none: with a CPU share, a chunk this narrow
-    // has its missing experts split between the CPU and copies as a decode step does, instead of
-    // copying every routed expert into the slot pool.
+    // The widest prompt chunk the misses take, 0 for none: a chunk this narrow stages the experts
+    // the cache lacks as a verification does, instead of taking the slot pool back from the cache
+    // and copying every routed expert the cache lacks into it.
     std::uint32_t prompt_miss_tokens = 0;
     // Each expert layer's routes of the current pass, [layer][10 * prefill_chunk] in one block per
     // rank (a stage's layers are consecutive), so one copy brings a rank's text layers home.
@@ -960,11 +966,11 @@ struct Executor::Impl {
     // is full, so a thread of their own (pool_copier) issues them: the layers between keep being
     // launched.
     static constexpr std::int32_t kPrefetchTokens = 256;
-    // With a CPU share, prompt chunks of up to this many tokens take the staged misses
-    // (served_by_misses): narrower than a prefetched group, within one call's capacity.
-    static constexpr std::uint32_t kPromptMissTokens = 64;
-    static_assert(kPromptMissTokens < std::uint32_t(kPrefetchTokens) &&
-                  kPromptMissTokens <= kMaxMissTokens);
+    // The widest verification and prompt chunk the staged misses take (served_by_misses):
+    // narrower than a prefetched group.
+    static constexpr std::uint32_t kMissTokens = 64;
+    static_assert(kMissTokens < std::uint32_t(kPrefetchTokens) &&
+                  kNarrowMissTokens == std::uint32_t(kVectorTokens));
     struct PoolPrefetch {
         // Per pool buffer: the layer whose experts it holds or receives, its copies' completion
         // and the completion of the last call that read it, and the copier's task that issues
@@ -2479,23 +2485,29 @@ struct Executor::Impl {
             out.push_back(std::move(layer));
         }
         // Every decode step, and every verification up to the calls' limit, the joint one of all
-        // sequences included; with a CPU share (and no lossy tail skip), prompt chunks of up to
-        // kPromptMissTokens too.
+        // sequences included; without the lossy tail skip, prompt chunks of up to kMissTokens
+        // too. The CPU takes a share of the narrow calls only (ExpertMisses). A layer whose rank
+        // has no slot pool (half the free memory could not hold one) has every verification and,
+        // without the tail skip, every prompt chunk take the misses: their rounds bring the
+        // missing experts to the device for the matrix kernel, as a pool would.
         MissOptions miss;
         miss.cpu_balance    = !options.hybrid_experts.dma_share && !options.hybrid_experts.mapped_misses;
         miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share.value_or(1.0F));
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
-        const bool prompts  = (miss.cpu_balance || miss.cpu_share > 0.0) && miss.tail_skip_rank == 0;
         const std::uint32_t joint = verify_width * options.sequences;
-        miss_tokens = std::min(kMaxMissTokens, std::max<std::uint32_t>(kVectorTokens, joint));
-        miss.verify_tokens  = miss_tokens;
-        miss.token_capacity = prompts ? std::max(miss_tokens, kPromptMissTokens) : miss_tokens;
+        const bool pooled = std::all_of(layers.begin(), layers.end(), [&](const auto& plan) {
+            return plan.rank < slot_pools.size() && slot_pools[plan.rank].slots != 0;
+        });
+        miss_tokens = std::max<std::uint32_t>(kVectorTokens, pooled ? std::min(kMissTokens, joint)
+                                                                    : joint);
+        prompt_miss_tokens =
+            miss.tail_skip_rank != 0 ? 0 : pooled ? kMissTokens : options.prefill_chunk;
+        miss.token_capacity = std::max(miss_tokens, prompt_miss_tokens);
         misses              = std::make_unique<ExpertMisses>(
             device, std::move(out),
             stream ? model.files() : std::vector<std::filesystem::path>{}, miss, cache.get());
-        prompt_miss_tokens  = prompts && misses->cpu_enabled() ? kPromptMissTokens : 0;
         for (auto& rank : memory.ranks) { rank.workspace_bytes += kStagingBytes; }
     }
 
@@ -3741,6 +3753,19 @@ struct Executor::Impl {
             Tensor y(rank.y, DType::FP32, {h, t});
             auto scope      = ws.scope();
             const auto call = misses->begin(index, ids, mixed, t, m.banks(), s);
+            if (t > kVectorTokens) {
+                // The matrix kernel, as over device banks: the cached experts' slots while the
+                // missing experts cross the bus, then each round of them (stage_wide).
+                const auto stage = ops::moe_experts_gguf_begin(mixed, ws, s);
+                ops::moe_experts_gguf_add(stage, mixed, call.cached_ids, weights, &shared,
+                                          m.cached(), ws, s);
+                misses->stage_wide(index, s, [&](const Tensor& missing_ids) {
+                    ops::moe_experts_gguf_add(stage, mixed, missing_ids, weights, nullptr,
+                                              call.missing_banks, ws, s);
+                });
+                ops::moe_experts_gguf_finish(stage, y, s);
+                return;
+            }
             if (ops::moe_experts_gguf_decode_supported(m.banks(), t)) {
                 const auto state = ops::moe_experts_gguf_decode_begin(
                     mixed, call.cached_ids, shared, m.banks(), ws, s, &rank.side);
@@ -4607,7 +4632,7 @@ struct Executor::Impl {
     // Whether the staged misses serve a pass of `t` tokens: a decode step, a verification up to
     // their widest call, the joint one of all sequences included, or a prompt chunk up to
     // prompt_miss_tokens. A wider pass copies its layers' missing experts into the slot pools
-    // instead.
+    // instead. Either way a call past kVectorTokens takes the matrix kernel, as over device banks.
     [[nodiscard]] bool served_by_misses(std::int32_t t) const {
         return misses && (t <= kVectorTokens || (verifying && std::uint32_t(t) <= miss_tokens) ||
                           std::uint32_t(t) <= prompt_miss_tokens);
@@ -7037,6 +7062,9 @@ std::string Executor::expert_execution_profile() const {
 bool Executor::hybrid_experts() const noexcept { return impl_->hybrid != nullptr; }
 std::string Executor::expert_cpu_description() const {
     return impl_->misses ? impl_->misses->cpu_description() : std::string();
+}
+std::uint32_t Executor::cpu_share_tokens() const noexcept {
+    return impl_->misses && impl_->misses->cpu_enabled() ? kNarrowMissTokens : 0;
 }
 void Executor::save_expert_profile() const {
     const auto& path = impl_->options.hybrid_experts.record_profile;
