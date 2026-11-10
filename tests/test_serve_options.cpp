@@ -1011,13 +1011,13 @@ int main() {
                      "--use-alt-prefix-caching"});
     } catch (const std::invalid_argument&) { both_caches_rejected = true; }
     failures += check(both_caches_rejected, "both prefix caching systems were accepted together");
-    bool hybrid_pipeline_rejected = false;
-    try {
-        (void)parse(
-            {"ninfer-serve", "model.ninfer", "--use-alt-prefix-caching", "--devices", "0,1"});
-    } catch (const std::invalid_argument&) { hybrid_pipeline_rejected = true; }
-    failures +=
-        check(hybrid_pipeline_rejected, "hybrid prefix cache was accepted across pipeline stages");
+    failures += check(
+        parse({"ninfer-serve", "model.ninfer", "--use-alt-prefix-caching", "--devices", "0,1"})
+                .context_cache.mode == ninfer::ContextCacheMode::Hybrid,
+        "--use-alt-prefix-caching did not keep the hybrid cache over two devices");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--devices", "0,1"})
+                              .context_cache.mode == ninfer::ContextCacheMode::Legacy,
+                      "two devices did not select the checkpoint catalog by default");
 
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
