@@ -18,8 +18,10 @@ system for `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_1
 `max_concurrency` 1..8, every KV profile (BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4),
 and every speculative backend (none, MTP, DFlash, DFlash2).
 
-In this line the mode runs on one device: pipeline stages (`--devices` with more than one entry)
-are rejected with it, and so are the checkpoint catalog's own policies (`--auto-long-anchors`,
+The mode also runs over pipeline stages and tensor parallelism (`--devices` with more than one
+entry), where `ninfer-serve` selects it only when `--use-alt-prefix-caching` is named. Its state
+images are sharded over the ranks like the live state, and its copies run on every rank's stream.
+The checkpoint catalog's own policies are rejected with it (`--auto-long-anchors`,
 `--auto-prefix-grid`, `--context-cache-policy`, `--release-diverged-checkpoints`,
 `--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`, the disk tier). Host
 restores and snapshot copies take the rank-stream form of the KV and StateImage copy routines, and a
@@ -32,8 +34,9 @@ Coexistence rules:
   `--use-original-prefix-caching` is given or an option only the catalog serves selects the
   catalog: its capacities (`--device-state-slots`, `--host-state-slots`, `--host-kv-mib`,
   `--max-private-continuations`, `--max-shared-prefixes`, `--max-long-anchors-per-continuation`),
-  anchors and policies, the disk tier, slot files, pipeline `--devices`, `--no-prefix-reuse` or a
-  `--graft`. With `--use-alt-prefix-caching` named, those options are rejected instead; Hybrid-only
+  anchors and policies, the disk tier, slot files, several `--devices`, `--no-prefix-reuse` or a
+  `--graft`. With `--use-alt-prefix-caching` named, several `--devices` keep Hybrid and the other
+  options are rejected instead; Hybrid-only
   options are rejected with the catalog. `--host-cache-mib` applies to both modes (in Hybrid mode
   it sizes the Host slab pool). Gemma 4 and Qwen3.8-Flash-Next run context caches of their own,
   and their Engine reports the Legacy mode.

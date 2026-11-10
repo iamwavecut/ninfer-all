@@ -266,7 +266,8 @@ std::string serve_usage_text(const char* argv0) {
            "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
            "  --graft and each checkpoint catalog option below (state slots, host KV,\n"
            "  catalogs, anchors, prefix grid, session keys, cache policies, disk tier, slot\n"
-           "  files) select the checkpoint catalog instead.\n"
+           "  files) select the checkpoint catalog instead; --use-alt-prefix-caching keeps\n"
+           "  the hybrid cache over several --devices.\n"
            "  --no-prefix-reuse             disable compatible-prefix caching (on by\n"
            "                                default); excludes the options below\n"
            "  --device-state-slots N        checkpoint states on the device beyond the\n"
@@ -1709,9 +1710,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             "caching systems");
     }
     // The hybrid prefix cache is the default. What only the checkpoint catalog serves selects the
-    // catalog instead: one of its options, pipeline stages, disabled prefix reuse (the hybrid
+    // catalog instead: one of its options, several devices, disabled prefix reuse (the hybrid
     // cache cannot be off) or a graft (a direct graft lives in a catalog shared-prefix slot).
-    // A named --use-alt-prefix-caching keeps the hybrid cache and rejects them below.
+    // A named --use-alt-prefix-caching keeps the hybrid cache, also over several devices, and
+    // rejects the others below.
     const char* catalog_option = legacy_cache_flag;
     if (catalog_option == nullptr && options.devices.size() > 1) { catalog_option = "--devices"; }
     if (catalog_option == nullptr && !options.allow_prefix_reuse) {
@@ -1738,11 +1740,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (!options.allow_prefix_reuse) {
             throw std::invalid_argument(
                 "--use-alt-prefix-caching cannot be combined with --no-prefix-reuse");
-        }
-        if (options.devices.size() > 1) {
-            throw std::invalid_argument(
-                "--use-alt-prefix-caching runs on one device and cannot be combined with "
-                "pipeline --devices");
         }
         std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         if (!file.empty()) {
