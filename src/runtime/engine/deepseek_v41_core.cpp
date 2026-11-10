@@ -656,6 +656,8 @@ struct DeepSeekV41Core::Impl {
         std::shared_ptr<Request> request;
         std::vector<TokenId> fed;
         std::vector<TokenId> anchor;
+        // runtime::lookup_draft's copy source, as its distance from the end of `fed`.
+        std::size_t lookup_lag = 0;
         // The pictures among fed and anchor (an image token does not tell one from another).
         std::vector<MediaMark> media, anchor_media;
         models::deepseek_v41::SequenceSnapshot snapshot;
@@ -2221,7 +2223,7 @@ struct DeepSeekV41Core::Impl {
     std::uint32_t lookup(const Request& r, std::uint32_t steps, TokenId* out) {
         std::vector<TokenId>& ledger = slots[r.slot].fed;
         ledger.push_back(r.feed.front());
-        const std::uint32_t found = runtime::lookup_draft(ledger, lookup_ngram, steps, out);
+        const std::uint32_t found = runtime::lookup_draft(ledger, lookup_ngram, steps, out, slots[r.slot].lookup_lag);
         ledger.pop_back();
         return found;
     }

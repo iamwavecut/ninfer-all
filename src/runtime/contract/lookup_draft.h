@@ -2,6 +2,7 @@
 
 #include "ninfer/base.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
 
@@ -45,37 +46,63 @@ namespace ninfer::runtime {
 // On output that copies its input the draft head copies too, so the wider window, not the lookup,
 // is what pays there; the lookup's remaining value is the case the head misses.
 //
+// **A copy keeps its source.** When the text occurs several times (two versions of a file, a passage
+// quoted twice), the newest occurrence of the last N tokens is often not the one the output is
+// copying: the newest version wins every tie and the round fails at each place the versions differ.
+// `lag` remembers the copy a sequence followed, as the distance from the ledger's end to the copy's
+// next source token. While that source still matches the last N tokens it is proposed again, and the
+// newest occurrence only when it does not. A wrong lag costs nothing: the source is compared before it
+// is proposed, so a stale value from another request, a rewound ledger or a rejected round finds no
+// match and falls back to the scan. Simulated with the Qwen3.5 tokenizer and greedy acceptance on six
+// of this repository's files, each shown as two versions (three identifiers renamed, small numbers
+// changed) and then copied again, 400 tokens each; rounds newest-first / keeping the copy / an oracle
+// that takes the best of every occurrence (an n-gram tree's ceiling):
+//
+//   N, drafts           two versions       one file, one identifier renamed
+//   4, 7                381 / 312 / 306    461 / 438 / 430
+//   8, 7                363 / 331 / 330    581 / 581 / 578
+//   8, 15               208 / 185 / 180    457 / 454 / 453
+//
 // Returns the number of drafts written, and zero when the n-gram has not been seen before -- which
-// the round already treats as a plain decode step.
+// the round already treats as a plain decode step. `lag` is the sequence's own; zero is "none".
 [[nodiscard]] inline std::uint32_t lookup_draft(std::span<const TokenId> ledger,
                                                 std::uint32_t ngram, std::uint32_t max_drafts,
-                                                TokenId* out) {
+                                                TokenId* out, std::size_t& lag) {
     if (ngram == 0 || max_drafts == 0 || out == nullptr) { return 0; }
     const std::size_t size = ledger.size();
     if (size <= ngram) { return 0; }
 
     // The n-gram to match is the tail of the ledger, whose last token is the one just committed.
     const TokenId* const tail = ledger.data() + (size - ngram);
-
-    // Backwards, so the most recent occurrence wins: in repetitive text the nearest copy is the one
-    // most likely to continue the same way.
-    for (std::size_t start = size - ngram; start-- > 0;) {
-        bool match = true;
+    const auto matches = [&](std::size_t start) {
         for (std::uint32_t j = 0; j < ngram; ++j) {
-            if (ledger[start + j] != tail[j]) {
-                match = false;
-                break;
-            }
+            if (ledger[start + j] != tail[j]) { return false; }
         }
-        if (!match) { continue; }
-        const std::size_t follow = start + ngram;
-        if (follow >= size) { continue; }
+        return true;
+    };
+    const auto propose = [&](std::size_t follow) {
         const std::size_t available = size - follow;
         const auto count =
             static_cast<std::uint32_t>(available < max_drafts ? available : max_drafts);
         for (std::uint32_t j = 0; j < count; ++j) { out[j] = ledger[follow + j]; }
+        lag = size - follow;
         return count;
+    };
+
+    // The copy this sequence followed, where its source has advanced with the ledger.
+    if (lag > 0 && lag < size) {
+        const std::size_t follow = size - lag;
+        if (follow >= ngram && matches(follow - ngram)) {
+            return propose(follow);
+        }
     }
+
+    // Backwards, so the most recent occurrence wins: in repetitive text the nearest copy is the one
+    // most likely to continue the same way.
+    for (std::size_t start = size - ngram; start-- > 0;) {
+        if (matches(start)) { return propose(start + ngram); }
+    }
+    lag = 0;
     return 0;
 }
 
