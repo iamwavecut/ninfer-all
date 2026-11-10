@@ -1,5 +1,7 @@
 #pragma once
 
+#include "runtime/prefix_cache/block_hash.h"
+
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -24,11 +26,31 @@ struct TapHint {
     TapHintKind kind       = TapHintKind::MessageBoundary;
 };
 
-// Half-open token span in which no resume point may lie (a Vision item's tokens).
+// Half-open token span in which no resume point may lie (a media item's tokens, media_exclusion).
 struct TapExclusion {
     std::uint32_t begin = 0;
     std::uint32_t end   = 0;
 };
+
+// The exclusion of a media item whose tokens are [begin, end): the item's span, extended to the end
+// of the block the item begins in. A block's key carries every item that begins before the block's
+// end, and a snapshot's tail, the tokens past its last full block, is compared as tokens alone,
+// where media tokens are placeholders. A frontier inside the block an item begins in would leave
+// that item in no key, so two prompts that differ only in that item would share the snapshot.
+[[nodiscard]] constexpr TapExclusion media_exclusion(std::uint32_t begin,
+                                                     std::uint32_t end) noexcept {
+    const std::uint32_t block_end = (begin / kBlockTokens + 1U) * kBlockTokens;
+    return TapExclusion{begin, end > block_end ? end : block_end};
+}
+
+// Whether a frontier lies inside an exclusion. Both ends of a span are valid frontiers.
+[[nodiscard]] constexpr bool inside_exclusion(std::uint32_t frontier,
+                                              std::span<const TapExclusion> exclusions) noexcept {
+    for (const TapExclusion& span : exclusions) {
+        if (span.begin < frontier && frontier < span.end) { return true; }
+    }
+    return false;
+}
 
 // How the prefill loop realizes a tap.
 enum class TapPlacement : std::uint8_t {

@@ -979,6 +979,57 @@ int exercise_vision(const char* artifact) {
         std::cerr << "vision: generation did not complete\n";
         ++failures;
     }
+
+    // A media item shorter than a block: a single-frame clip after a paragraph of the user's text,
+    // which puts the generation opener far enough from the system boundary to be tapped. The clip's
+    // tokens are placeholders and a snapshot's tail is compared as tokens alone, so no frontier in
+    // the block the clip begins in may be a resume point: a second clip of the same shape under the
+    // same text would otherwise resume past the first clip's rows. Each round's system text is
+    // about sixteen tokens longer, which moves the clip through its block, so in some rounds the
+    // clip and the rest of the prompt share one block.
+    std::string preface = "Before the clip, some context for the description.";
+    for (int sentence = 0; sentence < 8; ++sentence) {
+        preface += " Note " + std::to_string(sentence) + ": the viewer cannot see the screen.";
+    }
+    const auto clip_prompt = [&](const std::vector<std::uint8_t>& frame) {
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = preface, .media = {}});
+        ninfer::MessagePart media;
+        media.kind              = ninfer::MessagePartKind::Media;
+        media.media.kind        = ninfer::MediaKind::Video;
+        media.media.bytes       = frame;
+        media.media.media_type  = "image/x-portable-pixmap";
+        media.media.source_name = "single-frame.ppm";
+        user.parts.push_back(std::move(media));
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "Describe the clip.", .media = {}});
+        return conversation({text_message(ninfer::ChatRole::System, system), std::move(user)});
+    };
+    const std::vector<std::uint8_t> first_frame  = gradient_ppm(64, 0);
+    const std::vector<std::uint8_t> second_frame = gradient_ppm(64, 97);
+    // The vision end marker, the question and the generation opener follow the clip.
+    constexpr std::uint32_t kAfterClip = 8;
+    for (int round = 0; round < 4; ++round) {
+        system += " Further: one two three four five six seven eight nine ten eleven twelve.";
+        ninfer::PreparedPrompt prepared = engine.prepare(clip_prompt(first_frame));
+        const auto clip_tokens = static_cast<std::uint32_t>(prepared.preparation_stats().vision_tokens);
+        const ninfer::GenerationResult first_clip = engine.generate(std::move(prepared), greedy(4));
+        const ninfer::GenerationResult other_clip =
+            engine.generate(engine.prepare(clip_prompt(second_frame)), greedy(4));
+        std::cout << "vision: clip of " << clip_tokens << " tokens in a prompt of "
+                  << first_clip.prompt.prompt_tokens << "; a different clip reused "
+                  << other_clip.reused_prompt_tokens << '\n';
+        if (clip_tokens == 0 || other_clip.prompt.prompt_tokens != first_clip.prompt.prompt_tokens ||
+            other_clip.reused_prompt_tokens + clip_tokens + kAfterClip >
+                first_clip.prompt.prompt_tokens) {
+            std::cerr << "vision: a different clip of " << clip_tokens << " tokens reused "
+                      << other_clip.reused_prompt_tokens << " of "
+                      << other_clip.prompt.prompt_tokens << " tokens\n";
+            ++failures;
+        }
+    }
     return failures;
 }
 

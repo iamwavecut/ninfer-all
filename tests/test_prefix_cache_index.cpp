@@ -1670,6 +1670,26 @@ void test_tap_planner() {
     }
     require(find(excluded, 12000).has_value(), "an excluded explicit tap moves to the span start");
 
+    // A media item's exclusion reaches the end of the block the item begins in: a frontier inside
+    // that block would have the item in no block key. Items that end past it keep their own end.
+    require(media_exclusion(970, 990).begin == 970 && media_exclusion(970, 990).end == 1024,
+            "a media item inside one block excludes the rest of that block");
+    require(media_exclusion(960, 1024).end == 1024 && media_exclusion(1000, 1300).end == 1300 &&
+                media_exclusion(1023, 1024).end == 1024 && media_exclusion(0, 4).end == 64,
+            "a media item's exclusion ends at its own end or its first block's end");
+    const std::vector<TapExclusion> media{media_exclusion(970, 990)};
+    require(!inside_exclusion(970, media) && inside_exclusion(971, media) &&
+                inside_exclusion(990, media) && inside_exclusion(1023, media) &&
+                !inside_exclusion(1024, media) && !inside_exclusion(960, media),
+            "a frontier past a media item waits for the end of the item's first block");
+    // The generation opener 20 tokens past a 20-token item moves to the item's start.
+    const std::vector<TapHint> after_media{{1010, TapHintKind::GenerationOpener}};
+    const auto short_media = plan_taps(1013, 0, after_media, {}, media, config);
+    for (const PlannedTap& tap : short_media) {
+        require(!inside_exclusion(tap.position, media), "tap in a media item's first block");
+    }
+    require(find(short_media, 970).has_value(), "the opener past a short media item moves before it");
+
     // Budget: the highest-priority tap survives.
     TapPlannerConfig one = config;
     one.max_new_taps     = 1;
