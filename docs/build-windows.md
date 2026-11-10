@@ -95,7 +95,11 @@ memory, since MSVC cannot pass them by value, and WDDM charges pinned host memor
 card's memory. Every Windows build offers `--wddm-evictable-budget`, which sizes the KV cache against
 the card's memory less the weights and a 512 MiB desktop floor instead of what is free at startup,
 and commits the device arenas at startup. Another process that later takes memory makes WDDM page
-some of this process's memory out, which slows generation until it comes back. The Windows-only
+some of this process's memory out, which slows generation until it comes back. A process started
+by a low-priority parent (a Task Scheduler task at its default priority, a service, some IDE
+terminals) inherits I/O priority Low, and Windows throttles its reads; the Engine raises such a
+priority to normal before it reads the artifact and logs that it did, or warns when Windows refuses
+(`ninfer_io_priority_test`; not run on a Windows host). The Windows-only
 build option, untested:
 
 | option | effect |

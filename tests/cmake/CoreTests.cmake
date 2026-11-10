@@ -21,6 +21,10 @@ ninfer_add_test(ninfer_multi_gpu_test
           "${CMAKE_CURRENT_LIST_DIR}/../test_tensor_parallel.cu"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_io_priority_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_io_priority.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_arena_ranks_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena_ranks.cpp"
   LIBRARIES ninfer_core)
