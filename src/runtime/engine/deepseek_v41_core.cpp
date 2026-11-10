@@ -145,8 +145,8 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                                     "head");
     }
     if (options.kv_cache != KvCacheStorage::BFloat16) {
-        throw std::invalid_argument("DeepSeek-V4.1 keeps its attention latents in BF16 (no "
-                                    "--kv-dtype formats)");
+        throw std::invalid_argument("DeepSeek-V4.1 keeps its attention caches in the release's "
+                                    "FP8/FP4 forms (--kv-dtype bf16 only)");
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
@@ -374,8 +374,8 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         }
     }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "DeepSeek-V4.1: %u sequence(s), prompt chunks of %u tokens%s, BF16 latent "
-                       "caches %.0f MiB%s, workspace %.0f MiB",
+                       "DeepSeek-V4.1: %u sequence(s), prompt chunks of %u tokens%s, FP8/FP4 "
+                       "latent caches %.0f MiB%s, workspace %.0f MiB",
                        executor.sequences, chunk_tokens, spans.c_str(),
                        double(memory.kv_bytes) / 1048576.0,
                        memory.kv_grows

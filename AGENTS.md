@@ -76,7 +76,7 @@ DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`; `src/models/deepseek_v41`,
 GSQ-RCO GGUF (IQ1_M) and its Engram table GGUF with the ggml blocks kept as stored. It shares the
 Qwen3.5 frontend in a DeepSeek dialect (the converter's transcription of the release's encoder as
 its chat template, DSML tool calls, reasoning opened by the prompt), runs one to eight sequences in
-prompt chunks of 2048 tokens with BF16 caches, keeps the release's FP8/FP4 attention roundings,
+prompt chunks of 2048 tokens with FP8/FP4 caches, keeps the release's FP8/FP4 attention roundings,
 drafts with the release's DSpark drafter (the `dspark` component, from beamster's STQ pack or
 Unsloth's GGUF; `--spec dspark`) or by context lookup, and keeps its routed experts in pinned host
 memory or in the artifact's files (read into bounded buffers, never mapped), CPU threads computing a
