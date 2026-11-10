@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import prod
 from pathlib import Path
+import re
 import struct
 from typing import Any, Sequence
 
@@ -240,6 +241,12 @@ class GGUFFile:
     def data_bytes_available(self) -> int:
         return max(0, self.file_bytes - self.data_offset)
 
+    def truncated(self) -> bool:
+        """Whether the file ends before the last byte its tensor directory names."""
+
+        end = max((info.offset + info.nbytes for info in self.tensors.values()), default=0)
+        return self.data_bytes_available < end
+
     def info(self, name: str) -> TensorInfo:
         try:
             return self.tensors[name]
@@ -385,6 +392,78 @@ class GGUFFile:
         if info.type_id == TYPE_PQ2_0:
             return decode_pq2_0(blocks)
         return decode_ptq1_0(blocks)
+
+
+# llama.cpp's name for one shard of a split GGUF (`gguf-split`).
+SPLIT_NAME = re.compile(r"(.*)-(\d{5})-of-(\d{5})\.gguf")
+
+
+class GGUFSplit(GGUFFile):
+    """The shards of one llama.cpp split GGUF (`NAME-0000k-of-0000n.gguf`) as one file: the first
+    shard's metadata describes the model, and every tensor is read from the shard that holds it.
+
+    A shard missing from the directory is left out, so a release whose last shard is a table that
+    another source names opens without it; the recipe's own tensor check reports what a missing
+    shard held."""
+
+    def __init__(self, first: str | Path) -> None:
+        first = Path(first)
+        match = SPLIT_NAME.fullmatch(first.name)
+        if match is None or int(match[2]) != 1:
+            raise ValueError(f"{first}: name the first shard of the split GGUF")
+        count = int(match[3])
+        self.path = first
+        self._parts: list[GGUFFile] = []
+        self._owner: dict[str, GGUFFile] = {}
+        self.tensors: dict[str, TensorInfo] = {}
+        try:
+            for index in range(1, count + 1):
+                path = first.with_name(f"{match[1]}-{index:05d}-of-{count:05d}.gguf")
+                if index != 1 and not path.exists():
+                    continue
+                part = GGUFFile(path)
+                self._parts.append(part)
+                for name, info in part.tensors.items():
+                    if name in self._owner:
+                        raise ValueError(f"{path}: tensor {name} repeats another shard's")
+                    self._owner[name] = part
+                    self.tensors[name] = info
+        except BaseException:
+            self.close()
+            raise
+        self.kv = self._parts[0].kv
+        if int(self.kv.get("split.count", count)) != count:
+            raise ValueError(
+                f"{first}: split.count is {self.kv.get('split.count')}, the name says {count}"
+            )
+        self.alignment = self._parts[0].alignment
+
+    def close(self) -> None:
+        for part in self._parts:
+            part.close()
+
+    def __enter__(self) -> GGUFSplit:
+        return self
+
+    def truncated(self) -> bool:
+        return any(part.truncated() for part in self._parts)
+
+    def tensor_bytes(
+        self, name: str, byte_begin: int = 0, byte_end: int | None = None
+    ) -> np.ndarray:
+        self.info(name)
+        return self._owner[name].tensor_bytes(name, byte_begin, byte_end)
+
+
+def open_gguf(path: str | Path) -> GGUFFile:
+    """A GGUF file, or the whole split when `path` names the first shard of one."""
+
+    path = Path(path)
+    match = SPLIT_NAME.fullmatch(path.name)
+    if match is not None and int(match[2]) == 1:
+        return GGUFSplit(path)
+    return GGUFFile(path)
+
 
 
 def decode_pq2_0(blocks: np.ndarray) -> TernaryBlocks:

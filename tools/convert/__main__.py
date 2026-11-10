@@ -19,7 +19,7 @@ from .qwen4_exp import build_model as build_qwen4_exp
 from .qwen4_exp_gguf import RECIPES as QWEN4_EXP_GGUF_RECIPES
 from .qwen4_exp_gguf import with_gguf_expert_count, with_mtp_expert_count
 from .recipe import Recipe
-from .sources.gguf import GGUFFile
+from .sources.gguf import GGUFFile, open_gguf
 from .sources.safetensors import SafetensorsSource
 from .gguf_blocks import RECIPES as GGUF_RECIPES
 from .gemma4 import ARCHITECTURES as GEMMA4_ARCHITECTURES
@@ -39,7 +39,7 @@ def _open_named_source(name: str, path: Path, block_sources: frozenset[str]):
     if path.suffix == ".gguf":
         # The ternary and GGUF block recipes read their block formats themselves, without gguf-py.
         if name in block_sources:
-            return GGUFFile(path)
+            return open_gguf(path)
         from .sources.gguf_source import GGUFSource
 
         return GGUFSource(path)
