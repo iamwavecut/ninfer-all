@@ -820,7 +820,8 @@ public:
           transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
           row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
           row_counts_(other.row_counts_), logprobs_(other.logprobs_),
-          row_stride_(other.row_stride_), timing_(other.timing_) {
+          row_stride_(other.row_stride_), timing_(other.timing_),
+          numerical_faults_(other.numerical_faults_) {
         other.tokens_     = {};
         other.row_counts_ = {};
         other.logprobs_   = {};
@@ -845,6 +846,11 @@ public:
 
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
 
+    // The row's logits came out non-finite, or a token of its run lay outside the vocabulary (the
+    // run holds 0 there): its request ends with RequestErrorKind::NumericalFailure, released as a
+    // cancelled one's, and the other rows commit.
+    [[nodiscard]] bool numerical_fault(std::size_t row) const { return numerical_faults_.at(row); }
+
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:
@@ -857,6 +863,7 @@ private:
     std::span<const runtime::RawTokenLogprob> logprobs_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
+    std::array<bool, kMaximumConcurrency> numerical_faults_{};
 
     friend struct detail::RuntimeContractAccess;
 };
@@ -1420,7 +1427,8 @@ struct RuntimeContractAccess {
     make_pending(const void* owner, std::uint64_t transaction, std::span<const SequenceHandle> rows,
                  std::span<const TokenId> tokens, std::span<const std::int32_t> row_counts,
                  std::span<const runtime::RawTokenLogprob> logprobs, std::uint32_t row_stride,
-                 runtime::ExecutionTiming timing) {
+                 runtime::ExecutionTiming timing,
+                 const std::array<bool, kMaximumConcurrency>& numerical_faults) {
         PendingBatch out;
         out.owner_       = owner;
         out.transaction_ = transaction;
@@ -1431,6 +1439,7 @@ struct RuntimeContractAccess {
         out.logprobs_   = logprobs;
         out.row_stride_ = row_stride;
         out.timing_     = timing;
+        out.numerical_faults_ = numerical_faults;
         return out;
     }
 

@@ -28,4 +28,29 @@ inline void consume_armed_worker_failure() {
     if (armed != 0) { throw std::logic_error("injected worker failure"); }
 }
 
+// The same seam for a numerical failure (non-finite logits), which no public input produces on a
+// healthy model. A decode fault marks row 0 of the next decode round as the Program would mark a
+// row whose sampled token left the vocabulary: that request ends with
+// RequestErrorKind::NumericalFailure and the round's other rows commit. A prefill fault makes the
+// next completed prompt throw runtime::NumericalFault after the Program executed it, as the Program
+// does when a prompt's first token is non-finite: the Engine recovers.
+inline std::atomic<std::uint32_t> armed_decode_numerical_faults{0};
+inline std::atomic<std::uint32_t> armed_prefill_numerical_faults{0};
+
+inline void arm_decode_numerical_faults(std::uint32_t count) noexcept {
+    armed_decode_numerical_faults.store(count, std::memory_order_relaxed);
+}
+
+inline void arm_prefill_numerical_faults(std::uint32_t count) noexcept {
+    armed_prefill_numerical_faults.store(count, std::memory_order_relaxed);
+}
+
+// Worker-only: true once per armed fault.
+[[nodiscard]] inline bool consume_armed_numerical_fault(std::atomic<std::uint32_t>& armed_faults) noexcept {
+    std::uint32_t armed = armed_faults.load(std::memory_order_relaxed);
+    while (armed != 0 &&
+           !armed_faults.compare_exchange_weak(armed, armed - 1U, std::memory_order_relaxed)) {}
+    return armed != 0;
+}
+
 } // namespace ninfer::runtime

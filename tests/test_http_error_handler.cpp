@@ -48,6 +48,13 @@ int main() {
                           cancelled.param.empty(),
                       "preparation cancellation did not retain its HTTP classification");
 
+    const ninfer::serve::ApiError numerical =
+        ninfer::serve::request_error_to_api_error(ninfer::RequestError(
+            ninfer::RequestErrorKind::NumericalFailure, "the model produced non-finite logits"));
+    failures += check(numerical.status == 500 && numerical.type == "server_error" &&
+                          numerical.code == "numerical_failure" && numerical.param.empty(),
+                      "a numerical failure did not map to HTTP 500 numerical_failure");
+
     failures +=
         check(ninfer::serve::matches_bearer_credential("Bearer secret", "secret") &&
                   ninfer::serve::matches_bearer_credential("bearer secret", "secret") &&

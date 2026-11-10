@@ -557,12 +557,16 @@ void ProgramImpl::observe_masks(std::span<const std::uint32_t> lanes) {
     }
 }
 
-void ProgramImpl::validate_licensed_tokens(std::span<const TokenId> tokens) const {
-    for (const TokenId token : tokens) {
-        if (token < 0 || token >= dimension(parameters.model.resources().public_token_count)) {
-            throw std::runtime_error("target returned a token outside the public token domain");
+bool ProgramImpl::license_tokens(std::span<TokenId> tokens) const noexcept {
+    const auto limit = dimension(parameters.model.resources().public_token_count);
+    bool inside      = true;
+    for (TokenId& token : tokens) {
+        if (token < 0 || token >= limit) {
+            token  = 0;
+            inside = false;
         }
     }
+    return inside;
 }
 
 runtime::BatchedGeneratedRound
@@ -680,8 +684,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             RequestControl& request    = requests[lanes[row]];
             const std::uint32_t base_E = sequence.execution_frontier;
             const std::uint32_t base_S = sequence.ledger_frontier;
-            const TokenId token        = ordinary_host_egress->sampled_tokens[row];
-            validate_licensed_tokens(std::span<const TokenId>(&token, 1));
+            TokenId& token             = ordinary_host_egress->sampled_tokens[row];
+            if (!license_tokens(std::span<TokenId>(&token, 1))) { numerical_faults[row] = true; }
             // A round gathers every row when any of its requests asks; a row keeps a record only
             // for a request that asked.
             if (request.logprobs) {
@@ -911,10 +915,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     capacity) {
                 throw std::runtime_error("MTP batch returned invalid row metadata");
             }
-            const std::span<const TokenId> row_tokens(mtp_host_egress->licensed_tokens.data() +
-                                                          row * width,
-                                                      static_cast<std::size_t>(count_i));
-            validate_licensed_tokens(row_tokens);
+            const std::span<TokenId> row_tokens(mtp_host_egress->licensed_tokens.data() + row * width,
+                                                static_cast<std::size_t>(count_i));
+            if (!license_tokens(row_tokens)) { numerical_faults[row] = true; }
             // The gather row of verification column c in batch row r is c + r * width.
             for (std::size_t c = 0; request.logprobs && c < row_tokens.size(); ++c) {
                 round_logprobs[row * width + c] =
@@ -1189,10 +1192,9 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     capacity) {
                 throw std::runtime_error("DFlash batch returned invalid row metadata");
             }
-            const std::span<const TokenId> row_tokens(dflash_host_egress->licensed_tokens.data() +
-                                                          row * width,
-                                                      static_cast<std::size_t>(count_i));
-            validate_licensed_tokens(row_tokens);
+            const std::span<TokenId> row_tokens(dflash_host_egress->licensed_tokens.data() + row * width,
+                                                static_cast<std::size_t>(count_i));
+            if (!license_tokens(row_tokens)) { numerical_faults[row] = true; }
             for (std::size_t c = 0; request.logprobs && c < row_tokens.size(); ++c) {
                 round_logprobs[row * width + c] =
                     fetched_logprob(static_cast<std::int32_t>(row * width + c), row_tokens[c]);
@@ -1252,6 +1254,7 @@ runtime::BatchedGeneratedRound
 ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing) {
+    numerical_faults.fill(false);
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets, failed_timing);
     }

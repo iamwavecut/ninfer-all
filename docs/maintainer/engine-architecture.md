@@ -586,6 +586,17 @@ ResourceManager 清空，以错误完成 active lanes 与 materializing request�
 接缝：`arm_worker_failures(N)` 让随后 N 个 prefill unit 在 Program 执行后抛出，使恢复必须释放持有
 live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxed atomic load。
 
+数值失败（logits 非有限，sampler 返回 `ops::kSamplerNonFiniteToken`，或 licensed token 超出公开词表）
+不是 Engine 缺陷，也不终止服务。decode round 中 Program 把该行的越界 token 置为 0 并在
+`PendingBatch::numerical_fault(row)` 上报告；`commit_pending` 以 `RequestErrorKind::NumericalFailure`
+结束该行的请求，其 sequence 按取消的方式释放（接受 0 个 token），其余行照常提交：该 sequence 此前发布
+的状态都由更早的有限 logits 担保。prompt 末尾的第一个 token 非有限时没有这样的担保（该次 prefill
+写入的 KV、State 与途中采集的前缀快照都可能已被污染），Program 抛出 `runtime::NumericalFault`，worker
+走与 out-of-memory 相同的恢复并以 `NumericalFailure` 完成 active 请求；context transaction 期间的
+decode 行失败也走这条路。GGUF 家族的 core（Flash-Next、Gemma 4、Flint、DeepSeek）没有 Engine 级
+恢复：它们只结束该请求，并在 prompt 阶段失败时丢弃所有是该 prompt 前缀的已存前缀映像。验证接缝
+`arm_decode_numerical_faults(N)` 与 `arm_prefill_numerical_faults(N)` 位于同一头文件。
+
 设备停止完成工作时 CUDA 不报告任何错误，等待它的线程永远停在驱动里。`core/device_wait.h` 用两种监视
 结束这样的进程。其一监视每个线程的设备等待：`src/` 中等待设备的代码一律调用 `wait_for_stream`、
 `wait_for_event`、`wait_for_device`、`copy_and_wait`、`copy_between_devices_and_wait`、`fill_and_wait`；

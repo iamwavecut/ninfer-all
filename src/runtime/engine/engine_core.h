@@ -1849,6 +1849,37 @@ private:
                     finish_reasons[row] = FinishReason::Cancelled;
                     continue;
                 }
+                if (pending.numerical_fault(row) ||
+                    (decode_round && row == 0 &&
+                     consume_armed_numerical_fault(armed_decode_numerical_faults))) {
+                    // The row's logits were not finite. What the sequence published before this
+                    // round came from finite logits, so only this request ends: with the error,
+                    // its sequence released as a cancelled one's, and every other row commits. A
+                    // release waits for a global context transaction, so during one the failure
+                    // takes the recovery a prompt's does.
+                    if (instance_.program->has_context_transaction()) {
+                        throw runtime::NumericalFault(
+                            "the model produced non-finite logits during a context transaction");
+                    }
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "lane %u request %llu: non-finite logits or a token outside "
+                                       "the vocabulary after %zu generated tokens - ending the "
+                                       "request",
+                                       lane, static_cast<unsigned long long>(request->id),
+                                       request->generated.size());
+                    row_errors[row] = std::make_exception_ptr(RequestError(
+                        RequestErrorKind::NumericalFailure,
+                        "the model produced non-finite logits while generating"));
+                    (void)request->output.preview_terminal(FinishReason::Cancelled);
+                    cancelled[row] = true;
+                    decisions[row] = CommitDecision{
+                        .accepted_tokens = 0,
+                        .terminal        = true,
+                        .cancelled       = true,
+                    };
+                    finish_reasons[row] = FinishReason::Cancelled;
+                    continue;
+                }
                 // A round carries records for every row once one of its requests asks; only a
                 // request that asked takes its row's.
                 std::span<const runtime::RawTokenLogprob> row_logprobs{};
@@ -2359,6 +2390,9 @@ private:
                 planned - progress.processed_prompt_tokens;
         }
         consume_armed_worker_failure();
+        if (progress.complete && consume_armed_numerical_fault(armed_prefill_numerical_faults)) {
+            throw runtime::NumericalFault("injected numerical fault at the end of a prompt");
+        }
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start, paced);
         // A completed prefill already re-arms admission (owner cleared above). Re-arm again when
         // the request keeps prefilling: each prefill boundary is an admission point, so a waiting
@@ -3549,6 +3583,33 @@ private:
                 // Scheduler state was cleared by recover_from_oom_locked; treat the next
                 // iteration as a fresh scheduling boundary (no decode continuity).
                 decode_run = 0;
+                continue;
+            } catch (const runtime::NumericalFault& fault) {
+                // A prompt ended in non-finite logits. Nothing vouches for what its pass wrote
+                // (KV pages, recurrent state, snapshots the prefix cache took on the way), so the
+                // recovery of an allocation failure runs: active requests end with the error, the
+                // Program drops its state and caches, queued requests stay.
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                   "worker numerical failure: %s - recovering", fault.what());
+                const std::exception_ptr numerical_error = std::make_exception_ptr(RequestError(
+                    RequestErrorKind::NumericalFailure,
+                    "the model produced non-finite logits; the engine reset its state"));
+                if (!recovery_streak_.record_failure(Clock::now())) {
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "worker: %u consecutive recoveries - failing all pending",
+                                       recovery_streak_.count() - 1);
+                    fail_all_locked(numerical_error);
+                    return;
+                }
+                HostPhaseMeasurement cleanup = begin_host_phase();
+                if (!recover_from_oom_locked(numerical_error)) {
+                    fail_all_locked(numerical_error);
+                    finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                    return;
+                }
+                finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                oom_backoff_ = kOomBackoffIterations;
+                decode_run   = 0;
                 continue;
             } catch (const std::logic_error& invariant) {
                 if (!recover_invariant_failures_) {
