@@ -413,31 +413,58 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
             }
         }
         Tensor hidden = work.alloc(DType::BF16, {dimension(target.hidden_size), mask_columns});
-        ops::rmsnorm_pack_tail(residual, weights.final_norm, hidden, stream);
+        if (fused) {
+            ops::rmsnorm_pack_tail(residual, weights.final_norm, hidden, stream);
+        } else {
+            // The mask columns of every block, packed, then the plain final norm.
+            auto scope             = work.scope();
+            const std::size_t rows = std::size_t(target.hidden_size) * dtype_size(DType::BF16);
+            Tensor packed =
+                work.alloc(DType::BF16, {dimension(target.hidden_size), mask_columns});
+            CUDA_CHECK(cudaMemcpy2DAsync(packed.data, rows * std::size_t(k),
+                                         static_cast<const std::byte*>(residual.data) + rows,
+                                         rows * std::size_t(width), rows * std::size_t(k),
+                                         std::size_t(batch), cudaMemcpyDeviceToDevice, stream));
+            ops::rmsnorm(packed, weights.final_norm, config.rms_norm_eps, false, hidden, stream);
+        }
         Tensor candidates = frame.candidate_ids.slice(2, 0, batch);
         Tensor ids_flat =
             candidates.view({dimension(config.dflash2->selector_top_k), mask_columns});
         Tensor scores =
             work.alloc(DType::FP32, {dimension(config.dflash2->selector_top_k), mask_columns});
         // A rotated head reads its own copy: the selector projection below takes the primal hidden.
-        if (state.execution.proposal_head == ProposalHead::Full) {
-            const auto& head        = state.execution.parameters.draft->output_head;
+        const bool optimized = state.execution.proposal_head != ProposalHead::Full;
+        const auto& head     = optimized ? state.execution.parameters.proposal->head
+                                         : state.execution.parameters.draft->output_head;
+        const Tensor* token_ids =
+            optimized && state.execution.parameters.proposal->token_ids
+                ? &*state.execution.parameters.proposal->token_ids
+                : nullptr;
+        const std::int32_t public_tokens =
+            dimension(state.execution.parameters.model.resources().public_token_count);
+        if (fused) {
             const Tensor head_input = rotated_input(hidden, head.hadamard_signs, work, stream);
-            ops::linear_topk(
-                head_input, head.weight,
-                dimension(state.execution.parameters.model.resources().public_token_count),
-                ids_flat, scores, work, stream);
-        } else {
-            const auto& head        = *state.execution.parameters.proposal;
-            const Tensor head_input = rotated_input(hidden, head.head.hadamard_signs, work, stream);
-            if (head.token_ids) {
-                ops::linear_topk(head_input, head.head.weight, *head.token_ids, ids_flat, scores,
-                                 work, stream);
+            if (token_ids != nullptr) {
+                ops::linear_topk(head_input, head.weight, *token_ids, ids_flat, scores, work,
+                                 stream);
             } else {
-                ops::linear_topk(
-                    head_input, head.head.weight,
-                    dimension(state.execution.parameters.model.resources().public_token_count),
-                    ids_flat, scores, work, stream);
+                ops::linear_topk(head_input, head.weight, public_tokens, ids_flat, scores, work,
+                                 stream);
+            }
+        } else {
+            // A head the fused top-k does not take: dense BF16 logits, their sixteen largest a
+            // column, and the shortlist's rows mapped to token ids.
+            auto scope    = work.scope();
+            Tensor logits = work.alloc(DType::BF16, {head.weight.n, mask_columns});
+            project(hidden, head, logits, work, stream);
+            ops::candidate_topk(logits, token_ids != nullptr ? head.weight.n : public_tokens,
+                                ids_flat, scores, work, stream);
+            if (token_ids != nullptr) {
+                Tensor every = ids_flat.view(
+                    {dimension(config.dflash2->selector_top_k) * mask_columns});
+                ops::proposal_remap_token_ids(every,
+                                              static_cast<const std::int32_t*>(token_ids->data),
+                                              head.weight.n, stream);
             }
         }
         Tensor projected =

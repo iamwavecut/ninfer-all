@@ -1162,12 +1162,23 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     const auto& head = plan.proposal_head == ProposalHead::Optimized
                                            ? parameters.proposal->head
                                            : parameters.draft->output_head;
-                    if (execution::rotated(head.hadamard_signs)) {
-                        matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
+                    if (fused) {
+                        if (execution::rotated(head.hadamard_signs)) {
+                            matrix(layout, DType::BF16, dimension(config.hidden_size),
+                                   mask_columns);
+                        }
+                        scratch(layout, ops::linear_topk_workspace_capacity_bytes(
+                                            head.weight.qtype, head.weight.n, head.weight.k,
+                                            mask_columns, mask_columns));
+                    } else {
+                        // The packed mask columns before the final norm, then the dense logits
+                        // with the head's scratch or the top-k's.
+                        scratch(layout, std::size_t(config.hidden_size) * mask_columns * 2);
+                        auto dense = layout.scope();
+                        matrix(layout, DType::BF16, head.weight.n, mask_columns);
+                        linear_scratch(layout, head, mask_columns, mask_columns);
+                        scratch(layout, ops::candidate_topk_workspace_capacity_bytes(mask_columns));
                     }
-                    scratch(layout, ops::linear_topk_workspace_capacity_bytes(
-                                        head.weight.qtype, head.weight.n, head.weight.k,
-                                        mask_columns, mask_columns));
                     matrix(layout, DType::BF16, dimension(draft->dflash2->selector_rank),
                            mask_columns);
                     linear_scratch(layout, parameters.draft->selector->hidden_projection,
