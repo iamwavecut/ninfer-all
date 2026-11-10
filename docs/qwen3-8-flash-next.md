@@ -832,7 +832,11 @@ drafts after the three prompts and 1.43 times after a 9,741-token document (MTP'
   row by row over all its experts, summing a row in registers. The decoding of Q2_0, the routed
   experts' format, is integer-throughput bound, so its activations come transposed and its codes
   need two operations a word. The shared expert runs on a second stream meanwhile. All of it is
-  the separate kernels' arithmetic bit for bit.
+  the separate kernels' arithmetic bit for bit. Device and disk experts take the same decode form
+  in one stage, the shared expert on the second stream as well: on an RTX PRO 6000 Blackwell
+  Server (600 W), the UD-IQ2_XS release with device experts and no n-gram table decoded a
+  300-token greedy answer at 131.2 instead of 118.9 tok/s, with MTP and 4 drafts at 171.3 instead
+  of 153.0, and with disk experts at 70.6 instead of 67.5, the same bytes (November 10, 2026).
 - The expert cache counts the routes each forward pass took (decayed per token) and, between
   passes, copies the experts it needed most into its slots and points the tables at them: for
   every layer with mapped misses, and after a prompt chunk with staged ones. With disk experts the
