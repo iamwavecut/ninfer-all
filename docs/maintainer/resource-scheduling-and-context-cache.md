@@ -471,6 +471,18 @@ TerminalPending request 继续持有 `SequenceHandle` 和完整 reservation，�
 inactive owners，但只有严格优于 private-only baseline 的完整终态才会提交；否则跳过 shared publication，
 不阻塞 active request，也不改变同一 frontier 原本可执行的 private capture。
 
+**Stop string 截断的 turn。** Stop string 的匹配若开始于较早的 round、在之后的 round 才结束 turn，
+live state 已经读入被截掉的 token，任何后续 prompt 都无法延续它。Program 因此在 terminal commit 把
+sequence 退回到匹配开始处：每个 lane 在 catalog 之外另有一个 Device StateImage
+（`models::stop_hold_slots`，不计入 `PhysicalCapacity`，也不参与 pressure），匹配开始的 round 把当时的
+state 写入其中（无 draft 的 round 复制 lane 的 image；MTP、DFlash 和 DFlash2 round 以该列数多做一次
+replay fold，DFlash/DFlash2 还复制 lane 的 draft context 并把匹配之前 token 的 feature 追加进去）。
+Terminal commit 把它复制回 active image，并把 ledger、prefix identity 和 KV extent 截到该 frontier，
+随后 Finish 按普通 endpoint 发布。Sequence 在该 frontier 之后还有 checkpoint、或 image 被共享时保持
+原样。显式 KV 容量放不下时，启动会放弃这些 image 并给出诊断
+（`ContextCacheOptions::stop_hold_images`）。匹配在同一 round 内开始并结束的 turn 不需要 image：
+Engine 只提交匹配之前的 token。
+
 ### 6.3 Persistent backfill proof
 
 Scheduler 是否允许 backfill 由 [Engine 架构](engine-architecture.md#52-admission-顺序)决定。Program

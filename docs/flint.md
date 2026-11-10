@@ -131,9 +131,21 @@ keeps instead of prefilling those tokens again:
   time than computing its tokens again (about 50 tokens on). A disposable request (a decision read)
   leaves no image of its end.
 
-A sliding-window state cannot be cut back: the rings at a position hold the window before it, and
-each block's window reaches further back through the blocks below. A prompt therefore resumes only
-where a state was kept, not at an arbitrary common prefix.
+A sliding-window state cannot be cut back at will: the rings at a position hold the window before
+it, and each block's window reaches further back through the blocks below. A prompt therefore
+resumes only where a state was kept, not at an arbitrary common prefix.
+
+A turn that a stop string ends is the exception. Its state has read the tokens the cut removed, so
+the sequence goes back to where the stop string's match began, the state its visible text
+continues. The rings hold 768 positions for a window of 513, so that position's window is still in
+them while the sequence has written at most 255 positions past it, less a round's drafts; the
+full-attention rows are kept by position, and no state is copied. The next prompt resumes there
+when it repeats the reply's tokens, as a client that sends token ids does: on an RTX 4090 with host
+experts, after a reply of 184 tokens that a stop string cut at its 179th, the next request reused
+199 of its 207 tokens, as after a reply that its output limit ended there, with and without
+`--lookup-ngram`. A chat request renders the reply anew: with thinking off the generation prompt
+ends in an empty reasoning block that the history does not carry, so the next prompt resumes from
+the checkpoint at the last user turn whatever ended the reply.
 
 ## Measurements
 
