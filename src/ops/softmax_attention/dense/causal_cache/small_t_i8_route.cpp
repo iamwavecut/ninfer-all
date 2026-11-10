@@ -1,6 +1,6 @@
 // The INT8-family small-T route key, in a unit of its own: the per-width launch units and the
 // dispatcher both read it, and where the launch units live in the Windows kernel DLL each module
-// compiles its own copy.
+// links its own copy of this unit's archive.
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
 
 #include <string>
