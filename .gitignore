@@ -47,7 +47,6 @@ vcpkg_installed/
 /AGENTS.override.md
 /logs/
 *.log
-*.out
 *.tmp
 /core
 /core.*
