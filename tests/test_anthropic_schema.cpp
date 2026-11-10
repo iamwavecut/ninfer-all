@@ -650,6 +650,10 @@ int test_thinking_and_count_tokens() {
     failures += check(hidden.hide_thinking && hidden.generation.enable_thinking == true &&
                           !parse(base_request()).hide_thinking,
                       "display:omitted was not parsed as hidden adaptive Thinking");
+    body["thinking"] = Json{{"type", "adaptive"}, {"display", "updates"}};
+    const AnthropicMessagesRequest updates = parse(body);
+    failures += check(updates.hide_thinking && updates.generation.enable_thinking == true,
+                      "display:updates was not parsed as hidden adaptive Thinking");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "summarized"}};
     failures += check(!parse(body).hide_thinking, "display:summarized hid the Thinking text");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "future"}};
