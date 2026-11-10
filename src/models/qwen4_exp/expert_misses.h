@@ -1,17 +1,26 @@
 #pragma once
 
-// The routed experts a decode or verification layer needs but its device cache lacks, served while
-// the cached ones run. After a layer's routing a kernel splits its pairs: the cached ones run at once
-// from the device tables; the missing experts are posted to pinned host memory (one "doorbell" per
-// device) without any host synchronization, so the whole pass can replay as one CUDA graph. A host
-// thread picks the request up at once while passes keep it spinning (keep_alive), within
-// milliseconds once it sleeps, and, for each missing expert, either copies it into a device
-// staging region (or, when the cache's expert tier admits it, straight into a slot) by the copy
-// engine, or has the CPU compute its pairs from the bytes in RAM (host experts) or from the file
-// (disk experts); an expert the CPU computes crosses no bus and takes no slot. The second
-// stage of the layer waits for the request on the GPU, then runs the staged experts and adds the
-// CPU's products. The staged experts are reached through a second table that only the second
-// stage reads, so the resident stage needs no host at all.
+// The routed experts a layer's call needs but its device cache lacks, served while the cached ones
+// run. After a layer's routing a kernel splits its pairs: the cached ones run at once from the
+// device tables.
+//
+// A narrow call (up to kNarrowMissTokens tokens: decode steps, short verifications) posts its
+// missing experts to pinned host memory (one "doorbell" per device) without any host
+// synchronization, so the whole pass can replay as one CUDA graph. A host thread picks the request
+// up at once while passes keep it spinning (keep_alive), within milliseconds once it sleeps, and,
+// for each missing expert, either copies it into a device staging region (or, when the cache's
+// expert tier admits it, straight into a slot) by the copy engine, reads it across the bus when
+// the staging is full, or has the CPU compute its pairs from the bytes in RAM (host experts) or
+// from the file (disk experts); an expert the CPU computes crosses no bus and takes no slot. The
+// second stage of the layer waits for the request on the GPU, then runs the staged experts and adds
+// the CPU's products. The staged experts are reached through a second table that only the second
+// stage reads, so the resident stage needs no host at all. A narrow call takes the vector
+// products, which the CPU's equal bit for bit.
+//
+// A wide call takes the matrix kernel, as device banks do, so every missing expert reaches device
+// memory and the CPU takes no share: the calling thread waits for the split, then admits or stages
+// the missing experts in rounds of half the staging, each round's products running while the next
+// round's copies cross the bus (stage_wide).
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -24,6 +33,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -53,19 +63,16 @@ struct MissLayer {
     bool admit = false;
 };
 
-// The most tokens one call can take (MissOptions::token_capacity).
-inline constexpr std::uint32_t kMaxMissTokens = 64;
+// The widest narrow call: ops::moe_experts_gguf takes the vector products up to this width and the
+// matrix kernel past it, which the CPU's products do not reproduce.
+inline constexpr std::uint32_t kNarrowMissTokens = 8;
 
 // How long keep_alive() and each served request keep the service and its CPU workers spinning.
 inline constexpr std::chrono::milliseconds kMissKeepAlive{500};
 
 struct MissOptions {
-    std::uint32_t token_capacity = 8;    // tokens of one call, at most kMaxMissTokens
-    // The widest decode or verification call: wider calls are prompt chunks, whose copy and CPU
-    // times the balance fits apart, so that their many pairs per expert leave the narrow calls'
-    // lines alone.
-    std::uint32_t verify_tokens  = 8;
-    double cpu_share             = 0.0;  // share of a request's missing experts the CPU computes
+    std::uint32_t token_capacity = 8;    // tokens of one call, narrow or wide
+    double cpu_share             = 0.0;  // share of a narrow call's missing experts the CPU computes
     // Instead of a fixed share, each request gives the CPU the experts that make its copies and
     // its CPU products end soonest, by times fitted to the earlier requests.
     bool cpu_balance             = false;
@@ -79,7 +86,7 @@ struct MissOptions {
 struct MissStats {
     std::uint64_t requests    = 0; // layers that had missing experts
     std::uint64_t staged      = 0; // experts copied to device staging or straight into slots
-    std::uint64_t mapped      = 0; // experts the GPU read across the bus (staging full)
+    std::uint64_t mapped      = 0; // experts the GPU read across the bus (narrow, staging full)
     std::uint64_t computed    = 0; // experts the CPU computed
     std::uint64_t admitted    = 0; // of the staged, copied straight into cache slots
     std::uint64_t cpu_pairs   = 0;
@@ -108,15 +115,23 @@ public:
         const std::int32_t* count    = nullptr;
         std::int32_t max_products    = 0;
     };
-    // Enqueued on `stream` (capturable): splits `ids` of `tokens` tokens and posts the missing
-    // experts. `m` is the layer's BF16 input, copied to the host when the CPU takes a share.
+    // Enqueued on `stream` (capturable when narrow): splits `ids` of `tokens` tokens and, for a
+    // narrow call, posts the missing experts. `m` is the layer's BF16 input, copied to the host
+    // when the CPU takes a share. A wide call's missing_banks are device-resident.
     [[nodiscard]] Call begin(std::size_t layer, const Tensor& ids, const Tensor& m,
                              std::int32_t tokens, const ops::GgufMoeWeights& banks,
                              cudaStream_t stream);
-    // Enqueued: waits until the request's experts are staged and its CPU products written. Eager
-    // (the stream not capturing), it waits on the host and wakes the service first: the device may
-    // post the request long after begin() was enqueued.
+    // Narrow calls, enqueued: waits until the request's experts are staged and its CPU products
+    // written. Eager (the stream not capturing), it waits on the host and wakes the service first:
+    // the device may post the request long after begin() was enqueued.
     void await(std::size_t layer, cudaStream_t stream);
+    // Wide calls, eager, after begin(): waits on the host for the split, then brings every missing
+    // expert into device memory, straight into a cache slot when the tier admits it, else into a
+    // half of the staging, a round of experts at a time. `stage` enqueues on `stream` a round's
+    // products over Call::missing_banks; `missing_ids` lists the round's pairs (-1 for the
+    // others). A round's copies wait for the products of the round before it in the same half.
+    void stage_wide(std::size_t layer, cudaStream_t stream,
+                    const std::function<void(const Tensor& missing_ids)>& stage);
     // Keeps the service (and the CPU workers) spinning for kMissKeepAlive; a pass calls it before
     // its first layer. Rethrows a service failure. Asleep, the service still looks for requests
     // every few milliseconds, as no host call wakes it for a request a replayed layer posts.

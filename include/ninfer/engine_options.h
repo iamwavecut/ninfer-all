@@ -81,7 +81,8 @@ struct SpeculativeOptions {
     // Qwen3.8-Flash-Next with host experts with its DFlash2 drafter, kAutomaticDFlash2Tokens a
     // round verified through the first draft at or below kAutomaticDFlash2MinP, or without one
     // with its MTP block, kAutomaticDraftTokens a round ending at the first draft at or below
-    // kAutomaticDraftMinP; Gemma 4 with host or disk experts with its assistant,
+    // kAutomaticDraftMinP, a round of several requests with a CPU share verifying at most the
+    // eight tokens of a call the CPU shares; Gemma 4 with host or disk experts with its assistant,
     // kAutomaticDraftTokens a round; others run without drafts. The Engine's options() report the
     // resolved backend.
     bool automatic = false;

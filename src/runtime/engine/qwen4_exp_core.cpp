@@ -652,6 +652,9 @@ struct Qwen4ExpCore::Impl {
     bool holds_ready = false; // every slot's hold snapshot has its buffers
     const std::uint32_t drafts; // MTP drafts a speculative round proposes; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
+    // Under the automatic drafting with a CPU share of host experts' misses, the widest
+    // verification a round runs: the widest call whose misses the CPU shares. 0: no such limit.
+    const std::uint32_t round_tokens;
     const DiagnosticObserver diagnostics;
     // With --adaptive-mtp, the steps a round drafts and verifies: from one draft, since each draft
     // is a step of the MTP block of its own here, up to `drafts`.
@@ -751,7 +754,9 @@ struct Qwen4ExpCore::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
-          lookup_ngram(options.speculative.lookup_ngram), diagnostics(options.diagnostic_observer),
+          lookup_ngram(options.speculative.lookup_ngram),
+          round_tokens(options.speculative.automatic ? i.executor->cpu_share_tokens() : 0),
+          diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
               options.decode_rounds_per_prefill != 0
@@ -2702,6 +2707,16 @@ struct Qwen4ExpCore::Impl {
         return accepted;
     }
 
+    // The drafts each request of a round of `b` may verify: every draft, or with round_tokens as
+    // many as keep the round's verification within it (three each for two requests, one each for
+    // three or four); 0 past that, where the requests decode without drafts. A wider verification
+    // copies every missing expert to the GPU, and its drafts cost more than they keep.
+    [[nodiscard]] std::uint32_t round_drafts(std::size_t b) const {
+        if (round_tokens == 0 || b == 0) { return drafts; }
+        const auto width = round_tokens / static_cast<std::uint32_t>(b);
+        return width > 1 ? std::min(drafts, width - 1) : 0;
+    }
+
     // Whether the request's next step can be a speculative round: an Engine with drafts, one token
     // to feed, an MTP state that follows the sequence, room for the round in the context, and no
     // switch of sampling parameters pending (a reasoning block that has not closed yet when the
@@ -2744,6 +2759,10 @@ struct Qwen4ExpCore::Impl {
             } else {
                 (request->feed.size() == 1 ? batch : alone).push_back(request);
             }
+        }
+        if (!speculative.empty() && round_drafts(speculative.size()) == 0) {
+            batch.insert(batch.end(), speculative.begin(), speculative.end());
+            speculative.clear();
         }
         if (batch.empty() && alone.empty() && speculative.empty() && deferred.empty()) { return 1; }
         std::vector<std::pair<const Request*, std::uint32_t>> fed_from;
@@ -2913,14 +2932,15 @@ struct Qwen4ExpCore::Impl {
         const auto round_start = Clock::now();
         // With --adaptive-mtp the controller picks a lone request's steps from its draft survival
         // and the round times it has measured; a new request restarts its probe. A round of
-        // several requests drafts as the automatic drafting does, kAutomaticDraftTokens steps at
-        // most, every request verifying its drafts up to the floor: a batch drafts until each of
+        // several requests drafts kAutomaticDraftTokens steps at most, every request verifying
+        // its drafts up to the floor: a batch drafts until each of
         // its requests has reached the floor or the round's width, so a wider round runs nearly
-        // every step for all of them, and verifying fewer drafts than ran wastes the rest.
+        // every step for all of them, and verifying fewer drafts than ran wastes the rest. Under
+        // the automatic drafting with a CPU share, round_drafts() bounds the steps.
         const bool adapts   = mtp_controller && b == 1;
-        std::uint32_t steps = mtp_controller && b > 1
-                                  ? std::min(drafts, SpeculativeOptions::kAutomaticDraftTokens)
-                                  : drafts;
+        std::uint32_t steps = std::min(
+            round_drafts(b), mtp_controller && b > 1 ? SpeculativeOptions::kAutomaticDraftTokens
+                                                     : drafts);
         if (adapts) {
             std::vector<const runtime::MtpAdaptiveSignal*> signals;
             std::vector<std::uint32_t> available, room;
