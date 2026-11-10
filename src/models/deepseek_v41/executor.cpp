@@ -223,6 +223,8 @@ struct LayerPlan {
     gguf::GgmlType gate_up_type{}, down_type{};
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     DeviceBuffer tables; // device experts: [E] gate, [E] up, [E] gate_up, [E] down
+    // A drafter block under --draft-experts: its kept experts' weights, router rows and biases.
+    DeviceBuffer kept_experts, kept_router;
     int delivery_layer = -1;
     int engram         = -1; // index among the Engram blocks
     Weight engram_projection;
@@ -292,6 +294,7 @@ struct Executor::Impl {
     std::vector<KvArea*> sequence_areas;
     std::atomic<std::uint64_t> kv_backed{0};
     std::uint64_t kv_fixed = 0, kv_bytes = 0;
+    std::uint64_t drafter_expert_bytes = 0; // see ExecutorMemory
     std::vector<LayerPlan> layers;
     // The CPU's share of missing experts; it outlives the delivery that calls it.
     std::unique_ptr<CpuExperts> cpu_experts;
@@ -805,6 +808,87 @@ struct Executor::Impl {
         p.tables.copy_from_host(table.data(), table.size() * sizeof(void*));
     }
 
+    // --draft-experts: a drafter block's kept experts (Model::dspark_kept, ascending), copied from
+    // the pinned host weights to one device buffer with the kernels' zero tails, and their router
+    // rows and biases, so the block routes among them as experts 0..N-1. Startup only.
+    void keep_drafter_experts(LayerPlan& p, const LayerWeights& lw, std::span<const std::int32_t> kept) {
+        const int n           = int(kept.size());
+        constexpr std::size_t kAlign = 256, kTail = 512;
+        const auto aligned    = [](std::size_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; };
+        p.kept_router         = DeviceBuffer(aligned(std::size_t(n) * hidden * 4) + std::size_t(n) * 4);
+        auto* router          = static_cast<float*>(p.kept_router.p);
+        auto* bias            = reinterpret_cast<float*>(static_cast<std::byte*>(p.kept_router.p) +
+                                                         aligned(std::size_t(n) * hidden * 4));
+        for (int i = 0; i < n; ++i) {
+            const auto x = std::size_t(kept[std::size_t(i)]);
+            CUDA_CHECK(cudaMemcpy(router + std::size_t(i) * hidden, p.router + x * hidden,
+                                  std::size_t(hidden) * 4, cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(bias + i, p.router_bias + x, 4, cudaMemcpyDeviceToDevice));
+        }
+        p.router      = router;
+        p.router_bias = bias;
+        p.experts     = n;
+        // Each run: `bytes` per expert at `source` (host), expert x at source + x * bytes.
+        struct Run {
+            const std::byte* source;
+            std::size_t bytes;
+            std::byte* target = nullptr;
+        };
+        std::vector<Run> runs;
+        if (p.stq) {
+            for (ops::stq::Matrices* m : {&p.stq->gate, &p.stq->up, &p.stq->down}) {
+                runs.push_back({reinterpret_cast<const std::byte*>(m->trellis),
+                                std::size_t(m->trellis_stride) * 2});
+                runs.push_back({reinterpret_cast<const std::byte*>(m->suh), std::size_t(m->k) * 2});
+                runs.push_back({reinterpret_cast<const std::byte*>(m->svh), std::size_t(m->n) * 2});
+            }
+        } else {
+            const Weight gate_up = matrix(model, *lw.moe.gate_up);
+            const Weight down    = matrix(model, *lw.moe.down);
+            p.gate_up_type       = ops::detail::gguf_type(gate_up.qtype);
+            p.down_type          = ops::detail::gguf_type(down.qtype);
+            p.gate_up_row_bytes  = row_bytes(gate_up);
+            p.down_row_bytes     = row_bytes(down);
+            runs.push_back({static_cast<const std::byte*>(gate_up.qdata),
+                            std::size_t(2 * width) * std::size_t(p.gate_up_row_bytes)});
+            runs.push_back({static_cast<const std::byte*>(down.qdata),
+                            std::size_t(hidden) * std::size_t(p.down_row_bytes)});
+        }
+        std::size_t total = 0;
+        for (const Run& run : runs) { total += aligned(run.bytes * std::size_t(n) + kTail); }
+        p.kept_experts = DeviceBuffer(total);
+        p.kept_experts.fill(0);
+        auto* at = static_cast<std::byte*>(p.kept_experts.p);
+        for (Run& run : runs) {
+            run.target = at;
+            for (int i = 0; i < n; ++i) {
+                CUDA_CHECK(cudaMemcpy(at + std::size_t(i) * run.bytes,
+                                      run.source + std::size_t(kept[std::size_t(i)]) * run.bytes,
+                                      run.bytes, cudaMemcpyHostToDevice));
+            }
+            at += aligned(run.bytes * std::size_t(n) + kTail);
+        }
+        if (p.stq) {
+            std::size_t r = 0;
+            for (ops::stq::Matrices* m : {&p.stq->gate, &p.stq->up, &p.stq->down}) {
+                m->trellis = reinterpret_cast<const std::uint16_t*>(runs[r++].target);
+                m->suh     = reinterpret_cast<const __half*>(runs[r++].target);
+                m->svh     = reinterpret_cast<const __half*>(runs[r++].target);
+            }
+            return;
+        }
+        std::vector<const void*> table(4 * std::size_t(n));
+        for (int x = 0; x < n; ++x) {
+            const std::byte* gu = runs[0].target + std::size_t(x) * runs[0].bytes;
+            table[std::size_t(x)]         = gu;
+            table[std::size_t(n + x)]     = gu + std::int64_t(width) * p.gate_up_row_bytes;
+            table[std::size_t(2 * n + x)] = gu;
+            table[std::size_t(3 * n + x)] = runs[1].target + std::size_t(x) * runs[1].bytes;
+        }
+        p.tables = DeviceBuffer(table.size() * sizeof(void*));
+        p.tables.copy_from_host(table.data(), table.size() * sizeof(void*));
+    }
+
     // The drafter's blocks with their rings (and checkpoints), its tables and its buffers.
     void plan_drafter(std::size_t ring_bytes, std::size_t& branch_bytes) {
         const DSparkConfig& dc = *model.dspark_config();
@@ -836,8 +920,13 @@ struct Executor::Impl {
             const LayerWeights& lw = dw.layers[b];
             LayerPlan p = plan_block(lw, 0, int(dc.experts), int(dc.top_k),
                                      dc.stq ? &dw.stq_layers.at(b) : nullptr);
+            const bool kept = !model.dspark_kept().empty();
+            if (kept) {
+                keep_drafter_experts(p, lw, model.dspark_kept().at(b));
+                drafter_expert_bytes += p.kept_experts.bytes + p.kept_router.bytes;
+            }
             if (!dc.stq) {
-                plan_resident(p, lw.moe);
+                if (!kept) { plan_resident(p, lw.moe); }
                 // The seed's kv rows: of [query_a; kv] when the two are one parent.
                 Weight kv = p.query_kv.back();
                 if (p.query_kv.size() == 1) {
@@ -3527,6 +3616,7 @@ ExecutorMemory Executor::memory() const noexcept {
                           .engram_resident_bytes = impl_->engram ? impl_->engram->resident_bytes() : 0,
                           .vision_encode_bytes = impl_->tower ? impl_->tower->workspace_bytes() : 0,
                           .vision_owned_bytes  = impl_->vision_owned_bytes(),
+                          .drafter_expert_bytes = impl_->drafter_expert_bytes,
                           .experts = impl_->delivery ? impl_->delivery->memory() : ExpertDeliveryMemory{}};
 }
 

@@ -86,7 +86,9 @@ two-stage GDN prefill, parallel query tiles, MX FP8 MMA and Minnnn's column-band
 - The DeepSeek-V4.1-Flash artifacts import ISTA-DASLab's GSQ-RCO IQ1_M GGUF and its Engram table
   GGUF, under the model's MIT license. Its support follows DeepSeek's release code
   (`inference/model.py`, `kernel.py` and `encoding/encoding.py`) and was measured against Strata's
-  `strata-dsv41`.
+  `strata-dsv41`. The order in which `--draft-experts` keeps the DSpark drafter's experts is
+  [Basalt](https://github.com/jesdga95/basalt)'s profile `deepseek41-40x384-dspark.prof` (MIT,
+  copyright 2026 Jesús Gulfo).
 - The SiLU shared by the GPU's GGUF expert kernels and the CPU's expert products evaluates e^x with
   the single-precision polynomial of Stephen L. Moshier's Cephes Math Library.
 - llama.cpp's GGUF block kernels are vendored in `third_party/ggml-quants` under their MIT license;

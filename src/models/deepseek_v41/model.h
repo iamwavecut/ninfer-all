@@ -133,6 +133,10 @@ struct LoadOptions {
     std::filesystem::path artifact;
     ExpertResidency experts = ExpertResidency::Device;
     bool dspark             = false; // bind the artifact's DSpark drafter
+    // The drafter's routed experts each block keeps on the device (kDSparkExpertRanking's first),
+    // the rest pinned on the host; 0 or the block's whole count keeps every one on the device.
+    // Unset: kDefaultDraftExperts with the STQ drafter and host or disk experts, else every expert.
+    std::optional<std::uint32_t> draft_experts;
     // Binds the artifact's `vision` component, which must then exist, in this placement.
     VisionPlacement vision = VisionPlacement::None;
 };
@@ -150,6 +154,12 @@ public:
         return dspark_config_;
     }
     [[nodiscard]] const std::optional<DSparkWeights>& dspark() const noexcept { return dspark_; }
+    // LoadOptions::draft_experts below the block's count: each drafter block's kept experts in
+    // ascending order, whose routed weights (pinned on the host) the executor copies to the
+    // device; empty when every expert is on the device.
+    [[nodiscard]] const std::vector<std::vector<std::int32_t>>& dspark_kept() const noexcept {
+        return dspark_kept_;
+    }
     // The vision tower, when loaded.
     [[nodiscard]] const std::optional<VisionConfig>& vision_config() const noexcept {
         return vision_config_;
@@ -195,6 +205,7 @@ private:
     TextWeights weights_;
     std::optional<DSparkConfig> dspark_config_;
     std::optional<DSparkWeights> dspark_;
+    std::vector<std::vector<std::int32_t>> dspark_kept_;
     std::optional<VisionConfig> vision_config_;
     std::optional<VisionWeights> vision_;
     VisionPlacement vision_placement_ = VisionPlacement::None;

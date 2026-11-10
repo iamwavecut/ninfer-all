@@ -224,6 +224,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         {.artifact = options.artifact_path,
          .experts  = options.expert_residency,
          .dspark   = dspark,
+         .draft_experts = speculative.draft_experts,
          .vision   = vision},
         device, &options.startup_observer);
     // An image's span takes the release's 1024 prompt positions at most, fewer with
@@ -481,12 +482,21 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                            speculative.lookup_ngram, lookup_drafts);
     }
     if (dspark) {
+        const auto& kept = model->dspark_kept();
+        const std::string experts =
+            kept.empty() ? std::string("every expert on the GPU")
+                         : std::to_string(kept.front().size()) + " of " +
+                               std::to_string(model->dspark_config()->experts) +
+                               " experts a block on the GPU (" +
+                               std::to_string(instance->executor->memory().drafter_expert_bytes >> 20) +
+                               " MiB), the rest in pinned memory";
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "DeepSeek-V4.1: DSpark speculative decoding, up to %u drafts a round "
                            "while their confidence is at least %.2f, one decoding request at a "
-                           "time",
+                           "time, %s",
                            drafts,
-                           double(speculative.draft_confidence.value_or(kDSparkConfidenceFloor)));
+                           double(speculative.draft_confidence.value_or(kDSparkConfidenceFloor)),
+                           experts.c_str());
     }
     ConstructedDeepSeekV41 out;
     const auto& stats         = model->storage_stats();

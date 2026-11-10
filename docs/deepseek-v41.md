@@ -431,7 +431,8 @@ model:
 - **One request.** The drafter drafts while one request decodes; with more, each round decodes one
   token per request.
 - **Memory.** Unsloth's drafter's weights take 7.4 GiB of device memory, almost all of it its 384
-  MXFP4 experts, and the STQ drafter's 3.58 GiB; the rings take 0.39 MiB per sequence (twice that
+  MXFP4 experts, and the STQ drafter's 3.58 GiB, or 2.0 GiB with the 64 experts a block it keeps on
+  the card by default ([the drafter's experts](#the-drafters-experts)); the rings take 0.39 MiB per sequence (twice that
   with prefix checkpoints) and the tapped streams 7.5 MiB. The expert cache gives up that memory:
   on an RTX 4090 with host experts it keeps 73 experts with Unsloth's drafter and 618 with the STQ
   drafter instead of 1,137, and with Unsloth's drafter prompt spans shorten to 8,192 tokens.
@@ -563,6 +564,40 @@ the steps that decode one token:
 - **Memory.** The server's resident host memory peaked at 115.6 to 116.0 GiB in every arm.
 
 One run per row (the short answer's rate is the mean of its two warm runs); no spread is measured.
+
+### The drafter's experts
+
+`--draft-experts N` keeps on the card each drafter block's N experts that the drafter routes to
+most, and routes the block among those N; the other experts stay in pinned host memory and the
+drafter never reads them. The order is Basalt's (MIT), counted on live runs of the drafter. `0`
+keeps every expert on the card. The default is 64 with the STQ drafter and host or disk experts,
+whose expert cache takes the memory the drafter gives back, and every expert otherwise: with every
+expert on the card nothing takes it, and Unsloth's drafter was not measured. Drafts change, verified tokens do not: the target verifies every
+draft as before. Each block must keep at least the 3 experts a row routes to.
+
+On November 10, 2026, the Coder build's STQ drafter ran on an RTX 4090 (450 W, a RunPod host with
+a 32-core EPYC 7532) with host experts and on an RTX PRO 6000 Blackwell Workstation (600 W, a Vast
+host) with every expert on the card. One CLI request, greedy, thinking off: a code request
+answered with 300 tokens on the RTX 4090 and 256 on the RTX PRO 6000. The output bytes were the same
+in every run on a card:
+
+| card | kept a block | drafter experts on the card | expert cache | decode | drafts accepted |
+|---|---:|---:|---:|---:|---:|
+| RTX 4090 | no drafter | | 11.6 GiB, 1,824 slots | 35.1 / 35.1 tok/s | |
+| | 128 | 3,262 MiB | 7.95 GiB, 1,374 slots | 42.2 / 42.5 tok/s | 221 of 263 |
+| | 64 | 1,631 MiB | 9.53 GiB, 1,571 slots | 47.3 / 47.4 tok/s | 222 of 261 |
+| | 32 | 815 MiB | 10.3 GiB, 1,670 slots | 45.1 / 45.2 tok/s | 207 of 267 |
+| RTX PRO 6000 | 128 | 3,262 MiB | | 173.4 tok/s | 184, 77.0% of drafts |
+| | 64 | 1,631 MiB | | 175.9 tok/s | 184, 79.0% of drafts |
+| | 32 | 815 MiB | | 165.5 tok/s | 177, 75.6% of drafts |
+| RTX PRO 6000 Server, no Engram table | 128 | 3,262 MiB | | 163.2 tok/s | 223, 76.9% of drafts |
+| | 64 | 1,631 MiB | | 155.9 tok/s | 219, 72.8% of drafts |
+
+With host experts the memory the drafter gives back goes to the expert cache: 64 kept decode 12%
+faster than all 128, 32 kept accept fewer drafts. With every expert on the card nothing takes that
+memory: 64 decoded 1.4% faster than 128 on the Workstation card and 4.5% slower on the Server card
+(a 300-token answer, `--no-ngram-table`, the same bytes either way), one run each, so device
+experts keep all 128.
 
 ## Images
 

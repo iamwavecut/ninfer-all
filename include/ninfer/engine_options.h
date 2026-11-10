@@ -49,6 +49,11 @@ struct SpeculativeOptions {
     // DeepSeek-V4.1 DSpark: verify a round's drafts up to the first its confidence head scores below
     // this, in [0,1]; 0 keeps every draft. Unset keeps the drafter's default floor (0.5).
     std::optional<float> draft_confidence;
+    // DeepSeek-V4.1 DSpark: each drafter block keeps the N experts of its 128 that its shipped
+    // ranking routes most to on the device and routes among those (the others stay in pinned host
+    // memory); 0 keeps every expert on the device. Unset: 64 with the STQ drafter and host or disk
+    // experts, otherwise every expert.
+    std::optional<std::uint32_t> draft_experts;
     // An Engine's options() report the resolved head.
     ProposalHead proposal_head = ProposalHead::Auto;
     // Context-lookup drafting: match this many trailing tokens against the sequence so far and

@@ -133,6 +133,8 @@ struct ExecutorMemory {
     // tower and its image buffers own beside the model's weights.
     std::uint64_t vision_encode_bytes = 0;
     std::uint64_t vision_owned_bytes  = 0;
+    // --draft-experts: the device copy of the drafter's kept experts and their router rows.
+    std::uint64_t drafter_expert_bytes = 0;
     ExpertDeliveryMemory experts;
 };
 

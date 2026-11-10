@@ -72,6 +72,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         throw std::invalid_argument(
             "--draft-confidence requires --spec dspark and a finite value in [0,1]");
     }
+    if (options.draft_experts && options.backend != SpeculativeBackend::DSpark) {
+        throw std::invalid_argument("--draft-experts requires --spec dspark");
+    }
     if (options.ngram_archive_bytes != 0 &&
         (options.ngram_draft_tokens == 0 || options.ngram_session_bytes < (1ULL << 20) ||
          options.ngram_session_bytes > options.ngram_archive_bytes)) {
