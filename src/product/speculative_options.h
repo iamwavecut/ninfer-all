@@ -98,9 +98,13 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     }
     switch (options.backend) {
     case SpeculativeBackend::None:
-        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Auto) {
-            throw std::invalid_argument("--draft-tokens, --lm-head-draft and --full-draft-head "
-                                        "require --spec mtp|dflash|dflash2|dspark");
+        // Without --spec, --draft-tokens sizes a context lookup's proposals (Flint, DeepSeek-V4.1);
+        // the model's Engine checks that it drafts by lookup alone and the range it verifies.
+        if ((options.draft_tokens != 0 && options.lookup_ngram == 0) ||
+            options.proposal_head != ProposalHead::Auto) {
+            throw std::invalid_argument("--lm-head-draft, --full-draft-head and --draft-tokens "
+                                        "without --lookup-ngram require "
+                                        "--spec mtp|dflash|dflash2|dspark");
         }
         if (options.mtp_policy != MtpDraftPolicy::Fixed) {
             throw std::invalid_argument("--adaptive-mtp requires --spec mtp");

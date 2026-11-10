@@ -108,6 +108,18 @@ int main() {
         try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted an invalid --draft-confidence");
     }
+    {
+        // Without --spec, --draft-tokens sizes a context lookup (Flint, DeepSeek-V4.1).
+        const auto lookup = parse({"ninfer-serve", "model.ninfer", "--lookup-ngram", "4",
+                                   "--draft-tokens", "5"}).speculative;
+        failures += check(lookup.backend == ninfer::SpeculativeBackend::None &&
+                              lookup.lookup_ngram == 4 && lookup.draft_tokens == 5,
+                          "server refused or lost a context lookup's --draft-tokens");
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--draft-tokens", "5"}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted --draft-tokens without --spec or --lookup-ngram");
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).embedding_residency ==
                               ninfer::EmbeddingResidency::Device &&
                           parse({"ninfer-serve", "model.ninfer", "--embedding-residency", "host"})

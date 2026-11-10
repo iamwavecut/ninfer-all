@@ -616,6 +616,8 @@ struct Qwen4ExpCore::Impl {
         std::shared_ptr<Request> request;
         std::vector<TokenId> fed;
         std::vector<TokenId> anchor;
+        // runtime::lookup_draft's copy source, as its distance from the end of `fed`.
+        std::size_t lookup_lag = 0;
         std::vector<MediaMark> media, anchor_media;
         models::qwen4_exp::SequenceSnapshot snapshot;
         // The sequence's state after its first hold_tokens tokens, where a stop string's match
@@ -2954,8 +2956,9 @@ struct Qwen4ExpCore::Impl {
             for (std::size_t j = 0; j < b; ++j) {
                 std::vector<TokenId>& ledger = slots[batch[j]->slot].fed;
                 ledger.push_back(anchors[j]);
-                const std::uint32_t found = runtime::lookup_draft(
-                    ledger, lookup_ngram, steps, all_drafts.data() + j * drafts);
+                const std::uint32_t found =
+                    runtime::lookup_draft(ledger, lookup_ngram, steps, all_drafts.data() + j * drafts,
+                                          slots[batch[j]->slot].lookup_lag);
                 ledger.pop_back();
                 if (found != 0) {
                     looked_up[j]     = 1;

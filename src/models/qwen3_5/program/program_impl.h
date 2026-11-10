@@ -533,6 +533,8 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // runtime::lookup_draft's copy source, as its distance from the end of `ledger`.
+    std::size_t lookup_lag = 0;
     // The initial drafts are still on their way from the device (settle_initial_drafts).
     bool mtp_drafts_pending       = false;
     bool tail_hidden_valid        = false;

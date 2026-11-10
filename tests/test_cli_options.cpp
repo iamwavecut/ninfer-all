@@ -537,6 +537,18 @@ int run_tests() {
                           route.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
                           route.speculative.draft_tokens == 3,
                       "CLI did not parse the cuBLAS prefill and context-lookup controls");
+    // Without --spec, --draft-tokens sizes a context lookup (Flint, DeepSeek-V4.1); alone it is refused.
+    const ninfer::cli::Options lookup_only = parse(
+        {"ninfer-cli", "model.ninfer", "--prompt", "hello", "--lookup-ngram", "4", "--draft-tokens", "5"});
+    failures += check(lookup_only.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          lookup_only.speculative.lookup_ngram == 4 &&
+                          lookup_only.speculative.draft_tokens == 5,
+                      "CLI refused or lost a context lookup's --draft-tokens");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--draft-tokens", "5"});
+                      }),
+                      "CLI accepted --draft-tokens without --spec or --lookup-ngram");
     for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
         failures += check(help.find(flag) != std::string::npos,
                           "CLI help omits an accepted prefill or drafting control");

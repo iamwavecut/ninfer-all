@@ -398,6 +398,8 @@ struct FlintCore::Impl {
         std::shared_ptr<Request> request;
         std::vector<TokenId> fed;
         std::vector<TokenId> anchor;
+        // runtime::lookup_draft's copy source, as its distance from the end of `fed`.
+        std::size_t lookup_lag = 0;
         models::flint::SequenceSnapshot snapshot;
         std::uint64_t last_used = 0;
         bool disposable         = false; // its last request's
@@ -1790,7 +1792,7 @@ struct FlintCore::Impl {
     std::uint32_t lookup(const Request& r, std::uint32_t steps, TokenId* out) {
         std::vector<TokenId>& ledger = slots[r.slot].fed;
         ledger.push_back(r.feed.front());
-        const std::uint32_t found = runtime::lookup_draft(ledger, lookup_ngram, steps, out);
+        const std::uint32_t found = runtime::lookup_draft(ledger, lookup_ngram, steps, out, slots[r.slot].lookup_lag);
         ledger.pop_back();
         return found;
     }

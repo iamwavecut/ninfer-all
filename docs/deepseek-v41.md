@@ -83,7 +83,8 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   probabilities are plain decoding's.
 - **Speculative decoding by context lookup.** Without `--spec`, `--lookup-ngram N` proposes what
   followed the last N tokens' earlier occurrence in the sequence (up to `--draft-tokens`, 3 by
-  default, at most 7), and the target verifies the proposal in one pass of decode rows; the output
+  default, at most 7): the occurrence the sequence was already copying while it still matches, else
+  the newest, and the target verifies the proposal in one pass of decode rows; the output
   is the one plain decoding gives.
 - **Expert residency.** The routed experts stay on the GPU, in pinned host memory or in the
   artifact's files ([below](#expert-residency)); host memory is the residency to use. With host

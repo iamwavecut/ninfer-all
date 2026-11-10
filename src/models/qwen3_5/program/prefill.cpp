@@ -1212,7 +1212,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     if (lookup_ngram != 0) {
                         const auto found = ::ninfer::runtime::lookup_draft(
                             std::span<const TokenId>(sequence.ledger), lookup_ngram, draft_window,
-                            sequence.mtp_drafts.data());
+                            sequence.mtp_drafts.data(), sequence.lookup_lag);
                         if (found != 0) { sequence.mtp_draft_count = found; }
                     }
                 }

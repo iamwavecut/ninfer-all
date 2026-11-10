@@ -48,7 +48,8 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
 - **Sampling defaults.** The release's: temperature 1.0, top-p 0.95, top-k 20.
 - **Speculative decoding by context lookup.** Recursive publishes no draft model. `--lookup-ngram
   N` proposes what followed the last N tokens' earlier occurrence in the sequence (up to
-  `--draft-tokens`, 3 by default, at most 7), and the target verifies the proposal in one pass of
+  `--draft-tokens`, 3 by default, at most 7): the occurrence the sequence was already copying while
+  it still matches, else the newest, and the target verifies the proposal in one pass of
   decode rows; the output is the one plain decoding gives.
 - **Expert residency.** The routed experts stay on the GPU, in pinned host memory or in the
   artifact's files, with a device cache and a CPU share of decode misses
@@ -183,6 +184,12 @@ repetitions, the first having spread ±22%.
   of a six-function Python module with type hints and docstrings (1,024 tokens, reasoning first):
   335.0 → 377.7 tok/s (1.13x), 164 of 255 proposed tokens accepted. The output equals plain
   decoding's.
+- **A lookup keeps its copy.** RTX PRO 6000 Blackwell Server, ninfer-serve, `--lookup-ngram 4`,
+  greedy, 400 tokens, two server starts each, November 10, 2026: six prompts that show a source
+  file as two versions (three identifiers renamed, small numbers changed) and ask for the first
+  again decoded at 573.5-657.4 tok/s when the newest occurrence was always proposed and at
+  648.5-701.2 tok/s keeping the occurrence being copied (1.055-1.156x); a code and a prose request
+  decoded within 0.1%. The answers were the same bytes.
 - **Typed decisions.** On an NVIDIA A40 (48 GB, `sm_86`, 300 W), `scripts/pods/decision_bench.py`
   (four sequences): about a 340-token state, 1, 4 and 16 questions answer in 118, 135 and 236 ms
   cold and 59, 95 and 203 ms once the state is kept; about an 11,660-token state in 2.20, 2.22 and
