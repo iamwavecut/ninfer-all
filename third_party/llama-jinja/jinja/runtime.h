@@ -185,6 +185,8 @@ struct output_statement : public statement {
         const auto result = operand->execute(ctx);
         return mk_val<value_string>(result->as_string());
     }
+
+    void visit(context& ctx) override { ctx.visitor(false, this, {{"operand", {operand.get()}}}); }
 };
 
 // Statements
@@ -201,6 +203,8 @@ struct program : public statement {
     [[noreturn]] value execute_impl(context&) override {
         throw std::runtime_error("Cannot execute program directly, use jinja::runtime instead");
     }
+
+    void visit(context& ctx) override { ctx.visitor(false, this, {{"body", stmts_to_ptr(body)}}); }
 };
 
 struct if_statement : public statement {
@@ -239,12 +243,7 @@ struct for_statement : public statement {
     statements default_block; // if no iteration took place
 
     for_statement(statement_ptr&& loopvar, statement_ptr&& iterable, statements&& body,
-                  statements&& default_block)
-        : loopvar(std::move(loopvar)), iterable(std::move(iterable)), body(std::move(body)),
-          default_block(std::move(default_block)) {
-        chk_type<identifier, tuple_literal>(this->loopvar);
-        chk_type<expression>(this->iterable);
-    }
+                  statements&& default_block);
 
     std::string type() const override { return "For"; }
 
@@ -257,6 +256,10 @@ struct for_statement : public statement {
                      {"body", stmts_to_ptr(body)},
                      {"default_block", stmts_to_ptr(default_block)}});
     }
+
+private:
+    // Whether the body names `loop`. A body that does not gets no loop object.
+    bool body_uses_loop = true;
 };
 
 struct break_statement : public statement {
@@ -447,6 +450,8 @@ struct array_literal : public expression {
         for (const auto& item_stmt : val) { arr->push_back(item_stmt->execute(ctx)); }
         return arr;
     }
+
+    void visit(context& ctx) override { ctx.visitor(false, this, {{"val", stmts_to_ptr(val)}}); }
 };
 
 struct tuple_literal : public expression {
@@ -463,6 +468,8 @@ struct tuple_literal : public expression {
         for (const auto& item_stmt : val) { arr->push_back(item_stmt->execute(ctx)); }
         return mk_val<value_tuple>(std::move(arr->as_array()));
     }
+
+    void visit(context& ctx) override { ctx.visitor(false, this, {{"val", stmts_to_ptr(val)}}); }
 };
 
 struct object_literal : public expression {
@@ -479,6 +486,15 @@ struct object_literal : public expression {
     std::string type() const override { return "ObjectLiteral"; }
 
     value execute_impl(context& ctx) override;
+
+    void visit(context& ctx) override {
+        std::vector<statement*> keys, values;
+        for (const auto& [key, item] : val) {
+            keys.push_back(key.get());
+            values.push_back(item.get());
+        }
+        ctx.visitor(false, this, {{"keys", keys}, {"values", values}});
+    }
 };
 
 // Complex Expressions

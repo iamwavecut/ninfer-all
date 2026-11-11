@@ -67,6 +67,30 @@ int language_semantics() {
          Json::object(), "[value]"},
         {"{{ number }}", {{"number", 1.23456789}}, "1.23456789"},
         {"{% filter upper %}{{ text }}{% endfilter %}", {{"text", "straße"}}, "STRASSE"},
+        // A loop builds its loop object only when its body names `loop`: in output, in literals,
+        // through a variable, in a macro defined in the body, after a filter test.
+        {"{% for x in 'ab' %}{{ loop.index }}{{ x }}{% endfor %}", Json::object(), "1a2b"},
+        {"{% for x in [1, 2] %}{% for y in [3] %}{{ y }}{% endfor %}{{ loop.index }}{% endfor %}",
+         Json::object(), "3132"},
+        {"{% for x in [1, 2] %}{% set outer = loop %}{% for y in [0] %}{{ outer.index }}{% endfor "
+         "%}{% endfor %}",
+         Json::object(), "12"},
+        {"{% for x in [1] %}{{ [loop.index] | tojson }}{% endfor %}", Json::object(), "[1]"},
+        {"{% for x in [1] %}{{ {'i': loop.index0} | tojson }}{% endfor %}", Json::object(),
+         "{\"i\": 0}"},
+        {"{% for x in [1, 2] %}{{ (loop.first, loop.last) | list }}{% endfor %}", Json::object(),
+         "[True, False][False, True]"},
+        {"{% for x in [5, 6] %}{% macro m() %}{{ loop.index }}{% endmacro %}{{ m() }}{% endfor %}",
+         Json::object(), "12"},
+        {"{% for x in [1, 2, 3] if x > 1 %}{{ loop.index }}:{{ x }}{{ ',' if not loop.last }}{% "
+         "endfor %}",
+         Json::object(), "1:2,2:3"},
+        // A repeated key keeps its first position and takes the last value.
+        {"{{ {'a': 1, 'b': 2, 'a': 3} | tojson }}", Json::object(), "{\"a\": 3, \"b\": 2}"},
+        {"{% set ns = namespace(a=1, b=2) %}{% set ns.a = 3 %}{{ ns.a }}{{ ns.b }}", Json::object(),
+         "32"},
+        {"{% for k, v in {'b': 1, 'a': 2} | dictsort %}{{ k }}{{ v }}{% endfor %}", Json::object(),
+         "a2b1"},
     };
     int failures = 0;
     for (const auto& item : cases) {

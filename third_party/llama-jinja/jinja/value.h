@@ -327,7 +327,7 @@ struct value_string_t : public value_t {
 
 protected:
     virtual bool equivalent(const value_t& other) const override {
-        return typeid(*this) == typeid(other) && val_str.str() == other.val_str.str();
+        return typeid(*this) == typeid(other) && val_str.same_text(other.val_str);
     }
 };
 
@@ -497,13 +497,22 @@ struct value_tuple_t : public value_array_t {
 using value_tuple = std::shared_ptr<value_tuple_t>;
 
 struct value_object_t : public value_t {
-    std::unordered_map<value, value, value_hasher, value_equivalence> unordered;
+    using position_map = std::unordered_map<value, std::size_t, value_hasher, value_equivalence>;
+    // Each key's position in val_obj, which holds the entries in insertion order. Code that
+    // reorders val_obj calls reindex().
+    position_map positions;
     bool has_builtins = true; // context and loop objects do not have builtins
     value_object_t()  = default;
 
     value_object_t(value& v) {
         val_obj = v->val_obj;
-        for (const auto& pair : val_obj) { unordered[pair.first] = pair.second; }
+        reindex();
+    }
+
+    void reindex() {
+        positions.clear();
+        positions.reserve(val_obj.size());
+        for (std::size_t i = 0; i < val_obj.size(); ++i) { positions[val_obj[i].first] = i; }
     }
 
     value_object_t(const std::map<value, value>& obj) {
@@ -538,43 +547,33 @@ struct value_object_t : public value_t {
         return string(ss.str(), 0, true);
     }
 
-    virtual bool as_bool() const override { return !unordered.empty(); }
+    virtual bool as_bool() const override { return !positions.empty(); }
 
-    virtual bool has_key(const value& key) override {
-        if (!key->is_immutable() || !key->is_hashable()) {
-            throw std::runtime_error("Object key of unhashable type: " + key->type());
-        }
-        return unordered.find(key) != unordered.end();
-    }
+    virtual bool has_key(const value& key) override { return find(key) != positions.end(); }
 
     virtual void insert(const value& key, const value& val) override {
-        bool replaced = false;
         if (is_immutable()) { throw std::runtime_error("Attempting to modify immutable type"); }
-        if (has_key(key)) {
-            // if key exists, replace value in ordered list instead of appending
-            for (auto& pair : val_obj) {
-                if (*(pair.first) == *key) {
-                    pair.second = val;
-                    replaced    = true;
-                    break;
-                }
-            }
+        // An existing key keeps its position and its first key object; its value is replaced.
+        const auto [it, added] = positions.try_emplace(check_key(key), val_obj.size());
+        if (added) {
+            val_obj.push_back({key, val});
+        } else {
+            val_obj[it->second].second = val;
         }
-        unordered[key] = val;
-        if (!replaced) { val_obj.push_back({key, val}); }
     }
 
     virtual value& at(const value& key, value& default_val) override {
-        if (!has_key(key)) { return default_val; }
-        return unordered.at(key);
+        const auto it = find(key);
+        return it == positions.end() ? default_val : val_obj[it->second].second;
     }
 
     virtual value& at(const value& key) override {
-        if (!has_key(key)) {
+        const auto it = find(key);
+        if (it == positions.end()) {
             throw std::runtime_error("Key '" + key->as_string().str() +
                                      "' not found in value of type " + type());
         }
-        return unordered.at(key);
+        return val_obj[it->second].second;
     }
 
     virtual value& at(const std::string& key, value& default_val) override {
@@ -616,6 +615,18 @@ protected:
         return typeid(*this) == typeid(other) && is_hashable() && other.is_hashable() &&
                std::equal(val_obj.begin(), val_obj.end(), other.val_obj.begin(),
                           other.val_obj.end(), value_equivalence());
+    }
+
+private:
+    static const value& check_key(const value& key) {
+        if (!key->is_immutable() || !key->is_hashable()) {
+            throw std::runtime_error("Object key of unhashable type: " + key->type());
+        }
+        return key;
+    }
+
+    position_map::const_iterator find(const value& key) const {
+        return positions.find(check_key(key));
     }
 };
 

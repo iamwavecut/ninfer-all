@@ -383,6 +383,41 @@ value if_statement::execute_impl(context& ctx) {
     return str;
 }
 
+namespace {
+
+// Whether a statement of `stmts`, or a node below one, is the identifier `name`.
+bool names_identifier(const statements& stmts, const std::string& name) {
+    bool found = false;
+    context walk;
+    walk.visitor = [&](bool, statement* node, const std::vector<visitor_pair>& children) {
+        if (found) return;
+        if (const auto* id = dynamic_cast<const identifier*>(node); id && id->val == name) {
+            found = true;
+            return;
+        }
+        for (const auto& [_, nodes] : children) {
+            for (statement* child : nodes) {
+                if (child) child->visit(walk);
+            }
+        }
+    };
+    for (const auto& stmt : stmts) {
+        if (stmt) stmt->visit(walk);
+    }
+    return found;
+}
+
+} // namespace
+
+for_statement::for_statement(statement_ptr&& loopvar, statement_ptr&& iterable, statements&& body,
+                             statements&& default_block)
+    : loopvar(std::move(loopvar)), iterable(std::move(iterable)), body(std::move(body)),
+      default_block(std::move(default_block)) {
+    chk_type<identifier, tuple_literal>(this->loopvar);
+    chk_type<expression>(this->iterable);
+    body_uses_loop = names_identifier(this->body, "loop");
+}
+
 value for_statement::execute_impl(context& ctx) {
     context scope(ctx); // new scope for loop variables
 
@@ -430,31 +465,35 @@ value for_statement::execute_impl(context& ctx) {
         for (const auto& item : arr) { items.push_back(item); }
     }
 
-    std::vector<std::function<void(context&)>> scope_update_fns;
+    // Binds the loop variables to items[i]; the first pass below checked the item's shape.
+    const auto bind = [&](context& target, size_t i) {
+        if (is_stmt<identifier>(loopvar)) {
+            const auto& id = cast_stmt<identifier>(loopvar)->val;
+            target.set_val(id, is_val<value_object>(iterable_val) ? items[i]->as_array()[0]
+                                                                  : items[i]);
+            return;
+        }
+        // case example: {% for key, value in dict %}
+        const auto* tuple = cast_stmt<tuple_literal>(loopvar);
+        const auto& c_arr = items[i]->as_array();
+        for (size_t j = 0; j < tuple->val.size(); ++j) {
+            if (!is_stmt<identifier>(tuple->val[j])) {
+                throw std::runtime_error("Cannot unpack non-identifier type: " +
+                                         tuple->val[j]->type());
+            }
+            target.set_val(cast_stmt<identifier>(tuple->val[j])->val, c_arr[j]);
+        }
+    };
 
+    std::vector<size_t> filtered_indices; // positions in items of the iterations
     std::vector<value> filtered_items;
     for (size_t i = 0; i < items.size(); ++i) {
-        context loop_scope(scope);
-
         value current = items[i];
 
-        std::function<void(context&)> scope_update_fn = [](context&) { /* no-op */ };
         if (is_stmt<identifier>(loopvar)) {
-            auto id = cast_stmt<identifier>(loopvar)->val;
-
-            if (is_val<value_object>(iterable_val)) {
-                // case example: {% for key in dict %}
-                current         = items[i]->as_array()[0];
-                scope_update_fn = [id, &items, i](context& ctx) {
-                    ctx.set_val(id, items[i]->as_array()[0]);
-                };
-            } else {
-                // case example: {% for item in list %}
-                scope_update_fn = [id, &items, i](context& ctx) { ctx.set_val(id, items[i]); };
-            }
-
+            // case example: {% for key in dict %} iterates the keys
+            if (is_val<value_object>(iterable_val)) { current = items[i]->as_array()[0]; }
         } else if (is_stmt<tuple_literal>(loopvar)) {
-            // case example: {% for key, value in dict %}
             auto tuple = cast_stmt<tuple_literal>(loopvar);
             if (!is_val<value_array>(current)) {
                 throw std::runtime_error("Cannot unpack non-iterable type: " + current->type());
@@ -465,51 +504,42 @@ value for_statement::execute_impl(context& ctx) {
                                          (tuple->val.size() > c_arr.size() ? "few" : "many") +
                                          " items to unpack");
             }
-            scope_update_fn = [tuple, &items, i](context& ctx) {
-                auto& c_arr = items[i]->as_array();
-                for (size_t j = 0; j < tuple->val.size(); ++j) {
-                    if (!is_stmt<identifier>(tuple->val[j])) {
-                        throw std::runtime_error("Cannot unpack non-identifier type: " +
-                                                 tuple->val[j]->type());
-                    }
-                    auto id = cast_stmt<identifier>(tuple->val[j])->val;
-                    ctx.set_val(id, c_arr[j]);
-                }
-            };
-
         } else {
             throw std::runtime_error("Invalid loop variable(s): " + loopvar->type());
         }
 
         if (select_expr && test_expr) {
-            scope_update_fn(loop_scope);
+            context loop_scope(scope);
+            bind(loop_scope, i);
             value test_val = test_expr->execute(loop_scope);
             if (!test_val->as_bool()) { continue; }
         }
         filtered_items.push_back(current);
-        scope_update_fns.push_back(scope_update_fn);
+        filtered_indices.push_back(i);
     }
 
     auto result = mk_val<value_array>();
 
     bool noIteration = true;
     for (size_t i = 0; i < filtered_items.size(); i++) {
-        value_object loop_obj  = mk_val<value_object>();
-        loop_obj->has_builtins = false; // loop object has no builtins
-        loop_obj->insert("index", mk_val<value_int>(i + 1));
-        loop_obj->insert("index0", mk_val<value_int>(i));
-        loop_obj->insert("revindex", mk_val<value_int>(filtered_items.size() - i));
-        loop_obj->insert("revindex0", mk_val<value_int>(filtered_items.size() - i - 1));
-        loop_obj->insert("first", mk_val<value_bool>(i == 0));
-        loop_obj->insert("last", mk_val<value_bool>(i == filtered_items.size() - 1));
-        loop_obj->insert("length", mk_val<value_int>(filtered_items.size()));
-        loop_obj->insert("previtem",
-                         i > 0 ? filtered_items[i - 1] : mk_val<value_undefined>("previtem"));
-        loop_obj->insert("nextitem", i < filtered_items.size() - 1
-                                         ? filtered_items[i + 1]
-                                         : mk_val<value_undefined>("nextitem"));
-        scope.set_val("loop", loop_obj);
-        scope_update_fns[i](scope);
+        if (body_uses_loop) {
+            value_object loop_obj  = mk_val<value_object>();
+            loop_obj->has_builtins = false; // loop object has no builtins
+            loop_obj->insert("index", mk_val<value_int>(i + 1));
+            loop_obj->insert("index0", mk_val<value_int>(i));
+            loop_obj->insert("revindex", mk_val<value_int>(filtered_items.size() - i));
+            loop_obj->insert("revindex0", mk_val<value_int>(filtered_items.size() - i - 1));
+            loop_obj->insert("first", mk_val<value_bool>(i == 0));
+            loop_obj->insert("last", mk_val<value_bool>(i == filtered_items.size() - 1));
+            loop_obj->insert("length", mk_val<value_int>(filtered_items.size()));
+            loop_obj->insert("previtem", i > 0 ? filtered_items[i - 1]
+                                               : mk_val<value_undefined>("previtem"));
+            loop_obj->insert("nextitem", i < filtered_items.size() - 1
+                                             ? filtered_items[i + 1]
+                                             : mk_val<value_undefined>("nextitem"));
+            scope.set_val("loop", loop_obj);
+        }
+        bind(scope, filtered_indices[i]);
         try {
             for (auto& stmt : body) {
                 value val = stmt->execute(scope);
