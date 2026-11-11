@@ -688,6 +688,7 @@ struct RankState {
     DeviceBuffer gdn_backing;
     std::unique_ptr<LinearAttentionStatePool> gdn;
     DeviceBuffer slot_ids; // I32 [sequences] = 0, 1, ...: a sequence's pool slot on the device
+    DeviceBuffer route_done; // the router's completion counter (moe_route), zero between calls
     // Speculative verification (an executor with drafts): the replay records of the rank's Gated
     // DeltaNet layers and their fold, each sparse-attention layer's indexer projections (BF16
     // [640, columns] per layer), the PLE layer's normalised convolution input (FP32
@@ -1781,6 +1782,8 @@ struct Executor::Impl {
             rank.block_table.copy_from_host(identity.data(), std::size_t(pages) * 4);
             rank.slot_ids = DeviceBuffer(std::size_t(options.sequences) * 4);
             rank.slot_ids.copy_from_host(identity.data(), std::size_t(options.sequences) * 4);
+            rank.route_done = DeviceBuffer(4);
+            rank.route_done.fill(0);
             // ids, positions, RoPE positions, scatter columns, three-axis RoPE positions, rows.
             rank.staging = std::make_unique<PinnedHostBuffer>(
                 round_up(t * 28) + round_up(std::uint64_t(config.ngram_heads()) * t * row_b));
@@ -3812,6 +3815,11 @@ struct Executor::Impl {
         return true;
     }
 
+    // The rank's router counter: every router call of a rank runs on its stream, one at a time.
+    [[nodiscard]] static std::uint32_t* route_done(RankState& rank) {
+        return static_cast<std::uint32_t*>(rank.route_done.p);
+    }
+
     // Routes the `t` tokens in the rank's mixed plane: their experts into the layer's route record,
     // their weights and the shared expert's gate into the rank's route planes.
     void route(const MoePlan& m, RankState& rank, std::int32_t t, std::size_t index) {
@@ -3822,7 +3830,7 @@ struct Executor::Impl {
         Tensor shared(rank.route_shared, DType::FP32, {t});
         auto scope = rank.workspace->scope();
         ops::moe_route(Tensor(rank.mixed, DType::BF16, {h, t}), m.router, m.shared_gate,
-                       *rank.workspace, ids, weights, shared, rank.stream);
+                       *rank.workspace, ids, weights, shared, rank.stream, route_done(rank));
     }
 
     void run_moe(const LayerPlan& plan, RankState& rank, std::int32_t t, std::size_t index) {
@@ -4671,7 +4679,8 @@ struct Executor::Impl {
         Tensor shared(rank.route_shared + run.column, DType::FP32, {n});
         {
             auto scope = ws.scope();
-            ops::moe_route(mixed, m.router, m.shared_gate, ws, ids, weights, shared, s);
+            ops::moe_route(mixed, m.router, m.shared_gate, ws, ids, weights, shared, s,
+                           route_done(rank));
         }
         auto scope   = ws.scope();
         Tensor fixed = ws.alloc(DType::I64, {h, n});
@@ -4977,7 +4986,7 @@ struct Executor::Impl {
             Tensor shared(shared_p + at, DType::FP32, {t});
             auto scope = rank.workspace->scope();
             ops::moe_route(mixed, m.router, m.shared_gate, *rank.workspace, ids, weights, shared,
-                           st);
+                           st, route_done(rank));
         }
         const auto t = static_cast<std::int32_t>(chunks[last - 1].at +
                                                  std::size_t(chunks[last - 1].count) -
