@@ -873,6 +873,65 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
 }
 
+void causal_softmax_attention_append(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                     const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                     AttentionHeadGeometry geometry, PagedKVBatchLayerView cache,
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     cudaStream_t stream) {
+    constexpr const char* op = "causal_softmax_attention_append";
+    require_causal_geometry(geometry, op);
+    if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
+        throw std::invalid_argument("causal_softmax_attention_append: k/v must be BF16");
+    }
+    const bool masked = valid_columns.data != nullptr;
+    if (positions.dtype != DType::I32 || kv_table_rows.dtype != DType::I32 ||
+        (masked && valid_columns.dtype != DType::I32)) {
+        throw std::invalid_argument("causal_softmax_attention_append: batch metadata must be I32");
+    }
+    const std::int32_t width    = k.ne[2];
+    const std::int32_t batch    = k.ne[3];
+    const std::int32_t kv_heads = geometry.kv_heads;
+    if (width <= 0 || batch <= 0 || batch > kMaximumBatchSize ||
+        (batch > 1 && width > kMaximumVerifyTokens)) {
+        throw std::invalid_argument("causal_softmax_attention_append: unsupported B/W domain");
+    }
+    require_shape(k, kHeadDim, kv_heads, width, batch, op, "k");
+    require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
+    require_shape(positions, width, batch, 1, 1, op, "positions");
+    if (masked) { require_shape(valid_columns, batch, 1, 1, 1, op, "valid columns"); }
+    require_shape(kv_table_rows, batch, 1, 1, 1, op, "KV table rows");
+    require_contiguous_nonnull(k, op, "k");
+    require_contiguous_nonnull(v, op, "v");
+    require_contiguous_nonnull(positions, op, "positions");
+    if (masked) { require_contiguous_nonnull(valid_columns, op, "valid columns"); }
+    require_contiguous_nonnull(kv_table_rows, op, "KV table rows");
+    if (cache.num_kv_heads != kv_heads) {
+        throw std::invalid_argument("causal_softmax_attention_append: invalid KV cache heads");
+    }
+    const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
+    if (cache.block_tables.ne[1] < batch || envelope.min_visible_keys == 0 ||
+        envelope.min_visible_keys > envelope.max_visible_keys ||
+        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys ||
+        envelope.max_visible_keys > capacity ||
+        (!masked && envelope.max_visible_keys < static_cast<std::uint32_t>(width))) {
+        throw std::invalid_argument(
+            "causal_softmax_attention_append: invalid execution envelope or table");
+    }
+    if (cache.page_stride < 1 || cache.page_stride > kCausalAttentionMaximumMergeRanks ||
+        cache.page_residue < 0 || cache.page_residue >= cache.page_stride ||
+        (cache.storage == KvCacheStorage::Bf16Packed && cache.page_stride != 1)) {
+        throw std::invalid_argument("causal_softmax_attention_append: invalid position split");
+    }
+    // Every prompt route of causal_softmax_attention appends with this launch before it attends.
+    if (detail::causal_attention_resolve_route(geometry.query_heads, width, batch, cache.storage,
+                                               envelope) != detail::CausalAttentionRoute::Prompt) {
+        throw std::invalid_argument(
+            "causal_softmax_attention_append: the call does not take the prompt route");
+    }
+    detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                         stream);
+}
+
 void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      AttentionHeadGeometry geometry, float scale,
                                      const PagedKVLayerView& cache,

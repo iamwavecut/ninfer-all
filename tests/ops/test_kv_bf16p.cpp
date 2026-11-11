@@ -349,6 +349,7 @@ int attention_case(int q_heads, int kv_heads, int history, int width, std::vecto
                               std::to_string(ops::causal_softmax_attention_route_family(
                                   geometry, KvCacheStorage::Bf16Packed, envelope, batch, width));
     std::vector<std::uint16_t> outputs[2], cached[2];
+    int append_failures = 0;
     for (const bool packed : {false, true}) {
         const KvCacheStorage storage = packed ? KvCacheStorage::Bf16Packed : KvCacheStorage::BFloat16;
         const std::size_t bytes      = std::max<std::size_t>(
@@ -359,10 +360,44 @@ int attention_case(int q_heads, int kv_heads, int history, int width, std::vecto
         GuardedDeviceBuffer out(columns * q_heads * kDim * 2);
         out.fill(0x77);
         Tensor tout(out.data(), DType::BF16, {kDim, q_heads, width, batch});
+        // The cache planes this storage writes, to compare the append alone with the attention.
+        std::vector<GuardedDeviceBuffer*> planes{&caches.bf16_k, &caches.bf16_v};
+        if (packed) {
+            planes = {&caches.packed.k, &caches.packed.v, &caches.packed.k_side,
+                      &caches.packed.v_side};
+        }
+        const auto snapshot = [&] {
+            std::vector<std::vector<std::uint8_t>> bytes;
+            for (GuardedDeviceBuffer* plane : planes) {
+                bytes.push_back(from_device<std::uint8_t>(plane->data(), plane->bytes()));
+            }
+            return bytes;
+        };
+        const auto restore = [&](const std::vector<std::vector<std::uint8_t>>& bytes) {
+            for (std::size_t i = 0; i < planes.size(); ++i) {
+                planes[i]->copy_from_host(bytes[i].data(), bytes[i].size());
+            }
+        };
+        const auto before = snapshot();
         ops::causal_softmax_attention(tq, tk, tv, tp, tvalid, trows, geometry, kScale,
                                       caches.view(packed), envelope, workspace, tout, nullptr);
         cuda_synchronize();
         outputs[packed] = from_device<std::uint16_t>(out.data(), columns * q_heads * kDim);
+        if (ops::causal_softmax_attention_route_family(geometry, storage, envelope, batch, width) ==
+            2) {
+            // The append alone writes the bytes the attention call wrote.
+            const auto attended = snapshot();
+            restore(before);
+            ops::causal_softmax_attention_append(tk, tv, tp, tvalid, trows, geometry,
+                                                 caches.view(packed), envelope, nullptr);
+            cuda_synchronize();
+            if (snapshot() != attended) {
+                std::cerr << "FAIL " << label << (packed ? " bf16p" : " bf16")
+                          << ": the append alone wrote other cache bytes\n";
+                ++append_failures;
+            }
+            restore(attended);
+        }
         if (batch == 1) {
             out.fill(0x77);
             Tensor q1(dq.p, DType::BF16, {kDim, q_heads, width});
@@ -374,7 +409,7 @@ int attention_case(int q_heads, int kv_heads, int history, int width, std::vecto
             cached[packed] = from_device<std::uint16_t>(out.data(), columns * q_heads * kDim);
         }
     }
-    int failures = compare(label, outputs[0], outputs[1]);
+    int failures = append_failures + compare(label, outputs[0], outputs[1]);
     if (batch == 1) failures += compare(label + " cached", cached[0], cached[1]);
     return failures;
 }

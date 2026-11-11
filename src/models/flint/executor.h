@@ -106,7 +106,9 @@ public:
     // The CPU's share of missing experts: its threads and backend, or empty without one.
     [[nodiscard]] std::string expert_cpu_description() const;
     // Runs up to prefill_chunk tokens at the sequence's next positions and leaves the logits of the
-    // last `logit_rows` (at most kMaxLogitRows) in logits().
+    // last `logit_rows` (at most kMaxLogitRows) in logits(). With no logit rows (a chunk whose
+    // output nothing reads), a full-attention last block only writes the chunk's keys and values,
+    // the bytes the whole block writes.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows);
     // Branches of a prompt in one pass, each continuing the sequence from its position: branch b

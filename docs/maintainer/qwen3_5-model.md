@@ -365,6 +365,15 @@ logits hold them, so the sampler, argmax, draft acceptance, logprobs and scoring
 proposal heads keep their own choice (`fp32_proposal_logits`). Ordinary decode repeats this
 schedule for one new token. CUDA Graph replay uses the same selected model implementation.
 
+A prompt chunk whose rows produce no logits (each chunk before the prompt's last, and a scoring
+call's chunks before its first scored position) runs its last layer only up to the key/value
+append: that layer's attention output, output projection and FFN feed only the head. A short chunk
+whose attention takes the small-T route, which appends inside its kernels, still runs that
+attention. A chunk runs whole when MTP follows the prompt (the MTP layer takes each row's final
+hidden state for its own KV) and when a DFlash feature, a prefix-cache tap or a checkpoint reads
+its final hidden state. The appended rows come from the same projections and kernels, so caches,
+states and logits keep their bits.
+
 MTP is a one-layer predictor conditioned on a final-normalized target hidden state h_t and the
 following token x_(t+1):
 

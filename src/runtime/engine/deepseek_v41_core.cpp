@@ -2755,7 +2755,13 @@ struct DeepSeekV41Core::Impl {
         out.reserve(n - first_target);
         for (std::uint32_t at = 0; at + 1 < n; at += chunk) {
             const std::uint32_t count = std::min(chunk, n - 1 - at);
-            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, count), count);
+            // A chunk before the first target needs no logits, so its last block keeps only its
+            // window latents, unless a prefill tail shorter than the chunk would then leave rows
+            // out: scoring runs every row.
+            const std::uint32_t tail = executor.prefill_tail_rows();
+            const bool context       = first_target > at + count && (tail == 0 || tail >= count);
+            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, count),
+                             context ? 0U : count);
             const std::uint32_t first_row = first_target > at + 1 ? first_target - at - 1 : 0;
             if (first_row >= count) { continue; }
             const std::uint32_t rows = count - first_row;

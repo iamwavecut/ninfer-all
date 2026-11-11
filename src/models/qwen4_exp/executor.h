@@ -105,6 +105,9 @@ struct MediaItem {
 struct PromptPiece {
     std::uint32_t sequence = 0;
     std::span<const std::int32_t> tokens;
+    // Whether the piece leaves its last token's logits; a piece that does not end its prompt
+    // need not (Executor::forward_pieces).
+    bool logits = true;
 };
 
 struct SequenceSnapshot;
@@ -215,12 +218,17 @@ public:
     [[nodiscard]] std::uint32_t prompt_step() const noexcept;
     // Runs `tokens` (at most prompt_step()) at the sequence's next positions and leaves the
     // logits of the last `logit_rows` of them in logits(), BF16 [vocab, logit_rows] on the head
-    // device. Work is queued on the device streams; logits() is ready on head_stream(). Once the
-    // table rows of `tokens` are read, the rows of `next` (the known tokens that follow, at most
-    // prompt_step()) are hinted, to be read while the device runs `tokens`. With a `cut` (needs
-    // packs_prompts(); 0 < cut.tokens < tokens.size()), the step's chunks restart at the cut, as
-    // two calls split there would run them, and cut.state takes the sequence's state there, as
-    // snapshot() after the first of those calls would, while the step runs on in one span.
+    // device. With `logit_rows` 0 the step leaves no logits, and unless an MTP block follows the
+    // prompt the last layer of the step's chunks, a sparse-attention one, runs only its KV and
+    // indexer appends, which leave the sequence as the whole layer does; in a step that leaves
+    // logits, the chunks that share no expert call of the last layer with its last chunk run that
+    // layer so as well. Work is queued on the device streams; logits() is ready on
+    // head_stream(). Once the table rows of `tokens` are read, the rows of `next` (the known
+    // tokens that follow, at most prompt_step()) are hinted, to be read while the device runs
+    // `tokens`. With a `cut` (needs packs_prompts(); 0 < cut.tokens < tokens.size()), the step's
+    // chunks restart at the cut, as two calls split there would run them, and cut.state takes
+    // the sequence's state there, as snapshot() after the first of those calls would, while the
+    // step runs on in one span.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const std::int32_t> next = {},
                  PromptCut cut = {});
@@ -234,8 +242,9 @@ public:
     // at most max_logit_rows() pieces), each piece at its sequence's next positions with the
     // arithmetic forward() gives it, while each layer's uncached experts cross the bus once for
     // all of them. Leaves the logits of each piece's last token in logits(), one column per piece
-    // in order. A media prompt's tokens run only as a single piece. `next`, as in forward(), are
-    // the known tokens after the last piece.
+    // in order, where the piece wants them (PromptPiece::logits; as forward() with 0 rows, a piece
+    // without them may run its last layer's appends alone). A media prompt's tokens run only as a
+    // single piece. `next`, as in forward(), are the known tokens after the last piece.
     void forward_pieces(std::span<const PromptPiece> pieces,
                         std::span<const std::int32_t> next = {});
     // Branches of a sequence in one pass, each from the state `at` (a snapshot of the sequence):

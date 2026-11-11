@@ -1689,9 +1689,12 @@ struct Executor::Impl {
                  std::span<const std::uint32_t> branches = {}) {
         const int t = int(tokens.size());
         if (sequence >= options.sequences || t <= 0 || std::uint32_t(t) > options.prefill_chunk ||
-            logit_rows == 0 || logit_rows > std::min<std::uint32_t>(t, kMaxLogitRows)) {
+            logit_rows > std::min<std::uint32_t>(t, kMaxLogitRows) ||
+            (logit_rows == 0 && !branches.empty())) {
             throw std::invalid_argument("gemma4 forward: invalid call");
         }
+        // No logits: a full last block only writes its keys and values (Executor::forward).
+        const bool kv_only   = logit_rows == 0;
         const bool branching = !branches.empty();
         if (branching && (!media.empty() || logit_rows != branches.size() ||
                           std::accumulate(branches.begin(), branches.end(), std::uint64_t{0}) !=
@@ -1864,6 +1867,7 @@ struct Executor::Impl {
             qa.sequence    = p.full && !quantized ? int(sequence) : 0;
             qa.ring        = p.full ? 0 : prefill_ring;
             kernels::qkv_post(qa, stream);
+            const bool kv_only_block = kv_only && p.full && li + 1 == layers.size();
             if (quantized) {
                 // The chunk's rows into the sequence's planes: a sliding block's into its ring (the
                 // staging rows become the values they represent, which the chunk then attends to),
@@ -1890,7 +1894,7 @@ struct Executor::Impl {
                     store.write_back      = !p.full;
                     kernels::kv_store(store, stream);
                 }
-                if (p.full) {
+                if (p.full && !kv_only_block) {
                     kernels::KvLoadArgs load;
                     load.src             = p.vq;
                     load.sequence        = int(sequence);
@@ -1902,6 +1906,7 @@ struct Executor::Impl {
                     kernels::kv_load(load, stream);
                 }
             }
+            if (kv_only_block) { break; }
             if (p.full) {
                 kernels::derive_keys(
                     full_v + (quantized ? 0 : seq_offset), p.head_stride, p.kv_heads, p.head_dim,
@@ -1974,6 +1979,14 @@ struct Executor::Impl {
             }
             head_logits(rows, int(logit_rows), 0);
             // The branches' rows took the rings' slots past the sequence's position.
+            ring_floor[sequence] = first + std::uint32_t(t);
+            hold_base[sequence]  = kNoHold;
+            return;
+        }
+        if (kv_only) {
+            // The assistant's hidden is the last token's: it drafts after the next prompt chunk.
+            if (drafting()) { anchored[sequence] = 0; }
+            positions[sequence]  = first + std::uint32_t(t);
             ring_floor[sequence] = first + std::uint32_t(t);
             hold_base[sequence]  = kNoHold;
             return;

@@ -1449,7 +1449,9 @@ struct FlintCore::Impl {
             next_branches(r, executor.options().prefill_chunk - n, branch_tokens, lengths);
         }
         if (lengths.empty()) {
-            executor.forward(r.slot, chunk, 1);
+            // A chunk before the prompt's end leaves no logits: its last block only writes its
+            // keys and values.
+            executor.forward(r.slot, chunk, r.prefilled + n < prompt_n ? 0U : 1U);
         } else {
             executor.forward_prompt_branches(r.slot, chunk, branch_tokens, lengths);
         }
@@ -1529,7 +1531,7 @@ struct FlintCore::Impl {
         }
         const std::uint32_t n = prefill_step_tokens(r);
         const auto chunk      = std::span<const TokenId>(branch.tokens).subspan(r.branch_fed, n);
-        executor.forward(r.slot, chunk, 1);
+        executor.forward(r.slot, chunk, r.branch_fed + n < branch.tokens.size() ? 0U : 1U);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         r.branch_fed += n;
         r.progress = Clock::now();
@@ -2250,7 +2252,9 @@ struct FlintCore::Impl {
         out.reserve(n - first_target);
         for (std::uint32_t at = 0; at + 1 < n; at += chunk) {
             const std::uint32_t count = std::min(chunk, n - 1 - at);
-            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, count), count);
+            // A chunk before the first target only extends the context.
+            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, count),
+                             first_target > at + count ? 0U : count);
             const std::uint32_t first_row = first_target > at + 1 ? first_target - at - 1 : 0;
             if (first_row >= count) { continue; }
             const std::uint32_t rows = count - first_row;

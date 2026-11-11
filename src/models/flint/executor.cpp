@@ -1325,9 +1325,12 @@ struct Executor::Impl {
                  std::uint32_t shared = 0) {
         const int t = int(tokens.size());
         if (sequence >= options.sequences || t <= 0 || std::uint32_t(t) > options.prefill_chunk ||
-            logit_rows == 0 || logit_rows > std::min<std::uint32_t>(t, kMaxLogitRows)) {
+            logit_rows > std::min<std::uint32_t>(t, kMaxLogitRows) ||
+            (logit_rows == 0 && !branches.empty())) {
             throw std::invalid_argument("flint forward: invalid call");
         }
+        // No logits: a full last block only writes its keys and values (Executor::forward).
+        const bool kv_only   = logit_rows == 0;
         const bool branching = !branches.empty();
         if (branching && (logit_rows != branches.size() || shared >= std::uint32_t(t) ||
                           std::accumulate(branches.begin(), branches.end(), std::uint64_t{0}) !=
@@ -1433,6 +1436,7 @@ struct Executor::Impl {
                 qa.sequence    = int(sequence);
             }
             kernels::qkv_post(qa, stream);
+            if (kv_only && p.full && li + 1 == layers.size()) { break; }
             auto* attn = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
             const std::size_t fa_bytes =
                 gguf::flash_attention_workspace_bytes(head_dim, query_heads, kv_heads, t);
@@ -1498,6 +1502,11 @@ struct Executor::Impl {
             head_logits(rows, int(logit_rows), 0);
             positions[sequence]  = first + shared;
             ring_floor[sequence] = first + shared;
+            return;
+        }
+        if (kv_only) {
+            positions[sequence]  = first + std::uint32_t(t);
+            ring_floor[sequence] = first + std::uint32_t(t);
             return;
         }
         if (q8) {

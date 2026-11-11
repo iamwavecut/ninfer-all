@@ -2067,6 +2067,23 @@ public:
         return result;
     }
 
+    // Every byte of every plane equal to `other`'s, the private key representation included.
+    int verify_same_bytes(const std::string& label, const BatchDeviceCache& other) const {
+        const auto plane = [&](const char* name, const GuardedDeviceBuffer& got,
+                               const GuardedDeviceBuffer& expected) {
+            if (got.bytes() != expected.bytes()) {
+                std::cerr << label << " " << name << ": plane sizes differ\n";
+                return 1;
+            }
+            return verify_exact((label + " " + name).c_str(),
+                                copy_from_guarded<std::uint8_t>(got, got.bytes()),
+                                copy_from_guarded<std::uint8_t>(expected, expected.bytes()));
+        };
+        return plane("k", k_, other.k_) + plane("v", v_, other.v_) +
+               plane("k-scale", k_scale_, other.k_scale_) +
+               plane("v-scale", v_scale_, other.v_scale_);
+    }
+
     int verify(const std::string& label, std::span<const HostCache> expected) const {
         if (expected.size() != rows_) {
             std::cerr << label << ": expected cache row count mismatch\n";
@@ -3347,6 +3364,15 @@ int run_batch_case(const Geometry& geometry, const CachePlan& plan, const BatchA
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
+    if (ops::causal_softmax_attention_route_family(op_geometry(geometry), cache_plan_storage(plan),
+                                                   envelope, batch, test_case.width) == 2) {
+        BatchDeviceCache appended(initial, test_case.mapping);
+        ops::causal_softmax_attention_append(tk, tv, tp, masked ? tvalid : Tensor{}, ttable_rows,
+                                             op_geometry(geometry), appended.view(), envelope,
+                                             nullptr);
+        cuda_synchronize();
+        failures += appended.verify_same_bytes(label + " append-only", cache);
+    }
     failures += verify_gated_attention(
         label, geometry, test_case, tq, tk, tv, tp, masked ? tvalid : Tensor{}, ttable_rows, cache,
         envelope, workspace, tout, dout, output_bits, reference, attention_criterion(plan));
@@ -3490,6 +3516,16 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
+    }
+    // The append alone writes the cache bytes the attention call wrote, on the prompt route.
+    if (ops::causal_softmax_attention_route_family(op_geometry(geometry), storage, envelope, batch,
+                                                   test_case.width) == 2) {
+        BatchDeviceCache appended(initial, test_case.mapping);
+        ops::causal_softmax_attention_append(tk, tv, tp, masked ? tvalid : Tensor{}, ttable_rows,
+                                             op_geometry(geometry), appended.view(), envelope,
+                                             nullptr);
+        cuda_synchronize();
+        failures += appended.verify_same_bytes(label + " append-only", cache);
     }
     failures += verify_gated_attention(
         label, geometry, test_case, tq, tk, tv, tp, masked ? tvalid : Tensor{}, ttable_rows, cache,
@@ -3828,6 +3864,78 @@ int run_masked_prefix_invariance_tests() {
     failures += run_case_allowing_arch_skip("masked prefix invariance k8v4 KV cache", [] {
         return run_masked_prefix_invariance_cases(KvCacheStorage::Fp8KeyNvfp4Value);
     });
+    return failures;
+}
+
+// causal_softmax_attention_append on the prompt route of every storage but bf16p
+// (test_kv_bf16p.cpp): a partial page at each end, a fragmented table, and the bytes compared with
+// the attention call's (run_batch_case). A call off the prompt route is refused.
+int run_append_only_cases() {
+    int failures = 0;
+    const BatchAttentionCase wide{300, {700}, {300}, {0}, MappingPattern::Fragmented, 530u};
+    const ops::CausalAttentionExecutionEnvelope envelope{1000, 1000, false, false};
+    const auto prompt_route = [&](const Geometry& geometry, KvCacheStorage storage) {
+        if (ops::causal_softmax_attention_route_family(op_geometry(geometry), storage, envelope, 1,
+                                                       wide.width) == 2) {
+            return true;
+        }
+        std::cerr << "append-only " << cache_name(storage)
+                  << ": the case does not take the prompt route\n";
+        return false;
+    };
+    const auto run = [&](const Geometry& geometry, KvCacheStorage storage) {
+        return prompt_route(geometry, storage) ? run_batch_case(geometry, storage, wide) : 1;
+    };
+    for (const Geometry& geometry : kGeometries) {
+        // The KvCacheStorage fixture builds neither rk8v4 nor rk4v4 caches: those come from plans.
+        for (const CachePlan& plan : {kPlanBf16, kPlanInt8, kPlanRk8v4, kPlanRk4v4}) {
+            failures += prompt_route(geometry, cache_plan_storage(plan))
+                            ? run_batch_case(geometry, plan, wide)
+                            : 1;
+        }
+        for (const KvCacheStorage storage : {KvCacheStorage::RotatedInt4KeyInt4ValueE8,
+                                             KvCacheStorage::RotatedE8RootKeyInt4Value}) {
+            failures += run(geometry, storage);
+        }
+        for (const KvCacheStorage storage :
+             {KvCacheStorage::Fp8E4M3Row256, KvCacheStorage::Nvfp4Group16,
+              KvCacheStorage::Fp8KeyNvfp4Value}) {
+            failures +=
+                run_case_allowing_arch_skip(std::string("append-only ") + cache_name(storage),
+                                            [&] { return run(geometry, storage); });
+        }
+    }
+    // A small-T call appends inside its attention: the append alone refuses it. One column over
+    // four keys of the 16-head geometry is small-T; the 24-head geometry's BF16 prompt route takes
+    // up to 128 keys at that width.
+    {
+        const Geometry& geometry = kGeometries[1];
+        const ops::CausalAttentionExecutionEnvelope small{4, 4};
+        if (ops::causal_softmax_attention_route_family(
+                op_geometry(geometry), KvCacheStorage::BFloat16, small, 1, 1) != 0) {
+            std::cerr << "append-only: the refusal case does not take the small-T route\n";
+            return failures + 1;
+        }
+        const std::vector<HostCache> rows{make_cache(geometry, KvCacheStorage::BFloat16, 64, 531u)};
+        BatchDeviceCache cache(rows, MappingPattern::Identity);
+        GuardedDeviceBuffer kv(static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * 2);
+        GuardedDeviceBuffer meta(2 * sizeof(std::int32_t));
+        const std::array<std::int32_t, 2> host_meta{3, 0};
+        meta.copy_from_host(host_meta.data(), sizeof(host_meta));
+        Tensor k(kv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, 1, 1});
+        Tensor positions(meta.data(), DType::I32, {1, 1});
+        Tensor table_rows(static_cast<std::int32_t*>(meta.data()) + 1, DType::I32, {1});
+        bool refused = false;
+        try {
+            ops::causal_softmax_attention_append(k, k, positions, Tensor{}, table_rows,
+                                                 op_geometry(geometry), cache.view(), small,
+                                                 nullptr);
+        } catch (const std::invalid_argument&) { refused = true; }
+        if (!refused) {
+            std::cerr << "append-only: a small-T call was accepted\n";
+            ++failures;
+        }
+    }
     return failures;
 }
 
@@ -4976,6 +5084,7 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_rk4v4_e8_cases();
     failures += run_rk2v4_e8_cases();
     failures += run_batch_cases();
+    failures += run_append_only_cases();
     failures += run_masked_prefix_invariance_tests();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention public-contract correctness\n";

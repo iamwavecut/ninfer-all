@@ -800,6 +800,13 @@ struct Executor::Impl {
     // A pass of `forward`: a prompt chunk, whose tensor-parallel exchanges take the prompt
     // partials (ExecutorOptions::tensor_parallel_prompt_partials).
     bool prompt_pass = false;
+    // A prompt pass that leaves no logits and whose final stacks nothing reads (kv_only_allowed):
+    // its last layer, a sparse-attention one, runs only what the sequence keeps -- the KV append
+    // and the indexer's append -- and neither its attention, its experts nor the head run.
+    bool kv_only_pass = false;
+    // The text layers whose experts the pass's wide calls may copy ahead into the slot pools:
+    // layers.size(), or one fewer while no call of the last layer runs.
+    std::size_t pooled_end = ~std::size_t{0};
     std::vector<SequenceState*> verified; // the last verify()'s sequences, in order
     // Their first columns and widths in that verification.
     std::vector<std::int32_t> verified_columns, verified_widths;
@@ -908,6 +915,8 @@ struct Executor::Impl {
     std::unique_ptr<PinnedHostBuffer> route_host;
     std::uint32_t pending_routes = 0;
     bool pending_decode          = true; // they came from a decode step or verification
+    // The text layers whose routes the record holds: all, or all but a K/V-only last layer.
+    std::size_t pending_route_layers = 0;
 
     // Tensor parallelism (Model::tensor_parallel()): every rank runs every layer over its replica
     // of the stack, with its run of each mixer's heads and of the routed experts, and exchanges
@@ -2687,7 +2696,8 @@ struct Executor::Impl {
 
     // Whether text layer `index` exists on `rank` and runs its wide calls through the pool.
     [[nodiscard]] bool pooled_layer(std::size_t index, std::size_t rank) const {
-        return index < layers.size() && layers[index].rank == rank && !layers[index].moe.native;
+        return index < layers.size() && index < pooled_end && layers[index].rank == rank &&
+               !layers[index].moe.native;
     }
 
     // Has the copier copy every expert of text layer `index` that the cache lacks into its pool
@@ -2777,7 +2787,7 @@ struct Executor::Impl {
             // nearly every expert, only counts toward the statistics.
             const bool decode = pending_decode;
             if (pending_routes > 0) {
-                for (std::size_t i = 0; i < layers.size(); ++i) {
+                for (std::size_t i = 0; i < pending_route_layers; ++i) {
                     cache->observe(i, std::span(host + i * pairs, used), decode);
                 }
             }
@@ -2795,14 +2805,15 @@ struct Executor::Impl {
     }
 
     // Brings the pass's routes to the host for the expert cache's counts; nothing else reads them.
-    void record_routes(std::uint32_t tokens) {
+    // `routed`: the text layers that routed the pass's tokens, all but a K/V-only last layer.
+    void record_routes(std::uint32_t tokens, std::size_t routed) {
         if (!cache || warming) { return; }
         const std::uint64_t pairs =
             std::uint64_t(config.num_experts_per_tok) * options.prefill_chunk;
         auto* host = static_cast<std::int32_t*>(route_host->data());
-        for (std::size_t i = 0; i < layers.size();) {
+        for (std::size_t i = 0; i < routed;) {
             std::size_t end = i;
-            while (end < layers.size() && layers[end].rank == layers[i].rank) { ++end; }
+            while (end < routed && layers[end].rank == layers[i].rank) { ++end; }
             RankBinding bind(device, layers[i].rank);
             CUDA_CHECK(cudaMemcpy2DAsync(host + i * pairs, pairs * 4, route_records[i], pairs * 4,
                                          std::size_t(config.num_experts_per_tok) * tokens * 4,
@@ -2814,8 +2825,9 @@ struct Executor::Impl {
             RankBinding bind(device, rank.rank);
             CUDA_CHECK(cudaEventRecord(rank.routes, rank.stream));
         }
-        pending_routes = tokens;
-        pending_decode = tokens <= std::uint32_t(kVectorTokens) || verifying;
+        pending_routes       = tokens;
+        pending_route_layers = routed;
+        pending_decode       = tokens <= std::uint32_t(kVectorTokens) || verifying;
     }
 
     // The state regions a reset zeroes, a snapshot keeps and a restore puts back: the recurrent
@@ -3498,8 +3510,10 @@ struct Executor::Impl {
         }
     }
 
+    // With `kv_only` (a K/V-only last layer, kv_only_pass), only the part's KV and indexer appends
+    // run, which leave the sequence's state as the whole step leaves it.
     void qsa_part(const QsaPlan& a, LayerState& state, RankState& rank, const Part& part,
-                  std::int32_t t, const AttentionInputs& in) {
+                  std::int32_t t, const AttentionInputs& in, bool kv_only = false) {
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
         const QsaPlanes p    = qsa_planes(a, rank, t, nullptr);
@@ -3526,7 +3540,37 @@ struct Executor::Impl {
                     rank.block_table.p, paged_count, nk);
         const bool streamed = state.map.table != nullptr;
         const bool pooled_read = streamed && n <= static_cast<std::int32_t>(stream_width);
+        const auto block       = [](std::uint32_t position) {
+            return static_cast<std::int32_t>(position / ops::kKvStreamPageTokens);
+        };
         ops::kv_cache_append(ko, v3, positions, cache, s);
+        const auto di = static_cast<std::int32_t>(config.indexer_head_dim);
+        Tensor pooled(state.pooled.p, DType::FP32, {di, static_cast<std::int32_t>(pooled_slots)});
+        Tensor tail(in.tail, DType::FP32,
+                    {di, static_cast<std::int32_t>(config.indexer_compress_ratio - 1)});
+        const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
+        // The call's first position is the part's first staged one, read on the device.
+        const Tensor first(part_positions, DType::I32, {1});
+        if (kv_only) {
+            if (streamed) {
+                // As the attention's appends leave them: a staging copy that holds the layer's
+                // positions before the part takes the part's too, and no pool slot keeps a block
+                // older than the host copy.
+                if (pooled_read) {
+                    if (rank.kv_staged == &state) { rank.kv_staged = nullptr; }
+                } else if (rank.kv_staged == &state && rank.kv_staged_end >= in.first) {
+                    const PagedKVLayerView staged =
+                        kv_view([&](std::size_t i) { return rank.kv_staging[i].p; },
+                                kPagedKVPageSize, paged_count, rank.block_table.p, paged_count);
+                    ops::kv_cache_append(ko, v3, positions, staged, s);
+                    rank.kv_staged_end = in.first + std::uint32_t(n);
+                }
+                ops::kv_stream_evict(state.map, block(in.first),
+                                     block(in.first + std::uint32_t(n) - 1) + 1, s);
+            }
+            ops::qsa_indexer_append(index, first, iw, config.rms_norm_eps, yarn, pooled, tail, s);
+            return;
+        }
         PagedKVLayerView read = cache;
         if (pooled_read) {
             if (rank.kv_staged == &state) { rank.kv_staged = nullptr; }
@@ -3540,13 +3584,6 @@ struct Executor::Impl {
             ops::kv_cache_append(ko, v3, positions, read, s);
             rank.kv_staged_end = in.first + std::uint32_t(n);
         }
-        const auto di = static_cast<std::int32_t>(config.indexer_head_dim);
-        Tensor pooled(state.pooled.p, DType::FP32, {di, static_cast<std::int32_t>(pooled_slots)});
-        Tensor tail(in.tail, DType::FP32,
-                    {di, static_cast<std::int32_t>(config.indexer_compress_ratio - 1)});
-        const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
-        // The call's first position is the part's first staged one, read on the device.
-        const Tensor first(part_positions, DType::I32, {1});
         ops::qsa_indexer_append(index, first, iw, config.rms_norm_eps, yarn, pooled, tail, s);
         Tensor selected(rank.selected, DType::I32,
                         {static_cast<std::int32_t>(config.indexer_block_budget()), n});
@@ -3566,9 +3603,6 @@ struct Executor::Impl {
                                           1.0F / std::sqrt(float(d)), ws, attention, s);
         }
         if (streamed && !pooled_read) {
-            const auto block = [](std::uint32_t position) {
-                return static_cast<std::int32_t>(position / ops::kKvStreamPageTokens);
-            };
             ops::kv_stream_evict(state.map, block(in.first),
                                  block(in.first + std::uint32_t(n) - 1) + 1, s);
         }
@@ -3592,9 +3626,9 @@ struct Executor::Impl {
         }
     }
 
-    // One part's sparse attention in a pass of its own.
+    // One part's sparse attention in a pass of its own; with `kv_only`, its appends alone.
     void run_qsa(const LayerPlan& plan, LayerState& state, RankState& rank, const Part& part,
-                 const AttentionInputs& in) {
+                 const AttentionInputs& in, bool kv_only = false) {
         const std::span<const Part> parts(&part, 1);
         const std::int32_t t = part.column + part.count;
         // The pass's indexer plane, which the part's columns continue.
@@ -3603,20 +3637,24 @@ struct Executor::Impl {
                           : static_cast<std::byte*>(in.index) -
                                 std::size_t(plan.qsa->index.rows) * std::size_t(part.column) * 2;
         qsa_project(*plan.qsa, rank, parts, t, index, in.rope - part.column);
-        qsa_part(*plan.qsa, state, rank, part, t, in);
-        qsa_output(*plan.qsa, rank, parts, t, nullptr);
+        qsa_part(*plan.qsa, state, rank, part, t, in, kv_only);
+        if (!kv_only) { qsa_output(*plan.qsa, rank, parts, t, nullptr); }
     }
 
     // Layer `i`'s mixer over the pass's `parts` (its `t` columns), part k reading and advancing
     // the state `state_of(part)`: the projections and the steps without state over every column at
     // once, the others part by part. In a branch pass the first branch continues the state its
     // sequence holds and leaves a copy in `slot`, from which each later branch starts the layer.
-    // Under tensor parallelism into the rank's FP32 `partial`.
+    // Under tensor parallelism into the rank's FP32 `partial`. With `kv_only`, a sparse-attention
+    // layer's projections and appends alone (qsa_part), without an output.
     template <typename StateOf>
     void run_mixer(const LayerPlan& plan, std::size_t i, RankState& rank,
                    std::span<const Part> parts, std::int32_t t, std::size_t slot,
-                   const StateOf& state_of, float* partial) {
+                   const StateOf& state_of, float* partial, bool kv_only = false) {
         const std::size_t first_branch = branch_capture != nullptr ? 1 : 0;
+        if (kv_only && plan.gdn) {
+            throw std::logic_error("qwen4_exp: a K/V-only layer is a sparse-attention one");
+        }
         if (plan.gdn) {
             gdn_project(*plan.gdn, rank, parts, t);
         } else {
@@ -3629,10 +3667,12 @@ struct Executor::Impl {
             if (plan.gdn) {
                 gdn_part(plan, i, state, rank, part, t);
             } else {
-                qsa_part(*plan.qsa, state, rank, part, t, target_inputs(i, state, rank, part));
+                qsa_part(*plan.qsa, state, rank, part, t, target_inputs(i, state, rank, part),
+                         kv_only);
             }
             if (k == 0) { capture_branch_layer(state, slot, rank, kMixerRegions); }
         }
+        if (kv_only) { return; }
         if (plan.gdn) {
             gdn_output(*plan.gdn, rank, parts, t, partial);
         } else {
@@ -3901,7 +3941,8 @@ struct Executor::Impl {
     }
 
     // Queues one segment of the pass for the parts' `t` tokens on its rank's stream; with `head`,
-    // the logits of the last `logit_rows` tokens.
+    // the logits of the last `logit_rows` tokens (none for 0). In a K/V-only pass the last layer
+    // ends after its appends (kv_only_pass).
     void run_segment(std::span<const Part> parts, const Segment& segment, std::int32_t t,
                      std::uint32_t logit_rows) {
         if (tensor()) {
@@ -3954,9 +3995,12 @@ struct Executor::Impl {
                 }
                 pending = false;
             }
-            run_mixer(plan, i, rank, parts, t, state_slot(i, rank.rank),
-                      [&](const Part& part) -> LayerState& { return part.sequence->layers[i]; },
-                      nullptr);
+            const bool kv_only = kv_only_pass && i + 1 == layers.size();
+            run_mixer(
+                plan, i, rank, parts, t, state_slot(i, rank.rank),
+                [&](const Part& part) -> LayerState& { return part.sequence->layers[i]; }, nullptr,
+                kv_only);
+            if (kv_only) { break; }
             {
                 auto scope = rank.workspace->scope();
                 ops::hyper_connection_write_read(
@@ -3974,7 +4018,7 @@ struct Executor::Impl {
             }
         }
         if (pending) { ops::hyper_connection_write(stack, moe_out, inject, rank.stream); }
-        if (segment.head) { run_head(parts, rank, t, logit_rows); }
+        if (segment.head && logit_rows > 0) { run_head(parts, rank, t, logit_rows); }
     }
 
     // Whether the pass captures layer i's DFlash2 features.
@@ -4243,6 +4287,22 @@ struct Executor::Impl {
             // Every rank runs its key heads of a Gated DeltaNet layer; the ranks holding KV heads
             // of a sparse-attention layer run those.
             const std::size_t mixers = layers[i].gdn ? n : model.attention_ranks();
+            if (kv_only_pass && i + 1 == layers.size()) {
+                // A K/V-only last layer: the ranks holding its KV heads append the pass's keys,
+                // values and indexer keys, and no exchange follows.
+                for (std::size_t r = 0; r < mixers; ++r) {
+                    on(r, [&](RankState& rank) {
+                        run_mixer(
+                            plan_of(r, i), i, rank, parts, t, state_slot(i, r),
+                            [&](const Part& part) -> LayerState& {
+                                return state_of(*part.sequence, r, i);
+                            },
+                            nullptr, true);
+                    });
+                }
+                pending = false;
+                break;
+            }
             exchange_step(mixers, TensorParallelSum::StoreBf16,
                           [&](std::size_t r, RankState& rank, float* partial) {
                               run_mixer(plan_of(r, i), i, rank, parts, t, state_slot(i, r),
@@ -4293,7 +4353,7 @@ struct Executor::Impl {
         }
         if (segment.head && prompt_pass && logit_rows > std::uint32_t(head_columns)) {
             on(0, [&](RankState& rank) { run_whole_head(parts, rank, t, logit_rows); });
-        } else if (segment.head) {
+        } else if (segment.head && logit_rows > 0) {
             run_divided_head(parts, t, logit_rows);
         }
         for (std::size_t r = 1; r < n; ++r) {
@@ -4447,6 +4507,45 @@ struct Executor::Impl {
             // Every rank runs its key heads of a Gated DeltaNet layer; the ranks holding KV heads
             // of a sparse-attention layer run those.
             const std::size_t mixers = layers[i].gdn ? n : model.attention_ranks();
+            if (kv_only_pass && i + 1 == layers.size()) {
+                // A K/V-only last layer: piece by piece, once its experts' exchange is back, the
+                // ranks holding the layer's KV heads read the piece's MoE input and append its
+                // keys, values and indexer keys; no exchange follows.
+                for (std::size_t p = 0; p < pieces.size(); ++p) {
+                    for (std::size_t r = 0; r < mixers; ++r) {
+                        on(r, [&](RankState& rank) {
+                            const ColumnRun& run  = pieces[p];
+                            const LayerPlan& plan = plan_of(r, i);
+                            Tensor stack          = stack_of(rank, run);
+                            Tensor mixed          = mixed_of(rank, run);
+                            Tensor inject         = inject_of(rank, run);
+                            take_back(r, rank, p);
+                            {
+                                auto scope = rank.workspace->scope();
+                                if (pending) {
+                                    ops::hyper_connection_write_read(
+                                        stack, moe_out_of(rank, run), inject,
+                                        plan.attn_hc.weights(), config.rms_norm_eps,
+                                        *rank.workspace, mixed, &inject, rank.stream);
+                                } else {
+                                    ops::hyper_connection_read(stack, plan.attn_hc.weights(),
+                                                               config.rms_norm_eps, *rank.workspace,
+                                                               mixed, &inject, rank.stream);
+                                }
+                            }
+                            run_mixer(
+                                plan, i, rank, std::span<const Part>(&parts[p], 1), t,
+                                state_slot(i, r),
+                                [&](const Part& part) -> LayerState& {
+                                    return state_of(*part.sequence, r, i);
+                                },
+                                nullptr, true);
+                        });
+                    }
+                }
+                pending = false;
+                break;
+            }
             piece_step(
                 mixers, TensorParallelSum::StoreBf16, mixer_plane,
                 [&](std::size_t r, RankState& rank, std::size_t p, float* partial) {
@@ -4533,7 +4632,7 @@ struct Executor::Impl {
         const std::span<const Part> chunk(&whole, 1);
         if (segment.head && prompt_pass && logit_rows > std::uint32_t(head_columns)) {
             on(0, [&](RankState& rank) { run_whole_head(chunk, rank, t, logit_rows); });
-        } else if (segment.head) {
+        } else if (segment.head && logit_rows > 0) {
             run_divided_head(chunk, t, logit_rows);
         }
         for (std::size_t r = 1; r < n; ++r) {
@@ -4602,11 +4701,22 @@ struct Executor::Impl {
         return true;
     }
 
-    void check_tokens(std::span<const std::int32_t> tokens, std::uint32_t logit_rows) const {
+    // Whether a prompt pass that leaves no logits may run its last layer K/V-only: the layer is a
+    // sparse-attention one, no DFlash2 tap reads it, and no MTP block follows the prompt over the
+    // final stacks (mtp_catch_up reads every chunk's).
+    [[nodiscard]] bool kv_only_allowed() const noexcept {
+        return !mtp && !layers.empty() && layers.back().qsa &&
+               (!dflash2 || tap_of[layers.size() - 1] < 0);
+    }
+
+    // `none`: the call may leave no logits (a prompt step's).
+    void check_tokens(std::span<const std::int32_t> tokens, std::uint32_t logit_rows,
+                      bool none = false) const {
         if (tokens.empty() || tokens.size() > options.prefill_chunk) {
             throw std::invalid_argument("qwen4_exp forward: 1..prefill_chunk tokens per call");
         }
-        if (logit_rows == 0 || logit_rows > tokens.size() || logit_rows > max_logit_rows) {
+        if ((logit_rows == 0 && !none) || logit_rows > tokens.size() ||
+            logit_rows > max_logit_rows) {
             throw std::invalid_argument("qwen4_exp forward: invalid logit rows");
         }
         for (const auto token : tokens) {
@@ -4640,8 +4750,9 @@ struct Executor::Impl {
         SequenceState& first = *parts.front().sequence;
         // Staged misses keep disk experts' decode and verification free of host synchronization.
         const bool host_free = !stream || misses;
-        const bool decode_graph =
-            options.cuda_graphs && t == 1 && host_free && !verifying && branch_origin == nullptr;
+        // A K/V-only pass runs eagerly: the decode graphs end in the head.
+        const bool decode_graph = options.cuda_graphs && t == 1 && host_free && !verifying &&
+                                  branch_origin == nullptr && !kv_only_pass;
         const bool verify_graph = options.cuda_graphs && verifying && parts.size() == 1 &&
                                   host_free && t <= kVectorTokens && branch_origin == nullptr;
         if (misses) { misses->keep_alive(); }
@@ -4681,7 +4792,7 @@ struct Executor::Impl {
                 part.sequence->position += static_cast<std::uint32_t>(part.count);
             }
         }
-        record_routes(static_cast<std::uint32_t>(t));
+        record_routes(static_cast<std::uint32_t>(t), layers.size() - (kv_only_pass ? 1 : 0));
         // While a staged layer waits on the device for its missing experts, no other launch may
         // load a kernel lazily: loading can wait for the device to go idle, the waiting kernel for
         // the misses' service, and the service's own calls for the loader. The caller's next
@@ -4904,7 +5015,7 @@ struct Executor::Impl {
                                   .first    = sequence.position + std::uint32_t(at),
                                   .tokens   = tokens.subspan(at, std::size_t(t))});
                 check_tokens(chunks.back().tokens,
-                             at + std::size_t(t) == tokens.size() ? logit_rows : 1);
+                             at + std::size_t(t) == tokens.size() ? logit_rows : 1, true);
             }
         };
         SpanCut span_cut;
@@ -4916,7 +5027,9 @@ struct Executor::Impl {
             chunk_up(0, tokens.size());
         }
         const std::size_t last = chunks.size() - 1;
-        run_span(chunks, std::span(&last, 1), logit_rows, &sequence, next, span_cut);
+        const char wanted      = logit_rows > 0 ? 1 : 0;
+        run_span(chunks, std::span(&last, 1), std::span(&wanted, 1), logit_rows, &sequence, next,
+                 span_cut);
     }
 
     // Several sequences' prompt tokens in one span (Executor::forward_pieces).
@@ -4931,6 +5044,7 @@ struct Executor::Impl {
         std::size_t total = 0;
         std::vector<SpanChunk> chunks;
         std::vector<std::size_t> lasts;
+        std::vector<char> wanted;
         for (const PromptPiece& piece : pieces) {
             SequenceState& sequence = sequences.at(piece.sequence);
             for (const PromptPiece& other : pieces) {
@@ -4958,22 +5072,27 @@ struct Executor::Impl {
             }
             total += piece.tokens.size();
             lasts.push_back(chunks.size() - 1);
+            wanted.push_back(piece.logits ? 1 : 0);
         }
         if (total > span_tokens || next.size() > prompt_step()) {
             throw std::invalid_argument("qwen4_exp forward_pieces: tokens exceed the prompt span");
         }
-        run_span(chunks, lasts, 1, &sequences.at(pieces.back().sequence), next);
+        run_span(chunks, lasts, wanted, 1, &sequences.at(pieces.back().sequence), next);
     }
 
     // A prompt span, layer by layer: every chunk passes a layer before any passes the next, so a
     // wide call's pool copy of the layer's uncached experts serves every chunk. The arithmetic of
     // each chunk is that of forward() over its sequence. The logits are the last `logit_rows` rows
-    // of each chunk `lasts` names, the chunk's columns in order, chunk after chunk (several chunks
-    // take one row each); `hinted` then hints the rows of `next`. A `cut` keeps its sequence's
-    // state between two of its chunks as each layer, the ring and the MTP block pass there.
+    // of each chunk `lasts` names whose `wanted` entry is set, the chunk's columns in order, chunk
+    // after chunk (several chunks take one row each, and an unwanted chunk's place stays as it
+    // was); `hinted` then hints the rows of `next`. A `cut` keeps its sequence's state between two
+    // of its chunks as each layer, the ring and the MTP block pass there. Where kv_only_allowed(),
+    // the last layer's expert calls without a wanted chunk do not run, and their chunks run the
+    // layer's appends alone.
     void run_span(std::span<const SpanChunk> chunks, std::span<const std::size_t> lasts,
-                  std::uint32_t logit_rows, const SequenceState* hinted,
-                  std::span<const std::int32_t> next, SpanCut cut = {}) {
+                  std::span<const char> wanted, std::uint32_t logit_rows,
+                  const SequenceState* hinted, std::span<const std::int32_t> next,
+                  SpanCut cut = {}) {
         const std::size_t n = chunks.back().at + std::size_t(chunks.back().count);
         if (cut.state != nullptr) {
             if (cut.chunk == 0 || cut.chunk >= chunks.size() ||
@@ -5064,6 +5183,25 @@ struct Executor::Impl {
             if (narrow_chunk(chunks[k].count)) { calls.push_back({k, k + 1}); }
         }
         const SpanChunk& recorded = chunks[calls.back().last - 1];
+        // The last layer's calls that run, and the chunks that run the whole layer: all, or with a
+        // K/V-only last layer those that share a call with a chunk whose logits are wanted.
+        std::vector<char> last_runs(calls.size(), 1), last_whole(chunks.size(), 1);
+        if (kv_only_allowed()) {
+            std::vector<char> read(chunks.size(), 0);
+            for (std::size_t p = 0; p < lasts.size(); ++p) {
+                if (wanted[p] != 0 && logit_rows > 0) { read[lasts[p]] = 1; }
+            }
+            for (std::size_t c = 0; c < calls.size(); ++c) {
+                const auto first = read.begin() + std::ptrdiff_t(calls[c].first);
+                const auto end   = read.begin() + std::ptrdiff_t(calls[c].last);
+                last_runs[c]     = std::find(first, end, 1) != end ? 1 : 0;
+                std::fill(last_whole.begin() + std::ptrdiff_t(calls[c].first),
+                          last_whole.begin() + std::ptrdiff_t(calls[c].last), last_runs[c]);
+            }
+        }
+        const std::size_t span_pooled_end =
+            layers.size() -
+            (std::find(last_runs.begin(), last_runs.end(), 1) == last_runs.end() ? 1 : 0);
         // DFlash2: each following sequence's last window positions of the span, chunk by chunk;
         // their features take consecutive columns, sequence after sequence. A cut's sequence
         // first takes its last window positions before the cut, which the ring holds there.
@@ -5125,6 +5263,7 @@ struct Executor::Impl {
             rank.inject = static_cast<float*>(span_inject.p) + chunks[k].at * std::size_t(hc);
         };
         try {
+            pooled_end = span_pooled_end;
             // Each layer runs in two phases: attention over every chunk of the span, then the
             // experts over every chunk. The next layer's experts are copied into the pool while its
             // attention phase runs, so its first expert call rarely waits for them.
@@ -5172,15 +5311,16 @@ struct Executor::Impl {
                                                    config.rms_norm_eps, *rank.workspace, mixed,
                                                    &inject, st);
                     }
+                    const bool kv_only = i + 1 == layers.size() && last_whole[k] == 0;
                     if (plan.gdn) {
                         run_gdn(plan, i, state, rank, part);
                     } else {
                         // The sequence stands at its first chunk; this chunk begins at its own.
                         AttentionInputs in = target_inputs(i, state, rank, part);
                         in.first           = chunk.first;
-                        run_qsa(plan, state, rank, part, in);
+                        run_qsa(plan, state, rank, part, in, kv_only);
                     }
-                    {
+                    if (!kv_only) {
                         auto scope = rank.workspace->scope();
                         ops::hyper_connection_write_read(
                             stack, Tensor(rank.y, DType::BF16, {h, t}), inject,
@@ -5193,6 +5333,7 @@ struct Executor::Impl {
                     }
                 }
                 for (std::size_t c = 0; c < calls.size(); ++c) {
+                    if (i + 1 == layers.size() && last_runs[c] == 0) { continue; }
                     const auto [k, last] = calls[c];
                     const auto t         = static_cast<std::int32_t>(
                         chunks[last - 1].at + std::size_t(chunks[last - 1].count) - chunks[k].at);
@@ -5242,6 +5383,7 @@ struct Executor::Impl {
             const auto rows  = static_cast<std::int32_t>(logit_rows);
             const auto vocab = static_cast<std::int32_t>(config.vocab_size);
             for (std::size_t p = 0; p < lasts.size(); ++p) {
+                if (rows == 0 || wanted[p] == 0) { continue; }
                 const SpanChunk& chunk = chunks[lasts[p]];
                 const Tensor last(chunk_stack(lasts[p]) + width * std::size_t(chunk.count - rows),
                                   DType::FP32, {h, hc, rows});
@@ -5259,7 +5401,9 @@ struct Executor::Impl {
             for (const SpanChunk& chunk : chunks) {
                 chunk.sequence->position = chunk.first + std::uint32_t(chunk.count);
             }
-            record_routes(std::uint32_t(recorded.count));
+            pooled_end = ~std::size_t{0};
+            record_routes(std::uint32_t(recorded.count),
+                          layers.size() - (last_runs.back() != 0 ? 0 : 1));
             // A cut's ring lane is kept once its run before the cut is in.
             const std::span<const ContextRun> runs(span_runs);
             dflash2_context(runs.first(cut_runs), nullptr, 0);
@@ -5292,6 +5436,7 @@ struct Executor::Impl {
             rank.inject = own_inject;
             span_hold   = false;
             span_last   = false;
+            pooled_end  = ~std::size_t{0};
             throw;
         }
         rank.stack = own_stack;
@@ -5316,7 +5461,7 @@ struct Executor::Impl {
             forward_span(s, tokens, logit_rows, next, cut);
             return;
         }
-        check_tokens(tokens, logit_rows);
+        check_tokens(tokens, logit_rows, true);
         SequenceState& sequence      = sequences.at(s);
         const std::uint32_t position = sequence.position;
         const Part part{
@@ -5327,17 +5472,23 @@ struct Executor::Impl {
             dflash2 ? std::min(part.count, static_cast<std::int32_t>(
                                                *model.dflash2_config()->sliding_window))
                     : 0;
-        capture     = {.first = part.count - kept, .count = kept, .column = 0};
-        prompt_pass = true;
+        capture             = {.first = part.count - kept, .count = kept, .column = 0};
+        prompt_pass         = true;
+        kv_only_pass        = logit_rows == 0 && kv_only_allowed();
+        pooled_end          = layers.size() - (kv_only_pass ? 1 : 0);
+        const auto end_pass = [&] {
+            capture      = {};
+            prompt_pass  = false;
+            kv_only_pass = false;
+            pooled_end   = ~std::size_t{0};
+        };
         try {
             pass(std::span(&part, 1), tokens, logit_rows);
         } catch (...) {
-            capture     = {};
-            prompt_pass = false;
+            end_pass();
             throw;
         }
-        capture     = {};
-        prompt_pass = false;
+        end_pass();
         hint_next(sequence, next);
         if (kept > 0 && sequence.drafter_follows) {
             const ContextRun run{&sequence, 0, kept,

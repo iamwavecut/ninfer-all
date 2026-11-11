@@ -188,6 +188,14 @@ public:
         rewrite_checkpoint_hidden_output_ = output;
     }
 
+    // Lets a prompt chunk run the model's last layer as K/V only when nothing reads the chunk's
+    // final hidden state: it samples no token, ends before the prompt does, and feeds no MTP
+    // prompt, in-pass tap hidden, checkpoint hidden or drafter feature of that layer. The layer
+    // then appends its K/V rows and skips its attention, output projection and FFN; every cache
+    // byte stays as the whole layer writes it. A caller that reads prefill_hidden after such a
+    // chunk (causal scoring, forced tokens) leaves it off.
+    void set_last_layer_kv_only(bool allowed) noexcept { last_layer_kv_only_allowed_ = allowed; }
+
     // Exact prefix-cache taps inside the next chunk, in frontier order, without splitting the
     // pass: each Gated DeltaNet layer runs its convolution and recurrence up to each frontier into
     // that tap's slot and continues from there. A text chunk on one device whose columns hold
@@ -280,7 +288,9 @@ private:
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    // `kv_only` appends the layer's K/V rows and returns before its attention output.
+    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
+                  bool kv_only = false);
     // Position-split attention's second half on a rank: the merge of every rank's partial for its
     // query heads, gated by the gates attn_mix kept, and its share of the output projection.
     void attn_merge_output(const BlockParameters& weights, Tensor& x,
@@ -455,6 +465,9 @@ private:
     const GdnReplayRecords* replay_records_   = nullptr;
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
+    bool last_layer_kv_only_allowed_          = false;
+    // The running prefill pass runs the model's last layer as K/V only.
+    bool kv_only_pass_ = false;
     std::array<GdnTap, kMaximumGdnTaps> gdn_taps_{};
     std::size_t gdn_tap_count_ = 0;
     // The running chunk's tap columns; gdn_live_taps_ == 0 runs none.

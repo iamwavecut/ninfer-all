@@ -2221,7 +2221,9 @@ struct Qwen4ExpCore::Impl {
             slot.anchor_media.clear();
             cut = {.tokens = step.cut - r.prefilled, .state = &slot.snapshot};
         }
-        executor.forward(r.slot, prompt.subspan(r.prefilled, n), 1, next, cut);
+        // Only the prompt's last step leaves logits (end_prefill samples them).
+        executor.forward(r.slot, prompt.subspan(r.prefilled, n), r.prefilled + n < prompt_n ? 0 : 1,
+                         next, cut);
         end_prefill(request, n, 0, 1, step.cut);
     }
 
@@ -2304,7 +2306,8 @@ struct Qwen4ExpCore::Impl {
             pieces.push_back(
                 {.sequence = p.request->slot,
                  .tokens   = std::span<const TokenId>(p.request->prompt_tokens)
-                               .subspan(p.request->prefilled, p.tokens)});
+                                 .subspan(p.request->prefilled, p.tokens),
+                 .logits   = p.request->prefilled + p.tokens >= p.request->prompt_tokens.size()});
         }
         // The last piece's next step's table rows are read while this one runs.
         const Request& last  = *packed.back().request;
@@ -2368,7 +2371,8 @@ struct Qwen4ExpCore::Impl {
         }
         const std::uint32_t n = prompt_step(r, false).tokens;
         const auto chunk      = std::span<const TokenId>(branch.tokens).subspan(r.branch_fed, n);
-        executor.forward(r.slot, chunk, 1);
+        // Only the branch's last step leaves logits, which its first token reads.
+        executor.forward(r.slot, chunk, r.branch_fed + n < branch.tokens.size() ? 0 : 1);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         r.branch_fed += n;
         r.progress = Clock::now();
@@ -3324,7 +3328,9 @@ struct Qwen4ExpCore::Impl {
         RankBinding bind(device, executor.head_rank());
         for (std::uint32_t at = 0; at + 1 < n; at += chunk) {
             const std::uint32_t count = std::min(chunk, n - 1 - at);
-            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, count), count);
+            // A chunk before the first target only extends the context.
+            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, count),
+                             first_target > at + count ? 0 : count);
             // Rows predicting targets [at + 1, at + count].
             const std::uint32_t first_row = first_target > at + 1 ? first_target - at - 1 : 0;
             if (first_row >= count) { continue; }

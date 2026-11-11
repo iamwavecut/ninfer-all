@@ -977,6 +977,9 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 state_slot,
                 0,
                 0};
+            // A chunk before the first scored predictor only extends the context: nothing reads
+            // its final hidden rows.
+            schedule_state.last_layer_kv_only = cursor + nominal <= scored_predictor_begin;
             mark_workspace_usage(workspace_plan.text_prefill);
             const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                 schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
