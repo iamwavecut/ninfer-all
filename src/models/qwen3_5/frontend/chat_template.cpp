@@ -9,8 +9,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <future>
 #include <map>
 #include <stdexcept>
+#include <system_error>
 
 namespace ninfer::models::qwen3_5::frontend {
 namespace {
@@ -230,6 +233,23 @@ bool real_user(const ChatMessage& message) {
     return !(body.starts_with("<tool_response>") && body.ends_with("</tool_response>"));
 }
 
+// Whether an assistant message follows the request's query (its last real user message, or
+// without one its last tool result): render_as then probes a next user turn.
+bool assistant_after_query(const std::vector<ChatMessage>& messages) {
+    std::optional<std::size_t> query;
+    for (std::size_t i = messages.size(); i > 0; --i) {
+        if (real_user(messages[i - 1])) {
+            query = i - 1;
+            break;
+        }
+        if (!query && messages[i - 1].role == ChatRole::Tool) query = i - 1;
+    }
+    return query && std::any_of(messages.begin() + static_cast<std::ptrdiff_t>(*query) + 1,
+                                messages.end(), [](const ChatMessage& message) {
+                                    return message.role == ChatRole::Assistant;
+                                });
+}
+
 } // namespace
 
 bool ChatMessage::has_media() const noexcept {
@@ -386,6 +406,53 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
             throw std::invalid_argument("a forced tool call requires declared tools");
         }
     }
+    // Two probes render the whole conversation again and read only `context`: the history without
+    // the generation prompt (where that prompt starts) and, when an assistant message follows the
+    // query, the history before a new user turn (whether a next turn keeps it). They run on their
+    // own threads beside the main render, under the request's deadline; leaving this function
+    // stops a probe still running, one that the layout turned out not to need. A probe that cannot
+    // start a thread renders here when it is needed.
+    const auto next_turn_context = [&] {
+        Json probe = context;
+        probe["messages"].push_back({{"role", "user"}, {"content", ""}});
+        probe["add_generation_prompt"] = false;
+        return probe;
+    };
+    auto next_turn_options    = execution;
+    next_turn_options.regions = {};
+    std::atomic<bool> stop_probes{false};
+    const PreparationControl probe_control{
+        .deadline     = control.deadline,
+        .cancellation = CancellationView(
+            [&stop_probes] { return stop_probes.load(std::memory_order_relaxed); }),
+    };
+    const auto start_probe = [&](Json probe, text::TemplateRenderOptions probe_options) {
+        probe_options.checkpoint = [&probe_control] {
+            check_preparation_control(probe_control, "chat template");
+        };
+        try {
+            return std::async(std::launch::async, [this, probe = std::move(probe),
+                                                   probe_options = std::move(probe_options)] {
+                return compiled_.render(probe, probe_options);
+            });
+        } catch (const std::system_error&) { return std::future<text::TemplateOutput>{}; }
+    };
+    std::future<text::TemplateOutput> history_render, next_turn_render;
+    if (!continuation && options.add_generation_prompt) {
+        Json probe                     = context;
+        probe["add_generation_prompt"] = false;
+        history_render                 = start_probe(std::move(probe), execution);
+    }
+    if (!continuation && assistant_after_query(messages)) {
+        next_turn_render = start_probe(next_turn_context(), next_turn_options);
+    }
+
+    // Destroyed before the futures, whose destructors wait for their probes.
+    const struct StopProbes {
+        std::atomic<bool>& stop;
+
+        ~StopProbes() { stop.store(true, std::memory_order_relaxed); }
+    } stop_on_exit{stop_probes};
     auto output = compiled_.render(context, execution);
     auto layout = inspect_prompt_layout(output, media);
     if (continuation) {
@@ -423,12 +490,18 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         if (count > messages.size()) return std::nullopt;
         if (const auto it = prefix_cache.find(count); it != prefix_cache.end()) return it->second;
         std::optional<std::size_t> boundary;
-        Json probe = context;
-        probe["messages"].erase(probe["messages"].begin() + static_cast<std::ptrdiff_t>(count),
-                                probe["messages"].end());
-        probe["add_generation_prompt"] = false;
         try {
-            const auto rendered = compiled_.render(probe, execution);
+            text::TemplateOutput rendered;
+            if (count == messages.size() && history_render.valid()) {
+                rendered = history_render.get();
+            } else {
+                Json probe = context;
+                probe["messages"].erase(probe["messages"].begin() +
+                                            static_cast<std::ptrdiff_t>(count),
+                                        probe["messages"].end());
+                probe["add_generation_prompt"] = false;
+                rendered                       = compiled_.render(probe, execution);
+            }
             if (same_prefix(output, rendered, rendered.text.size()))
                 boundary = rendered.text.size();
         } catch (const RequestError&) {
@@ -522,13 +595,10 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
     // the checkpoint to retain: subsequent requests still require exact token/state identity.
     bool retain_open_turn = context.value("preserve_thinking", false);
     if (first_tail_assistant && layout.messages[*first_tail_assistant].closed) {
-        Json probe = context;
-        probe["messages"].push_back({{"role", "user"}, {"content", ""}});
-        probe["add_generation_prompt"] = false;
-        auto probe_options             = execution;
-        probe_options.regions          = {};
         try {
-            const auto next_turn     = compiled_.render(probe, probe_options);
+            const auto next_turn = next_turn_render.valid()
+                                       ? next_turn_render.get()
+                                       : compiled_.render(next_turn_context(), next_turn_options);
             const auto history_bytes = generation_begin.value_or(output.text.size());
             retain_open_turn         = same_prefix(next_turn, output, history_bytes);
         } catch (const RequestError&) { throw; } catch (const std::invalid_argument&) {
