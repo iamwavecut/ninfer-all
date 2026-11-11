@@ -333,8 +333,9 @@ public:
     [[nodiscard]] std::string expert_execution_profile() const;
     // GGUF host or disk experts with a CPU share: its threads and vector backend; else empty.
     [[nodiscard]] std::string expert_cpu_description() const;
-    // The widest call whose missing experts CPU threads share (kNarrowMissTokens with GGUF host
-    // experts and a CPU share); 0 without a CPU share. Wider calls copy every miss to the GPU.
+    // The widest verification whose missing experts CPU threads share: with a CPU share, every
+    // miss of a call of up to kNarrowMissTokens tokens, and with GGUF host experts those of few
+    // pairs up to kCpuMissTokens; 0 without a CPU share. Wider calls copy every miss to the GPU.
     [[nodiscard]] std::uint32_t cpu_share_tokens() const noexcept;
     [[nodiscard]] bool hybrid_experts() const noexcept;
     void save_expert_profile() const;

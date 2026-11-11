@@ -6,9 +6,10 @@
 // entries back on the host at once and the candidate's moved only once its copy has landed; prompt
 // routes must not steer them. A routing profile must size each layer's share of the slots and fill
 // them. An admission takes a free slot, else the coldest expert its call does not route when the
-// newcomer's count beats it, and counts the newcomer's routes in that call as misses. Lent buffers
-// are free slots until a wide pass reclaims them: their most routed experts move into colder slots
-// of the cache's own, no entry points inside them while the pass writes them, and they come back
+// newcomer's count beats it, and counts the newcomer's routes in that call as misses; a free
+// admission (a wide prompt call's) takes only a free slot. Lent buffers are free slots until a
+// wide pass reclaims them: their most routed experts move into colder slots of the cache's own,
+// no entry points inside them while the pass writes them, and they come back
 // zeroed, refilled with the most routed experts outside the cache and free for admissions past
 // those. A round's swaps start over the passes until the next round, a share of them a pass. With
 // two devices, rounds that copy into one rank's slots, then the other's, then both, reuse each
@@ -213,10 +214,7 @@ void paced(DeviceContext& device) {
 
 // Admits `expert` into layer `l` and copies it in and patches its entries, as the expert misses
 // do; the result's slot is null when the cache refused it.
-ExpertCache::Admitted admit(ExpertCache& cache, const Model& model, std::size_t l, std::int32_t expert,
-                            int pairs, const std::vector<unsigned char>& in_use) {
-    ExpertCache::Admitted out;
-    if (!cache.admit(l, expert, pairs, in_use, out)) { return out; }
+void fill(const Model& model, std::size_t l, std::int32_t expert, const ExpertCache::Admitted& out) {
     const Bank* banks[3] = {l == 0 ? &model.g0 : &model.g1, l == 0 ? &model.u0 : &model.u1,
                             l == 0 ? &model.d0 : &model.d1};
     for (int k = 0; k < 3; ++k) {
@@ -233,7 +231,45 @@ ExpertCache::Admitted admit(ExpertCache& cache, const Model& model, std::size_t 
                     "patch a victim entry");
         }
     }
+}
+
+ExpertCache::Admitted admit(ExpertCache& cache, const Model& model, std::size_t l, std::int32_t expert,
+                            int pairs, const std::vector<unsigned char>& in_use) {
+    ExpertCache::Admitted out;
+    if (cache.admit(l, expert, pairs, in_use, out)) { fill(model, l, expert, out); }
     return out;
+}
+
+// A wide prompt call's admissions take free slots only: once a handed-over layer's slots are all
+// taken, no expert leaves for a newcomer.
+void free_admissions(DeviceContext& device) {
+    Model model;
+    ExpertCache cache(device, model.layers(device), std::vector<std::uint64_t>{2 * 102400});
+    const auto admit_free = [&](std::int32_t expert) {
+        ExpertCache::Admitted out;
+        if (cache.admit_free(1, expert, out)) { fill(model, 1, expert, out); }
+        return out;
+    };
+    require(admit_free(0).slot[0] == nullptr, "a layer not handed over admits nothing");
+    cache.hand_over(1);
+    int slots = 0;
+    for (std::int32_t e = 0; e < kExperts; ++e) {
+        const auto out = admit_free(e);
+        if (out.slot[0] == nullptr) { break; }
+        require(out.victim < 0, "a free admission evicts nothing");
+        ++slots;
+    }
+    require(slots > 0 && slots < kExperts, "free admissions fill the free slots and stop: " +
+                                               std::to_string(slots));
+    require(int(model.cached(1, "free admissions").size()) == slots,
+            "every admitted expert's entries point at its slot");
+    require(admit_free(0).slot[0] == nullptr, "a cached expert is not admitted twice");
+    const auto refused = admit_free(std::int32_t(kExperts - 1));
+    const auto cached  = model.cached(1, "full");
+    require(refused.slot[0] == nullptr && int(cached.size()) == slots && holds(cached, 0) &&
+                !holds(cached, kExperts - 1),
+            "a full layer admits nothing and keeps its experts");
+    require(cache.stats().admitted == std::uint64_t(slots), "each free admission counts once");
 }
 
 void loans(DeviceContext& device) {
@@ -567,6 +603,7 @@ int main() {
         rounds(device);
         paced(device);
         admissions(device);
+        free_admissions(device);
         profile(device);
         loans(device);
         three_loans(device);

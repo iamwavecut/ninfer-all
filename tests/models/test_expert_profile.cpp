@@ -31,7 +31,14 @@ int main() {
         };
         auto wrong = artifact; wrong[0] = std::byte{1};
         rejects(wrong, widths);
-        rejects(artifact, std::array<std::size_t, 1>{3});
+        // A run without trailing layers (Flash-Next's MTP block) reads the leading ones; a model
+        // with more layers than the profile, or other widths, is refused.
+        if (read_expert_profile(path, artifact, std::array<std::size_t, 1>{3}) !=
+            ExpertRouteCounts{expected[0]}) {
+            throw std::runtime_error("expert profile did not serve its leading layers");
+        }
+        rejects(artifact, std::array<std::size_t, 3>{3, 2, 2});
+        rejects(artifact, std::array<std::size_t, 1>{2});
         rejects(artifact, std::array<std::size_t, 2>{2, 3});
         for (const auto* counts : {"[[1,-2,3],[4,5]]", "[[1,2.5,3],[4,5]]", "[[1,2,3],[4]]"}) {
             std::ofstream(path) << "{\"version\":1,\"artifact_id\":\"00000000000000000000000000000000\",\"counts\":" << counts << '}';
@@ -55,8 +62,17 @@ int main() {
                 }
             }
         }
-        if (builtin_expert_profile("deepseek-v4.1", std::vector<std::size_t>(40, 256))) {
+        if (builtin_expert_profile("deepseek-v4.1", std::vector<std::size_t>(40, 256)) ||
+            builtin_expert_profile("deepseek-v4.1", std::vector<std::size_t>(41, 384))) {
             throw std::runtime_error("built-in profile served a geometry it was not recorded on");
+        }
+        // Flash-Next's was recorded with the MTP block's layer after the 48 text layers; a run
+        // without the block (no drafts, DFlash2, perplexity) takes the text layers' counts.
+        const auto with_mtp = builtin_expert_profile("qwen3.8-flash-next", std::vector<std::size_t>(49, 512));
+        const auto text     = builtin_expert_profile("qwen3.8-flash-next", std::vector<std::size_t>(48, 512));
+        if (!with_mtp || !text || text->size() != 48 ||
+            !std::equal(text->begin(), text->end(), with_mtp->begin())) {
+            throw std::runtime_error("no built-in Flash-Next profile for the text layers alone");
         }
         std::cout << "EXPERT_PROFILE_CONTRACT_PASS\n";
         return 0;

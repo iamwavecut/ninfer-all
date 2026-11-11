@@ -49,13 +49,23 @@ void moe_experts_bf16(const Tensor& m, const Tensor& ids, const Tensor& weights,
  * BF16 middle cast; y is compared as FP32 by relative L2 and gross error. Q2_0 has an independent
  * CPU decoder in its qualification; other formats' existing fixtures still use the GPU decoder.
  *
- * Up to eight tokens run ggml-style vector products. Wider calls over `device_resident` banks run
- * all three projections through ggml's integer tensor-core matrix kernel (with the same q8_1
- * arithmetic): the tables then point at device memory only, and at least 256 zero bytes follow the
- * last expert of every down bank (and of a slot pool), since the kernel reads a 640-value row in
- * three 256-value steps. Banks in mapped host memory stay on the vector products, which read them
- * across the bus better.
+ * Up to eight tokens run ggml-style vector products. A wider call needs `device_resident` banks
+ * and runs all three projections through ggml's integer tensor-core matrix kernel (with the same
+ * q8_1 arithmetic) where the block type has one; in a call of at most kGgufMoeSplitTokens tokens,
+ * an expert with at most kGgufMoeVectorPairs pairs keeps the vector products instead. The choice
+ * depends on the call's width and the expert's pairs only, so a placement that stages the missing
+ * experts, or computes some on CPU threads (gguf_expert_cpu, which reproduces the vector
+ * products), gives the bits of device banks. The tables of a wide call point at device memory
+ * only, and at least 256 zero bytes follow the last expert of every down bank (and of a slot pool),
+ * since the matrix kernel reads a 640-value row in three 256-value steps.
  */
+// In a call of 9 to kGgufMoeSplitTokens tokens, an expert with at most this many pairs takes the
+// vector products. Wider calls are prompt chunks, which host experts' slot pools may group into
+// calls of other widths than device experts run: there every expert takes the matrix kernel,
+// whose result for a pair does not depend on the call's other pairs.
+inline constexpr std::int32_t kGgufMoeVectorPairs = 8;
+inline constexpr std::int32_t kGgufMoeSplitTokens = 64;
+
 struct GgufExpertTable {
     QType format               = QType::GGUF_Q8_0;
     const void* const* experts = nullptr; // device array of expert base pointers
@@ -68,16 +78,16 @@ struct GgufMoeWeights {
     GgufExpertTable shared_gate, shared_up, shared_down;
     // Entries of the routed tables: 512, or the 256 an expert-pruned release keeps.
     std::int32_t experts = 512;
-    // Every entry in device memory, zeros past each down bank (see above).
+    // Every entry in device memory, zeros past each down bank (see above); required of a call of
+    // more than eight tokens.
     bool device_resident = false;
     // The shared expert's width: its 640 middle values, or under tensor parallelism a device's
     // run of them, a multiple of 32 (the rows of its gate and up tables and the values of each down
     // row, whose rows are then `shared_down.row_bytes` apart). A narrower shared expert takes the
     // vector products at decode widths.
     std::int32_t shared_width = 640;
-    // IQ1_M tables of a wide call over device_resident banks take the matrix kernel too once the
-    // call routes enough rows to each expert; false keeps them on the vector products
-    // (EngineOptions::iq1m_expert_matrix).
+    // IQ1_M tables of a wide call take the matrix kernel too once the call routes enough rows to
+    // each expert; false keeps them on the vector products (EngineOptions::iq1m_expert_matrix).
     bool iq1m_matrix = true;
 };
 
@@ -94,8 +104,8 @@ void moe_experts_gguf(const Tensor& m, const Tensor& ids, const Tensor& weights,
  * `banks`, and the shared expert when `shared` is given. add_products adds `*count` (at most
  * `max_count`) externally computed pair values, FP32 [count][2560] with their pair indices in
  * `pairs`, weighted by `weights` and rounded per pair as the kernels round theirs; its arrays may be
- * mapped host memory. finish stores y. Pairs split across adds give exactly the single call's sum;
- * external products carry their own arithmetic.
+ * mapped host memory. finish stores y. Adds that divide the experts (every pair of an expert in the
+ * same add) give exactly the single call's sum; external products carry their own arithmetic.
  */
 struct GgufMoeStage {
     std::int32_t tokens       = 0;

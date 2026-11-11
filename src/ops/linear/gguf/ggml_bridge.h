@@ -184,6 +184,18 @@ struct MoeRouting {
 // changes no value.
 [[nodiscard]] MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts,
                                          void* workspace, cudaStream_t stream);
+// The same grouping divided by how many pairs each expert has, for a call whose few-pair experts
+// take the vector products and the others the matrix kernel: `all` is moe_sort_routes's routing,
+// `vector` lists as active only the experts with 1 to `vector_pairs` pairs, and `matrix` lists the
+// column tiles of the experts with more. All three share the bounds and sorted pairs. `workspace`
+// holds moe_split_routing_bytes.
+struct MoeSplitRouting {
+    MoeRouting all, vector, matrix;
+};
+[[nodiscard]] std::size_t moe_split_routing_bytes(int experts, int pairs);
+[[nodiscard]] MoeSplitRouting moe_sort_routes_split(const std::int32_t* ids, int pairs, int experts,
+                                                    int vector_pairs, void* workspace,
+                                                    cudaStream_t stream);
 
 // Expert parallelism: a device's part of a MoE call runs the routed experts [begin, end) it holds.
 // moe_keep_experts copies ids into `out` with -1 for every pair of another device's expert, which

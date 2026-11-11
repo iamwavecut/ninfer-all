@@ -296,6 +296,11 @@ then adds the CPU's sums to its own:
   ([measurements](#the-cpu-share-on-one-rtx-4090)), so `auto` copies every miss of disk experts; a
   share below `1` still gives the CPU its part.
 
+Flash-Next's CPU share also covers the missing experts with at most eight pairs in calls of 9 to 64
+tokens ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); DeepSeek-V4.1 does not have that
+route yet: its expert kernels take one route per call, and the shared expert delivery serves only
+narrow calls.
+
 ## IQ1_M experts in prompt chunks
 
 Calls of more than eight tokens run the routed experts on ggml's integer tensor-core matrix kernel,

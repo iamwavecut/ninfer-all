@@ -162,7 +162,9 @@ struct PickPrep {
 
 // One block: the pairs of each expert counted, scanned into bounds, then placed. The experts with
 // pairs are listed in ascending order, and so are the column tiles of each tile width that hold
-// any pair (MoeRouting::tiles).
+// any pair (MoeRouting::tiles). With `small_active` (moe_sort_routes_split), the experts with 1 to
+// `vector_pairs` pairs are listed there as well, and the column tiles of the others in
+// `large_tiles`.
 constexpr int kSortThreads = 1024;
 static_assert(sizeof(kMatrixColumnTiles) / sizeof(int) == kMoeTileWidths &&
                   kMatrixColumnTiles[0] == 16 && kMatrixColumnTiles[1] == 32 &&
@@ -179,8 +181,12 @@ __launch_bounds__(kSortThreads) __global__
                          std::int32_t* __restrict__ active,
                          std::int32_t* __restrict__ active_count,
                          std::int32_t* __restrict__ tile_count, std::int32_t* __restrict__ tiles,
-                         int tile_capacity) {
+                         int tile_capacity, int vector_pairs, std::int32_t* __restrict__ small_active,
+                         std::int32_t* __restrict__ small_count,
+                         std::int32_t* __restrict__ large_tile_count,
+                         std::int32_t* __restrict__ large_tiles) {
     extern __shared__ int shared[];
+    const bool split = small_active != nullptr; // uniform over the block
     int* count  = shared;
     int* cursor = shared + experts;
     for (int e = threadIdx.x; e < experts; e += blockDim.x) { count[e] = 0; }
@@ -196,32 +202,42 @@ __launch_bounds__(kSortThreads) __global__
     __shared__ typename Scan::TempStorage scan;
     const int per   = (experts + kSortThreads - 1) / kSortThreads;
     const int first = threadIdx.x * per;
-    int owned = 0, used = 0;
+    const auto small = [&](int e) { return count[e] != 0 && count[e] <= vector_pairs; };
+    int owned = 0, used = 0, few = 0;
     for (int e = first; e < min(first + per, experts); ++e) {
         owned += count[e];
         used += count[e] != 0;
+        few += split && small(e);
     }
-    int run = 0, listed = 0, listed_total = 0;
+    int run = 0, listed = 0, listed_total = 0, small_at = 0, small_total = 0;
     Scan(scan).ExclusiveSum(owned, run);
     __syncthreads();
     Scan(scan).ExclusiveSum(used, listed, listed_total);
+    if (split) {
+        __syncthreads();
+        Scan(scan).ExclusiveSum(few, small_at, small_total);
+    }
     for (int e = first; e < min(first + per, experts); ++e) {
         bounds[e] = run;
         cursor[e] = run;
         run += count[e];
         if (count[e] != 0) { active[listed++] = e; }
+        if (split && small(e)) { small_active[small_at++] = e; }
     }
     if (threadIdx.x == kSortThreads - 1) {
         bounds[experts] = run;
         *active_count   = listed_total;
+        if (split) { *small_count = small_total; }
     }
     // Each width's tiles: a scan over the runs of how many tiles their experts' pairs fill.
 #pragma unroll 1
     for (int w = 0; w < kMoeTileWidths; ++w) {
         const int width = 16 << w;
-        int filled      = 0;
+        int filled = 0, large = 0;
         for (int e = first; e < min(first + per, experts); ++e) {
-            filled += (count[e] + width - 1) / width;
+            const int n = (count[e] + width - 1) / width;
+            filled += n;
+            large += split && count[e] > vector_pairs ? n : 0;
         }
         int at = 0, total = 0;
         __syncthreads();
@@ -231,6 +247,19 @@ __launch_bounds__(kSortThreads) __global__
             for (int tile = 0; tile * width < count[e]; ++tile) { list[at++] = e | tile << 16; }
         }
         if (threadIdx.x == kSortThreads - 1) { tile_count[w] = total; }
+        if (split) {
+            int large_at = 0, large_total = 0;
+            __syncthreads();
+            Scan(scan).ExclusiveSum(large, large_at, large_total);
+            std::int32_t* large_list = large_tiles + std::int64_t(w) * tile_capacity;
+            for (int e = first; e < min(first + per, experts); ++e) {
+                if (count[e] <= vector_pairs) { continue; }
+                for (int tile = 0; tile * width < count[e]; ++tile) {
+                    large_list[large_at++] = e | tile << 16;
+                }
+            }
+            if (threadIdx.x == kSortThreads - 1) { large_tile_count[w] = large_total; }
+        }
     }
     __syncthreads();
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
@@ -641,8 +670,11 @@ std::size_t moe_routing_bytes(int experts, int pairs) {
            256;
 }
 
-MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts, void* workspace,
-                           cudaStream_t stream) {
+namespace {
+
+// moe_sort_routes, and with `vector_pairs` >= 0 the split's lists after its arrays.
+MoeSplitRouting sort_routes(const std::int32_t* ids, int pairs, int experts, int vector_pairs,
+                            void* workspace, cudaStream_t stream) {
     if (pairs <= 0 || experts <= 0 || experts > 8192 || workspace == nullptr) {
         throw std::invalid_argument("gguf moe routing: invalid pairs or experts");
     }
@@ -654,10 +686,47 @@ MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts, void
     std::int32_t* tile_count   = active_count + 1;
     std::int32_t* tiles        = tile_count + detail::kMoeTileWidths;
     const int capacity         = detail::moe_tile_capacity(experts, pairs);
+    const bool split           = vector_pairs >= 0;
+    std::int32_t* small_active = split ? tiles + std::int64_t(detail::kMoeTileWidths) * capacity
+                                       : nullptr;
+    std::int32_t* small_count  = split ? small_active + experts : nullptr;
+    std::int32_t* large_count  = split ? small_count + 1 : nullptr;
+    std::int32_t* large_tiles  = split ? large_count + detail::kMoeTileWidths : nullptr;
     detail::moe_sort_kernel<<<1, detail::kSortThreads, 2 * experts * sizeof(int), stream>>>(
-        ids, pairs, experts, bounds, sorted, active, active_count, tile_count, tiles, capacity);
+        ids, pairs, experts, bounds, sorted, active, active_count, tile_count, tiles, capacity,
+        vector_pairs, small_active, small_count, large_count, large_tiles);
     detail::check(cudaGetLastError(), "moe routing launch");
-    return MoeRouting{bounds, sorted, active, active_count, tile_count, tiles, capacity};
+    MoeSplitRouting out;
+    out.all    = MoeRouting{bounds, sorted, active, active_count, tile_count, tiles, capacity};
+    out.vector = out.all;
+    out.matrix = out.all;
+    if (split) {
+        out.vector.active       = small_active;
+        out.vector.active_count = small_count;
+        out.matrix.tile_count   = large_count;
+        out.matrix.tiles        = large_tiles;
+    }
+    return out;
+}
+
+} // namespace
+
+MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts, void* workspace,
+                           cudaStream_t stream) {
+    return sort_routes(ids, pairs, experts, -1, workspace, stream).all;
+}
+
+std::size_t moe_split_routing_bytes(int experts, int pairs) {
+    return moe_routing_bytes(experts, pairs) +
+           (std::size_t(experts) + 1 + detail::kMoeTileWidths +
+            std::size_t(detail::kMoeTileWidths) * detail::moe_tile_capacity(experts, pairs)) *
+               sizeof(std::int32_t);
+}
+
+MoeSplitRouting moe_sort_routes_split(const std::int32_t* ids, int pairs, int experts,
+                                      int vector_pairs, void* workspace, cudaStream_t stream) {
+    if (vector_pairs < 0) { throw std::invalid_argument("gguf moe routing: negative split"); }
+    return sort_routes(ids, pairs, experts, vector_pairs, workspace, stream);
 }
 
 namespace {

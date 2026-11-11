@@ -11,7 +11,8 @@
 // until the next round start an even share of its swaps each, copied on a side stream beside the
 // draft and the next pass, so a round never holds the bus for longer than a pass's share; a
 // candidate's table entries move to its slot once its copy has landed. The expert misses may also
-// place a miss they copy anyway into a slot at once, by the same rule (admit). A recorded routing
+// place a miss they copy anyway into a slot at once, by the same rule (admit), and a wide prompt
+// call an expert it copies anyway into a free slot (admit_free). A recorded routing
 // profile fills the slots at startup and, through the ranking of its counts over every layer, sizes
 // each layer's share of them.
 //
@@ -135,6 +136,10 @@ public:
     // counts as a miss until the next observe.
     bool admit(std::size_t layer, std::int32_t expert, int pairs,
                std::span<const unsigned char> in_use, Admitted& out);
+    // As admit, but only into a free slot: no expert leaves the cache. A wide prompt call's slot
+    // pool copies the uncached experts it routes this way first, while a handed-over layer's slots
+    // are not all taken.
+    bool admit_free(std::size_t layer, std::int32_t expert, Admitted& out);
     // The device tables (gate, up, down) of `layer`.
     [[nodiscard]] std::array<void*, 3> tables(std::size_t layer) const;
 
@@ -143,6 +148,9 @@ private:
     void upload(Layer& layer, cudaStream_t stream);
     // Moves the candidates of landed round copies into their slots' table entries.
     void land();
+    // admit's and admit_free's bookkeeping once `slot` of `layer` takes `expert`.
+    void place(Layer& layer, std::size_t index, std::int32_t expert, std::int32_t slot,
+               Admitted& out);
     // A spare event of `rank`, or a new one made on its device.
     cudaEvent_t take_event(std::size_t rank);
     DeviceContext& device_;

@@ -3,16 +3,20 @@
 // distinct banks cover all 512 experts while the routing still groups by expert id. The products
 // quantize their activations to q8_1 as llama.cpp does, so they are held to that arithmetic's
 // error; on a Tesla V100 the matrix kernel's FP16 route (FP16 activations and weights) stays well
-// within it. Up to eight tokens take the vector kernel; wider calls over device-resident banks
+// within it. Up to eight tokens take the vector kernel. Wider calls need device-resident banks
 // (each matrix followed by 256 zero bytes, which the matrix kernel's last K step of a 640-value
-// down row reads) take the matrix kernel wherever the block type has one (MXFP4 stays on the
-// vector kernel, and IQ1_M gate and up products until a call routes more than 16 rows to each
-// expert: 260 tokens stay on the vector kernel, 820 take the matrix kernel's 32-wide column tiles),
-// with one or several column tiles per expert, and the same calls over banks that are not declared
-// device resident take the vector kernel. Where the CPU has the bank's block types, the decode
-// form's second stage also comes from CPU products (gguf_expert_cpu, its automatically selected
-// backend), as a miss service with a CPU share supplies it, and the sum must equal the GPU's bit
-// for bit. Expert-parallel parts over tables that hold only their own experts
+// down row reads; banks not declared device resident are refused) take the matrix kernel
+// wherever the block type has one (MXFP4 stays on the vector kernel, and IQ1_M gate and up
+// products until a call routes more than 16 rows to each expert: 260 tokens stay on the vector
+// kernel, 820 take the matrix kernel's 32-wide column tiles), with one or several column tiles per
+// expert; up to kGgufMoeSplitTokens tokens, experts with at most kGgufMoeVectorPairs pairs keep
+// the vector kernel. The mixed-routing cases route both kinds in one call. Where the CPU has the
+// bank's block types, the decode form's second stage, and the few-pair experts of a wide call of
+// up to kGgufMoeSplitTokens tokens, also come from CPU products (gguf_expert_cpu, its
+// automatically selected backend), as a miss service with a CPU share supplies them, and the sum
+// must equal the GPU's bit for bit; so must a wide call whose experts two stages divide (as
+// staged misses run them).
+// Expert-parallel parts over tables that hold only their own experts
 // (the others null) combine to the whole call's y bit for bit; parts that also hold a run of the
 // shared expert's width each combine close to it and within the oracle's bounds.
 
@@ -90,13 +94,19 @@ std::vector<int> half_fields(QType q) {
     }
 }
 
+// Q6_K multiplies its binary16 factor by an int8 sub-scale and a 6-bit code (up to 128 x 32), so
+// its factors are a hundred times smaller than the other types', as a quantizer writes them (the
+// factor is the largest sub-scale's 1/128), and its weights stay within a real model's. With the
+// others' factors its weights reach 82 and a wide call's middles exceed what q8_1's binary16
+// scale holds (127 x 65504 per 32 values), the vector products' and llama.cpp's limit.
 std::vector<std::uint8_t> random_blocks(QType q, std::int32_t rows, std::int32_t k,
                                         std::mt19937& rng) {
     const auto block         = gguf_block_shape(q);
     const std::int64_t count = std::int64_t(rows) * (k / block.elements);
     std::vector<std::uint8_t> bytes(count * block.bytes);
     std::uniform_int_distribution<int> byte(0, 255);
-    std::uniform_real_distribution<float> scale(0.002f, 0.02f);
+    const float least = q == QType::GGUF_Q6_K ? 2e-5f : 0.002f;
+    std::uniform_real_distribution<float> scale(least, 10 * least);
     for (auto& b : bytes) { b = static_cast<std::uint8_t>(byte(rng)); }
     for (std::int64_t i = 0; i < count; ++i) {
         std::uint8_t* base = bytes.data() + i * block.bytes;
@@ -243,12 +253,8 @@ int run_case(const Case& c, std::uint32_t seed) {
     const Bank sup(c.shared_up, kWidth, kHidden, 1, 1, rng);
     const Bank sdown(c.shared_down, kHidden, kWidth, 1, 1, rng);
     int failures = 0;
-    std::vector<std::pair<int, bool>> calls; // tokens, device resident
     for (const int tokens : c.tokens) {
-        calls.emplace_back(tokens, true);
-        if (tokens > 8) { calls.emplace_back(tokens, false); }
-    }
-    for (const auto& [tokens, device_resident] : calls) {
+        const bool device_resident = true;
         const ops::GgufMoeWeights banks{gate.view(),  up.view(),  down.view(), sgate.view(),
                                         sup.view(),   sdown.view(), kExperts,  device_resident};
         std::normal_distribution<float> normal(0.0f, 1.0f);
@@ -290,8 +296,7 @@ int run_case(const Case& c, std::uint32_t seed) {
         std::vector<float> again(got.size());
         d_y.copy_to_host(again.data(), again.size() * 4);
         if (std::memcmp(got.data(), again.data(), got.size() * 4) != 0) {
-            std::cerr << "FAIL " << c.name << " T=" << tokens
-                      << (device_resident ? " matrix" : " vector") << ": a repeat differs\n";
+            std::cerr << "FAIL " << c.name << " T=" << tokens << ": a repeat differs\n";
             ++failures;
         }
         // The FP64 oracle of every output, and a y's relative L2 and gross error against it.
@@ -329,7 +334,7 @@ int run_case(const Case& c, std::uint32_t seed) {
             // Two q8_1 activations (the token and the middle) per product chain.
             const bool ok = std::isfinite(rms) && rms < 4e-2 && max < 1.6e-1;
             std::cout << (ok ? "OK   " : "FAIL ") << c.name << " T=" << tokens
-                      << (tokens > 8 ? (device_resident ? " matrix" : " vector") : "") << what
+                      << what
                       << " rms=" << rms << " max=" << max << '\n';
             return ok ? 0 : 1;
         };
@@ -376,8 +381,7 @@ int run_case(const Case& c, std::uint32_t seed) {
                 d_y.copy_to_host(combined.data(), combined.size() * 4);
                 const bool same = std::memcmp(got.data(), combined.data(), got.size() * 4) == 0;
                 std::cout << (same ? "OK   " : "FAIL ") << c.name << " T=" << tokens
-                          << (tokens > 8 ? (device_resident ? " matrix" : " vector") : "") << ": "
-                          << n << " expert-parallel parts " << (same ? "equal" : "differ from")
+                          << ": " << n << " expert-parallel parts " << (same ? "equal" : "differ from")
                           << " the whole call\n";
                 failures += same ? 0 : 1;
             }
@@ -482,8 +486,7 @@ int run_case(const Case& c, std::uint32_t seed) {
                 }
                 const bool close = std::isfinite(worst) && worst <= 1e-4 * scale;
                 std::cout << (close ? "OK   " : "FAIL ") << c.name << " T=" << tokens
-                          << (tokens > 8 ? (device_resident ? " matrix" : " vector") : "") << ": "
-                          << n << " parts with shared runs differ from the whole call by "
+                          << ": " << n << " parts with shared runs differ from the whole call by "
                           << worst / std::max(scale, 1e-30) << " of its largest output\n";
                 failures += close ? 0 : 1;
                 failures +=
@@ -609,57 +612,109 @@ int run_case(const Case& c, std::uint32_t seed) {
                 failures += differ == 0 ? 0 : 1;
             }
         }
-        if (tokens > 8 && !device_resident && ops::gguf_cpu_supported(c.gate) &&
-            ops::gguf_cpu_supported(c.up) && ops::gguf_cpu_supported(c.down)) {
-            // A wider call over banks read across the bus, as Flash-Next's misses serve a joint
-            // verification: the separate kernels over the even experts' pairs and the odd ones'
-            // CPU products give the whole call's y bit for bit.
-            std::vector<std::int32_t> first(ids.size(), -1), pairs;
-            std::vector<float> products;
-            for (std::size_t p = 0; p < ids.size(); ++p) {
-                if (ids[p] % 2 == 0) {
-                    first[p] = ids[p];
-                    continue;
+        if (tokens > 8) {
+            // Banks not declared device resident are refused past eight tokens.
+            ops::GgufMoeWeights mapped = banks;
+            mapped.device_resident     = false;
+            bool refused               = false;
+            try {
+                ops::moe_experts_gguf(t_m, t_ids, t_w, t_s, mapped, workspace, t_y, nullptr);
+            } catch (const std::invalid_argument&) {
+                refused = true;
+            }
+            std::cout << (refused ? "OK   " : "FAIL ") << c.name << " T=" << tokens
+                      << ": banks read across the bus are " << (refused ? "" : "not ")
+                      << "refused\n";
+            failures += refused ? 0 : 1;
+            // The experts of each kind: a mixed call routes both.
+            std::vector<int> uses(kExperts, 0);
+            for (const std::int32_t e : ids) { ++uses[e]; }
+            int few = 0, many = 0;
+            for (const int n : uses) {
+                few += n > 0 && n <= ops::kGgufMoeVectorPairs;
+                many += n > ops::kGgufMoeVectorPairs;
+            }
+            const auto stages = [&](const std::vector<std::int32_t>& first,
+                                    const std::vector<std::int32_t>& second,
+                                    const std::vector<float>* products,
+                                    const std::vector<std::int32_t>* pairs) {
+                DeviceBuffer d_first(ids.size() * 4), d_second(ids.size() * 4), d_count(4),
+                    d_products(std::max<std::size_t>(products ? products->size() : 0, 1) * 4),
+                    d_pairs(std::max<std::size_t>(pairs ? pairs->size() : 0, 1) * 4);
+                d_first.copy_from_host(first.data(), first.size() * 4);
+                d_second.copy_from_host(second.data(), second.size() * 4);
+                const std::int32_t count = pairs ? std::int32_t(pairs->size()) : 0;
+                if (count > 0) {
+                    d_products.copy_from_host(products->data(), products->size() * 4);
+                    d_pairs.copy_from_host(pairs->data(), pairs->size() * 4);
                 }
-                const auto* x = reinterpret_cast<const std::uint16_t*>(m.data()) +
-                                (p / kTopK) * std::size_t(kHidden);
-                const auto y = cpu_expert(gate, up, down, ids[p], x);
-                products.insert(products.end(), y.begin(), y.end());
-                pairs.push_back(std::int32_t(p));
-            }
-            const std::int32_t count = std::int32_t(pairs.size());
-            DeviceBuffer d_first(ids.size() * 4), d_count(4),
-                d_products(std::max<std::size_t>(products.size(), 1) * 4),
-                d_pairs(std::max<std::size_t>(pairs.size(), 1) * 4);
-            d_first.copy_from_host(first.data(), first.size() * 4);
-            if (count > 0) {
-                d_products.copy_from_host(products.data(), products.size() * 4);
-                d_pairs.copy_from_host(pairs.data(), pairs.size() * 4);
-            }
-            d_count.copy_from_host(&count, 4);
-            const Tensor t_first(d_first.p, DType::I32, {kTopK, tokens});
+                d_count.copy_from_host(&count, 4);
+                const Tensor t_first(d_first.p, DType::I32, {kTopK, tokens});
+                const Tensor t_second(d_second.p, DType::I32, {kTopK, tokens});
+                {
+                    auto scope       = workspace.scope();
+                    const auto stage = ops::moe_experts_gguf_begin(t_m, workspace, nullptr);
+                    ops::moe_experts_gguf_add(stage, t_m, t_first, t_w, &t_s, banks, workspace,
+                                              nullptr);
+                    ops::moe_experts_gguf_add(stage, t_m, t_second, t_w, nullptr, banks, workspace,
+                                              nullptr);
+                    if (count > 0) {
+                        ops::moe_experts_gguf_add_products(
+                            stage, static_cast<const float*>(d_products.p),
+                            static_cast<const std::int32_t*>(d_pairs.p),
+                            static_cast<const std::int32_t*>(d_count.p), count, t_w, nullptr);
+                    }
+                    ops::moe_experts_gguf_finish(stage, t_y, nullptr);
+                }
+                check(cudaDeviceSynchronize(), "a staged wide call");
+                std::vector<float> staged(got.size());
+                d_y.copy_to_host(staged.data(), staged.size() * 4);
+                std::size_t differ = 0;
+                for (std::size_t i = 0; i < got.size(); ++i) {
+                    differ += std::memcmp(&staged[i], &got[i], 4) != 0 ? 1 : 0;
+                }
+                return differ;
+            };
             {
-                auto scope       = workspace.scope();
-                const auto stage = ops::moe_experts_gguf_begin(t_m, workspace, nullptr);
-                ops::moe_experts_gguf_add(stage, t_m, t_first, t_w, &t_s, banks, workspace, nullptr);
-                ops::moe_experts_gguf_add_products(
-                    stage, static_cast<const float*>(d_products.p),
-                    static_cast<const std::int32_t*>(d_pairs.p),
-                    static_cast<const std::int32_t*>(d_count.p), std::int32_t(ids.size()), t_w,
-                    nullptr);
-                ops::moe_experts_gguf_finish(stage, t_y, nullptr);
+                // Two stages that divide the experts (the even ones, then the odd), as the staged
+                // misses' cached stage and rounds do: every expert's pairs in one stage.
+                std::vector<std::int32_t> first(ids.size(), -1), second(ids.size(), -1);
+                for (std::size_t p = 0; p < ids.size(); ++p) {
+                    (ids[p] % 2 == 0 ? first : second)[p] = ids[p];
+                }
+                const std::size_t differ = stages(first, second, nullptr, nullptr);
+                std::cout << (differ == 0 ? "OK   " : "FAIL ") << c.name << " T=" << tokens
+                          << " (" << few << " few-pair, " << many
+                          << " many-pair experts) in two stages: " << differ << " of "
+                          << got.size() << " outputs differ from the whole call\n";
+                failures += differ == 0 ? 0 : 1;
             }
-            check(cudaDeviceSynchronize(), "the wide call with CPU products");
-            std::vector<float> hybrid(got.size());
-            d_y.copy_to_host(hybrid.data(), hybrid.size() * 4);
-            std::size_t differ = 0;
-            for (std::size_t i = 0; i < got.size(); ++i) {
-                differ += std::memcmp(&hybrid[i], &got[i], 4) != 0 ? 1 : 0;
+            if (tokens <= ops::kGgufMoeSplitTokens && ops::gguf_cpu_supported(c.gate) &&
+                ops::gguf_cpu_supported(c.up) && ops::gguf_cpu_supported(c.down)) {
+                // The odd few-pair experts as CPU products, as a miss service with a CPU share
+                // supplies them; the GPU runs the rest.
+                std::vector<std::int32_t> first(ids.size(), -1), second(ids.size(), -1), pairs;
+                std::vector<float> products;
+                for (std::size_t p = 0; p < ids.size(); ++p) {
+                    const std::int32_t e = ids[p];
+                    if (e % 2 != 0 && uses[e] <= ops::kGgufMoeVectorPairs) {
+                        const auto* x = reinterpret_cast<const std::uint16_t*>(m.data()) +
+                                        (p / kTopK) * std::size_t(kHidden);
+                        const auto y = cpu_expert(gate, up, down, e, x);
+                        products.insert(products.end(), y.begin(), y.end());
+                        pairs.push_back(std::int32_t(p));
+                    } else {
+                        (e % 2 == 0 ? first : second)[p] = e;
+                    }
+                }
+                const std::size_t differ = stages(first, second, &products, &pairs);
+                std::cout << (differ == 0 ? "OK   " : "FAIL ") << c.name << " T=" << tokens
+                          << " with " << pairs.size() << " CPU products of few-pair experts ("
+                          << ops::gguf_cpu_backend_name(ops::GgufCpuBackend::Automatic)
+                          << "): " << differ << " of " << got.size()
+                          << " outputs differ from the GPU's\n";
+                failures += differ == 0 ? 0 : 1;
             }
-            std::cout << (differ == 0 ? "OK   " : "FAIL ") << c.name << " T=" << tokens
-                      << " vector with " << count << " CPU products: " << differ << " of "
-                      << got.size() << " outputs differ from the GPU's\n";
-            failures += differ == 0 ? 0 : 1;
         }
         failures += against_oracle(got, "");
     }
@@ -688,6 +743,18 @@ int main() {
              8,
              {1, 2, 3, 8, 9, 16, 24, 40, 48},
              kExperts},
+            // Routes over 30 experts: past eight tokens a call holds experts of up to eight pairs
+            // (the vector kernel's) beside experts of more (the matrix kernel's).
+            {"q2_0 mixed routing",
+             Q::GGUF_Q2_0,
+             Q::GGUF_Q2_0,
+             Q::GGUF_Q2_0,
+             Q::GGUF_IQ4_XS,
+             Q::GGUF_Q3_K,
+             Q::GGUF_Q5_0,
+             8,
+             {9, 24, 64},
+             30},
             // Experts concentrated on a few ids: several columns per pass (chunks 4 and 8).
             {"q2_0 dense routing",
              Q::GGUF_Q2_0,
@@ -742,8 +809,18 @@ int main() {
              Q::GGUF_Q6_K,
              Q::GGUF_IQ4_NL,
              4,
-             {1, 8, 9, 24},
+             {1, 8, 9, 24, 72},
              kExperts},
+            {"iq3_s mixed routing",
+             Q::GGUF_IQ3_S,
+             Q::GGUF_IQ3_S,
+             Q::GGUF_IQ4_NL,
+             Q::GGUF_Q6_K,
+             Q::GGUF_Q6_K,
+             Q::GGUF_IQ4_NL,
+             4,
+             {24, 64},
+             30},
             {"iq3_xxs dense routing",
              Q::GGUF_IQ3_XXS,
              Q::GGUF_IQ3_XXS,

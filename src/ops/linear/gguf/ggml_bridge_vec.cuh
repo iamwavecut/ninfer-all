@@ -883,9 +883,11 @@ void launch_columns(const VecArgs& args, int columns, cudaStream_t stream) {
     throw std::invalid_argument("gguf vector product: columns must be 1..8");
 }
 
-// The MoE form: block (x, y) takes rows of the y-th active expert for every pair routed to it, T of
-// them per pass over the rows. A pair's activation column is pair / column_group. Fused: the first
-// table holds the gate rows and the second the up rows, and each output row is silu(gate) * up.
+// The MoE form: block (x, y) takes rows of the y-th active expert for every pair routed to it, up
+// to T of them per pass over the rows; a pass over fewer skips the missing columns, and every
+// column's arithmetic is the same at any T. A pair's activation column is pair / column_group.
+// Fused: the first table holds the gate rows and the second the up rows, and each output row is
+// silu(gate) * up.
 template <ggml_type type, int T, bool Fused, bool Cooperative = false>
 __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
     using D                 = Decoder<type>;
@@ -946,6 +948,7 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
                 float d[T], sum[T];
 #pragma unroll
                 for (int j = 0; j < T; ++j) {
+                    if (j >= n) { break; }
                     const float2 ds = __half22float2(p.ds[std::int64_t(column[j]) * slices + s]);
                     d[j]            = ds.x;
                     sum[j]          = ds.y;
@@ -967,13 +970,17 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
                     decode_words<D, Cooperative>(
                         rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes, sub, table, sl);
 #pragma unroll
-                    for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
+                    for (int j = 0; j < T; ++j) {
+                        if (j >= n) { break; }
+                        acc[r][j] += D::dot(sl, a[j], d[j], sum[j]);
+                    }
                 }
             }
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
 #pragma unroll
                 for (int j = 0; j < T; ++j) {
+                    if (j >= n) { break; }
 #pragma unroll
                     for (int o = 16; o > 0; o >>= 1) {
                         acc[r][j] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][j], o);

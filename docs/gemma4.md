@@ -593,6 +593,10 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
   layers copy every miss.
   An expert the CPU computed takes no slot; the cache's rounds decide whether it enters.
+  Flash-Next's CPU share also covers the missing experts with at most eight pairs in calls of 9 to
+  64 tokens ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); Gemma 4 does not have that route
+  yet: its expert kernels take one route per call, and the shared expert delivery serves only narrow
+  calls.
 - **Calls.** Vector decode and verification run the cached pairs, then the block's dense MLP
   while the rest arrive, then the rest; both expert stages add to one fixed-point sum, so outputs
   equal resident execution bit for bit. A prompt chunk runs the dense MLP while its experts

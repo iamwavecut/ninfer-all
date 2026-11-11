@@ -525,17 +525,37 @@ bool ExpertCache::admit(std::size_t index, std::int32_t expert, int pairs,
         layer.point_host(victim.expert);
         tier_->set(index, victim.expert, ExpertTier::State::Out);
     }
-    // The misses copy the expert and count its bytes.
+    place(layer, index, expert, slot, out);
+    return true;
+}
+
+bool ExpertCache::admit_free(std::size_t index, std::int32_t expert, Admitted& out) {
+    std::lock_guard lock(mutex_);
+    Layer& layer = layers_.at(index);
+    if (!layer.handed_over || layer.free_slots.empty() || expert < 0 ||
+        std::size_t(expert) >= layer.experts() || layer.slot_of[std::size_t(expert)] >= 0) {
+        return false;
+    }
+    out                      = Admitted{};
+    const std::int32_t slot = layer.free_slots.back();
+    layer.free_slots.pop_back();
+    tier_->set_free(std::uint32_t(index), std::uint32_t(layer.free_slots.size()));
+    place(layer, index, expert, slot, out);
+    return true;
+}
+
+void ExpertCache::place(Layer& layer, std::size_t index, std::int32_t expert, std::int32_t slot,
+                        Admitted& out) {
+    // The caller copies the expert and counts its bytes.
     for (int k = 0; k < 3; ++k) { out.slot[k] = layer.slot_base(slot) + layer.offset(k); }
     layer.point_slot(expert, slot);
-    // The misses patch the device tables themselves; the mirror only keeps them for later uploads.
+    // The caller patches the device tables itself; the mirror only keeps them for later uploads.
     layer.dirty                        = false;
     layer.slot_of[std::size_t(expert)] = slot;
     layer.expert_of[std::size_t(slot)] = expert;
     layer.fresh[std::size_t(expert)]   = 1;
     tier_->set(index, expert, ExpertTier::State::Held);
     ++stats_.admitted;
-    return true;
 }
 
 std::array<void*, 3> ExpertCache::tables(std::size_t index) const {

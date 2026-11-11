@@ -17,10 +17,12 @@
 // stage reads, so the resident stage needs no host at all. A narrow call takes the vector
 // products, which the CPU's equal bit for bit.
 //
-// A wide call takes the matrix kernel, as device banks do, so every missing expert reaches device
-// memory and the CPU takes no share: the calling thread waits for the split, then admits or stages
-// the missing experts in rounds of half the staging, each round's products running while the next
-// round's copies cross the bus (stage_wide).
+// A wide call runs as over device banks (ops::moe_experts_gguf): its experts with at most
+// ops::kGgufMoeVectorPairs pairs on the vector products, the others on the matrix kernel. The
+// calling thread waits for the split, then admits or stages the missing experts in rounds of half
+// the staging, each round's products running while the next round's copies cross the bus; of
+// host experts with few pairs, the CPU computes a share meanwhile, up to kCpuMissTokens tokens
+// (stage_wide). Every missing expert with more pairs reaches device memory.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -63,16 +65,22 @@ struct MissLayer {
     bool admit = false;
 };
 
-// The widest narrow call: ops::moe_experts_gguf takes the vector products up to this width and the
-// matrix kernel past it, which the CPU's products do not reproduce.
+// The widest narrow call: ops::moe_experts_gguf takes the vector products up to this width; past
+// it, the matrix kernel (up to kCpuMissTokens, for experts with more than
+// ops::kGgufMoeVectorPairs pairs), which the CPU's products do not reproduce.
 inline constexpr std::uint32_t kNarrowMissTokens = 8;
+// The widest call whose missing experts with few pairs the CPU may compute: the widest whose
+// few-pair experts ops::moe_experts_gguf runs on the vector products.
+inline constexpr std::uint32_t kCpuMissTokens = std::uint32_t(ops::kGgufMoeSplitTokens);
 
 // How long keep_alive() and each served request keep the service and its CPU workers spinning.
 inline constexpr std::chrono::milliseconds kMissKeepAlive{500};
 
 struct MissOptions {
     std::uint32_t token_capacity = 8;    // tokens of one call, narrow or wide
-    double cpu_share             = 0.0;  // share of a narrow call's missing experts the CPU computes
+    // Share of a call's missing experts the CPU computes: of a wide call's, of those with at most
+    // ops::kGgufMoeVectorPairs pairs.
+    double cpu_share             = 0.0;
     // Instead of a fixed share, each request gives the CPU the experts that make its copies and
     // its CPU products end soonest, by times fitted to the earlier requests.
     bool cpu_balance             = false;
@@ -105,7 +113,7 @@ public:
     ExpertMisses& operator=(const ExpertMisses&) = delete;
 
     // Device views a layer's call uses: the cached pairs' ids, then the missing pairs' ids, tables
-    // and CPU products the host fills.
+    // and CPU products the host fills (a wide call's counted by stage_wide).
     struct Call {
         Tensor cached_ids;
         Tensor missing_ids;
@@ -125,13 +133,18 @@ public:
     // written. Eager (the stream not capturing), it waits on the host and wakes the service first:
     // the device may post the request long after begin() was enqueued.
     void await(std::size_t layer, cudaStream_t stream);
-    // Wide calls, eager, after begin(): waits on the host for the split, then brings every missing
-    // expert into device memory, straight into a cache slot when the tier admits it, else into a
-    // half of the staging, a round of experts at a time. `stage` enqueues on `stream` a round's
-    // products over Call::missing_banks; `missing_ids` lists the round's pairs (-1 for the
-    // others). A round's copies wait for the products of the round before it in the same half.
-    void stage_wide(std::size_t layer, cudaStream_t stream,
-                    const std::function<void(const Tensor& missing_ids)>& stage);
+    // Wide calls, eager, after begin(): waits on the host for the split, then brings the missing
+    // experts the GPU runs into device memory, straight into a cache slot when the tier admits it,
+    // else into a half of the staging, a round of experts at a time, while CPU threads compute the
+    // others (up to kCpuMissTokens tokens: a share of those with at most
+    // ops::kGgufMoeVectorPairs pairs). `stage` enqueues on `stream` a round's products over
+    // Call::missing_banks; `missing_ids` lists the round's pairs (-1 for the others). A round's
+    // copies wait for the products of the round before it in the same half. Returns the pairs the
+    // CPU computed, whose products Call::products holds once this returns (add them with
+    // ops::moe_experts_gguf_add_products); 0 when none.
+    [[nodiscard]] std::int32_t stage_wide(
+        std::size_t layer, cudaStream_t stream,
+        const std::function<void(const Tensor& missing_ids)>& stage);
     // Keeps the service (and the CPU workers) spinning for kMissKeepAlive; a pass calls it before
     // its first layer. Rethrows a service failure. Asleep, the service still looks for requests
     // every few milliseconds, as no host call wakes it for a request a replayed layer posts.
