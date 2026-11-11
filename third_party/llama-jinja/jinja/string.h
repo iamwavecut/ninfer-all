@@ -39,6 +39,8 @@ struct string {
     std::string str() const;
     std::size_t length() const;
     std::size_t byte_size() const;
+    // Whether both strings hold the same bytes, however their parts divide them.
+    bool same_text(const string& other) const noexcept;
     void hash_update(hasher& hash) const noexcept;
     bool is_uppercase() const;
     bool is_lowercase() const;

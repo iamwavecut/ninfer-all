@@ -21,10 +21,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <random>
 #include <span>
@@ -602,109 +604,157 @@ int test_boundary_aware_tokenization() {
     return failures;
 }
 
-// A long run of text between added tokens that starts with an earlier run's text takes that run's
-// words up to where the two texts can split differently (OrdinaryRunCache); its tokens and
-// boundary frontiers must be those of a tokenizer that has encoded nothing before. Texts mix
-// letters, whitespace runs, newlines, apostrophe suffixes, digits, punctuation, composed and
-// decomposed accents, no-break and ideographic spaces, CJK and an added token, over merges that
-// join a space or a newline with what follows.
-int test_tokenizer_run_reuse() {
+// The tokenizer of the run tests, byte-level or SentencePiece (Gemma 4's kind: spaces as U+2581,
+// byte fallback), with merges that join a space or a newline with what follows and one added
+// token, <|im_start|>.
+struct RunTokenizer {
+    std::string tokenizer_json, tokenizer_config_json;
+
+    [[nodiscard]] fi::TokenizerResources resources() const {
+        return {.tokenizer_json         = tokenizer_json,
+                .tokenizer_config_json  = tokenizer_config_json,
+                .generation_config_json = R"({"eos_token_id":0})"};
+    }
+};
+
+RunTokenizer run_tokenizer(bool sentencepiece) {
     nlohmann::json vocab = nlohmann::json::object();
     for (int value = 0; value <= 255; ++value) {
-        vocab[byte_level_symbol(static_cast<std::uint8_t>(value))] = value;
+        if (sentencepiece) {
+            char name[8];
+            std::snprintf(name, sizeof(name), "<0x%02X>", value);
+            vocab[name] = value;
+        } else {
+            vocab[byte_level_symbol(static_cast<std::uint8_t>(value))] = value;
+        }
     }
-    // Byte-level symbols: U+0120 a space, U+010A a newline.
-    const std::string space = "\u0120", newline = "\u010a";
+    int next = 256;
+    // Byte-level symbols: U+0120 a space, U+010A a newline. SentencePiece: U+2581 a space, and
+    // the letters and marks the merges join (other text falls back to bytes).
+    const std::string space   = sentencepiece ? "\u2581" : "\u0120";
+    const std::string newline = sentencepiece ? "\n" : "\u010a";
+    if (sentencepiece) {
+        for (const std::string piece :
+             {space, newline, std::string("t"), std::string("h"), std::string("e"),
+              std::string("o"), std::string("n"), std::string("'"), std::string("s"),
+              std::string("r"), std::string("a"), std::string("N"), std::string("1"),
+              std::string(".")}) {
+            vocab[piece] = next++;
+        }
+    }
     const std::vector<std::pair<std::string, std::string>> merges{
         {newline, space},   {space, "t"}, {"h", "e"},     {space + "t", "he"},
         {newline, newline}, {"o", "n"},   {space, space}, {"'", "s"},
         {"e", "r"},         {space, "a"}, {"a", "n"},     {space + "a", "n"},
         {newline, "N"},     {"N", "o"},   {space, "1"},   {".", newline}};
     nlohmann::json merge_rules = nlohmann::json::array();
-    int next                   = 256;
     for (const auto& [left, right] : merges) {
         if (!vocab.contains(left + right)) { vocab[left + right] = next++; }
         merge_rules.push_back(nlohmann::json::array({left, right}));
     }
-    const std::string tokenizer_json =
-        nlohmann::json{{"model", {{"type", "BPE"}, {"vocab", vocab}, {"merges", merge_rules}}},
-                       {"added_tokens", nlohmann::json::array({added(1000, "<|im_start|>", true)})}}
-            .dump();
-    const std::string tokenizer_config_json =
-        nlohmann::json{{"added_tokens_decoder", nlohmann::json::object()}}.dump();
-    const fi::TokenizerResources resources{.tokenizer_json         = tokenizer_json,
-                                           .tokenizer_config_json  = tokenizer_config_json,
-                                           .generation_config_json = R"({"eos_token_id":0})"};
-    const fi::Tokenizer kept(resources);
+    nlohmann::json model{{"type", "BPE"}, {"vocab", vocab}, {"merges", merge_rules}};
+    nlohmann::json root{
+        {"model", model},
+        {"added_tokens", nlohmann::json::array({added(1000, "<|im_start|>", true)})}};
+    if (sentencepiece) {
+        root["model"]["byte_fallback"] = true;
+        root["normalizer"]             = {
+            {"type", "Replace"}, {"pattern", {{"String", " "}}}, {"content", space}};
+    }
+    return {.tokenizer_json = root.dump(),
+            .tokenizer_config_json =
+                nlohmann::json{{"added_tokens_decoder", nlohmann::json::object()}}.dump()};
+}
 
+// Random text of at least `bytes` bytes: letters, whitespace runs, newlines, apostrophe suffixes,
+// digits, punctuation, composed and decomposed accents, no-break and ideographic spaces, CJK.
+std::string run_text(std::mt19937& rng, std::size_t bytes) {
+    static const std::vector<std::string> pieces{"a",
+                                                 "n",
+                                                 "t",
+                                                 "h",
+                                                 "e",
+                                                 "r",
+                                                 "o",
+                                                 "N",
+                                                 "x",
+                                                 "the",
+                                                 " ",
+                                                 " ",
+                                                 "  ",
+                                                 "   ",
+                                                 "\n",
+                                                 "\n\n",
+                                                 " \n",
+                                                 "'s",
+                                                 "'t",
+                                                 "'ll",
+                                                 "1",
+                                                 "23",
+                                                 ".",
+                                                 ",",
+                                                 "!",
+                                                 "-",
+                                                 "\xC3\xA9",
+                                                 "e\xCC\x81",
+                                                 "\xC2\xA0",
+                                                 "\xE3\x80\x80",
+                                                 "\xE4\xB8\xAD",
+                                                 "\t"};
+    std::string text;
+    std::uniform_int_distribution<std::size_t> pick(0, pieces.size() - 1);
+    while (text.size() < bytes) { text += pieces[pick(rng)]; }
+    return text;
+}
+
+// Whether `kept` encodes `text` (with byte boundaries and a token limit) to the tokens and boundary
+// frontiers of a tokenizer that has encoded nothing before.
+bool same_as_fresh(const RunTokenizer& fixture, const fi::Tokenizer& kept, const std::string& text,
+                   std::span<const std::size_t> boundaries,
+                   std::size_t max_tokens = std::numeric_limits<std::size_t>::max()) {
+    const fi::Tokenizer fresh(fixture.resources());
+    const fi::BoundaryEncodedText want =
+        fresh.encode_with_boundaries(text, boundaries, {.max_tokens = max_tokens});
+    const fi::BoundaryEncodedText got =
+        kept.encode_with_boundaries(text, boundaries, {.max_tokens = max_tokens});
+    bool same = want.input_ids == got.input_ids && want.boundaries.size() == got.boundaries.size();
+    for (std::size_t b = 0; same && b < want.boundaries.size(); ++b) {
+        same = want.boundaries[b].exact_frontier == got.boundaries[b].exact_frontier &&
+               want.boundaries[b].stable_frontier == got.boundaries[b].stable_frontier;
+    }
+    return same;
+}
+
+// A random offset of `text` in [from, size], moved back to a code point's first byte.
+std::size_t code_point_cut(std::mt19937& rng, const std::string& text, std::size_t from = 0) {
+    std::size_t at = std::uniform_int_distribution<std::size_t>(from, text.size())(rng);
+    while (at > 0 && at < text.size() && (static_cast<unsigned char>(text[at]) & 0xC0) == 0x80) {
+        --at;
+    }
+    return at;
+}
+
+// A long run of text between added tokens that starts with an earlier run's text takes that run's
+// words up to where the two texts can split differently (OrdinaryRunCache); its tokens and
+// boundary frontiers must be those of a tokenizer that has encoded nothing before.
+int test_tokenizer_run_reuse() {
+    const RunTokenizer fixture = run_tokenizer(false);
+    const fi::Tokenizer kept(fixture.resources());
     std::mt19937 rng(20261023);
-    const std::vector<std::string> pieces{"a",
-                                          "n",
-                                          "t",
-                                          "h",
-                                          "e",
-                                          "r",
-                                          "o",
-                                          "N",
-                                          "x",
-                                          "the",
-                                          " ",
-                                          " ",
-                                          "  ",
-                                          "   ",
-                                          "\n",
-                                          "\n\n",
-                                          " \n",
-                                          "'s",
-                                          "'t",
-                                          "'ll",
-                                          "1",
-                                          "23",
-                                          ".",
-                                          ",",
-                                          "!",
-                                          "-",
-                                          "\xC3\xA9",
-                                          "e\xCC\x81",
-                                          "\xC2\xA0",
-                                          "\xE3\x80\x80",
-                                          "\xE4\xB8\xAD",
-                                          "\t"};
-    const auto text_of = [&](std::size_t bytes) {
-        std::string text;
-        std::uniform_int_distribution<std::size_t> pick(0, pieces.size() - 1);
-        while (text.size() < bytes) { text += pieces[pick(rng)]; }
-        return text;
-    };
-    const auto same_as_fresh = [&](const std::string& text,
-                                   std::span<const std::size_t> boundaries) {
-        const fi::Tokenizer fresh(resources);
-        const fi::BoundaryEncodedText want = fresh.encode_with_boundaries(text, boundaries);
-        const fi::BoundaryEncodedText got  = kept.encode_with_boundaries(text, boundaries);
-        bool same =
-            want.input_ids == got.input_ids && want.boundaries.size() == got.boundaries.size();
-        for (std::size_t b = 0; same && b < want.boundaries.size(); ++b) {
-            same = want.boundaries[b].exact_frontier == got.boundaries[b].exact_frontier &&
-                   want.boundaries[b].stable_frontier == got.boundaries[b].stable_frontier;
-        }
-        return same;
+    const auto text_of = [&](std::size_t bytes) { return run_text(rng, bytes); };
+    const auto same    = [&](const std::string& text, std::span<const std::size_t> boundaries) {
+        return same_as_fresh(fixture, kept, text, boundaries);
     };
     // A newline then ten spaces: a later newline in the same whitespace run makes it one word, so
     // the word that ends after the first newline is not where the second text may resume.
     const std::string filler(5000, 'a');
-    int failures = check(same_as_fresh(filler + "\n" + std::string(10, ' ') + "x tail", {}) &&
-                             same_as_fresh(filler + "\n" + std::string(10, ' ') + "\n tail", {}),
+    int failures = check(same(filler + "\n" + std::string(10, ' ') + "x tail", {}) &&
+                             same(filler + "\n" + std::string(10, ' ') + "\n tail", {}),
                          "a reused run resumed inside a whitespace run");
     // Runs past the kept-run size on both sides of an added token.
     std::string previous = text_of(5000) + "<|im_start|>" + text_of(5000);
-    // A random offset of `text` past `from`, moved back to a code point's first byte.
-    const auto cut = [&](const std::string& text, std::size_t from = 0) {
-        std::size_t at = std::uniform_int_distribution<std::size_t>(from, text.size())(rng);
-        while (at > 0 && at < text.size() &&
-               (static_cast<unsigned char>(text[at]) & 0xC0) == 0x80) {
-            --at;
-        }
-        return at;
+    const auto cut       = [&](const std::string& text, std::size_t from = 0) {
+        return code_point_cut(rng, text, from);
     };
     for (int round = 0; round < 300 && failures == 0; ++round) {
         // Another text that shares most of the last long one, the whole of it at times, or a
@@ -716,9 +766,54 @@ int test_tokenizer_run_reuse() {
         }
         std::vector<std::size_t> boundaries;
         for (int b = 0; b < 4; ++b) { boundaries.push_back(cut(text)); }
-        failures += check(same_as_fresh(text, boundaries),
+        failures += check(same(text, boundaries),
                           "a reused ordinary run changed the tokens or a boundary frontier");
         if (text.size() >= 8000) { previous = std::move(text); }
+    }
+    return failures;
+}
+
+// A run equal to a remembered one takes its tokens (OrdinaryRunCache), in byte-level and
+// SentencePiece tokenizers. A conversation resent with each new turn, past the runs a byte-level
+// run searches for a prefix, with boundaries at and inside its runs and token limits inside it,
+// must give the tokens and boundary frontiers of a tokenizer that has encoded nothing before; so
+// must the byte-level tokenizer after distinct runs past the remembered bytes, whose least
+// recently used runs it drops.
+int test_tokenizer_run_memo() {
+    int failures = 0;
+    for (const bool sentencepiece : {false, true}) {
+        const RunTokenizer fixture = run_tokenizer(sentencepiece);
+        const fi::Tokenizer kept(fixture.resources());
+        std::mt19937 rng(sentencepiece ? 20261112 : 20261111);
+        std::string conversation;
+        for (int turn = 0; turn < 40 && failures == 0; ++turn) {
+            // Every fifth turn a run past 4096 bytes: a byte-level prefix source.
+            const std::size_t bytes =
+                turn % 5 == 0 ? 6000 : std::uniform_int_distribution<std::size_t>(30, 1500)(rng);
+            conversation += "<|im_start|>" + run_text(rng, bytes);
+            const std::size_t tokens = kept.encode(conversation).size();
+            std::vector<std::size_t> boundaries{conversation.size(),
+                                                conversation.rfind("<|im_start|>"),
+                                                code_point_cut(rng, conversation)};
+            failures += check(
+                same_as_fresh(fixture, kept, conversation, {}) &&
+                    same_as_fresh(fixture, kept, conversation, boundaries) &&
+                    same_as_fresh(fixture, kept, conversation, {},
+                                  std::uniform_int_distribution<std::size_t>(1, tokens)(rng)),
+                sentencepiece ? "a remembered SentencePiece run changed the tokens or a frontier"
+                              : "a remembered byte-level run changed the tokens or a frontier");
+        }
+        if (sentencepiece) { continue; }
+        // About 100 MiB of remembered runs (past 64 MiB), then the conversation again.
+        std::string filler;
+        for (int round = 0; round < 16 && failures == 0; ++round) {
+            filler.clear();
+            for (int run = 0; run < 64; ++run) { filler += "<|im_start|>" + run_text(rng, 8192); }
+            (void)kept.encode(filler);
+        }
+        failures += check(same_as_fresh(fixture, kept, conversation, {}) &&
+                              same_as_fresh(fixture, kept, filler, {}),
+                          "a run encoded past the remembered bytes changed the tokens");
     }
     return failures;
 }
@@ -4481,6 +4576,7 @@ int main() {
     failures += test_bpe_merge_order();
     failures += test_boundary_aware_tokenization();
     failures += test_tokenizer_run_reuse();
+    failures += test_tokenizer_run_memo();
     failures += test_rendered_special_tokens();
     failures += test_developer_role_without_template_support();
     failures += test_repeated_special_tokens_scan_linearly();

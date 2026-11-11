@@ -1121,6 +1121,7 @@ const func_builtins& value_object_t::get_builtins() const {
                                                             : value_compare_op::lt);
                            }
                        });
+             result->reindex();
              return result;
          }},
         {"join", object_join_not_implemented},

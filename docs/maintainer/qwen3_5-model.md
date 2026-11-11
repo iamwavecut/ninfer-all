@@ -461,10 +461,32 @@ The official tokenizer has 248,077 addressable IDs within 248,320 matrix rows. R
 rows are not assumed zero and do not become public tokens.
 
 Token spelling, special-token roles and EOS are derived from loaded resources. The frontend checks
-the tokenizer's supported BPE/normalization semantics and token-domain agreement. Template bytes
-select a compiled Qwen template; arbitrary Jinja execution is not implemented. Mode sampling
-presets are architecture-owned, with explicit application/request overrides. Resource loading
-does not infer execution identity from tokenizer filenames, release names or sampling values.
+the tokenizer's supported BPE/normalization semantics and token-domain agreement. The chat
+template runs in NInfer's Jinja engine (`third_party/llama-jinja`), compiled once when the model
+loads. Mode sampling presets are architecture-owned, with explicit application/request overrides.
+Resource loading does not infer execution identity from tokenizer filenames, release names or
+sampling values.
+
+### Request preparation
+
+Preparation renders the chat template over the request's messages and tokenizes the result. An
+agent client sends its whole conversation again with every request, and every family's frontend
+reuses the work of earlier requests:
+
+- The tokenizer keeps the tokens of each run of 64 bytes or more between added tokens, up to
+  64 MiB, and drops the least recently used first. A run with the same bytes as a kept one takes
+  its tokens without encoding, unless a requested boundary falls inside it or its tokens would
+  reach the request's token limit. A byte-level run that starts with the text of one of the 8 most
+  recently used kept runs of 4,096 normalized bytes or more takes that run's words up to a word end
+  that both texts decide alike, and encodes only the rest.
+- The template renders the conversation three times: the prompt, the history without the
+  generation prompt (where that prompt starts) and, when an assistant message follows the query,
+  the history before a new user turn (whether a next turn keeps it). The two probes run on their
+  own threads beside the prompt's render, under the request's deadline. A probe that cannot get a
+  thread renders after the prompt.
+- A template loop that scans the rest of the conversation from each message (Gemma 4's template
+  has two) costs time quadratic in the message count. The Jinja engine builds a loop's per-item
+  scope only for a filter test, and its loop object only when the body names `loop`.
 
 ## State and numerical boundaries
 

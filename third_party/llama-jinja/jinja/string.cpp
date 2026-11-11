@@ -28,6 +28,21 @@ std::size_t string::byte_size() const {
     return result;
 }
 
+bool string::same_text(const string& other) const noexcept {
+    if (byte_size() != other.byte_size()) return false;
+    auto a = parts.begin(), b = other.parts.begin();
+    std::size_t ai = 0, bi = 0;
+    while (a != parts.end() && b != other.parts.end()) {
+        if (ai == a->val.size()) { ++a; ai = 0; continue; }
+        if (bi == b->val.size()) { ++b; bi = 0; continue; }
+        const std::size_t n = std::min(a->val.size() - ai, b->val.size() - bi);
+        if (a->val.compare(ai, n, b->val, bi, n) != 0) return false;
+        ai += n;
+        bi += n;
+    }
+    return true;
+}
+
 std::size_t string::length() const { return unicode::length(str()); }
 
 void string::hash_update(hasher& hash) const noexcept {
