@@ -65,6 +65,8 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
+    // Each lane's MTP proposal sampler (runtime::draft_sampling of its sampling_config).
+    std::optional<TensorLayout> draft_sampling_config;
     std::optional<TensorLayout> grammar_masks;
     // One per rank with LoRA adapters or control vectors; empty without.
     std::vector<SteeringRankLayout> steering;
@@ -137,6 +139,9 @@ struct SequencePlanningInputs {
     std::size_t cuda_graph_allowance_bytes = 0;
     bool causal_scoring    = false;
     bool structured_output = false;
+    // EngineOptions::gumbel_sampling: a sampling row's MTP proposals draw from the drafter's
+    // distribution at the keys of the columns they fill (runtime::draft_sampling).
+    bool gumbel_sampling   = false;
     int device             = 0;
     ContextCacheOptions context_cache;
     // Main KV pages that stay allocated for the life of the Engine (injected graft prefixes). The
@@ -179,6 +184,9 @@ struct SequencePlanImpl {
     bool use_cuda_graph    = true;
     bool causal_scoring    = false;
     bool structured_output = false;
+    // EngineOptions::gumbel_sampling: a sampling row's MTP proposals draw from the drafter's
+    // distribution at the keys of the columns they fill (runtime::draft_sampling).
+    bool gumbel_sampling   = false;
     int device             = 0;
     ContextCacheOptions context_cache;
     std::uint32_t steering_adapters = 0;

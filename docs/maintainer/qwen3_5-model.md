@@ -390,7 +390,10 @@ draft_logits = target_output_head(draft_hidden)
 
 The stem concatenates embedding first, hidden second. MTP has private stem, block, final norm and
 KV state. Its attention and Dense/MoE geometry come from Text. It can recursively propose several
-tokens using the previous MTP hidden output.
+tokens using the previous MTP hidden output. A proposal is the argmax of draft_logits; under
+`--gumbel-sampling` a sampled row's proposal is its Gumbel-max draw under the keys the target's
+verification uses for that position (a proposal head over a vocabulary subset first spreads its
+logits over the full vocabulary, with negative infinity elsewhere).
 
 For prompt tokens x_0 through x_n and the target's first generated token x_(n+1), MTP prefill uses:
 

@@ -230,4 +230,20 @@ void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& sele
 void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_map,
                               std::int32_t count, cudaStream_t stream);
 
+/**
+ * Op: proposal_expand_logits
+ *
+ * Math / indexing:
+ *   expanded[id_map[i],t] = float(subset[i,t]) for 0<=i<count, and expanded[v,t] = -infinity for
+ *   every v in [0,V) that id_map does not name, 0<=t<T.
+ *
+ * Shape / numeric / effects:
+ *   subset is contiguous BF16 or FP32 [count,T]; id_map is a distinct device I32 array [count] of
+ *   distinct ids in [0,V); expanded is a distinct contiguous FP32 [V,T]. Exact conversions. The Op
+ *   writes all of expanded and uses no workspace or other state. A subset head's proposal is then
+ *   drawn over the vocabulary, each token's draw keyed by its own id.
+ */
+void proposal_expand_logits(const Tensor& subset, const std::int32_t* id_map, std::int32_t count,
+                            Tensor& expanded, cudaStream_t stream);
+
 } // namespace ninfer::ops

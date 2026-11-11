@@ -589,6 +589,8 @@ struct RequestControl {
     Lifecycle lifecycle             = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
+    // runtime::draft_sampling(sampling_host): the request's MTP proposal sampler.
+    ops::SamplingConfig draft_sampling_host;
     std::shared_ptr<text::GrammarState> grammar;
     // With a grammar: whether its masks are cheap enough for its rounds to verify drafts, and
     // while they are not, the mask of its next token computing ahead of its next round, started
@@ -969,6 +971,9 @@ public:
     const bool vision_enabled;
     const bool use_cuda_graph;
     const bool causal_scoring;
+    // EngineOptions::gumbel_sampling: a sampling row's MTP proposals draw at the keys of the
+    // columns they fill.
+    const bool gumbel_sampling;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     // Free device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
@@ -1038,6 +1043,8 @@ public:
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
+    // Each lane's MTP proposal sampler; unbound without MTP or --gumbel-sampling.
+    Tensor draft_sampling_config;
     Tensor token_counts;
     std::unique_ptr<qwen3_5::StructuredRound> structured_round;
 
@@ -1840,6 +1847,8 @@ private:
     void release_sequence_state_strict(SequenceState& sequence) noexcept;
     void release_sequence_state(SequenceState& sequence) noexcept;
     void prepare_graphs();
+    // Writes the request's sampler and its MTP proposal sampler to the lane's device records.
+    void upload_sampling(std::uint32_t lane, RequestControl& request);
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);

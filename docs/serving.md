@@ -432,7 +432,8 @@ concatenate them before parsing. Constraints guarantee format, not factual accur
 success.
 
 Masks are applied before target top-k/top-p/min-p filtering at **every** speculative position,
-including correction and bonus tokens. Drafts are proposed without the mask; every verification
+including correction and bonus tokens. Drafts are proposed without the mask (with
+`--gumbel-sampling`, an MTP-style drafter's draws from its own distribution); every verification
 draw -- MTP and DFlash coupled draws, DFlash2 accept/reject and residual sampling -- uses the
 constrained target distribution. Per-request grammar
 state advances only with Engine output commit, and is never restored from a prompt/KV cache.
@@ -2448,6 +2449,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--presence-penalty F` | process-level presence-penalty override | unset |
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
+| `--gumbel-sampling` | draw sampled tokens by Gumbel-max over keyed noise, and MTP-style drafts as the drafter's own draws under that noise ([the CLI's coupled draws](cli.md#speculative-decoding)); a seed gives other tokens than the default draw | off |
 | `--greedy` | force exact argmax for all requests | off |
 | `--post-thinking` | sample the answer of every thinking request with the post-thinking preset once its reasoning closes | off |
 | `--post-thinking-temperature F`, `--post-thinking-top-p F`, `--post-thinking-top-k N` | post-thinking overrides; each implies `--post-thinking` | preset |

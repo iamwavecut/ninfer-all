@@ -59,6 +59,7 @@ std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) 
            << " top_p=" << sampling.top_p << " top_k=" << sampling.top_k
            << " min_p=" << sampling.min_p << " presence=" << sampling.presence_penalty
            << " freq=" << sampling.frequency_penalty << " seed=" << sampling.seed;
+    if (sampling.gumbel) { output << " gumbel"; }
     return output.str();
 }
 
@@ -395,6 +396,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.speculative              = cli.speculative;
+        engine_options.gumbel_sampling          = cli.gumbel_sampling;
         engine_options.enable_vision            = cli.enable_vision;
         engine_options.vision_residency         = cli.vision_residency;
         engine_options.vision_max_merged_tokens = cli.vision_max_merged_tokens;

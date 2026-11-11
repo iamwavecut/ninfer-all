@@ -314,6 +314,10 @@ std::string usage_text(const char* argv0) {
            "  --frequency-penalty F         -2..2\n"
            "  --seed N                      fixed random seed\n"
            "  --greedy                      force temperature 0 (exact argmax)\n"
+           "  --gumbel-sampling             draw sampled tokens by Gumbel-max over keyed\n"
+           "                                noise, and MTP-style drafts as the drafter's\n"
+           "                                draws under the same noise: other tokens than\n"
+           "                                the default draw for the same seed (default off)\n"
            "  --post-thinking               sample the answer of a thinking request with the\n"
            "                                post-thinking preset (temperature 0.2) from the\n"
            "                                token after its reasoning closes (default off)\n"
@@ -650,6 +654,8 @@ Options parse_options(int argc, char** argv) {
             options.sampling.seed = parse_u64(value(arg), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
+        } else if (arg == "--gumbel-sampling") {
+            options.gumbel_sampling = true;
         } else if (arg == "--post-thinking") {
             if (!options.post_thinking_sampling) { options.post_thinking_sampling.emplace(); }
         } else if (arg == "--post-thinking-temperature" || arg == "--post-thinking-top-p" ||

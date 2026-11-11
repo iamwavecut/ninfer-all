@@ -765,6 +765,9 @@ struct Executor::Impl {
     std::array<PassGraphs, 17> verify_graphs;
     std::array<PassGraphs, 16> draft_graphs;
     std::array<PassGraphs, 15> step_graphs;
+    // The same shapes of chains whose rows draw their drafts (draft() with a sampling row).
+    std::array<PassGraphs, 16> sampled_draft_graphs;
+    std::array<PassGraphs, 15> sampled_step_graphs;
     std::uint64_t graph_bytes = 0;
     // The warm-up runs every draft step of a chain a probability floor would end early.
     bool every_step = false;
@@ -822,6 +825,9 @@ struct Executor::Impl {
     DeviceBuffer mtp_ids, mtp_positions, mtp_rope, mtp_axes, mtp_scatter, ngram_prefetch_tokens;
     DeviceBuffer mtp_logprobs;
     std::unique_ptr<PinnedHostBuffer> mtp_staging;
+    // A sampled chain's samplers [sequences] and keys [draft_tokens][rows], and their staging.
+    DeviceBuffer mtp_draft_configs, mtp_draft_keys;
+    std::unique_ptr<PinnedHostBuffer> mtp_draft_staging;
     cudaEvent_t mtp_staged       = nullptr;
     std::uint32_t mtp_routes     = 0; // MTP route pairs recorded for the expert cache
     // While a draft chain is captured: its replays count no routes for the expert cache (the
@@ -1209,6 +1215,8 @@ struct Executor::Impl {
         };
         reset_chains(draft_graphs);
         reset_chains(step_graphs);
+        reset_chains(sampled_draft_graphs);
+        reset_chains(sampled_step_graphs);
         reset_chains(dflash2_proposals);
         reset_chains(dflash2_contexts);
         for (auto& rank : ranks) {
@@ -1620,6 +1628,13 @@ struct Executor::Impl {
                  projection_workspace(mtp->fc_hidden,
                                       t * static_cast<std::int32_t>(config.hc_count)),
                  projection_workspace(mtp->head, static_cast<std::int32_t>(max_logit_rows)),
+                 // A sampled draft step's sampler, beside the step's argmax pair for the prefetch.
+                 options.sampled_drafts
+                     ? ops::sampling_workspace_capacity_bytes(
+                           static_cast<std::int32_t>(model.resources().public_token_count), 1,
+                           static_cast<std::int32_t>(options.sequences)) +
+                           round_up(std::uint64_t(options.sequences) * 4)
+                     : 0,
                  // The MTP block's calls over cached experts only: their kept ids and weights.
                  ops::moe_experts_gguf_workspace_bytes(t) +
                      2 * ((std::size_t(config.num_experts_per_tok) * t * 4 + 255) / 256 * 256)});
@@ -2193,6 +2208,15 @@ struct Executor::Impl {
                 mtp_logprobs =
                     DeviceBuffer(std::uint64_t(options.draft_tokens) * options.sequences * 4);
             }
+            if (options.sampled_drafts) {
+                const std::uint64_t config_bytes =
+                    options.sequences * sizeof(ops::SamplingConfig);
+                const std::uint64_t key_bytes =
+                    std::uint64_t(options.draft_tokens) * options.sequences * 4;
+                mtp_draft_configs = DeviceBuffer(config_bytes);
+                mtp_draft_keys    = DeviceBuffer(key_bytes);
+                mtp_draft_staging = std::make_unique<PinnedHostBuffer>(config_bytes + key_bytes);
+            }
             CUDA_CHECK(cudaEventCreateWithFlags(&mtp_staged, cudaEventDisableTiming));
         }
         if (table && options.ngram_read.residency != NgramResidency::Ram) {
@@ -2209,6 +2233,7 @@ struct Executor::Impl {
         memory.ranks[head].workspace_bytes += mtp_ids.bytes + mtp_positions.bytes + mtp_rope.bytes +
                                               mtp_axes.bytes + mtp_scatter.bytes +
                                               mtp_logprobs.bytes + ngram_prefetch_tokens.bytes +
+                                              mtp_draft_configs.bytes + mtp_draft_keys.bytes +
                                               sequences.size() * sequences.front().mtp.tail.bytes;
     }
 
@@ -5772,13 +5797,29 @@ struct Executor::Impl {
                     const ContextRun run{&state, 0, std::int32_t(count), state.position};
                     dflash2_context(std::span(&run, 1), nullptr, 0);
                 }
-            } else if (options.draft_min_p > 0) {
-                every_step = true;
-                draft(std::span(&sequence, 1), std::span(tokens).first(1), drafts, extents);
-                every_step = false;
             } else {
-                for (std::uint32_t k = 1; k <= options.draft_tokens; ++k) {
-                    draft(std::span(&sequence, 1), std::span(tokens).first(1), drafts, {}, k);
+                // The MTP chains of greedy rows, then of sampling ones (their own graphs).
+                ops::SamplingConfig sampler;
+                sampler.temperature       = 1.0F;
+                const std::int32_t length = std::int32_t(sequences.at(sequence).position);
+                for (const bool sampling : {false, true}) {
+                    const std::span<const ops::SamplingConfig> configs =
+                        sampling ? std::span<const ops::SamplingConfig>(&sampler, 1)
+                                 : std::span<const ops::SamplingConfig>{};
+                    const std::span<const std::int32_t> lengths =
+                        sampling ? std::span<const std::int32_t>(&length, 1)
+                                 : std::span<const std::int32_t>{};
+                    if (options.draft_min_p > 0) {
+                        every_step = true;
+                        draft(std::span(&sequence, 1), std::span(tokens).first(1), drafts, extents,
+                              0, configs, lengths);
+                        every_step = false;
+                    } else {
+                        for (std::uint32_t k = 1; k <= options.draft_tokens; ++k) {
+                            draft(std::span(&sequence, 1), std::span(tokens).first(1), drafts, {},
+                                  k, configs, lengths);
+                        }
+                    }
                 }
             }
         };
@@ -6293,11 +6334,12 @@ struct Executor::Impl {
         mtp_routes += std::uint32_t(n);
     }
 
-    // The greedy draft of each of the `n` single-cell parts of the last MTP pass: the block's
-    // final mixer, the head, and the argmax over the public tokens into `out` (device I32 [n],
-    // head rank).
+    // The draft of each of the `n` single-cell parts of the last MTP pass: the block's final mixer,
+    // the head, and the argmax over the public tokens into `out` (device I32 [n], head rank), or
+    // with `sampled_step` (>= 0) the draw of each row's sampler at the step's keys
+    // (mtp_draft_configs, mtp_draft_keys).
     void mtp_head(std::int32_t n, std::int32_t* out, std::int32_t* second = nullptr,
-                  float* logprobs = nullptr) {
+                  float* logprobs = nullptr, std::int32_t sampled_step = -1) {
         RankState& rank      = ranks[model.head_rank()];
         const cudaStream_t s = rank.stream;
         WorkspaceArena& ws   = *rank.workspace;
@@ -6317,7 +6359,21 @@ struct Executor::Impl {
             project(mtp->head, mixed, logits, ws, s);
         }
         Tensor tokens(out, DType::I32, {n});
-        if (second) {
+        if (sampled_step >= 0) {
+            auto scope = ws.scope();
+            if (second) {
+                // The prefetch reads the head's two best tokens beside the drawn one.
+                Tensor best = ws.alloc(DType::I32, {n});
+                Tensor alternative(second, DType::I32, {n});
+                ops::argmax_top2(logits, best, alternative, domain, s);
+            }
+            const Tensor keys(static_cast<std::int32_t*>(mtp_draft_keys.p) +
+                                  std::int64_t(sampled_step) * n,
+                              DType::I32, {n});
+            ops::sample(logits, tokens, domain,
+                        static_cast<const ops::SamplingConfig*>(mtp_draft_configs.p), keys,
+                        ops::kSamplePurposeDecode, ws, s);
+        } else if (second) {
             Tensor alternative(second, DType::I32, {n});
             ops::argmax_top2(logits, tokens, alternative, domain, s);
         } else {
@@ -6486,13 +6542,16 @@ struct Executor::Impl {
 
     std::uint32_t draft(std::span<const std::uint32_t> batch, std::span<const std::int32_t> anchors,
                         std::span<std::int32_t> out, std::span<std::uint32_t> extents = {},
-                        std::uint32_t steps = 0) {
+                        std::uint32_t steps                         = 0,
+                        std::span<const ops::SamplingConfig> configs = {},
+                        std::span<const std::int32_t> verify_lengths = {}) {
         require_drafts("draft");
         const std::size_t b      = batch.size();
         const std::size_t stride = options.draft_tokens;
         const std::size_t k      = steps == 0 ? stride : steps;
         if (b == 0 || b > sequences.size() || anchors.size() != b || out.size() != b * stride ||
-            (!extents.empty() && extents.size() != b) || k > stride) {
+            (!extents.empty() && extents.size() != b) || k > stride ||
+            (!configs.empty() && (configs.size() != b || verify_lengths.size() != b))) {
             throw std::invalid_argument("qwen4_exp draft: one anchor and its drafts per sequence");
         }
         std::vector<SequenceState*> drafting;
@@ -6519,6 +6578,37 @@ struct Executor::Impl {
         }
         RankBinding bind(device, model.head_rank());
         RankState& rank = ranks[model.head_rank()];
+        // A chain whose rows sample draws each row's drafts with its sampler at the keys of the
+        // verification columns they propose for; an all-greedy chain keeps the argmax.
+        const bool sampled = options.sampled_drafts &&
+                             std::any_of(configs.begin(), configs.end(),
+                                         [](const ops::SamplingConfig& c) {
+                                             return c.temperature > 0.0F;
+                                         });
+        if (sampled) {
+            auto* host_configs = static_cast<ops::SamplingConfig*>(mtp_draft_staging->data());
+            auto* host_keys    = reinterpret_cast<std::int32_t*>(
+                static_cast<std::byte*>(mtp_draft_staging->data()) +
+                std::size_t(options.sequences) * sizeof(ops::SamplingConfig));
+            for (std::size_t j = 0; j < b; ++j) {
+                ops::SamplingConfig c = configs[j];
+                c.presence_penalty    = 0.0F;
+                c.frequency_penalty   = 0.0F;
+                c.token_counts        = nullptr;
+                c.token_mask          = nullptr;
+                c.token_mask_stride   = 0;
+                c.non_finite_token    = 0;
+                host_configs[j]       = c;
+                for (std::size_t i = 0; i < k; ++i) {
+                    host_keys[i * b + j] = verify_lengths[j] + static_cast<std::int32_t>(i) + 1;
+                }
+            }
+            CUDA_CHECK(cudaMemcpyAsync(mtp_draft_configs.p, host_configs,
+                                       b * sizeof(ops::SamplingConfig), cudaMemcpyHostToDevice,
+                                       rank.stream));
+            CUDA_CHECK(cudaMemcpyAsync(mtp_draft_keys.p, host_keys, k * b * 4,
+                                       cudaMemcpyHostToDevice, rank.stream));
+        }
         // Step i's cell of a sequence sits at its position - 1 + i and pairs the stack before it
         // (the kept one at step 0) with the step's token (the anchor at step 0); it rotates at
         // that position's RoPE position, on one axis past a media prompt's last media token.
@@ -6562,7 +6652,8 @@ struct Executor::Impl {
                 stage_hidden(rank.stack, n, 0);
             }
             mtp_pass(parts, n, ids + i * b, at + i * b, turn + i * b, true);
-            mtp_head(n, ids + (i + 1) * b, second(i), confidence ? confidence + i * b : nullptr);
+            mtp_head(n, ids + (i + 1) * b, second(i), confidence ? confidence + i * b : nullptr,
+                     sampled ? static_cast<std::int32_t>(i) : -1);
         };
         const auto prefetch = [&](std::size_t i) {
             if (draft_prefetch) {
@@ -6606,7 +6697,7 @@ struct Executor::Impl {
         std::vector<std::uint32_t> lengths(b, static_cast<std::uint32_t>(k));
         std::size_t ran = k;
         if (confidence == nullptr || extents.empty()) {
-            replay(draft_graphs.at(k), [&] {
+            replay((sampled ? sampled_draft_graphs : draft_graphs).at(k), [&] {
                 for (std::size_t i = 0; i < k; ++i) {
                     step(i);
                     prefetch(i);
@@ -6623,7 +6714,7 @@ struct Executor::Impl {
             const float floor = std::log(options.draft_min_p);
             std::vector<char> open(b, 1);
             for (std::size_t i = 0; i < k; ++i) {
-                replay(step_graphs.at(i), [&] { step(i); });
+                replay((sampled ? sampled_step_graphs : step_graphs).at(i), [&] { step(i); });
                 prefetch(i);
                 CUDA_CHECK(cudaMemcpyAsync(logprobs + i * b, confidence + i * b,
                                            b * sizeof(float), cudaMemcpyDeviceToHost, rank.stream));
@@ -7264,8 +7355,10 @@ void Executor::stop_drafting(std::uint32_t sequence) {
 
 std::uint32_t Executor::draft(std::span<const std::uint32_t> sequences,
                               std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
-                              std::span<std::uint32_t> extents, std::uint32_t steps) {
-    return impl_->draft(sequences, anchors, out, extents, steps);
+                              std::span<std::uint32_t> extents, std::uint32_t steps,
+                              std::span<const ops::SamplingConfig> configs,
+                              std::span<const std::int32_t> lengths) {
+    return impl_->draft(sequences, anchors, out, extents, steps, configs, lengths);
 }
 
 void Executor::verify(std::span<const std::uint32_t> sequences,

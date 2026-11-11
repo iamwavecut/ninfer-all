@@ -208,7 +208,8 @@ Json sampler_json(const ninfer::ResolvedSamplingParameters& sampling) {
                 {"min_p", sampling.min_p},
                 {"presence_penalty", sampling.presence_penalty},
                 {"frequency_penalty", sampling.frequency_penalty},
-                {"seed", sampling.seed}};
+                {"seed", sampling.seed},
+                {"gumbel", sampling.gumbel}};
 }
 
 Json preset_json(const ninfer::SamplingPreset& preset) {
@@ -523,6 +524,7 @@ std::string sampler_str(const ninfer::ResolvedSamplingParameters& sampling) {
     if (sampling.presence_penalty != 0.0f) { out << " pres=" << sampling.presence_penalty; }
     if (sampling.frequency_penalty != 0.0f) { out << " freq=" << sampling.frequency_penalty; }
     out << " seed=" << sampling.seed;
+    if (sampling.gumbel) { out << " gumbel"; }
     return out.str();
 }
 

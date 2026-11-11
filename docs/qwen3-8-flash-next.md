@@ -664,7 +664,9 @@ on one device ([DFlash2](#dflash2-speculative-decoding)); with disk experts it d
 drafts ([below](#mtp-with-several-requests)), and `--spec none` decodes without drafts. Decoding
 requests then run rounds: the MTP block (one more sparse-attention layer with its own 512-expert
 MoE, its own final mixer and the model's head) drafts N tokens from the stack the model left at the
-request's last position (the head's argmax at each step), the model verifies the last sampled token
+request's last position (the head's argmax at each step; with `--gumbel-sampling` a sampled
+request's draw under the target's keyed noise, [coupled draws](cli.md#speculative-decoding)), the
+model verifies the last sampled token
 and the N drafts in one pass, and the acceptance keeps the drafts while they equal the model's own
 draw at each position, then commits the model's draw at the first difference (or after the last
 draft). The acceptance samples as the request does (greedy, temperature and top-k/top-p/min-p,

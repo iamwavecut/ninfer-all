@@ -1401,7 +1401,7 @@ int deterministic_sampling_case() {
 // terminal is sample()'s draw of the bonus column; a draft replaced at `mismatch` ends the round
 // there with that column's own draw. Both Ops must make the same draw from the same column on
 // every route they pick for the domain.
-int coupled_sample_case(int token_domain, int k, int mismatch) {
+int coupled_sample_case(int token_domain, int k, int mismatch, std::int32_t draw) {
     const std::int32_t initial_length = 700;
     std::vector<std::uint16_t> logits(static_cast<std::size_t>(token_domain) * (k + 1));
     std::uint64_t state = 0x9E3779B97F4A7C15ull ^ static_cast<std::uint64_t>(token_domain * 64 + k);
@@ -1418,6 +1418,7 @@ int coupled_sample_case(int token_domain, int k, int mismatch) {
     config.top_p       = 0.95f;
     config.min_p       = 0.01f;
     config.seed        = 0xC0FFEEull + static_cast<std::uint64_t>(k);
+    config.draw        = draw;
 
     DeviceBuffer d_logits = upload_logits(logits);
     DeviceBuffer d_config = device_config(config);
@@ -1446,7 +1447,8 @@ int coupled_sample_case(int token_domain, int k, int mismatch) {
     const auto expected = accept_state_oracle(
         drafts, accepted, drawn[static_cast<std::size_t>(accepted)], initial_length);
     return execute_accept_case("coupled sample() drafts domain=" + std::to_string(token_domain) +
-                                   " K=" + std::to_string(k) + " A=" + std::to_string(accepted),
+                                   " K=" + std::to_string(k) + " A=" + std::to_string(accepted) +
+                                   (draw == ops::kSampleDrawGumbel ? " gumbel" : ""),
                                std::vector<std::int32_t>(static_cast<std::size_t>(k + 1), 0),
                                logits, token_domain, drafts, initial_length, token_domain, config,
                                std::vector<std::int32_t>(static_cast<std::size_t>(token_domain), 0),
@@ -1807,6 +1809,62 @@ int remap_case(int token_count) {
     return failures;
 }
 
+// A subset head's logits spread over the vocabulary: each mapped row's value exactly (BF16 widened,
+// FP32 copied), -infinity at every other row, every column, nothing outside the output.
+int expand_case(int columns, bool fp32) {
+    constexpr int map_size   = 131072;
+    constexpr int vocabulary = 248320;
+    std::vector<std::int32_t> id_map(map_size);
+    for (int i = 0; i < map_size; ++i) {
+        // 65537 is prime to 248320: distinct ids, spread over the whole vocabulary.
+        id_map[static_cast<std::size_t>(i)] = static_cast<std::int32_t>(
+            (65537ULL * static_cast<std::uint64_t>(i) + 11ULL) % vocabulary);
+    }
+    const std::size_t count = static_cast<std::size_t>(map_size) * columns;
+    std::vector<std::uint32_t> values(count);
+    std::uint64_t state = 0x2545F4914F6CDD1DULL ^ static_cast<std::uint64_t>(columns);
+    for (auto& value : values) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        // Finite values of both signs; BF16 keeps the high half.
+        const float x = (static_cast<float>(state >> 40) / 16777216.0F - 0.5F) * 64.0F;
+        std::memcpy(&value, &x, sizeof(value));
+        if (!fp32) { value &= 0xFFFF0000U; }
+    }
+    std::vector<std::uint32_t> expected(static_cast<std::size_t>(vocabulary) * columns,
+                                        0xFF800000U);
+    for (int t = 0; t < columns; ++t) {
+        for (int i = 0; i < map_size; ++i) {
+            expected[static_cast<std::size_t>(t) * vocabulary +
+                     static_cast<std::size_t>(id_map[static_cast<std::size_t>(i)])] =
+                values[static_cast<std::size_t>(t) * map_size + static_cast<std::size_t>(i)];
+        }
+    }
+    DeviceBuffer d_map = to_device(id_map);
+    DeviceBuffer d_subset;
+    if (fp32) {
+        d_subset = to_device(values);
+    } else {
+        std::vector<std::uint16_t> halves(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            halves[i] = static_cast<std::uint16_t>(values[i] >> 16);
+        }
+        d_subset = to_device(halves);
+    }
+    GuardedDeviceBuffer d_expanded(expected.size() * sizeof(float));
+    initialize(d_expanded, std::vector<std::uint32_t>(expected.size(), 0x7FC00001U));
+    const Tensor subset(d_subset.p, fp32 ? DType::FP32 : DType::BF16, {map_size, columns});
+    Tensor expanded(d_expanded.data(), DType::FP32, {vocabulary, columns});
+    ops::proposal_expand_logits(subset, static_cast<const std::int32_t*>(d_map.p), map_size,
+                                expanded, nullptr);
+    cuda_synchronize();
+    const std::string label = std::string("proposal expand ") + (fp32 ? "FP32" : "BF16") +
+                              " T=" + std::to_string(columns);
+    int failures = verify_exact((label + " output").c_str(),
+                                read<std::uint32_t>(d_expanded, expected.size()), expected);
+    failures += d_expanded.verify_guards((label + " guards").c_str());
+    return failures;
+}
+
 int transforms_conformance() {
     int failures = 0;
     for (int k = 1; k <= 31; ++k)
@@ -1822,6 +1880,10 @@ int transforms_conformance() {
     failures += remap_case(1);
     failures += remap_case(15);
     failures += remap_case(120);
+    for (const int columns : {1, 3, 16}) {
+        failures += expand_case(columns, false);
+        failures += expand_case(columns, true);
+    }
     return failures;
 }
 
@@ -2253,7 +2315,9 @@ int main(int argc, char** argv) {
     for (int domain : {64, 257, 248077}) {
         for (int k : {1, 5, 15}) {
             for (int mismatch : {-1, 0, k / 2}) {
-                failures += coupled_sample_case(domain, k, mismatch);
+                for (const std::int32_t draw : {ops::kSampleDrawInverseCdf, ops::kSampleDrawGumbel}) {
+                    failures += coupled_sample_case(domain, k, mismatch, draw);
+                }
             }
         }
     }

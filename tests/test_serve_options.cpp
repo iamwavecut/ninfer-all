@@ -394,6 +394,11 @@ int main() {
                       "--lookup-ngram did not reach the Engine options next to --spec");
     failures += check(route_engine.prefill_cublas && !route_engine.prefill_cublas_projections,
                       "the cuBLAS prefill controls did not reach the Engine options");
+    failures += check(!default_engine.gumbel_sampling &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer",
+                                                     "--gumbel-sampling"}))
+                              .gumbel_sampling,
+                      "--gumbel-sampling did not reach the Engine options");
     for (const char* flag : {"--prefill-cublas", "--no-prefill-cublas-projections", "--lookup-ngram"}) {
         failures += check(kv_help.find(flag) != std::string::npos,
                           "serve help omits an accepted prefill or drafting control");
@@ -1325,6 +1330,7 @@ int main() {
                                         "--gpu-clock-floor",
                                         "--graft",
                                         "--greedy",
+                                        "--gumbel-sampling",
                                         "--host",
                                         "--host-cache-mib",
                                         "--host-kv-mib",

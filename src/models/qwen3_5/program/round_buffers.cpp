@@ -280,6 +280,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     static_assert(std::is_standard_layout_v<MtpDecodeIngress>);
     static_assert(std::is_standard_layout_v<MtpDecodeEgress>);
     static_assert(offsetof(MtpDecodeIngress, sampling) % alignof(ops::SamplingConfig) == 0);
+    static_assert(offsetof(MtpDecodeIngress, draft_sampling) % alignof(ops::SamplingConfig) == 0);
     const auto batch          = static_cast<std::int32_t>(batch_capacity);
     const auto drafts         = static_cast<std::int32_t>(verify_window);
     const auto width          = drafts + 1;
@@ -319,6 +320,9 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
+    draft_sampling = reinterpret_cast<const ops::SamplingConfig*>(
+        static_cast<const unsigned char*>(ingress.data) +
+        offsetof(MtpDecodeIngress, draft_sampling));
 
     licensed_tokens =
         egress_tensor(offsetof(MtpDecodeEgress, licensed_tokens), DType::I32, {width, batch});

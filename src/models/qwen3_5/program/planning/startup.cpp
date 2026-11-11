@@ -404,6 +404,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         out.sampling_config = add_tensor(
             builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
             "sampling config");
+        if (plan.features.mtp() && plan.gumbel_sampling) {
+            out.draft_sampling_config = add_tensor(
+                builder, DType::I32,
+                {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
+                "MTP proposal sampling config");
+        }
     }
     if (plan.steering_adapters != 0 || plan.steering_vectors) {
         // Every rank edits its replica or stage residual itself, so each holds its own copy.
@@ -696,19 +702,33 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::BF16, dimension(config.hidden_size), last);
         scratch(layout, share);
     };
+    // A proposal's logits and the head's scratch; with --gumbel-sampling also the sampler's, after
+    // a subset head's logits are spread over the vocabulary (TextContext::proposal_argmax).
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
+        const auto vocabulary = dimension(parameters.model.resources().public_token_count);
         if (plan.proposal_head == ProposalHead::Optimized) {
             const auto& head  = parameters.proposal->head;
             const DType dtype = execution::fp32_proposal_logits(head) ? DType::FP32 : DType::BF16;
             matrix(layout, dtype, dimension(parameters.proposal->rows), columns);
             linear_scratch(layout, head, columns, columns);
             divided_head_scratch(layout, parameters.proposal->head_shares, dtype, columns, columns);
+            if (plan.gumbel_sampling) {
+                if (parameters.proposal->token_ids) {
+                    matrix(layout, DType::FP32, vocabulary, columns);
+                }
+                scratch(layout,
+                        ops::sampling_workspace_capacity_bytes(vocabulary, columns, columns));
+            }
         } else {
             const bool fp32 = execution::fp32_proposal_logits(parameters.mtp->output_head);
             if (fp32) { matrix(layout, DType::FP32, dimension(config.vocab_size), columns); }
             linear_scratch(layout, parameters.mtp->output_head, columns, columns);
             divided_head_scratch(layout, parameters.mtp->output_head_shares,
                                  fp32 ? DType::FP32 : DType::BF16, columns, columns);
+            if (plan.gumbel_sampling) {
+                scratch(layout,
+                        ops::sampling_workspace_capacity_bytes(vocabulary, columns, columns));
+            }
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
@@ -1506,6 +1526,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->structured_output   = inputs.structured_output;
+    impl->gumbel_sampling     = inputs.gumbel_sampling;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
@@ -1848,6 +1869,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .cuda_graph_allowance_bytes = options.cuda_graph_allowance_bytes,
         .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,
         .structured_output          = options.structured_output,
+        .gumbel_sampling            = options.gumbel_sampling,
         .device                     = options.device,
         .context_cache              = options.context_cache,
         .resident_main_pages        = resident_main_pages,

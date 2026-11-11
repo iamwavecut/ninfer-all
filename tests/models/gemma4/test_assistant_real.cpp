@@ -103,6 +103,7 @@ int main() {
     options.prefill_chunk = 2048;
     options.sequences     = 2;
     options.draft_tokens  = kSteps;
+    options.sampled_drafts = true;
     options.kv_cache      = kv_storage(std::getenv("NINFER_GEMMA4_KV"));
     const bool quantized  = options.kv_cache != KvCacheStorage::BFloat16;
     gemma4::Executor executor(*model, device, options);
@@ -123,6 +124,37 @@ int main() {
         expect(again == drafts, "a replayed draft chain gives the same drafts");
     }
     std::cout << nlohmann::json({{"anchor", anchor}, {"drafts", drafts}}).dump() << '\n';
+    // Sampled chains (the Engine's drafting under --gumbel-sampling): a row at temperature 0
+    // drafts the argmax chain, and a sampled chain depends only on its keys: its eager run,
+    // captured graph and replay agree, for either draw the sampler takes.
+    {
+        const std::int32_t length = std::int32_t(prompt.size());
+        ops::SamplingConfig greedy;
+        std::vector<std::int32_t> argmax_chain(kSteps);
+        executor.draft({&s0, 1}, {&anchor, 1}, argmax_chain, kSteps, {&greedy, 1}, {&length, 1});
+        expect(argmax_chain == drafts, "a temperature-0 row drafts the argmax chain");
+        for (const std::int32_t draw : {ops::kSampleDrawInverseCdf, ops::kSampleDrawGumbel}) {
+            ops::SamplingConfig sampled;
+            sampled.temperature = 1.0F;
+            sampled.top_k       = 20;
+            sampled.top_p       = 0.95F;
+            sampled.seed        = 11;
+            sampled.draw        = draw;
+            std::vector<std::int32_t> chain(kSteps);
+            executor.draft({&s0, 1}, {&anchor, 1}, chain, kSteps, {&sampled, 1}, {&length, 1});
+            for (int pass = 0; pass < 2; ++pass) {
+                std::vector<std::int32_t> again(kSteps);
+                executor.draft({&s0, 1}, {&anchor, 1}, again, kSteps, {&sampled, 1},
+                               {&length, 1});
+                expect(again == chain, "a replayed sampled chain gives the same drafts");
+            }
+            for (const std::int32_t token : chain) {
+                expect(token >= 0 && token < domain, "a sampled draft is a public token");
+            }
+            std::cout << "sampled drafts (" << (draw == ops::kSampleDrawGumbel ? "Gumbel" : "CDF")
+                      << "): " << nlohmann::json(chain).dump() << '\n';
+        }
+    }
     const char* reference = std::getenv("NINFER_GEMMA4_DRAFTS");
     if (reference != nullptr && quantized) {
         std::cout << "quantized cache: the F16 oracle's drafts are not compared\n";

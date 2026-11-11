@@ -11,12 +11,13 @@
 namespace ninfer::ops {
 
 // Written to the token output instead of a vocabulary id when the selected token's own logit is
-// not finite. A diverged forward pass produces an all-NaN logits row, and because every ordering
-// comparison against NaN is false the reductions then return whatever index they started from,
-// after which top_k and the presence penalty walk the lowest token ids. That output reads like a
-// plausible sampling artefact rather than a fault, so the Ops emit this out-of-domain value and
-// let the runtime reject the round. The check is O(1) on the selected logit, not an exhaustive
-// scan: a row that still has a finite maximum samples normally.
+// not finite (SamplingConfig::non_finite_token, unless a drafter names a valid id instead). A
+// diverged forward pass produces an all-NaN logits row, and because every ordering comparison
+// against NaN is false the reductions then return whatever index they started from, after which
+// top_k and the presence penalty walk the lowest token ids. That output reads like a plausible
+// sampling artefact rather than a fault, so the Ops emit this out-of-domain value and let the
+// runtime reject the round. The check is O(1) on the selected logit, not an exhaustive scan: a row
+// that still has a finite maximum samples normally.
 inline constexpr std::int32_t kSamplerNonFiniteToken = -1;
 
 // Counter-based RNG subkey. Distinct purposes keep draws at the same logical position separate.
@@ -27,6 +28,16 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
     kSamplePurposeDFlash2Proposal       = 5,
+};
+
+// How a positive-temperature row draws its token from the truncated, renormalized candidates.
+enum SampleDraw : std::int32_t {
+    // The rank of the first candidate whose cumulative weight exceeds u(seed, position, purpose).
+    kSampleDrawInverseCdf = 0,
+    // The candidate whose log weight plus the Gumbel noise -log(-log u) keyed by its token id,
+    // u(seed, position, purpose, id + 1), is largest. Two distributions drawn with one key then
+    // agree wherever their weights are close, whatever their candidates' order.
+    kSampleDrawGumbel = 1,
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32
@@ -45,6 +56,10 @@ struct SamplingConfig {
     // Every reachable column must allow at least one token with a finite logit.
     const std::uint32_t* token_mask = nullptr;
     std::int32_t token_mask_stride  = 0; // words per column; ordinary sample uses column zero
+    std::int32_t draw               = kSampleDrawInverseCdf; // SampleDraw
+    // Written instead of the selected id when that token's own logit is not finite. A drafter,
+    // whose proposals the target verifies anyway, names a valid id here.
+    std::int32_t non_finite_token = kSamplerNonFiniteToken;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -77,19 +92,20 @@ struct SamplingConfig {
  * Candidate weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
  * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches
  * top_p times the pre-truncation candidate weight. At least the best candidate remains, the
- * support is renormalized, and one id is drawn for that row.
+ * support is renormalized, and one id is drawn for that row as configs[b].draw selects.
  *
  * Row b uses counter-based RNG key
- * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the
- * compact row index. In every mode the selected token atomically increments
- * configs[b].token_counts when it is non-null. Non-null token-count arrays belonging to distinct
+ * (configs[b].seed,logical_positions[b]+position_offset,purpose), without mutable RNG state or
+ * dependence on the compact row index. In every mode the selected token atomically increments
+ * configs[b].token_counts when it is non-null; a row whose selected token has a non-finite logit
+ * writes configs[b].non_finite_token instead and counts nothing. Non-null token-count arrays belonging to distinct
  * active requests must not alias. `out` must not overlap logits, configs, logical_positions, or any
  * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
  * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream);
+            WorkspaceArena& workspace, cudaStream_t stream, std::int32_t position_offset = 0);
 
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).

@@ -22,6 +22,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/sampling.h"
 #include "ninfer/engine_options.h"
 #include "ninfer/kv_cache_storage.h"
 #include "ninfer/observability/resources.h"
@@ -86,6 +87,8 @@ struct ExecutorOptions {
     bool dflash2 = false;
     // Absolute greedy-draft probability floor; zero disables confidence computation.
     float draft_min_p = 0;
+    // --gumbel-sampling: draft() may take samplers, whose rows' MTP block then draws its drafts.
+    bool sampled_drafts = false;
     // YaRN past the model's native window (a factor above one), for the sparse-attention layers'
     // RoPE, their indexer's and the MTP block's alike; inactive keeps the unscaled rotation.
     ops::RopeYarn rope_yarn;
@@ -319,10 +322,16 @@ public:
     // floor or `extents` an MTP chain of `steps` runs whole, captured once per step count; with
     // both, each step runs from its own graph and the chain ends at the first step after which
     // every sequence has drafted at or below the floor (the row's entries past the steps run are
-    // -1).
+    // -1). With `configs` (one per sequence; penalties, masks and counts unused) and `lengths`,
+    // the MTP block draws draft i of sequence j from its distribution under configs[j] with the key
+    // (configs[j].seed, lengths[j] + i + 1, kSamplePurposeDecode), the key of the verification
+    // column that draws the target's token at its place; a row at temperature 0 takes the argmax.
+    // The DFlash2 drafter ignores `configs` and proposes greedily.
     std::uint32_t draft(std::span<const std::uint32_t> sequences,
                         std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
-                        std::span<std::uint32_t> extents = {}, std::uint32_t steps = 0);
+                        std::span<std::uint32_t> extents = {}, std::uint32_t steps = 0,
+                        std::span<const ops::SamplingConfig> configs = {},
+                        std::span<const std::int32_t> lengths       = {});
     // Runs 1..draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
     // positions without committing them, and leaves the logits of every token in logits(), one
     // column per token, sequence after sequence. The sequences' positions and states stay where

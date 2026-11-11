@@ -4,6 +4,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
 #include "core/device.h"
+#include "runtime/contract/draft_sampling.h"
 
 #include <algorithm>
 #include <array>
@@ -294,6 +295,8 @@ void ProgramImpl::prepare_graphs() {
                 mtp_host_ingress->state_destination_slots[row] = capture_state_slot(row);
                 mtp_host_ingress->rope_deltas[row]             = 0;
                 mtp_host_ingress->sampling[row]                = {};
+                mtp_host_ingress->draft_sampling[row] =
+                    runtime::draft_sampling(ops::SamplingConfig{});
             }
         }
         if (io.ordinary) {
@@ -397,6 +400,7 @@ void ProgramImpl::prepare_graphs() {
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
                                                  state_images->continuation_hidden_store()};
+            mtp_state.sampled_drafts              = gumbel_sampling;
             const GraphExecutionProfile code_warm = planned_profiles.front();
             prepare_representative(code_warm.min, 1, verify_window);
             device.synchronize();
@@ -445,6 +449,7 @@ void ProgramImpl::prepare_graphs() {
                                                  *mtp_host_ingress,
                                                  *mtp_host_egress,
                                                  state_images->continuation_hidden_store()};
+            mtp_state.sampled_drafts              = gumbel_sampling;
             const GraphExecutionProfile code_warm = planned_profiles.front();
             prepare_representative(code_warm.min, 1, verify_window);
             device.synchronize();

@@ -25,7 +25,8 @@ namespace {
 template <typename Logit>
 void sample_batch_typed_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                                const SamplingConfig* configs, const Tensor& logical_positions,
-                               std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
+                               std::int32_t purpose, std::int32_t position_offset,
+                               DeviceSpan workspace, cudaStream_t stream) {
     const std::int32_t physical_rows     = logits.ne[0];
     const std::int32_t batch             = logits.ne[1];
     const auto* positions                = static_cast<const std::int32_t*>(logical_positions.data);
@@ -33,7 +34,7 @@ void sample_batch_typed_launch(const Tensor& logits, Tensor& out, std::int32_t t
     if (!layout.multiblock) {
         sample_row_kernel<Logit><<<static_cast<unsigned int>(batch), kSamplerBlock, 0, stream>>>(
             static_cast<const Logit*>(logits.data), static_cast<std::int32_t*>(out.data), configs,
-            positions, purpose, token_domain, physical_rows);
+            positions, position_offset, purpose, token_domain, physical_rows);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -47,8 +48,8 @@ void sample_batch_typed_launch(const Tensor& logits, Tensor& out, std::int32_t t
     CUDA_CHECK(cudaGetLastError());
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(batch));
     sampling_group_finalize_sample_kernel<<<group_grid, kSamplerGroupBlock, 0, stream>>>(
-        static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
-        partial_blocks, groups, scratch);
+        static_cast<std::int32_t*>(out.data), configs, positions, position_offset, purpose,
+        token_domain, partial_blocks, groups, scratch);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -56,14 +57,15 @@ void sample_batch_typed_launch(const Tensor& logits, Tensor& out, std::int32_t t
 
 void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                          const SamplingConfig* configs, const Tensor& logical_positions,
-                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
+                         std::int32_t purpose, std::int32_t position_offset, DeviceSpan workspace,
+                         cudaStream_t stream) {
     if (logits.dtype == DType::FP32) {
         sample_batch_typed_launch<float>(logits, out, token_domain, configs, logical_positions,
-                                         purpose, workspace, stream);
+                                         purpose, position_offset, workspace, stream);
         return;
     }
     sample_batch_typed_launch<__nv_bfloat16>(logits, out, token_domain, configs, logical_positions,
-                                             purpose, workspace, stream);
+                                             purpose, position_offset, workspace, stream);
 }
 
 void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts,

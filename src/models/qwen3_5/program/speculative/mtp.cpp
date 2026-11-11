@@ -30,11 +30,15 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     card.set_steering(state.execution.steering);
     card.set_rope_yarn(state.execution.rope_yarn);
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
-    configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
-                        state.state_destination_slot, state.mtp_proposal_extent);
+    configure_text_card(card, state.execution, state.sampling, state.draft_sampling,
+                        state.state_source_slot, state.state_destination_slot,
+                        state.mtp_proposal_extent);
 
+    // The bridge runs at the position before the anchor's: proposal i takes the target's key for
+    // position + i + 2.
     Tensor position_view = state.execution.io.mtp->target_positions.slice(0, 0, 1);
     ops::set_i32_scalar(position_view, position, state.execution.device.stream);
+    card.set_proposal_key(position_view, 2);
     Tensor mtp_hidden         = state.execution.io.mtp->ar_hidden;
     Tensor logits             = state.execution.io.logits.slice(1, 0, 1);
     Tensor draft0             = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
@@ -55,8 +59,10 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         throw std::logic_error("MTP bridge proposal extent is outside the configured window");
     }
 
+    // The step that proposes draft i runs at ar_position position + i.
     Tensor ar_position = state.execution.io.mtp->position.slice(0, 0, 1);
     ops::set_i32_scalar(ar_position, position + 1, state.execution.device.stream);
+    card.set_proposal_key(ar_position, 2);
     for (int i = 1; i < static_cast<int>(state.mtp_proposal_extent); ++i) {
         Tensor previous_token = state.execution.io.mtp->draft_tokens.slice(0, i - 1, 1);
         Tensor next_draft     = state.execution.io.mtp->draft_tokens.slice(0, i, 1);
@@ -176,8 +182,12 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
             ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
                                                     state.execution.device.stream);
 
+            // The verification moved each row's frontier to its new anchor: draft i takes the
+            // target's key for position frontier + i + 1.
             Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
             Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
+            card.set_proposal_sampling(state.sampled_drafts ? frame.draft_sampling : nullptr);
+            card.set_proposal_key(frontiers, 1);
             card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
             for (std::uint32_t step = 0; step + 1 < draft_window; ++step) {
                 Tensor previous =
@@ -199,6 +209,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
                      batch_size});
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
                                               mtp_rows, envelopes.ar[step], next_hidden_batch);
+                card.set_proposal_key(frontiers, static_cast<std::int32_t>(step) + 2);
                 card.mtp_propose_batch(next_hidden, proposal_logits, next);
                 CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                            cudaMemcpyDeviceToDevice,

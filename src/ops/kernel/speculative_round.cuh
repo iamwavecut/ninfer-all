@@ -526,8 +526,8 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_draf
         // The loop leaves at the barrier below once the row is decided, so no thread reads the
         // shared flag here while thread 0 may be writing it.
         if (tid == 0) {
-            const float u = sampling_uniform(cfg.seed, L_sh + i + 1, kSamplePurposeDecode, 0u);
-            const int t   = cand_idx[sampling_pick_rank(prob, n_support, u)];
+            const int t = cand_idx[sampling_pick(cfg, prob, cand_idx, n_support, L_sh + i + 1,
+                                                 kSamplePurposeDecode)];
             if (i < extent && t == row_drafts[i]) {
                 a_sh = i + 1; // the draft is the column's own draw: keep verifying
             } else {
@@ -859,8 +859,8 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     const int n            = workspace.dist_support[i];
                     const int* dist_idx    = workspace.dist_idx + sampling_dist_offset(i, 0);
                     const float* dist_prob = workspace.dist_prob + sampling_dist_offset(i, 0);
-                    const float u = sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeDecode, 0u);
-                    const int t   = dist_idx[sampling_pick_rank(dist_prob, n, u)];
+                    const int t = dist_idx[sampling_pick(cfg, dist_prob, dist_idx, n, L + i + 1,
+                                                         kSamplePurposeDecode)];
                     if (i < extent && t == row_drafts[i]) {
                         a = i + 1;
                         continue;
@@ -905,6 +905,25 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (i >= proposal_count) { return; }
     const int idx = proposal_tokens[i];
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
+}
+
+__global__ void proposal_fill_logits_kernel(float* expanded, std::int64_t elements) {
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t e = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         e < elements; e += stride) {
+        expanded[e] = -CUDART_INF_F;
+    }
+}
+
+template <class Logit>
+__global__ void proposal_scatter_logits_kernel(const Logit* subset, const std::int32_t* id_map,
+                                               std::int32_t n, std::int32_t rows,
+                                               float* expanded) {
+    const int i = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int t = static_cast<int>(blockIdx.y);
+    if (i >= n) { return; }
+    expanded[static_cast<std::int64_t>(t) * rows + id_map[i]] =
+        sampling_logit(subset[static_cast<std::int64_t>(t) * n + i]);
 }
 
 } // namespace ninfer::ops

@@ -14,8 +14,9 @@ namespace ninfer::ops {
 template <typename Logit>
 __launch_bounds__(kSamplerBlock) __global__
     void sample_row_kernel(const Logit* logits, std::int32_t* out, const SamplingConfig* configs,
-                           const std::int32_t* logical_positions, std::int32_t purpose,
-                           std::int32_t token_domain, std::int32_t physical_rows) {
+                           const std::int32_t* logical_positions, std::int32_t position_offset,
+                           std::int32_t purpose, std::int32_t token_domain,
+                           std::int32_t physical_rows) {
     const int row            = static_cast<int>(blockIdx.x);
     const std::int64_t base  = static_cast<std::int64_t>(row) * physical_rows;
     const int tid            = threadIdx.x;
@@ -61,7 +62,7 @@ __launch_bounds__(kSamplerBlock) __global__
         if (tid == 0) {
             const int picked = red_idx[0];
             if (!sampling_selected_logit_is_finite(logits, base, picked)) {
-                out[row] = kSamplerNonFiniteToken;
+                out[row] = cfg.non_finite_token;
             } else {
                 out[row] = picked;
                 if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
@@ -94,10 +95,11 @@ __launch_bounds__(kSamplerBlock) __global__
     }
 
     if (tid != 0) { return; }
-    const float u    = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
-    const int picked = cand_idx[sampling_pick_rank(prob, n_support, u)];
+    const int picked =
+        cand_idx[sampling_pick(cfg, prob, cand_idx, n_support,
+                               logical_positions[row] + position_offset, purpose)];
     if (!sampling_selected_logit_is_finite(logits, base, picked)) {
-        out[row] = kSamplerNonFiniteToken;
+        out[row] = cfg.non_finite_token;
         return;
     }
     out[row] = picked;
@@ -162,8 +164,8 @@ __launch_bounds__(kSamplerBlock) __global__
 
 __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
     std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* logical_positions,
-    std::int32_t purpose, std::int32_t token_domain, std::int32_t partial_blocks,
-    std::int32_t group_count, SamplingWorkspace workspace) {
+    std::int32_t position_offset, std::int32_t purpose, std::int32_t token_domain,
+    std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace) {
     const int group          = static_cast<int>(blockIdx.x);
     const int col            = static_cast<int>(blockIdx.y);
     const int tid            = threadIdx.x;
@@ -215,7 +217,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
             // This kernel never sees the logits, so the winner's own ordered value carries the
             // check. An empty key (0ull) decodes to NaN, which is the same rejection.
             if (picked == INT_MAX || !sampling_value_is_finite(sampling_key_float(best))) {
-                out[col] = kSamplerNonFiniteToken;
+                out[col] = cfg.non_finite_token;
             } else {
                 out[col] = picked;
                 if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
@@ -286,14 +288,14 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
 
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
     if (tid == 0) {
-        const float u          = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
-        const int rank         = sampling_pick_rank(prob, n_support, u);
+        const int rank = sampling_pick(cfg, prob, cand_idx, n_support,
+                                       logical_positions[col] + position_offset, purpose);
         const int picked       = cand_idx[rank];
         const float picked_val = cand_val[rank];
         // The candidate's own adjusted value stands in for the logit: this kernel is fed by the
         // partial/group workspace and never receives the logits themselves.
         if (!sampling_value_is_finite(picked_val)) {
-            out[col] = kSamplerNonFiniteToken;
+            out[col] = cfg.non_finite_token;
         } else {
             out[col] = picked;
             if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }

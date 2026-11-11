@@ -236,6 +236,28 @@ What can still separate a speculative answer from a plain one with the same seed
 floating-point effect of the verification width, as for greedy decoding. DFlash2 verifies its
 retained proposal distribution by rejection sampling.
 
+`--gumbel-sampling` draws each sampled token by Gumbel-max instead: the token whose logit plus
+keyed Gumbel noise (keyed by the seed, the position and the token) is largest. The tokens follow the
+same distribution, but a seed gives other tokens than the default draw, so the option is off by
+default. Drafts from an MTP block (Qwen3.5-core models, Qwen3.8-Flash-Next) and from Gemma 4's
+assistant then are the drafter's own draws under the same noise, which the target's draw keeps more
+often than a greedy draft. DSpark and lookup drafts stay greedy, and DFlash2 keeps its rejection
+sampling for the tokens it verifies. Greedy requests do not change. On an A40 (one request, three prompts, seeds 1 to 3, 256
+tokens a response, 2026-11-11):
+
+| Model and drafter | Temperature | Acceptance, default | Acceptance, `--gumbel-sampling` | tok/s, default | tok/s, `--gumbel-sampling` |
+|---|---|---|---|---|---|
+| Qwen3.8-27B IQ3_S, MTP | 0.7 | 0.396 | 0.424 | 66.8 | 69.0 |
+| Qwen3.8-27B IQ3_S, MTP | 1.0 | 0.396 | 0.407 | 66.6 | 67.4 |
+| Gemma 4 26B-A4B, assistant | 0.7 | 0.460 | 0.472 | 204.3 | 205.1 |
+| Gemma 4 26B-A4B, assistant | 1.0 | 0.443 | 0.485 | 200.0 | 207.5 |
+| Qwen3.8-Flash-Next Q2_0, MTP | 0.7 | 0.404 | 0.418 | 93.6 | 95.5 |
+| Qwen3.8-Flash-Next Q2_0, MTP | 1.0 | 0.362 | 0.403 | 88.8 | 93.7 |
+
+With the option, Gemma 4's and Flash-Next's speculative answers were the bytes of their plain answers
+with the same seed (21 of 21 each); Qwen3.8-27B's differed as its greedy ones do, by the
+verification width's floating-point effect.
+
 ### Choosing a draft count
 
 The draft count is a trade on what the output looks like. Each round verifies K+1 columns and runs
@@ -353,6 +375,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
+| `--gumbel-sampling` | draw sampled tokens by Gumbel-max over keyed noise, and MTP-style drafts as the drafter's own draws under that noise ([coupled draws](#speculative-decoding)); a seed gives other tokens than the default draw | off |
 | `--lora FNAME[,...]`, `--lora-scaled FNAME:SCALE[,...]` | llama.cpp LoRA adapters that remove a residual direction, at scale 1 or the given scale ([adapters and control vectors](serving.md#lora-adapters-and-control-vectors)) | none |
 | `--lora-init-without-apply` | load the adapters at scale 0 | off |
 | `--control-vector FNAME[,...]`, `--control-vector-scaled FNAME:SCALE[,...]` | llama.cpp control vectors added to the residual, at scale 1 or the given scale | none |

@@ -72,10 +72,13 @@ __device__ __forceinline__ float sampling_logit(__nv_bfloat16 value) {
 
 __device__ __forceinline__ float sampling_logit(float value) { return value; }
 
+// True when `index` names a token whose logit is finite. A reduction that met only NaN keeps its
+// empty sentinel, a negative index or INT_MAX, which names no token and reads nothing.
 template <typename Logit>
 __device__ __forceinline__ bool
 sampling_selected_logit_is_finite(const Logit* logits, std::int64_t base, std::int32_t index) {
-    return index >= 0 && sampling_value_is_finite(sampling_logit(logits[base + index]));
+    return index >= 0 && index != INT_MAX &&
+           sampling_value_is_finite(sampling_logit(logits[base + index]));
 }
 
 struct SamplingKeyGreater {
@@ -131,6 +134,12 @@ __device__ __forceinline__ float sampling_uniform(unsigned long long seed, int p
         (static_cast<unsigned long long>(sub) * 0x2545F4914F6CDD1Dull));
     const unsigned int bits = static_cast<unsigned int>(key >> 40); // 24 bits
     return static_cast<float>(bits) * (1.0f / 16777216.0f);
+}
+
+// The same keyed uniform in (0,1), for the Gumbel noise of token `sub - 1`.
+__device__ __forceinline__ float sampling_uniform_open(unsigned long long seed, int position,
+                                                       int purpose, unsigned int sub) {
+    return sampling_uniform(seed, position, purpose, sub) + 0.5f / 16777216.0f;
 }
 
 // Candidate ordering: higher value wins, ties broken by lower vocab index.
@@ -465,6 +474,31 @@ __device__ __forceinline__ int sampling_pick_rank(const float* prob, int n, floa
         if (u < acc) { return j; }
     }
     return n - 1;
+}
+
+// thread-0 helper: the rank of the keyed draw at (position, purpose) from the n candidates `idx`
+// with normalized weights `prob`, as cfg.draw selects: the inverse-CDF rank of
+// u(seed, position, purpose, 0), or the rank whose log weight plus the Gumbel noise of its token,
+// -log(-log u(seed, position, purpose, id + 1)), is largest (the lower rank on a tie). Drafters
+// drawing from their own distribution with the target's key share it with sample() and coupled
+// verification.
+__device__ __forceinline__ int sampling_pick(const SamplingConfig& cfg, const float* prob,
+                                             const int* idx, int n, int position, int purpose) {
+    if (cfg.draw == kSampleDrawGumbel) {
+        int best         = 0;
+        float best_score = -CUDART_INF_F;
+        for (int j = 0; j < n; ++j) {
+            const float u = sampling_uniform_open(cfg.seed, position, purpose,
+                                                  static_cast<unsigned int>(idx[j]) + 1u);
+            const float score = logf(prob[j]) - logf(-logf(u));
+            if (score > best_score) {
+                best_score = score;
+                best       = j;
+            }
+        }
+        return best;
+    }
+    return sampling_pick_rank(prob, n, sampling_uniform(cfg.seed, position, purpose, 0u));
 }
 
 } // namespace ninfer::ops
