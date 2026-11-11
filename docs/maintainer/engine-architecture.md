@@ -587,7 +587,9 @@ ResourceManager 清空，以错误完成 active lanes 与 materializing request�
 live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxed atomic load。
 
 数值失败（logits 非有限，sampler 返回 `ops::kSamplerNonFiniteToken`，或 licensed token 超出公开词表）
-不是 Engine 缺陷，也不终止服务。decode round 中 Program 把该行的越界 token 置为 0 并在
+不是 Engine 缺陷，也不终止服务。到达 MoE router 的 NaN（溢出的 hidden state）按 `ops::route_order` 当作最小的
+有限分数，仍选出范围内互不相同的 expert，于是 NaN 沿 residual 到达 logits，而不是以越界 expert id 让设备
+出错。decode round 中 Program 把该行的越界 token 置为 0 并在
 `PendingBatch::numerical_fault(row)` 上报告；`commit_pending` 以 `RequestErrorKind::NumericalFailure`
 结束该行的请求，其 sequence 按取消的方式释放（接受 0 个 token），其余行照常提交：该 sequence 此前发布
 的状态都由更早的有限 logits 担保。prompt 末尾的第一个 token 非有限时没有这样的担保（该次 prefill

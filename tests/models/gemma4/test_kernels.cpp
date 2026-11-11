@@ -3,7 +3,9 @@
 //    head, D 512 with eight), linear and sliding-window ring caches, one and many splits, short
 //    and long contexts and two sequences in one batch; the BF16 rows and the q8_1 rows; and keys
 //    derived from the values (K = V blocks: RoPE(V * k_norm), proportional over 64 of 256 pairs).
-//  - route_select: the logits, the top-k ids and weights and the expert grouping of the pairs.
+//  - route_select: the logits, the top-k ids and weights and the expert grouping of the pairs;
+//    route and route_select with a NaN row (an overflowed hidden state): that token selects
+//    experts 0..top_k-1, the other tokens as they do without it.
 //  - a branch pass's rows (several branches one after another past the state, each continuing it
 //    at the state's end): qkv_post's rotation at the branch position with the value stored at the
 //    row's own slot, keys derived at the branch positions, and the prompt masks of a sliding ring
@@ -281,6 +283,60 @@ void route(int tokens, std::mt19937& rng) {
     failures += ok ? 0 : 1;
 }
 
+// A NaN input row (an overflowed hidden state) through route() and route_select(): every expert
+// of its token ties at the lowest score, so the lower id wins and it selects experts
+// 0..top_k-1 (stale shared memory would leave other ids); the other tokens select as they do
+// without it.
+void route_nan(bool select, std::mt19937& rng) {
+    constexpr int kHidden = 2816, kExperts = 128, kTopK = 8, kTokens = 3;
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> x(std::size_t(kTokens) * kHidden), router(std::size_t(kExperts) * kHidden),
+        scale(kExperts, 1.0f);
+    for (auto& v : x) { v = normal(rng) * 0.02f; }
+    for (auto& v : router) { v = normal(rng); }
+    const int pairs = kTokens * kTopK;
+    DeviceBuffer dx(x.size() * 4), dr(router.size() * 4), dsc(scale.size() * 4),
+        logits(std::size_t(kTokens) * kExperts * 4), ids(pairs * 4), weights(pairs * 4),
+        routing((kExperts + 1 + pairs + kExperts + 1) * 4);
+    dr.copy_from_host(router.data(), router.size() * 4);
+    dsc.copy_from_host(scale.data(), scale.size() * 4);
+    auto* base       = static_cast<std::int32_t*>(routing.p);
+    const auto route = [&](const std::vector<float>& input) {
+        dx.copy_from_host(input.data(), input.size() * 4);
+        if (select) {
+            k::route_select(static_cast<const float*>(dx.p), kHidden, kTokens,
+                            static_cast<const float*>(dr.p), static_cast<const float*>(dsc.p),
+                            kExperts, kTopK, static_cast<float*>(logits.p),
+                            static_cast<std::int32_t*>(ids.p), static_cast<float*>(weights.p), base,
+                            base + kExperts + 1, base + kExperts + 1 + pairs,
+                            base + kExperts + 1 + pairs + kExperts, nullptr);
+        } else {
+            k::route(static_cast<const float*>(dx.p), kHidden, kTokens,
+                     static_cast<const float*>(dr.p), static_cast<const float*>(dsc.p), kExperts,
+                     kTopK, static_cast<float*>(logits.p), static_cast<std::int32_t*>(ids.p),
+                     static_cast<float*>(weights.p), nullptr);
+        }
+        check(cudaDeviceSynchronize(), "route NaN row");
+        std::vector<std::int32_t> got(pairs);
+        ids.copy_to_host(got.data(), pairs * 4);
+        return got;
+    };
+    const auto clean = route(x);
+    for (int i = 0; i < kHidden; ++i) { x[std::size_t(kHidden) + i] = std::nanf(""); }
+    const auto got = route(x);
+    bool ok = true;
+    for (int t = 0; t < kTokens; ++t) {
+        std::set<int> chosen;
+        for (int j = 0; j < kTopK; ++j) {
+            const int e = got[t * kTopK + j];
+            ok = ok && e >= 0 && e < kExperts && chosen.insert(e).second;
+            ok = ok && e == (t == 1 ? j : clean[t * kTopK + j]);
+        }
+    }
+    std::cout << (ok ? "OK   " : "FAIL ") << (select ? "route_select" : "route") << " NaN row\n";
+    failures += ok ? 0 : 1;
+}
+
 } // namespace
 
 // qkv_post against an FP64 oracle: per-head RMSNorm of Q and K, Q rotated at its position by the
@@ -527,6 +583,8 @@ int main() {
         qkv(512, 1.1434f, {5, 1000, 7}, rng);
         qkv(256, 1.21f, {0, 1023, 300}, rng);
         for (const int tokens : {1, 3, 8}) { route(tokens, rng); }
+        route_nan(false, rng);
+        route_nan(true, rng);
         // A branch pass: rows 0..4, 5..12 and 13..19 continue a 300-position state.
         qkv(512, 1.0f, {300, 301, 302, 303, 304, 300, 301, 302}, rng,
             {300, 301, 302, 303, 304, 305, 306, 307});

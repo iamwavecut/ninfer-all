@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "models/gemma4/kv_codec.cuh"
+#include "ops/common/route_order.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -961,7 +962,7 @@ __global__ void route_topk_kernel(const float* __restrict__ logits, int experts,
     __shared__ float chosen[8];
     __shared__ int chosen_id[8];
     const int t = blockIdx.x, e = threadIdx.x;
-    if (e < experts) { v[e] = logits[std::int64_t(t) * experts + e]; }
+    if (e < experts) { v[e] = ops::route_order(logits[std::int64_t(t) * experts + e]); }
     __syncthreads();
     if (e < experts) {
         const float mine = v[e];
@@ -1002,7 +1003,7 @@ __global__ void route_select_kernel(const float* __restrict__ logits, int tokens
     __shared__ int warp_total[kTopkMaxExperts / 32][2];
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
     for (int t = 0; t < tokens; ++t) {
-        if (e < experts) { v[e] = logits[std::int64_t(t) * experts + e]; }
+        if (e < experts) { v[e] = ops::route_order(logits[std::int64_t(t) * experts + e]); }
         __syncthreads();
         if (e < experts) {
             const float mine = v[e];

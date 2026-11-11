@@ -1,6 +1,7 @@
 #include "models/deepseek_v41/kernels.h"
 
 #include "core/device.h"
+#include "ops/common/route_order.cuh"
 #include "ops/common/silu.h"
 
 #include <cublas_v2.h>
@@ -1255,7 +1256,7 @@ __global__ void route_kernel(const float* __restrict__ logits, const float* __re
         const float x  = logits[std::int64_t(t) * experts + e];
         const float sp = x > 20.0f ? x : log1pf(expf(x));
         s              = sqrtf(sp);
-        sel[e]         = s + bias[e];
+        sel[e]         = ops::route_order(s + bias[e]);
     }
     __syncthreads();
     if (e < experts) {

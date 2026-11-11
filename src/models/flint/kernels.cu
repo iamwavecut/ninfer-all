@@ -1,6 +1,7 @@
 #include "models/flint/kernels.h"
 
 #include "core/device.h"
+#include "ops/common/route_order.cuh"
 #include "ops/common/silu.h"
 
 #include <cuda_bf16.h>
@@ -551,7 +552,7 @@ __global__ void route_topk_kernel(const float* __restrict__ logits, int experts,
     __shared__ float chosen[8];
     __shared__ int chosen_id[8];
     const int t = blockIdx.x, e = threadIdx.x;
-    if (e < experts) { v[e] = logits[std::int64_t(t) * experts + e]; }
+    if (e < experts) { v[e] = ops::route_order(logits[std::int64_t(t) * experts + e]); }
     __syncthreads();
     if (e < experts) {
         const float mine = v[e];
@@ -608,7 +609,8 @@ __device__ void select_routes(const float* logits, int tokens, int experts, int 
     __shared__ int warp_total[kTopkMaxExperts / 32][2];
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
     for (int t = 0; t < tokens; ++t) {
-        v[e] = e < experts ? __ldcg(logits + std::int64_t(t) * experts + e) : -INFINITY;
+        v[e] = e < experts ? ops::route_order(__ldcg(logits + std::int64_t(t) * experts + e))
+                           : -INFINITY;
         __syncthreads();
         if (e < experts) {
             const float mine = v[e];

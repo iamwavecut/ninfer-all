@@ -27,8 +27,9 @@
 //  - the grouped output projection of one to eight tokens as one vector product over the groups:
 //    every value the bits of its group's own vector product (Q5_K).
 //  - route (ties to the lower id, the softplus branch past 20, image rows by the image routing
-//    bias), clamped_swiglu (the clamps, rows scaled per token), moe_combine (weighted rows and
-//    2^-32 fixed-point sums).
+//    bias; a NaN row takes experts 0..top_k-1, the other rows select as without it),
+//    clamped_swiglu (the clamps, rows scaled per token), moe_combine (weighted rows and 2^-32
+//    fixed-point sums).
 //  - engram_rows (IQ4_NL), engram_gate (image rows passed through); the Engram hash ids of dead
 //    (image) positions and of the positions after them, in one call and across calls.
 //  - place_rows: an image's BF16 rows into stream 0 of their positions, nothing else written.
@@ -66,6 +67,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1636,6 +1638,41 @@ void route(int tokens, bool ties, std::mt19937& rng, bool images = false) {
                std::to_string(close) + " rows too close to judge");
 }
 
+// A NaN logits row (an overflowed hidden state): its token selects experts 0..top_k-1, and the
+// other rows select as they do without it.
+void route_nan(std::mt19937& rng) {
+    constexpr int kTokens = 3;
+    std::normal_distribution<float> normal(0.0f, 2.0f);
+    std::uniform_real_distribution<float> uniform(-0.1f, 0.1f);
+    std::vector<float> logits(std::size_t(kTokens) * kExperts), bias(kExperts);
+    for (auto& v : logits) { v = normal(rng); }
+    for (auto& v : bias) { v = uniform(rng); }
+    DeviceBuffer db = upload(bias), ids(std::size_t(kTokens) * kTopK * 4),
+                 weights(std::size_t(kTokens) * kTopK * 4);
+    const auto route = [&](const std::vector<float>& input) {
+        DeviceBuffer dl = upload(input);
+        k::route(as<float>(dl), as<float>(db), kTokens, kExperts, kTopK, 1.0f,
+                 as<std::int32_t>(ids), as<float>(weights), nullptr);
+        sync("route NaN row");
+        return download<std::int32_t>(ids, std::size_t(kTokens) * kTopK);
+    };
+    const auto clean = route(logits);
+    for (int e = 0; e < kExperts; ++e) { logits[std::size_t(kExperts) + e] = std::nanf(""); }
+    const auto got = route(logits);
+    bool ok = true;
+    for (int t = 0; t < kTokens; ++t) {
+        std::set<int> chosen;
+        for (int j = 0; j < kTopK; ++j) {
+            const int e = got[std::size_t(t) * kTopK + j];
+            ok = ok && e >= 0 && e < kExperts && chosen.insert(e).second;
+            // Every expert of the NaN row ties at the lowest score, so the lower index wins: the
+            // row takes experts 0..top_k-1 (stale shared memory would leave other ids).
+            ok = ok && e == (t == 1 ? j : clean[std::size_t(t) * kTopK + j]);
+        }
+    }
+    report(ok, "route NaN row");
+}
+
 void swiglu(int tokens, bool scaled, std::mt19937& rng) {
     const int per = scaled ? kTopK : 1, rows = tokens * per;
     const std::int64_t x_stride = 2 * kWidth, out_stride = kWidth + 64;
@@ -2446,6 +2483,7 @@ int main() {
         route(40, false, rng);
         route(1, true, rng);
         route(9, false, rng, true);
+        route_nan(rng);
         swiglu(5, true, rng);
         swiglu(3, false, rng);
         moe_combine(1, rng);
