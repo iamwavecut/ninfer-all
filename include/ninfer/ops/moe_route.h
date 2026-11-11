@@ -28,8 +28,13 @@ namespace ninfer::ops {
  */
 [[nodiscard]] std::size_t moe_route_workspace_bytes(std::int32_t tokens, std::int32_t experts);
 
+/**
+ * `done`, when given, is a device counter that is zero before the call and that no other call
+ * uses at the same time; the call leaves it at zero. With it, a call of up to eight tokens selects
+ * without a launch of its own. ids, weights and shared have the same bits either way.
+ */
 void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
                WorkspaceArena& workspace, Tensor& ids, Tensor& weights, Tensor& shared,
-               cudaStream_t stream);
+               cudaStream_t stream, std::uint32_t* done = nullptr);
 
 } // namespace ninfer::ops

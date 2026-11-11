@@ -1,6 +1,7 @@
 #include "ops/linear/bf16/bf16_general.cuh"
 #include "core/device.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
+#include "ops/linear/bf16/bf16_vector.h"
 
 #include <cublas_v2.h>
 
@@ -8,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -63,6 +65,15 @@ void launch_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <int T>
+void launch_gemv_together(const Tensor& x, const GemvProducts<__nv_bfloat16>& products,
+                          std::int32_t blocks, cudaStream_t stream) {
+    bf16_general_gemv_together_kernel<T, __nv_bfloat16>
+        <<<static_cast<unsigned>(blocks), kGemvWarps * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), products, x.ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool aligned16(const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0; }
 
 // Runtime-shape bf16 GEMM used for every linear projection the specialised bf16 kernels do not
@@ -108,6 +119,61 @@ void bf16_general_gemm(const Tensor& x, const Weight& weight, Tensor& out, cudaS
 }
 
 } // namespace
+
+bool bf16_general_vector(const Tensor& x, const Weight& weight) {
+    const std::int32_t T = x.ne[1];
+    return T < kCublasMinTokens && T <= kGemvMaxTokens && weight.k % 8 == 0 &&
+           aligned16(x.data) && aligned16(weight.qdata);
+}
+
+void bf16_general_vector_together(const Tensor& x, std::span<const Bf16VectorProduct> products,
+                                  cudaStream_t stream) {
+    for (const Bf16VectorProduct& product : products) {
+        if (product.out->dtype != DType::BF16 || product.weight->k != x.ne[0] ||
+            !bf16_general_vector(x, *product.weight)) {
+            throw std::invalid_argument("bf16 vector products: a product outside the GEMV form");
+        }
+    }
+    for (std::size_t first = 0; first < products.size(); first += kGemvTogether) {
+        GemvProducts<__nv_bfloat16> launch{};
+        std::int32_t blocks = 0;
+        for (std::size_t i = first; i < products.size() && launch.count < kGemvTogether; ++i) {
+            const Bf16VectorProduct& product = products[i];
+            launch.weight[launch.count] = static_cast<const __nv_bfloat16*>(product.weight->qdata);
+            launch.out[launch.count]    = static_cast<__nv_bfloat16*>(product.out->data);
+            launch.n[launch.count]      = product.weight->n;
+            launch.first_block[launch.count] = blocks;
+            blocks += (product.weight->n + kGemvWarps - 1) / kGemvWarps;
+            ++launch.count;
+        }
+        switch (x.ne[1]) {
+        case 1:
+            launch_gemv_together<1>(x, launch, blocks, stream);
+            break;
+        case 2:
+            launch_gemv_together<2>(x, launch, blocks, stream);
+            break;
+        case 3:
+            launch_gemv_together<3>(x, launch, blocks, stream);
+            break;
+        case 4:
+            launch_gemv_together<4>(x, launch, blocks, stream);
+            break;
+        case 5:
+            launch_gemv_together<5>(x, launch, blocks, stream);
+            break;
+        case 6:
+            launch_gemv_together<6>(x, launch, blocks, stream);
+            break;
+        case 7:
+            launch_gemv_together<7>(x, launch, blocks, stream);
+            break;
+        default:
+            launch_gemv_together<8>(x, launch, blocks, stream);
+            break;
+        }
+    }
+}
 
 [[nodiscard]] Bf16Launch select_bf16_general_launch(std::int32_t tokens) {
     (void)tokens;

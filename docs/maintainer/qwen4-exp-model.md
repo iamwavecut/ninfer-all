@@ -43,9 +43,10 @@ Built and kept experimental, not published:
 - the HF-source Q4/Q5 recipe (`qwen3_8_flash_next`), whose full-model quality is unmeasured, and the
   FP8 n-gram table, rejected for its 80% larger rows.
 
-Not supported: DFlash or DFlash2 (no drafter exists for this model; PixelML's NVFP4 DFlash drafter
-is a research artifact for vLLM), n-gram copy proposals, `--lm-head-draft`,
-`--mtp-attention-window`, disk residency of native banks. The Windows paths have not been run.
+DFlash2 drafts from the optional `dflash2` component ([DFlash and DFlash2](dflash.md#qwen38-flash-next)).
+Not supported: DFlash (PixelML's NVFP4 DFlash drafter is a research artifact for vLLM), n-gram copy
+proposals (`--ngram-draft-tokens`), `--lm-head-draft`, `--mtp-attention-window`, disk residency of
+native banks. The Windows paths have not been run.
 
 ---
 

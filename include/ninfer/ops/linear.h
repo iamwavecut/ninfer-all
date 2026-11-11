@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -200,6 +201,26 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
  * @param[in] stream CUDA stream on which execution is enqueued.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+
+/// One projection of linear_together: its weight, its output and the compute policy of its call.
+struct LinearInto {
+    const Weight* weight = nullptr;
+    Tensor* out          = nullptr;
+    LinearPolicy policy  = LinearPolicy::A16Only;
+};
+
+/**
+ * @brief Applies several bias-free projections of one input, each as linear() applies it.
+ *
+ * @details Every `out` receives the bytes that `linear(x, *weight, *out, policy, workspace,
+ * stream)` writes, under the same requirements on each problem. The BF16 problems whose own call
+ * runs the runtime-shape route's GEMV form (no registered shape, T up to 8, K a multiple of 8, a
+ * BF16 `out`) share one launch, four at a time, and every row runs that form's arithmetic; every
+ * other problem takes a call of its own. The outputs must not overlap each other, `x` or any
+ * weight plane. `workspace` is sized for the largest problem's linear_workspace_capacity_bytes().
+ */
+void linear_together(const Tensor& x, std::span<const LinearInto> list, WorkspaceArena& workspace,
+                     cudaStream_t stream);
 
 // Whether Linear writes an FP32 `out` for `format` and takes it at runtime shapes: BF16, GGUF and
 // the RowSplit, FP8 and NVFP4 formats; a tensor-parallel rank's piece of a projection is one.

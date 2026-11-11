@@ -2,6 +2,7 @@
 #include "ninfer/ops/linear.h"
 
 #include "ops/linear/bf16/bf16_dispatch.h"
+#include "ops/linear/bf16/bf16_vector.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
@@ -21,6 +22,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -231,6 +233,22 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
+}
+
+void linear_together(const Tensor& x, std::span<const LinearInto> list, WorkspaceArena& workspace,
+                     cudaStream_t stream) {
+    std::vector<detail::Bf16VectorProduct> vector;
+    for (const LinearInto& into : list) {
+        validate_linear_semantics(x, *into.weight, *into.out, into.policy);
+        if (into.weight->qtype == QType::BF16 &&
+            !sm70_route(x, *into.weight, into.policy, &workspace) &&
+            detail::bf16_dispatch_vector(x, *into.weight, *into.out, into.policy)) {
+            vector.push_back({.weight = into.weight, .out = into.out});
+            continue;
+        }
+        dispatch_linear(x, *into.weight, *into.out, into.policy, &workspace, stream);
+    }
+    if (!vector.empty()) { detail::bf16_general_vector_together(x, vector, stream); }
 }
 
 bool linear_writes_fp32(QType format) noexcept {

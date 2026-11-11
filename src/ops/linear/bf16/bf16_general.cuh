@@ -111,15 +111,13 @@ __device__ __forceinline__ void unpack_bf16x8(const uint4& v, float (&out)[8]) {
     }
 }
 
+// One warp's output row of the GEMV form: lane `lane` of the warp that owns `row`.
 template <int T, class Out>
-__global__ void __launch_bounds__(kGemvWarps * 32)
-    bf16_general_gemv_kernel(const __nv_bfloat16* __restrict__ x,
-                             const __nv_bfloat16* __restrict__ weight,
-                             Out* __restrict__ out, std::int32_t N, std::int32_t K) {
-    const std::int32_t row  = static_cast<std::int32_t>(blockIdx.x) * kGemvWarps +
-                              static_cast<std::int32_t>(threadIdx.x >> 5);
-    const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x & 31);
-    if (row >= N) { return; }
+__device__ __forceinline__ void bf16_general_gemv_row(const __nv_bfloat16* __restrict__ x,
+                                                      const __nv_bfloat16* __restrict__ weight,
+                                                      Out* __restrict__ out, std::int32_t N,
+                                                      std::int32_t K, std::int32_t row,
+                                                      std::int32_t lane) {
     const auto* w = reinterpret_cast<const uint4*>(weight + static_cast<std::int64_t>(row) * K);
     const std::int32_t vectors = K / 8;
     float acc[T]               = {};
@@ -148,6 +146,50 @@ __global__ void __launch_bounds__(kGemvWarps * 32)
             store_result(out + static_cast<std::int64_t>(t) * N + row, acc[t]);
         }
     }
+}
+
+template <int T, class Out>
+__global__ void __launch_bounds__(kGemvWarps * 32)
+    bf16_general_gemv_kernel(const __nv_bfloat16* __restrict__ x,
+                             const __nv_bfloat16* __restrict__ weight,
+                             Out* __restrict__ out, std::int32_t N, std::int32_t K) {
+    const std::int32_t row  = static_cast<std::int32_t>(blockIdx.x) * kGemvWarps +
+                              static_cast<std::int32_t>(threadIdx.x >> 5);
+    const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x & 31);
+    if (row >= N) { return; }
+    bf16_general_gemv_row<T, Out>(x, weight, out, N, K, row, lane);
+}
+
+// Up to kGemvTogether GEMV-form products of one x in one launch: product i takes the blocks from
+// first_block[i], kGemvWarps rows each, and every row runs bf16_general_gemv_row as its own launch
+// runs it.
+constexpr std::int32_t kGemvTogether = 4;
+
+template <class Out>
+struct GemvProducts {
+    const __nv_bfloat16* weight[kGemvTogether];
+    Out* out[kGemvTogether];
+    std::int32_t n[kGemvTogether];
+    std::int32_t first_block[kGemvTogether];
+    std::int32_t count;
+};
+
+template <int T, class Out>
+__global__ void __launch_bounds__(kGemvWarps * 32)
+    bf16_general_gemv_together_kernel(const __nv_bfloat16* __restrict__ x,
+                                      const GemvProducts<Out> products, std::int32_t K) {
+    const auto block = static_cast<std::int32_t>(blockIdx.x);
+    std::int32_t p   = 0;
+#pragma unroll
+    for (int i = 1; i < kGemvTogether; ++i) {
+        if (i < products.count && block >= products.first_block[i]) { p = i; }
+    }
+    const std::int32_t row = (block - products.first_block[p]) * kGemvWarps +
+                             static_cast<std::int32_t>(threadIdx.x >> 5);
+    const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x & 31);
+    if (row >= products.n[p]) { return; }
+    bf16_general_gemv_row<T, Out>(x, products.weight[p], products.out[p], products.n[p], K, row,
+                                  lane);
 }
 
 } // namespace ninfer::ops::detail

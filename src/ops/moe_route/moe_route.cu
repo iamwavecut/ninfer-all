@@ -3,7 +3,8 @@
 // and the router streamed in 16-byte vectors by every CTA of the device (or, for a BF16 input of
 // more than eight tokens, as cuBLAS tensor-core GEMMs with FP32 accumulation), then one warp per
 // token taking ten rounds of an arg-max over its logits that prefers the lower index on ties
-// (softmax is monotonic).
+// (softmax is monotonic). Given a completion counter, a call of up to eight tokens runs the
+// second step in the GEMV's last CTA instead of a launch of its own, with the same code.
 #include "ninfer/ops/moe_route.h"
 
 #include "core/device.h"
@@ -66,69 +67,23 @@ __device__ __forceinline__ void load_input(const Input* p, float (&out)[8]) {
     }
 }
 
-// logits[t, row] for rows 0..E (row E the shared gate), FP32 [E + 1, tokens].
-template <typename Input>
-__global__ void __launch_bounds__(kRowWarps * 32)
-    moe_route_logits_kernel(const Input* __restrict__ m, const __nv_bfloat16* __restrict__ router,
-                            const __nv_bfloat16* __restrict__ shared_gate, int experts, int tokens,
-                            float* __restrict__ logits) {
-    const int row   = blockIdx.x * kRowWarps + (threadIdx.x >> 5);
-    const int lane  = threadIdx.x & 31;
-    const int t0    = blockIdx.y * kColumnChunk;
-    const int count = min(kColumnChunk, tokens - t0);
-    if (row > experts) { return; }
-    const auto* w = reinterpret_cast<const uint4*>(
-        row < experts ? router + static_cast<std::int64_t>(row) * kHidden : shared_gate);
-    // Every weight load of the lane is in flight before the first product.
-    uint4 wv[kVectorsPerLane];
-#pragma unroll
-    for (int i = 0; i < kVectorsPerLane; ++i) { wv[i] = __ldg(w + lane + 32 * i); }
-    float acc[kColumnChunk] = {};
-#pragma unroll
-    for (int i = 0; i < kVectorsPerLane; ++i) {
-        const int v = lane + 32 * i;
-        float wf[8];
-        unpack_bf16x8(wv[i], wf);
-#pragma unroll
-        for (int j = 0; j < kColumnChunk; ++j) {
-            if (j < count) {
-                float x[8];
-                load_input(m + static_cast<std::int64_t>(t0 + j) * kHidden + 8 * v, x);
-#pragma unroll
-                for (int e = 0; e < 8; ++e) { acc[j] = fmaf(wf[e], x[e], acc[j]); }
-            }
-        }
-    }
-    float mine = 0.0f;
-#pragma unroll
-    for (int j = 0; j < kColumnChunk; ++j) {
-        if (j < count) { // uniform across the warp
-            const float v = warp_sum(acc[j]);
-            if (j == lane) { mine = v; }
-        }
-    }
-    if (lane < count) { logits[static_cast<std::int64_t>(t0 + lane) * (experts + 1) + row] = mine; }
-}
-
 // The better of two (logit, expert) candidates: the larger logit, the lower expert on a tie.
 __device__ __forceinline__ bool better(float value, int index, float other, int other_index) {
     return value > other || (value == other && index < other_index);
 }
 
-__global__ void __launch_bounds__(kSelectWarps * 32)
-    moe_route_select_kernel(const float* __restrict__ logits, int experts, int tokens,
-                            int* __restrict__ ids, float* __restrict__ weights,
-                            float* __restrict__ shared) {
-    const int t    = blockIdx.x * kSelectWarps + (threadIdx.x >> 5);
-    const int lane = threadIdx.x & 31;
-    if (t >= tokens) { return; }
-    const float* row = logits + static_cast<std::int64_t>(t) * (experts + 1);
+// Token t's selection from its logits `row` (the E experts, then the shared gate), by one warp.
+// The loads bypass L1: in the GEMV's last CTA, other CTAs wrote the row.
+__device__ __forceinline__ void select_token(const float* __restrict__ row, int experts, int t,
+                                             int lane, int* __restrict__ ids,
+                                             float* __restrict__ weights,
+                                             float* __restrict__ shared) {
     // Lane l holds experts l, l + 32, ...: ascending within a lane.
     float values[kLogitsPerLane];
 #pragma unroll
     for (int i = 0; i < kLogitsPerLane; ++i) {
         const int e = lane + 32 * i;
-        values[i]   = e < experts ? route_order(row[e]) : -INFINITY;
+        values[i]   = e < experts ? route_order(__ldcg(row + e)) : -INFINITY;
     }
     float chosen[kTopK];
     int chosen_index[kTopK];
@@ -164,7 +119,7 @@ __global__ void __launch_bounds__(kSelectWarps * 32)
         }
     }
     if (lane != 0) { return; }
-    shared[t] = 1.0f / (1.0f + __expf(-row[experts]));
+    shared[t] = 1.0f / (1.0f + __expf(-__ldcg(row + experts)));
     // Renormalised softmax over the chosen ten: the full softmax's denominator cancels.
     float sum = 0.0f;
     float e[kTopK];
@@ -174,6 +129,85 @@ __global__ void __launch_bounds__(kSelectWarps * 32)
     for (int k = 0; k < kTopK; ++k) {
         ids[t * kTopK + k]     = chosen_index[k];
         weights[t * kTopK + k] = e[k] / sum;
+    }
+}
+
+__global__ void __launch_bounds__(kSelectWarps * 32)
+    moe_route_select_kernel(const float* __restrict__ logits, int experts, int tokens,
+                            int* __restrict__ ids, float* __restrict__ weights,
+                            float* __restrict__ shared) {
+    const int t    = blockIdx.x * kSelectWarps + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (t >= tokens) { return; }
+    select_token(logits + static_cast<std::int64_t>(t) * (experts + 1), experts, t, lane, ids,
+                 weights, shared);
+}
+
+// logits[t, row] for rows 0..E (row E the shared gate), FP32 [E + 1, tokens]. With Select (one
+// column chunk, a grid of one row of CTAs), each CTA counts itself in `done` once its logits have
+// reached the device, and the last one counted selects every token, a warp a token, and leaves
+// `done` at zero.
+template <typename Input, bool Select>
+__global__ void __launch_bounds__(kRowWarps * 32)
+    moe_route_logits_kernel(const Input* __restrict__ m, const __nv_bfloat16* __restrict__ router,
+                            const __nv_bfloat16* __restrict__ shared_gate, int experts, int tokens,
+                            float* __restrict__ logits, unsigned int* __restrict__ done,
+                            int* __restrict__ ids, float* __restrict__ weights,
+                            float* __restrict__ shared) {
+    const int row    = blockIdx.x * kRowWarps + (threadIdx.x >> 5);
+    const int lane   = threadIdx.x & 31;
+    const int t0     = blockIdx.y * kColumnChunk;
+    const int count  = min(kColumnChunk, tokens - t0);
+    const bool owned = row <= experts;
+    if (!Select && !owned) { return; }
+    if (owned) {
+        const auto* w = reinterpret_cast<const uint4*>(
+            row < experts ? router + static_cast<std::int64_t>(row) * kHidden : shared_gate);
+        // Every weight load of the lane is in flight before the first product.
+        uint4 wv[kVectorsPerLane];
+#pragma unroll
+        for (int i = 0; i < kVectorsPerLane; ++i) { wv[i] = __ldg(w + lane + 32 * i); }
+        float acc[kColumnChunk] = {};
+#pragma unroll
+        for (int i = 0; i < kVectorsPerLane; ++i) {
+            const int v = lane + 32 * i;
+            float wf[8];
+            unpack_bf16x8(wv[i], wf);
+#pragma unroll
+            for (int j = 0; j < kColumnChunk; ++j) {
+                if (j < count) {
+                    float x[8];
+                    load_input(m + static_cast<std::int64_t>(t0 + j) * kHidden + 8 * v, x);
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) { acc[j] = fmaf(wf[e], x[e], acc[j]); }
+                }
+            }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kColumnChunk; ++j) {
+            if (j < count) { // uniform across the warp
+                const float v = warp_sum(acc[j]);
+                if (j == lane) { mine = v; }
+            }
+        }
+        if (lane < count) {
+            logits[static_cast<std::int64_t>(t0 + lane) * (experts + 1) + row] = mine;
+        }
+    }
+    if constexpr (Select) {
+        __shared__ bool last;
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) { last = atomicAdd(done, 1u) + 1u == gridDim.x; }
+        __syncthreads();
+        if (!last) { return; }
+        __threadfence();
+        for (int t = threadIdx.x >> 5; t < count; t += kRowWarps) {
+            select_token(logits + static_cast<std::int64_t>(t) * (experts + 1), experts, t, lane,
+                         ids, weights, shared);
+        }
+        if (threadIdx.x == 0) { *done = 0; }
     }
 }
 
@@ -226,7 +260,7 @@ std::size_t moe_route_workspace_bytes(std::int32_t tokens, std::int32_t experts)
 
 void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
                WorkspaceArena& workspace, Tensor& ids, Tensor& weights, Tensor& shared,
-               cudaStream_t stream) {
+               cudaStream_t stream, std::uint32_t* done) {
     require((m.dtype == DType::BF16 || m.dtype == DType::FP32) && m.is_contiguous() &&
                 m.data != nullptr && aligned16(m.data) && m.ne[0] == kHidden && m.ne[1] > 0 &&
                 m.ne[2] == 1,
@@ -255,24 +289,34 @@ void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
     const auto* r  = static_cast<const __nv_bfloat16*>(router.data);
     const auto* g  = static_cast<const __nv_bfloat16*>(shared_gate.data);
     auto* logits_p = static_cast<float*>(logits.data);
+    auto* ids_p     = static_cast<int*>(ids.data);
+    auto* weights_p = static_cast<float*>(weights.data);
+    auto* shared_p  = static_cast<float*>(shared.data);
     const dim3 grid(static_cast<unsigned>((experts + 1 + kRowWarps - 1) / kRowWarps),
                     static_cast<unsigned>((tokens + kColumnChunk - 1) / kColumnChunk));
+    // One column chunk with a counter: the GEMV's last CTA selects.
+    const bool fused = done != nullptr && tokens <= kColumnChunk;
+    const auto gemv  = [&]<typename Input, bool Select>(const Input* x) {
+        moe_route_logits_kernel<Input, Select><<<grid, kRowWarps * 32, 0, stream>>>(
+            x, r, g, experts, tokens, logits_p, done, ids_p, weights_p, shared_p);
+    };
     if (m.dtype == DType::FP32) {
-        moe_route_logits_kernel<float><<<grid, kRowWarps * 32, 0, stream>>>(
-            static_cast<const float*>(m.data), r, g, experts, tokens, logits_p);
+        const auto* x = static_cast<const float*>(m.data);
+        fused ? gemv.template operator()<float, true>(x) : gemv.template operator()<float, false>(x);
     } else if (tokens > kColumnChunk) {
         const auto* x = static_cast<const __nv_bfloat16*>(m.data);
         logits_gemm(stream, r, experts, x, tokens, logits_p, experts + 1);
         logits_gemm(stream, g, 1, x, tokens, logits_p + experts, experts + 1);
     } else {
-        moe_route_logits_kernel<__nv_bfloat16><<<grid, kRowWarps * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(m.data), r, g, experts, tokens, logits_p);
+        const auto* x = static_cast<const __nv_bfloat16*>(m.data);
+        fused ? gemv.template operator()<__nv_bfloat16, true>(x)
+              : gemv.template operator()<__nv_bfloat16, false>(x);
     }
     CUDA_CHECK(cudaGetLastError());
+    if (fused) { return; }
     moe_route_select_kernel<<<static_cast<unsigned>((tokens + kSelectWarps - 1) / kSelectWarps),
-                              kSelectWarps * 32, 0, stream>>>(
-        logits_p, experts, tokens, static_cast<int*>(ids.data), static_cast<float*>(weights.data),
-        static_cast<float*>(shared.data));
+                              kSelectWarps * 32, 0, stream>>>(logits_p, experts, tokens, ids_p,
+                                                              weights_p, shared_p);
     CUDA_CHECK(cudaGetLastError());
 }
 

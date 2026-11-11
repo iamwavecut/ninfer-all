@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <string>
 #include <thread>
@@ -326,6 +327,115 @@ int run_general_bf16_linear() {
     return failures;
 }
 
+// linear_together writes into every output the bytes of that output's own linear call: the
+// GEMV-form BF16 problems in shared launches (six of them at K=2560: two launches), a registered
+// shape, an FP32 result and the widths past the GEMV form in calls of their own; eager and in a
+// captured graph.
+int run_linear_together() {
+    struct Problem {
+        std::int32_t rows = 0;
+        bool fp32         = false;
+    };
+    struct Case {
+        std::int32_t k = 0;
+        std::vector<Problem> problems;
+    };
+    const std::vector<Case> cases = {
+        // Flash-Next's Gated DeltaNet a and b and its indexer, odd row counts, an FP32 result.
+        {2560, {{32}, {32}, {640}, {50}, {32, true}, {7}, {33}}},
+        // A registered shape beside two that take the GEMV form.
+        {5120, {{256}, {48}, {32}}},
+    };
+    DeviceContext context;
+    int failures       = 0;
+    std::uint32_t seed = 431U;
+    for (const Case& c : cases) {
+        std::vector<std::unique_ptr<DeviceWeight>> weights;
+        std::vector<Weight> views;
+        for (const Problem& problem : c.problems) {
+            weights.push_back(
+                std::make_unique<DeviceWeight>(make_patterned(problem.rows, c.k, seed++)));
+            views.push_back(weights.back()->view());
+        }
+        for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 33}) {
+            const auto bits    = make_activation_bits(c.k, tokens);
+            DeviceBuffer input = to_device(bits);
+            Tensor x(input.p, DType::BF16, {c.k, tokens});
+            std::size_t capacity = 256;
+            for (const Problem& problem : c.problems) {
+                capacity = std::max(capacity, ops::linear_workspace_capacity_bytes(
+                                                  QType::BF16, problem.rows, c.k,
+                                                  ops::LinearPolicy::A16Only, tokens, tokens));
+            }
+            DeviceArena scratch(capacity);
+            std::vector<std::unique_ptr<GuardedDeviceBuffer>> own, together;
+            std::vector<Tensor> own_out, together_out;
+            std::vector<std::size_t> bytes;
+            for (const Problem& problem : c.problems) {
+                bytes.push_back(std::size_t(problem.rows) * std::size_t(tokens) *
+                                (problem.fp32 ? sizeof(float) : sizeof(std::uint16_t)));
+                const DType dtype = problem.fp32 ? DType::FP32 : DType::BF16;
+                own.push_back(std::make_unique<GuardedDeviceBuffer>(bytes.back()));
+                together.push_back(std::make_unique<GuardedDeviceBuffer>(bytes.back()));
+                own.back()->fill(0xff);
+                own_out.push_back(Tensor(own.back()->data(), dtype, {problem.rows, tokens}));
+                together_out.push_back(
+                    Tensor(together.back()->data(), dtype, {problem.rows, tokens}));
+            }
+            std::vector<ops::LinearInto> list;
+            for (std::size_t i = 0; i < c.problems.size(); ++i) {
+                ops::linear(x, views[i], own_out[i], ops::LinearPolicy::A16Only, scratch,
+                            context.stream);
+                list.push_back({.weight = &views[i],
+                                .out    = &together_out[i],
+                                .policy = ops::LinearPolicy::A16Only});
+            }
+            cuda_synchronize(context.stream);
+            const std::string label =
+                "BF16 linear_together K=" + std::to_string(c.k) + " T=" + std::to_string(tokens);
+            for (const bool replay : {false, true}) {
+                for (auto& buffer : together) { buffer->fill(0xff); }
+                if (replay) {
+                    DecodeGraphDefinition definition;
+                    DecodeGraphExecutable graph;
+                    definition.capture(context.stream, [&] {
+                        ops::linear_together(x, list, scratch, context.stream);
+                    });
+                    graph.instantiate(definition);
+                    graph.launch(context.stream);
+                } else {
+                    ops::linear_together(x, list, scratch, context.stream);
+                }
+                cuda_synchronize(context.stream);
+                if (scratch.used() != 0) {
+                    std::cerr << label << ": workspace scope mismatch\n";
+                    ++failures;
+                }
+                for (std::size_t i = 0; i < c.problems.size(); ++i) {
+                    const std::string what = label + (replay ? " graph" : " eager") +
+                                             " rows=" + std::to_string(c.problems[i].rows) +
+                                             (c.problems[i].fp32 ? " fp32" : "");
+                    failures += together[i]->verify_guards(what);
+                    failures += own[i]->verify_guards(what + " own call");
+                    if (from_device<std::uint8_t>(together[i]->data(), bytes[i]) !=
+                        from_device<std::uint8_t>(own[i]->data(), bytes[i])) {
+                        std::cerr << what << ": differs from its own linear call\n";
+                        ++failures;
+                    }
+                }
+            }
+            if (from_device<std::uint16_t>(input, bits.size()) != bits) {
+                std::cerr << label << ": modified input\n";
+                ++failures;
+            }
+        }
+        for (const auto& weight : weights) {
+            failures += weight->verify_preserved("BF16 linear_together weight");
+        }
+    }
+    return failures;
+}
+
 int run_bf16_linear() {
     int failures = 0;
     DeviceWeight attention_weight(make_patterned(14336, 5120, 401U));
@@ -344,6 +454,7 @@ int run_bf16_linear() {
     }
     failures += run_selector_linear();
     failures += run_general_bf16_linear();
+    failures += run_linear_together();
     return failures;
 }
 

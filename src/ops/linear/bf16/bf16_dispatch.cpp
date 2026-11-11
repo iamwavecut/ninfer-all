@@ -1,6 +1,7 @@
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_shapes_unified.h"
+#include "ops/linear/bf16/bf16_vector.h"
 #include "ops/linear/common/route_table.h"
 #include <array>
 #include <stdexcept>
@@ -49,5 +50,13 @@ void bf16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
                                   ? select_bf16_general_launch(x.ne[1])
                                   : select_bf16_launch(weight.n, weight.k, x.ne[1], policy);
     launch(x, weight, out, stream);
+}
+
+bool bf16_dispatch_vector(const Tensor& x, const Weight& weight, const Tensor& out,
+                          LinearPolicy policy) {
+    return out.dtype == DType::BF16 &&
+           select_bf16_launch(weight.n, weight.k, x.ne[1], policy) ==
+               select_bf16_general_launch(x.ne[1]) &&
+           bf16_general_vector(x, weight);
 }
 } // namespace ninfer::ops::detail
