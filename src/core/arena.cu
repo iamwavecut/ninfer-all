@@ -107,22 +107,13 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     return *this;
 }
 
-// The same contract for a fill: CUDA documents `cudaMemset` on device memory as asynchronous with
-// respect to the host, and it completes on the legacy stream, which a non-blocking stream does not
-// wait for. Unlike `copy_from_host` below this one has *not* been observed to race on this box --
-// tests/test_device_buffer_visibility.cu exercises it 90 times per run and has never caught it, so
-// on this driver the memset appears to complete before the call returns. That is an implementation
-// detail rather than a guarantee, and the sync costs nothing on a path every caller uses at setup,
-// so make the contract explicit rather than depend on the observation.
+// `fill_and_wait` waits for the legacy stream that `cudaMemset` runs on, so the zeros are visible
+// to the non-blocking streams the caller uses next.
 void DeviceBuffer::fill(int byte_value) {
     if (bytes == 0) { return; }
     const cudaError_t err = ninfer::fill_and_wait(p, byte_value, bytes);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemset failed", err));
-    }
-    const cudaError_t sync = ninfer::wait_for_stream(nullptr);
-    if (sync != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("fill completion sync failed", sync));
     }
 }
 
@@ -132,7 +123,7 @@ void DeviceBuffer::fill(int byte_value) {
 // completed". That trailing DMA rides the legacy stream, and a stream created with
 // `cudaStreamNonBlocking` -- which is every stream `DeviceContext` owns -- is exempt from the
 // legacy stream's implicit ordering. So work enqueued on one of those streams immediately after
-// this call can, and does, read the destination before the copy lands.
+// a bare `cudaMemcpy` can, and does, read the destination before the copy lands.
 //
 // Measured on this RTX 3090 with a faithful replica of the sequence
 // tests/ops/test_attn_input_proj.cpp runs at graph replay phase 1 -- a 1,146,880-byte pageable
@@ -141,10 +132,10 @@ void DeviceBuffer::fill(int byte_value) {
 // *otherwise idle* GPU. Copies at or below ~256 KiB never raced; every size above it did.
 // tests/test_device_buffer_visibility.cu is that experiment, reduced.
 //
-// Synchronizing the legacy stream here costs one round trip on a path that is load-time setup in
-// every caller, and makes the method mean what its name says: on return, the bytes are visible to
-// any stream. Callers wanting an overlapped copy should use an explicitly stream-ordered one
-// (`cudaMemcpy2DAsync`, as the paged-KV and state-image pools already do) rather than this.
+// `copy_and_wait` therefore synchronizes the legacy stream after the copy: on return, the bytes
+// are visible to any stream. Callers wanting an overlapped copy should use an explicitly
+// stream-ordered one (`cudaMemcpy2DAsync`, as the paged-KV and state-image pools already do)
+// rather than this.
 void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset) {
     require_range(byte_offset, count, "host-to-device copy");
     if (count == 0) { return; }
@@ -153,11 +144,6 @@ void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::si
         ninfer::copy_and_wait(destination, source, count, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemcpy host-to-device failed", err));
-    }
-    const cudaError_t sync = ninfer::wait_for_stream(nullptr);
-    if (sync != cudaSuccess) {
-        throw std::runtime_error(
-            cuda_error_message("host-to-device copy completion sync failed", sync));
     }
 }
 
@@ -213,11 +199,10 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
     }
-    // Under the evictable budget, commit the pages now so WDDM makes room at startup; the wait
-    // orders the fill before uploads on the non-blocking load stream.
+    // Under the evictable budget, commit the pages now so WDDM makes room at startup; the fill
+    // completes before uploads on the non-blocking load stream.
     if (core::wddm_evictable_budget()) {
-        const cudaError_t fill = ninfer::fill_and_wait(ptr, 0, capacity_bytes);
-        const cudaError_t done = fill == cudaSuccess ? ninfer::wait_for_device() : fill;
+        const cudaError_t done = ninfer::fill_and_wait(ptr, 0, capacity_bytes);
         if (done != cudaSuccess) {
             log_cuda_error("cudaFree", ninfer::free_device_memory(ptr));
             throw std::runtime_error(cuda_error_message("cudaMemset failed", done));

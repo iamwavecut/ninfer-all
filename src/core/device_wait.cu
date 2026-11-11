@@ -453,19 +453,23 @@ cudaError_t wait_for_device() noexcept {
 cudaError_t copy_and_wait(void* destination, const void* source, std::size_t bytes,
                           cudaMemcpyKind kind) noexcept {
     const DeviceWaitScope scope("a copy");
-    return cudaMemcpy(destination, source, bytes, kind);
+    const cudaError_t copy = cudaMemcpy(destination, source, bytes, kind);
+    return copy != cudaSuccess ? copy : cudaStreamSynchronize(nullptr);
 }
 
 cudaError_t copy_between_devices_and_wait(void* destination, int destination_device,
                                           const void* source, int source_device,
                                           std::size_t bytes) noexcept {
     const DeviceWaitScope scope("a copy between devices");
-    return cudaMemcpyPeer(destination, destination_device, source, source_device, bytes);
+    const cudaError_t copy =
+        cudaMemcpyPeer(destination, destination_device, source, source_device, bytes);
+    return copy != cudaSuccess ? copy : cudaStreamSynchronize(nullptr);
 }
 
 cudaError_t fill_and_wait(void* destination, int value, std::size_t bytes) noexcept {
     const DeviceWaitScope scope("a fill");
-    return cudaMemset(destination, value, bytes);
+    const cudaError_t fill = cudaMemset(destination, value, bytes);
+    return fill != cudaSuccess ? fill : cudaStreamSynchronize(nullptr);
 }
 
 cudaError_t free_device_memory(void* memory) noexcept {

@@ -31,10 +31,15 @@ struct DeviceWaitState;
 // tools that slow the device many times over (Nsight Compute, compute-sanitizer); 0 turns both
 // watches off. A watch constructed with a limit of its own keeps it.
 
-// Waits for device work. Each returns what the CUDA call it names returns.
+// Waits for device work. Each returns what the CUDA call it names returns, or the error of the
+// wait that follows it.
 cudaError_t wait_for_stream(cudaStream_t stream) noexcept;    // cudaStreamSynchronize
 cudaError_t wait_for_event(cudaEvent_t event) noexcept;       // cudaEventSynchronize
 cudaError_t wait_for_device() noexcept;                       // cudaDeviceSynchronize
+// cudaMemcpy, cudaMemcpyPeer and cudaMemset return before a copy out of pageable memory, a copy
+// between devices or a fill of device memory lands, and that work runs on the legacy stream, which
+// DeviceContext's non-blocking streams do not wait for. These three also wait for the legacy
+// stream, so on return the bytes are visible to work on any stream.
 cudaError_t copy_and_wait(void* destination, const void* source, std::size_t bytes,
                           cudaMemcpyKind kind) noexcept;      // cudaMemcpy
 cudaError_t copy_between_devices_and_wait(void* destination, int destination_device,

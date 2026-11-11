@@ -602,7 +602,9 @@ decode 行失败也走这条路。GGUF 家族的 core（Flash-Next、Gemma 4、F
 `wait_for_event`、`wait_for_device`、`copy_and_wait`、`copy_between_devices_and_wait`、`fill_and_wait`；
 可能隐式等待设备的调用经由 `free_device_memory`（`cudaFree`）、`free_host_memory`、
 `unregister_host_memory`、`launch_graph`（launch 队列已满时等待）与 `DeviceWaitScope`（`vmm::unmap`、
-`vmm::set_access`）。Engine 的 worker 与调用方线程（suspend、resume、slot 操作、score）持有
+`vmm::set_access`）。`copy_and_wait`、`copy_between_devices_and_wait` 与 `fill_and_wait` 在 CUDA 调用之后还等待
+legacy stream：pageable 拷入、设备间拷贝与设备 memset 在调用返回时未必落地，而 `DeviceContext` 的
+non-blocking stream 不与 legacy stream 同步。Engine 的 worker 与调用方线程（suspend、resume、slot 操作、score）持有
 `DeviceWaitWatch`，以名字出现在消息中；其他线程（例如加载模型的启动线程）以操作系统线程号出现。其二是
 设备探针：`DeviceContext` 的每个 rank 持有其设备的探针，进程内一个线程每 5 s 在独立的最高优先级 stream
 上提交一次 4 字节拷入、单线程 kernel 与拷回。探针不依赖任何线程的等待，因此也覆盖空闲的服务器、因
