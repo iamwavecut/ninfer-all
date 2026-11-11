@@ -438,6 +438,12 @@ struct HybridExpertOptions {
     bool adaptive_cache = false;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
+    // Disk experts: a directory on a second drive holding byte-identical copies of the artifact's
+    // files (by file name). A read goes to one of the two copies by the 1 MiB stripe of its offset,
+    // so both drives serve a call's misses. Empty: the artifact's files only.
+    std::filesystem::path mirror;
+    // Disk experts: NVMe reads straight into device memory (ExpertDirect).
+    ExpertDirect direct = ExpertDirect::Auto;
 };
 
 // The n-gram table of Qwen3.8-Flash-Next's per-layer embedding or DeepSeek-V4.1-Flash's Engram: the

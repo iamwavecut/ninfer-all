@@ -1,6 +1,8 @@
 #include "models/qwen4_exp/expert_stream.h"
 
 #include "core/device_wait.h"
+#include "core/expert_direct.h"
+#include "core/expert_mirror.h"
 #include "core/file_read_error.h"
 #include "models/qwen4_exp/read_pool.h"
 
@@ -155,7 +157,7 @@ struct ExpertStream::Impl {
     };
 
     DeviceContext& device;
-    std::vector<std::unique_ptr<File>> files;
+    std::vector<std::unique_ptr<File>> files, mirror_files; // the artifact's, a drive mirror's
     std::vector<Layer> layers;
     std::vector<Pool> pools;
     std::unique_ptr<PinnedHostBuffer> staging;
@@ -181,12 +183,20 @@ struct ExpertStream::Impl {
 
     std::vector<Read> batch_reads;
     std::vector<Copy> batch_copies;
+    // Direct reads (core/expert_direct.h): a window per rank that serves layers, by rank, in place
+    // of the host staging (its halves at the same offsets); the batch's reads, by window file (the
+    // artifact's files, then a drive mirror's).
+    std::vector<std::unique_ptr<DirectExpertWindow>> windows;
+    std::vector<DirectRead> direct_batch;
 
     Impl(DeviceContext& d, const std::vector<std::filesystem::path>& paths,
          std::vector<ExpertStreamLayer> specs, std::span<const std::uint64_t> bytes_by_rank,
-         bool grows)
+         bool grows, const ExpertDiskReads& disk)
         : device(d) {
         for (const auto& path : paths) { files.push_back(std::make_unique<File>(path)); }
+        for (const auto& path : expert_mirror_files(paths, disk.mirror)) {
+            mirror_files.push_back(std::make_unique<File>(path));
+        }
         for (auto& spec : specs) {
             Layer layer;
             const std::size_t experts = spec.experts[0].size();
@@ -243,7 +253,23 @@ struct ExpertStream::Impl {
                            first > own_bytes ? first - own_bytes : 0, shared_slot,
                            widest_shared_call));
         }
-        staging = std::make_unique<PinnedHostBuffer>(2 * kStagingHalf);
+        // Every serving rank reads directly, or none does.
+        if (disk.direct != ExpertDirect::Off && !on_rank.empty()) {
+            std::vector<std::filesystem::path> all = paths;
+            const auto mirror                      = expert_mirror_files(paths, disk.mirror);
+            all.insert(all.end(), mirror.begin(), mirror.end());
+            windows.resize(device.size());
+            for (const auto& [rank, members] : on_rank) {
+                RankBinding bind(device, rank);
+                windows[rank] = open_direct_window(disk, device.rank(rank).device, all,
+                                                   2 * kStagingHalf, "expert stream");
+                if (!windows[rank]) {
+                    windows.clear();
+                    break;
+                }
+            }
+        }
+        if (windows.empty()) { staging = std::make_unique<PinnedHostBuffer>(2 * kStagingHalf); }
         half_done.resize(device.size());
         if (!on_rank.empty()) { half_rank.fill(on_rank.begin()->first); }
         for (const auto& [rank, members] : on_rank) {
@@ -333,7 +359,8 @@ struct ExpertStream::Impl {
     }
 
     // Closes the half being filled behind the copies queued from it and starts the other one,
-    // once the copies that last read it have finished (an event never recorded is complete).
+    // once the copies that last read it have finished (an event never recorded is complete). With
+    // windows the half is a rank's own, and stage_direct() waits for that rank's copies.
     void switch_half() {
         if (half_stream != nullptr) {
             RankBinding bind(device, half_rank[half]);
@@ -341,7 +368,9 @@ struct ExpertStream::Impl {
         }
         half   = 1 - half;
         cursor = 0;
-        CUDA_CHECK(ninfer::wait_for_event(half_done.at(half_rank[half])[half]));
+        if (windows.empty()) {
+            CUDA_CHECK(ninfer::wait_for_event(half_done.at(half_rank[half])[half]));
+        }
     }
 
     // Forgets every resident expert: after a failed read some slot holds an expert it was never
@@ -361,16 +390,21 @@ struct ExpertStream::Impl {
         }
         for (Layer& layer : layers) { std::fill(layer.slot_of.begin(), layer.slot_of.end(), -1); }
         batch_reads.clear();
+        direct_batch.clear();
         batch_copies.clear();
     }
 
     // Reads the staged batch in parallel and queues its copies on `stream`.
     void flush(cudaStream_t stream) {
         try {
-            reads.run(batch_reads.size(), [&](std::size_t i) {
-                const Read& read = batch_reads[i];
-                read.file->read(read.offset, read.destination, read.bytes);
-            });
+            if (!windows.empty()) {
+                if (!direct_batch.empty()) { windows.at(half_rank[half])->read(direct_batch); }
+            } else {
+                reads.run(batch_reads.size(), [&](std::size_t i) {
+                    const Read& read = batch_reads[i];
+                    read.file->read(read.offset, read.destination, read.bytes);
+                });
+            }
         } catch (const FileReadError&) {
             forget_residents();
             throw;
@@ -379,12 +413,32 @@ struct ExpertStream::Impl {
             if (copy.source == nullptr) {
                 CUDA_CHECK(cudaMemsetAsync(copy.target, 0, copy.bytes, stream));
             } else {
-                CUDA_CHECK(cudaMemcpyAsync(copy.target, copy.source, copy.bytes,
-                                           cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    copy.target, copy.source, copy.bytes,
+                    windows.empty() ? cudaMemcpyHostToDevice : cudaMemcpyDefault, stream));
             }
         }
         batch_reads.clear();
+        direct_batch.clear();
         batch_copies.clear();
+    }
+
+    // Direct reads: `cover` window bytes (whole blocks) in the half being filled of `rank`'s
+    // window, after that half's last copies on the rank have finished; their window offset.
+    std::uint64_t stage_direct(std::uint64_t cover, std::size_t rank, cudaStream_t stream) {
+        if (cover > kStagingHalf) {
+            throw std::logic_error("expert stream: an expert exceeds the staging half");
+        }
+        if (cursor + cover > kStagingHalf || (half_stream != nullptr && half_stream != stream)) {
+            flush(half_stream != nullptr ? half_stream : stream);
+            switch_half();
+        }
+        if (cursor == 0) { CUDA_CHECK(ninfer::wait_for_event(half_done.at(rank)[half])); }
+        half_stream            = stream;
+        half_rank[half]        = rank;
+        const std::uint64_t at = half * kStagingHalf + cursor;
+        cursor += static_cast<std::size_t>(cover);
+        return at;
     }
 
     std::byte* stage(std::size_t bytes, std::size_t rank, cudaStream_t stream) {
@@ -481,16 +535,40 @@ struct ExpertStream::Impl {
             auto* base = slot_base(pool, s);
             for (int k = 0; k < 3; ++k) {
                 const ExpertLocation& location = layer.spec.experts[k][expert];
-                std::byte* buffer              = stage(location.bytes, layer.spec.rank, stream);
-                std::uint64_t at               = 0;
-                for (const auto& run : location.runs) {
-                    if (run.bytes == 0) { continue; }
-                    batch_reads.push_back({files.at(run.file).get(), run.offset, buffer + at,
-                                           static_cast<std::size_t>(run.bytes)});
-                    at += run.bytes;
+                std::byte* target              = base + pool.offset[k];
+                if (!windows.empty()) {
+                    // Each run's cover in the rank's window, and its copy out of it.
+                    const DirectExpertWindow& window = *windows.at(layer.spec.rank);
+                    std::uint64_t at                 = 0;
+                    for (const auto& run : location.runs) {
+                        if (run.bytes == 0) { continue; }
+                        const std::uint64_t window_at = stage_direct(
+                            direct_cover(run.offset, run.bytes), layer.spec.rank, stream);
+                        const bool mirrored =
+                            !mirror_files.empty() && expert_mirror_copy(run.offset) == 1;
+                        direct_batch.push_back({run.file + (mirrored ? files.size() : 0),
+                                                run.offset, run.bytes, window_at});
+                        batch_copies.push_back({target + at,
+                                                window.data() + window_at + direct_lead(run.offset),
+                                                static_cast<std::size_t>(run.bytes)});
+                        at += run.bytes;
+                    }
+                } else {
+                    std::byte* buffer = stage(location.bytes, layer.spec.rank, stream);
+                    std::uint64_t at  = 0;
+                    for (const auto& run : location.runs) {
+                        if (run.bytes == 0) { continue; }
+                        const auto& copies =
+                            mirror_files.empty() || expert_mirror_copy(run.offset) == 0
+                                ? files
+                                : mirror_files;
+                        batch_reads.push_back({copies.at(run.file).get(), run.offset, buffer + at,
+                                               static_cast<std::size_t>(run.bytes)});
+                        at += run.bytes;
+                    }
+                    batch_copies.push_back(
+                        {target, buffer, static_cast<std::size_t>(location.bytes)});
                 }
-                std::byte* target = base + pool.offset[k];
-                batch_copies.push_back({target, buffer, static_cast<std::size_t>(location.bytes)});
                 if (k == 2) {
                     if (slot.down_written > location.bytes) {
                         batch_copies.push_back({target + location.bytes, nullptr,
@@ -523,8 +601,9 @@ struct ExpertStream::Impl {
 
 ExpertStream::ExpertStream(DeviceContext& device, const std::vector<std::filesystem::path>& files,
                            std::vector<ExpertStreamLayer> layers,
-                           std::span<const std::uint64_t> bytes_by_rank, bool grows)
-    : impl_(std::make_unique<Impl>(device, files, std::move(layers), bytes_by_rank, grows)) {}
+                           std::span<const std::uint64_t> bytes_by_rank, bool grows,
+                           const ExpertDiskReads& disk)
+    : impl_(std::make_unique<Impl>(device, files, std::move(layers), bytes_by_rank, grows, disk)) {}
 
 ExpertStream::~ExpertStream() = default;
 

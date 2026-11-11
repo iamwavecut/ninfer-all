@@ -75,6 +75,10 @@ ninfer_add_test(ninfer_file_read_queue_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_file_read_queue.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_expert_direct_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_direct.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_disk_kv_bridge_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_kv_bridge.cpp"
   LIBRARIES ninfer_core)

@@ -14,6 +14,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/expert_disk.h"
 #include "models/qwen4_exp/model.h"
 
 #include <array>
@@ -51,10 +52,12 @@ class ExpertStream {
 public:
     // With `grows` (the automatic cache) the pools are laid out as `bytes_by_rank` lays them, but
     // start at half of it, or at the widest call of their layers if that is more; grow() adds to
-    // them once startup is done.
+    // them once startup is done. `disk`: a drive mirror whose copies the reads of odd stripes go
+    // to, and the direct path (core/expert_disk.h).
     ExpertStream(DeviceContext& device, const std::vector<std::filesystem::path>& files,
                  std::vector<ExpertStreamLayer> layers,
-                 std::span<const std::uint64_t> bytes_by_rank, bool grows = false);
+                 std::span<const std::uint64_t> bytes_by_rank, bool grows = false,
+                 const ExpertDiskReads& disk = {});
     ~ExpertStream();
     ExpertStream(const ExpertStream&)            = delete;
     ExpertStream& operator=(const ExpertStream&) = delete;

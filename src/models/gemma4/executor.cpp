@@ -734,6 +734,7 @@ struct Executor::Impl {
             // has to give memory back.
             transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
             transport.elastic = growing;
+            transport.disk            = options.expert_disk;
             const float dma_share = options.expert_dma_share.value_or(0.0F);
             if (!(dma_share >= 0 && dma_share <= 1) || options.expert_cpu_threads > 256) {
                 throw std::invalid_argument("Gemma 4: the DMA share must be 0..1 and CPU threads 0..256");

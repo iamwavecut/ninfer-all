@@ -8,9 +8,10 @@
 namespace ninfer::models::qwen3_5::execution {
 
 NativeExpertRuntime::NativeExpertRuntime(const Model& model, DeviceContext& device,
-                                           std::span<const std::uint64_t> keep_free_by_rank,
-                                           std::optional<std::uint64_t> cache_bytes,
-                                           NativeExpertProfile profile, NativeExpertCpu cpu)
+                                         std::span<const std::uint64_t> keep_free_by_rank,
+                                         std::optional<std::uint64_t> cache_bytes,
+                                         NativeExpertProfile profile, NativeExpertCpu cpu,
+                                         const ExpertDiskReads& disk)
     : profile_(std::move(profile)) {
     const auto& source = model.expert_sources();
     if (profile_.counts && profile_.counts->size() != source.layers.size()) {
@@ -47,6 +48,7 @@ NativeExpertRuntime::NativeExpertRuntime(const Model& model, DeviceContext& devi
         if (cache_bytes) { options.cache_bytes = *cache_bytes / device.size(); }
         options.keep_free_bytes = expert_add(keep_free_by_rank[rank], 512ULL << 20);
         options.elastic = elastic_;
+        options.disk            = disk;
         const bool computes = std::any_of(cpu_layers[rank].begin(), cpu_layers[rank].end(),
                                           ops::detail::SparseMoeStreamCpu::computes);
         // One device only: every stage's delivery would start its own CPU pool.

@@ -562,6 +562,9 @@ ninfer /models/gemma4.ninfer --expert-residency host
 ninfer /models/gemma4.ninfer --expert-residency disk --expert-cache-mib 0
 ```
 
+With disk experts, `--expert-mirror` spreads the reads over a second drive and `--expert-direct`
+lets the drive write the experts into device memory ([disk expert reads](expert-disk-reads.md)).
+
 Experts reach the GPU through the shared transport (`core/expert_delivery`):
 
 - **Layer banks.** A prompt chunk's experts missing from the cache (and decode's, without a cache)

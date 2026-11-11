@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Gives NInfer's direct-read devices to group disk, whose members can already read raw drives,
+# which the direct reads also need. Install to /etc/udev/rules.d/ and reload udev.
+KERNEL=="ninfer_pin", GROUP="disk", MODE="0660"
+KERNEL=="ninfer_p2p", GROUP="disk", MODE="0660"

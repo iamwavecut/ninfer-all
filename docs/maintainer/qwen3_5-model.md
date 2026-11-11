@@ -231,7 +231,9 @@ relationship. Router loss coefficients and training-only outputs add no inferenc
 
 `--expert-residency device` retains the fused resident SparseMoe path. `host` retains the native
 routed banks in pinned memory. `disk` leaves them in the artifact and records file extents for
-each expert plane. Both offload modes use the common `core/expert_delivery` byte transport.
+each expert plane. Both offload modes use the common `core/expert_delivery` byte transport; disk
+reads may stripe over a drive mirror or land in device memory directly
+([disk expert reads](../expert-disk-reads.md)).
 Shared experts and router weights remain resident and keep the same gated SwiGLU mathematics.
 Dense Qwen models reject host/disk expert residency.
 

@@ -282,6 +282,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    executor.expert_disk        = {hybrid.mirror, hybrid.direct};
     // Expert parallelism: every device serves a share of the routed experts from host memory or
     // the files over its own bus; without --tensor-split the executor sizes the shares by each
     // device's room for its expert cache and its bus speed.

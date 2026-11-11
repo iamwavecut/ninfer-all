@@ -1017,6 +1017,7 @@ struct Executor::Impl {
         transport.cache_bytes     = options.expert_cache_bytes;
         transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
+        transport.disk            = options.expert_disk;
         const float dma_share     = options.expert_dma_share.value_or(0.0F);
         if (!(dma_share >= 0 && dma_share <= 1) || options.expert_cpu_threads > 256) {
             throw std::invalid_argument("DeepSeek-V4.1: the DMA share must be 0..1 and CPU threads 0..256");
@@ -1064,6 +1065,7 @@ struct Executor::Impl {
             peer.pair_capacity   = transport.pair_capacity;
             peer.cache_bytes     = options.expert_cache_bytes;
             peer.keep_free_bytes = kGraphReserve;
+            peer.disk            = options.expert_disk;
             // The delivery serves the calls on the rank's expert-parallel stream.
             RankContext rank         = device.rank(r);
             rank.stream              = expert_peers[r].stream;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/expert_disk.h"
 #include "models/expert_profile.h"
 #include "models/qwen3_5/model.h"
 #include "ops/sparse_moe/streamed_cpu.h"
@@ -32,9 +33,10 @@ struct NativeExpertCpu {
 class NativeExpertRuntime {
 public:
     NativeExpertRuntime(const Model& model, DeviceContext& device,
-                         std::span<const std::uint64_t> keep_free_by_rank,
-                         std::optional<std::uint64_t> cache_bytes = {},
-                         NativeExpertProfile profile = {}, NativeExpertCpu cpu = {});
+                        std::span<const std::uint64_t> keep_free_by_rank,
+                        std::optional<std::uint64_t> cache_bytes = {},
+                        NativeExpertProfile profile = {}, NativeExpertCpu cpu = {},
+                        const ExpertDiskReads& disk = {});
     ~NativeExpertRuntime();
     NativeExpertRuntime(const NativeExpertRuntime&) = delete;
     NativeExpertRuntime& operator=(const NativeExpertRuntime&) = delete;

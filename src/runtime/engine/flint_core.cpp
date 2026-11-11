@@ -177,6 +177,7 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    executor.expert_disk        = {hybrid.mirror, hybrid.direct};
     // The full-attention blocks carry no rotation and the sliding ones never rotate a distance past
     // their window, so no position takes scaling.
     if (options.rope_yarn || options.rope_yarn_factor > 1.0F || options.rope_scaling_factor > 1.0F) {

@@ -293,6 +293,9 @@ rounds and the growing KV):
   calls of 9 to 64 tokens ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); Flint does not
   have that route yet: its expert kernels take one route per call, and the shared expert delivery
   serves only narrow calls.
+- **Disk reads.** `--expert-mirror` spreads disk experts' reads over a second drive and
+  `--expert-direct` lets the drive write them into device memory
+  ([disk expert reads](expert-disk-reads.md)).
 
 On the RTX 3090 of the measurements above, with the cache NInfer sizes itself (`ninfer_bench`, one
 sequence, three repetitions; three CPU threads take a share of the decode misses). Disk experts read

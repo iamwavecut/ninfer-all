@@ -50,6 +50,8 @@ add_library(ninfer_core STATIC
   disk_kv_bridge.cpp
   direct_storage_reader.cpp
   file_read_queue.cpp
+  expert_mirror.cpp
+  expert_direct.cpp
   paged_kv_cache.cpp
   kv_expert_loan.cpp
   linear_attention_state.cpp
