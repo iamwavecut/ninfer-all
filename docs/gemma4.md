@@ -33,7 +33,9 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   publishes beside the model (`Gemma4AssistantForCausalLM`, four blocks of width 1024 that read the
   target's own KV cache) drafts up to seven tokens a round (`--spec mtp --draft-tokens N`); the
   target verifies them in one pass and every token it keeps is its own sample, so the output is
-  what plain decoding produces. See [below](#speculative-decoding-with-the-assistant).
+  what plain decoding produces. See [below](#speculative-decoding-with-the-assistant). With
+  `--gumbel-sampling` a sampled request drafts the assistant's own draws
+  ([coupled draws](cli.md#speculative-decoding)).
 - **Images and video.** The release's vision tower (27 blocks of width 1152) turns each picture or
   video frame into soft tokens in the prompt, on the GPU, streamed from pinned host memory, or on
   CPU threads (`--vision-residency`); see [below](#images-and-video).
