@@ -2418,8 +2418,9 @@ struct Executor::Impl {
                     .widest_call = i >= layers.size() ? widest_draft : widest_call,
                     .own_pool    = i >= layers.size()});
             }
-            stream = std::make_unique<ExpertStream>(device, model.files(), std::move(stream_layers),
-                                                    bytes, grows);
+            stream = std::make_unique<ExpertStream>(
+                device, model.files(), std::move(stream_layers), bytes, grows,
+                ExpertDiskReads{options.hybrid_experts.mirror, options.hybrid_experts.direct});
             for (std::size_t r = 0; r < bytes.size(); ++r) {
                 memory.ranks[r].expert_cache_bytes += stream->pool_bytes(r);
             }
@@ -2528,6 +2529,7 @@ struct Executor::Impl {
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
+        miss.disk = ExpertDiskReads{options.hybrid_experts.mirror, options.hybrid_experts.direct};
         const std::uint32_t joint = verify_width * options.sequences;
         const bool pooled = std::all_of(layers.begin(), layers.end(), [&](const auto& plan) {
             return plan.rank < slot_pools.size() && slot_pools[plan.rank].slots != 0;

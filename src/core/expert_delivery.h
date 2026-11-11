@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/expert_disk.h"
 #include "core/expert_tier.h"
 
 #include <cstddef>
@@ -88,6 +89,8 @@ struct ExpertDeliveryOptions {
     std::optional<std::uint64_t> cache_bytes;
     std::uint64_t keep_free_bytes = 512ULL << 20;
     std::uint64_t staging_bytes = 128ULL << 20; // disk only, two pinned halves
+    // Disk only: a drive mirror and the direct path (core/expert_disk.h).
+    ExpertDiskReads disk{};
     // Whole-layer device windows that hold the experts the cache does not. Two let the next layer
     // of a wide call (a prompt chunk, a wide verification) arrive while the current one computes;
     // one halves their memory and gives that up. Two fall back to one when memory is short.

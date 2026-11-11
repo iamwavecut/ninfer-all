@@ -2,6 +2,8 @@
 
 #include "core/cpu_spin_pool.h"
 #include "core/device_wait.h"
+#include "core/expert_direct.h"
+#include "core/expert_mirror.h"
 #include "core/expert_split.h"
 #include "core/file_read_error.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
@@ -44,6 +46,8 @@ constexpr int kMaxExperts     = 512;
 constexpr int kSplitThreads   = kMaxExperts / 2; // two expert flags a thread
 constexpr std::uint64_t kTail = 256;
 constexpr std::uint64_t kAlign = 256;
+// Disk experts with direct reads: each rank's window, at least its largest projection's covers.
+constexpr std::uint64_t kMissWindowBytes = 64ULL << 20;
 constexpr int kRanges          = int(std::tuple_size_v<ExpertCache::Ranges>);
 
 constexpr std::int64_t kKeepAliveNs = std::chrono::nanoseconds(kMissKeepAlive).count();
@@ -271,6 +275,13 @@ struct ExpertMisses::Impl {
         std::unique_ptr<PinnedHostBuffer> missing_ids, products, product_pairs, product_count;
         std::unique_ptr<PinnedHostBuffer> host_ids, host_missing, host_m;
         std::unique_ptr<PinnedHostBuffer> file_staging; // disk experts, two halves
+        // Disk experts with direct reads (core/expert_direct.h): the window the staged experts'
+        // reads land in, the bytes used from its start, and the event the copies out of it
+        // record before it is refilled.
+        std::unique_ptr<DirectExpertWindow> window;
+        std::uint64_t window_used = 0;
+        cudaEvent_t window_free   = nullptr;
+        std::vector<DirectRead> window_reads;
         std::unique_ptr<PinnedHostBuffer> patches;      // one request's table changes
         cudaStream_t copies    = nullptr;
         cudaEvent_t copying    = nullptr; // balance only: before a request's copies
@@ -290,7 +301,7 @@ struct ExpertMisses::Impl {
     // Per layer: its cached blocks as four device words, read by the kernels (captured graphs
     // see a change).
     std::vector<DeviceBuffer> ranges;
-    std::vector<std::unique_ptr<File>> files;
+    std::vector<std::unique_ptr<File>> files, mirror_files; // the artifact's, a drive mirror's
     MissOptions options;
     std::vector<Rank> ranks;
     std::uint32_t pair_capacity = 0;   // pairs of the widest call
@@ -352,15 +363,28 @@ struct ExpertMisses::Impl {
         pair_capacity = options.token_capacity * kTop;
         narrow_tokens = std::min(options.token_capacity, kNarrowMissTokens);
         cpu_tokens    = std::min(options.token_capacity, kCpuMissTokens);
-        std::uint64_t largest = 0;
+        // The largest expert's staged bytes, its file bytes, its largest projection's direct
+        // covers, and the most experts a layer has.
+        std::uint64_t largest = 0, largest_file = 0, largest_cover = 0, widest = 0;
         for (const auto& layer : layers) {
+            for (const auto& p : layer.projections) {
+                for (const auto& location : p.located) {
+                    std::uint64_t cover = 0;
+                    for (const auto& run : location.runs) {
+                        cover += direct_cover(run.offset, run.bytes);
+                    }
+                    largest_cover = std::max(largest_cover, cover);
+                }
+            }
             if (layer.rank >= ranks.size() || layer.experts < kTop || layer.experts > kMaxExperts ||
                 !layer.gate_table) {
                 throw std::invalid_argument("expert misses: invalid layer");
             }
             std::uint64_t bytes = 0;
             for (const auto& p : layer.projections) { bytes += aligned(std::uint64_t(p.expert_bytes)); }
-            largest = std::max(largest, bytes + kTail);
+            largest                = std::max(largest, bytes + kTail);
+            largest_file           = std::max(largest_file, bytes);
+            widest                 = std::max<std::uint64_t>(widest, layer.experts);
             disk    = disk || !layer.projections[0].located.empty();
             ranks[layer.rank].used = true;
             if (layer.admit && (cache == nullptr || !layer.projections[0].located.empty())) {
@@ -373,9 +397,25 @@ struct ExpertMisses::Impl {
             write_ranges(ranges.back(), layer.resident);
         }
         for (const auto& path : paths) { files.push_back(std::make_unique<File>(path)); }
+        std::vector<std::filesystem::path> window_files = paths;
+        for (const auto& path : expert_mirror_files(paths, options.disk.mirror)) {
+            mirror_files.push_back(std::make_unique<File>(path));
+            window_files.push_back(path);
+        }
+        // Every serving rank reads directly, or none does.
+        bool direct = disk && options.disk.direct != ExpertDirect::Off;
         half_bytes = std::max<std::uint64_t>(options.staging_bytes / 2, largest * 2);
         half_bytes = half_bytes / kAlign * kAlign;
-        file_half_bytes = disk ? half_bytes : 0;
+        // Every missing expert of a narrow call passes through a half of the file staging: a
+        // staged one on its way to the device staging, and one the GPU reads across the bus or
+        // the CPU computes for the whole call. A half holds a narrow call's every distinct expert,
+        // and a wide round's, which fills at most a device staging half.
+        if (disk) {
+            const std::uint64_t narrow_experts =
+                std::min<std::uint64_t>(std::uint64_t(narrow_tokens) * kTop, widest);
+            file_half_bytes = std::max(half_bytes, narrow_experts * largest_file);
+            file_half_bytes = (file_half_bytes + kAlign - 1) / kAlign * kAlign;
+        }
         // A wide round holds at least half_bytes / largest experts, which a layer has at most
         // kMaxExperts of.
         const std::uint64_t per_round = half_bytes / largest;
@@ -426,6 +466,15 @@ struct ExpertMisses::Impl {
                 }
             }
             if (disk) { rank.file_staging = std::make_unique<PinnedHostBuffer>(2 * file_half_bytes); }
+            if (direct) {
+                rank.window =
+                    open_direct_window(options.disk, device.rank(r).device, window_files,
+                                       std::max(kMissWindowBytes, largest_cover), "expert misses");
+                direct = rank.window != nullptr;
+                if (direct) {
+                    CUDA_CHECK(cudaEventCreateWithFlags(&rank.window_free, cudaEventDisableTiming));
+                }
+            }
             rank.patches = std::make_unique<PinnedHostBuffer>(2 * kMaxExperts * sizeof(TablePatch));
             CUDA_CHECK(cudaStreamCreateWithFlags(&rank.copies, cudaStreamNonBlocking));
             // Timed only for the balance, which reads the copies' durations.
@@ -442,6 +491,9 @@ struct ExpertMisses::Impl {
             wait_kernel<<<1, 1, 0, rank.copies>>>(rank.box, static_cast<const std::uint32_t*>(rank.need->data()));
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(ninfer::wait_for_stream(rank.copies));
+        }
+        if (!direct) {
+            for (auto& rank : ranks) { rank.window.reset(); }
         }
         if (cpu) {
             // By default one thread per physical core, this service's included; pinned, since the
@@ -469,6 +521,7 @@ struct ExpertMisses::Impl {
             if (rank.copies) { cudaStreamDestroy(rank.copies); }
             if (rank.copying) { cudaEventDestroy(rank.copying); }
             if (rank.copied) { cudaEventDestroy(rank.copied); }
+            if (rank.window_free) { cudaEventDestroy(rank.window_free); }
             if (rank.split_done) { cudaEventDestroy(rank.split_done); }
             if (rank.wide_copying) { cudaEventDestroy(rank.wide_copying); }
             if (rank.wide_copied) { cudaEventDestroy(rank.wide_copied); }
@@ -495,14 +548,48 @@ struct ExpertMisses::Impl {
         if (!failure) { failure = std::current_exception(); }
     }
 
-    // Reads one projection of a disk expert into `host_out`.
+    // Reads one projection of a disk expert into `host_out`; with a drive mirror, a run in an
+    // odd stripe from the mirror's copy.
     void fetch(const MissLayer::Projection& projection, std::int32_t expert, std::byte* host_out) {
         const ExpertLocation& location = projection.located[std::size_t(expert)];
         std::uint64_t at = 0;
         for (const auto& run : location.runs) {
             if (run.bytes == 0) { continue; }
-            files.at(run.file)->read(run.offset, host_out + at, std::size_t(run.bytes));
+            const auto& copies =
+                mirror_files.empty() || expert_mirror_copy(run.offset) == 0 ? files : mirror_files;
+            copies.at(run.file)->read(run.offset, host_out + at, std::size_t(run.bytes));
             at += run.bytes;
+        }
+    }
+
+    // Reads one projection of a disk expert into the rank's window and queues its copies to
+    // `target` on the rank's copy stream. The window fills from its start again once the copies
+    // out of it have landed.
+    void fetch_direct(Rank& rank, const MissLayer::Projection& projection, std::int32_t expert,
+                      std::byte* target) {
+        const ExpertLocation& location = projection.located[std::size_t(expert)];
+        std::uint64_t cover            = 0;
+        for (const auto& run : location.runs) { cover += direct_cover(run.offset, run.bytes); }
+        if (rank.window_used + cover > rank.window->bytes()) {
+            CUDA_CHECK(cudaEventRecord(rank.window_free, rank.copies));
+            CUDA_CHECK(ninfer::wait_for_event(rank.window_free));
+            rank.window_used = 0;
+        }
+        rank.window_reads.clear();
+        for (const auto& run : location.runs) {
+            if (run.bytes == 0) { continue; }
+            const bool mirrored = !mirror_files.empty() && expert_mirror_copy(run.offset) == 1;
+            rank.window_reads.push_back({run.file + (mirrored ? files.size() : 0), run.offset,
+                                         run.bytes, rank.window_used});
+            rank.window_used += direct_cover(run.offset, run.bytes);
+        }
+        rank.window->read(rank.window_reads);
+        std::uint64_t at = 0;
+        for (const DirectRead& read : rank.window_reads) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                target + at, rank.window->data() + read.window_offset + direct_lead(read.offset),
+                std::size_t(read.bytes), cudaMemcpyDefault, rank.copies));
+            at += read.bytes;
         }
     }
 
@@ -727,19 +814,23 @@ struct ExpertMisses::Impl {
         for (int k = 0; k < 3; ++k) {
             const auto& p  = layer.projections[std::size_t(k)];
             std::byte* at  = target + offset;
-            const void* source;
-            if (disk) {
-                if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
-                    throw std::runtime_error("expert misses: file staging exhausted");
-                }
-                fetch(p, e, file_staging + file_used);
-                source = file_staging + file_used;
-                file_used += aligned(std::uint64_t(p.expert_bytes));
+            if (disk && rank.window) {
+                fetch_direct(rank, p, e, at);
             } else {
-                source = p.host[std::size_t(e)];
+                const void* source;
+                if (disk) {
+                    if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
+                        throw std::runtime_error("expert misses: file staging exhausted");
+                    }
+                    fetch(p, e, file_staging + file_used);
+                    source = file_staging + file_used;
+                    file_used += aligned(std::uint64_t(p.expert_bytes));
+                } else {
+                    source = p.host[std::size_t(e)];
+                }
+                CUDA_CHECK(cudaMemcpyAsync(at, source, std::size_t(p.expert_bytes),
+                                           cudaMemcpyHostToDevice, rank.copies));
             }
-            CUDA_CHECK(cudaMemcpyAsync(at, source, std::size_t(p.expert_bytes),
-                                       cudaMemcpyHostToDevice, rank.copies));
             if (k == 2) {
                 CUDA_CHECK(cudaMemsetAsync(at + p.expert_bytes, 0, kTail, rank.copies));
             }

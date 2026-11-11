@@ -26,6 +26,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/expert_disk.h"
 #include "core/weight.h"
 #include "models/qwen4_exp/expert_cache.h"
 #include "models/qwen4_exp/expert_location.h"
@@ -85,10 +86,14 @@ struct MissOptions {
     // its CPU products end soonest, by times fitted to the earlier requests.
     bool cpu_balance             = false;
     std::uint32_t cpu_threads    = 0;    // 0: one per physical core (pool_cpu_count())
-    std::uint64_t staging_bytes  = 128ULL << 20; // device staging per rank, two halves
+    // Device staging per rank, two halves. Disk experts also take pinned file staging of two
+    // halves, each the larger of a device half and a narrow call's every missing expert.
+    std::uint64_t staging_bytes = 128ULL << 20;
     // 1..9: a call leaves out each missing expert that all its tokens rank past this many places
     // of their top ten (lossy); 0 serves every miss.
     std::uint32_t tail_skip_rank = 0;
+    // Disk experts: a drive mirror and the direct path (core/expert_disk.h).
+    ExpertDiskReads disk{};
 };
 
 struct MissStats {

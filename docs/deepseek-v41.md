@@ -261,6 +261,8 @@ cache and its rounds):
   reads through the OS page cache into bounded pinned transfer buffers, then copied to the device;
   NInfer maps no expert file into memory, so a miss never waits on a page fault inside a copy.
   Whatever the page cache holds is read at memory speed, the rest at the storage's.
+  `--expert-mirror` spreads these reads over a second drive and `--expert-direct` lets the drive
+  write them into device memory ([disk expert reads](expert-disk-reads.md)).
 - **Layer banks and cache.** A prompt chunk's experts missing from the cache land in a whole-layer
   bank laid out like the resident bank; two banks let the next layer arrive while the current one
   computes. `--expert-cache-mib` (default: what is free after startup) holds the experts decode

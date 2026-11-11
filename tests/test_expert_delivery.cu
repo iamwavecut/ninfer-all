@@ -20,6 +20,17 @@
 
 using namespace ninfer;
 namespace {
+
+// How the disk fixtures' experts are read (a drive mirror, direct reads into a host window); the
+// Fixture copies its files into the mirror directory.
+ExpertDiskReads disk_reads;
+
+const char* disk_label(bool disk) {
+    if (!disk) { return "host"; }
+    const bool direct = disk_reads.direct == ExpertDirect::On;
+    if (disk_reads.mirror.empty()) { return direct ? "disk direct" : "disk"; }
+    return direct ? "disk mirror direct" : "disk mirror";
+}
 constexpr int kLayers = 4, kExperts = 16, kPairs = 2048, kTail = 512;
 constexpr std::uint64_t kGu = 131072, kDown = 98304;
 
@@ -146,6 +157,14 @@ struct Fixture {
             }
             layers.push_back(std::move(layer));
         }
+        for (auto& file : output) { file.close(); }
+        if (disk && !disk_reads.mirror.empty()) {
+            std::filesystem::create_directories(disk_reads.mirror);
+            for (const auto& path : paths) {
+                std::filesystem::copy_file(path, disk_reads.mirror / path.filename(),
+                                           std::filesystem::copy_options::overwrite_existing);
+            }
+        }
     }
 };
 
@@ -153,6 +172,7 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
         bool shifting = false) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.disk          = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes = cache;
     options.staging_bytes = 4096; // exercise repeated DMA half reuse inside one blob
@@ -233,13 +253,13 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
                     (!shifting || stats.evictions != 0);
     std::printf("%s%s cache=%llu bad=%llu pairs=%llu hits=%llu misses=%llu evictions=%llu "
                 "admissions=%llu bank_reuses=%llu prefetched=%llu read=%llu copied=%llu "
-                "promoted=%llu banks=%u %s\n", disk ? "disk" : "host", shifting ? " shifting" : "",
-                (unsigned long long)cache, bad, count, (unsigned long long)stats.hits,
-                (unsigned long long)stats.misses, (unsigned long long)stats.evictions,
-                (unsigned long long)stats.admissions, (unsigned long long)stats.bank_reuses,
-                (unsigned long long)stats.prefetched_layers, (unsigned long long)stats.read_bytes,
-                (unsigned long long)stats.copied_bytes, (unsigned long long)stats.promoted_bytes,
-                memory.banks, ok ? "PASS" : "FAIL");
+                "promoted=%llu banks=%u %s\n",
+                disk_label(disk), shifting ? " shifting" : "", (unsigned long long)cache, bad,
+                count, (unsigned long long)stats.hits, (unsigned long long)stats.misses,
+                (unsigned long long)stats.evictions, (unsigned long long)stats.admissions,
+                (unsigned long long)stats.bank_reuses, (unsigned long long)stats.prefetched_layers,
+                (unsigned long long)stats.read_bytes, (unsigned long long)stats.copied_bytes,
+                (unsigned long long)stats.promoted_bytes, memory.banks, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -250,6 +270,7 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
 int span_prefetch(DeviceContext& device, bool disk, const std::filesystem::path& path) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.disk          = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 0;
     options.staging_bytes = 4096;
@@ -295,7 +316,7 @@ int span_prefetch(DeviceContext& device, bool disk, const std::filesystem::path&
     const bool ok = !bad && count == std::uint64_t(5) * kLayers * kPairs &&
                     prefetched == kLayers - 1 && reuses == std::uint64_t(2 * kLayers - 1) * kExperts;
     std::printf("%s span prefetch bad=%llu pairs=%llu prefetched=%llu bank_reuses=%llu %s\n",
-                disk ? "disk" : "host", bad, count, (unsigned long long)prefetched,
+                disk_label(disk), bad, count, (unsigned long long)prefetched,
                 (unsigned long long)reuses, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -370,9 +391,9 @@ int lent_landing(DeviceContext& device, bool disk, const std::filesystem::path& 
     const bool ok = !bad_steps && !bad && rounds.admissions != 0 && rounds.lent_admissions != 0 &&
                     in_cache;
     std::printf("%s lent landing slots=%d bad=%llu pairs=%llu round_admissions=%llu "
-                "lent_admissions=%llu x_cached=%d %s\n", disk ? "disk" : "host", slots, bad, count,
-                (unsigned long long)rounds.admissions, (unsigned long long)rounds.lent_admissions,
-                int(in_cache), ok ? "PASS" : "FAIL");
+                "lent_admissions=%llu x_cached=%d %s\n",
+                disk_label(disk), slots, bad, count, (unsigned long long)rounds.admissions,
+                (unsigned long long)rounds.lent_admissions, int(in_cache), ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -610,6 +631,7 @@ int cpu_share(DeviceContext& device, bool disk, double share, const std::filesys
     Fixture fixture(disk, path);
     PairEcho echo;
     ExpertDeliveryOptions options;
+    options.disk              = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes = 6ULL << 20;
     options.cpu.products = &echo;
@@ -670,12 +692,12 @@ int cpu_share(DeviceContext& device, bool disk, double share, const std::filesys
                     stats.cpu_experts != 0 && seeded_hits == 3 &&
                     (share < 1 || stats.hits > 6) &&
                     delivery.cpu_description().find("2 ") == 0;
-    std::printf("%s cpu share %.1f bad=%llu echo_bad=%llu cpu_experts=%llu cpu_pairs=%llu hits=%llu "
-                "seeded_hits=%llu %s\n",
-                disk ? "disk" : "host", share, bad, (unsigned long long)echo.bad,
-                (unsigned long long)stats.cpu_experts, computed, (unsigned long long)stats.hits,
-                (unsigned long long)seeded_hits,
-                ok ? "PASS" : "FAIL");
+    std::printf(
+        "%s cpu share %.1f bad=%llu echo_bad=%llu cpu_experts=%llu cpu_pairs=%llu hits=%llu "
+        "seeded_hits=%llu %s\n",
+        disk_label(disk), share, bad, (unsigned long long)echo.bad,
+        (unsigned long long)stats.cpu_experts, computed, (unsigned long long)stats.hits,
+        (unsigned long long)seeded_hits, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -785,7 +807,7 @@ int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path&
     visited.copy_to_host(&count, 8);
     const bool ok = !bad_steps && !bad && count == std::uint64_t(replays + 1) * kLayers * kPairs;
     std::printf("%s elastic cache keep=%llu hot_hits=%llu bad=%llu pairs=%llu %s\n",
-                disk ? "disk" : "host", (unsigned long long)keep, (unsigned long long)hot.hits, bad,
+                disk_label(disk), (unsigned long long)keep, (unsigned long long)hot.hits, bad,
                 count, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
@@ -796,6 +818,7 @@ int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path&
 int lent_banks(DeviceContext& device, bool disk, const std::filesystem::path& path) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.disk          = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 0;
     options.staging_bytes = 4096;
@@ -883,9 +906,10 @@ int lent_banks(DeviceContext& device, bool disk, const std::filesystem::path& pa
     visited.copy_to_host(&count, 8);
     const auto stats = delivery.stats();
     const bool ok = !bad_steps && !bad && count == std::uint64_t(replays + 1) * kLayers * kPairs;
-    std::printf("%s lent banks slots=%u lent_admissions=%llu lent_evictions=%llu bad=%llu pairs=%llu %s\n",
-                disk ? "disk" : "host", lent, (unsigned long long)stats.lent_admissions,
-                (unsigned long long)stats.lent_evictions, bad, count, ok ? "PASS" : "FAIL");
+    std::printf(
+        "%s lent banks slots=%u lent_admissions=%llu lent_evictions=%llu bad=%llu pairs=%llu %s\n",
+        disk_label(disk), lent, (unsigned long long)stats.lent_admissions,
+        (unsigned long long)stats.lent_evictions, bad, count, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -1162,6 +1186,19 @@ int main(int argc, char** argv) {
             failures += span_prefetch(device, disk, path);
             failures += lent_landing(device, disk, path);
         }
+        // Disk experts read directly (into the host window), from a drive mirror, and both.
+        const auto mirror = path / "mirror";
+        for (const auto& reads : {ExpertDiskReads{{}, ExpertDirect::On, true},
+                                  ExpertDiskReads{mirror, ExpertDirect::Off, false},
+                                  ExpertDiskReads{mirror, ExpertDirect::On, true}}) {
+            disk_reads = reads;
+            for (auto cache : {0ULL, 6ULL << 20}) { failures += run(device, true, cache, path); }
+            failures += run(device, true, 6ULL << 20, path, true);
+            failures += cpu_share(device, true, 0.5, path);
+            failures += lent_banks(device, true, path);
+            failures += span_prefetch(device, true, path);
+        }
+        disk_reads = {};
         failures += failure_control(device, path, false);
         return failures ? 1 : 0;
     } catch (const std::exception& error) {

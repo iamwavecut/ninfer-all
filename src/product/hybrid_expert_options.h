@@ -26,6 +26,12 @@ inline constexpr const char* kHybridExpertHelp =
     "  --expert-profile FILE         fill the expert cache from recorded counts (default: the\n"
     "                                built-in profile of the model family, where one exists)\n"
     "  --expert-profile-out FILE     record expert counts for this artifact after requests\n"
+    "  --expert-mirror DIR           disk experts: DIR on a second drive holds copies of the\n"
+    "                                artifact's files; reads alternate by 1 MiB stripe\n"
+    "  --expert-direct auto|on|off   disk experts on Linux: the NVMe drive writes experts\n"
+    "                                straight into device memory through the kernel modules\n"
+    "                                in kernel/ninfer-direct (auto, the default: when they are\n"
+    "                                loaded and a self-test read passes)\n"
     "  Flash-Next-only expert options:\n"
     "  --expert-misses staged|mapped GGUF experts: copy misses into device staging while the\n"
     "                                cached experts run (default), or read host experts across\n"
@@ -86,13 +92,30 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
         } else {
             throw std::invalid_argument("--expert-misses takes staged or mapped");
         }
+    } else if (option == "--expert-mirror") {
+        const std::string path(value());
+        if (path.empty()) { throw std::invalid_argument("--expert-mirror takes a directory"); }
+        out.mirror = path;
+    } else if (option == "--expert-direct") {
+        const std::string_view mode(value());
+        if (mode == "auto") {
+            out.direct = ExpertDirect::Auto;
+        } else if (mode == "on") {
+            out.direct = ExpertDirect::On;
+        } else if (mode == "off") {
+            out.direct = ExpertDirect::Off;
+        } else {
+            throw std::invalid_argument("--expert-direct takes auto, on or off");
+        }
     } else if (option == "--expert-cache-adaptive") {
         out.adaptive_cache = true;
     } else if (option == "--expert-profile" || option == "--expert-profile-out") {
         const std::string path(value());
         if (path.empty()) { throw std::invalid_argument(std::string(option) + " takes a file path"); }
         (option == "--expert-profile" ? out.routing_profile : out.record_profile) = path;
-    } else { return false; }
+    } else {
+        return false;
+    }
     return true;
 }
 

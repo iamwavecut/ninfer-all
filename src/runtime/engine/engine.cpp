@@ -80,6 +80,17 @@ EngineOptions with_family_steering(EngineOptions options) {
     return options;
 }
 
+// A drive mirror and the direct path change how disk experts are read.
+EngineOptions with_expert_disk_reads(EngineOptions options) {
+    const auto& hybrid = options.hybrid_experts;
+    if ((!hybrid.mirror.empty() || hybrid.direct == ExpertDirect::On) &&
+        options.expert_residency != ExpertResidency::Disk) {
+        throw std::invalid_argument(
+            "--expert-mirror and --expert-direct on require --expert-residency disk");
+    }
+    return options;
+}
+
 // Position-split and invariant attention are Qwen3.5 Program schedules over its paged cache. The
 // partial-sum exchange is the Qwen3.5 Program's and Flash-Next's; the other families divide only
 // their routed experts and sum them their own way.
@@ -439,9 +450,9 @@ public:
                               std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(
-              with_family_speculation(with_family_context_cache(with_family_attention(
-                  with_family_steering(with_family_embedding(std::move(engine_options)))))))),
+        : options(runtime::normalize_engine_options(with_family_speculation(
+              with_family_context_cache(with_family_attention(with_family_steering(
+                  with_family_embedding(with_expert_disk_reads(std::move(engine_options))))))))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         report_gpu_clock_floor(options, clock_floor);

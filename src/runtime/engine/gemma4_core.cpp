@@ -208,6 +208,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    executor.expert_disk        = {hybrid.mirror, hybrid.direct};
     // The rotation past the native window, as every family resolves it (rope_scaling.h): YaRN
     // for the full-attention blocks, the assistant's included; linear position interpolation is
     // refused. Google publishes no extension of this model's 262,144-token window, so YaRN here is

@@ -11,7 +11,11 @@
 // With a CPU share, the CPU takes its share of the missing experts with at most
 // ops::kGgufMoeVectorPairs pairs (the vector products' experts, which its products reproduce) and
 // none of the others (the matrix kernel's): a call whose experts all have more takes no CPU share.
-// A narrow call after it is served as before.
+// A narrow call after it is served as before. Disk experts take the same wide call (and the narrow
+// one), read from a file whose first expert starts inside a 4 KiB block of the second 1 MiB stripe:
+// through host staging, striped over a drive mirror, and by the direct path's host window, which
+// runs every step of direct reads but the kernel modules' DMA; each staged projection must hold
+// its expert's bytes.
 
 #include "models/qwen4_exp/expert_misses.h"
 
@@ -30,9 +34,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -229,6 +237,14 @@ void replay_late(Fixture& f, cudaStream_t stream, bool cpu, const std::string& l
     CUDA_CHECK(cudaGraphDestroy(graph));
 }
 
+// Where a fixture's experts are: in pinned host memory, or in a file (disk), read through host
+// staging or the direct path's host window, with or without a drive mirror.
+struct DiskMode {
+    bool disk   = false;
+    bool mirror = false;
+    bool direct = false;
+};
+
 // One layer of 16 Q8_0 experts at Flash-Next's shapes, each its own bytes (every byte of expert
 // e's projection k is 1 + 3e + k), behind a staging of two experts a half: a wide call of 16
 // tokens routes all 16, none cached. Uniform: token j to experts j..j + 9 mod 16, ten pairs each.
@@ -242,11 +258,15 @@ struct WideFixture {
         return slot < kHot ? slot : kHot + (token * (kTop - kHot) + slot - kHot) % (kExperts - kHot);
     }
     std::vector<std::unique_ptr<PinnedHostBuffer>> matrices; // [expert][projection]
+    // Disk experts: the file, the mirror directory and each projection's locations.
+    std::vector<std::filesystem::path> paths;
+    std::filesystem::path mirror;
+    std::array<std::vector<ExpertLocation>, 3> locations;
     DeviceBuffer gate_table, ids, input;
     std::unique_ptr<ExpertMisses> misses;
     std::array<std::int64_t, 3> bytes{};
 
-    WideFixture(DeviceContext& device, double cpu_share, bool mixed) {
+    WideFixture(DeviceContext& device, double cpu_share, bool mixed, const DiskMode& disk = {}) {
         MissLayer layer;
         layer.rank    = 0;
         layer.experts = kExperts;
@@ -260,12 +280,16 @@ struct WideFixture {
             projection.expert_bytes = projection.row_bytes * rows[p];
             bytes[p]                = projection.expert_bytes;
         }
-        for (int e = 0; e < kExperts; ++e) {
-            for (std::size_t p = 0; p < 3; ++p) {
-                auto matrix = std::make_unique<PinnedHostBuffer>(std::size_t(bytes[p]));
-                std::memset(matrix->data(), 1 + 3 * e + int(p), matrix->size());
-                layer.projections[p].host.push_back(matrix->data());
-                matrices.push_back(std::move(matrix));
+        if (disk.disk) {
+            write_experts(layer, disk);
+        } else {
+            for (int e = 0; e < kExperts; ++e) {
+                for (std::size_t p = 0; p < 3; ++p) {
+                    auto matrix = std::make_unique<PinnedHostBuffer>(std::size_t(bytes[p]));
+                    std::memset(matrix->data(), 1 + 3 * e + int(p), matrix->size());
+                    layer.projections[p].host.push_back(matrix->data());
+                    matrices.push_back(std::move(matrix));
+                }
             }
         }
         gate_table = DeviceBuffer(kExperts * sizeof(void*));
@@ -284,17 +308,63 @@ struct WideFixture {
         options.cpu_share      = cpu_share;
         options.cpu_threads    = 2;
         options.staging_bytes  = 0; // the least: two of the largest experts a half
+        if (disk.mirror) { options.disk.mirror = mirror; }
+        options.disk.direct      = disk.direct ? ExpertDirect::On : ExpertDirect::Off;
+        options.disk.host_window = disk.direct;
         std::vector<MissLayer> layers;
         layers.push_back(std::move(layer));
-        misses = std::make_unique<ExpertMisses>(device, std::move(layers),
-                                                std::vector<std::filesystem::path>{}, options,
-                                                nullptr);
+        misses = std::make_unique<ExpertMisses>(device, std::move(layers), paths, options, nullptr);
+    }
+
+    ~WideFixture() {
+        misses.reset();
+        std::error_code error;
+        for (const auto& path : paths) { std::filesystem::remove(path, error); }
+        if (!mirror.empty()) { std::filesystem::remove_all(mirror, error); }
+    }
+
+    WideFixture(const WideFixture&)            = delete;
+    WideFixture& operator=(const WideFixture&) = delete;
+
+    // The experts in one file, in order, after 1 MiB + 123 bytes of zeros, every byte of expert
+    // e's projection k 1 + 3e + k; with a mirror, a copy in a directory beside it.
+    void write_experts(MissLayer& layer, const DiskMode& disk) {
+        const auto stem = std::filesystem::current_path() /
+                          ("ninfer_misses_" + std::to_string(std::random_device{}()));
+        paths.push_back(stem.string() + ".experts");
+        std::uint64_t offset = (1ULL << 20) + 123;
+        {
+            std::ofstream file(paths[0], std::ios::binary);
+            const std::vector<char> zeros(std::size_t(offset), 0);
+            file.write(zeros.data(), std::streamsize(zeros.size()));
+            for (int e = 0; e < kExperts; ++e) {
+                for (std::size_t p = 0; p < 3; ++p) {
+                    const std::vector<char> data(std::size_t(bytes[p]), char(1 + 3 * e + int(p)));
+                    file.write(data.data(), std::streamsize(data.size()));
+                    ExpertLocation location;
+                    location.runs[0]   = {0, offset, std::uint64_t(bytes[p])};
+                    location.bytes     = std::uint64_t(bytes[p]);
+                    location.format    = layer.projections[p].format;
+                    location.row_bytes = layer.projections[p].row_bytes;
+                    location.rows      = layer.projections[p].rows;
+                    locations[p].push_back(location);
+                    offset += std::uint64_t(bytes[p]);
+                }
+            }
+            if (!file) { throw std::runtime_error("cannot write the disk experts"); }
+        }
+        for (std::size_t p = 0; p < 3; ++p) { layer.projections[p].located = locations[p]; }
+        if (disk.mirror) {
+            mirror = stem.string() + ".mirror";
+            std::filesystem::create_directory(mirror);
+            std::filesystem::copy_file(paths[0], mirror / paths[0].filename());
+        }
     }
 };
 
 void wide_call(DeviceContext& device, cudaStream_t stream, double cpu_share, bool mixed,
-               const std::string& label) {
-    WideFixture f(device, cpu_share, mixed);
+               const std::string& label, const DiskMode& disk = {}) {
+    WideFixture f(device, cpu_share, mixed, disk);
     const int tokens = WideFixture::kTokens;
     const MissStats before = f.misses->stats();
     const Tensor routed(f.ids.p, DType::I32, {kTop, tokens});
@@ -466,6 +536,14 @@ int run() {
 #endif
         wide_call(device, stream, cpu ? 0.5 : 0.0, false, label + ", wide");
         wide_call(device, stream, cpu ? 0.5 : 0.0, true, label + ", wide with few-pair experts");
+    }
+    // Disk experts: a wide call of disk experts runs every missing expert on the GPU.
+    for (const DiskMode mode : {DiskMode{true, false, false}, DiskMode{true, true, false},
+                                DiskMode{true, false, true}, DiskMode{true, true, true}}) {
+        const std::string label = std::string("disk") + (mode.mirror ? ", mirror" : "") +
+                                  (mode.direct ? ", direct (host window)" : "");
+        wide_call(device, stream, 0.0, false, label + ", wide", mode);
+        wide_call(device, stream, 0.0, true, label + ", wide with few-pair experts", mode);
     }
     CUDA_CHECK(cudaStreamDestroy(stream));
     if (failures != 0) { return 1; }

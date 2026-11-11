@@ -11,6 +11,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/expert_disk.h"
 #include "core/tensor.h"
 #include "models/expert_profile.h"
 #include "models/flint/model.h"
@@ -53,6 +54,8 @@ struct ExecutorOptions {
     // bus times. CPU threads: 0 for one per physical core.
     std::optional<float> expert_dma_share;
     std::uint32_t expert_cpu_threads = 0;
+    // Disk experts: a drive mirror and the direct path (core/expert_disk.h).
+    ExpertDiskReads expert_disk{};
 };
 
 struct ExecutorMemory {

@@ -70,6 +70,19 @@ enum class ExpertResidency : std::uint8_t {
     Disk,
 };
 
+// Disk experts on Linux: whether the NVMe drive writes the experts a pass reads straight into
+// device memory (peer-to-peer DMA through the kernel modules in kernel/ninfer-direct) instead of
+// through host memory.
+enum class ExpertDirect : std::uint8_t {
+    // When the modules are loaded and a self-test read over the direct path returns the bytes a
+    // normal read does; otherwise through host memory.
+    Auto,
+    // Always; startup fails with the reason when the direct path is unavailable.
+    On,
+    // Never.
+    Off,
+};
+
 // Qwen3.5-core tensor parallelism: how the devices divide a full-attention layer.
 enum class TensorAttention : std::uint8_t {
     // Each device holds a run of the KV heads with their cache and query heads; devices past the

@@ -11,7 +11,9 @@
 // to the shared pool, which misses take before any resident's; a read that fails raises
 // FileReadError and leaves no slot taken for an expert it did not finish reading; and with two
 // devices, layers of two ranks that alternate through the one staging ring each read their experts
-// into slots on their own device.
+// into slots on their own device. All of it holds with direct reads (through the host window), with
+// a drive mirror (the first file's experts lie in its second stripe, which the mirror serves), and
+// with both.
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/file_read_error.h"
@@ -42,15 +44,20 @@ void require(bool condition, const std::string& message) {
 
 constexpr int kExperts = 32;
 
-int run(int devices) {
+int run(int devices, bool direct, bool mirror) {
     DeviceContext device;
     std::mt19937 random(9300u);
     const std::string stem = "ninfer_expert_stream_" + std::to_string(std::random_device{}());
+    ExpertDiskReads reads;
+    reads.direct      = direct ? ExpertDirect::On : ExpertDirect::Off;
+    reads.host_window = direct;
+    if (mirror) { reads.mirror = std::filesystem::temp_directory_path() / (stem + ".mirror"); }
     // Three layers; layer 1's experts are smaller, as mixed block types are, and layer 2's wider,
     // as the MTP block's can be. Each projection of each expert is a distinct random byte run at
     // its own offset of one logical byte stream.
     const std::int64_t sizes[3][3] = {{3000, 3000, 1500}, {1200, 2400, 900}, {6000, 6000, 3000}};
-    std::vector<std::uint8_t> file_bytes;
+    // The experts start past the first MiB: a drive mirror serves the first file's reads.
+    std::vector<std::uint8_t> file_bytes(std::size_t(1) << 20);
     std::vector<std::vector<std::uint64_t>> logical(9);
     for (int layer = 0; layer < 3; ++layer) {
         for (int k = 0; k < 3; ++k) {
@@ -76,6 +83,13 @@ int run(int devices) {
         std::ofstream out(paths.back(), std::ios::binary);
         out.write(reinterpret_cast<const char*>(file_bytes.data() + begin),
                   static_cast<std::streamsize>(cuts[f] - begin));
+    }
+    if (mirror) {
+        std::filesystem::create_directories(reads.mirror);
+        for (const auto& path : paths) {
+            std::filesystem::copy_file(path, reads.mirror / path.filename(),
+                                       std::filesystem::copy_options::overwrite_existing);
+        }
     }
     std::vector<std::vector<ExpertLocation>> locations(9);
     int straddling = 0;
@@ -122,7 +136,8 @@ int run(int devices) {
     constexpr std::uint64_t kShared = 3072 + 3072 + 1792, kOwn = 6144 + 6144 + 3328;
     // Owned so it closes its files before they are removed: Windows cannot delete an open file.
     const std::vector<std::uint64_t> budget = {10 * kShared + 4 * kOwn};
-    auto owner = std::make_unique<ExpertStream>(device, paths, stream_layers(), budget);
+    auto owner =
+        std::make_unique<ExpertStream>(device, paths, stream_layers(), budget, false, reads);
     ExpertStream& stream = *owner;
     ExpertStream* checked = &stream; // the stream check() prepares and reads
     require(stream.stats().slots == 14, "ten shared slots and four of layer 2's own");
@@ -211,7 +226,7 @@ int run(int devices) {
     {
         // Empty slots go before released ones: in a fresh pool, layer 0's last chunk releases 0, 1
         // and 2, and its miss and layer 1's five take empty slots, so all five stay resident.
-        ExpertStream fresh(device, paths, stream_layers(), budget);
+        ExpertStream fresh(device, paths, stream_layers(), budget, false, reads);
         fresh.prepare(0, std::vector<std::int32_t>{0, 1, 2, 3}, false);
         fresh.prepare(0, std::vector<std::int32_t>{3, 4}, true);
         fresh.prepare(1, std::vector<std::int32_t>{0, 1, 2, 3, 4}, false);
@@ -224,7 +239,7 @@ int run(int devices) {
     {
         // A budget short of four own slots beside ten shared ones: one pool of the wider slots.
         ExpertStream narrow(device, paths, stream_layers(),
-                            std::vector<std::uint64_t>{10 * kShared + 3 * kOwn});
+                            std::vector<std::uint64_t>{10 * kShared + 3 * kOwn}, false, reads);
         require(narrow.stats().slots == (10 * kShared + 3 * kOwn) / kOwn,
                 "a short budget shares slots fitting the widest expert");
         require(narrow.storage(0) == narrow.storage(2), "layer 2 shares the slots");
@@ -240,7 +255,7 @@ int run(int devices) {
         // shared slots only; five misses take them, so layer 1's ten experts stay resident and
         // every expert reads as stored.
         ExpertStream half(device, paths, stream_layers(),
-                          std::vector<std::uint64_t>{20 * kShared + 4 * kOwn}, true);
+                          std::vector<std::uint64_t>{20 * kShared + 4 * kOwn}, true, reads);
         require(half.stats().slots == 14 && half.pool_bytes(0) == 10 * kShared + 4 * kOwn &&
                     half.storage(0) != half.storage(2),
                 "a pool that grows starts at its widest call in the budget's layout");
@@ -304,7 +319,8 @@ int run(int devices) {
         // layer 1's (1280 + 2560 + 1280 bytes) and layer 2's four.
         constexpr std::uint64_t kLayer1 = 1280 + 2560 + 1280;
         ExpertStream across(pair, paths, std::move(layers),
-                            std::vector<std::uint64_t>{10 * kShared, 10 * kLayer1 + 4 * kOwn});
+                            std::vector<std::uint64_t>{10 * kShared, 10 * kLayer1 + 4 * kOwn},
+                            false, reads);
         require(across.stats().slots == 24 && across.pool_bytes(0) == 10 * kShared &&
                     across.pool_bytes(1) == 10 * kLayer1 + 4 * kOwn,
                 "each rank's pools take its own budget");
@@ -341,6 +357,7 @@ int run(int devices) {
     }
     owner.reset();
     for (const auto& path : paths) { std::filesystem::remove(path); }
+    if (mirror) { std::filesystem::remove_all(reads.mirror); }
     return 0;
 }
 
@@ -353,7 +370,13 @@ int main() {
         return 77;
     }
     try {
-        run(devices);
+        for (const bool direct : {false, true}) {
+            for (const bool mirror : {false, true}) {
+                run(devices, direct, mirror);
+                std::cout << "checked" << (direct ? " direct" : "") << (mirror ? " mirror" : "")
+                          << '\n';
+            }
+        }
         std::cout << "PASS qwen4_exp expert stream\n";
         return 0;
     } catch (const std::exception& error) {
