@@ -987,7 +987,17 @@ struct IndexedByteBoundary {
 
 constexpr std::string_view kSentencePieceSpace = "\xe2\x96\x81"; // U+2581
 
+// Metaspace's "first" scheme prefixes only the run that starts at input byte zero;
+// added tokens interrupt ordinary runs but do not restart the prefix rule.
+bool is_metaspace_first(const Json& root) {
+    if (!root.contains("pre_tokenizer") || !root["pre_tokenizer"].is_object()) return false;
+    const auto& p = root["pre_tokenizer"];
+    return p.value("type", "") == "Metaspace" && p.value("replacement", "") == kSentencePieceSpace &&
+           p.value("prepend_scheme", "") == "first" && !p.value("split", true);
+}
+
 bool is_sentencepiece(const Json& root) {
+    if (is_metaspace_first(root)) return true;
     if (!root.contains("normalizer") || !root["normalizer"].is_object()) { return false; }
     const Json& normalizer = root["normalizer"];
     return normalizer.value("type", std::string{}) == "Replace" &&
@@ -1038,11 +1048,16 @@ bool append_sentencepiece_ids(std::vector<int>& ids, std::string_view text,
                               const BpeMergeTable& merge_rules,
                               const std::unordered_map<std::string, int>& token_to_id,
                               const std::array<int, 256>& byte_ids, std::size_t max_tokens,
-                              std::vector<std::size_t>* ends) {
+                              std::vector<std::size_t>* ends, bool prefix_space) {
     if (text.empty()) { return true; }
     if (ids.size() == max_tokens) { return false; }
     std::vector<BpeNode> nodes;
-    nodes.reserve(text.size());
+    nodes.reserve(text.size() + 1);
+    if (prefix_space && text.front() != ' ' && !text.starts_with(kSentencePieceSpace)) {
+        const auto space = token_to_id.find(std::string(kSentencePieceSpace));
+        if (space == token_to_id.end()) throw std::invalid_argument("Metaspace vocabulary lacks its replacement");
+        nodes.push_back(BpeNode{.symbol = space->second, .end = 0});
+    }
     std::string piece;
     for (std::size_t begin = 0; begin < text.size();) {
         const uni::CodepointSpan cp = uni::utf8_codepoint_at(text, begin, "Tokenizer::encode input");
@@ -1123,11 +1138,11 @@ bool append_sentencepiece_text(BoundaryEncodedText& encoded, std::string_view te
                                std::span<const IndexedByteBoundary> boundaries,
                                const BpeMergeTable& merge_rules,
                                const std::unordered_map<std::string, int>& token_to_id,
-                               const std::array<int, 256>& byte_ids, std::size_t max_tokens) {
+                               const std::array<int, 256>& byte_ids, std::size_t max_tokens, bool prefix_space) {
     const std::size_t token_base = encoded.input_ids.size();
     std::vector<std::size_t> ends;
     const bool complete = append_sentencepiece_ids(encoded.input_ids, text, merge_rules,
-                                                   token_to_id, byte_ids, max_tokens, &ends);
+                                                   token_to_id, byte_ids, max_tokens, &ends, prefix_space);
     for (const IndexedByteBoundary boundary : boundaries) {
         const std::size_t local = boundary.offset - text_offset;
         if (local == 0) {
@@ -1444,6 +1459,18 @@ void Tokenizer::load_sentencepiece(const nlohmann::json& root, const nlohmann::j
                                    const nlohmann::json& model, TokenizerResources resources) {
     constexpr std::string_view label = "tokenizer.json";
     sentencepiece_                   = true;
+    metaspace_first_ = is_metaspace_first(root);
+    if (metaspace_first_) {
+        const Json expected = {{"type", "Sequence"}, {"decoders", Json::array({
+            {{"type", "Replace"}, {"pattern", {{"String", kSentencePieceSpace}}}, {"content", " "}},
+            {{"type", "ByteFallback"}}, {{"type", "Fuse"}},
+            {{"type", "Strip"}, {"content", " "}, {"start", 1}, {"stop", 0}}
+        })}};
+        if (root.value("decoder", Json{}) != expected)
+            throw std::invalid_argument("Metaspace: unsupported decoder pipeline");
+        if (!root.value("normalizer", Json{}).is_null())
+            throw std::invalid_argument("Metaspace: normalizer is unsupported");
+    }
     if (model.value("byte_fallback", false) != true) {
         throw std::invalid_argument("SentencePiece tokenizer.json must use byte fallback");
     }
@@ -1547,7 +1574,7 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
             sentencepiece_
                 ? append_sentencepiece_text(encoded, text.substr(begin, end - begin), begin,
                                             requests, bpe_merge_rules_, vocab_token_to_id_,
-                                            byte_token_ids_, options.max_tokens)
+                                            byte_token_ids_, options.max_tokens, metaspace_first_ && begin == 0)
                 : append_ordinary_text(encoded, text.substr(begin, end - begin), begin, requests,
                                        nfc_, split_, bpe_merge_rules_, byte_token_ids_,
                                        options.max_tokens, run_cache_.get());
@@ -1617,6 +1644,7 @@ std::string Tokenizer::decode(std::span<const int> ids, DecodeOptions options) c
         if (i == terminal_stop_index) { continue; }
         text += decode_token_bytes(id, options.skip_special_tokens);
     }
+    if (metaspace_first_ && !text.empty() && text.front() == ' ') text.erase(0, 1);
     (void)uni::utf8_codepoints(text, "Tokenizer::decode reconstructed output");
     return text;
 }

@@ -28,3 +28,11 @@ set_tests_properties(${_ninfer_all_tests} PROPERTIES SKIP_RETURN_CODE 77 SKIP_RE
 # there once so they resolve their imports (the Windows loader only searches the executable's own
 # directory, the system directories and PATH).
 ninfer_stage_test_runtime_dlls(ninfer_tests)
+
+ninfer_add_test(ninfer_llama_frontend_test STANDALONE NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/models/llama/test_frontend.cpp"
+  LIBRARIES ninfer_model_runtime)
+
+add_executable(ninfer_llama_real_test models/llama/test_real.cpp)
+ninfer_test_includes(ninfer_llama_real_test)
+target_link_libraries(ninfer_llama_real_test PRIVATE ninfer_model_runtime)

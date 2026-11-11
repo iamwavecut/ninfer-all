@@ -16,6 +16,7 @@
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/deepseek_v41_core.h"
 #include "runtime/engine/flint_core.h"
+#include "runtime/engine/llama_core.h"
 #include "runtime/engine/gemma4_core.h"
 #include "runtime/engine/qwen4_exp_core.h"
 #include "runtime/engine/slot_spill_guard.h"
@@ -45,7 +46,7 @@ namespace {
 // Gemma 4, Flint, DeepSeek-V4.1 and Flash-Next: families with a core of their own, not the
 // Qwen3.5 load and Program.
 bool own_family_artifact(const std::filesystem::path& path) {
-    return runtime::is_gemma4_artifact(path) || runtime::is_flint_artifact(path) ||
+    return runtime::is_llama_artifact(path) || runtime::is_gemma4_artifact(path) || runtime::is_flint_artifact(path) ||
            runtime::is_deepseek_v41_artifact(path) || runtime::is_qwen4_exp_artifact(path);
 }
 
@@ -431,12 +432,13 @@ public:
     // Gemma 4: its own model family and core, which serves generation and scoring.
     using Gemma4Core = runtime::Gemma4Core;
     // Flint: likewise.
+    using LlamaCore = runtime::LlamaCore;
     using FlintCore = runtime::FlintCore;
     using DeepSeekV41Core = runtime::DeepSeekV41Core;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<HybridGenerationCore>, std::unique_ptr<ScoringCore>,
                               std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Gemma4Core>,
-                              std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>>;
+                              std::unique_ptr<LlamaCore>, std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(
@@ -456,6 +458,19 @@ public:
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<Gemma4Core>(*gemma, device, options);
+            finalize_phase.complete();
+            return;
+        }
+        if (runtime::is_llama_artifact(options.artifact_path)) {
+            auto constructed    = runtime::construct_llama(options, device);
+            llama               = std::move(constructed.instance);
+            load                = std::move(constructed.load);
+            load.cuda_sync_mode = device.sync_mode();
+            model_metadata      = std::move(constructed.model_metadata);
+            sampling_defaults   = llama->frontend.sampling_defaults();
+            StartupPhaseScope finalize_phase(options.startup_observer,
+                                             StartupPhase::EngineFinalize);
+            core = std::make_unique<LlamaCore>(*llama, device, options);
             finalize_phase.complete();
             return;
         }
@@ -657,6 +672,7 @@ public:
     // The model's frontend and prompt capacity, whichever family it is.
     [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
         return gemma      ? gemma->frontend
+               : llama    ? llama->frontend
                : flint    ? flint->frontend
                : deepseek ? deepseek->frontend
                : flash    ? flash->frontend
@@ -665,6 +681,7 @@ public:
 
     [[nodiscard]] std::uint32_t capacity() const {
         return gemma      ? gemma->capacity
+               : llama    ? llama->capacity
                : flint    ? flint->capacity
                : deepseek ? deepseek->capacity
                : flash    ? flash->capacity
@@ -678,6 +695,7 @@ public:
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> flash;
     std::unique_ptr<runtime::Gemma4Instance> gemma;
+    std::unique_ptr<runtime::LlamaInstance> llama;
     std::unique_ptr<runtime::FlintInstance> flint;
     std::unique_ptr<runtime::DeepSeekV41Instance> deepseek;
     LoadSummary load;
@@ -887,6 +905,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::Qwen4ExpCore>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::Gemma4Core>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::LlamaCore>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::FlintCore>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::DeepSeekV41Core>>) {
                 return core->score(std::move(prompt.impl_->value), first_target);
@@ -1150,13 +1169,13 @@ GenerationHandle Engine::submit_branches(std::vector<GenerationBranch> branches,
 bool Engine::runs_branches() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::Generation) { return false; }
-    if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek) { return true; }
+    if (impl_->flash || impl_->gemma || impl_->llama || impl_->flint || impl_->deepseek) { return true; }
     return impl_->active->program->runs_branched_reads();
 }
 
 std::uint32_t Engine::branch_token_limit() const {
     if (!runs_branches()) { return 0; }
-    if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek) {
+    if (impl_->flash || impl_->gemma || impl_->llama || impl_->flint || impl_->deepseek) {
         return std::numeric_limits<std::uint32_t>::max();
     }
     return impl_->active->program->prefill_batch_capacity();
@@ -1191,7 +1210,7 @@ std::uint32_t Engine::concurrent_output_budget(const PreparedPrompt& prompt) con
         throw std::logic_error("concurrent_output_budget requires a Generation Engine");
     }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
-    if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek) {
+    if (impl_->flash || impl_->gemma || impl_->llama || impl_->flint || impl_->deepseek) {
         // One sequence at a time: the whole window past the prompt.
         const std::uint32_t prompt_tokens = prompt.impl_->summary.prompt_tokens;
         return prompt_tokens >= impl_->capacity() ? 0U : impl_->capacity() - prompt_tokens + 1U;
