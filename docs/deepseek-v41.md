@@ -672,6 +672,14 @@ keeps instead of prefilling those tokens again:
 A window state cannot be cut back, so a prompt resumes only where a state was kept, not at an
 arbitrary common prefix.
 
+A resumed prompt does not reproduce a cold prefill's log probabilities bit for bit, and a decode
+moves them no more than a prefill split at the same place does. On an A40 (IQ1_M, host experts),
+the first answer token of a 134-token second turn had a log probability 0.076 from the cold
+prefill's when the turn resumed from the state the first turn's decode left, and 0.18 from it when
+the turn resumed from a prefilled prefix of the same 119 tokens; greedy, both answers left the cold
+prefill's text at a near tie. On Qwen3.8-27B the same three paths put that log probability within
+0.004 of each other and gave the same text.
+
 A turn that a stop string ends returns to the state where the stop string's match began, the one
 its visible text continues: the live state has read the tokens the cut removed. Each sequence
 holds a second copy of its rings and tails for it, written when a step's sampled token begins a
