@@ -46,6 +46,10 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   the model continues with the arguments; see [forced selection](serving.md#function-tools)),
   streaming, reasoning in its own channel when thinking is on, and causal scoring
   (`ninfer-perplexity`).
+- **Prompt chunks without logits.** A chunk before the prompt's last, or before a scoring call's
+  first scored position, runs its last block only up to the key/value store: that block's attention
+  output, MLP and experts feed only the head. The stored rows are those of the whole block, so
+  caches and logits keep their bits.
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
   with `chat_template_kwargs: {"enable_thinking": true}`, and the reasoning arrives as
   `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply and the

@@ -19,6 +19,22 @@ namespace ninfer::ops {
 
 inline constexpr int kCausalPromptHeadDim = 256;
 
+// A prompt CTA's query row block and grid y index (its query head, or its KV head under
+// PackGqa) in longest-first issue order: the first gridDim.y CTAs take the last row block of every
+// y index, whose rows see the most keys, so a causal launch's last wave holds its shortest CTAs.
+// Every (row block, y) pair still runs in exactly one CTA, which does the work blockIdx.x and
+// blockIdx.y would give it: the same bits.
+struct CausalPromptBlock {
+    int row_block = 0;
+    int y         = 0;
+};
+
+__device__ __forceinline__ CausalPromptBlock causal_prompt_block_longest_first() {
+    const int columns = static_cast<int>(gridDim.y);
+    const int linear  = static_cast<int>(blockIdx.x + blockIdx.y * gridDim.x);
+    return {static_cast<int>(gridDim.x) - 1 - linear / columns, linear % columns};
+}
+
 inline constexpr int kCausalPromptBr        = 64;
 inline constexpr int kCausalPromptBc        = 64;
 inline constexpr int kCausalPromptThreads   = 128;

@@ -14,9 +14,10 @@
 // DFlash2 block proposing the drafts from its ring of committed target features. Prompts of
 // several sequences packed in one span (host or disk experts on one device) must leave each piece
 // the logits it gets alone, bit for bit, and a span that keeps the state at a cut inside it the
-// logits and the state of two calls split there (plain, with MTP and with DFlash2). The context
-// cache's sequence images (live and at a snapshot) must continue as the sequence they were taken
-// from.
+// logits and the state of two calls split there (plain, with MTP and with DFlash2). A prompt fed
+// in steps that leave no logits, whose last layer then runs its appends alone, must leave the
+// state and logits of steps that leave them, byte for byte. The context cache's sequence images
+// (live and at a snapshot) must continue as the sequence they were taken from.
 //
 //   NINFER_QWEN4_EXP_ARTIFACT  the model's .ninfer (required; skips without it)
 //   NINFER_QWEN4_EXP_DRAFTS    MTP drafts a round (default 3; 0 skips the speculative check)
@@ -508,6 +509,70 @@ int check_prompt_cut(const Model& model, DeviceContext& device, ExecutorOptions 
     continues("an image of the cut's state, saved after the step");
     executor.restore(0, at);
     continues("the cut's state");
+    return failures;
+}
+
+// A prompt fed in steps that leave no logits (Executor::forward with 0 rows), whose last layer
+// then runs only its KV and indexer appends (unless an MTP block follows the prompt), must leave
+// the sequence's whole state (its image: the paged KV, the indexer's pooled keys, the recurrent
+// state) and the last step's logits that steps leaving one row leave, byte for byte, and decode on
+// the same: in steps of one chunk (passes) and, with prompt spans, of two chunks (spans).
+int check_kv_only(const Model& model, DeviceContext& device, ExecutorOptions options,
+                  const char* label) {
+    options.sequences = 1;
+    Executor executor(model, device, options);
+    const std::uint32_t c   = options.prefill_chunk;
+    const std::size_t total = 3 * std::size_t(c) + c / 3;
+    std::string text        = "<|im_start|>system\nThe readings below come from one building.\n";
+    for (std::size_t i = 0; i < total / 8 + 16; ++i) {
+        text += "Reading " + std::to_string(i) + ": room " + std::to_string((i * 5) % 23) +
+                " stood at " + std::to_string((i * 29) % 41) + " degrees.\n";
+    }
+    const auto ids = model.resources().tokenizer->encode(text, {.parse_added_tokens = true});
+    if (ids.size() < total) { throw std::runtime_error("K/V-only steps: short fixture"); }
+    const std::vector<std::int32_t> prompt(ids.begin(), ids.begin() + std::ptrdiff_t(total));
+    constexpr int kSteps           = 8;
+    constexpr std::size_t kPage    = 7'000'003;
+    const std::size_t vocab        = model.config().vocab_size;
+    const std::size_t domain       = model.resources().public_token_count;
+    std::vector<std::size_t> steps = {c};
+    if (executor.packs_prompts()) { steps.push_back(2 * std::size_t(c)); }
+    int failures = 0;
+    for (const std::size_t step : steps) {
+        // [0]: the steps before the last leave no logits; [1]: one row each. An image's last KV
+        // page carries the positions after the prompt, which the previous run's decode wrote: the
+        // first run only puts the same decode there before each compared one.
+        std::array<std::vector<__nv_bfloat16>, 2> logits;
+        std::array<std::vector<std::byte>, 2> state;
+        std::array<std::vector<int>, 2> tokens;
+        for (const std::uint32_t rows : {1U, 0U, 1U}) {
+            executor.reset(0);
+            for (std::size_t at = 0; at < prompt.size(); at += step) {
+                const std::size_t n = std::min(step, prompt.size() - at);
+                executor.forward(0, std::span(prompt).subspan(at, n),
+                                 at + n < prompt.size() ? rows : 1U);
+            }
+            logits[rows].resize(vocab);
+            read_logits(executor, logits[rows]);
+            const std::size_t count =
+                (executor.image_bytes(executor.position(0)) + kPage - 1) / kPage;
+            state[rows].assign(count * kPage, std::byte{0});
+            std::vector<std::byte*> pages(count);
+            for (std::size_t i = 0; i < count; ++i) { pages[i] = state[rows].data() + i * kPage; }
+            executor.save_image(0, nullptr, pages, kPage);
+            std::vector<__nv_bfloat16> scratch(vocab);
+            tokens[rows] =
+                decode_alone(executor, model, 0, argmax(logits[rows], domain), kSteps, scratch);
+        }
+        const bool same_logits = std::memcmp(logits[0].data(), logits[1].data(), vocab * 2) == 0;
+        const bool pass        = same_logits && state[0] == state[1] && tokens[0] == tokens[1];
+        std::cout << (pass ? "OK   " : "FAIL ") << "K/V-only steps (" << label << "), " << step
+                  << "-token steps over " << prompt.size() << " tokens: logits "
+                  << (same_logits ? "equal" : "differ" + difference(logits[0], logits[1]))
+                  << ", state " << (state[0] == state[1] ? "equal" : "differs") << ", decode "
+                  << (tokens[0] == tokens[1] ? "equal" : "differs") << '\n';
+        failures += pass ? 0 : 1;
+    }
     return failures;
 }
 
@@ -1005,11 +1070,13 @@ int run(const char* artifact_path) {
     failures += check_batch_and_snapshot(*model, device, options);
     failures += check_packed_prompts(*model, device, options);
     failures += check_prompt_cut(*model, device, options, "plain");
+    failures += check_kv_only(*model, device, options, "plain");
     failures += check_images(*model, device, options, prompts, replayed);
     if (load.mtp) {
         ExecutorOptions speculative = options;
         speculative.draft_tokens    = drafts;
         failures += check_prompt_cut(*model, device, speculative, "MTP");
+        failures += check_kv_only(*model, device, speculative, "MTP");
         failures += check_speculative(*model, device, speculative, prompts, replayed);
     } else {
         std::cout << "speculative decoding: not checked (no MTP block, or no drafts)\n";
@@ -1020,6 +1087,7 @@ int run(const char* artifact_path) {
         speculative.draft_tokens    = dflash2_drafts;
         speculative.dflash2         = true;
         failures += check_prompt_cut(*model, device, speculative, "DFlash2");
+        failures += check_kv_only(*model, device, speculative, "DFlash2");
         failures += check_speculative(*model, device, speculative, prompts, replayed);
     } else {
         std::cout << "DFlash2 speculative decoding: not checked (no drafter, or no drafts)\n";

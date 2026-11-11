@@ -376,7 +376,12 @@ blocks leave at a position, and the logits there, depend only on their rows with
 - **A stopped prompt.** A request stopped inside its prompt leaves those blocks behind the rest of
   the sequence's state. NInfer keeps no image of that state; the next prompt on the sequence starts
   from its last checkpoint, from the host store or from the beginning.
-- **Scoring.** Causal scoring computes every position's logits, so it runs every row.
+- **The last block.** A prompt chunk that produces no logits runs block 39 only up to its window
+  latents: its attention output and experts feed only the head. The latents are those of the whole
+  block, so tokens, log probabilities and kept states keep their bits under every tail.
+- **Scoring.** Causal scoring computes every position's logits, so it runs every row. A chunk before
+  the first scored position runs block 39 only up to its window latents, unless an `N` tail shorter
+  than the chunk would then leave rows out.
 
 Prefill rates, the outputs and the cost of a stopped prompt are
 [measured below](#prefill-tail-iq1_m-experts-and-engram-reads).

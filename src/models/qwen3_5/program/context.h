@@ -101,6 +101,10 @@ struct PrefillContext {
     std::function<void()> first_token;
     // Exact prefix-cache taps inside a text chunk (TextContext::set_gdn_taps).
     std::span<const GdnTap> gdn_taps;
+    // The caller reads no prefill_hidden column of a chunk that ends before the prompt and samples
+    // nothing, so such a chunk may run its last layer as K/V only
+    // (TextContext::set_last_layer_kv_only).
+    bool last_layer_kv_only = false;
 };
 
 struct OrdinaryBatchContext {

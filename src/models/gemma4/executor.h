@@ -136,10 +136,12 @@ public:
     // The CPU's share of missing experts: its threads and backend, or empty without one.
     [[nodiscard]] std::string expert_cpu_description() const;
     // Runs up to prefill_chunk tokens at the sequence's next positions and leaves the logits of the
-    // last `logit_rows` (at most kMaxLogitRows) in logits(). The soft tokens of `media` take the
-    // place of their rows' placeholder embeddings, and with the vision config's bidirectional
-    // attention a unit's soft tokens see each other in the sliding-window blocks; a unit must lie
-    // whole in one chunk.
+    // last `logit_rows` (at most kMaxLogitRows) in logits(). With no logit rows (a chunk whose
+    // output nothing reads), a full-attention last block only writes the chunk's keys and values,
+    // the bytes the whole block writes, and the assistant drafts after the next chunk. The soft
+    // tokens of `media` take the place of their rows' placeholder embeddings, and with the vision
+    // config's bidirectional attention a unit's soft tokens see each other in the sliding-window
+    // blocks; a unit must lie whole in one chunk.
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const ChunkMedia> media = {});
     // Branches of a text prompt in one pass, each continuing the sequence from its position:

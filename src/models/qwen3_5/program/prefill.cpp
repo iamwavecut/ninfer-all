@@ -109,6 +109,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     card.set_gdn_taps(state.gdn_taps);
+    card.set_last_layer_kv_only(state.last_layer_kv_only);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     if (state.first_token) { card.set_first_token_hook(state.first_token); }
     const std::span<const int> prompt(ids.data(), ids.size());
@@ -142,6 +143,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
+    card.set_last_layer_kv_only(state.last_layer_kv_only);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     if (state.dflash != nullptr && state.drafter) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -1383,6 +1385,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         };
         arm_logprobs(request.logprobs);
         schedule_state.readout_count = arm_readout(request.readout_tokens);
+        // This path reads prefill_hidden only after the chunk that finalizes the prompt.
+        schedule_state.last_layer_kv_only = true;
         // The first token leaves the device as soon as it is sampled. The drafter's work on the
         // prompt's end (its MTP pass or bridge and the initial proposals) finishes behind it, and
         // the initial drafts are taken when the lane's first round needs them. A Vision prompt's

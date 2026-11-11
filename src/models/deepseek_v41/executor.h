@@ -187,7 +187,8 @@ public:
     // layer by layer so that each block's missing experts cross the bus once for all of them.
     [[nodiscard]] std::uint32_t prompt_step() const noexcept;
     // Runs up to prompt_step() tokens at the sequence's next positions and leaves the logits of
-    // the last `logit_rows` (at most kMaxLogitRows; 0: none) in logits(). `images` (in row order,
+    // the last `logit_rows` (at most kMaxLogitRows; 0: none, and the last block of a chunk without
+    // logit rows only keeps its window latents) in logits(). `images` (in row order,
     // apart) replace their rows' embeddings. `state_at` (0: the call's end) is the position of the
     // next state the caller keeps or resumes from (an anchor, a stored prefix, the prompt's end),
     // at or past the call's end; every prompt call up to it passes the same one. Under a prefill

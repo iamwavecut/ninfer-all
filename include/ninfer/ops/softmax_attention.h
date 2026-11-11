@@ -200,6 +200,23 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               Tensor* partial = nullptr);
 
 /**
+ * Append the K/V rows of a causal_softmax_attention call without its attention.
+ *
+ * k, v, positions, valid_columns, kv_table_rows, geometry, cache and envelope follow
+ * causal_softmax_attention, for a call that resolves to the prompt route
+ * (causal_softmax_attention_route_family returns 2). This Op writes the same bytes into every
+ * cache row that call appends, including a position-split rank's rows, and writes no other byte.
+ * A caller that needs only the cache takes it, for example the last layer of a prompt chunk that
+ * produces no logits and no final hidden state. A call that resolves to another route throws: the
+ * small-T kernels append inside the attention.
+ */
+void causal_softmax_attention_append(const Tensor& k, const Tensor& v, const Tensor& positions,
+                                     const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                     AttentionHeadGeometry geometry, PagedKVBatchLayerView cache,
+                                     CausalAttentionExecutionEnvelope envelope,
+                                     cudaStream_t stream);
+
+/**
  * Position-split attention (--tensor-attention positions). Each rank of a position-split pool
  * holds some of a row's keys (PagedKVBatchLayerView::page_stride, page_residue): the stride and
  * residue select its physical pages, and causal_softmax_attention over that rank's view attends

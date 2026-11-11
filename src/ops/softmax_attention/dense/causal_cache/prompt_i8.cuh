@@ -196,8 +196,10 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_i8);
 
     constexpr int PackGroup = PackGqa ? Geometry::GroupSize : 1;
-    const int q_block       = static_cast<int>(blockIdx.x);
-    const int head          = static_cast<int>(blockIdx.y);
+    const CausalPromptBlock block = causal_prompt_block_longest_first();
+
+    const int q_block       = block.row_block;
+    const int head          = block.y;
     const int q_heads       = causal_prompt_q_heads<Geometry, PackGqa>();
     const int kv_heads      = q_heads / Geometry::GroupSize;
     const int tid           = static_cast<int>(threadIdx.x);

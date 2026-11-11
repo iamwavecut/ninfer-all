@@ -1467,7 +1467,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph, bool kv_only) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -1566,6 +1566,24 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const bool rotated_output = rotated(p.output.hadamard_signs);
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    if (kv_only) {
+        // The rows the attention call would append, through the same launch on its prompt route;
+        // a call on a small-T route appends inside its kernels, so it runs whole below and its
+        // output goes unused.
+        if (active_sequence_batch_ != 0 || !active_segments_.empty()) {
+            throw std::logic_error("a K/V-only layer runs one prompt chunk");
+        }
+        const ops::AttentionHeadGeometry geometry{dimension(config.attention->head_dim),
+                                                  dimension(config.attention->num_attention_heads),
+                                                  dimension(config.attention->num_key_value_heads)};
+        const PagedKVBatchLayerView view = batch_text_kv_->batch_layer_view(fidx, kv_rank);
+        if (ops::causal_softmax_attention_route_family(geometry, view.storage, envelope, 1, T) ==
+            2) {
+            ops::causal_softmax_attention_append(kn, v, cache_positions, Tensor{}, kv_table_rows,
+                                                 geometry, view, envelope, s);
+            return;
+        }
+    }
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1633,6 +1651,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             batch_text_kv_->batch_layer_view(fidx, kv_rank), envelope, work_, a, s,
             rotated_output || positions ? nullptr : &gate, positions ? &partial : nullptr);
     }
+    if (kv_only) { return; }
     if (positions) {
         // The rank's query heads' gates, contiguous for the merge.
         const TensorShare& share = stage_runtime_->tensor_parallel->shares[tensor_rank_];
@@ -2080,6 +2099,8 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
             if (layer < layer_ready_.size()) {
                 CUDA_CHECK(cudaStreamWaitEvent(ctx_.stream, layer_ready_[layer], 0));
             }
+            // A K/V-only pass ends at the model's last layer once its rows are in the cache.
+            const bool kv_only = kv_only_pass_ && layer + 1 == parameters_.text.layers.size();
             {
                 nvtx::ScopedRange mixer_range(
                     full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
@@ -2087,11 +2108,12 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                     full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
                 auto scope = work_.scope();
                 if (full) {
-                    attn_mix(block, x, compact, ph);
+                    attn_mix(block, x, compact, ph, kv_only);
                 } else {
                     gdn_mix(block, x, compact, ph);
                 }
             }
+            if (kv_only) { continue; }
             steer(ops::SteerResidualStep::Write, mixer_steering_site(layer), -1, x);
             {
                 nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer
@@ -2648,6 +2670,61 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
         ++attention_ranks;
     }
     const auto layers = static_cast<std::uint32_t>(parameters_.text.layers.size());
+    // A K/V-only pass: the ranks that hold the last layer's KV rows append them, piece by piece
+    // where the pass runs in pieces (the projections' shapes stay those of the whole layer), and
+    // nothing is exchanged. A position-split rank appends on the prompt route only, so a chunk
+    // whose attention leaves it runs that layer whole.
+    bool kv_only_last = kv_only_pass_;
+    if (kv_only_last && positions) {
+        const auto last_compact = dimension(config_.compact_layer_indices[layers - 1]);
+        ops::CausalAttentionExecutionEnvelope envelope = *active_causal_attention_envelope_;
+        envelope.invariant_segment_keys                = batch_text_kv_->attention_segment_keys();
+        const ops::AttentionHeadGeometry geometry{
+            dimension(config_.attention->head_dim),
+            dimension(config_.attention->num_attention_heads),
+            dimension(config_.attention->num_key_value_heads)};
+        kv_only_last = ops::causal_softmax_attention_route_family(
+                           geometry, batch_text_kv_->batch_layer_view(last_compact, 0).storage,
+                           envelope, 1, x.ne[1]) == 2;
+    }
+    ScopedValue<bool> kv_only_guard(kv_only_pass_, kv_only_last);
+    const auto kv_only_layer = [&](const auto& share) {
+        const std::size_t holders = positions ? ranks : attention_ranks;
+        if (pieces.empty()) {
+            for (std::size_t rank = 0; rank < holders; ++rank) {
+                on_rank(rank, [&](Tensor& replica) { share(rank, replica); });
+            }
+            return;
+        }
+        for (std::size_t index = 0; index < pieces.size(); ++index) {
+            const Piece& piece = pieces[index];
+            for (std::size_t rank = 0; rank < holders; ++rank) {
+                std::optional<ScopedDeviceRank> device_guard;
+                std::optional<ScopedArenaRank> arena_guard;
+                if (rank != 0) {
+                    device_guard.emplace(ctx_, rank);
+                    arena_guard.emplace(work_, rank);
+                }
+                ScopedControl control_guard(current, piece.control[rank], slots);
+                ScopedValue<const ops::CausalAttentionExecutionEnvelope*> envelope_guard(
+                    active_causal_attention_envelope_, &piece.envelope);
+                if (!first_piece_step) {
+                    CUDA_CHECK(
+                        cudaStreamWaitEvent(ctx_.stream, exchange.piece_done(rank, index), 0));
+                }
+                Tensor sub   = replicas[rank].x.slice(1, piece.column, piece.columns);
+                tensor_rank_ = rank;
+                try {
+                    auto scope = work_.scope();
+                    share(rank, sub);
+                } catch (...) {
+                    tensor_rank_ = 0;
+                    throw;
+                }
+                tensor_rank_ = 0;
+            }
+        }
+    };
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const auto block = [&](std::size_t rank) -> const BlockParameters& {
             return rank == 0 ? parameters_.text.layers[layer]
@@ -2658,6 +2735,12 @@ void TextContext::run_tensor_parallel(Tensor& x, Phase ph, Tap& tap) {
         try {
             if (layer < layer_ready_.size()) {
                 CUDA_CHECK(cudaStreamWaitEvent(entry_stream, layer_ready_[layer], 0));
+            }
+            if (kv_only_last && layer + 1 == layers) {
+                kv_only_layer([&](std::size_t rank, Tensor& replica) {
+                    attn_mix(block(rank), replica, compact, ph, true);
+                });
+                continue;
             }
             if (full && positions) {
                 // Every rank attends over its own pages into a slot of the exchange and publishes
@@ -2846,6 +2929,27 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             gdn_live_taps_ = inside ? gdn_tap_count_ : 0;
         }
         tapped = gdn_live_taps_ != 0;
+        // The last layer as K/V only (set_last_layer_kv_only): nothing reads the chunk's final
+        // hidden state.
+        const std::size_t prompt_tokens = multimodal != nullptr ? multimodal->token_ids.size()
+                                          : text_prefill != nullptr
+                                              ? text_prefill->token_ids.size()
+                                              : static_cast<std::size_t>(base) + ids.size();
+        bool kv_only =
+            last_layer_kv_only_allowed_ && !is_last && !prepare_mtp_prompt &&
+            static_cast<std::size_t>(prompt_t0) + static_cast<std::size_t>(len) < prompt_tokens &&
+            config_.layer_types.back() == MixerKind::FullAttention &&
+            !(split_rel > 0 && t0 + len == split_rel &&
+              rewrite_checkpoint_hidden_output_ != nullptr);
+        for (std::size_t index = 0; index < gdn_live_taps_; ++index) {
+            kv_only = kv_only && gdn_taps_[index].hidden == nullptr;
+        }
+        if constexpr (Tap::enabled) {
+            const auto last = static_cast<std::uint32_t>(parameters_.text.layers.size() - 1);
+            kv_only = kv_only &&
+                      std::find(tap.layers.begin(), tap.layers.end(), last) == tap.layers.end();
+        }
+        ScopedValue<bool> kv_only_guard(kv_only_pass_, kv_only);
         nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                       static_cast<std::uint64_t>(len));
 
@@ -2944,7 +3048,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-            ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+            if (!kv_only) { ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s); }
             for (std::size_t index = 0; index < gdn_live_taps_; ++index) {
                 Tensor* hidden = gdn_taps_[index].hidden;
                 if (hidden == nullptr) { continue; }

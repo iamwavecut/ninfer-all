@@ -271,6 +271,9 @@ struct Pass {
     // A prompt call's first row the decoder blocks run (t: none, under a prefill tail), and its
     // first row the drafter taps (-1: its last window of rows).
     int decoder_row = 0, tap_row = -1;
+    // A prompt call without logit rows: its last block leaves only its window latents (and a kv
+    // source's compressed rows), since no row reads that block's output.
+    bool kv_only = false;
 };
 
 } // namespace
@@ -1962,9 +1965,12 @@ struct Executor::Impl {
         kernels::engram_gate(h, kv, p.engram_gate, t, streams, hidden, eps, stream, image_mask);
     }
 
-    // The block's attention: its output y added to the streams through `post` and `comb`.
+    // The block's attention: its output y added to the streams through `post` and `comb`. With
+    // `kv_only`, only the state the block leaves for later rows: its window latents, and a kv
+    // source's compressed rows (the same projection, so the same bytes); the streams stay.
     void attention(const LayerPlan& p, float* h, const float* pre, int t, const Pass& s,
-                   std::int32_t* topk, std::uint32_t* candidates, const Coefficients& c) {
+                   std::int32_t* topk, std::uint32_t* candidates, const Coefficients& c,
+                   bool kv_only = false) {
         auto scope      = workspace->scope();
         const auto* pos = static_cast<const std::int32_t*>(d_positions.p) + s.row;
         const auto* seq = s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p);
@@ -2007,6 +2013,14 @@ struct Executor::Impl {
         kv.sequences = seq;
         kv.ring      = s.chunk ? prefill_ring : kRing;
         kernels::kv_post(kv, stream);
+        if (kv_only) {
+            if (!s.chunk) { throw std::logic_error("deepseek_v41: a key-value-only decode row"); }
+            if (p.ratio > 0 && p.kv_source) { compress_block(p, x32, t, s); }
+            const int end = int(s.first) + t;
+            kernels::ring_copy(stage_ring, prefill_ring, own, kRing, std::max(0, end - window), end,
+                               stream);
+            return;
+        }
         Tensor q = alloc_bf16(heads * kLatent, t);
         if (p.stq) {
             stq_project(p.stq->query_b, qr, nullptr, heads * kLatent, 0,
@@ -2900,10 +2914,13 @@ struct Executor::Impl {
             image_mask           = images == nullptr ? nullptr : images + r;
             if (p.engram >= 0) { engram_block(p, hr, part.t, part); }
             mixes(p.hc_attention, hr, part.t, mix_scratch, a);
-            attention(p, hr, pre == nullptr ? nullptr : pre + std::size_t(r) * streams, part.t, part,
-                      topk + std::size_t(r) * index_topk,
-                      candidates == nullptr ? nullptr : candidates + std::size_t(r) * candidate_words,
-                      a);
+            const bool kv_only = s.kv_only && l + 1 == layers.size();
+            attention(p, hr, pre == nullptr ? nullptr : pre + std::size_t(r) * streams, part.t,
+                      part, topk + std::size_t(r) * index_topk,
+                      candidates == nullptr ? nullptr
+                                            : candidates + std::size_t(r) * candidate_words,
+                      a, kv_only);
+            if (kv_only) { break; }
             mixes(p.hc_ffn, hr, part.t, mix_scratch, f);
             ffn(p, hr, a.pre, part.t, f);
             pre = ffn_site.pre;
@@ -3029,6 +3046,7 @@ struct Executor::Impl {
         s.logit_column = int(logit_column);
         s.decoder_row  = decoder_row;
         s.tap_row      = tap_start(first, t, state_at);
+        s.kv_only      = logit_rows == 0;
         run(s);
         decoder_ran(sequence, first + std::uint32_t(t), decoder_row, t);
         positions[sequence] = first + std::uint32_t(t);
@@ -3137,10 +3155,14 @@ struct Executor::Impl {
                                  : static_cast<const std::uint8_t*>(d_image.p) + lo;
                 if (p.engram >= 0) { engram_block(p, hc, s.t, s); }
                 mixes(p.hc_attention, hc, s.t, mix_scratch, a);
+                // The last block of a chunk before the span's logit rows: its window latents alone.
+                const bool kv_only = l + 1 == layers.size() && hi <= n - int(logit_rows);
                 // The first block reads stream 0; a later one the previous block's ffn site.
                 attention(p, hc, l == 0 ? nullptr : f.pre, s.t, s,
                           topk + std::size_t(lo) * index_topk,
-                          candidates ? candidates + std::size_t(lo) * candidate_words : nullptr, a);
+                          candidates ? candidates + std::size_t(lo) * candidate_words : nullptr, a,
+                          kv_only);
+                if (kv_only) { continue; }
                 mixes(p.hc_ffn, hc, s.t, mix_scratch, f);
                 ffn(p, hc, a.pre, s.t, f);
             }

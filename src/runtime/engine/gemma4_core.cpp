@@ -1640,7 +1640,9 @@ struct Gemma4Core::Impl {
         const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
         std::vector<std::vector<std::uint16_t>> host_embeddings;
         const auto media = chunk_media(r, r.prefilled, r.prefilled + n, host_embeddings);
-        executor.forward(r.slot, chunk, 1, media);
+        // A chunk before the prompt's end leaves no logits: its last block only writes its keys
+        // and values.
+        executor.forward(r.slot, chunk, r.prefilled + n < prompt_n ? 0U : 1U, media);
         if (!media.empty() && !instance.cpu_vision) {
             r.vision_seconds += executor.last_media_seconds();
         }
@@ -1725,7 +1727,7 @@ struct Gemma4Core::Impl {
         }
         const std::uint32_t n = prefill_step_tokens(r);
         const auto chunk      = std::span<const TokenId>(branch.tokens).subspan(r.branch_fed, n);
-        executor.forward(r.slot, chunk, 1);
+        executor.forward(r.slot, chunk, r.branch_fed + n < branch.tokens.size() ? 0U : 1U);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         r.branch_fed += n;
         r.progress = Clock::now();
@@ -2504,7 +2506,9 @@ struct Gemma4Core::Impl {
         out.reserve(n - first_target);
         for (std::uint32_t at = 0; at + 1 < n; at += chunk) {
             const std::uint32_t count = std::min(chunk, n - 1 - at);
-            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, count), count);
+            // A chunk before the first target only extends the context.
+            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, count),
+                             first_target > at + count ? 0U : count);
             const std::uint32_t first_row = first_target > at + 1 ? first_target - at - 1 : 0;
             if (first_row >= count) { continue; }
             const std::uint32_t rows = count - first_row;

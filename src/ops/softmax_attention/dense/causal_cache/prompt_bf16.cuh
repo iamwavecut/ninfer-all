@@ -470,8 +470,10 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
     __nv_bfloat16* k_s = q_s + Br * D; // [Bc, D] swizzled
     __nv_bfloat16* v_s = k_s + Bc * D; // [Bc, D] swizzled
 
-    const int q_block = static_cast<int>(blockIdx.x);
-    const int q_head  = static_cast<int>(blockIdx.y);
+    const CausalPromptBlock block = causal_prompt_block_longest_first();
+
+    const int q_block = block.row_block;
+    const int q_head  = block.y;
     const int q_heads = causal_prompt_q_heads<Geometry>();
     const int tid     = static_cast<int>(threadIdx.x);
     const int warp    = tid >> 5;

@@ -853,6 +853,12 @@ not.
   memory the device has free at startup: in a prompt past eight chunks each layer's uncached experts
   then cross the bus half as often ([Expert placements](#expert-placements)). Weighted expert
   outputs are summed in fixed point, so the result does not depend on the order experts finish in.
+- A prompt chunk whose rows produce no logits (each chunk before the prompt's last, and a scoring
+  call's chunks before its first scored position) runs the last layer, a sparse attention layer,
+  only up to its key/value and indexer-key appends. In a span, the last layer's expert calls run
+  only where one of their chunks produces logits, so those experts cross the bus less often. With
+  MTP every chunk runs whole, since the MTP block reads each position's final stack. The appended
+  rows come from the same projections and kernels, so caches, states and logits keep their bits.
 - Decode steps, verifications of up to 64 tokens and prompt chunks of up to 64 tokens (eight with
   `--expert-tail-skip`; every verification and prompt chunk where half the free memory cannot hold a
   slot pool) of GGUF host experts run in two stages. A kernel splits the call's routes into the
