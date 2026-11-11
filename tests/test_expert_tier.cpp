@@ -328,6 +328,15 @@ void split() {
     for (int call = 0; call < 9; ++call) { probes += slow_cpu.cpu_count(pairs, 2.0); }
     require(probes == 1, "the CPU is probed once in nine calls: " + std::to_string(probes));
     require(ExpertSplit::cpu_work(2.0, 5) > ExpertSplit::cpu_work(2.0, 1), "more pairs, more work");
+    // A wide call's first experts (more pairs than the CPU takes) stay on the GPU whatever the
+    // times; the CPU's share comes from the rest.
+    for (const std::size_t least : {std::size_t(4), std::size_t(10), std::size_t(12)}) {
+        const auto share = slow_copies.cpu_count(pairs, 2.0, least);
+        require(share <= (least < pairs.size() ? pairs.size() - least : 0),
+                "the first " + std::to_string(least) + " stay on the GPU: " +
+                    std::to_string(share));
+    }
+    require(slow_copies.cpu_count(pairs, 2.0, 4) >= 5, "the faster CPU takes nearly all the rest");
 }
 
 void pool() {

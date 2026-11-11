@@ -25,7 +25,12 @@ BF16.
 
 Every product quantizes its BF16 activation to ggml's `q8_1` numbers, one scale and one sum per 32
 values, as llama.cpp does, and accumulates in FP32; the weights' represented values are exactly
-those of `ggml-quants.c`.
+those of `ggml-quants.c`. The vector kernel stores both in binary16, as does the matrix kernel for
+the types whose products read the sum (Q4_K, Q5_K and IQ1_S among them): a 32-value block whose
+largest magnitude passes 127 × 65,504 (about 8.3 million) overflows such a scale, and one whose sum
+passes 65,504 overflows the sum. Flint's routed SwiGLU
+products reach the second limit, so its executor scales them ([F16 activation
+sums](flint.md#f16-activation-sums)).
 
 - **Up to eight columns** (decode, speculative verification, small batches), the vector kernel
   (`src/ops/linear/gguf/ggml_bridge_vec.cuh`) decodes each 32-value slice of a row once into int8

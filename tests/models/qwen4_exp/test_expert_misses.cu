@@ -6,10 +6,12 @@
 // the CPU computes its share) and releases the call, which must return within seconds. On Linux an
 // idle service and its CPU workers sleep: the process then uses almost no CPU time.
 //
-// A wide call (more than kNarrowMissTokens tokens) brings every missing expert into device memory
-// in rounds that alternate between the staging's halves, with zeros after each down, and the CPU
-// takes no share of it, whatever the misses' CPU share: its products take the matrix kernel, which
-// the CPU's do not reproduce. A narrow call after it is served as before.
+// A wide call (more than kNarrowMissTokens tokens) brings the missing experts the GPU runs into
+// device memory in rounds that alternate between the staging's halves, with zeros after each down.
+// With a CPU share, the CPU takes its share of the missing experts with at most
+// ops::kGgufMoeVectorPairs pairs (the vector products' experts, which its products reproduce) and
+// none of the others (the matrix kernel's): a call whose experts all have more takes no CPU share.
+// A narrow call after it is served as before.
 
 #include "models/qwen4_exp/expert_misses.h"
 
@@ -22,6 +24,7 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -228,15 +231,22 @@ void replay_late(Fixture& f, cudaStream_t stream, bool cpu, const std::string& l
 
 // One layer of 16 Q8_0 experts at Flash-Next's shapes, each its own bytes (every byte of expert
 // e's projection k is 1 + 3e + k), behind a staging of two experts a half: a wide call of 16
-// tokens routes all 16 (token j to experts j..j + 9 mod 16), none cached.
+// tokens routes all 16, none cached. Uniform: token j to experts j..j + 9 mod 16, ten pairs each.
+// Mixed: every token to experts 0..5 (16 pairs each) and four of experts 6..15 in turn (six or
+// seven pairs each).
 struct WideFixture {
     static constexpr int kTokens = 16;
+    static constexpr int kHot    = 6; // mixed: the experts every token routes
+    [[nodiscard]] static std::int32_t route(bool mixed, int token, int slot) {
+        if (!mixed) { return (token + slot) % kExperts; }
+        return slot < kHot ? slot : kHot + (token * (kTop - kHot) + slot - kHot) % (kExperts - kHot);
+    }
     std::vector<std::unique_ptr<PinnedHostBuffer>> matrices; // [expert][projection]
     DeviceBuffer gate_table, ids, input;
     std::unique_ptr<ExpertMisses> misses;
     std::array<std::int64_t, 3> bytes{};
 
-    WideFixture(DeviceContext& device, double cpu_share) {
+    WideFixture(DeviceContext& device, double cpu_share, bool mixed) {
         MissLayer layer;
         layer.rank    = 0;
         layer.experts = kExperts;
@@ -263,7 +273,7 @@ struct WideFixture {
         layer.gate_table = static_cast<const void* const*>(gate_table.p);
         std::vector<std::int32_t> routed(std::size_t(kTop) * kTokens);
         for (int j = 0; j < kTokens; ++j) {
-            for (int i = 0; i < kTop; ++i) { routed[std::size_t(j * kTop + i)] = (j + i) % kExperts; }
+            for (int i = 0; i < kTop; ++i) { routed[std::size_t(j * kTop + i)] = route(mixed, j, i); }
         }
         ids = DeviceBuffer(routed.size() * 4);
         ids.copy_from_host(routed.data(), routed.size() * 4);
@@ -282,23 +292,34 @@ struct WideFixture {
     }
 };
 
-void wide_call(DeviceContext& device, cudaStream_t stream, double cpu_share,
+void wide_call(DeviceContext& device, cudaStream_t stream, double cpu_share, bool mixed,
                const std::string& label) {
-    WideFixture f(device, cpu_share);
+    WideFixture f(device, cpu_share, mixed);
     const int tokens = WideFixture::kTokens;
     const MissStats before = f.misses->stats();
     const Tensor routed(f.ids.p, DType::I32, {kTop, tokens});
     const Tensor m(f.input.p, DType::BF16, {kHidden, tokens});
     const auto call = f.misses->begin(0, routed, m, tokens, ops::GgufMoeWeights{}, stream);
     expect(call.missing_banks.device_resident, label + ": the missing banks are device banks");
-    expect(call.max_products == 0, label + ": the CPU adds no products");
+    expect(call.max_products == 0, label + ": products are counted by stage_wide");
+    std::array<int, kExperts> uses{};
+    for (int j = 0; j < tokens; ++j) {
+        for (int i = 0; i < kTop; ++i) { ++uses[std::size_t(WideFixture::route(mixed, j, i))]; }
+    }
+    int few = 0;
+    for (const int n : uses) { few += n <= ops::kGgufMoeVectorPairs; }
+    expect(few == (mixed ? kExperts - WideFixture::kHot : 0), label + ": the fixture's few-pair experts");
+    // The fixed share: half of the few-pair experts, rounded.
+    const int cpu_experts = cpu_share > 0 ? int(std::lround(few * cpu_share)) : 0;
+    const int gpu_experts = kExperts - cpu_experts;
     std::vector<std::int32_t> cached(std::size_t(kTop) * tokens);
     std::vector<int> served(std::size_t(kTop) * tokens, 0);
     std::array<int, kExperts> rounds_of{};
     int rounds = 0;
+    std::int32_t computed = 0;
     {
         Watchdog guard(label + ": the rounds");
-        f.misses->stage_wide(0, stream, [&](const Tensor& missing_ids) {
+        computed = f.misses->stage_wide(0, stream, [&](const Tensor& missing_ids) {
             CUDA_CHECK(cudaStreamSynchronize(stream)); // the round's copies have landed
             std::vector<std::int32_t> round(cached.size());
             CUDA_CHECK(cudaMemcpy(round.data(), missing_ids.data, round.size() * 4,
@@ -307,7 +328,7 @@ void wide_call(DeviceContext& device, cudaStream_t stream, double cpu_share,
             for (std::size_t p = 0; p < round.size(); ++p) {
                 const std::int32_t e = round[p];
                 if (e < 0) { continue; }
-                expect(e == std::int32_t((p / kTop + p % kTop) % kExperts),
+                expect(e == WideFixture::route(mixed, int(p / kTop), int(p % kTop)),
                        label + ": a round's pair keeps its expert");
                 ++served[p];
                 in_round[std::size_t(e)] = true;
@@ -349,18 +370,40 @@ void wide_call(DeviceContext& device, cudaStream_t stream, double cpu_share,
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaMemcpy(cached.data(), call.cached_ids.data, cached.size() * 4,
                           cudaMemcpyDeviceToHost));
+    // The CPU's pairs: those of its experts, each listed once beside its product.
+    std::array<bool, kExperts> on_cpu{};
+    expect(computed == (cpu_experts == 0 ? 0 : *call.count), label + ": the products' count");
+    for (std::int32_t i = 0; i < computed; ++i) {
+        const std::int32_t p = call.pairs[i];
+        expect(p >= 0 && p < kTop * tokens, label + ": a product names a pair");
+        if (p < 0 || p >= kTop * tokens) { continue; }
+        const std::int32_t e = WideFixture::route(mixed, p / kTop, p % kTop);
+        expect(uses[std::size_t(e)] <= ops::kGgufMoeVectorPairs,
+               label + ": the CPU computes only few-pair experts");
+        on_cpu[std::size_t(e)] = true;
+        ++served[std::size_t(p)];
+    }
+    int cpu_count = 0;
+    for (const bool b : on_cpu) { cpu_count += b; }
+    expect(cpu_count == cpu_experts, label + ": the CPU's share, " + std::to_string(cpu_count) +
+                                         " experts");
     for (std::size_t p = 0; p < served.size(); ++p) {
         expect(cached[p] == -1, label + ": no pair is cached");
-        expect(served[p] == 1, label + ": every pair runs in exactly one round");
+        expect(served[p] == 1, label + ": every pair runs in exactly one round or on the CPU");
     }
-    for (const int count : rounds_of) { expect(count == 1, label + ": an expert takes one round"); }
-    expect(rounds == kExperts / 2, label + ": two experts a round, " + std::to_string(rounds) +
-                                       " rounds");
+    for (int e = 0; e < kExperts; ++e) {
+        expect(rounds_of[std::size_t(e)] == (on_cpu[std::size_t(e)] ? 0 : 1),
+               label + ": a GPU expert takes one round");
+    }
+    expect(rounds == (gpu_experts + 1) / 2, label + ": two experts a round, " +
+                                                std::to_string(rounds) + " rounds");
     const MissStats after = f.misses->stats();
     expect(after.requests == before.requests + 1, label + ": the call counts as a request");
-    expect(after.staged == before.staged + kExperts, label + ": every missing expert was staged");
-    expect(after.mapped == before.mapped && after.computed == before.computed,
-           label + ": nothing read across the bus or computed by the CPU");
+    expect(after.staged == before.staged + std::uint64_t(gpu_experts),
+           label + ": the GPU's missing experts were staged");
+    expect(after.mapped == before.mapped, label + ": nothing read across the bus");
+    expect(after.computed == before.computed + std::uint64_t(cpu_experts),
+           label + ": the CPU computed its share");
     f.misses->raise_failure();
 
     // A narrow call after the wide one: token 0's ten experts, served by the service.
@@ -421,7 +464,8 @@ int run() {
 #ifdef __linux__
         idle_sleeps(label);
 #endif
-        wide_call(device, stream, cpu ? 0.5 : 0.0, label + ", wide");
+        wide_call(device, stream, cpu ? 0.5 : 0.0, false, label + ", wide");
+        wide_call(device, stream, cpu ? 0.5 : 0.0, true, label + ", wide with few-pair experts");
     }
     CUDA_CHECK(cudaStreamDestroy(stream));
     if (failures != 0) { return 1; }

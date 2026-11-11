@@ -36,7 +36,7 @@ ExpertRouteCounts read_expert_profile(const std::filesystem::path& path,
     const auto data = nlohmann::json::parse(file);
     if (!data.is_object() || data.value("version", 0) != 1 ||
         data.value("artifact_id", std::string{}) != identity(artifact) || !data.contains("counts") ||
-        !data["counts"].is_array() || data["counts"].size() != experts.size()) {
+        !data["counts"].is_array() || data["counts"].size() < experts.size()) {
         throw std::invalid_argument("expert profile does not describe this artifact's layers");
     }
     ExpertRouteCounts out(experts.size());
@@ -66,23 +66,32 @@ void write_expert_profile(const std::filesystem::path& path,
 
 std::optional<ExpertRouteCounts> builtin_expert_profile(std::string_view family,
                                                         std::span<const std::size_t> experts) {
+    const auto leads = [&](const Builtin& profile) {
+        if (profile.family != family || profile.widths.size() < experts.size()) { return false; }
+        for (std::size_t layer = 0; layer < experts.size(); ++layer) {
+            if (profile.widths[layer] != experts[layer]) { return false; }
+        }
+        return true;
+    };
+    // A profile of exactly these layers, else one whose leading layers they are.
+    const Builtin* found = nullptr;
     for (const Builtin& profile : kBuiltinProfiles) {
-        if (profile.family != family || profile.widths.size() != experts.size()) { continue; }
-        bool same = true;
-        for (std::size_t layer = 0; layer < experts.size(); ++layer) {
-            same = same && profile.widths[layer] == experts[layer];
+        if (!leads(profile)) { continue; }
+        if (profile.widths.size() == experts.size()) {
+            found = &profile;
+            break;
         }
-        if (!same) { continue; }
-        ExpertRouteCounts out(experts.size());
-        std::size_t at = 0;
-        for (std::size_t layer = 0; layer < experts.size(); ++layer) {
-            out[layer].assign(profile.counts.begin() + std::ptrdiff_t(at),
-                              profile.counts.begin() + std::ptrdiff_t(at + experts[layer]));
-            at += experts[layer];
-        }
-        return out;
+        if (found == nullptr) { found = &profile; }
     }
-    return std::nullopt;
+    if (found == nullptr) { return std::nullopt; }
+    ExpertRouteCounts out(experts.size());
+    std::size_t at = 0;
+    for (std::size_t layer = 0; layer < experts.size(); ++layer) {
+        out[layer].assign(found->counts.begin() + std::ptrdiff_t(at),
+                          found->counts.begin() + std::ptrdiff_t(at + experts[layer]));
+        at += experts[layer];
+    }
+    return out;
 }
 
 } // namespace ninfer::models

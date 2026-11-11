@@ -141,6 +141,13 @@ Flash-Next with `--expert-residency host`:
 | Qwen3.8-Flash-Next IQ3_S | 524,287 | 5.2979 | 5.3079 (+0.2%) | 5.3325 (+0.7%) | 183 / 223 |
 | Gemma 4 26B-A4B QAT Q4_0 | 1,048,574 | 270.51 | 296.72 (+9.7%) | 230.79 (−14.7%) | 744 / 777 |
 
+Flash-Next's rates predate two changes to its host experts: perplexity, which loads no MTP block,
+now fills the expert cache from the routing profile's text layers, and a prompt chunk's slot pool
+puts uncached experts into free cache slots. On an RTX A6000 (Q2_0 release, 4,096-token windows
+advancing by 2,048 over the first 40 KB of the WikiText sample, `int8` KV) the two raised host
+experts from 84-85 to 919-927 tokens per second (device experts: 949), the pool's admission alone to
+656-661.
+
 Only whole windows are scored: the Qwen tokenizer makes the text 1.04 million tokens, one long
 window, and Gemma's 1.09 million, two. A long window gives its later tokens up to twice the
 context, which can lower perplexity by itself, so the plain and YaRN columns, at the same window,

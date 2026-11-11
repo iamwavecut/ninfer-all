@@ -38,15 +38,18 @@ double ExpertSplit::cpu_work(double megabytes, int pairs) {
     return megabytes * (1.0 + kTokenWork * double(std::max(pairs, 1) - 1));
 }
 
-std::size_t ExpertSplit::cpu_count(std::span<const int> pairs, double megabytes) {
+std::size_t ExpertSplit::cpu_count(std::span<const int> pairs, double megabytes,
+                                   std::size_t gpu_least) {
     constexpr std::uint32_t kProbe = 8;
     const std::size_t n = pairs.size();
-    if (n == 0) { return 0; }
+    if (n <= gpu_least) { return 0; }
     std::vector<double> work(n + 1, 0.0); // the CPU's work on experts [g, n)
-    for (std::size_t i = n; i-- > 0;) { work[i] = work[i + 1] + cpu_work(megabytes, pairs[i]); }
+    for (std::size_t i = n; i-- > gpu_least;) {
+        work[i] = work[i + 1] + cpu_work(megabytes, pairs[i]);
+    }
     std::size_t gpu = n;
     double soonest  = copy_.at(double(n) * megabytes);
-    for (std::size_t g = n; g-- > 0;) {
+    for (std::size_t g = n; g-- > gpu_least;) {
         const double copies = g == 0 ? 0.0 : copy_.at(double(g) * megabytes);
         const double end    = std::max(copies, cpu_.at(work[g]));
         if (end < soonest) {

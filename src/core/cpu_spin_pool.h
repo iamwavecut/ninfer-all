@@ -24,11 +24,15 @@
 // The expert products read stored weights at memory speed, which one thread per physical core
 // saturates: an SMT sibling shares its core's loads. The workers are pinned one to a physical core
 // of the process's CPUs (its affinity mask), the calling thread pins itself to the first of them
-// when it first runs, and pool_cpu_count() bounds the default by half the CPUs the process may
-// use, the rest left to the threads that drive the GPU and serve requests: on two EPYC 7742
-// sockets with a 61-CPU quota, a pool spinning on every CPU of the quota throttled the process in
-// 208 of 211 scheduling periods while it decoded, and 59 threads decoded Flash-Next 1.7-4.2%
-// slower than 8, 16, 24 or 32.
+// when it first runs (unless run() is told not to: a thread that drives the GPU and computes a
+// call's share itself stays where it runs), and pool_cpu_count() bounds the default by half the
+// CPUs the process may use, the rest left to the threads that drive the GPU and serve requests:
+// on two EPYC 7742 sockets with a 61-CPU quota, a pool spinning on every CPU of the quota
+// throttled the process in 208 of 211 scheduling periods while it decoded, and 59 threads decoded
+// Flash-Next 1.7-4.2% slower than 8, 16, 24 or 32. A thread that drives the GPU pinned to the
+// first core shares it with the spinning service thread: Flash-Next's wide calls pinned the
+// executor's thread that way, and eight requests on host experts decoded 8 instead of 95 tokens
+// per second on an RTX A6000.
 
 #include <atomic>
 #include <chrono>
@@ -102,14 +106,17 @@ public:
         run(count, std::forward<Job>(job), [] {});
     }
 
+    // `pin`: the calling thread takes the pool's first core (the thread that serves the pool's
+    // requests); false leaves it where it runs, for a thread that also drives the GPU.
+
     template <class Job, class Side>
-    void run(std::size_t count, Job&& job, Side&& side) {
+    void run(std::size_t count, Job&& job, Side&& side, bool pin = true) {
         if (count == 0) {
             side();
             complete_.finished = std::chrono::steady_clock::now().time_since_epoch().count();
             return;
         }
-        pin_caller();
+        if (pin) { pin_caller(); }
         job_.context = &job;
         job_.call    = [](void* context, std::size_t i) {
             (*static_cast<std::remove_reference_t<Job>*>(context))(i);

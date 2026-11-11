@@ -285,7 +285,10 @@ rounds and the growing KV):
   `--expert-cpu-threads`). The CPU computes SwiGLU over the [gate; up] rows, the BF16 middle
   quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same 2^-32
   fixed-point sums, so outputs do not depend on the split. Calls of more than eight tokens always
-  use the GPU.
+  use the GPU. Flash-Next's CPU share also covers the missing experts with at most eight pairs in
+  calls of 9 to 64 tokens ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); Flint does not
+  have that route yet: its expert kernels take one route per call, and the shared expert delivery
+  serves only narrow calls.
 
 On the RTX 3090 of the measurements above, with the cache NInfer sizes itself (`ninfer_bench`, one
 sequence, three repetitions; three CPU threads take a share of the decode misses). Disk experts read

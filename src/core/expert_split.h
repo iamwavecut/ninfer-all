@@ -38,8 +38,10 @@ public:
     // each stored block serves every token, a token's products add about a quarter.
     [[nodiscard]] static double cpu_work(double megabytes, int pairs);
     // How many of a call's missing experts the CPU computes: the last ones of `pairs` (each
-    // missing expert's pairs in the call, most first), all experts `megabytes` large.
-    [[nodiscard]] std::size_t cpu_count(std::span<const int> pairs, double megabytes);
+    // missing expert's pairs in the call, most first), all experts `megabytes` large. The first
+    // `gpu_least` stay on the GPU whatever the times.
+    [[nodiscard]] std::size_t cpu_count(std::span<const int> pairs, double megabytes,
+                                        std::size_t gpu_least = 0);
     // A call's copies of `megabytes` took `microseconds`; its CPU products of `work` took theirs.
     void copied(double megabytes, double microseconds) { copy_.add(megabytes, microseconds); }
     void computed(double work, double microseconds) { cpu_.add(work, microseconds); }
