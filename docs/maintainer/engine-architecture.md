@@ -587,7 +587,9 @@ ResourceManager 清空，以错误完成 active lanes 与 materializing request�
 live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxed atomic load。
 
 数值失败（logits 非有限，sampler 返回 `ops::kSamplerNonFiniteToken`，或 licensed token 超出公开词表）
-不是 Engine 缺陷，也不终止服务。decode round 中 Program 把该行的越界 token 置为 0 并在
+不是 Engine 缺陷，也不终止服务。到达 MoE router 的 NaN（溢出的 hidden state）按 `ops::route_order` 当作最小的
+有限分数，仍选出范围内互不相同的 expert，于是 NaN 沿 residual 到达 logits，而不是以越界 expert id 让设备
+出错。decode round 中 Program 把该行的越界 token 置为 0 并在
 `PendingBatch::numerical_fault(row)` 上报告；`commit_pending` 以 `RequestErrorKind::NumericalFailure`
 结束该行的请求，其 sequence 按取消的方式释放（接受 0 个 token），其余行照常提交：该 sequence 此前发布
 的状态都由更早的有限 logits 担保。prompt 末尾的第一个 token 非有限时没有这样的担保（该次 prefill
@@ -602,7 +604,9 @@ decode 行失败也走这条路。GGUF 家族的 core（Flash-Next、Gemma 4、F
 `wait_for_event`、`wait_for_device`、`copy_and_wait`、`copy_between_devices_and_wait`、`fill_and_wait`；
 可能隐式等待设备的调用经由 `free_device_memory`（`cudaFree`）、`free_host_memory`、
 `unregister_host_memory`、`launch_graph`（launch 队列已满时等待）与 `DeviceWaitScope`（`vmm::unmap`、
-`vmm::set_access`）。Engine 的 worker 与调用方线程（suspend、resume、slot 操作、score）持有
+`vmm::set_access`）。`copy_and_wait`、`copy_between_devices_and_wait` 与 `fill_and_wait` 在 CUDA 调用之后还等待
+legacy stream：pageable 拷入、设备间拷贝与设备 memset 在调用返回时未必落地，而 `DeviceContext` 的
+non-blocking stream 不与 legacy stream 同步。Engine 的 worker 与调用方线程（suspend、resume、slot 操作、score）持有
 `DeviceWaitWatch`，以名字出现在消息中；其他线程（例如加载模型的启动线程）以操作系统线程号出现。其二是
 设备探针：`DeviceContext` 的每个 rank 持有其设备的探针，进程内一个线程每 5 s 在独立的最高优先级 stream
 上提交一次 4 字节拷入、单线程 kernel 与拷回。探针不依赖任何线程的等待，因此也覆盖空闲的服务器、因

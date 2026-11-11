@@ -27,12 +27,20 @@
 // asynchronous with respect to the host in the same way. It has never actually caught a stale
 // read on this driver -- the memset appears to complete before the call returns -- so treat it as
 // pinning the contract rather than as a reproduction.
+//
+// The last case makes the window wide on purpose: a kernel holds the legacy stream for 50 ms, so a
+// fill_and_wait (cudaMemset) or a device-to-device copy_and_wait (cudaMemcpy) queued behind it
+// lands after the caller's next work on a non-blocking stream unless the call waits for the legacy
+// stream. The first is the weight loader's sequence: zero a placement, then copy the loaded bytes
+// into it on a transfer stream.
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/device_wait.h"
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -47,6 +55,16 @@ __global__ void count_stale(const std::uint16_t* data, int count, std::uint16_t 
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= count) return;
     if (data[index] == stale_value) atomicAdd(out, 1);
+}
+
+// Occupies the stream it runs on for `nanoseconds`.
+__global__ void hold(unsigned long long nanoseconds) {
+    unsigned long long start = 0, now = 0;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+    do {
+        __nanosleep(10000);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    } while (now - start < nanoseconds);
 }
 
 // Sized as the case that exposed this: 112 tokens of a 5,120-wide BF16 activation, 1,146,880
@@ -64,6 +82,60 @@ int check(cudaError_t status, const char* what) {
     if (status == cudaSuccess) return 0;
     std::printf("FAIL %s: %s\n", what, cudaGetErrorString(status));
     return 1;
+}
+
+// fill_and_wait and a device-to-device copy_and_wait behind a held legacy stream: on return their
+// bytes must be in place for work on `stream`. Returns the number of failed checks.
+int held_legacy_stream(cudaStream_t stream) {
+    constexpr unsigned long long kHold = 50'000'000;
+    const std::size_t bytes = sizeof(std::uint16_t) * kElements;
+    DeviceBuffer payload(bytes), fresh(bytes), counter(sizeof(int));
+    std::vector<std::uint16_t> got(kElements);
+    int failures = check(cudaMemset(fresh.p, 0xBB, bytes), "fresh") +
+                   check(cudaMemset(payload.p, 0xAA, bytes), "stale") +
+                   check(cudaDeviceSynchronize(), "settle held");
+    if (failures != 0) return failures;
+
+    // Zero the payload, then copy the fresh bytes over it on the stream: the zeros must not land
+    // last.
+    hold<<<1, 1>>>(kHold);
+    failures += check(cudaGetLastError(), "hold before fill");
+    failures += check(ninfer::fill_and_wait(payload.p, 0, bytes), "fill_and_wait");
+    failures += check(cudaMemcpyAsync(payload.p, fresh.p, bytes, cudaMemcpyDeviceToDevice, stream),
+                      "stream copy after the fill");
+    failures += check(cudaStreamSynchronize(stream), "stream sync after the fill");
+    failures += check(cudaDeviceSynchronize(), "settle after the fill");
+    payload.copy_to_host(got.data(), bytes);
+    int lost = 0;
+    for (const std::uint16_t value : got) { lost += value != kFresh ? 1 : 0; }
+    if (lost != 0) {
+        std::printf("FAIL fill_and_wait behind a held legacy stream: %d of %d elements lost the "
+                    "stream's later copy\n", lost, kElements);
+        ++failures;
+    }
+
+    // Copy the fresh bytes over stale ones, then read them on the stream.
+    failures += check(cudaMemset(payload.p, 0xAA, bytes), "stale again") +
+                check(cudaMemset(counter.p, 0, sizeof(int)), "counter") +
+                check(cudaDeviceSynchronize(), "settle before the copy");
+    hold<<<1, 1>>>(kHold);
+    failures += check(cudaGetLastError(), "hold before copy");
+    failures += check(ninfer::copy_and_wait(payload.p, fresh.p, bytes, cudaMemcpyDeviceToDevice),
+                      "copy_and_wait");
+    count_stale<<<(kElements + 255) / 256, 256, 0, stream>>>(
+        static_cast<const std::uint16_t*>(payload.p), kElements, kStale,
+        static_cast<int*>(counter.p));
+    failures += check(cudaGetLastError(), "count after the copy");
+    failures += check(cudaStreamSynchronize(stream), "stream sync after the copy");
+    failures += check(cudaDeviceSynchronize(), "settle after the copy");
+    int stale = 0;
+    counter.copy_to_host(&stale, sizeof(stale));
+    if (stale != 0) {
+        std::printf("FAIL copy_and_wait behind a held legacy stream: the stream read %d of %d "
+                    "elements stale\n", stale, kElements);
+        ++failures;
+    }
+    return failures;
 }
 
 } // namespace
@@ -129,7 +201,9 @@ int main() {
         if (stale > 0) ++fill_races;
     }
 
+    const int held_failures = held_legacy_stream(stream);
     (void)cudaStreamDestroy(stream);
+    if (held_failures != 0) return 1;
 
     if (copy_races != 0 || fill_races != 0) {
         std::printf("FAIL device_buffer_visibility: over %d iterations, copy_from_host was read "

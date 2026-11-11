@@ -98,7 +98,6 @@ struct Storage {
         } else {
             CUDA_CHECK(ninfer::fill_and_wait(p, 0, bytes));
         }
-        CUDA_CHECK(ninfer::wait_for_stream(nullptr));
     }
     [[nodiscard]] std::uint64_t backing_bytes() const noexcept {
         return growable ? growable.mapped_bytes() : region ? region.reserved_bytes() : bytes;

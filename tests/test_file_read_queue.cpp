@@ -2,12 +2,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -87,6 +91,28 @@ int run() {
             const ninfer::QueuedFileRead bad_file{2, 0, output[0]};
             refused<std::invalid_argument>([&] { queue->read(std::span(&bad_file, 1)); });
             queue->read({});
+            // The next batch on another thread while this one, which read the last batch, keeps
+            // running (as a loader thread spinning on a handshake does): its reads must complete.
+            std::atomic<bool> finished{false};
+            std::exception_ptr worker_error;
+            std::thread worker([&] {
+                try { queue->read(reads); } catch (...) { worker_error = std::current_exception(); }
+                finished.store(true, std::memory_order_release);
+            });
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!finished.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline) {}
+            const bool completed_while_running = finished.load(std::memory_order_acquire);
+            // Joining blocks this thread, which lets a limited port release the reads, so a
+            // regression fails here instead of hanging the test.
+            worker.join();
+            if (worker_error) { std::rethrow_exception(worker_error); }
+            require(completed_while_running,
+                    "a batch on another thread waited for a running caller");
+            for (const auto& read : reads) {
+                require(std::equal(read.destination.begin(), read.destination.end(),
+                                   fixture.bytes.begin() + read.offset), "handed-off bytes differ");
+            }
             std::cout << queue->backend() << " direct=" << direct << " depth=" << depth << " PASS\n";
         }
     }

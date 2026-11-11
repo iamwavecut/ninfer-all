@@ -8,6 +8,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "ops/common/route_order.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -127,7 +128,7 @@ __global__ void __launch_bounds__(kSelectWarps * 32)
 #pragma unroll
     for (int i = 0; i < kLogitsPerLane; ++i) {
         const int e = lane + 32 * i;
-        values[i]   = e < experts ? row[e] : -INFINITY;
+        values[i]   = e < experts ? route_order(row[e]) : -INFINITY;
     }
     float chosen[kTopK];
     int chosen_index[kTopK];

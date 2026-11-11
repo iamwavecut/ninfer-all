@@ -625,7 +625,9 @@ device, releases and if necessary rebuilds the context cache, and keeps serving 
 Flash-Next model file read that fails (disk experts or n-gram rows) likewise fails only the running
 requests, with `unavailable`. Non-finite logits (a token the sampler cannot name) end only the
 request whose row produced them, with an HTTP 500 `numerical_failure` error or an error event on a
-started stream, and the other requests continue; when they appear at the end of a prompt, a
+started stream, and the other requests continue. A NaN that reaches a MoE router first (an
+overflowed hidden state) still selects distinct experts in range, so it travels on to the logits
+instead of faulting the device. When non-finite logits appear at the end of a prompt, a
 Qwen3.5-core model takes the out-of-memory recovery (nothing vouches for what that pass cached), and
 the other families drop the stored prefixes of that prompt. Each
 recovery is counted as a top-level `engine_recoveries` counter on the request log's `throughput`

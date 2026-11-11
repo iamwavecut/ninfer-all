@@ -8,7 +8,9 @@
 //    K and V rows at their cache slots (ring, two sequences, a branch pass's own slots).
 //  - route and route_select: sigmoid scores of the top six logits renormalized, the expert
 //    grouping of the pairs, the decode and the tiled prompt logits; route_select's logits, experts
-//    and weights equal to route()'s bit for bit, its block count zero again after each launch.
+//    and weights equal to route()'s bit for bit, its block count zero again after each launch;
+//    with a NaN row (an overflowed hidden state), that token's experts 0..top_k-1, the other
+//    tokens' as without it.
 //  - rms_norm and ffn_combine with their BF16, q8_1 and FP32 rows; the weighted FP32 expert rows
 //    and the 2^-32 fixed-point sums.
 //  - build_mask of a prompt chunk (linear and ring) and of a branch pass, alone or after a
@@ -403,6 +405,58 @@ void route(int tokens, bool select, std::mt19937& rng) {
              bounds[kExperts] == pairs;
     }
     report(ok, std::string(select ? "route_select" : "route") + " T=" + std::to_string(tokens));
+}
+
+// A NaN input row (an overflowed hidden state) through route() and route_select(): every expert
+// of its token ties at the lowest score, so the lower id wins and it selects experts
+// 0..top_k-1 (stale shared memory would leave other ids); the other tokens select as they do
+// without it.
+void route_nan(bool select, std::mt19937& rng) {
+    constexpr int kTokens = 3;
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> x(std::size_t(kTokens) * kHidden), router(std::size_t(kExperts) * kHidden);
+    for (auto& v : x) { v = normal(rng); }
+    for (auto& v : router) { v = 0.02f * normal(rng); }
+    const int pairs = kTokens * kTopK;
+    DeviceBuffer dx(x.size() * 4), dr(router.size() * 4),
+        logits(std::size_t(kTokens) * kExperts * 4), ids(pairs * 4), weights(pairs * 4),
+        routing((kExperts + 1 + pairs + kExperts + 1) * 4), done(4);
+    dr.copy_from_host(router.data(), router.size() * 4);
+    done.fill();
+    auto* base       = static_cast<std::int32_t*>(routing.p);
+    const auto route = [&](const std::vector<float>& input) {
+        dx.copy_from_host(input.data(), input.size() * 4);
+        if (select) {
+            k::route_select(static_cast<const float*>(dx.p), kHidden, kTokens,
+                            static_cast<const float*>(dr.p), kExperts, kTopK,
+                            static_cast<float*>(logits.p), static_cast<std::int32_t*>(ids.p),
+                            static_cast<float*>(weights.p), base, base + kExperts + 1,
+                            base + kExperts + 1 + pairs, base + kExperts + 1 + pairs + kExperts,
+                            static_cast<std::uint32_t*>(done.p), nullptr);
+        } else {
+            k::route(static_cast<const float*>(dx.p), kHidden, kTokens,
+                     static_cast<const float*>(dr.p), kExperts, kTopK,
+                     static_cast<float*>(logits.p), static_cast<std::int32_t*>(ids.p),
+                     static_cast<float*>(weights.p), nullptr);
+        }
+        check(cudaDeviceSynchronize(), "route NaN row");
+        std::vector<std::int32_t> got(pairs);
+        ids.copy_to_host(got.data(), pairs * 4);
+        return got;
+    };
+    const auto clean = route(x);
+    for (int i = 0; i < kHidden; ++i) { x[std::size_t(kHidden) + i] = std::nanf(""); }
+    const auto got = route(x);
+    bool ok = true;
+    for (int t = 0; t < kTokens; ++t) {
+        std::set<int> chosen;
+        for (int j = 0; j < kTopK; ++j) {
+            const int e = got[t * kTopK + j];
+            ok = ok && e >= 0 && e < kExperts && chosen.insert(e).second;
+            ok = ok && e == (t == 1 ? j : clean[t * kTopK + j]);
+        }
+    }
+    report(ok, std::string(select ? "route_select" : "route") + " NaN row");
 }
 
 // rms_norm, then ffn_combine adding the routed rows (weighted FP32 rows, or fixed-point sums) to
@@ -877,6 +931,8 @@ int main() {
 
         for (const int tokens : {1, 3, 8}) { route(tokens, true, rng); }
         for (const int tokens : {1, 8, 9, 100}) { route(tokens, false, rng); }
+        route_nan(false, rng);
+        route_nan(true, rng);
 
         norms(1, false, rng);
         norms(5, true, rng);
