@@ -170,22 +170,18 @@ struct ProjectionInto {
     });
 }
 
-// Each out <- its projection of x (BF16 [k, T]). GGUF projections run as one gguf_project, which
-// quantizes x to q8_1 once for all of their parts and gives each part's rows what a call of its
-// own gives them; any other format keeps a call per projection.
+// Each out <- its projection of x (BF16 [k, T]). The GGUF projections run as one gguf_project,
+// which quantizes x to q8_1 once for all of their parts and gives each part's rows what a call of
+// its own gives them; a projection of another format (a BF16 gate or indexer) takes a call of its
+// own.
 void project_together(std::span<const ProjectionInto> list, const Tensor& x,
                       WorkspaceArena& workspace, cudaStream_t stream) {
-    const bool gguf = std::all_of(list.begin(), list.end(), [](const ProjectionInto& into) {
-        return gguf_projection(*into.projection);
-    });
-    if (!gguf) {
-        for (const ProjectionInto& into : list) {
-            project(*into.projection, x, *into.out, workspace, stream);
-        }
-        return;
-    }
     std::vector<ops::detail::GgufProduct> products;
     for (const ProjectionInto& into : list) {
+        if (!gguf_projection(*into.projection)) {
+            project(*into.projection, x, *into.out, workspace, stream);
+            continue;
+        }
         if (into.projection->k != x.ne[0]) {
             throw std::invalid_argument("projections of one input read its width");
         }
@@ -201,17 +197,17 @@ void project_together(std::span<const ProjectionInto> list, const Tensor& x,
 std::size_t projections_workspace(std::initializer_list<const Projection*> list,
                                   std::int32_t tokens) {
     std::size_t bytes = 0;
-    bool gguf         = true;
     std::vector<ops::detail::GgufShape> shapes;
     for (const Projection* p : list) {
         bytes = std::max(bytes, projection_workspace(*p, tokens));
-        gguf  = gguf && gguf_projection(*p);
+        if (!gguf_projection(*p)) { continue; }
         for (const auto& piece : p->pieces) {
             shapes.push_back({piece.weight.weight.qtype, piece.rows, p->k});
         }
     }
-    return gguf ? std::max(bytes, ops::detail::gguf_project_workspace_bytes(shapes, 1, tokens))
-                : bytes;
+    return shapes.empty()
+               ? bytes
+               : std::max(bytes, ops::detail::gguf_project_workspace_bytes(shapes, 1, tokens));
 }
 
 Tensor direct(const Model& model, WeightId id, std::initializer_list<std::int32_t> shape,
@@ -3188,37 +3184,72 @@ struct Executor::Impl {
     }
 
     // Several projections of one input x (BF16 [k, *]) into their planes, over the parts'
-    // columns: GGUF projections share each column group's q8_1 activation (project_together),
-    // others take project_columns one at a time.
+    // columns: the GGUF projections share each column group's q8_1 activation (project_together);
+    // the one-operand projections of another format take one linear_together a part, which runs
+    // the BF16 ones that a call of their own runs as a GEMV (a Gated DeltaNet layer's a and b) in
+    // one launch; a projection of several operands takes project_columns of its own.
     struct ColumnsInto {
         const Projection* projection = nullptr;
         void* out                    = nullptr;
     };
     static void project_columns(std::initializer_list<ColumnsInto> list, void* x,
                                 std::span<const Part> parts, WorkspaceArena& ws, cudaStream_t s) {
-        if (!std::all_of(list.begin(), list.end(),
-                         [](const ColumnsInto& into) { return gguf_only(*into.projection); })) {
-            for (const ColumnsInto& into : list) {
+        std::vector<const ColumnsInto*> gguf;
+        std::vector<const ColumnsInto*> single;
+        gguf.reserve(list.size());
+        single.reserve(list.size());
+        for (const ColumnsInto& into : list) {
+            if (gguf_only(*into.projection)) {
+                gguf.push_back(&into);
+            } else if (into.projection->pieces.size() == 1) {
+                single.push_back(&into);
+            } else {
                 project_columns(*into.projection, x, into.out, parts, ws, s);
             }
-            return;
         }
-        const std::int32_t k = list.begin()->projection->k;
+        if (!single.empty()) {
+            const std::int32_t k = single.front()->projection->k;
+            std::vector<Tensor> outs;
+            std::vector<ops::LinearInto> into;
+            outs.reserve(single.size());
+            into.reserve(single.size());
+            for (const ColumnRun& group : projection_groups(parts, false)) {
+                const Tensor in(columns(x, k, group.column, 2), DType::BF16, {k, group.count});
+                outs.clear();
+                into.clear();
+                for (const ColumnsInto* c : single) {
+                    if (c->projection->k != k) {
+                        throw std::invalid_argument("projections of one input read its width");
+                    }
+                    const std::int32_t rows = c->projection->rows;
+                    outs.push_back(Tensor(columns(c->out, rows, group.column, 2), DType::BF16,
+                                          {rows, group.count}));
+                }
+                for (std::size_t i = 0; i < outs.size(); ++i) {
+                    const auto& operand = single[i]->projection->pieces.front().weight;
+                    into.push_back({.weight = &operand.weight, .out = &outs[i],
+                                    .policy = operand.policy});
+                }
+                ops::linear_together(in, into, ws, s);
+            }
+        }
+        if (gguf.empty()) { return; }
+        const std::int32_t k = gguf.front()->projection->k;
         std::vector<Tensor> outs;
         std::vector<ProjectionInto> into;
-        outs.reserve(list.size());
-        into.reserve(list.size());
+        outs.reserve(gguf.size());
+        into.reserve(gguf.size());
         for (const ColumnRun& group : projection_groups(parts, true)) {
             const Tensor in(columns(x, k, group.column, 2), DType::BF16, {k, group.count});
             outs.clear();
             into.clear();
-            for (const ColumnsInto& c : list) {
-                const std::int32_t rows = c.projection->rows;
-                outs.push_back(Tensor(columns(c.out, rows, group.column, 2), DType::BF16,
+            for (const ColumnsInto* c : gguf) {
+                const std::int32_t rows = c->projection->rows;
+                outs.push_back(Tensor(columns(c->out, rows, group.column, 2), DType::BF16,
                                       {rows, group.count}));
             }
             for (std::size_t i = 0; i < outs.size(); ++i) {
-                into.push_back({(list.begin() + i)->projection, &outs[i]});
+                into.push_back({gguf[i]->projection, &outs[i]});
             }
             project_together(into, in, ws, s);
         }

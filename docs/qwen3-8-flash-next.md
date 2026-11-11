@@ -812,6 +812,11 @@ not.
   attention below 2,051 positions).
 - The PLE layer reads its 16 n-gram rows per token from the table's file (IQ4_NL rows decoded on
   the GPU).
+- A layer's projections of one input run together: the GGUF ones quantize the input to q8_1 once,
+  and the BF16 ones that a call of up to eight tokens runs as vector products (a Gated DeltaNet
+  layer's `a` and `b`) share one launch. The router's top-10 selection for up to eight tokens runs
+  in its logits launch, in the CTA that finishes last. Each product and selection keeps the bits of
+  its own launch.
 - The 512-expert MoE groups each layer's (token, expert) pairs by expert on the GPU and runs one
   pass over each selected expert's rows for all of its tokens, through device tables of expert base
   pointers: an expert is read wherever the table points, in device memory, a cache slot or the
