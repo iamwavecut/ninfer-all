@@ -3780,8 +3780,12 @@ struct Executor::Impl {
         // slots that this call reads.
         if (!prefetches.empty()) {
             drain_prefetches();
+            // A pool of one buffer (an explicit expert cache, --expert-prefill-buffers 1, or too
+            // little free memory for two) leaves the second buffer without events.
             for (auto& buffer : prefetches[rank.rank].buffers) {
-                CUDA_CHECK(cudaStreamWaitEvent(s, buffer.ready, 0));
+                if (buffer.ready != nullptr) {
+                    CUDA_CHECK(cudaStreamWaitEvent(s, buffer.ready, 0));
+                }
                 buffer.layer = ~std::size_t{0};
             }
         }
