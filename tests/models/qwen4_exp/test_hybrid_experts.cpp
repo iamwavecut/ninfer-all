@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/hybrid_experts.h"
 #include "core/decode_graph.h"
+#include "core/mapped_host_copy.h"
 #include "ops/op_tester.h"
 
 #include <array>
@@ -281,6 +282,9 @@ int main() {
     try {
         DeviceContext device;
         for (const bool mapped : {false, true}) {
+            // Under WDDM the queued exchange hung (#268) and the engine takes the mapped one there,
+            // so such a host runs the mapped exchange only.
+            if (!mapped && serialized_copy_queue()) { continue; }
             run(device, {2, 2, 2}, true, false, 0, 0, false, mapped);
             run(device, {2, 5, 4}, false, true, 4, 0.5F, false, mapped, 2);
             run(device, {5, 4, 5}, true, false, 0, 1, false, mapped);
