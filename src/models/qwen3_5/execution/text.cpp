@@ -1126,27 +1126,43 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
     require_logits_window(logits, dimension(config_.vocab_size), T, "proposal logits");
     nvtx::ScopedRange proposal_range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                                      static_cast<std::uint64_t>(T));
+    const auto vocabulary = dimension(parameters_.model.resources().public_token_count);
+    // A sampled proposal draws from the drafter's distribution at its position's target key
+    // (set_proposal_sampling, set_proposal_key); a greedy row's draw is the argmax.
+    const auto pick = [&](const Tensor& rows, std::int32_t domain) {
+        if (proposal_configs_ == nullptr) {
+            ops::argmax(rows, proposal_tokens, domain, ctx_.stream);
+            return;
+        }
+        require_tensor_shape(proposal_key_positions_, DType::I32, {T}, "proposal key positions");
+        ops::sample(rows, proposal_tokens, domain, proposal_configs_, proposal_key_positions_,
+                    ops::kSamplePurposeDecode, work_, ctx_.stream, proposal_key_offset_);
+    };
     if (proposal_head_ != nullptr) {
         Tensor proposal_logits =
             work_.alloc(fp32_proposal_logits(*proposal_head_) ? DType::FP32 : DType::BF16,
                         {proposal_head_n_, T});
         project_head(hidden, *proposal_head_, proposal_head_shares_, proposal_logits);
-        ops::argmax(proposal_logits, proposal_tokens,
-                    proposal_head_ids_
-                        ? proposal_head_n_
-                        : dimension(parameters_.model.resources().public_token_count),
-                    ctx_.stream);
-        if (proposal_head_ids_ != nullptr) {
+        if (proposal_head_ids_ == nullptr) {
+            pick(proposal_logits, vocabulary);
+        } else if (proposal_configs_ == nullptr) {
+            ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, ctx_.stream);
             ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                           ctx_.stream);
+        } else {
+            // A subset head's draw runs over the vocabulary, so each token's noise is the noise
+            // the target's draw gives that token.
+            Tensor expanded = work_.alloc(DType::FP32, {vocabulary, T});
+            ops::proposal_expand_logits(proposal_logits, proposal_head_ids_, proposal_head_n_,
+                                        expanded, ctx_.stream);
+            pick(expanded, vocabulary);
         }
     } else {
         Tensor output_logits = fp32_proposal_logits(mtp_->output_head)
                                    ? work_.alloc(DType::FP32, {dimension(config_.vocab_size), T})
                                    : bf16_window(logits, T);
         project_head(hidden, mtp_->output_head, &mtp_->output_head_shares, output_logits);
-        ops::argmax(output_logits, proposal_tokens,
-                    dimension(parameters_.model.resources().public_token_count), ctx_.stream);
+        pick(output_logits, vocabulary);
     }
 }
 
@@ -3157,12 +3173,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 if (is_last && mtp_proposal_extent_ != 0) {
                     Tensor logits = matrix_window(io_.logits, 1);
                     Tensor draft0 = io_.mtp->draft_tokens.slice(0, 0, 1);
+                    // The anchor (the token just sampled) fills position base_i + T: proposal i
+                    // takes the target's key for position base_i + T + i + 1.
+                    Tensor ar_position = io_.mtp->position.slice(0, 0, 1);
+                    ops::set_i32_scalar(ar_position, base_i + T, s);
+                    set_proposal_key(ar_position, 1);
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
                                       rope_positions, chunk_envelope, true, &io_.mtp->ar_hidden,
                                       &logits, &draft0);
 
-                    Tensor ar_position = io_.mtp->position.slice(0, 0, 1);
-                    ops::set_i32_scalar(ar_position, base_i + T, s);
+                    // The step that proposes draft i runs at ar_position base_i + T + i - 1.
+                    set_proposal_key(ar_position, 2);
                     for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
                         Tensor prev_token = io_.mtp->draft_tokens.slice(0, i - 1, 1);
                         Tensor next_token = io_.mtp->draft_tokens.slice(0, i, 1);

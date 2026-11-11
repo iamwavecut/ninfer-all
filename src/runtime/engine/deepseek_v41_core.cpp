@@ -1562,6 +1562,8 @@ struct DeepSeekV41Core::Impl {
             config.presence_penalty  = row.params->presence_penalty;
             config.frequency_penalty = row.params->frequency_penalty;
             config.seed              = row.params->seed;
+            config.draw              = row.params->gumbel ? ops::kSampleDrawGumbel
+                                                          : ops::kSampleDrawInverseCdf;
             config.token_counts      = row.counts ? static_cast<std::int32_t*>(token_counts.p) +
                                                         std::size_t(row.slot) * domain
                                                   : nullptr;
@@ -2511,6 +2513,8 @@ struct DeepSeekV41Core::Impl {
             config.presence_penalty  = row.params->presence_penalty;
             config.frequency_penalty = row.params->frequency_penalty;
             config.seed              = row.params->seed;
+            config.draw              = row.params->gumbel ? ops::kSampleDrawGumbel
+                                                          : ops::kSampleDrawInverseCdf;
             config.token_counts      = row.counts ? static_cast<std::int32_t*>(token_counts.p) +
                                                         std::size_t(row.slot) * domain
                                                   : nullptr;

@@ -155,6 +155,21 @@ public:
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
+    // Proposals drawn from the drafter's own distribution instead of its argmax: `configs` holds a
+    // device SamplingConfig per proposal column (runtime::draft_sampling; a greedy row keeps the
+    // argmax). Null keeps every proposal an argmax.
+    void set_proposal_sampling(const ops::SamplingConfig* configs) noexcept {
+        proposal_configs_ = configs;
+    }
+
+    // The next proposals' keys: column b draws with (seed, positions[b] + offset,
+    // kSamplePurposeDecode), the key of the target's own draw for the position it proposes, so the
+    // two draws agree wherever the distributions do. `positions` is a device I32 [columns].
+    void set_proposal_key(const Tensor& positions, std::int32_t offset) noexcept {
+        proposal_key_positions_ = positions;
+        proposal_key_offset_    = offset;
+    }
+
     // The typed readout a finalizing chunk performs on its sampled token's logits: the first
     // `count` ids of io.readout_ids, read into io.readout_values; zero reads nothing.
     void set_readout(std::int32_t count) noexcept { readout_count_ = count; }
@@ -484,6 +499,9 @@ private:
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
+    const ops::SamplingConfig* proposal_configs_ = nullptr;
+    Tensor proposal_key_positions_;
+    std::int32_t proposal_key_offset_           = 0;
     std::int32_t readout_count_                 = 0;
     std::function<void()> first_token_hook_;
     ops::RopeYarn rope_yarn_;

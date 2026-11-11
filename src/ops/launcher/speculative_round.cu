@@ -252,4 +252,27 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
     CUDA_CHECK(cudaGetLastError());
 }
 
+void proposal_expand_logits_launch(const Tensor& subset, const std::int32_t* id_map,
+                                   std::int32_t n, Tensor& expanded, cudaStream_t stream) {
+    constexpr int kBlock        = 256;
+    const std::int32_t rows     = expanded.ne[0];
+    const std::int32_t columns  = expanded.ne[1];
+    const std::int64_t elements = static_cast<std::int64_t>(rows) * columns;
+    const auto fill_grid        = static_cast<unsigned int>(
+        std::min<std::int64_t>(div_up(elements, std::int64_t{kBlock}), 4096));
+    auto* out                   = static_cast<float*>(expanded.data);
+    proposal_fill_logits_kernel<<<fill_grid, kBlock, 0, stream>>>(out, elements);
+    CUDA_CHECK(cudaGetLastError());
+    const dim3 grid(static_cast<unsigned int>(div_up(n, kBlock)),
+                    static_cast<unsigned int>(columns));
+    if (subset.dtype == DType::FP32) {
+        proposal_scatter_logits_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const float*>(subset.data), id_map, n, rows, out);
+    } else {
+        proposal_scatter_logits_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(subset.data), id_map, n, rows, out);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

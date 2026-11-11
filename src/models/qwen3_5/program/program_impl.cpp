@@ -273,6 +273,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       proposal_head(plan.proposal_head), rope_yarn(plan.rope_yarn),
       mtp_attention_window(plan.mtp_attention_window), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
+      gumbel_sampling(plan.gumbel_sampling),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       kv_arena(make_kv_arena(device_in, parameters_in, plan,
@@ -646,6 +647,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.sampling_config) {
         sampling_config = plan.persistent.sampling_config->bind(backing);
     }
+    if (plan.persistent.draft_sampling_config) {
+        draft_sampling_config = plan.persistent.draft_sampling_config->bind(backing);
+    }
     if (plan.persistent.grammar_masks) {
         structured_round = std::make_unique<qwen3_5::StructuredRound>(
             plan.persistent.grammar_masks->bind(backing),
@@ -711,6 +715,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
         CUDA_CHECK(
             cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
+        if (draft_sampling_config.data != nullptr) {
+            CUDA_CHECK(cudaMemsetAsync(draft_sampling_config.data, 0,
+                                       draft_sampling_config.bytes(), device.stream));
+        }
     }
     device.synchronize();
     if (speculative_backend == SpeculativeBackend::Mtp && mtp_policy == MtpDraftPolicy::Adaptive) {

@@ -19,6 +19,7 @@
 #include "models/gemma4/kv_format.h"
 #include "models/gemma4/model.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -64,6 +65,8 @@ struct ExecutorOptions {
     std::uint32_t expert_cpu_threads = 0;
     // Disk experts: a drive mirror and the direct path (core/expert_disk.h).
     ExpertDiskReads expert_disk{};
+    // --gumbel-sampling: draft() may take samplers, whose rows' assistant then draws its drafts.
+    bool sampled_drafts = false;
     // YaRN past the model's native window (a factor above one) for the full-attention blocks'
     // rotation, the assistant's included: their proportional schedule takes YaRN's frequencies,
     // and the queries the square of its attention factor. The sliding-window blocks never see a
@@ -168,10 +171,16 @@ public:
     // a commit has left the target's hidden state after its last fed token.
     [[nodiscard]] std::uint32_t draft_tokens() const noexcept;
     [[nodiscard]] bool can_draft(std::uint32_t sequence) const;
-    // `steps` (1..draft_tokens) greedy drafts after each sequence's anchor, the token its next
-    // position takes: drafts[j * steps + i] is sequence j's i-th draft.
+    // `steps` (1..draft_tokens) drafts after each sequence's anchor, the token its next position
+    // takes: drafts[j * steps + i] is sequence j's i-th draft, the assistant's argmax. With
+    // `configs` (one per sequence; penalties, masks and counts unused) and `lengths`, draft i of
+    // sequence j is drawn from the assistant's distribution under configs[j] with the key
+    // (configs[j].seed, lengths[j] + i + 1, kSamplePurposeDecode), the key of the verification
+    // column that draws the target's token at its place; a row at temperature 0 takes the argmax.
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
-               std::span<std::int32_t> drafts, std::uint32_t steps);
+               std::span<std::int32_t> drafts, std::uint32_t steps,
+               std::span<const ops::SamplingConfig> configs = {},
+               std::span<const std::int32_t> lengths    = {});
     // widths[j] tokens of sequence j (its anchor, then its drafts; without widths, tokens.size() /
     // sequences.size() each) at its next positions, as decode rows: logits one column each,
     // sequence by sequence. The positions advance only with commit().

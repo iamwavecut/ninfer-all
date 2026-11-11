@@ -468,6 +468,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --seed N                      seed of a request that sets none (default: fresh\n"
            "                                per request)\n"
            "  --greedy                      force temperature 0 (exact argmax)\n"
+           "  --gumbel-sampling             draw sampled tokens by Gumbel-max over keyed\n"
+           "                                noise, and MTP-style drafts as the drafter's\n"
+           "                                draws under the same noise: other tokens than\n"
+           "                                the default draw for the same seed (default off)\n"
            "  --post-thinking               sample a thinking request's answer with the\n"
            "                                post-thinking preset (temperature 0.2) from the\n"
            "                                token after its reasoning closes (default off;\n"
@@ -1680,6 +1684,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--greedy") {
             options.greedy = true;
+            continue;
+        }
+        if (arg == "--gumbel-sampling") {
+            options.gumbel_sampling = true;
             continue;
         }
         if (arg == "--post-thinking") {

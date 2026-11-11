@@ -219,6 +219,7 @@ struct ServeOptions {
     // them a request opts in with its own `post_thinking` object.
     std::optional<SamplingOverrides> post_thinking_overrides;
     bool greedy                 = false; // --greedy: force temperature 0 (exact argmax)
+    bool gumbel_sampling        = false; // --gumbel-sampling (EngineOptions::gumbel_sampling)
     product::LogLevel log_level = product::LogLevel::Info;
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted

@@ -73,6 +73,8 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // Each row's proposal sampler (runtime::draft_sampling of its request's).
+    std::array<ops::SamplingConfig, kMaximumConcurrency> draft_sampling{};
 };
 
 struct MtpDecodeEgress {
@@ -265,7 +267,8 @@ struct MtpDecodeState {
     Tensor state_source_slots;
     Tensor state_destination_slots;
     Tensor rope_deltas;
-    const ops::SamplingConfig* sampling = nullptr;
+    const ops::SamplingConfig* sampling       = nullptr;
+    const ops::SamplingConfig* draft_sampling = nullptr;
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;

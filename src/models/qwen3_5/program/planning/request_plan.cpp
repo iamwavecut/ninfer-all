@@ -36,6 +36,7 @@ ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source)
     out.presence_penalty  = source.presence_penalty;
     out.frequency_penalty = source.frequency_penalty;
     out.seed              = source.seed;
+    out.draw              = source.gumbel ? ops::kSampleDrawGumbel : ops::kSampleDrawInverseCdf;
     out.token_counts      = nullptr;
     return out;
 }

@@ -100,6 +100,7 @@ struct Options {
     std::optional<SamplingOverrides> post_thinking_sampling;
     StructuredOutputOptions structured_output;
     bool greedy                 = false;
+    bool gumbel_sampling        = false; // --gumbel-sampling (EngineOptions::gumbel_sampling)
     product::LogLevel log_level = product::LogLevel::Info;
 };
 

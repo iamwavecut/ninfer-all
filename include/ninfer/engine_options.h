@@ -555,6 +555,14 @@ struct EngineOptions {
     // Reserves the grammar mask planes that JSON and JSON Schema constrained requests sample
     // through. Off, those requests are refused and a DFlash round carries no grammar stage.
     bool structured_output = false;
+    // Every sampled request draws its tokens by Gumbel-max over keyed noise
+    // (ResolvedSamplingParameters::gumbel) instead of by inverse CDF, and its chained drafts (an
+    // MTP block, Gemma 4's assistant) become the drafter's own draws under the noise of the
+    // positions they fill instead of its argmax, so a draft matches the verified token whenever
+    // the drafter and the target rank the drawn token first. The draws differ from the default's
+    // for the same seed; greedy requests are unaffected. DSpark drafts stay the drafter's argmax,
+    // and DFlash2 drafts keep their rejection-sampled verification.
+    bool gumbel_sampling = false;
     // Admit waiting requests to free lanes while other requests prefill, instead of holding
     // admission until the staged prefill finishes.
     bool concurrent_prefill = false;

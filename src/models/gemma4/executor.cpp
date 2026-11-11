@@ -13,6 +13,7 @@
 #include "models/gemma4/vision_kernels.h"
 #include "models/divided_head.h"
 #include "ninfer/ops/argmax.h"
+#include "ninfer/ops/sampling.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
@@ -279,6 +280,9 @@ struct Executor::Impl {
     // A chain's drafts [steps][rows] (the device feeds each step the last one) and the host copy.
     DeviceBuffer d_drafts;
     std::unique_ptr<PinnedHostBuffer> h_drafts;
+    // A sampled chain's configs [rows] and keys [steps][rows], and their host staging.
+    DeviceBuffer d_draft_configs, d_draft_keys;
+    std::unique_ptr<PinnedHostBuffer> h_draft_sampling;
     // Rows per sequence of the last verify() and each sequence's first row.
     std::vector<std::uint32_t> verify_widths;
     std::vector<int> verify_starts;
@@ -972,6 +976,15 @@ struct Executor::Impl {
         d_drafts = DeviceBuffer(std::size_t(options.draft_tokens) * gguf::kMaxVectorColumns * 4);
         h_drafts = std::make_unique<PinnedHostBuffer>(std::size_t(options.draft_tokens) *
                                                       gguf::kMaxVectorColumns * 4);
+        if (options.sampled_drafts) {
+            const std::size_t config_bytes =
+                gguf::kMaxVectorColumns * sizeof(ops::SamplingConfig);
+            const std::size_t key_bytes =
+                std::size_t(options.draft_tokens) * gguf::kMaxVectorColumns * 4;
+            d_draft_configs  = DeviceBuffer(config_bytes);
+            d_draft_keys     = DeviceBuffer(key_bytes);
+            h_draft_sampling = std::make_unique<PinnedHostBuffer>(config_bytes + key_bytes);
+        }
     }
 
     // ---- Workspace -----------------------------------------------------------------------------
@@ -1045,6 +1058,13 @@ struct Executor::Impl {
             kernels::decode_attention_workspace_floats(int(options.sequences), query_heads, 256,
                                                        decode_splits_sliding) * 4;
         std::size_t total = bytes + moe + round_up(decode, kAlign) + gguf_scratch + (16u << 20);
+        if (options.draft_tokens > 0 && options.sampled_drafts) {
+            // A sampled draft chain's sampler, beside the chain's few rows.
+            total += round_up(ops::sampling_workspace_capacity_bytes(
+                                  int(model.resources().public_token_count), 1,
+                                  gguf::kMaxVectorColumns),
+                              kAlign);
+        }
         if (vision) {
             // A chunk's embeddings, then one tower batch at a time beside them.
             total = std::max(total, round_up(t * h * 4, kAlign) + vision->workspace_bytes());
@@ -2273,12 +2293,46 @@ struct Executor::Impl {
     }
 
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
-               std::span<std::int32_t> out, std::uint32_t steps) {
+               std::span<std::int32_t> out, std::uint32_t steps,
+               std::span<const ops::SamplingConfig> configs = {},
+               std::span<const std::int32_t> lengths       = {}) {
         const int n = int(sequences.size());
         if (!drafting() || n <= 0 || n > gguf::kMaxVectorColumns ||
             anchors.size() != sequences.size() || steps < 1 || steps > options.draft_tokens ||
-            out.size() < std::size_t(n) * steps) {
+            out.size() < std::size_t(n) * steps ||
+            (!configs.empty() && (configs.size() != sequences.size() ||
+                                  lengths.size() != sequences.size()))) {
             throw std::invalid_argument("gemma4 draft: invalid call");
+        }
+        // Sampled only when a row samples: an all-greedy chain keeps the argmax graphs.
+        const bool sampled = options.sampled_drafts &&
+                             std::any_of(configs.begin(), configs.end(),
+                                         [](const ops::SamplingConfig& c) {
+                                             return c.temperature > 0.0F;
+                                         });
+        if (sampled) {
+            auto* host_configs = static_cast<ops::SamplingConfig*>(h_draft_sampling->data());
+            auto* host_keys    = reinterpret_cast<std::int32_t*>(
+                static_cast<std::byte*>(h_draft_sampling->data()) +
+                gguf::kMaxVectorColumns * sizeof(ops::SamplingConfig));
+            for (int j = 0; j < n; ++j) {
+                ops::SamplingConfig c   = configs[j];
+                c.presence_penalty      = 0.0F;
+                c.frequency_penalty     = 0.0F;
+                c.token_counts          = nullptr;
+                c.token_mask            = nullptr;
+                c.token_mask_stride     = 0;
+                c.non_finite_token      = 0;
+                host_configs[j]         = c;
+                for (std::uint32_t i = 0; i < steps; ++i) {
+                    host_keys[i * n + j] = lengths[j] + std::int32_t(i) + 1;
+                }
+            }
+            CUDA_CHECK(cudaMemcpyAsync(d_draft_configs.p, host_configs,
+                                       std::size_t(n) * sizeof(ops::SamplingConfig),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(d_draft_keys.p, host_keys, std::size_t(n) * steps * 4,
+                                       cudaMemcpyHostToDevice, stream));
         }
         std::vector<std::int32_t> pos(n), seq(n), keys(n);
         for (int j = 0; j < n; ++j) {
@@ -2292,7 +2346,8 @@ struct Executor::Impl {
             seq[j]  = std::int32_t(s);
         }
         stage(anchors, pos, seq, keys);
-        run_graph(draft_graphs, std::uint32_t(n) << 8 | steps, [&] { draft_body(n, int(steps)); });
+        run_graph(draft_graphs, std::uint32_t(sampled) << 16 | std::uint32_t(n) << 8 | steps,
+                  [&] { draft_body(n, int(steps), sampled); });
         auto* host = static_cast<std::int32_t*>(h_drafts->data());
         CUDA_CHECK(cudaMemcpyAsync(host, d_drafts.p, std::size_t(n) * steps * 4,
                                    cudaMemcpyDeviceToHost, stream));
@@ -2302,8 +2357,9 @@ struct Executor::Impl {
         }
     }
 
-    // The assistant's chain over n rows: anchors, positions, sequences and key limits staged.
-    void draft_body(int n, int steps) {
+    // The assistant's chain over n rows: anchors, positions, sequences and key limits staged, and
+    // for a `sampled` chain its configs and keys.
+    void draft_body(int n, int steps, bool sampled) {
         workspace->reset();
         auto scope        = workspace->scope();
         const int a       = draft_hidden;
@@ -2358,7 +2414,16 @@ struct Executor::Impl {
             auto* drafted = static_cast<std::int32_t*>(d_drafts.p) + std::int64_t(step) * n;
             const Tensor logits(draft_logits, DType::BF16, {vocab, n});
             Tensor tokens(drafted, DType::I32, {n});
-            ops::argmax(logits, tokens, draft_domain, stream);
+            if (sampled) {
+                const Tensor keys(static_cast<std::int32_t*>(d_draft_keys.p) +
+                                      std::int64_t(step) * n,
+                                  DType::I32, {n});
+                ops::sample(logits, tokens, draft_domain,
+                            static_cast<const ops::SamplingConfig*>(d_draft_configs.p), keys,
+                            ops::kSamplePurposeDecode, *workspace, stream);
+            } else {
+                ops::argmax(logits, tokens, draft_domain, stream);
+            }
             ids = drafted;
             if (step + 1 < steps) {
                 gguf::VectorOutput next;
@@ -2477,10 +2542,16 @@ struct Executor::Impl {
             }
         }
         if (drafting()) {
-            // The assistant's and the verification's kernels, eagerly.
+            // The assistant's (a greedy and a sampled chain) and the verification's kernels,
+            // eagerly.
             const std::uint32_t s = 0;
             std::vector<std::int32_t> drafts(options.draft_tokens);
             draft({&s, 1}, std::vector<std::int32_t>{2}, drafts, options.draft_tokens);
+            ops::SamplingConfig sampler;
+            sampler.temperature       = 1.0F;
+            const std::int32_t length = std::int32_t(positions[s]);
+            draft({&s, 1}, std::vector<std::int32_t>{2}, drafts, options.draft_tokens, {&sampler, 1},
+                  {&length, 1});
             std::vector<std::int32_t> tokens(options.draft_tokens + 1, 2);
             verify({&s, 1}, tokens);
             const std::uint32_t one = 1;
@@ -2807,8 +2878,9 @@ bool Executor::can_draft(std::uint32_t sequence) const {
 
 void Executor::draft(std::span<const std::uint32_t> sequences,
                      std::span<const std::int32_t> anchors, std::span<std::int32_t> drafts,
-                     std::uint32_t steps) {
-    impl_->draft(sequences, anchors, drafts, steps);
+                     std::uint32_t steps, std::span<const ops::SamplingConfig> configs,
+                     std::span<const std::int32_t> lengths) {
+    impl_->draft(sequences, anchors, drafts, steps, configs, lengths);
 }
 
 void Executor::verify(std::span<const std::uint32_t> sequences,

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -46,7 +47,50 @@ bool same_config(const ops::SamplingConfig& a, const ops::SamplingConfig& b) {
            a.min_p == b.min_p && a.presence_penalty == b.presence_penalty &&
            a.frequency_penalty == b.frequency_penalty && a.seed == b.seed &&
            a.token_counts == b.token_counts && a.token_mask == b.token_mask &&
-           a.token_mask_stride == b.token_mask_stride;
+           a.token_mask_stride == b.token_mask_stride && a.draw == b.draw &&
+           a.non_finite_token == b.non_finite_token;
+}
+
+// The device's counter-based uniform (sampling_device.cuh), bit for bit: splitmix64 over the
+// seed, the position and then the purpose and sub-key, its top 24 bits over 2^24.
+std::uint64_t splitmix64(std::uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+double keyed_uniform(std::uint64_t seed, int position, int purpose, unsigned sub) {
+    std::uint64_t key = splitmix64(
+        seed ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(position)) *
+                0xD1B54A32D192ED03ull));
+    key = splitmix64(key ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(purpose)) << 21) ^
+                     (static_cast<std::uint64_t>(sub) * 0x2545F4914F6CDD1Dull));
+    return static_cast<double>(key >> 40) / 16777216.0;
+}
+
+// The Gumbel draw's FP64 oracle: the support token whose log probability plus
+// -log(-log(u + 2^-25)) keyed by its id is largest; -1 when the best two lie within `margin`,
+// where the device's FP32 arithmetic may pick either.
+int gumbel_oracle(const Distribution& distribution, std::uint64_t seed, int position,
+                  int purpose, double margin) {
+    int best = -1;
+    double best_score = -std::numeric_limits<double>::infinity();
+    double second     = -std::numeric_limits<double>::infinity();
+    for (std::size_t j = 0; j < distribution.tokens.size(); ++j) {
+        const double u = keyed_uniform(seed, position, purpose,
+                                       static_cast<unsigned>(distribution.tokens[j]) + 1u) +
+                         0.5 / 16777216.0;
+        const double score = std::log(distribution.probabilities[j]) - std::log(-std::log(u));
+        if (score > best_score) {
+            second     = best_score;
+            best_score = score;
+            best       = distribution.tokens[j];
+        } else if (score > second) {
+            second = score;
+        }
+    }
+    return best_score - second < margin ? -1 : best;
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
@@ -261,8 +305,9 @@ RunResult run_homogeneous_batch(const std::vector<float>& logits, int physical_r
                      row_counts);
 }
 
+// `offset`: sample()'s position_offset; the keys are then position + offset + i.
 RunResult run_repeated(const std::vector<float>& column, int token_domain, int total, int batch,
-                       ops::SamplingConfig config, int position, int purpose) {
+                       ops::SamplingConfig config, int position, int purpose, int offset = 0) {
     if (batch <= 0 || total <= 0 || total % batch != 0) {
         throw std::invalid_argument("repeated sample count must be a positive batch multiple");
     }
@@ -288,7 +333,7 @@ RunResult run_repeated(const std::vector<float>& column, int token_domain, int t
         Tensor positions_tensor(pos, DType::I32, {batch});
         ops::sample(logits_tensor, out_tensor, token_domain,
                     static_cast<const ops::SamplingConfig*>(device_configs.p), positions_tensor,
-                    purpose, workspace, nullptr);
+                    purpose, workspace, nullptr, offset);
     }
     cuda_synchronize();
 
@@ -509,6 +554,81 @@ int filtered_distribution_contract() {
            verify_distribution("sample top-k/top-p/min-p", result.tokens, oracle);
 }
 
+// The Gumbel draw samples the truncated distribution the inverse-CDF draw samples, and each of
+// its draws is the FP64 oracle's token for its key, on the small-column route, the multi-block
+// workspace route and the single-block route past 16 lanes.
+int gumbel_contract() {
+    int failures = 0;
+    std::vector<float> small = {3.0f, 2.7f,  2.7f,  2.1f,  1.5f,  0.7f,
+                                0.1f, -0.4f, -1.0f, -2.0f, -3.0f, -4.0f};
+    round_to_bf16(small);
+    ops::SamplingConfig config;
+    config.temperature = 0.75f;
+    config.top_k       = 6;
+    config.top_p       = 0.86f;
+    config.min_p       = 0.12f;
+    config.seed        = 20261111;
+    config.draw        = ops::kSampleDrawGumbel;
+    {
+        const Distribution oracle =
+            distribution_oracle(small, static_cast<int>(small.size()), config);
+        const RunResult result = run_repeated(small, static_cast<int>(small.size()), 16384, 8,
+                                              config, 400, ops::kSamplePurposeDecode);
+        failures += result.integrity_failures +
+                    verify_distribution("sample Gumbel top-k/top-p/min-p", result.tokens, oracle);
+    }
+    std::vector<float> wide(300, -30.0f);
+    for (int token = 0; token < 24; ++token) {
+        wide[static_cast<std::size_t>(11 * token + 7)] = 1.5f - 0.11f * static_cast<float>(token);
+    }
+    round_to_bf16(wide);
+    config.top_k = 16;
+    config.top_p = 0.97f;
+    config.min_p = 0.0f;
+    struct Route {
+        const std::vector<float>* column;
+        int batch;
+        const char* name;
+    };
+    for (const Route& route : {Route{&small, 8, "small"}, Route{&wide, 8, "workspace"},
+                               Route{&wide, 17, "single-block"}}) {
+        const int domain          = static_cast<int>(route.column->size());
+        const Distribution oracle = distribution_oracle(*route.column, domain, config);
+        const int total           = route.batch * 16;
+        const RunResult gumbel =
+            run_repeated(*route.column, domain, total, route.batch, config, 900,
+                         ops::kSamplePurposeDecode);
+        ops::SamplingConfig inverse = config;
+        inverse.draw                = ops::kSampleDrawInverseCdf;
+        const RunResult cdf = run_repeated(*route.column, domain, total, route.batch, inverse, 900,
+                                           ops::kSamplePurposeDecode);
+        failures += gumbel.integrity_failures + cdf.integrity_failures;
+        int compared = 0;
+        int differ   = 0;
+        for (int i = 0; i < total; ++i) {
+            const int token = gumbel.tokens[static_cast<std::size_t>(i)];
+            differ += token != cdf.tokens[static_cast<std::size_t>(i)];
+            const int expected =
+                gumbel_oracle(oracle, config.seed, 900 + i, ops::kSamplePurposeDecode, 1e-3);
+            if (expected < 0) { continue; }
+            ++compared;
+            if (token != expected) {
+                if (failures == 0) {
+                    std::cerr << "sample Gumbel " << route.name << " position " << 900 + i
+                              << ": token " << token << ", oracle " << expected << '\n';
+                }
+                ++failures;
+            }
+        }
+        if (compared < total * 3 / 4 || differ == 0) {
+            std::cerr << "sample Gumbel " << route.name << ": " << compared << " of " << total
+                      << " draws compared, " << differ << " differ from the inverse-CDF draw\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 int capped_distribution_contract() {
     std::vector<float> column(24, 0.0f);
     for (int token = 0; token < 24; ++token) {
@@ -577,6 +697,8 @@ int rng_key_contract() {
         run_repeated(column, 2, samples, 8, config, 101, ops::kSamplePurposeDecode);
     const RunResult other_purpose =
         run_repeated(column, 2, samples, 8, config, 100, ops::kSamplePurposePrefill);
+    const RunResult offset =
+        run_repeated(column, 2, samples, 8, config, 97, ops::kSamplePurposeDecode, 3);
     ops::SamplingConfig other_seed_config = config;
     ++other_seed_config.seed;
     const RunResult other_seed =
@@ -584,7 +706,10 @@ int rng_key_contract() {
 
     int failures = baseline.integrity_failures + repeat.integrity_failures +
                    rechunked.integrity_failures + shifted.integrity_failures +
-                   other_purpose.integrity_failures + other_seed.integrity_failures;
+                   other_purpose.integrity_failures + other_seed.integrity_failures +
+                   offset.integrity_failures;
+    failures += verify_exact("sample position offset adds to every row's position", offset.tokens,
+                             baseline.tokens);
     failures += verify_exact("sample identical counter key is reproducible", repeat.tokens,
                              baseline.tokens);
     failures += verify_exact("sample RNG does not depend on compact row", rechunked.tokens,
@@ -629,9 +754,13 @@ int workspace_route_rng_contract() {
             run_repeated(column, 257, width * 2, 1, config, 100, ops::kSamplePurposeDecode);
         const auto wide =
             run_repeated(column, 257, width * 2, width, config, 100, ops::kSamplePurposeDecode);
-        failures += single.integrity_failures + wide.integrity_failures;
+        const auto offset =
+            run_repeated(column, 257, width * 2, width, config, 90, ops::kSamplePurposeDecode, 10);
+        failures += single.integrity_failures + wide.integrity_failures + offset.integrity_failures;
         failures +=
             verify_exact("sampler routes preserve counter keys", wide.tokens, single.tokens);
+        failures += verify_exact("sampler routes add the position offset", offset.tokens,
+                                 single.tokens);
     }
     return failures;
 }
@@ -715,13 +844,49 @@ int fp32_near_tie_contract() {
     return failures;
 }
 
+// A row whose logits are all NaN writes its config's non_finite_token (kSamplerNonFiniteToken
+// unless a drafter names a valid id) and counts nothing, greedy or sampled, on the single-block
+// and the workspace routes.
+int non_finite_contract() {
+    int failures = 0;
+    for (const int domain : {256, 248077}) {
+        const int physical_rows = domain == 256 ? 256 : 248320;
+        constexpr int batch     = 4;
+        const std::vector<float> logits(static_cast<std::size_t>(physical_rows) * batch,
+                                        std::numeric_limits<float>::quiet_NaN());
+        std::vector<ops::SamplingConfig> configs(batch);
+        for (int row = 0; row < batch; ++row) {
+            auto& config            = configs[static_cast<std::size_t>(row)];
+            config.temperature      = row % 2 == 0 ? 0.0f : 0.9f;
+            config.seed             = 7 + static_cast<unsigned>(row);
+            config.draw             = row == 3 ? ops::kSampleDrawGumbel : ops::kSampleDrawInverseCdf;
+            config.non_finite_token = row < 2 ? ops::kSamplerNonFiniteToken : 0;
+        }
+        const std::vector<std::vector<int>> counts(batch,
+                                                   std::vector<int>(static_cast<std::size_t>(domain)));
+        const RunResult result = run_batch(logits, physical_rows, domain, configs, {3, 4, 5, 6},
+                                           ops::kSamplePurposeDecode, counts);
+        failures += result.integrity_failures;
+        failures += verify_exact("sample all-NaN rows write their non-finite token", result.tokens,
+                                 std::vector<int>{ops::kSamplerNonFiniteToken,
+                                                  ops::kSamplerNonFiniteToken, 0, 0});
+        for (std::size_t row = 0; row < result.counts.size(); ++row) {
+            failures += verify_exact("sample all-NaN rows count nothing", result.counts[row],
+                                     counts[row]);
+        }
+    }
+    return failures;
+}
+
 int run_contracts() {
     int failures = 0;
+    failures += non_finite_contract();
     failures += masked_sampling_contract();
     failures += greedy_contract();
     failures += deterministic_stochastic_contract();
     failures += heterogeneous_batch_contract();
     failures += filtered_distribution_contract();
+    failures += gumbel_contract();
     failures += capped_distribution_contract();
     failures += real_shape_distribution_contract();
     failures += rng_key_contract();

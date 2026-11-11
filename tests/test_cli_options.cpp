@@ -459,6 +459,7 @@ int run_tests() {
                                         "--gdn-state-fp16",
                                         "--gpu-clock-floor",
                                         "--greedy",
+                                        "--gumbel-sampling",
                                         "--json",
                                         "--json-schema",
                                         "--kv-capacity",
