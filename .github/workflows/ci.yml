@@ -407,6 +407,13 @@ jobs:
       - name: Install checkout tools
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
       - uses: actions/checkout@v7
+      # Checkout trusts the mounted tree only under its own HOME. The restore below reads the head
+      # commit to find the branch a master merge brought in; without it master's CI after a merge
+      # read only master's older snapshot (12 November: 403 release CUDA units recompiled in 2 h 20 min).
+      - name: Trust the mounted checkout for subsequent Git commands
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" log -1 --format=%s
       - name: Install Debian build dependencies and official CUDA Toolkit
         run: .github/scripts/install-linux-release-tools.sh
       - id: compiler-cache

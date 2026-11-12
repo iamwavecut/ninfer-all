@@ -339,8 +339,13 @@ def merged_branch(subject, repository):
 
 def head_merged_branch():
     import subprocess
-    subject = subprocess.run(['git', 'log', '-1', '--format=%s'], capture_output=True, text=True).stdout
-    return merged_branch(subject, os.environ.get('GITHUB_REPOSITORY', ''))
+    result = subprocess.run(['git', 'log', '-1', '--format=%s'], capture_output=True, text=True)
+    if result.returncode:
+        # Without the merged branch, master's first build of a merge starts from its older snapshot.
+        error = (result.stderr.strip().splitlines() or [f'exit {result.returncode}'])[0]
+        print(f'::warning::Cannot read the head commit for its merged branch: {error}', flush=True)
+        return None
+    return merged_branch(result.stdout, os.environ.get('GITHUB_REPOSITORY', ''))
 
 
 def require_cache_writer(family, ref):
