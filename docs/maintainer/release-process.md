@@ -114,12 +114,16 @@ that was still waiting when a newer one arrived. A cancelled build would lose ev
 started; on 11 November 2026 three master runs in a row were cancelled after 27-53 minutes, while
 a heavy attention unit compiles for 38-75. When its object jobs end, a run checks that its revision
 is still the branch head (`windows-current`, `linux-current`); a superseded run skips packaging,
-Docker and publication, so the newer run starts with its objects. A current run publishes on
-success when build inputs changed. In **Actions → Native release → Run workflow**, publication
+Docker and publication, so the newer run starts with its objects. A run that already passed that
+check when master moved is cancelled by the master coordinator, unless an object job (a shard, or
+the temporary runner's full Linux job) is still running; on 12 November the next run waited
+behind a superseded run's packaging and publication. Completed objects
+survive either way: shards save checkpoints while they compile and their objects when cancelled.
+A current run publishes on success when build inputs changed. In **Actions → Native release → Run workflow**, publication
 defaults to off; enable `publish` only on `master` when intended. Feature branches run only through
 manual dispatch and cannot publish. Build jobs have read access; only the publication job receives
-`contents: write`. The master cancellation coordinator cancels only older CI runs. Closing a PR
-cancels that PR's remaining runs.
+`contents: write`. The master cancellation coordinator cancels older CI runs and older Native
+release runs that no longer compile. Closing a PR cancels that PR's remaining runs.
 A superseded upload can leave an unpublished draft; it cannot replace the current release.
 
 ## Portable runtime boundary

@@ -31,8 +31,8 @@ permissions:
 # Runs of one branch queue: a newer commit waits for the running build, and GitHub drops the
 # commit that waited before it. A cancelled build would lose every object it had started; a run
 # whose revision is no longer the branch head finishes its objects for the next run and skips
-# packaging (the *-current jobs). Publication uses a draft and checks master again before moving
-# latest.
+# packaging (the *-current jobs). Past its objects, cancel-master-builds.py cancels it on master.
+# Publication uses a draft and checks master again before moving latest.
 concurrency:
   group: native-release-${{ github.ref }}
   cancel-in-progress: false

@@ -186,14 +186,28 @@ class BuildLifecycleTest(unittest.TestCase):
                    path=".github/workflows/ci.yml", head_sha="a" * 40,
                    created_at="2026-10-20T11:00:00Z")
         self.assertTrue(CANCEL.superseded(run, trigger))
-        # Native release queues: its objects serve the next commit, so it is never cancelled.
+        self.assertTrue(CANCEL.superseded(run | dict(path=".github/workflows/native-release.yml"), trigger))
         for changes in (dict(head_branch="build/windows-release"), dict(event="pull_request"),
                         dict(status="completed"), dict(head_sha=trigger["head_sha"]),
                         dict(path=".github/workflows/other.yml"),
-                        dict(path=".github/workflows/native-release.yml"),
                         dict(created_at="2026-10-20T12:00:01Z")):
             with self.subTest(changes=changes):
                 self.assertFalse(CANCEL.superseded(run | changes, trigger))
+
+    def test_an_older_release_is_cancelled_only_after_its_object_jobs(self):
+        def job(name, status="in_progress", labels=("ubuntu-24.04",)):
+            return dict(name=name, status=status, labels=list(labels))
+        shard = "windows-objects (3, 12.9.2, 70;75;80;86;89, [\"nvcc\"]) / windows"
+        rented = "linux (13.4.3, 75;80;86;89;120a) / Linux Debian 13 CUDA 13.4.3 (75;80;86;89;120a)"
+        for jobs in ([job(shard)], [job("linux-objects (0, 12.9.2, 70;75;80;86;89) / Linux")],
+                     [job(rented, labels=("ninfer-native-debian13",)), job("validate", "completed")]):
+            with self.subTest(jobs=jobs):
+                self.assertTrue(CANCEL.compiling(jobs))
+        for jobs in ([], [job(shard, "completed"), job("Assemble universal windows package")],
+                     [job(rented)], [job(rented, "queued", ("ninfer-native-debian13",))],
+                     [job("publish")]):
+            with self.subTest(jobs=jobs):
+                self.assertFalse(CANCEL.compiling(jobs))
 
     def test_refused_cancel_accepts_a_run_that_stops_on_its_own(self):
         # GitHub refuses to cancel a run its concurrency group is already stopping; the run reads
