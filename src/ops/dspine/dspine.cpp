@@ -139,7 +139,9 @@ void dspine_bridge_finish(const Tensor& raw, const Tensor& rms, const Tensor& de
     float* denominator_data = nullptr;
     if (denominator != nullptr) {
         require(*denominator, DType::FP32, {w, b}, op, "denominator");
-        require_apart(op, {denominator, &raw, &rms, &delta, &norm_weight, &out, &normed});
+        // out may alias raw, so the denominator is checked against each of them apart.
+        require_apart(op, {denominator, &raw, &rms, &delta, &norm_weight, &normed});
+        require_apart(op, {denominator, &out});
         denominator_data = static_cast<float*>(denominator->data);
     }
     detail::dspine_bridge_finish_launch(
