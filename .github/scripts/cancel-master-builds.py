@@ -43,6 +43,11 @@ def cancel(run, api, post, sleep=time.sleep, checks=13, interval=5):
     if not error:
         print(f"Cancellation requested: {run['name']} ({run['id']})", flush=True)
         return
+    # A run GitHub never queued has no jobs and cannot be cancelled; five such runs of 11 November
+    # (e4b8f4485) stopped every coordinator since before it reached the runs it should cancel.
+    if "has not been queued yet" in error:
+        print(f"::notice::Never queued, left as is: {run['name']} ({run['id']})", flush=True)
+        return
     for check in range(checks):
         if check:
             sleep(interval)

@@ -220,6 +220,14 @@ class BuildLifecycleTest(unittest.TestCase):
                           lambda run_id: "HTTP 409", sleep=sleeps.append)
         self.assertEqual(sleeps, [5, 5])
 
+    def test_a_run_github_never_queued_is_left_without_polling(self):
+        run = dict(id=43096747885, name="CI")
+        with patch("builtins.print") as printed:
+            CANCEL.cancel(run, lambda path: self.fail("polled"),
+                          lambda run_id: "gh: Cannot cancel a workflow run that has not been queued yet. (HTTP 409)",
+                          sleep=lambda seconds: self.fail("slept"))
+        self.assertIn("Never queued", printed.call_args.args[0])
+
     def test_refused_cancel_fails_when_the_run_keeps_going(self):
         run = dict(id=7, name="CI")
         sleeps = []
