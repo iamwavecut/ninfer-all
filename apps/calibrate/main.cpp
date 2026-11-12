@@ -6,6 +6,8 @@
 #include "calibration/device_calibration.h"
 #include "calibration/route_catalog.h"
 #include "core/device.h"
+#include "product/launch_config/launch_config.h"
+#include "product/option_layers.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/device_profile.h"
 
@@ -15,78 +17,103 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <stdexcept>
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
 [[noreturn]] void usage(const char* program, int code) {
     std::fprintf(
         code == 0 ? stdout : stderr,
-        "usage: %s [--device N] [--out PATH] [--print] [--repeat N] [--margin F]\n"
-        "          [--no-ternary] [--no-groupwise] [--no-nvfp4] [--no-attention]\n"
+        "usage: %s [--config FILE] [--device N] [--out PATH] [--print] [--repeat N]\n"
+        "          [--margin F] [--no-ternary] [--no-groupwise] [--no-nvfp4] [--no-attention]\n"
         "          [--no-linear-attention] [--only PREFIX] [--detail] [--quiet]\n"
         "  Times every route a device profile can steer on this GPU and stores the profile\n"
         "  at PATH (default: $NINFER_DEVICE_PROFILES, else the user cache), stamped with\n"
         "  this build's route catalog. --only limits it to the route keys starting with\n"
         "  PREFIX (the stored entry keeps the other keys it measured before); --detail logs\n"
-        "  every candidate; --print writes the stored entry to stdout.\n",
+        "  every candidate; --print writes the stored entry to stdout. --config FILE reads\n"
+        "  options from a launch configuration (docs/cli.md#launch-configuration-files);\n"
+        "  every switch also takes its --no- form.\n",
         program);
     std::exit(code);
 }
 
-} // namespace
-
-int main(int argc, char** argv) {
+struct Arguments {
     int device = 0;
     std::filesystem::path out;
     bool print = false;
     bool quiet = false;
     ninfer::calibration::CalibrationOptions options;
-    for (int index = 1; index < argc; ++index) {
-        const std::string_view arg(argv[index]);
+};
+
+// The arguments as one list. With `spans` it only splits them into options
+// (ninfer::product::parse_layered).
+Arguments parse_arguments(const std::vector<std::string>& arguments,
+                          std::vector<ninfer::product::OptionSpan>* spans) {
+    Arguments out;
+    ninfer::product::OptionSpanRecorder recorder(spans);
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        recorder.begin(index);
+        const std::string_view arg(arguments[index]);
         const auto value = [&]() -> const char* {
-            if (index + 1 >= argc) { usage(argv[0], 2); }
-            return argv[++index];
+            if (index + 1 >= arguments.size()) {
+                throw std::invalid_argument(std::string(arg) + " needs a value");
+            }
+            return arguments[++index].c_str();
+        };
+        const auto flag = [&](std::string_view name, bool& field) {
+            return ninfer::product::switch_option(arg, name, [&](bool on) { field = on; });
         };
         if (arg == "--device") {
-            device = std::atoi(value());
+            out.device = std::atoi(value());
         } else if (arg == "--out") {
-            out = value();
-        } else if (arg == "--print") {
-            print = true;
+            out.out = value();
+        } else if (flag("print", out.print) || flag("ternary", out.options.ternary) ||
+                   flag("groupwise", out.options.groupwise) || flag("nvfp4", out.options.nvfp4) ||
+                   flag("attention", out.options.attention) ||
+                   flag("linear-attention", out.options.linear_attention) ||
+                   flag("detail", out.options.detail) || flag("quiet", out.quiet)) {
         } else if (arg == "--repeat") {
-            options.repeat = std::max(3, std::atoi(value()));
+            out.options.repeat = std::max(3, std::atoi(value()));
         } else if (arg == "--margin") {
-            options.margin = std::atof(value());
-        } else if (arg == "--no-ternary") {
-            options.ternary = false;
-        } else if (arg == "--no-groupwise") {
-            options.groupwise = false;
-        } else if (arg == "--no-nvfp4") {
-            options.nvfp4 = false;
-        } else if (arg == "--no-attention") {
-            options.attention = false;
-        } else if (arg == "--no-linear-attention") {
-            options.linear_attention = false;
+            out.options.margin = std::atof(value());
         } else if (arg == "--only") {
-            options.only = value();
-        } else if (arg == "--detail") {
-            options.detail = true;
-        } else if (arg == "--quiet") {
-            quiet = true;
-        } else if (arg == "-h" || arg == "--help") {
-            usage(argv[0], 0);
+            out.options.only = value();
         } else {
-            usage(argv[0], 2);
+            throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
     }
+    recorder.finish(arguments.size());
+    return out;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    Arguments arguments;
+    try {
+        const ninfer::product::CommandLine command_line = ninfer::product::read_command_line(
+            argc, argv, ninfer::product::PositionalArtifact::None);
+        if (command_line.help) { usage(argv[0], 0); }
+        arguments = ninfer::product::parse_layered(command_line.layer_arguments(), {},
+                                                   parse_arguments);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "ninfer-calibrate: %s\n", error.what());
+        usage(argv[0], 2);
+    }
+    const int device                                = arguments.device;
+    const std::filesystem::path& out                = arguments.out;
+    const bool print                                = arguments.print;
+    ninfer::calibration::CalibrationOptions& options = arguments.options;
     try {
         CUDA_CHECK(cudaSetDevice(device));
         cudaDeviceProp properties{};
         CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
-        if (!quiet) {
+        if (!arguments.quiet) {
             options.log = [](const std::string& line) { std::fprintf(stderr, "%s\n", line.c_str()); };
         }
         ninfer::runtime::DeviceProfileEntry entry =

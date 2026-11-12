@@ -5,7 +5,8 @@
 #   run <model> [profile]     scripts/run.sh: the measured serving profiles (default: run qwen38-27b)
 #   download <model>          scripts/download-model.sh into /models
 #   ninfer | serve | perplexity | calibrate | ngram-profile [args]   the binary itself; serve
-#                             listens on NINFER_HOST:NINFER_PORT unless --host/--port are given
+#                             listens on NINFER_HOST:NINFER_PORT unless the arguments or their
+#                             --config files give host and port
 #   anything else             executed as given
 #
 # GPUs that need different builds (a layer pipeline with --devices across, say, an RTX 2080 Ti and
@@ -89,11 +90,15 @@ case "$command" in
       "$home/run.sh" "$model" "${@:2}" ;;
   ninfer) exec "$bin/ninfer" "$@" ;;
   serve)
-    # ninfer-serve binds 127.0.0.1 by default, which nothing outside the container reaches.
-    listen=()
-    [[ " $* " == *" --host "* ]] || listen+=(--host "$NINFER_HOST")
-    [[ " $* " == *" --port "* ]] || listen+=(--port "$NINFER_PORT")
-    exec "$bin/ninfer-serve" "$@" ${listen[@]+"${listen[@]}"} ;;
+    # ninfer-serve binds 127.0.0.1 by default, which nothing outside the container reaches. The
+    # container's address is the first configuration layer: the caller's --config files and
+    # options override it. The artifact, when given, stays the first argument.
+    if [[ $# -gt 0 && "$1" != -* ]]; then
+      exec "$bin/ninfer-serve" "$1" \
+        --config <(printf 'host = %s\nport = %s\n' "$NINFER_HOST" "$NINFER_PORT") "${@:2}"
+    fi
+    exec "$bin/ninfer-serve" \
+      --config <(printf 'host = %s\nport = %s\n' "$NINFER_HOST" "$NINFER_PORT") "$@" ;;
   perplexity) exec "$bin/ninfer-perplexity" "$@" ;;
   calibrate) exec "$bin/ninfer-calibrate" "$@" ;;
   ngram-profile) exec "$bin/ninfer-ngram-profile" "$@" ;;

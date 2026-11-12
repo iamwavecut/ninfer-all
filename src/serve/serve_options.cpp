@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/kv_resident_options.h"
+#include "product/option_layers.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
@@ -104,6 +105,36 @@ std::string read_ui_settings(const char* path) {
     return settings.dump();
 }
 
+// Spellings of one setting: a later layer's option replaces an earlier layer's other spelling.
+constexpr product::SettingAlias kSettingAliases[] = {
+    {"device", "devices"},
+    {"vram-headroom-mib", "kv-headroom-mib"},
+    {"full-draft-head", "lm-head-draft"},
+    {"vision-offload", "vision-residency"},
+    {"vision-cpu", "vision-residency"},
+    {"lora-scaled", "lora"},
+    {"control-vector-scaled", "control-vector"},
+    {"use-original-prefix-caching", "use-alt-prefix-caching"},
+};
+
+// The options that size or shape the context cache, which --no-prefix-reuse removes.
+constexpr std::string_view kContextCapacitySettings[] = {
+    "device-state-slots", "host-state-slots", "host-kv-mib", "host-cache-mib",
+    "context-cache-policy", "release-diverged-checkpoints", "thorough-admission-search",
+    "recency-eviction", "value-aware-demote", "kv-lease-growth", "max-private-continuations",
+    "max-shared-prefixes", "max-long-anchors-per-continuation", "auto-long-anchors",
+    "max-cache-markers-per-request"};
+
+// Options of the router itself; every other option of a router's layers is each model's.
+bool router_option(std::string_view argument) {
+    return argument == "--models-dir" || argument == "--models-preset" ||
+           argument == "--models-max" || argument == "--sleep-idle-seconds" ||
+           argument == "--unload-idle-seconds";
+}
+
+ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::string>& arguments,
+                                   std::vector<product::OptionSpan>* spans);
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
@@ -113,6 +144,11 @@ std::string serve_usage_text(const char* argv0) {
            "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n"
            "  --help, -h                    show this help and exit\n"
            "  --version                     print the build version and exit\n"
+           "  --config FILE                 read options from a launch configuration file\n"
+           "                                (`key = value` lines, docs/cli.md); repeatable,\n"
+           "                                each later file and the command line override\n"
+           "                                earlier ones; a file's `model` names the artifact\n"
+           "  Every switch below also takes a --no- form, which turns it off.\n"
            "\n"
            "MODEL & CONTEXT\n"
            "  --max-context N               logical context ceiling of each request (default\n"
@@ -628,19 +664,13 @@ std::vector<std::uint32_t> parse_stage_layers(std::string_view text) {
     return counts;
 }
 
-ServeOptions parse_serve_options(int argc, char** argv) {
+namespace {
+
+// The options after the artifact path, as one list. With `spans` it only splits them into options
+// (product::parse_layered); without, it also validates them together.
+ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::string>& arguments,
+                                   std::vector<product::OptionSpan>* spans) {
     ServeOptions options;
-    options.startup_argv.reserve(static_cast<std::size_t>(argc));
-    bool redact_next = false;
-    for (int i = 0; i < argc; ++i) {
-        if (redact_next) {
-            options.startup_argv.emplace_back("<redacted>");
-            redact_next = false;
-            continue;
-        }
-        options.startup_argv.emplace_back(argv[i] == nullptr ? "" : argv[i]);
-        redact_next = options.startup_argv.back() == "--api-key";
-    }
     bool kv_capacity_explicit         = false;
     bool device_explicit              = false;
     bool context_capacity_explicit    = false;
@@ -658,37 +688,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     const char* hybrid_option_flag = nullptr;
     bool original_cache_selected   = false;
     bool hybrid_cache_selected     = false;
-    if (argc >= 2 && std::string(argv[1]) == "--version") {
-        options.version_requested = true;
-        return options;
-    }
-    if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
-        options.help_requested = true;
-        return options;
-    }
-    if (argc < 2) { throw std::invalid_argument("artifact path is required"); }
-    // Router mode starts with an option: the models come from --models-dir or --models-preset.
-    const bool artifact_given = std::string_view(argv[1]).substr(0, 2) != "--";
-    if (artifact_given) { options.artifact_path = argv[1]; }
-    // Router options apply to the router; every other argument is passed on to each model.
-    const auto router_option = [](std::string_view arg) {
-        return arg == "--models-dir" || arg == "--models-preset" || arg == "--models-max" ||
-               arg == "--sleep-idle-seconds" || arg == "--unload-idle-seconds";
-    };
-    for (int i = artifact_given ? 2 : 1; i < argc; ++i) {
-        const std::string_view current = argv[i];
-        if (router_option(current)) {
-            ++i;
-            continue;
-        }
-        if (current == "--models-autoload" || current == "--no-models-autoload") { continue; }
-        options.model_arguments.emplace_back(current);
-    }
-    for (int i = artifact_given ? 2 : 1; i < argc; ++i) {
-        const std::string arg    = argv[i];
+    product::OptionSpanRecorder recorder(spans);
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        recorder.begin(i);
+        const std::string arg    = arguments[i];
         const auto require_value = [&](const char* flag) -> const char* {
-            if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
-            return argv[i];
+            if (++i >= arguments.size()) {
+                throw std::invalid_argument(std::string(flag) + " needs a value");
+            }
+            return arguments[i].c_str();
         };
         // One `if` per option, each ending in `continue`, not an `else if` chain: MSVC nests each
         // `else if` one block deeper and stops compiling at 128 (C1061).
@@ -770,8 +778,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
-        if (arg == "--fast-prefill-kernel") {
-            options.fast_prefill_kernel = true;
+        if (product::switch_option(arg, "fast-prefill-kernel",
+                                   [&](bool on) { options.fast_prefill_kernel = on; })) {
             continue;
         }
         if (arg == "--device-profile") {
@@ -859,12 +867,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.media_preprocess_threads = static_cast<std::uint32_t>(threads);
             continue;
         }
-        if (arg == "--use-alt-prefix-caching") {
-            hybrid_cache_selected = true;
-            continue;
-        }
-        if (arg == "--use-original-prefix-caching") {
-            original_cache_selected = true;
+        if (product::switch_option(arg, "use-alt-prefix-caching",
+                                   [&](bool on) { hybrid_cache_selected = on; }) ||
+            product::switch_option(arg, "use-original-prefix-caching",
+                                   [&](bool on) { original_cache_selected = on; })) {
             continue;
         }
         if (arg == "--device-snapshot-slots") {
@@ -983,12 +989,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_cache.disk_kv_capacity_bytes = gib << 30U;
             continue;
         }
-        if (arg == "--disk-kv-restore") {
-            options.context_cache.disk_kv_restore = true;
+        if (product::switch_option(arg, "disk-kv-restore", [&](bool on) { options.context_cache.disk_kv_restore = on; })) {
             continue;
         }
-        if (arg == "--disk-kv-directstorage") {
-            options.context_cache.disk_kv_directstorage = true;
+        if (product::switch_option(arg, "disk-kv-directstorage", [&](bool on) { options.context_cache.disk_kv_directstorage = on; })) {
             continue;
         }
         if (arg == "--context-cache-policy") {
@@ -1001,41 +1005,52 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             context_capacity_explicit               = true;
             continue;
         }
-        if (arg == "--release-diverged-checkpoints") {
-            legacy_cache_flag                                  = "--release-diverged-checkpoints";
-            options.context_cache.release_diverged_checkpoints = true;
-            context_capacity_explicit                          = true;
+        if (product::switch_option(arg, "release-diverged-checkpoints", [&](bool on) {
+                options.context_cache.release_diverged_checkpoints = on;
+                if (on) {
+                    legacy_cache_flag         = "--release-diverged-checkpoints";
+                    context_capacity_explicit = true;
+                }
+            })) {
             continue;
         }
-        if (arg == "--concurrent-prefill") {
-            options.concurrent_prefill = true;
+        if (product::switch_option(arg, "concurrent-prefill", [&](bool on) { options.concurrent_prefill = on; })) {
             continue;
         }
-        if (arg == "--recover-invariant-failures") {
-            options.recover_invariant_failures = true;
+        if (product::switch_option(arg, "recover-invariant-failures", [&](bool on) { options.recover_invariant_failures = on; })) {
             continue;
         }
-        if (arg == "--thorough-admission-search") {
-            legacy_cache_flag                               = "--thorough-admission-search";
-            options.context_cache.thorough_admission_search = true;
-            context_capacity_explicit                       = true;
+        if (product::switch_option(arg, "thorough-admission-search", [&](bool on) {
+                options.context_cache.thorough_admission_search = on;
+                if (on) {
+                    legacy_cache_flag         = "--thorough-admission-search";
+                    context_capacity_explicit = true;
+                }
+            })) {
             continue;
         }
-        if (arg == "--recency-eviction") {
-            legacy_cache_flag                      = "--recency-eviction";
-            options.context_cache.recency_eviction = true;
-            context_capacity_explicit              = true;
+        if (product::switch_option(arg, "recency-eviction", [&](bool on) {
+                options.context_cache.recency_eviction = on;
+                if (on) {
+                    legacy_cache_flag         = "--recency-eviction";
+                    context_capacity_explicit = true;
+                }
+            })) {
             continue;
         }
-        if (arg == "--value-aware-demote") {
-            legacy_cache_flag                        = "--value-aware-demote";
-            options.context_cache.value_aware_demote = true;
-            context_capacity_explicit                = true;
+        if (product::switch_option(arg, "value-aware-demote", [&](bool on) {
+                options.context_cache.value_aware_demote = on;
+                if (on) {
+                    legacy_cache_flag         = "--value-aware-demote";
+                    context_capacity_explicit = true;
+                }
+            })) {
             continue;
         }
-        if (arg == "--kv-lease-growth") {
-            options.context_cache.kv_lease_growth = true;
-            context_capacity_explicit             = true;
+        if (product::switch_option(arg, "kv-lease-growth", [&](bool on) {
+                options.context_cache.kv_lease_growth = on;
+                if (on) { context_capacity_explicit = true; }
+            })) {
             continue;
         }
         if (arg == "--max-private-continuations") {
@@ -1062,20 +1077,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             context_capacity_explicit = true;
             continue;
         }
-        if (arg == "--auto-long-anchors") {
-            legacy_cache_flag                            = "--auto-long-anchors";
-            options.context_cache.automatic_long_anchors = true;
-            context_capacity_explicit                    = true;
+        if (product::switch_option(arg, "auto-long-anchors", [&](bool on) {
+                options.context_cache.automatic_long_anchors = on;
+                if (on) {
+                    legacy_cache_flag         = "--auto-long-anchors";
+                    context_capacity_explicit = true;
+                }
+            })) {
             continue;
         }
-        if (arg == "--branch-anchors") {
-            legacy_cache_flag                    = "--branch-anchors";
-            options.context_cache.branch_anchors = true;
+        if (product::switch_option(arg, "branch-anchors", [&](bool on) {
+                options.context_cache.branch_anchors = on;
+                if (on) { legacy_cache_flag = "--branch-anchors"; }
+            })) {
             continue;
         }
-        if (arg == "--no-endpoint-anchors") {
-            legacy_cache_flag                      = "--no-endpoint-anchors";
-            options.context_cache.endpoint_anchors = false;
+        if (product::switch_option(arg, "endpoint-anchors", [&](bool on) {
+                options.context_cache.endpoint_anchors = on;
+                if (!on) { legacy_cache_flag = "--no-endpoint-anchors"; }
+            })) {
             continue;
         }
         if (arg == "--long-anchor-spacing") {
@@ -1187,8 +1207,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
             continue;
         }
-        if (arg == "--tensor-parallel") {
-            options.tensor_parallel = true;
+        if (product::switch_option(arg, "tensor-parallel", [&](bool on) { options.tensor_parallel = on; })) {
             continue;
         }
         if (arg == "--tensor-split") {
@@ -1210,8 +1229,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 require_value("--tensor-parallel-prompt-partials"));
             continue;
         }
-        if (arg == "--invariant-attention") {
-            options.invariant_attention = true;
+        if (product::switch_option(arg, "invariant-attention", [&](bool on) { options.invariant_attention = on; })) {
             continue;
         }
         if (arg == "--kv-dtype") {
@@ -1265,8 +1283,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             bytes       = static_cast<std::size_t>(mib << 20);
             continue;
         }
-        if (arg == "--ngram-native-sessions") {
-            options.ngram_native_sessions = true;
+        if (product::switch_option(arg, "ngram-native-sessions", [&](bool on) { options.ngram_native_sessions = on; })) {
             continue;
         }
         if (arg == "--default-max-tokens") {
@@ -1305,8 +1322,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 product::parse_reasoning_loop_action(require_value("--reasoning-loop"));
             continue;
         }
-        if (arg == "--vision") {
-            options.enable_vision = true;
+        if (product::switch_option(arg, "vision", [&](bool on) { options.enable_vision = on; })) {
             continue;
         }
         if (arg == "--vision-residency") {
@@ -1322,10 +1338,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
-        if (arg == "--vision-cpu") {
-            // The gzenz fork's switch for Vision on CPU threads.
-            options.enable_vision    = true;
-            options.vision_residency = VisionResidency::Cpu;
+        if (product::switch_option(arg, "vision-cpu", [&](bool on) {
+                // The gzenz fork's switch for Vision on CPU threads.
+                if (on) { options.enable_vision = true; }
+                options.vision_residency = on ? VisionResidency::Cpu : VisionResidency::Resident;
+            })) {
             continue;
         }
         if (arg == "--vision-offload") {
@@ -1350,8 +1367,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             vision_max_merged_explicit       = true;
             continue;
         }
-        if (arg == "--no-cuda-graph") {
-            options.use_cuda_graph = false;
+        if (product::switch_option(arg, "cuda-graph", [&](bool on) { options.use_cuda_graph = on; })) {
             continue;
         }
         if (arg == "--gpu-clock-floor") {
@@ -1372,21 +1388,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.cuda_graph_allowance_mib = mib;
             continue;
         }
-        if (arg == "--no-prefix-reuse") {
-            options.allow_prefix_reuse = false;
+        if (product::switch_option(arg, "prefix-reuse", [&](bool on) { options.allow_prefix_reuse = on; })) {
             continue;
         }
-        if (arg == "--lenient-assistant-history") {
-            options.lenient_assistant_history = true;
+        if (product::switch_option(arg, "lenient-assistant-history", [&](bool on) { options.lenient_assistant_history = on; })) {
             continue;
         }
-        if (arg == "--lenient-image-detail") {
-            options.lenient_image_detail = true;
+        if (product::switch_option(arg, "lenient-image-detail", [&](bool on) { options.lenient_image_detail = on; })) {
             continue;
         }
-        if (arg == "--derive-session-keys") {
-            legacy_cache_flag           = "--derive-session-keys";
-            options.derive_session_keys = true;
+        if (product::switch_option(arg, "derive-session-keys", [&](bool on) {
+                options.derive_session_keys = on;
+                if (on) { legacy_cache_flag = "--derive-session-keys"; }
+            })) {
             continue;
         }
         if (arg == "--slot-save-path") {
@@ -1398,26 +1412,29 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
-        if (arg == "--auto-save-evicted") {
-            legacy_cache_flag         = "--auto-save-evicted";
-            options.auto_save_evicted = true;
+        if (product::switch_option(arg, "auto-save-evicted", [&](bool on) {
+                options.auto_save_evicted = on;
+                if (on) { legacy_cache_flag = "--auto-save-evicted"; }
+            })) {
             continue;
         }
-        if (arg == "--auto-prefix-grid") {
-            legacy_cache_flag        = "--auto-prefix-grid";
-            options.auto_prefix_grid = true;
+        if (product::switch_option(arg, "auto-prefix-grid", [&](bool on) {
+                options.auto_prefix_grid = on;
+                if (on) { legacy_cache_flag = "--auto-prefix-grid"; }
+            })) {
             continue;
         }
-        if (arg == "--lm-head-draft") {
-            options.speculative.proposal_head = ProposalHead::Optimized;
+        if (product::switch_option(arg, "lm-head-draft", [&](bool on) {
+                options.speculative.proposal_head = on ? ProposalHead::Optimized : ProposalHead::Auto;
+            }) ||
+            product::switch_option(arg, "full-draft-head", [&](bool on) {
+                options.speculative.proposal_head = on ? ProposalHead::Full : ProposalHead::Auto;
+            })) {
             continue;
         }
-        if (arg == "--full-draft-head") {
-            options.speculative.proposal_head = ProposalHead::Full;
-            continue;
-        }
-        if (arg == "--adaptive-mtp") {
-            options.speculative.mtp_policy = MtpDraftPolicy::Adaptive;
+        if (product::switch_option(arg, "adaptive-mtp", [&](bool on) {
+                options.speculative.mtp_policy = on ? MtpDraftPolicy::Adaptive : MtpDraftPolicy::Fixed;
+            })) {
             continue;
         }
         if (arg == "--mtp-attention-window") {
@@ -1426,12 +1443,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                     require_value("--mtp-attention-window"), "mtp-attention-window"));
             continue;
         }
-        if (arg == "--lm-head-q4") {
-            options.lm_head_q4 = true;
+        if (product::switch_option(arg, "lm-head-q4", [&](bool on) { options.lm_head_q4 = on; })) {
             continue;
         }
-        if (arg == "--lm-head-q6") {
-            options.lm_head_q6 = true;
+        if (product::switch_option(arg, "lm-head-q6", [&](bool on) { options.lm_head_q6 = on; })) {
             continue;
         }
         if (arg == "--embedding-residency") {
@@ -1445,24 +1460,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
-        if (arg == "--embedding-q4") {
-            options.embedding_q4 = true;
+        if (product::switch_option(arg, "embedding-q4", [&](bool on) { options.embedding_q4 = on; })) {
             continue;
         }
-        if (arg == "--embedding-q6") {
-            options.embedding_q6 = true;
+        if (product::switch_option(arg, "embedding-q6", [&](bool on) { options.embedding_q6 = on; })) {
             continue;
         }
-        if (arg == "--mtp-experts-q4") {
-            options.mtp_experts_q4 = true;
+        if (product::switch_option(arg, "mtp-experts-q4", [&](bool on) { options.mtp_experts_q4 = on; })) {
             continue;
         }
-        if (arg == "--gdn-state-fp16") {
-            options.gdn_state_fp16 = true;
+        if (product::switch_option(arg, "gdn-state-fp16", [&](bool on) { options.gdn_state_fp16 = on; })) {
             continue;
         }
-        if (arg == "--rope-yarn") {
-            options.rope_yarn = true;
+        if (product::switch_option(arg, "rope-yarn", [&](bool on) { options.rope_yarn = on; })) {
             continue;
         }
         if (arg == "--rope-yarn-factor") {
@@ -1480,12 +1490,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 require_value("--rope-scaling-original-context"));
             continue;
         }
-        if (arg == "--wddm-evictable-budget") {
-            options.wddm_evictable_budget = true;
+        if (product::switch_option(arg, "wddm-evictable-budget", [&](bool on) { options.wddm_evictable_budget = on; })) {
             continue;
         }
-        if (arg == "--model-suspend") {
-            options.suspend.enabled = true;
+        if (product::switch_option(arg, "model-suspend", [&](bool on) { options.suspend.enabled = on; })) {
             continue;
         }
         if (arg == "--models-dir") {
@@ -1501,12 +1509,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--models-max"), "models-max"));
             continue;
         }
-        if (arg == "--models-autoload") {
-            options.models_autoload = true;
-            continue;
-        }
-        if (arg == "--no-models-autoload") {
-            options.models_autoload = false;
+        if (product::switch_option(arg, "models-autoload",
+                                   [&](bool on) { options.models_autoload = on; })) {
             continue;
         }
         if (arg == "--sleep-idle-seconds") {
@@ -1541,24 +1545,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
-        if (arg == "--no-auto-resume") {
-            options.suspend.auto_resume = false;
+        if (product::switch_option(arg, "auto-resume", [&](bool on) { options.suspend.auto_resume = on; })) {
             continue;
         }
-        if (arg == "--mlp-a8-decode") {
-            options.mlp_a8_decode = true;
+        if (product::switch_option(arg, "mlp-a8-decode", [&](bool on) { options.mlp_a8_decode = on; })) {
             continue;
         }
-        if (arg == "--no-prefill-a8") {
-            options.prefill_a8 = false;
+        if (product::switch_option(arg, "prefill-a8", [&](bool on) { options.prefill_a8 = on; })) {
             continue;
         }
-        if (arg == "--nvfp4-w4a8-int") {
-            options.nvfp4_w4a8_int = true;
+        if (product::switch_option(arg, "nvfp4-w4a8-int", [&](bool on) { options.nvfp4_w4a8_int = on; })) {
             continue;
         }
-        if (arg == "--nvfp4-w4a16") {
-            options.nvfp4_w4a16 = true;
+        if (product::switch_option(arg, "nvfp4-w4a16", [&](bool on) { options.nvfp4_w4a16 = on; })) {
             continue;
         }
         if (arg == "--lookup-ngram") {
@@ -1566,12 +1565,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--lookup-ngram"), "lookup-ngram"));
             continue;
         }
-        if (arg == "--prefill-cublas") {
-            options.prefill_cublas = true;
+        if (product::switch_option(arg, "prefill-cublas", [&](bool on) { options.prefill_cublas = on; })) {
             continue;
         }
-        if (arg == "--no-prefill-cublas-projections") {
-            options.prefill_cublas_projections = false;
+        if (product::switch_option(arg, "prefill-cublas-projections", [&](bool on) { options.prefill_cublas_projections = on; })) {
             continue;
         }
         if (arg == "--chat-template") {
@@ -1581,12 +1578,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
-        if (arg == "--no-thinking") {
-            options.enable_thinking = false;
+        if (product::switch_option(arg, "thinking", [&](bool on) { options.enable_thinking = on; })) {
             continue;
         }
-        if (arg == "--preserve-thinking") {
-            options.preserve_thinking = true;
+        if (product::switch_option(arg, "preserve-thinking", [&](bool on) { options.preserve_thinking = on; })) {
             continue;
         }
         if (arg == "--graft") {
@@ -1615,36 +1610,29 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
-        if (arg == "--cors") {
-            options.enable_cors = true;
+        if (product::switch_option(arg, "cors", [&](bool on) { options.enable_cors = on; })) {
             continue;
         }
-        if (arg == "--no-webui") {
-            options.enable_webui = false;
+        if (product::switch_option(arg, "webui", [&](bool on) { options.enable_webui = on; })) {
             continue;
         }
-        if (arg == "--webui-mcp-proxy") {
-            options.webui_mcp_proxy = true;
+        if (product::switch_option(arg, "webui-mcp-proxy", [&](bool on) { options.webui_mcp_proxy = on; })) {
             continue;
         }
         if (arg == "--ui-config-file") {
             options.ui_settings = read_ui_settings(require_value("--ui-config-file"));
             continue;
         }
-        if (arg == "--structured-output") {
-            options.structured_output = true;
+        if (product::switch_option(arg, "structured-output", [&](bool on) { options.structured_output = on; })) {
             continue;
         }
-        if (arg == "--unconstrained-response-format") {
-            options.unconstrained_response_format = true;
+        if (product::switch_option(arg, "unconstrained-response-format", [&](bool on) { options.unconstrained_response_format = on; })) {
             continue;
         }
-        if (arg == "--assistant-prefill") {
-            options.assistant_prefill = true;
+        if (product::switch_option(arg, "assistant-prefill", [&](bool on) { options.assistant_prefill = on; })) {
             continue;
         }
-        if (arg == "--usage-chunk-choice") {
-            options.usage_chunk_choice = true;
+        if (product::switch_option(arg, "usage-chunk-choice", [&](bool on) { options.usage_chunk_choice = on; })) {
             continue;
         }
         if (arg == "--temperature") {
@@ -1682,16 +1670,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
             continue;
         }
-        if (arg == "--greedy") {
-            options.greedy = true;
+        if (product::switch_option(arg, "greedy", [&](bool on) { options.greedy = on; })) {
             continue;
         }
-        if (arg == "--gumbel-sampling") {
-            options.gumbel_sampling = true;
+        if (product::switch_option(arg, "gumbel-sampling", [&](bool on) { options.gumbel_sampling = on; })) {
             continue;
         }
-        if (arg == "--post-thinking") {
-            if (!options.post_thinking_overrides) { options.post_thinking_overrides.emplace(); }
+        if (product::switch_option(arg, "post-thinking", [&](bool on) {
+                if (!on) {
+                    options.post_thinking_overrides.reset();
+                } else if (!options.post_thinking_overrides) {
+                    options.post_thinking_overrides.emplace();
+                }
+            })) {
             continue;
         }
         if (arg == "--post-thinking-temperature" || arg == "--post-thinking-top-p" ||
@@ -1716,12 +1707,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         throw std::invalid_argument("unknown argument: " + arg);
     }
+    recorder.finish(arguments.size());
+    if (recorder.splitting()) { return options; }
     if (!options.default_graft.empty() &&
         std::none_of(options.grafts.begin(), options.grafts.end(), [&](const GraftSource& source) {
             return source.name == options.default_graft;
         })) {
-        throw std::invalid_argument("--default-graft '" + options.default_graft +
-                                    "' does not name a --graft");
+        throw product::OptionConflict({"default-graft", "graft"},
+                                      "--default-graft '" + options.default_graft +
+                                          "' does not name a --graft");
     }
     if (original_cache_selected && hybrid_cache_selected) {
         throw std::invalid_argument(
@@ -1757,14 +1751,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                         "combined with --use-alt-prefix-caching");
         }
         if (!options.allow_prefix_reuse) {
-            throw std::invalid_argument(
+            throw product::OptionConflict(
+                {"use-alt-prefix-caching", "prefix-reuse"},
                 "--use-alt-prefix-caching cannot be combined with --no-prefix-reuse");
         }
         std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         if (!file.empty()) {
             if (host_cache_budget_explicit && !options.context_cache.host_cache_auto &&
                 options.context_cache.host_cache_budget_bytes == 0) {
-                throw std::invalid_argument(
+                throw product::OptionConflict(
+                    {"prefix-cache-file", "host-cache-mib"},
                     "--prefix-cache-file saves the Host tier, which --host-cache-mib 0 removes");
             }
             // Resolved now, so the save at shutdown writes where startup read, and checked now,
@@ -1789,32 +1785,43 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (kv_headroom_mib.has_value()) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
-            throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");
+            throw product::OptionConflict({"kv-headroom-mib", "kv-capacity"},
+                                          "--kv-headroom-mib requires --kv-capacity auto");
         }
         options.kv_capacity = KvCapacityPolicy::automatic(*kv_headroom_mib << 20);
     }
     if (long_anchor_spacing_explicit && !options.context_cache.automatic_long_anchors) {
-        throw std::invalid_argument("--long-anchor-spacing requires --auto-long-anchors");
+        throw product::OptionConflict({"long-anchor-spacing", "auto-long-anchors"},
+                                      "--long-anchor-spacing requires --auto-long-anchors");
     }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {
-            throw std::invalid_argument(
+            std::vector<std::string> settings{"prefix-reuse"};
+            settings.insert(settings.end(), std::begin(kContextCapacitySettings),
+                            std::end(kContextCapacitySettings));
+            throw product::OptionConflict(
+                std::move(settings),
                 "--no-prefix-reuse cannot be combined with context-cache capacity options");
         }
         if (options.auto_prefix_grid) {
-            throw std::invalid_argument(
+            throw product::OptionConflict(
+                {"prefix-reuse", "auto-prefix-grid"},
                 "--no-prefix-reuse cannot be combined with --auto-prefix-grid");
         }
         if (options.derive_session_keys) {
-            throw std::invalid_argument(
+            throw product::OptionConflict(
+                {"prefix-reuse", "derive-session-keys"},
                 "--no-prefix-reuse cannot be combined with --derive-session-keys");
         }
         if (!options.slot_save_path.empty()) {
-            throw std::invalid_argument(
+            throw product::OptionConflict(
+                {"prefix-reuse", "slot-save-path"},
                 "--no-prefix-reuse cannot be combined with --slot-save-path");
         }
         if (!options.context_cache.disk_kv_path.empty()) {
-            throw std::invalid_argument("--no-prefix-reuse cannot be combined with --disk-kv-path");
+            throw product::OptionConflict(
+                {"prefix-reuse", "disk-kv-path"},
+                "--no-prefix-reuse cannot be combined with --disk-kv-path");
         }
         options.context_cache.enabled                = false;
         options.context_cache.host_state_slots       = 0;
@@ -1823,17 +1830,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.context_cache.disk_kv_path.empty() &&
         (options.context_cache.disk_kv_restore || options.context_cache.disk_kv_directstorage ||
          options.context_cache.disk_kv_capacity_bytes != 0)) {
-        throw std::invalid_argument(
+        throw product::OptionConflict(
+            {"disk-kv-path", "disk-kv-restore", "disk-kv-directstorage", "disk-kv-gib"},
             "--disk-kv-restore, --disk-kv-directstorage and --disk-kv-gib need --disk-kv-path");
     }
     if (!options.devices.empty() && device_explicit) {
         throw std::invalid_argument("--device and --devices are mutually exclusive");
     }
     if (!options.stage_layers.empty() && options.devices.size() < 2) {
-        throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
+        throw product::OptionConflict(
+            {"stage-layers", "devices"}, "--stage-layers needs --devices naming more than one device");
     }
     if (options.tensor_parallel && options.devices.size() < 2) {
-        throw std::invalid_argument("--tensor-parallel needs --devices naming more than one device");
+        throw product::OptionConflict({"tensor-parallel", "devices"},
+                                      "--tensor-parallel needs --devices naming more than one device");
     }
     product::check_tensor_split(options.tensor_split, options.devices.size(),
                                 options.tensor_parallel);
@@ -1843,23 +1853,28 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     product::check_tensor_parallel_partials(options.tensor_parallel_prompt_partials,
                                             options.tensor_parallel);
     if (options.request_log_max_mib != 0 && options.request_log_jsonl.empty()) {
-        throw std::invalid_argument("--request-log-max-mib requires --request-log-jsonl");
+        throw product::OptionConflict({"request-log-max-mib", "request-log-jsonl"},
+                                      "--request-log-max-mib requires --request-log-jsonl");
     }
     if (options.auto_save_evicted && options.slot_save_path.empty()) {
-        throw std::invalid_argument("--auto-save-evicted requires --slot-save-path");
+        throw product::OptionConflict({"auto-save-evicted", "slot-save-path"},
+                                      "--auto-save-evicted requires --slot-save-path");
     }
     if (!options.context_cache.host_cache_auto &&
         (host_cache_reserve_explicit || options.context_cache.host_cache_max_bytes ||
          options.context_cache.host_cache_percent)) {
-        throw std::invalid_argument("--host-cache-reserve-mib, --host-cache-max-mib and "
-                                    "--host-cache-percent size --host-cache-mib auto");
+        throw product::OptionConflict(
+            {"host-cache-reserve-mib", "host-cache-max-mib", "host-cache-percent", "host-cache-mib"},
+            "--host-cache-reserve-mib, --host-cache-max-mib and --host-cache-percent size "
+            "--host-cache-mib auto");
     }
     if (host_cache_budget_explicit) {
         // The budget is the one host RAM ceiling; the two component flags would silently
         // fight it, and their independent-allocation semantics are exactly what the budget
         // exists to replace.
         if (host_state_slots_explicit || host_kv_mib_explicit) {
-            throw std::invalid_argument(
+            throw product::OptionConflict(
+                {"host-cache-mib", "host-state-slots", "host-kv-mib"},
                 "--host-cache-mib cannot be combined with --host-state-slots or --host-kv-mib: "
                 "the budget derives both Host state slots and Host KV bytes");
         }
@@ -1867,14 +1882,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
-    if (options.stats_port != 0 &&
-        (options.stats_port > 65535 || options.stats_port == options.port)) {
-        throw std::invalid_argument("--stats-port must be in [1,65535] and differ from --port");
+    if (options.stats_port > 65535) {
+        throw std::invalid_argument("--stats-port must be in [1,65535]");
+    }
+    if (options.stats_port != 0 && options.stats_port == options.port) {
+        throw product::OptionConflict({"stats-port", "port"}, "--stats-port must differ from --port");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+        throw product::OptionConflict({"kv-capacity", "max-context"},
+                                      "--kv-capacity must be at least --max-context");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
@@ -1892,14 +1910,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     if (options.unconstrained_response_format && options.structured_output) {
-        throw std::invalid_argument(
+        throw product::OptionConflict(
+            {"unconstrained-response-format", "structured-output"},
             "--unconstrained-response-format conflicts with --structured-output");
     }
     product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
     product::apply_automatic_speculation(options.speculative, spec_explicit);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency != VisionResidency::Resident && !options.enable_vision) {
-        throw std::invalid_argument("--vision-residency overlay or cpu requires --vision");
+        throw product::OptionConflict({"vision-residency", "vision"},
+                                      "--vision-residency overlay or cpu requires --vision");
     }
     // A CPU encode grows with the square of an item's patches: 256 merged tokens (about 512x512
     // pixels) keeps one to a few seconds.
@@ -1908,19 +1928,23 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.enable_thinking == false && options.default_reasoning_effort &&
         *options.default_reasoning_effort != RequestedReasoningEffort::None) {
-        throw std::invalid_argument("--default-reasoning-effort conflicts with --no-thinking");
+        throw product::OptionConflict({"default-reasoning-effort", "thinking"},
+                                      "--default-reasoning-effort conflicts with --no-thinking");
     }
     if (options.cuda_graph_allowance_mib != 0 && !options.use_cuda_graph) {
-        throw std::invalid_argument(
+        throw product::OptionConflict(
+            {"cuda-graph-allowance-mib", "cuda-graph"},
             "--cuda-graph-allowance-mib requires CUDA graphs (omit --no-cuda-graph)");
     }
     // The GDN conv-record workspace admits at most 16 verification columns when the batch holds
     // more than one request, so a wider ngram proposal is admitted only for one active request.
     if (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1) {
-        throw std::invalid_argument("--ngram-draft-tokens above 15 requires --max-concurrency 1");
+        throw product::OptionConflict({"ngram-draft-tokens", "max-concurrency"},
+                                      "--ngram-draft-tokens above 15 requires --max-concurrency 1");
     }
     if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {
-        throw std::invalid_argument("--ngram-native-sessions requires --ngram-archive-mib");
+        throw product::OptionConflict({"ngram-native-sessions", "ngram-archive-mib"},
+                                      "--ngram-native-sessions requires --ngram-archive-mib");
     }
     if (options.default_max_tokens && *options.default_max_tokens <= 0) {
         throw std::invalid_argument("--default-max-tokens must be positive");
@@ -1935,8 +1959,61 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             "path");
     }
     if (options.sleep_idle_seconds != 0 && !options.suspend.enabled && !options.router()) {
-        throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
+        throw product::OptionConflict({"sleep-idle-seconds", "model-suspend"},
+                                      "--sleep-idle-seconds requires --model-suspend");
     }
+    return options;
+}
+
+} // namespace
+
+ServeOptions parse_serve_options(const product::CommandLine& command_line) {
+    ServeOptions options;
+    if (command_line.version) {
+        options.version_requested = true;
+        return options;
+    }
+    if (command_line.help) {
+        options.help_requested = true;
+        return options;
+    }
+    std::vector<std::string> effective;
+    const bool artifact_given = command_line.artifact.has_value();
+    options                   = product::parse_layered(
+        command_line.layer_arguments(), kSettingAliases,
+        [&](const std::vector<std::string>& arguments, std::vector<product::OptionSpan>* spans) {
+            return parse_serve_arguments(artifact_given, arguments, spans);
+        },
+        &effective);
+    if (artifact_given) { options.artifact_path = *command_line.artifact; }
+    options.effective_arguments = product::redact_arguments(std::move(effective), {"--api-key"});
+    options.startup_argv        = {command_line.program};
+    if (artifact_given) { options.startup_argv.push_back(*command_line.artifact); }
+    options.startup_argv.insert(options.startup_argv.end(), options.effective_arguments.begin(),
+                                options.effective_arguments.end());
+    // Router options apply to the router; every other argument of each layer is each model's.
+    for (const product::ArgumentLayer& layer : command_line.layers) {
+        product::ArgumentLayer model_layer{.source = layer.source, .arguments = {}};
+        for (std::size_t i = 0; i < layer.arguments.size(); ++i) {
+            const std::string& argument = layer.arguments[i];
+            if (router_option(argument)) {
+                ++i;
+                continue;
+            }
+            if (argument == "--models-autoload" || argument == "--no-models-autoload") { continue; }
+            model_layer.arguments.push_back(argument);
+        }
+        options.model_layers.push_back(std::move(model_layer));
+    }
+    return options;
+}
+
+ServeOptions parse_serve_options(int argc, char** argv) {
+    ServeOptions options = parse_serve_options(
+        product::read_command_line(argc, argv, product::PositionalArtifact::Taken));
+    std::vector<std::string> startup;
+    for (int i = 0; i < argc; ++i) { startup.emplace_back(argv[i] == nullptr ? "" : argv[i]); }
+    options.startup_argv = product::redact_arguments(std::move(startup), {"--api-key"});
     return options;
 }
 

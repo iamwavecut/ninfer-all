@@ -407,6 +407,76 @@ generated token IDs in diagnostics.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 
+## Launch configuration files
+
+`--config FILE` reads a run's options from a file. `ninfer`, `ninfer-serve`, `ninfer-perplexity`,
+`ninfer_bench`, `ninfer-calibrate` and `ninfer-ngram-profile` take it, and the repository's
+`configs/` directory holds a file for each [launch recipe](recipes.md).
+
+```ini
+; Ternary Bonsai 2 27B on a 24 GB card
+model          = models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer
+model-id       = bonsai2-27b
+max-context    = 262144
+kv-capacity    = 262144
+kv-dtype       = rk8v4
+gdn-state-fp16 = true
+spec           = dflash2
+draft-tokens   = 5
+```
+
+```bash
+ninfer-serve --config configs/bonsai2-27b-dflash2.ini
+ninfer-serve --config configs/bonsai2-27b-dflash2.ini --max-context 131072 --port 9000
+```
+
+The format is llama.cpp's preset format, which [`--models-preset`](serving.md#several-models-router)
+also reads:
+
+- Each line is `key = value`. The key is the option without its leading dashes, in any case. The
+  value is the text after the first `=`; matching quotes around it are removed.
+- `true` is the switch itself (`gdn-state-fp16 = true` is `--gdn-state-fp16`), and `false` is its
+  `--no-` form. Every other value, `off`, `0` and `auto` included, is the option's value.
+- A repeatable option (`stop`, `lora`, `control-vector`) takes one line per value.
+- Blank lines and lines that start with `;` or `#` are comments.
+- `model` (or `artifact`) names the artifact; an artifact path on the command line wins.
+  `cuda-backend` selects the portable package's CUDA backend. `version` is ignored.
+- A file has no `[section]` and no `config` key. `ninfer_bench` names its artifact with `weights`.
+- Relative paths start in the directory the program runs in, not in the file's directory.
+
+`--config` can repeat. The files apply in the order given and the command line applies last, at any
+position of `--config` on the command line. A later layer overrides an earlier one by these rules:
+
+- An option replaces every earlier option of the same setting: a value, a repeatable option's whole
+  list (one `--stop` on the command line drops every `stop` line of a file), a switch in either
+  form, and the other spellings of the setting (`--device` replaces a file's `devices`,
+  `--full-draft-head` its `lm-head-draft`).
+- An option that contradicts an earlier layer's option drops that option: `--spec none` also drops
+  a file's `draft-tokens` and `adaptive-mtp`, `--no-thinking` drops `thinking-budget`, and
+  `--no-vision` drops `vision-residency`. The same contradiction inside one layer is an error.
+- Two choices stay errors across layers: `--device` with `--devices` inside one layer, and in
+  `ninfer-serve` a hybrid prefix cache option (`--device-snapshot-slots`, `--cache-taps-per-request`,
+  `--cache-tap-ladder`, `--cache-tap-min-gap`, `--prefix-cache-file`) together with an option that
+  selects the checkpoint catalog (`--use-original-prefix-caching`, `--no-prefix-reuse`, `--devices`
+  with several devices, `--graft`).
+
+Every switch of every program also takes a `--no-` form, so the command line can turn off a switch
+that a file turns on. `ninfer-serve` records the merged options, with the API key redacted, as
+`arguments` in the request log's `server_start` record. In router mode the router's files and
+command line are layers above each model's preset sections.
+
+The container image keeps the files in `/opt/ninfer/configs`. Its working directory is `/models`;
+`-w /` makes a file's `models/` paths reach the mounted `/models`:
+
+```bash
+docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
+  -v "$PWD/models:/models" -v ninfer-cache:/cache \
+  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve --config /opt/ninfer/configs/bonsai2-27b-dflash2.ini
+```
+
+The container's address (`NINFER_HOST`, `NINFER_PORT`) is the first layer, so a file's or the command
+line's `host` and `port` override it.
+
 ## CUDA synchronization
 
 `NINFER_CUDA_SYNC` selects the CUDA device synchronization schedule at startup for both the CLI

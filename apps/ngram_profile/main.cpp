@@ -7,6 +7,8 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "product/launch_config/launch_config.h"
+#include "product/option_layers.h"
 #include "product/prompt_input/prompt_input.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/ngram_hash.h"
@@ -58,7 +60,9 @@ constexpr const char* kUsage =
     "                       the budget would serve at best (the 4 KiB pages these reads read\n"
     "                       most)\n"
     "  --row-bytes B        bytes per stored row the budgets are reckoned in (default 90, the\n"
-    "                       published gguf_iq4_nl table; 320 for bf16)\n";
+    "                       published gguf_iq4_nl table; 320 for bf16)\n"
+    "  --config FILE        options from a launch configuration file (docs/cli.md); the command\n"
+    "                       line overrides it, and its `model` names the artifact\n";
 
 struct Options {
     std::filesystem::path model, out, evaluate;
@@ -76,18 +80,20 @@ std::uint64_t parse_count(std::string_view text, const char* option) {
     return value;
 }
 
-Options parse(int argc, char** argv) {
-    if (argc < 2 || std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h") {
-        std::cout << kUsage;
-        std::exit(argc < 2 ? 2 : 0);
-    }
+// The arguments after the model, as one list. With `spans` it only splits them into options
+// (product::parse_layered); without, it also validates them together.
+Options parse_arguments(const std::vector<std::string>& arguments,
+                        std::vector<product::OptionSpan>* spans) {
     Options out;
-    out.model = argv[1];
-    for (int i = 2; i < argc; ++i) {
-        const std::string_view arg = argv[i];
+    product::OptionSpanRecorder recorder(spans);
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        recorder.begin(i);
+        const std::string_view arg = arguments[i];
         const auto value           = [&]() -> std::string_view {
-            if (++i >= argc) { throw std::invalid_argument(std::string(arg) + " needs a value"); }
-            return argv[i];
+            if (++i >= arguments.size()) {
+                throw std::invalid_argument(std::string(arg) + " needs a value");
+            }
+            return arguments[i];
         };
         if (arg == "--out") {
             out.out = std::filesystem::path(value());
@@ -103,10 +109,24 @@ Options parse(int argc, char** argv) {
             out.texts.emplace_back(arg);
         }
     }
+    recorder.finish(arguments.size());
+    if (recorder.splitting()) { return out; }
     if (out.out.empty() == out.evaluate.empty()) {
-        throw std::invalid_argument("give one of --out and --evaluate");
+        throw product::OptionConflict({"out", "evaluate"}, "give one of --out and --evaluate");
     }
     if (out.texts.empty()) { throw std::invalid_argument("give the corpus's TEXT files"); }
+    return out;
+}
+
+Options parse(int argc, char** argv) {
+    const product::CommandLine command_line =
+        product::read_command_line(argc, argv, product::PositionalArtifact::Taken);
+    if (command_line.help || !command_line.artifact) {
+        std::cout << kUsage;
+        std::exit(command_line.help ? 0 : 2);
+    }
+    Options out = product::parse_layered(command_line.layer_arguments(), {}, parse_arguments);
+    out.model   = *command_line.artifact;
     return out;
 }
 

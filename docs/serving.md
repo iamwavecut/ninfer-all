@@ -7,6 +7,9 @@ artifacts as a [router](#several-models-router), one Engine per loaded model.
 ## Start the server
 
 See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
+The options can also come from a file: `--config FILE` reads them, the command line overrides the
+file, and `configs/` holds one for each [launch recipe](recipes.md)
+([launch configuration files](cli.md#launch-configuration-files)).
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \
@@ -194,12 +197,16 @@ starts one server process per model, every model here is an Engine in the one pr
   subdirectory holding exactly one `.ninfer` under the subdirectory's name.
 - `--models-preset FILE` is an INI file in llama.cpp's preset format. `[*]` holds options for every
   model; any other section is a model: `model = PATH` (or `artifact`), `alias = a, b` for further
-  names, `load-on-startup = true`, and any serve option without its leading dashes
-  (`kv-capacity = 65536`; a flag is `model-suspend = true`). A section named after a model of
-  `--models-dir` configures that model and needs no path. Comments start with `;` or `#`.
-- Serve options given on the command line apply to every model and win over the preset; a model's
-  own section wins over `[*]`. Each model is configured exactly as a single-model server started
-  with those options would be, except that the host, port and API key are the router's.
+  names, `load-on-startup = true`, and any serve option without its leading dashes, as in a
+  [launch configuration file](cli.md#launch-configuration-files): `kv-capacity = 65536`, a switch
+  `model-suspend = true` or `false`, and every other word (`device-profile = off`) the option's
+  value. A section named after a model of `--models-dir` configures that model and needs no path.
+  Comments start with `;` or `#`.
+- Each model's options are layers, lowest first: `[*]`, the model's own section, the router's
+  `--config` files, then the router's command line. A later layer overrides an earlier one by the
+  rules of [launch configuration files](cli.md#launch-configuration-files). Each model is
+  configured exactly as a single-model server started with those options would be, except that the
+  host, port and API key are the router's.
 
 A request names its model in the body's `model` field (POST) or in the `model` query parameter
 (GET); a request that names none gets the most recently used loaded model. A model that is not
@@ -2564,7 +2571,7 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, the rotation past the native window the Engine resolved (`engine.rope`: type `none` or `yarn`, factor, native window; Qwen3.8-Flash-Next reports it, the other families `null`), n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, and redacted argv |
+| `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, the rotation past the native window the Engine resolved (`engine.rope`: type `none` or `yarn`, factor, native window; Qwen3.8-Flash-Next reports it, the other families `null`), n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, redacted argv, and `arguments`: the redacted options the server runs with, its `--config` files merged under the command line ([launch configuration files](cli.md#launch-configuration-files)) |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, reasoning-loop guard firing, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |

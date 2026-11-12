@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/model_enums.h"
+#include "product/option_layers.h"
 
 #include <charconv>
 #include <cmath>
@@ -93,29 +94,34 @@ inline void check_tensor_split(const std::vector<double>& weights, std::size_t d
                                bool tensor_parallel) {
     if (weights.empty()) { return; }
     if (!tensor_parallel) {
-        throw std::invalid_argument("--tensor-split needs --tensor-parallel");
+        throw OptionConflict({"tensor-split", "tensor-parallel"},
+                             "--tensor-split needs --tensor-parallel");
     }
     if (weights.size() != devices) {
-        throw std::invalid_argument("--tensor-split needs one weight per device in --devices");
+        throw OptionConflict({"tensor-split", "devices"},
+                             "--tensor-split needs one weight per device in --devices");
     }
 }
 
 inline void check_tensor_attention(TensorAttention mode, bool tensor_parallel) {
     if (mode == TensorAttention::Positions && !tensor_parallel) {
-        throw std::invalid_argument("--tensor-attention needs --tensor-parallel");
+        throw OptionConflict({"tensor-attention", "tensor-parallel"},
+                             "--tensor-attention needs --tensor-parallel");
     }
 }
 
 inline void check_tensor_parallel_transport(TensorParallelTransport transport,
                                             bool tensor_parallel) {
     if (transport != TensorParallelTransport::Auto && !tensor_parallel) {
-        throw std::invalid_argument("--tensor-parallel-transport needs --tensor-parallel");
+        throw OptionConflict({"tensor-parallel-transport", "tensor-parallel"},
+                             "--tensor-parallel-transport needs --tensor-parallel");
     }
 }
 
 inline void check_tensor_parallel_partials(TensorParallelPartials partials, bool tensor_parallel) {
     if (partials != TensorParallelPartials::Fp32 && !tensor_parallel) {
-        throw std::invalid_argument("--tensor-parallel-prompt-partials needs --tensor-parallel");
+        throw OptionConflict({"tensor-parallel-prompt-partials", "tensor-parallel"},
+                             "--tensor-parallel-prompt-partials needs --tensor-parallel");
     }
 }
 

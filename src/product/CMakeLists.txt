@@ -21,3 +21,10 @@ add_library(ninfer_product_logging STATIC
 )
 ninfer_internal_includes(ninfer_product_logging)
 target_link_libraries(ninfer_product_logging PUBLIC spdlog::spdlog PRIVATE ninfer_media_decode)
+
+# Launch configuration files (--config) and their option layers. Plain C++: the portable launcher
+# reads the same files before it loads a CUDA backend.
+add_library(ninfer_product_launch_config STATIC
+  launch_config/launch_config.cpp
+)
+ninfer_internal_includes(ninfer_product_launch_config)

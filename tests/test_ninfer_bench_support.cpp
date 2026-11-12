@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -566,6 +568,32 @@ int test_human_and_csv_reports() {
     return failures;
 }
 
+
+// --config: the artifact as `weights`, and short spellings overriding a file's long keys.
+int test_launch_configuration() {
+    int failures         = 0;
+    const auto directory = std::filesystem::temp_directory_path() / "ninfer_bench_config_test";
+    std::filesystem::create_directories(directory);
+    const auto file = (directory / "bench.ini").string();
+    std::ofstream(file) << "weights = from-file.ninfer\nn-prompt = 512,2048\ncuda-graph = false\n";
+    const auto from_file = parse_for_test({"ninfer_bench", "--config", file});
+    failures += expect(from_file.artifact_path == "from-file.ninfer" &&
+                           from_file.n_prompt == std::vector<int>({512, 2048}) &&
+                           !from_file.use_cuda_graph,
+                       "a configuration file's options did not reach ninfer_bench");
+    const auto overridden = parse_for_test({"ninfer_bench", "--config", file, "-p", "128",
+                                            "--weights", "cli.ninfer", "--cuda-graph"});
+    failures += expect(overridden.artifact_path == "cli.ninfer" &&
+                           overridden.n_prompt == std::vector<int>({128}) &&
+                           overridden.use_cuda_graph,
+                       "-p, --weights and --cuda-graph must replace the file's settings");
+    std::ofstream(file) << "model = from-file.ninfer\n";
+    failures += expect_throws<std::invalid_argument>(
+        [&] { (void)parse_for_test({"ninfer_bench", "--config", file}); },
+        "a model key in a ninfer_bench configuration");
+    std::filesystem::remove_all(directory);
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -574,5 +602,6 @@ int main() {
     failures += test_measurement_contract();
     failures += test_report_contract();
     failures += test_human_and_csv_reports();
+    failures += test_launch_configuration();
     return failures == 0 ? 0 : fail("ninfer_bench support contract failed");
 }

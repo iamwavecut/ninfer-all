@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/engine_options.h"
+#include "product/option_layers.h"
 
 #include <charconv>
 #include <cmath>
@@ -107,8 +108,8 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
         } else {
             throw std::invalid_argument("--expert-direct takes auto, on or off");
         }
-    } else if (option == "--expert-cache-adaptive") {
-        out.adaptive_cache = true;
+    } else if (switch_option(option, "expert-cache-adaptive",
+                             [&](bool on) { out.adaptive_cache = on; })) {
     } else if (option == "--expert-profile" || option == "--expert-profile-out") {
         const std::string path(value());
         if (path.empty()) { throw std::invalid_argument(std::string(option) + " takes a file path"); }

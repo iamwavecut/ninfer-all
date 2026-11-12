@@ -8,6 +8,8 @@
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 #include "product/kv_resident_options.h"
+#include "product/launch_config/launch_config.h"
+#include "product/option_layers.h"
 #include "product/tensor_split_options.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
@@ -146,7 +148,10 @@ std::string usage_text() {
            "       (--prefill-cublas scores through the cuBLAS prefill route, which is how its\n"
            "        perplexity cost is measured; the projections flag keeps the attention and GDN\n"
            "        input projections off it)\n"
-           "       [--log-level trace|debug|info|warning|error|critical|off]\n";
+           "       [--log-level trace|debug|info|warning|error|critical|off]\n"
+           "       [--config FILE]...  options from a launch configuration file (docs/cli.md);\n"
+           "        later files and the command line override earlier ones, a file's `model`\n"
+           "        names the artifact, and every switch also takes a --no- form\n";
 }
 
 [[noreturn]] void usage_error(std::string_view message) {
@@ -163,20 +168,25 @@ Integer parse_integer(std::string_view text, const char* label) {
     return value;
 }
 
-Options parse_options(int argc, char** argv) {
-    if (argc == 2 && std::string_view(argv[1]) == "--help") {
-        return Options{.help_requested = true};
-    }
-    if (argc < 2 || std::string_view(argv[1]).starts_with("--")) {
-        usage_error("artifact path is required");
-    }
+// Spellings of one setting: a later layer's option replaces an earlier layer's other spelling.
+constexpr ninfer::product::SettingAlias kSettingAliases[] = {
+    {"device", "devices"},
+    {"lora-scaled", "lora"},
+    {"control-vector-scaled", "control-vector"},
+};
+
+// The options after the artifact path, as one list. With `spans` it only splits them into options
+// (ninfer::product::parse_layered); without, it also validates them together.
+Options parse_arguments(const std::vector<std::string>& arguments,
+                        std::vector<ninfer::product::OptionSpan>* spans) {
     Options out;
-    out.artifact = argv[1];
-    for (int i = 2; i < argc; ++i) {
-        const std::string_view option = argv[i];
+    ninfer::product::OptionSpanRecorder recorder(spans);
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        recorder.begin(i);
+        const std::string_view option = arguments[i];
         const auto value              = [&](const char* label) -> std::string_view {
-            if (++i >= argc) { usage_error(std::string(label) + " requires a value"); }
-            return argv[i];
+            if (++i >= arguments.size()) { usage_error(std::string(label) + " requires a value"); }
+            return arguments[i];
         };
         if (ninfer::product::parse_steering_flag(
                 option, [&, label = std::string(option)] { return value(label.c_str()); },
@@ -187,20 +197,20 @@ Options parse_options(int argc, char** argv) {
             out.corpus = std::filesystem::path(value("--corpus"));
         } else if (option == "--text") {
             out.text = std::filesystem::path(value("--text"));
-        } else if (option == "--quick") {
-            out.quick = true;
+        } else if (ninfer::product::switch_option(option, "quick",
+                                                   [&](bool on) { out.quick = on; })) {
         } else if (option == "--context") {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
-        } else if (option == "--disjoint") {
-            out.disjoint = true;
+        } else if (ninfer::product::switch_option(option, "disjoint",
+                                                   [&](bool on) { out.disjoint = on; })) {
         } else if (option == "--device") {
             out.device = parse_integer<int>(value("--device"), "device");
-        } else if (option == "--fast-prefill-kernel") {
-            out.fast_prefill_kernel = true;
-        } else if (option == "--nvfp4-w4a8-int") {
-            out.nvfp4_w4a8_int = true;
+        } else if (ninfer::product::switch_option(option, "fast-prefill-kernel",
+                                                   [&](bool on) { out.fast_prefill_kernel = on; })) {
+        } else if (ninfer::product::switch_option(option, "nvfp4-w4a8-int",
+                                                   [&](bool on) { out.nvfp4_w4a8_int = on; })) {
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -229,14 +239,14 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
-        } else if (option == "--lm-head-q4") {
-            out.lm_head_q4 = true;
-        } else if (option == "--lm-head-q6") {
-            out.lm_head_q6 = true;
-        } else if (option == "--embedding-q4") {
-            out.embedding_q4 = true;
-        } else if (option == "--embedding-q6") {
-            out.embedding_q6 = true;
+        } else if (ninfer::product::switch_option(option, "lm-head-q4",
+                                                   [&](bool on) { out.lm_head_q4 = on; })) {
+        } else if (ninfer::product::switch_option(option, "lm-head-q6",
+                                                   [&](bool on) { out.lm_head_q6 = on; })) {
+        } else if (ninfer::product::switch_option(option, "embedding-q4",
+                                                   [&](bool on) { out.embedding_q4 = on; })) {
+        } else if (ninfer::product::switch_option(option, "embedding-q6",
+                                                   [&](bool on) { out.embedding_q6 = on; })) {
         } else if (option == "--embedding-residency") {
             const std::string residency(value("--embedding-residency"));
             if (residency == "device") {
@@ -246,10 +256,10 @@ Options parse_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--embedding-residency must be device or host");
             }
-        } else if (option == "--mtp-experts-q4") {
-            out.mtp_experts_q4 = true;
-        } else if (option == "--gdn-state-fp16") {
-            out.gdn_state_fp16 = true;
+        } else if (ninfer::product::switch_option(option, "mtp-experts-q4",
+                                                   [&](bool on) { out.mtp_experts_q4 = on; })) {
+        } else if (ninfer::product::switch_option(option, "gdn-state-fp16",
+                                                   [&](bool on) { out.gdn_state_fp16 = on; })) {
         } else if (option == "--devices") {
             const std::string list(value("--devices"));
             std::size_t begin = 0;
@@ -259,8 +269,8 @@ Options parse_options(int argc, char** argv) {
                     parse_integer<int>(list.substr(begin, end - begin), "devices"));
                 begin = end + 1;
             }
-        } else if (option == "--tensor-parallel") {
-            out.tensor_parallel = true;
+        } else if (ninfer::product::switch_option(option, "tensor-parallel",
+                                                   [&](bool on) { out.tensor_parallel = on; })) {
         } else if (option == "--tensor-split") {
             out.tensor_split = ninfer::product::parse_tensor_split(value("--tensor-split"));
         } else if (option == "--tensor-attention") {
@@ -272,8 +282,8 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--tensor-parallel-prompt-partials") {
             out.tensor_parallel_prompt_partials = ninfer::product::parse_tensor_parallel_partials(
                 value("--tensor-parallel-prompt-partials"));
-        } else if (option == "--invariant-attention") {
-            out.invariant_attention = true;
+        } else if (ninfer::product::switch_option(option, "invariant-attention",
+                                                   [&](bool on) { out.invariant_attention = on; })) {
         } else if (option == "--expert-residency") {
             const std::string residency(value("--expert-residency"));
             if (residency == "device") {
@@ -301,8 +311,8 @@ Options parse_options(int argc, char** argv) {
                        option, out.prompt_routes, [&] { return value(option.data()); }, false)) {
         } else if (ninfer::product::parse_kv_resident_option(
                        option, out.kv_resident, [&] { return value(option.data()); })) {
-        } else if (option == "--rope-yarn") {
-            out.rope_yarn = true;
+        } else if (ninfer::product::switch_option(option, "rope-yarn",
+                                                   [&](bool on) { out.rope_yarn = on; })) {
         } else if (option == "--rope-yarn-factor") {
             out.rope_yarn_factor =
                 ninfer::product::parse_rope_yarn_factor(value("--rope-yarn-factor"));
@@ -313,30 +323,39 @@ Options parse_options(int argc, char** argv) {
             out.rope_scaling_original_context =
                 ninfer::product::parse_rope_scaling_original_context(
                     value("--rope-scaling-original-context"));
-        } else if (option == "--mlp-a8-decode") {
-            out.mlp_a8_decode = true;
-        } else if (option == "--no-prefill-a8") {
-            out.prefill_a8 = false;
-        } else if (option == "--prefill-cublas") {
-            out.prefill_cublas = true;
-        } else if (option == "--no-prefill-cublas-projections") {
-            out.prefill_cublas_projections = false;
+        } else if (ninfer::product::switch_option(option, "mlp-a8-decode",
+                                                   [&](bool on) { out.mlp_a8_decode = on; })) {
+        } else if (ninfer::product::switch_option(option, "prefill-a8",
+                                                   [&](bool on) { out.prefill_a8 = on; })) {
+        } else if (ninfer::product::switch_option(option, "prefill-cublas",
+                                                   [&](bool on) { out.prefill_cublas = on; })) {
+        } else if (ninfer::product::switch_option(option, "prefill-cublas-projections",
+                                                   [&](bool on) { out.prefill_cublas_projections = on; })) {
         } else if (option == "--log-level") {
             out.log_level = ninfer::product::parse_log_level(value("--log-level"));
         } else {
             usage_error("unknown option: " + std::string(option));
         }
     }
+    recorder.finish(arguments.size());
+    if (recorder.splitting()) { return out; }
     if (out.corpus.has_value() == out.text.has_value()) {
-        usage_error("exactly one of --corpus and --text is required");
+        throw ninfer::product::OptionConflict({"corpus", "text"},
+                                              "exactly one of --corpus and --text is required");
     }
-    if (out.quick && !out.corpus) { usage_error("--quick requires --corpus"); }
-    if (out.context < 2 ||
-        (!out.disjoint && (out.stride == 0 || out.stride >= out.context))) {
-        usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
+    if (out.quick && !out.corpus) {
+        throw ninfer::product::OptionConflict({"quick", "corpus"}, "--quick requires --corpus");
+    }
+    if (out.context < 2) { usage_error("--context must be at least 2"); }
+    if (!out.disjoint && (out.stride == 0 || out.stride >= out.context)) {
+        throw ninfer::product::OptionConflict(
+            {"stride", "context", "disjoint"},
+            "context/stride must satisfy context>=2 and 1<=stride<context");
     }
     if (out.tensor_parallel && out.devices.size() < 2) {
-        usage_error("--tensor-parallel needs --devices naming more than one device");
+        throw ninfer::product::OptionConflict(
+            {"tensor-parallel", "devices"},
+            "--tensor-parallel needs --devices naming more than one device");
     }
     ninfer::product::check_tensor_split(out.tensor_split, out.devices.size(), out.tensor_parallel);
     ninfer::product::check_tensor_attention(out.tensor_attention, out.tensor_parallel);
@@ -344,6 +363,17 @@ Options parse_options(int argc, char** argv) {
                                                      out.tensor_parallel);
     ninfer::product::check_tensor_parallel_partials(out.tensor_parallel_prompt_partials,
                                                     out.tensor_parallel);
+    return out;
+}
+
+Options parse_options(int argc, char** argv) {
+    const ninfer::product::CommandLine command_line = ninfer::product::read_command_line(
+        argc, argv, ninfer::product::PositionalArtifact::Taken);
+    if (command_line.help) { return Options{.help_requested = true}; }
+    if (!command_line.artifact) { usage_error("artifact path is required"); }
+    Options out = ninfer::product::parse_layered(command_line.layer_arguments(), kSettingAliases,
+                                                 parse_arguments);
+    out.artifact = *command_line.artifact;
     return out;
 }
 

@@ -4,6 +4,7 @@
 // waking a sleeping model, leases holding a model in place, idle sleep, explicit load/unload/sleep,
 // the event stream, and the preset/models-directory catalog with its option precedence.
 
+#include "product/launch_config/launch_config.h"
 #include "serve/model_catalog.h"
 #include "serve/model_registry.h"
 
@@ -236,7 +237,7 @@ void single_model_mode() {
 }
 
 void catalog() {
-    const auto preset = parse_preset_file(R"(
+    const auto preset = ninfer::product::parse_config_text(R"(
 version = 1
 ; shared by every model
 [*]
@@ -252,25 +253,38 @@ load-on-startup = true
 [big]
 artifact = "/models/big.ninfer"
 model-suspend = false
+device-profile = off
 )");
-    const auto models = build_catalog(std::nullopt, preset, {"--kv-capacity", "16384"});
+    const std::vector<ninfer::product::ArgumentLayer> router{
+        {.source = "command line", .arguments = {"--kv-capacity", "16384"}}};
+    const auto models = build_catalog(std::nullopt, preset, router);
     expect(models.size() == 2, "two models from the preset");
     const CatalogModel& small = models[0].id == "small" ? models[0] : models[1];
     const CatalogModel& big   = models[0].id == "small" ? models[1] : models[0];
     expect(small.artifact == "/models/small.ninfer" && small.load_on_startup,
            "path and startup flag");
     expect(small.aliases == std::vector<std::string>({"s", "tiny"}), "aliases");
-    const std::vector<std::string> small_arguments{"--max-context", "8192", "--model-suspend",
-                                                   "--kv-capacity", "4096", "--kv-capacity",
-                                                   "16384"};
-    expect(small.arguments == small_arguments,
+    // Layers, lowest precedence first: the global section, the model's section, the router's own.
+    expect(small.layers.size() == 3 && small.layers[0].source == "preset [*]" &&
+               small.layers[1].source == "preset [small]" &&
+               small.layers[2].source == "command line",
            "global, then model, then command line, so the command line wins");
+    expect(small.layers[0].arguments ==
+               std::vector<std::string>({"--max-context", "8192", "--model-suspend"}),
+           "the global section's options; `version` is not an option");
+    expect(small.layers[1].arguments == std::vector<std::string>({"--kv-capacity", "4096"}),
+           "the model's own options, without its catalog keys");
     expect(big.artifact == "/models/big.ninfer", "quoted path");
+    // `false` turns a switch off; any other word, `off` included, is the option's value.
+    expect(big.layers[1].arguments ==
+               std::vector<std::string>({"--no-model-suspend", "--device-profile", "off"}),
+           "false is --no-KEY and off is a value");
     bool duplicate = false;
     try {
-        (void)build_catalog(
-            std::nullopt,
-            parse_preset_file("[a]\nmodel=/x.ninfer\nalias=b\n[b]\nmodel=/y.ninfer\n"), {});
+        (void)build_catalog(std::nullopt,
+                            ninfer::product::parse_config_text(
+                                "[a]\nmodel=/x.ninfer\nalias=b\n[b]\nmodel=/y.ninfer\n"),
+                            {});
     } catch (const std::invalid_argument&) { duplicate = true; }
     expect(duplicate, "an alias may not repeat another model's id");
 

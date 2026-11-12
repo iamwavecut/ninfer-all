@@ -107,6 +107,7 @@ RUN for build in /opt/ninfer/sm* /opt/ninfer/multi; do \
       done; \
     done
 COPY scripts/run.sh scripts/download-model.sh /opt/ninfer/
+COPY configs/ /opt/ninfer/configs/
 COPY docker/entrypoint.sh /usr/local/bin/ninfer-entrypoint
 
 # nvidia-smi (the "utility" capability) is how the entrypoint reads the GPU's compute capability.

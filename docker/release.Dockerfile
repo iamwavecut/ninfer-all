@@ -14,6 +14,7 @@ COPY LICENSE* /opt/ninfer/licenses/
 COPY sources/ /opt/ninfer/sources/
 COPY --chmod=0755 ninfer ninfer-serve ninfer_bench ninfer-calibrate ninfer-perplexity ninfer-ngram-profile /opt/ninfer/multi/
 COPY --chmod=0755 run.sh download-model.sh entrypoint.sh /opt/ninfer/
+COPY configs/ /opt/ninfer/configs/
 ENV NINFER_IMAGE_ARCH=multi \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \

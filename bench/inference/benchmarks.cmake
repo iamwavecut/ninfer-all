@@ -4,11 +4,13 @@ set(_ninfer_bench_sources
   "${CMAKE_CURRENT_LIST_DIR}/ninfer_bench_support.cpp")
 if(NINFER_SHARED_RUNTIME)
   ninfer_runtime_program(ninfer_bench ninfer_app_bench
-    SOURCES ${_ninfer_bench_sources} LIBRARIES ninfer_engine ${NINFER_CUDART_TARGET})
+    SOURCES ${_ninfer_bench_sources}
+    LIBRARIES ninfer_engine ninfer_product_launch_config ${NINFER_CUDART_TARGET})
   set(_ninfer_bench_target ninfer_app_bench)
 else()
   add_executable(ninfer_bench ${_ninfer_bench_sources})
-  target_link_libraries(ninfer_bench PRIVATE ninfer_engine ${NINFER_CUDART_TARGET})
+  target_link_libraries(ninfer_bench PRIVATE ninfer_engine ninfer_product_launch_config
+                        ${NINFER_CUDART_TARGET})
   ninfer_stage_runtime_dlls(ninfer_bench)
   set(_ninfer_bench_target ninfer_bench)
 endif()

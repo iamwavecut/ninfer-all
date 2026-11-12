@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/engine_options.h"
+#include "product/option_layers.h"
 
 #include <cmath>
 #include <cstdint>
@@ -122,13 +123,26 @@ bool parse_steering_flag(std::string_view flag, Next&& next, SteeringFlags& out)
         }
         return true;
     }
-    if (flag == "--lora-init-without-apply") {
-        out.lora_init_without_apply = true;
+    if (switch_option(flag, "lora-init-without-apply",
+                      [&](bool on) { out.lora_init_without_apply = on; })) {
         return true;
     }
     if (flag == "--control-vector-layer-range") {
-        const std::uint32_t first = detail::steering_layer(flag, next());
-        const std::uint32_t last  = detail::steering_layer(flag, next());
+        // Two arguments, or one "START END" (a configuration file's value).
+        std::string first_text(next());
+        std::string last_text;
+        if (const std::size_t space = first_text.find(' '); space != std::string::npos) {
+            const std::size_t end = first_text.find_first_not_of(' ', space);
+            if (end == std::string::npos) {
+                throw std::invalid_argument(std::string(flag) + " needs START END");
+            }
+            last_text = first_text.substr(end);
+            first_text.resize(space);
+        } else {
+            last_text = std::string(next());
+        }
+        const std::uint32_t first = detail::steering_layer(flag, first_text);
+        const std::uint32_t last  = detail::steering_layer(flag, last_text);
         if (first == 0 || first > last) {
             throw std::invalid_argument(
                 "--control-vector-layer-range needs START END with 1 <= START <= END");

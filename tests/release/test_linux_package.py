@@ -129,6 +129,8 @@ class LinuxPackageTest(unittest.TestCase):
             'CMAKE_CUDA_ARCHITECTURES:STRING=75;120a\nNINFER_SHARED_RUNTIME:BOOL=ON\n')
         for name in ('LICENSE', 'docs/release-archive-linux.md', 'scripts/run.sh', 'scripts/download-model.sh'):
             (self.repo / name).write_text('fixture')
+        (self.repo / 'configs').mkdir()
+        (self.repo / 'configs/model.ini').write_text('model = models/model.ninfer\n')
         (self.build / 'generated').mkdir()
         (self.build / 'generated/ninfer_build_id.h').write_text(
             '#define NINFER_BUILD_ID "aaaaaaaaa"\n#define NINFER_VERSION "2026-10-23.2"\n')
@@ -211,6 +213,7 @@ class LinuxPackageTest(unittest.TestCase):
             self.assertTrue(archive.getmember(prefix + '/ninfer').isfile())
             self.assertTrue(archive.getmember(prefix + '/backends/cuda13/libninfer-runtime.so').isfile())
             self.assertIn(prefix + '/Dockerfile', names)
+            self.assertIn(prefix + '/configs/model.ini', names)
             info = json.load(archive.extractfile(prefix + '/BUILD-INFO.json'))
             self.assertEqual(info['architectures'], ['75', '120a'])
             self.assertEqual(info['version'], '2026-10-23.2')

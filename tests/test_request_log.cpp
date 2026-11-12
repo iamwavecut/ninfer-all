@@ -65,6 +65,7 @@ int main() {
     options.reasoning_loop                 = ninfer::ReasoningLoopAction::Conclude;
     options.sampling_overrides.temperature = 0.6F;
     options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
+    options.effective_arguments = {"--api-key", "<redacted>", "--max-context", "8192"};
 
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path                                   = options.artifact_path;
@@ -303,6 +304,9 @@ int main() {
                       "server JSON leaked the API key");
     failures += check(server.at("argv").at(3) == "<redacted>",
                       "server argv did not retain the redaction marker");
+    failures += check(server.at("arguments").size() == 4 &&
+                          server.at("arguments").at(3) == "8192",
+                      "server_start did not record the merged arguments");
 
     GenerationRequest request;
     // A derived budget: the parse-time context bound is replaced by what was actually submitted.
