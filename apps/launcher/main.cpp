@@ -103,6 +103,23 @@ int backend_major(std::string_view value) {
     throw std::runtime_error("--cuda-backend requires auto, 12 or 13");
 }
 
+// Quoted prompt/template strings must not become launcher options. These product flags consume
+// text even when that text starts with '--'.
+bool takes_text(std::string_view arg) {
+    return arg == "--prompt" || arg == "--system" || arg == "--chat-template" ||
+           arg == "--prompt-file" || arg == "--system-file" || arg == "--messages" ||
+           arg == "--stop" || arg == "--reasoning-stop" || arg == "--model-id" ||
+           arg == "--api-key" || arg == "--host" || arg == "--device-profile-path" ||
+           arg == "--context-cost-presets" || arg == "--prefix-cache-file" ||
+           arg == "--disk-kv-path" || arg == "--request-log-jsonl" ||
+           arg == "--thinking-budget-message" || arg == "--slot-save-path" ||
+           arg == "--models-dir" || arg == "--models-preset" || arg == "--graft" ||
+           arg == "--default-graft" || arg == "--ngram-table" || arg == "--ngram-profile" ||
+           arg == "--corpus" || arg == "--text" || arg == "--output" || arg == "--weights" ||
+           arg == "-m" || arg == "-f" || arg == "--output-file" || arg == "--out" ||
+           arg == "--evaluate";
+}
+
 // The devices one layer of arguments selects: kind 1 for --device, 2 for --devices, 0 for neither.
 struct DeviceChoice {
     int kind = 0;
@@ -129,21 +146,7 @@ DeviceChoice scan_layer(const std::vector<std::string>& arguments, Options& opti
                 list.remove_prefix(comma + 1);
             }
             if (choice.devices.size() > 8) throw std::runtime_error("--devices supports at most eight GPUs");
-        }
-        // Quoted prompt/template strings must not become launcher options. These
-        // product flags consume text even when that text starts with '--'.
-        else if (arg == "--prompt" || arg == "--system" || arg == "--chat-template" ||
-                 arg == "--prompt-file" || arg == "--system-file" || arg == "--messages" ||
-                 arg == "--stop" || arg == "--reasoning-stop" || arg == "--model-id" ||
-                 arg == "--api-key" || arg == "--host" || arg == "--device-profile-path" ||
-                 arg == "--context-cost-presets" || arg == "--prefix-cache-file" ||
-                 arg == "--disk-kv-path" || arg == "--request-log-jsonl" ||
-                 arg == "--thinking-budget-message" || arg == "--slot-save-path" ||
-                 arg == "--models-dir" || arg == "--models-preset" || arg == "--graft" ||
-                 arg == "--default-graft" || arg == "--ngram-table" || arg == "--ngram-profile" ||
-                 arg == "--corpus" || arg == "--text" || arg == "--output" ||
-                 arg == "--weights" || arg == "-m" || arg == "-f" || arg == "--output-file" ||
-                 arg == "--out" || arg == "--evaluate") {
+        } else if (takes_text(arg)) {
             if (i + 1 < arguments.size()) {
 #ifdef NINFER_ROUTER_LAUNCHER
                 if (arg == "--models-dir") options.models_directory = arguments[i + 1];
@@ -187,6 +190,8 @@ Options parse(int argc, char** argv) {
             continue;
         }
         options.arguments.push_back(argv[i]);
+        // A text value stays the product's, even when it reads as --cuda-backend.
+        if (takes_text(arg) && i + 1 < argc) options.arguments.push_back(argv[++i]);
     }
     const auto command_line = ninfer::product::read_command_line(
         static_cast<int>(options.arguments.size()), options.arguments.data(),
@@ -308,6 +313,13 @@ int main(int argc, char** argv) {
             // Linux uses a temporary driver stub for this build-tree operation.
             if (!selected) selected = has13 ? 13 : 12;
         } else {
+            // A launcher copied without its backends directory names the files it needs, not
+            // the GPUs or the driver.
+            if (!has12 && !has13) {
+                throw std::runtime_error(
+                    "No CUDA backend beside the launcher: " + runtime(root, 13).string() + " and " +
+                    runtime(root, 12).string() + " are missing");
+            }
             const auto hardware = inspect(options.devices);
             selected = ninfer::launcher::select(options.requested, hardware.driver,
                                                 hardware.architectures, has12, has13,
