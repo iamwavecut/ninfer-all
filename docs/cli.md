@@ -240,10 +240,13 @@ retained proposal distribution by rejection sampling.
 keyed Gumbel noise (keyed by the seed, the position and the token) is largest. The tokens follow the
 same distribution, but a seed gives other tokens than the default draw, so the option is off by
 default. Drafts from an MTP block (Qwen3.5-core models, Qwen3.8-Flash-Next) and from Gemma 4's
-assistant then are the drafter's own draws under the same noise, which the target's draw keeps more
-often than a greedy draft. DSpark and lookup drafts stay greedy, and DFlash2 keeps its rejection
-sampling for the tokens it verifies. Greedy requests do not change. On an A40 (one request, three prompts, seeds 1 to 3, 256
-tokens a response, 2026-11-11):
+assistant then are the drafter's own draws under the same noise, so a draft and the target's draw
+agree wherever the two distributions agree. Whether the target keeps more of these drafts than of
+greedy ones depends on the drafter and the temperature: Qwen3.6-35B-A3B's MTP block kept fewer at
+0.7 and more at 1.0. DSpark and lookup drafts stay greedy, and DFlash2 keeps its rejection
+sampling for the tokens it verifies. Greedy requests do not change. One request, three prompts,
+seeds 1 to 3, 256 tokens a response, on an A40 (2026-11-11) and, for Qwen3.6-35B-A3B, an RTX 5090
+(2026-11-12):
 
 | Model and drafter | Temperature | Acceptance, default | Acceptance, `--gumbel-sampling` | tok/s, default | tok/s, `--gumbel-sampling` |
 |---|---|---|---|---|---|
@@ -253,10 +256,12 @@ tokens a response, 2026-11-11):
 | Gemma 4 26B-A4B, assistant | 1.0 | 0.443 | 0.485 | 200.0 | 207.5 |
 | Qwen3.8-Flash-Next Q2_0, MTP | 0.7 | 0.404 | 0.418 | 93.6 | 95.5 |
 | Qwen3.8-Flash-Next Q2_0, MTP | 1.0 | 0.362 | 0.403 | 88.8 | 93.7 |
+| Qwen3.6-35B-A3B NVFP4, MTP (RTX 5090) | 0.7 | 0.459 | 0.443 | 563.7 | 547.4 |
+| Qwen3.6-35B-A3B NVFP4, MTP (RTX 5090) | 1.0 | 0.414 | 0.424 | 530.2 | 533.3 |
 
 With the option, Gemma 4's and Flash-Next's speculative answers were the bytes of their plain answers
-with the same seed (21 of 21 each); Qwen3.8-27B's differed as its greedy ones do, by the
-verification width's floating-point effect.
+with the same seed (21 of 21 each); Qwen3.8-27B's and Qwen3.6-35B-A3B's differed as their greedy
+ones do, by the verification width's floating-point effect.
 
 ### Choosing a draft count
 
