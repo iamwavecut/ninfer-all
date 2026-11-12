@@ -40,7 +40,7 @@ jobs:
   linux:
     name: Linux Debian 13 CUDA ${{ inputs.cuda }} (${{ inputs.archs }})${{ inputs.phase == 'objects' && format(' objects {0}/{1}', inputs.shard, inputs.count) || '' }}
     runs-on: ${{ inputs.runner }}
-    container: ${{ inputs.runner == 'ubuntu-24.04' && 'debian:13-slim' || '' }}
+    container: ${{ inputs.runner == 'ubuntu-24.04' && fromJSON('{"image":"debian:13-slim","volumes":["/usr/share/dotnet:/host-tools/dotnet","/usr/local/lib/android:/host-tools/android","/opt/hostedtoolcache:/host-tools/toolcache","/opt/ghc:/host-tools/ghc"]}') || '' }}
     timeout-minutes: 350
     # Each cache family has one writer, including temporary bootstrap runs: a shard writes its own,
     # the package or full build the aggregate. Shard 0 is a false value in an expression, so the
@@ -73,6 +73,17 @@ jobs:
         run: |
           echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
           echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
+      - name: Free the hosted runner's disk when it is short
+        # The runner's preinstalled toolchains, mounted under /host-tools, share the disk with the
+        # checkout. A CI job on 12 November had 4.3 GB left when its build started and failed.
+        if: inputs.runner == 'ubuntu-24.04'
+        run: |
+          avail=$(df -B1 --output=avail /__w | tail -1)
+          echo "Free disk: $((avail >> 30)) GiB"
+          if (( avail < 40 << 30 )); then
+            rm -rf /host-tools/*/* || true
+            echo "Free disk without the preinstalled toolchains: $(( $(df -B1 --output=avail /__w | tail -1) >> 30 )) GiB"
+          fi
       - name: Install checkout tools
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
       - name: Check the compiler-cache environment

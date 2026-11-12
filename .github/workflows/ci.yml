@@ -343,7 +343,13 @@ jobs:
     needs: build-inputs
     if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
     runs-on: ubuntu-24.04
-    container: debian:13-slim
+    container:
+      image: debian:13-slim
+      volumes:
+        - /usr/share/dotnet:/host-tools/dotnet
+        - /usr/local/lib/android:/host-tools/android
+        - /opt/hostedtoolcache:/host-tools/toolcache
+        - /opt/ghc:/host-tools/ghc
     timeout-minutes: 350
     permissions:
       contents: read
@@ -376,6 +382,16 @@ jobs:
         run: |
           echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
           echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
+      - name: Free the hosted runner's disk when it is short
+        # The runner's preinstalled toolchains, mounted under /host-tools, share the disk with the
+        # checkout. A CI job on 12 November had 4.3 GB left when its build started and failed.
+        run: |
+          avail=$(df -B1 --output=avail /__w | tail -1)
+          echo "Free disk: $((avail >> 30)) GiB"
+          if (( avail < 40 << 30 )); then
+            rm -rf /host-tools/*/* || true
+            echo "Free disk without the preinstalled toolchains: $(( $(df -B1 --output=avail /__w | tail -1) >> 30 )) GiB"
+          fi
       - name: Install checkout tools
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
       - uses: actions/checkout@v7
