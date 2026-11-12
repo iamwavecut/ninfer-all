@@ -228,8 +228,14 @@ own; retention then removes the predecessor, which no longer receives writes.
 Each platform uses eight object shards per Toolkit, each with a separate family:
 `native-linux-cuda-<toolkit>-shared-v1-shard-<index>` and
 `native-windows-cuda-<toolkit>-host-v2-shard-<index>`. A shard takes its objects from the compile
-database of `ninfer`, `ninfer-serve` and `ninfer_bench` by a hash of each object's path
-(`build-object-shard.py`), so a new source or archive needs no change there. A shard compiles no
+database of `ninfer`, `ninfer-serve` and `ninfer_bench` (`build-object-shard.py`). The objects that
+`.github/scripts/object-weights.json` lists for the platform, those whose cold compile took at least
+two minutes, go first, longest first, each to the shard with the least listed time; every other
+object goes to the shard of its path hash, so a new source or archive needs no change there. After a
+change adds or reshapes heavy units, download the `*-logs-*-objects-*` artifacts of a build that
+compiled them without cache hits and run
+`python3.11 .github/scripts/object-weights.py .github/scripts/object-weights.json <directory>`. An
+object the new list moves is in the aggregate that every shard restores first. A shard compiles no
 object of another shard: after its build the script reads the Ninja log and fails when it finds
 one. A generated source in a library target would cause that, because Ninja runs a target's custom
 command after every library the target links and starts the target's objects after the command;
