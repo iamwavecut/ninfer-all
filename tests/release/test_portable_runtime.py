@@ -85,6 +85,10 @@ function(ninfer_stamp_build_id target)
 endfunction()
 include("{ROOT.as_posix()}/cmake/NinferTargets.cmake")
 include("{ROOT.as_posix()}/cmake/NinferRuntime.cmake")
+# The launcher reads --config files before it loads a backend.
+add_library(ninfer_product_launch_config STATIC
+  "{ROOT.as_posix()}/src/product/launch_config/launch_config.cpp")
+ninfer_internal_includes(ninfer_product_launch_config)
 ninfer_runtime_program(fixture fixture_app SOURCES "${{CMAKE_CURRENT_SOURCE_DIR}}/app.cpp")
 target_include_directories(fixture_app PRIVATE "{ROOT.as_posix()}/src")
 target_include_directories(fixture PRIVATE "{ROOT.as_posix()}/src")
