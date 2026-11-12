@@ -43,9 +43,10 @@ jobs:
     container: ${{ inputs.runner == 'ubuntu-24.04' && 'debian:13-slim' || '' }}
     timeout-minutes: 350
     # Each cache family has one writer, including temporary bootstrap runs: a shard writes its own,
-    # the package or full build the aggregate.
+    # the package or full build the aggregate. Shard 0 is a false value in an expression, so the
+    # group names the shard as a string.
     concurrency:
-      group: native-linux-shared-${{ github.ref }}-${{ inputs.cuda }}-${{ inputs.phase == 'objects' && inputs.shard || 'all' }}
+      group: native-linux-shared-${{ github.ref }}-${{ inputs.cuda }}-${{ inputs.phase == 'objects' && format('shard-{0}', inputs.shard) || 'all' }}
       cancel-in-progress: false
     defaults:
       run:
