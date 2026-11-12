@@ -4,7 +4,7 @@
 #include "ops/linear/fp8/fp8_a16_gemm_mma.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/common/token_slices.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 namespace ninfer::ops::detail {
 namespace {

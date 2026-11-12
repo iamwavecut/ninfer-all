@@ -5,7 +5,7 @@
 #include "ops/linear/fp8/fp8_a16_mma.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/common/token_slices.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 namespace ninfer::ops::detail::unified {
 namespace {

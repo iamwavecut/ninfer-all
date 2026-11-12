@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan_unified.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"

@@ -7,7 +7,7 @@
 // second step in the GEMV's last CTA instead of a launch of its own, with the same code.
 #include "ninfer/ops/moe_route.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/layout.h"
 #include "ops/common/route_order.cuh"
 

@@ -1,6 +1,6 @@
 #include "models/gemma4/kernels.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "models/gemma4/kv_codec.cuh"
 #include "ops/common/route_order.cuh"
 

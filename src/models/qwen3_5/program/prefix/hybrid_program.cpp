@@ -14,7 +14,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 #include "models/qwen3_5/program/prefix/block_keys.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/startup.h"
 #include "runtime/prefix_cache/block_hash.h"
 

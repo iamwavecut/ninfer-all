@@ -8,7 +8,7 @@
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/softmax_attention_envelope.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/execution/stage_runtime.h"
 #include "models/qwen3_5/execution/text.h"

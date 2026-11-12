@@ -1,6 +1,6 @@
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/device_route.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"

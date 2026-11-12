@@ -1,7 +1,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/layout.h"
 #include "ops/common/device_route.h"
 #include "ops/common/math.h"

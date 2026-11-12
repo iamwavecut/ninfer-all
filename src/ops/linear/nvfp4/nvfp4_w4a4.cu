@@ -2,7 +2,7 @@
 #include "ops/common/blackwell_routes.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"

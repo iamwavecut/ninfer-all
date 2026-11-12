@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_simt.cuh"
 

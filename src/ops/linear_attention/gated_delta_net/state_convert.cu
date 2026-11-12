@@ -1,6 +1,6 @@
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <cuda_fp16.h>
 

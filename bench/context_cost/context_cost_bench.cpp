@@ -1,7 +1,7 @@
 #include "context_cost_measure.h"
 #include "model_context_fixture.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "runtime/engine/context_cache/context_cost.h"
 
 #include <nlohmann/json.hpp>

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/linear/q8/q8_ksplit_mma.cuh"
 

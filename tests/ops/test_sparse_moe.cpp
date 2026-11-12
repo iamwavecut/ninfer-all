@@ -1,5 +1,6 @@
 #include "core/weight.h"
 #include "ninfer/ops/sparse_moe.h"
+#include "core/device.h"
 #include "core/expert_delivery.h"
 #include "core/layout.h"
 #include "models/qwen3_5/expert_layout.h"

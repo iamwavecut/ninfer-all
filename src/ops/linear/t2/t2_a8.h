@@ -11,7 +11,7 @@
 #include "core/layout.h"
 #include "core/tensor.h"
 #include "core/weight.h"
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

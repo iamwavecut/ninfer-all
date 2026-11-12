@@ -1,6 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <algorithm>
 #include <array>

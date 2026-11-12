@@ -1,8 +1,9 @@
 #pragma once
 
-#include "core/weight.h"
+#include "core/arena.h"
 #include "core/tensor.h"
-#include "ninfer/ops/linear.h"
+#include "core/weight.h"
+#include "ninfer/ops/linear_policy.h"
 
 #include <cuda_runtime.h>
 

@@ -1,6 +1,6 @@
 #include "ops/launcher/prepare_masked_block.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/kernel/prepare_masked_block.cuh"
 

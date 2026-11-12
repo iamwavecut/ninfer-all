@@ -1,7 +1,7 @@
 // ninfer::ops - hadamard_transform launcher: one warp per (column, 1024-block), four warps per CTA.
 #include "ops/launcher/hadamard_transform.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/kernel/hadamard_producers.cuh"
 #include "ops/kernel/hadamard_transform.cuh"
 

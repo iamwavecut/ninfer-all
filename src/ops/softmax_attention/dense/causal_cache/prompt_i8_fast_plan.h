@@ -10,7 +10,8 @@
 // "attn_prompt_split" switch turns splits off on a card where they measured slower.
 
 #include "core/arena.h"
-#include "core/paged_kv_cache.h"
+#include "core/layout.h"
+#include "core/paged_kv_view.h"
 #include "core/tensor.h"
 
 #include <algorithm>

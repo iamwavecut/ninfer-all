@@ -7,8 +7,8 @@
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "core/arena.h"
-#include "core/device.h"
-#include "core/paged_kv_cache.h"
+#include "core/device_launch.h"
+#include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
 #include "ops/kv_bf16p_host.h"
 #include "ops/op_tester.h"
@@ -22,6 +22,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;

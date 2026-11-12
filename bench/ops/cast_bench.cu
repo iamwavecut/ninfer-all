@@ -1,5 +1,5 @@
 #include "ninfer/ops/cast.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_runtime.h>

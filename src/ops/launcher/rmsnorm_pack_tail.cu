@@ -1,6 +1,6 @@
 #include "ops/launcher/rmsnorm_pack_tail.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/kernel/rmsnorm_pack_tail.cuh"
 

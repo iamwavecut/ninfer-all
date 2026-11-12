@@ -2,7 +2,7 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/vision_pos_embed.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <algorithm>
 #include <cstdint>

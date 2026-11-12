@@ -29,7 +29,7 @@
 // only decidable if the margin clears the spread. Cold-flush margins overstate wins, so confirm
 // anything narrow with a profile of the real workload.
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer_bench_common.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "quantized_weight.cuh"

@@ -158,6 +158,28 @@ endif()
 if(NINFER_ARCH_BLACKWELL)
   add_compile_definitions(NINFER_SM120_NVFP4=1 NINFER_SM120_FP8=1)
 endif()
+# Every listed architecture gets its machine code, and the objects carry PTX for one architecture
+# only: 89, or the newest listed below it, whose PTX the driver compiles at load time for a card
+# outside the list (a Hopper or data-center Blackwell card, say). compute_120a PTX runs only on a
+# card that already has the sm_120a code, and older PTX only on cards that newer PTX serves too, so
+# leaving it out costs no card and spares nvcc its embedding. NINFER_ARCHITECTURES keeps the listed
+# names for the build's own records; CMAKE_CUDA_ARCHITECTURES from here on is the generated set.
+set(NINFER_ARCHITECTURES ${_ninfer_architectures})
+set(_ninfer_ptx_architecture "")
+foreach(_ninfer_architecture IN ITEMS 89 86 80 75 70)
+  if(_ninfer_architecture IN_LIST _ninfer_architectures)
+    set(_ninfer_ptx_architecture ${_ninfer_architecture})
+    break()
+  endif()
+endforeach()
+set(CMAKE_CUDA_ARCHITECTURES "")
+foreach(_ninfer_architecture IN LISTS _ninfer_architectures)
+  if(_ninfer_architecture STREQUAL _ninfer_ptx_architecture)
+    list(APPEND CMAKE_CUDA_ARCHITECTURES ${_ninfer_architecture})
+  else()
+    list(APPEND CMAKE_CUDA_ARCHITECTURES ${_ninfer_architecture}-real)
+  endif()
+endforeach()
 
 # The device code of several architectures outgrows the 2 GiB that 32-bit PC-relative references
 # span when it sits between an executable's code and its writable data (cmake/large-fatbin.ld).
@@ -347,7 +369,7 @@ include(cmake/NinferTargets.cmake)
 # startup log and --version print beside the id: the same sources can compile wrong with another
 # nvcc release, so a report needs the toolkit as well as the commit.
 set(NINFER_BUILD_ID_HEADER "${CMAKE_BINARY_DIR}/generated/ninfer_build_id.h")
-string(REPLACE ";" " " _ninfer_toolchain_architectures "${CMAKE_CUDA_ARCHITECTURES}")
+string(REPLACE ";" " " _ninfer_toolchain_architectures "${NINFER_ARCHITECTURES}")
 add_custom_target(ninfer_build_id_stamp ALL
   COMMAND ${CMAKE_COMMAND}
           -DSRC_DIR=${CMAKE_SOURCE_DIR}

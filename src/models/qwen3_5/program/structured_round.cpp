@@ -1,5 +1,5 @@
 #include "models/qwen3_5/program/structured_round.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/device_wait.h"
 #include <algorithm>
 #include <stdexcept>

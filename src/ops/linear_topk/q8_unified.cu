@@ -2,7 +2,7 @@
 #include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch_unified.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q8/q8_schedule.cuh"

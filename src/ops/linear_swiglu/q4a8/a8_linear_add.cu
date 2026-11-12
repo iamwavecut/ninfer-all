@@ -10,7 +10,7 @@
 
 #include "ops/linear_swiglu/q4a8/q4a8_linear_swiglu.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/weight_view.h"
 #include "ops/common/rowsplit_a8_mma.cuh"
 

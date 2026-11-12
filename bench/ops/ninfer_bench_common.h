@@ -12,7 +12,7 @@
 // concrete kernel question.
 
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <cuda_runtime.h>
 

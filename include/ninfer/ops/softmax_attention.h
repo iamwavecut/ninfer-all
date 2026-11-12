@@ -1,9 +1,10 @@
 #pragma once
 
 #include "ninfer/ops/attention_geometry.h"
+#include "ninfer/ops/softmax_attention_envelope.h"
 
 #include "core/arena.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -14,42 +15,10 @@
 
 namespace ninfer::ops {
 
-inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
-
-struct CausalAttentionExecutionEnvelope {
-    std::uint32_t min_visible_keys = 0;
-    std::uint32_t max_visible_keys = 0;
-    // Select the fast INT8 prompt kernel (FP16 per-tile PV accumulation) for prompt-route
-    // launches over an INT8-G64 cache. Other routes and cache formats ignore it; it never changes
-    // the route or workspace.
-    bool fast_prompt_kernel = false;
-    // Opt into chunked single-row verification through width 64; ordinary prompts keep
-    // their existing route. Workspace planning and execution must use the same hint.
-    bool wide_verification = false;
-    // Single-row prefill: widths 17 through 64 take the chunked small-T route once the visible
-    // keys make it faster than the prompt route. The prompt route runs one CTA per query head and
-    // row block, so a few query rows over a long context leave most SMs idle; small-T splits the
-    // keys across CTAs instead. Workspace planning and execution must use the same hint.
-    bool small_prefill = false;
-    // Invariant reductions (--invariant-attention) when nonzero: every call of 1 to 16 columns
-    // per row, at any batch size, takes the small-T routes, each split covers the keys
-    // [s * N, (s + 1) * N) for this N whatever the window, width or batch, and each storage runs
-    // one key tile and one reduction order. A live column's output is then the same bytes in every
-    // such call that holds it. N comes from causal_attention_invariant_segment_keys for the
-    // engine's whole context, so every envelope of one engine carries the same value. Workspace
-    // planned with it reserves for calls of either schedule.
-    std::uint32_t invariant_segment_keys = 0;
-};
-
 // The segment of invariant reductions for an engine whose calls see at most `max_context` keys:
 // the fewest keys, a multiple of the 64-key page, that keep every window within the small-T
 // launch's split capacity.
 [[nodiscard]] std::uint32_t causal_attention_invariant_segment_keys(std::uint32_t max_context);
-
-struct ContextAttentionExecutionEnvelope {
-    std::uint32_t min_context = 0;
-    std::uint32_t max_context = 0;
-};
 
 /**
  * Shared numerical contract.
@@ -237,7 +206,6 @@ void causal_softmax_attention_append(const Tensor& k, const Tensor& v, const Ten
  * sigmoid_mul rounds. The partials may live in another device's memory or in mapped host memory,
  * any pointer the merging device can read; at most kCausalAttentionMaximumMergeRanks of them.
  */
-inline constexpr std::int32_t kCausalAttentionMaximumMergeRanks = 8;
 [[nodiscard]] std::size_t causal_attention_partial_elements(std::int32_t q_heads,
                                                             std::int32_t columns);
 void causal_attention_merge_partials(std::span<const float* const> partials, std::int32_t q_heads,

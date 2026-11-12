@@ -1,5 +1,5 @@
 #pragma once
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/q5/q5_launch.h"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 

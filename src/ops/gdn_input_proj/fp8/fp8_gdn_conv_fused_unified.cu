@@ -2,7 +2,7 @@
 #include "core/weight.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan_unified.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/gdn_input_proj/gdn_conv_output.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/fp8/fp8_a16_gemv.cuh"

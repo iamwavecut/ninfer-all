@@ -6,7 +6,7 @@
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/kernel/silu_and_mul.cuh"
-#include "core/device.h" // CUDA_CHECK
+#include "core/device_launch.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>

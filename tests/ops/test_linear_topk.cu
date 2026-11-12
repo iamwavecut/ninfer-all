@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -12,6 +12,7 @@
 #include <exception>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {

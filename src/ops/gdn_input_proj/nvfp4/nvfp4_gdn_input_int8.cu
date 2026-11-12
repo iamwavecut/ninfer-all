@@ -4,7 +4,7 @@
 // rows to the two output tensors.
 
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/weight.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output_unified.cuh"
 #include "ops/linear/nvfp4/nvfp4_format.h"

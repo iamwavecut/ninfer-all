@@ -1,6 +1,6 @@
 #include "ops/linear_add/q8/q8_linear_add_kernels_unified.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 

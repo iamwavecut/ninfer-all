@@ -2,7 +2,7 @@
 
 // Definition behind small_t_i8_launch.h; included only by the per-width small_t_i8_w<N>.cu units.
 
-#include "core/device.h" // CUDA_CHECK
+#include "core/device_launch.h" // CUDA_CHECK
 #include "core/paged_kv_storage.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"

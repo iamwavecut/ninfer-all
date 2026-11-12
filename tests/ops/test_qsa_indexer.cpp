@@ -4,7 +4,7 @@
 // pointwise and every selection as a set, up to near-ties of the 512th score. The decode steps
 // replay one captured CUDA graph, the position advancing only in the device word the ops read.
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/qsa_indexer.h"
 #include "ops/op_tester.h"
 

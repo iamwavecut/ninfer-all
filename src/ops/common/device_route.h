@@ -15,6 +15,7 @@
 // 3090 Ti differ in SM count) each follow their own profile.
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>

@@ -16,7 +16,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "core/weight.h"
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 #include "ops/linear/sm70/sm70_project.h"
 
 #include <cuda_runtime.h>

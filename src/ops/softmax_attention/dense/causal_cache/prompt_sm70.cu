@@ -1,6 +1,6 @@
 #include "ops/softmax_attention/dense/causal_cache/prompt_sm70.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/device_tier.h"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/e8_root_codec.cuh"

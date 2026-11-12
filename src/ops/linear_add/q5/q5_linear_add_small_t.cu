@@ -1,6 +1,6 @@
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/q5/q5_small_t_mma.cuh"
 
 #include <cuda_bf16.h>

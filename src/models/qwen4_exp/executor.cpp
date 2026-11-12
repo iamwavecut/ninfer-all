@@ -8,7 +8,7 @@
 #include "core/host_worker_pool.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
 #include "core/stage_link.h"
 #include "core/tensor_parallel.h"

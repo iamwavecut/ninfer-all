@@ -12,7 +12,7 @@
 #include "models/deepseek_v41/kernels.h"
 #include "models/deepseek_v41/vision.h"
 #include "models/divided_head.h"
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"

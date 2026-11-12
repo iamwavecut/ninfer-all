@@ -2,7 +2,7 @@
 
 #include "core/weight.h"
 #include "core/tensor.h"
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <cuda_runtime.h>

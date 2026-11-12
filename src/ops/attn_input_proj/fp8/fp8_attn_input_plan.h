@@ -3,7 +3,7 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include <cuda_runtime.h>

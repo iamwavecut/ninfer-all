@@ -3,7 +3,7 @@
 
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cuh"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 

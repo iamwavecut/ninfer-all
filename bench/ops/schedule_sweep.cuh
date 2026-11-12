@@ -27,7 +27,7 @@
 // something the kernel is not -- that is how the Q4/Q5 switch fallthrough was found, where
 // selecting one schedule silently ran a second kernel over the top of it.
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_runtime.h>

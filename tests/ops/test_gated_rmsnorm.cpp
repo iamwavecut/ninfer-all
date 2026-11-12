@@ -1,5 +1,5 @@
 #include "ninfer/ops/gated_rmsnorm.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/norm_test_common.h"
 
 #include <cmath>

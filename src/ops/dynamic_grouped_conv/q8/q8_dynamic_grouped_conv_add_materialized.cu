@@ -1,6 +1,6 @@
 #include "core/weight.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_kernels.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/linear/q8/q8_ksplit_config.h"
 #include "ops/linear/q8/q8_launch.h"

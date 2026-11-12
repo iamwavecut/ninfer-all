@@ -1,5 +1,5 @@
 #include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"

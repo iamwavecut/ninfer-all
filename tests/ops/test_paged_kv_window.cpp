@@ -1,4 +1,4 @@
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/paged_kv_window.h"
 #include "ops/op_tester.h"
 

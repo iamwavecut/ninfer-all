@@ -7,7 +7,7 @@
 #include "ninfer/ops/qsa_indexer.h"
 #include "ninfer/ops/rope.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/layout.h"
 #include "ops/common/device_multiprocessors.h"
 #include "ops/common/device_tier.h"

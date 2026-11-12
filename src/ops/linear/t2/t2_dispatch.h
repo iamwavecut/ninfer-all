@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 #include "ops/linear/t2/t2_launch.h"
 
 #include <cstdint>

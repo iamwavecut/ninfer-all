@@ -4,7 +4,7 @@
 #include "ninfer/ops/sigmoid_mul.h"
 
 #include "core/layout.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/paged_kv_storage.h"
 #include "ops/common/device_multiprocessors.h"
 #include "ops/common/device_tier.h"

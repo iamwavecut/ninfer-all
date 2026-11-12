@@ -2,7 +2,7 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/fp8/fp8_a16_ksplit_mma.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"

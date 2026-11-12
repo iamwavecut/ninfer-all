@@ -1,6 +1,6 @@
 #include "ops/linear/q4/q4_shapes.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/common/small_t_split_store.cuh"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"

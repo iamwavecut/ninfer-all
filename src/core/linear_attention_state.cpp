@@ -1,6 +1,6 @@
 #include "core/linear_attention_state.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <limits>
 #include <stdexcept>

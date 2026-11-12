@@ -13,8 +13,8 @@
 #    include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
 #endif
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
-#include "core/device.h" // CUDA_CHECK
-#include "ninfer/ops/softmax_attention.h"
+#include "core/device_launch.h" // CUDA_CHECK
+#include "ninfer/ops/softmax_attention_envelope.h"
 
 #include <cstdint>
 #include <cstdlib>

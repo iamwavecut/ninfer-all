@@ -3,7 +3,7 @@
 // Algorithm assumptions: one independent CTA per column; no global workspace.
 #include "ops/launcher/target_logprobs.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/kernel/target_logprobs.cuh"
 
 namespace ninfer::ops::detail {

@@ -3,7 +3,7 @@
 #include "artifact/reader.h"
 #include "core/dtype.h"
 #include "core/evictable_weight_pool.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
 #include "core/stage_plan.h"
 #include "core/tensor_split.h"

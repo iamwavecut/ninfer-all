@@ -3,7 +3,7 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 #include "ops/linear/nvfp4/nvfp4_int8_route.h"
 

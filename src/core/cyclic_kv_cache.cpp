@@ -1,6 +1,6 @@
 #include "core/cyclic_kv_cache.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <array>
 #include <limits>

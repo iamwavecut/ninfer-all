@@ -1,6 +1,6 @@
 #include "ops/linear/sm70/sm70_integer.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/layout.h"
 #include "core/weight_view.h"
 #include "ops/common/device_multiprocessors.h"

@@ -6,8 +6,8 @@
 
 #include "ninfer/ops/softmax_attention.h"
 
-#include "core/device.h"
-#include "core/paged_kv_cache.h"
+#include "core/device_launch.h"
+#include "core/paged_kv_view.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>

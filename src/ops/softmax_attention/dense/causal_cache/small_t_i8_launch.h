@@ -3,7 +3,7 @@
 // The INT8-family small-T partial launch, instantiated per query width in small_t_i8_w<N>.cu so
 // the kernel's many specializations compile in parallel instead of in one translation unit.
 
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/tensor.h"
 #include "ops/common/device_limits.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"

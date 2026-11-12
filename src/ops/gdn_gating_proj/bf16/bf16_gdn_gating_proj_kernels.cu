@@ -6,7 +6,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh"
 
-#include "core/device.h" // CUDA_CHECK
+#include "core/device_launch.h" // CUDA_CHECK
 
 #include <cuda_bf16.h>
 

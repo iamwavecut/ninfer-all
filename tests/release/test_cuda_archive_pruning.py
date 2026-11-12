@@ -44,13 +44,16 @@ if mode != 'missing':
                                        PRUNE_MODE=mode))
 
     def test_preserves_every_requested_sass_target(self):
-        for archs in ('70;75;80;86;89', '75;80;86;89;120a', '120a'):
+        # A target names an architecture without PTX as "<arch>-real" (CMakeLists.txt).
+        for archs in ('70;75;80;86;89', '75;80;86;89;120a', '120a',
+                      '75-real;80-real;86-real;89;120a-real'):
             with self.subTest(archs=archs):
                 result = self.prune(archs)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 args = json.loads((self.root / 'args.json').read_text())
+                names = [a.removesuffix('-real') for a in archs.split(';')]
                 self.assertEqual(args[:-3], [f'--generate-code=arch=compute_{a},code=sm_{a}'
-                                             for a in archs.split(';')])
+                                             for a in names])
                 self.assertEqual(self.archive.read_bytes(), b'pruned archive')
 
     def test_failed_or_incomplete_output_never_replaces_original(self):

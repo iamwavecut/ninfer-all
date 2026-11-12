@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/linear/q4/q4_a16_gemv_launch.cuh"

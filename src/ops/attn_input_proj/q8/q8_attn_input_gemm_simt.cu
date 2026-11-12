@@ -3,7 +3,7 @@
 
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels_unified.h"
 #include "ops/linear/common/route_table.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_rowsplit_gemm_simt.cuh"
 

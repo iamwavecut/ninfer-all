@@ -6,7 +6,7 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/speculative_round.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 
 #include <algorithm>

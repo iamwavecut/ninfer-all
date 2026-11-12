@@ -4,7 +4,7 @@
 #include "ops/launcher/steer_residual.h"
 
 #include "ops/kernel/steer_residual.cuh"
-#include "core/device.h" // CUDA_CHECK
+#include "core/device_launch.h" // CUDA_CHECK
 
 #include <cstdint>
 

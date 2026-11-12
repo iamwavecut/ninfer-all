@@ -11,7 +11,7 @@
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
-#include "core/device.h" // CUDA_CHECK
+#include "core/device_launch.h" // CUDA_CHECK
 
 #include <cstdint>
 #include <cstdlib>

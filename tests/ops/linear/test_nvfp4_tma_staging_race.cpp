@@ -11,11 +11,12 @@
 
 #include "core/arena.h"
 #include "core/decode_graph.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/common/device_tier.h"
 #include "ops/quantized_weight.h"
 #include "ops/op_tester.h"
 
@@ -213,6 +214,11 @@ int main() {
     std::cout << "SKIP: this build has no NVFP4 TMA route\n";
     return 77;
 #endif
+    // A build of several architectures refuses the route on a card without the 120a code.
+    if (ninfer::ops::kBuildTiers > 1 && !ninfer::ops::current_device_blackwell()) {
+        std::cout << "SKIP: the NVFP4 TMA route runs on sm_120a GPUs only\n";
+        return 77;
+    }
     try {
         int failures = run_linear_race();
         failures += run_swiglu_race();

@@ -1,6 +1,6 @@
 #include "core/decode_graph.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/device_wait.h"
 #include "core/nvtx.h"
 

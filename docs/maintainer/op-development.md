@@ -403,7 +403,10 @@ The owning family registers its implementation in `src/ops/<family>/sources.cmak
 delegates to one explicit manifest per numeric format. A family manifest includes its wrappers
 even when they live in the horizontal `wrapper/` directory. Ordinary sources contribute to
 `ninfer_ops`; the three NVFP4 sources requiring non-RDC compilation contribute to
-`ninfer_nvfp4_non_rdc` from their owning manifests. Shape files retain their `.cpp` or `.cu`
+`ninfer_nvfp4_non_rdc` from their owning manifests. The FP8 A8, NVFP4 W4A4/A4, fast NVFP4 prompt
+and Volta projection units contribute to `ninfer_ops` too; `src/ops/CMakeLists.txt` compiles them
+for their tier's architecture alone (`ninfer_ops_route_family`), so their entry points must refuse
+other cards before a launch. Shape files retain their `.cpp` or `.cu`
 language and separate translation units. See [Build system](build-system.md) for the target policy.
 
 ## 6. Qualification

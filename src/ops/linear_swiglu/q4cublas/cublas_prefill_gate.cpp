@@ -1,9 +1,10 @@
 #include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
 
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 #include "ops/common/device_route.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <vector>
 
 namespace ninfer::ops::detail {

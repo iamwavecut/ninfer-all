@@ -1,6 +1,6 @@
 #include "ops/linear/t2/t2_rowsplit_gemm_simt.cuh"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/t2/t2_launch.h"

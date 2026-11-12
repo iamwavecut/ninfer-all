@@ -1,6 +1,6 @@
 #include "ops/linear/t2/t2_small_t_v2.cuh"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/t2/t2_launch.h"
 
 #include <cstdint>

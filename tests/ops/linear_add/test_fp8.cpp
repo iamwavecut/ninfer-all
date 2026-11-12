@@ -1,6 +1,6 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"

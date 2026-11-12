@@ -2,7 +2,7 @@
 #include "core/weight.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels_unified.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/q8/q8_schedule.cuh"
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"

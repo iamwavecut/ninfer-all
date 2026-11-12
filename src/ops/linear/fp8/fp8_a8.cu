@@ -2,7 +2,7 @@
 #include "ops/common/blackwell_routes.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"

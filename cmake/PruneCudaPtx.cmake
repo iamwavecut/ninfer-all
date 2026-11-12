@@ -5,6 +5,8 @@ if(NOT EXISTS "${ARCHIVE}" OR NOT ARCHITECTURES OR NOT NVPRUNE)
 endif()
 set(arguments)
 foreach(arch IN LISTS ARCHITECTURES)
+  # A target's architectures name machine code alone as "<arch>-real" (CMakeLists.txt).
+  string(REGEX REPLACE "-real$" "" arch "${arch}")
   if(NOT arch MATCHES "^(70|75|80|86|89|120a)$")
     message(FATAL_ERROR "Cannot preserve unsupported CUDA architecture: ${arch}")
   endif()

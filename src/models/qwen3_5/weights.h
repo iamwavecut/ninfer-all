@@ -3,7 +3,7 @@
 #include "core/stage_plan.h"
 #include "core/weight_view.h"
 #include "models/qwen3_5/config.h"
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -1,3 +1,4 @@
+#include "core/device.h"
 #include "core/weight.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/hadamard_transform.h"
@@ -16,6 +17,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;

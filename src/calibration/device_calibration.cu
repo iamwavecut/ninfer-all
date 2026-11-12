@@ -3,10 +3,10 @@
 #include "calibration/route_catalog.h"
 
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/device_wait.h"
 #include "core/dtype.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
 #include "core/weight.h"

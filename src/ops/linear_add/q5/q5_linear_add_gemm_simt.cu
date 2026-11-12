@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
 
 #include <cuda_bf16.h>

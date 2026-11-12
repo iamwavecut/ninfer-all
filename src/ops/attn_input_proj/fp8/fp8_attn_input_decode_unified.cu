@@ -2,7 +2,7 @@
 #include "core/weight.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan_unified.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output_unified.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/fp8/fp8_a16_gemv.cuh"

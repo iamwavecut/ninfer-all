@@ -4,7 +4,7 @@
 // handful of BF16/FP32 loads and needs no staging.
 #include "ninfer/ops/dynamic_grouped_conv.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <cuda_bf16.h>
 

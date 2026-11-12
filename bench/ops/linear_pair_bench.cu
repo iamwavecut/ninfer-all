@@ -3,7 +3,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_pair.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
 

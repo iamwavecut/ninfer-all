@@ -1,7 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
 #include "core/tensor_split.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/softmax_attention_envelope.h"
 
 #include <algorithm>
 #include <array>

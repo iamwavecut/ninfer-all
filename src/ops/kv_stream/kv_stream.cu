@@ -6,7 +6,7 @@
 // number of copies from the map, so a captured graph replays them at any position.
 #include "ninfer/ops/kv_stream.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/device_wait.h"
 #include "core/paged_kv_storage.h"
 

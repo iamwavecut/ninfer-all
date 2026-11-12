@@ -16,7 +16,7 @@
 // first) and keep the four inject rows on the FP32 GEMVs.
 #include "ninfer/ops/hyper_connection.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/layout.h"
 #include "ops/common/math.h"
 

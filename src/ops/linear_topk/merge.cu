@@ -1,6 +1,6 @@
 #include "ops/linear_topk/linear_topk_launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/common/score_id_order.cuh"
 #include "ops/linear_topk/linear_topk_workspace.h"

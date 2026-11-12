@@ -29,7 +29,7 @@
 // (codes[token * k + g * 32], scales[token * (k / 32) + g]) is the one the grouped and narrow
 // mainloops already read, and it is never handed to the own chain's MMQ route.
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/tensor.h"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/rmsnorm.cuh"

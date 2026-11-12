@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/weight.h"
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 #include "ops/linear/q5/q5_launch.h"
 
 #include <cstdint>

@@ -35,7 +35,7 @@
 // into it on a transfer stream.
 
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/device_wait.h"
 
 #include <cuda_runtime.h>

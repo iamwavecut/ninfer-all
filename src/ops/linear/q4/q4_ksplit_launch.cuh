@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stdexcept>
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 

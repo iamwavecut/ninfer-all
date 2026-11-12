@@ -3,7 +3,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/sampling.h"
 
 #include <algorithm>

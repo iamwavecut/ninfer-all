@@ -3,9 +3,9 @@
 // ninfer::ops::detail - private launch prototypes for causal_softmax_attention policies.
 
 #include "core/arena.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/tensor.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/softmax_attention_envelope.h"
 #include "ops/common/device_limits.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
 #include "ops/softmax_attention/dense/causal_cache/key_partition.h"

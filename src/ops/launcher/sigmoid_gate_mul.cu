@@ -5,7 +5,7 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/sigmoid_gate_mul.cuh"
-#include "core/device.h" // CUDA_CHECK
+#include "core/device_launch.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>

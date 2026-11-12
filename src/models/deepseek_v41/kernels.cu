@@ -1,6 +1,6 @@
 #include "models/deepseek_v41/kernels.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/route_order.cuh"
 #include "ops/common/silu.h"
 
