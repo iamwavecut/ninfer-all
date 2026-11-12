@@ -4,7 +4,7 @@
 // Algorithm assumptions: split-CTA partials, then one combining CTA per row (kernel header).
 #include "ops/launcher/logprob_topk.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/kernel/logprob_topk.cuh"
 
 namespace ninfer::ops::detail {

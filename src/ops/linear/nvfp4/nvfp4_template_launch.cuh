@@ -1,7 +1,7 @@
 #pragma once
 #include <stdexcept>
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"

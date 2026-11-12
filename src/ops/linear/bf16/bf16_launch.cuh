@@ -1,5 +1,5 @@
 #pragma once
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/linear/bf16/bf16_launch.h"
 #include "ops/linear/bf16/bf16_gemv.cuh"

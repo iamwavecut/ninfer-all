@@ -1,5 +1,5 @@
 #include "ninfer/ops/argmax.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include <algorithm>
 #include "ops/op_tester.h"
 

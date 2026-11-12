@@ -2,7 +2,7 @@
 // device (only the experts the routes name hold data), decode and verify widths, repeated experts
 // across tokens.
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/moe_experts.h"
 #include "ops/op_tester.h"
 
@@ -13,6 +13,7 @@
 #include <map>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;

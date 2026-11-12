@@ -8,7 +8,7 @@
 // Printed logical GB/s is informational; NCU determines the applicable resource roofline.
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/scatter.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer_bench_common.h"
 
 #include <cstddef>

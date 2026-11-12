@@ -1,6 +1,6 @@
 #include "ops/launcher/cast.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/kernel/cast.cuh"
 

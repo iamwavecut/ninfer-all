@@ -6,7 +6,7 @@
 //   ncu ... ./ninfer_rope_bench --text --geometry dflash --tokens 1024 --profile
 //   ./ninfer_rope_bench --vision --patches 8,256,4096,49152,65536
 // Add --control for the same-grid, same-payload fixed-resource control.
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer_bench_common.h"
 #include "ops/kernel/rope.cuh"

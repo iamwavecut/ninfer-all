@@ -4,6 +4,7 @@
 #include "core/cpu_spin_pool.h"
 #include "core/cuda_host_handshake.h"
 #include "core/cuda_host_handshake.cuh"
+#include "core/device.h"
 #include "core/device_wait.h"
 #include "core/expert_direct.h"
 #include "core/expert_mirror.h"

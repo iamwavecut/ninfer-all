@@ -1,5 +1,5 @@
 #include "ops/linear/bf16/bf16_shapes.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/common/token_slices.h"
 #include "ops/linear/bf16/bf16_n256_k5120.cuh"

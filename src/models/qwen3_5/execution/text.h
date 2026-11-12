@@ -10,7 +10,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/softmax_attention_envelope.h"
 #include "ninfer/ops/sparse_moe.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"

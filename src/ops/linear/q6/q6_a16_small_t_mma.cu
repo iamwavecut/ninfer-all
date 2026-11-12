@@ -18,7 +18,7 @@
 // group's fp16 scale is applied per row to an fp32 group accumulator, and the eight K partials are
 // reduced through shared memory.
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ops/common/memory.cuh"

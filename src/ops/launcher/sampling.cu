@@ -6,7 +6,7 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/sampling.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 namespace ninfer::ops::detail {
 

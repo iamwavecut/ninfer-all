@@ -6,7 +6,7 @@
 
 #include "ninfer/ops/linear.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/memory.cuh"
 #include "ops/linear_topk/grouped_ksplit_topk.cuh"
 #include "ops/linear_topk/linear_topk_launch.h"

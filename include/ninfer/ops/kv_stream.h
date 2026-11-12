@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaStream_t

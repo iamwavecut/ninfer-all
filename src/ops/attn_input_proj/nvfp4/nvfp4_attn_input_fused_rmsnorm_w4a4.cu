@@ -1,7 +1,7 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/common/blackwell_routes.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/kernel/rmsnorm.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"

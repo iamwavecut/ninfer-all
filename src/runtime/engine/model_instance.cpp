@@ -11,7 +11,7 @@
 #include "runtime/engine/prefill_pacing.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/startup.h"
 #include "core/tensor_parallel.h"
 #include "models/qwen3_5/frontend/graft.h"

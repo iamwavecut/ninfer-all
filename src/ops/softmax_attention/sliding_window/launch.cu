@@ -1,6 +1,6 @@
 #include "ops/softmax_attention/sliding_window/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/softmax_attention/sliding_window/kernel.cuh"
 

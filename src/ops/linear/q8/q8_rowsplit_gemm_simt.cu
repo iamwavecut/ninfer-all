@@ -2,7 +2,7 @@
 #include "ops/linear/q8/q8_rowsplit_gemm_simt.cuh"
 
 #include "ops/common/math.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/q8/q8_launch.h"
 

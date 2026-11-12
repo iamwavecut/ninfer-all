@@ -1,7 +1,7 @@
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 #include "ops/sparse_moe/streamed.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"

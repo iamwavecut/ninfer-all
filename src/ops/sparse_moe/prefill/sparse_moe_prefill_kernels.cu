@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/expert_delivery.h"
 #include "ops/sparse_moe/streamed.h"
 #include "ops/common/device_multiprocessors.h"

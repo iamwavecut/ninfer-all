@@ -1,5 +1,5 @@
 #pragma once
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include "ops/common/device_limits.h"
 #include "ops/common/math.h"

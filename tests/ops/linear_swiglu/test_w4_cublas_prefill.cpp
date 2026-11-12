@@ -24,7 +24,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
-#include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/common/device_route.h"

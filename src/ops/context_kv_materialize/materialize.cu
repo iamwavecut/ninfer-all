@@ -1,5 +1,5 @@
 #include "ops/context_kv_materialize/launch.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/common/device_limits.h"
 #include "ops/common/memory.cuh"

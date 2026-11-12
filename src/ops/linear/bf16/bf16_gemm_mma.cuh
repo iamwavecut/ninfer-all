@@ -8,7 +8,7 @@
 // K vector per token, which is the column-major B representation consumed by the
 // row.col MMA atom. M and K come from a compiled geometry; N remains runtime.
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/device_limits.h"
 #include "ops/common/mma.cuh"
 

@@ -3,7 +3,7 @@
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/kernel/mtp_pack.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <algorithm>
 #include <cstdint>

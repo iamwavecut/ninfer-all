@@ -1,6 +1,6 @@
 #include "ops/rmsnorm_rope/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/rmsnorm_rope/kernel.cuh"
 

@@ -1,7 +1,7 @@
 #include "ops/launcher/scatter.h"
 
 #include "ops/kernel/scatter.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 
 #include <cstdint>

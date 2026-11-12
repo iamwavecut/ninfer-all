@@ -1,4 +1,4 @@
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ops/op_tester.h"
 

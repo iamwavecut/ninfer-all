@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"

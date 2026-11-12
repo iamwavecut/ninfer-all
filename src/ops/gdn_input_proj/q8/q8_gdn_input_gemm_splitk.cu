@@ -3,7 +3,7 @@
 
 #include "ops/gdn_input_proj/q8/q8_gdn_input_kernels_unified.h"
 #include "ops/linear/common/route_table.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/gdn_input_proj/gdn_conv.cuh"

@@ -4,7 +4,7 @@
 
 #include "ops/linear/nvfp4/nvfp4_int8_fused_norm_quant.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/nvfp4/nvfp4_int8_fused_norm_quant.cuh"
 
 #include <stdexcept>

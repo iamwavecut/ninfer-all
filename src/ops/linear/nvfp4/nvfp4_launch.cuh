@@ -1,5 +1,5 @@
 #pragma once
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 #include "ops/linear/nvfp4/nvfp4_simt.cuh"

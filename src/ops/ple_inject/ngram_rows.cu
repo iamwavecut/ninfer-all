@@ -2,7 +2,7 @@
 // include/ninfer/ops/ngram_rows.h).
 #include "ninfer/ops/ngram_rows.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 
 #include <cuda_bf16.h>

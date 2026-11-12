@@ -1,6 +1,6 @@
 #include "ops/linear/sm70/sm70_dequantize.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>

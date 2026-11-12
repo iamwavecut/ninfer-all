@@ -3,7 +3,7 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/causal_conv1d.cuh"
-#include "core/device.h" // CUDA_CHECK
+#include "core/device_launch.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>

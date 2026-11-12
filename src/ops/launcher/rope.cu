@@ -1,7 +1,7 @@
 // ninfer::ops - rope launcher: private token-count tuning and generic fallback.
 #include "ops/launcher/rope.h"
 
-#include "core/device.h" // CUDA_CHECK
+#include "core/device_launch.h" // CUDA_CHECK
 #include "ops/kernel/rope.cuh"
 
 #include <algorithm>

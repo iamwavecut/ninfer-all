@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/linear/q4/q4_a16_gemv_launch.cuh"
 #include "ops/linear/q4/q4_a16_simt_launch.cuh"

@@ -8,7 +8,7 @@
 // values: keys in the rotated basis the append stores them in, scored against the query under the
 // same normalized Hadamard transform, and values as stored, which for NVFP4 and K8V4 are rotated
 // too, so the oracle takes the transform back from the result.
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/paged_kv_storage.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/sparse_attention.h"

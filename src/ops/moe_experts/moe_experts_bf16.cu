@@ -4,7 +4,7 @@
 // routed experts and the shared one, one warp per row.
 #include "ninfer/ops/moe_experts.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/layout.h"
 #include "ops/common/math.h"
 

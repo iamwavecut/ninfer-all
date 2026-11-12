@@ -12,7 +12,7 @@
 // the two high-plane bytes of that chunk (Q6RowSplitStorage::kHighBytesPerChunk); the decode is
 // Q6SimtDecodeAtom's exact half2 trick with the scale hoisted.
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ops/common/math.cuh"

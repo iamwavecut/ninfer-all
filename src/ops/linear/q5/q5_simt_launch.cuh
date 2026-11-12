@@ -1,5 +1,5 @@
 #pragma once
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/q5/q5_a16_simt.cuh"

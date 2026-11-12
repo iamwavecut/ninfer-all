@@ -1,5 +1,5 @@
 #include "ops/linear/bf16/bf16_general.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/bf16/bf16_vector.h"
 

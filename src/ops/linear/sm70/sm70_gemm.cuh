@@ -2,7 +2,7 @@
 
 // The slab loop of an sm_70 wide product (sm70_gemm.h) over a caller's dequantizer and epilogue.
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/sm70/sm70_gemm.h"
 
 #include <algorithm>

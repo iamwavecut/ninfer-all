@@ -11,7 +11,7 @@
 
 #include "core/arena.h"
 #include "core/decode_graph.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"

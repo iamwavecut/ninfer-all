@@ -1,9 +1,10 @@
 #include "ops/softmax_attention/dense/context/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/softmax_attention/dense/context/kernel.cuh"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 

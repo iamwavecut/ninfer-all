@@ -1,7 +1,7 @@
 // ninfer::ops - the cross-rank merge of position-split causal attention.
 #include "ninfer/ops/softmax_attention.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.cuh"
 
 #include <cuda_bf16.h>

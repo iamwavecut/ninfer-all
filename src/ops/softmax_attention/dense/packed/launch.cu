@@ -1,7 +1,7 @@
 #include "ops/softmax_attention/dense/packed/launch.h"
 
 #include "ops/softmax_attention/dense/packed/kernel.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <cstdint>
 #include <stdexcept>

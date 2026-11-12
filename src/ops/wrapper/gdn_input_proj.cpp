@@ -2,7 +2,7 @@
 #include "core/weight_view.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/layout.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/gguf/gguf_linear.h"

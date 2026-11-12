@@ -1,5 +1,5 @@
 #pragma once
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/linear/q4/q4_a16_gemv.cuh"
 #include "ops/linear/q4/q4_operands.h"

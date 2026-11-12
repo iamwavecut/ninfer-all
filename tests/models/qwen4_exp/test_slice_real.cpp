@@ -11,7 +11,7 @@
 #include "artifact/schema.h"
 #include "core/arena.h"
 #include "core/device.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/causal_conv1d_silu.h"

@@ -1,6 +1,6 @@
 #include "ops/launcher/scalar.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/kernel/scalar.cuh"
 
 namespace ninfer::ops::detail {

@@ -1,7 +1,7 @@
 // ngram_embed_rows against independently decoded rows: every FP8 E4M3 code (NaN excluded) under
 // FP16 scales across the exponent range, every IQ4_NL code under random FP16 scales, and BF16 rows
 // bit-exactly.
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/ngram_rows.h"
 #include "ops/op_tester.h"
 

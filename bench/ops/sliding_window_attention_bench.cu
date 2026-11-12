@@ -4,7 +4,7 @@
 
 #include "ninfer/ops/sliding_window_attention.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/cyclic_kv_cache.h"
 #include "ninfer_bench_common.h"
 #include "ops/softmax_attention/sliding_window/launch.h"

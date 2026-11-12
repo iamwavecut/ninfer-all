@@ -4,7 +4,7 @@
 // leaves to ple_history_advance.
 #include "ninfer/ops/ple_inject.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/layout.h"
 #include "ops/common/math.h"
 

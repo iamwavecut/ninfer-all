@@ -4,7 +4,7 @@
 // and one CTA per column merges the CTAs' lists.
 #include "ninfer/ops/candidate_selector.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>

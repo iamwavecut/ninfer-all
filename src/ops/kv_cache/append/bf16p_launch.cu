@@ -2,7 +2,7 @@
 // the poison row when it has no packed form (ops/kv_cache/bf16p_codec.cuh).
 #include "ops/kv_cache/append/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/append/geometry.cuh"

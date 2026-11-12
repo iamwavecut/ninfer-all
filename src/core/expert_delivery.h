@@ -1,8 +1,9 @@
 #pragma once
 
-#include "core/device.h"
 #include "core/expert_disk.h"
 #include "core/expert_tier.h"
+
+#include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,8 @@
 #include <vector>
 
 namespace ninfer {
+
+struct RankContext;
 
 // A blob is copied without decoding or repacking. File extents concatenate in order.
 struct ExpertExtent {

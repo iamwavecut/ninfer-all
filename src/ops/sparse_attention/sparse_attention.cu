@@ -14,7 +14,7 @@
 
 #include "ninfer/ops/kv_stream.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
 #include "ops/common/math.h"

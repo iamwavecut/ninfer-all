@@ -4,7 +4,7 @@
 // configured lane admissible at once. Pure arithmetic over fixed startup capacities, so both the
 // request planner and the concurrent-budget query use exactly one formula.
 
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "ninfer/model_enums.h"
 
 #include <algorithm>

@@ -1,5 +1,5 @@
 #include "core/arena.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -26,6 +26,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;

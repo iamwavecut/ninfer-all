@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_gemv.cuh"
 #include "ops/linear/fp8/fp8_output.cuh"

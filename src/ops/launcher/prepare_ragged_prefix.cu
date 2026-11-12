@@ -1,6 +1,6 @@
 #include "ops/launcher/prepare_ragged_prefix.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include "ops/kernel/prepare_ragged_prefix.cuh"
 

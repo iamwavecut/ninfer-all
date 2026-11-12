@@ -1,7 +1,7 @@
 // ninfer::ops::detail - FP8 E4M3FN split-KV small-T launch ownership.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_fp8.cuh"
 #include "ops/kv_cache/plane_types.h"

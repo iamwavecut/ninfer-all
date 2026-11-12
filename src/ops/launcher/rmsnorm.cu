@@ -2,7 +2,7 @@
 #include "ops/launcher/rmsnorm.h"
 
 #include "ops/kernel/rmsnorm.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 
 #include <array>

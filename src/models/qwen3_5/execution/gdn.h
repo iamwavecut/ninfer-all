@@ -2,7 +2,7 @@
 
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/rotation.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 namespace ninfer::models::qwen3_5::execution {
 

@@ -3,7 +3,7 @@
 #include "core/weight.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan_unified.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_a16_simt.cuh"

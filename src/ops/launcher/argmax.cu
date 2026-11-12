@@ -7,7 +7,7 @@
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/kernel/argmax.cuh"
-#include "core/device.h" // CUDA_CHECK
+#include "core/device_launch.h" // CUDA_CHECK
 #include "core/pdl.cuh"
 
 #include <cstdint>

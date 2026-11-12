@@ -22,7 +22,7 @@
 // FP16, and the key codings and value codes are decoded to FP16 with their group scales as they
 // load.
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/kv_cache/e8_root_codec.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"

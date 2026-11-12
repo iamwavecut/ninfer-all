@@ -1,6 +1,6 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/small_t_split_store.cuh"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 #include "ops/linear/q5/q5_small_t_mma.cuh"

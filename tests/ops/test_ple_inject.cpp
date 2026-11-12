@@ -4,7 +4,7 @@
 // replay, and a token whose gate score is exactly zero; and the record form of a speculative
 // verification with the history advanced past a committed prefix.
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/ple_inject.h"
 #include "ops/op_tester.h"
 

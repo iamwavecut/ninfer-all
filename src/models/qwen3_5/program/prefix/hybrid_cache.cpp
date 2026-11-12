@@ -2,7 +2,7 @@
 
 #include "core/device.h"
 #include "core/device_wait.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 
 #include <algorithm>
 #include <array>

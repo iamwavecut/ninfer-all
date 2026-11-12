@@ -5,7 +5,7 @@
 // hyper_connection_expand, which must widen the embedding into every stream exactly, and its MTP
 // form, which adds each stream's own term.
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/hyper_connection.h"
 #include "ops/op_tester.h"
 

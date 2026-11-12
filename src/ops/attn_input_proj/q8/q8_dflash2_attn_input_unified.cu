@@ -2,7 +2,7 @@
 #include "core/weight.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels_unified.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/q8/q8_schedule.cuh"

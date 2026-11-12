@@ -5,7 +5,7 @@
 #include "ops/linear_pair/q8/q8_pair_kernels.h"
 #include "ops/linear_pair/q8/q8_pair_kernels_unified.h"
 #include "ops/linear/common/route_table.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/tensor.h"
 #include "ops/linear/q8/q8_rowsplit_gemm_simt.cuh"
 

@@ -3,7 +3,7 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/l2norm.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <cstdint>
 #include <limits>

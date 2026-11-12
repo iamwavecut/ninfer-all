@@ -37,7 +37,7 @@
 // one row they are contiguous across groups while for one group they are strided by the row.
 // Nothing in the prefetch path waits on a synchronous global read.
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/tensor.h"
 #include "ops/common/device_limits.h"
 #include "ops/common/mma.cuh"

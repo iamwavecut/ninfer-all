@@ -1,6 +1,12 @@
 #pragma once
 
-#include "ninfer/ops/softmax_attention.h"
+#include "core/paged_kv_view.h"
+#include "core/tensor.h"
+#include "ninfer/ops/softmax_attention_envelope.h"
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
 
 namespace ninfer::ops::detail {
 

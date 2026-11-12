@@ -3,7 +3,7 @@
 
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels_unified.h"
 #include "ops/linear/common/route_table.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/q8/q8_ksplit_mma.cuh"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_output.cuh"
 

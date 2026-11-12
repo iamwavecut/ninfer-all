@@ -1,5 +1,5 @@
 #pragma once
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear/fp8/fp8_gemv.cuh"
 #include "ops/linear/fp8/fp8_simt.cuh"

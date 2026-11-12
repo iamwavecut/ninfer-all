@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.cuh"
 #include "ops/linear/q4/q4_sliced_k_launch.cuh"
 

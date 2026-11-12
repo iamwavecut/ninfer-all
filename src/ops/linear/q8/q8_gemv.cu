@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/linear/q8/q8_launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"

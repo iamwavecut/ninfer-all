@@ -5,7 +5,7 @@
 // mainloop with the other NVFP4 int8 routes via nvfp4_int8_grouped_mma.cuh.
 
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/weight.h"
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/nvfp4/nvfp4_format.h"

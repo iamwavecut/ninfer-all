@@ -4,7 +4,7 @@
 // experts in range, and the other tokens keep their oracle selection. Every case runs twice more
 // with a completion counter (the selection in the GEMV's last CTA for up to eight tokens): ids,
 // weights and shared equal the first call's bit for bit, and the counter is zero after each call.
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/moe_route.h"
 #include "ops/op_tester.h"
 

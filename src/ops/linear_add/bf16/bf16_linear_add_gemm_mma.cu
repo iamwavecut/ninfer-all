@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.cuh"
 #include "ops/common/math.h"
 #include "ops/linear/bf16/bf16_config.h"

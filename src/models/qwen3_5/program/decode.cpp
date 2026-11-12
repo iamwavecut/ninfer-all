@@ -5,7 +5,7 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/logprob_topk.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"

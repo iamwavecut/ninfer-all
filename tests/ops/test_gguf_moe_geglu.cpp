@@ -10,6 +10,7 @@
 // moe_weighted_rows of its rows, held against the same sum taken on the host.
 
 #include "core/arena.h"
+#include "core/device.h"
 #include "core/expert_delivery.h"
 #include "ops/common/fixed_point.cuh"
 #include "ops/linear/gguf/ggml_bridge.h"

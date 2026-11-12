@@ -359,6 +359,17 @@ than `engine.h` includes `ninfer/types.h`, when a `.cu` under `src/` reaches `en
 `engine_options.h`, `request.h` or `observability/`, or when `types_fwd.h` and the definitions
 disagree; CI runs it.
 
+Kernel units do not reach the host API headers either. `src/core/device.h` (device contexts,
+streams, events), `include/ninfer/ops/linear.h`, `include/ninfer/ops/softmax_attention.h` and
+`src/core/paged_kv_cache.h` change often and most host code includes them; the types a kernel
+launch needs are in `src/core/device_launch.h` (`CUDA_CHECK`, the shared memory limit, launch
+facts), `include/ninfer/ops/linear_policy.h`, `include/ninfer/ops/softmax_attention_envelope.h` and
+`src/core/paged_kv_view.h`, which the heavy headers include. A change to the host API then
+recompiles host code, not the kernels: a heavy attention unit costs 66-75 minutes of one compiler
+on a hosted Linux runner. The check fails when a `.cu` under `src/ops/` reaches one of the four
+heavy headers, unless `HOST_API_UNITS` in the script lists it as a unit that implements or calls
+that API and includes the header itself.
+
 ## Consumers and verification
 
 `apps/CMakeLists.txt` explicitly defines the four product executables, or with `NINFER_MULTICALL`

@@ -1,6 +1,6 @@
 #include "ops/linear/sm70/sm70_gemm.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <cublas_v2.h>
 

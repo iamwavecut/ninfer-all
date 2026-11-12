@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/gdn_input_proj/gdn_conv_output.cuh"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan_unified.h"
 #include "ops/linear/common/route_table.h"

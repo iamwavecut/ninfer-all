@@ -1,6 +1,6 @@
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/common.cuh"
 

@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"

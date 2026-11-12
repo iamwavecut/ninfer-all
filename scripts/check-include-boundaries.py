@@ -7,6 +7,12 @@
   options, requests or statistics would otherwise recompile the kernels. The kernels take what
   they need from the small headers (ninfer/base.h, ninfer/model_enums.h,
   ninfer/kv_cache_storage.h, ninfer/startup.h).
+- CUDA translation units under src/ops/ do not reach the host API headers core/device.h,
+  ninfer/ops/linear.h, ninfer/ops/softmax_attention.h and core/paged_kv_cache.h, which most host
+  code includes and changes often. Kernels take their launch types from core/device_launch.h,
+  ninfer/ops/linear_policy.h, ninfer/ops/softmax_attention_envelope.h and core/paged_kv_view.h. A
+  unit that implements or calls the host API includes that header itself and is listed in
+  HOST_API_UNITS.
 - ninfer/types_fwd.h declares every struct, class and enum the headers listed in ninfer/types.h
   define, with the same keyword, and nothing else.
 
@@ -32,6 +38,16 @@ ENGINE_LEVEL = {
     'include/ninfer/observability/snapshot.h',
     'include/ninfer/request.h',
     'include/ninfer/types.h',
+}
+HOST_API = (
+    'src/core/device.h',
+    'include/ninfer/ops/linear.h',
+    'include/ninfer/ops/softmax_attention.h',
+    'src/core/paged_kv_cache.h',
+)
+HOST_API_UNITS = {
+    'src/ops/linear_topk/t2.cu': {'include/ninfer/ops/linear.h'},  # calls ops::linear
+    'src/ops/softmax_attention/dense/causal_cache/merge.cu': {'include/ninfer/ops/softmax_attention.h'},
 }
 INCLUDE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.M)
 TYPE = re.compile(r'^(struct|class|enum class)\s+(\w+)\b[^;]*?(\{|;)', re.M)
@@ -112,6 +128,19 @@ def main():
             chain = chain_to(source, ENGINE_LEVEL, memo, cache)
             if chain:
                 failures.append(f'{source} reaches {chain[-1]}: ' + ' -> '.join(chain))
+    for directory, _, names in os.walk(os.path.join(ROOT, 'src', 'ops')):
+        for name in sorted(names):
+            if not name.endswith('.cu'):
+                continue
+            source = os.path.relpath(os.path.join(directory, name), ROOT)
+            allowed = HOST_API_UNITS.get(source, set())
+            for header in HOST_API:
+                chain = chain_to(source, {header}, memo, cache)
+                if chain and not (header in allowed and len(chain) == 2):
+                    failures.append(f'{source} reaches {header}: ' + ' -> '.join(chain))
+    for source, headers in sorted(HOST_API_UNITS.items()):
+        for header in sorted(headers - set(includes(source, memo, cache))):
+            failures.append(f'{source} no longer includes {header}; remove it from HOST_API_UNITS')
     for failure in failures:
         print(failure)
     if failures:

@@ -3,7 +3,7 @@
 
 #include "ops/linear_topk/linear_topk_launch_unified.h"
 #include "ops/linear/common/route_table.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/device_limits.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"

@@ -5,7 +5,7 @@
 
 #include "calibration/device_calibration.h"
 #include "calibration/route_catalog.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "product/launch_config/launch_config.h"
 #include "product/option_layers.h"
 #include "runtime/engine/context_cache/context_cost.h"

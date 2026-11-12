@@ -1,6 +1,6 @@
 #include "ops/launcher/paged_kv_window.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/kernel/paged_kv_window.cuh"
 
 namespace ninfer::ops::detail {

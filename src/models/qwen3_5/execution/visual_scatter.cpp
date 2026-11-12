@@ -1,6 +1,6 @@
 #include "models/qwen3_5/execution/visual_scatter.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/scatter.h"
 
 #include <stdexcept>

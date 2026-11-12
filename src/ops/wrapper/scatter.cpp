@@ -1,6 +1,6 @@
 #include "ninfer/ops/scatter.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/launcher/scatter.h"
 
 #include <cstddef>

@@ -9,7 +9,7 @@
 // question this cannot answer is perplexity. See ops/linear_swiglu/q4cublas/w4_cublas_prefill.h.
 
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer_bench_common.h"

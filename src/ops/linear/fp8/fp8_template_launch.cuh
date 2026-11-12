@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 #include <stdexcept>
 #include "ops/common/math.h"

@@ -3,7 +3,7 @@
 
 #include "ninfer/ops/softmax_attention.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>

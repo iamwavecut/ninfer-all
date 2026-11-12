@@ -3,7 +3,7 @@
 // Algorithm assumptions: one CTA reads the whole column; no global workspace.
 #include "ops/launcher/readout_logprobs.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/kernel/readout_logprobs.cuh"
 
 namespace ninfer::ops::detail {

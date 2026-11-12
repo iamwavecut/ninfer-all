@@ -8,7 +8,7 @@
 
 #include "ninfer/ops/attn_input_proj.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer_bench_common.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"

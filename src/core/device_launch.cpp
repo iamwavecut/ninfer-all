@@ -2,7 +2,7 @@
 // carries kernels outside the runtime (the Windows kernel DLL) links its own copy of them without
 // the rest of device.cu. Each copy calls its own module's CUDA runtime, which registered that
 // module's kernels.
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <cstdio>
 #include <cstdlib>

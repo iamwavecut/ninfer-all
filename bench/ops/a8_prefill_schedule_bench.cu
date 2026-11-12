@@ -12,7 +12,7 @@
 // Cold timing is not optional here. These GEMMs stream tens of MB of weights per call against 6 MB
 // of L2, so a warm loop measures a residency production never has.
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer_bench_common.h"

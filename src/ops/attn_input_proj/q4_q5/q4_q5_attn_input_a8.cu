@@ -11,7 +11,7 @@
 
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/weight_view.h"
 #include "ops/common/rowsplit_a8_mma.cuh"
 

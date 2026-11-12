@@ -1,7 +1,7 @@
 #include "ops/launcher/layer_norm.h"
 
 #include "ops/kernel/layer_norm.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 
 #include <cstdint>
 #include <limits>

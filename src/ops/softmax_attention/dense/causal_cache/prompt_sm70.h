@@ -14,7 +14,7 @@
 // compiled, skips the tiles of pages another rank holds, and writes FP32 outputs and log-sum-exps
 // for the cross-rank merge instead of BF16 rows.
 
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>

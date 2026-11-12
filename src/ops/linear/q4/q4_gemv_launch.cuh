@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/linear/q4/q4_launch.h"
 #include "ops/linear/q4/q4_rowsplit_gemv.cuh"

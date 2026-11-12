@@ -1,6 +1,6 @@
 #include "ops/kv_cache/append/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/nvfp4_kernel.cuh"
 #include "ops/kv_cache/plane_types.h"

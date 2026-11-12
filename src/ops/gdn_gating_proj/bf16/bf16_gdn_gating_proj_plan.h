@@ -2,7 +2,7 @@
 
 #include "core/weight.h"
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/tensor.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 

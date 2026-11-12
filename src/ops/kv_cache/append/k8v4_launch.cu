@@ -1,7 +1,7 @@
 // ninfer::ops::detail - asymmetric FP8-K/NVFP4-V append launch ownership.
 #include "ops/kv_cache/append/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/k8v4_kernel.cuh"
 #include "ops/kv_cache/plane_types.h"

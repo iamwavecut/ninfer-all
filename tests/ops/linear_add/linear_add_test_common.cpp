@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear_add/linear_add_test_common.h"
 
 #include "ninfer/ops/linear_add.h"

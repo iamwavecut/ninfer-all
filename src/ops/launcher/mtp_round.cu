@@ -2,7 +2,7 @@
 // Match: K=1..31 verified drafts (up to 63 at B=1), followed by P=1..15 MTP proposals.
 #include "ops/launcher/mtp_round.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/kernel/mtp_round.cuh"
 
 #include <cstdint>

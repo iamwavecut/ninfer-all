@@ -8,7 +8,8 @@
 #   * scripts/check-include-boundaries.py -- only include/ninfer/engine.h includes the umbrella
 #     ninfer/types.h, and no CUDA translation unit under src/ reaches the Engine-level public
 #     headers, so a change to the Engine options, requests or statistics does not recompile the
-#     kernels.
+#     kernels; and no CUDA translation unit under src/ops/ reaches the host API headers
+#     (core/device.h, ninfer/ops/linear.h, ninfer/ops/softmax_attention.h, core/paged_kv_cache.h).
 #
 #   * scripts/check-linux-scripts.sh -- the guard over the shell scripts shipped in the Linux
 #     release archive. Running it *here* rather than only on the Windows box is the point: two

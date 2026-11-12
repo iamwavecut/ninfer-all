@@ -1,7 +1,7 @@
 #include "core/weight.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_simt.cuh"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_epilogue.cuh"

@@ -1,6 +1,6 @@
 #include "core/mapped_host_copy.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/device_wait.h"
 
 #include <cuda_runtime.h>

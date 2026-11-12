@@ -1,6 +1,6 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/gdn_input_proj/gdn_conv.cuh"
 
 #include <cuda_bf16.h>

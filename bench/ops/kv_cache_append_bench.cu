@@ -1,12 +1,12 @@
 // Public-Op benchmark for full and device-count-prefix KV cache append contracts.
 // Cache encoding, launch geometry, and route selection remain private to the public wrappers.
 
-#include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/softmax_attention_envelope.h"
 #include "ninfer/ops/kv_cache_append.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/cyclic_kv_cache.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
 #include "ninfer_bench_common.h"
 

@@ -1,6 +1,6 @@
 #include "ops/linear_attention/gated_delta_net/two_stage/launch.h"
 
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
