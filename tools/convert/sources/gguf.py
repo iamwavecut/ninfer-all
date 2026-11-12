@@ -37,7 +37,9 @@ ROW_GAP_BYTES = 1024 * 1024
 TYPE_F32 = 0
 TYPE_F16 = 1
 TYPE_BF16 = 30
-# Integer tensors (llama.cpp's metadata carried as tensors, such as a hash's constants).
+# Integer tensors (llama.cpp's metadata carried as tensors, such as a hash's constants, or raw
+# bytes such as Strata's FP8 n-gram table).
+TYPE_I8 = 24
 TYPE_I32 = 26
 TYPE_I64 = 27
 TYPE_PQ2_0 = 142
@@ -52,6 +54,7 @@ TYPE_NAMES = {
     TYPE_F32: "F32",
     TYPE_F16: "F16",
     TYPE_BF16: "BF16",
+    TYPE_I8: "I8",
     TYPE_I32: "I32",
     TYPE_I64: "I64",
     TYPE_PQ2_0: "PQ2_0",
@@ -68,6 +71,7 @@ BLOCK_GEOMETRY = {
     TYPE_F32: (1, 4),
     TYPE_F16: (1, 2),
     TYPE_BF16: (1, 2),
+    TYPE_I8: (1, 1),
     TYPE_I32: (1, 4),
     TYPE_I64: (1, 8),
     TYPE_PQ2_0: (128, 34),

@@ -164,10 +164,11 @@ def _hc(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
 
 
 def expected_tensors(
-    ple_layers: tuple[int, ...] = (1,), experts: int = EXPERTS
+    ple_layers: tuple[int, ...] = (1,), experts: int = EXPERTS, routed: bool = True
 ) -> dict[str, tuple[tuple[int, ...], str]]:
     """Row-major shape and kind of every tensor of the model shard; an expert-pruned release keeps
-    `experts` of the 512 (and one router row for each)."""
+    `experts` of the 512 (and one router row for each). A skeleton GGUF, whose routed experts are
+    stored elsewhere (an Edge0 release), has none of the three expert banks (`routed` false)."""
 
     out = {
         "token_embd.weight": ((VOCABULARY, HIDDEN), MATRIX),
@@ -188,13 +189,16 @@ def expected_tensors(
         out |= {
             p + "ffn_gate_inp.weight": ((experts, HIDDEN), MATRIX),
             p + "ffn_gate_inp_shexp.weight": ((HIDDEN,), "direct"),
-            p + "ffn_gate_exps.weight": ((experts, EXPERT_WIDTH, HIDDEN), MATRIX),
-            p + "ffn_up_exps.weight": ((experts, EXPERT_WIDTH, HIDDEN), MATRIX),
-            p + "ffn_down_exps.weight": ((experts, HIDDEN, EXPERT_WIDTH), MATRIX),
             p + "ffn_gate_shexp.weight": ((SHARED_WIDTH, HIDDEN), MATRIX),
             p + "ffn_up_shexp.weight": ((SHARED_WIDTH, HIDDEN), MATRIX),
             p + "ffn_down_shexp.weight": ((HIDDEN, SHARED_WIDTH), MATRIX),
         }
+        if routed:
+            out |= {
+                p + "ffn_gate_exps.weight": ((experts, EXPERT_WIDTH, HIDDEN), MATRIX),
+                p + "ffn_up_exps.weight": ((experts, EXPERT_WIDTH, HIDDEN), MATRIX),
+                p + "ffn_down_exps.weight": ((experts, HIDDEN, EXPERT_WIDTH), MATRIX),
+            }
         if full_attention(layer):
             out |= {
                 p + "attn_q.weight": ((2 * QUERY_ROWS, HIDDEN), MATRIX),
@@ -287,8 +291,10 @@ def _stored(info, kind: str) -> bool:
     return info.type_id in DIRECT
 
 
-def validate(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None) -> None:
-    """Refuse any GGUF that is not the Flash-Next text model this config describes."""
+def validate(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None,
+             routed: bool = True) -> None:
+    """Refuse any GGUF that is not the Flash-Next text model this config describes (without its
+    routed expert banks when `routed` is false)."""
 
     for key, expected in EXPECTED_HEADER.items():
         if gguf.kv.get(key) != expected:
@@ -309,7 +315,7 @@ def validate(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None
     for layer, kind in zip(indices, config["layer_types"], strict=True):
         if (kind == "full_attention") != full_attention(layer):
             raise ValueError("the qwen4exp GGUF recipe needs QSA on every fourth block")
-    expected = expected_tensors((1,), config["num_experts"])
+    expected = expected_tensors((1,), config["num_experts"], routed)
     model = {name for name in gguf.tensors if name != NGRAM_TENSOR}
     if model != set(expected):
         missing = sorted(set(expected) - model)[:5]
@@ -317,7 +323,9 @@ def validate(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None
         raise ValueError(f"{gguf.path}: tensor set mismatch (missing {missing}, extra {extra})")
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
-        if info.shape != shape or not _stored(info, kind):
+        # A vector may be stored as a one-row matrix (Strata's skeleton keeps ffn_gate_inp_shexp so).
+        vector = kind == "direct" and len(shape) == 1 and info.shape == (1, *shape)
+        if (info.shape != shape and not vector) or not _stored(info, kind):
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
     if gguf.truncated():
         raise ValueError(f"{gguf.path}: the data section is truncated")
@@ -522,14 +530,15 @@ def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, 
     return out
 
 
-def _moe_sources(out: dict, gguf: GGUFFile, g: str, m: str, experts: int) -> None:
+def _moe_sources(out: dict, gguf: GGUFFile, g: str, m: str, experts: int,
+                 routed: bool = True) -> None:
     out[m + "router"] = matrix_source(gguf, g + "ffn_gate_inp.weight", (experts, HIDDEN), rows())
     out[m + "shared_score"] = (
         _direct(_words(gguf, g + "ffn_gate_inp_shexp.weight").reshape(1, HIDDEN),
                 torch.bfloat16, g + "ffn_gate_inp_shexp.weight"),
         False,
     )
-    for expert in range(experts):
+    for expert in range(experts if routed else 0):
         e = m + f"experts/{expert}/"
         out[e + "gate"] = matrix_source(gguf, g + "ffn_gate_exps.weight", (EXPERT_WIDTH, HIDDEN),
                                         rows(expert * EXPERT_WIDTH))
@@ -545,9 +554,10 @@ def _moe_sources(out: dict, gguf: GGUFFile, g: str, m: str, experts: int) -> Non
                                            (HIDDEN, SHARED_WIDTH), rows())
 
 
-def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None
-                 ) -> dict[str, tuple[LogicalSource, bool]]:
-    """Every text parameter's GGUF source; True marks encoded block rows."""
+def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None,
+                 routed: bool = True) -> dict[str, tuple[LogicalSource, bool]]:
+    """Every text parameter's GGUF source; True marks encoded block rows. A skeleton GGUF supplies
+    every parameter but the routed experts (`routed` false)."""
 
     out: dict[str, tuple[LogicalSource, bool]] = {}
 
@@ -614,7 +624,7 @@ def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | 
                                        untile(taps[2 * GDN_KEY_DIM:], GDN_HEAD_DIM)])
             direct(n + "convolution", _direct(channels.T, torch.bfloat16, g + "ssm_conv1d.weight"))
             direct(n + "norm", _norm(gguf, g + "ssm_norm.weight", False))
-        _moe_sources(out, gguf, g, p + "moe/", config["num_experts"])
+        _moe_sources(out, gguf, g, p + "moe/", config["num_experts"], routed)
         if layer in config["ple_layers"]:
             q = p + "ple/"
             matrix(q + "key", g + "ple_key.weight", (WIDTH, HIDDEN))

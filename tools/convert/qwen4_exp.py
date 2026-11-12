@@ -6,6 +6,11 @@ every block, and a hashed n-gram embedding (PLE) injected into the residual befo
 MTP block of one more QSA layer drafts for speculative decoding. The converter normalises the
 checkpoint's config into the text and MTP components' configs, which
 src/models/qwen4_exp/config.cpp parses strictly.
+
+A latent MoE (`text_config.latent_moe`, Edge0's models) keeps the router and the shared expert and
+moves the routed experts into a narrower space: each layer has `groups` pairs of projections, an
+encoder `[width, hidden]` and a decoder `[hidden, width]`, every expert belongs to one group, its
+gate and up rows read the encoder's output and its down rows write the decoder's input.
 """
 
 from __future__ import annotations
@@ -22,6 +27,29 @@ def _nonnegative(value, name):
     if type(value) is not int or value < 0:
         raise ValueError(f"{name}: expected a nonnegative integer")
     return value
+
+
+def latent_moe_config(raw: dict) -> dict | None:
+    """The optional `latent_moe` object of a text config: the latent width, the projection groups
+    per layer, and which of the two optional operands the artifact stores (the per-expert output
+    multipliers of an NVFP4 release, the per-layer input column scale of a Q3_K release)."""
+
+    latent = raw.get("latent_moe")
+    if latent is None:
+        return None
+    keys = {"width", "groups", "expert_scales", "column_scale"}
+    if not isinstance(latent, dict) or set(latent) != keys:
+        raise ValueError(f"text.latent_moe must hold exactly {sorted(keys)}")
+    for key in ("expert_scales", "column_scale"):
+        if type(latent[key]) is not bool:
+            raise ValueError(f"text.latent_moe.{key} must be boolean")
+    width = _positive(latent["width"], "text.latent_moe.width")
+    groups = _positive(latent["groups"], "text.latent_moe.groups")
+    # Every latent activation is quantized in whole q8_1 blocks of 32 values.
+    if width % 32:
+        raise ValueError("text.latent_moe.width must be a whole number of 32-value blocks")
+    return {"width": width, "groups": groups, "expert_scales": latent["expert_scales"],
+            "column_scale": latent["column_scale"]}
 
 
 def text_config(source: dict) -> dict:
@@ -128,6 +156,11 @@ def text_config(source: dict) -> dict:
         raise ValueError("text.indexer_budget must be a whole number of compressed blocks")
     if result["ple_embed_dim"] % ((result["ngram_size"] - 1) * result["heads_per_ngram"]):
         raise ValueError("text.ple_embed_dim must divide among the n-gram heads")
+    latent = latent_moe_config(raw)
+    if latent is not None:
+        if latent["groups"] > result["num_experts"]:
+            raise ValueError("text.latent_moe.groups exceeds the expert count")
+        result["latent_moe"] = latent
     return result
 
 
@@ -203,6 +236,43 @@ def _ple(builder, prefix, source_prefix, store, config):
     # Each channel's taps stay contiguous, oldest first, as ple_inject reads them.
     builder.add(prefix + "ple/convolution", store, source + "conv1d.weight",
                 (hc * h, taps), source_shape=(hc * h, 1, taps))
+
+
+def _latent_moe(builder, prefix, source_prefix, store, config):
+    """A latent MoE's parameters: the router and the shared expert as in the plain MoE, the two
+    projections, the experts' group labels, the optional scales, and experts whose gate and up rows
+    read `latent.width` values and whose down rows write them. No checkpoint names these tensors;
+    a recipe supplies every source (tools/convert/edge0.py)."""
+
+    from .model import Parameter
+    from .sources.logical import LogicalSource
+
+    latent = config["latent_moe"]
+    h, experts, middle = (config["hidden_size"], config["num_experts"],
+                          config["moe_intermediate_size"])
+    width, groups = latent["width"], latent["groups"]
+    builder.moe(prefix, source_prefix, store, config, routed=False)
+    p = prefix + "moe/"
+
+    def add(name, shape, inputs=(), direct="bf16"):
+        def unavailable(begin, end, name=name):
+            raise ValueError(f"{name}: a latent MoE parameter has no checkpoint source")
+
+        builder.model.add(Parameter(name, shape, LogicalSource(shape, name, unavailable), None,
+                                    tuple(inputs), direct, residency="text"))
+
+    add(p + "latent/encode", (groups * width, h), (prefix + "ffn_input",))
+    add(p + "latent/decode", (groups * h, width), (p + "latent/sum",))
+    add(p + "latent/labels", (experts,), direct="int32")
+    if latent["expert_scales"]:
+        add(p + "latent/expert_scales", (experts, 3), direct="fp32")
+    if latent["column_scale"]:
+        add(p + "latent/column_scale", (width,), direct="fp32")
+    for expert in range(experts):
+        e = p + f"experts/{expert}/"
+        add(e + "gate", (middle, width), (p + "latent/input",))
+        add(e + "up", (middle, width), (p + "latent/input",))
+        add(e + "down", (width, middle), (e + "product",))
 
 
 def ngram_config(source: dict) -> dict:
@@ -386,7 +456,10 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
             _indexer(builder, p, sp, base, config)
         else:
             builder.gdn(p, sp, base, config)
-        builder.moe(p, sp, base, config)
+        if "latent_moe" in config:
+            _latent_moe(builder, p, sp, base, config)
+        else:
+            builder.moe(p, sp, base, config)
         if i in config["ple_layers"]:
             _ple(builder, p, sp, base, config)
     if "vision" in selected:

@@ -18,6 +18,8 @@ from .qwen4_exp import _ARCHITECTURES as QWEN4_EXP_ARCHITECTURES
 from .qwen4_exp import build_model as build_qwen4_exp
 from .qwen4_exp_gguf import RECIPES as QWEN4_EXP_GGUF_RECIPES
 from .qwen4_exp_gguf import with_gguf_expert_count, with_mtp_expert_count
+from .edge0 import RECIPES as EDGE0_RECIPES
+from .edge0 import Edge0Pack, with_latent_moe
 from .recipe import Recipe
 from .sources.gguf import GGUFFile, open_gguf
 from .sources.safetensors import SafetensorsSource
@@ -49,8 +51,8 @@ def _open_named_source(name: str, path: Path, block_sources: frozenset[str]):
 class SourceInputs(Mapping):
     """Named optional sources are opened only when a recipe or component requests one."""
 
-    def __init__(self, base, paths, stack, block_sources):
-        self._sources = {"base": base}
+    def __init__(self, base, paths, stack, block_sources, opened=None):
+        self._sources = {"base": base, **(opened or {})}
         self._paths = dict(paths)
         self._stack = stack
         self._block_sources = block_sources
@@ -111,7 +113,7 @@ def _layers(value: str):
 
 def _function(value: str):
     recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES, **QWEN4_EXP_GGUF_RECIPES,
-               **GEMMA4_RECIPES, **FLINT_RECIPES, **DEEPSEEK_V41_RECIPES}
+               **EDGE0_RECIPES, **GEMMA4_RECIPES, **FLINT_RECIPES, **DEEPSEEK_V41_RECIPES}
     if value in recipes:
         return recipes[value]
     filename, function = _recipe_parts(value)
@@ -154,7 +156,10 @@ def main(argv=None):
         action="append",
         default=[],
         metavar="NAME=PATH",
-        help="named source such as quantized, dflash, dflash2, or mtp (replaces the base MTP head)",
+        help="named source such as quantized, dflash, dflash2, or mtp (replaces the base MTP head); "
+        "for Qwen3.8-Flash-Next pack=FOLDER, an Edge0 release folder, whose skeleton, n-gram table, "
+        "MTP block, tokenizer and chat template are the defaults of gguf, ngram, mtp and the two "
+        "resources",
     )
     parser.add_argument(
         "--components",
@@ -332,7 +337,18 @@ def main(argv=None):
             raise ValueError("--layers is implemented for Qwen3.8-Flash-Next")
         # Flash-Next's MTP GGUF is read block by block, as its model shard is.
         block_sources = frozenset(("ternary", "gguf", "ngram") + (("mtp",) if flash_next else ()))
-        sources = SourceInputs(base, paths, stack, block_sources)
+        opened = {}
+        if "pack" in paths:
+            if not flash_next:
+                raise ValueError("--source pack names an Edge0 release of Qwen3.8-Flash-Next")
+            # An Edge0 release: a latent MoE beside the skeleton, table and MTP block it ships.
+            pack = opened["pack"] = stack.enter_context(Edge0Pack(paths["pack"]))
+            paths.setdefault("gguf", pack.skeleton)
+            paths.setdefault("ngram", pack.table)
+            for role, path in pack.resources().items():
+                overrides.setdefault(role, path)
+            base.config = with_latent_moe(base.config, pack)
+        sources = SourceInputs(base, paths, stack, block_sources, opened)
         if args.components is None:
             components = ("text", "ngram") if flash_next else ("text",)
         else:

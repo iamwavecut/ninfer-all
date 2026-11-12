@@ -1,4 +1,5 @@
-"""Stream Flash-Next's sharded HF n-gram table into independent FP8/FP16 rows."""
+"""Flash-Next's n-gram table as independent FP8/FP16 rows: streamed from the HF checkpoint's
+sharded rows, or kept from Strata's FP8 table GGUF."""
 
 from __future__ import annotations
 
@@ -11,9 +12,9 @@ import struct
 import torch
 
 from tools.artifact.codecs.fp8_row import encode_fp8_row_interleaved
-from .methods import fp8_row_maxabs
+from .methods import fp8_row_maxabs, import_encoded
 from .quantization.fp8_row import quantize_bf16_rows
-from .sources.logical import LogicalSource
+from .sources.logical import EncodedRows, LogicalSource
 from .sources.safetensors import SafetensorsSource
 
 FORMAT = "fp8_e4m3fn_row_fp16"
@@ -107,11 +108,82 @@ def fp8_table_digest(source: LogicalSource, *, rows_per_chunk: int = 4096) -> st
     return digest.hexdigest()
 
 
+STRATA_TENSOR = "per_layer_token_embd.weight"
+
+
+def is_strata_fp8_table(table) -> bool:
+    """Whether a GGUF is Strata's FP8 table (`ple_fp8_pack.py`): the checkpoint's E4M3FN bytes as
+    one I8 tensor, with the one scale of the whole table in `strata.ple.scale`."""
+
+    return table.kv.get("strata.ple.format") == "f8_e4m3"
+
+
+def strata_fp8_source(table, descriptor: dict) -> tuple[LogicalSource, dict]:
+    """Strata's FP8 table as rows of this format, each row with the table's one scale, which must
+    be a binary16 value so that every row decodes to the stored numbers. A NaN code becomes zero,
+    as the reference engine reads it; the returned counter adds up those codes as rows are read."""
+
+    import numpy as np
+
+    rows, width = descriptor["rows"], descriptor["row_width"]
+    info = table.info(STRATA_TENSOR)
+    if info.shape != (rows, width) or info.type_name != "I8":
+        raise ValueError(f"{table.path}: {STRATA_TENSOR} is {info.type_name} {info.shape}, "
+                         f"expected I8 {(rows, width)}")
+    scale = table.kv.get("strata.ple.scale")
+    if type(scale) is not float or not scale > 0 or float(np.float16(scale)) != scale:
+        raise ValueError(f"{table.path}: strata.ple.scale = {scale!r} is not a positive value "
+                         "that binary16 holds exactly")
+    row_scale = torch.tensor(scale, dtype=torch.float16)
+    counter = {"nan_codes": 0}
+
+    def encoded(first: int, last: int) -> EncodedRows:
+        codes = table.tensor_bytes(STRATA_TENSOR, first * width, last * width)
+        codes = codes.reshape(last - first, width)
+        nan = (codes & 0x7F) == 0x7F
+        counter["nan_codes"] += int(np.count_nonzero(nan))
+        codes[nan] = 0
+        return EncodedRows(FORMAT, torch.from_numpy(codes),
+                           row_scale.expand(last - first).contiguous())
+
+    def values(begin: int, end: int) -> torch.Tensor:
+        first, last = begin // width, -(-end // width)
+        words = encoded(first, last).codes.view(torch.float8_e4m3fn).to(torch.float32)
+        flat = (words * scale).reshape(-1)
+        return flat[begin - first * width:end - first * width]
+
+    return LogicalSource((rows, width), f"{table.path}:FP8 table", values, encoded), counter
+
+
+def encoded_table_digest(source: LogicalSource, *, rows_per_chunk: int = 1 << 18) -> str:
+    """SHA-256 of exactly the row bytes the writer stores from a source's encoded rows."""
+
+    digest = hashlib.sha256()
+    rows, width = source.shape
+    for begin in range(0, rows, rows_per_chunk):
+        end = min(begin + rows_per_chunk, rows)
+        words = source.read_encoded(begin, end)
+        digest.update(encode_fp8_row_interleaved(words.codes, words.scales, (end - begin, width)))
+    return digest.hexdigest()
+
+
 def configure_ngram(model, recipe, table) -> None:
-    """Select HF FP8 rows or preserve an IQ4_NL GGUF table for either text recipe."""
+    """Select HF FP8 rows, Strata's FP8 table or an IQ4_NL GGUF table for either text recipe."""
     from .qwen4_exp_gguf import configure_ngram_gguf
     from .sources.gguf import GGUFFile
 
+    if isinstance(table, GGUFFile) and is_strata_fp8_table(table):
+        descriptor = model.components["ngram"]["config"]
+        source, counter = strata_fp8_source(table, descriptor)
+        size = source.shape[0] * (source.shape[1] + 2)
+        print(f"hashing Strata's FP8 n-gram rows ({size / 1e9:.1f} GB)", flush=True)
+        descriptor["format"] = FORMAT
+        descriptor["table_sha256"] = encoded_table_digest(source)
+        if counter["nan_codes"]:
+            print(f"{counter['nan_codes']} NaN codes of the table are stored as zero", flush=True)
+        if "ngram/table" in model.parameters:
+            recipe.assign("ngram/table", format=FORMAT, method=import_encoded, source=source)
+        return
     if isinstance(table, GGUFFile):
         configure_ngram_gguf(model, recipe, table)
         return
