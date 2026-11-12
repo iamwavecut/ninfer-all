@@ -814,6 +814,12 @@ proposes from the context in place of the drafter as it does under MTP; `--adapt
 `--spec mtp`, and pipeline stages are refused. The drafter's mathematics is in
 [DFlash and DFlash2](maintainer/dflash.md#qwen38-flash-next).
 
+`--spec dspine --draft-model PATH --draft-tokens N` drafts instead with a
+[DSpine](maintainer/dspine.md) drafter trained for this model, up to its block less one: through
+the same features, ring lanes, rounds, acceptance and `--draft-min-p`, with DSpine's block and code
+bridge, on one device or under tensor parallelism. No DSpine drafter for Qwen3.8-Flash-Next is
+published yet.
+
 Without `--spec`, an artifact with the drafter and host experts on one device drafts four tokens a
 round with `--draft-min-p 0.7`; over pipeline stages its MTP block drafts instead. On an RTX 3090
 with host experts (EPYC 7K62, 96 CPUs; 256 greedy tokens after a code prompt and after a prose

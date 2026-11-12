@@ -450,7 +450,7 @@ SessionSnapshot ProgramImpl::save_continuation(const ContinuationHandle& continu
     }
     if (is_masked_draft_backend(speculative_backend)) {
         throw std::invalid_argument(
-            "session persistence does not support the DFlash/DFlash2 backends");
+            "session persistence does not support the DFlash/DFlash2/DSpine backends");
     }
     const SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];
 
@@ -714,7 +714,7 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
     }
     if (is_masked_draft_backend(speculative_backend)) {
         throw std::invalid_argument(
-            "session persistence does not support the DFlash/DFlash2 backends");
+            "session persistence does not support the DFlash/DFlash2/DSpine backends");
     }
     if (hybrid_) {
         // Hybrid mode retains context in its prefix index and never holds a catalogued

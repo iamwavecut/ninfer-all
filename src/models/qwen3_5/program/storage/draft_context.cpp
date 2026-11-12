@@ -10,6 +10,7 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
       prefill_positions(layout.prefill_positions.bind(backing)),
       pending_features(layout.pending_features.bind(backing)) {
     if (layout.full) { full.emplace(backing, *layout.full); }
+    if (layout.dspine_head_write) { dspine_head_write = layout.dspine_head_write->bind(backing); }
 }
 
 CyclicKVCacheLayerView DFlashPersistentState::local_layer(std::uint32_t layer) const {

@@ -20,6 +20,7 @@
 
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
+#include "models/dspine/drafter.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
@@ -1039,6 +1040,9 @@ public:
     std::vector<std::unique_ptr<GdnReplayRecords>> extra_replay_records;
     std::vector<std::unique_ptr<ops::GdnReplayFoldPlan>> extra_replay_fold;
     std::optional<DFlashPersistentState> dflash;
+    // --spec dspine: the standalone drafter over this Program's target, its ring the state
+    // images' local cache and its table dflash->dspine_head_write.
+    std::optional<dspine::Drafter> dspine_drafter;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;

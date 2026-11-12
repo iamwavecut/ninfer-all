@@ -38,6 +38,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [tmark00/ninfer](https://github.com/tmark00/ninfer) | table-decoded E8 roots, the SM-count RMSNorm cutoff, the WebUI MCP proxy |
 | [quardex/ninfer-all](https://github.com/quardex/ninfer-all) (A. Ugryumov) | the Turing (`sm_75`) build: its MMA forms, BF16-cache attention on FP16 tensor cores, every KV coding in 64 KiB of shared memory, the Turing path of the Q8 K-split contraction and the TITAN RTX profile |
 | [2-com-org/ninfer-qwen](https://github.com/2-com-org/ninfer-qwen) (Micky Zhang) | host-side time to first token: the n-gram index on zero pages and built beside the prefill, NFC normalization only between NFC boundaries, Jinja `strip` over the trimmed characters, word-wide prefix shortlist digests, the small-T attention modules loaded at Program startup |
+| [Dylan997S/ninfer-dspine-rtx5090](https://github.com/Dylan997S/ninfer-dspine-rtx5090) | DSpine on the Qwen3.5 core: the split of its code bridge into Ops and the table form of its refinement, adapted to this tree |
 | pelebel, natpate | openable server URLs and CORS preflight echoes |
 | Matt Anderson | wide Q5 split tiles and an idle Engine that fails only the request it cannot place |
 | hyz615, lededev, NikolaFC | schema assertions in constrained decoding; the disk tier persisted on an orderly stop and MSVC-safe test builtins; Q8_0 `ssm_alpha`/`ssm_beta` in GGUF conversion |
@@ -89,6 +90,11 @@ two-stage GDN prefill, parallel query tiles, MX FP8 MMA and Minnnn's column-band
   `strata-dsv41`. The order in which `--draft-experts` keeps the DSpark drafter's experts is
   [Basalt](https://github.com/jesdga95/basalt)'s profile `deepseek41-40x384-dspark.prof` (MIT,
   copyright 2026 Jesús Gulfo).
+- The DSpine drafter artifact converts Tencent's
+  [Qwen3.8-27B-DSpine-b16](https://huggingface.co/tencent/Qwen3.8-27B-DSpine-b16) (Apache-2.0).
+  DSpine support follows Tencent's reference implementation
+  ([Tencent/DSpine](https://github.com/Tencent/DSpine), Apache-2.0) and its paper,
+  [arXiv 2609.36173](https://arxiv.org/abs/2609.36173).
 - The SiLU shared by the GPU's GGUF expert kernels and the CPU's expert products evaluates e^x with
   the single-precision polynomial of Stephen L. Moshier's Cephes Math Library.
 - llama.cpp's GGUF block kernels are vendored in `third_party/ggml-quants` under their MIT license;

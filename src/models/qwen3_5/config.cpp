@@ -284,6 +284,25 @@ DraftConfig draft(const Json& value, const DraftTarget& target, bool dflash2) {
     return out;
 }
 
+// A DSpine drafter's config as the masked-draft machinery reads a DFlash2 one: every layer
+// sliding at the trained window, the same taps and mask token.
+DraftConfig draft(const dspine::Config& value) {
+    DraftConfig out;
+    out.attention               = {value.num_attention_heads, value.num_key_value_heads,
+                                   value.head_dim};
+    out.intermediate_size       = value.intermediate_size;
+    out.num_hidden_layers       = value.num_hidden_layers;
+    out.max_position_embeddings = value.max_position_embeddings;
+    out.rms_norm_eps            = value.rms_norm_eps;
+    out.rope_theta              = value.rope_theta;
+    out.layer_types.assign(value.num_hidden_layers, DraftAttentionKind::SlidingAttention);
+    out.sliding_window   = value.sliding_window;
+    out.target_layer_ids = value.target_layer_ids;
+    out.mask_token_id    = value.mask_token_id;
+    out.dspine           = value;
+    return out;
+}
+
 } // namespace
 
 DraftConfig parse_draft_config(const Json& value, const DraftTarget& target, bool dflash2) {
@@ -393,6 +412,13 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
                               {out.text.hidden_size, out.text.vocab_size,
                                out.text.num_hidden_layers},
                               options.speculative == SpeculativeBackend::DFlash2);
+        }
+        if (options.speculative == SpeculativeBackend::DSpine) {
+            const auto drafter = dspine::read_config(options.draft_model);
+            dspine::check_target(drafter, out.text.hidden_size, out.text.vocab_size,
+                                 out.text.num_hidden_layers,
+                                 architecture_name(out.text.architecture));
+            out.draft = draft(drafter);
         }
         return out;
     } catch (const std::exception& error) {

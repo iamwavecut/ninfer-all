@@ -78,6 +78,7 @@ other references own narrower contracts:
 | [Pipeline stages](maintainer/pipeline-stages.md) | `--devices`: whole-layer stages over several GPUs, and `--tensor-parallel`: every layer divided over them; what each covers, verification and measurements |
 | [Quality trades](maintainer/quality-trade-experiments.md) | the precision options and what each costs and buys |
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
+| [DSpine](maintainer/dspine.md) | the standalone DSpine drafter: artifact, code bridge, refinement and state in every family |
 | [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | candidate selection, retention, materialization and Device/Host checkpoint policy |
 | [Hybrid prefix cache](maintainer/hybrid-prefix-cache-spec.md) | the default prefix cache of `ninfer-serve`: block tree, sparse state snapshots, tap placement, Host slab tier, eviction and automatic configuration |
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |

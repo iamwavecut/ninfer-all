@@ -114,7 +114,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
     }
     std::pair<std::size_t, std::size_t> draft_parameters{bindings.weights.size(),
                                                          bindings.weights.size()};
-    if (out->config.draft) {
+    // A DSpine drafter is its own artifact, which materialize_model loads beside this one.
+    if (out->config.draft && !out->config.draft->dspine) {
         out->weights.draft =
             loading::bind_draft(bindings, *out->config.draft, text, out->weights.text,
                                 std::string(options.speculative_component()));
@@ -253,7 +254,11 @@ std::uint64_t head_stage_bytes(const artifact::Reader& reader, loading::Bindings
             }
         }
     }
-    if (config.draft && options.masked_draft()) {
+    if (config.draft && config.draft->dspine) {
+        // A DSpine drafter's own artifact and the table it derives from the head.
+        out += dspine::weight_bytes(options.draft_model) +
+               dspine::head_write_bytes(*config.draft->dspine);
+    } else if (config.draft && options.masked_draft()) {
         // The drafter shares the target's embedding and head, so only what it binds anew counts.
         const std::size_t first = bindings.weights.size();
         (void)loading::bind_draft(bindings, *config.draft, text, weights,
@@ -749,11 +754,20 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             loading::vision_overlay_layout(*data->weights.vision, bound, backing.pinned_block());
     }
     AuxiliaryReplicas replicas(bound, device);
-    return std::unique_ptr<Model>(
+    const bool dspine     = data->options.dspine();
+    const auto draft_path = data->options.draft_model;
+    auto model            = std::unique_ptr<Model>(
         new Model(std::move(data->config), data->options, std::move(data->weights),
                   std::move(bound), std::move(replicas), std::move(data->resources),
                   std::move(data->info), std::move(backing), std::move(vision_overlay),
                   std::move(data->cpu_vision), std::move(experts)));
+    if (dspine) {
+        // On the head's device, where the drafts' embedding, head and round state are.
+        model->dspine_ = dspine::load_model(
+            draft_path, device, observer,
+            artifact::MaterializeOptions{.suspendable = materialize.suspendable});
+    }
+    return model;
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

@@ -8,13 +8,14 @@
 // tokenizer and chat template, which the shared frontend serves in its DeepSeek dialect. With
 // LoadOptions::dspark the DSpark drafter's blocks bind too, all on the device; with
 // LoadOptions::vision the vision tower, and the image routing bias the MoE routers select image
-// positions with.
+// positions with. With LoadOptions::dspine a standalone DSpine drafter artifact loads beside it.
 
 #include "artifact/materializer.h"
 #include "core/device.h"
 #include "core/expert_delivery.h"
 #include "core/startup.h"
 #include "models/deepseek_v41/config.h"
+#include "models/dspine/model.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/weights.h"
@@ -139,6 +140,9 @@ struct LoadOptions {
     std::optional<std::uint32_t> draft_experts;
     // Binds the artifact's `vision` component, which must then exist, in this placement.
     VisionPlacement vision = VisionPlacement::None;
+    // Loads the standalone DSpine drafter artifact at this path (--spec dspine --draft-model) on
+    // rank 0, the head's device; empty for none. It excludes the DSpark drafter.
+    std::filesystem::path dspine;
 };
 
 class Model {
@@ -166,6 +170,8 @@ public:
     }
     [[nodiscard]] const std::optional<VisionWeights>& vision() const noexcept { return vision_; }
     [[nodiscard]] VisionPlacement vision_placement() const noexcept { return vision_placement_; }
+    // The standalone DSpine drafter, when loaded (LoadOptions::dspine).
+    [[nodiscard]] const dspine::Model* dspine() const noexcept { return dspine_.get(); }
     [[nodiscard]] ExpertResidency expert_residency() const noexcept { return expert_residency_; }
     // Host or disk experts: one bank per block, in block order.
     [[nodiscard]] std::span<const ExpertBanks> expert_banks() const noexcept { return expert_banks_; }
@@ -216,6 +222,7 @@ private:
     ExpertResidency expert_residency_ = ExpertResidency::Device;
     std::vector<ExpertBanks> expert_banks_;
     std::vector<std::filesystem::path> expert_files_;
+    std::unique_ptr<dspine::Model> dspine_;
 };
 
 // Whether the artifact's text component is DeepSeek-V4.1, and whether it carries the DSpark drafter

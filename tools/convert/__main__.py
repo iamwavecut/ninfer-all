@@ -35,6 +35,9 @@ from .deepseek_v41 import ARCHITECTURES as DEEPSEEK_V41_ARCHITECTURES
 from .deepseek_v41 import RECIPES as DEEPSEEK_V41_RECIPES
 from .deepseek_v41 import GGUFShards
 from .deepseek_v41 import build_model as build_deepseek_v41
+from .dspine import RECIPES as DSPINE_RECIPES
+from .dspine import build_model as build_dspine
+from .dspine import is_dspine
 from .ternary import RECIPES as TERNARY_RECIPES
 
 
@@ -137,7 +140,8 @@ def _layers(value: str):
 
 def _function(value: str):
     recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES, **QWEN4_EXP_GGUF_RECIPES,
-               **EDGE0_RECIPES, **GEMMA4_RECIPES, **FLINT_RECIPES, **DEEPSEEK_V41_RECIPES}
+               **EDGE0_RECIPES, **GEMMA4_RECIPES, **FLINT_RECIPES, **DEEPSEEK_V41_RECIPES,
+               **DSPINE_RECIPES}
     if value in recipes:
         return recipes[value]
     filename, function = _recipe_parts(value)
@@ -236,6 +240,30 @@ def main(argv=None):
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
         architectures = base.config.get("architectures") or [None]
+        if is_dspine(base.config):
+            if (paths or overrides or args.layers or args.proposal
+                    or (args.components or "dspine") != "dspine"):
+                raise ValueError("a DSpine drafter converts alone into its own artifact: "
+                                 "--model DRAFTER --recipe dspine_q8 (or dspine_bf16); the "
+                                 "engine takes it with --draft-model")
+            model = build_dspine(base)
+            recipe = Recipe(model)
+            _function(args.recipe)(model, recipe, {"base": base})
+            if args.override:
+                _function(args.override)(model, recipe, {"base": base})
+            report = convert(
+                model, recipe, args.out, name=args.name,
+                provenance={"converter": "ninfer-v3", "recipe": args.recipe,
+                            "sources": {"base": {"path": str(args.model)}}},
+                device=args.device, rows_per_chunk=args.rows_per_chunk,
+                max_file_bytes=args.max_file_bytes,
+                progress=lambda index, total, job: print(
+                    f"[{index+1}/{total}] {job.parameters[0]}"
+                    + (f" (+{len(job.parameters)-1})" if len(job.parameters) > 1 else "")
+                    + f": {job.spec.format} {job.spec.shape}", flush=True))
+            print(f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, "
+                  f"{report['seconds']:.1f}s", flush=True)
+            return
         flash_next = architectures[0] in QWEN4_EXP_ARCHITECTURES
         gemma4 = architectures[0] in GEMMA4_ARCHITECTURES
         flint = architectures[0] in FLINT_ARCHITECTURES

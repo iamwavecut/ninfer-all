@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -91,25 +92,31 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
                                     "applies to Qwen3.5-family models");
     }
     if (options.enable_vision) { throw std::invalid_argument("Flint has no vision tower"); }
-    // Flint publishes no draft head: a speculative round verifies what a context lookup proposes.
+    // Flint's release has no draft head: a speculative round verifies what a context lookup or
+    // a standalone DSpine drafter (--spec dspine --draft-model) proposes.
     const SpeculativeOptions& speculative = options.speculative;
-    if (speculative.backend != SpeculativeBackend::None) {
-        throw std::invalid_argument("Flint has no draft model; it drafts by context lookup only "
-                                    "(--lookup-ngram, without --spec)");
+    const bool dspine = speculative.backend == SpeculativeBackend::DSpine;
+    if (speculative.backend != SpeculativeBackend::None && !dspine) {
+        throw std::invalid_argument("Flint drafts with a DSpine drafter (--spec dspine "
+                                    "--draft-model) or by context lookup (--lookup-ngram)");
     }
     const std::uint32_t lookup_drafts =
         speculative.lookup_ngram == 0 ? 0
         : speculative.draft_tokens != 0 ? speculative.draft_tokens
                                         : SpeculativeOptions::kAutomaticDraftTokens;
-    if (lookup_drafts > 7) {
-        throw std::invalid_argument("Flint: --lookup-ngram verifies 1 to 7 drafts (--draft-tokens)");
+    if (lookup_drafts > 7 || (dspine && (speculative.draft_tokens == 0 ||
+                                         speculative.draft_tokens > 7))) {
+        throw std::invalid_argument("Flint verifies 1 to 7 drafts a round (--draft-tokens)");
     }
-    if (speculative.draft_min_p.value_or(0.0F) != 0 || speculative.mtp_attention_window != 0 ||
-        speculative.ngram_draft_tokens != 0 || speculative.ngram_archive_bytes != 0 ||
-        speculative.proposal_head != ProposalHead::Auto ||
+    if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine) ||
+        speculative.mtp_attention_window != 0 || speculative.ngram_draft_tokens != 0 ||
+        speculative.ngram_archive_bytes != 0 ||
+        speculative.proposal_head == ProposalHead::Optimized ||
+        (speculative.proposal_head != ProposalHead::Auto && !dspine) ||
         speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
-        throw std::invalid_argument("Flint has no --draft-min-p, --adaptive-mtp, n-gram copy "
-                                    "proposals or archive, --mtp-attention-window or proposal head");
+        throw std::invalid_argument("Flint has no --adaptive-mtp, n-gram copy proposals or "
+                                    "archive, --mtp-attention-window or proposal head, and "
+                                    "--draft-min-p only with --spec dspine");
     }
     if (options.kv_cache != KvCacheStorage::BFloat16) {
         throw std::invalid_argument("Flint keeps its KV cache in F16 (no --kv-dtype formats)");
@@ -137,14 +144,15 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
     models::flint::LoadOptions load{.artifact = options.artifact_path,
                                     .experts  = options.expert_residency};
+    if (dspine) { load.dspine = speculative.draft_model; }
     // Expert parallelism: the routed experts divided over the devices, everything else on the
     // first. Without --tensor-split each device takes a share of its speed that fits beside what
     // it holds.
     if (options.tensor_parallel) {
         load.expert_split = options.tensor_split;
         if (load.expert_split.empty()) {
-            load.expert_split = models::flint::default_expert_split(reader, rank_free_bytes(device),
-                                                                    rank_copy_bandwidth(device));
+            load.expert_split = models::flint::default_expert_split(
+                reader, rank_free_bytes(device), rank_copy_bandwidth(device), load.dspine);
         }
     }
     auto model = models::flint::load_model(reader, load, device, &options.startup_observer);
@@ -173,7 +181,8 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
     executor.max_context   = options.max_context;
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs   = options.use_cuda_graph;
-    executor.draft_tokens  = lookup_drafts;
+    executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
+    executor.dspine        = dspine;
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
@@ -272,6 +281,17 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
                            "Flint: context-lookup speculative decoding, %u-token match, up to %u "
                            "drafts a round",
                            speculative.lookup_ngram, lookup_drafts);
+    }
+    if (dspine) {
+        const auto& drafter = *model->dspine();
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Flint: DSpine drafter %s, up to %u drafts a round%s, ring of %u "
+                           "positions; weights %.0f MiB, ring, table and workspace %.0f MiB",
+                           drafter.name().c_str(), speculative.draft_tokens,
+                           lookup_drafts != 0 ? " where no context lookup matches" : "",
+                           models::dspine::ring_capacity(drafter.config(), options.max_context),
+                           double(drafter.device_bytes()) / 1048576.0,
+                           double(instance->executor->memory().drafter_bytes) / 1048576.0);
     }
     ConstructedFlint out;
     const auto& stats              = model->storage_stats();
@@ -425,8 +445,11 @@ struct FlintCore::Impl {
     const std::uint32_t domain;
     const bool structured_output;
     const bool reuse_prefixes;
-    const std::uint32_t drafts;       // a lookup's drafts a round; 0 without speculation
+    const std::uint32_t drafts;       // drafts a round; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
+    const bool dspine;                // --spec dspine: the drafter proposes where no lookup does
+    // --draft-min-p: a DSpine round verifies through its first draft at or below this probability.
+    const float draft_floor;
     const DiagnosticObserver diagnostics;
 
     mutable std::mutex queue_mutex;
@@ -502,7 +525,10 @@ struct FlintCore::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
-          lookup_ngram(options.speculative.lookup_ngram), diagnostics(options.diagnostic_observer),
+          lookup_ngram(options.speculative.lookup_ngram),
+          dspine(options.speculative.backend == SpeculativeBackend::DSpine),
+          draft_floor(options.speculative.draft_min_p.value_or(0.0F)),
+          diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
               options.decode_rounds_per_prefill != 0
@@ -1089,6 +1115,7 @@ struct FlintCore::Impl {
         r.reused = r.prefilled = reused;
         if (drafts > 0) {
             r.speculative.enabled      = true;
+            r.speculative.backend      = dspine ? SpeculativeBackend::DSpine : SpeculativeBackend::None;
             r.speculative.draft_window = drafts;
             r.speculative.accepted_per_position.assign(drafts, 0);
         }
@@ -1802,11 +1829,42 @@ struct FlintCore::Impl {
         return found;
     }
 
-    // One step of every decoding request. Those whose context proposes a continuation run one
-    // speculative round together, the rest one batched decode step.
+    // DSpine proposals of `steps` drafts for each request of `rows` at once, each cut after its
+    // first draft at or below the floor.
+    std::vector<std::vector<TokenId>> drafter_proposals(
+        const std::vector<std::shared_ptr<Request>>& rows, std::uint32_t steps) {
+        std::vector<std::uint32_t> sequences;
+        std::vector<std::int32_t> anchors;
+        for (const auto& request : rows) {
+            sequences.push_back(request->slot);
+            anchors.push_back(request->feed.front());
+        }
+        std::vector<std::int32_t> drafted(rows.size() * steps);
+        std::vector<float> confidence(rows.size() * steps);
+        instance.executor->draft(sequences, anchors, steps, drafted, confidence);
+        std::vector<std::vector<TokenId>> out(rows.size());
+        for (std::size_t j = 0; j < rows.size(); ++j) {
+            std::uint32_t length = steps;
+            for (std::uint32_t i = 0; i < steps; ++i) {
+                const float p = confidence[j * steps + i];
+                if (!std::isfinite(p)) {
+                    throw std::runtime_error("Flint: non-finite DSpine draft confidence");
+                }
+                if (draft_floor > 0 && length == steps && p <= draft_floor) { length = i + 1; }
+            }
+            out[j].assign(drafted.begin() + std::ptrdiff_t(j * steps),
+                          drafted.begin() + std::ptrdiff_t(j * steps + length));
+        }
+        return out;
+    }
+
+    // One step of every decoding request. Those whose context or drafter proposes a continuation
+    // run one speculative round together, the rest one batched decode step.
     void decode_step() {
-        std::vector<std::shared_ptr<Request>> batch, speculative;
+        std::vector<std::shared_ptr<Request>> batch, speculative, drafting;
         std::vector<std::vector<TokenId>> proposals;
+        // Which of the round's proposals came from a context lookup.
+        std::vector<char> looked_up;
         std::size_t decoding = 0;
         for (const Slot& slot : slots) {
             if (slot.request && slot.request->decoding) { ++decoding; }
@@ -1828,20 +1886,37 @@ struct FlintCore::Impl {
             }
             if (steps > 0 && speculates(*request)) {
                 std::vector<TokenId> proposal(steps);
-                if (const std::uint32_t found = lookup(*request, steps, proposal.data())) {
+                const std::uint32_t found =
+                    lookup_ngram != 0 ? lookup(*request, steps, proposal.data()) : 0;
+                if (found != 0) {
                     proposal.resize(found);
                     proposals.push_back(std::move(proposal));
                     speculative.push_back(request);
+                    looked_up.push_back(1);
+                    continue;
+                }
+                if (dspine) {
+                    drafting.push_back(request);
                     continue;
                 }
             }
             batch.push_back(request);
         }
-        if (batch.empty() && speculative.empty() && deferred.empty()) { return; }
+        if (batch.empty() && speculative.empty() && drafting.empty() && deferred.empty()) {
+            return;
+        }
         const auto start = Clock::now();
+        if (!drafting.empty()) {
+            auto drafted = drafter_proposals(drafting, steps);
+            for (std::size_t j = 0; j < drafting.size(); ++j) {
+                proposals.push_back(std::move(drafted[j]));
+                speculative.push_back(drafting[j]);
+                looked_up.push_back(0);
+            }
+        }
         if (!deferred.empty()) { sample_deferred(deferred); }
         if (!batch.empty()) { plain_step(batch); }
-        if (!speculative.empty()) { speculative_round(speculative, proposals); }
+        if (!speculative.empty()) { speculative_round(speculative, proposals, looked_up); }
         std::lock_guard lock(stats_mutex);
         stats.decode_rounds += 1;
         stats.decode_row_rounds += batch.size() + speculative.size();
@@ -1954,7 +2029,8 @@ struct FlintCore::Impl {
     // output policy takes what it accepts of the run, and the executor commits the tokens fed up to
     // the last of them.
     void speculative_round(const std::vector<std::shared_ptr<Request>>& batch,
-                           const std::vector<std::vector<TokenId>>& proposals) {
+                           const std::vector<std::vector<TokenId>>& proposals,
+                           const std::vector<char>& looked_up) {
         auto& executor      = *instance.executor;
         const std::size_t b = batch.size();
         std::vector<std::uint32_t> sequences;
@@ -2183,10 +2259,13 @@ struct FlintCore::Impl {
             r.speculative.rounds += 1;
             r.speculative.drafted_tokens += draft_extents[j];
             r.speculative.accepted_tokens += std::uint32_t(drafts_n);
-            // Reported with the n-gram proposals as well: the context, not a model, proposed them.
-            ++r.speculative.ngram_rounds;
-            r.speculative.ngram_drafted_tokens += draft_extents[j];
-            r.speculative.ngram_accepted_tokens += std::uint32_t(drafts_n);
+            if (looked_up[j] != 0) {
+                // Reported with the n-gram proposals as well: the context, not a model, proposed
+                // them.
+                ++r.speculative.ngram_rounds;
+                r.speculative.ngram_drafted_tokens += draft_extents[j];
+                r.speculative.ngram_accepted_tokens += std::uint32_t(drafts_n);
+            }
             for (std::int32_t i = 0; i < drafts_n; ++i) {
                 ++r.speculative.accepted_per_position[i];
             }

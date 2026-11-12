@@ -181,6 +181,10 @@ ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prepare_masked_block.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_dspine_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dspine.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_moe.cpp"
   LIBRARIES ninfer_ops)

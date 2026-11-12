@@ -487,6 +487,13 @@ that comparison's RTX 4090 host, with and without [the CPU share](#the-cpu-share
 
 One run per row; no spread is measured.
 
+A [DSpine](maintainer/dspine.md) drafter trained for this model can draft instead:
+`--spec dspine --draft-model PATH --draft-tokens N` (1 to 7) loads it beside a model without
+`--spec dspark`, and `--draft-min-p P` verifies through the first draft whose confidence is at or
+below P. Its rounds verify as DSpark's do, for up to eight requests at once. If it taps a block
+after the last KV source block, the [prefill tail](#the-prefill-tail) is off. No DSpine drafter for
+DeepSeek-V4.1 is published yet.
+
 ### The STQ drafter
 
 beamster's `DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw` pack, made for sushi (an engine for Apple

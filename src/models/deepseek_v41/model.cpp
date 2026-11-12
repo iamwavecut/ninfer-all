@@ -152,6 +152,14 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         throw artifact::ArtifactError("the artifact's text component is not DeepseekV41ForCausalLM");
     }
     TextConfig config = parse_text_config(reader.directory().component("text").config);
+    if (!options.dspine.empty()) {
+        if (options.dspark) {
+            throw std::invalid_argument("DeepSeek-V4.1 drafts with one drafter: its DSpark drafter "
+                                        "or a DSpine drafter");
+        }
+        dspine::check_target(dspine::read_config(options.dspine), config.hidden_size,
+                             config.vocab_size, config.num_hidden_layers, "DeepSeek-V4.1");
+    }
     const bool vision = options.vision != VisionPlacement::None;
     if (vision && !has_vision(reader)) {
         throw artifact::ArtifactError("the artifact carries no vision tower (convert with "
@@ -455,6 +463,9 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             model->expert_files_.push_back(file.path ? options.artifact.parent_path() / *file.path
                                                      : options.artifact);
         }
+    }
+    if (!options.dspine.empty()) {
+        model->dspine_ = dspine::load_model(options.dspine, device, observer);
     }
     return model;
 }

@@ -7,7 +7,10 @@
 // a CUDA graph per batch size. Both add each head's learned sink to its softmax denominator.
 //
 // With draft_tokens, verify() runs a sequence's next token (its anchor) and up to draft_tokens
-// proposed tokens after it (a context lookup's) as decode rows, and commit() keeps the first ones.
+// proposed tokens after it (a context lookup's or a DSpine drafter's) as decode rows, and commit()
+// keeps the first ones. With a DSpine drafter (ExecutorOptions::dspine) every pass stores the
+// drafter's taps of the rows it computes, the rows a sequence keeps go into the drafter's context
+// ring (a lane per sequence and one per checkpoint), and draft() proposes.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -45,6 +48,8 @@ struct ExecutorOptions {
     std::uint32_t draft_tokens = 0;
     // One checkpoint of every sequence's rings (snapshot/restore), allocated with the caches.
     bool checkpoints = true;
+    // Drafts with the model's DSpine drafter (Model::dspine(), draft_tokens of them at most).
+    bool dspine = false;
     std::optional<std::uint64_t> expert_cache_bytes;
     // Host or disk experts: the cache's first contents, the most routed of these counts
     // ([expert layer][expert]) once warm-up is done; none leaves the cache empty then.
@@ -65,6 +70,8 @@ struct ExecutorMemory {
     std::uint64_t kv_backed_bytes = 0;
     bool kv_grows                 = false;
     std::uint64_t workspace_bytes = 0;
+    // A DSpine drafter's ring, table, features and workspace (its weights are the model's).
+    std::uint64_t drafter_bytes = 0;
     ExpertDeliveryMemory experts;
 };
 
@@ -76,9 +83,10 @@ struct SequenceSnapshot {
     std::uint32_t position = 0;
 };
 
-// A sequence's state in host memory, laid out as image_bytes() sizes it: its sliding-window rings
-// and its full-attention rows below `position`. The context cache keeps prefixes this way beyond
-// the device's sequences; the header travels beside the bytes.
+// A sequence's state in host memory, laid out as image_bytes() sizes it: its sliding-window rings,
+// its full-attention rows below `position` and a DSpine drafter's ring slots of the positions
+// before it. The context cache keeps prefixes this way beyond the device's sequences; the header
+// travels beside the bytes.
 struct SequenceImage {
     std::uint32_t position = 0;
 };
@@ -141,13 +149,22 @@ public:
                 std::span<const std::uint32_t> widths = {});
     // Keeps the first kept[j] (1..its width) of sequence j's verified tokens.
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept);
+    // DSpine (ExecutorOptions::dspine): for each of `sequences` (distinct, at most 8), the greedy
+    // drafts of the `k` (1..draft_tokens) positions after its anchor, the token it reads next,
+    // and each draft's probability under the drafter, k a sequence in `drafts` and `confidence`;
+    // returns once they are on the host.
+    void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
+               std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence);
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
     // Takes the sequence back `tokens` positions, to the state it had before it read them: false,
     // changing nothing, when its sliding-window rings no longer hold the window before that
     // position (they hold it for as many positions as their slots exceed the window and a
-    // round's drafts, and not before the sequence's last prompt, checkpoint or image).
+    // round's drafts, and not before the sequence's last prompt, checkpoint or image). A DSpine
+    // ring that has wrapped keeps, in the slots of the window's oldest `tokens` positions, the
+    // keys of the positions given back: later drafts see those slots as context, which changes
+    // the drafts only (the verification keeps the output exact).
     bool rewind(std::uint32_t sequence, std::uint32_t tokens);
     // Bytes of an image at `position`.
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;

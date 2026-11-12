@@ -54,7 +54,9 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   N` proposes what followed the last N tokens' earlier occurrence in the sequence (up to
   `--draft-tokens`, 3 by default, at most 7): the occurrence the sequence was already copying while
   it still matches, else the newest, and the target verifies the proposal in one pass of
-  decode rows; the output is the one plain decoding gives.
+  decode rows; the output is the one plain decoding gives. A [DSpine](maintainer/dspine.md)
+  drafter trained for Flint drafts with `--spec dspine --draft-model PATH --draft-tokens N` (1 to
+  7); none is published yet.
 - **Expert residency.** The routed experts stay on the GPU, in pinned host memory or in the
   artifact's files, with a device cache and a CPU share of decode misses
   ([below](#expert-residency)).

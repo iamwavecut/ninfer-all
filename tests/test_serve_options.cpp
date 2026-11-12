@@ -198,6 +198,29 @@ int main() {
         failures += check(rejected, "server accepted an invalid --draft-confidence");
     }
     {
+        // A DSpine drafter: the artifact --draft-model names beside --spec dspine, nowhere else.
+        const auto spine = parse({"ninfer-serve", "model.ninfer", "--spec", "dspine",
+                                  "--draft-model", "drafter.ninfer", "--draft-tokens", "7",
+                                  "--draft-min-p", "0.3"}).speculative;
+        failures += check(spine.backend == ninfer::SpeculativeBackend::DSpine &&
+                              spine.draft_model == "drafter.ninfer" && spine.draft_tokens == 7 &&
+                              spine.draft_min_p == 0.3F && spine.ngram_draft_tokens == 0,
+                          "server did not preserve --spec dspine");
+        for (const auto& args : std::vector<std::vector<std::string>>{
+                 {"--spec", "dspine", "--draft-tokens", "7"},
+                 {"--spec", "dspine", "--draft-model", "d.ninfer"},
+                 {"--spec", "dspine", "--draft-model", "d.ninfer", "--draft-tokens", "16"},
+                 {"--spec", "mtp", "--draft-tokens", "4", "--draft-model", "d.ninfer"},
+                 {"--draft-model", "d.ninfer"}}) {
+            std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
+            full.insert(full.end(), args.begin(), args.end());
+            bool rejected = false;
+            try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "server accepted --draft-model or --spec dspine out of "
+                                        "their contract");
+        }
+    }
+    {
         // Without --spec, --draft-tokens sizes a context lookup (Flint, DeepSeek-V4.1).
         const auto lookup = parse({"ninfer-serve", "model.ninfer", "--lookup-ngram", "4",
                                    "--draft-tokens", "5"}).speculative;

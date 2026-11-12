@@ -11,6 +11,7 @@ include(models/qwen4_exp/tests.cmake)
 include(models/gemma4/tests.cmake)
 include(models/flint/tests.cmake)
 include(models/deepseek_v41/tests.cmake)
+include(models/dspine/tests.cmake)
 include(ops/tests.cmake)
 
 ninfer_finalize_bundle(ninfer_tests)

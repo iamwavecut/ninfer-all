@@ -14,6 +14,9 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `reference/` — bounded checkpoint range fetch, exact subset bytes and hash manifests;
 - `models/qwen3_5/` — config/binding, frontend, state/context stores, workspace, MTP alignment and
   opt-in real Engine integration;
+- `models/dspine/` — the DSpine drafter and its lane runtime over a converted drafter of random
+  weights, against an FP64 evaluation of the drafter (needs NumPy, safetensors and PyTorch, else
+  skipped);
 - `ops/` — semantic Op qualification with independent mathematical or state-transition oracles;
   Linear and fused Linear suites are separated by their supported weight/activation paths;
 - root C++ tests — core storage, runtime admission/resource policy, public API, serving protocols,

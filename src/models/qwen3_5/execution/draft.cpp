@@ -7,6 +7,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
+#include "models/dspine/drafter.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -36,6 +37,7 @@
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -43,9 +45,21 @@ namespace {
 using detail::DFlashPersistentState;
 
 void require_dflash_state(const PrefillContext& state) {
-    if (state.dflash == nullptr || !state.execution.parameters.draft.has_value()) {
+    if (state.dflash == nullptr || (!state.execution.parameters.draft.has_value() &&
+                                    state.dflash->dspine == nullptr)) {
         throw std::logic_error("masked draft schedule requires its weights and state");
     }
+}
+
+// The DSpine drafter's ring: every layer's view of the state images' local cache.
+std::vector<CyclicKVCacheLayerView> dspine_ring(const DFlashPersistentState& state,
+                                                std::uint32_t layers) {
+    std::vector<CyclicKVCacheLayerView> out;
+    out.reserve(layers);
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        out.push_back(state.local_layer(layer));
+    }
+    return out;
 }
 
 DFlashPersistentState& dflash_state(PrefillContext& state) {
@@ -99,6 +113,20 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
         const std::int32_t columns = width * batch;
+        if (const auto* drafter = dflash_state(state).dspine) {
+            // The DSpine drafter projects, normalizes and stores the context itself; a single
+            // row wider than its ring keeps the last window, as below.
+            const auto ring = dspine_ring(dflash_state(state), config.num_hidden_layers);
+            drafter->materialize(
+                {.features  = features,
+                 .positions = positions,
+                 .counts    = commit_counts,
+                 .lanes     = lanes,
+                 .min_count = envelope.min_count,
+                 .max_count = envelope.max_count},
+                ring, state.execution.work, state.execution.device.stream);
+            return;
+        }
         nvtx::ScopedRange append_range(nvtx::Name::DFlashContextAppend, nvtx::Category::DFlash,
                                        static_cast<std::uint64_t>(columns));
         if (width <= 0 || batch <= 0 || features.dtype != DType::BF16 ||
@@ -370,7 +398,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads),
                      dimension(config.attention.num_key_value_heads)},
-                    dimension(config.sliding_window.value_or(0)),
+                    dimension(config.sliding_window.value_or(0)), ops::SlidingWindowMask::Symmetric,
                     static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
                     state.dflash.local_layer(static_cast<std::uint32_t>(layer_index)),
                     envelopes.local, work, attention, stream);
@@ -481,9 +509,35 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
     }
 }
 
+// The DSpine drafter's block over the frame's rows: its drafts, their 16 candidates and the
+// sampled proposal law the sparse verification reads.
+void propose_dspine_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame, int batch,
+                          int k) {
+    const auto& config = *state.execution.parameters.model.config().draft;
+    auto& work         = state.execution.work;
+    const auto ring    = dspine_ring(state.dflash, config.num_hidden_layers);
+    work.reset();
+    state.dflash.dspine->propose(
+        {.anchors       = frame.anchors.slice(0, 0, batch),
+         .frontiers     = frame.execution_frontiers.slice(0, 0, batch),
+         .valid_columns = frame.proposal_valid_columns.slice(0, 0, batch),
+         .lanes         = frame.state_destination_slots.slice(0, 0, batch),
+         .configs       = frame.sampling,
+         .batch         = batch,
+         .width         = k + 1,
+         .drafts        = frame.draft_tokens.slice(1, 0, batch),
+         .candidates    = frame.candidate_ids.slice(2, 0, batch),
+         .proposal_q    = frame.proposal_q.slice(2, 0, batch),
+         .confidence    = {}},
+        ring, work, state.execution.device.stream);
+    work.reset();
+}
+
 void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
                         std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
-    if (state.execution.parameters.model.config().draft->dflash2) {
+    if (state.dflash.dspine != nullptr) {
+        propose_dspine_batch(state, frame, batch_size, static_cast<int>(k));
+    } else if (state.execution.parameters.model.config().draft->dflash2) {
         nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                                          static_cast<std::uint64_t>(k + 1U) * batch_size);
         propose_dflash2_batch(state, frame, batch_size, k, envelopes);
@@ -574,6 +628,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                          dimension(config.attention.num_attention_heads),
                          dimension(config.attention.num_key_value_heads)},
                         dimension(config.sliding_window.value_or(0)),
+                        ops::SlidingWindowMask::Symmetric,
                         static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
                         dflash_state(state).local_layer(config.compact_layer_index(layer)),
                         envelopes.local, state.execution.work, attention_batch,
@@ -702,9 +757,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
 
         state.execution.work.reset();
-        Tensor compact_features = state.execution.work.alloc(
-            DType::BF16, {dimension(state.execution.parameters.draft->feature_projection.weight.k),
-                          frame.append_positions.ne[0], batch_size});
+        const auto& draft_config = *state.execution.parameters.model.config().draft;
+        Tensor compact_features  = state.execution.work.alloc(
+            DType::BF16,
+            {dimension(state.execution.parameters.model.config().text.hidden_size *
+                       std::uint64_t(draft_config.target_layer_ids.size())),
+             frame.append_positions.ne[0], batch_size});
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
                                    context_starts, frontiers, compact_features, append_positions,
                                    append_counts, state.execution.device.stream);
@@ -736,10 +794,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             Tensor candidates;
             Tensor proposal_q;
             // DFlash keeps its deterministic-draft verifier and count publication contract.
-            // DFlash2 represents the same deterministic proposal as a one-hot sparse law.
-            if (state.execution.parameters.model.config().draft->dflash2.has_value()) {
+            // DFlash2 and DSpine represent the same deterministic proposal as a one-hot sparse
+            // law.
+            if (draft_config.dflash2.has_value() || draft_config.dspine.has_value()) {
                 if (!frame.candidate_ids.data || !frame.proposal_q.data) {
-                    throw std::logic_error("DFlash2 ngram requires a sparse acceptance frame");
+                    throw std::logic_error("sparse ngram copies require a sparse acceptance frame");
                 }
                 const std::initializer_list<std::int32_t> sparse_shape{
                     ops::kSparseSpeculativeCandidates, static_cast<std::int32_t>(k), batch_size};

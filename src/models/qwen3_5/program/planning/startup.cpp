@@ -30,6 +30,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
+#include "models/dspine/drafter.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
 #include "runtime/contract/rope_scaling.h"
@@ -262,9 +263,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         const auto* draft =
             parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;
         if (plan.features.masked_draft()) {
+            // DSpine's ring is the narrowest attention window that sees the whole context.
             state_image_spec.dflash_local = qwen3_5::DFlashLocalStateSpec{
                 .layers   = draft->local_layer_count(),
-                .capacity = draft->sliding_window.value_or(0),
+                .capacity = draft->dspine ? dspine::ring_capacity(*draft->dspine, plan.capacity)
+                                          : draft->sliding_window.value_or(0),
                 .kv_heads = dimension(draft->attention.num_key_value_heads),
                 .head_dim = dimension(draft->attention.head_dim),
             };
@@ -362,6 +365,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                  static_cast<std::int32_t>(widest_verify_window(plan) + 1U),
                  static_cast<std::int32_t>(plan.max_concurrency)},
                 "DFlash pending target features");
+            if (draft->dspine) {
+                dflash.dspine_head_write = add_tensor(
+                    builder, DType::BF16,
+                    {dimension(draft->dspine->rank), dimension(draft->dspine->vocab_size)},
+                    "DSpine head-write table");
+            }
         }
     }
 
@@ -1064,7 +1073,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     if (plan.features.masked_draft()) {
         {
-            const auto* draft                  = &*parameters.model.config().draft;
+            const auto* draft = &*parameters.model.config().draft;
+            // DSpine: its Drafter's own workspace at the ring the state images hold, and the
+            // target head's at each call's columns.
+            const std::uint32_t dspine_ring =
+                draft->dspine ? dspine::ring_capacity(*draft->dspine, plan.capacity) : 0U;
+            if (draft->dspine && parameters.dspine == nullptr) {
+                throw std::logic_error("--spec dspine plans without its drafter");
+            }
+            const auto head_bytes = [&](std::int32_t columns) {
+                WorkspaceLayoutBuilder head;
+                linear_scratch(head, parameters.text.output_head, 1, columns);
+                return finish(head);
+            };
             const auto dflash_context_capacity = [&](std::int32_t width, std::int32_t batch,
                                                      bool compact_input) {
                 const auto tokens = width * batch;
@@ -1074,6 +1095,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                            dimension(config.hidden_size *
                                      std::uint64_t(draft->target_layer_ids.size())),
                            tokens);
+                }
+                if (draft->dspine.has_value()) {
+                    scratch(layout, dspine::Drafter::context_workspace_bytes(
+                                        *parameters.dspine, dspine_ring, width, batch));
+                    return finish(layout);
                 }
                 if (draft->dflash2.has_value()) {
                     const auto local_width =
@@ -1104,6 +1130,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens          = width * batch;
                 const std::int32_t proposal_drafts = width - 1;
+                if (draft->dspine.has_value()) {
+                    scratch(layout, dspine::Drafter::proposal_workspace_bytes(
+                                        *parameters.dspine, logits_dtype, dspine_ring,
+                                        plan.capacity, width, batch,
+                                        head_bytes(proposal_drafts * batch)));
+                    return finish(layout);
+                }
                 matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
                 if (draft->dflash2.has_value()) {
                     const bool fused = draft->fused_dflash2(config.hidden_size);
@@ -1265,6 +1298,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             out.dflash_context = dflash_context_capacity(chunk, 1, false);
+            if (draft->dspine.has_value()) {
+                // The head-write table's derivation at startup.
+                const auto concurrency = static_cast<std::int32_t>(plan.max_concurrency);
+                out.dflash_context = std::max(
+                    out.dflash_context,
+                    dspine::Drafter::prepare_workspace_bytes(
+                        *parameters.dspine, logits_dtype, concurrency, drafts + 1,
+                        head_bytes(dspine::Drafter::prepare_columns(*parameters.dspine,
+                                                                    concurrency, drafts + 1))));
+            }
             for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
                  ++batch) {
                 std::size_t target_bytes = 0;
@@ -1278,7 +1321,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     target_bytes = std::max(target_bytes, finish(target));
                 }
                 const std::size_t accept =
-                    draft->dflash2.has_value()
+                    draft->dflash2.has_value() || draft->dspine.has_value()
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), {false},
                               narrowest_drafts, verify_drafts, batch, batch)
@@ -1369,7 +1412,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // Past the native window positions run unscaled RoPE or YaRN, to four times the window: the
     // extension Qwen documents for these models (1,048,576 tokens on a 262,144-token window).
     constexpr std::uint64_t kPositionExtension = 4;
-    if (parameters.draft &&
+    if ((parameters.draft || parameters.dspine) &&
         options.max_context >
             kPositionExtension * parameters.model.config().draft->max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the selected draft position capacity");
@@ -1456,6 +1499,19 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("masked draft window must be in [1,15]");
         }
         break;
+    case SpeculativeBackend::DSpine: {
+        const auto& draft = parameters.model.config().draft;
+        if (parameters.dspine == nullptr || !draft || !draft->dspine) {
+            throw std::invalid_argument("--spec dspine needs its drafter artifact (--draft-model)");
+        }
+        if (options.speculative.draft_tokens == 0 ||
+            options.speculative.draft_tokens + 1 > draft->dspine->block_size ||
+            options.speculative.draft_tokens > 15) {
+            throw std::invalid_argument(
+                "the DSpine draft window must be in [1, min(15, block_size - 1)]");
+        }
+        break;
+    }
     case SpeculativeBackend::DSpark:
         throw std::invalid_argument("--spec dspark drafts for DeepSeek-V4.1 only");
     }
@@ -1487,12 +1543,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
           options.speculative.backend != SpeculativeBackend::DFlash &&
+          options.speculative.backend != SpeculativeBackend::DSpine &&
           options.speculative.backend != SpeculativeBackend::Mtp) ||
          options.speculative.ngram_draft_tokens > 63 || options.speculative.ngram_min_match < 4 ||
          options.speculative.ngram_min_match > 64 ||
          (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1))) {
         throw std::invalid_argument(
-            "ngram requires MTP/DFlash/DFlash2, K1..63 and match 4..64; the GDN conv-record "
+            "ngram requires MTP/DFlash/DFlash2/DSpine, K1..63 and match 4..64; the GDN conv-record "
             "workspace admits at most 16 verification columns for a multi-request batch, so K "
             "above 15 requires concurrency one");
     }

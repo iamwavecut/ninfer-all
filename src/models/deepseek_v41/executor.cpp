@@ -12,6 +12,7 @@
 #include "models/deepseek_v41/kernels.h"
 #include "models/deepseek_v41/vision.h"
 #include "models/divided_head.h"
+#include "models/dspine/runtime.h"
 #include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
@@ -274,6 +275,8 @@ struct Pass {
     // A prompt call without logit rows: its last block leaves only its window latents (and a kv
     // source's compressed rows), since no row reads that block's output.
     bool kv_only = false;
+    // A prompt call's first row a DSpine drafter keeps (t: none).
+    int spine_row = 0;
 };
 
 } // namespace
@@ -433,6 +436,12 @@ struct Executor::Impl {
         std::unique_ptr<CudaCompletionEvent> copied;
     };
     std::optional<Drafter> drafter;
+    // A standalone DSpine drafter (ExecutorOptions::dspine): its ring, table and features, and the
+    // FP32 rows a tap's streams' mean passes through on its way there. Branch passes keep nothing
+    // in it (in_branches).
+    std::unique_ptr<dspine::Runtime> spine;
+    DeviceBuffer spine_stage;
+    bool in_branches = false;
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(std::move(o)), config(m.config()),
@@ -486,6 +495,13 @@ struct Executor::Impl {
         head          = matrix(model, w.output_head);
         final_norm    = fp32(model, w.final_norm, hidden);
         if (!is_gguf(embedding.qtype)) { throw std::invalid_argument("DeepSeek-V4.1: GGUF token table"); }
+        if (options.dspine && (model.dspine() == nullptr || model.dspark() ||
+                               options.draft_tokens == 0 ||
+                               options.draft_tokens + 1 > model.dspine()->config().block_size)) {
+            throw std::invalid_argument("deepseek_v41 executor: DSpine drafting needs the model's "
+                                        "DSpine drafter alone and 1 to its block less one drafts "
+                                        "a round");
+        }
         {
             const auto window_freq = rope_freq(int(config.rope_dim), config.rope_theta, 0, 1, 0, 0);
             const auto yarn_freq   = rope_freq(int(config.rope_dim), config.compress_rope_theta,
@@ -530,6 +546,11 @@ struct Executor::Impl {
                           std::size_t(window) * model.dspark_config()->target_layers.size() * hidden * 4;
             }
             needed += std::size_t(prefill_ring) * kernels::kWindowRowBytes;
+            if (options.dspine) {
+                needed += dspine::Runtime::planned_bytes(*model.dspine(), DType::FP32,
+                                                         spine_options()) +
+                          spine_stage_bytes();
+            }
             if (options.checkpoints) {
                 // The held state (hold()): another copy of every sequence's rings.
                 needed += (config.num_hidden_layers +
@@ -697,9 +718,120 @@ struct Executor::Impl {
             }
         }
         workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
+        if (options.dspine) { make_spine(); }
         allocate_expert_peers();
         if (split_by_room) { size_expert_ranges(); }
         if (!model.expert_banks().empty()) { plan_delivery(); }
+    }
+
+    // ---- A DSpine drafter ----------------------------------------------------------------------
+
+    // Its state: a lane per sequence and one per checkpoint; the taps of a prompt step's last
+    // window of rows (a span's when spans may run) or of a decode or verification call's rows; and
+    // proposals for up to eight sequences at once.
+    [[nodiscard]] dspine::RuntimeOptions spine_options() const {
+        const dspine::Config& c    = model.dspine()->config();
+        const std::uint32_t window = dspine::ring_capacity(c, options.max_context);
+        const std::uint32_t step =
+            model.expert_banks().empty()
+                ? options.prefill_chunk
+                : std::max(options.prefill_chunk,
+                           std::min(options.max_context, kSpanChunks * options.prefill_chunk));
+        dspine::RuntimeOptions o;
+        o.sequences       = options.sequences;
+        o.kept_states     = options.checkpoints ? 1 : 0;
+        o.max_context     = options.max_context;
+        o.draft_tokens    = options.draft_tokens;
+        o.draft_rows      = std::min<std::uint32_t>(options.sequences, 8);
+        o.commit_rows     = std::min<std::uint32_t>(options.sequences, 8);
+        o.feature_columns = std::max<std::uint32_t>(std::min(step, window),
+                                                    std::uint32_t(gguf::kMaxVectorColumns));
+        const ops::detail::GgufShape shape{head.qtype, head.n, head.k};
+        o.head_bytes = ops::detail::gguf_project_workspace_bytes(
+                           {&shape, 1}, 1, static_cast<std::int32_t>(o.draft_tokens * o.draft_rows)) +
+                       kAlign;
+        return o;
+    }
+
+    // The FP32 rows a tap's streams' mean passes through: a store's piece of columns.
+    [[nodiscard]] std::size_t spine_stage_bytes() const {
+        const dspine::RuntimeOptions o = spine_options();
+        return std::size_t(hidden) * std::min(o.piece_columns, o.feature_columns) * 4;
+    }
+
+    // The drafter reads the target's token rows (its GGUF embedding, before the streams) and its
+    // head as FP32 logits, on rank 0.
+    void make_spine() {
+        dspine::Target target;
+        target.hidden = std::uint32_t(hidden);
+        target.vocab  = std::uint32_t(vocab);
+        target.layers = config.num_hidden_layers;
+        target.domain = static_cast<std::int32_t>(model.resources().public_token_count);
+        target.logits = DType::FP32;
+        target.embed  = [this](const Tensor& ids, Tensor& rows, cudaStream_t on) {
+            gguf::dequantize_rows(ops::detail::gguf_type(embedding.qtype), embedding.qdata,
+                                  row_bytes(embedding), hidden,
+                                  static_cast<const std::int32_t*>(ids.data), ids.ne[0],
+                                  static_cast<__nv_bfloat16*>(rows.data), hidden, on);
+        };
+        target.head = [this](const Tensor& x, Tensor& logits, WorkspaceArena& work,
+                             cudaStream_t on) {
+            Tensor rows = x; // scaled in place where the head's activation keeps F16 sums
+            project_on(rows, head, static_cast<float*>(logits.data), work, on);
+        };
+        spine_stage = DeviceBuffer(spine_stage_bytes());
+        spine = std::make_unique<dspine::Runtime>(*model.dspine(), std::move(target),
+                                                  spine_options());
+    }
+
+    // Whether the drafter reads the last block's output (a pass that keeps only the last block's
+    // window latents would not compute it).
+    [[nodiscard]] bool spine_taps_last() const {
+        return spine && spine->tap_of(std::uint32_t(layers.size() - 1)) >= 0;
+    }
+
+    // Block `layer`'s output for rows [lo, hi) of the streams h ([T][streams][H]), when the drafter
+    // taps it: their streams' mean into feature columns [lo - base, hi - base).
+    void spine_tap(std::size_t layer, const float* h, int lo, int hi, int base) {
+        if (!spine || lo >= hi) { return; }
+        const int tap = spine->tap_of(std::uint32_t(layer));
+        if (tap < 0) { return; }
+        const int piece = int(spine_stage.bytes / (std::size_t(hidden) * 4));
+        for (int row = lo; row < hi; row += piece) {
+            const int m = std::min(piece, hi - row);
+            kernels::stream_mean(h + std::size_t(row) * streams * hidden, m, streams, hidden,
+                                 static_cast<float*>(spine_stage.p), hidden, stream);
+            spine->store_tap(std::uint32_t(tap),
+                             Tensor(spine_stage.p, DType::FP32, {hidden, m}),
+                             std::uint32_t(row - base), stream);
+        }
+    }
+
+    // The first of a prompt call's t rows at `first` that a DSpine drafter keeps: those within its
+    // window before the state the caller keeps (tap_start()); none in a branch pass, which the
+    // sequence does not keep.
+    [[nodiscard]] int spine_start(std::uint32_t first, int t, std::uint32_t state_at) const {
+        if (!spine || in_branches) { return t; }
+        const std::int64_t at = state_at == 0 ? std::int64_t(first) + t : std::int64_t(state_at);
+        return int(std::clamp<std::int64_t>(at - std::int64_t(spine->window()) - std::int64_t(first),
+                                            0, t));
+    }
+
+    void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
+               std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence) {
+        if (!spine) { throw std::logic_error("deepseek_v41: an executor without a DSpine drafter"); }
+        std::vector<std::uint32_t> lanes, at;
+        for (std::size_t j = 0; j < sequences.size(); ++j) {
+            const std::uint32_t s = sequences[j];
+            if (s >= options.sequences ||
+                std::count(sequences.begin(), sequences.begin() + std::ptrdiff_t(j), s) != 0) {
+                throw std::invalid_argument("deepseek_v41 draft: invalid sequence");
+            }
+            require_resumable(s, "draft");
+            lanes.push_back(spine->lane(s));
+            at.push_back(positions[s]);
+        }
+        spine->draft(lanes, anchors, at, k, drafts, confidence, stream);
     }
 
     // The vision tower and the image buffers: a step's flags, a span's rows, an image's patches.
@@ -1258,6 +1390,13 @@ struct Executor::Impl {
         }
         const auto decoders = std::uint32_t(int(layers.size()) - decoder_block);
         exact_rows          = decoders == 0 ? 0 : decoders * std::uint32_t(window - 1) + 1;
+        // A DSpine drafter that taps a decoder block reads its output at every kept row.
+        bool taps_decoder = false;
+        if (options.dspine) {
+            for (const std::uint32_t l : model.dspine()->config().target_layer_ids) {
+                taps_decoder = taps_decoder || int(l) >= decoder_block;
+            }
+        }
         switch (options.prefill_tail) {
         case PrefillTail::Full: tail_rows = 0; break;
         case PrefillTail::Exact: tail_rows = exact_rows; break;
@@ -1271,7 +1410,7 @@ struct Executor::Impl {
             tail_rows = options.prefill_tail_rows;
             break;
         }
-        if (decoders == 0) { tail_rows = 0; }
+        if (decoders == 0 || taps_decoder) { tail_rows = 0; }
         complete_rows = std::min(tail_rows, exact_rows);
         decoder_from.assign(options.sequences, 0);
         decoder_behind.assign(options.sequences, 0);
@@ -2897,8 +3036,12 @@ struct Executor::Impl {
                                 co.comb + std::size_t(row) * streams * streams};
         };
         const std::uint8_t* const images = image_mask;
+        // A DSpine drafter's taps: a prompt call's rows it keeps, a decode or verification pass's
+        // every row.
+        const int spine_row = !spine ? t : s.chunk ? s.spine_row : 0;
         for (std::size_t l = 0; l < layers.size(); ++l) {
             const LayerPlan& p = layers[l];
+            if (l > 0) { spine_tap(l - 1, h, spine_row, t, spine_row); }
             // A prompt call under a prefill tail runs its decoder blocks over its rows from
             // decoder_row on; every other block, and every other pass, over all of them.
             const int r = p.decoder ? s.decoder_row : 0;
@@ -2928,6 +3071,13 @@ struct Executor::Impl {
             pre = ffn_site.pre;
         }
         image_mask = images;
+        if (!s.kv_only) { spine_tap(layers.size() - 1, h, spine_row, t, spine_row); }
+        if (spine && !s.chunk && s.seed) {
+            // A decode step's rows continue their sequences' lanes (a verification's wait for
+            // commit()).
+            spine->commit_rows(Tensor(d_sequences.p, DType::I32, {t}),
+                               Tensor(d_positions.p, DType::I32, {t}), 0, stream);
+        }
         if (tapped > 0 && s.seed) {
             const int from = s.row + tap_row;
             seed(tapped, 0, static_cast<const std::int32_t*>(d_positions.p) + from,
@@ -3048,8 +3198,13 @@ struct Executor::Impl {
         s.logit_column = int(logit_column);
         s.decoder_row  = decoder_row;
         s.tap_row      = tap_start(first, t, state_at);
-        s.kv_only      = logit_rows == 0;
+        s.kv_only      = logit_rows == 0 && !spine_taps_last();
+        s.spine_row    = spine_start(first, t, state_at);
         run(s);
+        if (s.spine_row < t) {
+            spine->commit(spine->lane(sequence), first + std::uint32_t(s.spine_row), 0,
+                          std::uint32_t(t - s.spine_row), stream);
+        }
         decoder_ran(sequence, first + std::uint32_t(t), decoder_row, t);
         positions[sequence] = first + std::uint32_t(t);
     }
@@ -3133,10 +3288,15 @@ struct Executor::Impl {
             return Coefficients{co.pre + std::size_t(row) * streams, co.post + std::size_t(row) * streams,
                                 co.comb + std::size_t(row) * streams * streams};
         };
+        // The span's rows a DSpine drafter keeps.
+        const int spine_row = spine_start(first, n, state_at);
         for (std::size_t l = 0; l < layers.size(); ++l) {
             const LayerPlan& p = layers[l];
             const int from     = p.decoder ? decoder_row : 0;
             for (int row = 0; row < n; row += c) {
+                if (l > 0) {
+                    spine_tap(l - 1, h, std::max(row, spine_row), std::min(row + c, n), spine_row);
+                }
                 // A chunk's rows from `from` on (under the Exact tail, whole chunks).
                 const int lo = std::max(row, from), hi = std::min(row + c, n);
                 if (lo >= hi) { continue; }
@@ -3157,8 +3317,10 @@ struct Executor::Impl {
                                  : static_cast<const std::uint8_t*>(d_image.p) + lo;
                 if (p.engram >= 0) { engram_block(p, hc, s.t, s); }
                 mixes(p.hc_attention, hc, s.t, mix_scratch, a);
-                // The last block of a chunk before the span's logit rows: its window latents alone.
-                const bool kv_only = l + 1 == layers.size() && hi <= n - int(logit_rows);
+                // The last block of a chunk before the span's logit rows: its window latents alone
+                // (unless a DSpine drafter reads its output).
+                const bool kv_only =
+                    l + 1 == layers.size() && hi <= n - int(logit_rows) && !spine_taps_last();
                 // The first block reads stream 0; a later one the previous block's ffn site.
                 attention(p, hc, l == 0 ? nullptr : f.pre, s.t, s,
                           topk + std::size_t(lo) * index_topk,
@@ -3172,6 +3334,11 @@ struct Executor::Impl {
         if (tapped > 0) {
             seed(tapped, 0, static_cast<const std::int32_t*>(d_positions.p) + tap_row, nullptr,
                  sequence);
+        }
+        if (spine_row < n) {
+            spine_tap(layers.size() - 1, h, spine_row, n, spine_row);
+            spine->commit(spine->lane(sequence), first + std::uint32_t(spine_row), 0,
+                          std::uint32_t(n - spine_row), stream);
         }
         if (logit_rows > 0) {
             const int last = n - int(logit_rows);
@@ -3353,6 +3520,14 @@ struct Executor::Impl {
             verified[s].clear();
             positions[s] += kept[j];
         }
+        if (spine) {
+            // The kept rows' taps (each sequence's from its first row) into its lane.
+            for (std::size_t j = 0; j < sequences.size(); ++j) {
+                const std::uint32_t s = sequences[j];
+                spine->commit(spine->lane(s), positions[s] - kept[j],
+                              std::uint32_t(verify_starts[j]), kept[j], stream);
+            }
+        }
         if (drafter) {
             // The kept rows' taps into the drafter's rings, at the positions and sequences the
             // verification staged.
@@ -3403,6 +3578,10 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemcpyAsync(to[i].first, from[i].first, from[i].second,
                                        cudaMemcpyDeviceToDevice, stream));
         }
+        if (spine) {
+            spine->copy_lane(spine->lane(sequence, from_checkpoint ? 1 : 0),
+                             spine->lane(sequence, to_checkpoint ? 1 : 0), stream);
+        }
     }
 
     void copy_hold_state(std::uint32_t sequence, bool save) {
@@ -3440,6 +3619,12 @@ struct Executor::Impl {
         const std::uint32_t from             = decoder_from[sequence];
         const std::uint8_t behind            = decoder_behind[sequence];
         copy_branch_state(sequence, true);
+        // A branch's rows stay out of the DSpine ring: the sequence keeps none of them.
+        in_branches = true;
+        struct Kept {
+            bool& flag;
+            ~Kept() { flag = false; }
+        } kept_flag{in_branches};
         std::size_t at = 0;
         for (std::size_t b = 0; b < lengths.size(); ++b) {
             forward(sequence, tokens.subspan(at, lengths[b]), 1, std::uint32_t(b));
@@ -3459,7 +3644,18 @@ struct Executor::Impl {
         // two, so every route has loaded its kernels before the first graph runs, and each graph
         // has finished before the next call.
         const std::vector<std::int32_t> prompt(std::min<std::uint32_t>(options.prefill_chunk, 16), 2);
+        // A DSpine drafter derives its table first, and drafts at every width once.
+        if (spine) { spine->prepare(stream); }
         forward(0, prompt, 1);
+        if (spine) {
+            const std::uint32_t s = 0;
+            const std::int32_t anchor = 2;
+            for (std::uint32_t k = 1; k <= options.draft_tokens; ++k) {
+                std::vector<std::int32_t> drafts(k);
+                std::vector<float> confidence(k);
+                draft({&s, 1}, {&anchor, 1}, k, drafts, confidence);
+            }
+        }
         reset_state(0);
         const std::uint32_t batches = std::min<std::uint32_t>(options.sequences, 8);
         // A verification's graph is keyed by its rows: one (sequences, width) shape for each.
@@ -3532,7 +3728,7 @@ struct Executor::Impl {
             if (!p.kv_source) { continue; }
             bytes += std::uint64_t(position / std::uint32_t(p.ratio)) * kCompressedRowBytes;
         }
-        return bytes;
+        return bytes + (spine ? spine->image_bytes(position) : 0);
     }
 
     // Copies a sequence's image between the device and the host pages: its rings and tails (from
@@ -3566,6 +3762,7 @@ struct Executor::Impl {
                      rows * area->entry_bytes);
             }
         }
+        if (spine) { spine->copy_image(spine->lane(sequence, checkpoint ? 1 : 0), position, copy); }
     }
 
     SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
@@ -3641,6 +3838,9 @@ ExecutorMemory Executor::memory() const noexcept {
                           .vision_encode_bytes = impl_->tower ? impl_->tower->workspace_bytes() : 0,
                           .vision_owned_bytes  = impl_->vision_owned_bytes(),
                           .drafter_expert_bytes = impl_->drafter_expert_bytes,
+                          .dspine_bytes = impl_->spine ? impl_->spine->device_bytes() +
+                                                             impl_->spine_stage.bytes
+                                                       : 0,
                           .experts = impl_->delivery ? impl_->delivery->memory() : ExpertDeliveryMemory{}};
 }
 
@@ -3771,6 +3971,11 @@ std::uint32_t Executor::dspark_block() const noexcept {
 void Executor::draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
                      std::span<float> confidence) {
     impl_->draft(sequence, anchor, drafts, confidence);
+}
+
+void Executor::draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
+                     std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence) {
+    impl_->draft(sequences, anchors, k, drafts, confidence);
 }
 
 void Executor::verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens,

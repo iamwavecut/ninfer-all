@@ -379,6 +379,11 @@ gives. `--adaptive-mtp` lets the round width follow each request's draft surviva
 `--lookup-ngram N` proposes what followed the last N tokens' earlier occurrence instead of the
 assistant's guess when there is one.
 
+A [DSpine](maintainer/dspine.md) drafter trained for this model can take the assistant's place:
+`--spec dspine --draft-model PATH --draft-tokens N` (1 to 7) loads it, and the assistant stays
+unloaded. Its rounds verify the same way, and `--draft-min-p P` verifies through the first draft
+whose confidence is at or below P. No DSpine drafter for Gemma 4 is published yet.
+
 Ten chat requests one at a time to `ninfer-serve` (code in Python and C++, an explanation, a
 summary of a 1,000-token source excerpt, a factual question, a translation, a math word problem, a
 story, a Russian answer, and a 13,600-token source excerpt to describe), 384 generated tokens each,

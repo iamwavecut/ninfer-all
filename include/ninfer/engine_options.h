@@ -54,6 +54,9 @@ struct SpeculativeOptions {
     // memory); 0 keeps every expert on the device. Unset: 64 with the STQ drafter and host or disk
     // experts, otherwise every expert.
     std::optional<std::uint32_t> draft_experts;
+    // --spec dspine: the DSpine drafter artifact (tools/convert, recipe dspine_q8 or dspine_bf16),
+    // trained for the model's hidden width, vocabulary and layers. Empty otherwise.
+    std::string draft_model;
     // An Engine's options() report the resolved head.
     ProposalHead proposal_head = ProposalHead::Auto;
     // Context-lookup drafting: match this many trailing tokens against the sequence so far and

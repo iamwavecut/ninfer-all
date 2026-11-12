@@ -96,6 +96,27 @@ int launch_configuration_tests() {
                           two_files.speculative.draft_tokens == 4,
                       "a later file must override an earlier one and keep its other options");
 
+    // A DSpine file's drafter: another backend on the command line takes it away.
+    const std::string spine = write("spine.ini", "spec = dspine\ndraft-model = drafter.ninfer\n"
+                                                 "draft-tokens = 7\n");
+    const auto from_spine   = parse({"ninfer", "m.ninfer", "--prompt", "x", "--config", spine});
+    failures += check(from_spine.speculative.backend == ninfer::SpeculativeBackend::DSpine &&
+                          from_spine.speculative.draft_model == "drafter.ninfer" &&
+                          from_spine.speculative.draft_tokens == 7,
+                      "a DSpine file's drafter was not applied");
+    const auto spine_to_mtp =
+        parse({"ninfer", "m.ninfer", "--prompt", "x", "--config", spine, "--spec", "mtp"});
+    failures += check(spine_to_mtp.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          spine_to_mtp.speculative.draft_model.empty() &&
+                          spine_to_mtp.speculative.draft_tokens == 7,
+                      "--spec mtp must take a file's DSpine drafter away and keep its drafts");
+    const auto spine_off =
+        parse({"ninfer", "m.ninfer", "--prompt", "x", "--config", spine, "--spec", "none"});
+    failures += check(spine_off.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          spine_off.speculative.draft_model.empty() &&
+                          spine_off.speculative.draft_tokens == 0,
+                      "--spec none must take a file's DSpine drafter and drafts away");
+
     // A combination one layer gives is the user's error, not an override.
     const std::string contradictory = write("contradictory.ini", "spec = none\ndraft-tokens = 4\n");
     failures += check(rejects([&] {
@@ -229,6 +250,32 @@ int run_tests() {
             args.insert(args.end(), tail.begin(), tail.end());
             failures += check(rejects([&] { (void)parse(args); }),
                               "CLI accepted an invalid --draft-confidence");
+        }
+    }
+    {
+        // A DSpine drafter: the artifact --draft-model names, 1..15 drafts, the full output head
+        // and the confidence floor; no copy drafts beside it unless asked.
+        const auto spine = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                  "dspine", "--draft-model", "drafter.ninfer", "--draft-tokens",
+                                  "15", "--draft-min-p", "0.2", "--full-draft-head"});
+        failures += check(spine.speculative.backend == ninfer::SpeculativeBackend::DSpine &&
+                              spine.speculative.draft_model == "drafter.ninfer" &&
+                              spine.speculative.draft_tokens == 15 &&
+                              spine.speculative.draft_min_p == 0.2f &&
+                              spine.speculative.ngram_draft_tokens == 0,
+                          "CLI did not preserve --spec dspine");
+        for (const std::vector<std::string> tail :
+             {std::vector<std::string>{"--spec", "dspine", "--draft-tokens", "7"},
+              {"--spec", "dspine", "--draft-model", "d.ninfer"},
+              {"--spec", "dspine", "--draft-model", "d.ninfer", "--draft-tokens", "16"},
+              {"--spec", "dspine", "--draft-model", "d.ninfer", "--draft-tokens", "7",
+               "--lm-head-draft"},
+              {"--spec", "mtp", "--draft-tokens", "4", "--draft-model", "d.ninfer"},
+              {"--draft-model", "d.ninfer"}}) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            failures += check(rejects([&] { (void)parse(args); }),
+                              "CLI accepted --draft-model or --spec dspine out of their contract");
         }
     }
     {

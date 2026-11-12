@@ -31,6 +31,7 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash,
     DFlash2,
     DSpark, // DeepSeek-V4.1's DSpark drafter
+    DSpine, // a standalone DSpine drafter artifact (SpeculativeOptions::draft_model)
 };
 
 // How many of its drafts an MTP round verifies: always all of them, or a width the Engine adapts

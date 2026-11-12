@@ -243,7 +243,7 @@ std::string usage_text(const char* argv0) {
            std::string(product::kKvResidentHelp) +
            "\n"
            "SPECULATIVE DECODING\n"
-           "  --spec none|mtp|dflash|dflash2|dspark\n"
+           "  --spec none|mtp|dflash|dflash2|dspark|dspine\n"
            "                                speculative decoding backend (default: dflash2\n"
            "                                with 4 drafts for Flash-Next host experts on one\n"
            "                                device whose artifact has that drafter, mtp with\n"
@@ -251,12 +251,19 @@ std::string usage_text(const char* argv0) {
            "                                MTP block, for Edge0 device experts serving one\n"
            "                                request at a time and for Gemma 4 host or disk\n"
            "                                experts whose artifact has the drafter, else\n"
-           "                                none; dspark: DeepSeek-V4.1's DSpark drafter)\n"
+           "                                none; dspark: DeepSeek-V4.1's DSpark drafter;\n"
+           "                                dspine: the DSpine drafter --draft-model names)\n"
+           "  --draft-model PATH            dspine: the DSpine drafter artifact, trained for\n"
+           "                                this model\n"
            "  --draft-tokens N              drafts per round, 1..15 (Flash-Next dflash2: 1..7;\n"
-           "                                dspark: up to its block of 5, the default)\n"
-           "  --draft-min-p P               Flash-Next MTP or DFlash2 confidence floor, 0..1\n"
-           "                                (default 0 with --spec, 0.5 when the engine\n"
-           "                                chooses MTP, 0.7 when it chooses DFlash2)\n"
+           "                                dspark: up to its block of 5, the default; dspine:\n"
+           "                                up to its block less one, 7 for Gemma 4, Flint\n"
+           "                                and DeepSeek-V4.1)\n"
+           "  --draft-min-p P               confidence floor 0..1 of Flash-Next MTP, DFlash2\n"
+           "                                or DSpine, and of DSpine on Gemma 4, Flint or\n"
+           "                                DeepSeek-V4.1 (default 0 with --spec, 0.5 when\n"
+           "                                the engine chooses MTP, 0.7 when it chooses\n"
+           "                                DFlash2)\n"
            "  --draft-confidence C          dspark: verify drafts while their confidence is\n"
            "                                at least C, 0..1 (default 0.5; 0 keeps every draft)\n"
            "  --draft-experts N             dspark: each drafter block keeps its N most routed\n"
@@ -509,6 +516,8 @@ Options parse_arguments(const std::vector<std::string>& arguments,
             spec_explicit               = true;
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = value(arg);
         } else if (arg == "--draft-confidence") {
             options.speculative.draft_confidence =
                 parse_float(value(arg), "draft-confidence", 0.0F, 1.0F);

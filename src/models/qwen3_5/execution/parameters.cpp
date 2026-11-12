@@ -736,6 +736,7 @@ Parameters::Parameters(const Model& source) : model(source) {
                                       w.proposal->rows, prepare.head_shares(w.proposal->head_shares)};
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
     }
+    dspine = model.dspine();
 }
 
 } // namespace ninfer::models::qwen3_5::execution

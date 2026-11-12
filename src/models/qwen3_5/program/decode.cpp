@@ -494,9 +494,11 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     Tensor device_counts            = frame.append_counts.slice(0, 0, batch);
 
     work.reset();
-    Tensor features =
-        work.alloc(DType::BF16, {dimension(parameters.draft->feature_projection.weight.k),
-                                 static_cast<std::int32_t>(widest_count), batch});
+    const auto& draft_config = *parameters.model.config().draft;
+    Tensor features          = work.alloc(
+        DType::BF16, {dimension(parameters.model.config().text.hidden_size *
+                                std::uint64_t(draft_config.target_layer_ids.size())),
+                      static_cast<std::int32_t>(widest_count), batch});
     ops::prepare_ragged_prefix(dflash->pending_features, active_lane_tensor, device_starts,
                                device_ends, features, positions, device_counts, device.stream);
 

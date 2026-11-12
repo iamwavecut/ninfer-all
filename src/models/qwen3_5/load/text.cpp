@@ -712,7 +712,9 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
         options.embedding_residency == EmbeddingResidency::Host ? artifact::Residency::Mapped
                                                                 : artifact::Residency::Device);
     std::vector<std::string> head_inputs{"text/final_hidden"};
-    if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
+    // A standalone DSpine drafter reads the head through the target's own use of it.
+    if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled() &&
+        !options.dspine()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");
     }
     if (options.tensor_parallel && !options.lm_head_q4 && !options.lm_head_q6) {

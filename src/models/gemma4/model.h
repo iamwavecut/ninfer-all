@@ -8,6 +8,7 @@
 #include "core/device.h"
 #include "core/expert_delivery.h"
 #include "core/startup.h"
+#include "models/dspine/model.h"
 #include "models/gemma4/config.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/model.h"
@@ -113,6 +114,9 @@ struct LoadOptions {
     // block's routed experts; empty for one device. Everything else stays on rank 0, and the
     // experts must be device resident.
     std::vector<double> expert_split;
+    // Loads the standalone DSpine drafter artifact at this path (--spec dspine --draft-model) on
+    // rank 0, the head's device; empty for none. It excludes the assistant.
+    std::filesystem::path dspine;
 };
 
 class Model {
@@ -161,6 +165,8 @@ public:
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
+    // The standalone DSpine drafter when the model was loaded with one (LoadOptions::dspine).
+    [[nodiscard]] const dspine::Model* dspine() const noexcept { return dspine_.get(); }
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
     }
@@ -193,6 +199,7 @@ private:
     std::vector<double> expert_split_;
     std::vector<ExpertBanks> expert_banks_;
     std::vector<std::filesystem::path> expert_files_;
+    std::unique_ptr<dspine::Model> dspine_;
 };
 
 // Whether the artifact's text component is Gemma 4.
@@ -207,7 +214,8 @@ private:
                                                 const StartupObserver* observer = nullptr);
 
 // Expert parallelism's split of the routed experts when none is given: by `speed`, within each
-// rank's `free_bytes` beside what the load of `options` puts on it (models::default_expert_split).
+// rank's `free_bytes` beside what the load of `options` puts on it (models::default_expert_split),
+// a DSpine drafter on rank 0 included.
 [[nodiscard]] std::vector<double> default_expert_split(const artifact::Reader& reader,
                                                        const LoadOptions& options,
                                                        std::span<const std::uint64_t> free_bytes,
