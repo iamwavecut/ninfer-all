@@ -159,8 +159,15 @@ and work directory `/__w` before dispatch. Each machine runs one CUDA variant at
 process limit is at most 32 and is reduced for the container's CPU quota, affinity and RAM limit.
 The workflow supplies the existing bucket credential. Keep compiler versions and flags unchanged
 to preserve cache compatibility. Remove the runner registrations and rentals after verifying the
-archives and HF snapshots. Native release also accepts `linux_runner: ninfer-native-debian13`;
-its default remains GitHub-hosted runners in Debian 13 containers.
+archives and HF snapshots.
+
+Native release's `linux_runner` input defaults to `configured`, which follows the repository
+variable `NINFER_LINUX_RUNNER`. While it is `ninfer-native-debian13`, every Native release builds
+Linux in one job per Toolkit on the temporary runner, and CI's CUDA jobs run there too, except for
+pull requests from forks. Without the variable both use GitHub-hosted runners in Debian 13
+containers. One machine takes these jobs one after another at the hosted path, with up to 32
+compilers each; the 12.9.2 Toolkit stays installed and patched between jobs. Delete the variable
+before removing the runner, or the jobs that name its label wait for a runner that no longer exists.
 
 The bootstrap writes the aggregate `native-linux-cuda-<toolkit>-shared-v1` family, as the final
 Linux job of Native release does; the next hosted shards start from it. Both artifact workflows
@@ -228,8 +235,14 @@ own; retention then removes the predecessor, which no longer receives writes.
 Each platform uses eight object shards per Toolkit, each with a separate family:
 `native-linux-cuda-<toolkit>-shared-v1-shard-<index>` and
 `native-windows-cuda-<toolkit>-host-v2-shard-<index>`. A shard takes its objects from the compile
-database of `ninfer`, `ninfer-serve` and `ninfer_bench` by a hash of each object's path
-(`build-object-shard.py`), so a new source or archive needs no change there. A shard compiles no
+database of `ninfer`, `ninfer-serve` and `ninfer_bench` (`build-object-shard.py`). The objects that
+`.github/scripts/object-weights.json` lists for the platform, those whose cold compile took at least
+two minutes, go first, longest first, each to the shard with the least listed time; every other
+object goes to the shard of its path hash, so a new source or archive needs no change there. After a
+change adds or reshapes heavy units, download the `*-logs-*-objects-*` artifacts of a build that
+compiled them without cache hits and run
+`python3.11 .github/scripts/object-weights.py .github/scripts/object-weights.json <directory>`. An
+object the new list moves is in the aggregate that every shard restores first. A shard compiles no
 object of another shard: after its build the script reads the Ninja log and fails when it finds
 one. A generated source in a library target would cause that, because Ninja runs a target's custom
 command after every library the target links and starts the target's objects after the command;

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -23,6 +24,32 @@ class ObjectShardsTest(unittest.TestCase):
         changed = [{"output": item["output"].replace("/", "\\")} for item in reversed(commands)]
         for index, part in enumerate(parts):
             self.assertEqual(SHARDS.select_objects(changed, index, 8), part)
+
+    def test_weighed_objects_spread_longest_first_and_others_keep_their_hash_owner(self):
+        light = [f"src/ops/CMakeFiles/ops.dir/light{i}.cu.obj" for i in range(200)]
+        heavy = [f"src/ops/CMakeFiles/ops.dir/heavy{i}.cu.obj" for i in range(6)]
+        weights = {f"src/ops/CMakeFiles/ops.dir/heavy{i}.cu": seconds
+                   for i, seconds in enumerate((3600, 3000, 2900, 2800, 600, 500))}
+        commands = [{"output": path} for path in light + heavy]
+        parts = [SHARDS.select_objects(commands, index, 4, weights) for index in range(4)]
+        self.assertEqual(sorted(output for part in parts for output in part),
+                         sorted(light + heavy))
+        loads = [sum(weights[SHARDS.object_key(o)] for o in part if "heavy" in o) for part in parts]
+        self.assertEqual(sorted(loads), [3000, 3400, 3400, 3600])
+        unweighed = [SHARDS.select_objects(commands, index, 4) for index in range(4)]
+        for part, plain in zip(parts, unweighed):
+            self.assertEqual([o for o in part if "light" in o], [o for o in plain if "light" in o])
+        linux = [{"output": path.replace(".obj", ".o")} for path in heavy]
+        self.assertEqual(SHARDS.select_objects(linux, 0, 4, weights),
+                         ["src/ops/CMakeFiles/ops.dir/heavy0.cu.o"])
+
+    def test_checked_in_weights_name_both_platforms_in_whole_seconds(self):
+        weights = json.loads(SHARDS.WEIGHTS.read_text())
+        self.assertEqual(sorted(weights), ["linux", "windows"])
+        for times in weights.values():
+            self.assertTrue(times)
+            self.assertTrue(all(isinstance(value, int) and value >= 120 for value in times.values()))
+            self.assertFalse([key for key in times if key.endswith((".o", ".obj"))])
 
     def test_duplicate_rules_do_not_compile_twice_and_invalid_shards_fail(self):
         self.assertEqual(SHARDS.select_objects([{"output": "x.o"}] * 2, 0, 1), ["x.o"])
@@ -66,3 +93,27 @@ class ReleaseCommandsTest(unittest.TestCase):
                     ["ninja", "-C", str(build), "-t", "compdb-targets", *SHARDS.RELEASE_TARGETS],
                     text=True))
                 self.assertEqual(sorted(item["output"] for item in targets), outputs)
+
+
+class ObjectWeightsTest(unittest.TestCase):
+    def test_longest_cold_time_over_toolkits_without_suffix_or_short_objects(self):
+        spec = importlib.util.spec_from_file_location(
+            "object_weights", Path(__file__).resolve().parents[2] / ".github/scripts/object-weights.py")
+        weights_tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(weights_tool)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            logs = {"linux-logs-12.9.2-objects-0": "0\t300000\t1\tsrc/a.cu.o\th\n"
+                                                   "0\t5000\t1\tsrc/b.cu.o\th\n",
+                    "linux-logs-13.4.3-objects-3": "0\t420000\t1\tsrc/a.cu.o\th\n",
+                    "windows-logs-13.4.3-objects-1": "# ninja log v7\n"
+                                                     "0\t3600000\t1\tsrc\\a.cu.obj\th\n"
+                                                     "0\t9000\t1\tsrc\\lib.lib\th\n"}
+            for name, text in logs.items():
+                (root / "logs" / name / "build-release").mkdir(parents=True)
+                (root / "logs" / name / "build-release" / ".ninja_log").write_text(text)
+            output = root / "weights.json"
+            subprocess.run([sys.executable, spec.origin, str(output), str(root / "logs")],
+                           check=True, capture_output=True)
+            self.assertEqual(json.loads(output.read_text()),
+                             {"linux": {"src/a.cu": 420}, "windows": {"src/a.cu": 3600}})

@@ -8,7 +8,10 @@ apt-get update
 apt-get install -y --no-install-recommends \
   build-essential ninja-build pkg-config patchelf python3 python3-venv \
   meson nasm libcurl4-openssl-dev zlib1g-dev
-if [[ "$CUDA_VERSION" == 12.9.2 ]]; then
+# A temporary runner keeps the Toolkit between jobs: the glibc patch below marks a finished install.
+if [[ "$CUDA_VERSION" == 12.9.2 && -f "/usr/local/cuda-$minor/ninfer-toolchain-patches.txt" ]]; then
+  echo "CUDA $CUDA_VERSION is already installed and patched."
+elif [[ "$CUDA_VERSION" == 12.9.2 ]]; then
   # Debian 13 rejects the SHA-1 binding in NVIDIA's Debian 12 repository key.
   # Use NVIDIA's release installer instead; do not weaken APT signature policy.
   # Its cuda-installer binary links libxml2.so.2, which no other build dependency pulls in.
