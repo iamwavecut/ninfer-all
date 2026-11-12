@@ -191,9 +191,10 @@ differences can change acceptance only, not the output distribution.
 | Gemma 4, Flint, DeepSeek-V4.1 | 1 to 7 | greedy | coupled: the target's keyed draws in plain decode rows | as Flash-Next |
 
 Every family commits only tokens that the target selects, so the output is the target's at any
-temperature. A DSpine round runs no n-gram copy proposal unless `--ngram-draft-tokens` sets its
-width (the Qwen3.5 core). The refinement reads the full head's logits, so DSpine refuses the
-optimized proposal head (`--lm-head-draft`).
+temperature. `--gumbel-sampling` changes only the target's draws: the greedy proposals stay greedy
+and the Qwen3.5 core keeps rejection sampling, as DFlash2 does. A DSpine round runs no n-gram copy
+proposal unless `--ngram-draft-tokens` sets its width (the Qwen3.5 core). The refinement reads the
+full head's logits, so DSpine refuses the optimized proposal head (`--lm-head-draft`).
 
 ## State
 
