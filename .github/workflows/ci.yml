@@ -73,6 +73,7 @@ jobs:
       python: ${{ steps.compare.outputs.python }}
       docker: ${{ steps.compare.outputs.docker }}
       release_tools: ${{ steps.compare.outputs.release_tools }}
+      linux_runner: ${{ steps.runner.outputs.label }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -83,6 +84,18 @@ jobs:
           python-version: '3.11'
       - id: compare
         run: .github/scripts/build-inputs.sh >> "$GITHUB_OUTPUT"
+      # While the repository variable NINFER_LINUX_RUNNER names a temporary runner, the CUDA builds
+      # run there; a pull request from a fork stays on a hosted runner.
+      - id: runner
+        env:
+          CONFIGURED: ${{ vars.NINFER_LINUX_RUNNER }}
+          FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          if [[ "$CONFIGURED" == ninfer-native-debian13 && "$FORK" != true ]]; then
+            echo label=ninfer-native-debian13 >> "$GITHUB_OUTPUT"
+          else
+            echo label=ubuntu-24.04 >> "$GITHUB_OUTPUT"
+          fi
 
   release-tools:
     needs: build-inputs
@@ -342,14 +355,12 @@ jobs:
     name: CUDA ${{ matrix.cuda }} multiarch build and tests (no GPU)
     needs: build-inputs
     if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
-    runs-on: ubuntu-24.04
-    container:
-      image: debian:13-slim
-      volumes:
-        - /usr/share/dotnet:/host-tools/dotnet
-        - /usr/local/lib/android:/host-tools/android
-        - /opt/hostedtoolcache:/host-tools/toolcache
-        - /opt/ghc:/host-tools/ghc
+    runs-on: ${{ needs.build-inputs.outputs.linux_runner }}
+    # A temporary runner provides Debian 13 itself; on a hosted runner the job runs in a container.
+    container: >-
+      ${{ needs.build-inputs.outputs.linux_runner == 'ubuntu-24.04' && fromJSON('{"image": "debian:13-slim",
+      "volumes": ["/usr/share/dotnet:/host-tools/dotnet", "/usr/local/lib/android:/host-tools/android",
+      "/opt/hostedtoolcache:/host-tools/toolcache", "/opt/ghc:/host-tools/ghc"]}') || '' }}
     timeout-minutes: 350
     permissions:
       contents: read
@@ -383,6 +394,7 @@ jobs:
           echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
           echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
       - name: Free the hosted runner's disk when it is short
+        if: needs.build-inputs.outputs.linux_runner == 'ubuntu-24.04'
         # The runner's preinstalled toolchains, mounted under /host-tools, share the disk with the
         # checkout. A CI job on 12 November had 4.3 GB left when its build started and failed.
         run: |
@@ -426,7 +438,7 @@ jobs:
         run: .github/scripts/configure-linux-build.sh ON
       - name: Check compiler resource budget
         id: capacity
-        run: python3.11 .github/scripts/check-build-capacity.py --jobs 4
+        run: python3.11 .github/scripts/check-build-capacity.py --jobs ${{ needs.build-inputs.outputs.linux_runner == 'ubuntu-24.04' && 4 || 32 }}
       - name: Build every target
         id: build
         timeout-minutes: 305
@@ -436,7 +448,7 @@ jobs:
         run: |
           # The stub lets binaries load without a driver; GPU tests skip with exit 77.
           mkdir -p /tmp/stub
-          ln -s "$CUDA_PATH/lib64/stubs/libcuda.so" /tmp/stub/libcuda.so.1
+          ln -sfn "$CUDA_PATH/lib64/stubs/libcuda.so" /tmp/stub/libcuda.so.1
           LD_LIBRARY_PATH=/tmp/stub ctest --test-dir build-release --output-on-failure -j
       - name: Record local cache counters
         if: always() && steps.compiler-cache.outcome == 'success'

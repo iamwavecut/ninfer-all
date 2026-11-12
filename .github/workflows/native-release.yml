@@ -20,10 +20,10 @@ on:
         options: [full, package]
         default: full
       linux_runner:
-        description: Linux runner (the temporary runner must already provide Debian 13)
+        description: Linux runner (configured follows the NINFER_LINUX_RUNNER repository variable; the temporary runner must already provide Debian 13)
         type: choice
-        options: [github-hosted, ninfer-native-debian13]
-        default: github-hosted
+        options: [configured, github-hosted, ninfer-native-debian13]
+        default: configured
 
 permissions:
   contents: read
@@ -72,11 +72,26 @@ jobs:
       actions: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      linux_runner: ${{ steps.runner.outputs.label }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+      # A push follows the repository variable NINFER_LINUX_RUNNER, which names a temporary runner
+      # while one is registered; a dispatch may choose either runner.
+      - name: Choose the Linux runner
+        id: runner
+        env:
+          CHOICE: ${{ inputs.linux_runner || 'configured' }}
+          CONFIGURED: ${{ vars.NINFER_LINUX_RUNNER }}
+        run: |
+          label="$CHOICE"
+          [[ "$label" != configured ]] || label="${CONFIGURED:-github-hosted}"
+          case "$label" in
+            github-hosted|ninfer-native-debian13) echo "label=$label" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unknown Linux runner: $label" >&2; exit 1 ;;
+          esac
       - name: Check publication scope
         env:
           PUBLISH: ${{ inputs.publish }}
@@ -174,10 +189,10 @@ jobs:
       HF_BUILD_CACHE_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
 
   # Hosted runners compile the objects in eight shards per Toolkit, as Windows does; a rented
-  # runner (linux_runner) compiles, links and packages in one job.
+  # runner (the validate job's linux_runner) compiles, links and packages in one job.
   linux-objects:
     needs: validate
-    if: inputs.platforms != 'windows' && inputs.linux_runner != 'ninfer-native-debian13'
+    if: inputs.platforms != 'windows' && needs.validate.outputs.linux_runner != 'ninfer-native-debian13'
     strategy:
       fail-fast: false
       max-parallel: 8
@@ -224,7 +239,7 @@ jobs:
       ${{ always() && !cancelled() && needs.validate.result == 'success' &&
           inputs.platforms != 'windows' && needs.linux-current.outputs.superseded == 'false' &&
           (needs.linux-objects.result == 'success' ||
-           (inputs.linux_runner == 'ninfer-native-debian13' && needs.linux-objects.result == 'skipped')) }}
+           (needs.validate.outputs.linux_runner == 'ninfer-native-debian13' && needs.linux-objects.result == 'skipped')) }}
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -238,9 +253,9 @@ jobs:
     with:
       cuda: ${{ matrix.cuda }}
       archs: ${{ matrix.archs }}
-      runner: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 'ninfer-native-debian13' || 'ubuntu-24.04' }}
-      jobs: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 32 || 4 }}
-      phase: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 'full' || 'package' }}
+      runner: ${{ needs.validate.outputs.linux_runner == 'ninfer-native-debian13' && 'ninfer-native-debian13' || 'ubuntu-24.04' }}
+      jobs: ${{ needs.validate.outputs.linux_runner == 'ninfer-native-debian13' && 32 || 4 }}
+      phase: ${{ needs.validate.outputs.linux_runner == 'ninfer-native-debian13' && 'full' || 'package' }}
       version: ${{ needs.validate.outputs.version }}
     secrets: inherit
 

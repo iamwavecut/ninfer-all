@@ -159,8 +159,15 @@ and work directory `/__w` before dispatch. Each machine runs one CUDA variant at
 process limit is at most 32 and is reduced for the container's CPU quota, affinity and RAM limit.
 The workflow supplies the existing bucket credential. Keep compiler versions and flags unchanged
 to preserve cache compatibility. Remove the runner registrations and rentals after verifying the
-archives and HF snapshots. Native release also accepts `linux_runner: ninfer-native-debian13`;
-its default remains GitHub-hosted runners in Debian 13 containers.
+archives and HF snapshots.
+
+Native release's `linux_runner` input defaults to `configured`, which follows the repository
+variable `NINFER_LINUX_RUNNER`. While it is `ninfer-native-debian13`, every Native release builds
+Linux in one job per Toolkit on the temporary runner, and CI's CUDA jobs run there too, except for
+pull requests from forks. Without the variable both use GitHub-hosted runners in Debian 13
+containers. One machine takes these jobs one after another at the hosted path, with up to 32
+compilers each; the 12.9.2 Toolkit stays installed and patched between jobs. Delete the variable
+before removing the runner, or the jobs that name its label wait for a runner that no longer exists.
 
 The bootstrap writes the aggregate `native-linux-cuda-<toolkit>-shared-v1` family, as the final
 Linux job of Native release does; the next hosted shards start from it. Both artifact workflows

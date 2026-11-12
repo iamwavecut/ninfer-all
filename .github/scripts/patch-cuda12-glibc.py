@@ -9,6 +9,13 @@ import sys
 def patch_headers(root):
     header = root / 'targets/x86_64-linux/include/crt/math_functions.h'
     inline = header.with_suffix('.hpp')
+    marker = root / 'ninfer-toolchain-patches.txt'
+    patched = re.compile(
+        r'^extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ (?:double|float)\s+'
+        r'(?:sinpi|cospi|sinpif|cospif)\((?:double|float) x\) noexcept \(true\);$', re.MULTILINE)
+    # A temporary runner keeps the patched Toolkit for its next job.
+    if marker.exists() and len(patched.findall(header.read_text())) == 4:
+        return
     declaration = re.compile(
         r'^(extern __DEVICE_FUNCTIONS_DECL__ __device_builtin__ (?:double|float)\s+'
         r'(?:sinpi|cospi|sinpif|cospif)\((?:double|float) x\));$', re.MULTILINE)
@@ -23,7 +30,7 @@ def patch_headers(root):
     # Only exception specifications change; function bodies and arithmetic stay as supplied.
     header.write_text(text)
     inline.write_text(definitions)
-    (root / 'ninfer-toolchain-patches.txt').write_text(
+    marker.write_text(
         'CUDA 12.9: sinpi/cospi/sinpif/cospif noexcept(true) declarations for glibc 2.41.\n'
         'https://forums.developer.nvidia.com/t/323591\n')
 
