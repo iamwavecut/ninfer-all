@@ -22,6 +22,20 @@ def select_objects(commands, index, count):
     return sorted(outputs)
 
 
+RELEASE_TARGETS = ("ninfer", "ninfer-serve", "ninfer_bench")
+
+
+def release_commands(build, targets=RELEASE_TARGETS):
+    """The compile database entries of the edges that `targets` need. `ninja -t compdb-targets`
+    lists them only from Ninja 1.13; Debian 13 ships 1.12. The whole graph's database, kept to the
+    commands `ninja -t commands` prints for the targets, is the same set on both."""
+    needed = set(subprocess.check_output(
+        ["ninja", "-C", str(build), "-t", "commands", *targets], text=True).splitlines())
+    database = json.loads(subprocess.check_output(
+        ["ninja", "-C", str(build), "-t", "compdb"], text=True))
+    return [item for item in database if item.get("command") in needed]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--build", type=Path, default=Path("build-release"))
@@ -29,10 +43,7 @@ def main():
     parser.add_argument("--count", type=int, required=True)
     parser.add_argument("--jobs", type=int, default=2)
     args = parser.parse_args()
-    commands = json.loads(subprocess.check_output(
-        ["ninja", "-C", str(args.build), "-t", "compdb-targets",
-         "ninfer", "ninfer-serve", "ninfer_bench"], text=True))
-    objects = select_objects(commands, args.shard, args.count)
+    objects = select_objects(release_commands(args.build), args.shard, args.count)
     if not objects:
         raise ValueError("The release object shard is empty")
     (args.build / "object-shard.json").write_text(json.dumps(objects, indent=2) + "\n")
