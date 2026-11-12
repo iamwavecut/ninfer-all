@@ -338,4 +338,21 @@ void proposal_expand_logits(const Tensor& subset, const std::int32_t* id_map, st
     detail::proposal_expand_logits_launch(subset, id_map, count, expanded, stream);
 }
 
+void proposal_select_sampled(Tensor& proposal_tokens, const Tensor& sampled,
+                             const SamplingConfig* configs, cudaStream_t stream) {
+    constexpr const char* op = "proposal_select_sampled";
+    require_vector(proposal_tokens, DType::I32, proposal_tokens.ne[0], op, "proposal_tokens");
+    require_vector(sampled, DType::I32, proposal_tokens.ne[0], op, "sampled");
+    if (!proposal_tokens.is_contiguous() || !sampled.is_contiguous()) {
+        throw std::invalid_argument("proposal_select_sampled: vectors must be contiguous");
+    }
+    if (configs == nullptr) {
+        throw std::invalid_argument("proposal_select_sampled: configs must be non-null");
+    }
+    if (proposal_tokens.data == sampled.data) {
+        throw std::invalid_argument("proposal_select_sampled: sampled must be distinct");
+    }
+    detail::proposal_select_sampled_launch(proposal_tokens, sampled, configs, stream);
+}
+
 } // namespace ninfer::ops

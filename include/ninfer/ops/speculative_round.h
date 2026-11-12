@@ -246,4 +246,21 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
 void proposal_expand_logits(const Tensor& subset, const std::int32_t* id_map, std::int32_t count,
                             Tensor& expanded, cudaStream_t stream);
 
+/**
+ * Op: proposal_select_sampled
+ *
+ * Math / indexing:
+ *   proposal_tokens[b]' = sampled[b] where configs[b].temperature > 0, the rows sample() draws,
+ *   and proposal_tokens[b]' = proposal_tokens[b] at every other (greedy) row, 0<=b<B.
+ *
+ * Shape / numeric / effects:
+ *   proposal_tokens and sampled are distinct contiguous non-empty I32 vectors [B]; configs is a
+ *   device-resident SamplingConfig[B] array. Updates proposal_tokens in place, reads nothing else
+ *   but sampled and each row's temperature, and uses no workspace or other state. A subset head's
+ *   greedy row so keeps its argmax over the subset, whose equal maxima select the lowest subset
+ *   row, beside the sampled rows' draws over the vocabulary.
+ */
+void proposal_select_sampled(Tensor& proposal_tokens, const Tensor& sampled,
+                             const SamplingConfig* configs, cudaStream_t stream);
+
 } // namespace ninfer::ops

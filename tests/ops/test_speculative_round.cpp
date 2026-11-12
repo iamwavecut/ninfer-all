@@ -1865,6 +1865,41 @@ int expand_case(int columns, bool fp32) {
     return failures;
 }
 
+// A row that sample() draws (a temperature above zero, the smallest normal one included) takes its
+// draw; a greedy row (zero, negative or NaN temperature) keeps its token; nothing else is written.
+int select_sampled_case(int columns) {
+    const float quiet_nan = std::numeric_limits<float>::quiet_NaN();
+    const float smallest  = std::numeric_limits<float>::min();
+    const std::array<float, 6> temperatures{0.0F, 0.7F, -1.0F, 1.0F, quiet_nan, smallest};
+    std::vector<ops::SamplingConfig> configs(static_cast<std::size_t>(columns));
+    std::vector<std::int32_t> tokens(configs.size()), sampled(configs.size()),
+        expected(configs.size());
+    for (int b = 0; b < columns; ++b) {
+        const auto i           = static_cast<std::size_t>(b);
+        configs[i].temperature = temperatures[i % temperatures.size()];
+        configs[i].seed        = 1000ULL + static_cast<unsigned long long>(b);
+        tokens[i]              = (7919 * b + 3) % 248320;
+        sampled[i]             = (104729 * b + 11) % 248320;
+        expected[i]            = configs[i].temperature > 0.0F ? sampled[i] : tokens[i];
+    }
+    DeviceBuffer d_configs = to_device(configs);
+    DeviceBuffer d_sampled = to_device(sampled);
+    GuardedDeviceBuffer d_tokens(tokens.size() * sizeof(std::int32_t));
+    initialize(d_tokens, tokens);
+    Tensor token_tensor(d_tokens.data(), DType::I32, {columns});
+    const Tensor sampled_tensor(d_sampled.p, DType::I32, {columns});
+    ops::proposal_select_sampled(token_tensor, sampled_tensor,
+                                 static_cast<const ops::SamplingConfig*>(d_configs.p), nullptr);
+    cuda_synchronize();
+    const std::string label = "proposal select sampled B=" + std::to_string(columns);
+    int failures            = verify_exact((label + " in-place output").c_str(),
+                                           read<std::int32_t>(d_tokens, tokens.size()), expected);
+    failures += verify_exact((label + " draws unchanged").c_str(),
+                             from_device<std::int32_t>(d_sampled, sampled.size()), sampled);
+    failures += d_tokens.verify_guards((label + " guards").c_str());
+    return failures;
+}
+
 int transforms_conformance() {
     int failures = 0;
     for (int k = 1; k <= 31; ++k)
@@ -1884,6 +1919,7 @@ int transforms_conformance() {
         failures += expand_case(columns, false);
         failures += expand_case(columns, true);
     }
+    for (const int columns : {1, 6, 32, 300}) { failures += select_sampled_case(columns); }
     return failures;
 }
 
