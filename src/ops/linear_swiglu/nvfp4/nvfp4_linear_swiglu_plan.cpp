@@ -6,6 +6,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/layout.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
