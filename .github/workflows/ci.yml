@@ -30,7 +30,8 @@
 #
 #   * Debian multiarch CUDA 12.9 and 13.4 builds of every target, then CTest. They use the
 #     release toolchains and read the latest available native compiler snapshot without waiting
-#     for its producer. CI never uploads compiler caches.
+#     for its producer, then CI's own snapshot of the objects the release does not build (tests,
+#     benchmarks, tools). Only a push to master saves that snapshot, after the build stopped.
 #
 # CUDA/MSVC jobs compare compiled inputs with the PR base or published image revision.
 # Other jobs have individual path scopes; Docker cache checks require a Docker definition change.
@@ -371,7 +372,9 @@ jobs:
             archs: '75;80;86;89;120a'
     steps:
       - name: Reserve time for tests and diagnostics
-        run: echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
+        run: |
+          echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+          echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
       - name: Install checkout tools
         run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
       - uses: actions/checkout@v7
@@ -382,14 +385,23 @@ jobs:
         run: python3.11 .github/scripts/install-compiler-cache.py
       - name: Install cache client and CTest Python dependency
         run: python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0 jinja2
-      - name: Read available native snapshot (optional)
+      - name: Read available native and CI snapshots (optional)
+        id: object-cache
         timeout-minutes: 10
         continue-on-error: true
         env:
-          # Reuse the bucket token only for restore. Fork PRs receive no secret.
+          # The bucket token reaches only the restore and save steps. Fork PRs receive no secret.
           HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
           CACHE_SOURCE_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
-        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-linux-cuda-${{ matrix.cuda }}-shared-v1 --source-ref "$CACHE_SOURCE_REF" --optional
+          # A pull request also reads the native snapshot of its own branch, which a Native release
+          # dispatch on that branch writes; a push to master that of the branch it merged.
+          ALSO_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || '' }}
+        run: |
+          restore=(python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --source-ref "$CACHE_SOURCE_REF" --optional)
+          [[ -z "$ALSO_REF" ]] || restore+=(--also-ref "$ALSO_REF")
+          # The CI snapshot holds only what differs from the native one recorded here.
+          "${restore[@]}" --merged-branch --family native-linux-cuda-${{ matrix.cuda }}-shared-v1 --baseline build-cache-baseline.tsv
+          "${restore[@]}" --family ci-linux-cuda-${{ matrix.cuda }}-v1
       - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
         run: python3.11 .github/scripts/check-compiler-cache.py
@@ -411,14 +423,31 @@ jobs:
           LD_LIBRARY_PATH=/tmp/stub ctest --test-dir build-release --output-on-failure -j
       - name: Record local cache counters
         if: always() && steps.compiler-cache.outcome == 'success'
-        run: python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
+        # A finished build keeps only the entries it used; an unfinished one keeps the restored rest.
+        run: >-
+          python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
+          ${{ steps.build.outcome == 'success' && '--evict-unused-since "$JOB_START"' || '' }}
+      # A cancelled or timed-out master build saves what it compiled, so the next run resumes; the
+      # native snapshot's own entries stay out of this family.
+      - name: Save CI objects from master (also after cancellation)
+        if: >-
+          always() && github.event_name == 'push' && github.ref == 'refs/heads/master' &&
+          steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
+        timeout-minutes: ${{ job.status == 'cancelled' && 3 || 20 }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+        run: >-
+          python3.11 .github/scripts/hf-build-cache.py save --directory .cache/objects
+          --family ci-linux-cuda-${{ matrix.cuda }}-v1 --exclude-baseline build-cache-baseline.tsv
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: ci-logs-cuda-${{ matrix.cuda }}
+          include-hidden-files: true
           path: |
             build-release/*.log
+            build-release/.ninja_log
             build-release/cache-stats.json
             build-release/cache-progress.jsonl
             build-release/Testing/Temporary/LastTest.log
