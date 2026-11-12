@@ -234,6 +234,8 @@ def main():
         (repo / 'scripts/run.sh', 'run.sh'), (repo / 'scripts/download-model.sh', 'download-model.sh'),
     ):
         shutil.copy2(source, package / destination)
+    # Launch configurations for the published models (docs/recipes.md).
+    shutil.copytree(repo / 'configs', package / 'configs')
     distro = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines()
                   if '=' in line)
     if distro.get('ID', '').strip('"') == 'debian' and distro.get('VERSION_ID', '').strip('"') == '13':

@@ -93,6 +93,8 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot 'docs\release-archive-windows.md') -
 foreach ($script in 'run.bat', 'download-model.bat') {
     Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\$script") -Destination $ProductRoot
 }
+# Launch configurations for the published models (docs/recipes.md).
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'configs') -Destination $ProductRoot -Recurse
 # Preserve dependency notices from the triplet used by the build.
 if ($VcpkgEntry.Count -eq 1) {
     $share = Join-Path $VcpkgInstalled "$(Read-Cache 'VCPKG_TARGET_TRIPLET')\share"
