@@ -7,7 +7,9 @@ runs ninfer_dspine_runtime_driver from the ninfer_tests bundle over them and che
 * every proposal against the drafter's FP64 evaluation over the context its lane holds,
   teacher-forced on the device's drafts: each draft's edge within 0.25 logits of the oracle's best
   candidate's, at least 85% of the drafts the oracle's own choice, each confidence within 0.06 of
-  the oracle's and within 0.01 on average;
+  the oracle's and within 0.01 on average. The device's drafter keeps its states in BF16, so a
+  candidate within those 0.25 logits of the oracle's 16th may take another's place in its 16: a
+  confidence is compared with the range the oracle's takes over every such candidate set;
 * a lane loaded from a context-cache image proposes bit for bit what the lane it was saved from
   proposes;
 * a lane that committed positions past a frontier proposes there bit for bit what a copy taken at
@@ -351,7 +353,8 @@ class Oracle:
 
     def propose(self, context, context_positions, anchor, frontier, senders):
         """Each draft row's edges over the vocabulary (logit units: divided by the final norm's
-        denominator) given its sender, senders[i] for row i, and its 16 candidates."""
+        denominator) given its sender, senders[i] for row i, and its head logits over the candidate
+        domain."""
         k, w = len(senders), len(senders) + 1
         positions = frontier + torch.arange(w, dtype=torch.int64)
         key_positions = torch.cat([context_positions, positions])
@@ -400,8 +403,30 @@ class Oracle:
             sent = (torch.sigmoid(q_r[n] + self.sender[sender, :RANK] + self.gate_bias)
                     * self.sender[sender, RANK:])
             edges = d[n] * logits[i] + rms[n] * (self.head_write @ (sent - message[n]))
-            steps.append((edges / d[n], torch.topk(logits[i, :DOMAIN], 16).indices))
+            steps.append((edges / d[n], logits[i, :DOMAIN]))
         return steps
+
+
+def confidence_range(edges, logits, chosen):
+    """The least and greatest probability of `chosen` under softmax(edges) over the candidate sets
+    that keep every logit above the oracle's 16th by more than GAP and fill the other places from
+    the logits within GAP of it, or None when no such set holds `chosen`."""
+    order = torch.argsort(logits, descending=True)
+    sixteenth = logits[order[15]].item()
+    sure = [c for c in order[:16].tolist() if logits[c].item() > sixteenth + GAP]
+    near = [c for c in order.tolist() if abs(logits[c].item() - sixteenth) <= GAP]
+    if chosen in sure:
+        fixed, pool = sure, near
+    elif chosen in near:
+        fixed, pool = sure + [chosen], [c for c in near if c != chosen]
+    else:
+        return None
+    free = 16 - len(fixed)
+    weight = torch.exp(edges - edges[fixed + pool].max())
+    base = weight[fixed].sum().item()
+    others = sorted(weight[pool].tolist())
+    heaviest, lightest = base + sum(others[len(others) - free:]), base + sum(others[:free])
+    return weight[chosen].item() / heaviest, weight[chosen].item() / lightest
 
 
 def verify(oracle, features, schedule, results) -> int:
@@ -428,7 +453,8 @@ def verify(oracle, features, schedule, results) -> int:
             reference = oracle.propose(*context_of(entries), anchor, frontier, senders)
             # The first two calls also run without a context: the choices must depend on it.
             blind = oracle.propose(*context_of([]), anchor, frontier, senders) if call < 2 else None
-            for i, (edges, candidates) in enumerate(reference):
+            for i, (edges, logits) in enumerate(reference):
+                candidates = torch.topk(logits, 16).indices
                 best = candidates[torch.argmax(edges[candidates])].item()
                 gap = (edges[best] - edges[ids[i]]).item()
                 steps += 1
@@ -437,17 +463,18 @@ def verify(oracle, features, schedule, results) -> int:
                 if gap > GAP:
                     failures.append(f"{label} draft {i}: {ids[i]} trails the oracle's {best} by "
                                     f"{gap:.3f} logits")
-                slot = (candidates == ids[i]).nonzero()
-                if slot.numel():
-                    expected = torch.softmax(edges[candidates], 0)[slot.item()].item()
-                    error = abs(probabilities[i] - expected)
+                bounds = confidence_range(edges, logits, ids[i])
+                if bounds is not None:
+                    low, high = bounds
+                    error = max(low - probabilities[i], probabilities[i] - high, 0.0)
                     worst_error, error_sum, errors = max(worst_error, error), error_sum + error, \
                         errors + 1
                     if error > CONFIDENCE:
                         failures.append(f"{label} draft {i}: confidence {probabilities[i]:.4f}, "
-                                        f"the oracle's {expected:.4f}")
+                                        f"the oracle's {low:.4f} to {high:.4f}")
                 if blind is not None:
-                    blind_edges, blind_candidates = blind[i]
+                    blind_edges, blind_logits = blind[i]
+                    blind_candidates = torch.topk(blind_logits, 16).indices
                     probed += 1
                     changed += blind_candidates[torch.argmax(
                         blind_edges[blind_candidates])].item() != best
