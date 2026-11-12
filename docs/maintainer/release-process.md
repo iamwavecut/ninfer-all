@@ -229,7 +229,11 @@ Each platform uses eight object shards per Toolkit, each with a separate family:
 `native-linux-cuda-<toolkit>-shared-v1-shard-<index>` and
 `native-windows-cuda-<toolkit>-host-v2-shard-<index>`. A shard takes its objects from the compile
 database of `ninfer`, `ninfer-serve` and `ninfer_bench` by a hash of each object's path
-(`build-object-shard.py`), so a new source or archive needs no change there. A shard restores the
+(`build-object-shard.py`), so a new source or archive needs no change there. A shard compiles no
+object of another shard: after its build the script reads the Ninja log and fails when it finds
+one. A generated source in a library target would cause that, because Ninja runs a target's custom
+command after every library the target links and starts the target's objects after the command;
+the embedded WebUI therefore compiles in its own library, `ninfer_webui_assets`. A shard restores the
 aggregate first and records its files as the baseline, then its own snapshot; it saves, also in its
 periodic checkpoints (`HF_CACHE_BASELINE`), only what differs from the aggregate. A finished shard
 build keeps only the entries it used. The final job of each platform and Toolkit restores the

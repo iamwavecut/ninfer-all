@@ -36,6 +36,27 @@ def release_commands(build, targets=RELEASE_TARGETS):
     return [item for item in database if item.get("command") in needed]
 
 
+# A generator tool that a custom command runs compiles in every shard that needs the command's output.
+GENERATOR_TOOLS = ("/ninfer_webui_embed.dir/",)
+
+
+def foreign_objects(build, objects):
+    """Objects the build compiled outside the shard, from its Ninja log. Ninja runs a target's
+    custom command after every library the target links and starts the target's objects after the
+    command, so a generated source in a library target makes a shard compile that whole closure."""
+    owned = set(objects)
+    compiled = set()
+    for line in (build / ".ninja_log").read_text().splitlines():
+        parts = line.split("\t")
+        if line.startswith("#") or len(parts) < 4:
+            continue
+        output = parts[3].replace("\\", "/")
+        if output.endswith((".o", ".obj")):
+            compiled.add(output)
+    return sorted(output for output in compiled - owned
+                  if not any(tool in output for tool in GENERATOR_TOOLS))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--build", type=Path, default=Path("build-release"))
@@ -61,6 +82,10 @@ def main():
     for batch in batches:
         subprocess.run(["cmake", "--build", str(args.build), "-j", str(args.jobs),
                         "--target", *batch], check=True)
+    foreign = foreign_objects(args.build, objects)
+    if foreign:
+        raise SystemExit(f"The shard compiled {len(foreign)} objects of other shards, among them "
+                         + ", ".join(foreign[:5]))
 
 
 if __name__ == "__main__":

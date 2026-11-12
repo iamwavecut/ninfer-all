@@ -30,6 +30,20 @@ class ObjectShardsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 SHARDS.select_objects([], index, count)
 
+    def test_foreign_objects_are_compiled_objects_of_other_shards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory)
+            (build / ".ninja_log").write_text(
+                "# ninja log v6\n"
+                "0\t9\t1\tsrc\\ops\\a.cu.obj\th\n"
+                "0\t9\t1\tsrc/ops/b.cu.obj\th\n"
+                "0\t9\t1\tsrc/serve/CMakeFiles/ninfer_webui_embed.dir/webui/embed.cpp.obj\th\n"
+                "0\t9\t1\tsrc/ops/libninfer_ops.a\th\n")
+            self.assertEqual(SHARDS.foreign_objects(build, ["src/ops/a.cu.obj"]),
+                             ["src/ops/b.cu.obj"])
+            self.assertEqual(SHARDS.foreign_objects(build, ["src/ops/a.cu.obj",
+                                                            "src/ops/b.cu.obj"]), [])
+
 
 @unittest.skipUnless(shutil.which("ninja"), "needs ninja")
 class ReleaseCommandsTest(unittest.TestCase):
