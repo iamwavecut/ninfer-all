@@ -1,5 +1,7 @@
 #include "options.h"
 
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -28,6 +30,100 @@ int check(bool condition, const char* message) {
     if (condition) { return 0; }
     std::cerr << message << '\n';
     return 1;
+}
+
+
+// --config files: layers of options below the command line (product/option_layers.h).
+int launch_configuration_tests() {
+    int failures         = 0;
+    const auto directory = std::filesystem::temp_directory_path() / "ninfer_cli_config_test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto write = [&](const char* name, const char* text) {
+        const auto path = directory / name;
+        std::ofstream(path) << text;
+        return path.string();
+    };
+    const std::string base = write("base.ini", "; a launch profile\n"
+                                               "model = from-file.ninfer\n"
+                                               "prompt = \"from file\"\n"
+                                               "max-context = 4096\n"
+                                               "spec = mtp\n"
+                                               "draft-tokens = 4\n"
+                                               "devices = 0,1\n"
+                                               "stop = alpha\n"
+                                               "thinking-budget = 512\n"
+                                               "cuda-graph = false\n"
+                                               "vision = true\n"
+                                               "vision-residency = overlay\n");
+    const auto from_file = parse({"ninfer", "--config", base});
+    failures += check(from_file.artifact_path == "from-file.ninfer" &&
+                          from_file.prompt == "from file" && from_file.max_context == 4096 &&
+                          from_file.speculative.backend == ninfer::SpeculativeBackend::Mtp &&
+                          from_file.speculative.draft_tokens == 4 &&
+                          from_file.devices == std::vector<int>({0, 1}) &&
+                          from_file.stop_strings.size() == 1 && from_file.thinking_budget == 512U &&
+                          !from_file.use_cuda_graph && from_file.enable_vision &&
+                          from_file.vision_residency == ninfer::VisionResidency::Overlay,
+                      "a configuration file's options, artifact and false switch were not applied");
+
+    const auto overridden =
+        parse({"ninfer", "cli.ninfer", "--config", base, "--max-context", "8192", "--device", "1",
+               "--stop", "beta", "--stop", "gamma", "--cuda-graph", "--spec", "none",
+               "--no-thinking", "--no-vision", "--prompt", "from cli"});
+    failures += check(overridden.artifact_path == "cli.ninfer" && overridden.prompt == "from cli" &&
+                          overridden.max_context == 8192,
+                      "the command line's artifact and values must replace the file's");
+    failures += check(overridden.device == 1 && overridden.devices.empty(),
+                      "--device must replace a file's --devices");
+    failures += check(overridden.stop_strings.size() == 2 &&
+                          overridden.stop_strings[0].text == "beta",
+                      "a repeatable option on the command line must replace the file's list");
+    failures += check(overridden.use_cuda_graph, "--cuda-graph must undo a file's false switch");
+    failures += check(overridden.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          overridden.speculative.draft_tokens == 0,
+                      "--spec none must also take the file's draft settings away");
+    failures += check(overridden.enable_thinking == false && !overridden.thinking_budget,
+                      "--no-thinking must take the file's thinking budget away");
+    failures += check(!overridden.enable_vision &&
+                          overridden.vision_residency == ninfer::VisionResidency::Resident,
+                      "--no-vision must take the file's vision residency away");
+
+    const std::string later = write("later.ini", "max-context = 16384\nspec = dflash2\n");
+    const auto two_files    = parse({"ninfer", "--config", base, "--config", later});
+    failures += check(two_files.max_context == 16384 &&
+                          two_files.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                          two_files.speculative.draft_tokens == 4,
+                      "a later file must override an earlier one and keep its other options");
+
+    // A combination one layer gives is the user's error, not an override.
+    const std::string contradictory = write("contradictory.ini", "spec = none\ndraft-tokens = 4\n");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer", "m.ninfer", "--prompt", "x", "--config",
+                                       contradictory});
+                      }),
+                      "one file's contradictory options were accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer", "m.ninfer", "--prompt", "x", "--spec", "none",
+                                       "--draft-tokens", "4"});
+                      }),
+                      "the command line's contradictory options were accepted");
+    const std::string sections = write("sections.ini", "[model]\nmax-context = 1\n");
+    const std::string dashed   = write("dashed.ini", "--max-context = 1\n");
+    const std::string nested   = write("nested.ini", "config = other.ini\n");
+    for (const std::string& file : {sections, dashed, nested, (directory / "missing.ini").string()}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer", "m.ninfer", "--prompt", "x", "--config", file});
+                          }),
+                          "a malformed, missing or nesting configuration file was accepted");
+    }
+    failures += check(rejects([] { (void)parse({"ninfer", "m.ninfer", "--config"}); }),
+                      "--config without a file was accepted");
+    failures += check(parse({"ninfer", "--config", (directory / "missing.ini").string(), "--help"})
+                          .help_requested,
+                      "--help must not read the configuration files");
+    std::filesystem::remove_all(directory);
+    return failures;
 }
 
 } // namespace
@@ -734,6 +830,7 @@ int run_tests() {
             (void)parse({"ninfer", "model.ninfer", "--prompt", "x", "--json", "--raw-output"});
         }),
         "raw JSON output should be rejected");
+    failures += launch_configuration_tests();
     return failures == 0 ? 0 : 1;
 }
 

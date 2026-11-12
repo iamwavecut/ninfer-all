@@ -1,6 +1,7 @@
 # The portable launcher reads the same model catalog before it loads a CUDA backend.
 add_library(ninfer_model_catalog STATIC model_catalog.cpp)
 ninfer_internal_includes(ninfer_model_catalog)
+target_link_libraries(ninfer_model_catalog PUBLIC ninfer_product_launch_config)
 
 add_library(ninfer_serve STATIC
   http_transport.cpp

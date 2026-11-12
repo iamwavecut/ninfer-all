@@ -28,6 +28,95 @@ ServeOptions parse(std::vector<std::string> arguments) {
     return parse_serve_options(static_cast<int>(argv.size()), argv.data());
 }
 
+// --config files under the command line (product/option_layers.h), and the router's view of them.
+int launch_configuration_tests() {
+    int failures         = 0;
+    const auto directory = std::filesystem::temp_directory_path() / "ninfer_serve_config_test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const auto write = [&](const char* name, const char* text) {
+        const auto path = directory / name;
+        std::ofstream(path) << text;
+        return path.string();
+    };
+    const std::string base = write("base.ini", "model = from-file.ninfer\n"
+                                               "host = 0.0.0.0\n"
+                                               "port = 9000\n"
+                                               "api-key = do-not-log\n"
+                                               "max-context = 32768\n"
+                                               "spec = mtp\n"
+                                               "draft-tokens = 4\n"
+                                               "adaptive-mtp = true\n"
+                                               "device-profile = off\n"
+                                               "models-max = 2\n");
+    const auto layered =
+        parse({"ninfer-serve", "--config", base, "--port", "9100", "--spec", "none"});
+    failures += check(layered.artifact_path == "from-file.ninfer" && layered.host == "0.0.0.0" &&
+                          layered.port == 9100 && layered.max_context == 32768 &&
+                          layered.api_key == "do-not-log" && layered.device_profile == "off",
+                      "a configuration file's options and artifact did not reach the server");
+    failures += check(layered.speculative.backend == ninfer::SpeculativeBackend::None &&
+                          layered.speculative.draft_tokens == 0 &&
+                          layered.speculative.mtp_policy == ninfer::MtpDraftPolicy::Fixed,
+                      "--spec none must take the file's draft settings away");
+    bool secret_logged = false;
+    bool redacted      = false;
+    for (const std::string& argument : layered.effective_arguments) {
+        secret_logged = secret_logged || argument == "do-not-log";
+        redacted      = redacted || argument == "<redacted>";
+    }
+    failures += check(!secret_logged && redacted,
+                      "the merged arguments must carry the API key redacted");
+    failures += check(layered.model_layers.size() == 2 &&
+                          layered.model_layers[0].source == base &&
+                          layered.model_layers[1].source == "command line",
+                      "each layer must reach a router's models");
+    bool router_option_kept = false;
+    for (const auto& layer : layered.model_layers) {
+        for (const std::string& argument : layer.arguments) {
+            router_option_kept = router_option_kept || argument == "--models-max";
+        }
+    }
+    failures += check(!router_option_kept, "a router option reached the models' layers");
+
+    // The router parses each model's catalog layers the same way.
+    const auto model = parse_serve_options(ninfer::product::CommandLine{
+        .program   = "ninfer-serve",
+        .artifact  = "small.ninfer",
+        .layers    = {{.source = "preset [*]", .arguments = {"--max-context", "4096"}},
+                      {.source = "preset [small]", .arguments = {"--no-cuda-graph"}},
+                      {.source = "command line", .arguments = {"--max-context", "8192"}}}});
+    failures += check(model.artifact_path == "small.ninfer" && model.max_context == 8192 &&
+                          !model.use_cuda_graph,
+                      "a router model's layers were not merged in order");
+
+    const std::string contradictory = write("contradictory.ini", "spec = none\ndraft-tokens = 4\n");
+    bool contradiction_rejected     = false;
+    try {
+        (void)parse({"ninfer-serve", "m.ninfer", "--config", contradictory});
+    } catch (const std::invalid_argument&) { contradiction_rejected = true; }
+    failures += check(contradiction_rejected, "one file's contradictory options were accepted");
+    std::filesystem::remove_all(directory);
+
+    // Every launch configuration the repository ships parses as ninfer-serve options.
+    std::size_t shipped = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(
+             std::filesystem::path(NINFER_SOURCE_DIR) / "configs")) {
+        if (entry.path().extension() != ".ini") { continue; }
+        ++shipped;
+        try {
+            const auto options = parse({"ninfer-serve", "--config", entry.path().string()});
+            failures += check(!options.artifact_path.empty(),
+                              "a shipped configuration names no model");
+        } catch (const std::exception& error) {
+            std::cerr << entry.path().string() << ": " << error.what() << '\n';
+            ++failures;
+        }
+    }
+    failures += check(shipped > 0, "no shipped launch configurations found");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -2016,6 +2105,7 @@ int main() {
         failures += check(resolve_prompt_semantics(request, defaults).lora->empty(),
                           "an empty lora list was refused on a server without adapters");
     }
+    failures += launch_configuration_tests();
 
     return failures == 0 ? 0 : 1;
 }

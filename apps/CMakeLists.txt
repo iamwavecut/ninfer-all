@@ -42,19 +42,21 @@ endfunction()
 
 ninfer_app(ninfer ninfer_app_cli BUILD_ID
   SOURCES cli/main.cpp cli/options.cpp
-  LIBRARIES ninfer_engine ninfer_product_logging ninfer_product_prompt_input)
+  LIBRARIES ninfer_engine ninfer_product_logging ninfer_product_prompt_input
+            ninfer_product_launch_config)
 ninfer_app(ninfer-serve ninfer_app_serve BUILD_ID
   SOURCES serve/main.cpp
   LIBRARIES ninfer_serve ninfer_product_logging)
 ninfer_app(ninfer-calibrate ninfer_app_calibrate
   SOURCES calibrate/main.cpp
-  LIBRARIES ninfer_calibration ninfer_runtime_support)
+  LIBRARIES ninfer_calibration ninfer_runtime_support ninfer_product_launch_config)
 ninfer_app(ninfer-perplexity ninfer_app_perplexity BUILD_ID
   SOURCES perplexity/main.cpp perplexity/corpus.cpp perplexity/evaluation.cpp
-  LIBRARIES ninfer_engine ninfer_product_logging ninfer::json)
+  LIBRARIES ninfer_engine ninfer_product_logging ninfer_product_launch_config ninfer::json)
 ninfer_app(ninfer-ngram-profile ninfer_app_ngram_profile
   SOURCES ngram_profile/main.cpp
-  LIBRARIES ninfer_model_runtime ninfer_product_prompt_input ninfer::json)
+  LIBRARIES ninfer_model_runtime ninfer_product_prompt_input ninfer_product_launch_config
+            ninfer::json)
 
 if(NINFER_MULTICALL)
   ninfer_finalize_bundle(ninfer-multicall)

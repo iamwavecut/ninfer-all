@@ -5,6 +5,7 @@
 
 #include "ninfer/engine_options.h"
 #include "ninfer/model_enums.h"
+#include "product/option_layers.h"
 
 #include <charconv>
 #include <cstdint>
@@ -66,7 +67,8 @@ inline std::uint64_t parse_ngram_count(std::string_view text, std::string_view o
 template <class Value>
 bool parse_ngram_table_option(std::string_view option, NgramTableOptions& out, Value&& value) {
     if (option == "--ngram-table") {
-        out.path = std::string(value());
+        out.path     = std::string(value());
+        out.disabled = false;
     } else if (option == "--no-ngram-table") {
         out.disabled = true;
     } else if (option == "--ngram-residency") {
@@ -100,8 +102,7 @@ bool parse_ngram_table_option(std::string_view option, NgramTableOptions& out, V
         out.ram_budget_bytes =
             detail::parse_ngram_count(std::string(value()), option, 0, std::uint64_t{1} << 30U)
             << 20U;
-    } else if (option == "--ngram-lock") {
-        out.lock = true;
+    } else if (switch_option(option, "ngram-lock", [&](bool on) { out.lock = on; })) {
     } else if (option == "--ngram-dedupe" || option == "--ngram-read-ahead") {
         const std::string state(value());
         if (state != "on" && state != "off") {

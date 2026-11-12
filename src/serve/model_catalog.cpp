@@ -25,14 +25,6 @@ std::string lower(std::string text) {
     return text;
 }
 
-std::string unquote(std::string value) {
-    if (value.size() >= 2 && ((value.front() == '"' && value.back() == '"') ||
-                              (value.front() == '\'' && value.back() == '\''))) {
-        return value.substr(1, value.size() - 2);
-    }
-    return value;
-}
-
 bool is_artifact(const std::filesystem::path& path) {
     return path.extension() == ".ninfer" && std::filesystem::is_regular_file(path);
 }
@@ -53,24 +45,6 @@ bool catalog_key(const std::string& key) {
            key == "stop-timeout" || key == "version";
 }
 
-void append_option(std::vector<std::string>& arguments, const std::string& section,
-                   const std::string& key, const std::string& value) {
-    if (key.empty() || key.front() == '-') {
-        throw std::invalid_argument("preset [" + section + "]: option '" + key +
-                                    "' must be written without leading dashes");
-    }
-    const std::string flag = "--" + key;
-    const std::string word = lower(value);
-    if (word == "true" || word == "on" || word == "yes") {
-        arguments.push_back(flag);
-    } else if (word == "false" || word == "off" || word == "no") {
-        // A false flag leaves the option out; an explicit negation is its own key (no-...).
-    } else {
-        arguments.push_back(flag);
-        arguments.push_back(value);
-    }
-}
-
 bool parse_bool(const std::string& section, const std::string& key, const std::string& value) {
     const std::string word = lower(value);
     if (word == "true" || word == "on" || word == "yes" || word == "1") { return true; }
@@ -79,54 +53,6 @@ bool parse_bool(const std::string& section, const std::string& key, const std::s
 }
 
 } // namespace
-
-PresetFile parse_preset_file(const std::string& text) {
-    PresetFile out;
-    std::stringstream stream(text);
-    std::size_t line_number      = 0;
-    PresetFile::Section* current = nullptr;
-    PresetFile::Section top{.name = "*", .entries = {}};
-    for (std::string line; std::getline(stream, line);) {
-        ++line_number;
-        line = trim(line);
-        if (line.empty() || line.front() == ';' || line.front() == '#') { continue; }
-        if (line.front() == '[') {
-            if (line.back() != ']' || line.size() < 3) {
-                throw std::invalid_argument("preset line " + std::to_string(line_number) +
-                                            ": malformed section header");
-            }
-            const std::string name = trim(line.substr(1, line.size() - 2));
-            auto existing = std::find_if(out.sections.begin(), out.sections.end(),
-                                         [&](const auto& section) { return section.name == name; });
-            if (existing != out.sections.end()) {
-                throw std::invalid_argument("preset line " + std::to_string(line_number) +
-                                            ": duplicate section [" + name + "]");
-            }
-            out.sections.push_back({.name = name, .entries = {}});
-            current = &out.sections.back();
-            continue;
-        }
-        const auto equals = line.find('=');
-        if (equals == std::string::npos) {
-            throw std::invalid_argument("preset line " + std::to_string(line_number) +
-                                        ": expected key = value");
-        }
-        const std::string key   = lower(trim(line.substr(0, equals)));
-        const std::string value = unquote(trim(line.substr(equals + 1)));
-        (current != nullptr ? *current : top).entries.emplace_back(key, value);
-    }
-    // Entries before any section (llama.cpp's `version = 1`) belong to the global section.
-    if (!top.entries.empty()) {
-        auto global = std::find_if(out.sections.begin(), out.sections.end(),
-                                   [](const auto& section) { return section.name == "*"; });
-        if (global == out.sections.end()) {
-            out.sections.insert(out.sections.begin(), std::move(top));
-        } else {
-            global->entries.insert(global->entries.begin(), top.entries.begin(), top.entries.end());
-        }
-    }
-    return out;
-}
 
 std::vector<CatalogModel> discover_models(const std::filesystem::path& directory) {
     if (!std::filesystem::is_directory(directory)) {
@@ -153,17 +79,17 @@ std::vector<CatalogModel> discover_models(const std::filesystem::path& directory
 }
 
 std::vector<CatalogModel> build_catalog(const std::optional<std::filesystem::path>& models_dir,
-                                        const std::optional<PresetFile>& preset,
-                                        const std::vector<std::string>& command_line) {
+                                        const std::optional<product::ConfigFile>& preset,
+                                        const std::vector<product::ArgumentLayer>& shared) {
     std::vector<CatalogModel> models;
     if (models_dir) { models = discover_models(*models_dir); }
-    std::vector<std::string> global_arguments;
+    product::ArgumentLayer global{.source = "preset [*]", .arguments = {}};
     if (preset) {
         for (const auto& section : preset->sections) {
             if (section.name != "*") { continue; }
             for (const auto& [key, value] : section.entries) {
                 if (catalog_key(key)) { continue; }
-                append_option(global_arguments, section.name, key, value);
+                product::append_config_option(global.arguments, "preset [*]: " + key, key, value);
             }
         }
         for (const auto& section : preset->sections) {
@@ -174,6 +100,7 @@ std::vector<CatalogModel> build_catalog(const std::optional<std::filesystem::pat
                 models.push_back({.id = section.name});
                 model = std::prev(models.end());
             }
+            model->layers.push_back({.source = "preset [" + section.name + "]", .arguments = {}});
             for (const auto& [key, value] : section.entries) {
                 if (key == "model" || key == "artifact") {
                     model->artifact = value;
@@ -183,7 +110,9 @@ std::vector<CatalogModel> build_catalog(const std::optional<std::filesystem::pat
                 } else if (key == "load-on-startup") {
                     model->load_on_startup = parse_bool(section.name, key, value);
                 } else if (!catalog_key(key)) {
-                    append_option(model->arguments, section.name, key, value);
+                    product::append_config_option(model->layers.back().arguments,
+                                                  "preset [" + section.name + "]: " + key, key,
+                                                  value);
                 }
             }
             if (model->artifact.empty()) {
@@ -205,11 +134,11 @@ std::vector<CatalogModel> build_catalog(const std::optional<std::filesystem::pat
             }
         }
         // Precedence, lowest first: the preset's global section, the model's own section, then the
-        // command line. The option parser keeps the last value an option is given.
-        std::vector<std::string> arguments = global_arguments;
-        arguments.insert(arguments.end(), model.arguments.begin(), model.arguments.end());
-        arguments.insert(arguments.end(), command_line.begin(), command_line.end());
-        model.arguments = std::move(arguments);
+        // router's configuration files and command line.
+        std::vector<product::ArgumentLayer> layers{global};
+        layers.insert(layers.end(), model.layers.begin(), model.layers.end());
+        layers.insert(layers.end(), shared.begin(), shared.end());
+        model.layers = std::move(layers);
     }
     if (models.empty()) {
         throw std::invalid_argument(

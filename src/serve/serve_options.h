@@ -5,6 +5,7 @@
 #include "ninfer/kv_cache_storage.h"
 #include "ninfer/model_enums.h"
 #include "ninfer/request.h"
+#include "product/launch_config/launch_config.h"
 #include "product/logging/logging.h"
 #include "product/prompt_route_options.h"
 #include "product/steering_options.h"
@@ -126,9 +127,9 @@ struct ServeOptions {
     // zero keeps it loaded. Both modes.
     std::uint32_t sleep_idle_seconds  = 0;
     std::uint32_t unload_idle_seconds = 0;
-    // The arguments after the artifact path, router options removed: what router mode starts each
-    // model with.
-    std::vector<std::string> model_arguments;
+    // The option layers after the artifact path (configuration files, then the command line),
+    // router options removed: what router mode starts each model with.
+    std::vector<product::ArgumentLayer> model_layers;
 
     [[nodiscard]] bool router() const noexcept { return models_dir || models_preset; }
     bool mlp_a8_decode      = false;
@@ -225,6 +226,10 @@ struct ServeOptions {
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.
     std::vector<std::string> startup_argv;
+    // The options the server was parsed from after its configuration files and command line were
+    // merged (product/option_layers.h), secrets redacted: the server-start record and a router's
+    // /models report them.
+    std::vector<std::string> effective_arguments;
 };
 
 // Parse-time limits. A request that omits max_tokens / max_completion_tokens / max_output_tokens
@@ -239,7 +244,10 @@ struct ServeOptions {
                          .lenient_image_detail      = options.lenient_image_detail};
 }
 
+// argv, with its --config files (product::read_command_line).
 ServeOptions parse_serve_options(int argc, char** argv);
+// One run's artifact and option layers: a router's model.
+ServeOptions parse_serve_options(const product::CommandLine& command_line);
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);

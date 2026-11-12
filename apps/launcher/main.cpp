@@ -1,10 +1,12 @@
 // Toolkit-independent launcher. One fixed backend remains loaded until process exit.
 #include "selection.h"
 #include "ninfer_build_id.h"
+#include "product/launch_config/launch_config.h"
 #ifdef NINFER_ROUTER_LAUNCHER
 #include "serve/model_catalog.h"
-#include <optional>
 #endif
+#include <algorithm>
+#include <optional>
 #include <charconv>
 #include <cstdio>
 #include <cstring>
@@ -84,49 +86,49 @@ struct Options {
     int requested = 0;
     std::vector<int> devices{0};
     std::vector<char*> arguments;
+    // The run's option layers (its --config files, then the command line).
+    std::vector<ninfer::product::ArgumentLayer> layers;
+    bool help    = false;
+    bool version = false;
 #ifdef NINFER_ROUTER_LAUNCHER
     std::optional<fs::path> models_directory;
     std::optional<fs::path> models_preset;
 #endif
 };
-Options parse(int argc, char** argv) {
-    Options options;
-    bool backend_seen = false;
-    int device_kind = 0;
-    options.arguments.push_back(argv[0]);
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view arg(argv[i]);
-        if (arg == "--cuda-backend" || arg.starts_with("--cuda-backend=")) {
-            if (backend_seen) throw std::runtime_error("Specify --cuda-backend once");
-            backend_seen = true;
-            std::string_view value;
-            if (arg == "--cuda-backend") {
-                if (++i == argc) throw std::runtime_error("--cuda-backend requires auto, 12 or 13");
-                value = argv[i];
-            } else value = arg.substr(std::strlen("--cuda-backend="));
-            if (value == "12") options.requested = 12;
-            else if (value == "13") options.requested = 13;
-            else if (value != "auto") throw std::runtime_error("--cuda-backend requires auto, 12 or 13");
-            continue;
-        }
-        options.arguments.push_back(argv[i]);
+
+int backend_major(std::string_view value) {
+    if (value == "12") return 12;
+    if (value == "13") return 13;
+    if (value == "auto") return 0;
+    throw std::runtime_error("--cuda-backend requires auto, 12 or 13");
+}
+
+// The devices one layer of arguments selects: kind 1 for --device, 2 for --devices, 0 for neither.
+struct DeviceChoice {
+    int kind = 0;
+    std::vector<int> devices;
+};
+
+DeviceChoice scan_layer(const std::vector<std::string>& arguments, Options& options) {
+    DeviceChoice choice;
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+        const std::string_view arg(arguments[i]);
         if (arg == "--device" || arg == "--devices") {
             const int kind = arg == "--device" ? 1 : 2;
-            if (device_kind && device_kind != kind)
+            if (choice.kind && choice.kind != kind)
                 throw std::runtime_error("--device and --devices are mutually exclusive");
-            device_kind = kind;
-            if (++i == argc) throw std::runtime_error(std::string(arg) + " requires a value");
-            options.arguments.push_back(argv[i]);
-            options.devices.clear();
-            std::string_view list(argv[i]);
+            choice.kind = kind;
+            if (++i == arguments.size()) throw std::runtime_error(std::string(arg) + " requires a value");
+            choice.devices.clear();
+            std::string_view list(arguments[i]);
             for (;;) {
                 const auto comma = list.find(',');
-                options.devices.push_back(number(list.substr(0, comma)));
+                choice.devices.push_back(number(list.substr(0, comma)));
                 if (comma == std::string_view::npos) break;
                 if (arg == "--device") throw std::runtime_error("--device requires one index");
                 list.remove_prefix(comma + 1);
             }
-            if (options.devices.size() > 8) throw std::runtime_error("--devices supports at most eight GPUs");
+            if (choice.devices.size() > 8) throw std::runtime_error("--devices supports at most eight GPUs");
         }
         // Quoted prompt/template strings must not become launcher options. These
         // product flags consume text even when that text starts with '--'.
@@ -142,39 +144,72 @@ Options parse(int argc, char** argv) {
                  arg == "--corpus" || arg == "--text" || arg == "--output" ||
                  arg == "--weights" || arg == "-m" || arg == "-f" || arg == "--output-file" ||
                  arg == "--out" || arg == "--evaluate") {
-            if (i + 1 < argc) {
+            if (i + 1 < arguments.size()) {
 #ifdef NINFER_ROUTER_LAUNCHER
-                if (arg == "--models-dir") options.models_directory = argv[i + 1];
-                if (arg == "--models-preset") options.models_preset = argv[i + 1];
+                if (arg == "--models-dir") options.models_directory = arguments[i + 1];
+                if (arg == "--models-preset") options.models_preset = arguments[i + 1];
+#else
+                (void)options;
 #endif
-                options.arguments.push_back(argv[++i]);
+                ++i;
             }
         }
     }
+    return choice;
+}
+
+// The devices of a run's layers: the latest layer that selects any decides.
+std::vector<int> layer_devices(const std::vector<ninfer::product::ArgumentLayer>& layers,
+                               Options& options) {
+    std::vector<int> devices{0};
+    for (const auto& layer : layers) {
+        DeviceChoice choice = scan_layer(layer.arguments, options);
+        if (choice.kind) devices = std::move(choice.devices);
+    }
+    return devices;
+}
+
+Options parse(int argc, char** argv) {
+    Options options;
+    bool backend_seen = false;
+    options.arguments.push_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg(argv[i]);
+        if (arg == "--cuda-backend" || arg.starts_with("--cuda-backend=")) {
+            if (backend_seen) throw std::runtime_error("Specify --cuda-backend once");
+            backend_seen = true;
+            std::string_view value;
+            if (arg == "--cuda-backend") {
+                if (++i == argc) throw std::runtime_error("--cuda-backend requires auto, 12 or 13");
+                value = argv[i];
+            } else value = arg.substr(std::strlen("--cuda-backend="));
+            options.requested = backend_major(value);
+            continue;
+        }
+        options.arguments.push_back(argv[i]);
+    }
+    const auto command_line = ninfer::product::read_command_line(
+        static_cast<int>(options.arguments.size()), options.arguments.data(),
+        ninfer::product::PositionalArtifact::Taken);
+    // A configuration file's cuda-backend applies unless the command line names one.
+    if (!backend_seen && command_line.cuda_backend)
+        options.requested = backend_major(*command_line.cuda_backend);
+    options.help    = command_line.help;
+    options.version = command_line.version;
+    options.layers  = command_line.layers;
+    if (!options.help && !options.version) options.devices = layer_devices(options.layers, options);
     return options;
 }
 
 #ifdef NINFER_ROUTER_LAUNCHER
-std::vector<int> catalog_devices(const Options& options) {
+std::vector<int> catalog_devices(Options& options) {
     if (!options.models_directory && !options.models_preset) return options.devices;
-    std::optional<ninfer::serve::PresetFile> preset;
-    if (options.models_preset) {
-        std::ifstream file(*options.models_preset);
-        if (!file) throw std::runtime_error("Cannot read --models-preset");
-        std::stringstream text;
-        text << file.rdbuf();
-        preset = ninfer::serve::parse_preset_file(text.str());
-    }
-    std::vector<std::string> shared;
-    for (std::size_t i = 1; i < options.arguments.size(); ++i) shared.emplace_back(options.arguments[i]);
+    std::optional<ninfer::product::ConfigFile> preset;
+    if (options.models_preset) preset = ninfer::product::read_config_file(*options.models_preset);
     std::vector<int> devices;
-    for (const auto& model : ninfer::serve::build_catalog(options.models_directory, preset, shared)) {
-        std::vector<std::string> words{NINFER_COMMAND, model.artifact.string()};
-        words.insert(words.end(), model.arguments.begin(), model.arguments.end());
-        std::vector<char*> args;
-        for (auto& word : words) args.push_back(word.data());
-        const auto selected = parse(static_cast<int>(args.size()), args.data());
-        devices.insert(devices.end(), selected.devices.begin(), selected.devices.end());
+    for (const auto& model : ninfer::serve::build_catalog(options.models_directory, preset, options.layers)) {
+        const auto selected = layer_devices(model.layers, options);
+        devices.insert(devices.end(), selected.begin(), selected.end());
     }
     std::sort(devices.begin(), devices.end());
     devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
@@ -248,10 +283,8 @@ int main(int argc, char** argv) {
     try {
         auto options = parse(argc, argv);
         const auto root = executable().parent_path();
-        const bool help = options.arguments.size() >= 2 &&
-            (std::string_view(options.arguments[1]) == "--help" ||
-             std::string_view(options.arguments[1]) == "-h");
-        if (options.arguments.size() >= 2 && std::string_view(options.arguments[1]) == "--version") {
+        const bool help = options.help;
+        if (options.version) {
             std::cout << NINFER_COMMAND << ' ' << NINFER_VERSION << '+' << NINFER_BUILD_ID << '\n';
             return 0;
         }
