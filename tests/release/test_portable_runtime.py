@@ -151,6 +151,18 @@ set_target_properties(driver PROPERTIES PREFIX "" SUFFIX "" OUTPUT_NAME "libcuda
         finally:
             (self.folder / 'hidden').rename(path)
 
+    def test_missing_backends_are_named(self):
+        path = self.folder / 'backends'
+        path.rename(self.folder / 'hidden')
+        try:
+            result = self.launch('model.ninfer', '--device', '0')
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('No CUDA backend beside the launcher', result.stderr)
+            self.assertIn(str(Path('backends') / 'cuda13'), result.stderr)
+            self.assertEqual(result.stdout, '')
+        finally:
+            (self.folder / 'hidden').rename(path)
+
     def test_runtime_help_crosses_private_entry_boundary(self):
         result = self.launch('--cuda-backend', '12', '--help')
         self.assertEqual(result.returncode, 0, result.stderr)

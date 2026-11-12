@@ -313,6 +313,13 @@ int main(int argc, char** argv) {
             // Linux uses a temporary driver stub for this build-tree operation.
             if (!selected) selected = has13 ? 13 : 12;
         } else {
+            // A launcher copied without its backends directory names the files it needs, not
+            // the GPUs or the driver.
+            if (!has12 && !has13) {
+                throw std::runtime_error(
+                    "No CUDA backend beside the launcher: " + runtime(root, 13).string() + " and " +
+                    runtime(root, 12).string() + " are missing");
+            }
             const auto hardware = inspect(options.devices);
             selected = ninfer::launcher::select(options.requested, hardware.driver,
                                                 hardware.architectures, has12, has13,
