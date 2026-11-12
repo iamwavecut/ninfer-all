@@ -209,6 +209,62 @@ class CheckpointTests(unittest.TestCase):
             self.assertTrue(CACHE.restore(self.bucket, target, family, self.ref, required=True))
         self.assertEqual((target / 'manifest').read_text(), 'previous and current headers')
 
+    def test_baseline_leaves_out_the_files_another_snapshot_supplied_unchanged(self):
+        # A shard restores the aggregate first: its own snapshot holds only what the shard changed.
+        for name, content in (('result', 'object of another shard'), ('manifest', 'headers')):
+            (self.source / name).write_text(content)
+        baseline = self.root / 'baseline.tsv'
+        CACHE.write_baseline(self.source, baseline)
+        os.utime(self.source / 'result', (5000, 5000))  # a hit renews the time, not the content
+        (self.source / 'manifest').write_text('headers and the current headers')
+        (self.source / 'new-result').write_text('object this shard compiled')
+        archive = self.root / 'test.tar'
+        self.assertEqual(CACHE.pack(self.source, archive, CACHE.read_baseline(baseline)), 2)
+        with tarfile.open(archive) as package:
+            self.assertEqual(sorted(package.getnames()), ['manifest', 'new-result'])
+
+    def test_shard_without_changes_still_publishes_its_snapshot(self):
+        # Every object of the shard was in the aggregate: the package job's required restore of the
+        # shard family must still find a snapshot.
+        (self.source / 'object').write_text('aggregate object')
+        baseline = self.root / 'baseline.tsv'
+        CACHE.write_baseline(self.source, baseline)
+        self.assertTrue(CACHE.save(self.bucket, self.source, self.family, self.ref,
+                                   baseline=CACHE.read_baseline(baseline)))
+        target = self.root / 'package'
+        self.assertTrue(CACHE.restore(self.bucket, target, self.family, self.ref, required=True))
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_extra_ref_adds_a_merged_branch_snapshot_to_master(self):
+        manifest = self.source / 'manifest'
+        manifest.write_text('master headers')
+        os.utime(manifest, (1000, 1000))
+        CACHE.save(self.bucket, self.source, self.family, 'refs/heads/master')
+        branch = self.root / 'branch'
+        branch.mkdir()
+        (branch / 'manifest').write_text('master and branch headers')
+        os.utime(branch / 'manifest', (2000, 2000))
+        (branch / 'branch-result').write_text('object the branch compiled')
+        CACHE.save(self.bucket, branch, self.family, 'refs/heads/dev/merged')
+        target = self.root / 'master-build'
+        self.assertTrue(CACHE.restore(self.bucket, target, self.family, 'refs/heads/master',
+                                      extra_refs=['refs/heads/dev/merged', 'refs/heads/dev/absent']))
+        self.assertEqual((target / 'manifest').read_text(), 'master and branch headers')
+        self.assertEqual((target / 'branch-result').read_text(), 'object the branch compiled')
+        cold = self.root / 'cold'
+        self.assertTrue(CACHE.restore(self.bucket, cold, 'other-family', 'refs/heads/master',
+                                      extra_refs=['refs/heads/dev/absent']) is False)
+
+    def test_merged_branch_comes_only_from_this_repository_merge_subject(self):
+        repository = 'iamwavecut/ninfer-all'
+        self.assertEqual(CACHE.merged_branch('Merge pull request #330 from iamwavecut/dev/launch-config', repository),
+                         'refs/heads/dev/launch-config')
+        for subject in ('Merge pull request #155 from witherhoard99/master',
+                        'fix(launcher): name the missing backend files',
+                        'Merge branch master into dev/x'):
+            with self.subTest(subject=subject):
+                self.assertIsNone(CACHE.merged_branch(subject, repository))
+
     def test_pack_excludes_mutable_statistics_and_temporary_entries(self):
         (self.source / 'tmp').mkdir()
         for name in ('object', 'stats', 'lock', 'entry.tmp', 'tmp/uncommitted'):
@@ -248,8 +304,14 @@ class RetentionTests(unittest.TestCase):
         self.prune('refs/heads/live', 'refs/heads/idle')
         self.assertTrue(self.kept('linux', 'refs/heads/master'))
         self.assertTrue(self.kept('linux', 'refs/heads/live'))
-        self.assertFalse(self.kept('linux', 'refs/heads/merged'))
+        # Master's first build of the merge reads the merged branch's snapshot.
+        self.assertTrue(self.kept('linux', 'refs/heads/merged'))
         self.assertFalse(self.kept('linux', 'refs/heads/idle'))
+        self.advance(1.1)
+        self.save('linux', 'refs/heads/master')
+        self.prune('refs/heads/live')
+        self.assertFalse(self.kept('linux', 'refs/heads/merged'))
+        self.assertTrue(self.kept('linux', 'refs/heads/live'))
 
     def test_family_without_writes_is_retired_only_while_its_branch_keeps_building(self):
         self.save('linux-host-v2', 'refs/heads/master')
@@ -278,6 +340,7 @@ class RetentionTests(unittest.TestCase):
 
     def test_dry_run_deletes_nothing(self):
         self.save('linux', 'refs/heads/merged')
+        self.advance(2)
         before = self.bucket.files.copy()
         self.assertEqual(len(self.prune(dry_run=True)), 2)
         self.assertEqual(self.bucket.files, before)
@@ -308,26 +371,56 @@ class CacheOwnershipTests(unittest.TestCase):
 
     def test_only_native_builds_can_write_their_own_families(self):
         with patch.dict(os.environ, self.env, clear=True):
-            CACHE.require_native_writer('native-linux-cuda-13.4.3', 'refs/heads/master')
+            CACHE.require_cache_writer('native-linux-cuda-13.4.3', 'refs/heads/master')
             for override in (dict(GITHUB_JOB='cuda'), dict(GITHUB_EVENT_NAME='pull_request'),
                              dict(GITHUB_WORKFLOW_REF='iamwavecut/ninfer-all/.github/workflows/ci.yml@refs/heads/master')):
                 with patch.dict(os.environ, override), self.assertRaises(ValueError):
-                    CACHE.require_native_writer('native-linux-cuda-13.4.3', 'refs/heads/master')
+                    CACHE.require_cache_writer('native-linux-cuda-13.4.3', 'refs/heads/master')
             with self.assertRaises(ValueError):
-                CACHE.require_native_writer('native-windows-cuda-13.4.3', 'refs/heads/master')
+                CACHE.require_cache_writer('native-windows-cuda-13.4.3', 'refs/heads/master')
             with patch.dict(os.environ, GITHUB_JOB='windows'):
-                CACHE.require_native_writer('vcpkg-baseline', 'refs/heads/master')
+                CACHE.require_cache_writer('vcpkg-baseline', 'refs/heads/master')
+
+    def test_ci_writes_only_its_own_family_from_master_pushes(self):
+        env = dict(self.env, GITHUB_JOB='cuda',
+                   GITHUB_WORKFLOW_REF='iamwavecut/ninfer-all/.github/workflows/ci.yml@refs/heads/master')
+        with patch.dict(os.environ, env, clear=True):
+            CACHE.require_cache_writer('ci-linux-cuda-13.4.3-v1', 'refs/heads/master')
+            for family, ref, override in (
+                    ('native-linux-cuda-13.4.3-shared-v1', 'refs/heads/master', {}),
+                    ('ci-linux-cuda-13.4.3-v1', 'refs/heads/dev/x', {}),
+                    ('ci-linux-cuda-13.4.3-v1', 'refs/heads/master', dict(GITHUB_EVENT_NAME='pull_request')),
+                    ('ci-linux-cuda-13.4.3-v1', 'refs/heads/master', dict(GITHUB_JOB='windows-msvc'))):
+                with self.subTest(family=family, ref=ref, override=override), \
+                        patch.dict(os.environ, override), self.assertRaises(ValueError):
+                    CACHE.require_cache_writer(family, ref)
+        with patch.dict(os.environ, self.env, clear=True), self.assertRaises(ValueError):
+            CACHE.require_cache_writer('ci-linux-cuda-13.4.3-v1', 'refs/heads/master')
+
+    def test_restore_records_a_baseline_even_when_the_optional_reader_starts_cold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'objects').mkdir()
+            (root / 'objects/kept').write_text('local entry')
+            command = [sys.executable, SPEC.origin, 'restore', '--directory', str(root / 'objects'),
+                       '--family', 'native-linux-cuda-test', '--source-ref', 'refs/heads/master',
+                       '--optional', '--baseline', str(root / 'baseline.tsv')]
+            env = os.environ | self.env
+            env.pop('HF_TOKEN', None)
+            result = subprocess.run(command, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(CACHE.read_baseline(root / 'baseline.tsv'), {'kept': 11})
 
     def test_bootstrap_can_write_only_its_linux_shared_cache(self):
         env = dict(self.env, GITHUB_EVENT_NAME='workflow_dispatch',
                    GITHUB_WORKFLOW_REF='iamwavecut/ninfer-all/.github/workflows/linux-cache-bootstrap.yml@refs/heads/build/windows-release')
         with patch.dict(os.environ, env, clear=True):
-            CACHE.require_native_writer('native-linux-cuda-13.4.3-shared-v1', env['GITHUB_REF'])
+            CACHE.require_cache_writer('native-linux-cuda-13.4.3-shared-v1', env['GITHUB_REF'])
             for family in ('native-linux-cuda-13.4.3-host-v2', 'native-windows-cuda-13.4.3', 'vcpkg-test'):
                 with self.assertRaises(ValueError):
-                    CACHE.require_native_writer(family, env['GITHUB_REF'])
+                    CACHE.require_cache_writer(family, env['GITHUB_REF'])
             with patch.dict(os.environ, GITHUB_EVENT_NAME='pull_request'), self.assertRaises(ValueError):
-                CACHE.require_native_writer('native-linux-cuda-13.4.3-shared-v1', env['GITHUB_REF'])
+                CACHE.require_cache_writer('native-linux-cuda-13.4.3-shared-v1', env['GITHUB_REF'])
 
     def test_older_rerun_cannot_replace_newer_native_cache(self):
         with tempfile.TemporaryDirectory() as directory:

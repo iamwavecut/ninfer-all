@@ -48,7 +48,14 @@ target_link_libraries(ninfer_serve
 
 # A WebUI is compiled in only from a local directory, never downloaded at configure time, so offline
 # and hermetic builds are unaffected. scripts/fetch-webui.sh unpacks llama.cpp's released WebUI into
-# such a directory.
+# such a directory. Its files compile in a library of their own that links nothing: Ninja runs a
+# target's custom command after every library the target links is built, and starts the target's
+# objects after the command. In ninfer_serve the generated source made each object of ninfer_serve
+# and of the products above it wait for the whole library closure, so a build of a few objects
+# (an object shard) compiled every library first.
+add_library(ninfer_webui_assets STATIC)
+ninfer_internal_includes(ninfer_webui_assets)
+target_link_libraries(ninfer_serve PRIVATE ninfer_webui_assets)
 set(NINFER_WEBUI_DIR "" CACHE PATH
     "Directory of built WebUI files (with index.html) to serve from ninfer-serve; empty embeds none")
 if(NINFER_WEBUI_DIR)
@@ -64,7 +71,7 @@ if(NINFER_WEBUI_DIR)
     DEPENDS ninfer_webui_embed ${NINFER_WEBUI_FILES}
     COMMENT "Embedding the WebUI from ${NINFER_WEBUI_DIR}"
     VERBATIM)
-  target_sources(ninfer_serve PRIVATE "${NINFER_WEBUI_SOURCE}")
+  target_sources(ninfer_webui_assets PRIVATE "${NINFER_WEBUI_SOURCE}")
 else()
-  target_sources(ninfer_serve PRIVATE webui_none.cpp)
+  target_sources(ninfer_webui_assets PRIVATE webui_none.cpp)
 endif()

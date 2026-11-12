@@ -15,6 +15,16 @@ on:
       jobs:
         type: number
         default: 4
+      phase:
+        description: full (compile, link and package), objects (one shard of the objects) or package
+        type: string
+        default: full
+      shard:
+        type: number
+        default: 0
+      count:
+        type: number
+        default: 8
       version:
         description: Release tag the binaries report; empty outside publication
         type: string
@@ -28,13 +38,14 @@ permissions:
 
 jobs:
   linux:
-    name: Linux Debian 13 CUDA ${{ inputs.cuda }} (${{ inputs.archs }})
+    name: Linux Debian 13 CUDA ${{ inputs.cuda }} (${{ inputs.archs }})${{ inputs.phase == 'objects' && format(' objects {0}/{1}', inputs.shard, inputs.count) || '' }}
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.runner == 'ubuntu-24.04' && 'debian:13-slim' || '' }}
     timeout-minutes: 350
-    # Each CUDA family has one writer, including temporary bootstrap runs.
+    # Each cache family has one writer, including temporary bootstrap runs: a shard writes its own,
+    # the package or full build the aggregate.
     concurrency:
-      group: native-linux-shared-${{ github.ref }}-${{ inputs.cuda }}
+      group: native-linux-shared-${{ github.ref }}-${{ inputs.cuda }}-${{ inputs.phase == 'objects' && inputs.shard || 'all' }}
       cancel-in-progress: false
     defaults:
       run:
@@ -43,7 +54,8 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
       HF_HUB_DISABLE_TELEMETRY: '1'
       NINFER_VERSION: ${{ inputs.version }}
-      HF_CACHE_FAMILY: native-linux-cuda-${{ inputs.cuda }}-shared-v1
+      HF_CACHE_AGGREGATE: native-linux-cuda-${{ inputs.cuda }}-shared-v1
+      HF_CACHE_FAMILY: native-linux-cuda-${{ inputs.cuda }}-shared-v1${{ inputs.phase == 'objects' && format('-shard-{0}', inputs.shard) || '' }}
       CCACHE_DIR: ${{ github.workspace }}/.cache/objects
       CCACHE_MAXSIZE: 8Gi
       CCACHE_COMPILERCHECK: content
@@ -82,7 +94,26 @@ jobs:
         run: python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0
       - name: Restore completed objects from HF
         id: object-cache
-        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-linux-cuda-${{ inputs.cuda }}-shared-v1
+        env:
+          PHASE: ${{ inputs.phase }}
+          COUNT: ${{ inputs.count }}
+        run: |
+          # Every phase starts from the aggregate of the last finished build, and on master also from
+          # the branch the head commit merged. A shard then adds its own snapshot and later saves
+          # only what differs from the aggregate; the package job adds every shard's snapshot.
+          restore=(python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --merged-branch)
+          if [[ "$PHASE" == objects ]]; then
+            "${restore[@]}" --family "$HF_CACHE_AGGREGATE" --baseline build-cache-baseline.tsv
+            echo "HF_CACHE_BASELINE=$PWD/build-cache-baseline.tsv" >> "$GITHUB_ENV"
+            "${restore[@]}" --family "$HF_CACHE_FAMILY"
+          else
+            "${restore[@]}" --family "$HF_CACHE_AGGREGATE"
+          fi
+          if [[ "$PHASE" == package ]]; then
+            for (( shard = 0; shard < COUNT; shard++ )); do
+              "${restore[@]}" --family "$HF_CACHE_AGGREGATE-shard-$shard" --required
+            done
+          fi
       - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
         run: python3.11 .github/scripts/check-compiler-cache.py
@@ -94,8 +125,17 @@ jobs:
       - name: Build release products
         id: build
         timeout-minutes: 305
+        env:
+          PHASE: ${{ inputs.phase }}
+          JOBS: ${{ steps.capacity.outputs.jobs }}
         # The rental exposes all host CPUs, beyond its container CPU and RAM quota.
-        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j ${{ steps.capacity.outputs.jobs }} --target ninfer ninfer-serve ninfer_bench ninfer-calibrate ninfer-perplexity ninfer-ngram-profile
+        run: |
+          if [[ "$PHASE" == objects ]]; then
+            build=(python3.11 .github/scripts/build-object-shard.py --shard ${{ inputs.shard }} --count ${{ inputs.count }} --jobs "$JOBS")
+          else
+            build=(cmake --build build-release -j "$JOBS" --target ninfer ninfer-serve ninfer_bench ninfer-calibrate ninfer-perplexity ninfer-ngram-profile)
+          fi
+          python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- "${build[@]}"
       - name: Prepare completed object cache for upload
         timeout-minutes: 2
         if: always() && steps.compiler-cache.outcome == 'success'
@@ -106,13 +146,16 @@ jobs:
       - name: Save completed objects even after cancellation
         if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
         timeout-minutes: ${{ job.status == 'cancelled' && 3 || 20 }}
-        run: python3.11 .github/scripts/hf-build-cache.py save --directory .cache/objects --family native-linux-cuda-${{ inputs.cuda }}-shared-v1
+        run: python3.11 .github/scripts/hf-build-cache.py save --directory .cache/objects --family "$HF_CACHE_FAMILY"
       - name: Package and verify Linux binaries
+        if: inputs.phase != 'objects'
         run: NINFER_BUILD_ROOT="$PWD/build-release" scripts/package-release.sh
       - name: Preserve Linux archive in HF and verify its checksum
+        if: inputs.phase != 'objects'
         timeout-minutes: 60
         run: python3.11 .github/scripts/archive-linux-artifact.py
       - uses: actions/upload-artifact@v7
+        if: inputs.phase != 'objects'
         with:
           name: native-linux-cuda-${{ inputs.cuda }}
           path: |
@@ -125,11 +168,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: linux-logs-${{ inputs.cuda }}
+          name: linux-logs-${{ inputs.cuda }}-${{ inputs.phase }}${{ inputs.phase == 'objects' && format('-{0}', inputs.shard) || '' }}
+          # .ninja_log holds each compile's start and end; ninja's console lines carry no times.
+          include-hidden-files: true
           path: |
             dist/HF-*.json
             build-cache-check/cache-stats.json
             build-release/*.log
+            build-release/.ninja_log
+            build-release/object-shard.json
             build-release/cache-stats.json
             build-release/cache-progress.jsonl
             build-release/CMakeFiles/CMakeConfigureLog.yaml

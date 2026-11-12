@@ -28,11 +28,14 @@ on:
 permissions:
   contents: read
 
-# A newer commit cancels old builds. Cleanup saves completed object-cache entries.
-# Publication uses a draft and checks master again before moving latest.
+# Runs of one branch queue: a newer commit waits for the running build, and GitHub drops the
+# commit that waited before it. A cancelled build would lose every object it had started; a run
+# whose revision is no longer the branch head finishes its objects for the next run and skips
+# packaging (the *-current jobs). Publication uses a draft and checks master again before moving
+# latest.
 concurrency:
   group: native-release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   changes:
@@ -83,10 +86,6 @@ jobs:
             echo 'Publication requires both Linux and Windows artifacts.' >&2
             exit 1
           fi
-      - name: Wait for the previous run to finish cache cleanup
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3.11 .github/scripts/wait-previous-builds.py
       # The binaries report the tag they will be published under; publish checks it again.
       - name: Allocate the release tag
         id: version
@@ -126,11 +125,32 @@ jobs:
     secrets:
       HF_BUILD_CACHE_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
 
-  windows:
+  windows-current:
+    name: Windows revision still current
     needs: [validate, windows-objects]
+    if: ${{ always() && !cancelled() && needs.validate.result == 'success' && inputs.platforms != 'linux' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      superseded: ${{ steps.head.outputs.superseded }}
+    steps:
+      - id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/${GITHUB_REF#refs/heads/}" --jq .object.sha)"
+          if [[ "$head" == "$GITHUB_SHA" ]]; then
+            echo superseded=false >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$GITHUB_REF moved to $head; its own run packages it."
+            echo superseded=true >> "$GITHUB_OUTPUT"
+          fi
+
+  windows:
+    needs: [validate, windows-objects, windows-current]
     if: >-
       ${{ always() && !cancelled() && needs.validate.result == 'success' &&
-          inputs.platforms != 'linux' &&
+          inputs.platforms != 'linux' && needs.windows-current.outputs.superseded == 'false' &&
           (needs.windows-objects.result == 'success' ||
            (inputs.windows_phase == 'package' && needs.windows-objects.result == 'skipped')) }}
     strategy:
@@ -153,9 +173,58 @@ jobs:
     secrets:
       HF_BUILD_CACHE_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
 
-  linux:
+  # Hosted runners compile the objects in eight shards per Toolkit, as Windows does; a rented
+  # runner (linux_runner) compiles, links and packages in one job.
+  linux-objects:
     needs: validate
-    if: inputs.platforms != 'windows'
+    if: inputs.platforms != 'windows' && inputs.linux_runner != 'ninfer-native-debian13'
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        toolkit:
+          - cuda: '12.9.2'
+            archs: '70;75;80;86;89'
+          - cuda: '13.4.3'
+            archs: '75;80;86;89;120a'
+    uses: ./.github/workflows/native-linux.yml
+    with:
+      cuda: ${{ matrix.toolkit.cuda }}
+      archs: ${{ matrix.toolkit.archs }}
+      phase: objects
+      shard: ${{ matrix.shard }}
+      version: ${{ needs.validate.outputs.version }}
+    secrets: inherit
+
+  linux-current:
+    name: Linux revision still current
+    needs: [validate, linux-objects]
+    if: ${{ always() && !cancelled() && needs.validate.result == 'success' && inputs.platforms != 'windows' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      superseded: ${{ steps.head.outputs.superseded }}
+    steps:
+      - id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/${GITHUB_REF#refs/heads/}" --jq .object.sha)"
+          if [[ "$head" == "$GITHUB_SHA" ]]; then
+            echo superseded=false >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$GITHUB_REF moved to $head; its own run packages it."
+            echo superseded=true >> "$GITHUB_OUTPUT"
+          fi
+
+  linux:
+    needs: [validate, linux-objects, linux-current]
+    if: >-
+      ${{ always() && !cancelled() && needs.validate.result == 'success' &&
+          inputs.platforms != 'windows' && needs.linux-current.outputs.superseded == 'false' &&
+          (needs.linux-objects.result == 'success' ||
+           (inputs.linux_runner == 'ninfer-native-debian13' && needs.linux-objects.result == 'skipped')) }}
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -171,12 +240,15 @@ jobs:
       archs: ${{ matrix.archs }}
       runner: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 'ninfer-native-debian13' || 'ubuntu-24.04' }}
       jobs: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 32 || 4 }}
+      phase: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 'full' || 'package' }}
       version: ${{ needs.validate.outputs.version }}
     secrets: inherit
 
   universal-linux:
     name: Assemble universal linux package
     needs: linux
+    # A rented runner skips the object-shard ancestor.
+    if: ${{ !cancelled() && needs.linux.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -268,6 +340,7 @@ jobs:
   containers:
     name: Docker images from Linux artifacts
     needs: linux
+    if: ${{ !cancelled() && needs.linux.result == 'success' }}
     uses: ./.github/workflows/docker.yml
     permissions:
       contents: read

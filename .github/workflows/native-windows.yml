@@ -40,6 +40,7 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
       HF_HUB_DISABLE_TELEMETRY: '1'
       NINFER_VERSION: ${{ inputs.version }}
+      HF_CACHE_AGGREGATE: native-windows-cuda-${{ inputs.cuda }}-host-v2
       HF_CACHE_FAMILY: native-windows-cuda-${{ inputs.cuda }}-host-v2${{ inputs.phase == 'objects' && format('-shard-{0}', inputs.shard) || '' }}
       CCACHE_DIR: ${{ github.workspace }}/.cache/objects
       CCACHE_MAXSIZE: 8Gi
@@ -113,16 +114,20 @@ jobs:
         id: object-cache
         timeout-minutes: 30
         run: |
-          # A shard without its own snapshot starts from the aggregate of all shards.
-          $fallback = @()
+          # Every phase starts from the aggregate of the last finished build, and on master also from
+          # the branch the head commit merged. A shard then adds its own snapshot and later saves
+          # only what differs from the aggregate; the package job adds every shard's snapshot.
+          $restore = @('.github/scripts/hf-build-cache.py', 'restore', '--directory', '.cache/objects', '--merged-branch')
           if ('${{ inputs.phase }}' -eq 'objects') {
-            $fallback = @('--fallback-family', 'native-windows-cuda-${{ inputs.cuda }}-host-v2')
+            python @restore --family $env:HF_CACHE_AGGREGATE --baseline build-cache-baseline.tsv
+            if ($LASTEXITCODE -ne 0) { throw 'Aggregate cache restore failed' }
+            "HF_CACHE_BASELINE=$pwd/build-cache-baseline.tsv" >> $env:GITHUB_ENV
           }
-          python .github/scripts/hf-build-cache.py restore --directory .cache/objects --family $env:HF_CACHE_FAMILY @fallback
+          python @restore --family $env:HF_CACHE_FAMILY
           if ($LASTEXITCODE -ne 0) { throw 'Object cache restore failed' }
           if ('${{ inputs.phase }}' -eq 'package') {
             for ($shard = 0; $shard -lt ${{ inputs.count }}; $shard++) {
-              python .github/scripts/hf-build-cache.py restore --directory .cache/objects --family "native-windows-cuda-${{ inputs.cuda }}-host-v2-shard-$shard" --required
+              python @restore --family "$env:HF_CACHE_AGGREGATE-shard-$shard" --required
               if ($LASTEXITCODE -ne 0) { throw "Shard $shard cache restore failed" }
             }
           }
@@ -241,6 +246,7 @@ jobs:
           path: |
             build-cache-check/cache-stats.json
             build-release/*.log
+            build-release/.ninja_log
             build-release/object-shard.json
             build-release/cache-stats.json
             build-release/cache-progress.jsonl
