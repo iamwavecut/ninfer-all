@@ -6,8 +6,6 @@
 // the residual after every layer; and a serial refinement of the last write that chains the
 // block's candidates. The target's token embedding and output head stay in the target's artifact.
 
-#include "artifact/schema.h"
-
 #include <cstdint>
 #include <filesystem>
 #include <string_view>
@@ -56,12 +54,11 @@ struct Config {
     }
 };
 
-// Throws artifact::ArtifactError naming the field that is missing, malformed or outside what the
-// engine implements.
-[[nodiscard]] Config parse_config(const artifact::Json& value);
-
-// Whether the artifact is a standalone DSpine drafter (its only component is `dspine`).
-[[nodiscard]] bool is_dspine_artifact(const artifact::Reader& reader);
+// The config of the standalone DSpine drafter `reader` opened at `path`. Throws
+// artifact::ArtifactError when the artifact is not one (its only component must be `dspine`) or
+// names the field that is missing, malformed or outside what the engine implements.
+[[nodiscard]] Config read_config(const artifact::Reader& reader,
+                                 const std::filesystem::path& path);
 
 // The drafter artifact's config, read from its directory without materializing a weight.
 [[nodiscard]] Config read_config(const std::filesystem::path& path);

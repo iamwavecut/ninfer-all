@@ -443,8 +443,8 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(kFlushBytes);
 
         if (options.profile) {
-            Case data(options.window, options.tokens.front(), options.batches.front(),
-                      options.contexts.front(),
+            Case data(options.window, options.mask, options.tokens.front(),
+                      options.batches.front(), options.contexts.front(),
                       options.envelope_max < 0 ? options.contexts.front() : options.envelope_max);
             profile(data, options, flush, stream);
             CUDA_CHECK(cudaStreamDestroy(stream));

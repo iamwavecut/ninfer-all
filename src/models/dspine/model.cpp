@@ -112,14 +112,9 @@ std::string Model::artifact_hex() const {
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, DeviceContext& device,
                                   const StartupObserver* observer,
                                   const artifact::MaterializeOptions& materialize) {
-    auto reader = std::make_shared<const artifact::Reader>(path);
-    if (!is_dspine_artifact(*reader)) {
-        throw artifact::ArtifactError(path.string() +
-                                      ": not a DSpine drafter artifact (its only component must "
-                                      "be dspine; convert one with tools/convert)");
-    }
+    auto reader    = std::make_shared<const artifact::Reader>(path);
     auto model     = std::unique_ptr<Model>(new Model());
-    model->config_ = parse_config(reader->directory().component("dspine").config);
+    model->config_ = read_config(*reader, path);
     artifact::Binder binder(*reader);
     Bindings b(binder);
     const Ids ids = bind(b, model->config_);

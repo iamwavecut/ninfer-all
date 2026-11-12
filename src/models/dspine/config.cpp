@@ -41,8 +41,6 @@ void require(bool condition, const std::string& message) {
 // The windows the sliding-window attention Op registers.
 constexpr std::uint32_t kWindows[] = {2048, 4096, 8192};
 
-} // namespace
-
 Config parse_config(const Json& value) {
     require(value.is_object(), "expected an object");
     const auto& architectures = value.at("architectures");
@@ -120,13 +118,18 @@ bool is_dspine_artifact(const artifact::Reader& reader) {
            config.at("architectures")[0] == "DSpineDraftModel";
 }
 
-Config read_config(const std::filesystem::path& path) {
-    const artifact::Reader reader(path);
+} // namespace
+
+Config read_config(const artifact::Reader& reader, const std::filesystem::path& path) {
     if (!is_dspine_artifact(reader)) {
         throw ArtifactError(path.string() + ": not a DSpine drafter artifact (its only component "
                                             "must be dspine; convert one with tools/convert)");
     }
     return parse_config(reader.directory().component("dspine").config);
+}
+
+Config read_config(const std::filesystem::path& path) {
+    return read_config(artifact::Reader(path), path);
 }
 
 void check_target(const Config& config, std::uint64_t hidden_size, std::uint64_t vocab_size,
