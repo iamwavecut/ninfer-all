@@ -92,6 +92,7 @@ API key blank.
 | `ninfer-calibrate.exe`, `ninfer-perplexity.exe`, `ninfer-ngram-profile.exe` | calibration, scoring and n-gram tools |
 | `download-model.bat` | pinned, resumable artifact downloads with verification |
 | `run.bat` | serving profiles: `run.bat <model> [profile]`, or double-click it to pick a model |
+| `configs\*.ini` | [launch configuration files](cli.md#launch-configuration-files) of the [launch recipes](recipes.md): `ninfer-serve.exe --config configs\<file>.ini` |
 | `backends/cuda*/*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS for the selected CUDA version |
 | `backends/cuda*/NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
 | `SHA256SUMS.txt` | checksums for the package files, including subdirectories |

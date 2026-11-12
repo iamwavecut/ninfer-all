@@ -18,6 +18,9 @@ English reference text, English long-form text, Chinese reference text, and NInf
   --kv-dtype int8
 ```
 
+A [launch configuration file](cli.md#launch-configuration-files) can hold the options and the
+artifact (`--config FILE`); the command line overrides it.
+
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
 KV representations are the server's ten: `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`,

@@ -86,5 +86,8 @@ workflow packages both Native release archives as `cuda12.9` and `cuda13.4`, wit
 
 The launcher downloads the selected model on first use. Set `NINFER_MODEL_DIR` to choose storage,
 `NINFER_MODEL` to use an existing artifact, and `NINFER_HOST`/`NINFER_PORT` for the server address.
+`configs/` holds the [launch recipes](recipes.md) as
+[launch configuration files](cli.md#launch-configuration-files):
+`./ninfer-serve --config configs/<file>.ini` from the directory that holds `models/`.
 CI checks device images, dynamic dependencies and `--help`; it does not run GPU inference or
 measure performance. Verify the intended model and GPU before relying on a package for serving.

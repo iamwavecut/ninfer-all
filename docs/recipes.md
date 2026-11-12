@@ -1,28 +1,40 @@
 # Launch recipes
 
-The `ninfer-serve` commands behind the [reference tables](performance.md), one section per model.
-The [quick start](../README.md#quick-start) serves one artifact; these sections add the flags that
-fit each model and memory size. `ninfer-serve --help` is the exact source for option spelling and
-defaults; [server options](serving.md#server-options) and the [CLI options](cli.md) describe every
-flag, and [Supported GPUs](gpus.md) says what fits a given amount of GPU memory.
+The `ninfer-serve` configurations behind the [reference tables](performance.md), one section per
+model. Each recipe is a [launch configuration file](cli.md#launch-configuration-files) in the
+repository's `configs/` directory; `ninfer-serve --config configs/<file>.ini` runs it from the
+directory that holds `models/`, where the [quick start](../README.md#quick-start) downloads the
+artifacts. Each file names its model, card and options in its first lines. `ninfer-serve --help` is
+the exact source for option spelling and defaults; [server options](serving.md#server-options) and
+the [CLI options](cli.md) describe every flag, and [Supported GPUs](gpus.md) says what fits a given
+amount of GPU memory.
+
+Options on the command line override the file's: another window, port or draft count, another
+artifact path, or `--spec none` without drafts.
+
+```bash
+ninfer-serve --config configs/bonsai2-27b-dflash2.ini --max-context 131072 --port 9000
+ninfer-serve /data/bonsai.ninfer --config configs/bonsai2-27b-dflash2.ini
+```
 
 ## Container or build
 
-The recipes are written for a build. In the container, replace `ninfer-serve models/` with the
-`docker run ... serve /models/` line of the quick start and keep the flags:
+The image keeps the files in `/opt/ninfer/configs`. Its working directory is `/models`; `-w /`
+makes a file's `models/` paths reach the mounted `/models`:
 
 ```bash
-docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
+docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve /models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer \
-  --model-id bonsai2-27b --max-context 262144 --kv-capacity 262144 --kv-dtype rk8v4 \
-  --gdn-state-fp16 --spec dflash2 --draft-tokens 5
+  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve --config /opt/ninfer/configs/bonsai2-27b-dflash2.ini
 ```
 
-A build listens on 127.0.0.1:8080 unless `--host` and `--port` say otherwise; the container listens
-on 0.0.0.0:8080.
+A build listens on 127.0.0.1:8080 unless `--host` and `--port` (or `host` and `port` in a file) say
+otherwise; the container listens on 0.0.0.0:8080 unless they do.
 
 ## Flags in these recipes
+
+Each entry of a file is a flag without its dashes (`kv-dtype = rk8v4` is `--kv-dtype rk8v4`, a switch
+is `true`):
 
 | Flag | What it sets |
 |---|---|
@@ -45,25 +57,18 @@ on 0.0.0.0:8080.
 The fastest single stream, MTP, the largest context a 24 GB card holds, and a disk tier.
 
 ```bash
-# Fastest single stream: DFlash2 with five drafts over the full 262,144-token window.
-ninfer-serve models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
-  --max-context 262144 --kv-capacity 262144 --kv-dtype rk8v4 --gdn-state-fp16 \
-  --spec dflash2 --draft-tokens 5
+# Fastest single stream: DFlash2 with five drafts over the full 262,144-token window of rk8v4.
+ninfer-serve --config configs/bonsai2-27b-dflash2.ini
 
-# MTP drafting through the proposal head.
-ninfer-serve models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
-  --max-context 262144 --kv-capacity 262144 --kv-dtype rk8v4 --gdn-state-fp16 \
-  --spec mtp --draft-tokens 3
+# MTP drafting through the proposal head: --spec mtp --draft-tokens 3.
+ninfer-serve --config configs/bonsai2-27b-mtp.ini
 
-# The largest context a 24 GB card holds: 958,464 tokens of rk4v4.
-ninfer-serve models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
-  --max-context 958464 --kv-capacity 958464 --kv-dtype rk4v4 --gdn-state-fp16 --rope-yarn
+# The largest context a 24 GB card holds: 958,464 tokens of rk4v4 with --rope-yarn.
+ninfer-serve --config configs/bonsai2-27b-max-context.ini
 
-# Adaptive MTP and a disk tier that keeps evicted conversations.
-ninfer-serve models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
-  --max-context 198400 --kv-capacity 198400 --kv-dtype rk8v4 --gdn-state-fp16 \
-  --spec mtp --draft-tokens 5 --adaptive-mtp \
-  --disk-kv-path /var/cache/ninfer --disk-kv-gib 64 --disk-kv-restore
+# Adaptive MTP over 198,400 tokens and a 64 GiB disk tier that keeps evicted conversations
+# (--disk-kv-path /var/cache/ninfer; give another path on the command line).
+ninfer-serve --config configs/bonsai2-27b-disk-tier.ini
 ```
 
 - **Draft count.** Five drafts are the all-round choice. Seven are faster on short answers; after
@@ -81,14 +86,10 @@ The official `groupwise-int` artifact and the GSQ-RCO IQ3_S release.
 
 ```bash
 # The official artifact on a 24 GB card: DFlash2 with five drafts over 245,760 tokens of rk4v4.
-ninfer-serve models/qwen3_8_27b.ninfer --model-id qwen3.8-27b \
-  --max-context 245760 --kv-capacity 245760 --kv-dtype rk4v4 --gdn-state-fp16 \
-  --spec dflash2 --draft-tokens 5
+ninfer-serve --config configs/qwen3.8-27b-dflash2.ini
 
 # GSQ-RCO IQ3_S: MTP over 176,128 tokens of rk8v4.
-ninfer-serve models/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer --model-id qwen3.8-27b \
-  --max-context 176128 --kv-capacity 176128 --kv-dtype rk8v4 --gdn-state-fp16 \
-  --spec mtp --draft-tokens 3
+ninfer-serve --config configs/qwen3.8-27b-iq3s-mtp.ini
 ```
 
 - **The official artifact with `rk8v4`.** The same speculation fits 167,936 tokens on an RTX 4090
@@ -101,20 +102,15 @@ Huihui abliterated, HauhauCS Aggressive and MXFP8-CRACK. All three have the offi
 them too; CRACK has no DFlash2 adapter. Their cards' configurations:
 
 ```bash
-# Huihui abliterated on one RTX 3090: 198,400 tokens with MTP and Vision.
-ninfer-serve models/Huihui-Qwen3.8-27B-abliterated-ninfer-v3.ninfer --model-id qwen3.8-27b \
-  --max-context 198400 --kv-capacity 198400 --kv-dtype rk8v4 --gdn-state-fp16 \
-  --spec mtp --draft-tokens 3 \
-  --vision --vision-residency overlay --vision-max-merged 12288
+# Huihui abliterated on one RTX 3090: 198,400 tokens of rk8v4 with MTP and Vision
+# (--vision --vision-residency overlay --vision-max-merged 12288).
+ninfer-serve --config configs/qwen3.8-27b-abliterated.ini
 
-# HauhauCS Aggressive: DFlash2 with seven drafts.
-ninfer-serve models/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-DFlash2-ninfer-v3.ninfer \
-  --model-id qwen3.8-27b --max-context 32768 --kv-capacity auto \
-  --spec dflash2 --draft-tokens 7
+# HauhauCS Aggressive: DFlash2 with seven drafts over 32,768 tokens.
+ninfer-serve --config configs/qwen3.8-27b-hauhaucs.ini
 
-# MXFP8-CRACK: MTP.
-ninfer-serve models/Qwen3.8-27B-MXFP8-CRACK-ninfer-v3.ninfer --model-id qwen3.8-27b \
-  --max-context 32768 --kv-capacity auto --spec mtp --draft-tokens 3
+# MXFP8-CRACK: MTP over 32,768 tokens.
+ninfer-serve --config configs/qwen3.8-27b-crack.ini
 ```
 
 ## Qwen3.8-Flash-Next
@@ -126,32 +122,28 @@ hf download WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3 \
   Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-ninfer-v3.ninfer --local-dir models
 hf download WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3 \
   Qwen3.8-Flash-Next-ngram-table-IQ4_NL-ninfer-v3.ninfer --local-dir models
-M=models/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-ninfer-v3.ninfer
-T=models/Qwen3.8-Flash-Next-ngram-table-IQ4_NL-ninfer-v3.ninfer
 
-# Every expert on one RTX PRO 6000 (96 GB).
-ninfer-serve $M --ngram-table $T --model-id qwen3.8-flash-next --max-context 32768
+# Every expert on one RTX PRO 6000 (96 GB), 32,768 tokens; the table's rows read from its file.
+ninfer-serve --config configs/qwen3.8-flash-next-device.ini
 
 # Every expert on two GPUs, one pipeline stage each (Linux): 24 GB cards for Q2_0, 32 GB for IQ3_S.
-ninfer-serve $M --ngram-table $T --model-id qwen3.8-flash-next --max-context 32768 --devices 0,1
+ninfer-serve --config configs/qwen3.8-flash-next-two-gpus.ini
 
 # One 24 GB GPU: the experts in pinned host memory, the most used of them cached on the GPU.
-ninfer-serve $M --ngram-table $T --model-id qwen3.8-flash-next --max-context 32768 --expert-residency host
+ninfer-serve --config configs/qwen3.8-flash-next-host.ini
 
 # One 24 GB GPU and little RAM: the experts stay in the file and stream into a GPU cache.
-ninfer-serve $M --ngram-table $T --model-id qwen3.8-flash-next --max-context 32768 --expert-residency disk
+ninfer-serve --config configs/qwen3.8-flash-next-disk.ini
 
 # The container, experts in host memory.
-docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
+docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve /models/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-ninfer-v3.ninfer \
-  --ngram-table /models/Qwen3.8-Flash-Next-ngram-table-IQ4_NL-ninfer-v3.ninfer \
-  --model-id qwen3.8-flash-next --max-context 32768 --expert-residency host
+  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve --config /opt/ninfer/configs/qwen3.8-flash-next-host.ini
 ```
 
-- **Other releases.** IQ3_S and the Coder IQ1_M build take the same flags with their own file and
-  the same table. The [performance page](performance.md#qwen38-flash-next) shows the placements
-  measured for each.
+- **Other releases.** IQ3_S and the Coder IQ1_M build take the same files with their own artifact on
+  the command line (`ninfer-serve models/<file>.ninfer --config ...`) and the same table. The
+  [performance page](performance.md#qwen38-flash-next) shows the placements measured for each.
 - **Memory.** Host experts pin 34 GB of RAM for Q2_0, 50 GB for IQ3_S and 25 GB for the Coder
   build. Disk experts need under 1 GB of RAM; the page cache does the rest. The GPU expert cache
   takes what is free after startup, or `--expert-cache-mib`.
@@ -188,8 +180,7 @@ python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf --componen
 
 # Four concurrent requests over 40K-token contexts, two drafts a round, images and video; thinking
 # stays off unless a request asks.
-ninfer-serve models/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer --model-id gemma4 \
-  --max-context 40960 --max-concurrency 4 --spec mtp --draft-tokens 2 --vision
+ninfer-serve --config configs/gemma4-26b-a4b.ini
 ```
 
 ## Flint
@@ -200,11 +191,11 @@ Unsloth's UD-Q4_K_XL GGUF as one artifact ([Flint](flint.md)); 23.4 GiB of weigh
 hf download WaveCut/Flint-UD-Q4_K_XL-NInfer-v3 flint-UD-Q4_K_XL-ninfer-v3.ninfer --local-dir models
 
 # Every expert on a 32 GB GPU: about 25.5 GiB for one 32K-token sequence.
-ninfer-serve models/flint-UD-Q4_K_XL-ninfer-v3.ninfer --model-id flint --max-context 32768
+ninfer-serve --config configs/flint-device.ini
 
-# A 16 or 24 GB GPU: the experts in pinned host memory (21.5 GiB), the most used cached on the GPU.
-ninfer-serve models/flint-UD-Q4_K_XL-ninfer-v3.ninfer --model-id flint \
-  --max-context 65536 --expert-residency host
+# A 16 or 24 GB GPU: the experts in pinned host memory (21.5 GiB), the most used cached on the GPU,
+# 65,536 tokens.
+ninfer-serve --config configs/flint-host.ini
 ```
 
 ## DeepSeek-V4.1-Flash
@@ -217,16 +208,13 @@ hf download WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3 \
   DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer --local-dir models
 hf download WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3 \
   DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --local-dir models
-M=models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer
-T=models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer
 
-# One GPU and room to pin 106.7 GiB of host memory: the experts in RAM, the most used cached on the GPU.
-ninfer-serve $M --ngram-table $T --model-id deepseek-v4.1-flash \
-  --max-context 32768 --max-concurrency 2 --expert-residency host
+# One GPU and room to pin 106.7 GiB of host memory: the experts in RAM, the most used cached on the
+# GPU, two concurrent requests.
+ninfer-serve --config configs/deepseek-v4.1-flash-host.ini
 
 # Less RAM: the experts stay in the file and reach the GPU through the page cache.
-ninfer-serve $M --ngram-table $T --model-id deepseek-v4.1-flash \
-  --max-context 32768 --expert-residency disk
+ninfer-serve --config configs/deepseek-v4.1-flash-disk.ini
 ```
 
 ISTA-DASLab's expert-pruned Coder build reads the same table; its routed experts take 61.5 GiB:
@@ -234,8 +222,7 @@ ISTA-DASLab's expert-pruned Coder build reads the same table; its routed experts
 ```bash
 hf download WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-NInfer-v3 \
   DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-ninfer-v3.ninfer --local-dir models
-ninfer-serve models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-ninfer-v3.ninfer --ngram-table $T \
-  --model-id deepseek-v4.1-flash-coder --max-context 32768 --expert-residency host
+ninfer-serve --config configs/deepseek-v4.1-flash-coder-host.ini
 ```
 
 ## Qwen3.6-35B-A3B NVFP4
@@ -243,9 +230,8 @@ ninfer-serve models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-ninfer-v3.nin
 RTX 50 series and RTX PRO 6000 only.
 
 ```bash
-ninfer-serve models/Qwen3.6-35B-A3B-NVFP4-ninfer-v3.ninfer --model-id qwen3.6-35b-a3b \
-  --max-context 262144 --kv-capacity 262144 --kv-dtype rk8v4 --gdn-state-fp16 \
-  --spec mtp --draft-tokens 3 --vision
+# MTP and images over 262,144 tokens of rk8v4.
+ninfer-serve --config configs/qwen3.6-35b-a3b-nvfp4.ini
 ```
 
 The NVFP4 experts prefill through W4A4 on Blackwell's FP4 tensor cores, so this needs a `120a`
@@ -260,25 +246,21 @@ another card of this size calibrates once at its first start, in one to three mi
 
 ```bash
 # 8 GB (RTX 3060 Ti): Ternary Bonsai 2 with 24,576 tokens of rk4v4 and no drafter. MTP does not fit.
-ninfer-serve models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
-  --max-context 24576 --kv-capacity 24576 --kv-dtype rk4v4 --gdn-state-fp16
+ninfer-serve --config configs/bonsai2-27b-8gb.ini
 
-# 11 GB (RTX 2080 Ti): 143,360 tokens of rk4v4 with MTP; without --spec and --draft-tokens, 200,704.
-ninfer-serve models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
-  --max-context 143360 --kv-capacity 143360 --kv-dtype rk4v4 --gdn-state-fp16 \
-  --spec mtp --draft-tokens 3
+# 11 GB (RTX 2080 Ti): 143,360 tokens of rk4v4 with MTP. Without drafting the card holds 200,704:
+# --spec none --max-context 200704 --kv-capacity 200704.
+ninfer-serve --config configs/bonsai2-27b-11gb.ini
 
 # 12 GB (RTX 3060): 266,240 tokens of rk4v4.
-ninfer-serve models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
-  --max-context 266240 --kv-capacity 266240 --kv-dtype rk4v4 --gdn-state-fp16
+ninfer-serve --config configs/bonsai2-27b-12gb.ini
 
-# 12 GB: the GSQ-RCO IQ3_S release with 8,192 tokens and no drafter.
-ninfer-serve models/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer --model-id qwen3.8-27b \
-  --max-context 8192 --kv-capacity 8192 --kv-dtype rk4v4 --gdn-state-fp16
+# 12 GB: the GSQ-RCO IQ3_S release with 8,192 tokens of rk4v4 and no drafter.
+ninfer-serve --config configs/qwen3.8-27b-iq3s-12gb.ini
 ```
 
-- **Qwen3.8-Flash-Next** runs on 8 and 12 GB with `--expert-residency host` or `disk` and the
-  recipe above (32,768 tokens of context, no other change). It keeps 2.83 GiB of dense weights on
+- **Qwen3.8-Flash-Next** runs on 8 and 12 GB with `configs/qwen3.8-flash-next-host.ini` or
+  `qwen3.8-flash-next-disk.ini` (32,768 tokens of context, no other change). It keeps 2.83 GiB of dense weights on
   the GPU and fills the rest of the card with an expert cache.
 - **Gemma 4** needs 16 GB: its 13.4 GiB of weights do not fit 12 GB.
 - **Output heads.** `--lm-head-q4` and `--embedding-q4` do not apply to Ternary Bonsai 2, whose
