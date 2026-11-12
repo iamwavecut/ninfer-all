@@ -129,10 +129,30 @@ same card in any build that runs it on the same tier. `DeviceContext` admits ran
 compute capabilities when each runs the build's code (`docs/maintainer/pipeline-stages.md`).
 Compile time and binary size grow with the number of architectures.
 
+Objects carry machine code for every listed architecture and PTX for one: 89, or the newest listed
+architecture below it. The driver compiles that PTX at load time for a card outside the list, such
+as a Hopper or data-center Blackwell card. `compute_120a` PTX would run only where the `sm_120a`
+code already runs, and older PTX only on cards that the newer PTX serves too. CMake therefore
+compiles `CMAKE_CUDA_ARCHITECTURES` as `<arch>-real` entries beside the one PTX architecture;
+`NINFER_ARCHITECTURES` keeps the listed names for `--version`, the refusal of an unsupported
+device and the portable launchers' `architectures.txt`.
+
+In a build of several architectures, a route family whose kernels only one tier launches compiles
+for that tier alone, without PTX (`ninfer_ops_route_family` in `src/ops/CMakeLists.txt`): the FP8
+A8 and NVFP4 W4A4/A4 units and the fast NVFP4 prompt kernel for `120a`, and the Volta projections
+(`src/ops/linear/sm70/`) for `70`, or for the first listed architecture in a build without 70,
+where they link and never run. Their entry points refuse, or their route predicates decline, every
+other card before a kernel launch, and the tier definitions stay those of the whole build, so every
+gate decides as in a single-architecture build. CUDA 13 gives every translation unit its own host
+stub of a template kernel (`-static-global-template-stub`). CUDA 12 merges the stubs of identical
+instantiations, and the runtime may then look a kernel up in the module that has fewer
+architectures, so under CUDA 12 (the Volta family) a kernel template that such a unit instantiates
+must not be launched on another tier's card from any other unit.
+
 `NINFER_CUDA_PRUNE_PTX=ON` runs NVIDIA `nvprune` on CUDA static archives before host linking.
 It retains all configured SASS targets and host code, and removes PTX. Object-cache entries remain
 unmodified. Windows release builds enable it to reduce image size; local and Linux builds default
-to OFF. A pruned build needs a GPU compatible with one of its SASS images, with no PTX fallback
+to OFF and keep the one PTX architecture described above. A pruned build needs a GPU compatible with one of its SASS images, with no PTX fallback
 for other targets.
 
 Windows releases also enable `NINFER_WINDOWS_KERNEL_DLL` (local default OFF). The GGML kernels

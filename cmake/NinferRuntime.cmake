@@ -46,7 +46,7 @@ function(ninfer_finalize_runtime)
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/portable/backends/cuda${cuda_major}/$<0:>"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/portable/backends/cuda${cuda_major}/$<0:>"
     BUILD_RPATH_USE_ORIGIN ON)
-  string(REPLACE ";" " " runtime_architectures "${CMAKE_CUDA_ARCHITECTURES}")
+  string(REPLACE ";" " " runtime_architectures "${NINFER_ARCHITECTURES}")
   file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/portable/backends/cuda${cuda_major}/architectures.txt"
     CONTENT "${runtime_architectures}\n")
   if(UNIX AND NOT APPLE)

@@ -12,7 +12,7 @@ add_library(ninfer_core_device STATIC
 ninfer_internal_includes(ninfer_core_device)
 # The architectures this build carries, for the message that refuses a device it cannot run. A
 # list's semicolons would split the property into several definitions.
-string(REPLACE ";" " " _ninfer_cuda_architectures "${CMAKE_CUDA_ARCHITECTURES}")
+string(REPLACE ";" " " _ninfer_cuda_architectures "${NINFER_ARCHITECTURES}")
 set_source_files_properties(device.cu PROPERTIES
   COMPILE_DEFINITIONS "NINFER_CUDA_ARCHITECTURES=\"${_ninfer_cuda_architectures}\"")
 ninfer_cuda_archive(ninfer_core_device)
