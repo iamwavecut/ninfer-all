@@ -18,8 +18,9 @@
 // limit ended at that position.
 //   NINFER_STOP_ARTIFACT       the artifact (skipped without one)
 //   NINFER_STOP_NGRAM_TABLE    a Qwen3.8-Flash-Next table artifact
-//   NINFER_STOP_SPECULATIVE    mtp | dflash | dflash2 | dspark | lookup: the reply decodes in
-//                              speculative rounds (NINFER_STOP_DRAFTS tokens, 4 by default)
+//   NINFER_STOP_SPECULATIVE    mtp | dflash | dflash2 | dspark | dspine | lookup: the reply decodes
+//                              in speculative rounds (NINFER_STOP_DRAFTS tokens, 4 by default)
+//   NINFER_STOP_DRAFT_MODEL    the DSpine drafter artifact (with dspine)
 //   NINFER_STOP_EXPERTS        host | disk: where the routed experts stay
 //   NINFER_STOP_CONTEXT_CACHE  hybrid: the hybrid prefix cache
 //   NINFER_STOP_KV             int8: an int8 KV cache
@@ -99,7 +100,9 @@ ninfer::EngineOptions engine_options(const char* artifact) {
             options.speculative.backend = backend == "mtp"       ? ninfer::SpeculativeBackend::Mtp
                                           : backend == "dflash"  ? ninfer::SpeculativeBackend::DFlash
                                           : backend == "dflash2" ? ninfer::SpeculativeBackend::DFlash2
+                                          : backend == "dspine"  ? ninfer::SpeculativeBackend::DSpine
                                                                  : ninfer::SpeculativeBackend::DSpark;
+            options.speculative.draft_model = std::string(variable("NINFER_STOP_DRAFT_MODEL"));
         }
         options.speculative.draft_tokens = count;
     }

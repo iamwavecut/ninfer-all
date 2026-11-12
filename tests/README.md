@@ -312,7 +312,8 @@ requests decoded as one batch and a JSON grammar's mask all reach the records, t
 array, string or integer root constrain the answer from its first token, and that a request
 without them gathers none. `NINFER_LOGPROBS_ARTIFACT` names the artifact, and the test is skipped
 without it; `NINFER_LOGPROBS_NGRAM_TABLE` names a Qwen3.8-Flash-Next table artifact,
-`NINFER_LOGPROBS_SPECULATIVE=mtp` or `dflash2` verifies the tokens in speculative rounds, and
+`NINFER_LOGPROBS_SPECULATIVE=mtp`, `dflash2` or `dspine` verifies the tokens in speculative rounds
+(`NINFER_LOGPROBS_DRAFT_MODEL` names the DSpine drafter), and
 `NINFER_LOGPROBS_CONTEXT_CACHE=hybrid` admits every request through the hybrid prefix cache.
 `NINFER_LOGPROBS_DEVICES=0,1` selects a two-GPU layer pipeline:
 
@@ -330,8 +331,9 @@ text before it as the turn did. The test measures how far the next prompt repeat
 where a template renders the reply anew (Flint and Gemma 4 with thinking off), no state of the
 reply continues it and the test only reports the reuse. `NINFER_STOP_ARTIFACT` names
 the artifact, and the test is skipped without it; `NINFER_STOP_NGRAM_TABLE` names a table artifact,
-`NINFER_STOP_SPECULATIVE=mtp`, `dflash`, `dflash2`, `dspark` or `lookup` decodes the reply in
-speculative rounds (`NINFER_STOP_DRAFTS` tokens), `NINFER_STOP_EXPERTS=host` or `disk` places the
+`NINFER_STOP_SPECULATIVE=mtp`, `dflash`, `dflash2`, `dspark`, `dspine` or `lookup` decodes the
+reply in speculative rounds (`NINFER_STOP_DRAFTS` tokens; `NINFER_STOP_DRAFT_MODEL` names the
+DSpine drafter), `NINFER_STOP_EXPERTS=host` or `disk` places the
 routed experts, `NINFER_STOP_CONTEXT_CACHE=hybrid` selects the hybrid prefix cache,
 `NINFER_STOP_KV=int8` an int8 KV cache, `NINFER_STOP_DEVICES=0,1` the devices (pipeline stages, or
 tensor parallelism with `NINFER_STOP_TENSOR_PARALLEL=1`),
