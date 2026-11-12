@@ -1,13 +1,14 @@
-"""Cancel older master build/publication runs without touching other branches."""
+"""Cancel older master CI runs without touching other branches.
+
+Native release runs queue instead (their concurrency group does not cancel): a cancelled build loses
+every object it had started, while a finished one serves the next commit's build."""
 import json
 import os
 import subprocess
 import time
 
 
-WORKFLOWS = {
-    ".github/workflows/ci.yml", ".github/workflows/native-release.yml",
-}
+WORKFLOWS = {".github/workflows/ci.yml"}
 
 
 def superseded(run, trigger):
@@ -21,7 +22,7 @@ def superseded(run, trigger):
 def cancel(run, api, post, sleep=time.sleep, checks=13, interval=5):
     """Cancel one run, or accept its own end within about a minute.
 
-    CI and Native release also cancel older master runs through their concurrency groups. GitHub
+    CI also cancels older master runs through its concurrency group. GitHub
     refuses a second cancellation of a run it is already stopping, and that run still reads
     in_progress for a few seconds.
     """
