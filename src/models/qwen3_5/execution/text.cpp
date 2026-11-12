@@ -1150,12 +1150,22 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
             ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                           ctx_.stream);
         } else {
-            // A subset head's draw runs over the vocabulary, so each token's noise is the noise
-            // the target's draw gives that token.
+            // A greedy row keeps the subset's argmax, whose equal maxima select the lowest subset
+            // row as without --gumbel-sampling (the vocabulary's would select the lowest id). A
+            // sampled row's draw runs over the vocabulary, so each token's noise is the noise the
+            // target's draw gives that token.
+            ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, ctx_.stream);
+            ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
+                                          ctx_.stream);
             Tensor expanded = work_.alloc(DType::FP32, {vocabulary, T});
             ops::proposal_expand_logits(proposal_logits, proposal_head_ids_, proposal_head_n_,
                                         expanded, ctx_.stream);
-            pick(expanded, vocabulary);
+            Tensor sampled = work_.alloc(DType::I32, {T});
+            require_tensor_shape(proposal_key_positions_, DType::I32, {T},
+                                 "proposal key positions");
+            ops::sample(expanded, sampled, vocabulary, proposal_configs_, proposal_key_positions_,
+                        ops::kSamplePurposeDecode, work_, ctx_.stream, proposal_key_offset_);
+            ops::proposal_select_sampled(proposal_tokens, sampled, proposal_configs_, ctx_.stream);
         }
     } else {
         Tensor output_logits = fp32_proposal_logits(mtp_->output_head)

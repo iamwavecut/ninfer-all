@@ -275,4 +275,15 @@ void proposal_expand_logits_launch(const Tensor& subset, const std::int32_t* id_
     CUDA_CHECK(cudaGetLastError());
 }
 
+void proposal_select_sampled_launch(Tensor& proposal_tokens, const Tensor& sampled,
+                                    const SamplingConfig* configs, cudaStream_t stream) {
+    constexpr int kBlock = 256;
+    const int count      = proposal_tokens.ne[0];
+    const int grid       = std::max(1, div_up(count, kBlock));
+    proposal_select_sampled_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<std::int32_t*>(proposal_tokens.data),
+        static_cast<const std::int32_t*>(sampled.data), configs, count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

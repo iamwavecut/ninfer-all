@@ -703,7 +703,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, share);
     };
     // A proposal's logits and the head's scratch; with --gumbel-sampling also the sampler's, after
-    // a subset head's logits are spread over the vocabulary (TextContext::proposal_argmax).
+    // a subset head's logits are spread over the vocabulary beside the sampled rows' draws
+    // (TextContext::proposal_argmax).
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         const auto vocabulary = dimension(parameters.model.resources().public_token_count);
         if (plan.proposal_head == ProposalHead::Optimized) {
@@ -715,6 +716,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             if (plan.gumbel_sampling) {
                 if (parameters.proposal->token_ids) {
                     matrix(layout, DType::FP32, vocabulary, columns);
+                    (void)layout.alloc(DType::I32, {columns});
                 }
                 scratch(layout,
                         ops::sampling_workspace_capacity_bytes(vocabulary, columns, columns));

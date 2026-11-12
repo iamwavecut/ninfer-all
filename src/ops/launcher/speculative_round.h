@@ -44,4 +44,7 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
 void proposal_expand_logits_launch(const Tensor& subset, const std::int32_t* id_map,
                                    std::int32_t n, Tensor& expanded, cudaStream_t stream);
 
+void proposal_select_sampled_launch(Tensor& proposal_tokens, const Tensor& sampled,
+                                    const SamplingConfig* configs, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

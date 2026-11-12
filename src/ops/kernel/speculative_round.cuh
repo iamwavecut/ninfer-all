@@ -907,6 +907,16 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
 }
 
+// sample()'s greedy rows are those whose temperature is not above zero; every other row takes its
+// draw.
+__global__ void proposal_select_sampled_kernel(std::int32_t* proposal_tokens,
+                                               const std::int32_t* sampled,
+                                               const SamplingConfig* configs, std::int32_t count) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= count) { return; }
+    if (configs[b].temperature > 0.0f) { proposal_tokens[b] = sampled[b]; }
+}
+
 __global__ void proposal_fill_logits_kernel(float* expanded, std::int64_t elements) {
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t e = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;

@@ -244,9 +244,10 @@ assistant then are the drafter's own draws under the same noise, so a draft and 
 agree wherever the two distributions agree. Whether the target keeps more of these drafts than of
 greedy ones depends on the drafter and the temperature: Qwen3.6-35B-A3B's MTP block kept fewer at
 0.7 and more at 1.0. DSpark and lookup drafts stay greedy, and DFlash2 keeps its rejection
-sampling for the tokens it verifies. Greedy requests do not change. One request, three prompts,
-seeds 1 to 3, 256 tokens a response, on an A40 (2026-11-11) and, for Qwen3.6-35B-A3B, an RTX 5090
-(2026-11-12):
+sampling for the tokens it verifies. A greedy request drafts and decodes as without the option
+(on Qwen3.6-35B-A3B, 3 of 3 answers with the same bytes and log probabilities). One request,
+three prompts, seeds 1 to 3, 256 tokens a response, on an A40 (2026-11-11) and, for
+Qwen3.6-35B-A3B, an RTX 5090 (2026-11-12):
 
 | Model and drafter | Temperature | Acceptance, default | Acceptance, `--gumbel-sampling` | tok/s, default | tok/s, `--gumbel-sampling` |
 |---|---|---|---|---|---|

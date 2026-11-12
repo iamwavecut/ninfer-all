@@ -393,7 +393,11 @@ KV state. Its attention and Dense/MoE geometry come from Text. It can recursivel
 tokens using the previous MTP hidden output. A proposal is the argmax of draft_logits; under
 `--gumbel-sampling` a sampled row's proposal is its Gumbel-max draw under the keys the target's
 verification uses for that position (a proposal head over a vocabulary subset first spreads its
-logits over the full vocabulary, with negative infinity elsewhere).
+logits over the full vocabulary, with negative infinity elsewhere). A greedy row keeps the argmax
+in both modes. A subset head's argmax is taken over the subset, whose rows are in frequency order,
+so equal maxima select the more frequent token; the argmax over the spread logits would select the
+lower token id and give a greedy request other drafts, so the option draws only the sampled rows
+over the spread logits (`proposal_select_sampled`).
 
 For prompt tokens x_0 through x_n and the target's first generated token x_(n+1), MTP prefill uses:
 
