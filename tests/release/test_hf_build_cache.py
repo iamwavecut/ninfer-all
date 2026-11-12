@@ -265,6 +265,18 @@ class CheckpointTests(unittest.TestCase):
             with self.subTest(subject=subject):
                 self.assertIsNone(CACHE.merged_branch(subject, repository))
 
+    def test_unreadable_head_commit_names_no_merged_branch_and_warns(self):
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(output), \
+                patch.dict(os.environ, {'GIT_CEILING_DIRECTORIES': directory}):
+            cwd = os.getcwd()
+            os.chdir(directory)
+            try:
+                self.assertIsNone(CACHE.head_merged_branch())
+            finally:
+                os.chdir(cwd)
+        self.assertIn('::warning::Cannot read the head commit', output.getvalue())
+
     def test_pack_excludes_mutable_statistics_and_temporary_entries(self):
         (self.source / 'tmp').mkdir()
         for name in ('object', 'stats', 'lock', 'entry.tmp', 'tmp/uncommitted'):
