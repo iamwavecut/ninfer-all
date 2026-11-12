@@ -1,7 +1,7 @@
 # Cutting a release
 
 The [Native release](../../.github/workflows/native-release.yml) workflow builds Windows x64
-executables and Debian 13 x64 binaries. As soon as both Linux matrix jobs succeed, its `containers`
+executables and Debian 13 x64 binaries. As soon as both final Linux jobs succeed, its `containers`
 job calls [Container image](../../.github/workflows/docker.yml) to package their archives without
 compilation. This dependency excludes Windows and native release publication. A Windows failure
 therefore does not block Docker. A failed or cancelled Linux job prevents both Docker variants.
@@ -16,8 +16,8 @@ CI builds every target and runs CTest for the same two multiarch CUDA configurat
 
 Both images use Debian 13 and the binaries and CUDA runtime libraries from the calling native run.
 The reusable workflow downloads artifacts from that run and checks out its exact commit. It needs
-no dispatch token or separate workflow-completion event. The parent workflow's concurrency group
-cancels obsolete builds and their Docker jobs together.
+no dispatch token or separate workflow-completion event. A run whose revision is no longer the
+branch head skips its final Linux jobs and therefore its Docker jobs.
 The handoff verifies volume checksums, packaged files, full source revision, CUDA version and the
 complete architecture list. Each image keeps its device images in the shared backend runtime.
 `commit12` is the first 12 hexadecimal characters of the source SHA.
@@ -27,7 +27,8 @@ floating CUDA tags, checking the current master SHA before each update. Registry
 separate operations: cancellation, a newer commit or registry failure can leave them temporarily
 pointing to different revisions. Use both commit tags when the same revision is required.
 A failed matrix does not promote either tag. Each variant reuses its previous image's inline
-BuildKit cache. Native artifact jobs save shared compiler caches; CI only reads them.
+BuildKit cache. Native artifact jobs save the native compiler caches; CI reads them and saves only
+its own family.
 
 The pipeline no longer updates `latest`, `multi`, version-only or `sha-…` tags. Existing registry
 images are not deleted. The old latest-based pruning policy is removed because it cannot retain
@@ -108,11 +109,17 @@ Every push to `master` compares inputs with the published native revision. Produ
 dependencies, build configuration and shipped runtime inputs start native builds and Docker packaging.
 Documentation and publication/control scripts run only their affected checks. Pending source changes
 from a cancelled or failed build remain in this comparison. Manual dispatch forces builds and checks.
-A new run cancels the previous run and publishes on success when build inputs changed. In **Actions → Native release
-→ Run workflow**, publication defaults to off; enable `publish` only on `master` when intended.
-Feature branches run only through manual dispatch and cannot publish. Build jobs have read
-access; only the publication job receives `contents: write`. The master cancellation coordinator
-also cancels older container publishers. Closing a PR cancels that PR's remaining runs.
+Runs of one branch queue: a new run waits until the running one has ended, and GitHub drops a run
+that was still waiting when a newer one arrived. A cancelled build would lose every object it had
+started; on 11 November 2026 three master runs in a row were cancelled after 27-53 minutes, while
+a heavy attention unit compiles for 38-75. When its object jobs end, a run checks that its revision
+is still the branch head (`windows-current`, `linux-current`); a superseded run skips packaging,
+Docker and publication, so the newer run starts with its objects. A current run publishes on
+success when build inputs changed. In **Actions → Native release → Run workflow**, publication
+defaults to off; enable `publish` only on `master` when intended. Feature branches run only through
+manual dispatch and cannot publish. Build jobs have read access; only the publication job receives
+`contents: write`. The master cancellation coordinator cancels only older CI runs. Closing a PR
+cancels that PR's remaining runs.
 A superseded upload can leave an unpublished draft; it cannot replace the current release.
 
 ## Portable runtime boundary
@@ -140,8 +147,13 @@ Existing HF snapshots remain available. Windows keeps the original CUDA object c
 
 ## Build caches
 
-The manual `Linux cache bootstrap` workflow uses the same reusable `native-linux.yml` job as
-Native release. Register two temporary Debian 13 x64 runners with label `ninfer-native-debian13`
+GitHub-hosted runners compile the Linux release objects in eight shards per Toolkit, as Windows
+does (see below); a final job per Toolkit links, packages and saves the aggregate. On 12 November
+2026 one hosted job per Toolkit compiled 16-18 of 41 invalidated attention units in its five
+hours, while the eight Windows shards per Toolkit finished the same change in 2 hours 41 minutes.
+
+The manual `Linux cache bootstrap` workflow runs the same reusable `native-linux.yml` job in one
+piece (`phase: full`): it compiles, links and packages. Register two temporary Debian 13 x64 runners with label `ninfer-native-debian13`
 and work directory `/__w` before dispatch. Each machine runs one CUDA variant at the hosted path
 `/__w/ninfer-all/ninfer-all`. Both variants can compile and upload independently. The compiler
 process limit is at most 32 and is reduced for the container's CPU quota, affinity and RAM limit.
@@ -150,9 +162,9 @@ to preserve cache compatibility. Remove the runner registrations and rentals aft
 archives and HF snapshots. Native release also accepts `linux_runner: ninfer-native-debian13`;
 its default remains GitHub-hosted runners in Debian 13 containers.
 
-The bootstrap writes the same `native-linux-cuda-<toolkit>-shared-v1` family as Native release.
-Both artifact workflows serialize writes per branch and Toolkit. This bootstrap does not cancel
-Windows jobs.
+The bootstrap writes the aggregate `native-linux-cuda-<toolkit>-shared-v1` family, as the final
+Linux job of Native release does; the next hosted shards start from it. Both artifact workflows
+serialize writes per branch, Toolkit and family. This bootstrap does not cancel Windows jobs.
 
 Linux native builds and CUDA CI set `LANG`, `LC_ALL` and `LC_CTYPE` to `C.UTF-8`.
 Ccache hashes these variables separately, even when they select the same effective locale.
@@ -166,26 +178,33 @@ shard snapshots, verifies their archives, and builds against the selected source
 packaging. Missing snapshots fail restoration; changed inputs rebuild through ccache normally.
 The default `windows_phase: full` builds the shards first.
 Publication requires `platforms: all`; a `windows_phase: package` run with `platforms: all` and
-`publish: true` builds Linux too and publishes without the shard jobs. Starting any new native run on the same branch cancels the
-whole previous run, including its other platform. The cleanup wait preserves its completed caches.
+`publish: true` builds Linux too and publishes without the shard jobs. A new native run on the
+same branch waits for the running one, including its other platform.
 
-Native Windows, Debian and CUDA CI use pinned ccache 4.14.2. Native release and its Linux artifact bootstrap write compiler
+Native Windows, Debian and CUDA CI use pinned ccache 4.14.2. Native release and its Linux artifact bootstrap write the native compiler
 snapshots. Only Native release writes Windows vcpkg snapshots to the private HF bucket `WaveCut/ninfer-cache`, under `github-actions/v2/`.
-`HF_BUILD_CACHE_TOKEN` has read/write access to this bucket only. Native jobs use it for snapshots;
-CI reuses it only in its restore step, by owner decision. The token itself can write, but CI has no
-upload steps, receives no token during compilation, and the save command rejects CI jobs. Existing
+`HF_BUILD_CACHE_TOKEN` has read/write access to this bucket only. Native jobs use it for snapshots.
+CI receives it only in its restore and save steps, never during compilation. By owner decision of
+12 November 2026, a CI run of a push to `master` saves the family `ci-linux-cuda-<toolkit>-v1`;
+the save command rejects every other CI write (pull requests, other branches, native families). Existing
 pod caches and model files use separate prefixes and are not changed. The client is pinned to `huggingface_hub==1.17.0`.
 
 CI uses Debian 13, the same official Toolkit installation, pinned ccache, Release flags, shared-runtime/PIC
 settings, architecture sets and `build-release` directory as the Linux artifact build. The shared
 configure script enables additional test targets for CI. Both CUDA variants compile all targets;
 CTest runs without a GPU and device tests skip. Windows host checks also use the two complete
-architecture sets. Test-only objects compile locally and are discarded after CI; they do not
-feed back into the production cache. Broader test builds can take longer on a cold cache.
+architecture sets. The objects only CI builds (tests, benchmarks, tools: 624 compiler misses per
+run on 11 November 2026, 43-47 minutes per job) go into the CI family, which holds only the files
+that differ from the native snapshot it restored: the restore records each native file's size
+(`--baseline`), and the save leaves out every file still of that size (`--exclude-baseline`).
+Result files are named by their content and a ccache manifest grows when it gains an entry, so a
+file of the recorded size is still the native one, also after a hit renewed its time. A cancelled
+or timed-out master CI run saves what it compiled, so the next one resumes. CI objects never
+enter the native families. Broader test builds can take longer on a cold cache.
 
 Each native or CI variant has an 8 GiB local compiler-cache limit. It does not bound a restored
 cache: snapshots omit ccache's counters, and a cleanup decides from the counters it finds before it
-recalculates them. A Linux artifact job, Windows object shard or final Windows job whose build
+recalculates them. A native object shard, final native job or CI job whose build
 finishes therefore evicts, before it saves, every entry that no compilation of the job used: a hit
 renews an entry's modification time, and a restored entry keeps the one it was archived with. A
 cancelled or failed build keeps the restored entries. On 7 November the master snapshot for CUDA
@@ -199,30 +218,41 @@ age. A branch behind master compiles the objects master has since changed.
 Each native platform/toolkit has its own family, with separate branch prefixes and one current
 snapshot. CI reads the corresponding
 `native-linux-cuda-<toolkit>-shared-v1` family. It takes the latest available verified snapshot without waiting
-for an artifact build to finish. It tries its branch, then master; a PR starts from its target branch.
+for an artifact build to finish. It tries its branch, then master; a PR starts from its target branch
+and adds its own branch's snapshot when a Native release dispatch on that branch saved one.
 Source commits are not cache-family boundaries. Missing credentials, unavailable storage or rejected
 snapshots produce a warning and allow a cold CI build. Fork PRs receive no repository secret.
 A renamed family reads its predecessor through `--fallback-family` until it has a snapshot of its
 own; retention then removes the predecessor, which no longer receives writes.
 
-Windows uses eight object shards per Toolkit, each with a separate
-`native-windows-cuda-<toolkit>-host-v2-shard-<index>` family. The final Windows job merges those
-snapshots, links and packages the same multiarch executables, and saves the aggregate family
-without the shard suffix. Only shard zero and the subsequent final job write the shared vcpkg
-family. A shard without a snapshot of its own starts from the aggregate; a finished shard build then
-keeps only the entries of its own objects, and the final job keeps those of the whole build. An
-unfinished build keeps old copies of other shards' entries; where restored snapshots hold the same
+Each platform uses eight object shards per Toolkit, each with a separate family:
+`native-linux-cuda-<toolkit>-shared-v1-shard-<index>` and
+`native-windows-cuda-<toolkit>-host-v2-shard-<index>`. A shard takes its objects from the compile
+database of `ninfer`, `ninfer-serve` and `ninfer_bench` by a hash of each object's path
+(`build-object-shard.py`), so a new source or archive needs no change there. A shard restores the
+aggregate first and records its files as the baseline, then its own snapshot; it saves, also in its
+periodic checkpoints (`HF_CACHE_BASELINE`), only what differs from the aggregate. A finished shard
+build keeps only the entries it used. The final job of each platform and Toolkit restores the
+aggregate and every shard, links and packages the same multiarch executables, and saves the
+aggregate, which then holds the entries of the whole build. Where restored snapshots hold the same
 file, the newer copy stays, and an old ccache manifest cannot hide the entry its owner shard added.
-The reusable Windows
-workflow remains part of Native release; CI has no cache writer.
+Only Windows shard zero and the subsequent final job write the shared vcpkg family. Linux and
+Windows object jobs run eight at a time each, so they and the queued master run stay within
+GitHub's 20 concurrent jobs.
 
-CI does not upload compiler caches to HF or Actions Cache. Python dependency caches remain in
-Actions Cache, within the repository's free 10 GiB limit. Docker publication downloads the compiled
-Linux archive from the same run after both Linux jobs succeed, checks its commit, CUDA version,
+Master's build of a merge also unpacks, after master's own snapshot of each family, the snapshot of
+the branch it merged (`--merged-branch`, read from the subject `Merge pull request #N from
+<owner>/<branch>`). A Native release dispatch that validated the branch therefore leaves master
+warm, and a change that recompiles most units is compiled once. Retention keeps a merged or
+deleted branch's compiler caches for a day after their last write.
+
+Python dependency caches remain in Actions Cache, within the repository's free 10 GiB limit.
+Docker publication downloads the compiled Linux archive from the same run after both final Linux
+jobs succeed, checks its commit, CUDA version,
 architecture set and checksums, and packages it without invoking a compiler or reading HF caches.
 Local source Docker builds retain their BuildKit cache mounts.
 
-Each Linux artifact job also uploads its archive volumes, checksum manifest and build metadata
+Each final Linux job also uploads its archive volumes, checksum manifest and build metadata
 to `WaveCut/ninfer-cache/native-artifacts/v2/iamwavecut/ninfer-all/<branch key>/<kind>/<run>/`,
 where the branch key is the first 20 hexadecimal digits of the ref's SHA-256 and the kind is the
 archive name without its commit. It downloads each uploaded file on the runner, checks SHA-256,
@@ -257,11 +287,11 @@ It then stops all remaining compiler descendants, even if that parent has alread
 uses the retained process group; Windows uses a dedicated Job Object that owns the entire tree.
 `Build workflow checks` tests cancellation on Windows and release tooling on Linux before native
 compilation. It can also be dispatched separately without starting compilers or accessing HF.
-Native save steps also run after a hard compilation-step timeout. A new native run waits for older
-runs of the same workflow and branch to finish cleanup before it can write snapshots. This allows
-the cancelled producer to flush completed objects before handing ownership to the new producer.
-The cache command rejects writes from other workflows/jobs and prevents an older run from replacing
-snapshots already saved by a newer run. CI cancels immediately and has no shared-cache cleanup.
+Native save steps also run after a hard compilation-step timeout. Native runs of one branch
+queue, so a run starts only after the previous one, saves included, has ended; a manual
+cancellation still leaves the cancelled run its cleanup. The cache command rejects writes from
+other workflows/jobs and prevents an older run from replacing snapshots already saved by a newer
+run. A newer master push cancels the running CI, whose save step then has three minutes.
 
 The final save has a twenty-minute limit after normal completion or failure. Cancellation reduces
 that limit to three minutes within GitHub's five-minute cancellation window. A measured 6.2 GB

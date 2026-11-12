@@ -1,8 +1,9 @@
 name: Build cache retention
 
 # Keeps the private HF bucket to the caches and Linux artifact backups that a current build reads.
-# A merge into master or a branch deletion removes that branch's state at once; the daily run
-# removes idle branches, superseded families and earlier layouts (hf-build-cache.py prune).
+# A merge into master or a branch deletion removes that branch's artifact backups at once and its
+# compiler caches a day after their last write (master's build of the merge reads them); the daily
+# run removes idle branches, superseded families and earlier layouts (hf-build-cache.py prune).
 on:
   push:
     branches: [master]
