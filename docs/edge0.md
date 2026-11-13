@@ -112,7 +112,9 @@ without the tower:
 | Edge0-120B-q3k | about 36 GB | 28.6 GB |
 
 The table is read 16 rows a token from its file, as for Flash-Next; `--ngram-residency ram` loads
-all 51.2 GB.
+all 51.2 GB. Flash-Next's 26.92 GiB IQ4_NL table, the same table at lower precision, works in its
+place (`--ngram-table`, [another table of the same shape](qwen3-8-flash-next.md#another-table-of-the-same-shape))
+at 0.6% to 1.2% higher perplexity ([measurements](#with-flash-nexts-table)).
 
 What differs from Flash-Next:
 
@@ -175,6 +177,25 @@ tensor-parallel ranks on the one card (`--devices 0,0 --tensor-parallel`, each w
 holding half of a layer's 512 experts) score 4.998407 with INT8 KV and 4.977586 with BF16 KV, 0.7%
 and 1.1% above one rank, about as far as the KV formats' roundings move it; their greedy answer
 follows one rank's for its first two sentences, then takes the other side of a near tie.
+
+### With Flash-Next's table
+
+The same text and KV with Flash-Next's IQ4_NL table in place of the FP8 table:
+
+| Release | Experts | FP8 table | IQ4_NL table | Change |
+|---|---|---:|---:|---:|
+| Edge0-145B-NVFP4 | disk | 3.067910 | 3.094717 | +0.87% |
+| Edge0-145B-q3k | disk | 3.127031 | 3.145938 | +0.60% |
+| Edge0-120B-NVFP4 | device | 4.795757 | 4.850954 | +1.15% |
+| Edge0-120B-q3k | device | 4.964565 | 5.017691 | +1.07% |
+
+The IQ4_NL column comes from conversions of each release that named the IQ4_NL table; the published
+Edge0-120B-q3k with `--ngram-table` and the IQ4_NL table gives the same 5.017691. The greedy sky
+answers change the wording of their last sentence and stay correct; `image_chart` answers the same.
+Edge0-120B-q3k decoded the sky answer without drafts at 54.1, 55.1 and 55.1 tokens per second with
+the FP8 table and 54.2, 55.0 and 55.1 with the IQ4_NL table, alternating on one pod. The IQ4_NL
+table fits in RAM where the FP8 table does not: with `--ngram-residency ram` it took 27,465 MiB and
+the process peaked at 29.0 GB of the container's 50 GB.
 
 ### Decode
 

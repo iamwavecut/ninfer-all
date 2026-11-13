@@ -48,7 +48,8 @@ eight requests at once (one batched decode step between prompt chunks), and may 
 experts off the GPU, in pinned host memory with a device cache of the most used
 ones (`--expert-residency host`) or in the artifact's files, read into a device cache as each layer
 routes to them (`--expert-residency disk`). Its n-gram table is stored in the model's artifact or
-in a separate table artifact the model names by digest (`--ngram-table`); it stays in that file,
+in a separate table artifact the model names by digest (`--ngram-table`), which any table of the
+same hash constants and geometry may replace in any row format; it stays in that file,
 read a row at a time, unless `--ngram-residency ram` loads it. A model with PLE requires its table
 unless `--no-ngram-table` overrides that; a qualification layer slice without PLE needs no table.
 Edge0-145B and Edge0-120B (`docs/edge0.md`) are a form of this family converted from Edge0's

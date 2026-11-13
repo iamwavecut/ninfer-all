@@ -21,7 +21,8 @@ namespace ninfer::product {
 inline constexpr const char* kNgramTableHelp =
     "  --ngram-table PATH            Qwen3.8-Flash-Next's n-gram table or DeepSeek-V4.1's\n"
     "                                Engram table artifact, for a model published\n"
-    "                                without its table\n"
+    "                                without its table; for Flash-Next any table of\n"
+    "                                the model's shape, in any row format\n"
     "  --ngram-residency disk|ram|ram-hot\n"
     "                                where the table's rows come from: its file, 16\n"
     "                                rows per token (default; DeepSeek-V4.1: 48); all\n"

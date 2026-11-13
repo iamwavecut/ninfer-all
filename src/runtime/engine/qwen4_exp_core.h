@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace ninfer::runtime {
@@ -45,6 +46,9 @@ struct Qwen4ExpInstance {
     // Free memory of the primary device once the weights were placed, and after startup.
     std::size_t free_after_weights = 0;
     std::size_t free_after_startup = 0;
+    // SHA-256 (hex) of the n-gram table the PLE layers read; empty without it. The table's values
+    // enter every layer's state, so a context store belongs to one table.
+    std::string ngram_table_digest;
 };
 
 struct ConstructedQwen4Exp {

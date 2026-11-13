@@ -115,6 +115,8 @@ NgramTableSource stored_rows(const artifact::Reader& reader, const std::filesyst
                             tensor.format + " but described as " + d.format);
     }
     NgramTableSource out;
+    out.table_format                = d.format;
+    out.table_digest                = d.digest;
     out.format                      = row_format(artifact, tensor.format);
     out.layout.row_bytes            = ops::ngram_row_bytes(out.format);
     out.layout.rows                 = d.rows;
@@ -165,19 +167,22 @@ NgramTableSource ngram_table_source(const artifact::Reader& reader,
                 "--no-ngram-table runs the model without it, a non-standard experimental mode "
                 "that badly degrades the output");
         }
-        return stored_rows(reader, artifact, model, config, read_hot_profile);
+        NgramTableSource out = stored_rows(reader, artifact, model, config, read_hot_profile);
+        out.model_format     = model.format;
+        out.model_digest     = model.digest;
+        return out;
     }
     const artifact::Reader other(table);
     if (!other.directory().bindings.contains(kTableBinding)) {
         throw ArtifactError(table.string() + " stores no n-gram table");
     }
+    // Any table of the model's hash constants and geometry: the one the model names, the same table
+    // in another row format, or another table of that shape. Its values are not compared.
     const Descriptor theirs = descriptor(other, table, config);
-    if (theirs.digest != model.digest || theirs.format != model.format) {
-        throw ArtifactError(table.string() + " holds a different n-gram table (" + theirs.format +
-                            ", sha256 " + theirs.digest.substr(0, 16) + "...) than the model's (" +
-                            model.format + ", sha256 " + model.digest.substr(0, 16) + "...)");
-    }
-    return stored_rows(other, table, theirs, config, read_hot_profile);
+    NgramTableSource out    = stored_rows(other, table, theirs, config, read_hot_profile);
+    out.model_format        = model.format;
+    out.model_digest        = model.digest;
+    return out;
 }
 
 } // namespace ninfer::models::qwen4_exp
