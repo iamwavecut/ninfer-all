@@ -108,7 +108,7 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
         launch.template operator()<kWide ? 8 : 4, true>();
         CUDA_CHECK(cudaGetLastError());
         constexpr float Log2E = 1.4426950408889634074f;
-        causal_attention_prompt_i8_fast_merge_kernel<Geometry>
+        causal_attention_prompt_fast_merge_kernel<Geometry>
             <<<dim3(static_cast<unsigned>(tokens), static_cast<unsigned>(q.ne[1])),
                kCausalPromptHeadDim, 0, stream>>>(static_cast<const float*>(partials.rows.data),
                                                   static_cast<const float2*>(partials.stats.data),
@@ -281,18 +281,22 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
 } // namespace
 
 bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested) {
-    // The fast kernels hold 100 KiB of shared memory, past a Volta card's 96 KiB.
+    // The INT8-family and nvfp4 fast kernels hold 100 KiB of shared memory, past a Volta card's
+    // 96 KiB, and the FP8 fast kernel compiles empty for Volta.
     if (current_device_volta()) { return false; }
     const bool supported = storage == KvCacheStorage::Int8Group64 ||
                            storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                            storage == KvCacheStorage::RotatedLloyd4KeyInt4Value ||
                            storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 ||
                            storage == KvCacheStorage::RotatedE8RootKeyInt4Value ||
-                           storage == KvCacheStorage::Nvfp4Group16;
+                           storage == KvCacheStorage::Nvfp4Group16 ||
+                           storage == KvCacheStorage::Fp8E4M3Row256;
     if (!supported) { return false; }
     // A card without the standard INT8-family prompt kernel (causal_prompt_i8_standard) takes the
-    // fast one for every INT8-family coding.
-    if (!causal_prompt_i8_standard_here() && storage != KvCacheStorage::Nvfp4Group16) {
+    // fast one for every INT8-family coding; the FP8 cache keeps its standard kernel there, so it
+    // follows the usual selection.
+    if (!causal_prompt_i8_standard_here() && storage != KvCacheStorage::Nvfp4Group16 &&
+        storage != KvCacheStorage::Fp8E4M3Row256) {
         return true;
     }
     if (requested) { return true; }
@@ -301,6 +305,10 @@ bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested)
         return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
     }();
     if (forced >= 0) { return forced == 1; }
+    // The profile key was measured on the INT8-family kernel only, and the FP8 fast kernel changes
+    // the output: a default --kv-dtype fp8 run must stay byte-identical to the standard route, so
+    // the profile never selects it. The flag or NINFER_PROMPT_FAST=1 (diagnosis) is its only route.
+    if (storage == KvCacheStorage::Fp8E4M3Row256) { return false; }
     return device_route_schedule("attn_prompt_fast", 1) == "on";
 }
 
@@ -339,7 +347,8 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
-        causal_attention_prompt_fp8_attention_launch(q, positions, scale, cache, out, stream);
+        causal_attention_prompt_fp8_attention_launch(q, positions, scale, cache, max_visible_keys,
+                                                     workspace, out, fast, stream);
         return;
     }
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
@@ -368,7 +377,7 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         causal_attention_prompt_fp8_launch(q, k, v, positions, valid_columns, table_rows, scale,
-                                           cache, out, stream);
+                                           cache, max_visible_keys, workspace, out, fast, stream);
         return;
     }
     kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);

@@ -677,15 +677,20 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
-    if (batch_size == 1 && kv_cache_is_int8_family(cache_storage) &&
+    if (batch_size == 1 &&
+        (kv_cache_is_int8_family(cache_storage) ||
+         cache_storage == KvCacheStorage::Fp8E4M3Row256) &&
         detail::causal_attention_prompt_fast_kernel(cache_storage, envelope.fast_prompt_kernel)) {
-        // The fast INT8-family prompt kernel's split partials. Only widths past every
-        // graph-captured call split (prompt_i8_fast_plan.h), and those always take the prompt
-        // route, so each plans at the envelope's maximum, which bounds every launch inside it.
+        // The fast prompt kernels' (INT8 family, row-scaled FP8) split partials. Only widths past
+        // every graph-captured call split (prompt_i8_fast_plan.h), and those always take the prompt
+        // route, so each plans at the envelope's maximum, which bounds every launch inside it. The
+        // FP8 fast CTA is four warps, so its plan never takes the wide eight-warp candidate.
         const detail::CausalPromptI8FastSplitPolicy policy =
             detail::causal_attention_prompt_fast_split_policy();
         const std::int32_t multiprocessors = detail::current_device_multiprocessors(170);
-        const bool wide                    = detail::causal_prompt_i8_fast_wide(cache_storage);
+        const bool wide                    = cache_storage == KvCacheStorage::Fp8E4M3Row256
+                                                 ? false
+                                                 : detail::causal_prompt_i8_fast_wide(cache_storage);
         for (std::int32_t width = std::max(min_width, detail::kCausalPromptI8FastMinSplitWidth);
              width <= max_width && policy.maximum > 1; ++width) {
             const detail::CausalPromptI8FastPlan plan = detail::causal_prompt_i8_fast_plan(

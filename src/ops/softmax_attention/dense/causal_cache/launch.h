@@ -38,9 +38,13 @@ inline constexpr int kCausalPromptI8StandardSmemBytes = 93184;
 }
 
 // Whether a prompt call on this storage takes the fast kernel (register-resident rows, FP16 PV per
-// 64-key tile): when the caller asks for it (--fast-prefill-kernel), else as NINFER_PROMPT_FAST=0|1
-// or the device profile's "attn_prompt_fast" says. Of the other storages only NVFP4-G16 has one
-// (prompt_nvfp4_fast.cuh, Blackwell builds, over more than 2048 visible keys).
+// 64-key tile for the INT8 family and the row-scaled FP8 cache, prompt_fp8_fast.cuh): when the
+// caller asks for it (--fast-prefill-kernel), else as NINFER_PROMPT_FAST=0|1 or the device
+// profile's "attn_prompt_fast" says. The FP8 cache stops short of the profile step: that key was
+// measured on the INT8-family kernel only and the fast kernel changes the output, so a default
+// --kv-dtype fp8 run keeps the standard kernel, byte-identical to master. Of the other storages
+// only NVFP4-G16 has one (prompt_nvfp4_fast.cuh, Blackwell builds, over more than 2048 visible
+// keys).
 [[nodiscard]] bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested);
 
 // Whether the fast INT8-family prompt kernel may split a launch's keys over several CTAs
@@ -201,15 +205,21 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
                                               WorkspaceArena& workspace, Tensor& out, bool fast,
                                               cudaStream_t stream);
 
+// The fast FP8 prompt kernel (prompt_fp8_fast.cuh) plans its key splits at `max_visible_keys` and
+// takes their partials from `workspace` (causal_softmax_attention_workspace_capacity_bytes
+// reserves them).
 void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                         const Tensor& positions, const Tensor& valid_columns,
                                         const Tensor& table_rows, float scale,
-                                        PagedKVBatchLayerView cache, Tensor& out,
+                                        PagedKVBatchLayerView cache, std::uint32_t max_visible_keys,
+                                        WorkspaceArena& workspace, Tensor& out, bool fast,
                                         cudaStream_t stream);
 
 void causal_attention_prompt_fp8_attention_launch(const Tensor& q, const Tensor& positions,
                                                   float scale, const PagedKVLayerView& cache,
-                                                  Tensor& out, cudaStream_t stream);
+                                                  std::uint32_t max_visible_keys,
+                                                  WorkspaceArena& workspace, Tensor& out, bool fast,
+                                                  cudaStream_t stream);
 
 void causal_attention_prompt_nvfp4_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                           const Tensor& positions, const Tensor& valid_columns,

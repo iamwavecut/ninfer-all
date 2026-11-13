@@ -31,7 +31,7 @@
 //     INT8 K tile after this tile's PV, so QK is unchanged.
 //   * A split launch (gridDim.z > 1, prompt_i8_fast_plan.h) gives each CTA a contiguous run of a
 //     row block's key pages and publishes, per row, the normalized FP32 row and its (max, sum)
-//     statistics; causal_attention_prompt_i8_fast_merge_kernel combines the splits.
+//     statistics; the shared fast-prompt merge kernel (prompt_fast_merge.cuh) combines the splits.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -40,6 +40,7 @@
 #include "ops/common/device_limits.h"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
+#include "ops/softmax_attention/dense/causal_cache/prompt_fast_merge.cuh"
 #include "ops/softmax_attention/dense/causal_cache/value_fragments.cuh"
 
 #include <cstdint>
@@ -123,13 +124,6 @@ static_assert(CausalPromptI8FastShape<4>::Launchable &&
               CausalPromptI8FastShape<4, false, true>::Launchable &&
               CausalPromptI8FastShape<4, true, true>::Launchable &&
               CausalPromptI8FastShape<8, true, true>::Launchable);
-
-// Split partial layout for key split s, column c and query head h: the D256 row at
-// ((s * width + c) * q_heads + h) * 256 and its (max, sum) pair at that row index.
-__host__ __device__ __forceinline__ std::int64_t
-causal_prompt_i8_fast_partial_row(int split, int column, int q_head, int width, int q_heads) {
-    return (static_cast<std::int64_t>(split) * width + column) * q_heads + q_head;
-}
 
 __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, unsigned& c1,
                                                                   unsigned a0, unsigned a1,
@@ -723,7 +717,8 @@ __global__ __launch_bounds__(
         const auto publish = [&](int row, float maximum, float sum, float inverse, int e0) {
             if (row >= rows) { return; }
             const std::int64_t index =
-                causal_prompt_i8_fast_partial_row(split, q0 + row, q_head, width, q_heads);
+                detail::causal_prompt_i8_fast_partial_row(split, q0 + row, q_head, width,
+                                                          q_heads);
             if (lid == 0) { partial_stats[index] = make_float2(maximum, sum); }
             float* target = partial_rows + index * D;
             if constexpr (PackedValues) {
@@ -779,46 +774,6 @@ __global__ __launch_bounds__(
         }
     }
 #endif
-}
-
-// Combines the key splits of one column and query head: every split row is normalized by its own
-// sum, so the merged row is sum_s w_s * row_s / sum_s w_s with w_s = sum_s * 2^((m_s - M) * c).
-// Columns past the valid count publish zeros.
-template <typename Geometry>
-__global__
-__launch_bounds__(kCausalPromptHeadDim) void causal_attention_prompt_i8_fast_merge_kernel(
-    const float* __restrict__ partial_rows, const float2* __restrict__ partial_stats,
-    const std::int32_t* __restrict__ valid_columns, std::int32_t width, std::int32_t splits,
-    float scale_l2, __nv_bfloat16* __restrict__ out) {
-    const int column  = static_cast<int>(blockIdx.x);
-    const int q_head  = static_cast<int>(blockIdx.y);
-    const int q_heads = causal_prompt_q_heads<Geometry>();
-    const int d       = static_cast<int>(threadIdx.x);
-    const int tokens  = valid_columns == nullptr ? width : max(0, min(width, valid_columns[0]));
-    const auto index  = causal_prompt_q_index<Geometry>(q_head, d, column, q_heads);
-    if (column >= tokens) {
-        out[index] = __float2bfloat16(0.0f);
-        return;
-    }
-    float maximum = -CUDART_INF_F;
-    for (int split = 0; split < splits; ++split) {
-        const float2 stats =
-            partial_stats[causal_prompt_i8_fast_partial_row(split, column, q_head, width, q_heads)];
-        if (stats.y > 0.0f) { maximum = fmaxf(maximum, stats.x); }
-    }
-    float numerator   = 0.0f;
-    float denominator = 0.0f;
-    for (int split = 0; split < splits; ++split) {
-        const std::int64_t row =
-            causal_prompt_i8_fast_partial_row(split, column, q_head, width, q_heads);
-        const float2 stats = partial_stats[row];
-        if (stats.y > 0.0f) {
-            const float weight = stats.y * exp2f((stats.x - maximum) * scale_l2);
-            numerator = __fmaf_rn(weight, partial_rows[row * kCausalPromptHeadDim + d], numerator);
-            denominator += weight;
-        }
-    }
-    out[index] = __float2bfloat16(denominator > 0.0f ? numerator / denominator : 0.0f);
 }
 
 } // namespace ninfer::ops
