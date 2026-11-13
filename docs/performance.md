@@ -480,26 +480,33 @@ summarization fell off there.
 
 Tencent's DSpine drafter ([converted](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3),
 Q8) beside the official artifact on one RTX 5090 at its 575 W default: the CLI with a 16,384-token
-window and `bf16` KV, thinking off, one greedy request of up to 400 tokens per configuration; decode
-tok/s, with the tokens a round in parentheses:
+window and `bf16` KV, thinking off, one greedy request per configuration; decode tok/s, with the
+tokens a round in parentheses. The Python answer continues a 1,024-token Python prompt, the English
+one an English prose prompt.
 
-| Answer | No drafts | MTP 3 | DFlash2 7 | DSpine 3 | DSpine 5 | DSpine 7 | DSpine 15 |
+| Answer | No drafts | MTP 3 | DFlash2 7 | DFlash2 15 | DSpine 7 | DSpine 11 | DSpine 15 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| code, 400 tokens | 90.8 | 232.9 (3.12) | 298.9 (4.20) | 216.6 (3.07) | 257.9 (3.76) | 279.5 (4.20) | 252.3 (4.99) |
-| prose, 252 to 269 tokens | 90.6 | 185.8 (2.49) | 185.6 (2.61) | 161.2 (2.28) | 167.3 (2.44) | 168.5 (2.54) | 130.1 (2.56) |
+| Python, 1,024 tokens | 90.7 | 251.8 (3.37) | 322.0 (4.55) | 405.1 (6.72) | 325.7 (4.92) | 421.5 (7.31) | 473.4 (8.38) |
+| English, 1,024 tokens | 90.4 | 182.7 (2.45) | 187.8 (2.67) | 163.4 (2.73) | 172.9 (2.62) | 149.3 (2.60) | 156.0 (2.76) |
+| code, 400 tokens | 90.3 | 232.3 (3.12) | 297.8 (4.20) | 292.7 (4.81) | 278.1 (4.20) | 251.1 (4.37) | 284.7 (4.99) |
+| prose, 269 tokens | 90.3 | 185.2 (2.49) | 184.9 (2.61) | 150.4 (2.47) | 167.7 (2.54) | 151.8 (2.61) | 146.7 (2.56) |
 
-Seven drafts are DSpine's best count on both answers. They keep as many tokens a round as DFlash2's
-seven on code and slightly fewer on prose, and a DSpine round costs more (five layers over the
-16-position block, the code bridge and the serial refinement), so DFlash2 and MTP stay faster on
-this card. The BF16 drafter (`dspine_bf16`) keeps the same tokens a round and decodes 254.1 and
-155.3. A sampled prose answer (temperature 0.7, seed 1) decoded 90.5 tok/s without drafts, 210.2
-with DFlash2 7 and 171.7 with DSpine 7. After startup the Q8 drafter leaves 2.7 GiB less free than
-no drafter (DFlash2 2.5 GiB, MTP 0.8 GiB), and the full 262,144-token window still fits with `rk4v4`
-and `rk8v4`. Each greedy answer is one of two token sequences: on code DFlash2 and every DSpine
-count give the same 400 tokens, which leave the plain answer at token 359 (MTP's at 248); on prose
-DFlash2 and DSpine 7 and 15 give the plain answer, MTP and DSpine 3 and 5 leave it at token 243. A
+On the long Python answer DSpine with 15 drafts keeps 8.38 tokens a round against DFlash2's 6.72 and
+decodes 1.17 times as fast as DFlash2's best count. On the short code answer and on prose DSpine's
+best count stays 4% and 9% behind DFlash2 7, at nearly the same tokens a round: a round of seven
+drafts takes 15.2 ms of kernel time against DFlash2's 14.2 ms (Nsight Systems, the difference
+between 608- and 96-token runs of the Python answer). The Q8 projection kernels account for the gap,
+2.92 ms a round against 1.96 ms: DSpine's five layers with 17,408-wide MLPs, and its candidates from
+the full 248,320-row head where DFlash2 reads its 131,072-row proposal head. Past eight drafts the
+target's verification costs about 2 ms more a round with either drafter, so 15 drafts pay only where
+most of them are kept. The BF16 drafter (`dspine_bf16`) keeps the same tokens a round as the Q8 one
+and decoded 254.1 and 155.3 tok/s on the code and prose answers at seven drafts. A sampled prose
+answer (temperature 0.7, seed 1) decoded 90.5 tok/s without drafts, 210.2 with DFlash2 7 and 171.7
+with DSpine 7. After startup the Q8 drafter leaves 2.7 GiB less free than no drafter (DFlash2 2.5
+GiB, MTP 0.8 GiB), and the full 262,144-token window still fits with `rk4v4` and `rk8v4`. A
 verification's width changes floating-point results, as [the CLI guide](cli.md#speculative-decoding)
-describes.
+describes; DSpine and DFlash2 rounds of the same width gave the same tokens on the Python, code and
+prose answers, and on the English one at seven drafts.
 
 ### MTP draft count by content
 

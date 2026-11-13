@@ -242,11 +242,10 @@ less the anchor), Gemma 4, Flint and DeepSeek-V4.1 with up to 7. The drafter rea
 head, so `--lm-head-draft` is refused. On Qwen3.5-core models a sampled request verifies DSpine's
 sampled proposal by rejection sampling, as DFlash2's; the other families verify its greedy drafts
 with coupled draws, and `--draft-min-p P` verifies a round through its first draft whose confidence
-is at or below P. On an RTX 5090 with the official Qwen3.8-27B artifact (400 greedy tokens), seven
-DSpine drafts decoded a code answer at 279.5 tokens per second and a prose answer at 168.5, against
-298.9 and 185.6 with seven DFlash2 drafts and 90.8 and 90.6 without drafts: DSpine kept as many
-tokens a round as DFlash2 on code, and its round costs more
-([measurements](performance.md#dspine-on-qwen38-27b)).
+is at or below P. On an RTX 5090 with the official Qwen3.8-27B artifact, 15 DSpine drafts decoded a
+1,024-token Python answer at 473.4 tokens per second against 405.1 with 15 DFlash2 drafts and 90.7
+without drafts; on shorter code and on prose seven DFlash2 drafts stayed 4-9% faster than DSpine's
+best count, whose round costs more ([measurements](performance.md#dspine-on-qwen38-27b)).
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b.ninfer \
@@ -375,7 +374,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query, verification keeps full attention (see [serving](serving.md#mtp-attention-window)) | `0` (whole history) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Flint and DeepSeek-V4.1 without it; DeepSeek-V4.1 refuses it beside `--spec dspark`): the last `N` tokens are matched against the sequence so far and what followed is proposed, from the occurrence the sequence was already copying while it still matches, else from the newest; exact, since verification rejects a wrong guess | `0` (off) |
-| `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; with DFlash or DFlash2 at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
+| `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; with DFlash, DFlash2 or DSpine at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
 | `--nvfp4-w4a8-int` | run NVFP4 weights on the int8 tensor cores (W4A8), prefill and decode alike: activations are quantised to int8 with one scale per token and 32 columns, the stored E2M1 codes widen to int8 exactly, and their E4M3 group scales apply in FP32. About 1.2-1.4% relative error from the activation quantisation; on an RTX 50-series card it replaces the W4A4 routes. The device profile's `nvfp4_int8/*` keys choose the wide kernel | off: BF16 activations (W4A16) before Blackwell, W4A4 on it |
