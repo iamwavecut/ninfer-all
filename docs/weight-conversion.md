@@ -27,8 +27,9 @@ downloaded files.
 ## Start with an official recipe
 
 Source-weight conversion requires a Python 3.11 environment with PyTorch and NumPy. It uses CUDA
-by default; `--device cpu` selects CPU conversion. The input paths below are placeholders for your
-local checkpoint directories.
+by default; `--device cpu` selects CPU conversion. PyTorch runs one thread per CPU the process may
+use, capped by a container's CPU quota; `OMP_NUM_THREADS` overrides that. The input paths below are
+placeholders for your local checkpoint directories.
 
 For Qwen3.6-27B floating-point source weights:
 

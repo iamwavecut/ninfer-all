@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 import importlib.util
+import os
 from pathlib import Path
 import re
 import sys
@@ -35,6 +36,29 @@ from .deepseek_v41 import RECIPES as DEEPSEEK_V41_RECIPES
 from .deepseek_v41 import GGUFShards
 from .deepseek_v41 import build_model as build_deepseek_v41
 from .ternary import RECIPES as TERNARY_RECIPES
+
+
+def usable_cpus(cgroup: Path = Path("/sys/fs/cgroup")) -> int:
+    """The CPUs this process may run on, capped by a container's CPU quota (cgroup v2 `cpu.max`,
+    v1 `cpu.cfs_quota_us`), as the engine's CPU pool counts them. torch sizes its thread pool by
+    the affinity mask alone: 96 threads on a 7.65-CPU quota made the n-gram table hash about 12 times
+    slower than 3 threads."""
+    try:
+        count = len(os.sched_getaffinity(0))
+    except AttributeError:
+        count = os.cpu_count() or 1
+    quota = 0.0
+    try:
+        limit, period = (cgroup / "cpu.max").read_text().split()[:2]
+        quota = int(limit) / int(period) if limit != "max" else 0.0
+    except (OSError, ValueError):
+        try:
+            limit = int((cgroup / "cpu" / "cpu.cfs_quota_us").read_text())
+            period = int((cgroup / "cpu" / "cpu.cfs_period_us").read_text())
+            quota = limit / period if limit > 0 and period > 0 else 0.0
+        except (OSError, ValueError):
+            pass
+    return min(count, max(1, int(quota))) if quota > 0 else max(1, count)
 
 
 def _open_named_source(name: str, path: Path, block_sources: frozenset[str]):
@@ -201,6 +225,10 @@ def main(argv=None):
         "(default: one file)",
     )
     args = parser.parse_args(argv)
+    if "OMP_NUM_THREADS" not in os.environ:
+        import torch
+
+        torch.set_num_threads(usable_cpus())
     paths = _pairs(args.source, "source")
     if "base" in paths:
         raise ValueError("select the base source with --model")
