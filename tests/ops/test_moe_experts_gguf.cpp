@@ -88,6 +88,7 @@ std::vector<int> half_fields(QType q) {
         return {208};
     case QType::GGUF_IQ1_M:
     case QType::GGUF_MXFP4:
+    case QType::GGUF_NVFP4:
         return {};
     default:
         return {0};
@@ -124,6 +125,10 @@ std::vector<std::uint8_t> random_blocks(QType q, std::int32_t rows, std::int32_t
         }
         // MXFP4's exponent byte: scales 2^-12 .. 2^-7.
         if (q == QType::GGUF_MXFP4) { base[0] = static_cast<std::uint8_t>(115 + byte(rng) % 6); }
+        // NVFP4's four UE4M3 scale bytes: halved scales 2^-10 .. 2^-5 (subnormals included).
+        if (q == QType::GGUF_NVFP4) {
+            for (int s = 0; s < 4; ++s) { base[s] = static_cast<std::uint8_t>(1 + byte(rng) % 31); }
+        }
     }
     return bytes;
 }
@@ -853,6 +858,28 @@ int main() {
              2,
              {8, 24},
              12},
+            // Edge0's expert formats: the NVFP4 builds' three projections, and the Q3_K builds'
+            // Q3_K gate and up with IQ4_NL down, on both kernels and the CPU products.
+            {"nvfp4 bank",
+             Q::GGUF_NVFP4,
+             Q::GGUF_NVFP4,
+             Q::GGUF_NVFP4,
+             Q::GGUF_Q8_0,
+             Q::GGUF_Q8_0,
+             Q::GGUF_Q8_0,
+             4,
+             {1, 3, 8, 9, 64, 260},
+             kExperts},
+            {"q3_k bank",
+             Q::GGUF_Q3_K,
+             Q::GGUF_Q3_K,
+             Q::GGUF_IQ4_NL,
+             Q::GGUF_Q8_0,
+             Q::GGUF_Q8_0,
+             Q::GGUF_Q8_0,
+             4,
+             {1, 8, 24, 260},
+             kExperts},
         };
         int failures       = 0;
         std::uint32_t seed = 4242;

@@ -15,6 +15,7 @@ set(ninfer_op_tests
   moe_route
   moe_experts
   moe_experts_gguf
+  moe_latent_gguf
   moe_experts_native
   rmsnorm
   rmsnorm_pack_tail

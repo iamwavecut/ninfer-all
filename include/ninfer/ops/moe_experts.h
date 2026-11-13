@@ -198,6 +198,153 @@ void moe_experts_gguf_part(const Tensor& m, const Tensor& ids, const Tensor& wei
 void moe_experts_gguf_combine(std::span<const Tensor> parts, Tensor& y, cudaStream_t stream);
 
 /**
+ * The shared expert of moe_experts_gguf alone, with its arithmetic there: shared * e_shared(m)
+ * added into `fixed` I64 [2560, tokens] (2^-32 fixed point, zeroed by the caller), through the
+ * decode kernels at up to eight tokens where its banks allow them and the bank pass otherwise
+ * (device-resident shared banks past eight tokens). Allocations stay in the caller's workspace
+ * scope until the sum is read. Given `side`, a call of up to eight tokens runs there and returns
+ * side->join, recorded after its work, for the caller to wait on before it reads the sum; otherwise
+ * it returns nullptr.
+ */
+[[nodiscard]] cudaEvent_t moe_experts_gguf_shared(const Tensor& m, const Tensor& shared,
+                                                  const GgufMoeWeights& banks,
+                                                  WorkspaceArena& workspace,
+                                                  unsigned long long* fixed, cudaStream_t stream,
+                                                  const GgufMoeSide* side = nullptr);
+[[nodiscard]] std::size_t moe_experts_gguf_shared_workspace_bytes(std::int32_t tokens);
+
+/**
+ * Edge0's latent MoE over GGUF block banks: Qwen3.8-Flash-Next's router and shared expert, with
+ * routed experts that work in a latent width L (1792 or 1280) of one of G = 8 projection groups:
+ *
+ *   xl[t, g] = c * (D_g . q8_1(m[t]))                       D_g [L, 2560], c FP32 [L] or ones
+ *   a_p      = q8_1(xl[t, g_e])                             g_e = labels[e], pair p = (t, e, w)
+ *   h_p      = silu(s_gate[e] * (gate_e . a_p)) * (s_up[e] * (up_e . a_p))   gate_e, up_e [640, L]
+ *   S[t, g]  = sum of w * (s_down[e] * (down_e . q8_1(h_p))) over token t's pairs with g_e = g
+ *   y[t]     = sum over the groups g token t routes to of U_g . q8_1(S[t, g]) + shared * e_shared(m)
+ *
+ * with down_e [L, 640], U_g [2560, L], and s_* FP32 per-expert multipliers (ones when absent).
+ * Each product rounds once in FP32; the multipliers apply to its FP32 result, h_p is stored as
+ * BF16 before its q8_1 quantization, and S and y are 2^-32 fixed-point sums as in
+ * moe_experts_gguf, so y does not depend on the order or placement in which the pairs run.
+ * edge0-strata applies U to each pair's q8_1(s_down * down_e . q8_1(h_p)) before the weighted sum;
+ * the two agree in exact arithmetic, and the group sum needs at most 8 U products per token
+ * instead of 10. A group no pair of a token routes to costs no D or U work.
+ *
+ * Up to eight tokens run the vector products; a wider call needs `device_resident` banks and runs
+ * D, U and each routed projection on the matrix kernel where the block type has one (the routed
+ * experts with at most kGgufMoeVectorPairs pairs of a call of up to kGgufMoeSplitTokens tokens keep
+ * the vector products), as moe_experts_gguf chooses. The choice depends on the call's width and
+ * routing only. Encoder, decoder, labels and scales are device memory; routed tables may point at
+ * banks, cache slots or mapped host memory as in moe_experts_gguf (device memory past eight tokens,
+ * with 256 zero bytes after the last expert of the down bank).
+ *
+ * The independent oracle decodes every stored block and the scales, and evaluates the formula in
+ * FP64 from the public BF16 input with the q8_1 points above; y is compared as FP32 by relative L2
+ * and gross error.
+ */
+struct GgufLatentWeights {
+    // Routed experts: gate and up 640 rows of `width` values, down `width` rows of 640.
+    GgufExpertTable gate, up, down;
+    // `groups` entries each: D_g `width` rows of 2560 values, U_g 2560 rows of `width`.
+    GgufExpertTable encode, decode;
+    GgufExpertTable shared_gate, shared_up, shared_down;
+    const std::int32_t* labels  = nullptr; // device I32 [experts], each below `groups`
+    const float* expert_scales  = nullptr; // device FP32 [experts][3] (gate, up, down), or ones
+    const float* column_scale   = nullptr; // device FP32 [width], or ones
+    std::int32_t width          = 0;       // L: a multiple of 256
+    std::int32_t groups         = 8;
+    std::int32_t experts        = 512;
+    std::int32_t shared_width   = 640;
+    bool device_resident        = false;
+};
+
+// moe_latent_gguf runs a call of more than kGgufLatentSliceTokens tokens in equal slices of at most
+// that many, each wider than kGgufMoeSplitTokens, so that every product takes the route the whole
+// call's would: the slices store the unsliced call's y, bit for bit, in the workspace of one slice.
+// The staged form below runs its call whole.
+inline constexpr std::int32_t kGgufLatentSliceTokens = 2048;
+
+// A call of `tokens` tokens through the staged form; moe_latent_gguf needs that of
+// min(tokens, kGgufLatentSliceTokens).
+[[nodiscard]] std::size_t moe_latent_gguf_workspace_bytes(std::int32_t tokens, std::int32_t width,
+                                                          std::int32_t groups);
+void moe_latent_gguf(const Tensor& m, const Tensor& ids, const Tensor& weights,
+                     const Tensor& shared, const GgufLatentWeights& banks,
+                     WorkspaceArena& workspace, Tensor& y, cudaStream_t stream);
+
+/**
+ * The same sum in stages, for routed experts whose missing ones arrive in device memory or are
+ * computed elsewhere. begin takes the whole call's `ids`: it runs the shared expert (on `side`
+ * when given), D for every group the tokens route to, and zeroes the latent and output sums; the
+ * workspace scope stays open until finish. Each add runs the routed pairs whose entry of its `ids`
+ * is non-negative through `banks`' routed tables. add_products adds `*count` (at most `max_count`)
+ * externally computed down products, FP32 [count][width] before s_down, with their pair indices
+ * in `pairs`; they take s_down, the pair weight and the fixed-point rounding here, as the kernels'
+ * products do. finish runs U and stores y. Adds that divide the experts (every pair of an expert in
+ * one add) give exactly the single call's sum.
+ *
+ * In a call of up to kGgufMoeSplitTokens tokens `inputs` holds the latent activations of every
+ * pair as the vector kernel reads them (planar q8_1, [tokens * 10][width]), so a CPU product of a
+ * pair reads the GPU's quantized input; wider calls leave it null.
+ */
+// The layout of GgufLatentStage::inputs over `pairs` pairs: int8 codes [pairs][width] from byte 0,
+// then binary16 (d, s) pairs [pairs][width / 32] from moe_latent_gguf_input_scales.
+[[nodiscard]] constexpr std::size_t moe_latent_gguf_input_scales(std::int32_t pairs,
+                                                                 std::int32_t width) {
+    return (std::size_t(width) * std::size_t(pairs) + 15) / 16 * 16;
+}
+[[nodiscard]] constexpr std::size_t moe_latent_gguf_input_bytes(std::int32_t pairs,
+                                                                std::int32_t width) {
+    return moe_latent_gguf_input_scales(pairs, width) + std::size_t(pairs) * (width / 32) * 4;
+}
+
+struct GgufLatentStage {
+    std::int32_t tokens          = 0;
+    std::int32_t pairs           = 0;    // routed pairs: tokens * 10
+    unsigned long long* fixed    = nullptr; // [tokens][2560]
+    unsigned long long* latent   = nullptr; // S [tokens * groups][width]
+    float* encoded               = nullptr; // xl [tokens * groups][width]
+    std::int32_t* sources        = nullptr; // [pairs]: the xl column of each pair, or -1
+    std::int32_t* group_ids      = nullptr; // [tokens * groups]: g, or -1 for a group not routed to
+    float* group_weights         = nullptr; // [tokens * groups]: ones
+    void* group_routing          = nullptr; // the groups' MoeRouting arrays
+    void* inputs                 = nullptr; // the pairs' latent activations (vector layout)
+    cudaEvent_t join             = nullptr; // the shared expert's side stream, when it ran on one
+};
+
+[[nodiscard]] GgufLatentStage moe_latent_gguf_begin(const Tensor& m, const Tensor& ids,
+                                                    const Tensor& shared,
+                                                    const GgufLatentWeights& banks,
+                                                    WorkspaceArena& workspace, cudaStream_t stream,
+                                                    const GgufMoeSide* side = nullptr);
+void moe_latent_gguf_add(const GgufLatentStage& stage, const Tensor& ids, const Tensor& weights,
+                         const GgufLatentWeights& banks, WorkspaceArena& workspace,
+                         cudaStream_t stream);
+void moe_latent_gguf_add_products(const GgufLatentStage& stage, const float* values,
+                                  const std::int32_t* pairs, const std::int32_t* count,
+                                  std::int32_t max_count, const Tensor& ids,
+                                  const Tensor& weights, const GgufLatentWeights& banks,
+                                  cudaStream_t stream);
+void moe_latent_gguf_finish(const GgufLatentStage& stage, const GgufLatentWeights& banks,
+                            WorkspaceArena& workspace, Tensor& y, cudaStream_t stream);
+
+/**
+ * Group parallelism: one device's part of moe_latent_gguf's sum, the groups [group_begin,
+ * group_end) with their D_g, U_g and routed experts, and the shared expert when `shared` is given.
+ * `fixed` I64 [2560, tokens] receives the part's 2^-32 fixed-point sum; with parts whose ranges
+ * partition the groups and the shared expert in exactly one, moe_experts_gguf_combine stores the y
+ * moe_latent_gguf stores, bit for bit. `banks` tables of other groups and their experts are never
+ * read. A part may hold a run of the shared expert's width, as moe_experts_gguf_part's may; given
+ * `side`, its shared expert runs there at up to eight tokens.
+ */
+void moe_latent_gguf_part(const Tensor& m, const Tensor& ids, const Tensor& weights,
+                          const Tensor* shared, const GgufLatentWeights& banks,
+                          std::int32_t group_begin, std::int32_t group_end,
+                          WorkspaceArena& workspace, Tensor& fixed, cudaStream_t stream,
+                          const GgufMoeSide* side = nullptr);
+
+/**
  * One native expert projection bank. `experts` is a caller-owned device array of prepared
  * Weight operands, all in `format`: BF16 or Q2/Q4/Q5/Q6/Q8 row-split weights. The operands
  * retain their actual code/high/scale planes and layout; no selected-weight repack is needed.
