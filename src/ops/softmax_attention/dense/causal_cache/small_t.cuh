@@ -1,7 +1,7 @@
 #pragma once
 
 // ninfer::ops - split-KV causal small-T attention shared scaffolding. The partial kernels of each
-// KV format live in their own headers (small_t_bf16.cuh, small_t_i8.cuh, small_t_fp8.cuh, ...);
+// KV format live in their own headers (bf16/small_t.cuh, int8/small_t.cuh, fp8/small_t.cuh, ...);
 // they are fully separate kernels (no shared body) so each format can be optimized independently.
 // This header owns only what they share: layout constants, split policies and device helpers. The
 // BF16 and INT8 split reducer is in small_t_reduce.cuh, the split bound the host launchers share

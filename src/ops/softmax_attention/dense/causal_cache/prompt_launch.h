@@ -21,7 +21,7 @@ namespace ninfer::ops::detail {
 // A position-split rank's prompt attention over the keys of its own pages, every storage: each
 // column's output normalized over those keys and its log-sum-exp, into `partial_out`
 // (causal_attention_merge_partials). The caller has appended the call's rows. One sequence; the
-// Volta prompt kernel's partial form on every architecture (prompt_sm70.h).
+// Volta prompt kernel's partial form on every architecture (sm70/prompt.h).
 void causal_attention_prompt_partial_launch(const Tensor& q, const Tensor& positions,
                                             const Tensor& valid_columns, const Tensor& table_rows,
                                             float scale, PagedKVBatchLayerView cache,

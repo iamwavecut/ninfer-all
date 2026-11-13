@@ -14,7 +14,7 @@ namespace ninfer::ops::detail {
 // block divides it.
 inline constexpr std::int32_t kPromptWaveRows = 128;
 
-// Shared memory of the standard INT8-family prompt kernel's tile (prompt_i8.cuh), and whether the
+// Shared memory of the standard INT8-family prompt kernel's tile (int8/prompt.cuh), and whether the
 // blocks of a shape set hold it (ops/common/device_tier.h). Turing's 64 KiB do not: there every
 // INT8-family prompt runs on the fast kernel, and the "attn_pack_gqa" and "attn_prompt_fast"
 // switches have nothing to choose.
@@ -25,7 +25,7 @@ inline constexpr int kCausalPromptI8StandardSmemBytes = 93184;
 }
 
 // The most CTAs the fast INT8-family prompt kernel splits one launch's keys over
-// (prompt_i8_fast_plan.h).
+// (int8/prompt_fast_plan.h).
 inline constexpr std::int32_t kCausalPromptI8FastMaxSplits = 8;
 
 } // namespace ninfer::ops::detail

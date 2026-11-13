@@ -96,7 +96,7 @@
   "src/ops/CMakeFiles/ninfer_ops.dir/linear_swiglu/q8/q8_linear_swiglu_gemm_splitk_unified.cu": 568,
   "src/ops/CMakeFiles/ninfer_ops.dir/moe_experts/moe_experts_native.cu": 148,
   "src/ops/CMakeFiles/ninfer_ops.dir/softmax_attention/dense/causal_cache/prompt.cu": 2459,
-  "src/ops/CMakeFiles/ninfer_ops.dir/softmax_attention/dense/causal_cache/prompt_sm70.cu": 131,
+  "src/ops/CMakeFiles/ninfer_ops.dir/softmax_attention/dense/causal_cache/sm70/prompt.cu": 131,
   "src/ops/CMakeFiles/ninfer_ops.dir/softmax_attention/dense/causal_cache/small_t.cu": 1935,
   "src/ops/CMakeFiles/ninfer_ops.dir/softmax_attention/dense/causal_cache/small_t_fp8.cu": 1425,
   "src/ops/CMakeFiles/ninfer_ops.dir/softmax_attention/dense/causal_cache/small_t_i8_w1_h16_append.cu": 2284,
@@ -132,7 +132,7 @@
   "src/ops/CMakeFiles/ninfer_ops.dir/softmax_attention/dense/context/launch.cu": 234,
   "src/ops/CMakeFiles/ninfer_ops.dir/softmax_attention/sliding_window/launch.cu": 221,
   "src/ops/CMakeFiles/ninfer_ops.dir/sparse_moe/prefill/sparse_moe_prefill_kernels.cu": 253,
-  "src/ops/CMakeFiles/ninfer_ops_nvfp4_a4.dir/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cu": 162,
+  "src/ops/CMakeFiles/ninfer_ops_nvfp4_a4.dir/softmax_attention/dense/causal_cache/nvfp4/prompt_fast.cu": 162,
   "src/ops/CMakeFiles/ninfer_ops_sm70.dir/linear/sm70/sm70_small.cu": 192
  },
  "windows": {
@@ -219,7 +219,7 @@
   "src/ops/CMakeFiles/ninfer_ops.dir/softmax_attention/dense/context/launch.cu": 226,
   "src/ops/CMakeFiles/ninfer_ops.dir/softmax_attention/sliding_window/launch.cu": 212,
   "src/ops/CMakeFiles/ninfer_ops.dir/sparse_moe/prefill/sparse_moe_prefill_kernels.cu": 218,
-  "src/ops/CMakeFiles/ninfer_ops_nvfp4_a4.dir/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cu": 137,
+  "src/ops/CMakeFiles/ninfer_ops_nvfp4_a4.dir/softmax_attention/dense/causal_cache/nvfp4/prompt_fast.cu": 137,
   "src/ops/CMakeFiles/ninfer_ops_sm70.dir/linear/sm70/sm70_small.cu": 187,
   "src/ops/CMakeFiles/ninfer_small_t_i8.dir/softmax_attention/dense/causal_cache/small_t_i8_w1_h16_append.cu": 2975,
   "src/ops/CMakeFiles/ninfer_small_t_i8.dir/softmax_attention/dense/causal_cache/small_t_i8_w1_h16_cached.cu": 2491,

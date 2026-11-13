@@ -5,7 +5,7 @@
 // compiles without the kernels and a kernel unit without the routing. Each kernel family, geometry
 // and metadata form compiles in a unit of its own (kernel_unit.cu.in).
 
-#include "ops/softmax_attention/dense/causal_cache/i8_coding.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/coding.h"
 
 #include <cuda_runtime_api.h>
 
@@ -49,20 +49,20 @@ struct PromptLaunch {
     cudaStream_t stream   = nullptr;
 };
 
-// The BF16 kernel (prompt_bf16.cuh) in the current device's shape set, over BF16 or bf16p planes.
+// The BF16 kernel (bf16/prompt.cuh) in the current device's shape set, over BF16 or bf16p planes.
 template <typename Geometry, PromptMetadataForm Form>
 void launch_prompt_bf16(const PromptLaunch& launch);
 
-// The standard INT8-family kernel (prompt_i8.cuh), where the build has the standard shape set.
+// The standard INT8-family kernel (int8/prompt.cuh), where the build has the standard shape set.
 template <typename Geometry, PromptMetadataForm Form>
 void launch_prompt_i8(const PromptLaunch& launch);
 
-// The fast INT8-family kernel (prompt_i8_fast.cuh) at the launch's plan; a split plan leaves its
+// The fast INT8-family kernel (int8/prompt_fast.cuh) at the launch's plan; a split plan leaves its
 // partials for launch_prompt_i8_fast_merge.
 template <typename Geometry, PromptMetadataForm Form>
 void launch_prompt_i8_fast(const PromptLaunch& launch);
 
-// Merges the fast kernel's split partials into `out` (prompt_i8_fast_merge.cu); `valid_columns`
+// Merges the fast kernel's split partials into `out` (int8/prompt_fast_merge.cu); `valid_columns`
 // masks a batch row's columns.
 void launch_prompt_i8_fast_merge(const PromptLaunch& launch);
 

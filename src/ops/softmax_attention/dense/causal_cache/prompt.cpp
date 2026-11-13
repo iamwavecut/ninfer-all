@@ -1,6 +1,6 @@
 // ninfer::ops - causal_softmax_attention prompt-scale launcher: fill k/v at device positions then
 // launch causal attention over absolute cached history. The kernels compile in generated units
-// (prompt_kernel_launch.h), the fast kernel's split merge in prompt_i8_fast_merge.cu.
+// (prompt_kernel_launch.h), the fast kernel's split merge in int8/prompt_fast_merge.cu.
 #include "ops/softmax_attention/dense/causal_cache/prompt_launch.h"
 
 #include "core/arena.h"
@@ -11,11 +11,11 @@
 #include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
-#include "ops/softmax_attention/dense/causal_cache/prompt_fp8_launch.h"
-#include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
-#include "ops/softmax_attention/dense/causal_cache/prompt_k8v4_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/fp8/prompt_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/prompt_fast_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/k8v4/prompt_launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_kernel_launch.h"
-#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/prompt_launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
 #include "ops/softmax_attention/dense/causal_cache/route.h"
 

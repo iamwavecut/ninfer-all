@@ -5,7 +5,7 @@
 
 #include "ninfer/kv_cache_storage.h"
 #include "ninfer/ops/softmax_attention_envelope.h"
-#include "ops/softmax_attention/dense/causal_cache/i8_coding.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/coding.h"
 
 #include <cstdint>
 

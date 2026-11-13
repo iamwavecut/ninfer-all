@@ -1,9 +1,9 @@
 #pragma once
 
-// The key-split merge of the fast prompt kernels (INT8 family: prompt_i8_fast.cuh, FP8:
-// prompt_fp8_fast.cuh): it combines the splits over the storage-agnostic FP32 partial rows and
+// The key-split merge of the fast prompt kernels (INT8 family: int8/prompt_fast.cuh, FP8:
+// fp8/prompt_fast.cuh): it combines the splits over the storage-agnostic FP32 partial rows and
 // (max, sum) statistics the split launches publish, so both families share this one kernel. The
-// partials' layout is here as well, apart from the host's plan (prompt_i8_fast_plan.h), so the
+// partials' layout is here as well, apart from the host's plan (int8/prompt_fast_plan.h), so the
 // kernel units do not read the routing.
 
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"

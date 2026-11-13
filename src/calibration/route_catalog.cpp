@@ -2,7 +2,7 @@
 
 #include "ops/linear/common/route_table.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
-#include "ops/softmax_attention/dense/causal_cache/small_t_i8_route.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/small_t_route.h"
 
 #include <algorithm>
 #include <array>
@@ -36,7 +36,7 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
 
     if (!volta) {
         // A Volta card runs its own projection, decode-attention and single-row prompt routes
-        // (ops/linear/sm70, small_t_sm70_*.cuh, prompt_sm70.cu), which consult none of the projection
+        // (ops/linear/sm70, small_t_sm70_*.cuh, sm70/prompt.cu), which consult none of the projection
         // and attention keys below; besides the GGUF load schedules above it calibrates the GDN
         // prefill switch alone.
 

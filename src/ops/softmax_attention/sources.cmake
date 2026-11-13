@@ -1,20 +1,20 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/causal_softmax_attention.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_fp8.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_nvfp4.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_k8v4.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_i8_dispatch.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/fp8/small_t.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/small_t.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/k8v4/small_t.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/int8/small_t_dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_reduce.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_nvfp4_reduce.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/small_t_k8v4_reduce.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/small_t_reduce.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/k8v4/small_t_reduce.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/merge.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_i8_fast_merge.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_fp8.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_sm70.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_k8v4.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/int8/prompt_fast_merge.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/fp8/prompt.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/sm70/prompt.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/prompt.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/k8v4/prompt.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/packed/packed_softmax_attention.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/packed/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/context/context_softmax_attention.cpp"
@@ -24,12 +24,12 @@ target_sources(ninfer_ops PRIVATE
 )
 
 # The small-T partial kernels compile in units generated from dense/causal_cache/kernel_unit.cu.in,
-# one launch instantiation each; host code (small_t.cpp, small_t_fp8.cpp, small_t_i8_dispatch.cpp,
+# one launch instantiation each; host code (small_t.cpp, fp8/small_t.cpp, int8/small_t_dispatch.cpp,
 # ...) routes every launch to one, so an edit of the routing compiles no kernel, an edit of one
 # kernel compiles only its units, and the units compile in parallel. BF16, bf16p, FP8, NVFP4 and
 # K8V4 have one unit per geometry and input, over every query width. The INT8 family has one per
 # tier, query width, geometry and input: the host router picks a tier per launch, and the tiers
-# built for a launch's 16-row Q tiles are those of small_t_i8_tier_built() (small_t_i8_tier.h); a
+# built for a launch's 16-row Q tiles are those of small_t_i8_tier_built() (int8/small_t_tier.h); a
 # unit asserts that its tier is one, and the router names each one, so a list below that differs
 # fails to compile or to link. Volta's kernels have units of their own, compiled for sm_70 alone in
 # a build of several architectures: only a Volta card launches them, so the other images would hold
@@ -89,14 +89,14 @@ foreach(_ninfer_small_t_geometry IN ITEMS h24 h16)
       "${_ninfer_small_t_type}, PromptMetadataForm::${_ninfer_prompt_form_id}")
     set(_ninfer_prompt_about "${_ninfer_prompt_arguments}")
     _ninfer_causal_cache_unit(_ninfer_causal_cache_sources "prompt_bf16_${_ninfer_prompt_suffix}"
-      prompt_bf16_launch.cuh launch_prompt_bf16 "${_ninfer_prompt_arguments}" "const PromptLaunch&"
+      bf16/prompt_launch.cuh launch_prompt_bf16 "${_ninfer_prompt_arguments}" "const PromptLaunch&"
       "the BF16 prompt kernel, ${_ninfer_prompt_about}")
     _ninfer_causal_cache_unit(_ninfer_causal_cache_sources "prompt_i8_${_ninfer_prompt_suffix}"
-      prompt_i8_launch.cuh launch_prompt_i8 "${_ninfer_prompt_arguments}" "const PromptLaunch&"
+      int8/prompt_launch.cuh launch_prompt_i8 "${_ninfer_prompt_arguments}" "const PromptLaunch&"
       "the standard INT8-family prompt kernel, ${_ninfer_prompt_about}")
     if(_ninfer_small_t_post_volta)
       _ninfer_causal_cache_unit(_ninfer_causal_cache_sources
-        "prompt_i8_fast_${_ninfer_prompt_suffix}" prompt_i8_fast_launch.cuh launch_prompt_i8_fast
+        "prompt_i8_fast_${_ninfer_prompt_suffix}" int8/prompt_fast_launch.cuh launch_prompt_i8_fast
         "${_ninfer_prompt_arguments}" "const PromptLaunch&"
         "the fast INT8-family prompt kernel, ${_ninfer_prompt_about}")
     endif()
@@ -115,7 +115,7 @@ foreach(_ninfer_small_t_geometry IN ITEMS h24 h16)
     set(_ninfer_small_t_about "${_ninfer_small_t_type}, ${_ninfer_small_t_input_type}")
     if(_ninfer_small_t_post_volta)
       _ninfer_causal_cache_unit(_ninfer_causal_cache_sources
-        "small_t_bf16_${_ninfer_small_t_suffix}" small_t_bf16_launch.cuh launch_small_t_bf16
+        "small_t_bf16_${_ninfer_small_t_suffix}" bf16/small_t_launch.cuh launch_small_t_bf16
         "${_ninfer_small_t_shape}" "${_ninfer_small_t_parameters}"
         "the BF16 kernel, ${_ninfer_small_t_about}")
     endif()
@@ -124,7 +124,7 @@ foreach(_ninfer_small_t_geometry IN ITEMS h24 h16)
     endif()
     if(NINFER_ARCH_VOLTA)
       _ninfer_causal_cache_unit(_ninfer_causal_cache_sm70_sources
-        "small_t_bf16_sm70_${_ninfer_small_t_suffix}" small_t_sm70_bf16_launch.cuh
+        "small_t_bf16_sm70_${_ninfer_small_t_suffix}" bf16/small_t_sm70_launch.cuh
         launch_small_t_bf16_sm70 "${_ninfer_small_t_shape}" "${_ninfer_small_t_parameters}"
         "Volta's BF16 kernel, ${_ninfer_small_t_about}")
     endif()
@@ -139,14 +139,14 @@ foreach(_ninfer_small_t_geometry IN ITEMS h24 h16)
       if(_ninfer_small_t_post_volta)
         _ninfer_causal_cache_unit(_ninfer_causal_cache_sources
           "small_t_${_ninfer_small_t_format}_${_ninfer_small_t_suffix}"
-          "small_t_${_ninfer_small_t_format}_launch.cuh" "launch_small_t_${_ninfer_small_t_format}"
+          "${_ninfer_small_t_format}/small_t_launch.cuh" "launch_small_t_${_ninfer_small_t_format}"
           "${_ninfer_small_t_shape}" "${_ninfer_small_t_parameters}"
           "the ${_ninfer_small_t_format} kernel, ${_ninfer_small_t_about}")
       endif()
       if(NINFER_ARCH_VOLTA)
         _ninfer_causal_cache_unit(_ninfer_causal_cache_sm70_sources
           "small_t_${_ninfer_small_t_format}_sm70_${_ninfer_small_t_suffix}"
-          small_t_sm70_quant_launch.cuh launch_small_t_quantized_sm70
+          sm70/small_t_quant_launch.cuh launch_small_t_quantized_sm70
           "${_ninfer_small_t_shape}, ${_ninfer_small_t_codings}" "${_ninfer_small_t_parameters}"
           "Volta's ${_ninfer_small_t_format} kernel, ${_ninfer_small_t_about}")
       endif()
@@ -172,20 +172,20 @@ foreach(_ninfer_small_t_geometry IN ITEMS h24 h16)
         foreach(_ninfer_small_t_tier IN LISTS _ninfer_small_t_i8_rows${_ninfer_small_t_rows})
           string(TOLOWER "${_ninfer_small_t_tier}" _ninfer_small_t_tier_name)
           _ninfer_causal_cache_unit(_ninfer_small_t_i8_sources
-            "${_ninfer_small_t_prefix}_${_ninfer_small_t_tier_name}" small_t_i8_tiled.cuh
+            "${_ninfer_small_t_prefix}_${_ninfer_small_t_tier_name}" int8/small_t_tiled.cuh
             launch_small_t_i8_tiled
             "${_ninfer_small_t_shape}, SmallTI8Tier::${_ninfer_small_t_tier}"
             "${_ninfer_small_t_i8_parameters}"
             "tier ${_ninfer_small_t_tier}, ${_ninfer_small_t_about}")
         endforeach()
         _ninfer_causal_cache_unit(_ninfer_small_t_i8_sources "${_ninfer_small_t_prefix}_pipelined"
-          small_t_i8_pipelined_launch.cuh launch_small_t_i8_pipelined "${_ninfer_small_t_shape}"
+          int8/small_t_pipelined_launch.cuh launch_small_t_i8_pipelined "${_ninfer_small_t_shape}"
           "${_ninfer_small_t_i8_parameters}"
           "the pipelined kernel, ${_ninfer_small_t_about}")
       endif()
       if(NINFER_ARCH_VOLTA)
         _ninfer_causal_cache_unit(_ninfer_small_t_i8_sm70_sources "${_ninfer_small_t_prefix}_sm70"
-          small_t_i8_sm70_launch.cuh launch_small_t_i8_sm70 "${_ninfer_small_t_shape}"
+          int8/small_t_sm70_launch.cuh launch_small_t_i8_sm70 "${_ninfer_small_t_shape}"
           "${_ninfer_small_t_i8_parameters}" "Volta's kernel, ${_ninfer_small_t_about}")
       endif()
     endforeach()
@@ -245,5 +245,5 @@ math(EXPR NINFER_SMALL_T_I8_INSTANTIATIONS
 # only Blackwell has: a build with 120a carries it, and only a card running the 120a code takes it.
 if(NINFER_ARCH_BLACKWELL)
   target_sources(ninfer_ops PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/prompt_nvfp4_fast.cu")
+    "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/prompt_fast.cu")
 endif()

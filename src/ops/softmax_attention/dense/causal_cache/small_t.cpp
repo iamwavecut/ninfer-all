@@ -1,7 +1,7 @@
 // ninfer::ops - host launch of the split-KV causal small-T attention over BF16, bf16p and
 // INT8-family caches, and the unified route dispatcher that hands FP8, NVFP4 and K8V4 caches to
-// their own launchers. The partial kernels compile in generated units (small_t_bf16_launch.h,
-// small_t_i8_launch.h), the reducer and the tile metadata in small_t_reduce.cu.
+// their own launchers. The partial kernels compile in generated units (bf16/small_t_launch.h,
+// int8/small_t_launch.h), the reducer and the tile metadata in small_t_reduce.cu.
 #include "ops/softmax_attention/dense/causal_cache/small_t_launch.h"
 
 #include "core/paged_kv_storage.h"
@@ -14,15 +14,15 @@
 #include "ops/softmax_attention/dense/causal_cache/cache_input.h"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 #include "ops/softmax_attention/dense/causal_cache/route.h"
-#include "ops/softmax_attention/dense/causal_cache/small_t_bf16_launch.h"
-#include "ops/softmax_attention/dense/causal_cache/small_t_fp8_launch.h"
-#include "ops/softmax_attention/dense/causal_cache/small_t_i8_route.h"
+#include "ops/softmax_attention/dense/causal_cache/bf16/small_t_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/fp8/small_t_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/small_t_route.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_invocation.h"
-#include "ops/softmax_attention/dense/causal_cache/small_t_k8v4_launch.h"
-#include "ops/softmax_attention/dense/causal_cache/small_t_nvfp4_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/k8v4/small_t_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/small_t_launch.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_policy.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_reduce_launch.h"
-#include "ops/softmax_attention/dense/causal_cache/small_t_sm70_shape.h"
+#include "ops/softmax_attention/dense/causal_cache/sm70/small_t_shape.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -134,7 +134,7 @@ template <typename Geometry>
 int i8_partial_ctas_per_sm(std::int32_t tokens, std::int32_t window, KvCacheStorage storage) {
 #if defined(NINFER_TIER_VOLTA)
     if (current_device_volta()) {
-        // Volta's kernel (small_t_sm70_i8.cuh) holds its own count, from its registers and shared
+        // Volta's kernel (int8/small_t_sm70.cuh) holds its own count, from its registers and shared
         // memory.
         int ctas = 1;
         [&]<int... T>(std::integer_sequence<int, T...>) {
@@ -267,7 +267,7 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     if constexpr (!kCausalPackedInput<CacheInput>) {
         if (i8_family) {
             // The INT8 family's tier, coding and PV accumulation are routed on the host
-            // (small_t_i8_dispatch.cpp); each tier's kernels compile in units of their own.
+            // (int8/small_t_dispatch.cpp); each tier's kernels compile in units of their own.
             SmallTI8Launch launch{partial};
             launch.wave_splits = wave_splits;
             // A U8 value plane is the packed signed int4 coding.
@@ -283,7 +283,7 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
                 throw std::invalid_argument(
                     "causal_softmax_attention: --kv-dtype bf16p needs sm_75 or newer");
             } else {
-                // Volta's own kernel (small_t_sm70_bf16.cuh): same grid, splits and partial
+                // Volta's own kernel (bf16/small_t_sm70.cuh): same grid, splits and partial
                 // outputs.
                 launch_small_t_bf16_sm70<Geometry, CacheInput>(partial, input);
             }
@@ -412,7 +412,7 @@ void causal_attention_small_t_load_modules(std::int32_t q_heads, std::int32_t kv
                                            std::int32_t max_width) {
     if (!kv_cache_is_int8_family(storage)) { return; }
     // Every INT8-family storage runs the same units (one per tier, width, geometry and input;
-    // small_t_i8_launch.h), so loading them serves them all.
+    // int8/small_t_launch.h), so loading them serves them all.
     with_causal_geometry(q_heads, kv_heads, [&]<typename Geometry>() {
         constexpr int kWidest = Geometry::ModelQHeads == 24 ? 8 : 6;
         if (cached_input) {

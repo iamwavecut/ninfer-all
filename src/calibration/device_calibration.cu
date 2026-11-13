@@ -1728,7 +1728,7 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
                     std::make_shared<const ops::DeviceRouteProfile>(profile));
             }
         }
-        // Key splits of the fast prompt kernel (prompt_i8_fast_plan.h) against unsplit launches,
+        // Key splits of the fast prompt kernel (int8/prompt_fast_plan.h) against unsplit launches,
         // where the fast kernel now serves prompts: a 256-token continuation at 32K and 131K of
         // context, where few row blocks leave SMs idle, and a wave-aligned chunk at 131K. The
         // split partials need their own workspace, sized with the fast kernel selected.

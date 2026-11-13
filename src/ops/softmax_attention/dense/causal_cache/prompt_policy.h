@@ -25,17 +25,17 @@ struct CausalPromptI8FastSplitPolicy {
 };
 
 // Whether a prompt call on this storage takes the fast kernel (register-resident rows, FP16 PV per
-// 64-key tile for the INT8 family and the row-scaled FP8 cache, prompt_fp8_fast.cuh): when the
+// 64-key tile for the INT8 family and the row-scaled FP8 cache, fp8/prompt_fast.cuh): when the
 // caller asks for it (--fast-prefill-kernel), else as NINFER_PROMPT_FAST=0|1 or the device
 // profile's "attn_prompt_fast" says. The FP8 cache stops short of the profile step: that key was
 // measured on the INT8-family kernel only and the fast kernel changes the output, so a default
 // --kv-dtype fp8 run keeps the standard kernel, byte-identical to master. Of the other storages
-// only NVFP4-G16 has one (prompt_nvfp4_fast.cuh, Blackwell builds, over more than 2048 visible
+// only NVFP4-G16 has one (nvfp4/prompt_fast.cuh, Blackwell builds, over more than 2048 visible
 // keys).
 [[nodiscard]] bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested);
 
 // Whether the fast INT8-family prompt kernel may split a launch's keys over several CTAs
-// (prompt_i8_fast_plan.h): unless the device profile's "attn_prompt_split" says "off".
+// (int8/prompt_fast_plan.h): unless the device profile's "attn_prompt_split" says "off".
 // NINFER_PROMPT_SPLITS=0 turns splits off, and N > 0 forces N splits wherever a launch may split.
 [[nodiscard]] CausalPromptI8FastSplitPolicy causal_attention_prompt_fast_split_policy();
 

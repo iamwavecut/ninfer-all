@@ -2,7 +2,7 @@
 
 // The split reductions of the causal small-T partials and the tile metadata of parallel query
 // tiles, as the host launchers call them: one unit per reducer (small_t_reduce.cu,
-// small_t_nvfp4_reduce.cu, small_t_k8v4_reduce.cu), so an edit of a partial kernel or of the
+// nvfp4/small_t_reduce.cu, k8v4/small_t_reduce.cu), so an edit of a partial kernel or of the
 // routing compiles none of them.
 
 #include "ops/softmax_attention/dense/causal_cache/key_partition.h"

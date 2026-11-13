@@ -100,7 +100,7 @@ if(_ninfer_ops_architecture_count GREATER 1)
   if(NINFER_ARCH_BLACKWELL)
     ninfer_ops_route_family(fp8_a8 120a-real "/fp8/[^/]+_a8(_unified)?\\.cu$")
     ninfer_ops_route_family(nvfp4_a4 120a-real
-      "/nvfp4/[^/]+_(w4a4|a4)\\.cu$|/causal_cache/prompt_nvfp4_fast\\.cu$")
+      "/nvfp4/[^/]+_(w4a4|a4)\\.cu$|/causal_cache/nvfp4/prompt_fast\\.cu$")
   endif()
   if(NINFER_ARCH_VOLTA)
     ninfer_ops_route_family(sm70 70-real "/linear/sm70/[^/]+\\.cu$")

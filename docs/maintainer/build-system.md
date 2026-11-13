@@ -59,8 +59,8 @@ unbounded). The Turing shape set differs from the standard one where a kernel do
   stages fit 64 KiB, so V widens during QK. The small-T FP8, NVFP4 and K8V4 shapes of two and three
   16-row tiles widen K and V into one shared tile (`kCausalSmallTCompactKV`); V overwrites K after
   QK.
-- The BF16 prompt and small-T attention take their Turing kernels (`prompt_bf16_sm75.cuh`,
-  `small_t_bf16_sm75.cuh`; the prompt kernel stages K and V through one buffer), context-KV
+- The BF16 prompt and small-T attention take their Turing kernels (`bf16/prompt_sm75.cuh`,
+  `bf16/small_t_sm75.cuh`; the prompt kernel stages K and V through one buffer), context-KV
   materialization uses 64-key blocks, the rowsplit A8 GEMM runs one stage and the BF16 GEMM rings
   at most two, and the BF16 `n256_k5120` GEMV splits K eight ways at narrow widths.
 - The GGUF flash attention of Gemma 4 (`ops/linear/gguf/ggml_fattn.cu`) takes, per tier, the most
@@ -78,8 +78,8 @@ are the same on every tier:
 
 - BF16-cache attention multiplies Q, K and V as their FP16 roundings: a value from 2^-17 to below
   2^16 is unchanged, and a smaller value changes by at most 2^-25. A tile that holds a value of
-  2^16 or more is swept again on the per-output FP32 route (`prompt_bf16_sm75.cuh`,
-  `small_t_bf16_sm75.cuh`, `ops/softmax_attention/common/bf16_attention.cuh`). The fast sweep and
+  2^16 or more is swept again on the per-output FP32 route (`bf16/prompt_sm75.cuh`,
+  `bf16/small_t_sm75.cuh`, `ops/softmax_attention/common/bf16_attention.cuh`). The fast sweep and
   the FP32 sweep are separate functions, because in one loop body the FP32 route made the fast
   route spill.
 - Every attention PV product with BF16 values rounds the softmax probabilities to FP16 in the
@@ -103,7 +103,7 @@ profile does so where `ninfer-calibrate` measured it faster
 
 A Volta card runs its own projection routes (`ops/linear/sm70`, chosen by `sm70::enabled()`), its
 decode attention (`small_t_sm70_*.cuh`, in units compiled for `70-real` alone), its single-row
-prompt attention (`prompt_sm70.cu`) and its
+prompt attention (`sm70/prompt.cu`) and its
 GGUF MoE matrix product (`ggml_bridge_sm70.cuh`, chosen in `moe_matrix_product` by the device's
 tier); those kernels' `mma.m8n8k4` bodies exist in the Volta image only. Its projection weights take the
 panel layout on the ranks whose device runs Volta's code (`apply_device_layouts`). Its route
@@ -179,7 +179,7 @@ object of a target that links the DLL, and every object shard would compile all 
 Exporting all their symbols would name every
 kernel the units instantiate, and a DLL can name at most 65535 exports. The units' sources are the
 same in every build, so other builds keep their cache entries. The units hold kernels and their
-launches only: the tier routing (`small_t_i8_dispatch.cpp`) is host code in the Ops. The DLL links
+launches only: the tier routing (`int8/small_t_dispatch.cpp`) is host code in the Ops. The DLL links
 its own copy of the device layer's launch helpers (`core/device_launch.cpp`), which call the DLL's
 own CUDA runtime, the one that registered its kernels.
 The DLL also owns the device-tier probe with its cache and the installed device route profiles,
@@ -336,8 +336,8 @@ kernel of each unit parses the module without loading kernel code into the conte
 memory after startup does not change.
 
 The causal-cache attention keeps its routing and its kernels in separate translation units, so an
-edit compiles only what it changes. Host launchers (`small_t.cpp`, `small_t_fp8.cpp`,
-`small_t_nvfp4.cpp`, `small_t_k8v4.cpp`, `small_t_i8_dispatch.cpp`, `prompt.cpp`) pick the kernel,
+edit compiles only what it changes. Host launchers (`small_t.cpp`, `fp8/small_t.cpp`,
+`nvfp4/small_t.cpp`, `k8v4/small_t.cpp`, `int8/small_t_dispatch.cpp`, `prompt.cpp`) pick the kernel,
 shape and coding of each launch and pass plain launch arguments (`SmallTPartialLaunch`,
 `SmallTI8Launch`, `PromptLaunch`) to kernel units that CMake generates from
 `dense/causal_cache/kernel_unit.cu.in` (`src/ops/softmax_attention/sources.cmake`): one explicit
@@ -345,8 +345,8 @@ instantiation of a launcher template each. The small-T BF16, bf16p, FP8, NVFP4 a
 have one unit per geometry and input, the prompt kernels one per kernel family, geometry and
 block-table form, and the INT8-family small-T kernel one per tier, query width, geometry and input.
 Volta's kernels have units of their own, compiled for `70-real` alone in a build of several
-architectures. The split reducers (`small_t_reduce.cu`, `small_t_nvfp4_reduce.cu`,
-`small_t_k8v4_reduce.cu`) and the fast prompt merge (`prompt_i8_fast_merge.cu`) are units of their
+architectures. The split reducers (`small_t_reduce.cu`, `nvfp4/small_t_reduce.cu`,
+`k8v4/small_t_reduce.cu`) and the fast prompt merge (`int8/prompt_fast_merge.cu`) are units of their
 own. A kernel header is included only by the units that launch it; a host header that both sides
 read carries no device code.
 
@@ -410,11 +410,11 @@ The causal-cache attention (`src/ops/softmax_attention/dense/causal_cache`) keep
 its kernels apart (see "CUDA compilation boundaries"). The check fails when a host launcher there
 (`*.cpp`) reaches a kernel header (`*.cuh`) other than `geometry.cuh`, or when a kernel unit's
 header (`*_launch.cuh`) or a reducer or merge unit (`*_reduce.cu`, `*_merge.cu`) reaches a routing
-header: `route.h`, `small_t_launch.h`, `small_t_invocation.h`, `small_t_i8_route.h`,
-`prompt_launch.h`, `prompt_policy.h`, `prompt_i8_fast_plan.h`, `core/paged_kv_view.h` or
+header: `route.h`, `small_t_launch.h`, `small_t_invocation.h`, `int8/small_t_route.h`,
+`prompt_launch.h`, `prompt_policy.h`, `int8/prompt_fast_plan.h`, `core/paged_kv_view.h` or
 `ninfer/ops/softmax_attention_envelope.h`. A routing edit then compiles no kernel, and a kernel
 edit compiles only that kernel's units. Facts both sides read live in small headers of their own
-(`prompt_shape.h`, `small_t_policy.h`, `i8_coding.h`).
+(`prompt_shape.h`, `small_t_policy.h`, `int8/coding.h`).
 
 ## Consumers and verification
 

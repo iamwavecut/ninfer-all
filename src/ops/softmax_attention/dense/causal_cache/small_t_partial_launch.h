@@ -1,7 +1,7 @@
 #pragma once
 
 // The arguments of a causal small-T partial launch as the host launchers (small_t.cpp,
-// small_t_fp8.cpp, ...) pass them to the kernel units: plain pointers and counts, so a launcher
+// fp8/small_t.cpp, ...) pass them to the kernel units: plain pointers and counts, so a launcher
 // compiles without the kernels and a kernel unit without the routing.
 
 #include "ops/softmax_attention/dense/causal_cache/key_partition.h"
