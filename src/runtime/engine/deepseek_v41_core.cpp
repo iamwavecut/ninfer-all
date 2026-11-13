@@ -191,16 +191,15 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
          table.read_ahead != defaults.read_ahead)) {
         throw std::invalid_argument("--no-ngram-table excludes the other n-gram table options");
     }
-    if (table.residency == NgramResidency::RamHot || !table.hot_profile.empty()) {
-        throw std::invalid_argument("DeepSeek-V4.1 reads its Engram table from the files "
-                                    "(--ngram-residency disk) or holds it whole in RAM (ram); it "
-                                    "has no hot-row profile");
+    if (table.residency != NgramResidency::RamHot && !table.hot_profile.empty()) {
+        throw std::invalid_argument(
+            "--ngram-hot-profile belongs to --ngram-residency ram-hot");
     }
     if (table.residency == NgramResidency::Ram && table.ram_budget_bytes) {
-        throw std::invalid_argument("--ngram-ram-mib needs --ngram-residency disk");
+        throw std::invalid_argument("--ngram-ram-mib needs --ngram-residency disk or ram-hot");
     }
     if (table.lock && table.residency == NgramResidency::Disk) {
-        throw std::invalid_argument("--ngram-lock needs --ngram-residency ram");
+        throw std::invalid_argument("--ngram-lock needs --ngram-residency ram or ram-hot");
     }
     if (table.io_depth == 0 || table.io_depth > 1024) {
         throw std::invalid_argument("--ngram-io-depth takes 1..1024 reads");
@@ -215,13 +214,28 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         throw std::invalid_argument("--vision: the artifact holds no DeepSeek-V4.1 vision tower "
                                     "(convert with --components text,dspark,vision)");
     }
-    // The Engram table is located before anything loads, so a model without it fails at once.
+    // The Engram table, and the hot-row profile of a ram-hot table, are located before anything
+    // loads, so a model without them fails at once.
     std::optional<models::qwen4_exp::NgramTableLayout> engram;
+    std::vector<std::uint32_t> hot_rows;
     if (!table.disabled) {
-        engram = models::deepseek_v41::engram_table_layout(
-            reader, options.artifact_path,
-            models::deepseek_v41::parse_text_config(reader.directory().component("text").config),
-            table.path);
+        const auto text =
+            models::deepseek_v41::parse_text_config(reader.directory().component("text").config);
+        const bool ram_hot = table.residency == NgramResidency::RamHot;
+        auto source        = models::deepseek_v41::engram_table_source(
+            reader, options.artifact_path, text, table.path, ram_hot && table.hot_profile.empty());
+        if (ram_hot && !table.hot_profile.empty()) {
+            auto profile = models::qwen4_exp::read_ngram_profile(table.hot_profile);
+            models::deepseek_v41::check_engram_profile(profile, reader, text, table.hot_profile);
+            hot_rows = std::move(profile.rows);
+        } else if (ram_hot && source.hot_profile) {
+            hot_rows = std::move(source.hot_profile->rows);
+        } else if (ram_hot) {
+            throw std::invalid_argument("--ngram-residency ram-hot needs a profile in the Engram "
+                                        "table artifact or --ngram-hot-profile PATH "
+                                        "(ninfer-ngram-profile makes one)");
+        }
+        engram = std::move(source.layout);
     }
     inspect.complete();
     install_device_route_profile_for(options, device);
@@ -298,9 +312,14 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     // device's room for its expert cache and its bus speed.
     if (options.tensor_parallel) { executor.expert_split = options.tensor_split; }
     executor.engram_table       = std::move(engram);
+    // ram-hot holds the profile's leading rows in 4 GiB unless --ngram-ram-mib says otherwise.
     executor.engram_read        = {.residency    = table.residency,
                                    .io           = table.io,
-                                   .budget_bytes = table.ram_budget_bytes.value_or(0),
+                                   .budget_bytes = table.ram_budget_bytes.value_or(
+                                       table.residency == NgramResidency::RamHot
+                                           ? std::uint64_t{4} << 30U
+                                           : 0),
+                                   .hot_rows     = std::move(hot_rows),
                                    .lock         = table.lock,
                                    .depth        = table.io_depth,
                                    .dedupe       = table.dedupe};

@@ -47,9 +47,11 @@ which supplies the skeleton, the experts, the n-gram table and the MTP block; `-
 names the Vision tower's mmproj.
 
 ```bash
-# The n-gram table once, as an artifact of its own that every Edge0 model names by digest.
+# The n-gram table once, as an artifact of its own that every Edge0 model names by digest, with a
+# hot-row profile for --ngram-residency ram-hot (the published table holds the IQ4_NL table's).
 python3.11 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
   --recipe edge0_pack --source pack=/path/to/Edge0-120B-q3k \
+  --resource ngram.hot=/path/to/flash-next.hot \
   --components ngram --device cpu --out models/Edge0-ngram-table-FP8-ninfer-v3.ninfer
 
 # Each model without the table, with its MTP block and the base model's Vision tower.
@@ -112,7 +114,11 @@ without the tower:
 | Edge0-120B-q3k | about 36 GB | 28.6 GB |
 
 The table is read 16 rows a token from its file, as for Flash-Next; `--ngram-residency ram` loads
-all 51.2 GB. Flash-Next's 26.92 GiB IQ4_NL table, the same table at lower precision, works in its
+all 51.2 GB, and `ram-hot` keeps the rows its embedded profile ranks first in 4 GiB of RAM
+(`--ngram-ram-mib`). The published table holds the broad profile of Flash-Next's IQ4_NL table byte
+for byte ([the n-gram rows](qwen3-8-flash-next.md#the-n-gram-rows)): the same hash addresses the
+same rows. With `ram-hot`, Flash-Next Q2_0 bound to the FP8 table scores the first 40 KB of
+WikiText (9,234 tokens) at perplexity 2.531971, as with `disk`. Flash-Next's 26.92 GiB IQ4_NL table, the same table at lower precision, works in its
 place (`--ngram-table`, [another table of the same shape](qwen3-8-flash-next.md#another-table-of-the-same-shape))
 at 0.6% to 1.2% higher perplexity ([measurements](#with-flash-nexts-table)).
 

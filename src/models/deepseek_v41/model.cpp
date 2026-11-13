@@ -3,12 +3,13 @@
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "models/deepseek_v41/dspark_ranking.h"
+#include "models/deepseek_v41/engram.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/load/bindings.h"
 
 #include <algorithm>
 #include <array>
-#include <cstring>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -45,14 +46,8 @@ FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& con
     }
     out.public_token_count = static_cast<std::uint32_t>(count);
     const auto map = resource("engram_token_map");
-    if (map.size() != std::size_t(config.vocab_size) * 4) {
-        throw artifact::ArtifactError("the Engram token map must hold a compressed id per token");
-    }
-    token_map.resize(config.vocab_size);
-    std::memcpy(token_map.data(), map.data(), map.size());
-    for (const auto id : token_map) {
-        if (id < 0) { throw artifact::ArtifactError("the Engram token map holds a negative id"); }
-    }
+    token_map      = decode_engram_token_map(
+        std::as_bytes(std::span(map.data(), map.size())), config.vocab_size);
     return out;
 }
 

@@ -501,7 +501,8 @@ the leading rows serve this share of row reads per RAM budget:
 
 Across the 239 language and domain groups with at least 2,048 held-out tokens the hit rate at 4 GiB
 runs from 20.5% to 95.5% (median 49.4%); Japanese books have the lowest coverage. Hits measure row
-reuse, not speed or quality.
+reuse, not speed or quality. Edge0's FP8 table carries the same profile, since one hash addresses
+both tables' rows.
 
 ### Another table of the same shape
 
@@ -521,7 +522,7 @@ of the 7.5 million pairs reaching 0.9.
 
 On one A40 (the CUDA 12.8 `sm_86` build, November 13, 2026), the first 40 KB of `wikitext/00.txt`
 with INT8 KV and device experts, the GSQ-RCO Q2_0 release scores 2.542153 with its IQ4_NL table and
-2.531971 (0.40% lower) with Edge0's 48.28 GiB FP8 table; Edge0's figures are in
+2.531971 (0.40% lower) with Edge0's 48.38 GiB FP8 table; Edge0's figures are in
 [its guide](edge0.md#with-flash-nexts-table). Q2_0's greedy answer to the sky prompt keeps its
 content and changes its wording with the FP8 table; it decodes at 87.6 and 87.5 tokens per second.
 

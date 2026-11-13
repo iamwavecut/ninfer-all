@@ -224,7 +224,7 @@ Perplexity: the first 40 KB of WikiText, INT8 KV, one A40.
 | Table | Size, GiB | Rows | Hot-row profile | Named by | Perplexity: Flash-Next Q2_0 · Edge0-120B-q3k |
 |---|---:|---|:-:|---|---|
 | [IQ4_NL](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) | 26.92 | IQ4_NL blocks, 90 bytes a row: the GSQ-RCO and Unsloth releases' table byte for byte | ✓ | Flash-Next builds, Coder | 2.542153 · 5.017691 |
-| [FP8](https://huggingface.co/WaveCut/Edge0-ngram-table-FP8-NInfer-v3) | 48.28 | FP8 E4M3 codes and an FP16 scale, 162 bytes a row: Edge0's `ple-fp8.gguf` codes byte for byte, its one scale in every row | — | Edge0 builds | 2.531971 · 4.964565 |
+| [FP8](https://huggingface.co/WaveCut/Edge0-ngram-table-FP8-NInfer-v3) | 48.38 | FP8 E4M3 codes and an FP16 scale, 162 bytes a row: Edge0's `ple-fp8.gguf` codes byte for byte, its one scale in every row | ✓ | Edge0 builds | 2.531971 · 4.964565 |
 
 The official NInfer artifacts (Qwen3.6-27B, Qwen3.6-35B-A3B and Qwen3.8-27B, `groupwise-int` and
 `nvfp4`) load too; the [documentation map](docs/README.md#model-artifacts) links them. Weight

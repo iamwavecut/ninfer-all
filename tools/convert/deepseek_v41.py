@@ -26,7 +26,10 @@ component: one table of IQ4_NL rows, the first Engram block's rows then the seco
 model names by the SHA-256 of its bytes. Both layouts hold the same bytes: llama.cpp's as one
 `per_layer_token_embd` tensor, the earlier one as a tensor per Engram block. `--components
 text,engram` stores the model with its table, `text` the model alone (its table read from a table
-artifact at run time) and `engram` that table artifact.
+artifact at run time) and `engram` that table artifact. `--resource engram.hot=PROFILE` stores a
+hot-row profile (ninfer-ngram-profile's NFNGHOT1 file) beside the table, as
+`engram.resources.hot_profile`, after checking it against the Engram hash of `--source gguf`, which
+a table alone then also needs.
 
 The release's DSpark drafter (`--source dspark=dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf`, llama.cpp
 architecture `dflash`) forms the `dspark` component beside `text` (`--components text,engram,dspark`):
@@ -64,6 +67,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -593,6 +597,46 @@ def engram_constants(gguf: GGUFShards, config: dict) -> dict:
             "pad_id": int(token_map[config["engram_pad_token_id"]])}
 
 
+def engram_hash_fingerprint(config: dict, constants: dict) -> int:
+    """The fingerprint a hot-row profile of the Engram table records (engram_hash_fingerprint in
+    models/deepseek_v41/engram.h): FNV-1a 64 over the little-endian u64 values ngram_size, heads,
+    pad_id, the block count and the blocks, then each block's rows, multipliers, primes and
+    offsets, then the token map's size and compressed ids."""
+
+    layers = list(config["engram_layer_ids"])
+    values = [config["engram_max_ngram_size"], config["engram_n_heads"], constants["pad_id"],
+              len(layers), *layers]
+    for index, rows_in_layer in enumerate(config["engram_num_embeddings"]):
+        values += [rows_in_layer, *constants["multipliers"][index], *constants["primes"][index],
+                   *constants["offsets"][index]]
+    token_map = [int(v) for v in constants["token_map"]]
+    values += [len(token_map), *token_map]
+    value = 0xCBF29CE484222325
+    for byte in struct.pack(f"<{len(values)}Q", *values):
+        value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return value
+
+
+def attach_engram_profile(model, path: Path, config: dict, constants: dict) -> None:
+    """Store a hot-row profile beside the Engram table after checking its hash and rows."""
+
+    data = path.read_bytes()
+    if len(data) < 40 or data[:8] != b"NFNGHOT1":
+        raise ValueError(f"{path}: not an n-gram hot-row profile")
+    table_rows, fingerprint, _tokens, count = struct.unpack_from("<4Q", data, 8)
+    if len(data) - 40 != count * 4:
+        raise ValueError(f"{path}: invalid hot-row profile row count")
+    rows = model.components["engram"]["config"]["rows"]
+    if table_rows != rows or fingerprint != engram_hash_fingerprint(config, constants):
+        raise ValueError(f"{path}: profile was counted for another Engram hash")
+    ranked = np.frombuffer(data, dtype="<u4", offset=40)
+    if (len(ranked) and int(ranked.max()) >= rows) or len(np.unique(ranked)) != count:
+        raise ValueError(f"{path}: duplicate or out-of-range profile rows")
+    object_id = "resource/engram/hot_profile"
+    model.resources[object_id] = data
+    model.components["engram"].setdefault("resources", {})["hot_profile"] = object_id
+
+
 def engram_table_config(config: dict) -> dict:
     """The `engram` component's config: one table of every Engram block's rows in order."""
 
@@ -811,11 +855,19 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
                          "layout carries it (blk.N.exp_probs_b_vl.bias)")
     config = text_config(base.config)
     records = {"engram": {"config": engram_table_config(config)}}
+    resource_overrides = dict(resource_overrides or {})
+    profile = resource_overrides.pop("engram.hot", None)
+    if profile is not None and ("engram" not in selected or gguf is None):
+        raise ValueError("engram.hot stores a hot-row profile beside the Engram table "
+                         "(--components ...,engram), checked against the Engram hash of "
+                         "--source gguf=SHARD1")
     if "text" not in selected:
         if resource_overrides:
             raise ValueError("resource overrides have no selected frontend consumer")
         model = Model(records)
         _engram_table(model)
+        if profile is not None:
+            attach_engram_profile(model, Path(profile), config, engram_constants(gguf, config))
         return model
     if gguf is None:
         raise ValueError("DeepSeek-V4.1 converts its text component from --source gguf=SHARD1")
@@ -825,8 +877,7 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
     config["engram"] = {"multipliers": constants["multipliers"], "primes": constants["primes"],
                         "offsets": constants["offsets"], "pad_id": constants["pad_id"]}
     h, vocab = config["hidden_size"], config["vocab_size"]
-    references, payloads, count, special = _load_resources(
-        base.root, vocab, dict(resource_overrides or {}))
+    references, payloads, count, special = _load_resources(base.root, vocab, resource_overrides)
     references["engram_token_map"] = "resource/text/engram_token_map"
     payloads["resource/text/engram_token_map"] = constants["token_map"].tobytes()
     records["text"] = {"config": config, "resources": references}
@@ -992,6 +1043,8 @@ def build_model(base, gguf: GGUFShards | None, *, components=("text", "engram"),
                             direct_format="fp32", residency="vision"))
     if "engram" in selected:
         _engram_table(model)
+        if profile is not None:
+            attach_engram_profile(model, Path(profile), config, constants)
     return model
 
 
