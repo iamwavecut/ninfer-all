@@ -350,6 +350,35 @@ struct Decoder<GGML_TYPE_MXFP4> {
     }
 };
 
+// NVFP4: four UE4M3 scale bytes (one per 16 values) and 32 bytes of E2M1 codes; value j of
+// sub-block s is the low nibble of code byte 8 s + j for j < 8 and the high nibble of code byte
+// 8 s + j - 8 otherwise. A 64-value block is two slices of two sub-blocks each. Blocks of 36 bytes
+// in rows of whole blocks start 4-byte aligned. The product is Q6_K's form over the two halves.
+template <>
+struct Decoder<GGML_TYPE_NVFP4> {
+    static constexpr int kBlockElems = 64, kBlockBytes = 36, kTableWords = 0;
+    __device__ static const std::uint32_t* table() { return nullptr; }
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int u, const std::uint32_t*,
+                                                  Slice& s) {
+        const std::uint32_t d = u32_a4(b);
+        s.f[0]                = ue4m3_half(d >> (16 * u));
+        s.f[1]                = ue4m3_half(d >> (16 * u + 8));
+        // Code word k holds bytes 4k..4k+3 of the slice's 16: low nibbles are values 4k..4k+3 of
+        // its sub-block (k < 2) or of the second (k >= 2, values 16 + 4(k - 2) ...), high nibbles
+        // the same eight positions later.
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int2 v = get_int_from_table_16(int(u32_a4(b + 4 + 16 * u + 4 * k)), kvalues_mxfp4);
+            s.w[4 * (k / 2) + k % 2]     = v.x;
+            s.w[4 * (k / 2) + 2 + k % 2] = v.y;
+        }
+    }
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return __fmul_rn(d, __fadd_rn(__fmul_rn(s.f[0], float(dot4(s.w, a, 0))),
+                                      __fmul_rn(s.f[1], float(dot4(s.w + 4, a + 4, 0)))));
+    }
+};
+
 template <>
 struct Decoder<GGML_TYPE_IQ4_XS> {
     static constexpr int kBlockElems = 256, kBlockBytes = 136, kTableWords = 0;
@@ -546,10 +575,11 @@ struct Decoder<GGML_TYPE_Q3_K> {
             s.h[i]                 = int(__funnelshift_r(hb, hb, hshift) & 0x04040404u);
         }
     }
+    // Q6_K's form, each step rounded, as gguf_expert_cpu computes it.
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
         const int lo = dot4(s.h, a, dot4(s.w, a, 0)) - 4 * sum4(a);
         const int hi = dot4(s.h + 4, a + 4, dot4(s.w + 4, a + 4, 0)) - 4 * sum4(a + 4);
-        return d * (s.f[0] * float(lo) + s.f[1] * float(hi));
+        return __fmul_rn(d, __fadd_rn(__fmul_rn(s.f[0], float(lo)), __fmul_rn(s.f[1], float(hi))));
     }
 };
 
@@ -1846,7 +1876,7 @@ __device__ __forceinline__ float slice_value(const Slice& s, int e, int j) {
     if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
         return s.f[0] * c - s.f[1];
     } else if constexpr (type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ2_XS ||
-                         type == GGML_TYPE_IQ2_S) {
+                         type == GGML_TYPE_IQ2_S || type == GGML_TYPE_NVFP4) {
         return (e < 4 ? s.f[0] : s.f[1]) * c;
     } else if constexpr (type == GGML_TYPE_Q2_K) {
         return e < 4 ? s.f[0] * c - s.f[2] : s.f[1] * c - s.f[3];

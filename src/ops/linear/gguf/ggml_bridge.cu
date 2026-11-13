@@ -55,6 +55,17 @@ namespace {
 // 32 values, element i of column c read from x[c][input_columns[i]] when a gather is given.
 constexpr int kQuantizeThreads = 256;
 
+// Value i of column `column` into the planar q8_1 activation; every lane of the warp takes part.
+__device__ __forceinline__ void quantize_vector_value(float xi, int i, int column,
+                                                      std::int8_t* __restrict__ qs,
+                                                      half2* __restrict__ ds, int k) {
+    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+    const float sum  = warp_reduce_sum<QK8_1>(xi);
+    const float d    = amax / 127.0f;
+    qs[std::int64_t(column) * k + i] = amax == 0.0f ? 0 : static_cast<std::int8_t>(roundf(xi / d));
+    if (i % QK8_1 == 0) { ds[std::int64_t(column) * (k / QK8_1) + i / QK8_1] = make_half2(d, sum); }
+}
+
 __launch_bounds__(kQuantizeThreads) __global__
     void quantize_vector_kernel(const __nv_bfloat16* __restrict__ x,
                                 const std::int32_t* __restrict__ input_columns,
@@ -63,12 +74,27 @@ __launch_bounds__(kQuantizeThreads) __global__
     const int column = blockIdx.y;
     if (i >= k) { return; }
     const int source = input_columns != nullptr ? input_columns[i] : i;
-    const float xi   = __bfloat162float(x[std::int64_t(column) * k + source]);
-    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
-    const float sum  = warp_reduce_sum<QK8_1>(xi);
-    const float d    = amax / 127.0f;
-    qs[std::int64_t(column) * k + i] = amax == 0.0f ? 0 : static_cast<std::int8_t>(roundf(xi / d));
-    if (i % QK8_1 == 0) { ds[std::int64_t(column) * (k / QK8_1) + i / QK8_1] = make_half2(d, sum); }
+    quantize_vector_value(__bfloat162float(x[std::int64_t(column) * k + source]), i, column, qs, ds,
+                          k);
+}
+
+// FP32 columns: output column c reads x column source[c] (zeros for a negative entry), each value
+// multiplied by scale[i] first when given.
+__launch_bounds__(kQuantizeThreads) __global__
+    void quantize_vector_f32_kernel(const float* __restrict__ x,
+                                    const std::int32_t* __restrict__ source,
+                                    const float* __restrict__ scale, std::int8_t* __restrict__ qs,
+                                    half2* __restrict__ ds, int k) {
+    const int i      = blockDim.x * blockIdx.x + threadIdx.x;
+    const int column = blockIdx.y;
+    if (i >= k) { return; }
+    const int from = source != nullptr ? source[column] : column;
+    float xi       = 0.0f;
+    if (from >= 0) {
+        xi = x[std::int64_t(from) * k + i];
+        if (scale != nullptr) { xi = __fmul_rn(xi, scale[i]); }
+    }
+    quantize_vector_value(xi, i, column, qs, ds, k);
 }
 
 using VectorLaunch = void (*)(const VecArgs&, int, bool, cudaStream_t);
@@ -114,6 +140,8 @@ MoeLaunch moe_launcher(GgmlType type) {
         return moe_launch<GGML_TYPE_IQ4_XS>;
     case GgmlType::MXFP4:
         return moe_launch<GGML_TYPE_MXFP4>;
+    case GgmlType::NVFP4:
+        return moe_launch<GGML_TYPE_NVFP4>;
     }
     throw std::invalid_argument("gguf moe product: unsupported block type");
 }
@@ -143,6 +171,7 @@ Fn decode_launcher(GgmlType type) {
     case GgmlType::IQ4_NL: return Pick<GGML_TYPE_IQ4_NL>::launch;
     case GgmlType::IQ4_XS: return Pick<GGML_TYPE_IQ4_XS>::launch;
     case GgmlType::MXFP4: return Pick<GGML_TYPE_MXFP4>::launch;
+    case GgmlType::NVFP4: return Pick<GGML_TYPE_NVFP4>::launch;
     }
     throw std::invalid_argument("gguf moe decode: unsupported block type");
 }
@@ -295,6 +324,7 @@ VectorLaunch vector_launch(GgmlType type) {
     case GgmlType::IQ4_NL: return vec_launch<GGML_TYPE_IQ4_NL>;
     case GgmlType::IQ4_XS: return vec_launch<GGML_TYPE_IQ4_XS>;
     case GgmlType::MXFP4: return vec_launch<GGML_TYPE_MXFP4>;
+    case GgmlType::NVFP4: return vec_launch<GGML_TYPE_NVFP4>;
     }
     throw std::invalid_argument("gguf vector product: unsupported block type");
 }
@@ -313,36 +343,14 @@ VecArgs vector_args(const void* weight, std::int64_t row_bytes, int rows, int k,
 
 constexpr int kMatrixQuantizeThreads = 128;
 
-// Output column c reads x column column_map[c] / column_group (c without a map), its values
-// gathered through input_columns when given; values from k up to k_padded are zero.
+// Values i0 .. i0 + 3 of column `column` into the matrix kernel's activation; every lane of the
+// warp takes part.
 template <mmq_q8_1_ds_layout ds_layout>
-__global__ void quantize_matrix_kernel(const __nv_bfloat16* __restrict__ x,
-                                       const std::int32_t* __restrict__ input_columns,
-                                       const std::int32_t* __restrict__ column_map,
-                                       int column_group, block_q8_1_mmq* __restrict__ y, int k,
-                                       int k_padded, int columns) {
+__device__ __forceinline__ void quantize_matrix_values(float4 xi, std::int64_t i0, int column,
+                                                       block_q8_1_mmq* __restrict__ y,
+                                                       int columns) {
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
-
-    const std::int64_t i0 = (std::int64_t(blockDim.x) * blockIdx.y + threadIdx.x) * 4;
-    if (i0 >= k_padded) { return; }
-    const int column             = blockIdx.x;
-    const int source_column = column_map != nullptr ? column_map[column] / column_group : column;
-    const __nv_bfloat16* source = x + std::int64_t(source_column) * k;
-    float4 xi;
-    if (i0 >= k) {
-        xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    } else if (input_columns != nullptr) {
-        xi = make_float4(__bfloat162float(source[input_columns[i0 + 0]]),
-                         __bfloat162float(source[input_columns[i0 + 1]]),
-                         __bfloat162float(source[input_columns[i0 + 2]]),
-                         __bfloat162float(source[input_columns[i0 + 3]]));
-    } else {
-        const uint2 words = *reinterpret_cast<const uint2*>(source + i0);
-        const float2 lo   = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words.x));
-        const float2 hi   = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words.y));
-        xi                = make_float4(lo.x, lo.y, hi.x, hi.y);
-    }
 
     const std::int64_t k_block = i0 / QK8_1_MMQ;
     const std::int64_t iqs     = i0 % QK8_1_MMQ;
@@ -385,6 +393,62 @@ __global__ void quantize_matrix_kernel(const __nv_bfloat16* __restrict__ x,
             y[ib].d4[iqs / 32] = d;
         }
     }
+}
+
+// Output column c reads x column column_map[c] / column_group (c without a map), its values
+// gathered through input_columns when given; values from k up to k_padded are zero.
+template <mmq_q8_1_ds_layout ds_layout>
+__global__ void quantize_matrix_kernel(const __nv_bfloat16* __restrict__ x,
+                                       const std::int32_t* __restrict__ input_columns,
+                                       const std::int32_t* __restrict__ column_map,
+                                       int column_group, block_q8_1_mmq* __restrict__ y, int k,
+                                       int k_padded, int columns) {
+    const std::int64_t i0 = (std::int64_t(blockDim.x) * blockIdx.y + threadIdx.x) * 4;
+    if (i0 >= k_padded) { return; }
+    const int column             = blockIdx.x;
+    const int source_column = column_map != nullptr ? column_map[column] / column_group : column;
+    const __nv_bfloat16* source = x + std::int64_t(source_column) * k;
+    float4 xi;
+    if (i0 >= k) {
+        xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else if (input_columns != nullptr) {
+        xi = make_float4(__bfloat162float(source[input_columns[i0 + 0]]),
+                         __bfloat162float(source[input_columns[i0 + 1]]),
+                         __bfloat162float(source[input_columns[i0 + 2]]),
+                         __bfloat162float(source[input_columns[i0 + 3]]));
+    } else {
+        const uint2 words = *reinterpret_cast<const uint2*>(source + i0);
+        const float2 lo   = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words.x));
+        const float2 hi   = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&words.y));
+        xi                = make_float4(lo.x, lo.y, hi.x, hi.y);
+    }
+    quantize_matrix_values<ds_layout>(xi, i0, column, y, columns);
+}
+
+// FP32 columns of a MoE product in routing order: output column c reads x column
+// source[column_map[c]] (zeros for a negative entry), each value multiplied by scale[i] first when
+// given; values from k up to k_padded are zero. k is a multiple of 4.
+template <mmq_q8_1_ds_layout ds_layout>
+__global__ void quantize_matrix_f32_kernel(const float* __restrict__ x,
+                                           const std::int32_t* __restrict__ source,
+                                           const std::int32_t* __restrict__ column_map,
+                                           const float* __restrict__ scale,
+                                           block_q8_1_mmq* __restrict__ y, int k, int k_padded,
+                                           int columns) {
+    const std::int64_t i0 = (std::int64_t(blockDim.x) * blockIdx.y + threadIdx.x) * 4;
+    if (i0 >= k_padded) { return; }
+    const int column = blockIdx.x;
+    const int pair   = column_map[column];
+    const int from   = source != nullptr ? source[pair] : pair;
+    float4 xi        = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i0 < k && from >= 0) {
+        xi = *reinterpret_cast<const float4*>(x + std::int64_t(from) * k + i0);
+        if (scale != nullptr) {
+            xi = make_float4(__fmul_rn(xi.x, scale[i0 + 0]), __fmul_rn(xi.y, scale[i0 + 1]),
+                             __fmul_rn(xi.z, scale[i0 + 2]), __fmul_rn(xi.w, scale[i0 + 3]));
+        }
+    }
+    quantize_matrix_values<ds_layout>(xi, i0, column, y, columns);
 }
 
 __global__ void store_plane_kernel(const float* __restrict__ in, std::int64_t in_column_stride,
@@ -431,7 +495,8 @@ cublasHandle_t blas_handle() {
 template <ggml_type type>
 inline constexpr bool kSmallBlocks =
     type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
-    type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_MXFP4;
+    type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_MXFP4 ||
+    type == GGML_TYPE_NVFP4;
 
 template <ggml_type type, int threads, typename dst_t>
 __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int64_t row_bytes,
@@ -519,6 +584,16 @@ __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int
             const int code       = j < QK_MXFP4 / 2 ? (b.qs[j] & 0xF) : (b.qs[j - QK_MXFP4 / 2] >> 4);
             y[i] = ggml_cuda_cast<dst_t>(ggml_cuda_e8m0_to_fp32(b.e) * 0.5f * float(kvalues_mxfp4[code]));
         }
+    } else if constexpr (type == GGML_TYPE_NVFP4) {
+        const block_nvfp4* blocks = static_cast<const block_nvfp4*>(x) + blockIdx.x * (QK_K / QK_NVFP4);
+        for (int i = threadIdx.x; i < count; i += threads) {
+            const block_nvfp4& b = blocks[i / QK_NVFP4];
+            const int sub        = (i % QK_NVFP4) / QK_NVFP4_SUB;
+            const int j          = i % QK_NVFP4_SUB;
+            const int byte       = b.qs[8 * sub + j % 8];
+            const int code       = j < 8 ? (byte & 0xF) : (byte >> 4);
+            y[i] = ggml_cuda_cast<dst_t>(ue4m3_half(b.d[sub]) * float(kvalues_mxfp4[code]));
+        }
     }
 }
 
@@ -573,6 +648,7 @@ void dispatch_dequantize(GgmlType type, const void* weight, std::int64_t row_byt
     case GgmlType::IQ4_NL: return launch_dequantize<GGML_TYPE_IQ4_NL, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     case GgmlType::IQ4_XS: return launch_dequantize<GGML_TYPE_IQ4_XS, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     case GgmlType::MXFP4: return launch_dequantize<GGML_TYPE_MXFP4, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
+    case GgmlType::NVFP4: return launch_dequantize<GGML_TYPE_NVFP4, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     }
     throw std::invalid_argument("gguf dequantize: unsupported block type");
 }
@@ -604,6 +680,7 @@ BlockShape block_shape(GgmlType type) {
     case GgmlType::IQ4_XS: return {256, 136};
     case GgmlType::IQ1_M: return {256, 56};
     case GgmlType::MXFP4: return {32, 17};
+    case GgmlType::NVFP4: return {64, 36};
     }
     throw std::invalid_argument("gguf: unsupported block type");
 }
@@ -631,6 +708,19 @@ void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
     const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads, columns, 1);
     detail::quantize_vector_kernel<<<blocks, detail::kQuantizeThreads, 0, stream>>>(
         x, input_columns, reinterpret_cast<std::int8_t*>(base),
+        reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k);
+    detail::check(cudaGetLastError(), "vector activation launch");
+}
+
+void quantize_vector_activation_f32(const float* x, int k, int columns, const std::int32_t* source,
+                                    const float* scale, void* out, cudaStream_t stream) {
+    if (k <= 0 || k % QK8_1 != 0 || columns <= 0 || columns > 65535) {
+        throw std::invalid_argument("gguf vector activation: K must be whole 32-value blocks");
+    }
+    auto* base = static_cast<std::uint8_t*>(out);
+    const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads, columns, 1);
+    detail::quantize_vector_f32_kernel<<<blocks, detail::kQuantizeThreads, 0, stream>>>(
+        x, source, scale, reinterpret_cast<std::int8_t*>(base),
         reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k);
     detail::check(cudaGetLastError(), "vector activation launch");
 }
@@ -714,6 +804,20 @@ MoeSplitRouting sort_routes(const std::int32_t* ids, int pairs, int experts, int
 MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts, void* workspace,
                            cudaStream_t stream) {
     return sort_routes(ids, pairs, experts, -1, workspace, stream).all;
+}
+
+MoeRouting moe_sorted_routes(void* workspace, int pairs, int experts) {
+    if (pairs <= 0 || experts <= 0 || experts > 8192 || workspace == nullptr) {
+        throw std::invalid_argument("gguf moe routing: invalid pairs or experts");
+    }
+    auto* bounds       = static_cast<std::int32_t*>(workspace);
+    auto* sorted       = bounds + experts + 1;
+    auto* active       = sorted + pairs;
+    auto* active_count = active + experts;
+    auto* tile_count   = active_count + 1;
+    auto* tiles        = tile_count + detail::kMoeTileWidths;
+    return MoeRouting{bounds, sorted, active, active_count, tile_count, tiles,
+                      detail::moe_tile_capacity(experts, pairs)};
 }
 
 std::size_t moe_split_routing_bytes(int experts, int pairs) {
@@ -990,17 +1094,15 @@ std::size_t moe_sm70_activation_bytes(int k_padded, int pairs) {
 
 constexpr int kSm70ActivationThreads = 256;
 
-__global__ void __launch_bounds__(kSm70ActivationThreads)
-    moe_sm70_activation_kernel(const __nv_bfloat16* __restrict__ x, int k, int k_padded,
-                               const std::int32_t* __restrict__ sorted, int column_group,
-                               __half* __restrict__ plane, float* __restrict__ factors) {
+// One column c of the plane from `load(i)`, values 2 i and 2 i + 1 of the column (i < k / 2).
+template <typename Load>
+__device__ __forceinline__ void moe_sm70_activation_column(Load load, int c, int k, int k_padded,
+                                                           __half* __restrict__ plane,
+                                                           float* __restrict__ factors) {
     __shared__ float warp_max[kSm70ActivationThreads / 32];
-    const int c                  = int(blockIdx.x);
-    const __nv_bfloat162* column = reinterpret_cast<const __nv_bfloat162*>(
-        x + std::int64_t(sorted[c] / column_group) * k);
     float largest = 0.0f;
     for (int i = int(threadIdx.x); i < k / 2; i += kSm70ActivationThreads) {
-        const float2 v = __bfloat1622float2(column[i]);
+        const float2 v = load(i);
         largest        = fmaxf(largest, fmaxf(fabsf(v.x), fabsf(v.y)));
         if (!isfinite(v.x) || !isfinite(v.y)) { largest = INFINITY; }
     }
@@ -1020,11 +1122,47 @@ __global__ void __launch_bounds__(kSm70ActivationThreads)
     for (int i = int(threadIdx.x); i < k_padded / 2; i += kSm70ActivationThreads) {
         float2 v = make_float2(0.0f, 0.0f);
         if (2 * i < k) {
-            v = __bfloat1622float2(column[i]);
+            v = load(i);
         }
         out[i] = __floats2half2_rn(v.x * down, v.y * down);
     }
     if (threadIdx.x == 0) { factors[c] = ldexpf(1.0f, e); }
+}
+
+__global__ void __launch_bounds__(kSm70ActivationThreads)
+    moe_sm70_activation_kernel(const __nv_bfloat16* __restrict__ x, int k, int k_padded,
+                               const std::int32_t* __restrict__ sorted, int column_group,
+                               __half* __restrict__ plane, float* __restrict__ factors) {
+    const int c                  = int(blockIdx.x);
+    const __nv_bfloat162* column = reinterpret_cast<const __nv_bfloat162*>(
+        x + std::int64_t(sorted[c] / column_group) * k);
+    moe_sm70_activation_column([column](int i) { return __bfloat1622float2(column[i]); }, c, k,
+                               k_padded, plane, factors);
+}
+
+// The FP32 form: column c reads x column source[sorted[c]] (zeros for a negative entry), each value
+// multiplied by scale[i] first when given.
+__global__ void __launch_bounds__(kSm70ActivationThreads)
+    moe_sm70_activation_f32_kernel(const float* __restrict__ x, int k, int k_padded,
+                                   const std::int32_t* __restrict__ sorted,
+                                   const std::int32_t* __restrict__ source,
+                                   const float* __restrict__ scale, __half* __restrict__ plane,
+                                   float* __restrict__ factors) {
+    const int c      = int(blockIdx.x);
+    const int pair   = sorted[c];
+    const int from   = source != nullptr ? source[pair] : pair;
+    const float2* column =
+        from >= 0 ? reinterpret_cast<const float2*>(x + std::int64_t(from) * k) : nullptr;
+    moe_sm70_activation_column(
+        [column, scale](int i) {
+            if (column == nullptr) { return make_float2(0.0f, 0.0f); }
+            float2 v = column[i];
+            if (scale != nullptr) {
+                v = make_float2(__fmul_rn(v.x, scale[2 * i]), __fmul_rn(v.y, scale[2 * i + 1]));
+            }
+            return v;
+        },
+        c, k, k_padded, plane, factors);
 }
 
 } // namespace
@@ -1064,6 +1202,47 @@ void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k
                     stream);
 }
 
+void quantize_moe_matrix_activation_f32(GgmlType type, const float* x, int k,
+                                        const MoeRouting& routing, int pairs,
+                                        const std::int32_t* source, const float* scale, void* out,
+                                        cudaStream_t stream) {
+    if (routing.sorted == nullptr || k <= 0 || k % 32 != 0 || pairs <= 0) {
+        throw std::invalid_argument("gguf moe matrix activation: invalid routing or K");
+    }
+    const int k_padded = moe_padded_k(k);
+    if (moe_matrix_sm70()) {
+        auto* plane = static_cast<__half*>(out);
+        moe_sm70_activation_f32_kernel<<<pairs, kSm70ActivationThreads, 0, stream>>>(
+            x, k, k_padded, routing.sorted, source, scale, plane,
+            reinterpret_cast<float*>(plane + std::size_t(pairs) * k_padded));
+        detail::check(cudaGetLastError(), "moe matrix activation (sm_70) launch");
+        return;
+    }
+    const dim3 blocks(pairs,
+                      (k_padded + 4 * detail::kMatrixQuantizeThreads - 1) /
+                          (4 * detail::kMatrixQuantizeThreads),
+                      1);
+    auto* y = static_cast<block_q8_1_mmq*>(out);
+    switch (mmq_get_q8_1_ds_layout(detail::to_ggml(type))) {
+    case MMQ_Q8_1_DS_LAYOUT_D4:
+        detail::quantize_matrix_f32_kernel<MMQ_Q8_1_DS_LAYOUT_D4>
+            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(
+                x, source, routing.sorted, scale, y, k, k_padded, pairs);
+        break;
+    case MMQ_Q8_1_DS_LAYOUT_DS4:
+        detail::quantize_matrix_f32_kernel<MMQ_Q8_1_DS_LAYOUT_DS4>
+            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(
+                x, source, routing.sorted, scale, y, k, k_padded, pairs);
+        break;
+    case MMQ_Q8_1_DS_LAYOUT_D2S6:
+        detail::quantize_matrix_f32_kernel<MMQ_Q8_1_DS_LAYOUT_D2S6>
+            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(
+                x, source, routing.sorted, scale, y, k, k_padded, pairs);
+        break;
+    }
+    detail::check(cudaGetLastError(), "moe matrix activation launch");
+}
+
 std::size_t matrix_fixup_bytes(GgmlType type, int rows, int columns) {
     switch (type) {
     case GgmlType::Q8_0: return detail::matrix_fixup_bytes_impl<GGML_TYPE_Q8_0>(rows, columns);
@@ -1086,6 +1265,7 @@ std::size_t matrix_fixup_bytes(GgmlType type, int rows, int columns) {
     case GgmlType::IQ1_S: return detail::matrix_fixup_bytes_impl<GGML_TYPE_IQ1_S>(rows, columns);
     case GgmlType::IQ4_NL: return detail::matrix_fixup_bytes_impl<GGML_TYPE_IQ4_NL>(rows, columns);
     case GgmlType::IQ4_XS: return detail::matrix_fixup_bytes_impl<GGML_TYPE_IQ4_XS>(rows, columns);
+    case GgmlType::NVFP4: return detail::matrix_fixup_bytes_impl<GGML_TYPE_NVFP4>(rows, columns);
     case GgmlType::IQ1_M:
     case GgmlType::MXFP4: break;
     }
@@ -1119,6 +1299,7 @@ void matrix_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
         NINFER_GGUF_MATRIX_CASE(IQ1_S);
         NINFER_GGUF_MATRIX_CASE(IQ4_NL);
         NINFER_GGUF_MATRIX_CASE(IQ4_XS);
+        NINFER_GGUF_MATRIX_CASE(NVFP4);
     case GgmlType::IQ1_M:
     case GgmlType::MXFP4:
         break;
@@ -1161,6 +1342,7 @@ void matrix_product_bf16(GgmlType type, const void* weight, std::int64_t row_byt
         NINFER_GGUF_MATRIX_CASE(IQ1_S);
         NINFER_GGUF_MATRIX_CASE(IQ4_NL);
         NINFER_GGUF_MATRIX_CASE(IQ4_XS);
+        NINFER_GGUF_MATRIX_CASE(NVFP4);
     case GgmlType::IQ1_M:
     case GgmlType::MXFP4:
         break;
@@ -1196,6 +1378,7 @@ bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail) {
         NINFER_GGUF_MOE_FITS_CASE(IQ1_M);
         NINFER_GGUF_MOE_FITS_CASE(IQ4_NL);
         NINFER_GGUF_MOE_FITS_CASE(IQ4_XS);
+        NINFER_GGUF_MOE_FITS_CASE(NVFP4);
     case GgmlType::MXFP4:
         return false;
     }
@@ -1237,6 +1420,7 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
             NINFER_GGUF_MOE_SM70_CASE(IQ1_S);
             NINFER_GGUF_MOE_SM70_CASE(IQ4_NL);
             NINFER_GGUF_MOE_SM70_CASE(IQ4_XS);
+            NINFER_GGUF_MOE_SM70_CASE(NVFP4);
         case GgmlType::IQ1_M:
         case GgmlType::MXFP4:
             break;
@@ -1271,6 +1455,7 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
         NINFER_GGUF_MOE_MATRIX_CASE(IQ1_M);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ4_NL);
         NINFER_GGUF_MOE_MATRIX_CASE(IQ4_XS);
+        NINFER_GGUF_MOE_MATRIX_CASE(NVFP4);
     case GgmlType::MXFP4:
         break;
     }

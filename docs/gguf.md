@@ -11,10 +11,12 @@ multiplies them in place. The Qwen3.8-Flash-Next releases convert the same way w
 
 ## Formats
 
-Eighteen block types: the fifteen llama.cpp writes for dense models, `Q8_0`, `Q2_K`, `Q3_K`,
+Twenty block types: the fifteen llama.cpp writes for dense models, `Q8_0`, `Q2_K`, `Q3_K`,
 `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`,
-`IQ4_NL` and `IQ4_XS`, and `Q2_0`, `Q4_0` and `Q5_0`, which the Flash-Next releases use, stored as
-the `gguf_*` formats of the `gguf_blocks_v1` layout
+`IQ4_NL` and `IQ4_XS`; `Q2_0`, `Q4_0` and `Q5_0`, which the Flash-Next releases use; `MXFP4`, the
+routed experts of DeepSeek-V4.1's DSpark GGUF drafter; and `NVFP4` (64 values in four groups of
+16 E2M1 codes with a UE4M3 scale each), the routed experts of the [Edge0](edge0.md) NVFP4 releases;
+stored as the `gguf_*` formats of the `gguf_blocks_v1` layout
 ([tensor formats](maintainer/tensor-formats.md#35-gguf-block-formats),
 [storage layouts](maintainer/storage-layouts.md#6-gguf_blocks_v1)). A projection may mix types:
 the parts of a fused projection that share a type are multiplied together, the others one by one

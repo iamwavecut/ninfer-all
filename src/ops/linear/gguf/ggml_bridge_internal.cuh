@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -33,6 +34,20 @@ inline void check(cudaError_t status, const char* what) {
 }
 
 [[nodiscard]] inline ggml_type to_ggml(GgmlType type) { return static_cast<ggml_type>(type); }
+
+// An NVFP4 scale byte as ggml-quants.c's ggml_ue4m3_to_fp32 decodes it: half the UE4M3 value (the
+// E2M1 table kvalues_mxfp4 holds doubled values), 0 and 0x7F standing for zero. The converters
+// refuse scale bytes with bit 7 set, where ggml's CUDA decoder (a signed E4M3 conversion) differs.
+__host__ __device__ __forceinline__ float ue4m3_half(std::uint32_t x) {
+    x &= 0xFFu;
+    if (x == 0 || x == 0x7F) { return 0.0f; }
+    const std::uint32_t exponent = (x >> 3) & 0xF, mantissa = x & 7;
+    if (exponent == 0) { return float(mantissa) * 0.0009765625f; }
+    const std::uint32_t bits = ((exponent + 119u) << 23) | (mantissa << 20);
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
 
 // Column tiles instantiated for the matrix kernel. A product is launched with the smallest number of
 // column tiles these allow, which is where ggml's own selection lands for them as well.

@@ -50,6 +50,13 @@ float round_to_half(float value) noexcept {
     return std::bit_cast<float>(sign | rounded);
 }
 
+float ue4m3_half(std::uint8_t x) noexcept {
+    if (x == 0 || x == 0x7F) { return 0.0F; }
+    const unsigned exponent = (x >> 3) & 15U, mantissa = x & 7U;
+    if (exponent == 0) { return float(mantissa) * 0x1p-10F; }
+    return std::bit_cast<float>(((exponent + 119U) << 23) | (mantissa << 20));
+}
+
 std::uint16_t float_to_bf16(float value) noexcept {
     const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
     if ((bits & 0x7FFFFFFFU) > 0x7F800000U) { return std::uint16_t((bits >> 16) | 0x40U); } // NaN
@@ -118,6 +125,21 @@ void decode_slice(QType format, const std::uint8_t* row, int slice, GgufCpuSlice
             const unsigned hi   = (block[6 + j] >> 4) | (((qh >> (j + 16)) & 1U) << 4);
             out.weights[j]      = static_cast<std::int8_t>(int(lo) - 16);
             out.weights[j + 16] = static_cast<std::int8_t>(int(hi) - 16);
+        }
+        return;
+    }
+    case QType::GGUF_NVFP4: {
+        // Four UE4M3 scale bytes, one per 16 values, then 32 bytes of E2M1 codes (ggml's values,
+        // doubled); a 64-value block is two slices. Value v of sub-block u is the low nibble of
+        // code byte 8 u + v for v < 8, the high nibble of code byte 8 u + v - 8 otherwise.
+        const std::uint8_t* block = row + std::size_t(slice / 2) * 36;
+        const int half            = slice % 2;
+        out.factor[0]             = ue4m3_half(block[2 * half]);
+        out.factor[1]             = ue4m3_half(block[2 * half + 1]);
+        for (int j = 0; j < 32; ++j) {
+            const int sub = 2 * half + j / 16, v = j % 16;
+            const unsigned byte = block[4 + 8 * sub + v % 8];
+            out.weights[j]      = kvalues_mxfp4[v < 8 ? byte & 15U : byte >> 4];
         }
         return;
     }
@@ -200,6 +222,27 @@ void decode_slice(QType format, const std::uint8_t* row, int slice, GgufCpuSlice
         }
         out.factor[0] = d * float(scales[2 * q]);
         out.factor[1] = d * float(scales[2 * q + 1]);
+        return;
+    }
+    case QType::GGUF_Q3_K: {
+        // 32 bytes of high bits, 64 of low bit pairs, 12 bytes of 6-bit scales, then d. Slice u =
+        // 4 h + j: bits 2 j of bytes 32 + 32 h ... and bit 4 h + j of bytes 0 ... (value v's bits
+        // in byte v), standing for low + 4 high - 4; scales 8 h + 2 j (values 0..15) and
+        // 8 h + 2 j + 1 (16..31), less 32: the low nibble (scale k < 8) or high nibble of byte
+        // 96 + k % 8 and two bits 2 (k / 4) of byte 104 + k % 4.
+        const int h = sub / 4, j = sub % 4;
+        const float d = half_to_float(load16(block + 108));
+        const auto scale = [block](int k) {
+            return int(((block[96 + k % 8] >> (4 * (k / 8))) & 15U) |
+                       (((block[104 + k % 4] >> (2 * (k / 4))) & 3U) << 4)) - 32;
+        };
+        for (int v = 0; v < 32; ++v) {
+            const unsigned low  = (block[32 + 32 * h + v] >> (2 * j)) & 3U;
+            const unsigned high = (block[v] >> (4 * h + j)) & 1U;
+            out.weights[v]      = static_cast<std::int8_t>(int(low + 4 * high) - 4);
+        }
+        out.factor[0] = d * float(scale(8 * h + 2 * j));
+        out.factor[1] = d * float(scale(8 * h + 2 * j + 1));
         return;
     }
     default: break;
@@ -315,7 +358,8 @@ void rows_scalar(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_beg
     const bool q2    = w.format == QType::GGUF_Q2_0;
     const bool two   = w.format == QType::GGUF_IQ2_S || w.format == QType::GGUF_IQ1_M;
     const bool delta = w.format == QType::GGUF_IQ1_S;
-    const bool six   = w.format == QType::GGUF_Q6_K;
+    const bool six   = w.format == QType::GGUF_Q6_K || w.format == QType::GGUF_Q3_K ||
+                     w.format == QType::GGUF_NVFP4;
     const bool min   = w.format == QType::GGUF_Q4_K || w.format == QType::GGUF_Q5_K;
     std::vector<float> lanes(std::size_t(tokens) * 32);
     GgufCpuSlice slice;
@@ -427,6 +471,7 @@ bool gguf_cpu_supported(QType format) noexcept {
     case QType::GGUF_Q4_0:
     case QType::GGUF_Q5_0:
     case QType::GGUF_Q8_0:
+    case QType::GGUF_Q3_K:
     case QType::GGUF_Q4_K:
     case QType::GGUF_Q5_K:
     case QType::GGUF_Q6_K:
@@ -437,7 +482,8 @@ bool gguf_cpu_supported(QType format) noexcept {
     case QType::GGUF_IQ2_S:
     case QType::GGUF_IQ3_XXS:
     case QType::GGUF_IQ3_S:
-    case QType::GGUF_IQ4_XS: return true;
+    case QType::GGUF_IQ4_XS:
+    case QType::GGUF_NVFP4: return true;
     default: return false;
     }
 }

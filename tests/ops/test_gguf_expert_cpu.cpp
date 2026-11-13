@@ -1,6 +1,7 @@
-// GGUF CPU expert rows (Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS,
-// IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS) against FP64 from independently decoded stored blocks, at the
-// Flash-Next, Gemma 4 and DeepSeek-V4.1 expert shapes, for every backend this host supports.
+// GGUF CPU expert rows (Q2_0, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S, IQ1_M,
+// IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, NVFP4) against FP64 from independently decoded stored
+// blocks, at the Flash-Next, Gemma 4, DeepSeek-V4.1 and Edge0 expert shapes, for every backend this
+// host supports.
 // Blocks are decoded by ggml's reference dequantizers. Two oracles: the exact product bounds the
 // int8 activation's error, and the q8_1 product (the activation quantized per 32 values as the GPU
 // does, d = amax / 127 rounded to binary16, codes round(v / d); a K-quant's minimum and IQ1_S's
@@ -136,6 +137,40 @@ void reference_plain_block(QType format, const std::uint8_t* x, double* y, doubl
         }
         return;
     }
+    if (format == QType::GGUF_Q3_K) {
+        // dequantize_row_q3_K: sixteen 6-bit scales from the twelve bytes at 96 (kmask1/kmask2),
+        // values (2-bit code) - (high bit clear ? 4 : 0).
+        const double d = exact_half(load16(x + 108));
+        std::uint32_t aux[4];
+        std::memcpy(aux, x + 96, 12);
+        const std::uint32_t kmask1 = 0x03030303, kmask2 = 0x0f0f0f0f, tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        const auto* scales = reinterpret_cast<const std::int8_t*>(aux);
+        const std::uint8_t* q  = x + 32;
+        const std::uint8_t* hm = x;
+        int is = 0;
+        std::uint8_t m = 1;
+        for (int n = 0; n < QK_K; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                double dl = d * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl * (int((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+                }
+                dl = d * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl * (int((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+        return;
+    }
     if (format == QType::GGUF_Q6_K) {
         const double d          = exact_half(load16(x + 208));
         const std::uint8_t* ql  = x;
@@ -188,6 +223,24 @@ void reference_plain_block(QType format, const std::uint8_t* x, double* y, doubl
         is += 2;
         u1 <<= 2;
         u2 <<= 2;
+    }
+}
+
+// dequantize_row_nvfp4 with FP64 output: the E2M1 value of each code (sign, two exponent bits, one
+// mantissa bit) times its 16-value sub-block's UE4M3 scale; value j of sub-block s is the low
+// nibble of code byte 8 s + j (j < 8) or the high nibble of code byte 8 s + j - 8.
+void reference_nvfp4(const std::uint8_t* x, double* y) {
+    for (int s = 0; s < 4; ++s) {
+        const int exponent = (x[s] >> 3) & 15, mantissa = x[s] & 7;
+        const double scale = exponent == 0 ? std::ldexp(double(mantissa), -9)
+                                           : std::ldexp(1.0 + mantissa / 8.0, exponent - 7);
+        for (int j = 0; j < 16; ++j) {
+            const int byte = x[4 + 8 * s + j % 8];
+            const int code = j < 8 ? byte & 15 : byte >> 4;
+            const int e = (code >> 1) & 3, f = code & 1;
+            const double magnitude = e == 0 ? 0.5 * f : std::ldexp(1.0 + 0.5 * f, e - 1);
+            y[16 * s + j] = (code & 8 ? -magnitude : magnitude) * scale;
+        }
     }
 }
 
@@ -360,8 +413,24 @@ void reference_block(QType format, const std::uint8_t* bytes, double* y, double*
 }
 
 Matrix make(QType format, int rows, int k, std::mt19937& rng) {
-    if (format == QType::GGUF_Q4_0 || format == QType::GGUF_Q5_0 || format == QType::GGUF_Q4_K ||
-        format == QType::GGUF_Q5_K || format == QType::GGUF_Q6_K) {
+    if (format == QType::GGUF_NVFP4) {
+        // Random codes; each UE4M3 scale byte 1 .. 31 (2^-9 .. 2^-4, subnormals included).
+        Matrix m{format, rows, k, std::int64_t(k / 64) * 36, {}, {}, {}};
+        m.bytes.resize(std::size_t(rows) * m.row_bytes);
+        for (auto& byte : m.bytes) { byte = static_cast<std::uint8_t>(rng()); }
+        m.values.resize(std::size_t(rows) * k);
+        m.minimums.resize(std::size_t(rows) * (k / 32));
+        for (int r = 0; r < rows; ++r) {
+            for (int b = 0; b < k / 64; ++b) {
+                std::uint8_t* p = m.bytes.data() + std::size_t(r) * m.row_bytes + std::size_t(b) * 36;
+                for (int s = 0; s < 4; ++s) { p[s] = static_cast<std::uint8_t>(1 + rng() % 31); }
+                reference_nvfp4(p, m.values.data() + std::size_t(r) * k + std::size_t(b) * 64);
+            }
+        }
+        return m;
+    }
+    if (format == QType::GGUF_Q4_0 || format == QType::GGUF_Q5_0 || format == QType::GGUF_Q3_K ||
+        format == QType::GGUF_Q4_K || format == QType::GGUF_Q5_K || format == QType::GGUF_Q6_K) {
         // Random codes and scales; the block multipliers are set to sensible sizes.
         const auto [group, block] = gguf_block_shape(format);
         Matrix m{format, rows, k, std::int64_t(k / group) * block, {}, {}, {}};
@@ -376,7 +445,8 @@ Matrix make(QType format, int rows, int k, std::mt19937& rng) {
                 std::uint8_t* p = m.bytes.data() + std::size_t(r) * m.row_bytes + std::size_t(b) * block;
                 const auto d    = half_bits(scale(rng));
                 const std::uint16_t signed_d = (rng() % 4 == 0) ? std::uint16_t(d | 0x8000) : d;
-                std::memcpy(p + (format == QType::GGUF_Q6_K ? 208 : 0), &signed_d, 2);
+                std::memcpy(p + (format == QType::GGUF_Q6_K ? 208 : format == QType::GGUF_Q3_K ? 108 : 0),
+                            &signed_d, 2);
                 if (k_minimum(format)) {
                     const auto dmin = half_bits(scale(rng));
                     std::memcpy(p + 2, &dmin, 2);
@@ -730,6 +800,17 @@ int main() {
                 check(down, tokens, rng);
             }
             require(gguf_cpu_supported(format), "an i-quant is not supported");
+        }
+        // Edge0's latent experts: gate and up rows of ELL = 1792 (145B) or 1280 (120B) values in
+        // Q3_K or NVFP4, down rows of 640 in IQ4_NL or NVFP4.
+        for (const int ell : {1792, 1280}) {
+            for (const QType format : {QType::GGUF_Q3_K, QType::GGUF_NVFP4}) {
+                const Matrix gate = make(format, 640, ell, rng);
+                for (const int tokens : {1, 2, 3, 8, 9}) { check(gate, tokens, rng); }
+                require(gguf_cpu_supported(format), "an Edge0 expert format is not supported");
+            }
+            const Matrix down = make(QType::GGUF_NVFP4, ell, 640, rng);
+            for (const int tokens : {1, 2, 8}) { check(down, tokens, rng); }
         }
         require(!gguf_cpu_supported(QType::GGUF_IQ2_XS), "an unimplemented format is supported");
         bool refused = false;

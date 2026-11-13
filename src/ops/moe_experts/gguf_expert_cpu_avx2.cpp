@@ -630,6 +630,88 @@ void k_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, i
                                                          decode, dot);
 }
 
+// Q3_K: a group is one 256-value block, decoded as decode_slice does. Slice u = 4 h + j takes
+// bits 2 j of the 32 bytes at 32 + 32 h and bit 4 h + j of the 32 bytes at 0, value
+// low + 4 high - 4, and its two halves' 6-bit scales less 32 times d.
+void q3k_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, int row_end,
+              float* y, std::size_t y_stride) {
+    const auto decode = [](const std::uint8_t* row, int g, int, Group& group) {
+        const std::uint8_t* block = row + std::size_t(g) * 110;
+        const float d             = half_at(block + 108);
+        const auto scale          = [block](int k) {
+            return int(((block[96 + k % 8] >> (4 * (k / 8))) & 15U) |
+                       (((block[104 + k % 4] >> (2 * (k / 4))) & 3U) << 4)) - 32;
+        };
+        alignas(32) float f0[8], f1[8];
+        for (int sub = 0; sub < 8; ++sub) {
+            const int h = sub / 4, j = sub % 4;
+            f0[sub]             = d * float(scale(8 * h + 2 * j));
+            f1[sub]             = d * float(scale(8 * h + 2 * j + 1));
+            const __m256i low   = bits_of(block + 32 + 32 * h, 2 * j, 3);
+            const __m256i high  = bits_of(block, 4 * h + j, 1);
+            const __m256i codes = _mm256_sub_epi8(_mm256_or_si256(low, _mm256_slli_epi16(high, 2)),
+                                                  _mm256_set1_epi8(4));
+            group.magnitude[sub] = _mm256_sign_epi8(codes, codes);
+            group.sign[sub]      = codes;
+        }
+        group.factor[0] = _mm256_load_ps(f0);
+        group.factor[1] = _mm256_load_ps(f1);
+    };
+    const auto dot = [&x](int t, int g, int, const Group& group) {
+        const std::int8_t* a = x.codes(t) + g * 256;
+        __m256i u[8];
+        for (int i = 0; i < 8; ++i) {
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32 * i));
+            u[i]            = dot_u8s8(group.magnitude[i], _mm256_sign_epi8(v, group.sign[i]));
+        }
+        return halves8(u);
+    };
+    rows_in_lane_order<Form::SixK>(w, x, row_begin, row_end, y, y_stride, decode, dot);
+}
+
+// NVFP4: a group is four 64-value blocks, two slices each, decoded as decode_slice does: ggml's
+// doubled E2M1 values of the low nibbles of a slice's 16 code bytes (values 0..7 and 16..23) and of
+// their high nibbles (8..15 and 24..31), and the halved UE4M3 scales of its two 16-value halves.
+void nvfp4_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, int row_end,
+                float* y, std::size_t y_stride) {
+    const auto decode = [](const std::uint8_t* row, int g, int live, Group& group) {
+        const __m128i table = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_mxfp4));
+        const __m128i nib   = _mm_set1_epi8(15);
+        alignas(32) float f0[8], f1[8];
+        for (int i = 0; i < 8; ++i) {
+            if (i >= live) {
+                f0[i] = f1[i]      = 0.0F;
+                group.magnitude[i] = group.sign[i] = _mm256_setzero_si256();
+                continue;
+            }
+            const std::uint8_t* block = row + std::size_t(4 * g + i / 2) * 36;
+            const int half            = i % 2;
+            f0[i]                     = ue4m3_half(block[2 * half]);
+            f1[i]                     = ue4m3_half(block[2 * half + 1]);
+            const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + 4 + 16 * half));
+            const __m128i lo    = _mm_shuffle_epi8(table, _mm_and_si128(bytes, nib));
+            const __m128i hi    = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(bytes, 4), nib));
+            const __m256i codes = _mm256_set_m128i(_mm_unpackhi_epi64(lo, hi), _mm_unpacklo_epi64(lo, hi));
+            group.magnitude[i]  = _mm256_sign_epi8(codes, codes);
+            group.sign[i]       = codes;
+        }
+        group.factor[0] = _mm256_load_ps(f0);
+        group.factor[1] = _mm256_load_ps(f1);
+    };
+    const auto dot = [&x](int t, int g, int live, const Group& group) {
+        const std::int8_t* a = x.codes(t) + g * 256;
+        __m256i u[8];
+        for (int i = 0; i < 8; ++i) {
+            // A slice past the row's end reads no activation.
+            const __m256i v = i < live ? _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + 32 * i))
+                                       : _mm256_setzero_si256();
+            u[i] = dot_u8s8(group.magnitude[i], _mm256_sign_epi8(v, group.sign[i]));
+        }
+        return halves8(u);
+    };
+    rows_in_lane_order<Form::SixK>(w, x, row_begin, row_end, y, y_stride, decode, dot);
+}
+
 // silu.h's e^v, eight values at a time: the same operations in the same order, so the same bits.
 inline __m256 exp_ps(__m256 v) {
     const __m256 one = _mm256_set1_ps(1.0F);
@@ -686,6 +768,8 @@ void rows_avx2(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin
     case QType::GGUF_Q4_K: return k_rows<QType::GGUF_Q4_K>(w, x, row_begin, row_end, y, y_stride);
     case QType::GGUF_Q5_K: return k_rows<QType::GGUF_Q5_K>(w, x, row_begin, row_end, y, y_stride);
     case QType::GGUF_Q6_K: return k_rows<QType::GGUF_Q6_K>(w, x, row_begin, row_end, y, y_stride);
+    case QType::GGUF_Q3_K: return q3k_rows(w, x, row_begin, row_end, y, y_stride);
+    case QType::GGUF_NVFP4: return nvfp4_rows(w, x, row_begin, row_end, y, y_stride);
     default: return rows_scalar(w, x, row_begin, row_end, y, y_stride);
     }
 }
