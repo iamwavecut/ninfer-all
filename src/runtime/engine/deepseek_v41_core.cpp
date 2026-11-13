@@ -462,10 +462,12 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                                                                : "";
         const std::string resident = std::to_string(memory.engram_resident_bytes >> 20U) + " MiB" +
                                      (table.lock ? ", locked" : "");
-        const std::string place = table.residency == NgramResidency::Ram
-                                      ? "in RAM (" + resident + ")"
-                                      : "read from " + file + io + " through the page cache, row "
-                                        "cache " + resident;
+        const std::string place =
+            table.residency == NgramResidency::Ram ? "in RAM (" + resident + ")"
+            : table.residency == NgramResidency::RamHot
+                ? "hot rows in RAM (" + resident + "), the rest read from " + file + io +
+                      " through the page cache"
+                : "read from " + file + io + " through the page cache, row cache " + resident;
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "DeepSeek-V4.1: Engram table %s, %s reads", place.c_str(),
                            instance->executor->engram_description().c_str());
