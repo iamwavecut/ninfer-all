@@ -204,7 +204,8 @@ def main(argv=None):
         default=[],
         metavar="ROLE=PATH",
         help="override a final frontend resource; Flash-Next also accepts ngram.hot=PROFILE "
-        "to embed a hot-row profile with the stored n-gram table",
+        "to embed a hot-row profile with the stored n-gram table, DeepSeek-V4.1 engram.hot=PROFILE "
+        "with the stored Engram table (checked against the Engram hash of --source gguf)",
     )
     parser.add_argument(
         "--layers", type=_layers, metavar="A..B",
@@ -282,8 +283,9 @@ def main(argv=None):
                                  "--components ...,vision its vision tower from --source "
                                  "vision=MMPROJ.gguf, for an earlier-layout GGUF with "
                                  "--source bias_vl=BIAS_VL.safetensors")
+            # A table alone reads the model's GGUF only for the Engram hash a profile is checked against.
             gguf = (stack.enter_context(GGUFShards(paths["gguf"]))
-                    if "text" in components else None)
+                    if "text" in components or "gguf" in paths else None)
             engram = stack.enter_context(GGUFFile(paths["engram"]))
             # A directory is an STQ pack whose drafter (mtp.*) the dspark component stores.
             dspark = None

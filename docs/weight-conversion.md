@@ -335,7 +335,11 @@ template: the recipe stores its own transcription of the release's encoder and g
 ([`templates/deepseek_v41`](../tools/convert/templates/deepseek_v41)) unless `--model` or
 `--resource` provides them. `--components text` stores the model alone, naming its table by the
 SHA-256 of its rows, and `engram` that table artifact, the layout the published conversions use;
-`text,engram` (the default) stores both in one file. Commands, runtime defaults and measurements: [DeepSeek-V4.1-Flash](deepseek-v41.md).
+`text,engram` (the default) stores both in one file. `--resource engram.hot=PATH` stores a hot-row
+profile made by `ninfer-ngram-profile` beside the stored Engram table as
+`engram.resources.hot_profile`, after checking its row IDs and the Engram hash and token map it was
+counted for against `--source gguf`, which a table alone then also needs; the table's bytes and
+digest stay the same. Commands, runtime defaults and measurements: [DeepSeek-V4.1-Flash](deepseek-v41.md).
 
 ## Change part of a recipe
 

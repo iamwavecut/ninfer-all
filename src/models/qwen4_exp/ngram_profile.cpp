@@ -59,20 +59,24 @@ void write_ngram_profile(const std::filesystem::path& path, const NgramProfile& 
     if (!file) { throw std::runtime_error("cannot write the hot-row profile " + path.string()); }
 }
 
-void check_ngram_profile(const NgramProfile& profile, const NgramHashConstants& constants,
+void check_ngram_profile(const NgramProfile& profile, std::uint64_t rows, std::uint64_t fingerprint,
                          const std::filesystem::path& path) {
-    if (profile.table_rows != constants.rows ||
-        profile.fingerprint != ngram_hash_fingerprint(constants)) {
+    if (profile.table_rows != rows || profile.fingerprint != fingerprint) {
         throw std::invalid_argument("the hot-row profile " + path.string() +
                                     " was counted for another n-gram hash than the model's");
     }
     auto sorted = profile.rows;
     std::sort(sorted.begin(), sorted.end());
-    if ((!sorted.empty() && sorted.back() >= constants.rows) ||
+    if ((!sorted.empty() && sorted.back() >= rows) ||
         std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
         throw std::invalid_argument("the hot-row profile " + path.string() +
                                     " has duplicate or out-of-range rows");
     }
+}
+
+void check_ngram_profile(const NgramProfile& profile, const NgramHashConstants& constants,
+                         const std::filesystem::path& path) {
+    check_ngram_profile(profile, constants.rows, ngram_hash_fingerprint(constants), path);
 }
 
 } // namespace ninfer::models::qwen4_exp

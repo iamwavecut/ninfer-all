@@ -91,7 +91,7 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   experts, CPU threads compute a share of a decode call's missing experts while the GPU copies the
   rest ([the CPU share](#the-cpu-share)).
 - **The Engram table.** Stored in the model's artifact or in a table artifact of its own, read row
-  by row from its file or held in RAM ([below](#the-engram-table)).
+  by row from its file, held in RAM, or with its most read rows in RAM ([below](#the-engram-table)).
 - **Images.** With `--vision`, the release's vision tower turns each picture into a span of prompt
   positions, prepared as the release's image processor prepares it; the text model routes those
   positions with the release's image routing bias and leaves them out of the Engram
@@ -141,9 +141,13 @@ python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gg
   --source vision=models/deepseek-v4.1/mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf \
   --name DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M \
   --out models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-ninfer-v3.ninfer --device cpu
-# The Engram table, one artifact for every DeepSeek-V4.1-Flash-1017 conversion.
+# The Engram table, one artifact for every DeepSeek-V4.1-Flash-1017 conversion, with an optional
+# hot-row profile for --ngram-residency ram-hot (the published table holds the broad one); the
+# profile is checked against the Engram hash of the model's GGUF (--source gguf).
 python -m tools.convert --model models/deepseek-v4.1/hf --recipe deepseek_v41_gguf --components engram \
   --source engram=models/deepseek-v4.1/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf \
+  --source gguf=models/deepseek-v4.1/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00006.gguf \
+  --resource engram.hot=models/deepseek-v4.1/engram-broad-v1.hot \
   --name DeepSeek-V4.1-Flash-Engram-IQ4_NL \
   --out models/DeepSeek-V4.1-Flash-Engram-IQ4_NL-ninfer-v3.ninfer --device cpu
 ```
@@ -188,7 +192,8 @@ The model reads the Engram GGUF only for the table's digest, and of the STQ pack
 its index and its six drafter files (3.85 GB), checking that the pack states the release's model and
 drafter keys. `--components text,dspark` leaves the vision tower out and `--components text` the
 drafter too; the objects they keep are the same bytes either way. The model with its drafter and
-tower is one file of 117.2 GiB, of which the tower takes 0.90 GiB; the table is one of 103.0 GiB.
+tower is one file of 117.2 GiB, of which the tower takes 0.90 GiB; the table is one of 103.0 GiB
+(103.3 GiB with the published hot-row profile, [below](#the-hot-row-profile)).
 On the 96 threads of a 48-core EPYC 7K62, with a download writing to the same disk, the model took
 6 min 23 s; on 24 cores of a Threadripper 3960X the table took 3 min 29 s.
 
@@ -400,9 +405,11 @@ addresses and copies them to the device:
   output: on a 1,112-token WikiText slice the perplexity rose from 3.07 to 9.68 with the build that
   added the model ([numerical checks](#numerical-checks)).
 - **How it is read.** `--ngram-residency disk` (the default) reads each pass's rows from the file
-  (`--ngram-io`, `--ngram-io-depth`, `--ngram-ram-mib` for a row cache), and `ram` holds the whole
-  table in RAM (`--ngram-lock` pins it). The table is 103.0 GiB, so `ram` and host experts together
-  need about 210 GiB of RAM.
+  (`--ngram-io`, `--ngram-io-depth`, `--ngram-ram-mib` for a row cache), `ram` holds the whole
+  table in RAM (`--ngram-lock` pins it), and `ram-hot` holds the rows a hot-row profile ranks first,
+  as many as `--ngram-ram-mib` holds (4,096 MiB by default), and reads the rest from the file
+  ([the hot-row profile](#the-hot-row-profile)). The table is 103.0 GiB, so `ram` and host experts
+  together need about 210 GiB of RAM.
 - **Repeated rows.** A pass that addresses one row several times, as a prompt that repeats its
   n-grams or an image's positions (which all hash the pad n-grams) do, reads it from the file once
   and copies it to the other places (`--ngram-dedupe off` reads every place).
@@ -413,6 +420,39 @@ addresses and copies them to the device:
   between, reads its own rows. The second buffer takes 114 MiB of pinned memory with spans of
   16,384 tokens and 14 MiB with chunks of 2048
   ([measurements](#prefill-tail-iq1_m-experts-and-engram-reads)).
+
+### The hot-row profile
+
+A row depends on its token and the three before it and nothing else, so `ninfer-ngram-profile`
+counts the rows a corpus reads from its tokens alone, without running the model, and ranks them by
+reads ([Flash-Next's hot-row profile](qwen3-8-flash-next.md#the-n-gram-rows) describes the tool and
+its file). Given a DeepSeek-V4.1 artifact it hashes the Engram's 48 rows a token and sizes a row at
+144 bytes. A profile names the table's row count and a fingerprint of the Engram hash (the n-gram
+sizes, heads, pad id, each block's multipliers, primes and offsets, and the model's token map);
+NInfer refuses one that differs, repeats a row or names a row past the table.
+
+The table artifact may carry a profile in `engram.resources.hot_profile`; `ram-hot` reads it when
+`--ngram-hot-profile` is absent, and an explicit file overrides it. Conversion stores the file that
+`--resource engram.hot=PATH` names, after the same checks; the table's digest and rows stay the
+same bytes. The published table carries a broad profile: 86,355,715 rows counted from 3,734,454
+tokens (5,831 documents of the corpus Flash-Next's profile was counted from). On 1,116,980 held-out
+tokens of the same sources (53,615,040 row reads, 47.6% of them of rows the profile lists) the
+leading rows serve this share of reads per RAM budget:
+
+| RAM budget, MiB | 256 | 512 | 1,024 | 2,048 | 4,096 | 8,192 | 16,384 and more |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Held-out row hits | 18.4% | 23.4% | 28.1% | 32.8% | 37.7% | 43.1% | 47.6% |
+
+At the default 4,096 MiB the RAM holds 29,117,807 rows. A row of 144 bytes and 48 reads a token give
+lower hit rates per MiB than Flash-Next's 90-byte rows and 16 reads a token. Hits measure row reuse,
+not speed or quality.
+
+At startup `ram-hot` reads whole every 4 MiB piece of the table that holds more than about 500 hot
+rows and the hot rows of the other pieces one by one. At 4,096 MiB that is nearly the whole file: on
+an RTX 3090 host (RunPod, container disk, November 13, 2026) the engine was ready after 2 min 26 s
+against 8.3 s with `disk`. The rows are the same either way: there the IQ1_M release with disk
+experts scored the first 16 KB of `wikitext/00.txt` (3,547 tokens) to the same total NLL, bit for
+bit, with `disk` and with `ram-hot` (perplexity 2.09739).
 
 ## The DSpark drafter
 

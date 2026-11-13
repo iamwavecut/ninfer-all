@@ -1,6 +1,7 @@
 #include "models/deepseek_v41/engram.h"
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -110,11 +111,25 @@ bool is_engram_table_artifact(const artifact::Reader& reader) {
            directory.bindings.contains(kTableBinding);
 }
 
-qwen4_exp::NgramTableLayout engram_table_layout(const artifact::Reader& reader,
-                                                const std::filesystem::path& artifact,
-                                                const TextConfig& config,
-                                                const std::filesystem::path& table) {
+EngramTableSource engram_table_source(const artifact::Reader& reader,
+                                      const std::filesystem::path& artifact,
+                                      const TextConfig& config,
+                                      const std::filesystem::path& table, bool read_hot_profile) {
     const Descriptor model = descriptor(reader, artifact, config);
+    // The profile the selected table artifact stores, checked against the model's hash.
+    const auto with_profile = [&](const artifact::Reader& selected,
+                                  const std::filesystem::path& path,
+                                  qwen4_exp::NgramTableLayout layout) {
+        EngramTableSource out{.layout = std::move(layout), .hot_profile = std::nullopt};
+        if (!read_hot_profile) { return out; }
+        const auto& resources = selected.directory().component("engram").resources;
+        const auto found      = resources.find("hot_profile");
+        if (found == resources.end()) { return out; }
+        out.hot_profile = qwen4_exp::decode_ngram_profile(selected.read_object(found->second),
+                                                          path.string() + ":engram.hot_profile");
+        check_engram_profile(*out.hot_profile, reader, config, path);
+        return out;
+    };
     if (table.empty()) {
         if (!reader.directory().bindings.contains(kTableBinding)) {
             throw ArtifactError(
@@ -124,7 +139,7 @@ qwen4_exp::NgramTableLayout engram_table_layout(const artifact::Reader& reader,
                 "--no-ngram-table runs the model without it, a non-standard experimental mode "
                 "that badly degrades the output");
         }
-        return stored_rows(reader, artifact, model);
+        return with_profile(reader, artifact, stored_rows(reader, artifact, model));
     }
     const artifact::Reader other(table);
     if (!other.directory().bindings.contains(kTableBinding)) {
@@ -136,7 +151,64 @@ qwen4_exp::NgramTableLayout engram_table_layout(const artifact::Reader& reader,
                             ", sha256 " + theirs.digest.substr(0, 16) + "...) than the model's (" +
                             model.format + ", sha256 " + model.digest.substr(0, 16) + "...)");
     }
-    return stored_rows(other, table, theirs);
+    return with_profile(other, table, stored_rows(other, table, theirs));
+}
+
+std::vector<std::int32_t> decode_engram_token_map(std::span<const std::byte> bytes,
+                                                  std::uint32_t vocab_size) {
+    if (bytes.size() != std::size_t(vocab_size) * sizeof(std::int32_t)) {
+        throw ArtifactError("the Engram token map must hold a compressed id per token");
+    }
+    std::vector<std::int32_t> out(vocab_size);
+    std::memcpy(out.data(), bytes.data(), bytes.size());
+    if (std::any_of(out.begin(), out.end(), [](std::int32_t id) { return id < 0; })) {
+        throw ArtifactError("the Engram token map holds a negative id");
+    }
+    return out;
+}
+
+std::vector<std::int32_t> engram_token_map(const artifact::Reader& reader,
+                                           const TextConfig& config) {
+    const auto& resources = reader.directory().component("text").resources;
+    const auto found      = resources.find("engram_token_map");
+    if (found == resources.end()) {
+        throw ArtifactError("the DeepSeek-V4.1 model stores no Engram token map");
+    }
+    return decode_engram_token_map(reader.read_object(found->second), config.vocab_size);
+}
+
+std::uint64_t engram_hash_fingerprint(const EngramHash& hash,
+                                      std::span<const std::int32_t> token_map) {
+    std::uint64_t value = 0xcbf29ce484222325ULL;
+    const auto feed     = [&](std::uint64_t word) {
+        for (unsigned byte = 0; byte < 8; ++byte) {
+            value ^= (word >> (8U * byte)) & 0xffU;
+            value *= 0x100000001b3ULL;
+        }
+    };
+    feed(hash.ngram_size);
+    feed(hash.heads);
+    feed(std::uint64_t(std::int64_t(hash.pad_id)));
+    feed(hash.layers.size());
+    for (const auto layer : hash.layers) { feed(layer); }
+    for (std::size_t l = 0; l < hash.layers.size(); ++l) {
+        feed(hash.layer_rows.at(l));
+        for (const auto* values : {&hash.multipliers.at(l), &hash.primes.at(l), &hash.offsets.at(l)}) {
+            for (const auto v : *values) { feed(v); }
+        }
+    }
+    feed(token_map.size());
+    for (const auto id : token_map) { feed(std::uint64_t(std::int64_t(id))); }
+    return value;
+}
+
+void check_engram_profile(const qwen4_exp::NgramProfile& profile, const artifact::Reader& reader,
+                          const TextConfig& config, const std::filesystem::path& path) {
+    std::uint64_t rows = 0;
+    for (const auto r : config.engram.layer_rows) { rows += r; }
+    qwen4_exp::check_ngram_profile(
+        profile, rows, engram_hash_fingerprint(config.engram, engram_token_map(reader, config)),
+        path);
 }
 
 void EngramHasher::History::push(std::int32_t compressed_id, std::uint32_t keep) {

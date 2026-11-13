@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 
 import numpy as np
 import pytest
@@ -355,14 +356,16 @@ def _bias_vl(tmp_path, layers=3):
 
 
 def _convert(tmp_path, hf, first, table, components=("text", "engram"), drafter=None,
-             mmproj=None, bias_vl=None):
+             mmproj=None, bias_vl=None, resource_overrides=None):
     from tools.convert.pipeline import convert
     from tools.convert.recipe import Recipe
     from tools.convert.sources.safetensors import SafetensorsSource
 
     output = tmp_path / ("-".join(components) + ".ninfer")
     with SafetensorsSource(hf) as base, GGUFFile(table) as engram:
-        gguf = deepseek_v41.GGUFShards(first) if "text" in components else None
+        # A table alone reads the GGUF for the Engram hash its profile is checked against.
+        gguf = (deepseek_v41.GGUFShards(first) if "text" in components or resource_overrides
+                else None)
         dspark = None
         if drafter:
             dspark = (SafetensorsSource(drafter) if drafter.is_dir()
@@ -370,7 +373,8 @@ def _convert(tmp_path, hf, first, table, components=("text", "engram"), drafter=
         vision = GGUFFile(mmproj) if mmproj else None
         bias = SafetensorsSource(bias_vl) if bias_vl else None
         model = deepseek_v41.build_model(base, gguf, components=components, dspark=dspark,
-                                         vision=vision, bias_vl=bias)
+                                         vision=vision, bias_vl=bias,
+                                         resource_overrides=resource_overrides)
         recipe = Recipe(model)
         sources = ({"base": base, "engram": engram} | ({"gguf": gguf} if gguf else {})
                    | ({"dspark": dspark} if dspark else {}))
@@ -499,6 +503,62 @@ def test_the_model_and_its_table_convert_apart(tmp_path):
         assert set(directory.bindings) == {"engram/table"}
         assert "text" not in directory.components
         assert directory.components["engram"]["config"]["table_sha256"] == digest
+
+
+def test_the_engram_fingerprint_matches_the_engine():
+    # tests/models/deepseek_v41/test_engram_table.cpp computes the same value for this hash.
+    config = {"engram_layer_ids": [1, 3], "engram_num_embeddings": [40, 50],
+              "engram_max_ngram_size": 3, "engram_n_heads": 2}
+    constants = {"pad_id": 0, "multipliers": [[3, 5, 7], [11, 13, 17]],
+                 "primes": [[7, 11, 13, 5], [13, 11, 17, 7]],
+                 "offsets": [[0, 7, 18, 31], [0, 13, 24, 41]],
+                 "token_map": np.arange(16, dtype="<i4") % 9}
+    assert deepseek_v41.engram_hash_fingerprint(config, constants) == 0xAE571DFFA7A86675
+
+
+def _engram_profile(rows, fingerprint, ranked):
+    return (b"NFNGHOT1" + struct.pack("<4Q", rows, fingerprint, 777, len(ranked))
+            + np.asarray(ranked, dtype="<u4").tobytes())
+
+
+def test_the_table_stores_a_checked_hot_row_profile(tmp_path):
+    from tools.artifact.reader import Artifact
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, first, table, _ = _release(tmp_path)
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(first) as gguf:
+        config = deepseek_v41.text_config(base.config)
+        fingerprint = deepseek_v41.engram_hash_fingerprint(
+            config, deepseek_v41.engram_constants(gguf, config))
+    good = tmp_path / "good.hot"
+    good.write_bytes(_engram_profile(ENGRAM_ROWS, fingerprint, [7, 0, ENGRAM_ROWS - 1]))
+    for components in (("engram",), ("text", "engram")):
+        output = _convert(tmp_path, hf, first, table, components,
+                          resource_overrides={"engram.hot": str(good)})
+        with Artifact(output) as artifact:
+            role = artifact.directory.components["engram"]["resources"]["hot_profile"]
+            assert artifact.read_object(role) == good.read_bytes()
+            assert "engram/table" in artifact.directory.bindings
+    bad = {
+        "foreign": _engram_profile(ENGRAM_ROWS, fingerprint ^ 1, [7]),
+        "resized": _engram_profile(ENGRAM_ROWS + 1, fingerprint, [7]),
+        "repeated": _engram_profile(ENGRAM_ROWS, fingerprint, [7, 7]),
+        "past": _engram_profile(ENGRAM_ROWS, fingerprint, [ENGRAM_ROWS]),
+    }
+    for name, data in bad.items():
+        path = tmp_path / f"{name}.hot"
+        path.write_bytes(data)
+        with pytest.raises(ValueError, match="Engram hash|duplicate or out-of-range"):
+            _convert(tmp_path, hf, first, table, ("engram",),
+                     resource_overrides={"engram.hot": str(path)})
+    # The profile needs a stored table, and the GGUF's Engram hash to be checked against.
+    with SafetensorsSource(hf) as base, deepseek_v41.GGUFShards(first) as gguf:
+        with pytest.raises(ValueError, match="engram.hot"):
+            deepseek_v41.build_model(base, gguf, components=("text",),
+                                     resource_overrides={"engram.hot": str(good)})
+        with pytest.raises(ValueError, match="engram.hot"):
+            deepseek_v41.build_model(base, None, components=("engram",),
+                                     resource_overrides={"engram.hot": str(good)})
 
 
 def test_the_drafter_keeps_its_blocks(tmp_path):

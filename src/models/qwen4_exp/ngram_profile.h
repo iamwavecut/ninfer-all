@@ -1,11 +1,12 @@
 #pragma once
 
-// A hot-row profile of the Qwen3.8-Flash-Next n-gram table: the rows a text corpus addresses, the
-// most frequent first, counted from the tokens alone (ninfer-ngram-profile). The RamHot residency
-// keeps the leading rows that fit its budget in RAM.
+// A hot-row profile of an n-gram table (Qwen3.8-Flash-Next's n-gram table, DeepSeek-V4.1's Engram
+// table): the rows a text corpus addresses, the most frequent first, counted from the tokens alone
+// (ninfer-ngram-profile). The RamHot residency keeps the leading rows that fit its budget in RAM.
 //
 // File (little-endian): the magic "NFNGHOT1", then u64 table rows, u64 fingerprint of the hash
-// constants (ngram_hash_fingerprint), u64 corpus tokens, u64 row count, and that many u32 row ids.
+// that addresses the rows (ngram_hash_fingerprint, deepseek_v41::engram_hash_fingerprint), u64
+// corpus tokens, u64 row count, and that many u32 row ids.
 
 #include "models/qwen4_exp/ngram_hash.h"
 
@@ -31,7 +32,11 @@ struct NgramProfile {
                                                 std::string_view label);
 void write_ngram_profile(const std::filesystem::path& path, const NgramProfile& profile);
 
-// Refuses (std::invalid_argument) a profile counted for other hash constants than `constants`.
+// Refuses (std::invalid_argument) a profile counted for another table than one of `rows` rows
+// addressed by the hash `fingerprint` identifies, and one with duplicate or out-of-range rows.
+void check_ngram_profile(const NgramProfile& profile, std::uint64_t rows, std::uint64_t fingerprint,
+                         const std::filesystem::path& path);
+// The same check for the Flash-Next hash `constants`.
 void check_ngram_profile(const NgramProfile& profile, const NgramHashConstants& constants,
                          const std::filesystem::path& path);
 
