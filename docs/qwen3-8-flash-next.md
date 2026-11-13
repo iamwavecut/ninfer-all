@@ -661,7 +661,9 @@ verification window's routes share the layer's missing experts, which the CPU co
 cached ones run; a round of several requests verifies at most 64 tokens,
 [below](#mtp-with-several-requests)), unless it also carries the DFlash2 drafter, which then drafts
 on one device ([DFlash2](#dflash2-speculative-decoding)); with disk experts it decodes without
-drafts ([below](#mtp-with-several-requests)), and `--spec none` decodes without drafts. Decoding
+drafts ([below](#mtp-with-several-requests)), and `--spec none` decodes without drafts. An
+[Edge0](edge0.md#drafting) artifact also drafts with device experts when the engine serves one
+request at a time. Decoding
 requests then run rounds: the MTP block (one more sparse-attention layer with its own 512-expert
 MoE, its own final mixer and the model's head) drafts N tokens from the stack the model left at the
 request's last position (the head's argmax at each step; with `--gumbel-sampling` a sampled
