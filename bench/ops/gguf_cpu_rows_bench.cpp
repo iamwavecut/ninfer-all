@@ -7,6 +7,7 @@
 // usage: ninfer_benches ninfer_gguf_cpu_rows_bench [--formats IQ3_S,Q4_0,...] [--k 2560]
 //        [--tokens 1,2,4,8] [--threads 1,8] [--megabytes 1024] [--seconds 2]
 //        [--backend automatic|scalar|avx2]
+#include "core/qtype.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 
 #include <algorithm>

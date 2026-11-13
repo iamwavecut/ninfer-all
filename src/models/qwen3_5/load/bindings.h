@@ -1,6 +1,7 @@
 #pragma once
 
 #include "artifact/binder.h"
+#include "core/qtype.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/expert_sources.h"
 #include "models/qwen3_5/frontend/resources.h"

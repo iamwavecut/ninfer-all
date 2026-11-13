@@ -1,7 +1,7 @@
 #pragma once
 
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/pinned_memory.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/ngram_table.h"
 

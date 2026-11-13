@@ -1,6 +1,7 @@
 // The text q/k norm+rope dispatch must compute the model's own RoPE theta and RMSNorm epsilon at
 // every width. The fused Op fixes theta 1e7 and epsilon 1e-6, so a model with other constants
 // has to take the three-call route even at the fused Op's decode widths.
+#include "core/device_buffer.h"
 #include "ops/op_tester.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "ninfer/ops/rmsnorm.h"

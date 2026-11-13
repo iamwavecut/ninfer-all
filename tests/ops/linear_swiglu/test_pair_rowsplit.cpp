@@ -5,6 +5,8 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"

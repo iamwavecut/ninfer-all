@@ -1,6 +1,7 @@
 #include "ops/linear/gguf/gguf_linear.h"
 
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "ops/linear/sm70/sm70_gemm.h"
 
 #include <algorithm>

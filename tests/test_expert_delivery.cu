@@ -1,6 +1,7 @@
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/expert_delivery.h"
+#include "core/pinned_memory.h"
 #include "core/vmm.h"
 
 #include <cuda_runtime.h>

@@ -2,8 +2,8 @@
 
 // Phase allocations shared by actual execution and startup sizing.
 
-#include "core/arena.h"
 #include "core/layout.h"
+#include "core/tensor.h"
 #include "models/qwen3_5/execution/parameters.h"
 
 #include <cstdint>

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/arena.h"
 #include "core/device.h"
 
 #include <cstddef>

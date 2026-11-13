@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
+#include "core/qtype.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/linear/nvfp4/nvfp4_int8_grouped_host.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"

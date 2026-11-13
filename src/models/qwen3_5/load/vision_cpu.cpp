@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "models/qwen3_5/load/vision_cpu.h"
 
 #include <bit>

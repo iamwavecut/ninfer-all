@@ -10,7 +10,7 @@
 // the BF16 activation itself, the 8-bit activation's own error; the report prints the two routes'
 // errors side by side. Off sm_70 only: there the experts take the FP16 route, which has no IQ1_M.
 
-#include "core/arena.h"
+#include "core/device_buffer.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 
 #include <cuda_bf16.h>

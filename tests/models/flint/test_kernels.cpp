@@ -22,7 +22,7 @@
 //    and their weights untouched, a second stage's pass changing nothing) and q8_1 rows equal to
 //    ggml's quantization of the rows it leaves, F16 sums finite.
 
-#include "core/arena.h"
+#include "core/device_buffer.h"
 #include "models/flint/kernels.h"
 
 #include <cuda_bf16.h>

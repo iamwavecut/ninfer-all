@@ -1,5 +1,6 @@
 // Public HC write/read composition versus the fused public Op, and the fused Op over BF16 versus ggml
 // Q8_0 matrices, at the model's real geometry.
+#include "core/device_buffer.h"
 #include "ninfer_bench_common.h"
 #include "ninfer/ops/hyper_connection.h"
 

@@ -1,5 +1,6 @@
 #include "models/deepseek_v41/vision.h"
 
+#include "core/device_buffer.h"
 #include "core/weight_view.h"
 #include "models/deepseek_v41/vision_kernels.h"
 

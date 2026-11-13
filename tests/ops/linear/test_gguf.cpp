@@ -4,7 +4,9 @@
 // Q4_K and Q6_K run once with each vector load schedule a device profile can name.
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/host_pages.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/embedding.h"

@@ -9,10 +9,10 @@
 // replicas of what each device computes for itself (LoadOptions::tensor_split).
 
 #include "artifact/materializer.h"
-#include "core/arena.h"
 #include "core/device.h"
 #include "core/stage_plan.h"
 #include "core/startup.h"
+#include "core/tensor.h"
 #include "models/qwen3_5/auxiliary_replicas.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/model.h"

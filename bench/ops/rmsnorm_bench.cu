@@ -2,6 +2,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>

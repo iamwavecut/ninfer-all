@@ -2,6 +2,7 @@
 
 #include "ninfer/ops/candidate_selector.h"
 
+#include "core/device_buffer.h"
 #include "ninfer_bench_common.h"
 #include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
 

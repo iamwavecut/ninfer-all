@@ -9,7 +9,6 @@
 // executing device's, so the wave terms follow the card; the device profile's
 // "attn_prompt_split" switch turns splits off on a card where they measured slower.
 
-#include "core/arena.h"
 #include "core/layout.h"
 #include "core/paged_kv_page.h"
 #include "core/tensor.h"

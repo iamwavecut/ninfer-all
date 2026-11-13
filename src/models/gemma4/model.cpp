@@ -2,6 +2,7 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "core/qtype.h"
 #include "core/tensor_split.h"
 #include "models/expert_parallel.h"
 #include "models/qwen3_5/frontend/tokenizer.h"

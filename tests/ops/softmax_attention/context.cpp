@@ -1,6 +1,7 @@
 #include "ninfer/ops/softmax_attention.h"
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
 

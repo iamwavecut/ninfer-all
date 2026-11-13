@@ -6,6 +6,7 @@
 // eight columns, its integer tensor-core kernel above.
 
 #include "core/arena.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ops/linear/gguf/ggml_bridge.h"

@@ -2,6 +2,8 @@
 // GPU timings include the public Op's shared-expert computation at zero contribution weight;
 // CPU timings exclude it. Neither measurement includes routing, transfers or whole inference.
 #include "core/arena.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "ninfer/ops/moe_experts.h"
 

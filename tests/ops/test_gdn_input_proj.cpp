@@ -1,3 +1,5 @@
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "core/device.h"
 #include "core/decode_graph.h"

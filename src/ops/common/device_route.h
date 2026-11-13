@@ -14,6 +14,8 @@
 // current device, which lets the ranks of a model split over different parts (an RTX 3090 and a
 // 3090 Ti differ in SM count) each follow their own profile.
 
+#include "ops/common/device_route_lookup.h"
+
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -41,9 +43,8 @@ void install_device_route_profile(int device, std::shared_ptr<const DeviceRouteP
 void install_device_route_profile(std::shared_ptr<const DeviceRouteProfile> profile);
 [[nodiscard]] std::shared_ptr<const DeviceRouteProfile> installed_device_route_profile();
 
-// The schedule the current device's profile names for `key` at `width`; empty when there is no
-// profile, no entry for the key, or the width lies past the entry's last band.
-[[nodiscard]] std::string_view device_route_schedule(std::string_view key, std::int32_t width);
+// device_route_schedule(), the schedule the current device's profile names for a key and width, is
+// declared in ops/common/device_route_lookup.h.
 // Whether device_route_schedule() answers for `key` at `width` from a measurement: a band of the
 // current device's profile reaches the width, or a DeviceRouteForce names the key.
 [[nodiscard]] bool device_route_measured(std::string_view key, std::int32_t width);

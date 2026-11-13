@@ -3,6 +3,7 @@
 
 #include "ninfer/ops/softmax_attention.h"
 
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "ninfer_bench_common.h"
 

@@ -2,10 +2,10 @@
 
 // Host plan of the fast NVFP4 prompt kernel: whether it applies, its CTA shape and key splits.
 
-#include "core/arena.h"
 #include "core/device_launch.h"
 #include "core/layout.h"
 #include "core/paged_kv_view.h"
+#include "core/tensor.h"
 #include "ops/common/math.h"
 
 #include <cstddef>

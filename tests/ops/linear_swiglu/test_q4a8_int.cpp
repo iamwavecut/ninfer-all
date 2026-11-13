@@ -18,6 +18,7 @@
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 
+#include "core/qtype.h"
 #include "ops/op_check.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"

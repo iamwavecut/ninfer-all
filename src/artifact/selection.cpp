@@ -1,6 +1,7 @@
 #include "artifact/selection.h"
 
 #include "artifact/schema.h"
+#include "core/qtype.h"
 
 #include <algorithm>
 

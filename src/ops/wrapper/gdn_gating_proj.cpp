@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 

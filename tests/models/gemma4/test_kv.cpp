@@ -8,7 +8,7 @@
 
 #include "../../ops/kv_cache_e8_root_host.h"
 #include "../../ops/kv_cache_lloyd4_oracle.h"
-#include "core/arena.h"
+#include "core/device_buffer.h"
 #include "models/gemma4/kernels.h"
 #include "models/gemma4/kv_format.h"
 

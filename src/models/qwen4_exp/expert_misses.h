@@ -24,9 +24,10 @@
 // host experts with few pairs, the CPU computes a share meanwhile, up to kCpuMissTokens tokens
 // (stage_wide). Every missing expert with more pairs reaches device memory.
 
-#include "core/arena.h"
 #include "core/device.h"
 #include "core/expert_disk.h"
+#include "core/qtype.h"
+#include "core/tensor.h"
 #include "core/weight.h"
 #include "models/qwen4_exp/expert_cache.h"
 #include "models/qwen4_exp/expert_location.h"

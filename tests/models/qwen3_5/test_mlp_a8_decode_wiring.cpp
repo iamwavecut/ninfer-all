@@ -8,6 +8,7 @@
 // zero because that band routes to SmallTTiled -- so the shortfall was the whole allocation rather
 // than a margin.
 
+#include "core/qtype.h"
 #include "guarded_main.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "ops/common/device_tier.h"

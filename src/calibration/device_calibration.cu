@@ -3,11 +3,13 @@
 #include "calibration/route_catalog.h"
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "core/device_wait.h"
 #include "core/dtype.h"
 #include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"

@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "models/qwen3_5/load/bindings.h"
 
 namespace ninfer::models::qwen3_5::loading {

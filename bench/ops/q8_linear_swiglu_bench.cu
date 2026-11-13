@@ -4,6 +4,8 @@
 #include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
 

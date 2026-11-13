@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "core/weight_view.h"
 
 #include <algorithm>

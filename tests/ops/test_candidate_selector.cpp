@@ -2,6 +2,7 @@
 
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
+#include "core/device_buffer.h"
 
 #include <algorithm>
 #include <array>

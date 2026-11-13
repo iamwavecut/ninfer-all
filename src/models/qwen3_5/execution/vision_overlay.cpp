@@ -2,6 +2,7 @@
 
 #include "core/device_wait.h"
 #include "core/kv_loan.h"
+#include "core/pinned_memory.h"
 #include "models/qwen3_5/execution/vision.h"
 
 #include <cuda_runtime.h>

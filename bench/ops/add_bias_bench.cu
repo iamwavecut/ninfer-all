@@ -1,3 +1,4 @@
+#include "core/device_buffer.h"
 #include "ninfer/ops/add_bias.h"
 #include "ninfer_bench_common.h"
 #include "ops/common/bf16_vector.cuh"

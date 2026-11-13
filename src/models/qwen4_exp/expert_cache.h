@@ -21,9 +21,9 @@
 // back (reclaim), keeping the most routed of the experts they held in colder slots of the cache's
 // own, and the next decode pass returns them empty (give_back), to fill as decode routes.
 
-#include "core/arena.h"
 #include "core/device.h"
 #include "core/expert_tier.h"
+#include "core/pinned_memory.h"
 #include "core/weight.h"
 
 #include <array>

@@ -1,5 +1,7 @@
 // Cold-cache benchmark for the complete DFlash2 five-layer context state transition.
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ninfer/ops/context_kv_materialize.h"
 

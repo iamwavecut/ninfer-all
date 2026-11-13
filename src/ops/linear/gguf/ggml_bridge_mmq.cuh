@@ -3,9 +3,9 @@
 // Host side of ggml's integer tensor-core matrix kernel (mmq.cuh launch_mul_mat_q), without ggml's
 // backend context: the caller owns the activation, the FP32 output and the stream-k fixup plane.
 
-#include "ggml_bridge_internal.cuh"
+#include "ggml_bridge_mmq_launch.cuh"
 #include "mmq_limits.h"
-#include "../../common/device_route.h"
+#include "../../common/device_route_lookup.h"
 
 #include <climits>
 #include <mutex>

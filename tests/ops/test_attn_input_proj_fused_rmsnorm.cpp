@@ -1,5 +1,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"

@@ -8,7 +8,7 @@
 // of the unrounded inputs, at query counts inside one tile, across tile boundaries and past one
 // stream-k wave, and each launch is repeated and held to the first one's bits.
 
-#include "core/arena.h"
+#include "core/device_buffer.h"
 #include "ops/linear/gguf/ggml_fattn.h"
 
 #include <cuda_fp16.h>

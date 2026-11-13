@@ -1,3 +1,4 @@
+#include "core/device_buffer.h"
 #include "ninfer/ops/steer_residual.h"
 #include "ops/op_tester.h"
 

@@ -14,6 +14,7 @@
 #include "core/paged_kv_view.h"
 #include "core/startup.h"
 #include "core/tensor_parallel.h"
+#include "core/wddm_budget.h"
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/expert_runtime.h"

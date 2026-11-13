@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/pinned_memory.h"
 #include "cuda_availability.h"
 #include "models/qwen3_5/state/state_image.h"
 

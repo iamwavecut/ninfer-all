@@ -1,6 +1,7 @@
 #include "core/evictable_weight_pool.h"
 
 #include "core/device_wait.h"
+#include "core/pinned_memory.h"
 #include "core/vmm.h"
 
 #include <algorithm>

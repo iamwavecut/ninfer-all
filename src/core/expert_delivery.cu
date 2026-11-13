@@ -1,16 +1,17 @@
 #include "core/expert_delivery.h"
 
-#include "core/arena.h"
 #include "core/cpu_spin_pool.h"
 #include "core/cuda_host_handshake.h"
 #include "core/cuda_host_handshake.cuh"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/device_wait.h"
 #include "core/expert_direct.h"
 #include "core/expert_mirror.h"
 #include "core/expert_split.h"
 #include "core/file_read_queue.h"
 #include "core/growable_region.h"
+#include "core/pinned_memory.h"
 #include "core/vmm.h"
 
 #include <algorithm>

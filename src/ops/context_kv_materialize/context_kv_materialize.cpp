@@ -2,6 +2,7 @@
 #include "ninfer/ops/context_kv_materialize.h"
 
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "ops/context_kv_materialize/launch.h"
 #include "ops/kv_cache/d256_profile.h"
 

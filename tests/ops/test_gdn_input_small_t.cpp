@@ -4,6 +4,7 @@
 // element is checked, starting from a sentinel so an unwritten one fails; tolerance is one bf16
 // rounding step (tests/ops/small_t_oracle.h).
 
+#include "core/qtype.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"

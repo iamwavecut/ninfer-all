@@ -3,6 +3,7 @@
 
 #include "core/device_launch.h"
 #include "core/expert_delivery.h"
+#include "core/qtype.h"
 #include "ops/sparse_moe/streamed.h"
 #include "ops/common/device_multiprocessors.h"
 #include "ops/common/math.cuh"

@@ -6,6 +6,8 @@
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/hyper_connection.h"
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ops/op_tester.h"
 

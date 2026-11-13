@@ -23,6 +23,8 @@
 
 #include "ninfer/ops/linear_add.h"
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
 #include "ops/linear_add/q8/q8_linear_add_plan.h"

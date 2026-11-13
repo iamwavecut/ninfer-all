@@ -1,5 +1,6 @@
 #include "ninfer/ops/gated_delta_net.h"
 
+#include "core/device_buffer.h"
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
 

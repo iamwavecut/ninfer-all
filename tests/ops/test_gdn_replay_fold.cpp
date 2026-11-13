@@ -3,11 +3,13 @@
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/gdn_replay.h"
 
+#include "core/device_buffer.h"
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
+#include "core/qtype.h"
 #include <cstring>
 #include "ops/input_projection_test_common.h"
 #include "ops/op_tester.h"

@@ -1,5 +1,7 @@
 // Native Flash-Next experts against independently decoded stored words and complete FP64 math.
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "ninfer/ops/moe_experts.h"
 #include "ops/op_tester.h"
 

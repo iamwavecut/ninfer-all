@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 

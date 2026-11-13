@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <algorithm>

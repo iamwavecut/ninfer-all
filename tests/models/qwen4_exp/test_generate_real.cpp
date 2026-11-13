@@ -36,6 +36,7 @@
 //                                      the devices have free)
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen4_exp/executor.h"
 #include "models/qwen4_exp/model.h"

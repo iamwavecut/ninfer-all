@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "ops/linear/linear_test_common.h"
 
 #include <exception>

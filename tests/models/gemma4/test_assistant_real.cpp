@@ -15,6 +15,7 @@
 
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/pinned_memory.h"
 #include "models/gemma4/executor.h"
 #include "models/gemma4/model.h"
 

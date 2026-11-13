@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "models/qwen3_5/expert_layout.h"
 #include "models/qwen3_5/expert_admission.h"
 

@@ -2,6 +2,7 @@
 
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
+#include "core/qtype.h"
 
 #include <optional>
 #include <span>

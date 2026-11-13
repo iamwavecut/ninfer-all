@@ -12,7 +12,6 @@
 // drafter's taps of the rows it computes, the rows a sequence keeps go into the drafter's context
 // ring (a lane per sequence and one per checkpoint), and draft() proposes.
 
-#include "core/arena.h"
 #include "core/device.h"
 #include "core/expert_disk.h"
 #include "core/tensor.h"

@@ -2,6 +2,7 @@
 
 #include "core/cpu_spin_pool.h"
 #include "core/expert_split.h"
+#include "core/qtype.h"
 #include "models/flint/kernels.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"

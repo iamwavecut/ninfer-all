@@ -1,6 +1,7 @@
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/rotation.h"
 
+#include "core/qtype.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 

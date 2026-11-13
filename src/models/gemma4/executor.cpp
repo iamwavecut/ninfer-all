@@ -1,9 +1,12 @@
 #include "models/gemma4/executor.h"
 
 #include "core/decode_graph.h"
+#include "core/device_buffer.h"
 #include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
+#include "core/pinned_memory.h"
+#include "core/qtype.h"
 #include "core/tensor_parallel.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"

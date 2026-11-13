@@ -1,5 +1,6 @@
 #include "ninfer/ops/rmsnorm_rope.h"
 #include "core/decode_graph.h"
+#include "core/device_buffer.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ops/op_tester.h"

@@ -1,5 +1,6 @@
 // Exact small-T qualification benchmark for offset_i32_positions.
 #include "ninfer/ops/position.h"
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "ninfer_bench_common.h"
 #include "ops/launcher/position.h"

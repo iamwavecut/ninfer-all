@@ -402,15 +402,33 @@ than `engine.h` includes `ninfer/types.h`, when a `.cu` under `src/` reaches `en
 disagree; CI runs it.
 
 Kernel units do not reach the host API headers either. `src/core/device.h` (device contexts,
-streams, events), `include/ninfer/ops/linear.h`, `include/ninfer/ops/softmax_attention.h` and
-`src/core/paged_kv_cache.h` change often and most host code includes them; the types a kernel
-launch needs are in `src/core/device_launch.h` (`CUDA_CHECK`, the shared memory limit, launch
-facts), `include/ninfer/ops/linear_policy.h`, `include/ninfer/ops/softmax_attention_envelope.h` and
-`src/core/paged_kv_view.h`, which the heavy headers include. A change to the host API then
-recompiles host code, not the kernels: a heavy attention unit costs 66-75 minutes of one compiler
-on a hosted Linux runner. The check fails when a `.cu` under `src/ops/` reaches one of the four
-heavy headers, unless `HOST_API_UNITS` in the script lists it as a unit that implements or calls
-that API and includes the header itself.
+streams, events), `include/ninfer/ops/linear.h`, `include/ninfer/ops/softmax_attention.h`,
+`src/core/paged_kv_cache.h` and `src/ops/common/device_route.h` (device route profiles) change
+often and most host code includes them; the types a kernel launch needs are in
+`src/core/device_launch.h` (`CUDA_CHECK`, the shared memory limit, launch facts),
+`include/ninfer/ops/linear_policy.h`, `include/ninfer/ops/softmax_attention_envelope.h` and
+`src/core/paged_kv_view.h`, which the heavy headers include, and a launch that consults the device
+profile includes `src/ops/common/device_route_lookup.h`. A change to the host API then recompiles
+host code, not the kernels: a heavy attention unit costs 66-75 minutes of one compiler on a hosted
+Linux runner. The check fails when a `.cu` under `src/ops/` reaches one of the five heavy headers,
+unless `HOST_API_UNITS` in the script lists it as a unit that implements or calls that API and
+includes the header itself.
+
+Headers that many kernels read keep apart what changes for other code:
+
+| Header | Holds | Kept out, and where it is |
+|---|---|---|
+| `src/core/weight.h` | `Weight`, `QuantLayout`, an opaque `QType` | the stored formats and ggml block shapes: `src/core/qtype.h` |
+| `src/core/arena.h` | `DeviceArena` (`WorkspaceArena`), `DeviceSpan` | `DeviceBuffer` (`device_buffer.h`), pinned host memory (`pinned_memory.h`), the WDDM budget switch (`wddm_budget.h`) |
+| `src/ops/linear/gguf/ggml_bridge_args.h` | epilogues, `MoeRouting`, the decode-call arguments, an opaque `GgmlType` | the bridge's entry points and block type values: `ggml_bridge.h` |
+
+A new storage format then recompiles the code that names formats, not every kernel that reads a
+`Weight`, and a new GGUF entry point or block type compiles the bridge's dispatch, not its 40
+kernel units; the check fails when one of those units (`ggml_vec_*.cu`, `ggml_mmq_*.cu`,
+`ggml_fattn.cu`) reaches `ggml_bridge.h`. The bridge's internals keep the vector kernel's launches
+(`ggml_bridge_vec_launch.cuh`) apart from the matrix kernel's (`ggml_bridge_mmq_launch.cuh`), so an
+edit of one family's launches compiles that family's 20 or 19 units and the dispatch, and the check
+fails when a unit of one family reaches the other's.
 
 The causal-cache attention (`src/ops/softmax_attention/dense/causal_cache`) keeps its routing and
 its kernels apart (see "CUDA compilation boundaries"). The check fails when a host launcher there

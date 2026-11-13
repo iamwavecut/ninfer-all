@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/expert_sources.h"
 

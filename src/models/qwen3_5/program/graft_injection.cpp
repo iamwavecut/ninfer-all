@@ -2,8 +2,9 @@
 #include "models/qwen3_5/program/program_impl.h"
 
 #include "ninfer/ops/kv_cache_append.h"
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/pinned_memory.h"
 #include "core/tensor.h"
 
 #include <cstring>

@@ -1,4 +1,5 @@
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"

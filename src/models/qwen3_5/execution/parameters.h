@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/qtype.h"
 #include "models/qwen3_5/model.h"
 #include "ninfer/ops/weight_input.h"
 

@@ -3,6 +3,7 @@
 #include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "artifact/fixture.h"
+#include "core/qtype.h"
 #include "core/weight_view.h"
 
 #include <algorithm>

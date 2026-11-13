@@ -4,6 +4,7 @@
 
 #include "core/device_launch.h"
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/part_projection.h"

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/qtype.h"
 #include "core/weight.h"
 
 #include <array>

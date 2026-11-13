@@ -4,6 +4,7 @@
 #include "models/qwen3_5/execution/rotation.h"
 
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"

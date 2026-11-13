@@ -9,6 +9,7 @@
 // changes a bit of the layer's output.
 
 #include "core/expert_delivery.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 

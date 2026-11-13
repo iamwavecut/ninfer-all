@@ -1,6 +1,8 @@
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/host_kv_arena.h"
 #include "core/paged_kv_cache.h"
+#include "core/pinned_memory.h"
 #include "cuda_availability.h"
 
 #include <cuda_runtime.h>

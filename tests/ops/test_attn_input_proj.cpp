@@ -4,6 +4,8 @@
 
 #include "core/device.h"
 #include "core/decode_graph.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
 #include "ops/linear/sm70/sm70_project.h"

@@ -8,16 +8,21 @@
   they need from the small headers (ninfer/base.h, ninfer/model_enums.h,
   ninfer/kv_cache_storage.h, ninfer/startup.h).
 - CUDA translation units under src/ops/ do not reach the host API headers core/device.h,
-  ninfer/ops/linear.h, ninfer/ops/softmax_attention.h and core/paged_kv_cache.h, which most host
-  code includes and changes often. Kernels take their launch types from core/device_launch.h,
-  ninfer/ops/linear_policy.h, ninfer/ops/softmax_attention_envelope.h and core/paged_kv_view.h. A
-  unit that implements or calls the host API includes that header itself and is listed in
-  HOST_API_UNITS.
+  ninfer/ops/linear.h, ninfer/ops/softmax_attention.h, core/paged_kv_cache.h and
+  ops/common/device_route.h, which most host code includes and changes often. Kernels take their
+  launch types from core/device_launch.h, ninfer/ops/linear_policy.h,
+  ninfer/ops/softmax_attention_envelope.h and core/paged_kv_view.h, and a route lookup from
+  ops/common/device_route_lookup.h. A unit that implements or calls the host API includes that
+  header itself and is listed in HOST_API_UNITS.
 - The host launchers of the causal-cache attention (causal_cache/**/*.cpp) reach no kernel header
   other than geometry.cuh, and the kernel units' headers (causal_cache/**/*_launch.cuh, which the
   generated units of kernel_unit.cu.in include) and the reducers and merges there (*_reduce.cu,
   *_merge.cu) reach none of the launchers' routing headers. An edit of a kernel then recompiles
   only its own units, and an edit of the routing compiles no kernel.
+- The GGUF bridge's kernel units (ggml_vec_*.cu, ggml_mmq_*.cu, ggml_fattn.cu) reach its types
+  (ggml_bridge_args.h) but not its entry points (ggml_bridge.h), so a new entry point or a new
+  block type's value compiles none of them; the vector units reach no matrix launch
+  (ggml_bridge_mmq_launch.cuh), the matrix units no vector launch (ggml_bridge_vec_launch.cuh).
 - ninfer/types_fwd.h declares every struct, class and enum the headers listed in ninfer/types.h
   define, with the same keyword, and nothing else.
 
@@ -49,11 +54,18 @@ HOST_API = (
     'include/ninfer/ops/linear.h',
     'include/ninfer/ops/softmax_attention.h',
     'src/core/paged_kv_cache.h',
+    'src/ops/common/device_route.h',
 )
 HOST_API_UNITS = {
+    'src/ops/linear/t2/t2_a8.cu': {'src/ops/common/device_route.h'},  # reads the installed profile
+    'src/ops/linear_add/q4/q4_linear_add.cu': {'src/ops/common/device_route.h'},  # routed_candidate
     'src/ops/linear_topk/t2.cu': {'include/ninfer/ops/linear.h'},  # calls ops::linear
     'src/ops/softmax_attention/dense/causal_cache/merge.cu': {'include/ninfer/ops/softmax_attention.h'},
 }
+GGUF = 'src/ops/linear/gguf'
+GGUF_ENTRY_POINTS = f'{GGUF}/ggml_bridge.h'
+GGUF_VECTOR_LAUNCHES = f'{GGUF}/ggml_bridge_vec_launch.cuh'
+GGUF_MATRIX_LAUNCHES = f'{GGUF}/ggml_bridge_mmq_launch.cuh'
 CAUSAL_CACHE = 'src/ops/softmax_attention/dense/causal_cache'
 CAUSAL_CACHE_HOST_KERNEL_HEADERS = {f'{CAUSAL_CACHE}/geometry.cuh'}
 CAUSAL_CACHE_ROUTING = {
@@ -172,6 +184,18 @@ def main():
             if chain:
                 failures.append(f'{source} reaches routing header {chain[-1]}: '
                                 + ' -> '.join(chain))
+    for name in sorted(os.listdir(os.path.join(ROOT, GGUF))):
+        forbidden = {GGUF_ENTRY_POINTS, GGUF_VECTOR_LAUNCHES, GGUF_MATRIX_LAUNCHES}
+        if name.startswith('ggml_vec_'):
+            forbidden.discard(GGUF_VECTOR_LAUNCHES)
+        elif name.startswith('ggml_mmq_'):
+            forbidden.discard(GGUF_MATRIX_LAUNCHES)
+        elif name != 'ggml_fattn.cu':
+            continue
+        source = f'{GGUF}/{name}'
+        chain = chain_to(source, forbidden, memo, cache)
+        if chain:
+            failures.append(f'{source} reaches {chain[-1]}: ' + ' -> '.join(chain))
     for source, headers in sorted(HOST_API_UNITS.items()):
         for header in sorted(headers - set(includes(source, memo, cache))):
             failures.append(f'{source} no longer includes {header}; remove it from HOST_API_UNITS')

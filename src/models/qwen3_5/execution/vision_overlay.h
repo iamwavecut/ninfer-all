@@ -10,6 +10,7 @@
 #include "core/evictable_kv_pool.h"
 #include "core/evictable_weight_pool.h"
 #include "core/paged_kv_cache.h"
+#include "core/pinned_memory.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/vision_control.h"

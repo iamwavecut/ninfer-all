@@ -1,5 +1,6 @@
 #include "models/divided_head.h"
 
+#include "core/device_buffer.h"
 #include "core/device_wait.h"
 #include "core/tensor_split.h"
 

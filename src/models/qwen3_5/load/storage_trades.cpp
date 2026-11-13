@@ -1,6 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
 #include "artifact/permute_row_split.h"
+#include "core/qtype.h"
 
 #include <span>
 #include <stdexcept>

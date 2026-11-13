@@ -11,8 +11,10 @@
 // calls followed by kv_stream_evict, and single steps replayed from a captured graph whose
 // position, inputs and selections change between replays.
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "core/paged_kv_storage.h"
+#include "core/pinned_memory.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/kv_stream.h"
 #include "ninfer/ops/sparse_attention.h"

@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ops/linear/common/route_table.h"
 #include "ops/linear/linear_test_common.h"

@@ -10,6 +10,7 @@
 // order, so no split of a call's misses changes a bit of the block's output.
 
 #include "core/expert_delivery.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 

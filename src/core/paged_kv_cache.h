@@ -5,6 +5,7 @@
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
 #include "core/paged_kv_view.h"
+#include "core/pinned_memory.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime_api.h>

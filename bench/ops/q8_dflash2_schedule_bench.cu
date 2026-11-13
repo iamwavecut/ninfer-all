@@ -12,6 +12,8 @@
 // a table of per-T specialisations. Outside that they throw std::invalid_argument, which the
 // sweep driver catches and prints as n/a -- but declaring max_cols keeps the table readable.
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels.h"

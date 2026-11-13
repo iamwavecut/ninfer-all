@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 #include "core/device_launch.h"

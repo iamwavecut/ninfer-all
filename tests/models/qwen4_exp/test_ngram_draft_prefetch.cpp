@@ -4,6 +4,7 @@
 #include "models/qwen4_exp/ngram_draft_prefetch.h"
 
 #include "core/decode_graph.h"
+#include "core/device_buffer.h"
 #include "cuda_availability.h"
 
 #include <array>

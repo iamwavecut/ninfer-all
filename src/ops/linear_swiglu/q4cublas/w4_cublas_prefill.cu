@@ -1,6 +1,7 @@
 #include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "core/weight_view.h"
 
 #include <cublas_v2.h>

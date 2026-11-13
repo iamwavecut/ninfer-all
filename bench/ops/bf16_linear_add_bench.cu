@@ -3,6 +3,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_add.h"
 
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "direct_bf16_weight.cuh"
 #include "ninfer_bench_common.h"

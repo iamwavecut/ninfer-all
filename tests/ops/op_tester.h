@@ -15,6 +15,7 @@
 //                                op_bf16_criterion());
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/tensor.h" // ninfer::DType, ninfer::Tensor (for op call sites)
 #include "cuda_availability.h"
 #include "ops/common/device_tier.h"

@@ -34,7 +34,7 @@
 // stream. The first is the weight loader's sequence: zero a placement, then copy the loaded bytes
 // into it on a transfer stream.
 
-#include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "core/device_wait.h"
 

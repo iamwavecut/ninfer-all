@@ -9,6 +9,8 @@
 
 #include "ninfer/ops/linear_add.h"
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "quantized_weight.cuh"

@@ -6,6 +6,7 @@
 // Every contract runs on BF16 logits, then on FP32 logits holding the same
 // values.  The test never reproduces the device RNG algorithm or uses another
 // production path as a golden.
+#include "core/device_buffer.h"
 #include "ninfer/ops/sampling.h"
 #include "ops/op_tester.h"
 

@@ -4,6 +4,7 @@
 //   ./ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5
 //   ./ninfer_sampling_select_bench --dflash2 --drafts 15 --batch 8 --mode stochastic --extent 15
 //   ./ninfer_sampling_select_bench --matrix
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"

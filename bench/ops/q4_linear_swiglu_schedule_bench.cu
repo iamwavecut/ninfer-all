@@ -14,7 +14,9 @@
 // before. Every schedule now goes through q4_linear_swiglu_execute_schedule instead, the real
 // dispatch minus its plan-matches-problem check, so the bench times the Op rather than a replica.
 
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "ninfer_bench_common.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"

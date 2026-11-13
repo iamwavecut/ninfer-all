@@ -20,7 +20,6 @@
 // the drafter's window) then loses earlier positions, which lowers the drafts' acceptance and
 // leaves the output exact.
 
-#include "core/arena.h"
 #include "core/device.h"
 #include "core/expert_disk.h"
 #include "core/tensor.h"

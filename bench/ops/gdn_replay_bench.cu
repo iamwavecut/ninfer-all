@@ -7,6 +7,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_replay.h"
 
+#include "core/device_buffer.h"
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"

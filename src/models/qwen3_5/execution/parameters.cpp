@@ -1,5 +1,6 @@
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/rotation.h"
+#include "core/qtype.h"
 
 #include "core/weight_view.h"
 

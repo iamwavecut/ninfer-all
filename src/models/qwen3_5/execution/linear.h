@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/qtype.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/rotation.h"
 #include "ninfer/ops/linear.h"

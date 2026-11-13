@@ -3,6 +3,7 @@
 // prints is informational only -- the gate is ncu sustained DRAM %% (see
 // docs/op-development.md §8).
 //   ./ninfer_silu_mul_bench --tokens 1,2,3,4,5,6,48
+#include "core/device_buffer.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer_bench_common.h"
 

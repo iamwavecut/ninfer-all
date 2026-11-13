@@ -2,6 +2,7 @@
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 
 #include "core/layout.h"
+#include "core/qtype.h"
 
 #include <stdexcept>
 

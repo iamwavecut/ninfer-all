@@ -1,3 +1,5 @@
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ops/linear_add/linear_add_test_common.h"
 

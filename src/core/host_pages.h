@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/arena.h"
+#include "core/pinned_memory.h"
 
 #include <cstddef>
 #include <memory>

@@ -9,9 +9,9 @@
 // The decoders follow ggml-quants.c's dequantize_row_* exactly, with float slice factors where
 // llama.cpp's vector kernels round integer scales (the 2- and 3-bit i-quants).
 
-#include "ggml_bridge_internal.cuh"
+#include "ggml_bridge_vec_launch.cuh"
 #include "../../common/fixed_point.cuh"
-#include "../../common/device_route.h"
+#include "../../common/device_route_lookup.h"
 
 #include <algorithm>
 #include <type_traits>

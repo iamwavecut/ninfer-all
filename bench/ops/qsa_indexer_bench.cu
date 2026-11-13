@@ -1,4 +1,5 @@
 // Complete public indexer selection, including query preparation and top-512 selection.
+#include "core/device_buffer.h"
 #include "ninfer_bench_common.h"
 #include "ninfer/ops/qsa_indexer.h"
 

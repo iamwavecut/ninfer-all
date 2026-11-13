@@ -5,6 +5,7 @@
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
+#include "core/qtype.h"
 #include "core/weight_view.h"
 
 #include <cstdint>

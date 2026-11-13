@@ -1,7 +1,7 @@
 #pragma once
 
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/stage_link.h"
 
 #include <cuda_runtime.h>

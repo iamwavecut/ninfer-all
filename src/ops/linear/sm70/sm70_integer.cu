@@ -2,6 +2,7 @@
 
 #include "core/device_launch.h"
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "core/weight_view.h"
 #include "ops/common/device_multiprocessors.h"
 #include "ops/common/math.cuh"

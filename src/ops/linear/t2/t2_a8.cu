@@ -10,6 +10,7 @@
 #include "ops/linear/t2/t2_a8.h"
 
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "ops/common/device_route.h"
 #include "ops/common/rowsplit_a8_mma.cuh"
 #include "ops/linear/t2/t2_prefill_i8.cuh"

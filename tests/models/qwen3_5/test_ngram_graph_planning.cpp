@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/qtype.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"

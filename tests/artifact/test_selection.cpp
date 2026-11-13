@@ -6,6 +6,7 @@
 #include "artifact/selection.h"
 
 #include "artifact/schema.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "core/weight_view.h"
 

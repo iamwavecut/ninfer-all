@@ -1,3 +1,4 @@
+#include "core/device_buffer.h"
 #include "core/weight.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 

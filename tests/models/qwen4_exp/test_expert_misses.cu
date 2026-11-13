@@ -19,8 +19,11 @@
 
 #include "models/qwen4_exp/expert_misses.h"
 
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/pinned_memory.h"
+#include "core/qtype.h"
+#include "core/tensor.h"
 
 #include "cuda_availability.h"
 

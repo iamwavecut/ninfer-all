@@ -1,5 +1,6 @@
 #include "ops/linear_add/linear_add_test_common.h"
 
+#include "core/qtype.h"
 #include "ninfer/ops/linear_add.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"

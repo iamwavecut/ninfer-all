@@ -45,7 +45,8 @@
 // and by at most one or two steps of the format there. Values that pass through without arithmetic
 // before an exact rounding must match exactly.
 
-#include "core/arena.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "models/deepseek_v41/cpu_experts.h"
 #include "models/deepseek_v41/engram.h"

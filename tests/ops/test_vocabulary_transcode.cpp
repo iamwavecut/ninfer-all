@@ -10,6 +10,7 @@
 //    oracle over the independently decoded weights on sampled rows.
 
 #include "artifact/transcode.h"
+#include "core/qtype.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
 #include "ops/op_check.h"

@@ -3,6 +3,7 @@
 // [7168,5120] Q5 into gate and v. Every output element is checked, starting from a sentinel so an
 // unwritten one fails; tolerance is one bf16 rounding step (tests/ops/small_t_oracle.h).
 
+#include "core/qtype.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"

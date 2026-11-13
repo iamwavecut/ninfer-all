@@ -4,7 +4,9 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/residual_add.h"
 
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"

@@ -5,6 +5,8 @@
 #include "artifact/transcode.h"
 #include "artifact/reader.h"
 #include "core/device_wait.h"
+#include "core/pinned_memory.h"
+#include "core/qtype.h"
 #include "core/startup.h"
 #include "core/vmm.h"
 

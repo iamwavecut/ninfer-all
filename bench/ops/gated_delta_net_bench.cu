@@ -10,6 +10,7 @@
 //
 // Every measurement is a cold-L2 CUDA Graph replay. The 256 MiB flush happens before, and outside,
 // each timed replay.
+#include "core/device_buffer.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/l2norm.h"
 #include "ninfer_bench_common.h"

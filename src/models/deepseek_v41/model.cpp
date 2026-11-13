@@ -2,6 +2,7 @@
 
 #include "artifact/binder.h"
 #include "artifact/reader.h"
+#include "core/qtype.h"
 #include "models/deepseek_v41/dspark_ranking.h"
 #include "models/deepseek_v41/engram.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
