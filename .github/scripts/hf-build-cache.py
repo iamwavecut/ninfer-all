@@ -12,6 +12,8 @@ import tempfile
 import time
 import threading
 
+import hf_client
+
 BUCKET = 'WaveCut/ninfer-cache'
 ROOT = 'github-actions/v2/iamwavecut/ninfer-all'
 # Retention owns both areas; archive-linux-artifact.py writes the second one.
@@ -348,22 +350,34 @@ def head_merged_branch():
     return merged_branch(result.stdout, os.environ.get('GITHUB_REPOSITORY', ''))
 
 
+def ci_target_ref():
+    """The branch a CI run writes for: its pull request's head branch, or the pushed branch."""
+    event, ref = os.environ.get('GITHUB_EVENT_NAME'), os.environ.get('GITHUB_REF', '')
+    if event == 'pull_request':
+        head = os.environ.get('GITHUB_HEAD_REF', '')
+        return f'refs/heads/{head}' if head else None
+    if event == 'push' and (ref == MASTER or ref.startswith('refs/heads/ci/')):
+        return ref
+    return None
+
+
 def require_cache_writer(family, ref):
-    """Reject writes from PRs, other jobs and retired recovery workflows.
+    """Reject writes from other jobs, other branches and retired recovery workflows.
 
     Native release and the Linux bootstrap write the native families. CI writes only its own family,
-    only from a push to master, whose code has been merged."""
+    for the branch it builds: master, a ci/ branch, or a pull request's head branch. A pull request
+    from a fork receives no bucket credential."""
     workflow = os.environ.get('GITHUB_WORKFLOW_REF', '').split('@')[0]
     if workflow == 'iamwavecut/ninfer-all/.github/workflows/ci.yml':
-        if (os.environ.get('GITHUB_EVENT_NAME') != 'push' or ref != MASTER or
-                os.environ.get('GITHUB_JOB') != 'cuda' or not family.startswith('ci-linux-cuda-') or
+        if (ref != ci_target_ref() or os.environ.get('GITHUB_JOB') != 'cuda' or
+                not family.startswith('ci-linux-cuda-') or
                 not os.environ.get('GITHUB_RUN_ID', '').isdecimal()):
-            raise ValueError('CI may save only its own family from a push to master')
+            raise ValueError("CI may save only its own family for the branch it builds")
         return
     bootstrap = workflow == 'iamwavecut/ninfer-all/.github/workflows/linux-cache-bootstrap.yml'
     if ((workflow != 'iamwavecut/ninfer-all/.github/workflows/native-release.yml' and not bootstrap) or
             os.environ.get('GITHUB_EVENT_NAME') not in ('push', 'workflow_dispatch') or
-            not ref.startswith('refs/heads/') or
+            not ref.startswith('refs/heads/') or ref != os.environ.get('GITHUB_REF') or
             not os.environ.get('GITHUB_RUN_ID', '').isdecimal()):
         raise ValueError('Only a native artifact build may save shared caches')
     job = os.environ.get('GITHUB_JOB')
@@ -391,6 +405,8 @@ def main():
         command.add_argument('--directory', type=Path, required=True)
         command.add_argument('--family', required=True)
     writer.add_argument('--verify-upload', action='store_true')
+    writer.add_argument('--target-ref', default=os.environ.get('HF_CACHE_TARGET_REF') or None,
+                        help="Branch whose snapshot to write; defaults to the run's own ref")
     writer.add_argument('--exclude-baseline', type=Path, default=os.environ.get('HF_CACHE_BASELINE') or None,
                         help='Leave out the files a restore recorded and the build did not change')
     reader.add_argument('--fallback-family', action='append', default=[])
@@ -417,7 +433,11 @@ def main():
             raise ValueError('Live refs must be branches')
     else:
         args.directory = args.directory.expanduser()
-        ref = args.source_ref if args.action == 'restore' and args.source_ref else os.environ['GITHUB_REF']
+        ref = os.environ['GITHUB_REF']
+        if args.action == 'restore' and args.source_ref:
+            ref = args.source_ref
+        elif args.action == 'save' and args.target_ref:
+            ref = args.target_ref
     if args.action == 'save':
         require_cache_writer(args.family, ref)
     elif args.action == 'restore':
@@ -427,8 +447,7 @@ def main():
     try:
         if not os.environ.get('HF_TOKEN'):
             raise ValueError('HF cache credential is not configured')
-        from huggingface_hub import HfApi
-        api = HfApi()
+        api = hf_client.open_api()
         if api.bucket_info(BUCKET).private is not True:
             raise ValueError('Build cache bucket must be private')
         if args.action == 'save':
@@ -455,6 +474,7 @@ def heartbeat(done):
 
 
 if __name__ == '__main__':
+    hf_client.throttle_progress()
     done = threading.Event()
     threading.Thread(target=heartbeat, args=(done,), daemon=True).start()
     try:

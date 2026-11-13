@@ -28,14 +28,14 @@ on:
 permissions:
   contents: read
 
-# Runs of one branch queue: a newer commit waits for the running build, and GitHub drops the
-# commit that waited before it. A cancelled build would lose every object it had started; a run
-# whose revision is no longer the branch head finishes its objects for the next run and skips
-# packaging (the *-current jobs). Past its objects, cancel-master-builds.py cancels it on master.
+# A newer commit cancels the running build of its branch: building a superseded revision wastes
+# runners. The cancelled object jobs save what they compiled (and their periodic checkpoints keep
+# the rest), so the newer run starts from those objects; only units in flight compile again.
+# Master compares with the published release, so a cancelled build hides no source change.
 # Publication uses a draft and checks master again before moving latest.
 concurrency:
   group: native-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   changes:
@@ -140,32 +140,10 @@ jobs:
     secrets:
       HF_BUILD_CACHE_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
 
-  windows-current:
-    name: Windows revision still current
-    needs: [validate, windows-objects]
-    if: ${{ always() && !cancelled() && needs.validate.result == 'success' && inputs.platforms != 'linux' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      superseded: ${{ steps.head.outputs.superseded }}
-    steps:
-      - id: head
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/${GITHUB_REF#refs/heads/}" --jq .object.sha)"
-          if [[ "$head" == "$GITHUB_SHA" ]]; then
-            echo superseded=false >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::$GITHUB_REF moved to $head; its own run packages it."
-            echo superseded=true >> "$GITHUB_OUTPUT"
-          fi
-
   windows:
-    needs: [validate, windows-objects, windows-current]
+    needs: [validate, windows-objects]
     if: >-
-      ${{ always() && !cancelled() && needs.validate.result == 'success' &&
-          inputs.platforms != 'linux' && needs.windows-current.outputs.superseded == 'false' &&
+      ${{ always() && !cancelled() && needs.validate.result == 'success' && inputs.platforms != 'linux' &&
           (needs.windows-objects.result == 'success' ||
            (inputs.windows_phase == 'package' && needs.windows-objects.result == 'skipped')) }}
     strategy:
@@ -212,32 +190,10 @@ jobs:
       version: ${{ needs.validate.outputs.version }}
     secrets: inherit
 
-  linux-current:
-    name: Linux revision still current
-    needs: [validate, linux-objects]
-    if: ${{ always() && !cancelled() && needs.validate.result == 'success' && inputs.platforms != 'windows' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      superseded: ${{ steps.head.outputs.superseded }}
-    steps:
-      - id: head
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/${GITHUB_REF#refs/heads/}" --jq .object.sha)"
-          if [[ "$head" == "$GITHUB_SHA" ]]; then
-            echo superseded=false >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::$GITHUB_REF moved to $head; its own run packages it."
-            echo superseded=true >> "$GITHUB_OUTPUT"
-          fi
-
   linux:
-    needs: [validate, linux-objects, linux-current]
+    needs: [validate, linux-objects]
     if: >-
-      ${{ always() && !cancelled() && needs.validate.result == 'success' &&
-          inputs.platforms != 'windows' && needs.linux-current.outputs.superseded == 'false' &&
+      ${{ always() && !cancelled() && needs.validate.result == 'success' && inputs.platforms != 'windows' &&
           (needs.linux-objects.result == 'success' ||
            (needs.validate.outputs.linux_runner == 'ninfer-native-debian13' && needs.linux-objects.result == 'skipped')) }}
     strategy:
@@ -293,6 +249,8 @@ jobs:
           python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0
           python3.11 .github/scripts/archive-linux-artifact.py
       - uses: actions/upload-artifact@v7
+        env:
+          NODE_OPTIONS: --require ./.github/scripts/quiet-upload-progress.cjs
         with:
           name: native-linux-universal
           path: |
@@ -303,6 +261,8 @@ jobs:
           compression-level: 0
           retention-days: 7
       - uses: actions/upload-artifact@v7
+        env:
+          NODE_OPTIONS: --require ./.github/scripts/quiet-upload-progress.cjs
         if: always()
         with:
           name: universal-linux-logs
@@ -336,6 +296,8 @@ jobs:
           --log universal-package.log -- python3.11 scripts/assemble-universal-release.py
           --input native-input --output dist --platform windows-x64 --revision "${{ github.sha }}"
       - uses: actions/upload-artifact@v7
+        env:
+          NODE_OPTIONS: --require ./.github/scripts/quiet-upload-progress.cjs
         with:
           name: native-windows-universal
           path: |
@@ -346,6 +308,8 @@ jobs:
           compression-level: 0
           retention-days: 7
       - uses: actions/upload-artifact@v7
+        env:
+          NODE_OPTIONS: --require ./.github/scripts/quiet-upload-progress.cjs
         if: always()
         with:
           name: universal-windows-logs

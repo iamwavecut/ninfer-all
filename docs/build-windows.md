@@ -168,8 +168,8 @@ instantiations, and is staged for apps, the product benchmark and tests. Local b
 the static libraries. The packager checks device images in the kernel DLL and the shared runtime
 DLL.
 
-Every push to `master` queues its build behind the running one; a run whose revision is no longer
-the branch head finishes its objects for the next run and skips packaging. Feature branches build
+Every push to `master` cancels the running build, which saves the objects it completed for the
+next run. Feature branches build
 only through a manual run, which builds the packages without publication by default. Select
 `publish` on `master` to publish. Both final Windows and both final Linux jobs must pass before
 publication. The workflow creates an source-identified `YYYY-MM-DD.N` release,

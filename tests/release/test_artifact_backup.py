@@ -2,10 +2,13 @@
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
 
+# The scripts import their sibling hf_client, as when run from .github/scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github/scripts"))
 SPEC = importlib.util.spec_from_file_location(
     "artifact_backup", Path(__file__).resolve().parents[2] / ".github/scripts/archive-linux-artifact.py")
 BACKUP = importlib.util.module_from_spec(SPEC)

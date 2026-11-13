@@ -32,7 +32,10 @@
 #   * Debian multiarch CUDA 12.9 and 13.4 builds of every target, then CTest. They use the
 #     release toolchains and read the latest available native compiler snapshot without waiting
 #     for its producer, then CI's own snapshot of the objects the release does not build (tests,
-#     benchmarks, tools). Only a push to master saves that snapshot, after the build stopped.
+#     benchmarks, tools) and of what the branch changed. Every run of this repository's branches
+#     saves that snapshot for its branch (a pull request's for its head branch) every ten minutes
+#     and when it stops, also when a newer push or the merge cancels it; master's run of a merge
+#     reads the merged branch's snapshot.
 #
 # CUDA/MSVC jobs compare compiled inputs with the PR base or published image revision.
 # Other jobs have individual path scopes; Docker cache checks require a Docker definition change.
@@ -380,6 +383,10 @@ jobs:
       LC_CTYPE: C.UTF-8
       ARCHS: ${{ matrix.archs }}
       CUDA_VERSION: ${{ matrix.cuda }}
+      CI_CACHE_FAMILY: ci-linux-cuda-${{ matrix.cuda }}-v1
+      # A pull request saves for its head branch; a fork's receives no bucket credential.
+      CI_CACHE_SAVES: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+      HF_CACHE_TARGET_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || github.ref }}
     strategy:
       fail-fast: false
       matrix:
@@ -435,9 +442,10 @@ jobs:
         run: |
           restore=(python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --source-ref "$CACHE_SOURCE_REF" --optional)
           [[ -z "$ALSO_REF" ]] || restore+=(--also-ref "$ALSO_REF")
-          # The CI snapshot holds only what differs from the native one recorded here.
+          # The CI snapshot holds only what differs from the native one recorded here. A branch
+          # without a snapshot of its own, or whose run saved nothing, reads master's.
           "${restore[@]}" --merged-branch --family native-linux-cuda-${{ matrix.cuda }}-shared-v1 --baseline build-cache-baseline.tsv
-          "${restore[@]}" --family ci-linux-cuda-${{ matrix.cuda }}-v1
+          "${restore[@]}" --merged-branch --family "$CI_CACHE_FAMILY"
       - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
         run: python3.11 .github/scripts/check-compiler-cache.py
@@ -449,7 +457,11 @@ jobs:
       - name: Build every target
         id: build
         timeout-minutes: 305
-        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j ${{ steps.capacity.outputs.jobs }}
+        env:
+          # Periodic checkpoints of the CI family; the supervisor keeps the credential from the build.
+          HF_TOKEN: ${{ env.CI_CACHE_SAVES == 'true' && steps.object-cache.outcome == 'success' && secrets.HF_BUILD_CACHE_TOKEN || '' }}
+          HF_CACHE_BASELINE: build-cache-baseline.tsv
+        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl --checkpoint-family "$CI_CACHE_FAMILY" -- cmake --build build-release -j ${{ steps.capacity.outputs.jobs }}
       - name: Run CTest
         timeout-minutes: 15
         run: |
@@ -463,21 +475,23 @@ jobs:
         run: >-
           python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
           ${{ steps.build.outcome == 'success' && '--evict-unused-since "$JOB_START"' || '' }}
-      # A cancelled or timed-out master build saves what it compiled, so the next run resumes; the
-      # native snapshot's own entries stay out of this family.
-      - name: Save CI objects from master (also after cancellation)
+      # A cancelled or timed-out build saves what it compiled, so the next run of the branch, or
+      # master's run of its merge, resumes; the native snapshot's own entries stay out of this family.
+      - name: Save CI objects for this branch (also after cancellation)
         if: >-
-          always() && github.event_name == 'push' && github.ref == 'refs/heads/master' &&
+          always() && env.CI_CACHE_SAVES == 'true' &&
           steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
         timeout-minutes: ${{ job.status == 'cancelled' && 3 || 20 }}
         env:
           HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
         run: >-
           python3.11 .github/scripts/hf-build-cache.py save --directory .cache/objects
-          --family ci-linux-cuda-${{ matrix.cuda }}-v1 --exclude-baseline build-cache-baseline.tsv
+          --family "$CI_CACHE_FAMILY" --exclude-baseline build-cache-baseline.tsv
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
+        env:
+          NODE_OPTIONS: --require ./.github/scripts/quiet-upload-progress.cjs
         with:
           name: ci-logs-cuda-${{ matrix.cuda }}
           include-hidden-files: true

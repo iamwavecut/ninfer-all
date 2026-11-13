@@ -13,6 +13,8 @@ import tempfile
 import threading
 import time
 
+import hf_client
+
 BUCKET = "WaveCut/ninfer-cache"
 ROOT = "native-artifacts/v2/iamwavecut/ninfer-all"
 
@@ -106,8 +108,7 @@ def main():
     if (len(workflow) != 2 or workflow[0] not in allowed or not workflow[1].startswith("refs/heads/")
             or os.environ.get("GITHUB_JOB") not in ("linux", "universal-linux")):
         raise ValueError("Only a native Linux artifact job may archive release volumes")
-    from huggingface_hub import HfApi
-    api = HfApi()
+    api = hf_client.open_api()
     if not api.bucket_info(BUCKET).private:
         raise ValueError("Artifact bucket must be private")
     manifest, = Path("dist").glob("SHA256SUMS-ninfer-linux-*.txt")
@@ -115,6 +116,7 @@ def main():
 
 
 if __name__ == "__main__":
+    hf_client.throttle_progress()
     done = threading.Event()
     def heartbeat():
         while not done.wait(60):

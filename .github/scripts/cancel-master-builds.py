@@ -1,19 +1,14 @@
 """Cancel older master CI and Native release runs without touching other branches.
 
-An older Native release run that still compiles is left to finish its objects, which serve the next
-commit's build: a cancelled compile loses its work. Once it only links, packages or publishes a
-revision that is no longer master's head, it is cancelled so the newer run, which waits in the same
-concurrency group, starts at once."""
+A cancelled build saves the objects it completed and keeps its periodic checkpoints, so the newer
+run starts from them; only the units it was compiling are lost."""
 import json
 import os
 import subprocess
 import time
 
 
-RELEASE = ".github/workflows/native-release.yml"
-WORKFLOWS = {".github/workflows/ci.yml", RELEASE}
-# A temporary runner compiles, links and packages Linux in one job.
-RENTED_LABEL = "ninfer-native-debian13"
+WORKFLOWS = {".github/workflows/ci.yml", ".github/workflows/native-release.yml"}
 
 
 def superseded(run, trigger):
@@ -24,18 +19,10 @@ def superseded(run, trigger):
             and run["created_at"] <= trigger["created_at"])
 
 
-def compiling(jobs):
-    """Whether a Native release run has an object job running: a shard, or a rented full build."""
-    return any(job["status"] == "in_progress" and (
-        job["name"].startswith(("windows-objects", "linux-objects"))
-        or (job["name"].startswith("linux (") and RENTED_LABEL in job.get("labels", [])))
-        for job in jobs)
-
-
 def cancel(run, api, post, sleep=time.sleep, checks=13, interval=5):
     """Cancel one run, or accept its own end within about a minute.
 
-    CI also cancels older master runs through its concurrency group. GitHub
+    Both workflows also cancel older master runs through their concurrency groups. GitHub
     refuses a second cancellation of a run it is already stopping, and that run still reads
     in_progress for a few seconds.
     """
@@ -86,16 +73,6 @@ def main():
             comparison = api(f"compare/{trigger['head_sha']}...{run['head_sha']}")
             if comparison["status"] != "behind":
                 continue
-            if run["path"].split("@", 1)[0] == RELEASE:
-                jobs = [job for page in json.loads(subprocess.check_output(
-                    ["gh", "api", "--paginate", "--slurp",
-                     f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"], text=True))
-                    for job in page["jobs"]]
-                if compiling(jobs):
-                    # Its revision check after the objects then skips packaging.
-                    print(f"Still compiling, left to finish its objects: {run['name']} ({run['id']})",
-                          flush=True)
-                    continue
             cancel(run, api, post)
 
 

@@ -14,6 +14,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+# The scripts import their sibling hf_client, as when run from .github/scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / '.github/scripts'))
 SPEC = importlib.util.spec_from_file_location('hf_cache', Path(__file__).resolve().parents[2] / '.github/scripts/hf-build-cache.py')
 CACHE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CACHE)
@@ -393,21 +395,41 @@ class CacheOwnershipTests(unittest.TestCase):
             with patch.dict(os.environ, GITHUB_JOB='windows'):
                 CACHE.require_cache_writer('vcpkg-baseline', 'refs/heads/master')
 
-    def test_ci_writes_only_its_own_family_from_master_pushes(self):
+    def test_ci_writes_only_its_own_family_for_the_branch_it_builds(self):
         env = dict(self.env, GITHUB_JOB='cuda',
                    GITHUB_WORKFLOW_REF='iamwavecut/ninfer-all/.github/workflows/ci.yml@refs/heads/master')
+        pull = dict(GITHUB_EVENT_NAME='pull_request', GITHUB_REF='refs/pull/7/merge', GITHUB_HEAD_REF='dev/x',
+                    GITHUB_WORKFLOW_REF='iamwavecut/ninfer-all/.github/workflows/ci.yml@refs/pull/7/merge')
         with patch.dict(os.environ, env, clear=True):
             CACHE.require_cache_writer('ci-linux-cuda-13.4.3-v1', 'refs/heads/master')
+            with patch.dict(os.environ, GITHUB_REF='refs/heads/ci/probe'):
+                CACHE.require_cache_writer('ci-linux-cuda-13.4.3-v1', 'refs/heads/ci/probe')
+            # A pull request's run, also one cancelled by the merge, keeps what it compiled for the
+            # head branch, which master's first CI run of the merge then reads.
+            with patch.dict(os.environ, pull):
+                CACHE.require_cache_writer('ci-linux-cuda-13.4.3-v1', 'refs/heads/dev/x')
             for family, ref, override in (
                     ('native-linux-cuda-13.4.3-shared-v1', 'refs/heads/master', {}),
                     ('ci-linux-cuda-13.4.3-v1', 'refs/heads/dev/x', {}),
-                    ('ci-linux-cuda-13.4.3-v1', 'refs/heads/master', dict(GITHUB_EVENT_NAME='pull_request')),
+                    ('ci-linux-cuda-13.4.3-v1', 'refs/heads/master', pull),
+                    ('ci-linux-cuda-13.4.3-v1', 'refs/pull/7/merge', pull),
+                    ('ci-linux-cuda-13.4.3-v1', 'refs/heads/dev/x', dict(pull, GITHUB_JOB='windows-msvc')),
+                    ('ci-linux-cuda-13.4.3-v1', 'refs/heads/dev/x',
+                     dict(GITHUB_EVENT_NAME='push', GITHUB_REF='refs/heads/dev/x')),
                     ('ci-linux-cuda-13.4.3-v1', 'refs/heads/master', dict(GITHUB_JOB='windows-msvc'))):
                 with self.subTest(family=family, ref=ref, override=override), \
                         patch.dict(os.environ, override), self.assertRaises(ValueError):
                     CACHE.require_cache_writer(family, ref)
         with patch.dict(os.environ, self.env, clear=True), self.assertRaises(ValueError):
             CACHE.require_cache_writer('ci-linux-cuda-13.4.3-v1', 'refs/heads/master')
+
+    def test_native_writers_write_only_their_own_branch(self):
+        env = dict(self.env, GITHUB_JOB='linux',
+                   GITHUB_WORKFLOW_REF='iamwavecut/ninfer-all/.github/workflows/native-release.yml@refs/heads/master')
+        with patch.dict(os.environ, env, clear=True):
+            CACHE.require_cache_writer('native-linux-cuda-13.4.3-shared-v1', env['GITHUB_REF'])
+            with self.assertRaises(ValueError):
+                CACHE.require_cache_writer('native-linux-cuda-13.4.3-shared-v1', 'refs/heads/dev/x')
 
     def test_restore_records_a_baseline_even_when_the_optional_reader_starts_cold(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -472,8 +494,10 @@ class CacheOwnershipTests(unittest.TestCase):
                 patch.dict(sys.modules, huggingface_hub=SimpleNamespace(HfApi=Unavailable)), \
                 patch.object(sys, 'argv', ['cache', 'restore', '--directory', directory,
                                           '--family', 'native-linux-cuda-test', '--optional']), \
-                redirect_stdout(output):
+                patch('time.sleep') as sleep, redirect_stdout(output):
             CACHE.main()
+        # A dropped connection is retried five times before the reader gives up.
+        self.assertEqual(sleep.call_count, 5)
         self.assertIn('ConnectionError', output.getvalue())
         self.assertNotIn('secret-signed-url', output.getvalue())
 
