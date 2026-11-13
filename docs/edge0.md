@@ -146,12 +146,14 @@ point.
 ## Drafting
 
 `--spec mtp` drafts with the release's MTP block and `--lookup-ngram` by context lookup, as for
-Flash-Next. Without `--spec`, an Edge0 model drafts three tokens a round with `--draft-min-p 0.5`
-with host experts, as Flash-Next does, and also with device experts when the engine serves one
-request at a time (`--max-concurrency 1`, the default): each layer's chain of group encoders,
-latent experts and decoders makes a token's step cost enough that the verification pays on prose as
-well ([measurements](#mtp)). With disk experts, or device experts and several requests, it decodes
-without drafts unless `--spec mtp` asks for them.
+Flash-Next. `--spec dspine --draft-model PATH` drafts with a [DSpine](maintainer/dspine.md) drafter
+trained for the release through Flash-Next's DSpine path; Edge0 publishes none, and no DSpine
+drafter has run on a latent MoE yet. Without `--spec`, an Edge0 model drafts three tokens a round
+with `--draft-min-p 0.5` with host experts, as Flash-Next does, and also with device experts when
+the engine serves one request at a time (`--max-concurrency 1`, the default): each layer's chain of
+group encoders, latent experts and decoders makes a token's step cost enough that the verification
+pays on prose as well ([measurements](#mtp)). With disk experts, or device experts and several
+requests, it decodes without drafts unless `--spec mtp` asks for them.
 
 ## Measurements
 

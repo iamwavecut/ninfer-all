@@ -11,9 +11,9 @@ head's candidates into drafts.
 
 NInfer runs a DSpine drafter as its own artifact beside the model: `--spec dspine --draft-model
 PATH` (`draft-model` in a launch file). Every family takes one: the Qwen3.5 core (dense and MoE
-releases), Qwen3.8-Flash-Next, Gemma 4, Flint and DeepSeek-V4.1. A drafter is trained for one
-target, and startup refuses a drafter whose hidden width, vocabulary or target layer count differs
-from the model's. Tencent publishes one drafter, for Qwen3.8-27B
+releases), Qwen3.8-Flash-Next with its Edge0 form, Gemma 4, Flint and DeepSeek-V4.1. A drafter is
+trained for one target, and startup refuses a drafter whose hidden width, vocabulary or target layer
+count differs from the model's. Tencent publishes one drafter, for Qwen3.8-27B
 ([converted](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3)). The other families'
 paths have run only in synthetic tests, against drafters of their geometry with random weights.
 
@@ -187,7 +187,7 @@ differences can change acceptance only, not the output distribution.
 | Family | Drafts a round | Proposal | Acceptance | `--draft-min-p P` |
 |---|---|---|---|---|
 | Qwen3.5 core | 1 to min(15, block − 1) | greedy, or sampled at the request's temperature | DFlash2's: greedy prefix, or rejection sampling against the recorded q | refused |
-| Qwen3.8-Flash-Next | 1 to min(15, block − 1) | greedy | coupled, as MTP's | verifies through the first draft of confidence at or below P |
+| Qwen3.8-Flash-Next, Edge0 | 1 to min(15, block − 1) | greedy | coupled, as MTP's | verifies through the first draft of confidence at or below P |
 | Gemma 4, Flint, DeepSeek-V4.1 | 1 to 7 | greedy | coupled: the target's keyed draws in plain decode rows | as Flash-Next |
 
 Every family commits only tokens that the target selects, so the output is the target's at any
@@ -207,7 +207,7 @@ persistence (`--slot-save-path`) refuses DSpine as it refuses DFlash and DFlash2
 tier keys its directory by the drafter's artifact as well as the model's, so one drafter's ring
 never seeds another's.
 
-**Qwen3.8-Flash-Next.** The drafter takes DFlash2's place in the executor: its features, ring lanes,
+**Qwen3.8-Flash-Next and Edge0.** The drafter takes DFlash2's place in the executor: its features, ring lanes,
 commits and CUDA Graphs, with DSpine's ring capacity, on one device or on the head's device under
 tensor parallelism; pipeline stages are refused. The context cache's store name carries the
 drafter's artifact digest and ring capacity.
