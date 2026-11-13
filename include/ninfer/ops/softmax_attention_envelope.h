@@ -12,8 +12,9 @@ inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
-    // Select the fast INT8 prompt kernel (FP16 per-tile PV accumulation) for prompt-route
-    // launches over an INT8-G64 cache. Other routes and cache formats ignore it; it never changes
+    // Select the fast prompt kernel for prompt-route launches over an INT8-G64 or row-scaled
+    // FP8-E4M3FN cache (the INT8 family: FP16 per-tile PV accumulation; FP8: in-register dequant
+    // over the same Flash-2 schedule). Other routes and cache formats ignore it; it never changes
     // the route or workspace.
     bool fast_prompt_kernel = false;
     // Opt into chunked single-row verification through width 64; ordinary prompts keep

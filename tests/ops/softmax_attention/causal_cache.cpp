@@ -8,6 +8,7 @@
 #include "ops/kv_cache_e8_root_host.h"
 #include "ops/kv_cache_lloyd4_oracle.h"
 #include "ops/op_tester.h"
+#include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
 #include "ops/softmax_attention/oracle.h"
 
@@ -4247,6 +4248,40 @@ int run_fp8_prompt_cases() {
     return failures;
 }
 
+// The fast FP8 prompt kernel (prompt_fp8_fast.cuh): partial and full 64-row CTAs, a production
+// prefill chunk after a long history, and a narrow width over 8K visible keys, where the plan's
+// key splits beat its unsplit launch and the merge kernel combines the splits' partial rows
+// (graph-replayed, so the split plan must survive capture).
+int run_fp8_fast_prompt_cases() {
+    int failures    = 0;
+    const auto fast = [](AttentionCase test_case) {
+        test_case.fast_prompt_kernel = true;
+        return test_case;
+    };
+    const Geometry& h24 = kGeometries[0];
+    const Geometry& h16 = kGeometries[1];
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, kPlanFp8, fast({65, 63, 192, 950u}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, kPlanFp8, fast({65, 63, 192, 951u}),
+                                MappingPattern::Fragmented);
+    }
+    failures += run_a1_case(h24, kPlanFp8, fast({300, 700, 8192, 952u}),
+                            MappingPattern::Fragmented);
+    failures += run_a3_case(h16, kPlanFp8, fast({300, 700, 8192, 953u}),
+                            MappingPattern::Offset);
+    // 100 rows over 8K visible keys: the four-warp plan's splits beat its unsplit cost, so the
+    // row block's pages divide across CTAs and the merge kernel combines their partial rows.
+    failures += run_a1_case(h16, kPlanFp8, fast({100, 8092, 8192, 954u}),
+                            MappingPattern::Fragmented);
+    failures += run_a3_case(h16, kPlanFp8, fast({100, 8092, 8192, 955u, false, true}),
+                            MappingPattern::Identity);
+    // A production prefill chunk after a long history.
+    failures += run_a1_case(h24, kPlanFp8, fast({2048, 4096, 6144, 956u}),
+                            MappingPattern::Fragmented);
+    return failures;
+}
+
 // RotorQuant-style rk8v4: rotated INT8 G64 keys plus unrotated packed signed-INT4
 // values with one FP16 scale per 32-value group (G32). This is the shipped compact KV
 // profile, but the consumer attention kernels only ever ran against BF16/INT8/FP8 caches,
@@ -4997,8 +5032,39 @@ int run_softmax_attention_small_t_pipelined_tests() {
 
 int run_softmax_attention_fp8_prompt_tests() {
     if (cuda_unavailable()) return 77;
+    // The fast kernel changes the output, and its profile key was measured on the INT8-family
+    // kernel only: with the flag unset and the environment quiet, the profile must not select it
+    // for the FP8 cache, so a default --kv-dtype fp8 run keeps the standard kernel; the flag (or
+    // NINFER_PROMPT_FAST=1 for diagnosis) is the only route to the fast one. Volta compiles the
+    // FP8 fast kernel empty and takes the standard route regardless. This block is the first
+    // prompt launch of the process, where the gate's environment is read, so the profile-step
+    // assertions require the variable to be absent from the process environment and are skipped
+    // (not failed) when it is set; the flag assertion holds under any environment because the
+    // flag is checked before the variable.
+    const bool environment_quiet = std::getenv("NINFER_PROMPT_FAST") == nullptr;
+    int failures = 0;
+    if (environment_quiet && !ops::current_device_volta()) {
+        const ops::DeviceRouteForce on("attn_prompt_fast", "on");
+        // The profile never selects the FP8 fast kernel, even forced on...
+        failures += ops::detail::causal_attention_prompt_fast_kernel(
+                        KvCacheStorage::Fp8E4M3Row256, false)
+                       ? 1
+                       : 0;
+        // ...while it still selects the INT8-family kernel it was measured for.
+        failures += ops::detail::causal_attention_prompt_fast_kernel(
+                        KvCacheStorage::Int8Group64, false)
+                       ? 0
+                       : 1;
+    }
+    if (!ops::current_device_volta()) {
+        // The flag selects the FP8 fast kernel.
+        failures += ops::detail::causal_attention_prompt_fast_kernel(
+                        KvCacheStorage::Fp8E4M3Row256, true)
+                       ? 0
+                       : 1;
+    }
     // Multiple 16- and 32-key tiles of the build's Bc (16 on Turing, 32 elsewhere).
-    int failures = run_fp8_prompt_cases();
+    failures += run_fp8_prompt_cases() + run_fp8_fast_prompt_cases();
     // Multiple key tiles, partial query tiles and real long-cache extents. Packed inputs retain
     // the existing independent code/scale decoder and FP64 softmax oracle.
     for (const Geometry& geometry : kGeometries) {

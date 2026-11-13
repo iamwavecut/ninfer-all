@@ -30,7 +30,8 @@ it puts in front of a window that lacks it; the scored tokens stay the window's 
 
 Seven of them were measured on this corpus with Qwen3.8-27B on an RTX 3090; the results, alongside
 each format's size and decode speed, are in [`docs/config-calculator.html`](config-calculator.html).
-`--fast-prefill-kernel` scores an `int8` or `rk*` cache with the fast prompt-attention kernel (as
+`--fast-prefill-kernel` scores an `int8` or `rk*` cache with the fast prompt-attention kernel and
+an `fp8` cache with its in-register dequant kernel (as
 `ninfer-serve --fast-prefill-kernel` prefills); `report.json` records it as `fast_prefill_kernel`.
 The evaluator also takes the server's `--devices` (one pipeline stage per GPU, or with
 `--tensor-parallel`, `--tensor-split`, `--tensor-attention`, `--tensor-parallel-transport` and
