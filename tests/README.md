@@ -321,9 +321,11 @@ NINFER_LOGPROBS_ARTIFACT=$PWD/out/qwen3_8_27b.ninfer NINFER_LOGPROBS_SPECULATIVE
 `ninfer_engine_stop_string_real_test` checks, for any model family, that a stop string changes no
 token of the turn it ends, that the next turn resumes from the state where the stop string's match
 began, and that this state is the one a turn limited to the reply's tokens before the match leaves
-(without drafts the next turn's tokens are equal). It measures how far the next prompt repeats the
-turn's tokens: where a template renders the reply anew (Flint and Gemma 4 with thinking off), no
-state of the reply continues it and the test only reports the reuse. `NINFER_STOP_ARTIFACT` names
+(without drafts the next turn's tokens are equal). The stop string is a piece of the reply that
+begins at a space after a word where the reply has one, so the next prompt tokenizes the visible
+text before it as the turn did. The test measures how far the next prompt repeats the turn's tokens:
+where a template renders the reply anew (Flint and Gemma 4 with thinking off), no state of the
+reply continues it and the test only reports the reuse. `NINFER_STOP_ARTIFACT` names
 the artifact, and the test is skipped without it; `NINFER_STOP_NGRAM_TABLE` names a table artifact,
 `NINFER_STOP_SPECULATIVE=mtp`, `dflash`, `dflash2`, `dspark` or `lookup` decodes the reply in
 speculative rounds (`NINFER_STOP_DRAFTS` tokens), `NINFER_STOP_EXPERTS=host` or `disk` places the
