@@ -193,8 +193,10 @@ differences can change acceptance only, not the output distribution.
 Every family commits only tokens that the target selects, so the output is the target's at any
 temperature. `--gumbel-sampling` changes only the target's draws: the greedy proposals stay greedy
 and the Qwen3.5 core keeps rejection sampling, as DFlash2 does. A DSpine round runs no n-gram copy
-proposal unless `--ngram-draft-tokens` sets its width (the Qwen3.5 core). The refinement reads the
-full head's logits, so DSpine refuses the optimized proposal head (`--lm-head-draft`).
+proposal unless `--ngram-draft-tokens` sets its width (the Qwen3.5 core). A copy round of several
+requests runs the drafter at that width as well, for the rows without a copy, so above one request
+the width is at most the block less one. The refinement reads the full head's logits, so DSpine
+refuses the optimized proposal head (`--lm-head-draft`).
 
 ## State
 

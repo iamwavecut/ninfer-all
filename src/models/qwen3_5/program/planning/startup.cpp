@@ -494,6 +494,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
+    // The masked drafter's widest proposal (a copy round of several rows runs it at its width).
+    const auto proposal_drafts = static_cast<std::int32_t>(
+        masked_proposal_window(plan.draft_window, plan.ngram_draft_window, plan.max_concurrency));
     // A copy round verifies up to the widest window; the neural drafter still proposes drafts.
     const auto verify_drafts = static_cast<std::int32_t>(widest_verify_window(plan));
     const auto verify        = verify_drafts + 1;
@@ -1304,9 +1307,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 out.dflash_context = std::max(
                     out.dflash_context,
                     dspine::Drafter::prepare_workspace_bytes(
-                        *parameters.dspine, logits_dtype, concurrency, drafts + 1,
-                        head_bytes(dspine::Drafter::prepare_columns(*parameters.dspine,
-                                                                    concurrency, drafts + 1))));
+                        *parameters.dspine, logits_dtype, concurrency, proposal_drafts + 1,
+                        head_bytes(dspine::Drafter::prepare_columns(
+                            *parameters.dspine, concurrency, proposal_drafts + 1))));
             }
             for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
                  ++batch) {
@@ -1328,9 +1331,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         : ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count),
                               narrowest_drafts, verify_drafts, batch, batch);
-                // A copy round above batch one also runs the drafter at its own window, and a
+                // A copy round above batch one also runs the drafter, at the copy window, and a
                 // round after a copy round appends up to the widest window of target features.
-                const std::size_t proposal = dflash_proposal_capacity(drafts + 1, batch);
+                const std::size_t proposal =
+                    dflash_proposal_capacity((batch > 1 ? proposal_drafts : drafts) + 1, batch);
                 const std::size_t gather   = ops::logprob_topk_workspace_capacity_bytes(
                     dimension(parameters.model.resources().public_token_count), batch * verify);
                 out.dflash_round =
@@ -1509,6 +1513,16 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             options.speculative.draft_tokens > 15) {
             throw std::invalid_argument(
                 "the DSpine draft window must be in [1, min(15, block_size - 1)]");
+        }
+        // Copy rounds of several requests run the drafter at the copy window.
+        if (masked_proposal_window(options.speculative.draft_tokens,
+                                   options.speculative.ngram_draft_tokens,
+                                   options.max_concurrency) +
+                1 >
+            draft->dspine->block_size) {
+            throw std::invalid_argument(
+                "above one request, --ngram-draft-tokens with DSpine must be at most its "
+                "block_size - 1, the widest proposal its drafter makes");
         }
         break;
     }

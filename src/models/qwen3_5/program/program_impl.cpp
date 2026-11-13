@@ -517,10 +517,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                 cudaStream_t stream) {
                     execution::project(hidden, text.output_head, logits, arena, stream);
                 }};
+            // Its widest proposal: a copy round of several rows runs it at the copy window.
+            const std::uint32_t proposal =
+                masked_proposal_window(draft_window, ngram_draft_window, max_concurrency);
             dspine_drafter.emplace(*drafter, std::move(target), dflash->dspine_head_write,
                                    local->capacity(), capacity,
                                    static_cast<std::int32_t>(max_concurrency),
-                                   static_cast<std::int32_t>(draft_window + 1U));
+                                   static_cast<std::int32_t>(proposal + 1U));
             RankBinding bind(device, 0);
             work.reset();
             dspine_drafter->prepare(work, device.stream);

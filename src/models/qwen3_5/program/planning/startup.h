@@ -207,6 +207,15 @@ struct SequencePlanImpl {
     return std::max(plan.draft_window, plan.ngram_draft_window);
 }
 
+// The widest proposal a masked drafter makes: its draft window, or above one request the copy
+// window when wider, since a copy round of several rows runs the drafter at the round's width
+// (execution/draft.cpp). A copy window past 15 holds one request, whose copy rounds skip it.
+[[nodiscard]] inline std::uint32_t masked_proposal_window(std::uint32_t draft_window,
+                                                          std::uint32_t ngram_draft_window,
+                                                          std::uint32_t max_concurrency) noexcept {
+    return max_concurrency > 1 ? std::max(draft_window, ngram_draft_window) : draft_window;
+}
+
 // The widest forward pass a pipeline stage boundary carries: prefill columns, or every lane's
 // verification columns. Sizes the boundary links and the scratch each stage needs around its layers.
 [[nodiscard]] inline std::uint64_t stage_boundary_columns(const SequencePlanImpl& plan) noexcept {
