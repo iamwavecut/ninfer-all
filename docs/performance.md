@@ -476,6 +476,31 @@ DFlash2's draft weights and its refusal of `--lm-head-q6` stop it at eight lanes
 prompt seven drafts were best on average, but the reasoning prompt kept improving to twelve while
 summarization fell off there.
 
+### DSpine on Qwen3.8-27B
+
+Tencent's DSpine drafter ([converted](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3),
+Q8) beside the official artifact on one RTX 5090 at its 575 W default: the CLI with a 16,384-token
+window and `bf16` KV, thinking off, one greedy request of up to 400 tokens per configuration; decode
+tok/s, with the tokens a round in parentheses:
+
+| Answer | No drafts | MTP 3 | DFlash2 7 | DSpine 3 | DSpine 5 | DSpine 7 | DSpine 15 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| code, 400 tokens | 90.8 | 232.9 (3.12) | 298.9 (4.20) | 216.6 (3.07) | 257.9 (3.76) | 279.5 (4.20) | 252.3 (4.99) |
+| prose, 252 to 269 tokens | 90.6 | 185.8 (2.49) | 185.6 (2.61) | 161.2 (2.28) | 167.3 (2.44) | 168.5 (2.54) | 130.1 (2.56) |
+
+Seven drafts are DSpine's best count on both answers. They keep as many tokens a round as DFlash2's
+seven on code and slightly fewer on prose, and a DSpine round costs more (five layers over the
+16-position block, the code bridge and the serial refinement), so DFlash2 and MTP stay faster on
+this card. The BF16 drafter (`dspine_bf16`) keeps the same tokens a round and decodes 254.1 and
+155.3. A sampled prose answer (temperature 0.7, seed 1) decoded 90.5 tok/s without drafts, 210.2
+with DFlash2 7 and 171.7 with DSpine 7. After startup the Q8 drafter leaves 2.7 GiB less free than
+no drafter (DFlash2 2.5 GiB, MTP 0.8 GiB), and the full 262,144-token window still fits with `rk4v4`
+and `rk8v4`. Each greedy answer is one of two token sequences: on code DFlash2 and every DSpine
+count give the same 400 tokens, which leave the plain answer at token 359 (MTP's at 248); on prose
+DFlash2 and DSpine 7 and 15 give the plain answer, MTP and DSpine 3 and 5 leave it at token 243. A
+verification's width changes floating-point results, as [the CLI guide](cli.md#speculative-decoding)
+describes.
+
 ### MTP draft count by content
 
 One RTX 3090, `rk4v4` KV with `--lm-head-q6 --embedding-q4 --gdn-state-fp16`, greedy, 512

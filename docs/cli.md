@@ -242,7 +242,11 @@ less the anchor), Gemma 4, Flint and DeepSeek-V4.1 with up to 7. The drafter rea
 head, so `--lm-head-draft` is refused. On Qwen3.5-core models a sampled request verifies DSpine's
 sampled proposal by rejection sampling, as DFlash2's; the other families verify its greedy drafts
 with coupled draws, and `--draft-min-p P` verifies a round through its first draft whose confidence
-is at or below P.
+is at or below P. On an RTX 5090 with the official Qwen3.8-27B artifact (400 greedy tokens), seven
+DSpine drafts decoded a code answer at 279.5 tokens per second and a prose answer at 168.5, against
+298.9 and 185.6 with seven DFlash2 drafts and 90.8 and 90.6 without drafts: DSpine kept as many
+tokens a round as DFlash2 on code, and its round costs more
+([measurements](performance.md#dspine-on-qwen38-27b)).
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b.ninfer \

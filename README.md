@@ -210,6 +210,9 @@ formats that only this engine reads.
 
 DeepSeek-V4.1-Flash models read the Engram table in their row, which the model names by digest; pass
 it with `--ngram-table`. The Engram table holds the release's IQ4_NL rows.
+Tencent's [DSpine drafter for Qwen3.8-27B](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3)
+(2.27 GiB, Q8 layers and a BF16 code bridge) is an artifact of its own, which
+`--spec dspine --draft-model` loads beside any Qwen3.8-27B artifact.
 
 ### Flash-Next n-gram tables
 
@@ -435,6 +438,11 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   published artifact carries (3.58 GiB on the card), it decodes 1.28 to 2.07 times as fast on an
   RTX PRO 6000; on an RTX 4090, whose expert cache it shrinks, it decodes code and reasoning 1.19
   and 1.21 times as fast and other requests 0.85 to 1.02 times.
+- A DSpine drafter is an artifact of its own (`--spec dspine --draft-model PATH`): 1 to 15 drafts
+  on Qwen3.5-core models and Qwen3.8-Flash-Next, 1 to 7 on Gemma 4, Flint and DeepSeek-V4.1.
+  Tencent's drafter for Qwen3.8-27B, converted, decodes a code answer 3.08 times and a prose answer
+  1.86 times as fast as plain decoding on an RTX 5090, where DFlash2 reaches 3.29 and 2.05
+  ([measurements](docs/performance.md#dspine-on-qwen38-27b)).
 - Flint, which has no drafter, and DeepSeek-V4.1-Flash without `--spec` draft by context lookup
   (`--lookup-ngram N`, 1 to 7 drafts): what followed the last N tokens' earlier occurrence (the one
   the sequence was already copying while it still matches, else the newest), verified in one pass of
