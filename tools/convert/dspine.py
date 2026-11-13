@@ -75,6 +75,9 @@ def dspine_config(raw: dict) -> dict:
         "attention_value_scale",
         "selected_prefix_feature_reliability",
         "selected_prefix_feature_next_token_rows",
+        # The terminal token residual adds a per-token term to the sender table's values
+        # (the reference's fold_terminal_sender_table); the converter does not fold it.
+        "selected_prefix_terminal_residual_rank",
     ):
         _require(not draft.get(key), f"unsupported dflash_config.{key}")
     for key, value in (

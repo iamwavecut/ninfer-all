@@ -134,6 +134,7 @@ def test_config_keeps_the_geometry_and_refuses_unimplemented_modes():
         lambda c: c["dflash_config"].update(selected_prefix_feature_write_mode="shared"),
         lambda c: c["dflash_config"].update(selected_prefix_feature_layers=[1]),
         lambda c: c["dflash_config"].update(conv_kernel_size=4),
+        lambda c: c["dflash_config"].update(selected_prefix_terminal_residual_rank=64),
         lambda c: c["code_bridge_second_pass"].update(first_exact=0),
         lambda c: c["code_bridge_second_pass"].update(head_topk=8),
         lambda c: c.update(layer_types=["full_attention"] * LAYERS),
