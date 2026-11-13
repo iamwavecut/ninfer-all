@@ -1,8 +1,10 @@
 // ninfer::ops::detail - launch of the fast NVFP4 prompt kernel (block-scaled FP4 QK): its split
 // partials, the partial kernel and the split merge. Blackwell builds only; see launch.h.
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_launch.h"
 
+#include "core/arena.h"
 #include "core/device_launch.h"
+#include "core/paged_kv_view.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/plane_types.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cuh"

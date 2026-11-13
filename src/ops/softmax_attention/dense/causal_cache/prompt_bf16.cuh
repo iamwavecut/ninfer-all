@@ -19,6 +19,7 @@
 
 #include <type_traits>
 
+#include "ops/common/device_tier.h"
 #include "ops/kv_cache/bf16p_codec.cuh"
 #include "ops/softmax_attention/common/bf16_attention.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"

@@ -1,17 +1,20 @@
 #pragma once
 
-// ninfer::ops - split-KV causal small-T attention shared scaffolding. The BF16 and
-// int8 partial kernels live in causal_attention_small_t_bf16.cuh and
-// causal_attention_small_t_i8.cuh respectively; they are fully separate kernels (no
-// shared body) so each KV format can be optimized independently. This header owns
-// only what both share: layout constants, device helpers, and the split reducer.
+// ninfer::ops - split-KV causal small-T attention shared scaffolding. The partial kernels of each
+// KV format live in their own headers (small_t_bf16.cuh, small_t_i8.cuh, small_t_fp8.cuh, ...);
+// they are fully separate kernels (no shared body) so each format can be optimized independently.
+// This header owns only what they share: layout constants, split policies and device helpers. The
+// BF16 and INT8 split reducer is in small_t_reduce.cuh, the split bound the host launchers share
+// in small_t_policy.h.
 
 #include "ops/common/device_limits.h"
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/softmax_attention/dense/causal_cache/cache_input.h"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 #include "ops/softmax_attention/dense/causal_cache/key_partition.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_policy.h"
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>
@@ -20,13 +23,6 @@
 #include <cstdint>
 
 namespace ninfer::ops {
-
-inline constexpr int kCausalHeadDim = 256;
-
-// The most keys one split may cover: a split stages at most 64 physical-page IDs, and two 64-key
-// pages go to key-tile rounding and page alignment. A split that must cover more, past the maximum
-// split count, reads its pages from the block table instead.
-inline constexpr int kCausalSmallTSplitKeyLimit = 3968;
 
 // The shared memory of a quantized-cache (FP8, NVFP4, K8V4) small-T CTA besides its key/value
 // stage: Q and the probabilities of `RowTiles` 16-row tiles, their row rescales, the key and value
@@ -46,29 +42,6 @@ inline constexpr bool
     kCausalSmallTCompactKV = kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> +
                                  SeparateStageBytes >
                              shape_max_shared_bytes_per_block(TuringShapes);
-
-struct CausalAppendInput {
-    static constexpr bool writes_cache = true;
-    const __nv_bfloat16* k;
-    const __nv_bfloat16* v;
-};
-
-struct CausalCachedInput {
-    static constexpr bool writes_cache = false;
-};
-
-// A packed BF16 cache (KvCacheStorage::Bf16Packed): the kernel's K and V planes hold 384-byte rows
-// and these their side records (ops/kv_cache/bf16p_codec.cuh). The call's rows were appended before
-// it, so it only reads.
-struct CausalPackedInput {
-    static constexpr bool writes_cache = false;
-    static constexpr bool packed       = true;
-    const std::uint8_t* k_side;
-    const std::uint8_t* v_side;
-};
-
-template <class CacheInput>
-inline constexpr bool kCausalPackedInput = requires { CacheInput::packed; };
 
 // The indexes below take the call's head counts at run time (geometry.cuh): `kv_heads` KV heads
 // and `q_heads` = kv_heads * GroupSize query heads.
@@ -284,7 +257,7 @@ __device__ __forceinline__ int causal_small_t_owned_tile_page(const std::int32_t
 // tokens==1 and window>8198 while the host granted that capacity to fp8 only, so nvfp4 and k8v4
 // silently ran fewer splits than this function returned and the two sides disagreed about intent.
 // Measurement said the host's default was the better number for all of them (see
-// causal_small_t_split_count in small_t.cu), so the request is gone rather than the grant
+// causal_small_t_split_count in small_t.cpp), so the request is gone rather than the grant
 // extended, and this now agrees with the host by construction.
 template <typename Geometry>
 __device__ __forceinline__ int
@@ -400,109 +373,6 @@ __device__ __forceinline__ void causal_store_partial_output(float* partial_out, 
     if (lead) {
         partial_out[block + static_cast<std::int64_t>(kCausalHeadDim) * q_heads + q_head] = lse;
     }
-}
-
-template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
-__launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_kernel(
-    const float* partial_acc, const float* partial_m, const float* partial_l,
-    const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t visible_capacity, std::int32_t split_count, std::int32_t wave_splits,
-    __nv_bfloat16* out, const __nv_bfloat16* __restrict__ gate, CausalKeyPartition partition,
-    float* partial_out) {
-    static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
-
-    // The grid spans the call's query heads.
-    const int q_heads     = static_cast<int>(gridDim.x);
-    const int q_head      = static_cast<int>(blockIdx.x);
-    const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
-    const int flat_column = static_cast<int>(blockIdx.z);
-    int batch             = 0;
-    int token             = flat_column;
-    if constexpr (MultiBatch) {
-        batch = flat_column / tokens;
-        token = flat_column - batch * tokens;
-    }
-    const int tid = threadIdx.x;
-    if (token >= tokens) { return; }
-    if constexpr (MultiBatch) {
-        if (batch >= batch_size) { return; }
-    }
-
-    if constexpr (Offset) { positions += column_begin; }
-    if constexpr (MultiBatch) { positions += batch * full_width; }
-    const int first_pos = positions[0];
-    int output_column   = token;
-    if constexpr (Offset) { output_column += column_begin; }
-    if constexpr (MultiBatch) { output_column += batch * full_width; }
-    if constexpr (Masked) {
-        const int absolute_column = token + (Offset ? column_begin : 0);
-        if (absolute_column >= valid_columns[batch]) {
-            if (partial_out != nullptr) {
-                if (tid < DChunk && d_start + tid < kCausalHeadDim) {
-                    causal_store_partial_output(partial_out, q_head, d_start + tid,
-                                                output_column, q_heads, 0.0f, -CUDART_INF_F,
-                                                tid == 0 && d_start == 0);
-                }
-                return;
-            }
-            if (tid < DChunk && d_start + tid < kCausalHeadDim) {
-                const auto index = causal_q_index(q_head, d_start + tid, output_column, q_heads);
-                // 0 * sigmoid(g) is 0 for every finite g, but not for a NaN gate, and the
-                // standalone multiply would propagate that NaN. Do the multiply either way.
-                out[index] =
-                    gate == nullptr
-                        ? __float2bfloat16(0.0f)
-                        : __float2bfloat16_rn(0.0f * sigmoid(__bfloat162float(gate[index])));
-            }
-            return;
-        }
-    }
-
-
-    if constexpr (MultiBatch) {
-        const std::int64_t partial_acc_row =
-            static_cast<std::int64_t>(batch) * kCausalHeadDim * q_heads * tokens * split_count;
-        const std::int64_t partial_stat_row =
-            static_cast<std::int64_t>(batch) * q_heads * tokens * split_count;
-        partial_acc += partial_acc_row;
-        partial_m += partial_stat_row;
-        partial_l += partial_stat_row;
-    }
-
-    const int window = causal_small_t_tile_window(first_pos, tokens, visible_capacity);
-    const int active_split_count = causal_small_t_partition_active(
-        partition, window,
-        causal_small_t_active_splits<Geometry, Int8>(window, split_count, tokens, wave_splits),
-        split_count);
-
-    __shared__ float weights[256], warp_sums[8], scalars[2];
-    const float head_l = causal_merge_split_statistics<Geometry>(
-        partial_m, partial_l, q_head, token, tokens, active_split_count, weights, warp_sums,
-        scalars, q_heads);
-    const int d = d_start + tid;
-    if (tid >= DChunk || d >= kCausalHeadDim) return;
-    const float numerator = causal_weighted_split_sum(partial_acc, weights, q_head, d, token,
-                                                      tokens, active_split_count, q_heads);
-
-    const float value    = (head_l > 0.0f) ? numerator / head_l : 0.0f;
-    if (partial_out != nullptr) {
-        causal_store_partial_output(partial_out, q_head, d, output_column, q_heads, value,
-                                    head_l > 0.0f ? scalars[0] + logf(head_l) : -CUDART_INF_F,
-                                    tid == 0 && d_start == 0);
-        return;
-    }
-    const auto out_index = causal_q_index(q_head, d, output_column, q_heads);
-    if (gate == nullptr) {
-        out[out_index] = __float2bfloat16(value);
-        return;
-    }
-    // Bit-exact with the standalone multiply: that kernel reads what attention stored, so it sees
-    // the reduce result already rounded to BF16. Round here first, widen back, multiply in FP32,
-    // round to nearest. Keeping the FP32 value would be more accurate and would move tokens.
-    const __nv_bfloat16 reduced = __float2bfloat16(value);
-    out[out_index] =
-        __float2bfloat16_rn(__bfloat162float(reduced) * sigmoid(__bfloat162float(gate[out_index])));
 }
 
 } // namespace ninfer::ops

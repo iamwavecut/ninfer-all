@@ -1,48 +1,41 @@
 #pragma once
 
-// The INT8-family small-T partial launch, instantiated per query width in small_t_i8_w<N>.cu so
-// the kernel's many specializations compile in parallel instead of in one translation unit.
+// The INT8-family small-T partial launches the host router (small_t_i8_dispatch.cpp) calls. Each
+// instantiation compiles in a unit of its own, generated per tier, query width, geometry and input
+// (kernel_unit.cu.in): an edit of one tier's launch or of the routing compiles no other kernel,
+// and the tiers compile in parallel.
 
-#include "core/paged_kv_view.h"
-#include "core/tensor.h"
-#include "ops/common/device_limits.h"
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
-
-#include <cuda_runtime.h>
+#include "ops/softmax_attention/dense/causal_cache/cache_input.h"
+#include "ops/softmax_attention/dense/causal_cache/i8_coding.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_tier.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_partial_launch.h"
 
 #include <cstdint>
-#include <string>
 
 namespace ninfer::ops::detail {
 
-// Whether a card of a shape set runs the partial kernel's "12x1x64d" tier: its 64-key dynamic arena
-// of 64 KiB beside the kernel's static tiles needs more than 64 KiB of shared memory per block,
-// which Turing does not have; there 2K-8K windows take 12x1x32 and the tier is no calibration
-// candidate.
-[[nodiscard]] constexpr bool small_t_i8_key_block64(bool turing_shapes) {
-    return shape_max_shared_bytes_per_block(turing_shapes) > 64 * 1024;
-}
+// A partial launch with the INT8 family's own choices, which the router made at run time.
+struct SmallTI8Launch : SmallTPartialLaunch {
+    // Splits per full wave of a single-row launch (causal_small_t_active_splits), or zero.
+    std::int32_t wave_splits = 0;
+    CausalI8Coding coding    = CausalI8Coding::Int8;
+    // FP16 sums of each key tile's PV products (the device profile's "attn_pv_f16").
+    bool pv_f16 = false;
+    // Load the unit's CUDA module and return without a launch; every other field is unread.
+    bool load_module_only = false;
+};
 
-// Whether any card this build runs takes it, and whether the current device does.
-inline constexpr bool kSmallTI8KeyBlock64Built = kBuildStandardShapes;
+// The tiled kernel at one tier (small_t_i8_tiled.cuh). Defined for the tiers
+// small_t_i8_tier_built() lists for the launch's row tiles.
+template <typename Geometry, int TokenTile, typename CacheInput, SmallTI8Tier Tier>
+void launch_small_t_i8_tiled(const SmallTI8Launch& launch, CacheInput input);
 
-[[nodiscard]] inline bool small_t_i8_key_block64_here() {
-    return small_t_i8_key_block64(turing_shapes_here());
-}
-
-// Device-profile key of the INT8-family partial kernel's launch tier:
-// "attn_i8_small/h24/rk8v4/w8". The axis is the launch's implementation window.
-std::string small_t_i8_route_key(std::int32_t q_heads, KvCacheStorage storage, std::int32_t width);
-
-// The CTAs per SM of a profile-routed tier at this window, or zero when the profile routes none.
-int small_t_i8_routed_ctas_per_sm(std::int32_t q_heads, KvCacheStorage storage, std::int32_t width,
-                                  std::int32_t window);
-
+// The pipelined kernel (small_t_i8_pipelined_launch.cuh): INT8 keys and values only.
 template <typename Geometry, int TokenTile, typename CacheInput>
-void launch_small_t_i8(bool multi_batch, bool masked, const Tensor& q, CacheInput input, const Tensor& pos, float scale,
-                       PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
-                       std::int32_t logical_capacity, std::int32_t implementation_window,
-                       std::int32_t splits, std::int32_t wave_splits, Tensor& partial_acc,
-                       Tensor& partial_m, Tensor& partial_l, cudaStream_t stream);
+void launch_small_t_i8_pipelined(const SmallTI8Launch& launch, CacheInput input);
+
+// Volta's kernel for every INT8-family coding (small_t_i8_sm70_launch.cuh), in builds with sm_70.
+template <typename Geometry, int TokenTile, typename CacheInput>
+void launch_small_t_i8_sm70(const SmallTI8Launch& launch, CacheInput input);
 
 } // namespace ninfer::ops::detail

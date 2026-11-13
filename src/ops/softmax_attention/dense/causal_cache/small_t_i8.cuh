@@ -68,7 +68,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t wave_splits,
         float scale, float* partial_acc, float* partial_m, float* partial_l,
         CausalKeyPartition partition) {
-    // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
+    // A Volta card runs its own kernel (small_t_sm70_i8.cuh): a build of several architectures
     // compiles this kernel empty in the Volta image.
 #if !defined(NINFER_SM70_DEVICE)
     constexpr bool PackedKeys          = Keys != KvKeyCoding::Int8;

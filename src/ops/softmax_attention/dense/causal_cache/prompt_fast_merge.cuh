@@ -2,11 +2,11 @@
 
 // The key-split merge of the fast prompt kernels (INT8 family: prompt_i8_fast.cuh, FP8:
 // prompt_fp8_fast.cuh): it combines the splits over the storage-agnostic FP32 partial rows and
-// (max, sum) statistics the split launches publish (prompt_i8_fast_plan.h's layout), so both
-// families share this one kernel.
+// (max, sum) statistics the split launches publish, so both families share this one kernel. The
+// partials' layout is here as well, apart from the host's plan (prompt_i8_fast_plan.h), so the
+// kernel units do not read the routing.
 
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
-#include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -15,6 +15,17 @@
 #include <cstdint>
 
 namespace ninfer::ops {
+
+namespace detail {
+
+// Split partial layout for key split s, column c and query head h: the D256 row at
+// ((s * width + c) * q_heads + h) * 256 and its (max, sum) pair at that row index.
+__host__ __device__ __forceinline__ std::int64_t
+causal_prompt_i8_fast_partial_row(int split, int column, int q_head, int width, int q_heads) {
+    return (static_cast<std::int64_t>(split) * width + column) * q_heads + q_head;
+}
+
+} // namespace detail
 
 // Combines the key splits of one column and query head: every split row is normalized by its own
 // sum, so the merged row is sum_s w_s * row_s / sum_s w_s with w_s = sum_s * 2^((m_s - M) * c).

@@ -11,9 +11,14 @@
 #include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_sm70.h"
+#include "ops/softmax_attention/dense/causal_cache/route.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_launch.h"
 
 #include <algorithm>
 #include <cmath>

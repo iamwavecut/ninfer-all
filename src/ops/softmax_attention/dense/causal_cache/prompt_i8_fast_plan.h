@@ -11,10 +11,9 @@
 
 #include "core/arena.h"
 #include "core/layout.h"
-#include "core/paged_kv_view.h"
+#include "core/paged_kv_page.h"
 #include "core/tensor.h"
-
-#include <cuda_runtime.h>
+#include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -35,7 +34,6 @@ struct CausalPromptI8FastPlan {
 // Splits only for widths no graph-captured call requests: verification and copy rounds stay at
 // most 64 columns, so their captured topology never gains the merge kernel.
 inline constexpr std::int32_t kCausalPromptI8FastMinSplitWidth = 65;
-inline constexpr std::int32_t kCausalPromptI8FastMaxSplits     = 8;
 // Every split keeps at least this many 64-key pages.
 inline constexpr std::int32_t kCausalPromptI8FastMinPagesPerSplit = 8;
 // Ceiling on the FP32 partials of one split launch.
@@ -70,13 +68,6 @@ allocate_causal_prompt_i8_fast_partials(Allocator& workspace, std::int32_t q_hea
             workspace.alloc(DType::FP32, {2, q_heads, width, splits})};
 }
 
-// Split partial layout for key split s, column c and query head h: the D256 row at
-// ((s * width + c) * q_heads + h) * 256 and its (max, sum) pair at that row index.
-__host__ __device__ __forceinline__ std::int64_t
-causal_prompt_i8_fast_partial_row(int split, int column, int q_head, int width, int q_heads) {
-    return (static_cast<std::int64_t>(split) * width + column) * q_heads + q_head;
-}
-
 inline std::size_t causal_prompt_i8_fast_split_bytes(std::int32_t q_heads, std::int32_t width,
                                                      std::int32_t splits) {
     if (splits <= 1) { return 0; }
@@ -84,13 +75,6 @@ inline std::size_t causal_prompt_i8_fast_split_bytes(std::int32_t q_heads, std::
     (void)allocate_causal_prompt_i8_fast_partials(layout, q_heads, width, splits);
     return layout.peak_bytes(1);
 }
-
-// What a launch may split: `maximum` 1 turns splits off; `forced` (with a maximum above 1) takes
-// exactly that many splits where the width and the budget allow, whatever the cost model says.
-struct CausalPromptI8FastSplitPolicy {
-    std::int32_t maximum = kCausalPromptI8FastMaxSplits;
-    std::int32_t forced  = 0;
-};
 
 // Plan for one launch of `width` columns whose last row sweeps `visible_keys` keys on a device of
 // `multiprocessors` SMs. `wide` says whether the eight-warp CTA launches in this shape set (it does

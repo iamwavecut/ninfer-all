@@ -35,7 +35,7 @@
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
-#include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_fast_merge.cuh"
 
 #include <cstdint>
 

@@ -1,11 +1,12 @@
 // ninfer::ops::detail - NVFP4 causal prompt launch ownership.
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_launch.h"
 
 #include "core/device_launch.h"
+#include "core/paged_kv_view.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/launch.h"
-#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cuh"
 #include "ops/kv_cache/plane_types.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4.cuh"
 
 #include <cstdint>
 

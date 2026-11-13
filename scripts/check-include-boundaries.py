@@ -13,6 +13,11 @@
   ninfer/ops/linear_policy.h, ninfer/ops/softmax_attention_envelope.h and core/paged_kv_view.h. A
   unit that implements or calls the host API includes that header itself and is listed in
   HOST_API_UNITS.
+- The host launchers of the causal-cache attention (causal_cache/*.cpp) reach no kernel header
+  other than geometry.cuh, and the kernel units' headers (causal_cache/*_launch.cuh, which the
+  generated units of kernel_unit.cu.in include) and the reducers and merges there (*_reduce.cu,
+  *_merge.cu) reach none of the launchers' routing headers. An edit of a kernel then recompiles
+  only its own units, and an edit of the routing compiles no kernel.
 - ninfer/types_fwd.h declares every struct, class and enum the headers listed in ninfer/types.h
   define, with the same keyword, and nothing else.
 
@@ -48,6 +53,19 @@ HOST_API = (
 HOST_API_UNITS = {
     'src/ops/linear_topk/t2.cu': {'include/ninfer/ops/linear.h'},  # calls ops::linear
     'src/ops/softmax_attention/dense/causal_cache/merge.cu': {'include/ninfer/ops/softmax_attention.h'},
+}
+CAUSAL_CACHE = 'src/ops/softmax_attention/dense/causal_cache'
+CAUSAL_CACHE_HOST_KERNEL_HEADERS = {f'{CAUSAL_CACHE}/geometry.cuh'}
+CAUSAL_CACHE_ROUTING = {
+    'include/ninfer/ops/softmax_attention_envelope.h',
+    'src/core/paged_kv_view.h',
+    f'{CAUSAL_CACHE}/prompt_launch.h',
+    f'{CAUSAL_CACHE}/prompt_i8_fast_plan.h',
+    f'{CAUSAL_CACHE}/prompt_policy.h',
+    f'{CAUSAL_CACHE}/route.h',
+    f'{CAUSAL_CACHE}/small_t_i8_route.h',
+    f'{CAUSAL_CACHE}/small_t_invocation.h',
+    f'{CAUSAL_CACHE}/small_t_launch.h',
 }
 INCLUDE = re.compile(r'^\s*#\s*include\s*[<"]([^>"]+)[>"]', re.M)
 TYPE = re.compile(r'^(struct|class|enum class)\s+(\w+)\b[^;]*?(\{|;)', re.M)
@@ -138,6 +156,20 @@ def main():
                 chain = chain_to(source, {header}, memo, cache)
                 if chain and not (header in allowed and len(chain) == 2):
                     failures.append(f'{source} reaches {header}: ' + ' -> '.join(chain))
+    names = sorted(os.listdir(os.path.join(ROOT, CAUSAL_CACHE)))
+    kernel_headers = {f'{CAUSAL_CACHE}/{name}' for name in names if name.endswith('.cuh')}
+    for name in names:
+        source = f'{CAUSAL_CACHE}/{name}'
+        if name.endswith('.cpp'):
+            chain = chain_to(source, kernel_headers - CAUSAL_CACHE_HOST_KERNEL_HEADERS, memo, cache)
+            if chain:
+                failures.append(f'{source} reaches kernel header {chain[-1]}: '
+                                + ' -> '.join(chain))
+        elif name.endswith(('_launch.cuh', '_reduce.cu', '_merge.cu')):
+            chain = chain_to(source, CAUSAL_CACHE_ROUTING, memo, cache)
+            if chain:
+                failures.append(f'{source} reaches routing header {chain[-1]}: '
+                                + ' -> '.join(chain))
     for source, headers in sorted(HOST_API_UNITS.items()):
         for header in sorted(headers - set(includes(source, memo, cache))):
             failures.append(f'{source} no longer includes {header}; remove it from HOST_API_UNITS')

@@ -8,7 +8,7 @@
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
-#include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
+#include "ops/softmax_attention/dense/causal_cache/small_t_sm70_common.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>

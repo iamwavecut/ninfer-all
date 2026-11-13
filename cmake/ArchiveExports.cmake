@@ -1,5 +1,6 @@
-# Write a module-definition file that exports the explicit instantiations of one function template
-# from a static archive: the public symbols whose MSVC-decorated names begin with ??$<SYMBOL>@.
+# Write a module-definition file that exports the explicit instantiations of function templates
+# from a static archive: the public symbols whose MSVC-decorated names begin with ??$<SYMBOL>@, where
+# SYMBOL is a regular expression for the templates' names.
 cmake_minimum_required(VERSION 3.28)
 if(NOT DUMPBIN OR NOT EXISTS "${ARCHIVE}" OR NOT SYMBOL OR NOT EXPECTED OR NOT OUTPUT)
   message(FATAL_ERROR "Archive exports require dumpbin, an archive, a symbol, a count and an output")

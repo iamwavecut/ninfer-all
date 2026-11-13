@@ -10,8 +10,9 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
+#include "ops/common/device_tier.h"
 #include "ops/kv_cache/int8_g64_codec.cuh"
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_shape.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
 
 #include <cstdint>

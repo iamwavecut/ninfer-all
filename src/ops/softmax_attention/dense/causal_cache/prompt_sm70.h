@@ -6,7 +6,7 @@
 // 64 query rows of one KV head (the group's query heads times consecutive tokens) and walks the
 // visible keys in tiles of 32: its threads read each tile from the pages and decode it to FP16 in
 // shared memory once, and each warp runs the decode kernel's m8n8k4 products and FP32 online
-// softmax over it for eight rows (small_t_sm70.cuh). The next tile's codes are read into registers
+// softmax over it for eight rows (small_t_sm70_common.cuh). The next tile's codes are read into registers
 // while the current one is multiplied. No workspace: the pages are read where they are.
 //
 // The same kernel is the position-split prompt route on every architecture

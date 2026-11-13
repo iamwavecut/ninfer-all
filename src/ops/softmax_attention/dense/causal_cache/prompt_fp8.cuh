@@ -31,7 +31,7 @@ inline constexpr int kCausalPromptFp8Threads       = kCausalPromptFp8Warps * 32;
 // beside its raw FP8 staging buffer on top of a real (unquantized) BF16 Q buffer, since unlike
 // the native-FP8-QK design this replaces, sm_86/sm_89 must run QK on ordinary BF16 Tensor Cores.
 // That's well over sm_86/sm_89's ~99KiB-per-block shared-memory budget (same constraint as
-// small_t_fp8.cu; see its comment). Br=Bc=32 fits comfortably (~68KiB) at the cost of more,
+// small_t_fp8_launch.cuh; see its comment). Br=Bc=32 fits comfortably (~68KiB) at the cost of more,
 // smaller row/key tiles. Turing's 64 KiB hold separate widened K and V stages only at Bc=16, where
 // V widens during QK instead of into the K stage after it: 13-15% faster than Bc=32 on an RTX 2080
 // Ti at every prompt width from 128 to 4096.

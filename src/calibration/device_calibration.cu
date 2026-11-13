@@ -31,7 +31,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
 
 #include <cuda_runtime.h>
 

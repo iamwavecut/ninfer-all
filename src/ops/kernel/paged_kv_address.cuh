@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/paged_kv_view.h"
+#include "core/paged_kv_page.h"
 
 #include <cstdint>
 

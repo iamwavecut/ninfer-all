@@ -8,8 +8,8 @@
 #include "ops/kv_cache_e8_root_host.h"
 #include "ops/kv_cache_lloyd4_oracle.h"
 #include "ops/op_tester.h"
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
-#include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_route.h"
 #include "ops/softmax_attention/oracle.h"
 
 #include <algorithm>

@@ -1,14 +1,17 @@
 // ninfer::ops::detail - row-scaled E4M3FN-cache causal prompt launch ownership.
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_fp8_launch.h"
 
 #include "core/device_launch.h"
+#include "core/paged_kv_view.h"
 #include "ops/common/device_multiprocessors.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/launch.h"
+#include "ops/kv_cache/plane_types.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_fast_merge.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_fp8_fast.cuh"
-#include "ops/kv_cache/plane_types.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
 
 #include <cstdint>
 

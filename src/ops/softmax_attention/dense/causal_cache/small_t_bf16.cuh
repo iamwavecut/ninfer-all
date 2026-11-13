@@ -252,7 +252,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     float* partial_acc, float* partial_m, float* partial_l, CausalKeyPartition partition) {
     if constexpr (!shape_set_in_image(false)) { return; } // not this image's set
-    // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
+    // A Volta card runs its own kernel (small_t_sm70_bf16.cuh): a build of several architectures
     // compiles this kernel empty in the Volta image.
 #if !defined(NINFER_SM70_DEVICE)
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
