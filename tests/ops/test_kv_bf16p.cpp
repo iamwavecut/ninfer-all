@@ -429,6 +429,12 @@ int main() {
         failures += append_case(kv_heads, 37, 130, 21U + static_cast<std::uint32_t>(kv_heads));
         failures += append_case(kv_heads, 63, 1, 31U + static_cast<std::uint32_t>(kv_heads));
     }
+    // Attention over a packed cache needs sm_75 or newer; a Volta card checks the appends only.
+    if (ops::current_device_volta()) {
+        std::cout << "SKIP attention: --kv-dtype bf16p needs sm_75 or newer\n";
+        std::cout << (failures == 0 ? "PASS" : "FAIL") << " kv_bf16p failures=" << failures << '\n';
+        return failures == 0 ? 0 : 1;
+    }
     struct Shape {
         int history, width;
     };

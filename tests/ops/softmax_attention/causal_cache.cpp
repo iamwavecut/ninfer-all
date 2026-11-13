@@ -4603,6 +4603,11 @@ int verify_workspace_capacity_contract() {
             for (const bool wide : {false, true}) {
                 const ops::CausalAttentionExecutionEnvelope envelope{1, 1025, false, wide};
                 const ops::AttentionHeadGeometry geometry{kHeadDim, heads.q_heads, heads.kv_heads};
+                // A prompt width needs workspace only for the fast prompt kernel's key-split
+                // partials (int8/prompt_fast_plan.h); a card without the standard INT8-family
+                // prompt kernel (Turing) runs the fast one whatever the envelope asks.
+                const bool fast_prompt = ops::detail::causal_attention_prompt_fast_kernel(
+                    storage, envelope.fast_prompt_kernel);
                 for (const std::int32_t first : {1, 17, 32, 33, 64, 65}) {
                     const std::size_t interval =
                         ops::causal_softmax_attention_workspace_capacity_bytes(
@@ -4612,7 +4617,8 @@ int verify_workspace_capacity_contract() {
                         const auto exact = ops::causal_softmax_attention_workspace_capacity_bytes(
                             geometry, storage, envelope, 1, tokens, tokens);
                         witness = std::max(witness, exact);
-                        if ((tokens <= (wide ? 64 : 16)) != (exact != 0)) {
+                        const bool small_t = tokens <= (wide ? 64 : 16);
+                        if (small_t ? exact == 0 : (exact != 0 && !fast_prompt)) {
                             std::cerr << "causal_softmax_attention wide route workspace mismatch\n";
                             ++failures;
                         }
