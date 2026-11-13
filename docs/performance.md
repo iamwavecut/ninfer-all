@@ -31,7 +31,7 @@ drafts with the tokens committed per verify round in brackets.
 | RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md) |
 | L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
-| A40 | 48 GB | `86` | 300 W | [Flint](flint.md#measurements) |
+| A40 | 48 GB | `86` | 300 W | [Flint](flint.md#measurements), [Edge0](edge0.md#measurements) |
 | RTX 3090 | 24 GB | `86` | 300 to 420 W by campaign | every page |
 | RTX 3060 | 12 GB | `86`, the image | 170 W | [small cards](performance/small-cards-2026-10.md) |
 | RTX 3060 Ti | 8 GB | `86`, the image | 200 W | [small cards](performance/small-cards-2026-10.md) |
@@ -784,6 +784,10 @@ on an L40S and 2.6509 on the Tesla V100 (llama.cpp 2.6502); IQ3_S 2.1317 (llama.
 five 65,536-token windows of PG-19 on two RTX 5090s: 8.0834 against llama.cpp's 8.0802. Host and
 disk experts give the same perplexity on every card checked (2.6057 on the V100 over the first
 40 KB, 2.53655 on the TITAN RTX over the first 40,000 bytes of `wikitext/00.txt`, INT8 KV).
+
+## Edge0-145B and Edge0-120B
+
+Every release on one A40, with each expert placement that fits it, with and without MTP, and against the publisher's engine: [Edge0 measurements](edge0.md#measurements).
 
 ## Gemma 4 26B-A4B
 

@@ -64,7 +64,7 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk) |
+| ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk), Edge0 (three-layer slices) |
 | ⬜ | RTX 5090 D | 32 GB | GeForce | | |
 | ⬜ | RTX 5090 D V2 | 24 GB | GeForce | ✓ | |
 | ✅ | RTX 5080 | 16 GB | GeForce | ✓ | IQ3_S under WSL2 ([field report](performance/field-reports.md#rtx-5080-wsl2)) |
@@ -130,7 +130,7 @@ means the card calibrates once at its first start.
 | ✅ | RTX A4000 | 16 GB | Workstation | | Qwen3.8-27B NVFP4 and groupwise, with tensor parallelism over two and four cards |
 | ⬜ | RTX A2000 | 12 GB | Workstation | | |
 | ⬜ | RTX A1000 | 8 GB | Workstation | | |
-| ✅ | A40 | 48 GB | Data center | ✓ | Flint |
+| ✅ | A40 | 48 GB | Data center | ✓ | Flint; Edge0-145B and Edge0-120B (experts on the GPU, in host memory, on disk; two tensor-parallel ranks on one card) |
 | ⬜ | A10 | 24 GB | Data center | ✓ | |
 | ⬜ | A10G | 24 GB | Data center | | |
 | ⬜ | A16 | 16 GB per GPU | Data center | | |
@@ -149,7 +149,7 @@ means the card calibrates once at its first start.
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
 | ✅ | TITAN RTX | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, MXFP8, Gemma 4, Flash-Next; 35B-A3B over two cards |
-| ✅ | RTX 2080 Ti | 11 GB | GeForce | ✓ | Bonsai 2 |
+| ✅ | RTX 2080 Ti | 11 GB | GeForce | ✓ | Bonsai 2, Edge0 (three-layer slices) |
 | ⬜ | RTX 2080 Super | 8 GB | GeForce | | |
 | ⬜ | RTX 2080 | 8 GB | GeForce | | |
 | ⬜ | RTX 2070 Super | 8 GB | GeForce | ✓ | |
@@ -171,7 +171,7 @@ means the card calibrates once at its first start.
 | ⬜ | TITAN V | 12 GB | GeForce | | |
 | ⬜ | Quadro GV100 | 32 GB | Workstation | | |
 | ✅ | Tesla V100-SXM2 | 16 GB | Data center | ✓ | Bonsai 2, IQ3_S, Qwen3.8-27B (Q4 embedding and head), Flash-Next (experts in host memory, on disk), Gemma 4 |
-| ✅ | Tesla V100-SXM2 | 32 GB | Data center | ✓ | DeepSeek-V4.1-Flash (experts in host memory, on disk; 16 GB of the card) |
+| ✅ | Tesla V100-SXM2 | 32 GB | Data center | ✓ | DeepSeek-V4.1-Flash (experts in host memory, on disk; 16 GB of the card), Edge0 (three-layer slices) |
 | ⬜ | Tesla V100 PCIe | 32 / 16 GB | Data center | | |
 | ⬜ | Tesla V100S PCIe | 32 GB | Data center | | |
 
