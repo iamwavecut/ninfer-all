@@ -133,7 +133,7 @@ struct LinearInto {
  *
  * @details Every `out` receives the bytes that `linear(x, *weight, *out, policy, workspace,
  * stream)` writes, under the same requirements on each problem. The BF16 problems whose own call
- * runs the runtime-shape route's GEMV form (no registered shape, T up to 8, K a multiple of 8, a
+ * runs the runtime-shape route's GEMV form (no registered shape, T up to 16, K a multiple of 8, a
  * BF16 `out`) share one launch, four at a time, and every row runs that form's arithmetic; every
  * other problem takes a call of its own. The outputs must not overlap each other, `x` or any
  * weight plane. `workspace` is sized for the largest problem's linear_workspace_capacity_bytes().

@@ -3,6 +3,7 @@
 
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/device_launch.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
 
@@ -273,13 +274,14 @@ int run_selector_linear() {
 
 int run_general_bf16_linear() {
     // Shapes outside the specialised table (14336/5120, 5120/6144, 256/5120) route to the general
-    // runtime-shape GEMM: its GEMV form up to eight tokens when K is a multiple of 8, the SIMT tile
+    // runtime-shape GEMM: its GEMV form up to 16 tokens when K is a multiple of 8, the SIMT tile
     // below 64 tokens and cuBLAS's tensor-core GEMM from 64 on. Cover the minimal tile,
     // non-tile-aligned extents (the row/column boundary guards), multi-tile grids, the QAT
     // full-precision vocab head's real shape, Qwen3.8-Flash-Next's BF16 projections (the Gated
-    // DeltaNet a/b rows and the sparse-attention indexer) and the Gemma 4 vision tower's (the
-    // patch projection, a block's Q/K/V, [gate; up] and down, the projection into the text model),
-    // with BF16 results and, through every form of the GEMM, FP32 ones.
+    // DeltaNet a/b rows and the sparse-attention indexer), the Gemma 4 vision tower's (the
+    // patch projection, a block's Q/K/V, [gate; up] and down, the projection into the text model)
+    // and a DSpine drafter's code bridge (read, projection, write), with BF16 results and, through
+    // every form of the GEMM, FP32 ones.
     int failures = 0;
     const std::vector<std::pair<int, int>> shapes = {
         {32, 32},   // exactly one 32x32 tile
@@ -294,6 +296,9 @@ int run_general_bf16_linear() {
         {8608, 1152},    // Gemma 4 vision [gate; up]
         {1152, 4304},    // Gemma 4 vision down
         {2816, 1152},    // Gemma 4 vision projection into the text model
+        {1024, 5120},    // DSpine bridge read
+        {1536, 1024},    // DSpine bridge projection
+        {5120, 512},     // DSpine bridge write
     };
     for (const auto& [n, k] : shapes) {
         DeviceWeight weight(make_patterned(n, k, 421U));
@@ -302,13 +307,15 @@ int run_general_bf16_linear() {
         const std::vector<int> widths =
             n > 4096 && k > 4096 ? std::vector<int>{1, 2}
             : k == 1152 || k == 768 || k == 4304 ? std::vector<int>{9, 63, 64, 70, 630}
-                                                 : std::vector<int>{1, 2, 3, 7, 8, 9, 32, 33, 128};
+                                                 : std::vector<int>{1, 2, 3, 7, 8, 9, 12, 15, 16,
+                                                                    17, 32, 33, 128};
         for (int tokens : widths) { failures += run_bf16_linear_case(weight, tokens); }
         // FP32 results: the vision tower's projections at its widths and the small shapes at the
         // GEMV, SIMT and cuBLAS widths.
         if (n <= 4096 || k <= 4096) {
             for (int tokens : k == 1152 || k == 768 || k == 4304 ? std::vector<int>{9, 64, 630}
-                                                                 : std::vector<int>{1, 8, 9, 33, 128}) {
+                                                                 : std::vector<int>{1, 8, 9, 16, 17, 33,
+                                                                                    128}) {
                 failures += run_bf16_linear_case(weight, tokens, false, true);
             }
         }
@@ -323,6 +330,59 @@ int run_general_bf16_linear() {
     DeviceWeight registered(make_patterned(256, 5120, 423U));
     for (int tokens : {1, 33, 64}) {
         failures += run_bf16_linear_case(registered, tokens, false, true);
+    }
+    return failures;
+}
+
+// The GEMV form gives each column the bits a one-token call on that column gives it, at every
+// width it takes (1..16), into BF16 and FP32 outputs: a verification's columns and a decode step
+// read the same products. sm_70 takes BF16 projections on its own route (ops/linear/sm70).
+int run_gemv_column_identity() {
+    int failures = 0;
+    int device = 0, major = 0, minor = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+    if (major == 7 && minor == 0) { return 0; }
+    for (const auto& [n, k] : std::vector<std::pair<int, int>>{{1024, 5120}, {5120, 512}, {640, 2560}}) {
+        DeviceWeight weight(make_patterned(n, k, 433U));
+        for (const bool fp32 : {false, true}) {
+            const std::size_t element = fp32 ? sizeof(float) : sizeof(std::uint16_t);
+            const DType dtype         = fp32 ? DType::FP32 : DType::BF16;
+            for (const std::int32_t tokens : {2, 8, 9, 15, 16}) {
+                const auto bits    = make_activation_bits(k, tokens);
+                DeviceBuffer input = to_device(bits);
+                Tensor x(input.p, DType::BF16, {k, tokens});
+                DeviceArena workspace(std::max<std::size_t>(
+                    256, ops::linear_workspace_capacity_bytes(QType::BF16, n, k,
+                                                              ops::LinearPolicy::A16Only, 1,
+                                                              tokens)));
+                GuardedDeviceBuffer wide(std::size_t(n) * std::size_t(tokens) * element);
+                Tensor wide_out(wide.data(), dtype, {n, tokens});
+                ops::linear(x, weight.view(), wide_out, ops::LinearPolicy::A16Only, workspace,
+                            nullptr);
+                cuda_synchronize();
+                const auto all = from_device<std::uint8_t>(wide.data(), wide.bytes());
+                for (std::int32_t column = 0; column < tokens; ++column) {
+                    Tensor one_x(static_cast<std::byte*>(input.p) +
+                                     std::size_t(column) * std::size_t(k) * sizeof(std::uint16_t),
+                                 DType::BF16, {k, 1});
+                    GuardedDeviceBuffer single(std::size_t(n) * element);
+                    Tensor one_out(single.data(), dtype, {n, 1});
+                    ops::linear(one_x, weight.view(), one_out, ops::LinearPolicy::A16Only,
+                                workspace, nullptr);
+                    cuda_synchronize();
+                    const auto one = from_device<std::uint8_t>(single.data(), single.bytes());
+                    const auto* begin = all.data() + std::size_t(column) * one.size();
+                    if (!std::equal(one.begin(), one.end(), begin)) {
+                        std::cerr << "BF16 GEMV [" << n << "," << k << "] T=" << tokens
+                                  << (fp32 ? " fp32" : "") << " column " << column
+                                  << " differs from its one-token call\n";
+                        ++failures;
+                    }
+                }
+            }
+        }
     }
     return failures;
 }
@@ -357,7 +417,7 @@ int run_linear_together() {
                 std::make_unique<DeviceWeight>(make_patterned(problem.rows, c.k, seed++)));
             views.push_back(weights.back()->view());
         }
-        for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 33}) {
+        for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 33}) {
             const auto bits    = make_activation_bits(c.k, tokens);
             DeviceBuffer input = to_device(bits);
             Tensor x(input.p, DType::BF16, {c.k, tokens});
@@ -454,6 +514,7 @@ int run_bf16_linear() {
     }
     failures += run_selector_linear();
     failures += run_general_bf16_linear();
+    failures += run_gemv_column_identity();
     failures += run_linear_together();
     return failures;
 }

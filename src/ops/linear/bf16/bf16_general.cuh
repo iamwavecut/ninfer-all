@@ -4,7 +4,7 @@
 // tile (for example a full-precision vocab projection kept as BF16 by a QAT checkpoint), and for
 // every FP32 result. Computes out[T, N] = x[T, K] * weight[N, K]^T with an fp32 accumulation and a
 // BF16 or FP32 store, matching the contiguous token-major layout of the specialised kernels. Tiling is fixed and the extents are
-// runtime, so any (N, K, T) is handled without a per-shape instantiation. Up to eight tokens over
+// runtime, so any (N, K, T) is handled without a per-shape instantiation. Up to 16 tokens over
 // 16-byte rows take the GEMV form instead: one warp per output row streams the row once.
 
 #include <cuda_bf16.h>
@@ -97,8 +97,12 @@ __global__ void bf16_general_gemm_kernel(const __nv_bfloat16* __restrict__ x,
 }
 
 // One warp per output row: the row in 16-byte vectors (K a multiple of 8), every token's sum in a
-// register, FP32 accumulation and a BF16 or FP32 store.
-constexpr std::int32_t kGemvMaxTokens = 8;
+// register, FP32 accumulation and a BF16 or FP32 store. A token's sum does not depend on how many
+// tokens share the launch, so every width gives each column the bits a one-token call gives it.
+// Up to 16 tokens: past eight the SIMT tile took 2.8 ms a round on an RTX 5090 for a DSpine
+// drafter's 15 bridge projections ([1024, 5120], [1536, 1024], [5120, 512]) at 16 columns, against
+// 0.14 ms for this form at eight.
+constexpr std::int32_t kGemvMaxTokens = 16;
 constexpr std::int32_t kGemvWarps     = 8;
 
 __device__ __forceinline__ void unpack_bf16x8(const uint4& v, float (&out)[8]) {

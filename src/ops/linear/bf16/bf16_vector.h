@@ -12,7 +12,7 @@
 
 namespace ninfer::ops::detail {
 
-// Whether the runtime-shape route runs x [K,T] against `weight` in its GEMV form: T up to 8, K a
+// Whether the runtime-shape route runs x [K,T] against `weight` in its GEMV form: T up to 16, K a
 // multiple of 8, x and the weight 16-byte aligned.
 [[nodiscard]] bool bf16_general_vector(const Tensor& x, const Weight& weight);
 
