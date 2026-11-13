@@ -24,6 +24,14 @@ Every folder also holds the skeleton as a llama.cpp GGUF (6.0 GB), the n-gram ta
 models are under the Edge0 Community Model License 1.0 and the Qwen license of the base model; a
 converted artifact is a conversion under those licenses.
 
+NInfer artifacts of the four releases are published without the table:
+[Edge0-145B-NVFP4](https://huggingface.co/WaveCut/Edge0-145B-NVFP4-NInfer-v3),
+[Edge0-145B-q3k](https://huggingface.co/WaveCut/Edge0-145B-q3k-NInfer-v3),
+[Edge0-120B-NVFP4](https://huggingface.co/WaveCut/Edge0-120B-NVFP4-NInfer-v3) and
+[Edge0-120B-q3k](https://huggingface.co/WaveCut/Edge0-120B-q3k-NInfer-v3). The table is published
+once, as [Edge0-ngram-table-FP8](https://huggingface.co/WaveCut/Edge0-ngram-table-FP8-NInfer-v3)
+([downloads](recipes.md#edge0-145b-and-edge0-120b)). The commands below use their file names.
+
 ## Convert
 
 `--model` needs the base model's configuration and tokenizer files (`config.json`,
@@ -36,12 +44,12 @@ which supplies the skeleton, the experts, the n-gram table and the MTP block.
 # The n-gram table once, as an artifact of its own that every Edge0 model names by digest.
 python3.11 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
   --recipe edge0_pack --source pack=/path/to/Edge0-120B-q3k \
-  --components ngram --device cpu --out models/edge0-ple-fp8-table.ninfer
+  --components ngram --device cpu --out models/Edge0-ngram-table-FP8-ninfer-v3.ninfer
 
 # Each model without the table, with its MTP block.
 python3.11 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
   --recipe edge0_pack --source pack=/path/to/Edge0-120B-q3k \
-  --components text,mtp --device cpu --name Edge0-120B-q3k --out models/edge0-120b-q3k.ninfer
+  --components text,mtp --device cpu --name Edge0-120B-q3k --out models/Edge0-120B-q3k-ninfer-v3.ninfer
 ```
 
 `edge0_pack` stores the encoder and decoder build the release's launcher selects;
@@ -61,20 +69,21 @@ conversion.
 ## Run
 
 ```bash
+M=models/Edge0-120B-q3k-ninfer-v3.ninfer
+T=models/Edge0-ngram-table-FP8-ninfer-v3.ninfer
+
 # One GPU with room for every expert (Edge0-120B-q3k on a 48 GB card).
-./build/apps/ninfer-serve models/edge0-120b-q3k.ninfer --ngram-table models/edge0-ple-fp8-table.ninfer \
-  --max-context 32768
+./build/apps/ninfer-serve $M --ngram-table $T --max-context 32768
 
 # One GPU: the experts in pinned host memory, the most used of them cached on the GPU.
-./build/apps/ninfer-serve models/edge0-120b-q3k.ninfer --ngram-table models/edge0-ple-fp8-table.ninfer \
-  --expert-residency host --max-context 32768
+./build/apps/ninfer-serve $M --ngram-table $T --expert-residency host --max-context 32768
 
 # One GPU and little RAM: the experts stay in the artifact's files and stream into a GPU cache.
-./build/apps/ninfer-serve models/edge0-120b-q3k.ninfer --ngram-table models/edge0-ple-fp8-table.ninfer \
-  --expert-residency disk --max-context 32768
+./build/apps/ninfer-serve $M --ngram-table $T --expert-residency disk --max-context 32768
 
-# Several GPUs dividing every layer: each GPU holds whole groups with their encoder, decoder and experts (Linux).
-./build/apps/ninfer-serve models/edge0-145b-q3k.ninfer --ngram-table models/edge0-ple-fp8-table.ninfer \
+# Several GPUs dividing every layer: each GPU holds whole groups with their encoder, decoder and
+# experts (Linux).
+./build/apps/ninfer-serve models/Edge0-145B-q3k-ninfer-v3.ninfer --ngram-table $T \
   --devices 0,1 --tensor-parallel --max-context 32768
 ```
 
