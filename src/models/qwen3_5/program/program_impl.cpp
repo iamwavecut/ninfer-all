@@ -1101,8 +1101,11 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.kv_capacity     = kv_capacity;
     out.kv_cache        = kv_storage;
     const auto& weights = parameters.model.storage_stats();
-    out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
-                                     weights.device_capacity_bytes};
+    // A DSpine drafter's weights load beside the model's on its first device.
+    const std::size_t model_weight_bytes =
+        weights.device_capacity_bytes +
+        (parameters.dspine != nullptr ? parameters.dspine->device_bytes() : 0U);
+    out.weights = ArenaMemorySummary{model_weight_bytes, model_weight_bytes, model_weight_bytes};
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
     std::size_t active_handoff_bytes = 0;

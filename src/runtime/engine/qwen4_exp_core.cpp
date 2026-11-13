@@ -3710,13 +3710,17 @@ MemorySummary Qwen4ExpCore::memory_summary() const {
     const auto arena   = [](std::uint64_t bytes) {
         return ArenaMemorySummary{bytes, bytes, bytes};
     };
+    // A DSpine drafter's weights load beside the model's on its first device.
+    const auto* drafter                 = impl_->instance.model->dspine();
+    const std::uint64_t drafter_weights = drafter != nullptr ? drafter->device_bytes() : 0U;
     std::vector<DeviceMemorySummary> devices;
     for (std::size_t r = 0; r < impl_->device.size(); ++r) {
         const auto& rank = memory.ranks.at(r);
+        const std::uint64_t rank_weights =
+            (r < stats.device_capacity_by_rank.size() ? stats.device_capacity_by_rank[r] : 0) +
+            (r == 0 ? drafter_weights : 0U);
         devices.push_back({.device    = impl_->device.rank(r).device,
-                           .weights   = arena(r < stats.device_capacity_by_rank.size()
-                                                  ? stats.device_capacity_by_rank[r]
-                                                  : 0),
+                           .weights   = arena(rank_weights),
                            .sequence  = arena(rank.state_bytes),
                            .workspace = arena(rank.workspace_bytes),
                            .expert_cache_bytes = rank.expert_cache_bytes});
