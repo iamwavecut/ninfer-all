@@ -429,7 +429,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                the server stops (Ctrl+C twice) (default off)\n"
            "\n"
            "SPECULATIVE DECODING\n"
-           "  --spec none|mtp|dflash|dflash2|dspark\n"
+           "  --spec none|mtp|dflash|dflash2|dspark|dspine\n"
            "                                speculative decoding backend (default: dflash2\n"
            "                                with 4 drafts for Flash-Next host experts on one\n"
            "                                device whose artifact has that drafter, mtp with\n"
@@ -437,12 +437,19 @@ std::string serve_usage_text(const char* argv0) {
            "                                MTP block, for Edge0 device experts serving one\n"
            "                                request at a time and for Gemma 4 host or disk\n"
            "                                experts whose artifact has the drafter, else\n"
-           "                                none; dspark: DeepSeek-V4.1's DSpark drafter)\n"
+           "                                none; dspark: DeepSeek-V4.1's DSpark drafter;\n"
+           "                                dspine: the DSpine drafter --draft-model names)\n"
+           "  --draft-model PATH            dspine: the DSpine drafter artifact, trained for\n"
+           "                                this model\n"
            "  --draft-tokens N              drafts per round, 1..15 (Flash-Next dflash2: 1..7;\n"
-           "                                dspark: up to its block of 5, the default)\n"
-           "  --draft-min-p P               Flash-Next MTP or DFlash2 confidence floor, 0..1\n"
-           "                                (default 0 with --spec, 0.5 when the engine\n"
-           "                                chooses MTP, 0.7 when it chooses DFlash2)\n"
+           "                                dspark: up to its block of 5, the default; dspine:\n"
+           "                                up to its block less one, 7 for Gemma 4, Flint\n"
+           "                                and DeepSeek-V4.1)\n"
+           "  --draft-min-p P               confidence floor 0..1 of Flash-Next MTP, DFlash2\n"
+           "                                or DSpine, and of DSpine on Gemma 4, Flint or\n"
+           "                                DeepSeek-V4.1 (default 0 with --spec, 0.5 when\n"
+           "                                the engine chooses MTP, 0.7 when it chooses\n"
+           "                                DFlash2)\n"
            "  --draft-confidence C          dspark: verify drafts while their confidence is\n"
            "                                at least C, 0..1 (default 0.5; 0 keeps every draft)\n"
            "  --draft-experts N             dspark: each drafter block keeps its N most routed\n"
@@ -455,7 +462,10 @@ std::string serve_usage_text(const char* argv0) {
            "                                artifact stores a proposal head\n"
            "  --adaptive-mtp                each MTP round verifies 3..--draft-tokens\n"
            "                                drafts, the width the drafts' measured survival\n"
-           "                                and round cost favor; greedy output is unchanged\n"
+           "                                and round cost favor; greedy output is unchanged;\n"
+           "                                with DFlash, DFlash2 or DSpine (Qwen3.5-core\n"
+           "                                models) a round drafts and verifies\n"
+           "                                --draft-tokens or half of them\n"
            "  --mtp-attention-window N      the MTP draft head attends to its first 64 keys\n"
            "                                and the newest N before its query, not the\n"
            "                                whole history; verification is unchanged\n"
@@ -1253,6 +1263,10 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         if (arg == "--draft-min-p") {
             options.speculative.draft_min_p =
                 parse_float_in(require_value("--draft-min-p"), "draft-min-p", 0.0F, 1.0F);
+            continue;
+        }
+        if (arg == "--draft-model") {
+            options.speculative.draft_model = require_value("--draft-model");
             continue;
         }
         if (arg == "--draft-confidence") {

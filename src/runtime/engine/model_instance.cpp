@@ -248,11 +248,13 @@ std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device,
 }
 
 // Disk-tier pages are keyed by token digests, which say nothing about the weights that produced
-// them: each artifact, and each set of control vectors run with it, gets its own directory so one
-// model can never restore another's KV.
+// them: each artifact, each set of control vectors run with it and each DSpine drafter beside it
+// (whose ring every StateImage holds) gets its own directory so one model can never restore
+// another's KV or drafter state.
 EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
                                         const artifact::ArtifactId& artifact,
-                                        const std::string& control_vectors) {
+                                        const std::string& control_vectors,
+                                        const std::string& drafter) {
     EngineOptions scoped = options;
     if (scoped.context_cache.disk_kv_path.empty()) { return scoped; }
     std::string name = "artifact_";
@@ -262,6 +264,7 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
         name += hex;
     }
     if (!control_vectors.empty()) { name += "_control_" + control_vectors; }
+    if (!drafter.empty()) { name += "_dspine_" + drafter; }
     scoped.context_cache.disk_kv_path /= name;
     return scoped;
 }
@@ -703,8 +706,10 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     // An automatic draft head is the artifact's optimized proposal head when it stores one: it
     // projects drafts onto a shortlist of the vocabulary instead of all of it.
     if (options.speculative.proposal_head == ProposalHead::Auto) {
+        // DSpine's refinement reads the whole head's logits, so it never takes a shortlist.
         const bool stored = options.purpose == EnginePurpose::Generation &&
                             options.speculative.backend != SpeculativeBackend::None &&
+                            options.speculative.backend != SpeculativeBackend::DSpine &&
                             reader.directory().component("text").proposal.has_value();
         options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
     }
@@ -757,7 +762,10 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         planner.emplace(models::qwen3_5::make_sequence_planner(
             instance->parameters, device,
             artifact_scoped_disk_tier(options, instance->model->info().artifact_id,
-                                      control_vectors_digest(instance->steering.get())),
+                                      control_vectors_digest(instance->steering.get()),
+                                      instance->model->dspine() != nullptr
+                                          ? instance->model->dspine()->artifact_hex()
+                                          : std::string()),
             graft_main_pages));
     };
     for (int refits = 0;; ++refits) {

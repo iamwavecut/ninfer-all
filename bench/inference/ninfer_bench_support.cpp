@@ -327,7 +327,8 @@ std::string usage_text(std::string_view program) {
         << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p>  KV cache storage "
            "(default: bf16)\n"
         << "  --fast-prefill-kernel       fast INT8/FP8-KV prompt kernel, wave-aligned chunks\n"
-        << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
+        << "  --spec <mtp|dflash|dflash2|dspine> speculative backend (default: none)\n"
+           "  --draft-model PATH          dspine: the DSpine drafter artifact\n"
         << "  --draft-tokens <n>         MTP, DFlash and DFlash2 1..15\n"
         << "  --adaptive-mtp              verify an adaptive 3..K drafts per MTP round\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 15 with "
@@ -444,6 +445,8 @@ BenchOptions parse_arguments(const std::vector<std::string>& arguments,
         } else if (product::switch_option(arg, "fast-prefill-kernel", [&](bool on) { options.fast_prefill_kernel = on; })) {
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = value("--draft-model");
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
         } else if (product::switch_option(arg, "prefill-a8", [&](bool on) { options.prefill_a8 = on; })) {

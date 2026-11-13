@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/dspine_head.h"
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
@@ -30,6 +31,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
+#include "models/dspine/drafter.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
 #include "runtime/contract/rope_scaling.h"
@@ -262,9 +264,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         const auto* draft =
             parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;
         if (plan.features.masked_draft()) {
+            // DSpine's ring is the narrowest attention window that sees the whole context.
             state_image_spec.dflash_local = qwen3_5::DFlashLocalStateSpec{
                 .layers   = draft->local_layer_count(),
-                .capacity = draft->sliding_window.value_or(0),
+                .capacity = draft->dspine ? dspine::ring_capacity(*draft->dspine, plan.capacity)
+                                          : draft->sliding_window.value_or(0),
                 .kv_heads = dimension(draft->attention.num_key_value_heads),
                 .head_dim = dimension(draft->attention.head_dim),
             };
@@ -362,6 +366,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                  static_cast<std::int32_t>(widest_verify_window(plan) + 1U),
                  static_cast<std::int32_t>(plan.max_concurrency)},
                 "DFlash pending target features");
+            if (draft->dspine) {
+                dflash.dspine_head_write = add_tensor(
+                    builder, DType::BF16,
+                    {dimension(draft->dspine->rank), dimension(draft->dspine->vocab_size)},
+                    "DSpine head-write table");
+            }
         }
     }
 
@@ -485,6 +495,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     }
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
+    // The masked drafter's widest proposal (a copy round of several rows runs it at its width).
+    const auto proposal_drafts = static_cast<std::int32_t>(
+        masked_proposal_window(plan.draft_window, plan.ngram_draft_window, plan.max_concurrency));
     // A copy round verifies up to the widest window; the neural drafter still proposes drafts.
     const auto verify_drafts = static_cast<std::int32_t>(widest_verify_window(plan));
     const auto verify        = verify_drafts + 1;
@@ -1064,7 +1077,38 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 
     if (plan.features.masked_draft()) {
         {
-            const auto* draft                  = &*parameters.model.config().draft;
+            const auto* draft = &*parameters.model.config().draft;
+            // DSpine: its Drafter's own workspace at the ring the state images hold, and the
+            // target head's at each call's columns.
+            const std::uint32_t dspine_ring =
+                draft->dspine ? dspine::ring_capacity(*draft->dspine, plan.capacity) : 0U;
+            if (draft->dspine && parameters.dspine == nullptr) {
+                throw std::logic_error("--spec dspine plans without its drafter");
+            }
+            const auto head_bytes = [&](std::int32_t columns) {
+                WorkspaceLayoutBuilder head;
+                linear_scratch(head, parameters.text.output_head, 1, columns);
+                std::size_t bytes = finish(head);
+                // A proposal ranks its candidates in one pass where the Op takes the head.
+                if (const auto* ranked =
+                        execution::dspine_ranked_head(parameters, plan.proposal_head)) {
+                    const Weight& w = ranked->weight;
+                    bytes           = std::max(
+                        bytes, execution::rotated_workspace_bytes(
+                                   ranked->hadamard_signs, static_cast<std::int32_t>(w.k), columns,
+                                   ops::linear_topk_workspace_capacity_bytes(w.qtype, w.n, w.k, 1,
+                                                                             columns)));
+                } else if (plan.proposal_head == ProposalHead::Optimized) {
+                    // A proposal head of another form: its dense logits, ranked.
+                    const auto& proposal = parameters.proposal->head;
+                    WorkspaceLayoutBuilder dense;
+                    matrix(dense, DType::BF16, proposal.weight.n, columns);
+                    linear_scratch(dense, proposal, 1, columns);
+                    scratch(dense, ops::candidate_topk_workspace_capacity_bytes(columns));
+                    bytes = std::max(bytes, finish(dense));
+                }
+                return bytes;
+            };
             const auto dflash_context_capacity = [&](std::int32_t width, std::int32_t batch,
                                                      bool compact_input) {
                 const auto tokens = width * batch;
@@ -1074,6 +1118,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                            dimension(config.hidden_size *
                                      std::uint64_t(draft->target_layer_ids.size())),
                            tokens);
+                }
+                if (draft->dspine.has_value()) {
+                    scratch(layout, dspine::Drafter::context_workspace_bytes(
+                                        *parameters.dspine, dspine_ring, width, batch));
+                    return finish(layout);
                 }
                 if (draft->dflash2.has_value()) {
                     const auto local_width =
@@ -1104,6 +1153,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens          = width * batch;
                 const std::int32_t proposal_drafts = width - 1;
+                if (draft->dspine.has_value()) {
+                    scratch(layout, dspine::Drafter::proposal_workspace_bytes(
+                                        *parameters.dspine, logits_dtype, dspine_ring,
+                                        plan.capacity, width, batch,
+                                        head_bytes(proposal_drafts * batch)));
+                    return finish(layout);
+                }
                 matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
                 if (draft->dflash2.has_value()) {
                     const bool fused = draft->fused_dflash2(config.hidden_size);
@@ -1265,6 +1321,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             };
 
             out.dflash_context = dflash_context_capacity(chunk, 1, false);
+            if (draft->dspine.has_value()) {
+                // The head-write table's derivation at startup.
+                const auto concurrency = static_cast<std::int32_t>(plan.max_concurrency);
+                out.dflash_context = std::max(
+                    out.dflash_context,
+                    dspine::Drafter::prepare_workspace_bytes(
+                        *parameters.dspine, logits_dtype, concurrency, proposal_drafts + 1,
+                        head_bytes(dspine::Drafter::prepare_columns(
+                            *parameters.dspine, concurrency, proposal_drafts + 1))));
+            }
             for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
                  ++batch) {
                 std::size_t target_bytes = 0;
@@ -1278,16 +1344,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     target_bytes = std::max(target_bytes, finish(target));
                 }
                 const std::size_t accept =
-                    draft->dflash2.has_value()
+                    draft->dflash2.has_value() || draft->dspine.has_value()
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), {false},
                               narrowest_drafts, verify_drafts, batch, batch)
                         : ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count),
                               narrowest_drafts, verify_drafts, batch, batch);
-                // A copy round above batch one also runs the drafter at its own window, and a
+                // A copy round above batch one also runs the drafter, at the copy window, and a
                 // round after a copy round appends up to the widest window of target features.
-                const std::size_t proposal = dflash_proposal_capacity(drafts + 1, batch);
+                const std::size_t proposal =
+                    dflash_proposal_capacity((batch > 1 ? proposal_drafts : drafts) + 1, batch);
                 const std::size_t gather   = ops::logprob_topk_workspace_capacity_bytes(
                     dimension(parameters.model.resources().public_token_count), batch * verify);
                 out.dflash_round =
@@ -1369,7 +1436,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // Past the native window positions run unscaled RoPE or YaRN, to four times the window: the
     // extension Qwen documents for these models (1,048,576 tokens on a 262,144-token window).
     constexpr std::uint64_t kPositionExtension = 4;
-    if (parameters.draft &&
+    if ((parameters.draft || parameters.dspine) &&
         options.max_context >
             kPositionExtension * parameters.model.config().draft->max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the selected draft position capacity");
@@ -1425,6 +1492,12 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("an MTP attention window requires the MTP backend");
     }
+    if (options.speculative.mtp_policy == MtpDraftPolicy::Adaptive &&
+        options.speculative.backend != SpeculativeBackend::Mtp &&
+        !is_masked_draft_backend(options.speculative.backend)) {
+        throw std::invalid_argument(
+            "--adaptive-mtp requires --spec mtp, dflash, dflash2 or dspine");
+    }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
@@ -1456,6 +1529,29 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("masked draft window must be in [1,15]");
         }
         break;
+    case SpeculativeBackend::DSpine: {
+        const auto& draft = parameters.model.config().draft;
+        if (parameters.dspine == nullptr || !draft || !draft->dspine) {
+            throw std::invalid_argument("--spec dspine needs its drafter artifact (--draft-model)");
+        }
+        if (options.speculative.draft_tokens == 0 ||
+            options.speculative.draft_tokens + 1 > draft->dspine->block_size ||
+            options.speculative.draft_tokens > 15) {
+            throw std::invalid_argument(
+                "the DSpine draft window must be in [1, min(15, block_size - 1)]");
+        }
+        // Copy rounds of several requests run the drafter at the copy window.
+        if (masked_proposal_window(options.speculative.draft_tokens,
+                                   options.speculative.ngram_draft_tokens,
+                                   options.max_concurrency) +
+                1 >
+            draft->dspine->block_size) {
+            throw std::invalid_argument(
+                "above one request, --ngram-draft-tokens with DSpine must be at most its "
+                "block_size - 1, the widest proposal its drafter makes");
+        }
+        break;
+    }
     case SpeculativeBackend::DSpark:
         throw std::invalid_argument("--spec dspark drafts for DeepSeek-V4.1 only");
     }
@@ -1487,12 +1583,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
           options.speculative.backend != SpeculativeBackend::DFlash &&
+          options.speculative.backend != SpeculativeBackend::DSpine &&
           options.speculative.backend != SpeculativeBackend::Mtp) ||
          options.speculative.ngram_draft_tokens > 63 || options.speculative.ngram_min_match < 4 ||
          options.speculative.ngram_min_match > 64 ||
          (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1))) {
         throw std::invalid_argument(
-            "ngram requires MTP/DFlash/DFlash2, K1..63 and match 4..64; the GDN conv-record "
+            "ngram requires MTP/DFlash/DFlash2/DSpine, K1..63 and match 4..64; the GDN conv-record "
             "workspace admits at most 16 verification columns for a multi-request batch, so K "
             "above 15 requires concurrency one");
     }
@@ -1658,10 +1755,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     },
                     "DFlash graph allowance");
             };
+            // Under adaptive MTP the neural rounds capture one set per width they may select.
+            const auto neural_windows = masked_neural_windows(
+                impl->draft_window, impl->mtp_policy == MtpDraftPolicy::Adaptive);
             for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
-                impl->graph_allowance_bytes = checked_add(
-                    impl->graph_allowance_bytes, class_allowance(batch_size, impl->draft_window),
-                    "DFlash exact-b graph allowance");
+                for (const std::uint32_t window : neural_windows) {
+                    impl->graph_allowance_bytes =
+                        checked_add(impl->graph_allowance_bytes, class_allowance(batch_size, window),
+                                    "DFlash exact-b graph allowance");
+                }
                 if (impl->ngram_draft_window != 0) {
                     impl->graph_allowance_bytes =
                         checked_add(impl->graph_allowance_bytes,

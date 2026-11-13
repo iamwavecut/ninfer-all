@@ -1,19 +1,24 @@
 // Adaptive MTP only chooses how many drafts a round verifies; greedy output is the same at every
 // width. What these checks defend is the choice: the survival estimate, the measured cost model,
 // that the controller widens under full acceptance and settles low under none, and that a packed
-// round's plan spends its rows where drafts survive.
+// round's plan spends its rows where drafts survive, and that a masked drafter's round keeps the
+// width whose drafts repay its measured cost.
 
 #include "runtime/contract/mtp_adaptive.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <span>
 #include <stdexcept>
 
 namespace {
 
+using ninfer::runtime::MaskedWidthController;
+using ninfer::runtime::MaskedWidthSignal;
 using ninfer::runtime::MtpAdaptiveBatchController;
 using ninfer::runtime::MtpAdaptiveSignal;
 using ninfer::runtime::MtpPackedPlanner;
@@ -104,6 +109,85 @@ void the_controller_widens_and_narrows() {
             "two surviving drafts did not settle at two or three");
 }
 
+// Rounds of `rows` rows under the masked drafters' controller (widths 15 and 7). `draw` gives the
+// drafts a row's wide round would accept (a narrow round keeps at most seven of them), `seconds`
+// the round's cost at a width and round index. Returns the width of the last round;
+// `narrow_rounds` counts the rounds at seven.
+template <typename Draw, typename Seconds>
+std::uint32_t simulate_masked(std::size_t rows, Draw draw, Seconds seconds,
+                              std::uint32_t& narrow_rounds) {
+    MaskedWidthController controller;
+    controller.reset(15, 7);
+    std::array<MaskedWidthSignal, 8> signals;
+    std::array<const MaskedWidthSignal*, 8> views{};
+    std::array<std::uint32_t, 8> room{};
+    for (std::size_t row = 0; row < rows; ++row) {
+        signals[row] = controller.pooled();
+        views[row]   = &signals[row];
+        room[row]    = 4096;
+    }
+    std::uint32_t state  = 12345;
+    std::uint32_t window = 0;
+    narrow_rounds        = 0;
+    for (int round = 0; round < 400; ++round) {
+        window = controller.select(std::span<const MaskedWidthSignal* const>(views.data(), rows),
+                                   std::span<const std::uint32_t>(room.data(), rows));
+        require(window == 7 || window == 15, "the masked width is neither width");
+        controller.observe_execution(static_cast<std::uint32_t>(rows), window,
+                                     seconds(window, round));
+        for (std::size_t row = 0; row < rows; ++row) {
+            state = state * 1664525U + 1013904223U;
+            const std::uint32_t accepted = std::min(draw(state >> 8U), window);
+            controller.observe_round(signals[row], window, accepted);
+        }
+        if (window == 7) { ++narrow_rounds; }
+    }
+    return window;
+}
+
+void the_masked_width_follows_survival_and_cost() {
+    // One Qwen3.8-27B request with DSpine on an RTX 5090: 17.2 ms a round of 15 drafts, 14.2 ms
+    // of 7. Code: half the rounds keep all 15 drafts, the rest stop anywhere (12.0 tokens a wide
+    // round against 7.1 a narrow one).
+    const auto single = [](std::uint32_t window, int) { return window == 15 ? 0.0172 : 0.0142; };
+    const auto code   = [](std::uint32_t random) {
+        return random % 2U == 0 ? 15U : (random >> 1U) % 15U;
+    };
+    std::uint32_t narrow = 0;
+    require(simulate_masked(1, code, single, narrow) == 15 && narrow <= 40,
+            "long survival did not keep the wide round");
+    require(narrow >= 4, "the narrow width was never measured");
+    // Prose: at most three drafts survive, so the narrow round commits as much for less.
+    const auto prose = [](std::uint32_t random) { return random % 4U; };
+    require(simulate_masked(1, prose, single, narrow) == 7 && narrow >= 360,
+            "short survival did not settle on the narrow round");
+    // Eight requests: 59.4 ms against 47.0 ms. Each draft survives with probability of about 0.8
+    // (4.78 tokens a wide round against 4.17 a narrow one), which does not repay the wide round.
+    const auto batched = [](std::uint32_t window, int) { return window == 15 ? 0.0594 : 0.0470; };
+    const auto geometric = [](std::uint32_t random) {
+        std::uint32_t kept = 0;
+        while (kept < 15 && (random % 5U) != 0) {
+            random /= 5U;
+            random += 7919U * (kept + 1U);
+            ++kept;
+        }
+        return kept;
+    };
+    require(simulate_masked(8, geometric, batched, narrow) == 7 && narrow >= 340,
+            "eight rows of short survival kept the wide round");
+    // Rounds that grow 40% slower as contexts lengthen: the wide width, last run in its probe, is
+    // priced from the narrow round's current time, not from its own early time.
+    const auto growing = [](std::uint32_t window, int round) {
+        return (window == 15 ? 0.0594 : 0.0470) * (1.0 + 0.001 * round);
+    };
+    require(simulate_masked(8, geometric, growing, narrow) == 7 && narrow >= 365,
+            "growing round times drew the batch to the wide round");
+    // Every draft surviving still pays for the wide round in a batch.
+    const auto all = [](std::uint32_t) { return 15U; };
+    require(simulate_masked(8, all, batched, narrow) == 15 && narrow <= 16,
+            "eight rows of full survival left the wide round");
+}
+
 void the_packed_plan_spends_rows_on_survival() {
     MtpAdaptiveSignal accepting;
     MtpAdaptiveSignal rejecting;
@@ -149,11 +233,12 @@ int main() {
         survival_follows_acceptance();
         costs_are_measured_then_scaled();
         the_controller_widens_and_narrows();
+        the_masked_width_follows_survival_and_cost();
         the_packed_plan_spends_rows_on_survival();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
     }
-    std::puts("adaptive MTP: survival, costs, width selection and packed plans ok");
+    std::puts("adaptive MTP: survival, costs, width selection, masked widths and packed plans ok");
     return 0;
 }

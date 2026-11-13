@@ -85,6 +85,9 @@ struct ExecutorOptions {
     // The drafts come from the DFlash2 drafter the model was loaded with (one masked block over
     // a context ring of the target's features) instead of the MTP block.
     bool dflash2 = false;
+    // The drafts come from the standalone DSpine drafter the model was loaded with
+    // (LoadOptions::dspine): DFlash2's ring, taps and rounds, with DSpine's block and code bridge.
+    bool dspine = false;
     // Absolute greedy-draft probability floor; zero disables confidence computation.
     float draft_min_p = 0;
     // --gumbel-sampling: draft() may take samplers, whose rows' MTP block then draws its drafts.

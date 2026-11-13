@@ -173,7 +173,8 @@ void DFlash2Drafter::propose(const DFlash2ProposalCall& call, WorkspaceArena& wo
             ops::rope(flat_positions, d, config_.rope_theta, q_heads, k_heads, stream);
             Tensor attended = work.alloc(DType::BF16, {d, hq, w, b});
             ops::sliding_window_attention(q, k, v, positions, call.valid_columns, call.lanes,
-                                          {d, hq, kv}, *config_.sliding_window, scale, ring_[l],
+                                          {d, hq, kv}, *config_.sliding_window,
+                                          ops::SlidingWindowMask::Symmetric, scale, ring_[l],
                                           envelope, work, attended, stream);
             Tensor output = work.alloc(DType::BF16, {h, w, b});
             Tensor out_flat = output.view({h, columns});

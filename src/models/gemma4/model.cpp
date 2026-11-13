@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/load/bindings.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <array>
 #include <string>
@@ -132,6 +133,13 @@ std::pair<std::uint32_t, std::uint32_t> Model::expert_range(std::size_t rank) co
 std::vector<double> default_expert_split(const artifact::Reader& reader, const LoadOptions& options,
                                          std::span<const std::uint64_t> free_bytes,
                                          std::span<const double> speed) {
+    // A DSpine drafter and its head-write table sit on rank 0 too.
+    std::vector<std::uint64_t> rank_free(free_bytes.begin(), free_bytes.end());
+    if (!options.dspine.empty() && !rank_free.empty()) {
+        const std::uint64_t drafter = dspine::weight_bytes(options.dspine) +
+                                      dspine::head_write_bytes(dspine::read_config(options.dspine));
+        rank_free.front() -= std::min(rank_free.front(), drafter);
+    }
     return models::default_expert_split(
         reader,
         [&](std::string_view name) {
@@ -141,7 +149,7 @@ std::vector<double> default_expert_split(const artifact::Reader& reader, const L
         [](std::string_view name) {
             return name.ends_with("/moe/gate_up") || name.ends_with("/moe/down");
         },
-        free_bytes, speed);
+        rank_free, speed);
 }
 
 bool is_gemma4(const artifact::Reader& reader) {
@@ -168,6 +176,14 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         throw artifact::ArtifactError("the artifact's text component is not Gemma4ForCausalLM");
     }
     TextConfig config = parse_text_config(reader.directory().component("text").config);
+    if (!options.dspine.empty()) {
+        if (options.assistant) {
+            throw std::invalid_argument("Gemma 4 drafts with one drafter: its assistant or a DSpine "
+                                        "drafter");
+        }
+        dspine::check_target(dspine::read_config(options.dspine), config.hidden_size,
+                             config.vocab_size, config.num_hidden_layers, "Gemma 4");
+    }
     const bool vision = options.vision != VisionPlacement::None;
     if (vision && !has_vision(reader)) {
         throw artifact::ArtifactError(
@@ -407,6 +423,9 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             model->expert_files_.push_back(file.path ? options.artifact.parent_path() / *file.path
                                                      : options.artifact);
         }
+    }
+    if (!options.dspine.empty()) {
+        model->dspine_ = dspine::load_model(options.dspine, device, observer);
     }
     return model;
 }

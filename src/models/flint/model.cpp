@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/load/bindings.h"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <string>
@@ -124,13 +125,21 @@ std::pair<std::uint32_t, std::uint32_t> Model::expert_range(std::size_t rank) co
 
 std::vector<double> default_expert_split(const artifact::Reader& reader,
                                          std::span<const std::uint64_t> free_bytes,
-                                         std::span<const double> speed) {
+                                         std::span<const double> speed,
+                                         const std::filesystem::path& dspine) {
+    // A DSpine drafter and its head-write table sit on rank 0 too.
+    std::vector<std::uint64_t> rank_free(free_bytes.begin(), free_bytes.end());
+    if (!dspine.empty() && !rank_free.empty()) {
+        const std::uint64_t drafter = dspine::weight_bytes(dspine) +
+                                      dspine::head_write_bytes(dspine::read_config(dspine));
+        rank_free.front() -= std::min(rank_free.front(), drafter);
+    }
     return models::default_expert_split(
         reader, [](std::string_view name) { return name.starts_with("text/"); },
         [](std::string_view name) {
             return name.ends_with("/moe/gate_up") || name.ends_with("/moe/down");
         },
-        free_bytes, speed);
+        rank_free, speed);
 }
 
 bool is_flint(const artifact::Reader& reader) {
@@ -149,6 +158,10 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         throw artifact::ArtifactError("the artifact's text component is not FlintForCausalLM");
     }
     TextConfig config = parse_text_config(reader.directory().component("text").config);
+    if (!options.dspine.empty()) {
+        dspine::check_target(dspine::read_config(options.dspine), config.hidden_size,
+                             config.vocab_size, config.num_hidden_layers, "Flint");
+    }
     artifact::Binder binder(reader);
     FrontendResources resources = bind_resources(binder, config);
     Bindings b(binder);
@@ -284,6 +297,9 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             model->expert_files_.push_back(file.path ? options.artifact.parent_path() / *file.path
                                                      : options.artifact);
         }
+    }
+    if (!options.dspine.empty()) {
+        model->dspine_ = dspine::load_model(options.dspine, device, observer);
     }
     return model;
 }

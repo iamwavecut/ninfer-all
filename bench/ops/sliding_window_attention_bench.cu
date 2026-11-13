@@ -1,4 +1,4 @@
-// Public-Op benchmark for symmetric sliding-window Softmax Attention.
+// Public-Op benchmark for sliding-window Softmax Attention (symmetric or causal block).
 // Every measured eager launch and captured graph is produced by one public
 // sliding_window_attention() call.
 
@@ -49,6 +49,7 @@ struct Options {
     std::vector<std::int32_t> contexts{0, 128, 2048, 4095, 4096, 8192, 262144};
     std::vector<std::int32_t> batches{1};
     std::int32_t window       = 4096;
+    ops::SlidingWindowMask mask = ops::SlidingWindowMask::Symmetric;
     std::int32_t envelope_max = -1;
     Execution execution       = Execution::Graph;
     CacheMode cache           = CacheMode::Cold;
@@ -83,7 +84,7 @@ struct Result {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_sliding_window_attention_bench "
-                 "[--window 2048|4096] [--tokens 1,...,16] [--batches 1,...,8] "
+                 "[--window 2048|4096|8192] [--causal] [--tokens 1,...,16] [--batches 1,...,8] "
                  "[--context 0,...,262144] [--envelope-max N] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n",
@@ -133,10 +134,12 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--batches") {
             options.batches = parse_list(next("--batches requires a value"), 1, 8, "--batches");
         } else if (argument == "--window") {
-            options.window = parse_i32(next("--window requires a value"), 2048, 4096, "--window");
-            if (options.window != 2048 && options.window != 4096) {
-                usage("--window expects 2048 or 4096");
+            options.window = parse_i32(next("--window requires a value"), 2048, 8192, "--window");
+            if (options.window != 2048 && options.window != 4096 && options.window != 8192) {
+                usage("--window expects 2048, 4096 or 8192");
             }
+        } else if (argument == "--causal") {
+            options.mask = ops::SlidingWindowMask::Causal;
         } else if (argument == "--context") {
             options.contexts =
                 parse_list(next("--context requires a value"), 0, 262144, "--context");
@@ -238,9 +241,9 @@ DeviceBuffer make_context_values(std::size_t elements) {
 
 class Case {
 public:
-    Case(std::int32_t window, std::int32_t tokens, std::int32_t batch, std::int32_t context,
-         std::int32_t maximum)
-        : window_(window), tokens_(tokens), batch_(batch), context_(context),
+    Case(std::int32_t window, ops::SlidingWindowMask mask, std::int32_t tokens,
+         std::int32_t batch, std::int32_t context, std::int32_t maximum)
+        : window_(window), mask_(mask), tokens_(tokens), batch_(batch), context_(context),
           q_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens * batch)),
           query_k_(
               bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKvHeads * tokens * batch)),
@@ -283,7 +286,8 @@ public:
     void launch(cudaStream_t stream) {
         ops::sliding_window_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
                                       positions_tensor_, valid_tensor_, lane_tensor_, kGeometry,
-                                      static_cast<std::uint32_t>(window_), kScale, context_view_,
+                                      static_cast<std::uint32_t>(window_), mask_, kScale,
+                                      context_view_,
                                       envelope_, workspace_, output_tensor_, stream);
     }
 
@@ -291,6 +295,7 @@ public:
 
 private:
     std::int32_t window_;
+    ops::SlidingWindowMask mask_;
     std::int32_t tokens_;
     std::int32_t batch_;
     std::int32_t context_;
@@ -438,8 +443,8 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(kFlushBytes);
 
         if (options.profile) {
-            Case data(options.window, options.tokens.front(), options.batches.front(),
-                      options.contexts.front(),
+            Case data(options.window, options.mask, options.tokens.front(),
+                      options.batches.front(), options.contexts.front(),
                       options.envelope_max < 0 ? options.contexts.front() : options.envelope_max);
             profile(data, options, flush, stream);
             CUDA_CHECK(cudaStreamDestroy(stream));
@@ -451,11 +456,12 @@ int main(int argc, char** argv) {
             for (const std::int32_t tokens : options.tokens) {
                 for (const std::int32_t batch : options.batches) {
                     const int maximum = options.envelope_max < 0 ? context : options.envelope_max;
-                    Case data(options.window, tokens, batch, context, maximum);
+                    Case data(options.window, options.mask, tokens, batch, context, maximum);
                     const ops::SlidingWindowAttentionExecutionEnvelope envelope{
                         0, static_cast<std::uint32_t>(maximum)};
                     const auto plan = ops::detail::sliding_window_attention_resolve_plan(
-                        static_cast<std::uint32_t>(options.window), tokens, batch, envelope);
+                        static_cast<std::uint32_t>(options.window), options.mask, tokens, batch,
+                        envelope);
                     bench::TimedGraph graph;
                     if (options.execution != Execution::Eager) {
                         data.launch(stream);

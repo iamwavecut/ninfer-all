@@ -476,6 +476,86 @@ DFlash2's draft weights and its refusal of `--lm-head-q6` stop it at eight lanes
 prompt seven drafts were best on average, but the reasoning prompt kept improving to twelve while
 summarization fell off there.
 
+### DSpine on Qwen3.8-27B
+
+Tencent's DSpine drafter ([converted](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3),
+Q8) beside the official artifact on one RTX 5090 at its 575 W default: the CLI with a 16,384-token
+window and `bf16` KV, thinking off, one greedy request per configuration; decode tok/s, with the
+tokens a round in parentheses. The Python answer continues a 1,024-token Python prompt, the English
+one an English prose prompt.
+
+| Answer | No drafts | MTP 3 | DFlash2 7 | DFlash2 15 | DSpine 7 | DSpine 11 | DSpine 15 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Python, 1,024 tokens | 90.7 | 251.8 (3.37) | 322.0 (4.55) | 405.1 (6.72) | 325.7 (4.92) | 421.5 (7.31) | 473.4 (8.38) |
+| English, 1,024 tokens | 90.4 | 182.7 (2.45) | 187.8 (2.67) | 163.4 (2.73) | 172.9 (2.62) | 149.3 (2.60) | 156.0 (2.76) |
+| code, 400 tokens | 90.3 | 232.3 (3.12) | 297.8 (4.20) | 292.7 (4.81) | 278.1 (4.20) | 251.1 (4.37) | 284.7 (4.99) |
+| prose, 269 tokens | 90.3 | 185.2 (2.49) | 184.9 (2.61) | 150.4 (2.47) | 167.7 (2.54) | 151.8 (2.61) | 146.7 (2.56) |
+
+On the long Python answer DSpine with 15 drafts keeps 8.38 tokens a round against DFlash2's 6.72 and
+decodes 1.17 times as fast as DFlash2's best count. On the short code answer and on prose DSpine's
+best count stays 4% and 9% behind DFlash2 7, at nearly the same tokens a round: a round of seven
+drafts takes 15.2 ms of kernel time against DFlash2's 14.2 ms (Nsight Systems, the difference
+between 608- and 96-token runs of the Python answer). The Q8 projection kernels account for the gap,
+2.92 ms a round against 1.96 ms: DSpine's five layers with 17,408-wide MLPs, and its candidates from
+the full 248,320-row head where DFlash2 reads its 131,072-row proposal head. Past eight drafts the
+target's verification costs about 2 ms more a round with either drafter, so 15 drafts pay only where
+most of them are kept. The BF16 drafter (`dspine_bf16`) keeps the same tokens a round as the Q8 one
+and decoded 254.1 and 155.3 tok/s on the code and prose answers at seven drafts. A sampled prose
+answer (temperature 0.7, seed 1) decoded 90.5 tok/s without drafts, 210.2 with DFlash2 7 and 171.7
+with DSpine 7. After startup the Q8 drafter leaves 2.7 GiB less free than no drafter (DFlash2 2.5
+GiB, MTP 0.8 GiB), and the full 262,144-token window still fits with `rk4v4` and `rk8v4`. A
+verification's width changes floating-point results, as [the CLI guide](cli.md#speculative-decoding)
+describes; DSpine and DFlash2 rounds of the same width gave the same tokens on the Python, code and
+prose answers, and on the English one at seven drafts.
+
+### DSpine under the model card's conditions
+
+The same drafter and artifact through `ninfer-serve` on one RTX 5090 at its 600 W default
+(2026-11-13), as Tencent's model card measures it: reasoning effort `xhigh`, at most 2,048 new
+tokens, prompts from GSM8K, MATH-500, HumanEval, MBPP and MT-Bench (two a dataset for one request
+at a time, eight for eight at once), `bf16` KV, no copy rounds (`--ngram-draft-tokens 0`), the
+full head unless a row names the proposal head (`--lm-head-draft`). Aggregate tok/s over the
+client's wall time, round time from the request log, and tokens a round (τ) overall and per
+dataset:
+
+| Requests, temperature | Drafter | tok/s | Round | τ | GSM8K | MATH-500 | HumanEval | MBPP | MT-Bench |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1, 0 | DFlash2 7 | 298.3 | 14.06 ms | 4.36 | 5.27 | 5.29 | 3.84 | 4.15 | 4.35 |
+| 1, 0 | DFlash2 15 | 299.2 | 16.40 ms | 5.10 | 6.30 | 6.11 | 4.36 | 4.97 | 5.22 |
+| 1, 0 | DSpine 7, proposal head | 294.8 | 14.24 ms | 4.36 | 5.52 | 5.04 | 3.87 | 4.13 | 4.47 |
+| 1, 0 | DSpine 15 | 303.3 | 17.21 ms | 5.43 | 7.20 | 5.96 | 4.64 | 5.80 | 5.67 |
+| 1, 0 | DSpine 15, proposal head | 296.7 | 16.65 ms | 5.14 | 6.54 | 5.88 | 4.31 | 5.51 | 5.36 |
+| 8, 0 | none | 457.8 | | | | | | | |
+| 8, 0 | DFlash2 7 | 629.1 | 45.14 ms | 4.46 | 4.93 | 5.14 | 4.42 | 4.37 | 3.94 |
+| 8, 0 | DFlash2 15 | 520.1 | 57.63 ms | 4.93 | 5.75 | 6.32 | 4.85 | 4.70 | 4.15 |
+| 8, 0 | DSpine 7 | 604.9 | 46.97 ms | 4.47 | 5.22 | 5.01 | 4.42 | 4.48 | 3.81 |
+| 8, 0 | DSpine 7, proposal head | 597.2 | 46.12 ms | 4.38 | 5.07 | 4.94 | 4.33 | 4.39 | 3.78 |
+| 8, 0 | DSpine 15 | 480.1 | 59.42 ms | 4.86 | 6.45 | 6.25 | 5.05 | 4.63 | 3.86 |
+| 8, 0 | DSpine 15, proposal head | 486.9 | 59.07 ms | 4.78 | 6.32 | 6.24 | 4.96 | 4.41 | 3.76 |
+| 8, 1 | none | 459.8 | | | | | | | |
+| 8, 1 | DFlash2 7 | 575.0 | 44.34 ms | 4.05 | 4.86 | 5.22 | 4.09 | 3.85 | 3.52 |
+| 8, 1 | DSpine 7, proposal head | 556.8 | 44.43 ms | 4.02 | 4.82 | 4.67 | 4.13 | 3.82 | 3.25 |
+| 8, 1 | DSpine 15, proposal head | 466.7 | 59.23 ms | 4.43 | 5.60 | 5.41 | 4.66 | 4.03 | 3.72 |
+
+DSpine 15 keeps 7.20 tokens a round on GSM8K at temperature 0, the card's figure; the card's
+MATH-500, HumanEval, MBPP and MT-Bench figures (6.49, 5.71, 6.14, 4.48) come from its full
+datasets on the BF16 model under SGLang, these from two to eight prompts each on the groupwise-int
+artifact. The card compares DSpine's block of 16 with DFlash2's of 8, and most of its gain is that
+width: at 15 drafts each, DSpine keeps 5.43 tokens a round against DFlash2's 5.10 for one request
+(DFlash2 through the proposal head; 5.14 for DSpine there) and 4.86 against 4.93 for eight. On the
+RTX 5090 a round of 15 drafts costs 2.3 ms more than one of seven for one request and 12.5 ms more
+for eight, whose verification of 128 columns is bound by compute (a Q4 [34816, 5120] projection
+takes 65.5 µs at 8 columns and 81.9 µs at 16 in graph replay), so seven drafts decode 1.26 times as
+fast as 15 at eight requests. At temperature 1 the drafters keep 0.89-0.93 times their greedy
+tokens a round, the ratio the card reports. A run of eight requests ends on its slowest answers,
+so its aggregate tok/s varies with the longest one; the round times compare the drafters more
+closely. The fused layer routes and the one-pass candidate head (docs/maintainer/dspine.md) cut
+the 15-draft round from 17.44 to 17.21 ms for one request and from 61.17 to 59.42 ms for eight.
+The proposal head keeps fewer tokens a round for DSpine (5.43 against 5.14 for one request), which
+its 3% shorter round does not repay, so the automatic head stays the full one for DSpine.
+With [`--adaptive-mtp`](serving.md#adaptive-mtp) each round drafts 15 or seven: eight requests at
+temperature 0 decode 561.0 tok/s for DSpine and 601.1 for DFlash2, between the two fixed widths.
+
 ### MTP draft count by content
 
 One RTX 3090, `rk4v4` KV with `--lm-head-q6 --embedding-q4 --gdn-state-fp16`, greedy, 512

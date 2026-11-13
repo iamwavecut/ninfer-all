@@ -10,6 +10,15 @@
 // target's final hidden state before it, a chain of steps at the anchor's position, each attending
 // over the target's caches, proposes the tokens after it; verify() runs the anchor and the drafts
 // of each sequence as decode rows, and commit() keeps the first ones.
+//
+// With ExecutorOptions::dspine, a standalone DSpine drafter (models/dspine/runtime.h) drafts in the
+// assistant's place: every pass leaves the residual after each block the drafter taps, a prompt
+// chunk's last window of rows, a decode step's rows and the rows commit() keeps continue each
+// sequence's lane of its context ring, and draft() proposes for several sequences at once. Branch
+// passes keep nothing there. A rewind leaves the lane's later positions in place, which the
+// sequence writes again before a proposal reads them; only a ring that wraps (a context longer than
+// the drafter's window) then loses earlier positions, which lowers the drafts' acceptance and
+// leaves the output exact.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -67,6 +76,9 @@ struct ExecutorOptions {
     ExpertDiskReads expert_disk{};
     // --gumbel-sampling: draft() may take samplers, whose rows' assistant then draws its drafts.
     bool sampled_drafts = false;
+    // The model's standalone DSpine drafter (Model::dspine()) drafts draft_tokens a round in the
+    // assistant's place.
+    bool dspine = false;
     // YaRN past the model's native window (a factor above one) for the full-attention blocks'
     // rotation, the assistant's included: their proportional schedule takes YaRN's frequencies,
     // and the queries the square of its attention factor. The sliding-window blocks never see a
@@ -98,6 +110,8 @@ struct ExecutorMemory {
     // the tower owns beside the model's weights (the streamed window and its resident copies).
     std::uint64_t vision_encode_bytes = 0;
     std::uint64_t vision_owned_bytes  = 0;
+    // A DSpine drafter's ring, head-write table, features, operands and workspace.
+    std::uint64_t dspine_bytes = 0;
     ExpertDeliveryMemory experts;
 };
 
@@ -109,9 +123,9 @@ struct SequenceSnapshot {
     std::uint32_t position = 0;
 };
 
-// A sequence's state in host memory, laid out as image_bytes() sizes it: its sliding-window rings
-// and its full-attention rows below `position`. The context cache keeps prefixes this way beyond
-// the device's sequences; the header travels beside the bytes.
+// A sequence's state in host memory, laid out as image_bytes() sizes it: its sliding-window rings,
+// its full-attention rows below `position` and a DSpine drafter's lane. The context cache keeps
+// prefixes this way beyond the device's sequences; the header travels beside the bytes.
 struct SequenceImage {
     std::uint32_t position = 0;
 };
@@ -168,7 +182,8 @@ public:
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
 
     // The assistant (draft_tokens > 0). A sequence can draft once a prompt chunk, a decode step or
-    // a commit has left the target's hidden state after its last fed token.
+    // a commit has left the target's hidden state after its last fed token; with a DSpine drafter,
+    // once it holds a position.
     [[nodiscard]] std::uint32_t draft_tokens() const noexcept;
     [[nodiscard]] bool can_draft(std::uint32_t sequence) const;
     // `steps` (1..draft_tokens) drafts after each sequence's anchor, the token its next position
@@ -181,6 +196,13 @@ public:
                std::span<std::int32_t> drafts, std::uint32_t steps,
                std::span<const ops::SamplingConfig> configs = {},
                std::span<const std::int32_t> lengths    = {});
+    // The DSpine drafter's proposals (ExecutorOptions::dspine): for each of up to eight `sequences`
+    // (distinct), the k (1..draft_tokens) greedy drafts after its anchor, the token its next
+    // position takes, and each draft's probability under the drafter's refined law;
+    // drafts[j * k + i] and confidence[j * k + i] are sequence j's i-th. Returns once both are on
+    // the host.
+    void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
+               std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence);
     // widths[j] tokens of sequence j (its anchor, then its drafts; without widths, tokens.size() /
     // sequences.size() each) at its next positions, as decode rows: logits one column each,
     // sequence by sequence. The positions advance only with commit().

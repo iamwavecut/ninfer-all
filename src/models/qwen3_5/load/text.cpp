@@ -712,7 +712,9 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
         options.embedding_residency == EmbeddingResidency::Host ? artifact::Residency::Mapped
                                                                 : artifact::Residency::Device);
     std::vector<std::string> head_inputs{"text/final_hidden"};
-    if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
+    // A standalone DSpine drafter reads the head through the target's own use of it.
+    if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled() &&
+        !options.dspine()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");
     }
     if (options.tensor_parallel && !options.lm_head_q4 && !options.lm_head_q6) {
@@ -752,8 +754,21 @@ ProposalWeights bind_proposal(Bindings& b, const artifact::Proposal& proposal,
     }
     ProposalWeights out;
     out.rows = static_cast<std::uint32_t>(rows);
-    const std::vector<std::string> inputs{std::string(options.speculative_component()) +
-                                          "/final_hidden"};
+    std::vector<std::string> inputs{std::string(options.speculative_component()) +
+                                    "/final_hidden"};
+    if (options.dspine()) {
+        // A DSpine drafter is an artifact of its own, so the model declares no input of the
+        // proposal head for it. Its final hidden is a masked drafter's: the head takes it
+        // through DFlash2's input, else DFlash's, else MTP's, whichever the artifact declares.
+        const auto& uses = b.binder.reader().directory().uses;
+        for (const char* drafter : {"dflash2", "dflash", "mtp"}) {
+            std::string input = std::string(drafter) + "/final_hidden";
+            if (uses.find({"proposal/head", input}) != uses.end()) {
+                inputs = {std::move(input)};
+                break;
+            }
+        }
+    }
     if (options.tensor_parallel) {
         out.head_shares =
             bind_head_shares(b, "proposal/head", rows, target.hidden_size, inputs, options);

@@ -92,6 +92,49 @@ between two fixed `--draft-tokens` settings (`--invariant-attention` removes att
 that difference; the other Ops keep theirs). The per-request log reports the rounds run at each
 width and the width changes.
 
+With `--spec dflash`, `dflash2` or `dspine` on a Qwen3.5-core model, `--adaptive-mtp` lets each
+round without a copy draft and verify either `--draft-tokens K` drafts or K/2 (rounded down; with
+K = 1 it changes nothing). A masked drafter makes a round's drafts in one pass at the round's width,
+so the narrow round also drafts less. Each request keeps three moving averages over about ten
+rounds: the tokens a narrow round commits, how often all K/2 of its drafts survive, and how many
+more a wide round keeps after such a prefix. The wide round's expected tokens are the first plus
+the product of the other two, which narrow rounds keep current: a DSpine block is causal, so its
+narrow drafts are the wide round's first K/2 (a DFlash or DFlash2 block attends both ways, so there
+the sum is an approximation). Round times grow as contexts lengthen, so the width that is not
+running is priced from the running width's current time and the ratio of the two measured close
+together; each batch size measures that ratio over four rounds of the other width, and again over
+two every 96 rounds. A width changes after it has led by 2% for four rounds in a row, and a new
+request starts from the pooled averages of the requests before it. The Engine captures CUDA Graphs
+for both widths, and the KV sizing reserves graph memory for both: on an RTX 5090 with eight
+requests and an 8,192-token window, DSpine's graphs measured 264 MiB against 186 MiB with one width,
+but the reservation doubled to 4.5 GiB and the KV pool fell from 52,544 tokens to 15,680;
+`--cuda-graph-allowance-mib 2304` keeps the one-width pool. On that card with Qwen3.8-27B
+(`ninfer-serve`, `bf16` KV, no copy rounds), in decode tok/s:
+
+| Workload | Drafter | 7 drafts | 15 drafts | `--adaptive-mtp`, 15 |
+|---|---|---:|---:|---:|
+| Python module, one request | DSpine | 341.7 | 486.8 | 354.8 |
+| Python module, one request | DFlash2 | 311.6 | 411.0 | 414.6 |
+| English prose, one request | DSpine | 182.2 | 160.3 | 182.3 |
+| English prose, one request | DFlash2 | 192.9 | 167.8 | 195.4 |
+| Model card set, one request at a time | DSpine | not run | 315.8 | 312.8 |
+| Model card set, eight requests | DSpine | 604.9 | 480.1 | 561.0 |
+| Model card set, eight requests | DFlash2 | 629.1 | 520.1 | 601.1 |
+
+The two long requests decode 1,024 tokens with thinking off. The model card set is two prompts a
+dataset from GSM8K, MATH-500, HumanEval, MBPP and MT-Bench at reasoning effort `xhigh` and up to
+2,048 tokens, one request at a time (mean per-request decode tok/s), or eight a dataset at eight
+requests (aggregate tok/s, every run with a 52,544-token KV pool: the adaptive runs pass
+`--cuda-graph-allowance-mib 2304`). Each cell is one run; a repeated fixed run measured 594.5 for
+DSpine's 7 drafts and 486.6 for its 15. With eight requests the adaptive width is 15-17% faster
+than 15 drafts and 4-7% slower than 7. With one request it is between 1.0% slower and 1.3% faster
+than the faster fixed width, except on DSpine's Python answer. DSpine's Python answer under
+`--adaptive-mtp` is another text: its rounds were 151 of 171 wide, but a wide round kept 5.1
+drafts on average against 7.4 in the fixed answer. Greedy answers change with the width, so a
+single long request can land on text the drafter predicts better or worse. On the card set one
+request at a time, a wide round kept 4.9 drafts against 4.4 at a fixed 15, and wide rounds right
+after narrow ones kept 5.7, so the narrow rounds leave the drafter's context intact.
+
 The Flash-Next, Gemma 4, Flint and DeepSeek-V4.1 Engines verify a round's rows packed at their
 own widths: a request verifies its anchor and the drafts it can take (its own extent after the
 draft floor, a lookup's length, and its output budget), not the widest request's. A round where a
@@ -2353,17 +2396,18 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4\|bf16p` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; those nine are accepted on every build target; `bf16p` is opt-in BF16 packed losslessly into 23% fewer bytes, for Qwen3.5 and Qwen3.8-Flash-Next from sm_75, without `--tensor-attention positions` (see [Context and memory](cli.md#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV; Flint keeps F16 only (`bf16`) | `bf16` |
 | `--kv-resident N\|all\|auto` | Qwen3.8-Flash-Next: positions of each sparse-attention layer's KV a sequence keeps in device memory; past them the layers' KV streams from pinned host memory (see [streamed KV](qwen3-8-flash-next.md#streamed-sparse-attention-kv)) | `auto`: 32,768 with host or disk experts, all with device experts |
-| `--spec none\|mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) and `dflash2` from one carrying its DFlash2 drafter (see [DFlash2 speculative decoding](qwen3-8-flash-next.md#dflash2-speculative-decoding)), Gemma 4 from one converted with its assistant; Flint has no drafter and takes `--lookup-ngram` without `--spec` | for Flash-Next artifacts with host experts `dflash2` with 4 drafts (with `--draft-min-p 0.7`) on one device when they carry the DFlash2 drafter, else (over pipeline stages too) `mtp` with 3 drafts (with `--draft-min-p 0.5`) when they carry the MTP block, a round of several requests with a CPU share verifying at most 64 tokens ([MTP with several requests](qwen3-8-flash-next.md#mtp-with-several-requests)); for [Edge0](edge0.md#drafting) artifacts also with device experts and `--max-concurrency 1`; `mtp` with 3 drafts for Gemma 4 artifacts with their assistant and host or disk experts; otherwise off |
-| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for Qwen3.8-Flash-Next's DFlash2 drafter (its block of 8), Gemma 4's assistant and Flint's context lookup | unset (Flint's lookup: 3) |
-| `--draft-min-p P` | Flash-Next MTP and DFlash2 only: verify a round's drafts through the first at or below this probability (MTP: its absolute probability, which also ends the drafting; DFlash2: its selector confidence); see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) and [DFlash2](qwen3-8-flash-next.md#dflash2-speculative-decoding) | `0` (off) with `--spec mtp` or `--spec dflash2`; `0.5` when the engine chooses MTP and `0.7` when it chooses DFlash2 (no `--spec`), unless set |
+| `--spec none\|mtp\|dflash\|dflash2\|dspark\|dspine` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) and `dflash2` from one carrying its DFlash2 drafter (see [DFlash2 speculative decoding](qwen3-8-flash-next.md#dflash2-speculative-decoding)), Gemma 4 from one converted with its assistant; DeepSeek-V4.1 takes `dspark` from an artifact converted with its DSpark drafter (see [the DSpark drafter](deepseek-v41.md#the-dspark-drafter)); every family takes `dspine` with `--draft-model` (see [DSpine](maintainer/dspine.md)); Flint has no drafter of its own and takes `--lookup-ngram` without `--spec` | for Flash-Next artifacts with host experts `dflash2` with 4 drafts (with `--draft-min-p 0.7`) on one device when they carry the DFlash2 drafter, else (over pipeline stages too) `mtp` with 3 drafts (with `--draft-min-p 0.5`) when they carry the MTP block, a round of several requests with a CPU share verifying at most 64 tokens ([MTP with several requests](qwen3-8-flash-next.md#mtp-with-several-requests)); for [Edge0](edge0.md#drafting) artifacts also with device experts and `--max-concurrency 1`; `mtp` with 3 drafts for Gemma 4 artifacts with their assistant and host or disk experts; otherwise off |
+| `--draft-model PATH` | DSpine only: the drafter artifact, trained for the model | unset |
+| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for Qwen3.8-Flash-Next's DFlash2 drafter (its block of 8), Gemma 4's assistant and the context lookup of Flint and DeepSeek-V4.1; `1..5` for DSpark, its block; for DSpine up to its block less one and at most 15, or 7 on Gemma 4, Flint and DeepSeek-V4.1 | unset (their lookup: 3; DSpark: 5) |
+| `--draft-min-p P` | Flash-Next MTP and DFlash2, and DSpine on every family but the Qwen3.5 core: verify a round's drafts through the first at or below this probability (MTP: its absolute probability, which also ends the drafting; DFlash2 and DSpine: the drafter's confidence); see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding), [DFlash2](qwen3-8-flash-next.md#dflash2-speculative-decoding) and [DSpine](maintainer/dspine.md#verification-by-family) | `0` (off) with `--spec`; `0.5` when the engine chooses MTP and `0.7` when it chooses DFlash2 (no `--spec`), unless set |
 | `--draft-experts N` | DSpark only: each drafter block keeps its `N` most routed experts on the GPU and routes among them, the rest in pinned memory; `0` keeps all ([details](deepseek-v41.md#the-drafters-experts)) | `64` with the STQ drafter and host or disk experts, otherwise all |
 | `--draft-confidence C` | DSpark only: verify a round's drafts up to the first its confidence head scores below `C` (`0..1`); `0` verifies every draft | `0.5` |
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
-| `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens` for a lone request, drafting only those, and up to three in a round of several), the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
+| `--adaptive-mtp` | MTP: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens` for a lone request, drafting only those, and up to three in a round of several), the width favored by the drafts' measured survival and the measured round cost; DFlash, DFlash2 and DSpine on Qwen3.5-core models: each round without a copy drafts and verifies `--draft-tokens` or half of them, chosen the same way; see [Adaptive MTP](#adaptive-mtp) | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Qwen3.8-Flash-Next: `--spec mtp` or `dflash2`; Flint, which has no drafter, without it): the last `N` tokens are matched against the sequence so far and what followed is proposed, from the occurrence the sequence was already copying while it still matches, else from the newest; exact, since verification rejects a wrong guess | `0` (off) |
-| `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`; with DFlash or DFlash2 at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
+| `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`; with DFlash, DFlash2 or DSpine at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
 | `--ngram-archive-mib N` | RAM archive that keeps finished requests' copy sources for later requests naming the same `X-NInfer-Draft-Session` | `0` (off) |
 | `--ngram-session-mib N` | per-session share of that archive, 1 MiB up to the archive size | `128` |
@@ -2760,9 +2804,9 @@ by pressure or by the catalog limit, it is written there before its memory is re
 as a prefix chain, the StateImage at its endpoint, and the tail page and StateImage of its rewrite
 seam and of its three earliest long anchors. The continuations still resident at shutdown are
 written the same way. Pages are keyed by the prefix digest at their last token and by the execution
-profile, so an identical prefix is stored once, and the files survive restarts. Each artifact gets
-its own subdirectory and each KV format, stride and YaRN setting its own files, so one model or
-profile never restores another's KV. `--disk-kv-gib` (default 64) is the total budget, split
+profile, so an identical prefix is stored once, and the files survive restarts. Each artifact (and
+each [DSpine](maintainer/dspine.md) drafter beside it) gets its own subdirectory and each KV format,
+stride and YaRN setting its own files, so one model or profile never restores another's KV. `--disk-kv-gib` (default 64) is the total budget, split
 65/25/10 across Main KV, Backend KV and StateImages (85/15 without a backend); the least recently
 used page goes first. The files are sparse until written, and a torn page fails its CRC and reads as
 a miss.

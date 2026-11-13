@@ -540,7 +540,8 @@ public:
             throw std::invalid_argument("expert routing profiles require host or disk experts");
         }
         if (options.speculative.draft_min_p.value_or(0.0F) != 0) {
-            throw std::invalid_argument("--draft-min-p requires Qwen3.8-Flash-Next drafts");
+            throw std::invalid_argument("--draft-min-p requires Qwen3.8-Flash-Next drafts or a "
+                                        "DSpine drafter of Gemma 4, Flint or DeepSeek-V4.1");
         }
         auto constructed  = runtime::construct_model(options, device);
         // construct_model returns the resolved options for this instance. Anything the model had

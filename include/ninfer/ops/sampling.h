@@ -28,6 +28,7 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
     kSamplePurposeDFlash2Proposal       = 5,
+    kSamplePurposeDSpineProposal        = 6,
 };
 
 // How a positive-temperature row draws its token from the truncated, renormalized candidates.

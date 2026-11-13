@@ -2,6 +2,7 @@
 
 #include "artifact/framing.h"
 #include "artifact/materializer.h"
+#include "models/dspine/model.h"
 #include "models/qwen3_5/auxiliary_replicas.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/expert_sources.h"
@@ -57,6 +58,10 @@ public:
 
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
 
+    // --spec dspine: the standalone drafter, materialized on rank 0 beside the target; null
+    // otherwise.
+    [[nodiscard]] const dspine::Model* dspine() const noexcept { return dspine_.get(); }
+
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
 
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
@@ -81,21 +86,41 @@ public:
     // Model suspend: the weight arenas give their device memory back and later receive the same
     // bytes again from the artifact, at the same addresses, so every bound weight and captured
     // graph stays valid. The caller has drained every stream that reads them.
-    [[nodiscard]] bool weights_suspendable() const noexcept { return backing_.suspendable(); }
+    // A DSpine drafter's weights take part in every step.
+    [[nodiscard]] bool weights_suspendable() const noexcept {
+        return backing_.suspendable() && (!dspine_ || dspine_->backing().suspendable());
+    }
     [[nodiscard]] bool weights_resident() const noexcept { return backing_.device_backed(); }
     [[nodiscard]] std::uint64_t weight_backing_bytes() const noexcept {
-        return backing_.device_backing_bytes();
+        return backing_.device_backing_bytes() +
+               (dspine_ ? dspine_->backing().device_backing_bytes() : 0);
     }
     [[nodiscard]] std::vector<artifact::MaterializedArtifact::RankArena>
     device_weight_arenas() const {
-        return backing_.device_arenas();
+        auto arenas = backing_.device_arenas();
+        if (dspine_) {
+            for (const auto& arena : dspine_->backing().device_arenas()) { arenas.push_back(arena); }
+        }
+        return arenas;
     }
-    void release_device_weights() { backing_.release_device_backing(); }
+    void release_device_weights() {
+        backing_.release_device_backing();
+        if (dspine_) { dspine_->backing().release_device_backing(); }
+    }
     void restore_device_weight_backing(DeviceContext& device) {
         backing_.restore_device_backing(device);
+        if (dspine_) { dspine_->backing().restore_device_backing(device); }
     }
     artifact::MaterializationStats reload_device_weights(DeviceContext& device) {
-        return backing_.upload_device_objects_again(device);
+        auto stats = backing_.upload_device_objects_again(device);
+        if (dspine_) {
+            const auto drafter = dspine_->backing().upload_device_objects_again(device);
+            stats.file_bytes += drafter.file_bytes;
+            stats.read_bytes += drafter.read_bytes;
+            stats.h2d_bytes += drafter.h2d_bytes;
+            stats.upload_seconds += drafter.upload_seconds;
+        }
+        return stats;
     }
 
     // CPU Vision residency only: the tower decoded to host FP32, shared with every encode session.
@@ -126,6 +151,7 @@ private:
     std::optional<VisionOverlayLayout> vision_overlay_;
     std::shared_ptr<const CpuVisionWeights> cpu_vision_;
     NativeExpertSources experts_;
+    std::unique_ptr<dspine::Model> dspine_;
 };
 
 } // namespace ninfer::models::qwen3_5

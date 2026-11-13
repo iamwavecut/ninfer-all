@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -112,22 +113,32 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         vision_budget = models::qwen3_5::frontend::gemma_budget_at_most(
             options.vision_max_merged_tokens);
     }
+    // A speculative round verifies what the release's assistant proposes (--spec mtp) or what a
+    // standalone DSpine drafter does (--spec dspine --draft-model), where no context lookup
+    // matches (--lookup-ngram).
     const SpeculativeOptions& speculative = options.speculative;
-    const bool mtp = speculative.backend == SpeculativeBackend::Mtp;
-    if (speculative.backend != SpeculativeBackend::None && !mtp) {
-        throw std::invalid_argument("Gemma 4 drafts with its assistant only (--spec mtp)");
+    const bool mtp    = speculative.backend == SpeculativeBackend::Mtp;
+    const bool dspine = speculative.backend == SpeculativeBackend::DSpine;
+    if (speculative.backend != SpeculativeBackend::None && !mtp && !dspine) {
+        throw std::invalid_argument("Gemma 4 drafts with its assistant (--spec mtp) or a DSpine "
+                                    "drafter (--spec dspine --draft-model)");
     }
-    if (mtp && (speculative.draft_tokens == 0 || speculative.draft_tokens > 7)) {
-        throw std::invalid_argument("Gemma 4: --spec mtp requires --draft-tokens in [1,7]");
+    if ((mtp || dspine) && (speculative.draft_tokens == 0 || speculative.draft_tokens > 7)) {
+        throw std::invalid_argument(std::string("Gemma 4: --spec ") + (mtp ? "mtp" : "dspine") +
+                                    " requires --draft-tokens in [1,7]");
     }
-    if (speculative.draft_min_p.value_or(0.0F) != 0 || speculative.mtp_attention_window != 0 ||
-        speculative.ngram_archive_bytes != 0 || speculative.proposal_head != ProposalHead::Auto) {
-        throw std::invalid_argument("Gemma 4's assistant has no --draft-min-p, n-gram archive, "
-                                    "--mtp-attention-window or proposal head");
+    if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine) ||
+        speculative.mtp_attention_window != 0 || speculative.ngram_archive_bytes != 0 ||
+        speculative.proposal_head == ProposalHead::Optimized ||
+        (speculative.proposal_head != ProposalHead::Auto && !dspine)) {
+        throw std::invalid_argument("Gemma 4 has no n-gram archive, --mtp-attention-window or "
+                                    "proposal head, and --draft-min-p only with --spec dspine");
     }
-    if (!mtp && (speculative.lookup_ngram != 0 ||
-                 speculative.mtp_policy == MtpDraftPolicy::Adaptive)) {
-        throw std::invalid_argument("--lookup-ngram and --adaptive-mtp require --spec mtp");
+    if (!mtp && !dspine && speculative.lookup_ngram != 0) {
+        throw std::invalid_argument("--lookup-ngram requires --spec mtp or --spec dspine");
+    }
+    if (!mtp && speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
+        throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
@@ -162,6 +173,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                                      .assistant = mtp,
                                      .vision    = vision,
                                      .experts   = options.expert_residency};
+    if (dspine) { load.dspine = speculative.draft_model; }
     // Expert parallelism: the routed experts divided over the devices, everything else on the
     // first. Without --tensor-split each device takes a share of its speed that fits beside what
     // it holds.
@@ -204,7 +216,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     executor.max_context   = options.max_context + 1;
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs   = options.use_cuda_graph;
-    executor.draft_tokens  = mtp ? speculative.draft_tokens : 0;
+    executor.draft_tokens  = mtp || dspine ? speculative.draft_tokens : 0;
+    executor.dspine        = dspine;
     executor.kv_cache      = options.kv_cache;
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
@@ -317,12 +330,22 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                            "Gemma 4: assistant speculative decoding, up to %u drafts a round%s",
                            executor.draft_tokens,
                            speculative.mtp_policy == MtpDraftPolicy::Adaptive ? " (adaptive)" : "");
-        if (speculative.ngram_draft_tokens != 0) {
-            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                               "Gemma 4 drafts with its assistant and context lookup "
-                               "(--lookup-ngram); n-gram copy proposals (--ngram-draft-tokens) "
-                               "are not available for it");
-        }
+    }
+    if (dspine) {
+        const auto& drafter = *model->dspine();
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Gemma 4: DSpine drafter %s, up to %u drafts a round%s, ring of %u "
+                           "positions; weights %.0f MiB, ring, table and workspace %.0f MiB",
+                           drafter.name().c_str(), executor.draft_tokens,
+                           speculative.lookup_ngram != 0 ? " where no context lookup matches" : "",
+                           models::dspine::ring_capacity(drafter.config(), executor.max_context),
+                           double(drafter.device_bytes()) / 1048576.0,
+                           double(instance->executor->memory().dspine_bytes) / 1048576.0);
+    }
+    if ((mtp || dspine) && speculative.ngram_draft_tokens != 0) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Gemma 4 drafts with its drafter and context lookup (--lookup-ngram); "
+                           "n-gram copy proposals (--ngram-draft-tokens) are not available for it");
     }
 
     if (executor.rope_yarn.active()) {
@@ -519,8 +542,11 @@ struct Gemma4Core::Impl {
     const std::uint32_t domain;
     const bool structured_output;
     const bool reuse_prefixes;
-    const std::uint32_t drafts;       // the assistant's drafts a round; 0 without speculation
+    const std::uint32_t drafts;       // the drafter's drafts a round; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
+    const bool dspine;                // --spec dspine: a DSpine drafter in the assistant's place
+    // --draft-min-p: a DSpine round verifies through its first draft at or below this probability.
+    const float draft_floor;
     const DiagnosticObserver diagnostics;
     // With --adaptive-mtp, the drafts a round proposes and verifies, 1..drafts.
     std::optional<runtime::MtpAdaptiveBatchController> mtp_controller;
@@ -600,7 +626,10 @@ struct Gemma4Core::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
-          lookup_ngram(options.speculative.lookup_ngram), diagnostics(options.diagnostic_observer),
+          lookup_ngram(options.speculative.lookup_ngram),
+          dspine(options.speculative.backend == SpeculativeBackend::DSpine),
+          draft_floor(options.speculative.draft_min_p.value_or(0.0F)),
+          diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
               options.decode_rounds_per_prefill != 0
@@ -1215,7 +1244,7 @@ struct Gemma4Core::Impl {
         slot.disposable = r.disposable;
         r.reused = r.prefilled = reused;
         if (drafts > 0) {
-            r.speculative.backend      = SpeculativeBackend::Mtp;
+            r.speculative.backend      = dspine ? SpeculativeBackend::DSpine : SpeculativeBackend::Mtp;
             r.speculative.enabled      = true;
             r.speculative.draft_window = drafts;
             r.speculative.accepted_per_position.assign(drafts, 0);
@@ -2193,11 +2222,32 @@ struct Gemma4Core::Impl {
                 mtp_lengths.push_back(static_cast<std::int32_t>(batch[j]->position));
             }
             std::vector<TokenId> mtp_drafts(mtp_sequences.size() * steps);
-            executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, steps, mtp_configs, mtp_lengths);
+            // A DSpine drafter's greedy drafts, each row's cut after its first draft at or below
+            // the floor (--draft-min-p).
+            std::vector<std::uint32_t> lengths(mtp_sequences.size(), steps);
+            if (dspine) {
+                std::vector<float> confidence(mtp_drafts.size());
+                executor.draft(mtp_sequences, mtp_anchors, steps, mtp_drafts, confidence);
+                for (std::size_t m = 0; m < lengths.size(); ++m) {
+                    for (std::uint32_t i = 0; i < steps; ++i) {
+                        const float p = confidence[m * steps + i];
+                        if (!std::isfinite(p)) {
+                            throw std::runtime_error("Gemma 4: non-finite DSpine draft confidence");
+                        }
+                        if (draft_floor > 0 && lengths[m] == steps && p <= draft_floor) {
+                            lengths[m] = i + 1;
+                        }
+                    }
+                }
+            } else {
+                executor.draft(mtp_sequences, mtp_anchors, mtp_drafts, steps, mtp_configs,
+                               mtp_lengths);
+            }
             for (std::size_t j = 0, m = 0; j < b; ++j) {
                 if (looked_up[j]) { continue; }
                 std::copy_n(mtp_drafts.begin() + std::ptrdiff_t(m * steps), steps,
                             all_drafts.begin() + std::ptrdiff_t(j * drafts));
+                draft_extents[j] = lengths[m];
                 ++m;
             }
         }
@@ -2865,14 +2915,20 @@ MemorySummary Gemma4Core::memory_summary() const {
         std::lock_guard lock(impl_->stats_mutex);
         out.host_kv_occupied_bytes = impl_->stats.host_kv_occupied_bytes;
     }
-    out.weights   = arena(stats.device_capacity_by_rank.empty() ? 0 : stats.device_capacity_by_rank[0]);
+    // A DSpine drafter's weights load beside the model's on its first device.
+    const auto* drafter = impl_->instance.model->dspine();
+    const std::uint64_t drafter_weights = drafter != nullptr ? drafter->device_bytes() : 0U;
+    const std::uint64_t model_weights =
+        stats.device_capacity_by_rank.empty() ? 0 : stats.device_capacity_by_rank[0];
+    out.weights   = arena(model_weights + drafter_weights);
     out.sequence  = {memory.kv_bytes, memory.kv_backed_bytes, memory.kv_backed_bytes};
     out.workspace = arena(memory.workspace_bytes + memory.experts.bank_bytes +
                           memory.experts.metadata_bytes);
     out.kv_payload_bytes              = memory.kv_bytes;
     out.expert_cache_bytes = memory.experts.cache_bytes;
     out.runtime_reservation_bytes = memory.kv_bytes + memory.workspace_bytes +
-        memory.experts.cache_bytes + memory.experts.bank_bytes + memory.experts.metadata_bytes;
+        memory.experts.cache_bytes + memory.experts.bank_bytes + memory.experts.metadata_bytes +
+        memory.dspine_bytes;
     out.available_after_weights_bytes = impl_->instance.free_after_weights;
     out.available_after_startup_bytes = impl_->instance.free_after_startup;
     if (impl_->instance.vision_budget > 0) {

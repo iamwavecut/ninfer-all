@@ -20,6 +20,7 @@
 
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
+#include "models/dspine/drafter.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
@@ -56,6 +57,8 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+using runtime::MaskedWidthController;
+using runtime::MaskedWidthSignal;
 using runtime::MtpAdaptiveBatchController;
 using runtime::MtpAdaptiveSignal;
 using PreparedPromptData    = qwen3_5::PreparedPromptData;
@@ -609,6 +612,8 @@ struct RequestControl {
     SpeculativeStats speculative_stats;
     // Adaptive MTP: how far this request's drafts survive.
     MtpAdaptiveSignal mtp_signal;
+    // Adaptive MTP with a masked drafter: what this request's rounds commit at either width.
+    MaskedWidthSignal masked_signal;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
@@ -1039,6 +1044,9 @@ public:
     std::vector<std::unique_ptr<GdnReplayRecords>> extra_replay_records;
     std::vector<std::unique_ptr<ops::GdnReplayFoldPlan>> extra_replay_fold;
     std::optional<DFlashPersistentState> dflash;
+    // --spec dspine: the standalone drafter over this Program's target, its ring the state
+    // images' local cache and its table dflash->dspine_head_write.
+    std::optional<dspine::Drafter> dspine_drafter;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
@@ -1083,6 +1091,9 @@ public:
     std::optional<PinnedHostBuffer> score_logprobs_host;
     // Present under adaptive MTP: picks each round's verification width.
     std::optional<MtpAdaptiveBatchController> mtp_controller;
+    // Present under adaptive MTP with a masked drafter: picks the width of each round without a
+    // copy, the draft window or its half.
+    std::optional<MaskedWidthController> masked_controller;
     TokenId* host_tokens = nullptr;
     // The round's logprob records, [row, column]; a returned round's span points here until the
     // Engine commits it. The host copy of the device gather lands in logprobs_host, and

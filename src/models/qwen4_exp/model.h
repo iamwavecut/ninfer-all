@@ -171,6 +171,9 @@ struct LoadOptions {
     // Loads the DFlash2 drafter the artifact carries (its `dflash2` component) onto the device of
     // the head, which it reads, as it reads the token embedding.
     bool dflash2 = false;
+    // Loads the standalone DSpine drafter artifact at this path (--draft-model) onto the device of
+    // the head; empty for none. One device or tensor parallelism, as DFlash2.
+    std::filesystem::path dspine;
     // Tensor parallelism (`--tensor-parallel`): each rank's relative share of every layer, one
     // positive weight per rank; empty for none. Each rank holds a run of every Gated DeltaNet
     // layer's heads, of the sparse-attention layers' KV heads (as far as the two allow) and of the
@@ -239,6 +242,9 @@ public:
         return dflash2_weights_;
     }
 
+    // The standalone DSpine drafter when the model was loaded with one (LoadOptions::dspine).
+    [[nodiscard]] const dspine::Model* dspine() const noexcept { return dspine_.get(); }
+
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
 
     // The artifact's files, in its order (disk-resident experts are read from them).
@@ -284,6 +290,7 @@ private:
     std::optional<MtpWeights> mtp_weights_;
     std::optional<DFlash2Config> dflash2_config_;
     std::optional<DFlash2Weights> dflash2_weights_;
+    std::unique_ptr<dspine::Model> dspine_;
     std::vector<TensorShare> shares_; // by rank under tensor parallelism
 };
 

@@ -4,6 +4,11 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/execution/dspine_head.h"
+#include "models/qwen3_5/program/planning/graph_profiles.h"
+#include "ninfer/ops/candidate_selector.h"
+#include "ninfer/ops/linear_topk.h"
+#include "ninfer/ops/speculative_round.h"
 #include "core/evictable_kv_pool.h"
 #include "core/host_kv_clamp.h"
 #include "core/startup.h"
@@ -499,6 +504,78 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             throw std::logic_error("DFlash StateImage has no local fixed state");
         }
         dflash.emplace(backing, *plan.persistent.dflash, *local);
+        if (const dspine::Model* drafter = parameters.dspine) {
+            const auto& text   = parameters.text;
+            const auto& config = parameters.model.config().text;
+            dspine::Target target{
+                .hidden = config.hidden_size,
+                .vocab  = config.vocab_size,
+                .layers = config.num_hidden_layers,
+                .domain = static_cast<std::int32_t>(
+                    parameters.model.resources().public_token_count),
+                .logits = execution::target_logits_dtype(text.output_head),
+                .embed  = [&text](const Tensor& ids, Tensor& rows, cudaStream_t stream) {
+                    execution::embed_tokens(ids, text.token_embedding, text.token_embedding_signs,
+                                            rows, stream);
+                },
+                .head = [&text](const Tensor& hidden, Tensor& logits, WorkspaceArena& arena,
+                                cudaStream_t stream) {
+                    execution::project(hidden, text.output_head, logits, arena, stream);
+                }};
+            // Candidates in one pass where linear_topk takes the head. The proposal head of another
+            // form projects dense logits, ranks them and maps its rows to token ids, as DFlash2's.
+            const auto* ranked   = execution::dspine_ranked_head(parameters, proposal_head);
+            const bool shortlist = proposal_head == ProposalHead::Optimized;
+            if (ranked != nullptr || shortlist) {
+                const execution::LinearParameters& head =
+                    shortlist ? parameters.proposal->head : text.output_head;
+                const Tensor* rows =
+                    shortlist && parameters.proposal->token_ids ? &*parameters.proposal->token_ids
+                                                                : nullptr;
+                const auto valid = static_cast<std::int32_t>(
+                    parameters.model.resources().public_token_count);
+                target.head_topk = [ranked, &head, rows, valid](const Tensor& hidden, Tensor& ids,
+                                                                Tensor& scores,
+                                                                WorkspaceArena& arena,
+                                                                cudaStream_t stream) {
+                    auto scope = arena.scope();
+                    if (ranked != nullptr) {
+                        const Tensor input = execution::rotated_input(
+                            hidden, ranked->hadamard_signs, arena, stream);
+                        if (rows != nullptr) {
+                            ops::linear_topk(input, ranked->weight, *rows, ids, scores, arena,
+                                             stream);
+                        } else {
+                            ops::linear_topk(input, ranked->weight, valid, ids, scores, arena,
+                                             stream);
+                        }
+                        return;
+                    }
+                    Tensor logits = arena.alloc(DType::BF16, {head.weight.n, hidden.ne[1]});
+                    execution::project(hidden, head, logits, arena, stream);
+                    ops::candidate_topk(logits, rows != nullptr ? head.weight.n : valid, ids,
+                                        scores, arena, stream);
+                    if (rows != nullptr) {
+                        Tensor every = ids.view({ids.ne[0] * ids.ne[1]});
+                        ops::proposal_remap_token_ids(
+                            every, static_cast<const std::int32_t*>(rows->data), head.weight.n,
+                            stream);
+                    }
+                };
+            }
+            // Its widest proposal: a copy round of several rows runs it at the copy window.
+            const std::uint32_t proposal =
+                masked_proposal_window(draft_window, ngram_draft_window, max_concurrency);
+            dspine_drafter.emplace(*drafter, std::move(target), dflash->dspine_head_write,
+                                   local->capacity(), capacity,
+                                   static_cast<std::int32_t>(max_concurrency),
+                                   static_cast<std::int32_t>(proposal + 1U));
+            RankBinding bind(device, 0);
+            work.reset();
+            dspine_drafter->prepare(work, device.stream);
+            work.reset();
+            dflash->dspine = &*dspine_drafter;
+        }
     }
     if (dflash.has_value() != plan.features.masked_draft()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
@@ -654,9 +731,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         structured_round = std::make_unique<qwen3_5::StructuredRound>(
             plan.persistent.grammar_masks->bind(backing),
             parameters.model.resources().public_token_count, widest_verify_window() + 1U,
-            max_concurrency,
-            speculative_backend == SpeculativeBackend::DFlash ||
-                speculative_backend == SpeculativeBackend::DFlash2);
+            max_concurrency, is_masked_draft_backend(speculative_backend));
         io.structured = structured_round.get();
     }
     active_continuations.fill(continuation_capacity);
@@ -724,6 +799,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (speculative_backend == SpeculativeBackend::Mtp && mtp_policy == MtpDraftPolicy::Adaptive) {
         mtp_controller.emplace();
         mtp_controller->reset(draft_window);
+    }
+    if (is_masked_draft_backend(speculative_backend) && mtp_policy == MtpDraftPolicy::Adaptive) {
+        const auto windows = masked_neural_windows(draft_window, true);
+        if (windows.size() == 2) {
+            masked_controller.emplace();
+            masked_controller->reset(windows[1], windows[0]);
+        }
     }
     // CUDA would otherwise load an attention width's module inside the first request that reaches
     // it, behind a context synchronization.
@@ -1075,8 +1157,11 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.kv_capacity     = kv_capacity;
     out.kv_cache        = kv_storage;
     const auto& weights = parameters.model.storage_stats();
-    out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
-                                     weights.device_capacity_bytes};
+    // A DSpine drafter's weights load beside the model's on its first device.
+    const std::size_t model_weight_bytes =
+        weights.device_capacity_bytes +
+        (parameters.dspine != nullptr ? parameters.dspine->device_bytes() : 0U);
+    out.weights = ArenaMemorySummary{model_weight_bytes, model_weight_bytes, model_weight_bytes};
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
     std::size_t active_handoff_bytes = 0;

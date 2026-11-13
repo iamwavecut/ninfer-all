@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -118,12 +119,16 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         }
     }
     // A speculative round verifies what the release's DSpark drafter proposes (--spec dspark, an
-    // artifact converted with it) or what a context lookup does (--lookup-ngram).
+    // artifact converted with it), what a standalone DSpine drafter does (--spec dspine
+    // --draft-model, where no context lookup matches) or what a context lookup does
+    // (--lookup-ngram).
     const SpeculativeOptions& speculative = options.speculative;
     const bool dspark = speculative.backend == SpeculativeBackend::DSpark;
-    if (speculative.backend != SpeculativeBackend::None && !dspark) {
-        throw std::invalid_argument("DeepSeek-V4.1 drafts with its DSpark drafter (--spec dspark) or "
-                                    "by context lookup (--lookup-ngram, without --spec)");
+    const bool dspine = speculative.backend == SpeculativeBackend::DSpine;
+    if (speculative.backend != SpeculativeBackend::None && !dspark && !dspine) {
+        throw std::invalid_argument("DeepSeek-V4.1 drafts with its DSpark drafter (--spec dspark), a "
+                                    "DSpine drafter (--spec dspine --draft-model) or by context "
+                                    "lookup (--lookup-ngram)");
     }
     if (dspark && speculative.lookup_ngram != 0) {
         throw std::invalid_argument("DeepSeek-V4.1: --spec dspark and --lookup-ngram exclude each other");
@@ -132,17 +137,19 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         speculative.lookup_ngram == 0 ? 0
         : speculative.draft_tokens != 0 ? speculative.draft_tokens
                                         : SpeculativeOptions::kAutomaticDraftTokens;
-    if (lookup_drafts > 7) {
-        throw std::invalid_argument(
-            "DeepSeek-V4.1: --lookup-ngram verifies 1 to 7 drafts (--draft-tokens)");
+    if (lookup_drafts > 7 || (dspine && (speculative.draft_tokens == 0 ||
+                                         speculative.draft_tokens > 7))) {
+        throw std::invalid_argument("DeepSeek-V4.1 verifies 1 to 7 drafts a round (--draft-tokens)");
     }
-    if (speculative.draft_min_p.value_or(0.0F) != 0 || speculative.mtp_attention_window != 0 ||
-        speculative.ngram_draft_tokens != 0 || speculative.ngram_archive_bytes != 0 ||
-        speculative.proposal_head != ProposalHead::Auto ||
+    if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine) ||
+        speculative.mtp_attention_window != 0 || speculative.ngram_draft_tokens != 0 ||
+        speculative.ngram_archive_bytes != 0 ||
+        speculative.proposal_head == ProposalHead::Optimized ||
+        (speculative.proposal_head != ProposalHead::Auto && !dspine) ||
         speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
-        throw std::invalid_argument("DeepSeek-V4.1 has no --draft-min-p, --adaptive-mtp, n-gram "
-                                    "copy proposals or archive, --mtp-attention-window or proposal "
-                                    "head");
+        throw std::invalid_argument("DeepSeek-V4.1 has no --adaptive-mtp, n-gram copy proposals or "
+                                    "archive, --mtp-attention-window or proposal head, and "
+                                    "--draft-min-p only with --spec dspine");
     }
     if (options.kv_cache != KvCacheStorage::BFloat16) {
         throw std::invalid_argument("DeepSeek-V4.1 keeps its attention caches in the release's "
@@ -225,7 +232,9 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
          .experts  = options.expert_residency,
          .dspark   = dspark,
          .draft_experts = speculative.draft_experts,
-         .vision   = vision},
+         .vision   = vision,
+         .dspine   = dspine ? std::filesystem::path(speculative.draft_model)
+                            : std::filesystem::path()},
         device, &options.startup_observer);
     // An image's span takes the release's 1024 prompt positions at most, fewer with
     // --vision-max-merged.
@@ -237,7 +246,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         }
     }
     // The drafter proposes its block's drafts a round, or fewer with --draft-tokens.
-    std::uint32_t drafts = lookup_drafts;
+    std::uint32_t drafts = dspine ? speculative.draft_tokens : lookup_drafts;
     if (dspark) {
         const std::uint32_t block = model->dspark_config()->block_size;
         drafts = speculative.draft_tokens != 0 ? speculative.draft_tokens : block;
@@ -279,6 +288,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     executor.sequences          = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs        = options.use_cuda_graph;
     executor.draft_tokens       = drafts;
+    executor.dspine             = dspine;
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
@@ -499,6 +509,17 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
                            double(speculative.draft_confidence.value_or(kDSparkConfidenceFloor)),
                            experts.c_str());
     }
+    if (dspine) {
+        const auto& drafter = *model->dspine();
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "DeepSeek-V4.1: DSpine drafter %s, up to %u drafts a round%s, ring of "
+                           "%u positions; weights %.0f MiB, ring, table and workspace %.0f MiB",
+                           drafter.name().c_str(), drafts,
+                           lookup_drafts != 0 ? " where no context lookup matches" : "",
+                           models::dspine::ring_capacity(drafter.config(), options.max_context + 1),
+                           double(drafter.device_bytes()) / 1048576.0,
+                           double(instance->executor->memory().dspine_bytes) / 1048576.0);
+    }
     ConstructedDeepSeekV41 out;
     const auto& stats         = model->storage_stats();
     out.load.architecture     = std::string(models::architecture_name(models::Architecture::DeepSeekV41));
@@ -694,6 +715,9 @@ struct DeepSeekV41Core::Impl {
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
     const std::uint32_t dspark_block; // --spec dspark: the drafter's block; 0 is off
     const float dspark_floor;         // the confidence a kept draft reaches
+    const bool dspine;                // --spec dspine: the drafter proposes where no lookup does
+    // --draft-min-p: a DSpine round verifies through its first draft at or below this probability.
+    const float draft_floor;
     const DiagnosticObserver diagnostics;
     static constexpr TokenId kBos = 0; // <｜begin▁of▁sentence｜>
 
@@ -774,6 +798,8 @@ struct DeepSeekV41Core::Impl {
           reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
           lookup_ngram(options.speculative.lookup_ngram), dspark_block(i.executor->dspark_block()),
           dspark_floor(options.speculative.draft_confidence.value_or(kDSparkConfidenceFloor)),
+          dspine(options.speculative.backend == SpeculativeBackend::DSpine),
+          draft_floor(options.speculative.draft_min_p.value_or(0.0F)),
           diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
@@ -1397,6 +1423,7 @@ struct DeepSeekV41Core::Impl {
             r.speculative.draft_window = drafts;
             r.speculative.accepted_per_position.assign(drafts, 0);
             if (dspark_block != 0) { r.speculative.backend = SpeculativeBackend::DSpark; }
+            if (dspine) { r.speculative.backend = SpeculativeBackend::DSpine; }
         }
         r.prefill_start        = Clock::now();
         r.progress             = r.prefill_start;
@@ -2213,8 +2240,8 @@ struct DeepSeekV41Core::Impl {
     // The drafts a round takes while `decoding` requests decode at once. Each verified row routes to
     // its own experts, so the rows a round adds cost more as requests join; Gemma 4's measurement of
     // this on an RTX 3090 (two requests gain with one draft each and lose with three, four lose with
-    // one) sets the same bounds here.
-    // The drafter drafts for one request at a time.
+    // one) sets the same bounds here, for context lookups and DSpine proposals alike.
+    // The DSpark drafter drafts for one request at a time.
     [[nodiscard]] std::uint32_t round_drafts(std::size_t decoding) const noexcept {
         if (dspark_block != 0) { return decoding == 1 ? drafts : 0U; }
         return decoding == 1 ? drafts : decoding <= 3 ? 1U : 0U;
@@ -2248,12 +2275,43 @@ struct DeepSeekV41Core::Impl {
         return kept;
     }
 
-    // One step of every decoding request. Those whose context proposes a continuation run one
-    // speculative round together, the rest one batched decode step; one feeding a thinking-control
-    // span runs it alone through the prompt route.
+    // DSpine proposals of `steps` drafts for each request of `rows` at once, each cut after its
+    // first draft at or below the floor.
+    std::vector<std::vector<TokenId>> drafter_proposals(
+        const std::vector<std::shared_ptr<Request>>& rows, std::uint32_t steps) {
+        std::vector<std::uint32_t> sequences;
+        std::vector<std::int32_t> anchors;
+        for (const auto& request : rows) {
+            sequences.push_back(request->slot);
+            anchors.push_back(request->feed.front());
+        }
+        std::vector<std::int32_t> drafted(rows.size() * steps);
+        std::vector<float> confidence(rows.size() * steps);
+        instance.executor->draft(sequences, anchors, steps, drafted, confidence);
+        std::vector<std::vector<TokenId>> out(rows.size());
+        for (std::size_t j = 0; j < rows.size(); ++j) {
+            std::uint32_t length = steps;
+            for (std::uint32_t i = 0; i < steps; ++i) {
+                const float p = confidence[j * steps + i];
+                if (!std::isfinite(p)) {
+                    throw std::runtime_error("DeepSeek-V4.1: non-finite DSpine draft confidence");
+                }
+                if (draft_floor > 0 && length == steps && p <= draft_floor) { length = i + 1; }
+            }
+            out[j].assign(drafted.begin() + std::ptrdiff_t(j * steps),
+                          drafted.begin() + std::ptrdiff_t(j * steps + length));
+        }
+        return out;
+    }
+
+    // One step of every decoding request. Those whose context or drafter proposes a continuation
+    // run one speculative round together, the rest one batched decode step; one feeding a
+    // thinking-control span runs it alone through the prompt route.
     void decode_step() {
-        std::vector<std::shared_ptr<Request>> batch, speculative, alone;
+        std::vector<std::shared_ptr<Request>> batch, speculative, alone, drafting;
         std::vector<std::vector<TokenId>> proposals;
+        // Which of the round's proposals came from a context lookup.
+        std::vector<char> looked_up;
         std::size_t decoding = 0;
         for (const Slot& slot : slots) {
             if (slot.request && slot.request->decoding) { ++decoding; }
@@ -2282,17 +2340,35 @@ struct DeepSeekV41Core::Impl {
             }
             if (steps > 0 && speculates(*request)) {
                 std::vector<TokenId> proposal(steps);
-                if (const std::uint32_t found = propose(*request, steps, proposal.data())) {
+                const std::uint32_t found =
+                    dspine && lookup_ngram == 0 ? 0 : propose(*request, steps, proposal.data());
+                if (found != 0) {
                     proposal.resize(found);
                     proposals.push_back(std::move(proposal));
                     speculative.push_back(request);
+                    looked_up.push_back(dspark_block == 0 ? 1 : 0);
+                    continue;
+                }
+                if (dspine) {
+                    drafting.push_back(request);
                     continue;
                 }
             }
             batch.push_back(request);
         }
-        if (batch.empty() && speculative.empty() && deferred.empty() && alone.empty()) { return; }
+        if (batch.empty() && speculative.empty() && drafting.empty() && deferred.empty() &&
+            alone.empty()) {
+            return;
+        }
         const auto start = Clock::now();
+        if (!drafting.empty()) {
+            auto drafted = drafter_proposals(drafting, steps);
+            for (std::size_t j = 0; j < drafting.size(); ++j) {
+                proposals.push_back(std::move(drafted[j]));
+                speculative.push_back(drafting[j]);
+                looked_up.push_back(0);
+            }
+        }
         if (!deferred.empty()) { sample_deferred(deferred); }
         for (const auto& request : alone) {
             Request& r = *request;
@@ -2318,7 +2394,7 @@ struct DeepSeekV41Core::Impl {
             } catch (...) { fail(request, std::current_exception()); }
         }
         if (!batch.empty()) { plain_step(batch); }
-        if (!speculative.empty()) { speculative_round(speculative, proposals); }
+        if (!speculative.empty()) { speculative_round(speculative, proposals, looked_up); }
         std::lock_guard lock(stats_mutex);
         stats.decode_rounds += 1;
         stats.decode_row_rounds += batch.size() + speculative.size() + alone.size();
@@ -2431,7 +2507,8 @@ struct DeepSeekV41Core::Impl {
     // output policy takes what it accepts of the run, and the executor commits the tokens fed up to
     // the last of them.
     void speculative_round(const std::vector<std::shared_ptr<Request>>& batch,
-                           const std::vector<std::vector<TokenId>>& proposals) {
+                           const std::vector<std::vector<TokenId>>& proposals,
+                           const std::vector<char>& looked_up) {
         auto& executor      = *instance.executor;
         const std::size_t b = batch.size();
         std::vector<std::uint32_t> sequences;
@@ -2660,7 +2737,7 @@ struct DeepSeekV41Core::Impl {
             r.speculative.rounds += 1;
             r.speculative.drafted_tokens += draft_extents[j];
             r.speculative.accepted_tokens += std::uint32_t(drafts_n);
-            if (dspark_block == 0) {
+            if (looked_up[j] != 0) {
                 // Reported with the n-gram proposals as well: the context, not a model, proposed them.
                 ++r.speculative.ngram_rounds;
                 r.speculative.ngram_drafted_tokens += draft_extents[j];
@@ -3109,14 +3186,20 @@ MemorySummary DeepSeekV41Core::memory_summary() const {
         std::lock_guard lock(impl_->stats_mutex);
         out.host_kv_occupied_bytes = impl_->stats.host_kv_occupied_bytes;
     }
-    out.weights   = arena(stats.device_capacity_by_rank.empty() ? 0 : stats.device_capacity_by_rank[0]);
+    // A DSpine drafter's weights load beside the model's on its first device.
+    const auto* drafter = impl_->instance.model->dspine();
+    const std::uint64_t drafter_weights = drafter != nullptr ? drafter->device_bytes() : 0U;
+    const std::uint64_t model_weights =
+        stats.device_capacity_by_rank.empty() ? 0 : stats.device_capacity_by_rank[0];
+    out.weights   = arena(model_weights + drafter_weights);
     out.sequence  = {memory.kv_bytes, memory.kv_backed_bytes, memory.kv_backed_bytes};
     out.workspace = arena(memory.workspace_bytes + memory.experts.bank_bytes +
                           memory.experts.metadata_bytes);
     out.kv_payload_bytes              = memory.kv_bytes;
     out.expert_cache_bytes = memory.experts.cache_bytes;
     out.runtime_reservation_bytes = memory.kv_bytes + memory.workspace_bytes +
-        memory.experts.cache_bytes + memory.experts.bank_bytes + memory.experts.metadata_bytes;
+        memory.experts.cache_bytes + memory.experts.bank_bytes + memory.experts.metadata_bytes +
+        memory.dspine_bytes;
     out.available_after_weights_bytes = impl_->instance.free_after_weights;
     out.available_after_startup_bytes = impl_->instance.free_after_startup;
     if (impl_->instance.vision_budget > 0) {

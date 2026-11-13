@@ -106,6 +106,8 @@ GPU residency is frozen when the Engine starts:
   `--spec` below);
 - `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B, Qwen3.6-35B-A3B,
   Qwen3.8-Flash-Next) load only the selected speculative backend;
+- `--spec dspine --draft-model PATH` loads that drafter artifact on the device of the model's head
+  and derives its head-write table from the head;
 - a speculative backend loads the artifact's optimized proposal head when it stores one, unless
   `--full-draft-head` keeps the drafts on the full output head and omits it;
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
@@ -228,6 +230,34 @@ three, five and seven DFlash2 drafts; a prose answer 403, 548 and 465, 420 and 3
 corpus (`ninfer_bench`, 128 tokens) 403, 497 and 427, 350 and 455. Draft with it where the output is
 code; MTP stays ahead elsewhere.
 
+A [DSpine](maintainer/dspine.md) drafter is an artifact of its own, which `--spec dspine
+--draft-model PATH --draft-tokens N` loads beside the model it was trained for; startup refuses a
+model of another hidden width, vocabulary or layer count. Tencent's drafter for Qwen3.8-27B is
+published converted as
+[Qwen3.8-27B-DSpine-b16-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3),
+and `python -m tools.convert --model CHECKPOINT --recipe dspine_q8 --out drafter.ninfer` converts
+another DSpine checkpoint (`dspine_bf16` keeps every weight in BF16). Every family takes a DSpine
+drafter: Qwen3.5-core models and Qwen3.8-Flash-Next with up to 15 drafts a round (its block of 16
+less the anchor), Gemma 4, Flint and DeepSeek-V4.1 with up to 7. On Qwen3.5-core models
+`--lm-head-draft` takes the drafter's candidates from the artifact's proposal head, as DFlash2's.
+On Qwen3.5-core models a sampled request verifies DSpine's
+sampled proposal by rejection sampling, as DFlash2's; the other families verify its greedy drafts
+with coupled draws, and `--draft-min-p P` verifies a round through its first draft whose confidence
+is at or below P. On an RTX 5090 with the official Qwen3.8-27B artifact, 15 DSpine drafts decoded a
+1,024-token Python answer at 473.4 tokens per second against 405.1 with 15 DFlash2 drafts and 90.7
+without drafts; on shorter code and on prose seven DFlash2 drafts stayed 4-9% faster than DSpine's
+best count, whose round costs more ([measurements](performance.md#dspine-on-qwen38-27b)). The best
+count depends on the answer and on how many requests share a round; `ninfer-serve --adaptive-mtp`
+picks 15 or 7 drafts each round from measured survival and round time
+([Adaptive MTP](serving.md#adaptive-mtp)).
+
+```bash
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
+  --prompt "Write a short explanation of speculative decoding." \
+  --max-context 16384 --max-new 512 \
+  --spec dspine --draft-model models/Qwen3.8-27B-DSpine-b16-ninfer-v3.ninfer --draft-tokens 7
+```
+
 A request that samples (temperature above zero) verifies MTP and DFlash drafts with coupled
 draws: the model draws each verified position with the request's seed and that position as the key,
 exactly as plain decoding does, and keeps a draft only while it equals that draw. Every emitted
@@ -243,10 +273,11 @@ default. Drafts from an MTP block (Qwen3.5-core models, Qwen3.8-Flash-Next) and 
 assistant then are the drafter's own draws under the same noise, so a draft and the target's draw
 agree wherever the two distributions agree. Whether the target keeps more of these drafts than of
 greedy ones depends on the drafter and the temperature: Qwen3.6-35B-A3B's MTP block kept fewer at
-0.7 and more at 1.0. DSpark and lookup drafts stay greedy, and DFlash2 keeps its rejection
-sampling for the tokens it verifies. A greedy request drafts and decodes as without the option
-(on Qwen3.6-35B-A3B, 3 of 3 answers with the same bytes and log probabilities). One request,
-three prompts, seeds 1 to 3, 256 tokens a response, on an A40 (2026-11-11) and, for
+0.7 and more at 1.0. DSpark and lookup drafts, and DSpine's outside the Qwen3.5 core, stay
+greedy; DFlash2 and DSpine on Qwen3.5-core models keep their rejection sampling for the tokens they
+verify. A greedy request drafts and decodes as without the option (on Qwen3.6-35B-A3B, 3 of 3
+answers with the same bytes and log probabilities). One request, three prompts, seeds 1 to 3, 256
+tokens a response, on an A40 (2026-11-11) and, for
 Qwen3.6-35B-A3B, an RTX 5090 (2026-11-12):
 
 | Model and drafter | Temperature | Acceptance, default | Acceptance, `--gumbel-sampling` | tok/s, default | tok/s, `--gumbel-sampling` |
@@ -337,16 +368,17 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--no-ngram-table` | Qwen3.8-Flash-Next: run without the n-gram table, a non-standard experimental mode (the Q2_0 release's WikiText-2 perplexity rises from 2.66 to 5.01); DeepSeek-V4.1: without its Engram table (the IQ1_M release's perplexity on a 1,112-token WikiText slice rose from 3.07 to 9.68 on October 25) | off |
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4\|bf16p` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; those nine are accepted on every build target; `bf16p` is opt-in BF16 packed losslessly into 23% fewer bytes, for Qwen3.5 and Qwen3.8-Flash-Next from sm_75, without `--tensor-attention positions` (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV; for Gemma 4 the sliding-window blocks' K and V, with the full-attention blocks' one value plane in an unrotated coding (see [Gemma 4](gemma4.md#kv-cache-formats)); Flint keeps F16 only (`bf16`), DeepSeek-V4.1 BF16 only | `bf16` |
 | `--kv-resident N\|all\|auto` | Qwen3.8-Flash-Next: positions of each sparse-attention layer's KV a sequence keeps in device memory; past them the layers' KV streams from pinned host memory (see [streamed KV](qwen3-8-flash-next.md#streamed-sparse-attention-kv)) | `auto`: 32,768 with host or disk experts, all with device experts |
-| `--spec none\|mtp\|dflash\|dflash2\|dspark` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) and `dflash2` from one carrying its DFlash2 drafter (see [DFlash2 speculative decoding](qwen3-8-flash-next.md#dflash2-speculative-decoding)), Gemma 4 from one converted with its assistant (see [Gemma 4](gemma4.md#speculative-decoding-with-the-assistant)); DeepSeek-V4.1 takes `dspark` from an artifact converted with its DSpark drafter (see [the DSpark drafter](deepseek-v41.md#the-dspark-drafter)); Flint has no drafter and takes `--lookup-ngram` without `--spec`, as DeepSeek-V4.1 does without `dspark` | for Flash-Next artifacts with host experts `dflash2` with 4 drafts (with `--draft-min-p 0.7`) on one device when they carry the DFlash2 drafter, else (over pipeline stages too) `mtp` with 3 drafts (with `--draft-min-p 0.5`) when they carry the MTP block, a round of several requests with a CPU share verifying at most 64 tokens ([MTP with several requests](qwen3-8-flash-next.md#mtp-with-several-requests)); for [Edge0](edge0.md#drafting) artifacts also with device experts and `--max-concurrency 1`; `mtp` with 3 drafts for Gemma 4 artifacts with their assistant and host or disk experts; otherwise off |
-| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for Qwen3.8-Flash-Next's DFlash2 drafter (its block of 8), Gemma 4's assistant and the context lookup of Flint and DeepSeek-V4.1; `1..5` for DSpark, its block | unset (their lookup: 3; DSpark: 5) |
-| `--draft-min-p P` | Flash-Next MTP and DFlash2 only: verify a round's drafts through the first at or below this probability (MTP: its absolute probability, which also ends the drafting; DFlash2: its selector confidence); see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) and [DFlash2](qwen3-8-flash-next.md#dflash2-speculative-decoding) | `0` (off) with `--spec mtp` or `--spec dflash2`; `0.5` when the engine chooses MTP and `0.7` when it chooses DFlash2 (no `--spec`), unless set |
+| `--spec none\|mtp\|dflash\|dflash2\|dspark\|dspine` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) and `dflash2` from one carrying its DFlash2 drafter (see [DFlash2 speculative decoding](qwen3-8-flash-next.md#dflash2-speculative-decoding)), Gemma 4 from one converted with its assistant (see [Gemma 4](gemma4.md#speculative-decoding-with-the-assistant)); DeepSeek-V4.1 takes `dspark` from an artifact converted with its DSpark drafter (see [the DSpark drafter](deepseek-v41.md#the-dspark-drafter)); every family takes `dspine` with `--draft-model` (see [DSpine](maintainer/dspine.md)); Flint has no drafter of its own and takes `--lookup-ngram` without `--spec`, as DeepSeek-V4.1 does without `dspark` | for Flash-Next artifacts with host experts `dflash2` with 4 drafts (with `--draft-min-p 0.7`) on one device when they carry the DFlash2 drafter, else (over pipeline stages too) `mtp` with 3 drafts (with `--draft-min-p 0.5`) when they carry the MTP block, a round of several requests with a CPU share verifying at most 64 tokens ([MTP with several requests](qwen3-8-flash-next.md#mtp-with-several-requests)); for [Edge0](edge0.md#drafting) artifacts also with device experts and `--max-concurrency 1`; `mtp` with 3 drafts for Gemma 4 artifacts with their assistant and host or disk experts; otherwise off |
+| `--draft-model PATH` | DSpine only: the drafter artifact, trained for the model | unset |
+| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for Qwen3.8-Flash-Next's DFlash2 drafter (its block of 8), Gemma 4's assistant and the context lookup of Flint and DeepSeek-V4.1; `1..5` for DSpark, its block; for DSpine up to its block less one and at most 15, or 7 on Gemma 4, Flint and DeepSeek-V4.1 | unset (their lookup: 3; DSpark: 5) |
+| `--draft-min-p P` | Flash-Next MTP and DFlash2, and DSpine on every family but the Qwen3.5 core: verify a round's drafts through the first at or below this probability (MTP: its absolute probability, which also ends the drafting; DFlash2 and DSpine: the drafter's confidence); see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding), [DFlash2](qwen3-8-flash-next.md#dflash2-speculative-decoding) and [DSpine](maintainer/dspine.md#verification-by-family) | `0` (off) with `--spec`; `0.5` when the engine chooses MTP and `0.7` when it chooses DFlash2 (no `--spec`), unless set |
 | `--draft-experts N` | DSpark only: each drafter block keeps its `N` most routed experts on the GPU and routes among them, the rest in pinned memory; `0` keeps all ([details](deepseek-v41.md#the-drafters-experts)) | `64` with the STQ drafter and host or disk experts, otherwise all |
 | `--draft-confidence C` | DSpark only: verify a round's drafts up to the first its confidence head scores below `C` (`0..1`); `0` verifies every draft | `0.5` |
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query, verification keeps full attention (see [serving](serving.md#mtp-attention-window)) | `0` (whole history) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Flint and DeepSeek-V4.1 without it; DeepSeek-V4.1 refuses it beside `--spec dspark`): the last `N` tokens are matched against the sequence so far and what followed is proposed, from the occurrence the sequence was already copying while it still matches, else from the newest; exact, since verification rejects a wrong guess | `0` (off) |
-| `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; with DFlash or DFlash2 at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
+| `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; with DFlash, DFlash2 or DSpine at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
 | `--nvfp4-w4a8-int` | run NVFP4 weights on the int8 tensor cores (W4A8), prefill and decode alike: activations are quantised to int8 with one scale per token and 32 columns, the stored E2M1 codes widen to int8 exactly, and their E4M3 group scales apply in FP32. About 1.2-1.4% relative error from the activation quantisation; on an RTX 50-series card it replaces the W4A4 routes. The device profile's `nvfp4_int8/*` keys choose the wide kernel | off: BF16 activations (W4A16) before Blackwell, W4A4 on it |
@@ -458,8 +490,9 @@ position of `--config` on the command line. A later layer overrides an earlier o
   form, and the other spellings of the setting (`--device` replaces a file's `devices`,
   `--full-draft-head` its `lm-head-draft`).
 - An option that contradicts an earlier layer's option drops that option: `--spec none` also drops
-  a file's `draft-tokens` and `adaptive-mtp`, `--no-thinking` drops `thinking-budget`, and
-  `--no-vision` drops `vision-residency`. The same contradiction inside one layer is an error.
+  a file's `draft-tokens` and `adaptive-mtp`, `--spec mtp` its `draft-model`, `--no-thinking` drops
+  `thinking-budget`, and `--no-vision` drops `vision-residency`. The same contradiction inside one
+  layer is an error.
 - Two choices stay errors across layers: `--device` with `--devices` inside one layer, and in
   `ninfer-serve` a hybrid prefix cache option (`--device-snapshot-slots`, `--cache-taps-per-request`,
   `--cache-tap-ladder`, `--cache-tap-min-gap`, `--prefix-cache-file`) together with an option that

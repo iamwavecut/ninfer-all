@@ -32,6 +32,7 @@ constexpr int kLogicalPages       = 3;
 constexpr int kPhysicalPages      = 6;
 constexpr int kDFlash2Window      = 2048;
 constexpr int kDFlashWindow       = 4096;
+constexpr int kDSpineWindow       = 8192;
 constexpr int kFullHeadDim        = 256;
 constexpr int kFullGroup          = 64;
 constexpr int kFullGroups         = kFullHeadDim / kFullGroup;
@@ -2154,6 +2155,12 @@ int main(int argc, char** argv) {
     failures += run_case(8, 8, 3 * kDFlash2Window - 4, true, {}, 8, kDFlash2Window);
     failures += run_case(kDFlash2Window, kDFlash2Window, 3 * kDFlash2Window - kDFlash2Window / 2,
                          true, {}, kDFlash2Window, kDFlash2Window);
+    // The DSpine ring: an 8192 window, a prompt chunk's commit and a wrapped block.
+    failures += run_case(1, 1, 2 * kDSpineWindow - 1, true, {}, 0, kDSpineWindow);
+    failures += run_case(16, 11, 3 * kDSpineWindow - 5, true, {}, 0, kDSpineWindow);
+    failures += run_case(2048, 2048, kDSpineWindow - 1000, true, {}, 2048, kDSpineWindow);
+    failures += cyclic_graph_replay_case(kDSpineWindow, 16);
+    failures += batch_selector_case(true, kDSpineWindow);
     failures += cyclic_graph_replay_case(kDFlashWindow, 16);
     failures += cyclic_graph_replay_case(kDFlash2Window, 8);
     failures += paged_graph_replay_case();

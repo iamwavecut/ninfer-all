@@ -922,6 +922,14 @@ std::vector<std::uint64_t> expert_ends(std::uint32_t experts, std::span<const do
 std::vector<double> default_tensor_split(const artifact::Reader& reader, const LoadOptions& options,
                                          std::span<const std::uint64_t> free_bytes,
                                          std::span<const double> speed) {
+    // A DSpine drafter and its head-write table also sit on rank 0.
+    std::vector<std::uint64_t> rank_free(free_bytes.begin(), free_bytes.end());
+    if (!options.dspine.empty() && !rank_free.empty()) {
+        const std::uint64_t drafter =
+            dspine::weight_bytes(options.dspine) +
+            dspine::head_write_bytes(dspine::read_config(options.dspine));
+        rank_free.front() -= std::min(rank_free.front(), drafter);
+    }
     // The MTP block's experts stay whole on rank 0 with the rest of the block.
     return models::default_expert_split(
         reader,
@@ -933,7 +941,7 @@ std::vector<double> default_tensor_split(const artifact::Reader& reader, const L
         [](std::string_view name) {
             return name.starts_with("text/") && name.find("/moe/experts/") != std::string_view::npos;
         },
-        free_bytes, speed);
+        rank_free, speed);
 }
 
 ops::WeightInput Model::input(WeightId id) const {
@@ -1024,6 +1032,18 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         }
         dflash2_config = parse_dflash2_config(reader.directory().component("dflash2").config,
                                               config);
+    }
+    if (!options.dspine.empty()) {
+        if (options.ranks > 1 && !tensor_parallel) {
+            throw std::invalid_argument("the DSpine drafter runs on one device or under tensor "
+                                        "parallelism, not over pipeline stages");
+        }
+        if (options.mtp || options.dflash2) {
+            throw std::invalid_argument("Qwen3.8-Flash-Next drafts with one drafter: its MTP "
+                                        "block, its DFlash2 drafter or a DSpine drafter");
+        }
+        dspine::check_target(dspine::read_config(options.dspine), config.hidden_size,
+                             config.vocab_size, config.num_hidden_layers, "Qwen3.8-Flash-Next");
     }
     FrontendResources resources = bind_resources(binder, config, options.vision);
     Bindings b(binder);
@@ -1206,6 +1226,9 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     model->mtp_weights_    = std::move(mtp_weights);
     model->dflash2_config_  = std::move(dflash2_config);
     model->dflash2_weights_ = std::move(dflash2_weights);
+    if (!options.dspine.empty()) {
+        model->dspine_ = dspine::load_model(options.dspine, device, observer);
+    }
     model->shares_         = std::move(shares);
     return model;
 }

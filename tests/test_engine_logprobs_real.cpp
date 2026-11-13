@@ -14,9 +14,9 @@
 
 // Token log probabilities on a real model through the public Engine, for any model family:
 // NINFER_LOGPROBS_ARTIFACT names the artifact, NINFER_LOGPROBS_NGRAM_TABLE a Qwen3.8-Flash-Next
-// table artifact, NINFER_LOGPROBS_SPECULATIVE=mtp|dflash2 verifies the tokens in speculative
-// rounds, and NINFER_LOGPROBS_CONTEXT_CACHE=hybrid admits every request through the hybrid prefix
-// cache.
+// table artifact, NINFER_LOGPROBS_SPECULATIVE=mtp|dflash2|dspine verifies the tokens in
+// speculative rounds (NINFER_LOGPROBS_DRAFT_MODEL names the DSpine drafter), and
+// NINFER_LOGPROBS_CONTEXT_CACHE=hybrid admits every request through the hybrid prefix cache.
 namespace {
 
 int g_failures = 0;
@@ -56,10 +56,15 @@ ninfer::EngineOptions engine_options(const char* artifact) {
         options.context_cache.host_cache_budget_bytes = 1ULL << 30;
     }
     if (const char* spec = std::getenv("NINFER_LOGPROBS_SPECULATIVE"); spec && *spec) {
+        using ninfer::SpeculativeBackend;
         const std::string_view backend(spec);
-        options.speculative.backend      = backend == "mtp" ? ninfer::SpeculativeBackend::Mtp
-                                                            : ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.backend      = backend == "mtp"      ? SpeculativeBackend::Mtp
+                                           : backend == "dspine" ? SpeculativeBackend::DSpine
+                                                                 : SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens = backend == "mtp" ? 3 : 15;
+        if (const char* drafter = std::getenv("NINFER_LOGPROBS_DRAFT_MODEL"); drafter && *drafter) {
+            options.speculative.draft_model = drafter;
+        }
     }
     return options;
 }

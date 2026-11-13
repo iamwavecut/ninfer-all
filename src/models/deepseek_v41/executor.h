@@ -19,6 +19,11 @@
 // (a verification's at commit(), the rows kept). draft() runs the drafter's block after a
 // sequence's anchor at its next positions, from a CUDA graph.
 //
+// With a standalone DSpine drafter (ExecutorOptions::dspine), every pass stores the streams' mean
+// after each block the drafter taps for the rows a sequence keeps (a prompt call's last window of
+// them), those rows go into the sequence's lane of the drafter's context ring (a verification's at
+// commit()), and draft() proposes for several sequences at once. Branch passes keep nothing there.
+//
 // With the model's vision tower (vision_max_patches), encode_image() turns an image's patches into
 // its span's rows, and a prompt call's image rows take the place of their tokens' embeddings: they
 // route with the image routing bias, and the Engram neither adds to them nor looks back past them.
@@ -90,6 +95,9 @@ struct ExecutorOptions {
     std::uint32_t expert_cpu_threads = 0;
     // Disk experts: a drive mirror and the direct path (core/expert_disk.h).
     ExpertDiskReads expert_disk{};
+    // Drafts with the model's DSpine drafter (Model::dspine(), draft_tokens of them at most). When
+    // it taps a decoder block, every prompt row runs every block (no prefill tail).
+    bool dspine = false;
     // The Engram table's rows and how they are read; none runs the model without its Engram (a
     // non-standard mode that degrades the output).
     std::optional<qwen4_exp::NgramTableLayout> engram_table;
@@ -138,6 +146,9 @@ struct ExecutorMemory {
     std::uint64_t vision_owned_bytes  = 0;
     // --draft-experts: the device copy of the drafter's kept experts and their router rows.
     std::uint64_t drafter_expert_bytes = 0;
+    // A DSpine drafter's ring, table, features, staging and workspace (its weights are the
+    // model's).
+    std::uint64_t dspine_bytes = 0;
     ExpertDeliveryMemory experts;
 };
 
@@ -150,8 +161,8 @@ struct SequenceSnapshot {
     EngramHasher::History history;
 };
 
-// A sequence's state in host memory, laid out as image_bytes() sizes it: its rings, tails and
-// compressed rows below `position`. The context cache keeps prefixes this way beyond the device's
+// A sequence's state in host memory, laid out as image_bytes() sizes it: its rings, tails,
+// compressed rows below `position` and a DSpine drafter's ring slots of the positions before it. The context cache keeps prefixes this way beyond the device's
 // sequences; the header (position and Engram history) travels beside the bytes.
 struct SequenceImage {
     std::uint32_t position = 0;
@@ -241,6 +252,12 @@ public:
     // state do not change.
     void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
                std::span<float> confidence);
+    // DSpine (ExecutorOptions::dspine): for each of `sequences` (distinct, at most 8), the greedy
+    // drafts of the `k` (1..draft_tokens) positions after its anchor, the token it reads next,
+    // and each draft's probability under the drafter, k a sequence in `drafts` and `confidence`;
+    // returns once they are on the host.
+    void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
+               std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence);
     // widths[j] tokens of sequence j (its anchor, then its drafts; without widths, tokens.size() /
     // sequences.size() each) at its next positions, as decode rows: logits one column each,
     // sequence by sequence. The positions advance only with commit().
@@ -260,7 +277,9 @@ public:
     // A second kept state beside the checkpoint, of an executor with checkpoints: hold() keeps the
     // sequence's live state (false when it is mid-way through a prefill tail, keeping nothing),
     // restore_hold() takes the sequence back to it. The engine keeps the state before the token
-    // that begins a stop string's match this way.
+    // that begins a stop string's match this way. A DSpine ring keeps no held copy: once it has
+    // wrapped, the slots of its window's oldest positions hold the keys of the positions given
+    // back, which changes later drafts only.
     bool hold(std::uint32_t sequence, SequenceSnapshot& out);
     void restore_hold(std::uint32_t sequence, const SequenceSnapshot& from);
     // Bytes of an image at `position`.

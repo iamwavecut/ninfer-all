@@ -33,8 +33,8 @@ spelling and defaults.
 ## Model artifacts
 
 The artifacts converted for this engine (Ternary Bonsai 2, the GSQ-RCO and Flash-Next conversions,
-the Qwen3.8-27B fine-tunes and Qwen3.6-35B-A3B NVFP4) are in the README's
-[artifact table](../README.md#artifacts); their cards live on Hugging Face. The official NInfer
+the Qwen3.8-27B fine-tunes, Qwen3.6-35B-A3B NVFP4 and the Qwen3.8-27B DSpine drafter) are in the
+README's [artifact table](../README.md#artifacts); their cards live on Hugging Face. The official NInfer
 artifacts load as well; their cards on Hugging Face give upstream's requirements and its
 measurements on one RTX 5090. The `groupwise-int` artifacts run on every supported card. The
 `nvfp4` ones run on the FP4 tensor cores of a `120a` build and, on cards without them, through
@@ -78,6 +78,7 @@ other references own narrower contracts:
 | [Pipeline stages](maintainer/pipeline-stages.md) | `--devices`: whole-layer stages over several GPUs, and `--tensor-parallel`: every layer divided over them; what each covers, verification and measurements |
 | [Quality trades](maintainer/quality-trade-experiments.md) | the precision options and what each costs and buys |
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
+| [DSpine](maintainer/dspine.md) | the standalone DSpine drafter: artifact, code bridge, refinement and state in every family |
 | [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | candidate selection, retention, materialization and Device/Host checkpoint policy |
 | [Hybrid prefix cache](maintainer/hybrid-prefix-cache-spec.md) | the default prefix cache of `ninfer-serve`: block tree, sparse state snapshots, tap placement, Host slab tier, eviction and automatic configuration |
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |

@@ -17,6 +17,7 @@ namespace ninfer::product {
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
     if (value == "dspark") { return SpeculativeBackend::DSpark; }
+    if (value == "dspine") { return SpeculativeBackend::DSpine; }
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
 
@@ -32,19 +33,22 @@ namespace ninfer::product {
         return "dflash2";
     case SpeculativeBackend::DSpark:
         return "dspark";
+    case SpeculativeBackend::DSpine:
+        return "dspine";
     }
     return "unknown";
 }
 
-// Copy drafting rides along with every drafter but DSpark unless the command line sets its width.
-// Fifteen drafts is the widest a multi-request batch verifies, so the default holds at any
-// concurrency.
+// Copy drafting rides along with every drafter but DSpark and DSpine unless the command line sets
+// its width (a DSpine drafter serves models whose Engines have no copy proposals). Fifteen drafts
+// is the widest a multi-request batch verifies, so the default holds at any concurrency.
 inline constexpr std::uint32_t kDefaultNgramDraftTokens = 15;
 
 inline void apply_default_ngram_draft_tokens(SpeculativeOptions& options,
                                              bool width_explicit) noexcept {
     if (!width_explicit && options.backend != SpeculativeBackend::None &&
-        options.backend != SpeculativeBackend::DSpark) {
+        options.backend != SpeculativeBackend::DSpark &&
+        options.backend != SpeculativeBackend::DSpine) {
         options.ngram_draft_tokens = kDefaultNgramDraftTokens;
     }
 }
@@ -65,9 +69,18 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         throw std::invalid_argument("--draft-min-p takes a finite value in [0,1]");
     }
     if (options.draft_min_p && options.backend != SpeculativeBackend::Mtp &&
-        options.backend != SpeculativeBackend::DFlash2 && !options.automatic) {
+        options.backend != SpeculativeBackend::DFlash2 &&
+        options.backend != SpeculativeBackend::DSpine && !options.automatic) {
         throw OptionConflict({"draft-min-p", "spec"},
-                             "--draft-min-p requires --spec mtp, --spec dflash2 or no --spec");
+                             "--draft-min-p requires --spec mtp, dflash2, dspine or no --spec");
+    }
+    if (options.backend == SpeculativeBackend::DSpine && options.draft_model.empty()) {
+        throw OptionConflict({"spec", "draft-model"},
+                             "--spec dspine requires --draft-model PATH, the DSpine drafter "
+                             "artifact");
+    }
+    if (!options.draft_model.empty() && options.backend != SpeculativeBackend::DSpine) {
+        throw OptionConflict({"draft-model", "spec"}, "--draft-model requires --spec dspine");
     }
     if (options.draft_confidence &&
         (!std::isfinite(*options.draft_confidence) || *options.draft_confidence < 0 ||
@@ -93,9 +106,10 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         throw std::invalid_argument("ngram drafting takes drafts 1..63 and match 4..64");
     }
     if (options.ngram_draft_tokens != 0 && options.backend != SpeculativeBackend::DFlash2 &&
-        options.backend != SpeculativeBackend::DFlash && options.backend != SpeculativeBackend::Mtp) {
+        options.backend != SpeculativeBackend::DFlash && options.backend != SpeculativeBackend::Mtp &&
+        options.backend != SpeculativeBackend::DSpine) {
         throw OptionConflict({"ngram-draft-tokens", "spec"},
-                             "ngram drafting requires --spec mtp|dflash|dflash2");
+                             "ngram drafting requires --spec mtp|dflash|dflash2|dspine");
     }
     if (options.mtp_attention_window != 0 &&
         (options.backend != SpeculativeBackend::Mtp ||
@@ -104,8 +118,14 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             {"mtp-attention-window", "spec", "draft-tokens"},
             "--mtp-attention-window requires --spec mtp and at least --draft-tokens + 1 keys");
     }
-    if (options.mtp_policy != MtpDraftPolicy::Fixed && options.backend != SpeculativeBackend::Mtp) {
-        throw OptionConflict({"adaptive-mtp", "spec"}, "--adaptive-mtp requires --spec mtp");
+    // The Qwen3.5-core models also adapt a masked drafter's rounds; the other families' Engines
+    // refuse that themselves.
+    if (options.mtp_policy != MtpDraftPolicy::Fixed && options.backend != SpeculativeBackend::Mtp &&
+        options.backend != SpeculativeBackend::DFlash &&
+        options.backend != SpeculativeBackend::DFlash2 &&
+        options.backend != SpeculativeBackend::DSpine) {
+        throw OptionConflict({"adaptive-mtp", "spec"},
+                             "--adaptive-mtp requires --spec mtp|dflash|dflash2|dspine");
     }
     switch (options.backend) {
     case SpeculativeBackend::None:
@@ -115,7 +135,7 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             options.proposal_head != ProposalHead::Auto) {
             throw OptionConflict({"lm-head-draft", "draft-tokens", "lookup-ngram", "spec"},
                                  "--lm-head-draft, --full-draft-head and --draft-tokens without "
-                                 "--lookup-ngram require --spec mtp|dflash|dflash2|dspark");
+                                 "--lookup-ngram require --spec mtp|dflash|dflash2|dspark|dspine");
         }
         return;
     case SpeculativeBackend::Mtp:
@@ -132,6 +152,13 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         if (options.draft_tokens > 15 || options.proposal_head != ProposalHead::Auto) {
             throw OptionConflict({"spec", "draft-tokens", "lm-head-draft"},
                                  "--spec dspark takes --draft-tokens up to 15 and no proposal head");
+        }
+        return;
+    case SpeculativeBackend::DSpine:
+        // The model's Engine checks the drafts against the drafter's block.
+        if (options.draft_tokens == 0 || options.draft_tokens > 15) {
+            throw OptionConflict({"spec", "draft-tokens"},
+                                 "--spec dspine requires --draft-tokens in [1,15]");
         }
         return;
     }
