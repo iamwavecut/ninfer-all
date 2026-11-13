@@ -1,8 +1,8 @@
 #pragma once
 
 // Definition of launch_prompt_i8 (prompt_kernel_launch.h): the standard INT8-family prompt kernel
-// (int8/prompt.cuh) over every coding, PV accumulation and GQA packing. Included only by the
-// generated prompt units (kernel_unit.cu.in).
+// (int8/prompt.cuh) over the codings with packed int4 values or over INT8 values, every PV
+// accumulation and GQA packing. Included only by the generated prompt units (kernel_unit.cu.in).
 
 #include "core/device_launch.h" // CUDA_CHECK, raise_dynamic_shared_memory
 #include "ops/common/device_tier.h"
@@ -16,12 +16,13 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 
 static_assert(kPromptWaveRows % kCausalPromptI8Br == 0);
 
-template <typename Geometry, PromptMetadataForm Form>
+template <typename Geometry, PromptMetadataForm Form, bool PackedValueCodings>
 void launch_prompt_i8(const PromptLaunch& launch) {
     // A build of Turing's shape set alone does not compile the standard kernel.
     if constexpr (kBuildStandardShapes) {
@@ -72,22 +73,25 @@ void launch_prompt_i8(const PromptLaunch& launch) {
             }
             pack.template operator()<PackedValues, Keys, false>();
         };
-        switch (launch.coding) {
-        case CausalI8Coding::Lloyd4:
-            with_pv.template operator()<true, KvKeyCoding::Lloyd4>();
-            break;
-        case CausalI8Coding::Int4E8:
-            with_pv.template operator()<true, KvKeyCoding::Int4E8>();
-            break;
-        case CausalI8Coding::RootE8:
-            pack.template operator()<true, KvKeyCoding::RootE8, false>();
-            break;
-        case CausalI8Coding::PackedValues:
-            with_pv.template operator()<true, KvKeyCoding::Int8>();
-            break;
-        case CausalI8Coding::Int8:
+        if constexpr (PackedValueCodings) {
+            switch (launch.coding) {
+            case CausalI8Coding::Lloyd4:
+                with_pv.template operator()<true, KvKeyCoding::Lloyd4>();
+                break;
+            case CausalI8Coding::Int4E8:
+                with_pv.template operator()<true, KvKeyCoding::Int4E8>();
+                break;
+            case CausalI8Coding::RootE8:
+                pack.template operator()<true, KvKeyCoding::RootE8, false>();
+                break;
+            case CausalI8Coding::PackedValues:
+                with_pv.template operator()<true, KvKeyCoding::Int8>();
+                break;
+            case CausalI8Coding::Int8:
+                throw std::logic_error("INT8 values reached the packed codings' prompt launch");
+            }
+        } else {
             pack.template operator()<false, KvKeyCoding::Int8, false>();
-            break;
         }
         CUDA_CHECK(cudaGetLastError());
     }

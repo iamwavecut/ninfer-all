@@ -342,11 +342,14 @@ shape and coding of each launch and pass plain launch arguments (`SmallTPartialL
 `SmallTI8Launch`, `PromptLaunch`) to kernel units that CMake generates from
 `dense/causal_cache/kernel_unit.cu.in` (`src/ops/softmax_attention/sources.cmake`): one explicit
 instantiation of a launcher template each, three in a prompt unit. The small-T BF16, bf16p, FP8,
-NVFP4 and K8V4 kernels have one unit per geometry and input, the prompt kernels one per geometry and
+NVFP4 and K8V4 kernels have one unit per geometry and input, the prompt kernels two per geometry and
 block-table form, and the INT8-family small-T kernel one per tier, query width, geometry and input.
-A prompt unit instantiates the fast INT8-family, standard INT8-family and BF16 launches in this
-order: NVVM compiles a kernel differently after other kernels of its module, and the standard
-INT8-family kernels compiled alone run rk4v4 and rk4v4-e8 prompts 2-6 % slower on an RTX 4090.
+A prompt unit instantiates the fast INT8-family launch, the standard INT8-family launch over the
+codings with packed int4 values and the BF16 launch in this order: NVVM compiles a kernel
+differently after other kernels of its module, and the standard kernels of the packed codings
+compiled alone run rk4v4 and rk4v4-e8 prompts 2-6 % slower on an RTX 4090. The standard kernel over
+INT8 values runs int8-g64 prompts 1-2 % faster on an RTX 3090 and an RTX 4090 compiled alone, in
+the second prompt unit.
 Volta's kernels have units of their own, compiled for `70-real` alone in a build of several
 architectures. The split reducers (`small_t_reduce.cu`, `nvfp4/small_t_reduce.cu`,
 `k8v4/small_t_reduce.cu`) and the fast prompt merge (`int8/prompt_fast_merge.cu`) are units of their

@@ -124,7 +124,11 @@ void causal_attention_prompt_attention_launch_for(const CacheView& cache, Prompt
                                    launch.coding == CausalI8Coding::Int4E8 ||
                                    launch.coding == CausalI8Coding::PackedValues;
             launch.pv_f16 = pv_coding && !current_device_volta() && prompt_pv_f16();
-            launch_prompt_i8<Geometry, Form>(launch);
+            if (launch.coding == CausalI8Coding::Int8) {
+                launch_prompt_i8<Geometry, Form, false>(launch);
+            } else {
+                launch_prompt_i8<Geometry, Form, true>(launch);
+            }
         }
     } else {
         launch.packed_planes = cache.storage == KvCacheStorage::Bf16Packed;

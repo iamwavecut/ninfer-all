@@ -103,12 +103,15 @@ foreach(_ninfer_small_t_geometry IN ITEMS h24 h16)
     set(_ninfer_small_t_widest 6)
   endif()
   # The prompt kernels of one geometry and block-table form share a unit: the fast INT8-family
-  # launch (in a build with post-Volta code), the standard INT8-family launch and the BF16 launch,
-  # in this order. NVVM compiles a kernel differently after other kernels of its module. Compiled
-  # alone, the standard INT8-family kernels recompute their shared-memory scale addresses in the key
-  # loop and run rk4v4 and rk4v4-e8 prompts 2-6 % slower on an RTX 4090; compiled after the fast
-  # ones, they keep them in registers. In this order every prompt kernel's PTX for sm_70 through
-  # sm_120a is the PTX of one unit that holds every geometry and form.
+  # launch (in a build with post-Volta code), the standard INT8-family launch over the codings with
+  # packed int4 values and the BF16 launch, in this order. NVVM compiles a kernel differently after
+  # other kernels of its module. Compiled alone, the standard kernels of the packed codings
+  # recompute their shared-memory scale addresses in the key loop and run rk4v4 and rk4v4-e8
+  # prompts 2-6 % slower on an RTX 4090; compiled after the fast ones, they keep them in registers.
+  # In this order their PTX and the other prompt kernels' PTX for sm_70 through sm_120a is the PTX
+  # of one unit that holds every geometry and form. The standard kernel over INT8 values is the
+  # exception: compiled alone, it runs int8-g64 prompts 1-2 % faster on an RTX 3090 and an RTX
+  # 4090, so it has a unit of its own.
   foreach(_ninfer_prompt_form IN ITEMS direct batch masked)
     if(_ninfer_prompt_form STREQUAL direct)
       set(_ninfer_prompt_form_id Direct)
@@ -121,18 +124,22 @@ foreach(_ninfer_small_t_geometry IN ITEMS h24 h16)
     set(_ninfer_prompt_arguments
       "${_ninfer_small_t_type}, PromptMetadataForm::${_ninfer_prompt_form_id}")
     set(_ninfer_prompt_launches "")
-    set(_ninfer_prompt_kernels "INT8, BF16")
+    set(_ninfer_prompt_kernels "packed INT8, BF16")
     if(_ninfer_small_t_post_volta)
       list(APPEND _ninfer_prompt_launches int8/prompt_fast_launch.cuh launch_prompt_i8_fast
         "${_ninfer_prompt_arguments}" "const PromptLaunch&")
       set(_ninfer_prompt_kernels "fast INT8, ${_ninfer_prompt_kernels}")
     endif()
     list(APPEND _ninfer_prompt_launches
-      int8/prompt_launch.cuh launch_prompt_i8 "${_ninfer_prompt_arguments}" "const PromptLaunch&"
+      int8/prompt_launch.cuh launch_prompt_i8 "${_ninfer_prompt_arguments}, true"
+      "const PromptLaunch&"
       bf16/prompt_launch.cuh launch_prompt_bf16 "${_ninfer_prompt_arguments}" "const PromptLaunch&")
     _ninfer_causal_cache_launches(_ninfer_causal_cache_sources "prompt_${_ninfer_prompt_suffix}"
       "the prompt kernels\n// of ${_ninfer_prompt_arguments} (${_ninfer_prompt_kernels})"
       ${_ninfer_prompt_launches})
+    _ninfer_causal_cache_unit(_ninfer_causal_cache_sources "prompt_i8_int8_${_ninfer_prompt_suffix}"
+      int8/prompt_launch.cuh launch_prompt_i8 "${_ninfer_prompt_arguments}, false"
+      "const PromptLaunch&" "the standard INT8-family prompt kernel over INT8 values")
   endforeach()
   foreach(_ninfer_small_t_input IN ITEMS append cached packed)
     if(_ninfer_small_t_input STREQUAL append)

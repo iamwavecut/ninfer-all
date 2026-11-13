@@ -2,9 +2,10 @@
 
 // The causal prompt attention launches over BF16, bf16p and INT8-family caches that the host
 // launcher (prompt.cpp) calls, and their arguments: plain pointers and counts, so the launcher
-// compiles without the kernels and a kernel unit without the routing. The three kernel families of
-// each geometry and metadata form compile in one unit (kernel_unit.cu.in; sources.cmake gives
-// their order).
+// compiles without the kernels and a kernel unit without the routing. Of each geometry and
+// metadata form, the fast INT8-family kernels, the standard ones of the codings with packed int4
+// values and the BF16 kernels compile in one unit, the standard ones over INT8 values in another
+// (kernel_unit.cu.in; sources.cmake gives why).
 
 #include "ops/softmax_attention/dense/causal_cache/int8/coding.h"
 
@@ -54,8 +55,10 @@ struct PromptLaunch {
 template <typename Geometry, PromptMetadataForm Form>
 void launch_prompt_bf16(const PromptLaunch& launch);
 
-// The standard INT8-family kernel (int8/prompt.cuh), where the build has the standard shape set.
-template <typename Geometry, PromptMetadataForm Form>
+// The standard INT8-family kernel (int8/prompt.cuh), where the build has the standard shape set:
+// the codings with packed int4 values (rk4v4, rk4v4-e8, rk2v4-e8, rk8v4) where PackedValueCodings,
+// INT8 values (int8-g64) otherwise. The two compile in separate units (sources.cmake).
+template <typename Geometry, PromptMetadataForm Form, bool PackedValueCodings>
 void launch_prompt_i8(const PromptLaunch& launch);
 
 // The fast INT8-family kernel (int8/prompt_fast.cuh) at the launch's plan; a split plan leaves its
