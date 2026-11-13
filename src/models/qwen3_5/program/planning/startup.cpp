@@ -1496,6 +1496,15 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             "workspace admits at most 16 verification columns for a multi-request batch, so K "
             "above 15 requires concurrency one");
     }
+    // A copy round of a masked drafter verifies the drafter's proposal inside its own width
+    // (execution/draft.cpp), so its width is at least the draft window.
+    if (options.speculative.ngram_draft_tokens != 0 &&
+        options.speculative.backend != SpeculativeBackend::Mtp &&
+        options.speculative.ngram_draft_tokens < options.speculative.draft_tokens) {
+        throw std::invalid_argument(
+            "--ngram-draft-tokens must be at least --draft-tokens with a masked drafter: a copy "
+            "round verifies the drafter's proposal inside its own width");
+    }
 }
 
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
