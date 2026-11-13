@@ -12,8 +12,8 @@ OLD_TABLE = "WaveCut/Qwen3.8-Flash-Next-IQ4-table-NInfer-exp-20261008"
 PUBLIC_TABLE = "WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3"
 PUBLIC_FILE = "Qwen3.8-Flash-Next-ngram-table-IQ4_NL-ninfer-v3.ninfer"
 TARGETS = {
-    "WaveCut/Qwen3.8-Flash-Next-native-Q2-MTP-FP8-table-NInfer-exp-20261008": "FP8 table rejected by the user",
-    "WaveCut/Qwen3.8-Flash-Next-FP8-table-NInfer-exp-20261008": "FP8 table rejected by the user",
+    "WaveCut/Qwen3.8-Flash-Next-native-Q2-MTP-FP8-table-NInfer-exp-20261008": "FP8 table rejected",
+    "WaveCut/Qwen3.8-Flash-Next-FP8-table-NInfer-exp-20261008": "FP8 table rejected",
     OLD_TABLE: "same row digest and descriptor as the retained public IQ4 table",
 }
 RETAINED = [
