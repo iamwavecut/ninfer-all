@@ -510,12 +510,15 @@ no padding between rows, `row * row_bytes` from the payload start; the 90 traili
 (320,001,446 addressed rows, the header records 320,001,536). Its descriptor carries the format, `row_bytes`, the
 row count, `head_dim_ng` 160, the 16 heads, the three multipliers, `head_vocab` and `head_offset`, the EOS and
 image/video placeholder ids, and the SHA-256 of the rows; the runtime derives the constants again from the model's
-configuration and refuses a table that disagrees.
+configuration and refuses a table that disagrees. A table artifact of those constants, row count and row width stands in
+for the model's own in any row format the runtime decodes, whatever its digest; its values are not compared, and
+startup warns that the table is not the one the model names. The selected table's digest keys the context cache's disk
+store, since its values enter every layer's state.
 
 | format | bytes per row | table | use |
 |---|---:|---:|---|
 | `gguf_iq4_nl` | 90 (five 32-value blocks of an FP16 scale and 16 bytes of IQ4_NL codes) | 28.8 GB | the GSQ-RCO releases' shard 2, imported byte for byte; the published table |
-| `fp8_e4m3fn_row_fp16` | 162 (160 E4M3FN codes and an FP16 scale) | 51.8 GB | written from the HF BF16 shards; supported, not published |
+| `fp8_e4m3fn_row_fp16` | 162 (160 E4M3FN codes and an FP16 scale) | 51.8 GB | written from the HF BF16 shards, or Edge0's `ple-fp8.gguf` byte for byte; Edge0's published table |
 | `bf16` | 320 | 102.4 GB | reference |
 
 A model either stores the rows itself or names a table artifact, a `.ninfer` with the `ngram` component alone that

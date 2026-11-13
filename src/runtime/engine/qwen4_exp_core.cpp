@@ -244,6 +244,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         ngram = models::qwen4_exp::ngram_table_source(
             reader, options.artifact_path, text, table.path,
             table.residency == NgramResidency::RamHot && table.hot_profile.empty());
+        if (ngram->table_digest != ngram->model_digest ||
+            ngram->table_format != ngram->model_format) {
+            publish_diagnostic(
+                options.diagnostic_observer, DiagnosticLevel::Warning,
+                "Qwen3.8-Flash-Next: n-gram table %s, sha256 %.16s..., in place of the %s table "
+                "the model names, sha256 %.16s...; its hash constants and geometry match the "
+                "model's, its values are not checked",
+                ngram->table_format.c_str(), ngram->table_digest.c_str(),
+                ngram->model_format.c_str(), ngram->model_digest.c_str());
+        }
         if (table.residency == NgramResidency::RamHot) {
             if (!table.hot_profile.empty()) {
                 auto profile = models::qwen4_exp::read_ngram_profile(table.hot_profile);
@@ -325,6 +335,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                         (executor.draft_tokens + 1) * executor.sequences);
     };
     executor.prefill_chunk = chunk_of(options.prefill_chunk ? options.prefill_chunk : 1024);
+    instance->ngram_table_digest = ngram ? ngram->table_digest : std::string();
     executor.ngram           = std::move(ngram);
     executor.ngram_read      = std::move(ngram_read);
     executor.iq1m_matrix     = options.iq1m_expert_matrix;
@@ -1228,8 +1239,10 @@ struct Qwen4ExpCore::Impl {
                "-drafts" + std::to_string(drafts) + "-draft-min-p" +
                std::to_string(
                    std::bit_cast<std::uint32_t>(options.speculative.draft_min_p.value_or(0.0F))) +
-               "-ngram" + std::to_string(options.ngram_table.disabled ? 0 : 1) + "-experts-" +
-               instance.executor->expert_execution_profile();
+               "-ngram" +
+               (instance.ngram_table_digest.empty() ? std::string("0")
+                                                    : instance.ngram_table_digest.substr(0, 16)) +
+               "-experts-" + instance.executor->expert_execution_profile();
     }
 
     struct FileHeader {

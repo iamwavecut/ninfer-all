@@ -1,8 +1,10 @@
 // ngram_table_source finds a Qwen3.8-Flash-Next model's n-gram table: the rows its own artifact
-// stores, or those of a separate table artifact (an `ngram` component alone) that names the same
-// digest and format. It refuses a model stored without its rows when no table artifact is given, a
-// table artifact holding another table or no rows, and a descriptor whose constants or format
-// differ from the model's; is_ngram_table_artifact tells a table artifact from a model.
+// stores, or those of a separate table artifact (an `ngram` component alone) of the model's hash
+// constants and geometry, the table the model names or another one in any row format, and reports
+// both tables' descriptors. It refuses a model stored without its rows when no table artifact is
+// given, a table artifact without rows, rows stored in another format than described, and a
+// descriptor whose constants differ from the model's; is_ngram_table_artifact tells a table
+// artifact from a model.
 #include "artifact/framing.h"
 #include "artifact/reader.h"
 #include "models/qwen4_exp/ngram_component.h"
@@ -241,6 +243,9 @@ int run() {
     require(external.layout.segments.size() == 1 && external.layout.segments[0].path == table &&
                 external.layout.segments[0].bytes == rows * 90 && external.layout.rows == rows,
             "external table segment");
+    require(external.table_format == iq4.format && external.table_digest == digest &&
+                external.model_format == iq4.format && external.model_digest == digest,
+            "the table the model names");
     // A table artifact also stands in for a model's own rows.
     const NgramTableSource replaced = ngram_table_source(embedded_reader, embedded, config, table);
     require(replaced.layout.segments[0].path == table, "an explicit table artifact wins");
@@ -278,10 +283,29 @@ int run() {
     refuses([&] { (void)ngram_table_source(bare_reader, bare, config, bad_hot, true); },
             "another n-gram hash", "an embedded profile for a different hash");
 
-    refuses([&] { (void)ngram_table_source(bare_reader, bare, config, foreign); },
-            "different n-gram table", "another digest");
-    refuses([&] { (void)ngram_table_source(bare_reader, bare, config, widened); },
-            "different n-gram table", "another format");
+    // Another table of the model's shape stands in for its own, in any row format.
+    const NgramTableSource other_table = ngram_table_source(bare_reader, bare, config, foreign);
+    require(other_table.layout.segments[0].path == foreign && other_table.table_digest == other &&
+                other_table.model_digest == digest && other_table.layout.row_bytes == 90,
+            "a table of another digest");
+    const NgramTableSource other_format = ngram_table_source(bare_reader, bare, config, widened);
+    require(other_format.format == ninfer::ops::NgramRowFormat::Bf16 &&
+                other_format.layout.row_bytes == kWidth * 2 &&
+                other_format.layout.segments[0].bytes == rows * kWidth * 2 &&
+                other_format.table_format == bf16.format && other_format.model_format == iq4.format,
+            "the table in another row format");
+    const auto fp8_for_bare = ngram_table_source(bare_reader, bare, config, fp8_path);
+    require(fp8_for_bare.format == ninfer::ops::NgramRowFormat::Fp8E4M3RowScale &&
+                fp8_for_bare.layout.row_bytes == 162,
+            "the table as FP8 rows");
+    // A table written for another hash does not.
+    TextConfig reseeded   = config;
+    reseeded.ngram.seed   = 99;
+    const auto reseeded_table = dir.write(
+        "reseeded.ninfer", {{"ngram", {{"config", descriptor(reseeded, iq4.format, other)}}}}, &iq4,
+        rows, false);
+    refuses([&] { (void)ngram_table_source(bare_reader, bare, config, reseeded_table); },
+            "hash constants", "a table of another hash");
     refuses([&] { (void)ngram_table_source(bare_reader, bare, config, bare); },
             "stores no n-gram table", "a table artifact without rows");
     refuses([&] { (void)ngram_table_source(bare_reader, bare, config, mislabeled); },
