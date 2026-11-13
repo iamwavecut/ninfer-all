@@ -168,7 +168,9 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& path, DeviceConte
     }
     model->name_         = reader->directory().metadata.value("name", std::string("DSpine"));
     model->path_         = path;
-    model->device_bytes_ = model->backing_.device_backing_bytes();
+    // The weight arena on rank 0, where every drafter weight sits. device_backing_bytes() counts
+    // only arenas a suspend can release, which a plain load does not reserve.
+    model->device_bytes_ = model->backing_.stats().device_capacity_bytes;
     model->reader_       = std::move(reader);
     return model;
 }
