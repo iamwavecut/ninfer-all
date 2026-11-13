@@ -159,7 +159,7 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
 ## Edge0-145B and Edge0-120B
 
 Converted from Edge0's release folders ([convert](edge0.md#convert)) and published: each model
-without its n-gram table, and the table once for all four.
+with the base model's Vision tower and without its n-gram table, and the table once for all four.
 
 ```bash
 hf download WaveCut/Edge0-ngram-table-FP8-NInfer-v3 Edge0-ngram-table-FP8-ninfer-v3.ninfer --local-dir models
@@ -184,6 +184,8 @@ ninfer-serve --config configs/edge0-145b-nvfp4-disk.ini
 - **Memory.** Host experts pin 40.1 GB of RAM for Edge0-145B-q3k, 47.6 GB for -NVFP4, 28.6 GB for
   Edge0-120B-q3k and 34.0 GB for -NVFP4; device experts need about 36 GB of GPU memory for
   Edge0-120B-q3k and 41 GB for -NVFP4 before KV ([run](edge0.md#run)).
+- **Vision.** `--vision` (or `vision = true` in a configuration file) adds the Vision tower for
+  images and video, 0.9 GB of GPU memory ([measurements](edge0.md#vision)).
 - **Drafting.** Host experts, and device experts serving one request at a time, draft three tokens
   a round with the MTP block; with disk experts `--spec mtp --draft-tokens 3` asks for it. The
   [measurements](edge0.md#measurements) on an A40 show what each placement decodes with and without

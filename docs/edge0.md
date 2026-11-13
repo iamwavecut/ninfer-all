@@ -21,10 +21,14 @@ reads, in two expert builds:
 
 Every folder also holds the skeleton as a llama.cpp GGUF (6.0 GB), the n-gram table in FP8
 (`ple-fp8.gguf`, 51.2 GB, the same in all four), the MTP block and the publisher's tokenizer. The
-models are under the Edge0 Community Model License 1.0 and the Qwen license of the base model; a
-converted artifact is a conversion under those licenses.
+folders hold no Vision tower: `edge0-strata` reads pictures with the base model's, the
+`mmproj-Qwen3.8-Flash-Next-BF16.gguf` of
+[ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF),
+and the NInfer artifacts carry that tower. The models are under the Edge0 Community Model License
+1.0 and the Qwen license of the base model; a converted artifact is a conversion under those
+licenses.
 
-NInfer artifacts of the four releases are published without the table:
+NInfer artifacts of the four releases are published with the Vision tower and without the table:
 [Edge0-145B-NVFP4](https://huggingface.co/WaveCut/Edge0-145B-NVFP4-NInfer-v3),
 [Edge0-145B-q3k](https://huggingface.co/WaveCut/Edge0-145B-q3k-NInfer-v3),
 [Edge0-120B-NVFP4](https://huggingface.co/WaveCut/Edge0-120B-NVFP4-NInfer-v3) and
@@ -35,10 +39,12 @@ once, as [Edge0-ngram-table-FP8](https://huggingface.co/WaveCut/Edge0-ngram-tabl
 ## Convert
 
 `--model` needs the base model's configuration and tokenizer files (`config.json`,
-`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`) from
+`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`, and for
+the Vision tower `preprocessor_config.json` and `video_preprocessor_config.json`) from
 [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next); the converter refuses a
 folder whose vocabulary or merges differ from them. `--source pack=FOLDER` names the release folder,
-which supplies the skeleton, the experts, the n-gram table and the MTP block.
+which supplies the skeleton, the experts, the n-gram table and the MTP block; `--source vision=FILE`
+names the Vision tower's mmproj.
 
 ```bash
 # The n-gram table once, as an artifact of its own that every Edge0 model names by digest.
@@ -46,10 +52,12 @@ python3.11 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
   --recipe edge0_pack --source pack=/path/to/Edge0-120B-q3k \
   --components ngram --device cpu --out models/Edge0-ngram-table-FP8-ninfer-v3.ninfer
 
-# Each model without the table, with its MTP block.
+# Each model without the table, with its MTP block and the base model's Vision tower.
 python3.11 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
   --recipe edge0_pack --source pack=/path/to/Edge0-120B-q3k \
-  --components text,mtp --device cpu --name Edge0-120B-q3k --out models/Edge0-120B-q3k-ninfer-v3.ninfer
+  --source vision=/path/to/mmproj-Qwen3.8-Flash-Next-BF16.gguf \
+  --components text,vision,mtp --device cpu --name Edge0-120B-q3k \
+  --out models/Edge0-120B-q3k-ninfer-v3.ninfer
 ```
 
 `edge0_pack` stores the encoder and decoder build the release's launcher selects;
@@ -64,7 +72,8 @@ column scales become their reciprocals, one FP32 division each as `edge0-strata`
 table becomes `fp8_e4m3fn_row_fp16` rows of 160 codes with the release's global scale in every row
 (exact in FP16). The MTP block's Q2_0 experts become `gguf_q2_0` blocks, its norms drop their stored
 `1 + w`, and its BF16 hyper-connection matrices become Q8_0 rows, as in every Flash-Next GGUF
-conversion.
+conversion. The Vision tower keeps the mmproj's BF16 tensors (0.9 GB), as for
+[Flash-Next](qwen3-8-flash-next.md#convert).
 
 ## Run
 
@@ -74,6 +83,9 @@ T=models/Edge0-ngram-table-FP8-ninfer-v3.ninfer
 
 # One GPU with room for every expert (Edge0-120B-q3k on a 48 GB card).
 ./build/apps/ninfer-serve $M --ngram-table $T --max-context 32768
+
+# The same with the Vision tower, for images and video.
+./build/apps/ninfer-serve $M --ngram-table $T --vision --max-context 32768
 
 # One GPU: the experts in pinned host memory, the most used of them cached on the GPU.
 ./build/apps/ninfer-serve $M --ngram-table $T --expert-residency host --max-context 32768
@@ -89,7 +101,8 @@ T=models/Edge0-ngram-table-FP8-ninfer-v3.ninfer
 
 The encoder, the decoder, the labels and the scales stay in device memory under every placement:
 3.74 GB for Edge0-145B (Q8_0) and 2.67 GB for Edge0-120B with Q8_0 projections, 1.42 GB with Q4_0.
-Stored bytes before KV and workspace:
+`--vision` adds the Vision tower's 0.9 GB of GPU memory. Stored bytes before KV and workspace,
+without the tower:
 
 | Model | Device residency | Pinned host experts |
 |---|---|---:|
@@ -121,7 +134,7 @@ What differs from Flash-Next:
   profiles have a third in common on average. `--expert-profile` replaces it with counts recorded
   by `--expert-profile-out`. Disk experts fill their cache as the layers route, as for Flash-Next.
 - **Drafting**: MTP also by default with device experts and one request at a time
-  ([below](#drafting)). The releases have no DFlash2 drafter and no Vision tower.
+  ([below](#drafting)). The releases have no DFlash2 drafter.
 
 `edge0-strata` applies the decoder to each routed expert's quantized output before the router
 weights add them; NInfer applies it once per routed group to the weighted sum of that group's
@@ -204,6 +217,25 @@ second:
 Eight requests at once through `ninfer-serve` (160 tokens each, about 850 in all) decoded 131.9 and
 148.1 tokens per second in all without drafts and 111.3 and 129.5 with MTP, so the engine drafts by
 default with device experts only for one request at a time.
+
+### Vision
+
+The four artifacts with the Vision tower, `--vision`, greedy, without drafts, 128 tokens at most,
+the repository's CLI examples (`examples/cli/messages/`). Each answer is the expected one:
+
+| Release | Experts | `image_chart` | `image_natural` |
+|---|---|---|---|
+| Edge0-145B-NVFP4 | disk | NIFER VISION 731；3；左侧 | the scene; mailbox 24; the sun on the right |
+| Edge0-145B-q3k | disk | NIFER VISION 731；3；左侧 | the scene; mailbox 24; the sun on the right |
+| Edge0-120B-NVFP4 | device | NIFER VISION 731；3；左侧 | the scene; mailbox 24; the sun on the right |
+| Edge0-120B-q3k | device | NIFER VISION 731；3；左侧 | the scene; mailbox 24; the sun on the right |
+
+Edge0-120B-q3k with device experts also answered `multi_image_compare` (2；3；五角星) and
+`mixed_image_video` (NIFER-9, the picture's first word and the video's last number). Its
+`image_chart` answer was the same with host experts and with the default MTP drafting, which kept
+every draft and decoded at 100.8 tokens per second. The tower encoded a picture in 30 ms beside
+device experts and in 125 to 146 ms beside disk experts. The tower changes no text: each artifact's
+perplexity and greedy sky answer equal those of the text-only conversion.
 
 ### Serving
 
