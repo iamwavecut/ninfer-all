@@ -2,7 +2,7 @@
 
 // Definition of launch_prompt_bf16 (prompt_kernel_launch.h): the BF16 prompt kernel
 // (bf16/prompt.cuh) in the current device's shape set, over BF16 or bf16p planes. Included only by
-// the generated BF16 prompt units (kernel_unit.cu.in).
+// the generated prompt units (kernel_unit.cu.in).
 
 #include "core/device_launch.h" // CUDA_CHECK, raise_dynamic_shared_memory
 #include "ops/common/device_tier.h"

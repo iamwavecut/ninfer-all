@@ -50,16 +50,42 @@ set(_ninfer_small_t_i8_sources "")
 set(_ninfer_small_t_i8_sm70_sources "")
 set(_ninfer_causal_cache_sources "")
 set(_ninfer_causal_cache_sm70_sources "")
-function(_ninfer_causal_cache_unit list name header function arguments parameters description)
-  set(NINFER_KERNEL_UNIT_HEADER "${header}")
-  set(NINFER_KERNEL_UNIT_FUNCTION "${function}")
-  set(NINFER_KERNEL_UNIT_ARGUMENTS "${arguments}")
-  set(NINFER_KERNEL_UNIT_PARAMETERS "${parameters}")
+# _ninfer_causal_cache_launches(list name description header function arguments parameters ...)
+# generates a unit of one or more launch instantiations, each given by four arguments: the launch
+# header under dense/causal_cache, the launcher template, its template arguments and its parameter
+# types. The unit instantiates them in the order given. The description completes the unit's first
+# comment line and may continue on the next ("\n// ").
+function(_ninfer_causal_cache_launches list name description)
   set(NINFER_KERNEL_UNIT_DESCRIPTION "${description}")
+  set(NINFER_KERNEL_UNIT_INCLUDES "")
+  set(NINFER_KERNEL_UNIT_INSTANTIATIONS "")
+  set(launches ${ARGN})
+  list(LENGTH launches count)
+  math(EXPR last "${count} - 1")
+  foreach(index RANGE 0 ${last} 4)
+    math(EXPR function_index "${index} + 1")
+    math(EXPR arguments_index "${index} + 2")
+    math(EXPR parameters_index "${index} + 3")
+    list(GET launches ${index} header)
+    list(GET launches ${function_index} function)
+    list(GET launches ${arguments_index} arguments)
+    list(GET launches ${parameters_index} parameters)
+    string(APPEND NINFER_KERNEL_UNIT_INCLUDES
+      "#include \"ops/softmax_attention/dense/causal_cache/${header}\"\n")
+    string(APPEND NINFER_KERNEL_UNIT_INSTANTIATIONS
+      "\ntemplate void ${function}<${arguments}>(\n    ${parameters});\n")
+  endforeach()
   set(unit "${CMAKE_CURRENT_BINARY_DIR}/causal_cache/${name}.cu")
   configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/dense/causal_cache/kernel_unit.cu.in"
     "${unit}" @ONLY)
   set(${list} ${${list}} "${unit}" PARENT_SCOPE)
+endfunction()
+# A unit of one launch.
+function(_ninfer_causal_cache_unit list name header function arguments parameters description)
+  _ninfer_causal_cache_launches(${list} "${name}"
+    "one causal-cache\n// attention kernel launch, ${description}"
+    "${header}" "${function}" "${arguments}" "${parameters}")
+  set(${list} ${${list}} PARENT_SCOPE)
 endfunction()
 if(NINFER_ARCH_TURING OR NINFER_ARCH_AMPERE OR NINFER_ARCH_BLACKWELL)
   set(_ninfer_small_t_post_volta ON)
@@ -76,6 +102,13 @@ foreach(_ninfer_small_t_geometry IN ITEMS h24 h16)
     set(_ninfer_small_t_group 8)
     set(_ninfer_small_t_widest 6)
   endif()
+  # The prompt kernels of one geometry and block-table form share a unit: the fast INT8-family
+  # launch (in a build with post-Volta code), the standard INT8-family launch and the BF16 launch,
+  # in this order. NVVM compiles a kernel differently after other kernels of its module. Compiled
+  # alone, the standard INT8-family kernels recompute their shared-memory scale addresses in the key
+  # loop and run rk4v4 and rk4v4-e8 prompts 2-6 % slower on an RTX 4090; compiled after the fast
+  # ones, they keep them in registers. In this order every prompt kernel's PTX for sm_70 through
+  # sm_120a is the PTX of one unit that holds every geometry and form.
   foreach(_ninfer_prompt_form IN ITEMS direct batch masked)
     if(_ninfer_prompt_form STREQUAL direct)
       set(_ninfer_prompt_form_id Direct)
@@ -87,19 +120,19 @@ foreach(_ninfer_small_t_geometry IN ITEMS h24 h16)
     set(_ninfer_prompt_suffix "${_ninfer_small_t_geometry}_${_ninfer_prompt_form}")
     set(_ninfer_prompt_arguments
       "${_ninfer_small_t_type}, PromptMetadataForm::${_ninfer_prompt_form_id}")
-    set(_ninfer_prompt_about "${_ninfer_prompt_arguments}")
-    _ninfer_causal_cache_unit(_ninfer_causal_cache_sources "prompt_bf16_${_ninfer_prompt_suffix}"
-      bf16/prompt_launch.cuh launch_prompt_bf16 "${_ninfer_prompt_arguments}" "const PromptLaunch&"
-      "the BF16 prompt kernel, ${_ninfer_prompt_about}")
-    _ninfer_causal_cache_unit(_ninfer_causal_cache_sources "prompt_i8_${_ninfer_prompt_suffix}"
-      int8/prompt_launch.cuh launch_prompt_i8 "${_ninfer_prompt_arguments}" "const PromptLaunch&"
-      "the standard INT8-family prompt kernel, ${_ninfer_prompt_about}")
+    set(_ninfer_prompt_launches "")
+    set(_ninfer_prompt_kernels "INT8, BF16")
     if(_ninfer_small_t_post_volta)
-      _ninfer_causal_cache_unit(_ninfer_causal_cache_sources
-        "prompt_i8_fast_${_ninfer_prompt_suffix}" int8/prompt_fast_launch.cuh launch_prompt_i8_fast
-        "${_ninfer_prompt_arguments}" "const PromptLaunch&"
-        "the fast INT8-family prompt kernel, ${_ninfer_prompt_about}")
+      list(APPEND _ninfer_prompt_launches int8/prompt_fast_launch.cuh launch_prompt_i8_fast
+        "${_ninfer_prompt_arguments}" "const PromptLaunch&")
+      set(_ninfer_prompt_kernels "fast INT8, ${_ninfer_prompt_kernels}")
     endif()
+    list(APPEND _ninfer_prompt_launches
+      int8/prompt_launch.cuh launch_prompt_i8 "${_ninfer_prompt_arguments}" "const PromptLaunch&"
+      bf16/prompt_launch.cuh launch_prompt_bf16 "${_ninfer_prompt_arguments}" "const PromptLaunch&")
+    _ninfer_causal_cache_launches(_ninfer_causal_cache_sources "prompt_${_ninfer_prompt_suffix}"
+      "the prompt kernels\n// of ${_ninfer_prompt_arguments} (${_ninfer_prompt_kernels})"
+      ${_ninfer_prompt_launches})
   endforeach()
   foreach(_ninfer_small_t_input IN ITEMS append cached packed)
     if(_ninfer_small_t_input STREQUAL append)

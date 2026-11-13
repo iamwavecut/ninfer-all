@@ -2,8 +2,9 @@
 
 // The causal prompt attention launches over BF16, bf16p and INT8-family caches that the host
 // launcher (prompt.cpp) calls, and their arguments: plain pointers and counts, so the launcher
-// compiles without the kernels and a kernel unit without the routing. Each kernel family, geometry
-// and metadata form compiles in a unit of its own (kernel_unit.cu.in).
+// compiles without the kernels and a kernel unit without the routing. The three kernel families of
+// each geometry and metadata form compile in one unit (kernel_unit.cu.in; sources.cmake gives
+// their order).
 
 #include "ops/softmax_attention/dense/causal_cache/int8/coding.h"
 

@@ -2,7 +2,7 @@
 
 // Definition of launch_prompt_i8_fast (prompt_kernel_launch.h): the fast INT8-family prompt kernel
 // (int8/prompt_fast.cuh) over every coding and CTA shape of its plan. Included only by the
-// generated fast INT8 prompt units (kernel_unit.cu.in).
+// generated prompt units (kernel_unit.cu.in).
 
 #include "core/device_launch.h" // CUDA_CHECK, raise_dynamic_shared_memory
 #include "ops/common/device_tier.h"

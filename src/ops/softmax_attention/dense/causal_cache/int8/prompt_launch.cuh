@@ -2,7 +2,7 @@
 
 // Definition of launch_prompt_i8 (prompt_kernel_launch.h): the standard INT8-family prompt kernel
 // (int8/prompt.cuh) over every coding, PV accumulation and GQA packing. Included only by the
-// generated standard INT8 prompt units (kernel_unit.cu.in).
+// generated prompt units (kernel_unit.cu.in).
 
 #include "core/device_launch.h" // CUDA_CHECK, raise_dynamic_shared_memory
 #include "ops/common/device_tier.h"

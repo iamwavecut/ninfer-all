@@ -341,9 +341,12 @@ edit compiles only what it changes. Host launchers (`small_t.cpp`, `fp8/small_t.
 shape and coding of each launch and pass plain launch arguments (`SmallTPartialLaunch`,
 `SmallTI8Launch`, `PromptLaunch`) to kernel units that CMake generates from
 `dense/causal_cache/kernel_unit.cu.in` (`src/ops/softmax_attention/sources.cmake`): one explicit
-instantiation of a launcher template each. The small-T BF16, bf16p, FP8, NVFP4 and K8V4 kernels
-have one unit per geometry and input, the prompt kernels one per kernel family, geometry and
+instantiation of a launcher template each, three in a prompt unit. The small-T BF16, bf16p, FP8,
+NVFP4 and K8V4 kernels have one unit per geometry and input, the prompt kernels one per geometry and
 block-table form, and the INT8-family small-T kernel one per tier, query width, geometry and input.
+A prompt unit instantiates the fast INT8-family, standard INT8-family and BF16 launches in this
+order: NVVM compiles a kernel differently after other kernels of its module, and the standard
+INT8-family kernels compiled alone run rk4v4 and rk4v4-e8 prompts 2-6 % slower on an RTX 4090.
 Volta's kernels have units of their own, compiled for `70-real` alone in a build of several
 architectures. The split reducers (`small_t_reduce.cu`, `nvfp4/small_t_reduce.cu`,
 `k8v4/small_t_reduce.cu`) and the fast prompt merge (`int8/prompt_fast_merge.cu`) are units of their
