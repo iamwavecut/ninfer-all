@@ -44,7 +44,7 @@ is `true`):
 | `--gdn-state-fp16` | keep the Gated DeltaNet recurrent state in FP16 |
 | `--rope-yarn` | past the native window, YaRN instead of plain RoPE |
 | `--spec`, `--draft-tokens`, `--draft-model` | the speculative backend (`mtp`, `dflash`, `dflash2`, `dspine` with its drafter artifact) and the drafts of a round (1 to 15; 1 to 7 for Gemma 4) |
-| `--adaptive-mtp` | MTP only: pick each round's width from the drafts' measured survival |
+| `--adaptive-mtp` | pick each round's width from the drafts' measured survival: MTP, and on Qwen3.5-core models DFlash, DFlash2 and DSpine (`--draft-tokens` or half) |
 | `--vision`, `--vision-residency`, `--vision-max-merged` | image and video input, where the tower lives (`overlay` borrows device memory per image), and the merged-token budget of one item |
 | `--max-concurrency` | requests admitted at once, 1 to 8 |
 | `--devices` | one pipeline stage per listed GPU (Linux) |

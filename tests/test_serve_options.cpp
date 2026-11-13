@@ -1642,12 +1642,16 @@ int main() {
                                  "5", "--adaptive-mtp"})
                                   .speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive,
                       "--adaptive-mtp did not default off or was not preserved");
-    bool adaptive_without_mtp_rejected = false;
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "dspine", "--draft-model",
+                             "drafter.ninfer", "--draft-tokens", "15", "--adaptive-mtp"})
+                              .speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive,
+                      "--adaptive-mtp was refused with a masked drafter");
+    bool adaptive_without_drafter_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
-                     "--adaptive-mtp"});
-    } catch (const std::invalid_argument&) { adaptive_without_mtp_rejected = true; }
-    failures += check(adaptive_without_mtp_rejected, "--adaptive-mtp was accepted without MTP");
+        (void)parse({"ninfer-serve", "model.ninfer", "--adaptive-mtp"});
+    } catch (const std::invalid_argument&) { adaptive_without_drafter_rejected = true; }
+    failures += check(adaptive_without_drafter_rejected,
+                      "--adaptive-mtp was accepted without a drafter");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--fast-prefill-kernel"})
                           .fast_prefill_kernel,
                       "--fast-prefill-kernel was not preserved");

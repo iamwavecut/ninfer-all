@@ -26,6 +26,16 @@ mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
 [[nodiscard]] constexpr std::uint32_t mtp_minimum_adaptive_window(std::uint32_t draft_window) {
     return draft_window < 3 ? draft_window : 3U;
 }
+
+// The widths a masked drafter's rounds verify without a copy: the draft window, and under
+// --adaptive-mtp also half of it (MaskedWidthController picks one a round), narrowest first.
+[[nodiscard]] inline std::vector<std::uint32_t> masked_neural_windows(std::uint32_t draft_window,
+                                                                      bool adaptive) {
+    const std::uint32_t narrow = draft_window / 2U;
+    if (!adaptive || narrow == 0) { return {draft_window}; }
+    return {narrow, draft_window};
+}
+
 [[nodiscard]] std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend backend,
                                                                        std::uint32_t capacity,
                                                                        std::uint32_t draft_window,

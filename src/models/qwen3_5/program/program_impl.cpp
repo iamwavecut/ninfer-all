@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/dspine_head.h"
+#include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/speculative_round.h"
@@ -798,6 +799,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (speculative_backend == SpeculativeBackend::Mtp && mtp_policy == MtpDraftPolicy::Adaptive) {
         mtp_controller.emplace();
         mtp_controller->reset(draft_window);
+    }
+    if (is_masked_draft_backend(speculative_backend) && mtp_policy == MtpDraftPolicy::Adaptive) {
+        const auto windows = masked_neural_windows(draft_window, true);
+        if (windows.size() == 2) {
+            masked_controller.emplace();
+            masked_controller->reset(windows[1], windows[0]);
+        }
     }
     // CUDA would otherwise load an attention width's module inside the first request that reaches
     // it, behind a context synchronization.

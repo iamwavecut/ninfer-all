@@ -118,8 +118,14 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             {"mtp-attention-window", "spec", "draft-tokens"},
             "--mtp-attention-window requires --spec mtp and at least --draft-tokens + 1 keys");
     }
-    if (options.mtp_policy != MtpDraftPolicy::Fixed && options.backend != SpeculativeBackend::Mtp) {
-        throw OptionConflict({"adaptive-mtp", "spec"}, "--adaptive-mtp requires --spec mtp");
+    // The Qwen3.5-core models also adapt a masked drafter's rounds; the other families' Engines
+    // refuse that themselves.
+    if (options.mtp_policy != MtpDraftPolicy::Fixed && options.backend != SpeculativeBackend::Mtp &&
+        options.backend != SpeculativeBackend::DFlash &&
+        options.backend != SpeculativeBackend::DFlash2 &&
+        options.backend != SpeculativeBackend::DSpine) {
+        throw OptionConflict({"adaptive-mtp", "spec"},
+                             "--adaptive-mtp requires --spec mtp|dflash|dflash2|dspine");
     }
     switch (options.backend) {
     case SpeculativeBackend::None:

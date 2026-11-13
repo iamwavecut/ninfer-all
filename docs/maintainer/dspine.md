@@ -204,7 +204,7 @@ differences can change acceptance only, not the output distribution.
 
 | Family | Drafts a round | Proposal | Acceptance | `--draft-min-p P` |
 |---|---|---|---|---|
-| Qwen3.5 core | 1 to min(15, block − 1) | greedy, or sampled at the request's temperature | DFlash2's: greedy prefix, or rejection sampling against the recorded q | refused |
+| Qwen3.5 core | 1 to min(15, block − 1); with `--adaptive-mtp` the window K or K/2 a round | greedy, or sampled at the request's temperature | DFlash2's: greedy prefix, or rejection sampling against the recorded q | refused |
 | Qwen3.8-Flash-Next, Edge0 | 1 to min(15, block − 1) | greedy | coupled, as MTP's | verifies through the first draft of confidence at or below P |
 | Gemma 4, Flint, DeepSeek-V4.1 | 1 to 7 | greedy | coupled: the target's keyed draws in plain decode rows | as Flash-Next |
 
@@ -213,7 +213,12 @@ temperature. `--gumbel-sampling` changes only the target's draws: the greedy pro
 and the Qwen3.5 core keeps rejection sampling, as DFlash2 does. A DSpine round runs no n-gram copy
 proposal unless `--ngram-draft-tokens` sets its width, at least the draft window (the Qwen3.5 core).
 A copy round of several requests runs the drafter at that width as well, for the rows without a
-copy, so above one request the width is at most the block less one.
+copy, so above one request the width is at most the block less one. Under `--adaptive-mtp` the
+Qwen3.5 core drafts and verifies each round without a copy at the window K or at K/2, whichever
+the measured survival and round time favor ([Adaptive MTP](../serving.md#adaptive-mtp)). The
+block is causal, so a narrow round drafts the first K/2 drafts of the wide round, up to the
+rounding of kernels that take another route at the other width; a DFlash or DFlash2 block attends
+both ways and drafts other tokens at another width.
 
 ## State
 

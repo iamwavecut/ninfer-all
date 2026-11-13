@@ -208,11 +208,12 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
         .enabled               = speculative_backend != SpeculativeBackend::None,
         .draft_window          = draft_window,
         .accepted_per_position = std::vector<std::uint64_t>(widest_verify_window(), 0),
-        .adaptive              = mtp_controller.has_value(),
-        .rounds_per_window =
-            std::vector<std::uint64_t>(mtp_controller.has_value() ? draft_window : 0U, 0),
+        .adaptive              = mtp_controller.has_value() || masked_controller.has_value(),
+        .rounds_per_window     = std::vector<std::uint64_t>(
+            mtp_controller.has_value() || masked_controller.has_value() ? draft_window : 0U, 0),
     };
     request.mtp_signal.reset();
+    if (masked_controller) { request.masked_signal = masked_controller->pooled(); }
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
     if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream)); }
@@ -1024,11 +1025,31 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     // viewed at that width. At batch>1 the drafter also runs and the copy payload overlays it on
     // the device, so a row without a copy keeps its neural proposal; at batch one the copy alone
     // is verified.
+    // Without a copy, adaptive MTP verifies the width its controller selects (the draft window or
+    // its half) and the drafter drafts at that width.
     const std::vector<NgramProposer::Match> matches = propose_ngram(lanes, budgets);
     const bool copy_round =
         std::any_of(matches.begin(), matches.end(),
                     [](const NgramProposer::Match& match) { return !match.tokens.empty(); });
-    const std::uint32_t verify_drafts = copy_round ? ngram_draft_window : draft_window;
+    std::uint32_t neural_drafts = draft_window;
+    if (masked_controller && !copy_round &&
+        std::all_of(lanes.begin(), lanes.end(),
+                    [this](std::uint32_t lane) { return lane < max_concurrency; })) {
+        std::array<const MaskedWidthSignal*, kMaximumConcurrency> signals{};
+        std::array<std::uint32_t, kMaximumConcurrency> room{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const SequenceState& sequence = active_sequence(lanes[row]);
+            signals[row]                  = &requests[lanes[row]].masked_signal;
+            room[row] = std::min(budgets[row].generated_tokens_remaining,
+                                 capacity > sequence.execution_frontier
+                                     ? capacity - sequence.execution_frontier
+                                     : 0U);
+        }
+        neural_drafts = masked_controller->select(
+            std::span<const MaskedWidthSignal* const>(signals.data(), lanes.size()),
+            std::span<const std::uint32_t>(room.data(), lanes.size()));
+    }
+    const std::uint32_t verify_drafts = copy_round ? ngram_draft_window : neural_drafts;
     const bool drafter_runs           = !copy_round || lanes.size() > 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         dflash_host_ingress->copy_rows[row] = !matches[row].tokens.empty() ? 1 : 0;
@@ -1097,9 +1118,9 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         auto target_envelope                 = target_envelope_for(maximum_frontier);
         if (use_cuda_graph) {
             DecodeGraphFamily& family   = copy_round ? ngram_graphs : dflash_graphs;
-            DecodeGraphProfile& profile = select_graph_profile(
-                family, static_cast<std::uint32_t>(lanes.size()), maximum_frontier, "DFlash batch",
-                copy_round ? verify_drafts : 0U);
+            DecodeGraphProfile& profile =
+                select_graph_profile(family, static_cast<std::uint32_t>(lanes.size()),
+                                     maximum_frontier, "DFlash batch", verify_drafts);
             executable = &install_graph_profile(family, profile, "DFlash batch");
             envelopes =
                 dflash_envelopes(profile.min_execution_frontier, profile.max_execution_frontier);
@@ -1117,7 +1138,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t proposed =
                 !matches[row].tokens.empty()
                     ? static_cast<std::uint32_t>(matches[row].tokens.size())
-                    : (drafter_runs ? draft_window : 0U);
+                    : (drafter_runs ? neural_drafts : 0U);
             const std::uint32_t extent = std::min(
                 {proposed, max_by_budget, capacity - frontier - 1U, speculative_extent(request)});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
@@ -1126,7 +1147,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->context_frontiers[row] =
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
             dflash_host_ingress->proposal_valid_columns[row] =
-                static_cast<std::int32_t>(draft_window + 1U);
+                static_cast<std::int32_t>(neural_drafts + 1U);
             dflash_host_ingress->proposal_extents[row]       = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             for (std::uint32_t column = 0; column < width; ++column) {
@@ -1177,7 +1198,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             *dflash_host_egress,
             state_images->continuation_hidden_store()};
         schedule_state.ngram                  = copy_round;
-        schedule_state.neural_proposal_drafts = draft_window;
+        schedule_state.neural_proposal_drafts = neural_drafts;
 
         mark_workspace_usage(workspace_plan.dflash_round);
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -1228,9 +1249,20 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         1;
                 }
             }
+            // The adaptive controller measures the neural drafter only.
+            if (masked_controller && !copy_round) {
+                request.speculative_stats.rounds_per_window[verify_drafts - 1U] += 1;
+                if (masked_controller->transitioned()) {
+                    request.speculative_stats.window_transitions += 1;
+                }
+            }
             if (!matches[row].tokens.empty()) {
                 record_ngram_round(request, matches[row], extent,
                                    static_cast<std::uint32_t>(accepted_i));
+            } else if (masked_controller && extent == verify_drafts) {
+                // A round its budget cut short says nothing of the width's survival.
+                masked_controller->observe_round(request.masked_signal, verify_drafts,
+                                                 static_cast<std::uint32_t>(accepted_i));
             }
             sequence.dflash_context_frontier = base_E;
             request.pending                  = PendingCandidate{
@@ -1243,6 +1275,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             };
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
+        }
+        if (masked_controller && !copy_round) {
+            masked_controller->observe_execution(static_cast<std::uint32_t>(lanes.size()),
+                                                 verify_drafts, seconds);
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(dflash_host_egress->licensed_tokens.data(),

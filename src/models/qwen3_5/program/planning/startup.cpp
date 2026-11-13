@@ -1492,6 +1492,12 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("an MTP attention window requires the MTP backend");
     }
+    if (options.speculative.mtp_policy == MtpDraftPolicy::Adaptive &&
+        options.speculative.backend != SpeculativeBackend::Mtp &&
+        !is_masked_draft_backend(options.speculative.backend)) {
+        throw std::invalid_argument(
+            "--adaptive-mtp requires --spec mtp, dflash, dflash2 or dspine");
+    }
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
@@ -1749,10 +1755,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     },
                     "DFlash graph allowance");
             };
+            // Under adaptive MTP the neural rounds capture one set per width they may select.
+            const auto neural_windows = masked_neural_windows(
+                impl->draft_window, impl->mtp_policy == MtpDraftPolicy::Adaptive);
             for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
-                impl->graph_allowance_bytes = checked_add(
-                    impl->graph_allowance_bytes, class_allowance(batch_size, impl->draft_window),
-                    "DFlash exact-b graph allowance");
+                for (const std::uint32_t window : neural_windows) {
+                    impl->graph_allowance_bytes =
+                        checked_add(impl->graph_allowance_bytes, class_allowance(batch_size, window),
+                                    "DFlash exact-b graph allowance");
+                }
                 if (impl->ngram_draft_window != 0) {
                     impl->graph_allowance_bytes =
                         checked_add(impl->graph_allowance_bytes,

@@ -246,7 +246,10 @@ with coupled draws, and `--draft-min-p P` verifies a round through its first dra
 is at or below P. On an RTX 5090 with the official Qwen3.8-27B artifact, 15 DSpine drafts decoded a
 1,024-token Python answer at 473.4 tokens per second against 405.1 with 15 DFlash2 drafts and 90.7
 without drafts; on shorter code and on prose seven DFlash2 drafts stayed 4-9% faster than DSpine's
-best count, whose round costs more ([measurements](performance.md#dspine-on-qwen38-27b)).
+best count, whose round costs more ([measurements](performance.md#dspine-on-qwen38-27b)). The best
+count depends on the answer and on how many requests share a round; `ninfer-serve --adaptive-mtp`
+picks 15 or 7 drafts each round from measured survival and round time
+([Adaptive MTP](serving.md#adaptive-mtp)).
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b.ninfer \
