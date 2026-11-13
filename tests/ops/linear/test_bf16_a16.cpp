@@ -95,7 +95,7 @@ std::vector<std::int32_t> sampled_tokens(std::int32_t tokens) {
 }
 
 int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay = false,
-                         bool fp32 = false) {
+                         bool fp32 = false, bool eager_first = true) {
     const std::int32_t rows                    = weight.host.n;
     const std::int32_t hidden                  = weight.host.k;
     std::vector<std::uint16_t> activation_bits = make_activation_bits(hidden, tokens);
@@ -111,8 +111,10 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay 
     DeviceArena workspace(std::max<std::size_t>(
         256, ops::linear_workspace_capacity_bytes(QType::BF16, rows, hidden,
                                                   ops::LinearPolicy::A16Only, tokens, tokens)));
-    ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace, nullptr);
-    cuda_synchronize();
+    if (eager_first) {
+        ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace, nullptr);
+        cuda_synchronize();
+    }
 
     if (replay) {
         DeviceContext context;
@@ -498,6 +500,13 @@ int run_linear_together() {
 
 int run_bf16_linear() {
     int failures = 0;
+    {
+        // The process's first cuBLAS product inside a stream capture (it creates the handle
+        // there): a DSpine drafter's bridge read over eight rows of sixteen block columns. Runs
+        // before every other case, which would create the handle eagerly.
+        DeviceWeight bridge_read(make_patterned(1024, 5120, 427U));
+        failures += run_bf16_linear_case(bridge_read, 128, true, false, false);
+    }
     DeviceWeight attention_weight(make_patterned(14336, 5120, 401U));
     DeviceWeight output_weight(make_patterned(5120, 6144, 409U));
     for (DeviceWeight* weight : {&attention_weight, &output_weight}) {

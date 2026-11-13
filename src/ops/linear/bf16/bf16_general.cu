@@ -29,7 +29,15 @@ cublasHandle_t blas_handle() {
         throw std::invalid_argument("bf16 linear: device ordinal out of range");
     }
     std::call_once(once[device], [&] {
-        if (cublasCreate(&handles[device]) != CUBLAS_STATUS_SUCCESS) {
+        // The first product may come inside a stream capture: a DSpine drafter's bridge at eight
+        // rows of eight or more columns. The handle allocates its workspace as it is created,
+        // which the capture's global mode forbids, so this thread relaxes the mode for the call;
+        // captured products then use that workspace and allocate nothing.
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+        const cublasStatus_t created = cublasCreate(&handles[device]);
+        CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+        if (created != CUBLAS_STATUS_SUCCESS) {
             throw std::runtime_error("bf16 linear: cublasCreate failed");
         }
     });
