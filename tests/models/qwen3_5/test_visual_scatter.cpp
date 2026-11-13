@@ -1,3 +1,4 @@
+#include "core/device_buffer.h"
 #include "guarded_main.h"
 #include "ops/op_tester.h"
 #include "models/qwen3_5/execution/visual_scatter.h"

@@ -2,6 +2,7 @@
 #include "ninfer/ops/sparse_moe.h"
 
 #include "core/nvtx.h"
+#include "core/qtype.h"
 #include "ops/common/device_tier.h"
 #include "ops/sparse_moe/laboratory.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"

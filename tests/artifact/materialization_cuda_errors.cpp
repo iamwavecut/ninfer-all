@@ -1,5 +1,6 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
+#include "core/pinned_memory.h"
 
 #include <cuda_runtime.h>
 

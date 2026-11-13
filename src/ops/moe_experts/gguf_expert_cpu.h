@@ -25,6 +25,7 @@
 // is quantized for the down product, as the GPU stores it. These translation units build without floating-point
 // contraction, so no step fuses unless written as a fused multiply-add.
 
+#include "core/qtype.h"
 #include "core/weight.h"
 
 #include <cstddef>

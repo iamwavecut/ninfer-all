@@ -2,6 +2,7 @@
 
 #include "core/cpu_spin_pool.h"
 #include "core/expert_split.h"
+#include "core/qtype.h"
 #include "ops/common/silu.h"
 #include "ops/sparse_moe/streamed_cpu_detail.h"
 

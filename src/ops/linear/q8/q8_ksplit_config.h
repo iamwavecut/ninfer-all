@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ops/common/device_route.h"
+#include "ops/common/device_route_lookup.h"
 #include "ops/common/memory.cuh"
 #include "ops/linear/q8/q8_geometry.h"
 

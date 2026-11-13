@@ -1,4 +1,6 @@
 #include "core/arena.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ops/common/device_route.h"

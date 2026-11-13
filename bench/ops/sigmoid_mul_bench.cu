@@ -1,3 +1,4 @@
+#include "core/device_buffer.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer_bench_common.h"
 #include "ops/launcher/sigmoid_gate_mul.h"

@@ -5,6 +5,7 @@
 // nvfp4_int8_grouped_mma.cuh; this file adds the instantiation and the shape-checked launcher.
 
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/nvfp4/nvfp4_format.h"

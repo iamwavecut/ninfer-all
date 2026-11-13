@@ -3,11 +3,13 @@
 #include "calibration/route_catalog.h"
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "core/device_wait.h"
 #include "core/dtype.h"
 #include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
@@ -31,7 +33,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
 
 #include <cuda_runtime.h>
 
@@ -1728,7 +1730,7 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
                     std::make_shared<const ops::DeviceRouteProfile>(profile));
             }
         }
-        // Key splits of the fast prompt kernel (prompt_i8_fast_plan.h) against unsplit launches,
+        // Key splits of the fast prompt kernel (int8/prompt_fast_plan.h) against unsplit launches,
         // where the fast kernel now serves prompts: a 256-token continuation at 32K and 131K of
         // context, where few row blocks leave SMs idle, and a wave-aligned chunk at 131K. The
         // split partials need their own workspace, sized with the fast kernel selected.

@@ -1,3 +1,4 @@
+#include "core/device_buffer.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer_bench_common.h"
 

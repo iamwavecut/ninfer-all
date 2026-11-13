@@ -5,6 +5,8 @@
 // and on devices 0 and 1 where the host has two.
 
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "models/divided_head.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 

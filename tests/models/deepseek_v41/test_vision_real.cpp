@@ -20,6 +20,7 @@
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/weight_view.h"
 #include "models/deepseek_v41/model.h"
 #include "models/deepseek_v41/vision.h"

@@ -1,5 +1,5 @@
 #pragma once
-#include "core/arena.h"
+#include "core/pinned_memory.h"
 #include "core/tensor.h"
 #include "runtime/contract/grammar_masks.h"
 #include "text/structured_output.h"

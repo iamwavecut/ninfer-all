@@ -3,6 +3,7 @@
 // sliding_window_attention() call.
 
 #include "ninfer/ops/sliding_window_attention.h"
+#include "core/device_buffer.h"
 
 #include "core/device_launch.h"
 #include "core/cyclic_kv_cache.h"

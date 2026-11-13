@@ -3,6 +3,7 @@
 //   ./ninfer_argmax_bench
 //   ./ninfer_argmax_bench --shape full --cols 1
 //   ./ninfer_argmax_bench --shape shortlist --cols 120
+#include "core/device_buffer.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer_bench_common.h"
 

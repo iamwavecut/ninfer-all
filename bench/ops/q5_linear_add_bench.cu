@@ -9,7 +9,9 @@
 #include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/linear_add.h"
 
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
 

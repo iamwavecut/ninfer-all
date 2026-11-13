@@ -8,8 +8,11 @@
 #   * scripts/check-include-boundaries.py -- only include/ninfer/engine.h includes the umbrella
 #     ninfer/types.h, and no CUDA translation unit under src/ reaches the Engine-level public
 #     headers, so a change to the Engine options, requests or statistics does not recompile the
-#     kernels; and no CUDA translation unit under src/ops/ reaches the host API headers
-#     (core/device.h, ninfer/ops/linear.h, ninfer/ops/softmax_attention.h, core/paged_kv_cache.h).
+#     kernels; no CUDA translation unit under src/ops/ reaches the host API headers
+#     (core/device.h, ninfer/ops/linear.h, ninfer/ops/softmax_attention.h, core/paged_kv_cache.h,
+#     ops/common/device_route.h); the causal-cache attention's routers and kernel units stay apart;
+#     and the GGUF kernel units reach neither the bridge's entry points nor the other family's
+#     launches.
 #
 #   * scripts/check-linux-scripts.sh -- the guard over the shell scripts shipped in the Linux
 #     release archive. Running it *here* rather than only on the Windows box is the point: two
@@ -32,11 +35,16 @@
 #   * Debian multiarch CUDA 12.9 and 13.4 builds of every target, then CTest. They use the
 #     release toolchains and read the latest available native compiler snapshot without waiting
 #     for its producer, then CI's own snapshot of the objects the release does not build (tests,
-#     benchmarks, tools). Only a push to master saves that snapshot, after the build stopped.
+#     benchmarks, tools) and of what the branch changed. Every run of this repository's branches
+#     saves that snapshot for its branch (a pull request's for its head branch) every ten minutes
+#     and when it stops, also when a newer push or the merge cancels it; master's run of a merge
+#     reads the merged branch's snapshot.
 #
 # CUDA/MSVC jobs compare compiled inputs with the PR base or published image revision.
 # Other jobs have individual path scopes; Docker cache checks require a Docker definition change.
 # Empty/Markdown-only PRs run only the change detector. Manual dispatch forces all scopes.
+# A stack of pull requests builds CUDA, MSVC and Docker on its top pull request only, which holds
+# every layer's changes; its lower layers run the other checks.
 name: CI
 
 on:
@@ -74,6 +82,7 @@ jobs:
       docker: ${{ steps.compare.outputs.docker }}
       release_tools: ${{ steps.compare.outputs.release_tools }}
       linux_runner: ${{ steps.runner.outputs.label }}
+      stack_top: ${{ steps.stack.outputs.top }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -84,6 +93,17 @@ jobs:
           python-version: '3.11'
       - id: compare
         run: .github/scripts/build-inputs.sh >> "$GITHUB_OUTPUT"
+      # A pull request below the top of a stack (github.event.pull_request.stack) skips the builds.
+      - id: stack
+        env:
+          POSITION: ${{ github.event.pull_request.stack.position }}
+          SIZE: ${{ github.event.pull_request.stack.size }}
+        run: |
+          if [[ -n "$SIZE" && "$POSITION" != "$SIZE" ]]; then
+            echo top=false >> "$GITHUB_OUTPUT"
+          else
+            echo top=true >> "$GITHUB_OUTPUT"
+          fi
       # While the repository variable NINFER_LINUX_RUNNER names a temporary runner, the CUDA builds
       # run there; a pull request from a fork stays on a hosted runner.
       - id: runner
@@ -159,7 +179,9 @@ jobs:
   windows-msvc:
     name: Host code under MSVC (${{ matrix.build.label }}, part ${{ matrix.shard }}/3)
     needs: build-inputs
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
+    if: >-
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.build-inputs.outputs.changed == 'true' && needs.build-inputs.outputs.stack_top == 'true'
     # Visual Studio 2022 (MSVC 14.44): CUDA 12.9 refuses Visual Studio 2026's MSVC 14.5x.
     runs-on: windows-2022
     timeout-minutes: 60
@@ -326,7 +348,9 @@ jobs:
   docker-build-cache:
     name: Dockerfile build cache
     needs: build-inputs
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.docker == 'true'
+    if: >-
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.build-inputs.outputs.docker == 'true' && needs.build-inputs.outputs.stack_top == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -354,7 +378,9 @@ jobs:
   cuda:
     name: CUDA ${{ matrix.cuda }} multiarch build and tests (no GPU)
     needs: build-inputs
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
+    if: >-
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.build-inputs.outputs.changed == 'true' && needs.build-inputs.outputs.stack_top == 'true'
     runs-on: ${{ needs.build-inputs.outputs.linux_runner }}
     # A temporary runner provides Debian 13 itself; on a hosted runner the job runs in a container.
     container: >-
@@ -380,6 +406,10 @@ jobs:
       LC_CTYPE: C.UTF-8
       ARCHS: ${{ matrix.archs }}
       CUDA_VERSION: ${{ matrix.cuda }}
+      CI_CACHE_FAMILY: ci-linux-cuda-${{ matrix.cuda }}-v1
+      # A pull request saves for its head branch; a fork's receives no bucket credential.
+      CI_CACHE_SAVES: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+      HF_CACHE_TARGET_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || github.ref }}
     strategy:
       fail-fast: false
       matrix:
@@ -428,16 +458,20 @@ jobs:
         env:
           # The bucket token reaches only the restore and save steps. Fork PRs receive no secret.
           HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
-          CACHE_SOURCE_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
+          # A stacked pull request reads the snapshots of the stack's base, not of the layer below.
+          CACHE_SOURCE_REF: >-
+            ${{ github.event_name == 'pull_request' && format('refs/heads/{0}',
+            github.event.pull_request.stack.base.ref || github.base_ref) || github.ref }}
           # A pull request also reads the native snapshot of its own branch, which a Native release
           # dispatch on that branch writes; a push to master that of the branch it merged.
           ALSO_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || '' }}
         run: |
           restore=(python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --source-ref "$CACHE_SOURCE_REF" --optional)
           [[ -z "$ALSO_REF" ]] || restore+=(--also-ref "$ALSO_REF")
-          # The CI snapshot holds only what differs from the native one recorded here.
+          # The CI snapshot holds only what differs from the native one recorded here. A branch
+          # without a snapshot of its own, or whose run saved nothing, reads master's.
           "${restore[@]}" --merged-branch --family native-linux-cuda-${{ matrix.cuda }}-shared-v1 --baseline build-cache-baseline.tsv
-          "${restore[@]}" --family ci-linux-cuda-${{ matrix.cuda }}-v1
+          "${restore[@]}" --merged-branch --family "$CI_CACHE_FAMILY"
       - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
         run: python3.11 .github/scripts/check-compiler-cache.py
@@ -449,7 +483,11 @@ jobs:
       - name: Build every target
         id: build
         timeout-minutes: 305
-        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j ${{ steps.capacity.outputs.jobs }}
+        env:
+          # Periodic checkpoints of the CI family; the supervisor keeps the credential from the build.
+          HF_TOKEN: ${{ env.CI_CACHE_SAVES == 'true' && steps.object-cache.outcome == 'success' && secrets.HF_BUILD_CACHE_TOKEN || '' }}
+          HF_CACHE_BASELINE: build-cache-baseline.tsv
+        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl --checkpoint-family "$CI_CACHE_FAMILY" -- cmake --build build-release -j ${{ steps.capacity.outputs.jobs }}
       - name: Run CTest
         timeout-minutes: 15
         run: |
@@ -463,21 +501,23 @@ jobs:
         run: >-
           python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
           ${{ steps.build.outcome == 'success' && '--evict-unused-since "$JOB_START"' || '' }}
-      # A cancelled or timed-out master build saves what it compiled, so the next run resumes; the
-      # native snapshot's own entries stay out of this family.
-      - name: Save CI objects from master (also after cancellation)
+      # A cancelled or timed-out build saves what it compiled, so the next run of the branch, or
+      # master's run of its merge, resumes; the native snapshot's own entries stay out of this family.
+      - name: Save CI objects for this branch (also after cancellation)
         if: >-
-          always() && github.event_name == 'push' && github.ref == 'refs/heads/master' &&
+          always() && env.CI_CACHE_SAVES == 'true' &&
           steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
         timeout-minutes: ${{ job.status == 'cancelled' && 3 || 20 }}
         env:
           HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
         run: >-
           python3.11 .github/scripts/hf-build-cache.py save --directory .cache/objects
-          --family ci-linux-cuda-${{ matrix.cuda }}-v1 --exclude-baseline build-cache-baseline.tsv
+          --family "$CI_CACHE_FAMILY" --exclude-baseline build-cache-baseline.tsv
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
+        env:
+          NODE_OPTIONS: --require ./.github/scripts/quiet-upload-progress.cjs
         with:
           name: ci-logs-cuda-${{ matrix.cuda }}
           include-hidden-files: true

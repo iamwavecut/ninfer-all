@@ -1,6 +1,7 @@
 // The streamed native experts' CPU rows (ops/sparse_moe/streamed_cpu.h) against an FP64 oracle of
 // independently decoded stored bytes, and every vector backend against the scalar one bit for bit.
 // The GPU's bits are the streaming SparseMoe test's (test_sparse_moe --streaming).
+#include "core/qtype.h"
 #include "ops/sparse_moe/streamed_cpu.h"
 
 #include <bit>

@@ -1,6 +1,9 @@
 #include "models/qwen4_exp/hybrid_experts.h"
 #include "core/decode_graph.h"
+#include "core/device_buffer.h"
 #include "core/mapped_host_copy.h"
+#include "core/pinned_memory.h"
+#include "core/qtype.h"
 #include "ops/op_tester.h"
 
 #include <array>

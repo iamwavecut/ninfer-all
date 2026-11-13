@@ -4,6 +4,7 @@
 #include "artifact/selection.h"
 #include "artifact/transcode.h"
 #include "artifact/views.h"
+#include "core/qtype.h"
 #include "ninfer/ops/linear.h"
 
 #include <algorithm>

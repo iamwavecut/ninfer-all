@@ -10,7 +10,9 @@
 // the A4 TMA route, which has the same release.
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"

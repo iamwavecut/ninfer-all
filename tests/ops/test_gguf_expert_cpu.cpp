@@ -15,6 +15,7 @@
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
+#include "core/qtype.h"
 #include "ggml-common.h"
 
 #include <algorithm>

@@ -5,6 +5,8 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/weight_view.h"
 #include "ops/linear/sm70/sm70_gemm.h"
 #include "ops/op_tester.h"

@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
+#include "core/pinned_memory.h"
 #include "core/tensor.h"
 #include "core/transfer_work.h"
 

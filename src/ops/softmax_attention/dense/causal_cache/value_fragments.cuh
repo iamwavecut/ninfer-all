@@ -1,8 +1,8 @@
 #pragma once
 
 // FP16 PV B fragments decoded in registers from INT8-family value codes that ldmatrix.trans read
-// from shared memory as byte pairs. The fast prompt kernel (prompt_i8_fast.cuh) and the pipelined
-// small-T kernel (small_t_i8_pipelined.cuh) share them, so both widen a code exactly as the
+// from shared memory as byte pairs. The fast prompt kernel (int8/prompt_fast.cuh) and the pipelined
+// small-T kernel (int8/small_t_pipelined.cuh) share them, so both widen a code exactly as the
 // retired FP16 staging tile did: the code exactly to FP16, then one FP16 multiply by its key's
 // represented group scale, which rounds like the FP32 product rounded to FP16.
 

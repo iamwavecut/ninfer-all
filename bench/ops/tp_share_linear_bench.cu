@@ -9,6 +9,8 @@
 
 #include "ninfer/ops/linear.h"
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/common/output.cuh"
 #include "ops/common/small_t_split_store.cuh"

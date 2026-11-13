@@ -1,10 +1,10 @@
 #include "core/expert_direct.h"
 
-#include "core/arena.h"
 #include "core/device.h"
 #include "core/device_wait.h"
 #include "core/file_read_error.h"
 #include "core/host_worker_pool.h"
+#include "core/pinned_memory.h"
 #include "core/vmm.h"
 
 #include <cuda.h>

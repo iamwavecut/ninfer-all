@@ -2,6 +2,7 @@
 
 #include "core/device_launch.h"
 #include "core/nvtx.h"
+#include "core/qtype.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/dspine.h"
 #include "ninfer/ops/attn_input_proj.h"

@@ -5,6 +5,9 @@
 
 namespace ninfer::ops {
 
+// The head dimension of every causal attention geometry.
+inline constexpr int kCausalHeadDim = 256;
+
 // A causal attention geometry fixes the query heads per KV head (GroupSize) and the small-T split
 // scale at compile time. How many KV heads a call attends with is a run-time count: the model's,
 // or a tensor-parallel rank's run of them, at most ModelKVHeads. Every kernel takes it from its

@@ -1,3 +1,4 @@
+#include "core/device_buffer.h"
 #include "ninfer/ops/readout_logprobs.h"
 #include "ops/op_tester.h"
 

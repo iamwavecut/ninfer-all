@@ -3,6 +3,7 @@
 
 #include "core/device_launch.h"
 #include "core/pdl.cuh"
+#include "core/qtype.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/silu.h"

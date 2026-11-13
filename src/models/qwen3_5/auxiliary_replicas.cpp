@@ -1,5 +1,6 @@
 #include "models/qwen3_5/auxiliary_replicas.h"
 
+#include "core/device_buffer.h"
 #include "core/device_wait.h"
 
 #include <cstdint>

@@ -2,6 +2,7 @@
 // keeps its own chain of fused multiply-adds in the scalar backend's order, and the lanes meet in
 // the same tree. Built with AVX2, FMA and F16C, without floating-point contraction.
 
+#include "core/qtype.h"
 #include "ops/sparse_moe/streamed_cpu_detail.h"
 
 #include <immintrin.h>

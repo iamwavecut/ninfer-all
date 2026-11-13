@@ -11,6 +11,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / ".github/scripts/finish-compiler-cache.py"
+# The scripts import their sibling hf_client, as when run from .github/scripts.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github/scripts"))
 SPEC = importlib.util.spec_from_file_location("hf_build_cache", ROOT / ".github/scripts/hf-build-cache.py")
 SNAPSHOT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SNAPSHOT)

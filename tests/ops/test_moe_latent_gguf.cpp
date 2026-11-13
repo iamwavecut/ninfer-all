@@ -13,6 +13,8 @@
 // moe_latent_gguf_workspace_bytes and leaves its scopes closed.
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/moe_experts.h"

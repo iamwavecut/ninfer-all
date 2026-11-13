@@ -4,6 +4,7 @@
 // contiguous row range of the parent is itself a valid RowSplit weight with offset code and scale
 // pointers; the fused wrappers project the parent's parts through ops::linear with these views.
 
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 

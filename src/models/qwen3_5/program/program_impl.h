@@ -5,6 +5,7 @@
 
 #include "core/arena.h"
 #include "core/device_snapshot.h"
+#include "core/pinned_memory.h"
 #include "core/vmm.h"
 #include "core/disk_kv_bridge.h"
 #include "core/gdn_replay_records.h"

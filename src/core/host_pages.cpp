@@ -1,6 +1,7 @@
 #include "core/host_pages.h"
 
 #include "core/host_memory.h"
+#include "core/pinned_memory.h"
 
 #include <algorithm>
 #include <exception>

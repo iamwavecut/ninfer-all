@@ -12,6 +12,7 @@
 // (q5_rowsplit_gemm_mma.cuh), so where the residual nearly cancels the product they sit a bf16
 // step of the product away from the oracle. This kernel rounds once.
 
+#include "core/qtype.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"

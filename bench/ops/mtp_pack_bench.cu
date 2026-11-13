@@ -2,6 +2,7 @@
 
 #include "ninfer/ops/mtp_pack.h"
 
+#include "core/device_buffer.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_runtime.h>

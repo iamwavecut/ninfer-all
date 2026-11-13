@@ -3,6 +3,7 @@
 // informational only -- the gate is ncu sustained DRAM % (see
 // docs/op-development.md §8).
 //   ./ninfer_gdn_gating_bench [--decode] [--prefill]   (default: both)
+#include "core/device_buffer.h"
 #include "ninfer/ops/gdn_gating.h"
 #include "ninfer_bench_common.h"
 

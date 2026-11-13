@@ -1,5 +1,7 @@
 #include "ops/linear/linear_test_common.h"
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"

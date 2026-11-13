@@ -7,6 +7,7 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/kv_cache_append.h"
 
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"

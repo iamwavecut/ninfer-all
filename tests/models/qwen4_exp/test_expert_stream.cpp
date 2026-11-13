@@ -14,9 +14,10 @@
 // into slots on their own device. All of it holds with direct reads (through the host window), with
 // a drive mirror (the first file's experts lie in its second stripe, which the mirror serves), and
 // with both.
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/file_read_error.h"
+#include "core/qtype.h"
 #include "models/qwen4_exp/expert_stream.h"
 
 #include <cuda_runtime.h>

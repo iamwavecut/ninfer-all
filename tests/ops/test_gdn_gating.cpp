@@ -1,5 +1,6 @@
 #include "ninfer/ops/gdn_gating.h"
 
+#include "core/device_buffer.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>

@@ -1,3 +1,6 @@
+#include "core/device_buffer.h"
+#include "core/pinned_memory.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ninfer/ops/sparse_moe.h"
 #include "core/device.h"

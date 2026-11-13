@@ -1,4 +1,6 @@
 // Public cold-cache benchmark for the three registered linear_topk profiles.
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 

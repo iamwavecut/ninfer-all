@@ -8,6 +8,8 @@
 #include "ops/sparse_moe/laboratory.h"
 
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/device_buffer.h"
 #include "ops/op_tester.h"
 
 #include <cstdint>

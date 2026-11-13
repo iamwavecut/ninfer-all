@@ -1,6 +1,7 @@
 // Measures five public feature-slice captures into a strided lane-owned pool.
 #include "ninfer/ops/scatter.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>

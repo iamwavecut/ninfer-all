@@ -21,6 +21,7 @@
 #include "ops/linear/linear_test_common.h"
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "core/tensor.h"
 #include "core/weight.h"

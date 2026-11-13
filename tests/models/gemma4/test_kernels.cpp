@@ -11,7 +11,7 @@
 //    row's own slot, keys derived at the branch positions, and the prompt masks of a sliding ring
 //    and of a linear cache, where a row sees the state as its position does and its own branch.
 
-#include "core/arena.h"
+#include "core/device_buffer.h"
 #include "models/gemma4/kernels.h"
 #include "ninfer/ops/rope.h"
 

@@ -1,7 +1,9 @@
 // Entry points into the vendored ggml CUDA kernels and the vector kernel (ggml_bridge_vec.cuh). The
 // activation quantizers follow ggml's q8_1, reading BF16 and optionally gathering the input columns.
 
-#include "ggml_bridge_internal.cuh"
+#include "ggml_bridge.h"
+#include "ggml_bridge_mmq_launch.cuh"
+#include "ggml_bridge_vec_launch.cuh"
 
 #include "../../common/device_tier.h"
 #include "../../common/fixed_point.cuh"
@@ -30,6 +32,14 @@ extern "C" void ggml_abort(const char* file, int line, const char* fmt, ...) {
 
 namespace ninfer::ops::gguf {
 namespace detail {
+
+[[nodiscard]] inline ggml_type to_ggml(GgmlType type) { return static_cast<ggml_type>(type); }
+
+// The matrix kernel's activation carries one block_q8_1_mmq per 128 values per column; ggml
+// over-reads up to one widest column tile past the end, so the plane keeps that much slack.
+inline constexpr std::size_t kMatrixActivationSlack = 128 * sizeof(block_q8_1_mmq);
+// MoeRouting lists the matrix kernel's work for each of the column tiles (kMatrixColumnTiles).
+inline constexpr int kMoeTileWidths = 4;
 
 const DeviceFacts& device_facts() {
     static std::array<DeviceFacts, 16> facts{};

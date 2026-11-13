@@ -2,8 +2,11 @@
 
 #include "core/arena.h"
 #include "core/cuda_host_handshake.h"
+#include "core/device_buffer.h"
 #include "core/device_wait.h"
 #include "core/mapped_host_copy.h"
+#include "core/pinned_memory.h"
+#include "core/qtype.h"
 #include "models/qwen4_exp/read_pool.h"
 #include "ninfer/ops/residual_add.h"
 

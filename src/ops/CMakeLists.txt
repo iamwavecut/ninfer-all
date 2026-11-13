@@ -100,7 +100,7 @@ if(_ninfer_ops_architecture_count GREATER 1)
   if(NINFER_ARCH_BLACKWELL)
     ninfer_ops_route_family(fp8_a8 120a-real "/fp8/[^/]+_a8(_unified)?\\.cu$")
     ninfer_ops_route_family(nvfp4_a4 120a-real
-      "/nvfp4/[^/]+_(w4a4|a4)\\.cu$|/causal_cache/prompt_nvfp4_fast\\.cu$")
+      "/nvfp4/[^/]+_(w4a4|a4)\\.cu$|/causal_cache/nvfp4/prompt_fast\\.cu$")
   endif()
   if(NINFER_ARCH_VOLTA)
     ninfer_ops_route_family(sm70 70-real "/linear/sm70/[^/]+\\.cu$")
@@ -117,7 +117,8 @@ endif()
 # and the installed route profiles that both they and the static Ops use. The GGML, tier and route
 # objects compile independently of DLL-only definitions, preserving their cache identity, and are
 # exported whole; their bridges import no global data or virtual tables. The small-T archive is
-# linked whole and exports only its launch instantiations: each unit instantiates several hundred
+# linked whole and exports only its launch instantiations (launch_small_t_i8_tiled, _pipelined and
+# _sm70, one per unit; the router in ninfer_ops calls them): each unit instantiates dozens of
 # kernels, and a DLL can name at most 65535 exports. The DLL links its own copy of the device
 # layer's launch helpers (core/device_launch.cpp), bound to its own CUDA runtime.
 if(NINFER_WINDOWS_KERNEL_DLL)
@@ -128,7 +129,7 @@ if(NINFER_WINDOWS_KERNEL_DLL)
     WINDOWS_EXPORT_ALL_SYMBOLS ON
     LINKER_LANGUAGE CUDA CUDA_RUNTIME_LIBRARY Static
     CUDA_SEPARABLE_COMPILATION OFF CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
-  ninfer_export_archive_instantiations(ninfer_kernels ninfer_small_t_i8 launch_small_t_i8
+  ninfer_export_archive_instantiations(ninfer_kernels ninfer_small_t_i8 "launch_small_t_i8_[a-z0-9]+"
     ${NINFER_SMALL_T_I8_INSTANTIATIONS})
   target_link_libraries(ninfer_kernels PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cublas)
   target_link_libraries(ninfer_ops PRIVATE ninfer_kernels)

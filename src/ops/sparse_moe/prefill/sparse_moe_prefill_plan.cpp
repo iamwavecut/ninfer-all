@@ -2,6 +2,7 @@
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "ops/common/device_route.h"
 #include "ops/sparse_moe/policy.h"
 

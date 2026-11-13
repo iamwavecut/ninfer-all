@@ -2,6 +2,7 @@
 
 #include "core/cpu_spin_pool.h"
 #include "core/expert_split.h"
+#include "core/qtype.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 // After the bridge, which brings the CUDA host definitions fixed_point.cuh's qualifiers need.
 #include "ops/common/fixed_point.cuh"

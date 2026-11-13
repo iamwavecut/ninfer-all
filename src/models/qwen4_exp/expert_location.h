@@ -3,6 +3,7 @@
 // Where the routed experts of a Qwen3.8-Flash-Next layer sit in the artifact's files, for disk
 // residency. The model binds these at load; the miss service reads by them.
 
+#include "core/qtype.h"
 #include "core/weight.h"
 
 #include <array>

@@ -12,7 +12,6 @@
 // The host memory this mode needs is the staging ring; the page cache keeps what the system can
 // spare.
 
-#include "core/arena.h"
 #include "core/device.h"
 #include "core/expert_disk.h"
 #include "models/qwen4_exp/model.h"

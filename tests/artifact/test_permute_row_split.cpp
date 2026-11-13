@@ -4,6 +4,7 @@
 // the permutation is exactly the one the kernels assume, and that it is a bijection.
 
 #include "artifact/permute_row_split.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "core/weight_view.h"
 

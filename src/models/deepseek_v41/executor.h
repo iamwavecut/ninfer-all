@@ -34,7 +34,6 @@
 // position (forward's state_at) and the call's logit rows depend on; their first rows attend no
 // further back than the run's first position (the window floor).
 
-#include "core/arena.h"
 #include "core/device.h"
 #include "core/expert_disk.h"
 #include "core/tensor.h"

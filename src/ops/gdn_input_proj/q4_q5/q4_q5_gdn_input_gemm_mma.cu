@@ -2,6 +2,7 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
 #include "ops/common/token_slices.h"

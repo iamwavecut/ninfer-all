@@ -3,6 +3,7 @@
 //
 // Narrow one-case profiling example:
 //   ./ninfer_l2norm_bench --tokens 1024
+#include "core/device_buffer.h"
 #include "ninfer/ops/l2norm.h"
 #include "ninfer_bench_common.h"
 

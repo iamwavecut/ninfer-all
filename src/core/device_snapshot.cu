@@ -1,6 +1,7 @@
 #include "core/device_snapshot.h"
 
 #include "core/device_wait.h"
+#include "core/pinned_memory.h"
 
 #include <cuda_runtime.h>
 

@@ -1,6 +1,7 @@
 #include "artifact/transcode.h"
 
 #include "artifact/schema.h"
+#include "core/qtype.h"
 #include "core/weight_view.h"
 
 #include <algorithm>

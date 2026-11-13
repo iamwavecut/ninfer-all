@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ops/linear_pair/linear_pair_test_common.h"
 

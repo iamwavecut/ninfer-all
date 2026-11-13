@@ -1,4 +1,5 @@
 #include "ninfer/ops/gated_delta_net.h"
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 
 #include "ops/op_tester.h"

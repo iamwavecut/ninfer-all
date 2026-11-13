@@ -3,6 +3,7 @@
 // Test-owned packed-weight fixtures for every registered quantized Weight format. Physical
 // row-split and block-scale codecs remain format-specific beneath one logical fixture interface.
 
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "core/tensor.h"
 

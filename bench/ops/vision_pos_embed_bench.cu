@@ -1,3 +1,4 @@
+#include "core/device_buffer.h"
 #include "ninfer/ops/vision_pos_embed.h"
 #include "ninfer_bench_common.h"
 

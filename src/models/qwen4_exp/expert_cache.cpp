@@ -1,6 +1,8 @@
 #include "models/qwen4_exp/expert_cache.h"
 
+#include "core/device_buffer.h"
 #include "core/device_wait.h"
+#include "core/pinned_memory.h"
 
 #include <algorithm>
 #include <cstring>

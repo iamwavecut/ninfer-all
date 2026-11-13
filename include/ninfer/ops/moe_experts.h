@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/weight_input.h"

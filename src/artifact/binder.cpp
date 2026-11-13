@@ -3,6 +3,7 @@
 #include "artifact/framing.h"
 #include "artifact/permute_row_split.h"
 #include "artifact/transcode.h"
+#include "core/qtype.h"
 
 #include <algorithm>
 #include <bit>

@@ -6,6 +6,7 @@
 #include "core/host_pages.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
+#include "core/pinned_memory.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
 #include "ninfer/startup.h"

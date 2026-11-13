@@ -11,6 +11,7 @@
 
 #include "core/device_launch.h"
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "ops/common/fixed_point.cuh"
 #include "ops/common/silu.h"
 #include "ops/linear/gguf/gguf_linear.h"

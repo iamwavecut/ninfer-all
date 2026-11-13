@@ -5,6 +5,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "core/device_launch.h" // CUDA_CHECK
+#include "core/qtype.h"
 #include "ops/linear/common/route_table.h"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 #include "ops/linear/q4/q4_small_t_mma_i8.cuh"

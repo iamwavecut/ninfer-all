@@ -3,6 +3,7 @@
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ninfer/ops/rmsnorm.h"
 
+#include "core/qtype.h"
 #include "ops/launcher/hadamard_transform.h"
 
 #include <cmath>

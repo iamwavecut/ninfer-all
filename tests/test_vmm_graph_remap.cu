@@ -4,8 +4,8 @@
 // all while a CUDA graph captured against the home addresses stays launchable
 // and correct. Also reports per-chunk map/unmap latency for the overlay budget.
 
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/pinned_memory.h"
 #include "core/vmm.h"
 #include "cuda_availability.h"
 

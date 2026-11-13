@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "models/qwen3_5/execution/vision_cpu.h"
 #include "models/qwen3_5/load/vision_cpu.h"
 #include "ops/quantized_weight.h"

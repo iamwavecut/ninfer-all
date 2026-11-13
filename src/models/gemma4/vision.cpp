@@ -1,5 +1,7 @@
 #include "models/gemma4/vision.h"
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/weight_view.h"
 #include "models/gemma4/vision_kernels.h"
 #include "ninfer/ops/attention_geometry.h"

@@ -3,6 +3,8 @@
 
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ops/quantized_weight.h"
 
 #include <algorithm>

@@ -101,8 +101,8 @@ The CPU's GGUF expert products reproduce the GPU's decode products bit for bit
 (`gguf_expert_cpu`); a change to either side keeps them equal.
 Develop the existing GGUF host-RAM and disk-streaming paths;
 reuse published weights and the published IQ4 table when adding MTP. Disk residency uses the OS
-page cache. An additional application-managed RAM cache of experts is excluded from this delivery
-by the user's decision. Keep the bounded transfer buffers and the device expert cache.
+page cache. An additional application-managed RAM cache of experts is not part of this delivery.
+Keep the bounded transfer buffers and the device expert cache.
 This line builds for **`sm_86`** (the RTX 30 series; that build also runs the RTX 40 series),
 `sm_89`, `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer except 13.2.0 and 13.2.1) and `sm_75`
 (Turing: the TITAN RTX and RTX 20 series, Turing forms of the sm_80 instructions and Turing shapes

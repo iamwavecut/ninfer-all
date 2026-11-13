@@ -11,6 +11,7 @@
 // usage: ninfer_benches ninfer_gguf_moe_matrix_bench [--formats IQ1_M,IQ1_S,IQ2_XXS,IQ2_S|all]
 //        [--tokens 64,512,2048] [--experts 384] [--hidden 5120] [--width 2304] [--top-k 6]
 
+#include "core/device_buffer.h"
 #include "ninfer_bench_common.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 

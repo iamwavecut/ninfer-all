@@ -25,6 +25,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "cuda_availability.h"

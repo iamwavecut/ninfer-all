@@ -22,6 +22,7 @@
 // shared-memory stage of direct BF16 calls.
 
 #include "ops/linear/sm70/sm70_dequantize.h"
+#include "ops/linear/sm70/sm70_bf16_f16.cuh"
 #include "ops/linear/sm70/sm70_gemm.h"
 
 #include <cuda_bf16.h>

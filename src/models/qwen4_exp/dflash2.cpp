@@ -2,6 +2,7 @@
 
 #include "core/device_launch.h"
 #include "core/nvtx.h"
+#include "core/qtype.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/embedding.h"

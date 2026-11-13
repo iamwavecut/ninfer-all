@@ -167,6 +167,8 @@ jobs:
         timeout-minutes: 60
         run: python3.11 .github/scripts/archive-linux-artifact.py
       - uses: actions/upload-artifact@v7
+        env:
+          NODE_OPTIONS: --require ./.github/scripts/quiet-upload-progress.cjs
         if: inputs.phase != 'objects'
         with:
           name: native-linux-cuda-${{ inputs.cuda }}
@@ -179,6 +181,8 @@ jobs:
       - name: Preserve build diagnostics
         if: always()
         uses: actions/upload-artifact@v7
+        env:
+          NODE_OPTIONS: --require ./.github/scripts/quiet-upload-progress.cjs
         with:
           name: linux-logs-${{ inputs.cuda }}-${{ inputs.phase }}${{ inputs.phase == 'objects' && format('-{0}', inputs.shard) || '' }}
           # .ninja_log holds each compile's start and end; ninja's console lines carry no times.

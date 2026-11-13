@@ -20,6 +20,7 @@
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "models/gemma4/model.h"
 #include "models/gemma4/vision.h"
 #include "models/gemma4/vision_cpu.h"

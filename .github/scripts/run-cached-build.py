@@ -63,7 +63,9 @@ def main():
                 from windows_build_job import WindowsBuildJob
                 windows_job = WindowsBuildJob()
                 command = windows_job.command(command)
-            child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, **options)
+            # The bucket credential serves the checkpoints only, not the build's own code.
+            build_env = {name: value for name, value in os.environ.items() if name != "HF_TOKEN"}
+            child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=build_env, **options)
             next_report = 0
             next_sample = 0
             while child.poll() is None and not cancelled:

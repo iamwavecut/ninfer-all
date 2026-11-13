@@ -15,6 +15,8 @@
 // slice the token dimension by their own column tile and pick a full-tile variant based on
 // alignment, and a bench that reimplemented that would be timing a replica of the Op.
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ops/linear_pair/q8/q8_pair_plan.h"
 #include "quantized_weight.cuh"
 #include "schedule_sweep.cuh"

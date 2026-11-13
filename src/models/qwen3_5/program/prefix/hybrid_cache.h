@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/arena.h"
 #include "core/host_pages.h"
 #include "core/startup.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"

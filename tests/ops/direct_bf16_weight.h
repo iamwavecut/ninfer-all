@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ops/op_tester.h"
 

@@ -1,4 +1,5 @@
 // Public warm-cache Graph benchmark for the fused tail-pack RMSNorm contract.
+#include "core/device_buffer.h"
 #include "ninfer/ops/rmsnorm_pack_tail.h"
 #include "ninfer_bench_common.h"
 #include <cstdlib>

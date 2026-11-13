@@ -109,21 +109,15 @@ Every push to `master` compares inputs with the published native revision. Produ
 dependencies, build configuration and shipped runtime inputs start native builds and Docker packaging.
 Documentation and publication/control scripts run only their affected checks. Pending source changes
 from a cancelled or failed build remain in this comparison. Manual dispatch forces builds and checks.
-Runs of one branch queue: a new run waits until the running one has ended, and GitHub drops a run
-that was still waiting when a newer one arrived. A cancelled build would lose every object it had
-started; on 11 November 2026 three master runs in a row were cancelled after 27-53 minutes, while
-a heavy attention unit compiles for 38-75. When its object jobs end, a run checks that its revision
-is still the branch head (`windows-current`, `linux-current`); a superseded run skips packaging,
-Docker and publication, so the newer run starts with its objects. A run that already passed that
-check when master moved is cancelled by the master coordinator, unless an object job (a shard, or
-the temporary runner's full Linux job) is still running; on 12 November the next run waited
-behind a superseded run's packaging and publication. Completed objects
-survive either way: shards save checkpoints while they compile and their objects when cancelled.
-A current run publishes on success when build inputs changed. In **Actions → Native release → Run workflow**, publication
+A newer commit cancels the running build of its branch, because a superseded revision is never
+published. The cancelled object jobs save the objects they completed, and their periodic
+checkpoints keep the rest, so the newer run starts from them; only the units that were compiling
+at that moment compile again (a heavy attention unit takes 38-75 minutes on a hosted runner).
+A run publishes on success when build inputs changed. In **Actions → Native release → Run workflow**, publication
 defaults to off; enable `publish` only on `master` when intended. Feature branches run only through
 manual dispatch and cannot publish. Build jobs have read access; only the publication job receives
-`contents: write`. The master cancellation coordinator cancels older CI runs and older Native
-release runs that no longer compile. Closing a PR cancels that PR's remaining runs.
+`contents: write`. The master cancellation coordinator also cancels older CI and Native release
+runs of `master`. Closing a PR cancels that PR's remaining runs.
 A superseded upload can leave an unpublished draft; it cannot replace the current release.
 
 ## Portable runtime boundary
@@ -190,15 +184,27 @@ packaging. Missing snapshots fail restoration; changed inputs rebuild through cc
 The default `windows_phase: full` builds the shards first.
 Publication requires `platforms: all`; a `windows_phase: package` run with `platforms: all` and
 `publish: true` builds Linux too and publishes without the shard jobs. A new native run on the
-same branch waits for the running one, including its other platform.
+same branch cancels the running one, including its other platform.
 
 Native Windows, Debian and CUDA CI use pinned ccache 4.14.2. Native release and its Linux artifact bootstrap write the native compiler
 snapshots. Only Native release writes Windows vcpkg snapshots to the private HF bucket `WaveCut/ninfer-cache`, under `github-actions/v2/`.
 `HF_BUILD_CACHE_TOKEN` has read/write access to this bucket only. Native jobs use it for snapshots.
-CI receives it only in its restore and save steps, never during compilation. By owner decision of
-12 November 2026, a CI run of a push to `master` saves the family `ci-linux-cuda-<toolkit>-v1`;
-the save command rejects every other CI write (pull requests, other branches, native families). Existing
-pod caches and model files use separate prefixes and are not changed. The client is pinned to `huggingface_hub==1.17.0`.
+CI receives it in its restore and save steps and in the build step's supervisor, which writes the
+periodic checkpoints and starts the build without it. CI saves the family `ci-linux-cuda-<toolkit>-v1`
+for the branch it builds: `master`, a `ci/` branch, or a pull request's head branch; the save command
+rejects every other CI write (other branches, native families), and a pull request from a fork
+receives no credential. Existing pod caches and model
+files use separate prefixes and are not changed. The client is pinned to `huggingface_hub==1.17.0`.
+
+Every bucket call of these scripts (`hf_client.py`) retries a transport error or an HTTP 408, 425,
+429 or 5xx answer five times, after 5, 10, 20, 40 and 60 seconds; each call has its own budget,
+so a success restores five retries for the next one. A missing file or another 4xx answer fails at
+once. On 13 November 2026 one `RemoteProtocolError` during a Windows shard's restore failed the
+master release of #340. Progress output is throttled: huggingface_hub's transfer bars appear at
+most once per 30 seconds and once at the end, and `quiet-upload-progress.cjs`, preloaded into
+`actions/upload-artifact` through `NODE_OPTIONS`, keeps one of its per-8-MiB `Uploaded bytes` lines
+per 30 seconds and the last one (for the 6.2 GB universal Linux package of Native release
+43396928446 the artifact upload logged 744 such lines and the step of its HF backup 1,605 lines).
 
 CI uses Debian 13, the same official Toolkit installation, pinned ccache, Release flags, shared-runtime/PIC
 settings, architecture sets and `build-release` directory as the Linux artifact build. The shared
@@ -209,9 +215,14 @@ run on 11 November 2026, 43-47 minutes per job) go into the CI family, which hol
 that differ from the native snapshot it restored: the restore records each native file's size
 (`--baseline`), and the save leaves out every file still of that size (`--exclude-baseline`).
 Result files are named by their content and a ccache manifest grows when it gains an entry, so a
-file of the recorded size is still the native one, also after a hit renewed its time. A cancelled
-or timed-out master CI run saves what it compiled, so the next one resumes. CI objects never
-enter the native families. Broader test builds can take longer on a cold cache.
+file of the recorded size is still the native one, also after a hit renewed its time. A CI run
+checkpoints the family every ten minutes and saves it when it stops, also when cancelled by a newer
+push or by the merge of its pull request; the next run of the branch reads master's family and
+then the branch's own. Master's run of a merge also reads the merged branch's family
+(`--merged-branch`), so the objects a pull request compiled are not compiled again, also when
+the pull request was merged before its CI finished. If the branch's CI saved nothing, master's
+run starts from master's own family. CI objects never enter the native families. Broader test builds can take
+longer on a cold cache.
 
 Each native or CI variant has an 8 GiB local compiler-cache limit. It does not bound a restored
 cache: snapshots omit ccache's counters, and a cleanup decides from the counters it finds before it
@@ -258,8 +269,8 @@ aggregate and every shard, links and packages the same multiarch executables, an
 aggregate, which then holds the entries of the whole build. Where restored snapshots hold the same
 file, the newer copy stays, and an old ccache manifest cannot hide the entry its owner shard added.
 Only Windows shard zero and the subsequent final job write the shared vcpkg family. Linux and
-Windows object jobs run eight at a time each, so they and the queued master run stay within
-GitHub's 20 concurrent jobs.
+Windows object jobs run eight at a time each, so they and CI's two CUDA jobs stay within GitHub's
+20 concurrent jobs.
 
 Master's build of a merge also unpacks, after master's own snapshot of each family, the snapshot of
 the branch it merged (`--merged-branch`, read from the subject `Merge pull request #N from
@@ -308,11 +319,10 @@ It then stops all remaining compiler descendants, even if that parent has alread
 uses the retained process group; Windows uses a dedicated Job Object that owns the entire tree.
 `Build workflow checks` tests cancellation on Windows and release tooling on Linux before native
 compilation. It can also be dispatched separately without starting compilers or accessing HF.
-Native save steps also run after a hard compilation-step timeout. Native runs of one branch
-queue, so a run starts only after the previous one, saves included, has ended; a manual
-cancellation still leaves the cancelled run its cleanup. The cache command rejects writes from
-other workflows/jobs and prevents an older run from replacing snapshots already saved by a newer
-run. A newer master push cancels the running CI, whose save step then has three minutes.
+Native save steps also run after a hard compilation-step timeout. A newer push cancels the running
+native and CI builds of its branch; their save steps then have three minutes. The cache command
+rejects writes from other workflows/jobs and prevents an older run from replacing snapshots already
+saved by a newer run.
 
 The final save has a twenty-minute limit after normal completion or failure. Cancellation reduces
 that limit to three minutes within GitHub's five-minute cancellation window. A measured 6.2 GB

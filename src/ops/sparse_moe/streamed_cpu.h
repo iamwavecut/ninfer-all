@@ -18,6 +18,7 @@
 // step fuses unless written as a fused multiply-add.
 
 #include "core/expert_delivery.h"
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 

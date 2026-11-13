@@ -14,8 +14,9 @@
 // those. A round's swaps start over the passes until the next round, a share of them a pass. With
 // two devices, rounds that copy into one rank's slots, then the other's, then both, reuse each
 // copy's event on the device it was made on.
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/pinned_memory.h"
 #include "models/qwen4_exp/expert_cache.h"
 
 #include <cuda_runtime.h>

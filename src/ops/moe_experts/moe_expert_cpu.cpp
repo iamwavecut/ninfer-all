@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "ninfer/ops/moe_expert_cpu.h"
 #include "ops/moe_experts/cpu_projection.h"
 

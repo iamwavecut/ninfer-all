@@ -17,39 +17,6 @@ struct DeviceSpan {
 
 // Owning device allocation for long-lived buffers. DeviceArena remains the
 // suballocation primitive for workspaces; this type owns exactly one cudaMalloc.
-class DeviceBuffer {
-public:
-    DeviceBuffer() noexcept = default;
-    explicit DeviceBuffer(std::size_t size_bytes);
-    ~DeviceBuffer();
-
-    DeviceBuffer(const DeviceBuffer&)            = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-    DeviceBuffer(DeviceBuffer&& other) noexcept;
-    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
-
-    void fill(int byte_value = 0);
-    // Completes the upload before returning. Callers must first order any prior device
-    // accesses to the destination range.
-    void copy_from_host(const void* source, std::size_t count, std::size_t byte_offset = 0);
-    void copy_to_host(void* destination, std::size_t count, std::size_t byte_offset = 0) const;
-
-    // Raw access is intentional: Tensor and Weight are non-owning views.
-    void* p           = nullptr;
-    std::size_t bytes = 0;
-
-private:
-    void require_range(std::size_t byte_offset, std::size_t count, const char* operation) const;
-};
-
-namespace core {
-// The WDDM evictable budget (Windows builds, --wddm-evictable-budget): every owning DeviceArena
-// commits its pages when it is created, so WDDM makes room for them at startup rather than at the
-// first launch that touches them. Other builds refuse to enable it.
-void set_wddm_evictable_budget(bool enabled);
-[[nodiscard]] bool wddm_evictable_budget() noexcept;
-} // namespace core
-
 class DeviceArena {
 public:
     class Scope {
@@ -138,39 +105,6 @@ private:
     // no extra work.
     std::vector<RankBacking> ranks_;
     std::size_t active_rank_ = 0;
-};
-
-class PinnedHostBuffer {
-public:
-    explicit PinnedHostBuffer(std::size_t size_bytes);
-    ~PinnedHostBuffer();
-
-    PinnedHostBuffer(const PinnedHostBuffer&)            = delete;
-    PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
-    PinnedHostBuffer(PinnedHostBuffer&& other) noexcept;
-    PinnedHostBuffer& operator=(PinnedHostBuffer&& other) noexcept;
-
-    void* data() const noexcept;
-    std::size_t size() const noexcept;
-
-private:
-    void* data_       = nullptr;
-    std::size_t size_ = 0;
-};
-
-// Registers an existing host allocation without moving its bytes. The allocation must outlive
-// the registration and every queued transfer; portable registration serves every device rank.
-// `mapped` also maps it into the device address space, for kernels that read it in place
-// (cudaHostGetDevicePointer gives the address they use).
-class HostMemoryRegistration {
-public:
-    HostMemoryRegistration(void* data, std::size_t bytes, bool mapped = false);
-    ~HostMemoryRegistration();
-    HostMemoryRegistration(const HostMemoryRegistration&) = delete;
-    HostMemoryRegistration& operator=(const HostMemoryRegistration&) = delete;
-
-private:
-    void* data_ = nullptr;
 };
 
 using WorkspaceArena = DeviceArena;

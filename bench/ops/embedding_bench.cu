@@ -3,6 +3,8 @@
 #include "ninfer/ops/embedding.h"
 
 #include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_bf16.h>

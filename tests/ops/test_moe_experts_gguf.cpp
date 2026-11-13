@@ -21,6 +21,8 @@
 // shared expert's width each combine close to it and within the oracle's bounds.
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/moe_experts.h"

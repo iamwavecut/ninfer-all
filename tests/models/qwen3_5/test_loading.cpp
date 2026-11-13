@@ -1,6 +1,7 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
 #include "artifact/formats.h"
+#include "core/qtype.h"
 #include "models/qwen3_5/load.h"
 
 #include <algorithm>

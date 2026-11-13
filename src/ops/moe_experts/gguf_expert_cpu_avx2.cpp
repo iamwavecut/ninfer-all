@@ -1,5 +1,6 @@
 #include "ops/moe_experts/gguf_expert_cpu.h"
 
+#include "core/qtype.h"
 #include "ops/common/silu.h"
 #include "ops/moe_experts/gguf_cpu_tables.h"
 

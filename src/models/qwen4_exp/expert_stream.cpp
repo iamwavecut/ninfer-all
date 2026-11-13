@@ -1,9 +1,11 @@
 #include "models/qwen4_exp/expert_stream.h"
 
+#include "core/device_buffer.h"
 #include "core/device_wait.h"
 #include "core/expert_direct.h"
 #include "core/expert_mirror.h"
 #include "core/file_read_error.h"
+#include "core/pinned_memory.h"
 #include "models/qwen4_exp/read_pool.h"
 
 #include <algorithm>

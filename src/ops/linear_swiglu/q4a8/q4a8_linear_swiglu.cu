@@ -1,6 +1,7 @@
 #include "ops/linear_swiglu/q4a8/q4a8_linear_swiglu.h"
 
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "ops/common/mma.cuh"
 
 #include <cuda_bf16.h>

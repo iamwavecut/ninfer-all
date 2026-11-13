@@ -1,3 +1,4 @@
+#include "core/device_buffer.h"
 #include "core/expert_parallel.h"
 
 #include <stdexcept>

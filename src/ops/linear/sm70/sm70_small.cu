@@ -1,9 +1,11 @@
 #include "ops/linear/sm70/sm70_small.h"
 
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "ops/common/math.cuh"
 #include "ops/linear/sm70/sm70_dequantize.h"
 #include "ops/linear/sm70/sm70_epilogue.cuh"
+#include "ops/linear/sm70/sm70_bf16_f16.cuh"
 #include "ops/linear/sm70/sm70_gemm.h"
 #include "ops/linear/sm70/sm70_small.cuh"
 

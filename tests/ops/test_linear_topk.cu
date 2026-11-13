@@ -1,7 +1,9 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear_topk.h"
 
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 

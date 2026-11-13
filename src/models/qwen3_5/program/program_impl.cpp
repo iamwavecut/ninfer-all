@@ -11,6 +11,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include "core/evictable_kv_pool.h"
 #include "core/host_kv_clamp.h"
+#include "core/pinned_memory.h"
 #include "core/startup.h"
 #include "core/device.h"
 #include <cuda_runtime.h>

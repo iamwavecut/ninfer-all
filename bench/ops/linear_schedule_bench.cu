@@ -21,6 +21,8 @@
 
 #include "ninfer/ops/linear.h"
 
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q4/q4_ksplit_launch.cuh"

@@ -1,4 +1,5 @@
 // Complete CPU SwiGLU against FP64 from independently decoded physical weight bytes.
+#include "core/qtype.h"
 #include "ninfer/ops/moe_expert_cpu.h"
 
 #include <algorithm>

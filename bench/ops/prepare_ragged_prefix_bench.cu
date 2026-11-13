@@ -1,6 +1,7 @@
 // Measures one public prepare_ragged_prefix call, including values, positions and counts.
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>

@@ -9,9 +9,10 @@
 // to the whole call's 2^-32 fixed-point sum bit for bit; a matrix call's whole sum is
 // moe_weighted_rows of its rows, held against the same sum taken on the host.
 
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/expert_delivery.h"
+#include "core/pinned_memory.h"
 #include "ops/common/fixed_point.cuh"
 #include "ops/linear/gguf/ggml_bridge.h"
 

@@ -1,3 +1,4 @@
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/attn_input_proj.h"

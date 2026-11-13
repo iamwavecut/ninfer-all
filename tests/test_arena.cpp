@@ -1,5 +1,7 @@
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
+#include "core/pinned_memory.h"
 #include "cuda_availability.h"
 
 #include <cuda_runtime.h>

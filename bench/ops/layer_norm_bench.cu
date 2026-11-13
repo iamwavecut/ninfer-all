@@ -1,3 +1,4 @@
+#include "core/device_buffer.h"
 #include "ninfer/ops/layer_norm.h"
 #include "ninfer_bench_common.h"
 

@@ -16,6 +16,7 @@
 // stream while the block before it computes; the patch projection and the aligner stay resident.
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
 #include "models/deepseek_v41/model.h"
 

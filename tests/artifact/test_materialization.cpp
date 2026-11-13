@@ -4,7 +4,9 @@
 #include "artifact/selection.h"
 #include "artifact/views.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/evictable_weight_pool.h"
+#include "core/qtype.h"
 #include "cuda_availability.h"
 
 #include <cuda_runtime.h>

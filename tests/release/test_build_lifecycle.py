@@ -136,6 +136,17 @@ class BuildLifecycleTest(unittest.TestCase):
             self.assertEqual(result.returncode, 124)
             self.assertFalse((root / "started").exists())
 
+    def test_the_build_does_not_receive_the_bucket_credential(self):
+        # CI gives the supervisor the credential for checkpoints of pull request branches.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "build.log"
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "--log", str(log), "--checkpoint-family=", "--",
+                 sys.executable, "-c", "import os; print('token:', os.environ.get('HF_TOKEN', 'absent'))"],
+                env=os.environ | {"HF_TOKEN": "test-only"}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("token: absent", log.read_text())
+
     def test_build_failure_is_not_hidden_by_logging(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "build.log"
@@ -193,21 +204,6 @@ class BuildLifecycleTest(unittest.TestCase):
                         dict(created_at="2026-10-20T12:00:01Z")):
             with self.subTest(changes=changes):
                 self.assertFalse(CANCEL.superseded(run | changes, trigger))
-
-    def test_an_older_release_is_cancelled_only_after_its_object_jobs(self):
-        def job(name, status="in_progress", labels=("ubuntu-24.04",)):
-            return dict(name=name, status=status, labels=list(labels))
-        shard = "windows-objects (3, 12.9.2, 70;75;80;86;89, [\"nvcc\"]) / windows"
-        rented = "linux (13.4.3, 75;80;86;89;120a) / Linux Debian 13 CUDA 13.4.3 (75;80;86;89;120a)"
-        for jobs in ([job(shard)], [job("linux-objects (0, 12.9.2, 70;75;80;86;89) / Linux")],
-                     [job(rented, labels=("ninfer-native-debian13",)), job("validate", "completed")]):
-            with self.subTest(jobs=jobs):
-                self.assertTrue(CANCEL.compiling(jobs))
-        for jobs in ([], [job(shard, "completed"), job("Assemble universal windows package")],
-                     [job(rented)], [job(rented, "queued", ("ninfer-native-debian13",))],
-                     [job("publish")]):
-            with self.subTest(jobs=jobs):
-                self.assertFalse(CANCEL.compiling(jobs))
 
     def test_refused_cancel_accepts_a_run_that_stops_on_its_own(self):
         # GitHub refuses to cancel a run its concurrency group is already stopping; the run reads

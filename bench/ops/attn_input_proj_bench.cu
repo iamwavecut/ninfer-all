@@ -4,7 +4,9 @@
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 
+#include "core/device_buffer.h"
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "direct_bf16_weight.cuh"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"

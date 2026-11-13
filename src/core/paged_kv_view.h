@@ -3,14 +3,13 @@
 // The non-owning page-table views that the attention and cache kernels read; the pools that own the
 // pages are in core/paged_kv_cache.h, which includes this header.
 
+#include "core/paged_kv_page.h"
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
 
 #include <cstdint>
 
 namespace ninfer {
-
-inline constexpr std::int32_t kPagedKVPageSize = 64;
 
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {

@@ -2,6 +2,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
+#include "core/device_buffer.h"
 #include <algorithm>
 #include "ops/op_tester.h"
 

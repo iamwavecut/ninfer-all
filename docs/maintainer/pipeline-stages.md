@@ -689,7 +689,7 @@ on the hosts measured below it is slower than dividing by heads.
   normalized FP32 output and its log-sum-exp, `-inf` where the rank holds none of the column's keys:
   257 floats per head and column (`causal_attention_partial_elements`). Decode, verification and a
   short prefill take the small-T routes, where a split over another rank's pages is empty. A prompt
-  chunk of one sequence takes the m8n8k4 prompt kernel written for sm_70 (`prompt_sm70.cu`; the
+  chunk of one sequence takes the m8n8k4 prompt kernel written for sm_70 (`sm70/prompt.cu`; the
   route emits m8n8k4 on every architecture), which skips the 32-key tiles the rank does not hold.
 - **The merge.** The partial goes into the mixer exchange's slot
   (`TensorParallelExchange::publish_whole`). The exchange's next step gathers every rank's partial

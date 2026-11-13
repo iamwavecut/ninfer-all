@@ -18,8 +18,8 @@
 // draft whenever it decodes. A catch-up runs the block's attention and router but not its
 // experts, whose output only a draft reads.
 
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/tensor.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sampling.h"

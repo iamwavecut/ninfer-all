@@ -9,6 +9,7 @@
 // the given stream, on the device that was current at construction (the target's head device).
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
 #include "models/dspine/drafter.h"

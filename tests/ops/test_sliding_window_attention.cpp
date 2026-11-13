@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
+#include "core/device_buffer.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
 

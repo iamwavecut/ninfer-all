@@ -2,6 +2,7 @@
 
 #include "core/device_launch.h"
 #include "core/layout.h"
+#include "core/qtype.h"
 #include "ops/common/mma.cuh"
 
 #include <cuda_bf16.h>

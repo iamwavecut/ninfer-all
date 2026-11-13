@@ -3,6 +3,7 @@
 // The head a DSpine drafter's proposals rank in one pass (ops::linear_topk), shared by the
 // startup's workspace plan and the Program's drafter target.
 
+#include "core/qtype.h"
 #include "core/weight.h"
 #include "models/load_options.h"
 #include "models/qwen3_5/execution/parameters.h"

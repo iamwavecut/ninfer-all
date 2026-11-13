@@ -7,8 +7,8 @@
 // weights read such an auxiliary gets its own copy, so no Use reads another GPU's memory, which a
 // device without peer access cannot address.
 
-#include "core/arena.h"
 #include "core/device.h"
+#include "core/device_buffer.h"
 #include "core/tensor.h"
 #include "core/weight_view.h"
 #include "models/qwen3_5/weights.h"

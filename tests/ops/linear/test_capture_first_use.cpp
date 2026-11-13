@@ -4,6 +4,8 @@
 // the replay must equal an eager call of the same route.
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"

@@ -1,6 +1,7 @@
 #include "artifact/formats.h"
 
 #include "artifact/schema.h"
+#include "core/qtype.h"
 
 #include <array>
 
