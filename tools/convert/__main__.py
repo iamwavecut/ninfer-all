@@ -157,9 +157,8 @@ def main(argv=None):
         default=[],
         metavar="NAME=PATH",
         help="named source such as quantized, dflash, dflash2, or mtp (replaces the base MTP head); "
-        "for Qwen3.8-Flash-Next pack=FOLDER, an Edge0 release folder, whose skeleton, n-gram table, "
-        "MTP block, tokenizer and chat template are the defaults of gguf, ngram, mtp and the two "
-        "resources",
+        "for Qwen3.8-Flash-Next pack=FOLDER, an Edge0 release folder, whose skeleton, n-gram table "
+        "and MTP block are the defaults of gguf, ngram and mtp",
     )
     parser.add_argument(
         "--components",
@@ -345,8 +344,7 @@ def main(argv=None):
             pack = opened["pack"] = stack.enter_context(Edge0Pack(paths["pack"]))
             paths.setdefault("gguf", pack.skeleton)
             paths.setdefault("ngram", pack.table)
-            for role, path in pack.resources().items():
-                overrides.setdefault(role, path)
+            pack.check_tokenizer(overrides.get("tokenizer.json", Path(args.model) / "tokenizer.json"))
             base.config = with_latent_moe(base.config, pack)
         sources = SourceInputs(base, paths, stack, block_sources, opened)
         if args.components is None:

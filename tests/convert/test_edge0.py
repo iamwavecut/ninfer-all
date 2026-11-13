@@ -94,6 +94,10 @@ def _write_pack(root: Path, generator, *, nvfp4: bool) -> dict:
         tails = np.zeros((LAYERS, EXPERTS, 4), dtype="<f4")
         tails[..., :3] = scales
         experts[..., -16:] = tails.view(np.uint8).reshape(LAYERS, EXPERTS, 16)
+        # Scale bytes are unsigned E4M3: bit 7 clear.
+        blocks = experts[..., :-16].reshape(LAYERS, EXPERTS, -1, 36)
+        blocks[..., :4] &= 0x7F
+        experts[..., :-16] = blocks.reshape(LAYERS, EXPERTS, -1)
     (root / "experts.bin").write_bytes(experts.tobytes())
     labels = generator.integers(0, 8, size=(LAYERS, EXPERTS), dtype="<i4")
     (root / "labels.bin").write_bytes(labels.tobytes())
@@ -184,6 +188,62 @@ def test_a_tail_must_hold_three_positive_multipliers(tmp_path):
         with pytest.raises(ValueError, match="positive finite multipliers and a zero"):
             pack.expert_scales(0)
         assert np.array_equal(pack.expert_scales(1), written["scales"][1])
+
+
+def test_a_header_may_describe_the_pack_formats(tmp_path):
+    _write_pack(tmp_path / "pack", np.random.default_rng(14), nvfp4=False)
+    index = tmp_path / "pack" / "native_experts.txt"
+    lines = index.read_text().splitlines()
+    lines[0] = (f"# strata native experts v6: latent A-only, Q3_K gu + shared colscale "
+                f"(expert_embd {WIDTH}, expert_ff {MIDDLE})")
+    index.write_text("\n".join(lines) + "\n")
+    with edge0.Edge0Pack(tmp_path / "pack", hidden=HIDDEN) as pack:
+        assert (pack.width, pack.middle) == (WIDTH, MIDDLE)
+
+
+def _write_tokenizers(root: Path, base: Path) -> None:
+    # The release's GGUF export (vocabulary padded past the added tokens) and the HF tokenizer.
+    (root / "tokenizer").mkdir()
+    vocab = {"a": 0, "b": 1, "ab": 2, "#": 5, "##": 6, "<|im_end|>": 3, "[PAD4]": 4}
+    (root / "tokenizer" / "vocab.json").write_text(json.dumps(vocab))
+    (root / "tokenizer" / "merges.txt").write_text("#version: 0.2\na b\n# #\n")
+    (root / "tokenizer" / "tokenizer.json").write_text(json.dumps({"model": "gpt2"}))
+    base.write_text(json.dumps({
+        "model": {"vocab": {"a": 0, "b": 1, "ab": 2, "#": 5, "##": 6},
+                  "merges": [["a", "b"], ["#", "#"]]},
+        "added_tokens": [{"id": 3, "content": "<|im_end|>"}]}))
+
+
+def test_the_release_tokenizer_must_be_the_base_models(tmp_path):
+    _write_pack(tmp_path / "pack", np.random.default_rng(15), nvfp4=False)
+    base = tmp_path / "tokenizer.json"
+    _write_tokenizers(tmp_path / "pack", base)
+    with edge0.Edge0Pack(tmp_path / "pack", hidden=HIDDEN) as pack:
+        pack.check_tokenizer(base)
+        (tmp_path / "pack" / "tokenizer" / "merges.txt").write_text("#version: 0.2\na b\n")
+        with pytest.raises(ValueError, match="merges equal: False"):
+            pack.check_tokenizer(base)
+        (tmp_path / "pack" / "tokenizer" / "merges.txt").write_text("a b\n# #\n")
+        pack.check_tokenizer(base)
+        (tmp_path / "pack" / "tokenizer" / "vocab.json").write_text(json.dumps({"a": 0, "b": 2}))
+        with pytest.raises(ValueError, match="5 tokens differ"):
+            pack.check_tokenizer(base)
+
+
+def test_an_nvfp4_scale_byte_with_bit_7_is_refused(tmp_path):
+    written = _write_pack(tmp_path / "pack", np.random.default_rng(12), nvfp4=True)
+    experts = written["experts"].copy()
+    row = written["row"]
+    # Expert 2 of layer 1: the second scale byte of the down projection's last row.
+    experts[1, 2, (2 * MIDDLE + WIDTH - 1) * row + 1] |= 0x80
+    (tmp_path / "pack" / "experts.bin").write_bytes(experts.tobytes())
+    with edge0.Edge0Pack(tmp_path / "pack", hidden=HIDDEN) as pack:
+        with pytest.raises(ValueError, match="bit 7"):
+            pack.expert_rows(1, 2, "down", WIDTH - 2, WIDTH)
+        assert np.array_equal(pack.expert_rows(1, 2, "down", 0, WIDTH - 1),
+                              experts[1, 2, 2 * MIDDLE * row:(2 * MIDDLE + WIDTH - 1) * row]
+                              .reshape(WIDTH - 1, row))
+        pack.expert_rows(1, 2, "gate", 0, MIDDLE)
 
 
 def test_latent_sources_name_every_parameter_of_a_layer(tmp_path):

@@ -62,8 +62,20 @@ struct GdnWeights {
     WeightId convolution, norm, output;
 };
 
+// A latent MoE's own operands (TextConfig::latent_moe): the groups' encoders [groups * width,
+// hidden] and decoders [groups * hidden, width] as one parameter each, the experts' group labels,
+// and the optional multipliers. Under tensor parallelism a rank's encoder and decoder hold the
+// layer's groups [group_begin, group_end), else every group.
+struct LatentWeights {
+    WeightId encode, decode, labels;
+    std::optional<WeightId> expert_scales, column_scale;
+    std::uint32_t group_begin = 0, group_end = 0;
+};
+
 struct MoeWeights {
     WeightId router, shared_score;
+    // Edge0's latent experts: then each expert's gate and up are [640, width], its down [width, 640].
+    std::optional<LatentWeights> latent;
     // One per expert; empty when the experts stay in the files, which `located` then describes.
     std::vector<WeightId> gate, up, down;
     std::vector<ExpertLocation> located_gate, located_up, located_down;
@@ -109,6 +121,9 @@ struct TextWeights {
 struct TensorShare {
     std::uint32_t key_head_begin = 0, key_head_end = 0;
     std::uint32_t kv_head_begin = 0, kv_head_end = 0;
+    // A latent MoE's ranks hold whole projection groups, chosen in each layer by its labels
+    // (LatentWeights::group_begin); expert_begin and expert_end then count the rank's share of
+    // the experts, which only the shared expert's runs follow.
     std::uint32_t expert_begin = 0, expert_end = 0;
     std::uint32_t shared_begin = 0, shared_end = 0;
 };

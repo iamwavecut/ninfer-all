@@ -71,12 +71,13 @@ GROUPS = 8
 GGML_Q4_0, GGML_Q8_0, GGML_NVFP4, GGML_Q2_0 = 2, 8, 40, 42
 NVFP4_TAIL = 16
 MTP_EXPERTS = 512
+# The pack's description of its formats (", Q3_K gu + shared colscale" in the Q3_K builds) is free
+# text; the layer lines carry the formats.
 _HEADER = re.compile(
-    r"# strata native experts v6: latent A-only \(expert_embd ([0-9]+), expert_ff ([0-9]+)\)"
+    r"# strata native experts v6: latent A-only(?:, [^()]*)? "
+    r"\(expert_embd ([0-9]+), expert_ff ([0-9]+)\)"
 )
 _DENSE_FILES = {"q8": ("latent_dense_q8.bin", GGML_Q8_0), "q4": ("latent_dense_q4.bin", GGML_Q4_0)}
-# The frontend files of the release, which replace the base checkpoint's.
-_RESOURCES = ("tokenizer.json", "chat_template.jinja")
 
 
 def _row_bytes(type_id: int, columns: int) -> int:
@@ -204,11 +205,31 @@ class Edge0Pack:
     def table(self) -> Path:
         return self.path / "ple-fp8.gguf"
 
-    def resources(self) -> dict[str, Path]:
-        """The release's tokenizer and chat template, by resource role."""
+    def check_tokenizer(self, tokenizer_json: Path) -> None:
+        """Refuse a release whose vocabulary or merges differ from the base model's tokenizer.
 
-        found = {role: self.path / "tokenizer" / role for role in _RESOURCES}
-        return {role: path for role, path in found.items() if path.is_file()}
+        The release's `tokenizer/` holds the GGUF's vocabulary (`vocab.json`, every id up to the
+        padded vocabulary), its merges and a llama.cpp form of the chat template without the
+        `generation` markers; its `tokenizer.json` is a summary, not a Hugging Face tokenizer. The
+        base model's frontend files therefore stay, once its ids and merges are the release's."""
+
+        folder = self.path / "tokenizer"
+        if not (folder / "vocab.json").is_file() or not (folder / "merges.txt").is_file():
+            return
+        base = json.loads(Path(tokenizer_json).read_text(encoding="utf-8"))
+        vocab = json.loads((folder / "vocab.json").read_text(encoding="utf-8"))
+        expected = dict(base["model"]["vocab"])
+        expected.update({token["content"]: token["id"] for token in base.get("added_tokens", ())})
+        differ = [token for token, index in expected.items() if vocab.get(token) != index]
+        merges = [line for line in (folder / "merges.txt").read_text(encoding="utf-8").splitlines()
+                  if line]
+        # A "#version" header; other lines that start with "#" are merges ("# #").
+        if merges and merges[0].startswith("#version"):
+            merges = merges[1:]
+        base_merges = [m if isinstance(m, str) else " ".join(m) for m in base["model"]["merges"]]
+        if differ or merges != base_merges:
+            raise ValueError(f"{folder}: the release's tokenizer is not the base model's "
+                             f"({len(differ)} tokens differ, merges equal: {merges == base_merges})")
 
     def latent_config(self) -> dict:
         return {"width": self.width, "groups": GROUPS, "expert_scales": self.tail != 0,
@@ -231,6 +252,12 @@ class Edge0Pack:
             raise ValueError(f"expert rows [{first},{last}) are outside {rows}")
         base = (layer * self.experts + expert) * self.record + offset
         raw = self._experts.read(base + first * row_bytes, (last - first) * row_bytes)
+        type_id = self.down_type if role == "down" else self.gate_up_type
+        # ggml's CPU decoder reads bits 0-6 of an NVFP4 scale byte and its CUDA decoder all eight
+        # (a signed E4M3 conversion): a byte with bit 7 set has no single value.
+        if type_id == GGML_NVFP4 and (raw.reshape(-1, 36)[:, :4] & 0x80).any():
+            raise ValueError(f"{self.path}: layer {layer} expert {expert} {role} has an NVFP4 "
+                             "scale byte with bit 7 set")
         return raw.reshape(last - first, row_bytes)
 
     def expert_scales(self, layer: int) -> np.ndarray:
@@ -643,8 +670,8 @@ def edge0_pack(model, recipe, sources):
     """An Edge0 release folder (`--source pack=FOLDER`) with the projections its launcher selects
     (Q8_0 for Edge0-145B, Q4_0 for Edge0-120B-NVFP4). The skeleton, the MTP block and the n-gram
     table come from the folder unless `--source gguf`, `--source mtp` or `--source ngram` names
-    another file; `--model` supplies the base Qwen3.8-Flash-Next config and frontend files, and
-    the folder's tokenizer and chat template replace the base model's."""
+    another file; `--model` supplies the base Qwen3.8-Flash-Next config and frontend files, which
+    must carry the folder's vocabulary and merges."""
 
     _configure(model, recipe, sources, None)
 

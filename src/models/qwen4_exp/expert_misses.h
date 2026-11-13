@@ -64,6 +64,13 @@ struct MissLayer {
     // Host experts whose layer the cache handed over: a missing expert the GPU copies anyway goes
     // straight into a slot when the cache's tier admits it (ExpertCache::admit), and stays.
     bool admit = false;
+    // Edge0's latent experts (ops::moe_latent_gguf), `latent_width` > 0: the CPU reads each pair's
+    // quantized latent input (the call's GgufLatentStage::inputs, given to begin() as `m`) instead
+    // of its token's hidden column, multiplies gate and up by the expert's `latent_scales` (FP32
+    // [experts][3] gate, up, down; empty: ones), and writes down products `latent_width` long,
+    // before s_down (ops::moe_latent_gguf_add_products).
+    std::int32_t latent_width = 0;
+    std::vector<float> latent_scales;
 };
 
 // The widest narrow call: ops::moe_experts_gguf takes the vector products up to this width; past
@@ -129,8 +136,9 @@ public:
         std::int32_t max_products    = 0;
     };
     // Enqueued on `stream` (capturable when narrow): splits `ids` of `tokens` tokens and, for a
-    // narrow call, posts the missing experts. `m` is the layer's BF16 input, copied to the host
-    // when the CPU takes a share. A wide call's missing_banks are device-resident.
+    // narrow call, posts the missing experts. `m` is the layer's BF16 input [2560, tokens], or a
+    // latent layer's quantized pair inputs (U8, ops::moe_latent_gguf_input_bytes), copied to the
+    // host when the CPU takes a share. A wide call's missing_banks are device-resident.
     [[nodiscard]] Call begin(std::size_t layer, const Tensor& ids, const Tensor& m,
                              std::int32_t tokens, const ops::GgufMoeWeights& banks,
                              cudaStream_t stream);
