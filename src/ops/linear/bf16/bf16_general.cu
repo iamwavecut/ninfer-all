@@ -74,6 +74,28 @@ void launch_gemv_together(const Tensor& x, const GemvProducts<__nv_bfloat16>& pr
     CUDA_CHECK(cudaGetLastError());
 }
 
+// The GEMV form at a runtime width 1..kGemvMaxTokens, each width its own instantiation.
+template <class Out, int T = 1>
+void launch_gemv_width(std::int32_t tokens, const Tensor& x, const Weight& weight, Tensor& out,
+                       cudaStream_t stream) {
+    if constexpr (T < kGemvMaxTokens) {
+        if (tokens != T) { return launch_gemv_width<Out, T + 1>(tokens, x, weight, out, stream); }
+    }
+    launch_gemv<T, Out>(x, weight, out, stream);
+}
+
+template <int T = 1>
+void launch_gemv_together_width(std::int32_t tokens, const Tensor& x,
+                                const GemvProducts<__nv_bfloat16>& products, std::int32_t blocks,
+                                cudaStream_t stream) {
+    if constexpr (T < kGemvMaxTokens) {
+        if (tokens != T) {
+            return launch_gemv_together_width<T + 1>(tokens, x, products, blocks, stream);
+        }
+    }
+    launch_gemv_together<T>(x, products, blocks, stream);
+}
+
 bool aligned16(const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0; }
 
 // Runtime-shape bf16 GEMM used for every linear projection the specialised bf16 kernels do not
@@ -86,24 +108,7 @@ void bf16_general_gemm_as(const Tensor& x, const Weight& weight, Tensor& out, cu
     const std::int32_t T = x.ne[1];
     if (T >= kCublasMinTokens) { return bf16_cublas_gemm(x, weight, out, stream); }
     if (T <= kGemvMaxTokens && K % 8 == 0 && aligned16(x.data) && aligned16(weight.qdata)) {
-        switch (T) {
-        case 1:
-            return launch_gemv<1, Out>(x, weight, out, stream);
-        case 2:
-            return launch_gemv<2, Out>(x, weight, out, stream);
-        case 3:
-            return launch_gemv<3, Out>(x, weight, out, stream);
-        case 4:
-            return launch_gemv<4, Out>(x, weight, out, stream);
-        case 5:
-            return launch_gemv<5, Out>(x, weight, out, stream);
-        case 6:
-            return launch_gemv<6, Out>(x, weight, out, stream);
-        case 7:
-            return launch_gemv<7, Out>(x, weight, out, stream);
-        default:
-            return launch_gemv<8, Out>(x, weight, out, stream);
-        }
+        return launch_gemv_width<Out>(T, x, weight, out, stream);
     }
     const dim3 grid(static_cast<unsigned>((N + kTileN - 1) / kTileN),
                     static_cast<unsigned>((T + kTileT - 1) / kTileT));
@@ -146,32 +151,7 @@ void bf16_general_vector_together(const Tensor& x, std::span<const Bf16VectorPro
             blocks += (product.weight->n + kGemvWarps - 1) / kGemvWarps;
             ++launch.count;
         }
-        switch (x.ne[1]) {
-        case 1:
-            launch_gemv_together<1>(x, launch, blocks, stream);
-            break;
-        case 2:
-            launch_gemv_together<2>(x, launch, blocks, stream);
-            break;
-        case 3:
-            launch_gemv_together<3>(x, launch, blocks, stream);
-            break;
-        case 4:
-            launch_gemv_together<4>(x, launch, blocks, stream);
-            break;
-        case 5:
-            launch_gemv_together<5>(x, launch, blocks, stream);
-            break;
-        case 6:
-            launch_gemv_together<6>(x, launch, blocks, stream);
-            break;
-        case 7:
-            launch_gemv_together<7>(x, launch, blocks, stream);
-            break;
-        default:
-            launch_gemv_together<8>(x, launch, blocks, stream);
-            break;
-        }
+        launch_gemv_together_width(x.ne[1], x, launch, blocks, stream);
     }
 }
 
