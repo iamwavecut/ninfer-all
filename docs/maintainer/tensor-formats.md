@@ -67,6 +67,8 @@ decoding or requantizing:
 | `gguf_iq2_s` | 22 | 256 | 82 | 2.5625 |
 | `gguf_iq4_xs` | 23 | 256 | 136 | 4.25 |
 | `gguf_iq1_m` | 29 | 256 | 56 | 1.75 |
+| `gguf_mxfp4` | 39 | 32 | 17 | 4.25 |
+| `gguf_nvfp4` | 40 | 64 | 36 | 4.50 |
 
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and

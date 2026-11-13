@@ -33,6 +33,7 @@ enum class GgmlType : int {
     IQ4_XS  = 23,
     IQ1_M   = 29,
     MXFP4   = 39,
+    NVFP4   = 40,
     Q2_0    = 42,
 };
 
@@ -62,6 +63,11 @@ inline constexpr int kMaxVectorColumns = 8;
 // `input_columns` (optional, [k]) makes element c of each column x[input_columns[c]].
 void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
                                 const std::int32_t* input_columns, void* out, cudaStream_t stream);
+// The same activation from FP32 columns: output column c holds x column source[c] (zeros for a
+// negative entry; column c without `source`), each value first multiplied by scale[i] when `scale`
+// ([k]) is given, quantized as the BF16 form quantizes its values.
+void quantize_vector_activation_f32(const float* x, int k, int columns, const std::int32_t* source,
+                                    const float* scale, void* out, cudaStream_t stream);
 
 enum class Epilogue : int {
     Store,       // out = y
@@ -184,6 +190,9 @@ struct MoeRouting {
 // changes no value.
 [[nodiscard]] MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts,
                                          void* workspace, cudaStream_t stream);
+// The routing an earlier moe_sort_routes of the same pairs and experts left in `workspace`, without
+// sorting again.
+[[nodiscard]] MoeRouting moe_sorted_routes(void* workspace, int pairs, int experts);
 // The same grouping divided by how many pairs each expert has, for a call whose few-pair experts
 // take the vector products and the others the matrix kernel: `all` is moe_sort_routes's routing,
 // `vector` lists as active only the experts with 1 to `vector_pairs` pairs, and `matrix` lists the
@@ -383,6 +392,13 @@ void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& 
 void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k,
                                     const MoeRouting& routing, int pairs, int column_group,
                                     void* out, cudaStream_t stream);
+// The same activation from FP32 columns: column c (routing order) holds x column
+// source[routing.sorted[c]] (zeros for a negative entry; the pair's own column without `source`),
+// each value first multiplied by scale[i] when `scale` ([k]) is given. k is a multiple of 32.
+void quantize_moe_matrix_activation_f32(GgmlType type, const float* x, int k,
+                                        const MoeRouting& routing, int pairs,
+                                        const std::int32_t* source, const float* scale, void* out,
+                                        cudaStream_t stream);
 
 // out[i, :] = dequantize(W[row_ids ? row_ids[i] : i, :]) as BF16, rows `out_row_stride` apart.
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,

@@ -342,6 +342,59 @@ y       += sigmoid(shared_expert_gate @ m) * down_s( silu(gate_s @ m) * (up_s @ 
 The router GEMV is the selection-sensitive step: keep its weight BF16 (or better) and its activation unrounded; Strata
 measured that a BF16-rounded activation flips top-10 selections (logit error 8.1e-3).
 
+### 1.7a Edge0's latent MoE (`text_config.latent_moe`)
+
+Edge0-145B and Edge0-120B ([the guide](../edge0.md)) keep this skeleton, router, shared expert and
+MTP block, and replace each text layer's routed experts by latent ones: every expert belongs to one
+of `G` = 8 groups (`labels[e]`), reads its group's encoding of `m` in a latent width `L` (1792 for
+145B, 1280 for 120B), and writes into it; the group's decoder brings the sum back to `H`. The text
+config's optional `latent_moe` object (`width`, `groups`, and whether the artifact stores
+`expert_scales` and `column_scale`) selects it; `config.cpp` accepts widths in whole 256-value steps
+up to 8192 and one to sixteen groups. The arithmetic `ops::moe_latent_gguf` computes, with the q8_1
+quantization points the release's engine (`edge0-strata`) uses:
+```
+xl[t, g] = c * (D_g . q8_1(m[t]))                        D_g [L, H], c FP32 [L] (Q3_K builds) or ones
+a_p      = q8_1(xl[t, g_e])                              pair p = (t, e, w), g_e = labels[e]
+h_p      = BF16(silu(s_gate[e] * (gate_e . a_p)) * (s_up[e] * (up_e . a_p)))     gate_e, up_e [640, L]
+S[t, g]  = sum of w * (s_down[e] * (down_e . q8_1(h_p))) over token t's pairs with g_e = g    down_e [L, 640]
+y[t]     = sum over the groups g token t routes to of U_g . q8_1(S[t, g])  +  shared * e_shared(m[t])
+```
+`s_gate`, `s_up`, `s_down` are FP32 per-expert multipliers (the NVFP4 builds' record tails, ones in
+the Q3_K builds); `c` is the reciprocal of the Q3_K builds' stored column scale, one FP32 division
+each as the reference computes it. Each multiplier rounds once onto its FP32 product. S and y are
+2^-32 fixed-point sums, so the order and placement of the pairs (device, host, disk, CPU share,
+tensor-parallel parts) never change the bits.
+
+One deviation from `edge0-strata`: it applies `U` to each pair's `q8_1(s_down * down_e . q8_1(h_p))`
+before the router-weighted sum, ten `U` products per token; NInfer applies `U` once per routed group
+to the weighted group sum, at most eight, with one quantization on the sum. The two agree in exact
+arithmetic and differ by the rounding of that quantization point.
+
+| Parameter | Shape | Stored |
+|---|---|---|
+| `moe/latent/encode` | `[G*L, H]` | Q8_0 (145B, 120B-q3k) or Q4_0 (120B-NVFP4), group `g` = rows `g*L..` |
+| `moe/latent/decode` | `[G*H, L]` | as the encoder, group `g` = rows `g*H..` |
+| `moe/latent/labels` | `[E]` INT32 | the group of each expert |
+| `moe/latent/expert_scales` | `[E, 3]` FP32 | NVFP4 builds: `s_gate`, `s_up`, `s_down` |
+| `moe/latent/column_scale` | `[L]` FP32 | Q3_K builds: `c` |
+| `moe/experts/{e}/gate`, `up` | `[640, L]` | NVFP4 (`gguf_nvfp4`, ggml type 40) or Q3_K |
+| `moe/experts/{e}/down` | `[L, 640]` | NVFP4 or IQ4_NL |
+
+The Op runs `D` and `U` as banks of `G` experts through the GGUF bridge's MoE products: a token's
+column `(t, g)` exists only when one of its routed experts belongs to group `g`, so an unrouted group
+costs no work. The routed experts take the vector or matrix kernel as `moe_experts_gguf` chooses
+(the choice depends on the call's width and routing only). A single call past 2048 tokens runs in
+equal slices wider than 64 tokens, which take the same kernels, so the slices store the unsliced
+call's bits in one slice's workspace. The staged form (begin, adds, products, finish) serves host
+and disk experts: the cached pairs run while the missing experts are copied, and CPU threads
+compute their share of the missing pairs from the GPU's quantized latent inputs (`GgufLatentStage::
+inputs`, copied to the host with the split), bit for bit as the vector kernel would. Under tensor
+parallelism each rank holds a run of whole groups with their `D_g`, `U_g` and labelled experts:
+the loader reads each layer's labels before it binds and cuts the groups where the experts before
+the cut come nearest each rank's share of the split (`latent_group_ends`; Edge0's groups hold 8
+to 200 experts). Each rank runs its part into the fixed-point sum (`moe_latent_gguf_part`), so
+the combined routed output equals one device's for any cut.
+
 ### 1.8 Final mixer and head
 
 ```

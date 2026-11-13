@@ -401,12 +401,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "Qwen3.8-Flash-Next: %zu stage(s), prompt chunks of %u tokens, experts in "
-                       "%s memory, n-gram table %s, state %.0f MiB, workspace %.0f MiB, expert "
+                       "%s, n-gram table %s, state %.0f MiB, workspace %.0f MiB, expert "
                        "cache %.0f MiB, CUDA Graphs %.0f MiB",
                        model->stages().stages(), executor.prefill_chunk,
-                       options.expert_residency == ExpertResidency::Host   ? "host"
+                       options.expert_residency == ExpertResidency::Host   ? "host memory"
                        : options.expert_residency == ExpertResidency::Disk ? "the artifact's files"
-                                                                           : "device",
+                                                                           : "device memory",
                        table_place.c_str(),
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
@@ -432,9 +432,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         publish_diagnostic(
             options.diagnostic_observer, DiagnosticLevel::Info,
             "Qwen3.8-Flash-Next: tensor parallelism, by device Gated DeltaNet key "
-            "heads %s, sparse-attention KV heads %s, routed experts %s, shared-expert "
+            "heads %s, sparse-attention KV heads %s, %s %s, shared-expert "
             "middle %s, head rows %s",
-            keys.c_str(), kv.c_str(), experts.c_str(), shared.c_str(), head.c_str());
+            keys.c_str(), kv.c_str(),
+            model->config().latent_moe
+                ? "latent groups cut in each layer nearest the routed experts' shares"
+                : "routed experts",
+            experts.c_str(), shared.c_str(), head.c_str());
     }
     if (const auto memory = instance->executor->memory(); memory.streamed_kv) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,

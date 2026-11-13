@@ -269,3 +269,63 @@ def test_build_model_adds_the_mtp_block(tmp_path):
         mtp.config["text_config"]["hc_lowrank"] += 1
         with pytest.raises(ValueError, match="MTP companion hc_lowrank"):
             build_model(source, components=("text", "mtp"), companions={"mtp": mtp})
+
+
+@pytest.mark.parametrize(
+    "latent, message",
+    [
+        ({"width": 1792, "groups": 8, "expert_scales": True}, "exactly"),
+        ({"width": 1790, "groups": 8, "expert_scales": True, "column_scale": False}, "32-value"),
+        ({"width": 1792, "groups": 0, "expert_scales": True, "column_scale": False}, "groups"),
+        ({"width": 1792, "groups": 8, "expert_scales": 1, "column_scale": False}, "boolean"),
+        ({"width": 1792, "groups": 513, "expert_scales": True, "column_scale": False},
+         "exceeds the expert count"),
+    ],
+)
+def test_text_config_refuses_a_malformed_latent_moe(latent, message):
+    source = deepcopy(_checkpoint())
+    source["text_config"]["latent_moe"] = latent
+    with pytest.raises(ValueError, match=message):
+        text_config(source)
+
+
+def test_build_model_declares_a_latent_moe(tmp_path):
+    # Edge0: the router and shared expert stay; the routed experts read and write the latent width,
+    # beside the encoder D, the decoder U, the expert groups and the release's multipliers.
+    from tools.convert.qwen4_exp import build_model
+    from tools.convert.sources.safetensors import SafetensorsSource
+    from safetensors.torch import save_file
+
+    config = _tiny_config()
+    config["text_config"]["latent_moe"] = {"width": 32, "groups": 2, "expert_scales": True,
+                                           "column_scale": True}
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "config.json").write_text(json.dumps(config))
+    save_file({"unused": torch.zeros(1)}, root / "model.safetensors")
+    for name, value in {
+        "tokenizer.json": {"model": {"vocab": {str(i): i for i in range(6)}}},
+        "tokenizer_config.json": {},
+        "generation_config.json": {},
+    }.items():
+        (root / name).write_text(json.dumps(value))
+    (root / "chat_template.jinja").write_text("{{ messages }}")
+    with SafetensorsSource(root) as source:
+        model = build_model(source, components=("text",))
+    assert model.config["latent_moe"]["width"] == 32
+    p = "text/layers/1/moe/"
+    shapes = {name[len(p):]: parameter.shape for name, parameter in model.parameters.items()
+              if name.startswith(p)}
+    assert shapes == {
+        "router": (3, 8), "shared_score": (1, 8),
+        "shared/gate": (4, 8), "shared/up": (4, 8), "shared/down": (8, 4),
+        "latent/encode": (64, 8), "latent/decode": (16, 32), "latent/labels": (3,),
+        "latent/expert_scales": (3, 3), "latent/column_scale": (32,),
+        **{f"experts/{e}/{role}": shape for e in range(3)
+           for role, shape in (("gate", (4, 32)), ("up", (4, 32)), ("down", (32, 4)))},
+    }
+    assert model.parameters[p + "latent/labels"].direct_format == "int32"
+    assert model.parameters[p + "latent/column_scale"].direct_format == "fp32"
+    assert model.parameters[p + "experts/0/gate"].inputs == (p + "latent/input",)
+    with pytest.raises(ValueError, match="no checkpoint source"):
+        model.parameters[p + "latent/encode"].source.rows(0, 1)

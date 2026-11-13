@@ -53,7 +53,7 @@ std::vector<TypeCase> cases() {
         {QType::GGUF_IQ1_M, "iq1_m", {}},      {QType::GGUF_IQ4_NL, "iq4_nl", {0}},
         {QType::GGUF_IQ4_XS, "iq4_xs", {0}},   {QType::GGUF_Q4_0, "q4_0", {0}},
         {QType::GGUF_Q5_0, "q5_0", {0}},       {QType::GGUF_Q2_0, "q2_0", {0}},
-        {QType::GGUF_MXFP4, "mxfp4", {}},
+        {QType::GGUF_MXFP4, "mxfp4", {}},      {QType::GGUF_NVFP4, "nvfp4", {}},
     };
 }
 
@@ -66,15 +66,23 @@ float half_value(const std::uint8_t* p) {
 // An independent host decode of the formats simple enough to state here, each value d * (code -
 // offset): Q4_0 (low nibbles first, then high), Q5_0 (Q4_0 plus bit j of qh as bit 4 of value j)
 // and Q2_0 (two bits per value, low bits first); and MXFP4, the E2M1 value of each nibble (sign,
-// two exponent bits, one mantissa bit; low nibbles first) times 2^(e - 127). Empty for every other
+// two exponent bits, one mantissa bit; low nibbles first) times 2^(e - 127); and NVFP4, the E2M1
+// value of each nibble (value j of sub-block s the low nibble of code byte 8 s + j, j < 8, else the
+// high nibble of code byte 8 s + j - 8) times its sub-block's UE4M3 scale. Empty for every other
 // type.
 std::vector<float> host_decode(QType qtype, const std::vector<std::uint8_t>& bytes) {
     std::vector<float> out;
     const auto block = gguf_block_shape(qtype);
     if (qtype != QType::GGUF_Q4_0 && qtype != QType::GGUF_Q5_0 && qtype != QType::GGUF_Q2_0 &&
-        qtype != QType::GGUF_MXFP4) {
+        qtype != QType::GGUF_MXFP4 && qtype != QType::GGUF_NVFP4) {
         return out;
     }
+    const auto e2m1 = [](int code) {
+        const int exponent = (code >> 1) & 3, mantissa = code & 1;
+        const double magnitude =
+            exponent == 0 ? 0.5 * mantissa : std::ldexp(1.0 + 0.5 * mantissa, exponent - 1);
+        return code & 8 ? -magnitude : magnitude;
+    };
     const std::size_t blocks = bytes.size() / block.bytes;
     out.reserve(blocks * block.elements);
     for (std::size_t i = 0; i < blocks; ++i) {
@@ -82,11 +90,19 @@ std::vector<float> host_decode(QType qtype, const std::vector<std::uint8_t>& byt
         if (qtype == QType::GGUF_MXFP4) {
             const double scale = std::ldexp(1.0, int(b[0]) - 127);
             for (int j = 0; j < block.elements; ++j) {
-                const int code     = j < 16 ? (b[1 + j] & 0xF) : (b[1 + j - 16] >> 4);
-                const int exponent = (code >> 1) & 3, mantissa = code & 1;
-                const double magnitude =
-                    exponent == 0 ? 0.5 * mantissa : std::ldexp(1.0 + 0.5 * mantissa, exponent - 1);
-                out.push_back(float((code & 8 ? -magnitude : magnitude) * scale));
+                const int code = j < 16 ? (b[1 + j] & 0xF) : (b[1 + j - 16] >> 4);
+                out.push_back(float(e2m1(code) * scale));
+            }
+            continue;
+        }
+        if (qtype == QType::GGUF_NVFP4) {
+            for (int j = 0; j < block.elements; ++j) {
+                const int s = j / 16, v = j % 16;
+                const int exponent = (b[s] >> 3) & 15, mantissa = b[s] & 7;
+                const double scale = exponent == 0 ? std::ldexp(double(mantissa), -9)
+                                                   : std::ldexp(1.0 + mantissa / 8.0, exponent - 7);
+                const int byte = b[4 + 8 * s + v % 8];
+                out.push_back(float(e2m1(v < 8 ? byte & 0xF : byte >> 4) * scale));
             }
             continue;
         }
@@ -126,7 +142,8 @@ std::uint16_t half_bits(float value) {
 }
 
 // Random blocks with every binary16 multiplier finite; IQ1_M spreads its multiplier over the top
-// nibbles of its four scale words, and MXFP4's exponent byte takes scales 2^-12 .. 2^-7.
+// nibbles of its four scale words, MXFP4's exponent byte takes scales 2^-12 .. 2^-7 and NVFP4's
+// UE4M3 scale bytes 2^-9 .. 2^-4 (subnormals included).
 std::vector<std::uint8_t> random_blocks(const TypeCase& c, std::int32_t rows, std::int32_t k,
                                         std::mt19937& rng) {
     const auto block = gguf_block_shape(c.qtype);
@@ -149,6 +166,9 @@ std::vector<std::uint8_t> random_blocks(const TypeCase& c, std::int32_t rows, st
             }
         }
         if (c.qtype == QType::GGUF_MXFP4) { base[0] = static_cast<std::uint8_t>(115 + byte(rng) % 6); }
+        if (c.qtype == QType::GGUF_NVFP4) {
+            for (int s = 0; s < 4; ++s) { base[s] = static_cast<std::uint8_t>(1 + byte(rng) % 31); }
+        }
     }
     return bytes;
 }
@@ -522,6 +542,23 @@ int main() {
                               << (schedule.empty() ? "" : " ") << schedule << '\n';
                     failures += f;
                 }
+            }
+        }
+        // The latent widths of Edge0's routed experts: gate and up K = 1792 (145B) or 1280 (120B) in
+        // NVFP4 or Q3_K, down K = 640 in NVFP4 or IQ4_NL.
+        for (const auto& c : cases()) {
+            if (c.qtype != QType::GGUF_NVFP4 && c.qtype != QType::GGUF_Q3_K &&
+                c.qtype != QType::GGUF_IQ4_NL) {
+                continue;
+            }
+            for (const std::int32_t k : {1792, 1280, 640}) {
+                const bool down = k == 640;
+                if ((c.qtype == QType::GGUF_Q3_K && down) || (c.qtype == QType::GGUF_IQ4_NL && !down)) {
+                    continue;
+                }
+                const int f = run_type(c, seed++, k);
+                std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k << '\n';
+                failures += f;
             }
         }
         for (const std::string_view schedule : {"", "async"}) {

@@ -77,8 +77,10 @@ constexpr std::int32_t kTensorPieceColumns = 1024;
 constexpr std::uint32_t kMaxChunk = 4096;
 static_assert((kMaxChunk + kTensorPieceColumns - 1) / kTensorPieceColumns <=
               TensorParallelExchange::kPieces);
-// The family name of Flash-Next's built-in routing profiles (models/expert_profile.h).
+// The family name of Flash-Next's built-in routing profiles (models/expert_profile.h), and of a
+// latent MoE's (Edge0), whose experts route as they were trained for it.
 constexpr std::string_view kExpertProfileFamily = "qwen3.8-flash-next";
+constexpr std::string_view kLatentProfileFamily = "edge0";
 // Zero bytes after every device slot's down matrix (see expert_stream.cpp and moe_experts_gguf).
 constexpr std::uint64_t kSlotTail = 256;
 
@@ -216,7 +218,9 @@ Tensor direct(const Model& model, WeightId id, std::initializer_list<std::int32_
     Tensor tensor    = weight_tensor(view, shape);
     if (tensor.dtype != dtype) {
         throw std::invalid_argument(model.weight(id).name + " must be stored as " +
-                                    (dtype == DType::BF16 ? "bf16" : "fp32"));
+                                    (dtype == DType::BF16  ? "bf16"
+                                     : dtype == DType::I32 ? "int32"
+                                                           : "fp32"));
     }
     return tensor;
 }
@@ -430,6 +434,32 @@ ExpertTable make_located_table(std::span<const ExpertLocation> locations) {
     return out;
 }
 
+// A latent MoE's encoder or decoder: the groups [begin, end) of `groups` as one bank of their equal
+// runs of rows (all of them, or a tensor-parallel rank's), as a table of `groups` entries pointing
+// at the runs' first rows, the other groups' null (never read).
+ExpertTable make_group_table(const Model& model, WeightId id, std::uint32_t groups,
+                             std::uint32_t begin, std::uint32_t end) {
+    const Weight w = native_weight(model.weight(id).view);
+    if (!is_gguf(w.qtype) || begin >= end || end > groups || w.n % (end - begin) != 0) {
+        throw std::invalid_argument(model.weight(id).name +
+                                    ": a latent projection takes a GGUF bank of whole groups");
+    }
+    const auto block = gguf_block_shape(w.qtype);
+    ExpertTable out;
+    out.format    = w.qtype;
+    out.row_bytes = std::int64_t(w.k / block.elements) * block.bytes;
+    out.rows      = static_cast<std::int32_t>(w.n / (end - begin));
+    out.pointers.assign(groups, nullptr);
+    for (std::uint32_t g = begin; g < end; ++g) {
+        out.pointers[g] = static_cast<const std::byte*>(w.qdata) +
+                          std::size_t(g - begin) * out.rows * out.row_bytes;
+    }
+    out.table = DeviceBuffer(out.pointers.size() * sizeof(void*));
+    out.table.copy_from_host(out.pointers.data(), out.pointers.size() * sizeof(void*));
+    out.seal();
+    return out;
+}
+
 // Native operands retain the artifact's planes. The Program owns only these device tables.
 struct NativeExpertTable {
     QType format = QType::BF16;
@@ -474,17 +504,29 @@ struct NativeMoePlan {
     }
 };
 
+// Edge0's latent experts (TextConfig::latent_moe): the groups' encoders and decoders as tables of
+// `groups` entries, the experts' group labels and the optional multipliers.
+struct LatentPlan {
+    ExpertTable encode, decode;
+    Tensor labels, expert_scales, column_scale;
+    std::int32_t width = 0, groups = 0;
+};
+
 struct MoePlan {
     Tensor router, shared_gate;
     ExpertTable gate, up, down, shared_gate_table, shared_up_table, shared_down_table;
     std::optional<NativeMoePlan> native;
+    std::optional<LatentPlan> latent;
     // Device banks or disk experts' device slots, with zeros after the down banks; host experts
     // are read across the bus.
     bool device_resident = false;
     // Tensor parallelism: the routed experts [expert_begin, expert_end) the rank holds, the only
-    // entries of its tables that are set; the shared expert's tables hold the rank's run of it.
+    // entries of its tables that are set; the shared expert's tables hold the rank's run of it. A
+    // latent MoE's rank holds the layer's groups [group_begin, group_end) and the experts they
+    // label (LatentWeights).
     bool share = false;
     std::uint32_t expert_begin = 0, expert_end = 0;
+    std::uint32_t group_begin = 0, group_end = 0;
     bool iq1m_matrix = true; // ExecutorOptions::iq1m_matrix
 
     [[nodiscard]] ops::GgufMoeWeights banks() const {
@@ -499,6 +541,28 @@ struct MoePlan {
                 shared_gate_table.rows > 0 ? shared_gate_table.rows : 640,
                 iq1m_matrix};
     }
+    // The latent call over `routed`'s routed and shared tables (banks(), pooled() or cached()).
+    [[nodiscard]] ops::GgufLatentWeights latent_banks(const ops::GgufMoeWeights& routed) const {
+        ops::GgufLatentWeights out;
+        out.gate            = routed.gate;
+        out.up              = routed.up;
+        out.down            = routed.down;
+        out.shared_gate     = routed.shared_gate;
+        out.shared_up       = routed.shared_up;
+        out.shared_down     = routed.shared_down;
+        out.encode          = latent->encode.view();
+        out.decode          = latent->decode.view();
+        out.labels          = static_cast<const std::int32_t*>(latent->labels.data);
+        out.expert_scales   = static_cast<const float*>(latent->expert_scales.data);
+        out.column_scale    = static_cast<const float*>(latent->column_scale.data);
+        out.width           = latent->width;
+        out.groups          = latent->groups;
+        out.experts         = routed.experts;
+        out.shared_width    = routed.shared_width;
+        out.device_resident = routed.device_resident;
+        return out;
+    }
+    [[nodiscard]] ops::GgufLatentWeights latent_banks() const { return latent_banks(banks()); }
     // A wide call over a slot pool's table ([E] gate, [E] up, [E] down). Its entries are device
     // cache slots' planes, which start at 256-byte boundaries, or a pool bank's experts, each at
     // its index from a 256-byte boundary: a row stride of whole 16 bytes aligns every entry.
@@ -1517,6 +1581,12 @@ struct Executor::Impl {
             plan.moe.shared_gate_table = make_table(model, std::span(&lw.moe.shared_gate, 1));
             plan.moe.shared_up_table   = make_table(model, std::span(&lw.moe.shared_up, 1));
             plan.moe.shared_down_table = make_table(model, std::span(&lw.moe.shared_down, 1));
+            if (lw.moe.latent) {
+                plan.moe.group_begin = lw.moe.latent->group_begin;
+                plan.moe.group_end   = lw.moe.latent->group_end;
+                plan.moe.latent      = make_latent_plan(*lw.moe.latent, experts,
+                                                        plan.moe.group_begin, plan.moe.group_end);
+            }
             return plan;
         }
         if (!lw.moe.gate.empty() &&
@@ -1534,6 +1604,10 @@ struct Executor::Impl {
             plan.moe.native = std::move(native);
             return plan;
         }
+        if (lw.moe.latent) {
+            plan.moe.latent =
+                make_latent_plan(*lw.moe.latent, experts, 0, config.latent_moe->groups);
+        }
         if (lw.moe.gate.empty()) {
             plan.moe.gate = make_located_table(lw.moe.located_gate);
             plan.moe.up   = make_located_table(lw.moe.located_up);
@@ -1548,6 +1622,27 @@ struct Executor::Impl {
         plan.moe.shared_up_table   = make_table(model, std::span(&lw.moe.shared_up, 1));
         plan.moe.shared_down_table = make_table(model, std::span(&lw.moe.shared_down, 1));
         return plan;
+    }
+
+    // A layer's latent operands on its device: the groups [begin, end) of its encoder and decoder
+    // (all of them, or a tensor-parallel rank's), the labels and the multipliers.
+    [[nodiscard]] LatentPlan make_latent_plan(const LatentWeights& l, std::uint32_t experts,
+                                              std::uint32_t begin, std::uint32_t end) const {
+        const auto& latent = *config.latent_moe;
+        LatentPlan out;
+        out.width  = static_cast<std::int32_t>(latent.width);
+        out.groups = static_cast<std::int32_t>(latent.groups);
+        out.encode = make_group_table(model, l.encode, latent.groups, begin, end);
+        out.decode = make_group_table(model, l.decode, latent.groups, begin, end);
+        out.labels = direct(model, l.labels, {static_cast<std::int32_t>(experts)}, DType::I32);
+        if (l.expert_scales) {
+            out.expert_scales = direct(model, *l.expert_scales,
+                                       {3, static_cast<std::int32_t>(experts)}, DType::FP32);
+        }
+        if (l.column_scale) {
+            out.column_scale = direct(model, *l.column_scale, {out.width}, DType::FP32);
+        }
+        return out;
     }
 
     void plan_segments() {
@@ -1643,6 +1738,24 @@ struct Executor::Impl {
             const LayerPlan& plan = *layer;
             if (plan.moe.native) {
                 bytes = std::max(bytes, ops::moe_experts_native_workspace_bytes(t));
+            }
+            if (plan.moe.latent) {
+                // The staged misses take a whole chunk; a single call, a span group's included,
+                // a slice of at most kGgufLatentSliceTokens.
+                const std::int32_t group =
+                    rank == 0 ? static_cast<std::int32_t>(planned_group_chunks()) * t : t;
+                const std::int32_t call  = std::min(group, ops::kGgufLatentSliceTokens);
+                const auto& latent       = *plan.moe.latent;
+                bytes = std::max({bytes,
+                                  ops::moe_latent_gguf_workspace_bytes(t, latent.width, latent.groups),
+                                  ops::moe_latent_gguf_workspace_bytes(call, latent.width,
+                                                                       latent.groups)});
+                if (tensor()) {
+                    // A rank's groups' fixed-point part, held beside the part's own workspace.
+                    bytes = std::max(bytes, ops::moe_latent_gguf_workspace_bytes(t, latent.width,
+                                                                                 latent.groups) +
+                                                round_up(std::uint64_t(config.hidden_size) * t * 8));
+                }
             }
             if (plan.gdn) {
                 bytes = std::max({bytes,
@@ -2474,7 +2587,8 @@ struct Executor::Impl {
             profile = read_expert_profile(options.hybrid_experts.routing_profile,
                                           model.info().artifact_id, widths);
         } else {
-            profile = builtin_expert_profile(kExpertProfileFamily, widths);
+            profile = builtin_expert_profile(
+                config.latent_moe ? kLatentProfileFamily : kExpertProfileFamily, widths);
         }
         cache = std::make_unique<ExpertCache>(device, std::move(cache_layers), bytes,
                                               profile ? &*profile : nullptr,
@@ -2521,13 +2635,25 @@ struct Executor::Impl {
                 p.format       = tables[k]->format;
                 p.row_bytes    = tables[k]->row_bytes;
                 p.rows         = tables[k]->rows;
-                p.k            = std::int32_t(k == 2 ? config.moe_intermediate_size
-                                                     : config.hidden_size);
+                // A latent layer's gate and up read its latent width (TextConfig::latent_moe).
+                p.k            = std::int32_t(k == 2              ? config.moe_intermediate_size
+                                              : plan->moe.latent ? std::uint32_t(plan->moe.latent->width)
+                                                                 : config.hidden_size);
                 p.expert_bytes = std::int64_t(p.rows) * p.row_bytes;
                 if (stream) {
                     p.located = located[k];
                 } else {
                     p.host = tables[k]->pointers;
+                }
+            }
+            if (const auto& latent = plan->moe.latent) {
+                layer.latent_width = latent->width;
+                if (latent->expert_scales.data != nullptr) {
+                    RankBinding bind(device, plan->rank);
+                    layer.latent_scales.resize(std::size_t(latent->expert_scales.numel()));
+                    CUDA_CHECK(cudaMemcpy(layer.latent_scales.data(), latent->expert_scales.data,
+                                          layer.latent_scales.size() * sizeof(float),
+                                          cudaMemcpyDeviceToHost));
                 }
             }
             layer.gate_table = static_cast<const void* const*>(plan->moe.gate.table.p);
@@ -3814,7 +3940,7 @@ struct Executor::Impl {
             Tensor y(rank.y, DType::FP32, {h, t});
             {
                 auto scope = rank.workspace->scope();
-                ops::moe_experts_gguf(mixed, ids, weights, shared, banks, *rank.workspace, y, s);
+                run_gguf(plan.moe, mixed, ids, weights, shared, banks, *rank.workspace, y, s);
             }
             CUDA_CHECK(cudaEventRecord(buffer.free, s));
             // A span's later chunks run this layer's experts again from the pool; otherwise the
@@ -3867,8 +3993,60 @@ struct Executor::Impl {
         const Tensor mixed(rank.mixed, DType::BF16, {h, t});
         Tensor y(rank.y, DType::FP32, {h, t});
         auto scope = rank.workspace->scope();
-        ops::moe_experts_gguf(mixed, ids, weights, shared, banks, *rank.workspace, y, s);
+        run_gguf(m, mixed, ids, weights, shared, banks, *rank.workspace, y, s);
         return true;
+    }
+
+    // One call over `banks` (device banks, cache slots or a slot pool): Flash-Next's experts, or a
+    // latent MoE's through the same routed tables.
+    static void run_gguf(const MoePlan& m, const Tensor& mixed, const Tensor& ids,
+                         const Tensor& weights, const Tensor& shared,
+                         const ops::GgufMoeWeights& banks, WorkspaceArena& ws, Tensor& y,
+                         cudaStream_t s) {
+        if (m.latent) {
+            ops::moe_latent_gguf(mixed, ids, weights, shared, m.latent_banks(banks), ws, y, s);
+            return;
+        }
+        ops::moe_experts_gguf(mixed, ids, weights, shared, banks, ws, y, s);
+    }
+
+    // A latent layer's call over host or disk experts through the misses (served_by_misses): D and
+    // the shared expert, then the cached pairs while the missing experts arrive or CPU threads
+    // compute them from the pairs' latent inputs, then U.
+    void run_latent_misses(const MoePlan& m, RankState& rank, std::int32_t t, std::size_t index,
+                           const Tensor& mixed, const Tensor& ids, const Tensor& weights,
+                           const Tensor& shared, Tensor& y) {
+        WorkspaceArena& ws       = *rank.workspace;
+        const cudaStream_t s     = rank.stream;
+        const bool wide          = t > kVectorTokens;
+        // A wide call's stages read device memory only: cache slots, staging and the dense banks.
+        const auto all           = m.latent_banks(wide ? m.cached() : m.banks());
+        const auto stage         = ops::moe_latent_gguf_begin(mixed, ids, shared, all, ws, s,
+                                                              wide ? nullptr : &rank.side);
+        const Tensor inputs =
+            stage.inputs != nullptr
+                ? Tensor(stage.inputs, DType::U8,
+                         {static_cast<std::int32_t>(
+                             ops::moe_latent_gguf_input_bytes(stage.pairs, m.latent->width))})
+                : mixed;
+        const auto call = misses->begin(index, ids, inputs, t, m.banks(), s);
+        ops::moe_latent_gguf_add(stage, call.cached_ids, weights, all, ws, s);
+        const auto missing = m.latent_banks(call.missing_banks);
+        std::int32_t products = 0;
+        if (wide) {
+            products = misses->stage_wide(index, s, [&](const Tensor& missing_ids) {
+                ops::moe_latent_gguf_add(stage, missing_ids, weights, missing, ws, s);
+            });
+        } else {
+            misses->await(index, s);
+            ops::moe_latent_gguf_add(stage, call.missing_ids, weights, missing, ws, s);
+            products = call.max_products;
+        }
+        if (products > 0) {
+            ops::moe_latent_gguf_add_products(stage, call.products, call.pairs, call.count,
+                                              products, ids, weights, all, s);
+        }
+        ops::moe_latent_gguf_finish(stage, all, ws, y, s);
     }
 
     // The rank's router counter: every router call of a rank runs on its stream, one at a time.
@@ -3916,6 +4094,10 @@ struct Executor::Impl {
             // meanwhile, and run in a second stage.
             Tensor y(rank.y, DType::FP32, {h, t});
             auto scope      = ws.scope();
+            if (m.latent) {
+                run_latent_misses(m, rank, t, index, mixed, ids, weights, shared, y);
+                return;
+            }
             const auto call = misses->begin(index, ids, mixed, t, m.banks(), s);
             if (t > kVectorTokens) {
                 // As over device banks: the cached experts' slots while the missing experts
@@ -3978,6 +4160,15 @@ struct Executor::Impl {
         }
         Tensor y(rank.y, DType::FP32, {h, t});
         auto scope = ws.scope();
+        if (m.latent) {
+            // The shared expert on the side stream beside the latent work at decode widths.
+            const ops::GgufLatentWeights banks = m.latent_banks();
+            const auto stage = ops::moe_latent_gguf_begin(
+                mixed, ids, shared, banks, ws, s, t <= kVectorTokens ? &rank.side : nullptr);
+            ops::moe_latent_gguf_add(stage, ids, weights, banks, ws, s);
+            ops::moe_latent_gguf_finish(stage, banks, ws, y, s);
+            return;
+        }
         if (ops::moe_experts_gguf_decode_supported(m.banks(), t)) {
             // The shared expert on the side stream beside the routed pairs, as with staged misses.
             const auto state = ops::moe_experts_gguf_decode_begin(mixed, ids, shared, m.banks(), ws,
@@ -4740,9 +4931,16 @@ struct Executor::Impl {
         }
         auto scope   = ws.scope();
         Tensor fixed = ws.alloc(DType::I64, {h, n});
-        ops::moe_experts_gguf_part(
-            mixed, ids, weights, &shared, m.banks(), static_cast<std::int32_t>(m.expert_begin),
-            static_cast<std::int32_t>(m.expert_end), ws, fixed, s, &rank.side);
+        if (m.latent) {
+            ops::moe_latent_gguf_part(mixed, ids, weights, &shared, m.latent_banks(),
+                                      static_cast<std::int32_t>(m.group_begin),
+                                      static_cast<std::int32_t>(m.group_end), ws, fixed, s,
+                                      &rank.side);
+        } else {
+            ops::moe_experts_gguf_part(
+                mixed, ids, weights, &shared, m.banks(), static_cast<std::int32_t>(m.expert_begin),
+                static_cast<std::int32_t>(m.expert_end), ws, fixed, s, &rank.side);
+        }
         Tensor y(partial + std::size_t(h) * std::size_t(run.column), DType::FP32, {h, n});
         ops::moe_experts_gguf_combine(std::span<const Tensor>(&fixed, 1), y, s);
     }

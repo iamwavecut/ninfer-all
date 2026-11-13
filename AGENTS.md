@@ -51,6 +51,11 @@ routes to them (`--expert-residency disk`). Its n-gram table is stored in the mo
 in a separate table artifact the model names by digest (`--ngram-table`); it stays in that file,
 read a row at a time, unless `--ngram-residency ram` loads it. A model with PLE requires its table
 unless `--no-ngram-table` overrides that; a qualification layer slice without PLE needs no table.
+Edge0-145B and Edge0-120B (`docs/edge0.md`) are a form of this family converted from Edge0's
+release folders (`text_config.latent_moe`): each text layer's routed experts are latent experts in
+8 groups (NVFP4, or Q3_K and IQ4_NL) between Q8_0 or Q4_0 group encoders and decoders, which
+`moe_latent_gguf` runs with the family's placements, CPU share and tensor parallelism by whole
+groups.
 Native Qwen MoE, Gemma MoE and Flint also support host/disk expert placements, with whole-layer
 device banks beside the optional persistent cache and the same CPU share of decode misses.
 Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditionalGeneration`;

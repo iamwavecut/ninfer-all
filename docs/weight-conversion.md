@@ -27,8 +27,9 @@ downloaded files.
 ## Start with an official recipe
 
 Source-weight conversion requires a Python 3.11 environment with PyTorch and NumPy. It uses CUDA
-by default; `--device cpu` selects CPU conversion. The input paths below are placeholders for your
-local checkpoint directories.
+by default; `--device cpu` selects CPU conversion. PyTorch runs one thread per CPU the process may
+use, capped by a container's CPU quota; `OMP_NUM_THREADS` overrides that. The input paths below are
+placeholders for your local checkpoint directories.
 
 For Qwen3.6-27B floating-point source weights:
 
@@ -75,6 +76,7 @@ The built-in recipes are ordinary Python functions in
 | `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte; an untied BF16 output head as BF16 words | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
+| `edge0_pack`, `edge0_pack_q8`, `edge0_pack_q4` | Edge0-145B and Edge0-120B from an Edge0 release folder: the Flash-Next skeleton GGUF as `qwen3_8_flash_next_gguf` reads it, every latent expert row (NVFP4, Q3_K, IQ4_NL) and encoder and decoder row (Q8_0 or Q4_0: the release's choice, or the one the recipe names) byte for byte, the labels, the NVFP4 experts' FP32 multipliers or the reciprocals of the Q3_K builds' column scales; the FP8 n-gram table's codes in the artifact or in a table artifact of their own; the release's MTP block | `pack` (the release folder); `gguf`, `ngram`, `mtp` override its files |
 | `gemma4_gguf` | Gemma 4 26B-A4B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way | `gguf`, `mtp` |
 | `flint_gguf` | Flint from a llama.cpp GGUF (Unsloth's UD-Q4_K_XL or another quantization): every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] rows of the dense MLP and the shared expert always, the router (BF16 in the GGUF), norms and sinks as FP32 | `gguf` |
 | `deepseek_v41_gguf` | DeepSeek-V4.1-Flash from ISTA-DASLab's split GSQ-RCO GGUF, in llama.cpp's layout or the earlier one: every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, the BF16 and F32 tensors (router, compressors, indexers, hyper-connection matrices, norms, sinks) as FP32, the Engram gate as the FP32 product of its BF16 factors; the Engram GGUF's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the first shard), `engram` (the Engram GGUF), `dspark`, `vision`, `bias_vl` (the earlier layout's image routing bias) |
@@ -283,6 +285,16 @@ matrices, BF16 in the GSQ-RCO GGUFs, are the one thing the recipe re-quantises: 
 reference rounding, which halves the largest share of a decoded token's weight reads. Commands,
 runtime options and measurements:
 [Qwen3.8-Flash-Next](qwen3-8-flash-next.md).
+
+### Edge0 release folders
+
+`edge0_pack` ([`edge0.py`](../tools/convert/edge0.py)) imports an Edge0 release folder
+(`--source pack=FOLDER`) with `--model` holding the base Qwen3.8-Flash-Next's configuration and
+tokenizer files: the skeleton GGUF as the Flash-Next recipe imports it, and the latent MoE beside it,
+its expert, encoder and decoder rows byte for byte. The text configuration gains `latent_moe` (the
+latent width, the 8 groups and which scales the artifact stores). The FP8 n-gram table becomes
+`fp8_e4m3fn_row_fp16` rows with the release's one scale in each row, and `--components` places it as
+for Flash-Next. Commands, runtime options and the mathematics: [Edge0](edge0.md).
 
 ### Gemma 4 GGUF releases
 

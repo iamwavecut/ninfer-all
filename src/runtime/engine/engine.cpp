@@ -126,20 +126,28 @@ EngineOptions with_family_attention(EngineOptions options) {
 // CPU share: a layer reads every expert its cache lacks before it runs, so a verification's drafts
 // multiply the reads. Flash-Next takes its DFlash2 drafter where the artifact carries one, which
 // drafted faster than its MTP block, else the block; over pipeline stages, where DFlash2 does not
-// run, the block. Gemma 4 takes its assistant.
+// run, the block. Gemma 4 takes its assistant. Edge0's latent-MoE form of Flash-Next also drafts
+// with device experts when it serves one request at a time: each layer's chain of group encoders,
+// latent experts and decoders makes a token's step cost enough that MTP's verification pays on
+// prose too (Edge0-120B-q3k on an A40: 1.28 times as fast on prose, 1.84 on code, 1.49 after a
+// 5,415-token document, 1.23 on prose over two tensor-parallel ranks), while eight requests at
+// once decoded 0.84-0.87 times as fast with drafts as without.
 EngineOptions with_family_speculation(EngineOptions options) {
     SpeculativeOptions& speculative = options.speculative;
     if (!speculative.automatic || speculative.backend != SpeculativeBackend::None ||
-        options.expert_residency == ExpertResidency::Device ||
         options.purpose != EnginePurpose::Generation) {
         return options;
     }
     const bool flash_next = runtime::is_qwen4_exp_artifact(options.artifact_path);
-    if (flash_next ? options.expert_residency == ExpertResidency::Disk
-                   : !runtime::is_gemma4_artifact(options.artifact_path)) {
+    if (!flash_next && !runtime::is_gemma4_artifact(options.artifact_path)) { return options; }
+    const artifact::Reader reader(options.artifact_path);
+    const auto& components = reader.directory().components;
+    const bool latent = flash_next && components.at("text").config.contains("latent_moe");
+    if ((options.expert_residency == ExpertResidency::Device &&
+         !(latent && options.max_concurrency == 1)) ||
+        (flash_next && options.expert_residency == ExpertResidency::Disk)) {
         return options;
     }
-    const auto& components = artifact::Reader(options.artifact_path).directory().components;
     const bool stages = options.devices.size() > 1 && !options.tensor_parallel;
     if (flash_next && !stages && components.contains("dflash2")) {
         speculative.backend      = SpeculativeBackend::DFlash2;

@@ -82,6 +82,32 @@ int run() {
     expect_refusal([](Json& c) { c["rope_parameters"]["mrope_section"] = Json::array({11, 11, 11}); },
                    "MRoPE sections past the rotary width");
 
+    // Edge0's latent MoE (tools/convert/qwen4_exp.py latent_moe_config): absent for Flash-Next's
+    // own experts; widths in whole 256-value steps, one to sixteen groups, both flags boolean.
+    require(!config.latent_moe, "Flash-Next's experts are not latent");
+    Json latent          = fixture();
+    latent["latent_moe"] = {{"width", 1792}, {"groups", 8}, {"expert_scales", true},
+                            {"column_scale", false}};
+    const auto edge0 = parse_text_config(latent);
+    require(edge0.latent_moe && edge0.latent_moe->width == 1792 && edge0.latent_moe->groups == 8 &&
+                edge0.latent_moe->expert_scales && !edge0.latent_moe->column_scale,
+            "Edge0's latent MoE parses");
+    const auto refuses_latent = [&](const std::function<void(Json&)>& edit, const std::string& label) {
+        expect_refusal(
+            [&](Json& c) {
+                c["latent_moe"] = latent["latent_moe"];
+                edit(c["latent_moe"]);
+            },
+            label);
+    };
+    refuses_latent([](Json& l) { l["width"] = 1800; }, "a latent width off 256-value steps");
+    refuses_latent([](Json& l) { l["width"] = 0; }, "a zero latent width");
+    refuses_latent([](Json& l) { l["groups"] = 0; }, "no groups");
+    refuses_latent([](Json& l) { l["groups"] = 17; }, "more groups than implemented");
+    refuses_latent([](Json& l) { l["expert_scales"] = 1; }, "a non-boolean flag");
+    refuses_latent([](Json& l) { l.erase("column_scale"); }, "a missing latent field");
+    refuses_latent([](Json& l) { l["rank"] = 4; }, "an unknown latent field");
+
     // The MTP block: the full model's 512 experts beside an expert-pruned text model, the text
     // model's theta, and nothing else.
     const Json mtp         = {{"architectures", Json::array({"Qwen4ExpMTP"})},

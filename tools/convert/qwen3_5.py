@@ -598,7 +598,8 @@ class _Builder:
         )
         self.group(prefix + "mlp/gate", prefix + "mlp/up")
 
-    def moe(self, prefix, source_prefix, store, config):
+    def moe(self, prefix, source_prefix, store, config, *, routed=True):
+        """The router, the shared expert and, with `routed`, the routed experts of one MoE."""
         h, e = config["hidden_size"], config["num_experts"]
         ir, shared = (
             config["moe_intermediate_size"],
@@ -621,7 +622,7 @@ class _Builder:
         )
         self.group(p + "router", p + "shared_score")
         gate_up, downs = [], []
-        for expert in range(e):
+        for expert in range(e if routed else 0):
             ep = p + f"experts/{expert}/"
             for role, half in (("gate", 0), ("up", 1)):
                 self.add(
@@ -646,8 +647,9 @@ class _Builder:
                 inputs=(ep + "product",),
             )
             downs.append(ep + "down")
-        self.group(*gate_up)
-        self.group(*downs)
+        if routed:
+            self.group(*gate_up)
+            self.group(*downs)
         for role in ("gate", "up"):
             self.add(
                 p + "shared/" + role,

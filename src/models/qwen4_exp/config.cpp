@@ -54,7 +54,7 @@ TextConfig parse_text_config(const Json& value) {
          "shared_expert_intermediate_size", "hc_count", "hc_lowrank", "ple_layers",
          "ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram",
          "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "ngram_seed"},
-        {}, "Qwen4Exp text config");
+        {"latent_moe"}, "Qwen4Exp text config");
     const auto& architectures = value.at("architectures");
     if (!architectures.is_array() || architectures.size() != 1 ||
         architectures[0] != "Qwen4ExpForCausalLM" || value.at("model_type") != "qwen4_exp_text") {
@@ -179,6 +179,31 @@ TextConfig parse_text_config(const Json& value) {
     require_value(out.ngram.ngram_size, 3, "ngram_size");
     require_value(out.ngram.heads_per_ngram, 8, "heads_per_ngram");
     require_value(out.ple_embed_dim / out.ngram_heads(), 160, "n-gram head width");
+    if (value.contains("latent_moe")) {
+        const auto& latent = value.at("latent_moe");
+        artifact::require_members(latent, {"width", "groups", "expert_scales", "column_scale"}, {},
+                                  "Qwen4Exp latent MoE");
+        LatentMoe moe;
+        moe.width  = integer(latent, "width");
+        moe.groups = integer(latent, "groups");
+        for (const char* name : {"expert_scales", "column_scale"}) {
+            if (!latent.at(name).is_boolean()) {
+                throw ArtifactError(std::string("latent_moe.") + name + " must be boolean");
+            }
+        }
+        moe.expert_scales = latent.at("expert_scales").get<bool>();
+        moe.column_scale  = latent.at("column_scale").get<bool>();
+        // ops::moe_latent_gguf: whole 256-value steps of the expert matrix kernel, up to 16 groups.
+        if (moe.width == 0 || moe.width % 256 != 0 || moe.width > 8192) {
+            throw ArtifactError("latent_moe.width is " + std::to_string(moe.width) +
+                                "; this engine implements multiples of 256 up to 8192");
+        }
+        if (moe.groups == 0 || moe.groups > 16 || moe.groups > out.num_experts) {
+            throw ArtifactError("latent_moe.groups is " + std::to_string(moe.groups) +
+                                "; this engine implements 1 to 16, at most one per expert");
+        }
+        out.latent_moe = moe;
+    }
     return out;
 }
 

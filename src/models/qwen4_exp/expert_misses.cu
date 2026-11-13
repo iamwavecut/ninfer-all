@@ -78,15 +78,15 @@ __device__ __forceinline__ bool in_ranges(std::uintptr_t at, const std::uintptr_
 // in `cached` (else -1); every other expert is listed once in `missing`. With `keep_ranks` above
 // zero, an uncached expert that every token of the call ranks at or past that position of its top
 // ten is left out instead: its pairs add nothing and the others keep their router weights. The
-// pairs (and, for the CPU, the input) reach the host and need[1] counts the missing experts; with
-// `post` and missing experts the request is posted too (need[0], else 0).
+// pairs (and, for the CPU, the input: `m_vectors` 16-byte words) reach the host and need[1] counts
+// the missing experts; with `post` and missing experts the request is posted too (need[0], else 0).
 __global__ void __launch_bounds__(kSplitThreads)
     split_kernel(const std::int32_t* __restrict__ ids, int pairs, int experts,
                  const void* const* __restrict__ gate, const std::uintptr_t* __restrict__ ranges,
                  std::int32_t* __restrict__ cached, std::int32_t* __restrict__ host_ids,
                  std::int32_t* __restrict__ host_missing, std::int32_t* __restrict__ missing_ids,
-                 std::int32_t* product_count, const __nv_bfloat16* __restrict__ m,
-                 __nv_bfloat16* __restrict__ host_m, int m_values, Mailbox* box,
+                 std::int32_t* product_count, const uint4* __restrict__ m,
+                 uint4* __restrict__ host_m, int m_vectors, Mailbox* box,
                  std::uint32_t layer, int tokens, int keep_ranks, bool post, std::uint32_t* need) {
     __shared__ unsigned char missing[kMaxExperts];
     __shared__ int warp_total[kSplitThreads / 32];
@@ -142,10 +142,9 @@ __global__ void __launch_bounds__(kSplitThreads)
     if (second) { host_missing[at + int(first)] = 2 * threadIdx.x + 1; }
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) { host_ids[p] = ids[p]; }
     if (host_m != nullptr) {
-        // Eight values a store: a wide call's input is up to 320 KiB.
-        const auto* from = reinterpret_cast<const uint4*>(m);
-        auto* to         = reinterpret_cast<uint4*>(host_m);
-        for (int i = threadIdx.x; i < m_values / 8; i += blockDim.x) { to[i] = from[i]; }
+        // Sixteen bytes a store: a wide call's input is up to 320 KiB (a latent layer's pair inputs
+        // up to 1.3 MiB).
+        for (int i = threadIdx.x; i < m_vectors; i += blockDim.x) { host_m[i] = m[i]; }
     }
     __threadfence_system();
     __syncthreads();
@@ -424,6 +423,20 @@ struct ExpertMisses::Impl {
                          : 0;
         const std::size_t narrow_pairs = std::size_t(narrow_tokens) * kTop;
         const std::size_t cpu_pairs    = std::size_t(cpu_tokens) * kTop;
+        // The CPU's input and products of the widest call it shares: hidden columns, or a latent
+        // layer's pair inputs and its products `latent_width` long.
+        std::size_t input_bytes = std::size_t(cpu_tokens) * kHidden * 2;
+        std::size_t product_width = kHidden;
+        for (const auto& layer : layers) {
+            if (layer.latent_width <= 0) { continue; }
+            if (layer.latent_width % 256 != 0 ||
+                (!layer.latent_scales.empty() && layer.latent_scales.size() != 3 * layer.experts)) {
+                throw std::invalid_argument("expert misses: invalid latent layer");
+            }
+            input_bytes = std::max(input_bytes, ops::moe_latent_gguf_input_bytes(
+                                                    std::int32_t(cpu_pairs), layer.latent_width));
+            product_width = std::max(product_width, std::size_t(layer.latent_width));
+        }
         // A CPU share needs a layer whose formats have CPU products.
         const bool cpu = (options.cpu_share > 0 || options.cpu_balance) &&
                          std::any_of(layers.begin(), layers.end(), [](const MissLayer& layer) {
@@ -448,12 +461,10 @@ struct ExpertMisses::Impl {
             rank.product_pairs = std::make_unique<PinnedHostBuffer>(cpu_pairs * 4);
             rank.product_count = std::make_unique<PinnedHostBuffer>(64);
             rank.products      = std::make_unique<PinnedHostBuffer>(
-                cpu ? cpu_pairs * kHidden * 4 : 64);
+                cpu ? cpu_pairs * product_width * 4 : 64);
             rank.host_ids      = std::make_unique<PinnedHostBuffer>(std::size_t(pair_capacity) * 4);
             rank.host_missing  = std::make_unique<PinnedHostBuffer>(kMaxExperts * 4);
-            rank.host_m        = cpu ? std::make_unique<PinnedHostBuffer>(
-                                    std::size_t(cpu_tokens) * kHidden * 2)
-                                     : nullptr;
+            rank.host_m        = cpu ? std::make_unique<PinnedHostBuffer>(input_bytes) : nullptr;
             if (max_rounds > 0) {
                 rank.round_ids = std::make_unique<PinnedHostBuffer>(std::size_t(max_rounds) *
                                                                     pair_capacity * 4);
@@ -753,6 +764,137 @@ struct ExpertMisses::Impl {
                std::chrono::duration<double, std::micro>(done - middle).count();
     }
 
+    // A latent layer's CPU share (MissLayer::latent_width) of a call of `tokens` tokens: each
+    // expert's pairs' latent inputs as the GPU quantized them, the gate and up rows with the
+    // expert's multipliers, the BF16 middle quantized for down, and the down rows into products
+    // `latent_width` long. Returns the microseconds the phases took, `side` left out.
+    template <class Side>
+    double compute_latent_cpu(const MissLayer& layer, Rank& rank, std::uint32_t tokens, Side&& side,
+                              bool pin) {
+        using Clock               = std::chrono::steady_clock;
+        const auto started        = Clock::now();
+        const int width           = layer.latent_width;
+        const auto pairs          = std::int32_t(tokens) * kTop;
+        const auto* input         = static_cast<const std::uint8_t*>(rank.host_m->data());
+        const auto* codes         = reinterpret_cast<const std::int8_t*>(input);
+        const auto* ds            = reinterpret_cast<const std::uint16_t*>(
+            input + ops::moe_latent_gguf_input_scales(pairs, width));
+        auto* products            = static_cast<float*>(rank.products->data());
+        auto* product_pairs       = static_cast<std::int32_t*>(rank.product_pairs->data());
+        const auto& gate_p        = layer.projections[0];
+        const auto& up_p          = layer.projections[1];
+        const auto& down_p        = layer.projections[2];
+        const bool own_up         = up_p.format != gate_p.format;
+        const int expert_capacity = std::max(int(narrow_tokens), int(ops::kGgufMoeVectorPairs));
+        std::int32_t first        = 0;
+        for (auto& job : cpu_experts) {
+            const int n     = static_cast<int>(job.pairs.size());
+            job.every_token = false;
+            if (job.input.k() != width) { job.input = ops::GgufCpuActivation(expert_capacity, width); }
+            if (own_up && job.input_up.k() != width) {
+                job.input_up = ops::GgufCpuActivation(expert_capacity, width);
+            }
+            if (job.middle.k() != kWidth) {
+                job.middle = ops::GgufCpuActivation(expert_capacity, kWidth);
+            }
+            job.middle.reset(down_p.format, n);
+            job.gate.resize(std::size_t(n) * kWidth);
+            job.up.resize(std::size_t(n) * kWidth);
+            job.middle_bf16.resize(std::size_t(n) * kWidth);
+            job.first = first;
+            for (int j = 0; j < n; ++j) { product_pairs[first + j] = job.pairs[std::size_t(j)]; }
+            first += n;
+        }
+        pool->run(
+            cpu_experts.size(),
+            [&](std::size_t index) {
+                auto& job = cpu_experts[index];
+                job.input.load_q8_1(gate_p.format, codes, ds, job.pairs);
+                if (own_up) { job.input_up.load_q8_1(up_p.format, codes, ds, job.pairs); }
+            },
+            [] {}, pin);
+        const auto loaded = Clock::now();
+        parts.clear();
+        for (const auto& job : cpu_experts) {
+            const double cost = ExpertSplit::cpu_work(1.0, int(job.tokens.size()));
+            parts.push_back({kWidth, cost});
+            parts.push_back({kWidth, cost});
+        }
+        tasks = row_tasks(parts, pool->threads(), kRowQuantum);
+        pool->run(
+            tasks.size(),
+            [&](std::size_t index) {
+                const RowTask& task = tasks[index];
+                auto& job           = cpu_experts[task.part / 2];
+                const bool is_up    = (task.part & 1U) != 0;
+                const auto& p       = is_up ? up_p : gate_p;
+                const ops::GgufCpuMatrix w{p.format, job.bytes[is_up ? 1 : 0], p.row_bytes, p.rows,
+                                           p.k};
+                ops::gguf_cpu_rows(w, is_up && own_up ? job.input_up : job.input, task.begin,
+                                   task.end, (is_up ? job.up : job.gate).data(), kWidth, backend);
+            },
+            side, pin);
+        const double rows_us =
+            std::chrono::duration<double, std::micro>(pool->finished() - loaded).count();
+        const auto middle = Clock::now();
+        // The multipliers apply to each FP32 product, then the middle in BF16, as the GPU's
+        // latent kernels store it.
+        pieces.clear();
+        for (std::uint32_t i = 0; i < cpu_experts.size(); ++i) {
+            for (int j = 0; j < int(cpu_experts[i].tokens.size()); ++j) {
+                pieces.push_back({i, j, 0, false});
+            }
+        }
+        pool->run(
+            pieces.size(),
+            [&](std::size_t index) {
+                const Piece& piece   = pieces[index];
+                auto& job            = cpu_experts[piece.job];
+                const std::size_t at = std::size_t(piece.token) * kWidth;
+                float* gate          = job.gate.data() + at;
+                float* up            = job.up.data() + at;
+                if (!layer.latent_scales.empty()) {
+                    const float* scale = layer.latent_scales.data() + 3 * std::size_t(job.expert);
+                    for (int i = 0; i < kWidth; ++i) {
+                        gate[i] = scale[0] * gate[i];
+                        up[i]   = scale[1] * up[i];
+                    }
+                }
+                ops::gguf_cpu_swiglu_bf16(gate, up, kWidth, job.middle_bf16.data() + at, backend);
+                job.middle.quantize_bf16(piece.token, job.middle_bf16.data() + at, 0, kWidth / 32);
+            },
+            [] {}, pin);
+        parts.clear();
+        for (const auto& job : cpu_experts) {
+            parts.push_back({width, ExpertSplit::cpu_work(1.0, int(job.tokens.size()))});
+        }
+        tasks = row_tasks(parts, pool->threads(), kRowQuantum);
+        pool->run(
+            tasks.size(),
+            [&](std::size_t index) {
+                const RowTask& task = tasks[index];
+                auto& job           = cpu_experts[task.part];
+                const ops::GgufCpuMatrix w{down_p.format, job.bytes[2], down_p.row_bytes,
+                                           down_p.rows, down_p.k};
+                ops::gguf_cpu_rows(w, job.middle, task.begin, task.end,
+                                   products + std::size_t(job.first) * width, width, backend);
+            },
+            [] {}, pin);
+        *static_cast<std::int32_t*>(rank.product_count->data()) = first;
+        const auto done = Clock::now();
+        return std::chrono::duration<double, std::micro>(loaded - started).count() + rows_us +
+               std::chrono::duration<double, std::micro>(done - middle).count();
+    }
+
+    // The CPU's share of a request of `tokens` tokens, by the layer's kind.
+    template <class Side>
+    double compute(const MissLayer& layer, Rank& rank, std::uint32_t tokens, Side&& side,
+                   bool pin = true) {
+        return layer.latent_width > 0
+                   ? compute_latent_cpu(layer, rank, tokens, std::forward<Side>(side), pin)
+                   : compute_cpu(layer, rank, std::forward<Side>(side), pin);
+    }
+
     static double expert_megabytes(const MissLayer& layer) {
         double bytes = 0;
         for (const auto& p : layer.projections) { bytes += double(p.expert_bytes); }
@@ -990,7 +1132,7 @@ struct ExpertMisses::Impl {
                 }
             }
             const double microseconds =
-                disk ? compute_cpu(layer, rank, [] {}) : compute_cpu(layer, rank, issue);
+                disk ? compute(layer, rank, tokens, [] {}) : compute(layer, rank, tokens, issue);
             if (options.cpu_balance) { split.computed(cpu_work_done, microseconds); }
         } else {
             issue();
@@ -1099,6 +1241,18 @@ struct ExpertMisses::Impl {
         // The CPU may take a share: its input reaches the host with the split.
         const bool cpu_input = rank.host_m && std::uint32_t(tokens) <= cpu_tokens &&
                                cpu_capable(layer) && !(wide && disk);
+        // The CPU's input: the BF16 columns, or a latent layer's quantized pair inputs.
+        std::size_t input_bytes = std::size_t(tokens) * kHidden * 2;
+        if (cpu_input && layer.latent_width > 0) {
+            input_bytes = ops::moe_latent_gguf_input_bytes(pairs, layer.latent_width);
+            if (m.dtype != DType::U8 || std::size_t(m.numel()) != input_bytes) {
+                throw std::invalid_argument("expert misses: a latent call's input is its pair inputs");
+            }
+        }
+        if (cpu_input && (input_bytes % 16 != 0 || input_bytes > rank.host_m->size() ||
+                          reinterpret_cast<std::uintptr_t>(m.data) % 16 != 0)) {
+            throw std::invalid_argument("expert misses: the CPU's input is not whole 16-byte words");
+        }
         split_kernel<<<1, kSplitThreads, 0, stream>>>(
             static_cast<const std::int32_t*>(ids.data), pairs, int(layer.experts), layer.gate_table,
             static_cast<const std::uintptr_t*>(ranges.at(index).p),
@@ -1107,9 +1261,10 @@ struct ExpertMisses::Impl {
             static_cast<std::int32_t*>(rank.host_missing->data()),
             static_cast<std::int32_t*>(rank.missing_device.p),
             static_cast<std::int32_t*>(rank.product_count->data()),
-            static_cast<const __nv_bfloat16*>(m.data),
-            cpu_input ? static_cast<__nv_bfloat16*>(rank.host_m->data()) : nullptr,
-            tokens * kHidden, rank.box, std::uint32_t(index), tokens, int(options.tail_skip_rank),
+            static_cast<const uint4*>(m.data),
+            cpu_input ? static_cast<uint4*>(rank.host_m->data()) : nullptr,
+            int(input_bytes / 16), rank.box, std::uint32_t(index), tokens,
+            int(options.tail_skip_rank),
             !wide, static_cast<std::uint32_t*>(rank.need->data()));
         CUDA_CHECK(cudaGetLastError());
         if (wide) {
@@ -1310,7 +1465,7 @@ struct ExpertMisses::Impl {
                         layer.projections[std::size_t(k)].host[std::size_t(job.expert)]);
                 }
             }
-            const double microseconds = compute_cpu(layer, rank, issue, false);
+            const double microseconds = compute(layer, rank, tokens, issue, false);
             if (options.cpu_balance) { rank.wide_split.computed(work, microseconds); }
         } else {
             issue();

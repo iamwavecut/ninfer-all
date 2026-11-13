@@ -52,10 +52,15 @@ enum class QType : std::uint16_t {
     // itself (an STQ matrix's trellis; its sign vectors are FP16).
     FP16   = 31,
     UINT16 = 32,
+    // ggml's NVFP4 blocks (GgufBlocks) of 64 values: four UE4M3 scale bytes, one per 16 values,
+    // then 32 bytes of E2M1 codes; value j of sub-block s is the low nibble of code byte 8 s + j for
+    // j < 8 and the high nibble of code byte 8 s + j - 8 otherwise.
+    GGUF_NVFP4 = 33,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
-    return (format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0) || format == QType::GGUF_MXFP4;
+    return (format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0) ||
+           format == QType::GGUF_MXFP4 || format == QType::GGUF_NVFP4;
 }
 
 struct GgufBlockShape {
@@ -88,6 +93,7 @@ struct GgufBlockShape {
     case QType::GGUF_Q2_0:
         return {64, 18};
     case QType::GGUF_MXFP4: return {32, 17};
+    case QType::GGUF_NVFP4: return {64, 36};
     default: return {};
     }
 }

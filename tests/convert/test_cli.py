@@ -8,7 +8,27 @@ import sys
 
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import binding_parts
-from tools.convert.__main__ import _recipe_parts
+from tools.convert.__main__ import _recipe_parts, usable_cpus
+
+
+def test_usable_cpus_caps_the_affinity_mask_by_the_cpu_quota(tmp_path):
+    allowed = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    assert usable_cpus(tmp_path) == allowed  # no cgroup files: the mask alone
+    (tmp_path / "cpu.max").write_text("max 100000\n")
+    assert usable_cpus(tmp_path) == allowed
+    # A 7.65-CPU quota rounds down; a quota under one CPU still leaves one thread.
+    (tmp_path / "cpu.max").write_text("765000 100000\n")
+    assert usable_cpus(tmp_path) == min(allowed, 7)
+    (tmp_path / "cpu.max").write_text("50000 100000\n")
+    assert usable_cpus(tmp_path) == 1
+    # cgroup v1.
+    (tmp_path / "cpu.max").unlink()
+    (tmp_path / "cpu").mkdir()
+    (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("200000\n")
+    (tmp_path / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
+    assert usable_cpus(tmp_path) == min(allowed, 2)
+    (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("-1\n")
+    assert usable_cpus(tmp_path) == allowed
 
 
 def test_recipe_parts_keeps_path_colons():

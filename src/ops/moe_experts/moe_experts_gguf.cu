@@ -695,6 +695,90 @@ GgufMoeDecode moe_experts_gguf_decode_begin(const Tensor& m, const Tensor& ids,
     return decode_begin(m, ids, &shared, banks, workspace, stream, side);
 }
 
+cudaEvent_t moe_experts_gguf_shared(const Tensor& m, const Tensor& shared,
+                                    const GgufMoeWeights& banks, WorkspaceArena& workspace,
+                                    unsigned long long* fixed, cudaStream_t stream,
+                                    const GgufMoeSide* side) {
+    const std::int32_t tokens = m.ne[1];
+    require(tokens > 0 && shaped(m, DType::BF16, kHidden, tokens), "m must be BF16 [2560, tokens]");
+    require(shared.dtype == DType::FP32 && shared.is_contiguous() && shared.numel() == tokens,
+            "shared must be FP32 [tokens]");
+    require(fixed != nullptr, "the shared expert needs a sum");
+    require_shared_width(banks);
+    if (tokens > kVectorTokens) {
+        // The bank pass keeps its scope to itself, so it stays on the call's stream.
+        Tensor activation = workspace.alloc(
+            DType::U8, {static_cast<std::int32_t>(gguf::vector_activation_bytes(kHidden, tokens))});
+        const auto* m_p = static_cast<const __nv_bfloat16*>(m.data);
+        gguf::quantize_vector_activation(m_p, kHidden, tokens, nullptr, activation.data, stream);
+        Tensor shared_ids = workspace.alloc(DType::I32, {tokens});
+        CUDA_CHECK(cudaMemsetAsync(shared_ids.data, 0, shared_ids.bytes(), stream));
+        run_bank(shared_ids, tokens, 1, 1, static_cast<const float*>(shared.data), m_p,
+                 activation.data, tokens, banks.shared_gate, banks.shared_up, banks.shared_down,
+                 banks.shared_width, banks.device_resident, banks.iq1m_matrix, workspace, fixed,
+                 stream);
+        return nullptr;
+    }
+    GgufMoeDecode out;
+    out.tokens        = tokens;
+    out.fixed         = fixed;
+    out.shared_middle = workspace.alloc(DType::BF16, {kWidth, tokens}).data;
+    cudaStream_t run  = stream;
+    if (side != nullptr) {
+        CUDA_CHECK(cudaEventRecord(side->fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(side->stream, side->fork, 0));
+        run = side->stream;
+    }
+    run_shared(m, shared, banks, workspace, out, decode_chunk(tokens), run);
+    if (side == nullptr) { return nullptr; }
+    CUDA_CHECK(cudaEventRecord(side->join, side->stream));
+    return side->join;
+}
+
+std::size_t moe_experts_gguf_shared_workspace_bytes(std::int32_t tokens) {
+    require(tokens > 0, "tokens must be positive");
+    WorkspaceLayoutBuilder layout;
+    if (tokens <= kVectorTokens) {
+        // The decode kernels' middle, or the vector path's activation, routing, middle, gate plane
+        // and down input.
+        (void)layout.alloc(DType::BF16, {kWidth, tokens});
+        (void)layout.alloc(DType::U8, {static_cast<std::int32_t>(
+                                          gguf::vector_activation_bytes(kHidden, tokens))});
+        (void)layout.alloc(DType::U8,
+                           {static_cast<std::int32_t>(gguf::moe_routing_bytes(1, tokens))});
+        (void)layout.alloc(DType::BF16, {kWidth, tokens});
+        (void)layout.alloc(DType::FP32, {kWidth, tokens});
+        (void)layout.alloc(DType::U8,
+                           {static_cast<std::int32_t>(gguf::vector_activation_bytes(kWidth, tokens))});
+        return layout.peak_bytes(1);
+    }
+    // The bank pass of one expert every token selects: its activation and ids, then run_bank's
+    // routing, middle, gate and up planes with their activations, and the down input and plane.
+    (void)layout.alloc(DType::U8,
+                       {static_cast<std::int32_t>(gguf::vector_activation_bytes(kHidden, tokens))});
+    (void)layout.alloc(DType::I32, {tokens});
+    (void)layout.alloc(DType::U8, {static_cast<std::int32_t>(
+                                      tokens <= kGgufMoeSplitTokens
+                                          ? gguf::moe_split_routing_bytes(1, tokens)
+                                          : gguf::moe_routing_bytes(1, tokens))});
+    (void)layout.alloc(DType::BF16, {kWidth, tokens});
+    {
+        auto planes = layout.scope();
+        const auto activation_bytes =
+            static_cast<std::int32_t>(gguf::moe_matrix_activation_bytes(kHidden, tokens));
+        (void)layout.alloc(DType::FP32, {kWidth, tokens});
+        (void)layout.alloc(DType::U8, {activation_bytes});
+        (void)layout.alloc(DType::U8, {activation_bytes});
+        (void)layout.alloc(DType::FP32, {kWidth, tokens});
+    }
+    (void)layout.alloc(DType::U8, {static_cast<std::int32_t>(
+                                      gguf::moe_matrix_activation_bytes(kWidth, tokens))});
+    (void)layout.alloc(DType::FP32, {kHidden, tokens});
+    (void)layout.alloc(DType::U8,
+                       {static_cast<std::int32_t>(gguf::vector_activation_bytes(kWidth, tokens))});
+    return layout.peak_bytes(1);
+}
+
 
 void moe_experts_gguf_decode_missing(const GgufMoeDecode& state, const Tensor& m,
                                      const Tensor& ids, const GgufMoeWeights& banks,

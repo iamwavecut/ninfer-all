@@ -9,6 +9,8 @@
 #include "models/qwen3_5/load/bindings.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <numeric>
 #include <set>
 #include <stdexcept>
@@ -349,6 +351,8 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& c,
         if (shared_allowed[at]) { shared_ends.push_back(at); }
     }
     const std::size_t ranks    = split.size();
+    // A latent MoE's ranks hold whole groups, which each layer cuts by its labels so that the
+    // experts follow the split (latent_group_ends); the shared runs follow that share.
     const auto experts         = expert_ends(c.num_experts, split);
     const auto shared          = split_shares(width, shared_ends, shared_runs(c, experts));
     const auto key_heads       = split_shares(c.linear_num_key_heads, key_ends, split);
@@ -464,7 +468,132 @@ void bind_expert_shares(Bindings& b, const TextConfig& c, const std::string& m,
     }
 }
 
-// `split` divides the routed experts over the ranks (expert parallelism; device residency only).
+// A latent MoE layer's expert group labels (moe/latent/labels), read before anything is bound:
+// under tensor parallelism each expert goes to the rank that holds its group.
+std::vector<std::int32_t> read_labels(const artifact::Reader& reader, const std::string& name,
+                                      std::uint32_t experts, std::uint32_t groups) {
+    const auto& bindings = reader.directory().bindings;
+    const auto found     = bindings.find(name);
+    if (found == bindings.end() || found->second.parts.size() != 1) {
+        throw artifact::ArtifactError(name + ": the labels must be one stored region");
+    }
+    const auto& part = found->second.parts.front();
+    if (reader.geometry(part.object).format != QType::INT32 || part.end - part.begin != experts) {
+        throw artifact::ArtifactError(name + ": the labels must be one int32 per expert");
+    }
+    const auto bytes = reader.read_range(
+        reader.directory().tensor(part.object).offset + part.begin * 4, std::uint64_t(experts) * 4);
+    std::vector<std::int32_t> out(experts);
+    std::memcpy(out.data(), bytes.data(), out.size() * 4);
+    for (const std::int32_t label : out) {
+        if (label < 0 || std::uint32_t(label) >= groups) {
+            throw artifact::ArtifactError(name + ": a label names no group");
+        }
+    }
+    return out;
+}
+
+// Tensor parallelism over a latent MoE layer: the ends of each rank's run of whole groups, from 0
+// to `groups`. Each cut falls where the experts the labels assign to the groups before it come
+// nearest the split's share of them, every rank keeping at least one group: the groups differ in
+// size (8 to 200 experts in Edge0's layers), so an even count of groups would give one rank three
+// quarters of a layer's experts. Every cut gives the same sums (each group's part is exact).
+std::vector<std::uint32_t> latent_group_ends(std::span<const std::int32_t> labels,
+                                             std::uint32_t groups, std::span<const double> split) {
+    const std::size_t ranks = split.size();
+    if (ranks == 0 || ranks > groups) {
+        throw std::invalid_argument("tensor parallelism over a latent MoE takes at most one device "
+                                    "per expert group");
+    }
+    std::vector<std::uint64_t> before(groups + 1, 0);
+    for (const std::int32_t label : labels) { ++before[std::size_t(label) + 1]; }
+    for (std::uint32_t g = 0; g < groups; ++g) { before[g + 1] += before[g]; }
+    const double total = std::accumulate(split.begin(), split.end(), 0.0);
+    std::vector<std::uint32_t> ends{0};
+    double share = 0;
+    for (std::size_t r = 0; r + 1 < ranks; ++r) {
+        share += split[r];
+        const double target       = double(labels.size()) * share / total;
+        const std::uint32_t low   = ends.back() + 1;
+        const std::uint32_t high  = groups - std::uint32_t(ranks - 1 - r);
+        std::uint32_t best        = low;
+        for (std::uint32_t at = low + 1; at <= high; ++at) {
+            if (std::abs(double(before[at]) - target) < std::abs(double(before[best]) - target)) {
+                best = at;
+            }
+        }
+        ends.push_back(best);
+    }
+    ends.push_back(groups);
+    return ends;
+}
+
+// The rank ends of layer `p`'s groups under tensor parallelism with `split` (latent_group_ends).
+std::vector<std::uint32_t> latent_ends(Bindings& b, const TextConfig& c, const std::string& p,
+                                       std::span<const double> split) {
+    const auto labels = read_labels(b.binder.reader(), p + "moe/latent/labels", c.num_experts,
+                                    c.latent_moe->groups);
+    return latent_group_ends(labels, c.latent_moe->groups, split);
+}
+
+// Tensor parallelism over a latent MoE: rank `rank`'s groups [begin, end) of layer `p`, their
+// encoder and decoder rows, and replicas of the labels and multipliers.
+LatentWeights bind_latent_share(Bindings& b, const TextConfig& c, const std::string& p,
+                                std::uint32_t begin, std::uint32_t end, std::size_t rank) {
+    const auto& latent        = *c.latent_moe;
+    const std::uint64_t h     = c.hidden_size, width = latent.width, groups = latent.groups;
+    const std::string m       = p + "moe/";
+    const auto whole          = [&](const std::string& name, const Shape& shape, QType format) {
+        return rank == 0 ? b.direct(name, shape, format)
+                         : replica(b, name, shape, {}, format, rank);
+    };
+    LatentWeights out;
+    out.group_begin = begin;
+    out.group_end   = end;
+    out.encode = b.piece(m + "latent/encode", {groups * width, h}, {p + "ffn_input"}, {}, rank,
+                         row_piece(scaled(begin, end, width)));
+    out.decode = b.piece(m + "latent/decode", {groups * h, width}, {m + "latent/sum"}, {}, rank,
+                         row_piece(scaled(begin, end, h)));
+    out.labels = whole(m + "latent/labels", {c.num_experts}, QType::INT32);
+    if (latent.expert_scales) {
+        out.expert_scales = whole(m + "latent/expert_scales", {c.num_experts, 3}, QType::FP32);
+    }
+    if (latent.column_scale) {
+        out.column_scale = whole(m + "latent/column_scale", {width}, QType::FP32);
+    }
+    return out;
+}
+
+// Tensor parallelism over a latent MoE: every expert of layer `p` on the rank that holds its group
+// (`ends`, latent_group_ends), with the zeros the expert matrix kernel reads past each down.
+void bind_latent_experts(Bindings& b, const TextConfig& c, const std::string& p,
+                         std::span<const std::uint32_t> ends, MoeWeights& out) {
+    const std::uint64_t width = c.latent_moe->width, w = c.moe_intermediate_size;
+    const std::string m       = p + "moe/";
+    const auto labels         = read_labels(b.binder.reader(), m + "latent/labels", c.num_experts,
+                                            c.latent_moe->groups);
+    out.gate.resize(c.num_experts);
+    out.up.resize(c.num_experts);
+    out.down.resize(c.num_experts);
+    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+        const auto after    = std::upper_bound(ends.begin(), ends.end(), std::uint32_t(labels[e]));
+        const auto rank     = static_cast<std::size_t>(after - ends.begin()) - 1;
+        const std::string x = m + "experts/" + std::to_string(e) + "/";
+        out.gate[e] = b.piece(x + "gate", {w, width}, {m + "latent/input"}, {}, rank,
+                              row_piece({0, w}));
+        out.up[e]   = b.piece(x + "up", {w, width}, {m + "latent/input"}, {}, rank, row_piece({0, w}));
+        out.down[e] = b.piece(x + "down", {width, w}, {x + "product"}, {}, rank,
+                              row_piece({0, width}));
+        for (const auto& part : b.at(out.down[e]).reference.binding.parts) {
+            if (is_gguf(b.binder.geometry(part.object).format)) {
+                b.binder.device_tail(part.object, kExpertTail);
+            }
+        }
+    }
+}
+
+// `split` divides the routed experts over the ranks (expert parallelism; device residency only),
+// a latent MoE's by whole groups (latent_group_ends).
 MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
                     ExpertResidency residency, std::span<const double> split = {}) {
     const std::uint64_t h = c.hidden_size, w = c.moe_intermediate_size;
@@ -472,16 +601,41 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
     MoeWeights out;
     out.router       = b.parameter(m + "router", {c.num_experts, h}, {input});
     out.shared_score = b.parameter(m + "shared_score", {1, h}, {input});
-    if (!split.empty()) {
+    // A latent MoE's experts read and write its latent width: gate and up [w, width] from the
+    // group's encoded input, down [width, w] into the group's sum.
+    std::uint64_t k = h;
+    std::string expert_input = input;
+    if (c.latent_moe && !split.empty()) {
+        const auto ends = latent_ends(b, c, p, split);
+        out.latent      = bind_latent_share(b, c, p, ends[0], ends[1], 0);
+        bind_latent_experts(b, c, p, ends, out);
+    } else if (c.latent_moe) {
+        const auto& latent = *c.latent_moe;
+        const std::uint64_t width = latent.width, groups = latent.groups;
+        LatentWeights l;
+        l.encode = b.parameter(m + "latent/encode", {groups * width, h}, {input});
+        l.decode = b.parameter(m + "latent/decode", {groups * h, width}, {m + "latent/sum"});
+        l.labels = b.direct(m + "latent/labels", {c.num_experts}, QType::INT32);
+        if (latent.expert_scales) {
+            l.expert_scales = b.direct(m + "latent/expert_scales", {c.num_experts, 3}, QType::FP32);
+        }
+        if (latent.column_scale) {
+            l.column_scale = b.direct(m + "latent/column_scale", {width}, QType::FP32);
+        }
+        out.latent   = l;
+        k            = width;
+        expert_input = m + "latent/input";
+    }
+    if (!split.empty() && !c.latent_moe) {
         bind_expert_shares(b, c, m, input, expert_ends(c.num_experts, split), out);
     }
     for (std::uint32_t e = 0; e < c.num_experts && split.empty(); ++e) {
         const std::string x = m + "experts/" + std::to_string(e) + "/";
         if (residency == ExpertResidency::Disk) {
             const auto& reader = b.binder.reader();
-            out.located_gate.push_back(locate(reader, x + "gate", w, h));
-            out.located_up.push_back(locate(reader, x + "up", w, h));
-            out.located_down.push_back(locate(reader, x + "down", h, w));
+            out.located_gate.push_back(locate(reader, x + "gate", w, k));
+            out.located_up.push_back(locate(reader, x + "up", w, k));
+            out.located_down.push_back(locate(reader, x + "down", k, w));
             continue;
         }
         const auto storage = [&](const char* role) {
@@ -504,9 +658,9 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
             return artifact::Residency::Host;
 #endif
         };
-        out.gate.push_back(b.parameter(x + "gate", {w, h}, {input}, {}, storage("gate")));
-        out.up.push_back(b.parameter(x + "up", {w, h}, {input}, {}, storage("up")));
-        out.down.push_back(b.parameter(x + "down", {h, w}, {x + "product"}, {}, storage("down")));
+        out.gate.push_back(b.parameter(x + "gate", {w, k}, {expert_input}, {}, storage("gate")));
+        out.up.push_back(b.parameter(x + "up", {w, k}, {expert_input}, {}, storage("up")));
+        out.down.push_back(b.parameter(x + "down", {k, w}, {x + "product"}, {}, storage("down")));
     }
     // Under expert parallelism each rank binds its run of the shared expert (bind_shared_run).
     std::vector<WeightId> downs;
@@ -578,6 +732,8 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const MtpConfig& mtp,
     out.layer.mixer     = bind_attention(b, c, p);
     TextConfig experts  = c;
     experts.num_experts = mtp.num_experts;
+    // The MTP block keeps the base model's experts.
+    experts.latent_moe.reset();
     out.layer.moe       = bind_moe(b, experts, p, residency, split);
     out.final_mixer     = bind_hc(b, c, "mtp/final_mixer/", false);
     return out;
@@ -601,6 +757,11 @@ std::vector<WeightId> layer_weights(const LayerWeights& layer, bool with_experts
     }
     const MoeWeights& m = layer.moe;
     out.insert(out.end(), {m.router, m.shared_score, m.shared_gate, m.shared_up, m.shared_down});
+    if (m.latent) {
+        out.insert(out.end(), {m.latent->encode, m.latent->decode, m.latent->labels});
+        if (m.latent->expert_scales) { out.push_back(*m.latent->expert_scales); }
+        if (m.latent->column_scale) { out.push_back(*m.latent->column_scale); }
+    }
     if (with_experts) {
         out.insert(out.end(), m.gate.begin(), m.gate.end());
         out.insert(out.end(), m.up.begin(), m.up.end());
@@ -947,6 +1108,10 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                 replica(b, m + "router", {config.num_experts, config.hidden_size}, {input}, {}, rank);
             layer.moe.shared_score =
                 replica(b, m + "shared_score", {1, config.hidden_size}, {input}, {}, rank);
+            if (config.latent_moe) {
+                const auto ends  = latent_ends(b, config, p, options.tensor_split);
+                layer.moe.latent = bind_latent_share(b, config, p, ends[rank], ends[rank + 1], rank);
+            }
             bind_shared_run(b, config, p, share, rank, layer.moe);
             if (ple_layer(i)) { layer.ple = bind_ple_replica(b, config, p, rank); }
             layers.push_back(std::move(layer));

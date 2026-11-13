@@ -109,6 +109,10 @@ GGUF_Q5_0 = GgufFormat("gguf_q5_0", 6, 32, 22)
 GGUF_Q2_0 = GgufFormat("gguf_q2_0", 42, 64, 18)
 # An E8M0 exponent byte and 32 E2M1 codes (OCP MXFP4), 16 bytes of nibbles.
 GGUF_MXFP4 = GgufFormat("gguf_mxfp4", 39, 32, 17)
+# Four UE4M3 scale bytes, one per 16 values, then 64 E2M1 codes in 32 bytes of nibbles (ggml's
+# NVFP4): value j of sub-block s is the low nibble of byte 8 s + j for j < 8, the high nibble of
+# byte 8 s + j - 8 otherwise.
+GGUF_NVFP4 = GgufFormat("gguf_nvfp4", 40, 64, 36)
 
 
 DIRECT_FORMATS = MappingProxyType(
@@ -147,6 +151,7 @@ GGUF_FORMATS = MappingProxyType(
             GGUF_Q5_0,
             GGUF_Q2_0,
             GGUF_MXFP4,
+            GGUF_NVFP4,
         )
     }
 )

@@ -156,6 +156,32 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
   carry.
 - **Images and video.** `--vision` adds the Vision tower (0.9 GB on the GPU).
 
+## Edge0-145B and Edge0-120B
+
+Converted from Edge0's release folders ([convert](edge0.md#convert)); no NInfer artifact of them is
+published. The commands' file names are those of the conversion's example.
+
+```bash
+# Every expert on one 48 GB GPU, 32,768 tokens; one request at a time drafts with the MTP block.
+ninfer-serve --config configs/edge0-120b-q3k-device.ini
+
+# One GPU: Edge0-145B-q3k's experts in pinned host memory, the most used of them cached on the GPU.
+ninfer-serve --config configs/edge0-145b-q3k-host.ini
+
+# One GPU and little RAM: Edge0-145B-NVFP4's experts stay in the file and stream into a GPU cache.
+ninfer-serve --config configs/edge0-145b-nvfp4-disk.ini
+```
+
+- **Other releases.** Each release runs with any of the three files and its own artifact on the
+  command line (`ninfer-serve models/<file>.ninfer --config ...`); all four share the table.
+- **Memory.** Host experts pin 40.1 GB of RAM for Edge0-145B-q3k, 47.6 GB for -NVFP4, 28.6 GB for
+  Edge0-120B-q3k and 34.0 GB for -NVFP4; device experts need about 36 GB of GPU memory for
+  Edge0-120B-q3k and 41 GB for -NVFP4 before KV ([run](edge0.md#run)).
+- **Drafting.** Host experts, and device experts serving one request at a time, draft three tokens
+  a round with the MTP block; with disk experts `--spec mtp --draft-tokens 3` asks for it. The
+  [measurements](edge0.md#measurements) on an A40 show what each placement decodes with and without
+  drafts.
+
 ## Gemma 4 26B-A4B
 
 Converted from Google's QAT GGUF release.
