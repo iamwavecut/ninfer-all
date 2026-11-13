@@ -12,7 +12,9 @@
 // The same kernel is the position-split prompt route on every architecture
 // (causal_attention_prompt_partial_launch, launch.h): it emits the m8n8k4 products wherever it is
 // compiled, skips the tiles of pages another rank holds, and writes FP32 outputs and log-sum-exps
-// for the cross-rank merge instead of BF16 rows.
+// for the cross-rank merge instead of BF16 rows. A Turing card runs it in its shape set: 32 query
+// rows on four warps, whose 52 KiB of shared memory fit the 64 KiB a Turing block may hold (64 rows
+// stage 71 KiB).
 
 #include "core/paged_kv_view.h"
 #include "core/tensor.h"

@@ -19,18 +19,29 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kHeadDim     = 256;
-constexpr int kRows        = 64; // query rows per CTA
-constexpr int kWarps       = 8;  // eight rows each
-constexpr int kTile        = 32; // keys per tile
-constexpr int kThreads     = kWarps * 32;
-constexpr int kStride      = sm70_attention::kQStride; // halves per staged Q, K or V row
-constexpr int kPStride     = sm70_attention::kPStride;
-constexpr int kSharedBytes = (kRows * kStride + 2 * kTile * kStride + kWarps * 8 * kPStride) *
-                             static_cast<int>(sizeof(__half));
-static_assert((kRows * kHeadDim + kRows) * sizeof(float) <=
-                  (kRows + 2 * kTile) * kStride * sizeof(__half),
-              "the rotated epilogue's FP32 rows and log-sum-exps reuse the Q, K and V stages");
+constexpr int kHeadDim = 256;
+constexpr int kTile    = 32;                       // keys per tile
+constexpr int kStride  = sm70_attention::kQStride; // halves per staged Q, K or V row
+constexpr int kPStride = sm70_attention::kPStride;
+
+// A CTA's warps take eight query rows each. The standard set's eight warps (64 rows) stage 71 KiB,
+// past the 64 KiB a Turing block may hold, and their rotated epilogue's FP32 rows alone take 64.25
+// KiB; Turing's set runs four warps (32 rows), whose threads load two (key, part) slots of a tile.
+template <bool TuringShapes>
+struct PromptShape {
+    static constexpr int kWarps   = TuringShapes ? 4 : 8;
+    static constexpr int kRows    = kWarps * 8; // query rows per CTA
+    static constexpr int kThreads = kWarps * 32;
+    static constexpr int kLoads   = kTile * 8 / kThreads; // (key, 32-dimension part) slots
+    static constexpr int kSharedBytes =
+        (kRows * kStride + 2 * kTile * kStride + kWarps * 8 * kPStride) *
+        static_cast<int>(sizeof(__half));
+    static_assert(kLoads * kThreads == kTile * 8, "every slot of a tile has one loader");
+    static_assert(kSharedBytes <= shape_max_shared_bytes_per_block(TuringShapes));
+    static_assert((kRows * kHeadDim + kRows) * sizeof(float) <=
+                      (kRows + 2 * kTile) * kStride * sizeof(__half),
+                  "the rotated epilogue's FP32 rows and log-sum-exps reuse the Q, K and V stages");
+};
 
 // How a cache stores its K or V plane. Every plane is [page][head][page offset][row], so a token's
 // row (page * kv_heads + head) * page size + offset addresses each of them.
@@ -289,8 +300,9 @@ __device__ __forceinline__ std::int32_t valid_tokens(const std::int32_t* valid_c
 // attends only over the tiles of the pages `partition` gives this rank and writes the rows'
 // normalized FP32 outputs and log-sum-exps to `partial_out` (causal_attention_partial_elements)
 // in place of `out`; a row without a key here, or past the valid tokens, gets 0 and -inf.
-template <class Metadata, Coding K, Coding V, bool RotatedKeys, bool RotatedValues, bool Partial>
-__launch_bounds__(kThreads) __global__
+template <bool TuringShapes, class Metadata, Coding K, Coding V, bool RotatedKeys,
+          bool RotatedValues, bool Partial>
+__launch_bounds__(PromptShape<TuringShapes>::kThreads) __global__
     void prompt_kernel(const __nv_bfloat16* __restrict__ q,
                        const std::int32_t* __restrict__ positions,
                        const std::int32_t* __restrict__ valid_columns, Metadata metadata,
@@ -299,6 +311,12 @@ __launch_bounds__(kThreads) __global__
                        std::int32_t tokens, std::int32_t q_heads, std::int32_t kv_heads,
                        float scale, __nv_bfloat16* __restrict__ out, CausalKeyPartition partition,
                        float* __restrict__ partial_out) {
+    if constexpr (!shape_set_in_image(TuringShapes)) { return; } // not this image's set
+    using Shape            = PromptShape<TuringShapes>;
+    constexpr int kRows    = Shape::kRows;
+    constexpr int kWarps   = Shape::kWarps;
+    constexpr int kThreads = Shape::kThreads;
+    constexpr int kLoads   = Shape::kLoads;
     extern __shared__ __align__(16) unsigned char shared_bytes[];
     __half* q_s = reinterpret_cast<__half*>(shared_bytes);
     __half* k_s = q_s + kRows * kStride;
@@ -359,7 +377,8 @@ __launch_bounds__(kThreads) __global__
     __half* p_tile      = p_s + warp * 8 * kPStride;
     sm70_attention::RowState st;
 
-    // Loader thread: key k0 + tid / 8, dimensions [32 (tid % 8), +32).
+    // A thread's loader slot s: key k0 + tid / 8 + s * kThreads / 8, dimensions
+    // [32 (tid % 8), +32).
     const int load_key        = tid >> 3;
     const int part            = tid & 7;
     const std::int32_t* table = metadata.block_table();
@@ -373,23 +392,26 @@ __launch_bounds__(kThreads) __global__
             return physical;
         }
     };
-    const auto read = [&](int k0, Raw& key_raw, Raw& value_raw) {
-        const int key = k0 + load_key;
-        const int page = key < window ? tile_page(k0) : -1;
-        if (page >= 0) {
-            const std::int64_t row = (static_cast<std::int64_t>(page) * kv_heads + kv_head) *
-                                         kPagedKVPageSize +
-                                     (key & kPagedKVPageMask);
-            key_raw   = read_raw<K>(cache_k, scale_k, row, part);
-            value_raw = read_raw<V>(cache_v, scale_v, row, part);
-        } else {
-            key_raw   = Raw{};
-            value_raw = Raw{};
+    const auto read = [&](int k0, Raw (&key_raw)[kLoads], Raw (&value_raw)[kLoads]) {
+#pragma unroll
+        for (int s = 0; s < kLoads; ++s) {
+            const int key  = k0 + load_key + s * (kThreads / 8);
+            const int page = key < window ? tile_page(k0) : -1;
+            if (page >= 0) {
+                const std::int64_t row = (static_cast<std::int64_t>(page) * kv_heads + kv_head) *
+                                             kPagedKVPageSize +
+                                         (key & kPagedKVPageMask);
+                key_raw[s]   = read_raw<K>(cache_k, scale_k, row, part);
+                value_raw[s] = read_raw<V>(cache_v, scale_v, row, part);
+            } else {
+                key_raw[s]   = Raw{};
+                value_raw[s] = Raw{};
+            }
         }
     };
     const int tiles = (window + kTile - 1) / kTile;
-    Raw key_raw{};
-    Raw value_raw{};
+    Raw key_raw[kLoads]{};
+    Raw value_raw[kLoads]{};
     if (tiles > 0) { read(0, key_raw, value_raw); }
     // A BF16 query beyond FP16 sends every tile through the exact scores; the others ignore it.
     query_beyond = __syncthreads_or(query_beyond) != 0;
@@ -403,11 +425,16 @@ __launch_bounds__(kThreads) __global__
             }
         }
         unsigned words[16];
-        const bool raw_saturates = raw_beyond<K>(key_raw) || raw_beyond<V>(value_raw);
-        decode_raw<K>(key_raw, words);
-        store_row(k_s + load_key * kStride + 32 * part, words);
-        decode_raw<V>(value_raw, words);
-        store_row(v_s + load_key * kStride + 32 * part, words);
+        bool raw_saturates = false;
+#pragma unroll
+        for (int s = 0; s < kLoads; ++s) {
+            const int key_row = load_key + s * (kThreads / 8);
+            raw_saturates |= raw_beyond<K>(key_raw[s]) || raw_beyond<V>(value_raw[s]);
+            decode_raw<K>(key_raw[s], words);
+            store_row(k_s + key_row * kStride + 32 * part, words);
+            decode_raw<V>(value_raw[s], words);
+            store_row(v_s + key_row * kStride + 32 * part, words);
+        }
         const bool tile_beyond = __syncthreads_or(raw_saturates) != 0;
         if (tile + 1 < tiles) { read(k0 + kTile, key_raw, value_raw); }
         if (warp_position >= k0) {
@@ -562,19 +589,24 @@ void launch(const Tensor& q, const Tensor& positions, const std::int32_t* valid_
         throw std::invalid_argument("causal_attention_prompt_sm70: unsupported geometry");
     }
     const std::int32_t rows = tokens * (q_heads / kv_heads);
-    const dim3 grid(static_cast<unsigned>((rows + kRows - 1) / kRows),
-                    static_cast<unsigned>(kv_heads));
-    with_codings(cache.storage, [&]<Coding K, Coding V, bool RotatedKeys, bool RotatedValues>() {
-        auto kernel = prompt_kernel<Metadata, K, V, RotatedKeys, RotatedValues, Partial>;
-        raise_dynamic_shared_memory(kernel, kSharedBytes);
-        kernel<<<grid, kThreads, kSharedBytes, stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data),
-            static_cast<const std::int32_t*>(positions.data), valid_columns, metadata,
-            cache.k_pages.data, cache.v_pages.data, cache.k_scale_pages.data,
-            cache.v_scale_pages.data, tokens, q_heads, kv_heads, scale,
-            out == nullptr ? nullptr : static_cast<__nv_bfloat16*>(out->data), partition,
-            partial_out);
-        CUDA_CHECK(cudaGetLastError());
+    with_shape_set([&]<bool TuringShapes>() {
+        using Shape = PromptShape<TuringShapes>;
+        const dim3 grid(static_cast<unsigned>((rows + Shape::kRows - 1) / Shape::kRows),
+                        static_cast<unsigned>(kv_heads));
+        with_codings(cache.storage,
+                     [&]<Coding K, Coding V, bool RotatedKeys, bool RotatedValues>() {
+            auto kernel =
+                prompt_kernel<TuringShapes, Metadata, K, V, RotatedKeys, RotatedValues, Partial>;
+            raise_dynamic_shared_memory(kernel, Shape::kSharedBytes);
+            kernel<<<grid, Shape::kThreads, Shape::kSharedBytes, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const std::int32_t*>(positions.data), valid_columns, metadata,
+                cache.k_pages.data, cache.v_pages.data, cache.k_scale_pages.data,
+                cache.v_scale_pages.data, tokens, q_heads, kv_heads, scale,
+                out == nullptr ? nullptr : static_cast<__nv_bfloat16*>(out->data), partition,
+                partial_out);
+            CUDA_CHECK(cudaGetLastError());
+        });
     });
 }
 
