@@ -29,9 +29,9 @@ The published conversions store the models without the table, which is published
 | Artifact | Size | |
 |---|---:|---|
 | [n-gram table](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) | 26.92 GiB | IQ4_NL rows and an optional broad hot-row profile |
-| [Q2_0](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) | 38.49 GiB | Vision and shared-Q8_0 MTP |
-| [IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3) | 54.50 GiB | Vision and shared-Q8_0 MTP |
-| [Coder IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 31.02 GiB | 256 text experts per layer, Vision and shared-Q8_0 MTP |
+| [Q2_0](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) | 38.23 GiB | Vision and shared-Q8_0 MTP |
+| [IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3) | 54.24 GiB | Vision and shared-Q8_0 MTP |
+| [Coder IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 30.76 GiB | 256 text experts per layer, Vision and shared-Q8_0 MTP |
 | [Unsloth UD-IQ2_XS](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-UD-IQ2_XS-NInfer-v3) | 47.43 GiB | Unsloth Dynamic v3.1, Vision, shared-Q8_0 MTP and the DFlash2 drafter |
 | [Unsloth UD-IQ3_XXS](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-v3) | 54.66 GiB | Unsloth Dynamic v3.1, Vision, shared-Q8_0 MTP and the DFlash2 drafter |
 
