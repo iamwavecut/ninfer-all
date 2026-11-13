@@ -40,6 +40,8 @@
 # CUDA/MSVC jobs compare compiled inputs with the PR base or published image revision.
 # Other jobs have individual path scopes; Docker cache checks require a Docker definition change.
 # Empty/Markdown-only PRs run only the change detector. Manual dispatch forces all scopes.
+# A stack of pull requests builds CUDA, MSVC and Docker on its top pull request only, which holds
+# every layer's changes; its lower layers run the other checks.
 name: CI
 
 on:
@@ -77,6 +79,7 @@ jobs:
       docker: ${{ steps.compare.outputs.docker }}
       release_tools: ${{ steps.compare.outputs.release_tools }}
       linux_runner: ${{ steps.runner.outputs.label }}
+      stack_top: ${{ steps.stack.outputs.top }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -87,6 +90,17 @@ jobs:
           python-version: '3.11'
       - id: compare
         run: .github/scripts/build-inputs.sh >> "$GITHUB_OUTPUT"
+      # A pull request below the top of a stack (github.event.pull_request.stack) skips the builds.
+      - id: stack
+        env:
+          POSITION: ${{ github.event.pull_request.stack.position }}
+          SIZE: ${{ github.event.pull_request.stack.size }}
+        run: |
+          if [[ -n "$SIZE" && "$POSITION" != "$SIZE" ]]; then
+            echo top=false >> "$GITHUB_OUTPUT"
+          else
+            echo top=true >> "$GITHUB_OUTPUT"
+          fi
       # While the repository variable NINFER_LINUX_RUNNER names a temporary runner, the CUDA builds
       # run there; a pull request from a fork stays on a hosted runner.
       - id: runner
@@ -162,7 +176,9 @@ jobs:
   windows-msvc:
     name: Host code under MSVC (${{ matrix.build.label }}, part ${{ matrix.shard }}/3)
     needs: build-inputs
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
+    if: >-
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.build-inputs.outputs.changed == 'true' && needs.build-inputs.outputs.stack_top == 'true'
     # Visual Studio 2022 (MSVC 14.44): CUDA 12.9 refuses Visual Studio 2026's MSVC 14.5x.
     runs-on: windows-2022
     timeout-minutes: 60
@@ -329,7 +345,9 @@ jobs:
   docker-build-cache:
     name: Dockerfile build cache
     needs: build-inputs
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.docker == 'true'
+    if: >-
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.build-inputs.outputs.docker == 'true' && needs.build-inputs.outputs.stack_top == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -357,7 +375,9 @@ jobs:
   cuda:
     name: CUDA ${{ matrix.cuda }} multiarch build and tests (no GPU)
     needs: build-inputs
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.build-inputs.outputs.changed == 'true'
+    if: >-
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      needs.build-inputs.outputs.changed == 'true' && needs.build-inputs.outputs.stack_top == 'true'
     runs-on: ${{ needs.build-inputs.outputs.linux_runner }}
     # A temporary runner provides Debian 13 itself; on a hosted runner the job runs in a container.
     container: >-
@@ -435,7 +455,10 @@ jobs:
         env:
           # The bucket token reaches only the restore and save steps. Fork PRs receive no secret.
           HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
-          CACHE_SOURCE_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.base_ref) || github.ref }}
+          # A stacked pull request reads the snapshots of the stack's base, not of the layer below.
+          CACHE_SOURCE_REF: >-
+            ${{ github.event_name == 'pull_request' && format('refs/heads/{0}',
+            github.event.pull_request.stack.base.ref || github.base_ref) || github.ref }}
           # A pull request also reads the native snapshot of its own branch, which a Native release
           # dispatch on that branch writes; a push to master that of the branch it merged.
           ALSO_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || '' }}
