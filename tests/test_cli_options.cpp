@@ -253,8 +253,8 @@ int run_tests() {
         }
     }
     {
-        // A DSpine drafter: the artifact --draft-model names, 1..15 drafts, the full output head
-        // and the confidence floor; no copy drafts beside it unless asked.
+        // A DSpine drafter: the artifact --draft-model names, 1..15 drafts, either head and the
+        // confidence floor; no copy drafts beside it unless asked.
         const auto spine = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec",
                                   "dspine", "--draft-model", "drafter.ninfer", "--draft-tokens",
                                   "15", "--draft-min-p", "0.2", "--full-draft-head"});
@@ -262,14 +262,18 @@ int run_tests() {
                               spine.speculative.draft_model == "drafter.ninfer" &&
                               spine.speculative.draft_tokens == 15 &&
                               spine.speculative.draft_min_p == 0.2f &&
+                              spine.speculative.proposal_head == ninfer::ProposalHead::Full &&
                               spine.speculative.ngram_draft_tokens == 0,
                           "CLI did not preserve --spec dspine");
+        const auto listed = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                   "dspine", "--draft-model", "drafter.ninfer", "--draft-tokens",
+                                   "7", "--lm-head-draft"});
+        failures += check(listed.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                          "CLI did not let --spec dspine draft with the proposal head");
         for (const std::vector<std::string> tail :
              {std::vector<std::string>{"--spec", "dspine", "--draft-tokens", "7"},
               {"--spec", "dspine", "--draft-model", "d.ninfer"},
               {"--spec", "dspine", "--draft-model", "d.ninfer", "--draft-tokens", "16"},
-              {"--spec", "dspine", "--draft-model", "d.ninfer", "--draft-tokens", "7",
-               "--lm-head-draft"},
               {"--spec", "mtp", "--draft-tokens", "4", "--draft-model", "d.ninfer"},
               {"--draft-model", "d.ninfer"}}) {
             std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};

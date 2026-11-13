@@ -4,6 +4,10 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/execution/dspine_head.h"
+#include "ninfer/ops/candidate_selector.h"
+#include "ninfer/ops/linear_topk.h"
+#include "ninfer/ops/speculative_round.h"
 #include "core/evictable_kv_pool.h"
 #include "core/host_kv_clamp.h"
 #include "core/startup.h"
@@ -517,6 +521,47 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                 cudaStream_t stream) {
                     execution::project(hidden, text.output_head, logits, arena, stream);
                 }};
+            // Candidates in one pass where linear_topk takes the head. The proposal head of another
+            // form projects dense logits, ranks them and maps its rows to token ids, as DFlash2's.
+            const auto* ranked   = execution::dspine_ranked_head(parameters, proposal_head);
+            const bool shortlist = proposal_head == ProposalHead::Optimized;
+            if (ranked != nullptr || shortlist) {
+                const execution::LinearParameters& head =
+                    shortlist ? parameters.proposal->head : text.output_head;
+                const Tensor* rows =
+                    shortlist && parameters.proposal->token_ids ? &*parameters.proposal->token_ids
+                                                                : nullptr;
+                const auto valid = static_cast<std::int32_t>(
+                    parameters.model.resources().public_token_count);
+                target.head_topk = [ranked, &head, rows, valid](const Tensor& hidden, Tensor& ids,
+                                                                Tensor& scores,
+                                                                WorkspaceArena& arena,
+                                                                cudaStream_t stream) {
+                    auto scope = arena.scope();
+                    if (ranked != nullptr) {
+                        const Tensor input = execution::rotated_input(
+                            hidden, ranked->hadamard_signs, arena, stream);
+                        if (rows != nullptr) {
+                            ops::linear_topk(input, ranked->weight, *rows, ids, scores, arena,
+                                             stream);
+                        } else {
+                            ops::linear_topk(input, ranked->weight, valid, ids, scores, arena,
+                                             stream);
+                        }
+                        return;
+                    }
+                    Tensor logits = arena.alloc(DType::BF16, {head.weight.n, hidden.ne[1]});
+                    execution::project(hidden, head, logits, arena, stream);
+                    ops::candidate_topk(logits, rows != nullptr ? head.weight.n : valid, ids,
+                                        scores, arena, stream);
+                    if (rows != nullptr) {
+                        Tensor every = ids.view({ids.ne[0] * ids.ne[1]});
+                        ops::proposal_remap_token_ids(
+                            every, static_cast<const std::int32_t*>(rows->data), head.weight.n,
+                            stream);
+                    }
+                };
+            }
             // Its widest proposal: a copy round of several rows runs it at the copy window.
             const std::uint32_t proposal =
                 masked_proposal_window(draft_window, ngram_draft_window, max_concurrency);

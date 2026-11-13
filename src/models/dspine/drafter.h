@@ -39,6 +39,13 @@ struct Target {
     // The target's output head without a final soft cap (the drafter needs logits linear in the
     // hidden): BF16 [H, U] into logits [vocab, U] of the type above.
     std::function<void(const Tensor& hidden, Tensor& logits, WorkspaceArena&, cudaStream_t)> head;
+    // Optional: the head and its 16 best candidates of each column in one pass, without dense
+    // logits: BF16 [H, U] into ids I32 [16, U] and their logits FP32 [16, U], in descending
+    // order (ops::linear_topk). A shortlist head ranks only its own rows. When set, proposals
+    // take their candidates here instead of from `head` and ops::candidate_topk.
+    std::function<void(const Tensor& hidden, Tensor& ids, Tensor& scores, WorkspaceArena&,
+                       cudaStream_t)>
+        head_topk;
 };
 
 // Committed target features into the ring: row b's first counts[b] columns (positions[i, b], a

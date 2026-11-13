@@ -4,11 +4,16 @@
 #include "core/nvtx.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/dspine.h"
+#include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/linear_pair.h"
+#include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/rmsnorm_rope.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/silu_mul.h"
@@ -47,6 +52,44 @@ void require(bool condition, const std::string& message) {
 
 bool is_window(std::uint32_t window) {
     return window == 2048 || window == 4096 || window == 8192;
+}
+
+// The registered fused routes a layer takes where its weights fit them (the Ops' headers list
+// the forms); any other format or geometry runs the separate projections.
+bool fused_query_key_value(const std::optional<ops::SingleProjectionWeight>& w) {
+    return w && w->weight.qtype == QType::Q8_G32_FP16 && w->weight.n == 6144 &&
+           (w->weight.k == 5120 || w->weight.k == 2048);
+}
+
+bool fused_swiglu(const std::optional<ops::SingleProjectionWeight>& w) {
+    return w && w->weight.qtype == QType::Q8_G32_FP16 &&
+           ((w->weight.n == 34816 && w->weight.k == 5120) ||
+            (w->weight.n == 12288 && w->weight.k == 2048));
+}
+
+bool fused_add(const ops::SingleProjectionWeight& w) {
+    const auto n = w.weight.n, k = w.weight.k;
+    switch (w.weight.qtype) {
+    case QType::Q8_G32_FP16:
+        return (n == 2048 && (k == 4096 || k == 6144)) || (n == 5120 && (k == 6144 || k == 17408));
+    case QType::BF16:
+        return n == 5120 && k == 6144;
+    default:
+        return false;
+    }
+}
+
+// The pair form of rmsnorm_rope: q [128,32,W,B] and k [128,8,W,B], W 2..16, B 1..8.
+bool fused_norm_rope(const Config& c, std::int32_t width, std::int32_t batch) {
+    return ops::rmsnorm_rope_constants_match(c.rope_theta, c.rms_norm_eps) && c.head_dim == 128 &&
+           c.num_attention_heads == 32 && c.num_key_value_heads == 8 && width >= 2 &&
+           width <= 16 && batch >= 1 && batch <= 8;
+}
+
+// The single-K form: k [128,8,T], T 1..2048.
+bool fused_key_norm_rope(const Config& c, std::int32_t columns) {
+    return ops::rmsnorm_rope_constants_match(c.rope_theta, c.rms_norm_eps) && c.head_dim == 128 &&
+           c.num_key_value_heads == 8 && columns >= 1 && columns <= 2048;
 }
 
 } // namespace
@@ -142,20 +185,31 @@ void Drafter::materialize(const ContextCall& call, std::span<const CyclicKVCache
     Tensor context = work.alloc(DType::BF16, {h, columns});
     ops::rmsnorm(projected, p.context_norm, c.rms_norm_eps, false, context, stream);
     const Tensor flat_positions = positions.view({columns});
+    const bool norm_rope        = fused_key_norm_rope(c, columns);
     for (std::size_t l = 0; l < p.layers.size(); ++l) {
         auto layer_scope  = work.scope();
         const auto& layer = p.layers[l];
-        Tensor key_raw    = work.alloc(DType::BF16, {d * kv, columns});
         Tensor value      = work.alloc(DType::BF16, {d, kv, width, b});
         Tensor value_flat = value.view({d * kv, columns});
         Tensor key        = work.alloc(DType::BF16, {d, kv, width, b});
-        project(layer.context_key, context, key_raw, work, stream);
-        project(layer.context_value, context, value_flat, work, stream);
-        Tensor key_rows = key.view({d, kv * columns});
-        ops::rmsnorm(key_raw.view({d, kv * columns}), layer.key_norm, c.rms_norm_eps, false,
-                     key_rows, stream);
+        Tensor key_raw =
+            norm_rope ? key.view({d * kv, columns}) : work.alloc(DType::BF16, {d * kv, columns});
+        if (ops::linear_pair_admits(layer.context_key.weight, layer.context_value.weight)) {
+            ops::linear_pair(context, layer.context_key.weight, layer.context_value.weight,
+                             key_raw, value_flat, stream);
+        } else {
+            project(layer.context_key, context, key_raw, work, stream);
+            project(layer.context_value, context, value_flat, work, stream);
+        }
         Tensor rotated = key.view({d, kv, columns});
-        ops::rope(flat_positions, d, c.rope_theta, rotated, stream);
+        if (norm_rope) {
+            ops::rmsnorm_rope(flat_positions, layer.key_norm, rotated, stream);
+        } else {
+            Tensor key_rows = key.view({d, kv * columns});
+            ops::rmsnorm(key_raw.view({d, kv * columns}), layer.key_norm, c.rms_norm_eps, false,
+                         key_rows, stream);
+            ops::rope(flat_positions, d, c.rope_theta, rotated, stream);
+        }
         ops::kv_cache_append_prefix(key, value, positions.view({width, b}), counts, call.lanes,
                                     envelope, ring[l], stream);
     }
@@ -198,6 +252,7 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
     ops::rmsnorm(residual_flat, p.layers.front().input_norm, eps, false, normed_flat, stream);
     const ops::SlidingWindowAttentionExecutionEnvelope envelope{0, max_context_};
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d)));
+    const bool norm_rope = fused_norm_rope(c, w, b);
     for (std::size_t l = 0; l < p.layers.size(); ++l) {
         const auto& layer = p.layers[l];
         const bool last   = l + 1 == p.layers.size();
@@ -205,47 +260,75 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
         {
             // Attention over the normalized input, causal inside the block.
             auto branch   = work.scope();
-            Tensor q_raw  = work.alloc(DType::BF16, {d * hq, columns});
-            Tensor k_raw  = work.alloc(DType::BF16, {d * kv, columns});
-            Tensor value  = work.alloc(DType::BF16, {d, kv, w, b});
-            Tensor v_flat = value.view({d * kv, columns});
-            project(layer.query, normed_flat, q_raw, work, stream);
-            project(layer.key, normed_flat, k_raw, work, stream);
-            project(layer.value, normed_flat, v_flat, work, stream);
             Tensor q      = work.alloc(DType::BF16, {d, hq, w, b});
             Tensor key    = work.alloc(DType::BF16, {d, kv, w, b});
-            Tensor q_rows = q.view({d, hq * columns});
-            Tensor k_rows = key.view({d, kv * columns});
-            ops::rmsnorm(q_raw.view({d, hq * columns}), layer.query_norm, eps, false, q_rows,
-                         stream);
-            ops::rmsnorm(k_raw.view({d, kv * columns}), layer.key_norm, eps, false, k_rows,
-                         stream);
-            Tensor q_heads = q.view({d, hq, columns});
-            Tensor k_heads = key.view({d, kv, columns});
-            ops::rope(flat_positions, d, c.rope_theta, q_heads, k_heads, stream);
+            Tensor value  = work.alloc(DType::BF16, {d, kv, w, b});
+            Tensor v_flat = value.view({d * kv, columns});
+            // The fused norm and rotation work in place on the projections' outputs.
+            Tensor q_raw = norm_rope ? q.view({d * hq, columns})
+                                     : work.alloc(DType::BF16, {d * hq, columns});
+            Tensor k_raw = norm_rope ? key.view({d * kv, columns})
+                                     : work.alloc(DType::BF16, {d * kv, columns});
+            if (fused_query_key_value(layer.query_key_value)) {
+                ops::attn_input_proj(normed_flat, layer.query_key_value->weight, q_raw, k_raw,
+                                     v_flat, stream);
+            } else {
+                project(layer.query, normed_flat, q_raw, work, stream);
+                project(layer.key, normed_flat, k_raw, work, stream);
+                project(layer.value, normed_flat, v_flat, work, stream);
+            }
+            if (norm_rope) {
+                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, q, key, stream);
+            } else {
+                Tensor q_rows = q.view({d, hq * columns});
+                Tensor k_rows = key.view({d, kv * columns});
+                ops::rmsnorm(q_raw.view({d, hq * columns}), layer.query_norm, eps, false, q_rows,
+                             stream);
+                ops::rmsnorm(k_raw.view({d, kv * columns}), layer.key_norm, eps, false, k_rows,
+                             stream);
+                Tensor q_heads = q.view({d, hq, columns});
+                Tensor k_heads = key.view({d, kv, columns});
+                ops::rope(flat_positions, d, c.rope_theta, q_heads, k_heads, stream);
+            }
             Tensor attended = work.alloc(DType::BF16, {d, hq, w, b});
             ops::sliding_window_attention(q, key, value, positions, call.valid_columns,
                                           call.lanes, {d, hq, kv}, window_,
                                           ops::SlidingWindowMask::Causal, scale, ring[l],
                                           envelope, work, attended, stream);
-            Tensor output = work.alloc(DType::BF16, {h, columns});
-            project(layer.output, attended.view({d * hq, columns}), output, work, stream);
-            ops::residual_add(output, residual_flat, stream);
+            const Tensor attended_flat = attended.view({d * hq, columns});
+            if (fused_add(layer.output)) {
+                ops::linear_add(attended_flat, layer.output.weight, residual_flat,
+                                layer.output.policy, work, stream);
+            } else {
+                Tensor output = work.alloc(DType::BF16, {h, columns});
+                project(layer.output, attended_flat, output, work, stream);
+                ops::residual_add(output, residual_flat, stream);
+            }
         }
         {
             // The MLP over the post-attention norm; the residual then holds the bridge's raw row.
-            auto branch  = work.scope();
-            Tensor x     = work.alloc(DType::BF16, {h, columns});
-            ops::rmsnorm(residual_flat, layer.post_attention_norm, eps, false, x, stream);
-            Tensor gate  = work.alloc(DType::BF16, {inner, columns});
-            Tensor up    = work.alloc(DType::BF16, {inner, columns});
-            project(layer.gate, x, gate, work, stream);
-            project(layer.up, x, up, work, stream);
+            auto branch    = work.scope();
+            Tensor x       = work.alloc(DType::BF16, {h, columns});
             Tensor product = work.alloc(DType::BF16, {inner, columns});
-            ops::silu_mul(gate, up, product, stream);
-            Tensor down = work.alloc(DType::BF16, {h, columns});
-            project(layer.down, product, down, work, stream);
-            ops::residual_add(down, residual_flat, stream);
+            ops::rmsnorm(residual_flat, layer.post_attention_norm, eps, false, x, stream);
+            if (fused_swiglu(layer.gate_up)) {
+                ops::linear_swiglu(x, layer.gate_up->weight, product, layer.gate_up->policy, work,
+                                   stream);
+            } else {
+                Tensor gate = work.alloc(DType::BF16, {inner, columns});
+                Tensor up   = work.alloc(DType::BF16, {inner, columns});
+                project(layer.gate, x, gate, work, stream);
+                project(layer.up, x, up, work, stream);
+                ops::silu_mul(gate, up, product, stream);
+            }
+            if (fused_add(layer.down)) {
+                ops::linear_add(product, layer.down.weight, residual_flat, layer.down.policy, work,
+                                stream);
+            } else {
+                Tensor down = work.alloc(DType::BF16, {h, columns});
+                project(layer.down, product, down, work, stream);
+                ops::residual_add(down, residual_flat, stream);
+            }
         }
         {
             // The bridge's write, and the next layer's (or the final) norm of its output.
@@ -277,7 +360,12 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
                                  std::size_t(w) * row, std::size_t(k) * row, std::size_t(b),
                                  cudaMemcpyDeviceToDevice, stream));
     Tensor scores = work.alloc(DType::FP32, {ops::kDSpineCandidates, k, b});
-    {
+    if (target_.head_topk) {
+        auto head_scope   = work.scope();
+        Tensor candidates = call.candidates.view({ops::kDSpineCandidates, masks});
+        Tensor flat       = scores.view({ops::kDSpineCandidates, masks});
+        target_.head_topk(hidden, candidates, flat, work, stream);
+    } else {
         auto head_scope   = work.scope();
         Tensor logits     = work.alloc(target_.logits, {v, masks});
         target_.head(hidden, logits, work, stream);
@@ -341,6 +429,20 @@ std::size_t Drafter::proposal_workspace_bytes(const Model& model, DType logits,
                                    &layer.gate, &layer.up, &layer.down, &layer.read,
                                    &layer.write}) {
             projections = std::max(projections, linear_bytes(*weight, dim(cells)));
+        }
+        if (fused_swiglu(layer.gate_up)) {
+            const Weight& gu = layer.gate_up->weight;
+            projections      = std::max(projections, ops::linear_swiglu_workspace_capacity_bytes(
+                                                          gu.qtype, gu.n, gu.k,
+                                                          layer.gate_up->policy, 1, dim(cells)));
+        }
+        for (const auto* weight : {&layer.output, &layer.down}) {
+            if (fused_add(*weight)) {
+                projections = std::max(projections, ops::linear_add_workspace_capacity_bytes(
+                                                        weight->weight.qtype, weight->weight.n,
+                                                        weight->weight.k, weight->policy, 1,
+                                                        dim(cells)));
+            }
         }
     }
     const std::size_t attend = ops::sliding_window_attention_workspace_capacity_bytes(

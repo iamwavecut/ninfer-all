@@ -149,13 +149,10 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         }
         return;
     case SpeculativeBackend::DSpine:
-        // The drafter derives its table from the full output head; the model's Engine checks
-        // the drafts against the drafter's block.
-        if (options.draft_tokens == 0 || options.draft_tokens > 15 ||
-            options.proposal_head == ProposalHead::Optimized) {
-            throw OptionConflict({"spec", "draft-tokens", "lm-head-draft"},
-                                 "--spec dspine requires --draft-tokens in [1,15] and the full "
-                                 "output head");
+        // The model's Engine checks the drafts against the drafter's block.
+        if (options.draft_tokens == 0 || options.draft_tokens > 15) {
+            throw OptionConflict({"spec", "draft-tokens"},
+                                 "--spec dspine requires --draft-tokens in [1,15]");
         }
         return;
     }

@@ -238,8 +238,9 @@ published converted as
 and `python -m tools.convert --model CHECKPOINT --recipe dspine_q8 --out drafter.ninfer` converts
 another DSpine checkpoint (`dspine_bf16` keeps every weight in BF16). Every family takes a DSpine
 drafter: Qwen3.5-core models and Qwen3.8-Flash-Next with up to 15 drafts a round (its block of 16
-less the anchor), Gemma 4, Flint and DeepSeek-V4.1 with up to 7. The drafter reads the full output
-head, so `--lm-head-draft` is refused. On Qwen3.5-core models a sampled request verifies DSpine's
+less the anchor), Gemma 4, Flint and DeepSeek-V4.1 with up to 7. On Qwen3.5-core models
+`--lm-head-draft` takes the drafter's candidates from the artifact's proposal head, as DFlash2's.
+On Qwen3.5-core models a sampled request verifies DSpine's
 sampled proposal by rejection sampling, as DFlash2's; the other families verify its greedy drafts
 with coupled draws, and `--draft-min-p P` verifies a round through its first draft whose confidence
 is at or below P. On an RTX 5090 with the official Qwen3.8-27B artifact, 15 DSpine drafts decoded a

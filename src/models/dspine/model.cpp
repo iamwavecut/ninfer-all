@@ -85,14 +85,17 @@ Tensor tensor(const BoundWeight& bound) {
     throw std::invalid_argument(bound.name + ": a DSpine direct parameter is a vector or matrix");
 }
 
-ops::SingleProjectionWeight projection(const BoundWeight& bound) {
+ops::WeightInput input(const BoundWeight& bound) {
     if (bound.uses.size() != 1 || bound.uses.front().hadamard_signs ||
         bound.uses.front().input_columns) {
         throw std::invalid_argument(bound.name + ": a DSpine projection needs one plain use");
     }
     const auto& use = bound.uses.front();
-    return ops::prepare_linear_weight(
-        ops::WeightInput{bound.view, use.policy, use.activation_input_divisor});
+    return ops::WeightInput{bound.view, use.policy, use.activation_input_divisor};
+}
+
+ops::SingleProjectionWeight projection(const BoundWeight& bound) {
+    return ops::prepare_linear_weight(input(bound));
 }
 
 } // namespace
@@ -155,6 +158,16 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& path, DeviceConte
         l.gate                = projection(at(layer.gate));
         l.up                  = projection(at(layer.up));
         l.down                = projection(at(layer.down));
+        // The converter stores each input's projections as rows of one parent, as it does a
+        // DFlash drafter's: the fused routes then read q/k/v and gate/up in one pass.
+        if (const std::array qkv{input(at(layer.query)), input(at(layer.key)),
+                                 input(at(layer.value))};
+            ops::joins(qkv)) {
+            l.query_key_value = ops::prepare_attn_input_proj_weights(qkv[0], qkv[1], qkv[2]);
+        }
+        if (const std::array mlp{input(at(layer.gate)), input(at(layer.up))}; ops::joins(mlp)) {
+            l.gate_up = ops::prepare_linear_swiglu_weight(mlp[0], mlp[1]);
+        }
         l.read                = projection(at(layer.read));
         l.write               = projection(at(layer.write));
         out.layers.push_back(l);

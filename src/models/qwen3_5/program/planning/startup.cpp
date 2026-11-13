@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/attention.h"
+#include "models/qwen3_5/execution/dspine_head.h"
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
@@ -1087,7 +1088,26 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             const auto head_bytes = [&](std::int32_t columns) {
                 WorkspaceLayoutBuilder head;
                 linear_scratch(head, parameters.text.output_head, 1, columns);
-                return finish(head);
+                std::size_t bytes = finish(head);
+                // A proposal ranks its candidates in one pass where the Op takes the head.
+                if (const auto* ranked =
+                        execution::dspine_ranked_head(parameters, plan.proposal_head)) {
+                    const Weight& w = ranked->weight;
+                    bytes           = std::max(
+                        bytes, execution::rotated_workspace_bytes(
+                                   ranked->hadamard_signs, static_cast<std::int32_t>(w.k), columns,
+                                   ops::linear_topk_workspace_capacity_bytes(w.qtype, w.n, w.k, 1,
+                                                                             columns)));
+                } else if (plan.proposal_head == ProposalHead::Optimized) {
+                    // A proposal head of another form: its dense logits, ranked.
+                    const auto& proposal = parameters.proposal->head;
+                    WorkspaceLayoutBuilder dense;
+                    matrix(dense, DType::BF16, proposal.weight.n, columns);
+                    linear_scratch(dense, proposal, 1, columns);
+                    scratch(dense, ops::candidate_topk_workspace_capacity_bytes(columns));
+                    bytes = std::max(bytes, finish(dense));
+                }
+                return bytes;
             };
             const auto dflash_context_capacity = [&](std::int32_t width, std::int32_t batch,
                                                      bool compact_input) {

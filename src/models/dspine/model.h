@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,9 @@ struct LayerOperands {
     // The context's K/V: the key and value matrices through the context's input.
     ops::SingleProjectionWeight context_key, context_value;
     ops::SingleProjectionWeight gate, up, down;
+    // The query, key and value rows as one parent [Q + 2K, H], and the gate and up rows as one
+    // [2I, H], where the artifact stores each group in one parent: the fused routes read them.
+    std::optional<ops::SingleProjectionWeight> query_key_value, gate_up;
     // The bridge after this layer: its read [C, H] and its write [H, R].
     ops::SingleProjectionWeight read, write;
 };

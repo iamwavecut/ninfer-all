@@ -142,6 +142,18 @@ out_0     = raw_0
 out_i     = BF16(raw_i + rms_i * W_write^l msg_i)              i >= 1
 ```
 
+The converter stores a layer's query, key and value as rows of one parent, and its gate and up as
+rows of another, as it does a DFlash drafter's. Where those parents and the output and down
+projections have a registered fused form (the `dspine_q8` drafter for Qwen3.8-27B: Q8 parents
+`[6144,5120]` and `[34816,5120]`, down `[5120,17408]`), a layer projects q, k and v in one pass
+(`attn_input_proj`), normalizes and rotates q and k in place in one Op (`rmsnorm_rope`, up to 16
+columns in up to 8 rows), gates the MLP inside its projection (`linear_swiglu`) and adds the down
+projection into the residual as it computes it (`linear_add`), as it does an output projection of a
+registered form (the 27B drafter's `[5120,4096]` has none). The context's K and
+V project in one pass where `linear_pair` takes them. Each fused Op is qualified against its own
+FP64 oracle; a fused layer rounds at fewer points than the separate Ops, so its drafts may differ
+in the last bits, never the verified output.
+
 The anchor is a known token, so column 1 reads its sender rows `[s_0; w_0]` from the sender table
 at `a`, not from the anchor column's own code. `out` is the next layer's x and, normalized by the
 next layer's input norm or after the last layer by the final norm, its n. The last layer also keeps
@@ -152,7 +164,13 @@ the final norm's denominator `d_i = sqrt(mean_h out_i^2 + e)` for the refinement
 
 The target's own head maps each mask column's final hidden `h_i` to logits `u_i`; Gemma 4's head
 runs without its final soft cap, since the refinement needs logits linear in the hidden. The 16
-best candidates of each row come from the public vocabulary (`candidate_topk`). Draft row i is
+best candidates of each row come from the public vocabulary. On the Qwen3.5 core a Q8, FP8 or T2
+head of 248,320 rows by 5120 ranks them in the same pass that projects the hidden, with FP32 scores
+and no dense logits (`linear_topk`); every other head writes its logits and `candidate_topk` ranks
+them. With `--lm-head-draft` the candidates come from the artifact's proposal head instead: its
+131,072 rows, the shortlist DFlash2 drafts with, ranked the same way and mapped to their token ids.
+A token outside the shortlist is then never drafted; the head-write table still comes from the full
+head, so every candidate's table row is the full head's. Draft row i is
 block column `n = i+1`. Its sender t is the anchor for row 0 and the previous row's draft otherwise,
 and an edge to candidate c replaces the column's own message by the one that t sends:
 
@@ -195,8 +213,7 @@ temperature. `--gumbel-sampling` changes only the target's draws: the greedy pro
 and the Qwen3.5 core keeps rejection sampling, as DFlash2 does. A DSpine round runs no n-gram copy
 proposal unless `--ngram-draft-tokens` sets its width, at least the draft window (the Qwen3.5 core).
 A copy round of several requests runs the drafter at that width as well, for the rows without a
-copy, so above one request the width is at most the block less one. The refinement reads the full
-head's logits, so DSpine refuses the optimized proposal head (`--lm-head-draft`).
+copy, so above one request the width is at most the block less one.
 
 ## State
 
