@@ -2,6 +2,7 @@
 #include "ninfer/engine.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -168,19 +169,25 @@ int run() {
         whole_ids  = std::move(reply.generated_token_ids);
     }
     // A stop string of several tokens, taken from the reply itself where it first occurs: late
-    // enough that the reply before it is long, early enough that the reply reaches it.
+    // enough that the reply before it is long, early enough that the reply reaches it. It begins at
+    // a space after a word where the reply has one: a match that begins inside a word leaves a
+    // fragment of it in the visible text, which the next prompt's tokenizer joins to the token
+    // before it (Qwen3.8-27B's "E" and the "l" of "lias" become "El"), so no state the turn kept
+    // continues that prompt.
     const auto asked_bytes       = variable("NINFER_STOP_BYTES");
     const std::size_t stop_bytes = asked_bytes.empty() ? 14U : std::stoul(std::string(asked_bytes));
     std::optional<std::size_t> cut;
-    for (std::size_t at = whole.size() * 3 / 4; at + stop_bytes <= whole.size(); ++at) {
-        const std::string_view candidate = std::string_view(whole).substr(at, stop_bytes);
-        const bool ascii = std::all_of(candidate.begin(), candidate.end(), [](char byte) {
-            return static_cast<unsigned char>(byte) < 0x80U;
-        });
-        if (ascii && whole.find(candidate) == at) {
-            cut = at;
-            break;
+    for (const bool after_word : {true, false}) {
+        for (std::size_t at = whole.size() * 3 / 4; !cut && at + stop_bytes <= whole.size(); ++at) {
+            const std::string_view candidate = std::string_view(whole).substr(at, stop_bytes);
+            const bool ascii = std::all_of(candidate.begin(), candidate.end(), [](char byte) {
+                return static_cast<unsigned char>(byte) < 0x80U;
+            });
+            const bool word_ends = at > 0 && whole[at] == ' ' &&
+                                   std::isalnum(static_cast<unsigned char>(whole[at - 1])) != 0;
+            if (ascii && (word_ends || !after_word) && whole.find(candidate) == at) { cut = at; }
         }
+        if (cut) { break; }
     }
     check(cut.has_value(), "the reply holds a usable stop string");
     if (!cut) { return 1; }
