@@ -105,13 +105,36 @@ def _layer_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
     }
 
 
-def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
+def stored_vocabulary(gguf: GGUFFile) -> int:
+    """Rows of the stored token table. A vocabulary-trimmed or extended release (for example 141141
+    rows instead of ``VOCABULARY``) is read as stored: the shape the GGUF declares decides, and
+    ``qwen3_8_27b_gguf`` checks it against the model's own config."""
+
+    info = gguf.tensors.get("token_embd.weight")
+    if info is None or len(info.shape) != 2:
+        return VOCABULARY
+    return int(info.shape[0])
+
+
+# The GGUF matrix-product kernel (ggml_bridge_mmq.cuh) takes only whole 128-row tiles, so the token
+# table and the output head are padded with zero rows up to a multiple of 128 (the original
+# 248320 already is one). The tokenizer keeps its own, smaller public domain.
+ROW_TILE = 128
+
+
+def padded_rows(rows: int) -> int:
+    return -(-rows // ROW_TILE) * ROW_TILE
+
+
+def expected_tensors(
+    mtp: bool, vocabulary: int = VOCABULARY
+) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
     """Row-major shape and kinds of every tensor: "blocks" (any stored ggml block type) and the
     ggml type names it may have."""
 
     out = {
-        "token_embd.weight": ((VOCABULARY, HIDDEN), "blocks"),
-        "output.weight": ((VOCABULARY, HIDDEN), HEAD_TYPES),
+        "token_embd.weight": ((vocabulary, HIDDEN), "blocks"),
+        "output.weight": ((vocabulary, HIDDEN), HEAD_TYPES),
         "output_norm.weight": ((HIDDEN,), "F32"),
     }
     for layer in range(LAYERS):
@@ -159,7 +182,7 @@ def validate(gguf: GGUFFile) -> None:
     blocks = gguf.kv.get("qwen35.block_count")
     if blocks != LAYERS + (1 if mtp else 0):
         raise ValueError(f"{gguf.path}: {blocks} blocks, expected {LAYERS} (+1 for MTP)")
-    expected = expected_tensors(mtp)
+    expected = expected_tensors(mtp, stored_vocabulary(gguf))
     if set(gguf.tensors) != set(expected):
         missing = sorted(set(expected) - set(gguf.tensors))[:5]
         extra = sorted(set(gguf.tensors) - set(expected))[:5]
@@ -172,8 +195,16 @@ def validate(gguf: GGUFFile) -> None:
         accepted = info.type_name in kinds or (
             "blocks" in kinds and info.type_id in GGUF_FORMATS_BY_TYPE
         )
-        if info.shape != shape or not accepted:
-            raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
+        if info.shape != shape:
+            raise ValueError(
+                f"{gguf.path}: {name} is {info.type_name} {info.shape}, expected {shape}"
+            )
+        if not accepted:
+            raise ValueError(
+                f"{gguf.path}: {name} is stored as {info.type_name} (ggml type {info.type_id}), "
+                "which has no registered block format in tools.artifact.formats."
+                "GGUF_FORMATS_BY_TYPE; register it there to import its blocks as-is"
+            )
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
     if gguf.data_bytes_available < end:
         raise ValueError(f"{gguf.path}: the data section is truncated")
@@ -312,8 +343,12 @@ def block_source(
     shape: tuple[int, int],
     select: RowMap,
     columns: np.ndarray | None = None,
+    stored_rows: int | None = None,
 ) -> LogicalSource:
     """Rows of a stored block matrix as encoded ggml rows, and their values on request.
+
+    ``stored_rows`` is the number of rows the GGUF holds when ``shape[0]`` is larger: the logical
+    rows past it are padding, all-zero blocks (a zero scale, so every value is zero).
 
     ``columns`` describes a matrix stored over permuted input columns: stored column ``c``
     multiplies logical input element ``columns[c]``. The encoded rows keep the stored order and
@@ -323,6 +358,9 @@ def block_source(
 
     format = block_format(gguf, tensor)
     empty = torch.empty(0, dtype=torch.float16)
+    real = shape[0] if stored_rows is None else stored_rows
+    if not 0 < real <= shape[0]:
+        raise ValueError(f"{tensor}: {real} stored rows do not fit {shape[0]} logical rows")
     gather, logical = None, None
     if columns is not None:
         columns = np.asarray(columns, dtype=np.int64)
@@ -332,36 +370,72 @@ def block_source(
         # Logical column g is the stored column that multiplies element g.
         logical = torch.from_numpy(np.argsort(columns))
 
+    def first_row() -> np.ndarray:
+        row = gguf.read_rows(tensor, select(0, 1))
+        if row.ndim != 2 or row.shape[0] != 1:
+            raise ValueError(f"{tensor}: expected one uint8 row, got shape {row.shape}")
+        return row
+
     def encoded(begin: int, end: int) -> EncodedRows:
-        blocks = gguf.read_rows(tensor, select(begin, end))
+        parts = []
+        if begin < min(end, real):
+            parts.append(gguf.read_rows(tensor, select(begin, min(end, real))))
+        padding = end - max(begin, min(end, real))
+        if padding > 0:
+            row = first_row()
+            parts.append(np.zeros((padding, row.shape[1]), dtype=row.dtype))
+        blocks = parts[0] if len(parts) == 1 else np.concatenate(parts)
         return EncodedRows(format, torch.from_numpy(blocks), empty, input_columns=gather)
 
     def values(first: int, last: int) -> torch.Tensor:
-        stored = _dequantize_rows(gguf, tensor, gguf.read_rows(tensor, select(first, last)))
-        return stored if logical is None else stored[:, logical]
+        parts = []
+        if first < min(last, real):
+            blocks = gguf.read_rows(tensor, select(first, min(last, real)))
+            parts.append(_dequantize_rows(gguf, tensor, blocks))
+        padding = last - max(first, min(last, real))
+        if padding > 0:
+            reference = parts[0] if parts else _dequantize_rows(gguf, tensor, first_row())
+            parts.append(reference.new_zeros((padding, reference.shape[1])))
+        matrix = parts[0] if len(parts) == 1 else torch.cat(parts)
+        return matrix if logical is None else matrix[:, logical]
 
     return LogicalSource(
         shape, f"{tensor}[{format}]{list(shape)}", _flat(values, shape[1]), encoded
     )
 
 
-def bf16_source(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
-    """A stored BF16 matrix as its exact words, read a run of rows at a time."""
+def bf16_source(
+    gguf: GGUFFile, tensor: str, shape: tuple[int, int], stored_rows: int | None = None
+) -> LogicalSource:
+    """A stored BF16 matrix as its exact words, read a run of rows at a time; rows past
+    ``stored_rows`` (when ``shape[0]`` is larger) are zero padding."""
+
+    real = shape[0] if stored_rows is None else stored_rows
 
     def values(first: int, last: int) -> torch.Tensor:
-        words = gguf.read_bf16_words(tensor, first, last)
-        return torch.from_numpy(words.view(np.int16)).view(torch.bfloat16)
+        parts = []
+        if first < min(last, real):
+            words = gguf.read_bf16_words(tensor, first, min(last, real))
+            parts.append(
+                torch.from_numpy(words.view(np.int16)).view(torch.bfloat16).reshape(-1, shape[1])
+            )
+        padding = last - max(first, min(last, real))
+        if padding > 0:
+            parts.append(torch.zeros((padding, shape[1]), dtype=torch.bfloat16))
+        return parts[0] if len(parts) == 1 else torch.cat(parts)
 
     return LogicalSource(shape, f"{tensor}[BF16]{list(shape)}", _flat(values, shape[1]))
 
 
 def head_source(gguf: GGUFFile) -> tuple[LogicalSource, bool]:
-    """The output head: stored blocks as encoded rows (True), or BF16 words as values (False)."""
+    """The output head: stored blocks as encoded rows (True), or BF16 words as values (False),
+    padded with zero rows up to a whole number of 128-row tiles."""
 
-    shape = gguf.info("output.weight").shape
+    shape = tuple(gguf.info("output.weight").shape)
+    padded = (padded_rows(shape[0]), shape[1])
     if gguf.info("output.weight").type_id == TYPE_BF16:
-        return bf16_source(gguf, "output.weight", shape), False
-    return block_source(gguf, "output.weight", shape, rows()), True
+        return bf16_source(gguf, "output.weight", padded, shape[0]), False
+    return block_source(gguf, "output.weight", padded, rows(), stored_rows=shape[0]), True
 
 
 def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
@@ -496,14 +570,19 @@ def _layer(
 
 
 def text_sources(
-    gguf: GGUFFile, *, mtp: bool
+    gguf: GGUFFile, *, mtp: bool, vocabulary: int | None = None
 ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
     """Encoded block sources and direct sources of every GGUF-backed text (and MTP) parameter; a
     BF16 output head is a direct source."""
 
+    vocabulary = stored_vocabulary(gguf) if vocabulary is None else vocabulary
     encoded = {
         "text/token_embedding": block_source(
-            gguf, "token_embd.weight", (VOCABULARY, HIDDEN), rows()
+            gguf,
+            "token_embd.weight",
+            (padded_rows(vocabulary), HIDDEN),
+            rows(),
+            stored_rows=vocabulary,
         ),
     }
     direct = {"text/final_norm": _norm(gguf, "output_norm.weight", True)}
@@ -662,11 +741,20 @@ def qwen3_8_27b_gguf(model, recipe, sources):
     if not isinstance(gguf, GGUFFile):
         raise ValueError("--source gguf must name the model's .gguf file")
     validate(gguf)
+    vocabulary = stored_vocabulary(gguf)
+    declared = config.get("vocab_size")
+    if declared is not None and declared != padded_rows(vocabulary):
+        raise ValueError(
+            f"{gguf.path}: token_embd.weight has {vocabulary} rows, padded to "
+            f"{padded_rows(vocabulary)} for the 128-row kernel tiles, but the model config "
+            f"declares vocab_size {declared}; set vocab_size to {padded_rows(vocabulary)} "
+            "(the tokenizer keeps its own, smaller domain)"
+        )
     mtp = "mtp" in model.components
     if mtp and not has_mtp(gguf):
         raise ValueError(f"{gguf.path}: the MTP component needs an -mtp GGUF (blk.64.nextn.*)")
     _companions(model, recipe, sources)
-    encoded, direct = text_sources(gguf, mtp=mtp)
+    encoded, direct = text_sources(gguf, mtp=mtp, vocabulary=vocabulary)
     formats = {}
     for name, source in encoded.items():
         format = source.read_encoded(0, 1).format
@@ -712,6 +800,8 @@ __all__ = [
     "head_source",
     "qwen3_8_27b_gguf",
     "q2_native_source",
+    "padded_rows",
+    "stored_vocabulary",
     "q8_native_source",
     "text_sources",
     "tiled_input_columns",
