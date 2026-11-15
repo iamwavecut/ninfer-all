@@ -80,13 +80,12 @@ struct Q6MmaDecodeAtom {
         const std::uint8_t packed =
             staged_codes[staged_group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane];
         const std::uint8_t high_byte =
-            staged_high[staged_group_index * Q6RowSplitStorage::kHighBytesPerGroup + (lane >> 1)];
+            staged_high[staged_group_index * Q6RowSplitStorage::kHighBytesPerGroup + (lane >> 1)] ^
+            0xaa;
         const int shift = (lane & 1) * 4;
-        const int q0 =
-            ((static_cast<int>(packed & 0x0fu) | (((high_byte >> shift) & 3) << 4)) ^ 0x20) - 0x20;
+        const int q0 = ((static_cast<int>(packed & 0x0fu) | (((high_byte >> shift) & 3) << 4))) - 32;
         const int q1 =
-            ((static_cast<int>(packed >> 4) | (((high_byte >> (shift + 2)) & 3) << 4)) ^ 0x20) -
-            0x20;
+            ((static_cast<int>(packed >> 4) | (((high_byte >> (shift + 2)) & 3) << 4))) - 32;
         return __floats2bfloat162_rn(static_cast<float>(q0) * scale,
                                      static_cast<float>(q1) * scale);
     }

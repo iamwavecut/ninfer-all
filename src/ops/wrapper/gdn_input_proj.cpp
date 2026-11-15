@@ -1,3 +1,5 @@
+#include "ops/linear/t5/t5_project.h"
+
 #include "core/weight.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -268,19 +270,26 @@ void require_record_capacity_domain(std::int32_t batch_size, std::int32_t min_wi
 void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
     const bool no_high   = weight.qhigh == nullptr && weight.high_plane_bytes == 0;
     const bool q4_planes = qtype != QType::Q4_G64_FP16 || no_high;
-    const bool t2_planes = qtype != QType::T2_G128_FP16 || no_high;
+    const bool ternary = is_ternary(qtype);
+    const bool t2_planes = !ternary ||
+        (weight.qtype != QType::PTQ1_G128_FP16 ? no_high
+         : (weight.qhigh != nullptr && weight.high_plane_bytes != 0));
     const bool q5_planes =
         qtype != QType::Q5_G64_FP16 || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
-    const std::int32_t group = qtype == QType::T2_G128_FP16 ? 128 : 64;
+    const bool q6_planes =
+        qtype != QType::Q6_G64_FP16 || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
+    const std::int32_t group = ternary ? 128 : 64;
     // The panel layout is RowSplit's bytes permuted (sm_70 loads, read by its routes).
-    if (weight.qtype != qtype || !is_row_split(weight.layout) ||
+    if ((weight.qtype != qtype && !(ternary && is_ternary(weight.qtype))) ||
+        !is_row_split(weight.layout) ||
         weight.scale_dtype != DType::FP16 ||
         weight.group_size != static_cast<std::uint32_t>(group) || weight.group != group ||
         !t2_planes || weight.ndim != 2 || weight.n != rows || weight.k != 5120 ||
         weight.shape[0] != rows || weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != 5120 || !q4_planes || !q5_planes ||
+        weight.padded_shape[1] != 5120 || !q4_planes || !q5_planes || !q6_planes ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 4) ||
-        (qtype == QType::Q5_G64_FP16 && !aligned_to(weight.qhigh, 16))) {
+        ((qtype == QType::Q5_G64_FP16 || qtype == QType::Q6_G64_FP16) &&
+         !aligned_to(weight.qhigh, 16))) {
         throw std::invalid_argument(std::string("gdn_input_proj: invalid ") + label);
     }
 }
@@ -851,14 +860,24 @@ void require_split_profile(const Tensor& x, const Weight& qk_weight, const Weigh
     require_matrix(x, kHidden, cols, "x");
     require_matrix(qkv, kQkvRows, cols, "qkv");
     require_matrix(z, kZRows, cols, "z");
-    require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
+    const bool qk_ok = qk_weight.qtype == QType::Q4_G64_FP16 ||
+                       qk_weight.qtype == QType::Q5_G64_FP16 ||
+                       qk_weight.qtype == QType::Q6_G64_FP16;
+    const bool vz_ok = value_z_weight.qtype == QType::Q4_G64_FP16 ||
+                       value_z_weight.qtype == QType::Q5_G64_FP16 ||
+                       value_z_weight.qtype == QType::Q6_G64_FP16;
+    if (!qk_ok || !vz_ok) {
+        throw std::invalid_argument("gdn_input_proj: unsupported split profile qtype");
+    }
+    require_rowsplit(qk_weight, qk_weight.qtype, kQkRows, "qk weight");
+    require_rowsplit(value_z_weight, value_z_weight.qtype, kParentRows, "value/z weight");
 }
 
 bool t2_two_parent(const Weight& qk_weight, const Weight& value_z_weight) {
-    const bool qk = qk_weight.qtype == QType::T2_G128_FP16;
-    if (qk != (value_z_weight.qtype == QType::T2_G128_FP16)) {
-        throw std::invalid_argument("gdn_input_proj: the two parents must share the T2 format");
+    const bool qk = is_ternary(qk_weight.qtype);
+    if (qk != is_ternary(value_z_weight.qtype) ||
+        (qk && qk_weight.qtype != value_z_weight.qtype)) {
+        throw std::invalid_argument("gdn_input_proj: the two ternary parents must share one format");
     }
     return qk;
 }
@@ -881,6 +900,15 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
     require_matrix(z, kZRows, cols, "z");
     require_rowsplit(qk_weight, QType::T2_G128_FP16, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::T2_G128_FP16, kValueRows + kZRows, "value/z weight");
+    if (qk_weight.qtype == QType::T5_G128_FP16) {
+        Tensor qk = qkv.slice(0, 0, kQkRows);
+        Tensor value = qkv.slice(0, kQkRows, kValueRows);
+        Tensor* first[]{&qk};
+        Tensor* second[]{&value, &z};
+        detail::t5_project(x, qk_weight, first, false, policy, &workspace, stream);
+        detail::t5_project(x, value_z_weight, second, false, policy, &workspace, stream);
+        return;
+    }
     if (sm70_takes(x, qk_weight, &value_z_weight)) {
         sm70_project_gdn(x, qk_weight, &value_z_weight, qkv, z, policy, workspace, stream);
         return;
@@ -889,7 +917,7 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
     if (detail::t2_a8_admits(policy) && detail::t2_a8_supported(qk_weight, cols) &&
         detail::t2_a8_supported(value_z_weight, cols)) {
         // One quantisation of x; q/k and value land in qkv directly and z in its own plane.
-        const auto activations = detail::t2_a8_quantize(x, workspace, stream);
+        const auto activations = detail::t2_a8_quantize(x, workspace, stream, qk_weight.qtype == QType::PTQ1_G128_FP16);
         detail::t2_a8_project_split_pair(activations, {qk_weight, qkv, 0, kQkRows, qkv, 0},
                                          {value_z_weight, qkv, kQkRows, kValueRows, z, 0}, stream);
         return;
@@ -914,9 +942,13 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
 // integer route's activation planes where it takes the width, otherwise the q/k and value planes of
 // the A16 route (whose T2 linears take no workspace).
 std::size_t t2_two_parent_projection_bytes(std::int32_t min_columns, std::int32_t max_columns,
-                                           LinearPolicy policy = LinearPolicy::A16Only) {
+                                           LinearPolicy policy = LinearPolicy::A16Only,
+                                           QType qtype = QType::T2_G128_FP16) {
+    if (qtype == QType::T5_G128_FP16) {
+        return detail::t5_workspace_capacity_bytes(policy, 5120, max_columns);
+    }
     // sm_70 projects both parents through its own routes at every width.
-    if (detail::sm70::enabled()) {
+    if (detail::sm70::enabled() && qtype == QType::T2_G128_FP16) {
         return sm70_projection_bytes(QType::T2_G128_FP16, QType::T2_G128_FP16, 12288, 5120,
                                      min_columns, max_columns, policy);
     }
@@ -924,7 +956,7 @@ std::size_t t2_two_parent_projection_bytes(std::int32_t min_columns, std::int32_
     for (std::int32_t columns = min_columns; columns <= max_columns; ++columns) {
         WorkspaceLayoutBuilder layout;
         if (!detail::t2_a8_admits(policy) ||
-            !detail::t2_a8_layout_activations(layout, 5120, columns)) {
+            !detail::t2_a8_layout_activations(layout, 5120, columns, qtype == QType::PTQ1_G128_FP16)) {
             (void)layout.alloc(DType::BF16, {4096, columns});
             (void)layout.alloc(DType::BF16, {6144, columns});
         }
@@ -985,12 +1017,12 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
-    if (qk_qtype == QType::T2_G128_FP16 || value_z_qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qk_qtype) || is_ternary(value_z_qtype)) {
         if (qk_qtype != value_z_qtype || qk_rows != 4096 || value_z_rows != 12288 ||
             input_rows != 5120) {
             throw std::invalid_argument("gdn_input_proj workspace: unregistered T2 pair");
         }
-        return t2_two_parent_projection_bytes(min_tokens, max_tokens, policy);
+        return t2_two_parent_projection_bytes(min_tokens, max_tokens, policy, qk_qtype);
     }
     const bool registered = qk_qtype == QType::Q4_G64_FP16 && qk_rows == 4096 &&
                             value_z_qtype == QType::Q5_G64_FP16 && value_z_rows == 12288 &&
@@ -1031,8 +1063,17 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     if (t2_two_parent(qk_weight, value_z_weight)) {
         throw std::invalid_argument("gdn_input_proj: the T2 pair needs the workspace overload");
     }
-    require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
+    const bool qk_ok = qk_weight.qtype == QType::Q4_G64_FP16 ||
+                       qk_weight.qtype == QType::Q5_G64_FP16 ||
+                       qk_weight.qtype == QType::Q6_G64_FP16;
+    const bool vz_ok = value_z_weight.qtype == QType::Q4_G64_FP16 ||
+                       value_z_weight.qtype == QType::Q5_G64_FP16 ||
+                       value_z_weight.qtype == QType::Q6_G64_FP16;
+    if (!qk_ok || !vz_ok) {
+        throw std::invalid_argument("gdn_input_proj: unsupported split profile qtype");
+    }
+    require_rowsplit(qk_weight, qk_weight.qtype, kQkRows, "qk weight");
+    require_rowsplit(value_z_weight, value_z_weight.qtype, kParentRows, "value/z weight");
 
     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
 }
@@ -1183,12 +1224,12 @@ std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(QType qk
 std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
     QType qk_qtype, QType value_z_qtype, LinearPolicy policy, std::int32_t batch_size,
     std::int32_t min_width, std::int32_t max_width) {
-    if (qk_qtype == QType::T2_G128_FP16 && value_z_qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qk_qtype) && qk_qtype == value_z_qtype) {
         require_snapshot_capacity_domain(batch_size, min_width, max_width);
         const std::int32_t columns = std::max(batch_size, 1) * max_width;
         return composed_snapshot_capacity(
             2048 + 2048 + 6144, columns,
-            t2_two_parent_projection_bytes(std::max(batch_size, 1) * min_width, columns, policy));
+            t2_two_parent_projection_bytes(std::max(batch_size, 1) * min_width, columns, policy, qk_qtype));
     }
     if (qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16) {
         return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
@@ -1209,10 +1250,10 @@ std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(QType qk_q
 std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(
     QType qk_qtype, QType value_z_qtype, LinearPolicy policy, std::int32_t batch_size,
     std::int32_t min_width, std::int32_t max_width) {
-    if (qk_qtype == QType::T2_G128_FP16 && value_z_qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qk_qtype) && qk_qtype == value_z_qtype) {
         require_record_capacity_domain(batch_size, min_width, max_width);
         return t2_two_parent_projection_bytes(std::max(batch_size, 1) * min_width,
-                                              std::max(batch_size, 1) * max_width, policy);
+                                              std::max(batch_size, 1) * max_width, policy, qk_qtype);
     }
     if (qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16) {
         return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
@@ -1473,10 +1514,15 @@ PartGdnGeometry require_part_gdn(const PartProjectionWeights& weights) {
     for (const auto& part : weights.parts) {
         if (gguf) { detail::require_gguf(part.weight, "gdn_input_proj GGUF part"); }
         if (part.weight.k != geometry.hidden || part.output < 0 || part.output > 1 ||
-            part.row != covered[part.output]) {
+            part.row != covered[part.output] || part.weight.n <= 0) {
             throw std::invalid_argument("gdn_input_proj: parts do not tile q/k/v and z");
         }
         covered[part.output] += part.weight.n;
+    }
+    const auto key = (covered[0] - covered[1]) / 2;
+    if (geometry.hidden <= 0 || key <= 0 || key % 128 || covered[1] <= 0 ||
+        covered[1] % key || 2 * key + covered[1] != covered[0] || covered[0] > INT32_MAX) {
+        throw std::invalid_argument("gdn_input_proj: invalid GGUF q/k/v/z geometry");
     }
     geometry.qkv       = static_cast<std::int32_t>(covered[0]);
     geometry.z         = static_cast<std::int32_t>(covered[1]);

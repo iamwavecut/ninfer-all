@@ -52,10 +52,40 @@ enum class QType : std::uint16_t {
     // itself (an STQ matrix's trellis; its sign vectors are FP16).
     FP16   = 31,
     UINT16 = 32,
+    // Native Prism PTQ1_0: 24 base-3 bytes + 2 tail bytes + FP16 scale per 128 weights.
+    PTQ1_G128_FP16 = 33,
+    // Exact ternary reordering: two 13-byte T5 units plus FP16 scale per 128.
+    T5_G128_FP16 = 34,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
     return (format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0) || format == QType::GGUF_MXFP4;
+}
+
+[[nodiscard]] constexpr bool is_ternary(QType format) {
+    return format == QType::T2_G128_FP16 || format == QType::PTQ1_G128_FP16 ||
+           format == QType::T5_G128_FP16;
+}
+
+struct RowSplitFormat {
+    int group = 0;
+    int code_bytes = 0;
+    int high_bytes = 0;
+    int scale_bytes = 0;
+};
+
+[[nodiscard]] constexpr RowSplitFormat row_split_format(QType format) {
+    switch (format) {
+    case QType::Q2_G64_FP16: return {64, 16, 0, 2};
+    case QType::Q4_G64_FP16: return {64, 32, 0, 2};
+    case QType::Q5_G64_FP16: return {64, 32, 8, 2};
+    case QType::Q6_G64_FP16: return {64, 32, 16, 2};
+    case QType::Q8_G32_FP16: return {32, 32, 0, 2};
+    case QType::T2_G128_FP16: return {128, 32, 0, 2};
+    case QType::PTQ1_G128_FP16: return {128, 24, 2, 2};
+    case QType::T5_G128_FP16: return {128, 26, 0, 2};
+    default: return {};
+    }
 }
 
 struct GgufBlockShape {
@@ -157,6 +187,18 @@ struct Weight {
     // INT32 [K] input gather of a GGUF matrix whose stored columns are a permutation of its
     // input's: column c multiplies input element input_columns[c]. Null for every other matrix.
     const std::int32_t* input_columns = nullptr;
+
+    // Immutable GGUF NVFP4 preparation, owned by model execution Parameters. The global
+    // covers a gate/up pair where needed; each table records two bits per 16 weights.
+    float gguf_amax = 0.0F;
+    const std::uint8_t* fp4_choices = nullptr;
+    float fp4_choices_amax = 0.0F;
+
+    // For row-split weights with mixed sub-weight qtypes (e.g. attn_q=Q6 + attn_k=Q4),
+    // the overall qtype is the first sub-weight's qtype. These fields describe the second
+    // sub-weight: its qtype and starting row. If second_sub_row == 0, the weight is not mixed.
+    QType second_sub_qtype = QType::Q4_G64_FP16;
+    std::int32_t second_sub_row = 0;
 };
 
 } // namespace ninfer

@@ -1,0 +1,1313 @@
+source_tensor	ud_struct_type	ud_struct_bpw	new_format	new_bpw	delta_bpw	runner_up	method	elems	struct_bytes	new_bytes	delta_bytes	param
+TTurbo-mmproj-BF16.gguf:mm.0.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4608	18432	9216	-9216	
+TTurbo-mmproj-BF16.gguf:mm.0.weight	mm_type12(4.5)	4.5000	q5_g64_fp16	5.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	21233664	11943936	13934592	1990656	
+TTurbo-mmproj-BF16.gguf:mm.2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+TTurbo-mmproj-BF16.gguf:mm.2.weight	mm_type12(4.5)	4.5000	q5_g64_fp16	5.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	23592960	13271040	15482880	2211840	
+TTurbo-mmproj-BF16.gguf:v.blk.0.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.0.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.0.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.0.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.0.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.0.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.0.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.0.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.0.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.0.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.0.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.0.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.1.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.1.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.1.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.1.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.1.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.1.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.1.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.1.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.1.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.1.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.1.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.1.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.10.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.10.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.10.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.10.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.10.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.10.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.10.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.10.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.10.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.10.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.10.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.10.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.11.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.11.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.11.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.11.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.11.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.11.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.11.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.11.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.11.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.11.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.11.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.11.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.12.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.12.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.12.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.12.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.12.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.12.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.12.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.12.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.12.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.12.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.12.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.12.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.13.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.13.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.13.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.13.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.13.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.13.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.13.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.13.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.13.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.13.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.13.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.13.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.14.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.14.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.14.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.14.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.14.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.14.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.14.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.14.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.14.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.14.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.14.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.14.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.15.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.15.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.15.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.15.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.15.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.15.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.15.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.15.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.15.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.15.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.15.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.15.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.16.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.16.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.16.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.16.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.16.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.16.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.16.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.16.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.16.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.16.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.16.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.16.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.17.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.17.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.17.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.17.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.17.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.17.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.17.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.17.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.17.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.17.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.17.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.17.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.18.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.18.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.18.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.18.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.18.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.18.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.18.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.18.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.18.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.18.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.18.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.18.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.19.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.19.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.19.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.19.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.19.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.19.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.19.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.19.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.19.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.19.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.19.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.19.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.2.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.2.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.2.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.2.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.2.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.2.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.2.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.2.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.2.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.2.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.2.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.2.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.20.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.20.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.20.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.20.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.20.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.20.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.20.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.20.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.20.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.20.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.20.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.20.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.21.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.21.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.21.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.21.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.21.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.21.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.21.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.21.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.21.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.21.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.21.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.21.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.22.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.22.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.22.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.22.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.22.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.22.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.22.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.22.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.22.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.22.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.22.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.22.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.23.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.23.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.23.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.23.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.23.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.23.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.23.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.23.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.23.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.23.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.23.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.23.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.24.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.24.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.24.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.24.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.24.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.24.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.24.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.24.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.24.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.24.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.24.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.24.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.25.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.25.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.25.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.25.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.25.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.25.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.25.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.25.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.25.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.25.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.25.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.25.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.26.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.26.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.26.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.26.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.26.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.26.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.26.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.26.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.26.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.26.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.26.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.26.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.3.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.3.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.3.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.3.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.3.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.3.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.3.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.3.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.3.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.3.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.3.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.3.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.4.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.4.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.4.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.4.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.4.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.4.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.4.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.4.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.4.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.4.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.4.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.4.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.5.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.5.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.5.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.5.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.5.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.5.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.5.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.5.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.5.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.5.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.5.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.5.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.6.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.6.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.6.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.6.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.6.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.6.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.6.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.6.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.6.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.6.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.6.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.6.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.7.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.7.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.7.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.7.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.7.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.7.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.7.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.7.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.7.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.7.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.7.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.7.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.8.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.8.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.8.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.8.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.8.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.8.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.8.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.8.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.8.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.8.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.8.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.8.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.9.attn_out.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.9.attn_out.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	1327104	912384	1036800	124416	
+TTurbo-mmproj-BF16.gguf:v.blk.9.attn_qkv.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	3456	13824	6912	-6912	
+TTurbo-mmproj-BF16.gguf:v.blk.9.attn_qkv.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	3981312	2737152	3110400	373248	
+TTurbo-mmproj-BF16.gguf:v.blk.9.ffn_down.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.9.ffn_down.weight	mm_type14(6.5625)	6.5625	q6_g64_fp16	6.25	+1.6875	upgrade-one-level(B)	grouped_absmax	4958208	4067280	3873600	-193680	
+TTurbo-mmproj-BF16.gguf:v.blk.9.ffn_up.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4304	17216	8608	-8608	
+TTurbo-mmproj-BF16.gguf:v.blk.9.ffn_up.weight	mm_type6(5.5)	5.5000	q6_g64_fp16	6.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	4958208	3408768	3873600	464832	
+TTurbo-mmproj-BF16.gguf:v.blk.9.ln1.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.9.ln1.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.9.ln2.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.blk.9.ln2.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.patch_embd.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.patch_embd.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	884736	3538944	1769472	-1769472	
+TTurbo-mmproj-BF16.gguf:v.patch_embd.weight.1	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	884736	3538944	1769472	-1769472	
+TTurbo-mmproj-BF16.gguf:v.position_embd.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	2654208	10616832	5308416	-5308416	
+TTurbo-mmproj-BF16.gguf:v.post_ln.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+TTurbo-mmproj-BF16.gguf:v.post_ln.weight	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	1152	4608	2304	-2304	
+blk.0.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.0.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.0.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.0.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.0.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.0.ffn_down.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.0.ffn_gate.weight	type17	2.3125	q4_g64_fp16	4.25	+1.9375	t2_g128_fp16(2.1250)	grouped_absmax	89128960	25763840	47349760	21585920	
+blk.0.ffn_up.weight	type22	2.5625	q4_g64_fp16	4.25	+1.6875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	28549120	47349760	18800640	
+blk.0.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.0.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.0.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.0.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.0.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.0.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.0.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.0.ssm_out.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.1.attn_gate.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	
+blk.1.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.1.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	key
+blk.1.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	query
+blk.1.attn_qkv.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	value
+blk.1.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	47349760	47349760	9052160	
+blk.1.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.1.ffn_up.weight	type11	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.1.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.1.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.1.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.1.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.1.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.1.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.1.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.1.ssm_out.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.10.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.10.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.10.attn_qkv.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	10485760	4014080	5570560	1556480	key
+blk.10.attn_qkv.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	10485760	4014080	5570560	1556480	query
+blk.10.attn_qkv.weight	type18	3.0625	q5_g64_fp16	5.25	+2.1875	t2_g128_fp16(2.1250)	grouped_absmax	31457280	12042240	20643840	8601600	value
+blk.10.ffn_down.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.10.ffn_gate.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.10.ffn_up.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.10.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.10.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.10.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.10.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.10.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.10.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.10.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.10.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.11.attn_k.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	2785280	-819200	
+blk.11.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.11.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.11.attn_output.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.11.attn_q.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	t2_g128_fp16(2.1250)	grouped_absmax	31457280	16711680	16711680	0	gate
+blk.11.attn_q.weight	type23	4.2500	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	31457280	16711680	16711680	4669440	query
+blk.11.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.11.attn_v.weight	type12	4.5000	q4_g64_fp16	4.25	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	5242880	2949120	2785280	-163840	
+blk.11.ffn_down.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.11.ffn_gate.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.11.ffn_up.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.11.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.12.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.12.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.12.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.12.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.12.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.12.ffn_down.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.12.ffn_gate.weight	type17	2.3125	q4_g64_fp16	4.25	+1.9375	t2_g128_fp16(2.1250)	grouped_absmax	89128960	25763840	47349760	21585920	
+blk.12.ffn_up.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.12.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.12.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.12.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.12.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.12.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.12.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.12.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.12.ssm_out.weight	type12	4.5000	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	31457280	17694720	16711680	3194880	
+blk.13.attn_gate.weight	type21	3.4375	q5_g64_fp16	5.25	+1.8125	q2_g64_fp16(2.2500)	grouped_absmax	31457280	13516800	20643840	7127040	
+blk.13.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.13.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	key
+blk.13.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	query
+blk.13.attn_qkv.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	value
+blk.13.ffn_down.weight	type11	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.13.ffn_gate.weight	type11	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.13.ffn_up.weight	type18	3.0625	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	34119680	47349760	9052160	
+blk.13.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.13.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.13.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.13.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.13.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.13.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.13.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.13.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.14.attn_gate.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	
+blk.14.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.14.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.14.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.14.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.14.ffn_down.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.14.ffn_gate.weight	type22	2.5625	q4_g64_fp16	4.25	+1.6875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	28549120	47349760	18800640	
+blk.14.ffn_up.weight	type22	2.5625	q4_g64_fp16	4.25	+1.6875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	28549120	47349760	18800640	
+blk.14.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.14.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.14.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.14.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.14.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.14.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.14.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.14.ssm_out.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.15.attn_k.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	5242880	2949120	2785280	-163840	
+blk.15.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.15.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.15.attn_output.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.15.attn_q.weight	type10	2.6250	q5_g64_fp16	5.25	+2.625	t2_g128_fp16(2.1250)	grouped_absmax	31457280	10321920	20643840	10321920	gate
+blk.15.attn_q.weight	type10	2.6250	q4_g64_fp16	4.25	+1.625	t2_g128_fp16(2.1250)	grouped_absmax	31457280	10321920	16711680	6389760	query
+blk.15.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.15.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.15.ffn_down.weight	type18	3.0625	q4_g64_fp16	4.25	+1.6875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	18800640	
+blk.15.ffn_gate.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.15.ffn_up.weight	type22	2.5625	q4_g64_fp16	4.25	+1.6875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	28549120	47349760	18800640	
+blk.15.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.16.attn_gate.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	
+blk.16.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.16.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	key
+blk.16.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	query
+blk.16.attn_qkv.weight	type21	3.4375	q5_g64_fp16	5.25	+1.8125	q2_g64_fp16(2.2500)	grouped_absmax	31457280	13516800	20643840	7127040	value
+blk.16.ffn_down.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.16.ffn_gate.weight	type22	2.5625	q4_g64_fp16	4.25	+1.6875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	28549120	47349760	18800640	
+blk.16.ffn_up.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.16.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.16.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.16.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.16.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.16.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.16.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.16.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.16.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.17.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.17.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.17.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.17.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.17.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.17.ffn_down.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	q4_g64_fp16	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.17.ffn_gate.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.17.ffn_up.weight	type18	3.0625	q4_g64_fp16	4.25	+1.6875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	18800640	
+blk.17.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.17.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.17.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.17.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.17.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.17.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.17.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.17.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.18.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.18.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.18.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.18.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.18.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.18.ffn_down.weight	type21	3.4375	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.18.ffn_gate.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.18.ffn_up.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.18.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.18.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.18.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.18.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.18.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.18.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.18.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.18.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.19.attn_k.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	5242880	2949120	2785280	-163840	
+blk.19.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.19.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.19.attn_output.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.19.attn_q.weight	type18	3.0625	q5_g64_fp16	5.25	+2.1875	t2_g128_fp16(2.1250)	grouped_absmax	31457280	12042240	20643840	8601600	gate
+blk.19.attn_q.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	31457280	12042240	16711680	4669440	query
+blk.19.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.19.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.19.ffn_down.weight	type21	3.4375	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.19.ffn_gate.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.19.ffn_up.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.19.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.2.attn_gate.weight	type12	4.5000	q4_g64_fp16	4.25	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.2.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.2.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	-327680	key
+blk.2.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	-327680	query
+blk.2.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	value
+blk.2.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.2.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.2.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	47349760	47349760	9052160	
+blk.2.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.2.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.2.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.2.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.2.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.2.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.2.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.2.ssm_out.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.20.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.20.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.20.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.20.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.20.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.20.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.20.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.20.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	47349760	47349760	9052160	
+blk.20.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.20.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.20.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.20.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.20.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.20.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.20.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.20.ssm_out.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.21.attn_gate.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	
+blk.21.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.21.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.21.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.21.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.21.ffn_down.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	50135040	47349760	-2785280	
+blk.21.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.21.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.21.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.21.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.21.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.21.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.21.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.21.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.21.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.21.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.22.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.22.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.22.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	key
+blk.22.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	query
+blk.22.attn_qkv.weight	type21	3.4375	q5_g64_fp16	5.25	+1.8125	q2_g64_fp16(2.2500)	grouped_absmax	31457280	13516800	20643840	7127040	value
+blk.22.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.22.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.22.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.22.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.22.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.22.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.22.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.22.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.22.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.22.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.22.ssm_out.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.23.attn_k.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	2785280	-819200	
+blk.23.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.23.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.23.attn_output.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.23.attn_q.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	gate
+blk.23.attn_q.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	query
+blk.23.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.23.attn_v.weight	type14	6.5625	q5_g64_fp16	5.25	-1.3125	q5_g64_fp16(5.2500)	grouped_absmax	5242880	4300800	3440640	-860160	
+blk.23.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.23.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.23.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.23.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.24.attn_gate.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	
+blk.24.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.24.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	key
+blk.24.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	query
+blk.24.attn_qkv.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	value
+blk.24.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.24.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.24.ffn_up.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	50135040	47349760	-2785280	
+blk.24.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.24.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.24.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.24.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.24.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.24.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.24.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.24.ssm_out.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.25.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.25.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.25.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.25.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.25.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.25.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.25.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.25.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	-2785280	
+blk.25.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.25.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.25.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.25.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.25.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.25.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.25.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.25.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.26.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.26.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.26.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	key
+blk.26.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	query
+blk.26.attn_qkv.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	value
+blk.26.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.26.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.26.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.26.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.26.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.26.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.26.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.26.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.26.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.26.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.26.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.27.attn_k.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	2785280	-819200	
+blk.27.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.27.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.27.attn_output.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.27.attn_q.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	gate
+blk.27.attn_q.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	query
+blk.27.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.27.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.27.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.27.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.27.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.27.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.28.attn_gate.weight	type12	4.5000	q4_g64_fp16	4.25	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.28.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.28.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	-327680	key
+blk.28.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	-327680	query
+blk.28.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	value
+blk.28.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.28.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.28.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.28.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.28.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.28.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.28.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.28.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.28.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.28.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.28.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.29.attn_gate.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	
+blk.29.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.29.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.29.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.29.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.29.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.29.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	47349760	47349760	9052160	
+blk.29.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.29.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.29.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.29.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.29.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.29.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.29.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.29.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.29.ssm_out.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.3.attn_k.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	5242880	2949120	2785280	-163840	
+blk.3.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.3.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.3.attn_output.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.3.attn_q.weight	type20	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	gate
+blk.3.attn_q.weight	type20	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	query
+blk.3.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.3.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.3.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.3.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	47349760	47349760	9052160	
+blk.3.ffn_up.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.3.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.30.attn_gate.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	
+blk.30.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.30.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.30.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.30.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.30.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.30.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.30.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.30.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.30.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.30.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.30.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.30.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.30.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.30.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.30.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.31.attn_k.weight	type13	5.5000	q5_g64_fp16	5.25	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.31.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.31.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.31.attn_output.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	q4_g64_fp16	grouped_absmax	31457280	16711680	16711680	0	
+blk.31.attn_q.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	gate
+blk.31.attn_q.weight	type23	4.2500	q5_g64_fp16	5.25	+1.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	query
+blk.31.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.31.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.31.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.31.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.31.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.31.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.32.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.32.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.32.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.32.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.32.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.32.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.32.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.32.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.32.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.32.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.32.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.32.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.32.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.32.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.32.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.32.ssm_out.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.33.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.33.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.33.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.33.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.33.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.33.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	9052160	
+blk.33.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.33.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.33.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.33.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.33.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.33.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.33.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.33.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.33.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.33.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.34.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.34.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.34.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.34.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.34.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.34.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.34.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	47349760	47349760	9052160	
+blk.34.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.34.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.34.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.34.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.34.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.34.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.34.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.34.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.34.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.35.attn_k.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	5242880	2949120	2785280	-163840	
+blk.35.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.35.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.35.attn_output.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q4_g64_fp16	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.35.attn_q.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	gate
+blk.35.attn_q.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	query
+blk.35.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.35.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.35.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.35.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	47349760	47349760	9052160	
+blk.35.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.35.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.36.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.36.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.36.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.36.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.36.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.36.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.36.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.36.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.36.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.36.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.36.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.36.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.36.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.36.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.36.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.36.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.37.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.37.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.37.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.37.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.37.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.37.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.37.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.37.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.37.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.37.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.37.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.37.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.37.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.37.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.37.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.37.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.38.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.38.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.38.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	key
+blk.38.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	query
+blk.38.attn_qkv.weight	type21	3.4375	q5_g64_fp16	5.25	+1.8125	q2_g64_fp16(2.2500)	grouped_absmax	31457280	13516800	20643840	7127040	value
+blk.38.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.38.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.38.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.38.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.38.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.38.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.38.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.38.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.38.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.38.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.38.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.39.attn_k.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	5242880	2949120	2785280	-163840	
+blk.39.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.39.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.39.attn_output.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.39.attn_q.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	gate
+blk.39.attn_q.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	query
+blk.39.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.39.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.39.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.39.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.39.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.39.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.4.attn_gate.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	
+blk.4.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.4.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.4.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.4.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.4.ffn_down.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	50135040	47349760	-2785280	
+blk.4.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.4.ffn_up.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.4.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.4.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.4.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.4.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.4.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.4.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.4.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.4.ssm_out.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.40.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.40.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.40.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.40.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.40.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.40.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.40.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.40.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.40.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.40.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.40.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.40.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.40.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.40.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.40.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.40.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.41.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.41.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.41.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.41.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.41.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.41.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.41.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.41.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.41.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.41.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.41.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.41.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.41.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.41.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.41.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.41.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.42.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.42.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.42.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.42.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.42.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.42.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.42.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.42.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.42.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.42.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.42.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.42.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.42.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.42.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.42.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.42.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.43.attn_k.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	2785280	-819200	
+blk.43.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.43.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.43.attn_output.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q4_g64_fp16	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.43.attn_q.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	gate
+blk.43.attn_q.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	query
+blk.43.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.43.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.43.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.43.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.43.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.43.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.44.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.44.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.44.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.44.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.44.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.44.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.44.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.44.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.44.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.44.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.44.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.44.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.44.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.44.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.44.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.44.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.45.attn_gate.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	q2_g64_fp16(2.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.45.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.45.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	key
+blk.45.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	query
+blk.45.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	31457280	13516800	16711680	3194880	value
+blk.45.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.45.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.45.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.45.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.45.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.45.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.45.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.45.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.45.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.45.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.45.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	-983040	
+blk.46.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.46.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.46.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.46.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.46.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.46.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.46.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.46.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.46.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.46.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.46.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.46.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.46.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.46.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.46.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.46.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.47.attn_k.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	2785280	-819200	
+blk.47.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.47.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.47.attn_output.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.47.attn_q.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	gate
+blk.47.attn_q.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	query
+blk.47.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.47.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.47.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.47.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.47.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.47.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.48.attn_gate.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.48.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.48.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	-327680	key
+blk.48.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	-327680	query
+blk.48.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	value
+blk.48.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.48.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.48.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.48.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.48.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.48.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.48.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.48.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.48.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.48.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.48.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.49.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.49.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.49.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.49.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.49.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.49.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.49.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.49.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.49.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.49.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.49.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.49.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.49.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.49.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.49.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.49.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.5.attn_gate.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.5.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.5.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	key
+blk.5.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	query
+blk.5.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	value
+blk.5.ffn_down.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.5.ffn_gate.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.5.ffn_up.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.5.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.5.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.5.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.5.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.5.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.5.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.5.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.5.ssm_out.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.50.attn_gate.weight	type12	4.5000	q4_g64_fp16	4.25	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.50.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.50.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	-327680	key
+blk.50.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	-327680	query
+blk.50.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	value
+blk.50.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.50.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.50.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.50.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.50.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.50.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.50.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.50.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.50.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.50.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.50.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.51.attn_k.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	2785280	-819200	
+blk.51.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.51.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.51.attn_output.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.51.attn_q.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	gate
+blk.51.attn_q.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	query
+blk.51.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.51.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.51.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.51.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.51.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	-2785280	
+blk.51.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.52.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.52.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.52.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	key
+blk.52.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	query
+blk.52.attn_qkv.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	value
+blk.52.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.52.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.52.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.52.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.52.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.52.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.52.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.52.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.52.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.52.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.52.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.53.attn_gate.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.53.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.53.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	5570560	5570560	1064960	key
+blk.53.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	5570560	5570560	1064960	query
+blk.53.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0.0000	q2_g64_fp16(2.2500)	grouped_absmax	31457280	16711680	16711680	0	value
+blk.53.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.53.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.53.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.53.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.53.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.53.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.53.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.53.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.53.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.53.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.53.ssm_out.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.54.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.54.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.54.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	key
+blk.54.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	query
+blk.54.attn_qkv.weight	type21	3.4375	q5_g64_fp16	5.25	+1.8125	q2_g64_fp16(2.2500)	grouped_absmax	31457280	13516800	20643840	7127040	value
+blk.54.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.54.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.54.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.54.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.54.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.54.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.54.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.54.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.54.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.54.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.54.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.55.attn_k.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	2785280	-819200	
+blk.55.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.55.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.55.attn_output.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.55.attn_q.weight	type21	3.4375	q6_g64_fp16	6.25	+2.8125	q2_g64_fp16(2.2500)	grouped_absmax	31457280	13516800	24576000	11059200	gate
+blk.55.attn_q.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	31457280	13516800	16711680	3194880	query
+blk.55.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.55.attn_v.weight	type14	6.5625	q6_g64_fp16	6.25	-0.3125	q6_g64_fp16(6.2500)	grouped_absmax	5242880	4300800	4096000	-204800	
+blk.55.ffn_down.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	58490880	-2785280	
+blk.55.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.55.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.55.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.56.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.56.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.56.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.56.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.56.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.56.ffn_down.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	58490880	-2785280	
+blk.56.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.56.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.56.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.56.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.56.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.56.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.56.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.56.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.56.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.56.ssm_out.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.57.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.57.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.57.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.57.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.57.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.57.ffn_down.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	58490880	-2785280	
+blk.57.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.57.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.57.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.57.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.57.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.57.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.57.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.57.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.57.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.57.ssm_out.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.58.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.58.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.58.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.58.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.58.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.58.ffn_down.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	58490880	-2785280	
+blk.58.ffn_gate.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	47349760	-13926400	
+blk.58.ffn_up.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	47349760	-13926400	
+blk.58.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.58.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.58.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.58.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.58.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.58.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.58.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.58.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.59.attn_k.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	2785280	-819200	
+blk.59.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.59.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.59.attn_output.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.59.attn_q.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	gate
+blk.59.attn_q.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	query
+blk.59.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.59.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.59.ffn_down.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	58490880	-2785280	
+blk.59.ffn_gate.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	47349760	-13926400	
+blk.59.ffn_up.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	47349760	-13926400	
+blk.59.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.6.attn_gate.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	
+blk.6.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.6.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.6.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.6.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.6.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	-2785280	
+blk.6.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	47349760	47349760	9052160	
+blk.6.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.6.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.6.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.6.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.6.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.6.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.6.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.6.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.6.ssm_out.weight	type20	4.5000	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	0	
+blk.60.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.60.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.60.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.60.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.60.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.60.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.60.ffn_gate.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	47349760	-13926400	
+blk.60.ffn_up.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	47349760	-13926400	
+blk.60.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.60.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.60.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.60.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.60.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.60.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.60.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.60.ssm_out.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.61.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.61.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.61.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.61.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.61.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.61.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.61.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.61.ffn_up.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.61.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.61.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.61.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.61.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.61.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.61.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.61.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.61.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.62.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.62.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.62.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	key
+blk.62.attn_qkv.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5570560	5570560	0	query
+blk.62.attn_qkv.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	value
+blk.62.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.62.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.62.ffn_up.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	89128960	50135040	47349760	-2785280	
+blk.62.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.62.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.62.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.62.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.62.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.62.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.62.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.62.ssm_out.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.63.attn_k.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	2785280	-819200	
+blk.63.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.63.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.63.attn_output.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	31457280	21626880	20643840	-983040	
+blk.63.attn_q.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	gate
+blk.63.attn_q.weight	type23	4.2500	q4_g64_fp16	4.25	+0	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	query
+blk.63.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.63.attn_v.weight	type14	6.5625	q5_g64_fp16	5.25	-1.3125	q5_g64_fp16(5.2500)	grouped_absmax	5242880	4300800	3440640	-860160	
+blk.63.ffn_down.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	58490880	-2785280	
+blk.63.ffn_gate.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	47349760	-13926400	
+blk.63.ffn_up.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	89128960	61276160	47349760	-13926400	
+blk.63.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.64.attn_k.weight	type8	8.5000	q4_g64_fp16	4.2500	-2.3125	q6_g64_fp16(6.2500)	grouped_absmax	5242880	5570560	2785280	-1515520	
+blk.64.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.64.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.64.attn_output.weight	type14	6.5625	q4_g64_fp16	4.2500	-2.3125	q6_g64_fp16(6.2500)	grouped_absmax	31457280	25804800	16711680	-9093120	
+blk.64.attn_q.weight	type14	6.5625	q4_g64_fp16	4.2500	-2.3125	q6_g64_fp16(6.2500)	grouped_absmax	62914560	51609600	33423360	-18186240	
+blk.64.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.64.attn_v.weight	type8	8.5000	q4_g64_fp16	4.2500	-2.3125	q6_g64_fp16(6.2500)	grouped_absmax	5242880	5570560	2785280	-1515520	
+blk.64.ffn_down.weight	type14	6.5625	q4_g64_fp16	4.25	-2.3125	q4_g64_fp16(4.2500)	grouped_absmax	89128960	73113600	47349760	-25763840	
+blk.64.ffn_gate.weight	type14	6.5625	q4_g64_fp16	4.25	-2.3125	q4_g64_fp16(4.2500)	grouped_absmax	89128960	73113600	47349760	-25763840	
+blk.64.ffn_up.weight	type14	6.5625	q4_g64_fp16	4.25	-2.3125	q4_g64_fp16(4.2500)	grouped_absmax	89128960	73113600	47349760	-25763840	
+blk.64.nextn.eh_proj.weight	type14	6.5625	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	52428800	43008000	27852800	-1638400	
+blk.64.nextn.enorm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.64.nextn.hnorm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.64.nextn.shared_head_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.64.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.7.attn_k.weight	type13	5.5000	q4_g64_fp16	4.25	-1.25	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	2785280	-819200	
+blk.7.attn_k_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.7.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.7.attn_output.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+blk.7.attn_q.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	gate
+blk.7.attn_q.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	query
+blk.7.attn_q_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	256	1024	512	-512	
+blk.7.attn_v.weight	type13	5.5000	q5_g64_fp16	5.2500	-0.2500	q6_g64_fp16(6.2500)	grouped_absmax	5242880	3604480	3440640	-163840	
+blk.7.ffn_down.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.7.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	89128960	47349760	47349760	0	
+blk.7.ffn_up.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.7.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.8.attn_gate.weight	type23	4.2500	q5_g64_fp16	5.25	+1	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	20643840	3932160	
+blk.8.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.8.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	key
+blk.8.attn_qkv.weight	type12	4.5000	q4_g64_fp16	4.25	-0.25	q5_g64_fp16(5.2500)	grouped_absmax	10485760	5898240	5570560	-327680	query
+blk.8.attn_qkv.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	value
+blk.8.ffn_down.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.8.ffn_gate.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	47349760	47349760	9052160	
+blk.8.ffn_up.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.8.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.8.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.8.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.8.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.8.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.8.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.8.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.8.ssm_out.weight	type12	4.5000	q4_g64_fp16	4.2500	-0.2500	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	16711680	-983040	
+blk.9.attn_gate.weight	type12	4.5000	q5_g64_fp16	5.25	+0.75	q5_g64_fp16(5.2500)	grouped_absmax	31457280	17694720	20643840	2949120	
+blk.9.attn_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.9.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	key
+blk.9.attn_qkv.weight	type21	3.4375	q4_g64_fp16	4.25	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	10485760	4505600	5570560	1064960	query
+blk.9.attn_qkv.weight	type21	3.4375	q5_g64_fp16	5.25	+1.8125	q2_g64_fp16(2.2500)	grouped_absmax	31457280	13516800	20643840	7127040	value
+blk.9.ffn_down.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.9.ffn_gate.weight	type18	3.0625	q4_g64_fp16	4.25	+1.1875	t2_g128_fp16(2.1250)	grouped_absmax	89128960	34119680	47349760	13230080	
+blk.9.ffn_up.weight	type21	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	89128960	38297600	47349760	9052160	
+blk.9.post_attention_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+blk.9.ssm_a	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.9.ssm_alpha.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.9.ssm_beta.weight	type8	8.5000	bf16	16.0000	+7.5000	q8_g32 (runtime-rejected)	cast_direct	245760	261120	491520	230400	
+blk.9.ssm_conv1d.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	40960	163840	81920	-81920	
+blk.9.ssm_dt.bias	type0	32.0000	fp32	32.0000	+0.0000	int32(32.0000)	cast_direct	48	192	192	0	
+blk.9.ssm_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	128	512	256	-256	
+blk.9.ssm_out.weight	type23	4.2500	q4_g64_fp16	4.2500	+0.0000	q5_g64_fp16(5.2500)	grouped_absmax	31457280	16711680	16711680	0	
+output.weight	type13	5.5000	q4_g64_fp16	4.2500	-1.2500	q5_g64_fp16(5.2500)	grouped_absmax	1271398400	874086400	675430400	-198656000	
+output_norm.weight	type0	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	5120	20480	10240	-10240	
+token_embd.weight	type11	3.4375	q4_g64_fp16	4.2500	+0.8125	q2_g64_fp16(2.2500)	grouped_absmax	1271398400	546304000	675430400	129126400	

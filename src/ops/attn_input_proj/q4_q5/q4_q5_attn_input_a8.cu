@@ -57,28 +57,54 @@ void launch_all(const Tensor& x, const Weight& query_key, const Weight& gate_val
         reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, codes, scales);
     CUDA_CHECK(cudaGetLastError());
 
-    launch_range<a8::Q4Codec, NT>(query_key, codes, scales, tokens, 0, kQRows,
-                                  static_cast<__nv_bfloat16*>(q.data), kQRows, stream);
-    launch_range<a8::Q4Codec, NT>(query_key, codes, scales, tokens, kQRows, kKvRows,
-                                  static_cast<__nv_bfloat16*>(k.data), kKvRows, stream);
-    launch_range<a8::Q5Codec, NT>(gate_value, codes, scales, tokens, 0, kQRows,
-                                  static_cast<__nv_bfloat16*>(gate.data), kQRows, stream);
-    launch_range<a8::Q5Codec, NT>(gate_value, codes, scales, tokens, kQRows, kKvRows,
-                                  static_cast<__nv_bfloat16*>(v.data), kKvRows, stream);
+    if (query_key.qtype == QType::Q6_G64_FP16) {
+        launch_range<a8::Q6Codec, NT>(query_key, codes, scales, tokens, 0, kQRows,
+                                      static_cast<__nv_bfloat16*>(q.data), kQRows, stream);
+        launch_range<a8::Q6Codec, NT>(query_key, codes, scales, tokens, kQRows, kKvRows,
+                                      static_cast<__nv_bfloat16*>(k.data), kKvRows, stream);
+    } else {
+        launch_range<a8::Q4Codec, NT>(query_key, codes, scales, tokens, 0, kQRows,
+                                      static_cast<__nv_bfloat16*>(q.data), kQRows, stream);
+        launch_range<a8::Q4Codec, NT>(query_key, codes, scales, tokens, kQRows, kKvRows,
+                                      static_cast<__nv_bfloat16*>(k.data), kKvRows, stream);
+    }
+    if (gate_value.qtype == QType::Q6_G64_FP16) {
+        launch_range<a8::Q6Codec, NT>(gate_value, codes, scales, tokens, 0, kQRows,
+                                      static_cast<__nv_bfloat16*>(gate.data), kQRows, stream);
+        launch_range<a8::Q6Codec, NT>(gate_value, codes, scales, tokens, kQRows, kKvRows,
+                                      static_cast<__nv_bfloat16*>(v.data), kKvRows, stream);
+    } else if (gate_value.qtype == QType::Q5_G64_FP16) {
+        launch_range<a8::Q5Codec, NT>(gate_value, codes, scales, tokens, 0, kQRows,
+                                      static_cast<__nv_bfloat16*>(gate.data), kQRows, stream);
+        launch_range<a8::Q5Codec, NT>(gate_value, codes, scales, tokens, kQRows, kKvRows,
+                                      static_cast<__nv_bfloat16*>(v.data), kKvRows, stream);
+    } else {
+        launch_range<a8::Q4Codec, NT>(gate_value, codes, scales, tokens, 0, kQRows,
+                                      static_cast<__nv_bfloat16*>(gate.data), kQRows, stream);
+        launch_range<a8::Q4Codec, NT>(gate_value, codes, scales, tokens, kQRows, kKvRows,
+                                      static_cast<__nv_bfloat16*>(v.data), kKvRows, stream);
+    }
 }
 
 } // namespace
 
 bool q4_q5_attn_input_a8_supported(const Weight& query_key, const Weight& gate_value,
                                    std::int32_t tokens) {
-    return a8::tokens_supported(tokens) && query_key.qtype == QType::Q4_G64_FP16 &&
+    // A8 path does not support mixed qtype weights (e.g. attn_q=Q6 + attn_k=Q4).
+    // Q6 weights must use the MMA path which has mixed_slice for mixed qtype.
+    if (query_key.qtype == QType::Q6_G64_FP16 || gate_value.qtype == QType::Q6_G64_FP16) {
+        return false;
+    }
+    const bool qk_ok = (query_key.qtype == QType::Q4_G64_FP16) &&
            is_row_split(query_key.layout) && query_key.n == kParentRows &&
            query_key.k == kHidden && query_key.group == a8::kGroup && query_key.qdata != nullptr &&
-           query_key.scales != nullptr && gate_value.qtype == QType::Q5_G64_FP16 &&
+           query_key.scales != nullptr;
+    const bool gv_ok = (gate_value.qtype == QType::Q5_G64_FP16 ||
+                        gate_value.qtype == QType::Q4_G64_FP16) &&
            is_row_split(gate_value.layout) && gate_value.n == kParentRows &&
            gate_value.k == kHidden && gate_value.group == a8::kGroup &&
-           gate_value.qdata != nullptr && gate_value.qhigh != nullptr &&
-           gate_value.scales != nullptr;
+           gate_value.qdata != nullptr && gate_value.scales != nullptr;
+    return a8::tokens_supported(tokens) && qk_ok && gv_ok;
 }
 
 std::size_t q4_q5_attn_input_a8_workspace_capacity_bytes(std::int32_t min_tokens,

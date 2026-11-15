@@ -113,6 +113,7 @@ struct Q4Codec {
     static constexpr bool kHasHigh       = false;
     static constexpr bool kTernary       = false;
     static constexpr int kCodeBytes      = 32; // one row's 64-wide group
+    static constexpr int kHighBytesPerGroup = 0;
     static constexpr int kGroupsPerScale = 1;
     __device__ static unsigned decode(unsigned pair, unsigned /*high_nibble*/) {
         return __vsub4(expand_nibbles(pair) ^ 0x08080808u, 0x08080808u);
@@ -123,10 +124,34 @@ struct Q5Codec {
     static constexpr bool kHasHigh       = true;
     static constexpr bool kTernary       = false;
     static constexpr int kCodeBytes      = 32;
+    static constexpr int kHighBytesPerGroup = 8;
     static constexpr int kGroupsPerScale = 1;
     __device__ static unsigned decode(unsigned pair, unsigned high_nibble) {
         const unsigned v = expand_nibbles(pair) | (spread4(high_nibble) << 4);
         return __vsub4(v ^ 0x10101010u, 0x10101010u);
+    }
+};
+
+// Q6: each code is six bits, stored as a four-bit nibble in the code plane plus two high bits in
+// the high plane. The high plane is 16 bytes per group (two bits per code x 64 codes), so each
+// lane's eight codes need two high bytes. The decode reads both bytes and spreads the four high
+// bits of each into the fifth and sixth positions of the four codes in the pair.
+struct Q6Codec {
+    static constexpr bool kHasHigh       = true;
+    static constexpr bool kTernary       = false;
+    static constexpr int kCodeBytes      = 32;
+    static constexpr int kHighBytesPerGroup = 16;
+    static constexpr int kGroupsPerScale = 1;
+    __device__ static unsigned decode(unsigned pair, unsigned high_byte) {
+        // high_byte: bits 0-1 code 0, bits 2-3 code 1, bits 4-5 code 2, bits 6-7 code 3.
+        // spread4 only handles 1 bit per code (Q5); Q6 needs 2 bits per code.
+        const unsigned codes = expand_nibbles(pair);
+        const unsigned high = ((high_byte & 0x03u) << 4) |
+                              (((high_byte >> 2) & 0x03u) << 12) |
+                              (((high_byte >> 4) & 0x03u) << 20) |
+                              (((high_byte >> 6) & 0x03u) << 28);
+        const unsigned v = codes | high;
+        return __vsub4(v ^ 0x20202020u, 0x20202020u);
     }
 };
 
@@ -137,6 +162,7 @@ struct T2Codec {
     static constexpr bool kHasHigh       = false;
     static constexpr bool kTernary       = true;
     static constexpr int kCodeBytes      = 16;
+    static constexpr int kHighBytesPerGroup = 0;
     static constexpr int kGroupsPerScale = 2;
 
     __device__ static unsigned decode(unsigned byte) {
@@ -277,7 +303,7 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(const std::uint8_t* __
     constexpr int BN       = kWarpsN * NT * 8;
     constexpr int kNTiles  = BN / 8;
     constexpr int kWBytes  = BM * kWRow;
-    constexpr int kHBytes  = Codec::kHasHigh ? BM * 8 : 0;
+    constexpr int kHBytes  = Codec::kHighBytesPerGroup * BM;
     constexpr int kXBytes  = kNTiles * 32 * 16;
     constexpr int kXsBytes = BN * 2;
     constexpr int kStage   = kWBytes + kHBytes + kXBytes + kXsBytes;
@@ -343,13 +369,13 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(const std::uint8_t* __
             const int staged      = tid + i * kThreads;
             const int safe        = staged < BM ? staged : 0;
             const std::size_t row = static_cast<std::size_t>(rows.weight_row(row_block, safe));
-            h_lane[i] = w_high + (row & ~panel_mask) * (static_cast<std::size_t>(kGroups) * 8) +
-                        (row & panel_mask) * 8;
-            h_dst[i] = staged < BM ? (kWBytes + staged * 8) : -1;
+            h_lane[i] = w_high + (row & ~panel_mask) * (static_cast<std::size_t>(kGroups) * Codec::kHighBytesPerGroup) +
+                        (row & panel_mask) * Codec::kHighBytesPerGroup;
+            h_dst[i] = staged < BM ? (kWBytes + staged * Codec::kHighBytesPerGroup) : -1;
         }
     }
     const int w_group_stride = Codec::kCodeBytes << panel_shift;
-    const int h_group_stride = 8 << panel_shift;
+    const int h_group_stride = Codec::kHighBytesPerGroup << panel_shift;
 
     auto issue = [&](int g, int buf) {
         char* const dst = s_base + buf * kStage;
@@ -442,12 +468,15 @@ __global__ __launch_bounds__(kThreads) void a8_mma_kernel(const std::uint8_t* __
                 if constexpr (Codec::kHasHigh) {
                     // The four codes at ks*32 + tig*4 take one nibble of the high byte covering
                     // codes 8i..8i+7, and the +16 chunk takes a nibble two bytes further on.
-                    const int byte = ks * 4 + (tig >> 1);
+                    // For Q6 (kHighBytesPerGroup=16) each group's high plane is 16 bytes, so the
+                    // byte index doubles: byte = ks*8 + (tig>>1), and the +16 chunk is +4 bytes.
+                    constexpr int kHighScale = Codec::kHighBytesPerGroup / 8;
+                    const int byte = ks * 4 * kHighScale + (tig >> 1) * kHighScale;
                     const int shift = (tig & 1) * 4;
-                    h0 = lds8(sh + r0 * 8 + byte) >> shift;
-                    h1 = lds8(sh + r1 * 8 + byte) >> shift;
-                    h2 = lds8(sh + r0 * 8 + byte + 2) >> shift;
-                    h3 = lds8(sh + r1 * 8 + byte + 2) >> shift;
+                    h0 = lds8(sh + r0 * Codec::kHighBytesPerGroup + byte) >> shift;
+                    h1 = lds8(sh + r1 * Codec::kHighBytesPerGroup + byte) >> shift;
+                    h2 = lds8(sh + r0 * Codec::kHighBytesPerGroup + byte + 2 * kHighScale) >> shift;
+                    h3 = lds8(sh + r1 * Codec::kHighBytesPerGroup + byte + 2 * kHighScale) >> shift;
                 }
                 if constexpr (Codec::kTernary) {
                     // Byte ks*8 + tig holds k = ks*32 + tig*4 .. +3, and k + 16 is 4 bytes on.
@@ -533,7 +562,7 @@ template <class Codec, int MT, int NT, class RowMap, bool TuringShapes>
     constexpr int BM      = RowMap::kStagedRows;
     constexpr int BN      = kWarpsN * NT * 8;
     constexpr int kWBytes = BM * kWRow;
-    constexpr int kHBytes = Codec::kHasHigh ? BM * 8 : 0;
+    constexpr int kHBytes = Codec::kHighBytesPerGroup * BM;
     constexpr int kXBytes = (BN / 8) * 32 * 16;
     (void)input_rows;
     return static_cast<std::size_t>(stages(TuringShapes)) * (kWBytes + kHBytes + kXBytes + BN * 2) +

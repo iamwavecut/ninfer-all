@@ -6,6 +6,9 @@
 #include "ops/common/rowsplit_grouped_mma.cuh"
 #include "ops/common/token_slices.h"
 
+#include <cuda_fp16.h>
+#include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 
@@ -18,18 +21,71 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t row_begin, std
         out.ne[0] != row_count) {
         throw std::invalid_argument("Q4/Q5 attention input grouped MMA row view is invalid");
     }
+    // Use the second sub-weight's qtype if this row range falls in its range.
+    const QType effective_qtype =
+        (weight.second_sub_row > 0 && row_begin >= weight.second_sub_row)
+            ? weight.second_sub_qtype
+            : weight.qtype;
+    if (effective_qtype == QType::Q6_G64_FP16) {
+        fprintf(stderr, "[debug] MMA make_job Q6: row_begin=%d row_count=%d n=%d\n",
+                row_begin, row_count, weight.n);
+    }
+    if (row_begin >= 6000 && row_begin < 7200) {
+        fprintf(stderr, "[debug] make_job attn row_begin=%d qtype=%d second_sub_row=%d second_sub_qtype=%d effective=%d\n",
+                row_begin, (int)weight.qtype, weight.second_sub_row, (int)weight.second_sub_qtype, (int)effective_qtype);
+        // Copy scales from device to host and verify
+        const auto* device_scales = static_cast<const std::uint8_t*>(weight.scales);
+        const int64_t groups = weight.padded_shape[1] / 64;
+        const int64_t scale_bytes = (int64_t)weight.n * groups * 2;
+        if (device_scales && scale_bytes > 0 && scale_bytes < 10000000) {
+            std::uint8_t* host_scales = static_cast<std::uint8_t*>(malloc(scale_bytes));
+            if (host_scales) {
+                cudaMemcpy(host_scales, device_scales, scale_bytes, cudaMemcpyDeviceToHost);
+                // Check specific location that kernel reported NaN (job-relative row 3777 = full weight row row_begin+3777)
+                const int64_t check_full_row = row_begin + 3777;
+                if (check_full_row < weight.n) {
+                    const int64_t gi = check_full_row * groups + 36;
+                    if (gi * 2 + 1 < scale_bytes) {
+                        const std::uint16_t scale_bits = *reinterpret_cast<const std::uint16_t*>(&host_scales[gi * 2]);
+                        fprintf(stderr, "[debug] make_job DEVICE scales row_begin=%d full_row=%lld g=36: bits=0x%04x\n",
+                                row_begin, (long long)check_full_row, scale_bits);
+                    }
+                }
+                // Scan all for NaN
+                int nan_count = 0;
+                for (int64_t i = 0; i < (int64_t)weight.n * groups; ++i) {
+                    const std::uint16_t bits = *reinterpret_cast<const std::uint16_t*>(&host_scales[i * 2]);
+                    const float val = __half2float(__ushort_as_half(bits));
+                    if (!std::isfinite(val)) {
+                        nan_count++;
+                        if (nan_count <= 5) {
+                            fprintf(stderr, "[debug] make_job DEVICE scale non-finite: gi=%lld bits=0x%04x val=%f\n",
+                                    (long long)i, bits, val);
+                        }
+                    }
+                }
+                fprintf(stderr, "[debug] make_job DEVICE scales total non-finite: %d / %lld\n",
+                        nan_count, (long long)((int64_t)weight.n * groups));
+                free(host_scales);
+            }
+        }
+    }
     const std::int64_t groups = weight.padded_shape[1] / 64;
     const auto* codes         = static_cast<const std::uint8_t*>(weight.qdata) +
                         static_cast<std::int64_t>(row_begin) * groups * 32;
-    const auto* high   = weight.qtype == QType::Q5_G64_FP16
+    const auto* high   = effective_qtype == QType::Q5_G64_FP16
                              ? static_cast<const std::uint8_t*>(weight.qhigh) +
                                  static_cast<std::int64_t>(row_begin) * groups * 8
-                             : nullptr;
+                             : effective_qtype == QType::Q6_G64_FP16
+                                 ? static_cast<const std::uint8_t*>(weight.qhigh) +
+                                     static_cast<std::int64_t>(row_begin) * groups * 16
+                                 : nullptr;
     const auto* scales = static_cast<const std::uint8_t*>(weight.scales) +
                          static_cast<std::int64_t>(row_begin) * groups * 2;
     return RowSplitGroupedMmaJob{
         codes,     high,      scales, static_cast<__nv_bfloat16*>(out.data),
-        row_count, out.ne[0], 0,      weight.qtype == QType::Q5_G64_FP16,
+        row_count, out.ne[0], 0,      effective_qtype == QType::Q5_G64_FP16,
+        effective_qtype == QType::Q6_G64_FP16,
     };
 }
 
@@ -60,12 +116,32 @@ template <class Schedule>
 void launch_slice(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
                   Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     const bool full = (x.ne[1] % Schedule::BN) == 0;
-    launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
-        full, x, make_job(query_key_weight, 0, 6144, q), make_job(query_key_weight, 6144, 1024, k),
-        stream);
-    launch_pair<Schedule, RowSplitGroupedMmaCodec::Q5>(
-        full, x, make_job(gate_value_weight, 0, 6144, gate),
-        make_job(gate_value_weight, 6144, 1024, v), stream);
+    if (query_key_weight.qtype == QType::Q6_G64_FP16) {
+        launch_pair<Schedule, RowSplitGroupedMmaCodec::Q6>(
+            full, x, make_job(query_key_weight, 0, 6144, q),
+            make_job(query_key_weight, 6144, 1024, k), stream);
+    } else if (query_key_weight.qtype == QType::Q5_G64_FP16) {
+        launch_pair<Schedule, RowSplitGroupedMmaCodec::Q5>(
+            full, x, make_job(query_key_weight, 0, 6144, q),
+            make_job(query_key_weight, 6144, 1024, k), stream);
+    } else {
+        launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
+            full, x, make_job(query_key_weight, 0, 6144, q),
+            make_job(query_key_weight, 6144, 1024, k), stream);
+    }
+    if (gate_value_weight.qtype == QType::Q6_G64_FP16) {
+        launch_pair<Schedule, RowSplitGroupedMmaCodec::Q6>(
+            full, x, make_job(gate_value_weight, 0, 6144, gate),
+            make_job(gate_value_weight, 6144, 1024, v), stream);
+    } else if (gate_value_weight.qtype == QType::Q5_G64_FP16) {
+        launch_pair<Schedule, RowSplitGroupedMmaCodec::Q5>(
+            full, x, make_job(gate_value_weight, 0, 6144, gate),
+            make_job(gate_value_weight, 6144, 1024, v), stream);
+    } else {
+        launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
+            full, x, make_job(gate_value_weight, 0, 6144, gate),
+            make_job(gate_value_weight, 6144, 1024, v), stream);
+    }
 }
 
 template <class Schedule>
@@ -86,8 +162,8 @@ void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_
 // The pair tile pads every column group to its full width, so a 64-wide tile does twice the
 // MMA work a 32-column decode round needs. The 32-wide tile covers every decode extent; the
 // 64-wide tile stays for prefill chunks.
-using MmaR32C32S4 = GemmCfg<32, 32, 64, 16, 16, 4, 1, false, true, true>;
-using MmaR32C64S4 = GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>;
+using MmaR32C32S4 = GemmCfg<32, 32, 64, 16, 16, 2, 1, false, true, true>;
+using MmaR32C64S4 = GemmCfg<32, 64, 64, 16, 16, 2, 1, false, true, true>;
 
 template <class S, bool Full>
 void mixed_slice(const Tensor& x, const Weight& w0, const Weight& w1, Tensor& q, Tensor& g,

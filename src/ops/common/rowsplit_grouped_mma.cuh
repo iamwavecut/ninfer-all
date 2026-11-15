@@ -7,6 +7,7 @@
 #include "ops/common/rowsplit_mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
+#include "ops/linear/q6/q6_rowsplit_storage.cuh"
 #include "core/tensor.h"
 
 #include <cuda_bf16.h>
@@ -24,12 +25,14 @@ struct RowSplitGroupedMmaJob {
     std::int32_t out_ld         = 0;
     std::int32_t out_row_offset = 0;
     bool q5                     = false;
+    bool q6                     = false;
 };
 
 enum class RowSplitGroupedMmaCodec : std::uint8_t {
     Mixed,
     Q4,
     Q5,
+    Q6,
 };
 
 template <class Cfg, bool FullTiles, RowSplitGroupedMmaCodec Codec = RowSplitGroupedMmaCodec::Mixed,
@@ -49,7 +52,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
     constexpr int KSUB              = BK / 16;
     constexpr int S                 = Cfg::STAGES;
     constexpr int SCALE_STAGE_BYTES = Cfg::SCALE_PAIR_LOAD && GPB == 1 ? 4 : GPB * 2;
-    constexpr int HB                = Codec == RowSplitGroupedMmaCodec::Q4 ? 1 : 8;
+    constexpr int HB                = Codec == RowSplitGroupedMmaCodec::Q4 ? 1 :
+                                      Codec == RowSplitGroupedMmaCodec::Q6 ? 16 : 8;
     static_assert(GPB == 1 || GPB == 2,
                   "grouped input GEMM supports one or two quant groups per BK");
     static_assert(Jobs == 2 || Jobs == 4, "grouped input GEMM supports two or four jobs");
@@ -126,9 +130,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
             const int col      = t0 + tl;
             const int kk       = k0 + kl;
             __nv_bfloat16* dst = &Bs[stage][tl * BK + gemm_swz64(tl, kl)];
-            if constexpr (FullTiles) {
-                gemm_cp_async<16, Cfg>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
-            } else if (col < t && kk + 8 <= k) {
+            if (col < t && kk + 8 <= k) {
                 gemm_cp_async<16, Cfg>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
                 store_vec(dst, make_int4(0, 0, 0, 0));
@@ -157,35 +159,66 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }
             }
-            if constexpr (Codec == RowSplitGroupedMmaCodec::Q5) {
+            if constexpr (Codec == RowSplitGroupedMmaCodec::Q5 ||
+                          Codec == RowSplitGroupedMmaCodec::Q6) {
 #pragma unroll 1
                 for (int row = tid; row < BM; row += Cfg::THREADS) {
                     const int grow = m0 + row;
                     auto* dst      = &Hr[stage][group * BM * HB + row * HB];
                     if constexpr (FullTiles) {
                         const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                        gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
+                        if constexpr (Codec == RowSplitGroupedMmaCodec::Q6) {
+                            gemm_cp_async<8, Cfg>(dst, &job.high[gi * 16]);
+                            gemm_cp_async<8, Cfg>(dst + 8, &job.high[gi * 16 + 8]);
+                        } else {
+                            gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
+                        }
                     } else if (grow < job.n) {
                         const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                        gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
+                        if constexpr (Codec == RowSplitGroupedMmaCodec::Q6) {
+                            gemm_cp_async<8, Cfg>(dst, &job.high[gi * 16]);
+                            gemm_cp_async<8, Cfg>(dst + 8, &job.high[gi * 16 + 8]);
+                        } else {
+                            gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
+                        }
                     } else {
-                        *reinterpret_cast<std::uint64_t*>(dst) = 0;
+                        if constexpr (Codec == RowSplitGroupedMmaCodec::Q6) {
+                            *reinterpret_cast<std::uint64_t*>(dst) = 0;
+                            *reinterpret_cast<std::uint64_t*>(dst + 8) = 0;
+                        } else {
+                            *reinterpret_cast<std::uint64_t*>(dst) = 0;
+                        }
                     }
                 }
             } else if constexpr (Codec == RowSplitGroupedMmaCodec::Mixed) {
-                if (job.q5) {
+                if (job.q5 || job.q6) {
 #pragma unroll 1
                     for (int row = tid; row < BM; row += Cfg::THREADS) {
                         const int grow = m0 + row;
                         auto* dst      = &Hr[stage][group * BM * HB + row * HB];
                         if constexpr (FullTiles) {
                             const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                            gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
+                            if (job.q6) {
+                                gemm_cp_async<8, Cfg>(dst, &job.high[gi * 16]);
+                                gemm_cp_async<8, Cfg>(dst + 8, &job.high[gi * 16 + 8]);
+                            } else {
+                                gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
+                            }
                         } else if (grow < job.n) {
                             const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                            gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
+                            if (job.q6) {
+                                gemm_cp_async<8, Cfg>(dst, &job.high[gi * 16]);
+                                gemm_cp_async<8, Cfg>(dst + 8, &job.high[gi * 16 + 8]);
+                            } else {
+                                gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
+                            }
                         } else {
-                            *reinterpret_cast<std::uint64_t*>(dst) = 0;
+                            if (job.q6) {
+                                *reinterpret_cast<std::uint64_t*>(dst) = 0;
+                                *reinterpret_cast<std::uint64_t*>(dst + 8) = 0;
+                            } else {
+                                *reinterpret_cast<std::uint64_t*>(dst) = 0;
+                            }
                         }
                     }
                 }
@@ -195,32 +228,52 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
         for (int row = tid; row < BM; row += Cfg::THREADS) {
             const int grow = m0 + row;
             auto* dst      = &Sr[stage][row * SCALE_STAGE_BYTES];
+            const bool is_q6_scale = (Codec == RowSplitGroupedMmaCodec::Q6) ||
+                                     (Codec == RowSplitGroupedMmaCodec::Mixed && job.q6);
             if constexpr (Cfg::SCALE_PAIR_LOAD) {
-                const int aligned_g = first_g & ~1;
-                if constexpr (FullTiles) {
-                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + first_g;
-                    const std::int64_t aligned_gi =
-                        static_cast<std::int64_t>(grow) * kg + aligned_g;
-                    if (aligned_g + 1 < kg) {
-                        gemm_cp_async<4, Cfg>(dst, &job.scales[aligned_gi * 2]);
+                if (!is_q6_scale) {
+                    const int aligned_g = first_g & ~1;
+                    if constexpr (FullTiles) {
+                        const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + first_g;
+                        const std::int64_t aligned_gi =
+                            static_cast<std::int64_t>(grow) * kg + aligned_g;
+                        if (aligned_g + 1 < kg) {
+                            gemm_cp_async<4, Cfg>(dst, &job.scales[aligned_gi * 2]);
+                        } else {
+                            *reinterpret_cast<std::uint16_t*>(dst) =
+                                *reinterpret_cast<const std::uint16_t*>(&job.scales[gi * 2]);
+                            *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
+                        }
+                    } else if (grow < job.n) {
+                        const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + first_g;
+                        const std::int64_t aligned_gi =
+                            static_cast<std::int64_t>(grow) * kg + aligned_g;
+                        if (aligned_g + 1 < kg) {
+                            gemm_cp_async<4, Cfg>(dst, &job.scales[aligned_gi * 2]);
+                        } else {
+                            *reinterpret_cast<std::uint16_t*>(dst) =
+                                *reinterpret_cast<const std::uint16_t*>(&job.scales[gi * 2]);
+                            *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
+                        }
                     } else {
-                        *reinterpret_cast<std::uint16_t*>(dst) =
-                            *reinterpret_cast<const std::uint16_t*>(&job.scales[gi * 2]);
-                        *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
-                    }
-                } else if (grow < job.n) {
-                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + first_g;
-                    const std::int64_t aligned_gi =
-                        static_cast<std::int64_t>(grow) * kg + aligned_g;
-                    if (aligned_g + 1 < kg) {
-                        gemm_cp_async<4, Cfg>(dst, &job.scales[aligned_gi * 2]);
-                    } else {
-                        *reinterpret_cast<std::uint16_t*>(dst) =
-                            *reinterpret_cast<const std::uint16_t*>(&job.scales[gi * 2]);
-                        *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
+                        *reinterpret_cast<std::uint32_t*>(dst) = 0;
                     }
                 } else {
-                    *reinterpret_cast<std::uint32_t*>(dst) = 0;
+#pragma unroll
+                    for (int group = 0; group < GPB; ++group) {
+                        const int g           = first_g + group;
+                        const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
+                        auto* scale_dst       = dst + group * 2;
+                        if constexpr (FullTiles) {
+                            *reinterpret_cast<std::uint16_t*>(scale_dst) =
+                                *reinterpret_cast<const std::uint16_t*>(&job.scales[gi * 2]);
+                        } else if (grow < job.n) {
+                            *reinterpret_cast<std::uint16_t*>(scale_dst) =
+                                *reinterpret_cast<const std::uint16_t*>(&job.scales[gi * 2]);
+                        } else {
+                            *reinterpret_cast<std::uint16_t*>(scale_dst) = 0;
+                        }
+                    }
                 }
             } else if constexpr (FullTiles) {
 #pragma unroll
@@ -257,20 +310,48 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
     auto dequant_to_As = [&](int stage, int kt) {
         const int first_g = (kt * BK) >> 6;
         for (int row = warp; row < BM; row += Cfg::WARPS) {
+            const int grow = m0 + row;
 #pragma unroll
             for (int group = 0; group < GPB; ++group) {
                 const int g         = first_g + group;
-                const int scale_off = Cfg::SCALE_PAIR_LOAD ? ((g & 1) * 2) : (group * 2);
+                const int scale_off = (Codec == RowSplitGroupedMmaCodec::Q6) ||
+                                      (Codec == RowSplitGroupedMmaCodec::Mixed && job.q6)
+                                          ? (group * 2)
+                                          : (Cfg::SCALE_PAIR_LOAD ? ((g & 1) * 2) : (group * 2));
                 const auto* codes   = &Cr[stage][group * BM * 32];
                 const auto* high    = &Hr[stage][group * BM * HB];
-                const auto* scales  = &Sr[stage][row * SCALE_STAGE_BYTES + scale_off];
+                // Debug: print high bytes for first row/group/kt to compare with model file
+                if (blockIdx.x == 0 && blockIdx.y == 0 && row == 0 && group == 0 && kt == 0 && threadIdx.x == 0) {
+                    printf("[debug] Q6 high[0:8]=%02x%02x%02x%02x%02x%02x%02x%02x codes[0:4]=%02x%02x%02x%02x\n",
+                           high[0], high[1], high[2], high[3], high[4], high[5], high[6], high[7],
+                           codes[0], codes[1], codes[2], codes[3]);
+                }
+                const bool is_q6_scale = (Codec == RowSplitGroupedMmaCodec::Q6) ||
+                                         (Codec == RowSplitGroupedMmaCodec::Mixed && job.q6);
+                const std::uint8_t* scales;
+                if (is_q6_scale) {
+                    const int grow = m0 + row;
+                    const int g = first_g + group;
+                    const int kg = padded_k >> 6;
+                    if (grow < job.n) {
+                        scales = &job.scales[static_cast<std::int64_t>(grow) * kg + g * 2];
+                    } else {
+                        scales = &Sr[stage][row * SCALE_STAGE_BYTES + scale_off];
+                    }
+                } else {
+                    scales = &Sr[stage][row * SCALE_STAGE_BYTES + scale_off];
+                }
                 __nv_bfloat162 w;
                 if constexpr (Codec == RowSplitGroupedMmaCodec::Q5) {
                     w = Q5MmaDecodeAtom::decode_pair(codes, high, scales, row, lane);
                 } else if constexpr (Codec == RowSplitGroupedMmaCodec::Q4) {
                     w = Q4MmaDecodeAtom::decode_pair(codes, scales, row, lane);
+                } else if constexpr (Codec == RowSplitGroupedMmaCodec::Q6) {
+                    w = Q6MmaDecodeAtom::decode_pair(codes, high, scales, row, lane);
                 } else {
-                    if (job.q5) {
+                    if (job.q6) {
+                        w = Q6MmaDecodeAtom::decode_pair(codes, high, scales, row, lane);
+                    } else if (job.q5) {
                         w = Q5MmaDecodeAtom::decode_pair(codes, high, scales, row, lane);
                     } else {
                         w = Q4MmaDecodeAtom::decode_pair(codes, scales, row, lane);
@@ -339,21 +420,10 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
                 job.out[static_cast<std::int64_t>(col) * job.out_ld + job.out_row_offset + row] =
                     __float2bfloat16_rn(value);
             };
-            if constexpr (FullTiles) {
-                store(cc0, r0, acc[mi][ni][0]);
-                store(cc1, r0, acc[mi][ni][1]);
-                store(cc0, r1, acc[mi][ni][2]);
-                store(cc1, r1, acc[mi][ni][3]);
-            } else {
-                if (r0 < job.n) {
-                    if (cc0 < t) { store(cc0, r0, acc[mi][ni][0]); }
-                    if (cc1 < t) { store(cc1, r0, acc[mi][ni][1]); }
-                }
-                if (r1 < job.n) {
-                    if (cc0 < t) { store(cc0, r1, acc[mi][ni][2]); }
-                    if (cc1 < t) { store(cc1, r1, acc[mi][ni][3]); }
-                }
-            }
+            if (cc0 < t && r0 < job.n) { store(cc0, r0, acc[mi][ni][0]); }
+            if (cc1 < t && r0 < job.n) { store(cc1, r0, acc[mi][ni][1]); }
+            if (cc0 < t && r1 < job.n) { store(cc0, r1, acc[mi][ni][2]); }
+            if (cc1 < t && r1 < job.n) { store(cc1, r1, acc[mi][ni][3]); }
         }
     }
 }

@@ -65,23 +65,46 @@ void launch_all(const Tensor& x, const Weight& qk, const Weight& value_z, std::i
         reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, codes, scales);
     CUDA_CHECK(cudaGetLastError());
 
-    launch_range<a8::Q4Codec, NT>(qk, codes, scales, tokens, 0, kQkRows,
-                                  a8::StoreEpilogue{qkv, kQkvRows, 0}, stream);
-    launch_range<a8::Q5Codec, NT>(value_z, codes, scales, tokens, 0, kValueRows,
-                                  a8::StoreEpilogue{qkv, kQkvRows, kQkRows}, stream);
-    launch_range<a8::Q5Codec, NT>(value_z, codes, scales, tokens, kValueRows, kZRows,
-                                  a8::StoreEpilogue{z, kZRows, 0}, stream);
+    if (qk.qtype == QType::Q6_G64_FP16) {
+        launch_range<a8::Q6Codec, NT>(qk, codes, scales, tokens, 0, kQkRows,
+                                      a8::StoreEpilogue{qkv, kQkvRows, 0}, stream);
+    } else {
+        launch_range<a8::Q4Codec, NT>(qk, codes, scales, tokens, 0, kQkRows,
+                                      a8::StoreEpilogue{qkv, kQkvRows, 0}, stream);
+    }
+    if (value_z.qtype == QType::Q6_G64_FP16) {
+        launch_range<a8::Q6Codec, NT>(value_z, codes, scales, tokens, 0, kValueRows,
+                                      a8::StoreEpilogue{qkv, kQkvRows, kQkRows}, stream);
+        launch_range<a8::Q6Codec, NT>(value_z, codes, scales, tokens, kValueRows, kZRows,
+                                      a8::StoreEpilogue{z, kZRows, 0}, stream);
+    } else if (value_z.qtype == QType::Q5_G64_FP16) {
+        launch_range<a8::Q5Codec, NT>(value_z, codes, scales, tokens, 0, kValueRows,
+                                      a8::StoreEpilogue{qkv, kQkvRows, kQkRows}, stream);
+        launch_range<a8::Q5Codec, NT>(value_z, codes, scales, tokens, kValueRows, kZRows,
+                                      a8::StoreEpilogue{z, kZRows, 0}, stream);
+    } else {
+        launch_range<a8::Q4Codec, NT>(value_z, codes, scales, tokens, 0, kValueRows,
+                                      a8::StoreEpilogue{qkv, kQkvRows, kQkRows}, stream);
+        launch_range<a8::Q4Codec, NT>(value_z, codes, scales, tokens, kValueRows, kZRows,
+                                      a8::StoreEpilogue{z, kZRows, 0}, stream);
+    }
 }
 
 } // namespace
 
 bool q4_q5_gdn_input_a8_supported(const Weight& qk, const Weight& value_z, std::int32_t tokens) {
-    return a8::tokens_supported(tokens) && qk.qtype == QType::Q4_G64_FP16 &&
+    // A8 path does not support mixed qtype weights. Q6 weights must use the MMA path.
+    if (qk.qtype == QType::Q6_G64_FP16 || value_z.qtype == QType::Q6_G64_FP16) {
+        return false;
+    }
+    const bool qk_ok = (qk.qtype == QType::Q4_G64_FP16) &&
            is_row_split(qk.layout) && qk.n == kQkRows && qk.k == kHidden &&
-           qk.group == a8::kGroup && qk.qdata != nullptr && qk.scales != nullptr &&
-           value_z.qtype == QType::Q5_G64_FP16 && is_row_split(value_z.layout) &&
-           value_z.n == kParentRows && value_z.k == kHidden && value_z.group == a8::kGroup &&
-           value_z.qdata != nullptr && value_z.qhigh != nullptr && value_z.scales != nullptr;
+           qk.group == a8::kGroup && qk.qdata != nullptr && qk.scales != nullptr;
+    const bool vz_ok = (value_z.qtype == QType::Q5_G64_FP16 ||
+                        value_z.qtype == QType::Q4_G64_FP16) &&
+           is_row_split(value_z.layout) && value_z.n == kParentRows && value_z.k == kHidden &&
+           value_z.group == a8::kGroup && value_z.qdata != nullptr && value_z.scales != nullptr;
+    return a8::tokens_supported(tokens) && qk_ok && vz_ok;
 }
 
 std::size_t q4_q5_gdn_input_a8_workspace_capacity_bytes(std::int32_t min_tokens,
