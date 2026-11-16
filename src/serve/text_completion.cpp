@@ -206,13 +206,10 @@ void parse_stop(const Json& body, GenerationRequest& output) {
 
 void parse_output_limit(const Json& body, const RequestLimits& limits,
                         TextCompletionDialect dialect, TextCompletionRequest& output) {
-    // llama.cpp reads n_predict, then max_tokens; OpenAI reads max_tokens.
-    const char* param        = "max_tokens";
-    std::optional<int> limit = std::nullopt;
-    if (dialect == TextCompletionDialect::LlamaCpp) {
-        limit = optional_int(body, "n_predict");
-        if (limit) { param = "n_predict"; }
-    }
+    // Both dialects read llama.cpp's n_predict, then max_tokens, as llama.cpp's server does.
+    std::optional<int> limit = optional_int(body, "n_predict");
+    const bool n_predict     = limit.has_value();
+    const char* param        = n_predict ? "n_predict" : "max_tokens";
     if (!limit) { limit = optional_int(body, "max_tokens"); }
     if (!limit) {
         apply_default_output_limit(output.generation, limits);
@@ -220,8 +217,9 @@ void parse_output_limit(const Json& body, const RequestLimits& limits,
     }
     output.output_tokens_explicit = true;
     // llama.cpp's -1 (and -2, until the context fills) is no limit: the largest budget that still
-    // lets every lane hold such a request, as on Chat Completions.
-    const bool unlimited = dialect == TextCompletionDialect::LlamaCpp ? *limit < 0 : *limit == -1;
+    // lets every lane hold such a request, as on Chat Completions. OpenAI's max_tokens takes -1.
+    const bool unlimited =
+        (n_predict || dialect == TextCompletionDialect::LlamaCpp) ? *limit < 0 : *limit == -1;
     if (unlimited) {
         output.generation.max_tokens           = limits.max_context;
         output.generation.derive_output_budget = true;

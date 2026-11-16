@@ -134,6 +134,15 @@ void controls() {
            "an omitted limit takes the server default");
     expect(!refusal(R"({"prompt": "x", "max_tokens": -2})", TextCompletionDialect::OpenAI).empty(),
            "OpenAI's max_tokens accepts only -1 below zero");
+    const auto openai_limited = parse(R"({"prompt": "x", "n_predict": 12, "max_tokens": 99})",
+                                      TextCompletionDialect::OpenAI);
+    expect(openai_limited.generation.max_tokens == 12 && openai_limited.output_tokens_explicit,
+           "n_predict wins over max_tokens on /v1/completions");
+    const auto openai_unlimited =
+        parse(R"({"prompt": "x", "n_predict": -2, "max_tokens": 99})",
+              TextCompletionDialect::OpenAI);
+    expect(openai_unlimited.generation.derive_output_budget,
+           "a negative n_predict is no limit on /v1/completions");
 
     const auto stops = parse(R"({"prompt": "x", "stop": ["a", "b", "c", "d", "e"],
                                 "ignore_eos": true, "cache_prompt": false})");

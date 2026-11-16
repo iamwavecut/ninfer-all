@@ -117,3 +117,8 @@ ninfer_add_test(ninfer_http_routes_test
 ninfer_add_test(ninfer_http_transport_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_transport.cpp"
   LIBRARIES ninfer_serve)
+
+# The media fetcher against a local HTTP server, and the --media-urls serving policy.
+ninfer_add_test(ninfer_media_acquire_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_media_acquire.cpp"
+  LIBRARIES ninfer_serve ninfer_media_acquire)

@@ -44,9 +44,10 @@ void check_control(const Policy& policy) {
 long bounded_timeout_ms(const Policy& policy, int configured) {
     if (policy.deadline == Clock::time_point{}) { return configured; }
     check_control(policy);
+    // Rounded up, with one millisecond for curl's whole-millisecond clock: a curl timer that the
+    // deadline bounds expires after the deadline, so check_control reports the deadline.
     const auto remaining =
-        std::chrono::duration_cast<std::chrono::milliseconds>(policy.deadline - Clock::now())
-            .count();
+        std::chrono::ceil<std::chrono::milliseconds>(policy.deadline - Clock::now()).count() + 1;
     return std::min<long>(configured, std::max<std::int64_t>(1, remaining));
 }
 
@@ -89,29 +90,71 @@ std::vector<std::uint8_t> decode_base64(std::string_view text) {
     return out;
 }
 
-bool private_ipv4(std::uint32_t address) {
-    const std::uint32_t a = ntohl(address);
-    return (a >> 24U) == 0 || (a >> 24U) == 10 || (a >> 24U) == 127 || (a >> 16U) == 0xa9fe ||
-           (a >> 20U) == 0xac1 || (a >> 16U) == 0xc0a8 || (a >> 22U) == 0x0191 ||
-           (a >> 17U) == 0x6309 || (a >> 24U) >= 224;
+// Addresses a fetch must not reach unless private networks are allowed: this host, private and
+// shared networks, link-local, documentation, benchmarking and reserved blocks, multicast, and the
+// IPv6 forms that carry an IPv4 address (mapped, translated, 6to4) when that address is one.
+bool disallowed_ipv4(std::uint32_t network_order) {
+    const std::uint32_t a = ntohl(network_order);
+    return (a >> 24U) == 0 ||                                  // 0.0.0.0/8
+           (a >> 24U) == 10 ||                                 // 10.0.0.0/8
+           (a >> 22U) == ((100U << 2U) | 1U) ||                // 100.64.0.0/10
+           (a >> 24U) == 127 ||                                // 127.0.0.0/8
+           (a >> 16U) == 0xa9feU ||                            // 169.254.0.0/16
+           (a >> 20U) == 0xac1U ||                             // 172.16.0.0/12
+           (a >> 8U) == 0xc00000U ||                           // 192.0.0.0/24
+           (a >> 8U) == 0xc00002U ||                           // 192.0.2.0/24
+           (a >> 8U) == 0xc05863U ||                           // 192.88.99.0/24
+           (a >> 16U) == 0xc0a8U ||                            // 192.168.0.0/16
+           (a >> 17U) == (0xc612U >> 1U) ||                    // 198.18.0.0/15
+           (a >> 8U) == 0xc63364U ||                           // 198.51.100.0/24
+           (a >> 8U) == 0xcb0071U ||                           // 203.0.113.0/24
+           (a >> 28U) >= 0xeU;                                 // 224.0.0.0/4, 240.0.0.0/4
 }
 
-bool private_address(const sockaddr* address) {
-    if (address->sa_family == AF_INET) {
-        return private_ipv4(reinterpret_cast<const sockaddr_in*>(address)->sin_addr.s_addr);
+bool embedded_ipv4_disallowed(const std::uint8_t* bytes) {
+    std::uint32_t v4 = 0;
+    std::memcpy(&v4, bytes, sizeof(v4));
+    return disallowed_ipv4(v4);
+}
+
+bool disallowed_ipv6(const in6_addr& address) {
+    const std::uint8_t* b = address.s6_addr;
+    const auto zero       = [b](int first, int last) {
+        for (int i = first; i < last; ++i) {
+            if (b[i] != 0) { return false; }
+        }
+        return true;
+    };
+    if (zero(0, 12)) { return true; } // ::/96: unspecified, loopback, IPv4-compatible
+    if (zero(0, 10) && b[10] == 0xff && b[11] == 0xff) {
+        return embedded_ipv4_disallowed(b + 12); // ::ffff:0:0/96, IPv4-mapped
     }
-    if (address->sa_family != AF_INET6) { return true; }
-    const in6_addr& a = reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr;
-    if (IN6_IS_ADDR_UNSPECIFIED(&a) || IN6_IS_ADDR_LOOPBACK(&a) || IN6_IS_ADDR_LINKLOCAL(&a) ||
-        IN6_IS_ADDR_MULTICAST(&a) || (a.s6_addr[0] & 0xfeU) == 0xfcU) {
+    if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b) {
+        // 64:ff9b::/96 translates an IPv4 address; 64:ff9b:1::/48 is local-use.
+        return !zero(4, 12) || embedded_ipv4_disallowed(b + 12);
+    }
+    if (b[0] == 0x01 && b[1] == 0x00 && zero(2, 8)) { return true; }      // 100::/64, discard
+    if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x00 && b[3] == 0x00) {   // 2001::/32, Teredo
         return true;
     }
-    if (IN6_IS_ADDR_V4MAPPED(&a)) {
-        std::uint32_t v4 = 0;
-        std::memcpy(&v4, &a.s6_addr[12], sizeof(v4));
-        return private_ipv4(v4);
+    if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0d && b[3] == 0xb8) {   // 2001:db8::/32
+        return true;
     }
-    return false;
+    if (b[0] == 0x20 && b[1] == 0x02) { return embedded_ipv4_disallowed(b + 2); } // 2002::/16
+    return (b[0] & 0xfeU) == 0xfcU ||                      // fc00::/7, unique local
+           (b[0] == 0xfe && (b[1] & 0xc0U) == 0x80U) ||    // fe80::/10, link-local
+           (b[0] == 0xfe && (b[1] & 0xc0U) == 0xc0U) ||    // fec0::/10, site-local
+           b[0] == 0xff;                                   // ff00::/8, multicast
+}
+
+bool disallowed_address(const sockaddr* address) {
+    if (address->sa_family == AF_INET) {
+        return disallowed_ipv4(reinterpret_cast<const sockaddr_in*>(address)->sin_addr.s_addr);
+    }
+    if (address->sa_family == AF_INET6) {
+        return disallowed_ipv6(reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr);
+    }
+    return true;
 }
 
 struct UrlParts {
@@ -163,7 +206,11 @@ std::string resolve_public(const UrlParts& url, bool allow_private) {
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* raw     = nullptr;
-    const int rc      = getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &raw);
+    // An IPv6 literal comes bracketed from the URL; the resolver takes it bare.
+    const std::string host = url.host.size() > 2 && url.host.front() == '[' && url.host.back() == ']'
+                                 ? url.host.substr(1, url.host.size() - 2)
+                                 : url.host;
+    const int rc      = getaddrinfo(host.c_str(), url.port.c_str(), &hints, &raw);
     if (rc != 0) {
         throw Error(ErrorKind::RemoteUnavailable,
 #ifdef _WIN32
@@ -175,7 +222,7 @@ std::string resolve_public(const UrlParts& url, bool allow_private) {
     std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addresses(raw, freeaddrinfo);
     std::string selected;
     for (const addrinfo* it = raw; it != nullptr; it = it->ai_next) {
-        if (!allow_private && private_address(it->ai_addr)) { continue; }
+        if (!allow_private && disallowed_address(it->ai_addr)) { continue; }
         std::array<char, INET6_ADDRSTRLEN> text{};
         const void* bytes =
             it->ai_family == AF_INET
@@ -228,9 +275,14 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         }
     });
 
+    std::string previous_scheme;
     for (int redirect = 0; redirect <= policy.max_redirects; ++redirect) {
         check_control(policy);
         const UrlParts parts = parse_url(url);
+        if (previous_scheme == "https" && parts.scheme != "https") {
+            throw std::invalid_argument("media URL redirects from HTTPS to HTTP");
+        }
+        previous_scheme = parts.scheme;
         const std::string ip = resolve_public(parts, policy.allow_private_network);
         check_control(policy);
         std::string resolve = parts.host + ":" + parts.port + ":";
@@ -337,6 +389,15 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
 }
 
 } // namespace
+
+bool detail::disallowed_numeric_address(std::string_view address) {
+    const std::string text(address);
+    in_addr v4{};
+    if (inet_pton(AF_INET, text.c_str(), &v4) == 1) { return disallowed_ipv4(v4.s_addr); }
+    in6_addr v6{};
+    if (inet_pton(AF_INET6, text.c_str(), &v6) == 1) { return disallowed_ipv6(v6); }
+    throw std::invalid_argument("not a numeric IP address: " + text);
+}
 
 std::vector<std::uint8_t> acquire_bytes(const Source& source, const Policy& policy) {
     if (policy.max_bytes == 0) { throw std::invalid_argument("media byte limit must be positive"); }

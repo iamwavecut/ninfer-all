@@ -993,11 +993,13 @@ The endpoint supports:
 - string content and ordered text/refusal parts; adjacent parts are preserved without inserted
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
-  `video_url` extension using HTTP(S) or data URIs; image `detail` `auto`, `high` or `low` (see
+  `video_url` extension using data URIs, or HTTP(S) URLs on a server started with
+  [`--media-urls`](#media-urls); image `detail` `auto`, `high` or `low` (see
   [image detail](#image-detail));
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation; llama.cpp's `-1` ("no limit", the WebUI's default) and omitting
-  both apply the [default output limit](#default-output-limit);
+  both apply the [default output limit](#default-output-limit); llama.cpp's `n_predict` overrides
+  both, as on llama.cpp's server, and any negative `n_predict` is no limit;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` and `min_p` (`0..1`) sampler extensions; `top_k` is a non-negative
   integer, and a value above the sampler's 20-candidate domain is clamped to 20 rather than
@@ -1409,7 +1411,35 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
+OpenAI image and video sources may be base64 data URLs, or HTTP(S) URLs on a server started with
+[`--media-urls`](#media-urls), as this example needs.
+
+### Media URLs
+
+The server fetches the HTTP(S) image and video URLs of a request (Chat Completions, Responses,
+Messages, `/v1/systemone` and `/v1/decisions`) only when it is started with `--media-urls SIZE`,
+for example `--media-urls 20M`, or `media-urls = 20M` in a
+[launch configuration file](cli.md#launch-configuration-files). SIZE is the largest file that one
+URL may return: a number with the unit `K`, `M` or `G`, each a power of 1024 (`KB`, `KiB` and the
+like are the same), at most `256M`. The default `0` refuses every media URL with 400
+`media_urls_disabled`; data URLs need no option. A request's media together stay within 256 MiB
+and `--max-request-mib`.
+
+A fetch:
+
+- uses HTTP or HTTPS only, verifies TLS certificates, and sends no credentials, goes through no
+  proxy and decodes no `Content-Encoding`;
+- connects only to the address that the host name resolved to, and only when that address is
+  outside loopback, private, shared, link-local, documentation, benchmarking, reserved and multicast
+  networks, including the IPv6 forms that carry such an IPv4 address;
+- follows at most 3 redirects, checks each new address the same way, and refuses a redirect from
+  HTTPS to HTTP;
+- stops at SIZE bytes, 5 s without a connection, 60 s in all, or the request's deadline or
+  cancellation.
+
+A refused URL or address returns 400 `invalid_media`, a file over SIZE 400
+`media_budget_exceeded`, a failed fetch 502 `media_fetch_failed` and a timeout 504
+`media_fetch_timeout`.
 
 ### Media formats
 
@@ -1470,9 +1500,10 @@ candidate set, 20), `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `
 a random one), `stop` (a string or up to 32 strings), `ignore_eos`, `stream`, `timings_per_token`,
 `response_format`, the vLLM and llama.cpp constraint fields of [Structured
 output](#structured-output) (`grammar` among them), and llama.cpp's `cache_prompt` (`false` keeps
-the request out of the context cache). The output limit is llama.cpp's `n_predict` (then
-`max_tokens`) on `/completion`, where any negative value is no limit, and `max_tokens` on
-`/v1/completions`, where `-1` is; omitted, it is the [default output limit](#default-output-limit).
+the request out of the context cache). The output limit is llama.cpp's `n_predict`, then
+`max_tokens`. Any negative `n_predict` is no limit; so is any negative `max_tokens` on
+`/completion`, and `-1` on `/v1/completions`. Omitted, it is the [default output
+limit](#default-output-limit).
 llama.cpp sampler controls NInfer does not have are accepted at their neutral values and refused
 otherwise, each with `<field>_not_supported`: `repeat_penalty` (1), `typical_p` (1), `tfs_z` (1),
 `dynatemp_range` (0), `mirostat` (0), `xtc_probability` (0), `dry_multiplier` (0), `top_n_sigma` (0
@@ -1578,17 +1609,58 @@ digit at a time: one read for the first digit, one for the next digit after each
 probability the product along the label. Unknown fields, `joint` reads and a thinking request are
 refused with 400; `audio` and `videos` fields and audio data with 501.
 
-Images and video come as data URLs (`data:image/...;base64,...`, `data:video/...`), as llama.cpp's
-System One takes them, and need a model with a vision tower started with `--vision` (otherwise
-501): `files` and its alias `images` (arrays of data URLs), and the `image_url` parts of a `state`
-made of chat messages (an array of `{role, content}` messages, or an object with a `messages`
-array), which leave the state's text. `/v1/decisions` takes `input_image` parts (`image_url` a
-data URL, optional `detail`) in its input messages. Every read places the media, `files` first,
-then `images`, then the state's own, ahead of the state, inside the part that the state's cache
-boundary closes; `state` may be left out of a request about its media alone. A URL that is not a
-data URL and `input_image.file_id` are refused with 400, and so is a choice of more than 26
-options, whose later digits are read from token prompts that carry no media. Each read's request
-holds its own copy of the media, and their size times the reads may not exceed 512 MiB.
+Images and video need a model with a vision tower started with `--vision` (otherwise 501).
+System One takes `files` and its alias `images` (arrays of sources), and the `image_url` parts of
+a `state` made of chat messages (an array of `{role, content}` messages, or an object with a
+`messages` array), which leave the state's text; `/v1/decisions` takes `input_image` parts
+(`image_url`, optional `detail`) in its input messages. A source is an image or video data URL
+(`data:image/...;base64,...`, `data:video/...`) or an image's HTTP(S) URL, which the server fetches
+only with [`--media-urls`](#media-urls). Each source is acquired once per request, before its
+reads. Every read places the media, `files` first, then `images`, then the state's own, ahead of
+the state, inside the part that the state's cache boundary closes; `state` may be left out of a
+request about its media alone. `input_image.file_id` is refused with 400. A label of several
+digits keeps the prepared images, their positions and their cache identity as its digits are
+appended. Each question's request holds its own copy of the acquired bytes; these copies,
+including Runoff's extra requests, are bounded together at 512 MiB.
+
+### Image boxes
+
+System One also accepts `box` questions alongside `choice`, `noul` and `score`:
+
+```bash
+curl http://127.0.0.1:8080/v1/systemone -d '{
+  "state": "a checkout screen", "images": ["data:image/png;base64,iVBORw0KGgo..."],
+  "questions": {
+    "visible": {"type": "noul", "instructions": "Is a checkout button visible?"},
+    "button": {"type": "box", "instructions": "Where is the checkout button?",
+               "criteria": {"step": 0.01, "aggregate": "mode"}}}}'
+```
+
+A box needs an image in `files`, `images`, the state's image parts or `conversation`. Its answer has
+`type: "box"`, `box: {top, bottom, left, right}`, `confidence`, `aggregate`, and `edges`. Coordinates are fractions
+of the whole image, measured downward and rightward from its top-left corner. Each edge is scored
+on a grid covering 0 to 1. The optional `criteria.step` defaults to `0.01` and must divide that
+interval evenly into 2 to 255 values. Like a choice's options, a grid of up to 26 values (a step of
+0.04 or more) is labeled `A`..`Z` and a finer one with digits; Flint and DeepSeek-V4.1, whose
+tokenizers group digits, refuse digit labels with 400, so they read a box with a step of 0.04 or
+more. `criteria.aggregate` is `mode` (default), `mean` or `median`;
+the mean is snapped to the nearest grid point, ties to the lower point. Crossed edge pairs are
+sorted. Each entry in `edges` reports `modal`, `mean`, `median`, the modal `probability`, and
+`moved` when sorting changed that edge. Box confidence is the least concentrated edge's confidence:
+one minus its expected distance from the mode divided by a uniform grid's mean distance from 0.5,
+clamped to 0..1. Per-edge label masses and readout provenance are under `diagnostics.<id>`.
+
+The normalized box shape follows [TypeSafe's Box primitive](https://docs.typesafe.ai/primitives/box);
+the grid controls and the edge details are NInfer's extensions.
+This route uses the `images` contract above, rather than TypeSafe's hosted asset-upload protocol.
+One box expands into four coordinate questions, which count toward the 200-question read limit.
+Multi-digit grids require a read per trie node, so cost is not simply proportional to grid size.
+Boxes use the existing vision preparation and context cache; no second model is loaded.
+Their coordinates and confidence come from the served chat model, not a calibrated detector.
+For an absent target a box still returns coordinates; pair it with a noul and apply the caller's
+own visibility threshold. `/v1/decisions` keeps its existing choice/predicate/score contract.
+
+### Read configuration and responses
 
 Four fields change how the questions are asked, in both endpoints:
 
@@ -1615,15 +1687,16 @@ The response holds `answers` by question id: a `choice` with the most likely opt
 `probabilities` by option (summing to 1) and `confidence`; a `noul` with `noul` (the probability of
 yes) and the same `probabilities` and `confidence`; a `score` with `score` (the expected level index,
 weighted by probability), the `legend` and `probabilities` by level index, and `confidence`. Every
-answer also carries `margin`, its most likely option's probability less the second's, by which a
-client can send a near tie on to a generation with reasoning. Probabilities are the softmax over
+choice/noul/score answer also carries `margin`, its most likely option's probability less the
+second's, by which a client can send a near tie on to a generation with reasoning. Probabilities are the softmax over
 the labels; `confidence` is the chosen label's probability over
 the whole vocabulary, its share of the labels times `diagnostics.<id>.label_mass`, the probability
 the model put on the labels at all. `diagnostics.<id>.argmax_is_label` says whether the model's most
 likely token was one of the labels, and `readout` whether the labels were read exactly (`exact`) or
 from the top alternatives (`top_k`, where a label outside them counts as likely as the least likely
 alternative, its upper bound). `usage.input_tokens` sums the prompts of every read and
-`output_tokens` counts one token per question. The probabilities are those of a general chat model
+`output_tokens` counts one token per label read (including subsequent digits and optional rechecks).
+The probabilities are those of a general chat model
 under this prompt, not calibrated to any data. The Qwen3.5 family reads them from FP32 logits; the
 other families' head logits are BF16, so two options such a model scores within one BF16 step (about
 0.1 nat at these magnitudes) share one probability. A label the tokenizer does not hold as one token
@@ -1663,8 +1736,9 @@ from it, so a question about a new short state costs one pass. A branch longer t
 alone from a device snapshot of the state, and so does every branch on a Flash-Next model whose
 sparse-attention KV streams from host memory (`--kv-resident`). A request with media runs no
 branched read, since a branch's prompt is its tokens alone: its reads go the way described next,
-each decoding the media on the host again while the later ones resume past them, and past the
-state, from the context cache. A Runoff choice adds a second
+each preparing the same owned media through the frontend's bounded media cache while later reads
+resume past them, and past the state, from the context cache. Continued digit reads keep the
+image's geometry and mRoPE positions. A Runoff choice adds a second
 branched read for its listings, and `recheck_margin` one read per near tie. A Qwen3.5-core model split over several devices runs no branched reads, and on a
 Qwen3.5-core model a branch holds at most `--prefill-chunk` tokens; there, when a question with
 its options is longer, or with media, the first question runs alone and leaves the state in the context cache,
@@ -1815,8 +1889,8 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; `detail` `auto`, `high` or `low` (see [image detail](#image-detail)); requires server `--vision` |
-| `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with a data-URI or ([`--media-urls`](#media-urls)) HTTP(S) `image_url`; `detail` `auto`, `high` or `low` (see [image detail](#image-detail)); requires server `--vision` |
+| `input_video` | NInfer extension with a data-URI or ([`--media-urls`](#media-urls)) HTTP(S) `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content (`content` itself may be omitted); summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments`; `async` may only be `false` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
@@ -2072,7 +2146,7 @@ curl http://127.0.0.1:8080/v1/messages \
 ```
 
 The endpoint accepts top-level System text, ordered User/Assistant/System history, text and image
-blocks, Thinking history, tool-use history, tool results, user-defined tools, aggregate responses,
+blocks (base64 sources, or `url` sources with [`--media-urls`](#media-urls)), Thinking history, tool-use history, tool results, user-defined tools, aggregate responses,
 and Anthropic SSE. Consecutive User or Assistant messages are joined without adding separators.
 System messages in `messages` may appear anywhere, including first, between two User messages,
 directly after an Assistant message, or last; each renders as its own System turn at that position
@@ -2387,6 +2461,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
+| `--media-urls SIZE` | fetch the HTTP(S) image and video URLs of requests, each up to SIZE (`512K`, `20M`, at most `256M`; [Media URLs](#media-urls)); `0` refuses them | `0` |
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
@@ -2932,12 +3007,12 @@ reaching `max_tokens`.
 
 ### Default output limit
 
-A request that omits its output limit (`max_completion_tokens`/`max_tokens` on Chat Completions,
-`max_output_tokens` on Responses, `max_tokens` on Messages) receives the largest budget that still
-lets every configured lane be admitted at the same time. Once its prompt is prepared, the Engine
-finds the largest output whose admission entitlement -- Main KV pages for the prompt and output,
-plus the MTP draft-window or DFlash backend KV pages when speculation is on -- fits one lane's share
-(`1/--max-concurrency`) of each KV pool, and clamps it to the remaining context
+A request that omits its output limit (`n_predict`, `max_completion_tokens` and `max_tokens` on Chat
+Completions, `max_output_tokens` on Responses, `max_tokens` on Messages) receives the largest budget
+that still lets every configured lane be admitted at the same time. Once its prompt is prepared, the
+Engine finds the largest output whose admission entitlement -- Main KV pages for the prompt and
+output, plus the MTP draft-window or DFlash backend KV pages when speculation is on -- fits one
+lane's share (`1/--max-concurrency`) of each KV pool, and clamps it to the remaining context
 (`--max-context` minus the prompt). With the prefix cache on, a Qwen3.5-core lane also keeps pages
 of its share free for the cache's snapshot copies: one per snapshot a request may capture (the
 hybrid cache's `--cache-taps-per-request`, 8 with a Host tier; the catalog's 7 prompt candidates)
