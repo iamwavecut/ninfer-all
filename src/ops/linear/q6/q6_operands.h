@@ -37,7 +37,7 @@ inline void validate_q6_operands(const Q6LinearOperands& operands) {
     const auto aligned = [](const void* pointer, std::uintptr_t alignment) {
         return pointer && (reinterpret_cast<std::uintptr_t>(pointer) % alignment) == 0;
     };
-    if (operands.rows <= 0 || operands.tokens <= 0 || operands.k <= 0 || operands.k % 128 != 0 ||
+    if (operands.rows <= 0 || operands.tokens <= 0 || operands.k <= 0 ||
         operands.padded_k < operands.k || operands.padded_k % 128 != 0) {
         throw std::invalid_argument(
             "Q6 templates require positive N/T and K/padded K aligned to 128");
