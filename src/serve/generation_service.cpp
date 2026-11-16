@@ -544,6 +544,11 @@ StagedRequest GenerationService::stage_read(const BranchRead& read,
             throw_invalid_input(std::invalid_argument(exception.what()), "invalid_prompt");
         }
     }
+    // A continued read resumes from the endpoint of the read whose prompt it continues and leaves
+    // none that a read resumes from; elsewhere the endpoint needs no drafting.
+    if (!read.continuation.empty() || !engine_->read_endpoints_need_drafting()) {
+        staged.submission.options.execution.speculative_drafting = false;
+    }
     staged.submission.options.execution.readout_tokens = read.readout;
     return staged;
 }

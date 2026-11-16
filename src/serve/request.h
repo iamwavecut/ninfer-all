@@ -293,8 +293,12 @@ struct GenerationRequest {
     // With logprobs: token ids whose exact log probabilities the first content token's record
     // carries (ninfer::ExecutionOptions::readout_tokens), the typed decisions' label readout.
     std::vector<ninfer::TokenId> readout_tokens;
+    // ninfer::OutputOptions::raw: every generated token is content, a stop token or a special
+    // token included, so a one-token read (the typed decisions, rerank) has its first token's
+    // record whatever token the model chose. The output text is then raw.
+    bool raw_output = false;
     // ninfer::ExecutionOptions::speculative_drafting: false keeps --spec's drafter off a one-token
-    // read (the typed decisions).
+    // read that no read continues (rerank, typed decisions with one-character labels).
     bool speculative_drafting = true;
 
     // The alternatives each reported token carries, absent unless the request asked for logprobs.

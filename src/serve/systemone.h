@@ -129,9 +129,10 @@ decision_read_nodes(const DecisionLabels& labels,
                     const std::function<ninfer::TokenId(const std::string&)>& token);
 
 // The request that reads `question`: the system turn, then one user turn with the state, the
-// question and its options under the labels, thinking off, one output token without the
-// speculative drafter, with the labels' token ids (aligned with decision_labels(question).texts)
-// read out exactly. Explicit cache boundaries follow the system turn and the user turn's part
+// question and its options under the labels, thinking off, one output token (prepared for the
+// speculative drafter only for labels of several digits, whose later reads resume from this one's
+// endpoint), with the labels' token ids (aligned with decision_labels(question).texts) read out
+// exactly. Explicit cache boundaries follow the system turn and the user turn's part
 // that holds the context and the state, which the request's media precede; the last part holds
 // the question.
 // With `conversation` (the request's parsed conversation) its messages and tools come first, an

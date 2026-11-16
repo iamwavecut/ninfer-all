@@ -177,6 +177,11 @@ public:
     // pass's columns on a Qwen3.5-core model, unbounded on Gemma 4, Flint and Flash-Next, which
     // run a branch in prompt chunks; 0 when runs_branches() is false.
     [[nodiscard]] std::uint32_t branch_token_limit() const;
+    // Whether a one-token request leaves its prompt's endpoint in the context cache only while it
+    // drafts (ExecutionOptions::speculative_drafting): true on a Qwen3.5-core Engine with a
+    // speculative drafter, whose drafter state would stop short of the endpoint; the other
+    // families publish it either way. A read whose prompt later reads continue drafts there.
+    [[nodiscard]] bool read_endpoints_need_drafting() const;
 
     // The largest requested_output_tokens for this prompt whose admission entitlement -- Main KV
     // plus any MTP/DFlash backend KV, draft window included -- fits one lane's share of each pool,

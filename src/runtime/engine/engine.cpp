@@ -1195,6 +1195,15 @@ bool Engine::runs_branches() const {
     return impl_->active->program->runs_branched_reads();
 }
 
+bool Engine::read_endpoints_need_drafting() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::Generation || impl_->flash || impl_->gemma ||
+        impl_->flint || impl_->deepseek) {
+        return false;
+    }
+    return impl_->options.speculative.backend != SpeculativeBackend::None;
+}
+
 std::uint32_t Engine::branch_token_limit() const {
     if (!runs_branches()) { return 0; }
     if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek) {
