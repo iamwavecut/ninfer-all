@@ -997,7 +997,8 @@ The endpoint supports:
   [image detail](#image-detail));
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation; llama.cpp's `-1` ("no limit", the WebUI's default) and omitting
-  both apply the [default output limit](#default-output-limit);
+  both apply the [default output limit](#default-output-limit); llama.cpp's `n_predict` overrides
+  both, as on llama.cpp's server, and any negative `n_predict` is no limit;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` and `min_p` (`0..1`) sampler extensions; `top_k` is a non-negative
   integer, and a value above the sampler's 20-candidate domain is clamped to 20 rather than
@@ -1470,9 +1471,10 @@ candidate set, 20), `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `
 a random one), `stop` (a string or up to 32 strings), `ignore_eos`, `stream`, `timings_per_token`,
 `response_format`, the vLLM and llama.cpp constraint fields of [Structured
 output](#structured-output) (`grammar` among them), and llama.cpp's `cache_prompt` (`false` keeps
-the request out of the context cache). The output limit is llama.cpp's `n_predict` (then
-`max_tokens`) on `/completion`, where any negative value is no limit, and `max_tokens` on
-`/v1/completions`, where `-1` is; omitted, it is the [default output limit](#default-output-limit).
+the request out of the context cache). The output limit is llama.cpp's `n_predict`, then
+`max_tokens`. Any negative `n_predict` is no limit; so is any negative `max_tokens` on
+`/completion`, and `-1` on `/v1/completions`. Omitted, it is the [default output
+limit](#default-output-limit).
 llama.cpp sampler controls NInfer does not have are accepted at their neutral values and refused
 otherwise, each with `<field>_not_supported`: `repeat_penalty` (1), `typical_p` (1), `tfs_z` (1),
 `dynatemp_range` (0), `mirostat` (0), `xtc_probability` (0), `dry_multiplier` (0), `top_n_sigma` (0
@@ -2932,12 +2934,12 @@ reaching `max_tokens`.
 
 ### Default output limit
 
-A request that omits its output limit (`max_completion_tokens`/`max_tokens` on Chat Completions,
-`max_output_tokens` on Responses, `max_tokens` on Messages) receives the largest budget that still
-lets every configured lane be admitted at the same time. Once its prompt is prepared, the Engine
-finds the largest output whose admission entitlement -- Main KV pages for the prompt and output,
-plus the MTP draft-window or DFlash backend KV pages when speculation is on -- fits one lane's share
-(`1/--max-concurrency`) of each KV pool, and clamps it to the remaining context
+A request that omits its output limit (`n_predict`, `max_completion_tokens` and `max_tokens` on Chat
+Completions, `max_output_tokens` on Responses, `max_tokens` on Messages) receives the largest budget
+that still lets every configured lane be admitted at the same time. Once its prompt is prepared, the
+Engine finds the largest output whose admission entitlement -- Main KV pages for the prompt and
+output, plus the MTP draft-window or DFlash backend KV pages when speculation is on -- fits one
+lane's share (`1/--max-concurrency`) of each KV pool, and clamps it to the remaining context
 (`--max-context` minus the prompt). With the prefix cache on, a Qwen3.5-core lane also keeps pages
 of its share free for the cache's snapshot copies: one per snapshot a request may capture (the
 hybrid cache's `--cache-taps-per-request`, 8 with a Host tier; the catalog's 7 prompt candidates)
