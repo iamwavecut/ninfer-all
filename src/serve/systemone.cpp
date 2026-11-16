@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -19,6 +20,7 @@ namespace {
 
 using Json    = RequestJson;
 using OutJson = nlohmann::ordered_json;
+constexpr std::array kBoxEdges{"top", "bottom", "left", "right"};
 
 // The system turn of every read. It keeps the reply's first token on the labels: on a 27B chat
 // model the labels' probability mass rose from 0.6-0.9 to 0.98-0.99 with it.
@@ -80,11 +82,27 @@ void refuse_media(const Json& body, std::initializer_list<const char*> keys) {
     }
 }
 
-// An image or video given as a data URL; audio is not read.
-ContentPart data_url_media(const Json& value, const std::string& param) {
-    if (!value.is_string()) { bad_request(param + " must be a data URL string", param); }
+// Data URLs in both dialects; System One also accepts HTTP(S) and local image sources.
+ContentPart data_url_media(const Json& value, const std::string& param,
+                           bool image_sources = false) {
+    if (!value.is_string()) { bad_request(param + " must be a media source string", param); }
     const std::string& url = value.get_ref<const std::string&>();
     ContentPart part;
+    if (image_sources && !url.starts_with("data:")) {
+        if (url.empty() || url.find('\0') != std::string::npos) {
+            bad_request(param + " must be a nonempty image source", param);
+        }
+        part.kind         = ContentKind::Image;
+        part.type_raw     = "image_url";
+        const bool remote = url.starts_with("http://") || url.starts_with("https://");
+        if (!remote && url.find("://") != std::string::npos) {
+            bad_request(param + " supports HTTP(S), data URLs or filesystem paths", param);
+        }
+        part.source.kind  = remote ? ninfer::product::media_acquire::SourceKind::Url
+                                   : ninfer::product::media_acquire::SourceKind::Path;
+        part.source.value = url;
+        return part;
+    }
     if (url.starts_with("data:image/")) {
         part.kind     = ContentKind::Image;
         part.type_raw = "image_url";
@@ -102,16 +120,16 @@ ContentPart data_url_media(const Json& value, const std::string& param) {
     return part;
 }
 
-// System One's `files` or `images`: an array of data URLs.
+// System One's `files` or `images`: an array of media sources.
 void append_media_array(const Json& body, const char* key, std::vector<ContentPart>& media) {
     if (!present(body, key)) { return; }
     const Json& values = body.at(key);
     if (!values.is_array()) {
-        bad_request(std::string(key) + " must be an array of data URLs", key);
+        bad_request(std::string(key) + " must be an array of media sources", key);
     }
     for (std::size_t index = 0; index < values.size(); ++index) {
-        media.push_back(
-            data_url_media(values[index], std::string(key) + "[" + std::to_string(index) + "]"));
+        media.push_back(data_url_media(values[index],
+                                       std::string(key) + "[" + std::to_string(index) + "]", true));
     }
 }
 
@@ -159,7 +177,7 @@ void take_state_media(Json& state, std::vector<ContentPart>& media) {
             const Json& url = entry.at("image_url");
             media.push_back(
                 data_url_media(url.is_object() && url.contains("url") ? url.at("url") : url,
-                               scope + ".image_url"));
+                               scope + ".image_url", true));
         }
         content = std::move(kept);
     }
@@ -173,10 +191,11 @@ DecisionType parse_type(const Json& question, const std::string& param, Decision
     const std::string type = question.at("type").get<std::string>();
     if (type == "choice") { return DecisionType::Choice; }
     if (type == "score") { return DecisionType::Score; }
+    if (dialect == DecisionDialect::SystemOne && type == "box") { return DecisionType::Box; }
     if (dialect == DecisionDialect::SystemOne && type == "noul") { return DecisionType::Noul; }
     if (dialect == DecisionDialect::OpenAI && type == "predicate") { return DecisionType::Noul; }
     bad_request(field + " must be " +
-                    (dialect == DecisionDialect::SystemOne ? "choice, noul or score"
+                    (dialect == DecisionDialect::SystemOne ? "choice, noul, score or box"
                                                            : "predicate, choice or score"),
                 field);
 }
@@ -202,6 +221,8 @@ std::vector<DecisionOption> parse_criteria(const Json& question, DecisionType ty
     const std::string field = param + ".criteria";
     std::vector<DecisionOption> options;
     switch (type) {
+    case DecisionType::Box:
+        throw std::logic_error("box criteria must be expanded before parsing label options");
     case DecisionType::Choice: {
         if (!present(question, "criteria") || !question.at("criteria").is_object()) {
             bad_request(field + " must map each option to its description or null", field);
@@ -558,10 +579,78 @@ DecisionRequest parse_systemone_request(const Json& body) {
         parsed.id           = id;
         parsed.type         = parse_type(question, param, DecisionDialect::SystemOne);
         parsed.instructions = required_text(question, "instructions", param + ".instructions");
+        if (parsed.type == DecisionType::Box) {
+            const Json criteria =
+                present(question, "criteria") ? question.at("criteria") : Json::object();
+            if (!criteria.is_object()) {
+                bad_request(param + ".criteria must be an object", param);
+            }
+            refuse_unknown_fields(criteria, {"step", "aggregate"}, param + ".criteria.");
+            if (criteria.contains("aggregate")) {
+                if (!criteria.at("aggregate").is_string()) {
+                    bad_request("aggregate must be mode, mean or median",
+                                param + ".criteria.aggregate");
+                }
+                parsed.aggregate = criteria.at("aggregate").get<std::string>();
+            }
+            if (parsed.aggregate != "mode" && parsed.aggregate != "mean" &&
+                parsed.aggregate != "median") {
+                bad_request("aggregate must be mode, mean or median",
+                            param + ".criteria.aggregate");
+            }
+            const Json step_json = criteria.value("step", Json(0.01));
+            if (!step_json.is_number()) {
+                bad_request("step must be numeric", param + ".criteria.step");
+            }
+            const double step      = step_json.get<double>();
+            const double intervals = std::round(1.0 / step);
+            if (!std::isfinite(step) || step <= 0 || !std::isfinite(intervals) || intervals < 1 ||
+                intervals >= kMaximumDecisionOptions || std::abs(intervals * step - 1.0) > 1e-12) {
+                bad_request("step must divide 0..1 into 2 to 255 coordinates",
+                            param + ".criteria.step");
+            }
+            for (std::size_t k = 0; k <= static_cast<std::size_t>(intervals); ++k) {
+                const double value = static_cast<double>(k) / intervals;
+                parsed.options.push_back({.value       = Json(value),
+                                          .text        = Json(value).dump(),
+                                          .description = std::nullopt});
+            }
+            for (std::size_t edge = 0; edge < kBoxEdges.size(); ++edge) {
+                auto coordinate     = parsed;
+                coordinate.box_edge = edge;
+                coordinate.instructions +=
+                    "\nSelect the " + std::string(kBoxEdges[edge]) +
+                    " edge of the requested object's bounding box in the image. Coordinates "
+                    "run from 0 to 1 across the whole image: top/bottom measure downward, "
+                    "left/right measure rightward. Select the label for the normalized coordinate.";
+                out.questions.push_back(std::move(coordinate));
+            }
+            continue;
+        }
         parsed.options      = parse_criteria(question, parsed.type, param);
         out.questions.push_back(std::move(parsed));
     }
+    require_question_count(out.questions.size(), "questions (four reads per box)");
+    if (!out.conversation) { validate_decision_media(out); }
     return out;
+}
+
+void validate_decision_media(const DecisionRequest& request,
+                             const GenerationRequest* conversation) {
+    const auto image = [](const ContentPart& part) { return part.kind == ContentKind::Image; };
+    bool has_image   = std::any_of(request.media.begin(), request.media.end(), image);
+    if (conversation) {
+        for (const ChatTurn& turn : conversation->messages) {
+            has_image |= std::any_of(turn.content.begin(), turn.content.end(), image);
+        }
+    }
+    if (has_image) { return; }
+    for (const DecisionQuestion& question : request.questions) {
+        if (question.type == DecisionType::Box) {
+            bad_request("a box requires an image in images, files, state or conversation",
+                        "questions." + question.id);
+        }
+    }
 }
 
 DecisionRequest parse_decisions_request(const Json& body) {
@@ -623,6 +712,7 @@ DecisionLabels decision_labels(const DecisionQuestion& question) {
         labels.option.push_back(option);
     };
     switch (question.type) {
+    case DecisionType::Box:
     case DecisionType::Choice:
         if (question.options.size() <= kMaximumLetterOptions) {
             for (std::size_t k = 0; k < question.options.size(); ++k) {
@@ -656,6 +746,7 @@ std::string question_options(const DecisionQuestion& question) {
     const std::vector<std::string> labels = shown_labels(question);
     std::string text;
     switch (question.type) {
+    case DecisionType::Box:
     case DecisionType::Choice:
         text += "Options:\n";
         for (std::size_t k = 0; k < question.options.size(); ++k) {
@@ -684,6 +775,7 @@ std::string question_options(const DecisionQuestion& question) {
 std::string question_reply(const DecisionQuestion& question) {
     const std::vector<std::string> labels = shown_labels(question);
     switch (question.type) {
+    case DecisionType::Box:
     case DecisionType::Choice:
         return labels.front().size() == 1
                    ? "Reply with a single letter (" + label_span(labels) + ") and nothing else."
@@ -1081,6 +1173,89 @@ std::string make_decision_response(const DecisionRequest& request,
     for (std::size_t q = 0; q < answers.size(); ++q) {
         const DecisionQuestion& question = request.questions[q];
         const DecisionAnswer& answer     = answers[q];
+        if (question.type == DecisionType::Box) {
+            if (!system_one || question.box_edge != 0 || q + kBoxEdges.size() > answers.size()) {
+                throw std::logic_error("incomplete box answer");
+            }
+            OutJson box = OutJson::object(), edges = OutJson::object(), detail = OutJson::object();
+            std::array<double, 4> selected{};
+            double confidence = 1.0;
+            for (std::size_t edge = 0; edge < kBoxEdges.size(); ++edge) {
+                const auto& coordinate = request.questions[q + edge];
+                const auto& read       = answers[q + edge];
+                const auto& ps         = read.probabilities;
+                if (coordinate.type != DecisionType::Box || coordinate.box_edge != edge ||
+                    coordinate.id != question.id || ps.size() != coordinate.options.size() ||
+                    ps.size() < 2) {
+                    throw std::logic_error("box reads do not match their coordinates");
+                }
+                double total = 0.0;
+                for (const double p : ps) {
+                    if (!std::isfinite(p) || p < 0 || p > 1) {
+                        throw std::logic_error("invalid box probability");
+                    }
+                    total += p;
+                }
+                if (std::abs(total - 1.0) > 1e-8) {
+                    throw std::logic_error("invalid box distribution");
+                }
+                const auto mode =
+                    static_cast<std::size_t>(std::max_element(ps.begin(), ps.end()) - ps.begin());
+                const auto value = [&](std::size_t i) {
+                    return coordinate.options[i].value.get<double>();
+                };
+                double mean = 0.0, cumulative = 0.0, spread = 0.0, uniform = 0.0;
+                std::size_t median = ps.size() - 1;
+                bool found         = false;
+                for (std::size_t i = 0; i < ps.size(); ++i) {
+                    mean += ps[i] * value(i);
+                    cumulative += ps[i];
+                    if (!found && cumulative >= 0.5) {
+                        median = i;
+                        found  = true;
+                    }
+                    spread += ps[i] * std::abs(value(i) - value(mode));
+                    uniform += std::abs(value(i) - 0.5) / ps.size();
+                }
+                std::size_t nearest = 0;
+                for (std::size_t i = 1; i < ps.size(); ++i) {
+                    if (std::abs(value(i) - mean) < std::abs(value(nearest) - mean)) {
+                        nearest = i;
+                    }
+                }
+                selected[edge]       = value(question.aggregate == "mean"     ? nearest
+                                             : question.aggregate == "median" ? median
+                                                                              : mode);
+                box[kBoxEdges[edge]] = selected[edge];
+                confidence = std::min(confidence, std::clamp(1.0 - spread / uniform, 0.0, 1.0));
+                edges[kBoxEdges[edge]]  = {{"probability", ps[mode]},
+                                           {"modal", value(mode)},
+                                           {"mean", value(nearest)},
+                                           {"median", value(median)}};
+                detail[kBoxEdges[edge]] = {{"label_mass", read.label_mass},
+                                           {"argmax_is_label", read.argmax_is_label},
+                                           {"readout", read.exact ? "exact" : "top_k"}};
+            }
+            // Sort crossed edges for a valid rectangle, while reporting the model's original edges.
+            if (selected[0] > selected[1]) { std::swap(box["top"], box["bottom"]); }
+            if (selected[2] > selected[3]) { std::swap(box["left"], box["right"]); }
+            for (std::size_t edge = 0; edge < kBoxEdges.size(); ++edge) {
+                edges[kBoxEdges[edge]]["moved"] =
+                    selected[edge] != box[kBoxEdges[edge]].get<double>();
+            }
+            rendered[question.id]    = {{"type", "box"},
+                                        {"aggregate", question.aggregate},
+                                        {"box", std::move(box)},
+                                        {"confidence", confidence},
+                                        {"edges", std::move(edges)}};
+            diagnostics[question.id] = std::move(detail);
+            q += kBoxEdges.size() - 1;
+            continue;
+        }
+        if (answer.probabilities.size() != question.options.size() ||
+            answer.probabilities.empty()) {
+            throw std::logic_error("decision probabilities do not match the options");
+        }
         const auto best                  = static_cast<std::size_t>(
             std::max_element(answer.probabilities.begin(), answer.probabilities.end()) -
             answer.probabilities.begin());
@@ -1091,6 +1266,8 @@ std::string make_decision_response(const DecisionRequest& request,
                               {"readout", answer.exact ? "exact" : "top_k"}};
         if (system_one) {
             switch (question.type) {
+            case DecisionType::Box:
+                throw std::logic_error("box answer was not folded");
             case DecisionType::Choice: {
                 OutJson probabilities = OutJson::object();
                 for (std::size_t k = 0; k < question.options.size(); ++k) {
@@ -1136,6 +1313,8 @@ std::string make_decision_response(const DecisionRequest& request,
         }
         const OutJson name = question.named ? OutJson(question.id) : OutJson(nullptr);
         switch (question.type) {
+        case DecisionType::Box:
+            throw std::logic_error("boxes belong to System One");
         case DecisionType::Noul:
             entry = {{"type", "predicate"},
                      {"name", name},

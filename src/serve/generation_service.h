@@ -281,6 +281,10 @@ public:
                                                   const ContextCacheHints& context_cache) const;
 
     [[nodiscard]] bool runs_branches() const { return engine_->runs_branches(); }
+
+    // Snapshot each decision source once, before fanout, under the normal acquisition controls.
+    void acquire_read_media(std::span<ContentPart*> media, std::size_t maximum_bytes,
+                            std::function<bool()> is_cancelled) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 

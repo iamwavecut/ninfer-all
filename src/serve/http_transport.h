@@ -17,6 +17,9 @@
 
 namespace ninfer::serve {
 
+// Local media access is reserved for direct loopback clients, not browsers or forwarded requests.
+[[nodiscard]] bool permits_local_media(const httplib::Request& request);
+
 [[nodiscard]] NgramSessionHints resolve_ngram_session(const httplib::Request& request,
                                                       const RequestJson& body,
                                                       const ServeOptions& options);

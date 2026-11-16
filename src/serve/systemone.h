@@ -40,8 +40,8 @@ enum class DecisionDialect { SystemOne, OpenAI };
 // requests that ask the same questions, each read then naming the one to answer.
 enum class DecisionLayout { StateFirst, SchemaFirst };
 
-// System One's choice / noul / score; OpenAI's predicate is a noul.
-enum class DecisionType { Choice, Noul, Score };
+// System One's choice / noul / score / box; OpenAI's predicate is a noul.
+enum class DecisionType { Choice, Noul, Score, Box };
 
 struct DecisionOption {
     // The option's wire value: a System One option name or score level, or an OpenAI choice value
@@ -61,6 +61,9 @@ struct DecisionQuestion {
     // A choice's options or a score's levels, lowest first; a noul's optional yes and no
     // descriptions as two entries (text "yes" and "no").
     std::vector<DecisionOption> options;
+    // A box expands into top, bottom, left, right reads, then folds into one public answer.
+    std::size_t box_edge  = 0;
+    std::string aggregate = "mode";
 };
 
 struct DecisionRequest {
@@ -70,9 +73,9 @@ struct DecisionRequest {
     std::string state;
     // Optional context placed ahead of the state (System One's `instructions`).
     std::string instructions;
-    // Images and videos as data URLs, placed ahead of the state in every read: System One's
-    // `files` and its alias `images` in that order, then the image_url parts of a state made of
-    // chat messages (removed from the state's text); OpenAI's input_image parts in input order.
+    // Images (data, HTTP(S), local paths) and videos (data URLs), ahead of every state: System
+    // One's `files` and its alias `images` in that order, then the image_url parts of a state made
+    // of chat messages (removed from the state's text); OpenAI's input_image parts in input order.
     std::vector<ContentPart> media;
     std::vector<DecisionQuestion> questions;
     // A live conversation the questions are asked about: an OpenAI chat completion request body
@@ -90,11 +93,12 @@ struct DecisionRequest {
     double recheck_margin = 0.0;
 };
 
-// Strict: unknown fields are refused, as vLLM refuses them. Media come as data URLs (llama.cpp's
-// System One contract); audio and System One's `audio` and `videos` fields are refused as not
-// implemented, other media sources as invalid.
+// Strict: unknown fields are refused. System One also accepts image URLs and local paths;
+// the HTTP layer authorizes local access and acquires each source before expanding reads.
 [[nodiscard]] DecisionRequest parse_systemone_request(const RequestJson& body);
 [[nodiscard]] DecisionRequest parse_decisions_request(const RequestJson& body);
+void validate_decision_media(const DecisionRequest& request,
+                             const GenerationRequest* conversation = nullptr);
 
 struct DecisionLabels {
     // The label texts the read looks up: A..Z for a choice of up to 26 options and 00.. or 000..

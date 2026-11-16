@@ -2427,6 +2427,48 @@ int test_low_image_detail(const Frontend& frontend) {
     return failures;
 }
 
+int test_read_continuation(const Frontend& frontend) {
+    auto input = image_text_input(block_ppm(128, 96, 91), "Locate the button.", "read.ppm");
+    input.options.speculative_drafting = false;
+    auto prompt                        = frontend.prepare(std::move(input));
+    const auto before                  = FrontendFactory::inspect(prompt);
+    const auto suffix                  = frontend.tokenize_text("01", false);
+    prompt                             = frontend.append_read_tokens(std::move(prompt), suffix);
+    const auto& after                  = FrontendFactory::inspect(prompt);
+    const auto old_size                = before.token_ids.size();
+    const auto size                    = old_size + suffix.size();
+    int failures =
+        check(after.token_ids.size() == size && after.has_media() &&
+                  after.media_payloads == before.media_payloads &&
+                  after.rope_delta == before.rope_delta &&
+                  after.vision_items.front().content_digest ==
+                      before.vision_items.front().content_digest &&
+                  after.lora_key == before.lora_key &&
+                  after.context_cache.retention == before.context_cache.retention &&
+                  after.context_cache.opportunities == before.context_cache.opportunities &&
+                  after.ngram_archive_sources.empty() && !after.ngram_index,
+              "a label continuation discarded its image or cache identity");
+    bool positions = true;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < old_size; ++i) {
+            positions &= after.positions[axis * size + i] == before.positions[axis * old_size + i];
+        }
+        for (std::size_t i = old_size; i < size; ++i) {
+            positions &=
+                after.positions[axis * size + i] == static_cast<int>(i) + before.rope_delta &&
+                after.token_types[i] == 0 && after.token_ids[i] == suffix[i - old_size];
+        }
+    }
+    failures += check(positions, "a label continuation lost image mRoPE positions");
+    bool refused = false;
+    try {
+        const std::vector<ninfer::TokenId> invalid{-1};
+        (void)frontend.append_read_tokens(std::move(prompt), invalid);
+    } catch (const std::out_of_range&) { refused = true; }
+    failures += check(refused, "a label continuation accepted an invalid token");
+    return failures;
+}
+
 int test_video_prepare(const Frontend& frontend) {
     ninfer::MessagePart video;
     video.kind              = ninfer::MessagePartKind::Media;
@@ -4607,6 +4649,7 @@ int main() {
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_low_image_detail(frontend);
+    failures += test_read_continuation(frontend);
     failures += test_video_prepare(frontend);
     failures += test_cross_round_stop(frontend);
     failures += test_stop_hold_in_one_round(frontend);

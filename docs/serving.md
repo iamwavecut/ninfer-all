@@ -1578,17 +1578,58 @@ digit at a time: one read for the first digit, one for the next digit after each
 probability the product along the label. Unknown fields, `joint` reads and a thinking request are
 refused with 400; `audio` and `videos` fields and audio data with 501.
 
-Images and video come as data URLs (`data:image/...;base64,...`, `data:video/...`), as llama.cpp's
-System One takes them, and need a model with a vision tower started with `--vision` (otherwise
-501): `files` and its alias `images` (arrays of data URLs), and the `image_url` parts of a `state`
-made of chat messages (an array of `{role, content}` messages, or an object with a `messages`
-array), which leave the state's text. `/v1/decisions` takes `input_image` parts (`image_url` a
+Images and video need a model with a vision tower started with `--vision` (otherwise 501).
+System One accepts `files` and its alias `images` (arrays of sources), and the `image_url` parts of
+a `state` made of chat messages (an array of `{role, content}` messages, or an object with a `messages`
+array), which leave the state's text. Sources may be image or video data URLs
+(`data:image/...;base64,...`, `data:video/...`), or image HTTP(S) URLs and local image paths.
+Local paths require a direct loopback client with a localhost Host, without Origin or forwarded
+headers. HTTP(S) uses the same acquisition limits and network policy as chat media. Each source
+is acquired once per request before its owned bytes are copied into the reads, under the pending
+deadline and cancellation/engine-stop gate. `/v1/decisions` takes `input_image` parts (`image_url` a
 data URL, optional `detail`) in its input messages. Every read places the media, `files` first,
 then `images`, then the state's own, ahead of the state, inside the part that the state's cache
 boundary closes; `state` may be left out of a request about its media alone. A URL that is not a
-data URL and `input_image.file_id` are refused with 400, and so is a choice of more than 26
-options, whose later digits are read from token prompts that carry no media. Each read's request
-holds its own copy of the media, and their size times the reads may not exceed 512 MiB.
+data URL in OpenAI's `input_image`, and `input_image.file_id`, are refused with 400.
+Multi-digit labels retain the prepared image payloads, positions and content-aware cache identity
+as their digits are appended. Each question's request holds its own copy of the acquired bytes;
+these copies, including Runoff's extra requests, are bounded together at 512 MiB.
+
+### Image boxes
+
+System One also accepts `box` questions alongside `choice`, `noul` and `score`:
+
+```bash
+curl http://127.0.0.1:8080/v1/systemone -d '{
+  "state": "a checkout screen", "images": ["screenshot.png"],
+  "questions": {
+    "visible": {"type": "noul", "instructions": "Is a checkout button visible?"},
+    "button": {"type": "box", "instructions": "Where is the checkout button?",
+               "criteria": {"step": 0.01, "aggregate": "mode"}}}}'
+```
+
+A box needs an image in `files`, `images`, the state's image parts or `conversation`. Its answer has
+`type: "box"`, `box: {top, bottom, left, right}`, `confidence`, `aggregate`, and `edges`. Coordinates are fractions
+of the whole image, measured downward and rightward from its top-left corner. Each edge is scored
+on a grid covering 0 to 1. The optional `criteria.step` defaults to `0.01` and must divide that
+interval evenly into 2 to 255 values. `criteria.aggregate` is `mode` (default), `mean` or `median`;
+the mean is snapped to the nearest grid point, ties to the lower point. Crossed edge pairs are
+sorted. Each entry in `edges` reports `modal`, `mean`, `median`, the modal `probability`, and
+`moved` when sorting changed that edge. Box confidence is the least concentrated edge's confidence:
+one minus its expected distance from the mode divided by a uniform grid's mean distance from 0.5,
+clamped to 0..1. Per-edge label masses and readout provenance are under `diagnostics.<id>`.
+
+The normalized box shape follows [TypeSafe's Box primitive](https://docs.typesafe.ai/primitives/box);
+grid controls and edge details are local extensions shared with the Basalt decision adapter.
+This route uses the `images` contract above, rather than TypeSafe's hosted asset-upload protocol.
+One box expands into four coordinate questions, which count toward the 200-question read limit.
+Multi-digit grids require a read per trie node, so cost is not simply proportional to grid size.
+Boxes use the existing vision preparation and context cache; no second model is loaded.
+Their coordinates and confidence come from the served chat model, not a calibrated detector.
+For an absent target a box still returns coordinates; pair it with a noul and apply the caller's
+own visibility threshold. `/v1/decisions` keeps its existing choice/predicate/score contract.
+
+### Read configuration and responses
 
 Four fields change how the questions are asked, in both endpoints:
 
@@ -1615,15 +1656,16 @@ The response holds `answers` by question id: a `choice` with the most likely opt
 `probabilities` by option (summing to 1) and `confidence`; a `noul` with `noul` (the probability of
 yes) and the same `probabilities` and `confidence`; a `score` with `score` (the expected level index,
 weighted by probability), the `legend` and `probabilities` by level index, and `confidence`. Every
-answer also carries `margin`, its most likely option's probability less the second's, by which a
-client can send a near tie on to a generation with reasoning. Probabilities are the softmax over
+choice/noul/score answer also carries `margin`, its most likely option's probability less the
+second's, by which a client can send a near tie on to a generation with reasoning. Probabilities are the softmax over
 the labels; `confidence` is the chosen label's probability over
 the whole vocabulary, its share of the labels times `diagnostics.<id>.label_mass`, the probability
 the model put on the labels at all. `diagnostics.<id>.argmax_is_label` says whether the model's most
 likely token was one of the labels, and `readout` whether the labels were read exactly (`exact`) or
 from the top alternatives (`top_k`, where a label outside them counts as likely as the least likely
 alternative, its upper bound). `usage.input_tokens` sums the prompts of every read and
-`output_tokens` counts one token per question. The probabilities are those of a general chat model
+`output_tokens` counts one token per label read (including subsequent digits and optional rechecks).
+The probabilities are those of a general chat model
 under this prompt, not calibrated to any data. The Qwen3.5 family reads them from FP32 logits; the
 other families' head logits are BF16, so two options such a model scores within one BF16 step (about
 0.1 nat at these magnitudes) share one probability. A label the tokenizer does not hold as one token
@@ -1663,8 +1705,9 @@ from it, so a question about a new short state costs one pass. A branch longer t
 alone from a device snapshot of the state, and so does every branch on a Flash-Next model whose
 sparse-attention KV streams from host memory (`--kv-resident`). A request with media runs no
 branched read, since a branch's prompt is its tokens alone: its reads go the way described next,
-each decoding the media on the host again while the later ones resume past them, and past the
-state, from the context cache. A Runoff choice adds a second
+each preparing the same owned media through the frontend's bounded media cache while later reads
+resume past them, and past the state, from the context cache. Continued digit reads keep the
+image's geometry and mRoPE positions. A Runoff choice adds a second
 branched read for its listings, and `recheck_margin` one read per near tie. A Qwen3.5-core model split over several devices runs no branched reads, and on a
 Qwen3.5-core model a branch holds at most `--prefill-chunk` tokens; there, when a question with
 its options is longer, or with media, the first question runs alone and leaves the state in the context cache,

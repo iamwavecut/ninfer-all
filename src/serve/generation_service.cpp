@@ -474,6 +474,32 @@ GenerationService::submit_group(std::vector<StagedRequest> staged) const {
     return prepared;
 }
 
+void GenerationService::acquire_read_media(std::span<ContentPart*> media, std::size_t maximum_bytes,
+                                           std::function<bool()> is_cancelled) const {
+    const auto lifetime    = acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout);
+    const auto interrupted = [&] {
+        return !engine_->is_available() || (is_cancelled && is_cancelled());
+    };
+    std::size_t remaining =
+        std::min({maximum_bytes, options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes});
+    try {
+        for (ContentPart* part : media) {
+            check_preparation_control(lifetime->deadline, interrupted);
+            auto acquired     = acquire_media(*part, lifetime->deadline, interrupted, remaining);
+            part->source.kind = ninfer::product::media_acquire::SourceKind::Bytes;
+            part->source.value.clear();
+            part->source.bytes      = std::move(acquired.bytes);
+            part->source.media_type = std::move(acquired.media_type);
+        }
+    } catch (const ApiException&) {
+        if (!engine_->is_available()) {
+            throw_request_error(ninfer::RequestError(ninfer::RequestErrorKind::Unavailable,
+                                                     "engine stopped during media acquisition"));
+        }
+        throw;
+    }
+}
+
 StagedRequest GenerationService::stage_read(const BranchRead& read,
                                             ninfer::GenerationObservationOptions observation,
                                             std::function<bool()> is_cancelled,
@@ -481,14 +507,13 @@ StagedRequest GenerationService::stage_read(const BranchRead& read,
     StagedRequest staged = stage(*read.request, GenerationConsumerMode::Aggregate, observation,
                                  std::move(is_cancelled), context_cache);
     if (!read.continuation.empty()) {
-        const std::span<const ninfer::TokenId> base = staged.submission.prompt.token_ids();
-        std::vector<ninfer::TokenId> tokens(base.begin(), base.end());
-        tokens.insert(tokens.end(), read.continuation.begin(), read.continuation.end());
-        staged.prepared.prompt_tokens = static_cast<int>(tokens.size());
         try {
             staged.submission.prompt =
-                engine_->prepare_tokens(std::move(tokens), true, false,
-                                        read.request->speculative_drafting, read.request->lora);
+                engine_->append_read_tokens(std::move(staged.submission.prompt), read.continuation);
+            staged.prepared.prompt_tokens =
+                static_cast<int>(staged.submission.prompt.summary().prompt_tokens);
+        } catch (const ninfer::RequestError& exception) {
+            throw_request_error(exception);
         } catch (const std::out_of_range& exception) {
             throw_invalid_input(std::invalid_argument(exception.what()), "invalid_prompt");
         }
@@ -590,6 +615,10 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
                                             ContextCacheHints context_cache,
                                             CacheParticipation cache_participation,
                                             DeadlinePolicy deadline_policy) const {
+    const auto caller_cancelled = std::move(is_cancelled);
+    is_cancelled                = [this, caller_cancelled] {
+        return !engine_->is_available() || (caller_cancelled && caller_cancelled());
+    };
     const std::optional<GenerationRequest> unconstrained = drop_unavailable_constraints(
         incoming, options_.structured_output, options_.unconstrained_response_format);
     const GenerationRequest& request = unconstrained ? *unconstrained : incoming;
@@ -614,6 +643,7 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
     prepared.lifetime = acquire_request_lifetime(deadline_policy);
 
     try {
+        check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         const auto acquisition_started = Clock::now();
         ninfer::PreparedPrompt prompt;
         if (request.raw_prompt) {
@@ -708,7 +738,17 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
                                     : ninfer::OutputConsumerMode::Aggregate,
             .observation      = observation,
             .pending_deadline = prepared.lifetime->deadline};
-    } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
+    } catch (const ApiException&) {
+        if (!engine_->is_available()) {
+            throw_request_error(ninfer::RequestError(ninfer::RequestErrorKind::Unavailable,
+                                                     "engine stopped during request preparation"));
+        }
+        throw;
+    } catch (const ninfer::RequestError& exception) {
+        if (!engine_->is_available()) {
+            throw_request_error(ninfer::RequestError(ninfer::RequestErrorKind::Unavailable,
+                                                     "engine stopped during request preparation"));
+        }
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_prompt");

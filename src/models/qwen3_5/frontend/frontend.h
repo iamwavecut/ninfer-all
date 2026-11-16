@@ -130,6 +130,8 @@ public:
     prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity = true,
                    bool anchor_prompt_end = false, bool speculative_drafting = true,
                    const std::optional<std::vector<LoraScale>>& lora = std::nullopt) const;
+    [[nodiscard]] PreparedPrompt append_read_tokens(PreparedPrompt prompt,
+                                                    std::span<const TokenId> tokens) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text,
                                                      bool parse_special = true) const;
     [[nodiscard]] std::string token_bytes(TokenId token) const;
