@@ -320,12 +320,6 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
                                           : (Cfg::SCALE_PAIR_LOAD ? ((g & 1) * 2) : (group * 2));
                 const auto* codes   = &Cr[stage][group * BM * 32];
                 const auto* high    = &Hr[stage][group * BM * HB];
-                // Debug: print high bytes for first row/group/kt to compare with model file
-                if (blockIdx.x == 0 && blockIdx.y == 0 && row == 0 && group == 0 && kt == 0 && threadIdx.x == 0) {
-                    printf("[debug] Q6 high[0:8]=%02x%02x%02x%02x%02x%02x%02x%02x codes[0:4]=%02x%02x%02x%02x\n",
-                           high[0], high[1], high[2], high[3], high[4], high[5], high[6], high[7],
-                           codes[0], codes[1], codes[2], codes[3]);
-                }
                 const bool is_q6_scale = (Codec == RowSplitGroupedMmaCodec::Q6) ||
                                          (Codec == RowSplitGroupedMmaCodec::Mixed && job.q6);
                 const std::uint8_t* scales;

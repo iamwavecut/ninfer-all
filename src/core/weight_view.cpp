@@ -1,11 +1,20 @@
 #include "core/weight_view.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
 namespace ninfer {
 namespace {
+
+inline bool debug_weights() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("NINFER_DEBUG_WEIGHTS");
+        return v != nullptr && *v != '\0';
+    }();
+    return enabled;
+}
 
 std::uint64_t add(std::uint64_t a, std::uint64_t b) {
     if (b > std::numeric_limits<std::uint64_t>::max() - a) {
@@ -105,38 +114,19 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     const auto k       = shape[1];
     out.padded_columns = k;
     if (is_row_split(layout)) {
-        std::uint64_t code_per_group = 32;
-        std::uint64_t high_per_group = 0;
-        switch (format) {
-        case QType::Q2_G64_FP16:
-            out.group_size = 64;
-            code_per_group = 16;
-            break;
-        case QType::Q4_G64_FP16:
-            out.group_size = 64;
-            break;
-        case QType::Q5_G64_FP16:
-            out.group_size = 64;
-            high_per_group = 8;
-            break;
-        case QType::Q6_G64_FP16:
-            out.group_size = 64;
-            high_per_group = 16;
-            break;
-        case QType::Q8_G32_FP16:
-            out.group_size = 32;
-            break;
-        case QType::T2_G128_FP16:
-            out.group_size = 128;
-            break;
-        default:
+        const RowSplitFormat geometry = row_split_format(format);
+        if (geometry.group == 0) {
             throw std::invalid_argument("RowSplit requires a grouped integer format");
         }
+        if ((format == QType::PTQ1_G128_FP16 || format == QType::T5_G128_FP16) && (k % 128 || layout != QuantLayout::RowSplit)) {
+            throw std::invalid_argument("PTQ1 requires RowSplit and whole 128-column groups");
+        }
+        out.group_size          = geometry.group;
         out.padded_columns      = aligned(k, 128);
         const auto groups       = out.padded_columns / out.group_size;
-        out.code_bytes_per_row  = mul(groups, code_per_group);
-        out.high_bytes_per_row  = mul(groups, high_per_group);
-        out.scale_bytes_per_row = mul(groups, 2);
+        out.code_bytes_per_row  = mul(groups, geometry.code_bytes);
+        out.high_bytes_per_row  = mul(groups, geometry.high_bytes);
+        out.scale_bytes_per_row = mul(groups, geometry.scale_bytes);
         out.code_bytes          = mul(n, out.code_bytes_per_row);
         out.high_offset         = aligned(out.code_bytes, 256);
         out.high_bytes          = mul(n, out.high_bytes_per_row);
@@ -276,6 +266,10 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     if (g.high_bytes) {
         out.high = parent.data + g.high_offset + out.row_begin * out.high_row_bytes;
     }
+    if (g.format == QType::Q5_G64_FP16 && out.row_begin == 0 && debug_weights()) {
+        printf("[debug] weight_row_planes Q5: parent.data=%p high_offset=%llu high=%p codes=%p\n",
+               (void*)parent.data, (unsigned long long)g.high_offset, (void*)out.high, (void*)out.codes);
+    }
     out.swizzled_scales = g.layout == QuantLayout::BlockScaleK16M128x4;
     if (g.scale_bytes) {
         out.scales = parent.data + g.scale_offset +
@@ -305,6 +299,16 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     if (view.shape.size() != 2 || !region.parent->data) {
         throw std::invalid_argument("native Weight requires a resident logical matrix");
     }
+    if (debug_weights()) {
+        fprintf(stderr, "[debug] native_weight parts=%d first_parent=%p qtype=%d n=%lld k=%lld\n",
+                (int)view.parts.size(), (void*)region.parent->data, (int)g.format,
+                (long long)view.shape[0], (long long)view.shape[1]);
+        for (int i = 0; i < (int)view.parts.size(); i++) {
+            fprintf(stderr, "[debug]   part[%d]: parent=%p qtype=%d rows=%lld\n", i,
+                    (void*)view.parts[i].parent->data, (int)view.parts[i].parent->geometry.format,
+                    (long long)(view.parts[i].end - view.parts[i].begin));
+        }
+    }
     Weight out;
     out.payload          = region.parent->data;
     out.payload_bytes    = g.bytes;
@@ -331,6 +335,12 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.qdata                = planes.codes;
     out.qhigh                = planes.high;
     out.scales               = planes.scales;
+    if (g.format == QType::Q5_G64_FP16 && debug_weights()) {
+        printf("[debug] native_weight Q5: n=%llu k=%llu high_offset=%llu high_bytes=%llu scale_offset=%llu\n",
+               (unsigned long long)out.n, (unsigned long long)out.k,
+               (unsigned long long)g.high_offset, (unsigned long long)g.high_bytes,
+               (unsigned long long)g.scale_offset);
+    }
     out.group_size           = static_cast<std::uint32_t>(g.group_size);
     out.group                = g.group_size ? dimension(g.group_size) : 0;
     out.weight_scale_divisor = region.parent->weight_scale_divisor;

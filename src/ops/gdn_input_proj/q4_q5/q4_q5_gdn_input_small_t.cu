@@ -8,10 +8,19 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+inline bool debug_weights() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("NINFER_DEBUG_WEIGHTS");
+        return v != nullptr && *v != '\0';
+    }();
+    return enabled;
+}
 
 constexpr std::int32_t kQkRows     = 4096;
 constexpr std::int32_t kValueRows  = 6144;
@@ -44,6 +53,24 @@ void launch_value_z(const Tensor& x, const Weight& w, Tensor& value, Tensor& z,
         static_cast<const std::uint8_t*>(w.scales), epilogue, x.ne[1]);
 }
 
+// Q4 value_z path: uses q4_ksplit_mma_launch (same kernel as the qk path)
+template <int TileCols, int KWarps = 8, int Stages = 1>
+void launch_value_z_q4(const Tensor& x, const Weight& w, Tensor& value, Tensor& z,
+                       cudaStream_t stream) {
+    const SmallTSplitStore epilogue{static_cast<__nv_bfloat16*>(value.data),
+                                    static_cast<__nv_bfloat16*>(z.data),
+                                    leading_dimension(value),
+                                    leading_dimension(z),
+                                    kValueRows,
+                                    x.ne[1]};
+    q4_ksplit_mma_launch<GdnQkGeometry, TileCols, TileCols, SmallTSplitStore,
+                         Q4KSplitIdentityRows, true, KWarps, Stages>(
+        kValueZRows / SmallTLayout<KWarps>::kRowsPerCta, stream,
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(value.data),
+        epilogue, Q4KSplitIdentityRows{}, x.ne[1]);
+}
+
 template <int TileCols, int KWarps = 8, int Stages = 1>
 void launch_qk(const Tensor& x, const Weight& w, Tensor& qk, cudaStream_t stream) {
     const SmallTSplitStore epilogue{static_cast<__nv_bfloat16*>(qk.data),
@@ -65,6 +92,10 @@ void launch_qk(const Tensor& x, const Weight& w, Tensor& qk, cudaStream_t stream
 void q4_q5_gdn_input_small_t_launch(const Tensor& x, const Weight& qk_weight,
                                     const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                     Tensor& z, cudaStream_t stream) {
+    if (debug_weights()) {
+        fprintf(stderr, "[debug] GDN small_T: qk_qtype=%d vz_qtype=%d qk_n=%d vz_n=%d T=%d\n",
+                (int)qk_weight.qtype, (int)value_z_weight.qtype, qk_weight.n, value_z_weight.n, x.ne[1]);
+    }
     if (x.ne[1] < 1 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4/Q5 GDN input small-T MMA requires T in [1,32]");
     }
@@ -81,14 +112,27 @@ void q4_q5_gdn_input_small_t_launch(const Tensor& x, const Weight& qk_weight,
     //   query_key [4096]  16   47.1 / 42.0 (s2)  25.6 (s2)
     //   query_key [4096]  32   75.8             38.9 (s2)
     const int columns = x.ne[1];
-    if (columns <= 4) {
-        launch_value_z<4, 2>(x, value_z_weight, value, z, stream);
-    } else if (columns <= 8) {
-        launch_value_z<8, 1>(x, value_z_weight, value, z, stream);
-    } else if (columns <= 16) {
-        launch_value_z<16, 3, 4>(x, value_z_weight, value, z, stream);
+    const bool vz_is_q4 = (value_z_weight.qtype == QType::Q4_G64_FP16);
+    if (vz_is_q4) {
+        // Q4 value_z: use q4_ksplit_mma_launch
+        if (columns <= 8) {
+            launch_value_z_q4<8>(x, value_z_weight, value, z, stream);
+        } else if (columns <= 16) {
+            launch_value_z_q4<16, 4, 2>(x, value_z_weight, value, z, stream);
+        } else {
+            launch_value_z_q4<32, 4, 2>(x, value_z_weight, value, z, stream);
+        }
     } else {
-        launch_value_z<32, 1, 4>(x, value_z_weight, value, z, stream);
+        // Q5 value_z: use q5_small_t_mma_launch
+        if (columns <= 4) {
+            launch_value_z<4, 2>(x, value_z_weight, value, z, stream);
+        } else if (columns <= 8) {
+            launch_value_z<8, 1>(x, value_z_weight, value, z, stream);
+        } else if (columns <= 16) {
+            launch_value_z<16, 3, 4>(x, value_z_weight, value, z, stream);
+        } else {
+            launch_value_z<32, 1, 4>(x, value_z_weight, value, z, stream);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     if (columns <= 8) {

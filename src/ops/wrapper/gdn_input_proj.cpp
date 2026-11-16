@@ -1231,7 +1231,39 @@ std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
             2048 + 2048 + 6144, columns,
             t2_two_parent_projection_bytes(std::max(batch_size, 1) * min_width, columns, policy, qk_qtype));
     }
+    if (qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q4_G64_FP16) {
+        return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                     min_width, max_width);
+    }
     if (qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16) {
+        return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                     min_width, max_width);
+    }
+    if (qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q6_G64_FP16) {
+        return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                     min_width, max_width);
+    }
+    if (qk_qtype == QType::Q5_G64_FP16 && value_z_qtype == QType::Q4_G64_FP16) {
+        return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                     min_width, max_width);
+    }
+    if (qk_qtype == QType::Q5_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16) {
+        return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                     min_width, max_width);
+    }
+    if (qk_qtype == QType::Q5_G64_FP16 && value_z_qtype == QType::Q6_G64_FP16) {
+        return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                     min_width, max_width);
+    }
+    if (qk_qtype == QType::Q6_G64_FP16 && value_z_qtype == QType::Q4_G64_FP16) {
+        return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                     min_width, max_width);
+    }
+    if (qk_qtype == QType::Q6_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16) {
+        return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                     min_width, max_width);
+    }
+    if (qk_qtype == QType::Q6_G64_FP16 && value_z_qtype == QType::Q6_G64_FP16) {
         return gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
                                                                      min_width, max_width);
     }
@@ -1255,7 +1287,39 @@ std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(
         return t2_two_parent_projection_bytes(std::max(batch_size, 1) * min_width,
                                               std::max(batch_size, 1) * max_width, policy, qk_qtype);
     }
+    if (qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q4_G64_FP16) {
+        return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                   min_width, max_width);
+    }
     if (qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16) {
+        return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                   min_width, max_width);
+    }
+    if (qk_qtype == QType::Q4_G64_FP16 && value_z_qtype == QType::Q6_G64_FP16) {
+        return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                   min_width, max_width);
+    }
+    if (qk_qtype == QType::Q5_G64_FP16 && value_z_qtype == QType::Q4_G64_FP16) {
+        return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                   min_width, max_width);
+    }
+    if (qk_qtype == QType::Q5_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16) {
+        return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                   min_width, max_width);
+    }
+    if (qk_qtype == QType::Q5_G64_FP16 && value_z_qtype == QType::Q6_G64_FP16) {
+        return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                   min_width, max_width);
+    }
+    if (qk_qtype == QType::Q6_G64_FP16 && value_z_qtype == QType::Q4_G64_FP16) {
+        return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                   min_width, max_width);
+    }
+    if (qk_qtype == QType::Q6_G64_FP16 && value_z_qtype == QType::Q5_G64_FP16) {
+        return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
+                                                                   min_width, max_width);
+    }
+    if (qk_qtype == QType::Q6_G64_FP16 && value_z_qtype == QType::Q6_G64_FP16) {
         return gdn_input_proj_conv_record_workspace_capacity_bytes(2048, 2048, 6144, batch_size,
                                                                    min_width, max_width);
     }
@@ -1344,10 +1408,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
     constexpr std::int32_t kParentRows = kValueRows + kZRows;
     const ConvGeometry geometry        = require_snapshot_input(x, kHidden);
     const bool ternary                 = t2_two_parent(qk_weight, value_z_weight);
-    require_rowsplit(qk_weight, ternary ? QType::T2_G128_FP16 : QType::Q4_G64_FP16,
-                     kQueryRows + kKeyRows, "qk weight");
-    require_rowsplit(value_z_weight, ternary ? QType::T2_G128_FP16 : QType::Q5_G64_FP16,
-                     kParentRows, "value/z weight");
+    require_rowsplit(qk_weight, qk_weight.qtype, kQueryRows + kKeyRows, "qk weight");
+    require_rowsplit(value_z_weight, value_z_weight.qtype, kParentRows, "value/z weight");
     require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
                               snapshot_base_slots, kChannels, geometry);
     require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
@@ -1417,10 +1479,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
     constexpr std::int32_t kParentRows = kValueRows + kZRows;
     const ConvGeometry geometry        = require_record_input(x, kHidden);
     const bool ternary                 = t2_two_parent(qk_weight, value_z_weight);
-    require_rowsplit(qk_weight, ternary ? QType::T2_G128_FP16 : QType::Q4_G64_FP16,
-                     kQueryRows + kKeyRows, "qk weight");
-    require_rowsplit(value_z_weight, ternary ? QType::T2_G128_FP16 : QType::Q5_G64_FP16,
-                     kParentRows, "value/z weight");
+    require_rowsplit(qk_weight, qk_weight.qtype, kQueryRows + kKeyRows, "qk weight");
+    require_rowsplit(value_z_weight, value_z_weight.qtype, kParentRows, "value/z weight");
     require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,
                             geometry);
     require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,

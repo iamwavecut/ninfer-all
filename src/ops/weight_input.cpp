@@ -4,11 +4,20 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops {
 namespace {
+
+inline bool debug_weights() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("NINFER_DEBUG_WEIGHTS");
+        return v != nullptr && *v != '\0';
+    }();
+    return enabled;
+}
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(message); }
@@ -226,8 +235,10 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     }
     require(dense || moe, "input projection: unsupported native logical projection geometry");
     const auto joined = concatenate_rows(inputs);
-    fprintf(stderr, "[debug] input_projection attention=%d contiguous=%d\n",
-            (int)attention, (int)contiguous(joined));
+    if (debug_weights()) {
+        fprintf(stderr, "[debug] input_projection attention=%d contiguous=%d\n",
+                (int)attention, (int)contiguous(joined));
+    }
     if (contiguous(joined)) {
         auto result       = single(inputs);
         const auto format = result.weight.qtype;
@@ -246,24 +257,30 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     if (attention) {
         const auto q_fmt = inputs[0].weight.parts[0].parent->geometry.format;
         const auto k_fmt = inputs[1].weight.parts[0].parent->geometry.format;
-        fprintf(stderr, "[debug] input_projection qk: q=%d k=%d g=%d v=%d first_qtype=%d second_qtype=%d\n",
-                (int)q_fmt, (int)k_fmt,
-                (int)inputs[2].weight.parts[0].parent->geometry.format,
-                (int)inputs[3].weight.parts[0].parent->geometry.format,
-                (int)first.weight.qtype, (int)second.weight.qtype);
+        if (debug_weights()) {
+            fprintf(stderr, "[debug] input_projection qk: q=%d k=%d g=%d v=%d first_qtype=%d second_qtype=%d\n",
+                    (int)q_fmt, (int)k_fmt,
+                    (int)inputs[2].weight.parts[0].parent->geometry.format,
+                    (int)inputs[3].weight.parts[0].parent->geometry.format,
+                    (int)first.weight.qtype, (int)second.weight.qtype);
+        }
         if (q_fmt != k_fmt) {
             first.weight.second_sub_qtype = k_fmt;
             first.weight.second_sub_row   = static_cast<std::int32_t>(inputs[0].weight.shape[0]);
-            fprintf(stderr, "[debug] input_projection MIXED qk: q=%d k=%d row=%d\n",
-                    (int)q_fmt, (int)k_fmt, first.weight.second_sub_row);
+            if (debug_weights()) {
+                fprintf(stderr, "[debug] input_projection MIXED qk: q=%d k=%d row=%d\n",
+                        (int)q_fmt, (int)k_fmt, first.weight.second_sub_row);
+            }
         }
         const auto g_fmt = inputs[2].weight.parts[0].parent->geometry.format;
         const auto v_fmt = inputs[3].weight.parts[0].parent->geometry.format;
         if (g_fmt != v_fmt) {
             second.weight.second_sub_qtype = v_fmt;
             second.weight.second_sub_row   = static_cast<std::int32_t>(inputs[2].weight.shape[0]);
-            fprintf(stderr, "[debug] input_projection MIXED gv: g=%d v=%d row=%d\n",
-                    (int)g_fmt, (int)v_fmt, second.weight.second_sub_row);
+            if (debug_weights()) {
+                fprintf(stderr, "[debug] input_projection MIXED gv: g=%d v=%d row=%d\n",
+                        (int)g_fmt, (int)v_fmt, second.weight.second_sub_row);
+            }
         }
     } else {
         const auto q_fmt = inputs[0].weight.parts[0].parent->geometry.format;

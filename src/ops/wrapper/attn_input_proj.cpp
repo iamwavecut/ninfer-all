@@ -19,6 +19,7 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan_unified.h"
+#include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -456,6 +457,23 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                                            workspace, stream);
         return;
     }
+    // Always use grouped MMA path for T <= 32 (supports all Q4/Q5/Q6 combinations).
+    // Small-T kernels are disabled due to CUDA graph capture issues.
+    // Use R32C32S4 (32-col tile) for decode, not R32C64S4 (64-col tile, for prefill).
+    if (x.ne[1] <= 32) {
+        // Small-T kernels disabled: Q5 path crashes on r11-real2, Q4+Q4 rejected by kernel check
+        // (requires Q4 query_key + Q5 gate_value). Use grouped MMA for all T<=32.
+        const bool has_q6 = (query_key_weight.qtype == QType::Q6_G64_FP16 ||
+                             gate_value_weight.qtype == QType::Q6_G64_FP16);
+        if (has_q6) {
+            detail::q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(
+                x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+        } else {
+            detail::q4_q5_attn_input_grouped_mma_r32_c32_s4_launch(
+                x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+        }
+        return;
+    }
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                       stream);
 }
@@ -552,7 +570,12 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     }
     require_rowsplit(query_key_weight, query_key_weight.qtype, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, gate_value_weight.qtype, kQRows + kKvRows, "gate/value weight");
-
+    // Always use grouped MMA path for T <= 32 (supports all Q4/Q5/Q6 combinations).
+    if (cols <= 32) {
+        detail::q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(
+            x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+        return;
+    }
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
                                       stream);
 }

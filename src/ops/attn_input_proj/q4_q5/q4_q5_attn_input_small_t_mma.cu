@@ -8,10 +8,19 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+inline bool debug_weights() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("NINFER_DEBUG_WEIGHTS");
+        return v != nullptr && *v != '\0';
+    }();
+    return enabled;
+}
 
 // Qwen3.6/3.8-27B full attention: 24 query heads x 256 and 4 KV heads x 256, so each projection
 // is a 7168-row parent split at 6144 -- query_key into q and k, gate_value into gate and v.
@@ -40,6 +49,11 @@ SmallTSplitStore split_store(Tensor& head, Tensor& tail, int columns) {
 template <int XCols, int Stages, int KWarps = 8>
 void launch_gate_value(const Tensor& x, const Weight& w, Tensor& gate, Tensor& v,
                        cudaStream_t stream) {
+    if (debug_weights()) {
+        fprintf(stderr, "[debug] small_T gate_value: x=%p qdata=%p qhigh=%p scales=%p gate=%p v=%p T=%d n=%d\n",
+                x.data, (const void*)w.qdata, (const void*)w.qhigh, (const void*)w.scales,
+                gate.data, v.data, x.ne[1], w.n);
+    }
     q5_small_t_mma_launch<kParentRows, kHidden, XCols, Stages, SmallTSplitStore, KWarps>(
         stream, static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.qhigh),
@@ -69,6 +83,12 @@ void q4_q5_attn_input_small_t_mma_launch(const Tensor& x, const Weight& query_ke
         gate_value_weight.n != kParentRows || query_key_weight.padded_shape[1] != kHidden ||
         gate_value_weight.padded_shape[1] != kHidden) {
         throw std::invalid_argument("Q4/Q5 attention input small-T MMA: unsupported shape");
+    }
+    // Small-T kernels require exactly Q4 query_key + Q5 gate_value.
+    if (query_key_weight.qtype != QType::Q4_G64_FP16 ||
+        gate_value_weight.qtype != QType::Q5_G64_FP16) {
+        throw std::invalid_argument(
+            "Q4/Q5 attention input small-T MMA: requires Q4 query_key + Q5 gate_value");
     }
     // Wider extents share each staged activation slab between row tiles (KWarps < 8). One kernel,
     // cold L2, median of 21, us:

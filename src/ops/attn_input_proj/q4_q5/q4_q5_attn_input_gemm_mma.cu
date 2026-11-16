@@ -15,71 +15,49 @@
 namespace ninfer::ops::detail {
 namespace {
 
+inline bool debug_weights() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("NINFER_DEBUG_WEIGHTS");
+        return v != nullptr && *v != '\0';
+    }();
+    return enabled;
+}
+
 RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t row_begin, std::int32_t row_count,
                                Tensor& out) {
     if (row_begin < 0 || row_count <= 0 || row_begin + row_count > weight.n ||
         out.ne[0] != row_count) {
         throw std::invalid_argument("Q4/Q5 attention input grouped MMA row view is invalid");
     }
-    // Use the second sub-weight's qtype if this row range falls in its range.
-    const QType effective_qtype =
-        (weight.second_sub_row > 0 && row_begin >= weight.second_sub_row)
-            ? weight.second_sub_qtype
-            : weight.qtype;
-    if (effective_qtype == QType::Q6_G64_FP16) {
+    // The Weight struct's qtype field may be incorrect for multi-part weights (it reflects
+    // the first part's qtype, which can be Q4 even when the slice is Q5/Q6). Use the qhigh
+    // pointer as the authoritative signal: non-null qhigh means Q5 or Q6.
+    QType effective_qtype = weight.qtype;
+    if (effective_qtype == QType::Q4_G64_FP16 && weight.qhigh != nullptr) {
+        effective_qtype = QType::Q5_G64_FP16;
+    }
+    if (debug_weights() && row_begin >= 6000 && row_begin < 7200) {
+        fprintf(stderr, "[debug] make_job POINTERS: row_begin=%d qdata=%p qhigh=%p scales=%p n=%d k=%d\n",
+                row_begin, weight.qdata, weight.qhigh, weight.scales, weight.n, weight.k);
+    }
+    if (effective_qtype == QType::Q6_G64_FP16 && debug_weights()) {
         fprintf(stderr, "[debug] MMA make_job Q6: row_begin=%d row_count=%d n=%d\n",
                 row_begin, row_count, weight.n);
     }
-    if (row_begin >= 6000 && row_begin < 7200) {
+    if (debug_weights() && row_begin >= 6000 && row_begin < 7200) {
         fprintf(stderr, "[debug] make_job attn row_begin=%d qtype=%d second_sub_row=%d second_sub_qtype=%d effective=%d\n",
                 row_begin, (int)weight.qtype, weight.second_sub_row, (int)weight.second_sub_qtype, (int)effective_qtype);
-        // Copy scales from device to host and verify
-        const auto* device_scales = static_cast<const std::uint8_t*>(weight.scales);
-        const int64_t groups = weight.padded_shape[1] / 64;
-        const int64_t scale_bytes = (int64_t)weight.n * groups * 2;
-        if (device_scales && scale_bytes > 0 && scale_bytes < 10000000) {
-            std::uint8_t* host_scales = static_cast<std::uint8_t*>(malloc(scale_bytes));
-            if (host_scales) {
-                cudaMemcpy(host_scales, device_scales, scale_bytes, cudaMemcpyDeviceToHost);
-                // Check specific location that kernel reported NaN (job-relative row 3777 = full weight row row_begin+3777)
-                const int64_t check_full_row = row_begin + 3777;
-                if (check_full_row < weight.n) {
-                    const int64_t gi = check_full_row * groups + 36;
-                    if (gi * 2 + 1 < scale_bytes) {
-                        const std::uint16_t scale_bits = *reinterpret_cast<const std::uint16_t*>(&host_scales[gi * 2]);
-                        fprintf(stderr, "[debug] make_job DEVICE scales row_begin=%d full_row=%lld g=36: bits=0x%04x\n",
-                                row_begin, (long long)check_full_row, scale_bits);
-                    }
-                }
-                // Scan all for NaN
-                int nan_count = 0;
-                for (int64_t i = 0; i < (int64_t)weight.n * groups; ++i) {
-                    const std::uint16_t bits = *reinterpret_cast<const std::uint16_t*>(&host_scales[i * 2]);
-                    const float val = __half2float(__ushort_as_half(bits));
-                    if (!std::isfinite(val)) {
-                        nan_count++;
-                        if (nan_count <= 5) {
-                            fprintf(stderr, "[debug] make_job DEVICE scale non-finite: gi=%lld bits=0x%04x val=%f\n",
-                                    (long long)i, bits, val);
-                        }
-                    }
-                }
-                fprintf(stderr, "[debug] make_job DEVICE scales total non-finite: %d / %lld\n",
-                        nan_count, (long long)((int64_t)weight.n * groups));
-                free(host_scales);
-            }
-        }
     }
     const std::int64_t groups = weight.padded_shape[1] / 64;
     const auto* codes         = static_cast<const std::uint8_t*>(weight.qdata) +
                         static_cast<std::int64_t>(row_begin) * groups * 32;
-    const auto* high   = effective_qtype == QType::Q5_G64_FP16
+    const auto* high   = (effective_qtype == QType::Q5_G64_FP16 && weight.qhigh)
                              ? static_cast<const std::uint8_t*>(weight.qhigh) +
                                  static_cast<std::int64_t>(row_begin) * groups * 8
-                             : effective_qtype == QType::Q6_G64_FP16
-                                 ? static_cast<const std::uint8_t*>(weight.qhigh) +
-                                     static_cast<std::int64_t>(row_begin) * groups * 16
-                                 : nullptr;
+                             : (effective_qtype == QType::Q6_G64_FP16 && weight.qhigh)
+                                   ? static_cast<const std::uint8_t*>(weight.qhigh) +
+                                         static_cast<std::int64_t>(row_begin) * groups * 16
+                                   : nullptr;
     const auto* scales = static_cast<const std::uint8_t*>(weight.scales) +
                          static_cast<std::int64_t>(row_begin) * groups * 2;
     return RowSplitGroupedMmaJob{
@@ -92,6 +70,32 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t row_begin, std
 template <class Schedule, RowSplitGroupedMmaCodec Codec>
 void launch_pair(bool full, const Tensor& x, RowSplitGroupedMmaJob first,
                  RowSplitGroupedMmaJob second, cudaStream_t stream) {
+    if (debug_weights()) {
+        auto check_ptr = [](const void* p, const char* name) {
+            if (p == nullptr) return;
+            cudaPointerAttributes attr;
+            cudaError_t err = cudaPointerGetAttributes(&attr, p);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "[debug] launch_pair BAD PTR: %s=%p err=%s\n",
+                        name, p, cudaGetErrorString(err));
+            } else {
+                int current_device = -1;
+                cudaGetDevice(&current_device);
+                fprintf(stderr, "[debug] launch_pair PTR: %s=%p dev=%d current_dev=%d type=%d\n",
+                        name, p, attr.device, current_device, (int)attr.type);
+            }
+        };
+        check_ptr(x.data, "x");
+        check_ptr(first.codes, "first.codes");
+        check_ptr(first.high, "first.high");
+        check_ptr(first.scales, "first.scales");
+        check_ptr(first.out, "first.out");
+        check_ptr(second.codes, "second.codes");
+        check_ptr(second.high, "second.high");
+        check_ptr(second.scales, "second.scales");
+        check_ptr(second.out, "second.out");
+    }
+
     const int tiles = div_up(first.n, Schedule::BM) + div_up(second.n, Schedule::BM);
     const int cols  = x.ne[1];
     const dim3 grid(static_cast<unsigned>(tiles),
@@ -147,6 +151,11 @@ void launch_slice(const Tensor& x, const Weight& query_key_weight, const Weight&
 template <class Schedule>
 void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
             Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (debug_weights() && gate_value_weight.n == 7168) {
+        fprintf(stderr, "[debug] launch GV: qtype=%d qdata=%p qhigh=%p scales=%p n=%d k=%d\n",
+                (int)gate_value_weight.qtype, gate_value_weight.qdata, gate_value_weight.qhigh,
+                gate_value_weight.scales, gate_value_weight.n, gate_value_weight.k);
+    }
     constexpr std::int32_t kSliceCols = Schedule::BN;
     for_each_token_slice(x.ne[1], kSliceCols, [&](std::int32_t offset, std::int32_t count) {
         const Tensor x_slice = x.slice(1, offset, count);

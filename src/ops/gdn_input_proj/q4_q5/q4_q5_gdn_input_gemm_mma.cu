@@ -13,21 +13,22 @@ namespace {
 
 RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_offset,
                                std::int32_t rows, Tensor& out, std::int32_t output_row_offset) {
-    // Use the second sub-weight's qtype if this row range falls in its range.
-    const QType effective_qtype =
-        (weight.second_sub_row > 0 && weight_row_offset >= weight.second_sub_row)
-            ? weight.second_sub_qtype
-            : weight.qtype;
+    // The Weight struct's qtype field may be incorrect for multi-part weights. Use the qhigh
+    // pointer as the authoritative signal: non-null qhigh means Q5 or Q6.
+    QType effective_qtype = weight.qtype;
+    if (effective_qtype == QType::Q4_G64_FP16 && weight.qhigh != nullptr) {
+        effective_qtype = QType::Q5_G64_FP16;
+    }
     const std::int64_t groups = weight.padded_shape[1] / weight.group;
     const auto* codes         = static_cast<const std::uint8_t*>(weight.qdata) +
                         static_cast<std::int64_t>(weight_row_offset) * groups * 32;
-    const auto* high   = effective_qtype == QType::Q5_G64_FP16
+    const auto* high   = (effective_qtype == QType::Q5_G64_FP16 && weight.qhigh)
                              ? static_cast<const std::uint8_t*>(weight.qhigh) +
                                  static_cast<std::int64_t>(weight_row_offset) * groups * 8
-                             : effective_qtype == QType::Q6_G64_FP16
-                                 ? static_cast<const std::uint8_t*>(weight.qhigh) +
-                                     static_cast<std::int64_t>(weight_row_offset) * groups * 16
-                                 : nullptr;
+                             : (effective_qtype == QType::Q6_G64_FP16 && weight.qhigh)
+                                   ? static_cast<const std::uint8_t*>(weight.qhigh) +
+                                         static_cast<std::int64_t>(weight_row_offset) * groups * 16
+                                   : nullptr;
     const auto* scales = static_cast<const std::uint8_t*>(weight.scales) +
                          static_cast<std::int64_t>(weight_row_offset) * groups * 2;
     return RowSplitGroupedMmaJob{
