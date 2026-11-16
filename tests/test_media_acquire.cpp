@@ -312,8 +312,8 @@ void addresses(const LocalServer& server) {
                        Outcome::Invalid);
     }
     for (const char* bad :
-         {"ftp://example.com/a.png", "file:///etc/hosts", "gopher://example.com/", "http:///a.png",
-          "http://", "not a url", "https://user@example.com/a.png"}) {
+         {"ftp://example.com/a.png", "file:///etc/hosts", "gopher://example.com/",
+          "http://:80/a.png", "http://", "not a url", "https://user@example.com/a.png"}) {
         expect_outcome(std::string("the URL ") + bad, fetch(url(bad), policy), Outcome::Invalid);
     }
 

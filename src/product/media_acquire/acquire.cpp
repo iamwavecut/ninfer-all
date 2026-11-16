@@ -44,9 +44,10 @@ void check_control(const Policy& policy) {
 long bounded_timeout_ms(const Policy& policy, int configured) {
     if (policy.deadline == Clock::time_point{}) { return configured; }
     check_control(policy);
+    // Rounded up, with one millisecond for curl's whole-millisecond clock: a curl timer that the
+    // deadline bounds expires after the deadline, so check_control reports the deadline.
     const auto remaining =
-        std::chrono::duration_cast<std::chrono::milliseconds>(policy.deadline - Clock::now())
-            .count();
+        std::chrono::ceil<std::chrono::milliseconds>(policy.deadline - Clock::now()).count() + 1;
     return std::min<long>(configured, std::max<std::int64_t>(1, remaining));
 }
 
