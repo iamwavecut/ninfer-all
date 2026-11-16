@@ -1,3 +1,12 @@
+# Qwen3.8-27B UD3.1 IQ4_XS-style → ninfer native format conversion table
+# Source: Unsloth AI Dynamic v3.1 (UD3.1) IQ4_XS GGUF
+#   https://huggingface.co/unsloth/Qwen3.8-27B-GGUF
+#   https://unsloth.ai/docs/basics/dynamic-3.0-ggufs
+#
+# Maps each UD3.1 IQ4_XS GGUF tensor to its native ninfer format
+# (q4_g64_fp16 / q5_g64_fp16 / q6_g64_fp16 / bf16), with bits-per-weight,
+# byte counts, and quantization method.
+#
 source_tensor	ud_struct_type	ud_struct_bpw	new_format	new_bpw	delta_bpw	runner_up	method	elems	struct_bytes	new_bytes	delta_bytes	param
 TTurbo-mmproj-BF16.gguf:mm.0.bias	mm_type0(32.0)	32.0000	bf16	16.0000	-16.0000	fp32 (runtime-rejected)	cast_direct	4608	18432	9216	-9216	
 TTurbo-mmproj-BF16.gguf:mm.0.weight	mm_type12(4.5)	4.5000	q5_g64_fp16	5.2500	+0.7500	upgrade-one-level(B)	grouped_absmax	21233664	11943936	13934592	1990656	
