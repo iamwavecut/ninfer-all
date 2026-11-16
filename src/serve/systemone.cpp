@@ -854,8 +854,11 @@ GenerationRequest make_decision_read(const DecisionRequest& request,
     out.readout_tokens             = std::move(label_tokens);
     // A read whose most likely token is a stop token still has its record.
     out.raw_output = true;
-    // One token drafts nothing; --spec's drafter would only run over the prompt.
-    out.speculative_drafting = false;
+    // One token drafts nothing, and --spec's drafter would only run over the prompt. The reads of
+    // a wide label's next digits resume from this read's endpoint, which a Qwen3.5-core Engine
+    // with --spec publishes only for a drafting request: such a read is prepared for drafting, and
+    // GenerationService::stage_read keeps the drafter only where the endpoint needs it.
+    out.speculative_drafting = decision_labels(question).width > 1;
     // The server's default graft would be a hidden prefix the question does not expect.
     out.graft = std::string();
     return out;

@@ -270,7 +270,9 @@ public:
     // Qwen3.5-core Engine runs the last prompt chunks of short ones in one shared prefill pass.
     [[nodiscard]] std::vector<PreparedRequest> submit_group(std::vector<StagedRequest> staged) const;
     // stage() of a read's request, its prompt continued by the read's tokens and its readout
-    // replaced by the read's.
+    // replaced by the read's. It drafts only when its request does, its prompt is not continued
+    // and the Engine publishes a read's endpoint only for a drafting request
+    // (read_endpoints_need_drafting): the reads that continue its prompt resume from it.
     [[nodiscard]] StagedRequest stage_read(const BranchRead& read,
                                            ninfer::GenerationObservationOptions observation,
                                            std::function<bool()> is_cancelled,
@@ -289,6 +291,10 @@ public:
                                                   const ContextCacheHints& context_cache) const;
 
     [[nodiscard]] bool runs_branches() const { return engine_->runs_branches(); }
+    // ninfer::Engine::read_endpoints_need_drafting.
+    [[nodiscard]] bool read_endpoints_need_drafting() const {
+        return engine_->read_endpoints_need_drafting();
+    }
 
     // Snapshot each decision source once, before fanout, under the normal acquisition controls.
     void acquire_read_media(std::span<ContentPart*> media, std::size_t maximum_bytes,

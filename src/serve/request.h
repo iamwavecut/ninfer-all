@@ -298,7 +298,7 @@ struct GenerationRequest {
     // record whatever token the model chose. The output text is then raw.
     bool raw_output = false;
     // ninfer::ExecutionOptions::speculative_drafting: false keeps --spec's drafter off a one-token
-    // read (the typed decisions).
+    // read that no read continues (rerank, typed decisions with one-character labels).
     bool speculative_drafting = true;
 
     // The alternatives each reported token carries, absent unless the request asked for logprobs.

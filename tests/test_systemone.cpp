@@ -320,6 +320,15 @@ void prompts() {
                choice.sampling.presence_penalty == 0.0 && !choice.speculative_drafting,
            "one greedy token with the labels read out, no thinking, no graft, no penalties, no "
            "drafter");
+    expect(choice.raw_output, "a read whose model picks a stop token loses its record");
+    {
+        // 27 options take two-digit labels: the second digit's reads resume from this read's
+        // endpoint, which a request publishes on an Engine with --spec only while it drafts.
+        DecisionQuestion two_digit = request.questions[0];
+        two_digit.options.resize(27, two_digit.options.back());
+        expect(make_decision_read(request, two_digit, {1, 2, 3}).speculative_drafting,
+               "a read of two-digit labels publishes no endpoint under --spec");
+    }
     const GenerationRequest noul = make_decision_read(request, request.questions[1], {1, 2, 3, 4});
     expect(user_text(noul).find(
                "Question: Reply within the hour?\nyes: money is moving\n"

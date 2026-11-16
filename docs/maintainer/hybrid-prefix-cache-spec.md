@@ -698,11 +698,15 @@ Candidates, in priority order:
   continues it, so a snapshot of its own text (the question) serves nobody and an exact tap there
   only costs a pass.
 - On an Engine with a drafter (`--spec`), a request without drafting
-  (`ExecutionOptions::speculative_drafting = false`, one output token; the decision reads) keeps
-  only exact taps, and the drafter's prompt work (the MTP bridge and KV, the DFlash context) runs
-  only below the deepest one or its resume point: the snapshots it publishes there carry the
-  drafter's state for drafting requests, and the rest of its prompt runs without the drafter. It
-  publishes no endpoint, since its drafter state stops short of it.
+  (`ExecutionOptions::speculative_drafting = false`, one output token; rerank judgements and the
+  decision reads of one-character labels) keeps only exact taps, and the drafter's prompt work
+  (the MTP bridge and KV, the DFlash context) runs only below the deepest one or its resume point:
+  the snapshots it publishes there carry the drafter's state for drafting requests, and the rest
+  of its prompt runs without the drafter. It publishes no endpoint, since its drafter state stops
+  short of it (`Engine::read_endpoints_need_drafting`). The first decision read of a label of
+  several digits drafts, so the reads of its next digits resume from its endpoint; Flash-Next,
+  whose reads without drafting publish entries that serve only such reads, and the other families
+  run it without drafting.
 - Hints are the Frontend's existing `message_boundaries` plus the structural boundaries it already
   computes.
 - At most `max_new_taps` (default 8 with a Host tier, 2 without) taps are kept per request.
