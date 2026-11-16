@@ -23,6 +23,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [liqlos](https://github.com/liqlos) (Aleksei Bukhalov) | GGUF matrix products that store BF16 after the stream-K reduction, Q4_K and Q6_K vector loads shared across lanes, and Q4_K matrix tiles staged through `cp.async` for dense layers and routed experts | [#127](https://github.com/iamwavecut/ninfer-all/pull/127), [#134](https://github.com/iamwavecut/ninfer-all/pull/134), [#257](https://github.com/iamwavecut/ninfer-all/pull/257) |
 | [eruca](https://github.com/eruca) | A second window of hits for a document asked about every round, and the Host-tier workloads that showed fewer conversations cached with 4 GiB than with 2 GiB | [#256](https://github.com/iamwavecut/ninfer-all/pull/256) |
 | [dzaurov](https://github.com/dzaurov) | Default device snapshot slots that give way to the KV capacity, `output_config.effort` beside disabled Thinking in the Messages API, the n-gram writer interop test's skip without its Python modules, and the RTX 5080 field report | [#283](https://github.com/iamwavecut/ninfer-all/pull/283), [#284](https://github.com/iamwavecut/ninfer-all/pull/284), [#285](https://github.com/iamwavecut/ninfer-all/pull/285) |
+| [fakezeta](https://github.com/fakezeta) | Qwen3.8-27B GGUFs with a condensed vocabulary: token tables and output heads padded to whole 128-row tiles, and the tokenizer, configuration ids and proposal ranking moved to the condensed ids | [#359](https://github.com/iamwavecut/ninfer-all/pull/359) |
 
 ## Work carried from other forks
 

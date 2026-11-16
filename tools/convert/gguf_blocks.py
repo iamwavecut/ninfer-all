@@ -20,10 +20,17 @@ rounded to BF16: the one place a stored value changes.
 Vision comes from the release's ``mmproj`` GGUF (``--source vision=mmproj.gguf``) with the official
 Vision formats, DFlash2 from ``--source dflash2`` and the frontend resources from ``--model``, which
 needs only the base checkpoint's config and tokenizer files.
+
+A GGUF whose vocabulary was condensed (pruned to fewer token rows and numbered anew) converts the
+same way. Its token table and output head gain zero rows up to whole 128-row tiles, the GGUF
+products' row unit, and ``--model`` is the directory ``tools.convert.condense_vocabulary`` writes:
+the GGUF's tokens at its ids, ``vocab_size`` the padded row count. Its drafts come from MTP or
+context lookup; DFlash and DFlash2 drafters are trained on the official ids.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Callable
 
 import numpy as np
@@ -106,9 +113,9 @@ def _layer_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
 
 
 def stored_vocabulary(gguf: GGUFFile) -> int:
-    """Rows of the stored token table. A vocabulary-trimmed or extended release (for example 141141
-    rows instead of ``VOCABULARY``) is read as stored: the shape the GGUF declares decides, and
-    ``qwen3_8_27b_gguf`` checks it against the model's own config."""
+    """Rows of the stored token table: ``VOCABULARY``, or fewer in a condensed vocabulary (141141
+    in a pruned UD-Q3_K_XL). ``validate`` holds the output head to the same rows and
+    ``check_vocabulary`` the model's resources."""
 
     info = gguf.tensors.get("token_embd.weight")
     if info is None or len(info.shape) != 2:
@@ -116,14 +123,83 @@ def stored_vocabulary(gguf: GGUFFile) -> int:
     return int(info.shape[0])
 
 
-# The GGUF matrix-product kernel (ggml_bridge_mmq.cuh) takes only whole 128-row tiles, so the token
-# table and the output head are padded with zero rows up to a multiple of 128 (the original
-# 248320 already is one). The tokenizer keeps its own, smaller public domain.
+# The GGUF matrix products (ggml_bridge_mmq.cuh) take whole 128-row tiles, so the token table and
+# the output head gain zero rows up to a multiple of 128 (``VOCABULARY`` already is one). A zero
+# block has a zero scale and decodes to zeros; the tokenizer's smaller public domain never reaches
+# those rows.
 ROW_TILE = 128
 
 
 def padded_rows(rows: int) -> int:
     return -(-rows // ROW_TILE) * ROW_TILE
+
+
+def tokenizer_ids(tokenizer: dict) -> dict[str, int]:
+    """Every token text of a tokenizer.json and its id: the model vocabulary and added tokens."""
+
+    ids = dict(tokenizer["model"]["vocab"])
+    for entry in tokenizer.get("added_tokens", []):
+        ids[entry["content"]] = entry["id"]
+    return ids
+
+
+def check_vocabulary(model, gguf: GGUFFile, vocabulary: int) -> None:
+    """Refuse a model whose resources do not describe the GGUF's token table.
+
+    ``vocab_size`` must be the padded row count. A condensed vocabulary also needs every tokenizer
+    token at the GGUF's id of the same text (``tools.convert.condense_vocabulary`` writes such a
+    ``--model`` directory) and drafts without DFlash and DFlash2, whose drafters were trained on
+    the official ids.
+    """
+
+    rows = padded_rows(vocabulary)
+    declared = model.config.get("vocab_size")
+    if declared != rows:
+        raise ValueError(
+            f"{gguf.path}: token_embd.weight has {vocabulary} rows, {rows} with the zero rows "
+            f"of whole 128-row tiles, but the model config declares vocab_size {declared}"
+            + (
+                ""
+                if vocabulary == VOCABULARY
+                else "; write the --model directory of a condensed vocabulary with "
+                "python -m tools.convert.condense_vocabulary"
+            )
+        )
+    if vocabulary == VOCABULARY:
+        return
+    drafters = [name for name in ("dflash", "dflash2") if name in model.components]
+    if drafters:
+        raise ValueError(
+            f"{gguf.path}: a condensed vocabulary of {vocabulary} rows drafts with MTP or context "
+            f"lookup; the {' and '.join(drafters)} drafter predicts the official "
+            f"{VOCABULARY}-row ids"
+        )
+    if model.token_count > vocabulary:
+        raise ValueError(
+            f"{gguf.path}: the tokenizer has {model.token_count} tokens, the GGUF {vocabulary} "
+            "rows; write the --model directory with python -m tools.convert.condense_vocabulary"
+        )
+    tokens = gguf.kv.get("tokenizer.ggml.tokens")
+    payload = model.resources.get("resource/text/tokenizer.json")
+    if not isinstance(tokens, list) or payload is None:
+        raise ValueError(
+            f"{gguf.path}: a condensed vocabulary needs the GGUF's tokenizer.ggml.tokens and the "
+            "model's tokenizer.json to check one against the other"
+        )
+    ids = tokenizer_ids(json.loads(payload))
+    wrong = sorted(
+        (index, text)
+        for text, index in ids.items()
+        if index >= len(tokens) or tokens[index] != text
+    )
+    if wrong:
+        index, text = wrong[0]
+        stored = tokens[index] if index < len(tokens) else None
+        raise ValueError(
+            f"{gguf.path}: {len(wrong)} tokenizer tokens differ from the GGUF's, the first id "
+            f"{index}: {text!r} in tokenizer.json, {stored!r} in the GGUF; write the --model "
+            "directory from this GGUF with python -m tools.convert.condense_vocabulary"
+        )
 
 
 def expected_tensors(
@@ -200,10 +276,12 @@ def validate(gguf: GGUFFile) -> None:
                 f"{gguf.path}: {name} is {info.type_name} {info.shape}, expected {shape}"
             )
         if not accepted:
+            allowed = [kind for kind in kinds if kind != "blocks"]
+            if "blocks" in kinds:
+                allowed.insert(0, "a block type of tools.artifact.formats.GGUF_FORMATS_BY_TYPE")
             raise ValueError(
-                f"{gguf.path}: {name} is stored as {info.type_name} (ggml type {info.type_id}), "
-                "which has no registered block format in tools.artifact.formats."
-                "GGUF_FORMATS_BY_TYPE; register it there to import its blocks as-is"
+                f"{gguf.path}: {name} is {info.type_name} (ggml type {info.type_id}), "
+                f"expected {' or '.join(allowed)}"
             )
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
     if gguf.data_bytes_available < end:
@@ -742,14 +820,7 @@ def qwen3_8_27b_gguf(model, recipe, sources):
         raise ValueError("--source gguf must name the model's .gguf file")
     validate(gguf)
     vocabulary = stored_vocabulary(gguf)
-    declared = config.get("vocab_size")
-    if declared is not None and declared != padded_rows(vocabulary):
-        raise ValueError(
-            f"{gguf.path}: token_embd.weight has {vocabulary} rows, padded to "
-            f"{padded_rows(vocabulary)} for the 128-row kernel tiles, but the model config "
-            f"declares vocab_size {declared}; set vocab_size to {padded_rows(vocabulary)} "
-            "(the tokenizer keeps its own, smaller domain)"
-        )
+    check_vocabulary(model, gguf, vocabulary)
     mtp = "mtp" in model.components
     if mtp and not has_mtp(gguf):
         raise ValueError(f"{gguf.path}: the MTP component needs an -mtp GGUF (blk.64.nextn.*)")
@@ -794,6 +865,7 @@ __all__ = [
     "block_format",
     "bf16_source",
     "block_source",
+    "check_vocabulary",
     "expected_tensors",
     "gdn_control_source",
     "has_mtp",
@@ -802,6 +874,7 @@ __all__ = [
     "q2_native_source",
     "padded_rows",
     "stored_vocabulary",
+    "tokenizer_ids",
     "q8_native_source",
     "text_sources",
     "tiled_input_columns",

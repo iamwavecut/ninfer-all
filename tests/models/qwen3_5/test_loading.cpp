@@ -424,6 +424,33 @@ void bf16_head_beside_gguf_blocks() {
             "the BF16 head lost its Use");
 }
 
+// The DFlash, DFlash2 and DSpine drafters predict the official 248320-row vocabulary's ids, so a
+// model with another vocabulary (a condensed GGUF's, here the fixture's 272 rows) refuses them by
+// name before reading a drafter, and loads without one.
+void drafters_need_the_official_vocabulary() {
+    ModelFixture fixture;
+    fixture.file.write();
+    artifact::Reader reader(fixture.file.entry);
+    for (const auto backend : {SpeculativeBackend::DFlash, SpeculativeBackend::DFlash2,
+                               SpeculativeBackend::DSpine}) {
+        try {
+            (void)qwen::plan_load(reader,
+                                  {.speculative = backend, .draft_model = "absent.ninfer"});
+        } catch (const artifact::ArtifactError& error) {
+            const std::string message = error.what();
+            if (message.find("official 248320-row vocabulary, and this model's has 272 rows "
+                             "(a condensed vocabulary)") == std::string::npos) {
+                throw std::runtime_error("a drafter on another vocabulary was refused without "
+                                         "naming the reason: " + message);
+            }
+            continue;
+        }
+        throw std::runtime_error("a drafter was accepted on a vocabulary it was not trained on");
+    }
+    require(qwen::plan_load(reader).resources().public_token_count == 265,
+            "a model with its own vocabulary did not load without a drafter");
+}
+
 void invalid_model_data() {
     ModelFixture fixture;
     const Json original = fixture.file.root;
@@ -458,6 +485,7 @@ int main() {
         native_uses();
         input_gathers();
         bf16_head_beside_gguf_blocks();
+        drafters_need_the_official_vocabulary();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";
         return 0;
