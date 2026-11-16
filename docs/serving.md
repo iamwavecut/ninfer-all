@@ -1638,7 +1638,10 @@ A box needs an image in `files`, `images`, the state's image parts or `conversat
 `type: "box"`, `box: {top, bottom, left, right}`, `confidence`, `aggregate`, and `edges`. Coordinates are fractions
 of the whole image, measured downward and rightward from its top-left corner. Each edge is scored
 on a grid covering 0 to 1. The optional `criteria.step` defaults to `0.01` and must divide that
-interval evenly into 2 to 255 values. `criteria.aggregate` is `mode` (default), `mean` or `median`;
+interval evenly into 2 to 255 values. Like a choice's options, a grid of up to 26 values (a step of
+0.04 or more) is labeled `A`..`Z` and a finer one with digits; Flint and DeepSeek-V4.1, whose
+tokenizers group digits, refuse digit labels with 400, so they read a box with a step of 0.04 or
+more. `criteria.aggregate` is `mode` (default), `mean` or `median`;
 the mean is snapped to the nearest grid point, ties to the lower point. Crossed edge pairs are
 sorted. Each entry in `edges` reports `modal`, `mean`, `median`, the modal `probability`, and
 `moved` when sorting changed that edge. Box confidence is the least concentrated edge's confidence:

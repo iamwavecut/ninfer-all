@@ -29,8 +29,9 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens (1024 or 512 on a card without room for them), prefix reuse across turns and requests
   with host-memory images ([below](#prefix-reuse)), branched reads for
-  [typed decisions](serving.md#typed-decisions) (a choice of at most 26 options: the tokenizer
-  groups up to three digits into one token, so a two-digit label cannot be read a digit at a time;
+  [typed decisions](serving.md#typed-decisions) (a choice of at most 26 options and a box grid of
+  at most 26 values: the tokenizer groups up to three digits into one token, so a two-digit label
+  cannot be read a digit at a time;
   [how the labels move](#rounding-with-the-pass)), structured output, streaming, causal scoring
   (`ninfer-perplexity`), and the model's GLM-4.7 tool calls
   (`<tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>...</tool_call>`) returned as

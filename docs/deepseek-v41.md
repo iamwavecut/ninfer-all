@@ -49,7 +49,9 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   prompt rows the output depends on ([below](#the-prefill-tail)), prefix reuse across turns and
   requests with
   host-memory images ([below](#prefix-reuse)), branched reads for
-  [typed decisions](serving.md#typed-decisions), structured output, streaming, log probabilities,
+  [typed decisions](serving.md#typed-decisions) (a choice of at most 26 options and a box grid of
+  at most 26 values: the tokenizer groups digits, so a label of several digits cannot be read a
+  digit at a time), structured output, streaming, log probabilities,
   causal scoring (`ninfer-perplexity`; a window that does not start with `<｜begin▁of▁sentence｜>`
   gets it in front), and the model's DSML tool calls returned as OpenAI tool calls, under the
   tool's JSON Schema when it is `strict` and beside a response format:
