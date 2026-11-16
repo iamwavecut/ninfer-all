@@ -159,11 +159,13 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& path, DeviceConte
         l.up                  = projection(at(layer.up));
         l.down                = projection(at(layer.down));
         // The converter stores each input's projections as rows of one parent, as it does a
-        // DFlash drafter's: the fused routes then read q/k/v and gate/up in one pass.
+        // DFlash drafter's: the fused routes then read q/k/v and gate/up in one pass. The drafter
+        // takes them only for the formats and geometries they have (drafter.cpp); any other
+        // drafter keeps the joined view and runs the separate projections.
         if (const std::array qkv{input(at(layer.query)), input(at(layer.key)),
                                  input(at(layer.value))};
             ops::joins(qkv)) {
-            l.query_key_value = ops::prepare_attn_input_proj_weights(qkv[0], qkv[1], qkv[2]);
+            l.query_key_value = ops::prepare_linear_weight(qkv);
         }
         if (const std::array mlp{input(at(layer.gate)), input(at(layer.up))}; ops::joins(mlp)) {
             l.gate_up = ops::prepare_linear_swiglu_weight(mlp[0], mlp[1]);
