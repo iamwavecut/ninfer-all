@@ -123,15 +123,20 @@ bool small_t_pv_f16() {
     return device_route_schedule("attn_pv_f16", 1) == "on";
 }
 
+// Calls `f.template operator()<Tier>()` when the tier is built for `RowTiles`. The row count is a
+// template argument: MSVC 14.52 does not evaluate a captured constexpr local in an `if constexpr`
+// of a nested generic lambda (C2131).
+template <int RowTiles, SmallTI8Tier Tier, typename F>
+void invoke_tier_if_built(F& f) {
+    if constexpr (small_t_i8_tier_built(RowTiles, Tier)) { f.template operator()<Tier>(); }
+}
+
 // Calls `f.template operator()<Tier>()` for every tiled tier built for the width's row tiles.
 template <typename Geometry, int TokenTile, typename F>
 void for_each_built_tier(F&& f) {
     constexpr int kRows = small_t_i8_row_tiles(Geometry::GroupSize, TokenTile);
     [&]<int... Index>(std::integer_sequence<int, Index...>) {
-        const auto one = [&]<SmallTI8Tier Tier>() {
-            if constexpr (small_t_i8_tier_built(kRows, Tier)) { f.template operator()<Tier>(); }
-        };
-        (one.template operator()<static_cast<SmallTI8Tier>(Index)>(), ...);
+        (invoke_tier_if_built<kRows, static_cast<SmallTI8Tier>(Index)>(f), ...);
     }(std::make_integer_sequence<int, kSmallTI8TiledTiers>{});
 }
 
