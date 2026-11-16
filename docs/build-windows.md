@@ -96,12 +96,15 @@ card's memory. Every Windows build offers `--wddm-evictable-budget`, which sizes
 the card's memory less the weights and a 512 MiB desktop floor instead of what is free at startup,
 and commits the device arenas at startup. Another process that later takes memory makes WDDM page
 some of this process's memory out, which slows generation until it comes back. WDDM may queue a
-device's copies behind one another whatever their streams; the one place that put a host-to-device
-copy behind a device-side wait for the host, the exchange of Flash-Next native host experts, hung
-under WSL2 with queued copies; it uses mapped host memory and a copy kernel on Windows and under
-WSL2 ([native host banks](qwen3-8-flash-next.md#the-expert-cache)). This repository has no Windows or
-WSL2 host: `ninfer_qwen4_exp_hybrid_experts_test` runs both exchanges on Linux and only the mapped
-one under WDDM, where it has not run yet. A process started
+device's copies behind one another whatever their streams. The exchange of Flash-Next native host
+experts, which put a host-to-device copy behind a device-side wait for the host, hung under WSL2
+with queued copies; it uses mapped host memory and a copy kernel on Windows and under WSL2
+([native host banks](qwen3-8-flash-next.md#the-expert-cache)). GGUF host experts with staged
+misses, whose service copies the missing experts while a replayed layer waits for them on the
+device, hung while the warm-up prepared the CUDA Graphs on Windows; there and under WSL2 their
+passes run eagerly. This repository has no Windows or WSL2 host:
+`ninfer_qwen4_exp_hybrid_experts_test` runs both exchanges on Linux and only the mapped one under
+WDDM, where it has not run yet. A process started
 by a low-priority parent (a Task Scheduler task at its default priority, a service, some IDE
 terminals) inherits I/O priority Low, and Windows throttles its reads; the Engine raises such a
 priority to normal before it reads the artifact and logs that it did, or warns when Windows refuses

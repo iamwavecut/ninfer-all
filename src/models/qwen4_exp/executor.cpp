@@ -9,6 +9,7 @@
 #include "core/host_worker_pool.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
+#include "core/mapped_host_copy.h"
 #include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
 #include "core/pinned_memory.h"
@@ -2760,7 +2761,14 @@ struct Executor::Impl {
             memory.ranks[r].expert_cache_bytes += bytes[r];
         }
         if (profile) { cache->seed(*profile); }
-        if (staged) { allocate_misses(); }
+        if (staged) {
+            allocate_misses();
+            // Where a device's copies queue behind one another whatever their streams
+            // (serialized_copy_queue), a replayed layer's device-side wait for the misses can hold
+            // the copies its graph queued after it ahead of the service's own copies, which end
+            // that wait. Eager passes wait on the host and queue nothing behind the wait.
+            if (serialized_copy_queue()) { options.cuda_graphs = false; }
+        }
     }
 
     // A text layer's call of more than eight tokens over GGUF host experts runs from device memory
@@ -7769,6 +7777,7 @@ std::string Executor::expert_execution_profile() const {
 }
 
 bool Executor::hybrid_experts() const noexcept { return impl_->hybrid != nullptr; }
+bool Executor::cuda_graphs() const noexcept { return impl_->options.cuda_graphs; }
 std::string Executor::expert_cpu_description() const {
     return impl_->misses ? impl_->misses->cpu_description() : std::string();
 }
