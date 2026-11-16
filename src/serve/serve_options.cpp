@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -58,6 +59,61 @@ std::uint64_t parse_u64(const char* text, const char* label) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<std::uint64_t>(value);
+}
+
+// A byte count written with a unit: B, K, M or G (also KB/KiB, MB/MiB, GB/GiB, any case), each a
+// power of 1024, after a whole or decimal number (512K, 20M, 1.5G). A bare 0 is zero; any other
+// count needs its unit. The bytes are rounded down and must not be zero.
+std::uint64_t parse_byte_size(const char* text, const char* label) {
+    const auto invalid = [&] {
+        return std::invalid_argument(std::string("invalid ") + label + ": " +
+                                     (text == nullptr ? "" : text) +
+                                     " (a size with a unit: 512K, 20M, 1G; or 0)");
+    };
+    if (text == nullptr) { throw invalid(); }
+    const std::string_view value(text);
+    if (value == "0") { return 0; }
+    std::size_t index = 0;
+    std::uint64_t whole = 0;
+    std::size_t whole_digits = 0;
+    while (index < value.size() && value[index] >= '0' && value[index] <= '9') {
+        if (whole > (std::numeric_limits<std::uint64_t>::max() - 9) / 10) { throw invalid(); }
+        whole = whole * 10 + static_cast<std::uint64_t>(value[index] - '0');
+        ++index;
+        ++whole_digits;
+    }
+    std::uint64_t fraction = 0, scale = 1;
+    if (index < value.size() && value[index] == '.') {
+        ++index;
+        std::size_t digits = 0;
+        while (index < value.size() && value[index] >= '0' && value[index] <= '9') {
+            if (++digits > 6) { throw invalid(); }
+            fraction = fraction * 10 + static_cast<std::uint64_t>(value[index] - '0');
+            scale *= 10;
+            ++index;
+        }
+        if (digits == 0) { throw invalid(); }
+    }
+    if (whole_digits == 0) { throw invalid(); }
+    std::string unit(value.substr(index));
+    std::transform(unit.begin(), unit.end(), unit.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::uint64_t multiplier = 0;
+    if (unit == "b") {
+        multiplier = 1;
+    } else if (unit == "k" || unit == "kb" || unit == "kib") {
+        multiplier = 1ULL << 10;
+    } else if (unit == "m" || unit == "mb" || unit == "mib") {
+        multiplier = 1ULL << 20;
+    } else if (unit == "g" || unit == "gb" || unit == "gib") {
+        multiplier = 1ULL << 30;
+    } else {
+        throw invalid();
+    }
+    if (whole > std::numeric_limits<std::uint64_t>::max() / multiplier) { throw invalid(); }
+    const std::uint64_t bytes = whole * multiplier + fraction * multiplier / scale;
+    if (bytes == 0) { throw invalid(); }
+    return bytes;
 }
 
 KvCacheStorage parse_kv_dtype(const char* text) {
@@ -503,6 +559,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                (default 16384); larger media is downscaled\n"
            "  --media-cache-mib N           retained prepared media (default 1024; 0\n"
            "                                disables)\n"
+           "  --media-urls SIZE             fetch the HTTP(S) image and video URLs of\n"
+           "                                requests, each up to SIZE (512K, 20M; at most\n"
+           "                                256M); default 0 refuses every URL\n"
            "  --media-live-mib N            all live prepared media payloads (default 2048)\n"
            "  --media-preprocess-threads N  media preprocessing workers (default 0: auto, at\n"
            "                                most 16)\n"
@@ -860,6 +919,16 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                 throw std::invalid_argument("--media-cache-mib is out of range");
             }
             options.media_cache_bytes = static_cast<std::size_t>(mib << 20);
+            continue;
+        }
+        if (arg == "--media-urls") {
+            const std::uint64_t bytes =
+                parse_byte_size(require_value("--media-urls"), "--media-urls");
+            if (bytes > ninfer::kMaximumPromptMediaBytes) {
+                throw std::invalid_argument(
+                    "--media-urls is at most 256M: a request's media stay within 256 MiB");
+            }
+            options.media_url_max_bytes = static_cast<std::size_t>(bytes);
             continue;
         }
         if (arg == "--media-live-mib") {

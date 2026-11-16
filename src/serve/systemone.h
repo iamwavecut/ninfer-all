@@ -30,7 +30,7 @@ inline constexpr std::size_t kMaximumDecisionOptions   = 255;
 inline constexpr std::size_t kMaximumLetterOptions     = 26;
 inline constexpr std::size_t kMaximumDecisionLevels    = 10;
 inline constexpr std::size_t kMaximumDecisionIdLength  = 100;
-// Each read's request holds its own copy of the media's data URLs: their size times the reads.
+// Each read's request holds its own copy of the media's bytes: their size times the reads.
 inline constexpr std::size_t kMaximumDecisionMediaCopies = std::size_t{512} << 20;
 
 enum class DecisionDialect { SystemOne, OpenAI };
@@ -73,7 +73,7 @@ struct DecisionRequest {
     std::string state;
     // Optional context placed ahead of the state (System One's `instructions`).
     std::string instructions;
-    // Images (data, HTTP(S), local paths) and videos (data URLs), ahead of every state: System
+    // Images (data or HTTP(S) URLs) and videos (data URLs), ahead of every state: System
     // One's `files` and its alias `images` in that order, then the image_url parts of a state made
     // of chat messages (removed from the state's text); OpenAI's input_image parts in input order.
     std::vector<ContentPart> media;
@@ -93,8 +93,9 @@ struct DecisionRequest {
     double recheck_margin = 0.0;
 };
 
-// Strict: unknown fields are refused. System One also accepts image URLs and local paths;
-// the HTTP layer authorizes local access and acquires each source before expanding reads.
+// Strict: unknown fields are refused. Images come as data URLs or HTTP(S) URLs, videos as data
+// URLs; the HTTP layer acquires each source once, before it expands the reads, and fetches a URL
+// only on a server started with --media-urls.
 [[nodiscard]] DecisionRequest parse_systemone_request(const RequestJson& body);
 [[nodiscard]] DecisionRequest parse_decisions_request(const RequestJson& body);
 void validate_decision_media(const DecisionRequest& request,

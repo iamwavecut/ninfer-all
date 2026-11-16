@@ -4,6 +4,7 @@
 // adapters normalize before this layer and render IDs, usage, and response events after it.
 
 #include "ninfer/engine.h"
+#include "product/media_acquire/acquire.h"
 #include "serve/branch_memo.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
@@ -169,6 +170,13 @@ struct BranchRead {
 // The Engine configuration a serve invocation selects. Separate from the service so the mapping
 // from parsed options to what the Engine is actually started with can be checked without a model.
 [[nodiscard]] ninfer::EngineOptions make_engine_options(const ServeOptions& options);
+
+// The acquisition policy of one request media source within the request's remaining media bytes.
+// A URL is fetched only when `url_max_bytes` (--media-urls) is not 0, and up to that many bytes;
+// otherwise it is refused with 400 `media_urls_disabled`. The server reads no local files.
+[[nodiscard]] ninfer::product::media_acquire::Policy
+media_acquire_policy(const ninfer::product::media_acquire::Source& source,
+                     std::size_t remaining_bytes, std::size_t url_max_bytes);
 
 class GenerationService {
 public:

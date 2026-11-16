@@ -87,18 +87,6 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
                     }
                 }
             }
-            for (const ContentPart* part : media) {
-                if (part->source.kind == ninfer::product::media_acquire::SourceKind::Path &&
-                    !permits_local_media(req)) {
-                    ApiError error;
-                    error.status = 403;
-                    error.type   = "permission_error";
-                    error.param  = "images";
-                    error.message =
-                        "local media requires a direct loopback client; use data or HTTPS";
-                    throw ApiException(std::move(error));
-                }
-            }
             // Bound owned copies before materializing sources. Later digit reads refer to these
             // requests, not new media copies; Runoff also owns judgements and rotated listings.
             std::size_t copies = 1 + request.questions.size();

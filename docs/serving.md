@@ -993,7 +993,8 @@ The endpoint supports:
 - string content and ordered text/refusal parts; adjacent parts are preserved without inserted
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
-  `video_url` extension using HTTP(S) or data URIs; image `detail` `auto`, `high` or `low` (see
+  `video_url` extension using data URIs, or HTTP(S) URLs on a server started with
+  [`--media-urls`](#media-urls); image `detail` `auto`, `high` or `low` (see
   [image detail](#image-detail));
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation; llama.cpp's `-1` ("no limit", the WebUI's default) and omitting
@@ -1409,7 +1410,35 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
+OpenAI image and video sources may be base64 data URLs, or HTTP(S) URLs on a server started with
+[`--media-urls`](#media-urls), as this example needs.
+
+### Media URLs
+
+The server fetches the HTTP(S) image and video URLs of a request (Chat Completions, Responses,
+Messages, `/v1/systemone` and `/v1/decisions`) only when it is started with `--media-urls SIZE`,
+for example `--media-urls 20M`, or `media-urls = 20M` in a
+[launch configuration file](cli.md#launch-configuration-files). SIZE is the largest file that one
+URL may return: a number with the unit `K`, `M` or `G`, each a power of 1024 (`KB`, `KiB` and the
+like are the same), at most `256M`. The default `0` refuses every media URL with 400
+`media_urls_disabled`; data URLs need no option. A request's media together stay within 256 MiB
+and `--max-request-mib`.
+
+A fetch:
+
+- uses HTTP or HTTPS only, verifies TLS certificates, and sends no credentials, goes through no
+  proxy and decodes no `Content-Encoding`;
+- connects only to the address that the host name resolved to, and only when that address is
+  outside loopback, private, shared, link-local, documentation, benchmarking, reserved and multicast
+  networks, including the IPv6 forms that carry such an IPv4 address;
+- follows at most 3 redirects, checks each new address the same way, and refuses a redirect from
+  HTTPS to HTTP;
+- stops at SIZE bytes, 5 s without a connection, 60 s in all, or the request's deadline or
+  cancellation.
+
+A refused URL or address returns 400 `invalid_media`, a file over SIZE 400
+`media_budget_exceeded`, a failed fetch 502 `media_fetch_failed` and a timeout 504
+`media_fetch_timeout`.
 
 ### Media formats
 
@@ -1579,21 +1608,18 @@ probability the product along the label. Unknown fields, `joint` reads and a thi
 refused with 400; `audio` and `videos` fields and audio data with 501.
 
 Images and video need a model with a vision tower started with `--vision` (otherwise 501).
-System One accepts `files` and its alias `images` (arrays of sources), and the `image_url` parts of
-a `state` made of chat messages (an array of `{role, content}` messages, or an object with a `messages`
-array), which leave the state's text. Sources may be image or video data URLs
-(`data:image/...;base64,...`, `data:video/...`), or image HTTP(S) URLs and local image paths.
-Local paths require a direct loopback client with a localhost Host, without Origin or forwarded
-headers. HTTP(S) uses the same acquisition limits and network policy as chat media. Each source
-is acquired once per request before its owned bytes are copied into the reads, under the pending
-deadline and cancellation/engine-stop gate. `/v1/decisions` takes `input_image` parts (`image_url` a
-data URL, optional `detail`) in its input messages. Every read places the media, `files` first,
-then `images`, then the state's own, ahead of the state, inside the part that the state's cache
-boundary closes; `state` may be left out of a request about its media alone. A URL that is not a
-data URL in OpenAI's `input_image`, and `input_image.file_id`, are refused with 400.
-Multi-digit labels retain the prepared image payloads, positions and content-aware cache identity
-as their digits are appended. Each question's request holds its own copy of the acquired bytes;
-these copies, including Runoff's extra requests, are bounded together at 512 MiB.
+System One takes `files` and its alias `images` (arrays of sources), and the `image_url` parts of
+a `state` made of chat messages (an array of `{role, content}` messages, or an object with a
+`messages` array), which leave the state's text; `/v1/decisions` takes `input_image` parts
+(`image_url`, optional `detail`) in its input messages. A source is an image or video data URL
+(`data:image/...;base64,...`, `data:video/...`) or an image's HTTP(S) URL, which the server fetches
+only with [`--media-urls`](#media-urls). Each source is acquired once per request, before its
+reads. Every read places the media, `files` first, then `images`, then the state's own, ahead of
+the state, inside the part that the state's cache boundary closes; `state` may be left out of a
+request about its media alone. `input_image.file_id` is refused with 400. A label of several
+digits keeps the prepared images, their positions and their cache identity as its digits are
+appended. Each question's request holds its own copy of the acquired bytes; these copies,
+including Runoff's extra requests, are bounded together at 512 MiB.
 
 ### Image boxes
 
@@ -1601,7 +1627,7 @@ System One also accepts `box` questions alongside `choice`, `noul` and `score`:
 
 ```bash
 curl http://127.0.0.1:8080/v1/systemone -d '{
-  "state": "a checkout screen", "images": ["screenshot.png"],
+  "state": "a checkout screen", "images": ["data:image/png;base64,iVBORw0KGgo..."],
   "questions": {
     "visible": {"type": "noul", "instructions": "Is a checkout button visible?"},
     "button": {"type": "box", "instructions": "Where is the checkout button?",
@@ -1620,7 +1646,7 @@ one minus its expected distance from the mode divided by a uniform grid's mean d
 clamped to 0..1. Per-edge label masses and readout provenance are under `diagnostics.<id>`.
 
 The normalized box shape follows [TypeSafe's Box primitive](https://docs.typesafe.ai/primitives/box);
-grid controls and edge details are local extensions shared with the Basalt decision adapter.
+the grid controls and the edge details are NInfer's extensions.
 This route uses the `images` contract above, rather than TypeSafe's hosted asset-upload protocol.
 One box expands into four coordinate questions, which count toward the 200-question read limit.
 Multi-digit grids require a read per trie node, so cost is not simply proportional to grid size.
@@ -1858,8 +1884,8 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; `detail` `auto`, `high` or `low` (see [image detail](#image-detail)); requires server `--vision` |
-| `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with a data-URI or ([`--media-urls`](#media-urls)) HTTP(S) `image_url`; `detail` `auto`, `high` or `low` (see [image detail](#image-detail)); requires server `--vision` |
+| `input_video` | NInfer extension with a data-URI or ([`--media-urls`](#media-urls)) HTTP(S) `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content (`content` itself may be omitted); summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments`; `async` may only be `false` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
@@ -2115,7 +2141,7 @@ curl http://127.0.0.1:8080/v1/messages \
 ```
 
 The endpoint accepts top-level System text, ordered User/Assistant/System history, text and image
-blocks, Thinking history, tool-use history, tool results, user-defined tools, aggregate responses,
+blocks (base64 sources, or `url` sources with [`--media-urls`](#media-urls)), Thinking history, tool-use history, tool results, user-defined tools, aggregate responses,
 and Anthropic SSE. Consecutive User or Assistant messages are joined without adding separators.
 System messages in `messages` may appear anywhere, including first, between two User messages,
 directly after an Assistant message, or last; each renders as its own System turn at that position
@@ -2430,6 +2456,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
+| `--media-urls SIZE` | fetch the HTTP(S) image and video URLs of requests, each up to SIZE (`512K`, `20M`, at most `256M`; [Media URLs](#media-urls)); `0` refuses them | `0` |
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |

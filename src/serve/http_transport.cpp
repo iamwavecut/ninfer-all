@@ -37,33 +37,6 @@ void set_socket_option(socket_t socket, int level, int option, const T& value) n
 
 } // namespace
 
-bool permits_local_media(const httplib::Request& request) {
-    if (request.remote_addr != "127.0.0.1" && request.remote_addr != "::1" &&
-        request.remote_addr != "::ffff:127.0.0.1") {
-        return false;
-    }
-    for (const auto& [name, value] : request.headers) {
-        std::string lower = name;
-        for (auto& c : lower) {
-            if (c >= 'A' && c <= 'Z') { c += 'a' - 'A'; }
-        }
-        if (lower == "origin" || lower == "forwarded" || lower.starts_with("x-forwarded-")) {
-            return false;
-        }
-    }
-    if (request.get_header_value_count("Host") != 1) { return false; }
-    const auto host = request.get_header_value("Host");
-    for (const std::string_view local : {"localhost", "127.0.0.1", "[::1]"}) {
-        if (host == local || (host.starts_with(local) && host.size() > local.size() + 1 &&
-                              host[local.size()] == ':' &&
-                              std::all_of(host.begin() + local.size() + 1, host.end(),
-                                          [](char c) { return c >= '0' && c <= '9'; }))) {
-            return true;
-        }
-    }
-    return false;
-}
-
 void set_ngram_generation_header(httplib::Response& response, const NgramArchiveStats& stats) {
     if (has_ngram_generation(stats)) {
         response.set_header("X-NInfer-Draft-Generation", std::to_string(stats.generation));

@@ -547,16 +547,21 @@ void media() {
         "a text request keeps its two parts");
 
     const auto sources = parse_systemone_request(RequestJson::parse(R"({
-        "images": ["https://example.com/a.png", "/tmp/a.png", "C:\\photos\\a.png"],
+        "images": ["https://example.com/a.png", "http://example.com/b.png"],
         "questions": {"q": {"type": "noul", "instructions": "i"}}})"));
-    expect(sources.media[0].source.kind == SourceKind::Url &&
-               sources.media[1].source.kind == SourceKind::Path &&
-               sources.media[2].source.kind == SourceKind::Path,
-           "System One distinguishes image URLs and local paths before acquisition");
-    expect(systemone_refusal(R"({"images": ["ftp://example.com/a.png"],
-        "questions": {"q": {"type": "noul", "instructions": "i"}}})")
-                   .status == 400,
-           "unsupported image URL schemes are refused");
+    expect(sources.media.size() == 2 && sources.media[0].source.kind == SourceKind::Url &&
+               sources.media[1].source.kind == SourceKind::Url &&
+               sources.media[0].kind == ContentKind::Image,
+           "System One takes image URLs, which the server fetches under --media-urls");
+    for (const char* source : {"/tmp/a.png", "C:\\\\photos\\\\a.png", "a.png",
+                               "ftp://example.com/a.png", "file:///etc/passwd", ""}) {
+        const auto refusal = systemone_refusal(
+            (std::string(R"({"images": [")") + source +
+             R"("], "questions": {"q": {"type": "noul", "instructions": "i"}}})")
+                .c_str());
+        expect(refusal.status == 400 && refusal.param == "images[0]",
+               std::string("System One accepted the media source ") + source);
+    }
     expect(systemone_refusal(R"({"state": "s", "files": ["data:audio/wav;base64,AA=="],
                                  "questions": {"q": {"type": "noul", "instructions": "i"}}})")
                    .status == 501,
@@ -581,11 +586,17 @@ void media() {
                openai.media[1].source.value == "data:image/png;base64,Cw==" &&
                openai.state == "Which form is this?",
            "input_image parts in order; a message of images alone adds no text");
+    const DecisionRequest linked = parse_decisions_request(RequestJson::parse(R"({
+        "input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.com/a.png"}]}],
+        "questions": [{"type": "predicate", "instructions": "i"}]})"));
+    expect(linked.media.size() == 1 && linked.media[0].source.kind == SourceKind::Url,
+           "OpenAI's input_image takes an HTTP(S) URL, which the server fetches under --media-urls");
     expect(decisions_refusal(R"({"input": [{"role": "user", "content": [
-                                   {"type": "input_image", "image_url": "https://example.com/a.png"}]}],
+                                   {"type": "input_image", "image_url": "/etc/passwd"}]}],
                                  "questions": [{"type": "predicate", "instructions": "i"}]})")
                    .param == "input[0].content[0].image_url",
-           "OpenAI's input_image takes a data URL");
+           "OpenAI's input_image took a local path");
     expect(decisions_refusal(R"({"input": [{"role": "user", "content": [
                                    {"type": "input_image", "file_id": "file-1"}]}],
                                  "questions": [{"type": "predicate", "instructions": "i"}]})")

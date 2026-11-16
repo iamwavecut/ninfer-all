@@ -82,24 +82,16 @@ void refuse_media(const Json& body, std::initializer_list<const char*> keys) {
     }
 }
 
-// Data URLs in both dialects; System One also accepts HTTP(S) and local image sources.
-ContentPart data_url_media(const Json& value, const std::string& param,
-                           bool image_sources = false) {
-    if (!value.is_string()) { bad_request(param + " must be a media source string", param); }
+// An image or video data URL, or an image's HTTP(S) URL, which the server fetches only when
+// started with --media-urls (the acquisition refuses it otherwise); audio is not read.
+ContentPart media_source(const Json& value, const std::string& param) {
+    if (!value.is_string()) { bad_request(param + " must be a data URL or an HTTP(S) URL", param); }
     const std::string& url = value.get_ref<const std::string&>();
     ContentPart part;
-    if (image_sources && !url.starts_with("data:")) {
-        if (url.empty() || url.find('\0') != std::string::npos) {
-            bad_request(param + " must be a nonempty image source", param);
-        }
+    if (url.starts_with("http://") || url.starts_with("https://")) {
         part.kind         = ContentKind::Image;
         part.type_raw     = "image_url";
-        const bool remote = url.starts_with("http://") || url.starts_with("https://");
-        if (!remote && url.find("://") != std::string::npos) {
-            bad_request(param + " supports HTTP(S), data URLs or filesystem paths", param);
-        }
-        part.source.kind  = remote ? ninfer::product::media_acquire::SourceKind::Url
-                                   : ninfer::product::media_acquire::SourceKind::Path;
+        part.source.kind  = ninfer::product::media_acquire::SourceKind::Url;
         part.source.value = url;
         return part;
     }
@@ -112,7 +104,8 @@ ContentPart data_url_media(const Json& value, const std::string& param,
     } else if (url.starts_with("data:audio/")) {
         not_implemented("audio is not supported: decisions read text, images and video", param);
     } else {
-        bad_request(param + " must be an image or video data URL (data:image/...;base64,...)",
+        bad_request(param + " must be an image or video data URL (data:image/...;base64,...) or an "
+                            "image's HTTP(S) URL",
                     param);
     }
     part.source.kind  = ninfer::product::media_acquire::SourceKind::Data;
@@ -128,8 +121,8 @@ void append_media_array(const Json& body, const char* key, std::vector<ContentPa
         bad_request(std::string(key) + " must be an array of media sources", key);
     }
     for (std::size_t index = 0; index < values.size(); ++index) {
-        media.push_back(data_url_media(values[index],
-                                       std::string(key) + "[" + std::to_string(index) + "]", true));
+        media.push_back(
+            media_source(values[index], std::string(key) + "[" + std::to_string(index) + "]"));
     }
 }
 
@@ -176,8 +169,8 @@ void take_state_media(Json& state, std::vector<ContentPart>& media) {
             }
             const Json& url = entry.at("image_url");
             media.push_back(
-                data_url_media(url.is_object() && url.contains("url") ? url.at("url") : url,
-                               scope + ".image_url", true));
+                media_source(url.is_object() && url.contains("url") ? url.at("url") : url,
+                             scope + ".image_url"));
         }
         content = std::move(kept);
     }
@@ -386,7 +379,7 @@ void require_question_count(std::size_t count, const char* param) {
     }
 }
 
-// OpenAI's input: its text, and its input_image parts (data URLs) appended to `media` in order.
+// OpenAI's input: its text, and its input_image parts appended to `media` in order.
 std::string openai_input(const Json& input, std::vector<ContentPart>& media) {
     if (input.is_string()) { return input.get<std::string>(); }
     if (!input.is_array() || input.empty()) {
@@ -430,7 +423,7 @@ std::string openai_input(const Json& input, std::vector<ContentPart>& media) {
                         bad_request(part_scope + " must contain image_url", part_scope);
                     }
                     ContentPart image =
-                        data_url_media(entry.at("image_url"), part_scope + ".image_url");
+                        media_source(entry.at("image_url"), part_scope + ".image_url");
                     if (present(entry, "detail")) {
                         const std::optional<ninfer::ImageDetail> detail =
                             entry.at("detail").is_string()

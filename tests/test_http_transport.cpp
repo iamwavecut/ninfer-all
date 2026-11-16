@@ -413,40 +413,9 @@ int test_successor_binds_over_time_wait() {
 
 } // namespace
 
-namespace {
-
-int test_local_media_access() {
-    using ninfer::serve::permits_local_media;
-    httplib::Request request;
-    request.remote_addr = "127.0.0.1";
-    request.headers.emplace("Host", "localhost:8080");
-    int failures = check(permits_local_media(request), "direct localhost image paths were refused");
-    for (const auto* header : {"Origin", "Forwarded", "X-Forwarded-For", "x-forwarded-host"}) {
-        request.headers.emplace(header, "https://example.com");
-        failures +=
-            check(!permits_local_media(request), "browser/forwarded image paths were allowed");
-        request.headers.erase(header);
-    }
-    request.remote_addr = "192.0.2.1";
-    failures += check(!permits_local_media(request), "remote image paths were allowed");
-    request.remote_addr = "::1";
-    request.headers.clear();
-    request.headers.emplace("Host", "[::1]:8080");
-    failures += check(permits_local_media(request), "direct IPv6 image paths were refused");
-    request.headers.emplace("Host", "localhost");
-    failures += check(!permits_local_media(request), "ambiguous Host headers were allowed");
-    request.headers.clear();
-    request.headers.emplace("Host", "localhost.evil:8080");
-    failures += check(!permits_local_media(request), "nonlocal Host image paths were allowed");
-    return failures;
-}
-
-} // namespace
-
 int main() {
     int failures = test_ngram_identity() + test_ngram_generation() + test_sse_transport() +
-                   test_sse_response_headers() + test_prompt_json_member_order() +
-                   test_local_media_access();
+                   test_sse_response_headers() + test_prompt_json_member_order();
 #if defined(__linux__) || defined(_WIN32)
     failures += test_inherited_socket_liveness();
 #endif
