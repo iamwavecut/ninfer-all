@@ -107,6 +107,11 @@ public:
                    bool anchor_prompt_end = false, bool speculative_drafting = true,
                    const std::optional<std::vector<LoraScale>>& lora = std::nullopt) const;
 
+    // Extend a prepared label read without discarding its media, positions, cache markers or LoRA.
+    // The result is for non-drafting reads; no GPU state is acquired here.
+    [[nodiscard]] PreparedPrompt append_read_tokens(PreparedPrompt prompt,
+                                                    std::span<const TokenId> tokens) const;
+
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added;
     // special-token text in `text` encodes as that token unless `parse_special` is false.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text,

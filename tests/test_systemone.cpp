@@ -8,6 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <iostream>
@@ -19,6 +20,7 @@ namespace {
 
 using namespace ninfer::serve;
 using Json = nlohmann::json;
+using ninfer::product::media_acquire::SourceKind;
 
 int failures = 0;
 
@@ -544,10 +546,22 @@ void media() {
                 2,
         "a text request keeps its two parts");
 
-    expect(systemone_refusal(R"({"state": "s", "images": ["https://example.com/a.png"],
-                                 "questions": {"q": {"type": "noul", "instructions": "i"}}})")
-                   .param == "images[0]",
-           "System One takes data URLs only");
+    const auto sources = parse_systemone_request(RequestJson::parse(R"({
+        "images": ["https://example.com/a.png", "http://example.com/b.png"],
+        "questions": {"q": {"type": "noul", "instructions": "i"}}})"));
+    expect(sources.media.size() == 2 && sources.media[0].source.kind == SourceKind::Url &&
+               sources.media[1].source.kind == SourceKind::Url &&
+               sources.media[0].kind == ContentKind::Image,
+           "System One takes image URLs, which the server fetches under --media-urls");
+    for (const char* source : {"/tmp/a.png", "C:\\\\photos\\\\a.png", "a.png",
+                               "ftp://example.com/a.png", "file:///etc/passwd", ""}) {
+        const auto refusal = systemone_refusal(
+            (std::string(R"({"images": [")") + source +
+             R"("], "questions": {"q": {"type": "noul", "instructions": "i"}}})")
+                .c_str());
+        expect(refusal.status == 400 && refusal.param == "images[0]",
+               std::string("System One accepted the media source ") + source);
+    }
     expect(systemone_refusal(R"({"state": "s", "files": ["data:audio/wav;base64,AA=="],
                                  "questions": {"q": {"type": "noul", "instructions": "i"}}})")
                    .status == 501,
@@ -572,11 +586,17 @@ void media() {
                openai.media[1].source.value == "data:image/png;base64,Cw==" &&
                openai.state == "Which form is this?",
            "input_image parts in order; a message of images alone adds no text");
+    const DecisionRequest linked = parse_decisions_request(RequestJson::parse(R"({
+        "input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.com/a.png"}]}],
+        "questions": [{"type": "predicate", "instructions": "i"}]})"));
+    expect(linked.media.size() == 1 && linked.media[0].source.kind == SourceKind::Url,
+           "OpenAI's input_image takes an HTTP(S) URL, which the server fetches under --media-urls");
     expect(decisions_refusal(R"({"input": [{"role": "user", "content": [
-                                   {"type": "input_image", "image_url": "https://example.com/a.png"}]}],
+                                   {"type": "input_image", "image_url": "/etc/passwd"}]}],
                                  "questions": [{"type": "predicate", "instructions": "i"}]})")
                    .param == "input[0].content[0].image_url",
-           "OpenAI's input_image takes a data URL");
+           "OpenAI's input_image took a local path");
     expect(decisions_refusal(R"({"input": [{"role": "user", "content": [
                                    {"type": "input_image", "file_id": "file-1"}]}],
                                  "questions": [{"type": "predicate", "instructions": "i"}]})")
@@ -588,12 +608,92 @@ void media() {
            "OpenAI's request has no images field");
 }
 
+namespace {
+
+void boxes() {
+    auto body           = RequestJson::parse(R"({"images":["data:image/png;base64,Bw=="],
+        "questions":{"target":{"type":"box","instructions":"Find the button"},
+                     "visible":{"type":"noul","instructions":"Is it visible?"}}})");
+    const auto defaults = parse_systemone_request(body);
+    expect(defaults.questions.size() == 5 && defaults.questions[0].options.size() == 101 &&
+               defaults.questions[3].box_edge == 3 &&
+               defaults.questions[4].type == DecisionType::Noul,
+           "a box expands into four coordinate distributions beside ordinary questions");
+    const auto labels = decision_labels(defaults.questions[0]);
+    expect(labels.texts.front() == "000" && labels.texts.back() == "100",
+           "the default box grid uses the existing multi-token label reader");
+    for (const auto* aggregate : {"mode", "mean", "median"}) {
+        body["questions"]["target"]["criteria"] = {{"step", 0.25}, {"aggregate", aggregate}};
+        const auto request                      = parse_systemone_request(body);
+        std::vector<DecisionAnswer> answers(5);
+        const std::array<std::size_t, 4> winners{4, 0, 3, 1};
+        for (std::size_t edge = 0; edge < winners.size(); ++edge) {
+            answers[edge].probabilities.assign(5, 0.0);
+            answers[edge].probabilities[winners[edge]] = 1.0;
+            answers[edge].label_mass                   = 0.9;
+        }
+        answers[4].probabilities = {0.8, 0.2};
+        answers[4].label_mass    = 0.9;
+        const auto response      = Json::parse(make_decision_response(request, answers, 50, 5));
+        const auto& target       = response["answers"]["target"];
+        expect(response["answers"].size() == 2 && target["aggregate"] == aggregate &&
+                   target["box"] ==
+                       Json({{"top", 0.0}, {"bottom", 1.0}, {"left", 0.25}, {"right", 0.75}}) &&
+                   target["confidence"] == 1.0 && target["edges"]["top"]["moved"] == true,
+               "coordinate estimates fold and sort without exposing internal question ids");
+        expect(close_to(response["answers"]["visible"]["confidence"], 0.72) &&
+                   response["usage"]["output_tokens"] == 5,
+               "box questions retain the existing noul confidence and usage contract");
+        for (std::size_t edge = 0; edge < 4; ++edge) { answers[edge].probabilities.assign(5, 0.2); }
+        const auto uniform = Json::parse(make_decision_response(request, answers, 50, 5));
+        expect(uniform["answers"]["target"]["confidence"] == 0.0,
+               "a uniform coordinate distribution has zero box confidence");
+        for (std::size_t edge = 0; edge < 4; ++edge) {
+            answers[edge].probabilities = {0.4, 0.0, 0.0, 0.0, 0.6};
+        }
+        const auto bimodal      = Json::parse(make_decision_response(request, answers, 50, 5));
+        const double coordinate = std::string_view(aggregate) == "mean" ? 0.5 : 1.0;
+        expect(bimodal["answers"]["target"]["box"]["top"] == coordinate,
+               "mean snaps 0.6 to the grid while mode and median select 1.0");
+    }
+    for (const auto& step : RequestJson::array({0, -0.1, 0.3, 0.001, "0.1", nullptr})) {
+        body["questions"]["target"]["criteria"] = {{"step", step}};
+        expect(systemone_refusal(body.dump().c_str()).status == 400,
+               "invalid box grids are refused");
+    }
+    body["questions"]["target"]["criteria"] = {{"aggregate", "first"}};
+    expect(systemone_refusal(body.dump().c_str()).status == 400,
+           "unknown box aggregation is refused");
+    body["questions"]["target"].erase("criteria");
+    body.erase("images");
+    body["state"] = "text alone";
+    expect(systemone_refusal(body.dump().c_str()).status == 400, "a box requires an image");
+    body["conversation"] = {
+        {"messages",
+         RequestJson::array({{{"role", "user"}, {"content", "An existing conversation"}}})}};
+    const auto conversational = parse_systemone_request(body);
+    GenerationRequest conversation;
+    ChatTurn turn;
+    turn.content.push_back(ContentPart{.kind = ContentKind::Image});
+    conversation.messages.push_back(std::move(turn));
+    validate_decision_media(conversational, &conversation);
+    bool refused                                       = false;
+    conversation.messages.front().content.front().kind = ContentKind::Video;
+    try {
+        validate_decision_media(conversational, &conversation);
+    } catch (const ApiException& error) { refused = error.error().status == 400; }
+    expect(refused, "a conversation with no still image cannot satisfy a box");
+}
+
+} // namespace
+
 int main() {
     try {
         systemone_parsing();
         decisions_parsing();
         prompts();
         media();
+        boxes();
         reading();
         responses();
     } catch (const std::exception& error) {

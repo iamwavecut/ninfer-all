@@ -826,6 +826,37 @@ int main() {
                           configured.media_preprocess_threads == 6,
                       "media preparation limits did not reach serving options");
 
+    // Media URLs are fetched only on request: --media-urls SIZE turns them on, 0 keeps them off.
+    failures += check(defaults.media_url_max_bytes == 0, "media URLs are not off by default");
+    for (const auto& [text, bytes] : std::vector<std::pair<std::string, std::size_t>>{
+             {"0", 0},
+             {"4096B", 4096},
+             {"512K", 512ULL << 10},
+             {"512kb", 512ULL << 10},
+             {"512KiB", 512ULL << 10},
+             {"20M", 20ULL << 20},
+             {"20MiB", 20ULL << 20},
+             {"1.5M", 3ULL << 19},
+             {"0.25G", 256ULL << 20},
+             {"256M", 256ULL << 20}}) {
+        const ServeOptions sized = parse({"ninfer-serve", "model.ninfer", "--media-urls", text});
+        if (sized.media_url_max_bytes != bytes) {
+            std::cerr << "--media-urls " << text << " gave " << sized.media_url_max_bytes << '\n';
+            ++failures;
+        }
+    }
+    for (const char* text : {"20", "M", "-1M", "+1M", "1.M", ".5M", "20X", "1 M", "0M",
+                             "0.0000001K", "1.1234567M", "257M", "1G", "99999999999999999999G"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--media-urls", text});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) {
+            std::cerr << "--media-urls accepted " << text << '\n';
+            ++failures;
+        }
+    }
+
     const ServeOptions logging = parse({"ninfer-serve", "model.ninfer", "--log-level", "debug"});
     failures += check(logging.log_level == ninfer::product::LogLevel::Debug,
                       "log level did not reach serving options");
@@ -1473,6 +1504,7 @@ int main() {
                                         "--media-cache-mib",
                                         "--media-live-mib",
                                         "--media-preprocess-threads",
+                                        "--media-urls",
                                         "--min-p",
                                         "--mlp-a8-decode",
                                         "--mtp-attention-window",

@@ -8,6 +8,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -44,6 +45,17 @@ struct Policy {
     std::function<bool()> is_cancelled;
 };
 
+// A URL is fetched over HTTP(S) only, without credentials, a proxy or content decoding, with TLS
+// verified. Its host must resolve to an address outside private, loopback, link-local, reserved and
+// multicast networks (unless allow_private_network), and the fetch connects to that address alone.
+// Redirects are followed by hand, at most max_redirects, each checked the same way and none from
+// HTTPS to HTTP. The body stops at max_bytes, the transfer at timeout_ms and the deadline.
 std::vector<std::uint8_t> acquire_bytes(const Source& source, const Policy& policy = {});
+
+namespace detail {
+// Whether a numeric IPv4 or IPv6 address is one a fetch may not reach without
+// allow_private_network. Throws std::invalid_argument for text that is not an address.
+[[nodiscard]] bool disallowed_numeric_address(std::string_view address);
+} // namespace detail
 
 } // namespace ninfer::product::media_acquire

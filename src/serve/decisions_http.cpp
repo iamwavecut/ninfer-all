@@ -66,6 +66,7 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
                 throw ApiException(std::move(error));
             }
         }
+        validate_decision_media(request, conversation ? &*conversation : nullptr);
         has_media =
             !request.media.empty() || (conversation && conversation->media_item_count() != 0);
         if (has_media) {
@@ -77,41 +78,33 @@ void HttpServer::handle_decisions(const httplib::Request& req, httplib::Response
                 error.message = "the served model reads no images or video";
                 throw ApiException(std::move(error));
             }
-            // Every read's request holds its own copy of the media: Runoff's reads included.
-            std::size_t bytes = 0;
-            for (const ContentPart& part : request.media) { bytes += part.source.value.size(); }
+            std::vector<ContentPart*> media;
+            for (ContentPart& part : request.media) { media.push_back(&part); }
             if (conversation) {
-                for (const ChatTurn& turn : conversation->messages) {
-                    for (const ContentPart& part : turn.content) {
-                        if (part.kind != ContentKind::Text) { bytes += part.source.value.size(); }
+                for (ChatTurn& turn : conversation->messages) {
+                    for (ContentPart& part : turn.content) {
+                        if (part.kind != ContentKind::Text) { media.push_back(&part); }
                     }
                 }
             }
-            std::size_t copies = request.questions.size();
+            // Bound owned copies before materializing sources. Later digit reads refer to these
+            // requests, not new media copies; Runoff also owns judgements and rotated listings.
+            std::size_t copies = 1 + request.questions.size();
             if (request.runoff) {
+                ++copies;
                 for (const DecisionQuestion& question : request.questions) {
                     if (question.type == DecisionType::Choice) {
                         copies += 2 * question.options.size();
                     }
                 }
             }
-            if (bytes * copies > kMaximumDecisionMediaCopies) {
-                bad_request("the media's data times the reads exceeds " +
-                                std::to_string(kMaximumDecisionMediaCopies >> 20) +
-                                " MiB: ask fewer questions about them per request",
-                            "questions");
-            }
+            lease.service().acquire_read_media(media, kMaximumDecisionMediaCopies / copies,
+                                               [&req] { return client_disconnected(req); });
         }
         for (const DecisionQuestion& question : request.questions) {
             labels.push_back(decision_labels(question));
             nodes.push_back(decision_read_nodes(labels.back(), token));
             if (labels.back().width > 1) {
-                if (has_media) {
-                    // Its later digits are read from token prompts, which carry no media.
-                    bad_request("a choice of more than " + std::to_string(kMaximumLetterOptions) +
-                                    " options cannot be asked about images or video",
-                                "questions");
-                }
                 // A wide label must read as its digits' tokens one after another.
                 const std::string& sample = labels.back().texts.back();
                 std::vector<ninfer::TokenId> digits;

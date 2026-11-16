@@ -95,6 +95,31 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     return error;
 }
 
+ninfer::product::media_acquire::Policy
+media_acquire_policy(const ninfer::product::media_acquire::Source& source,
+                     std::size_t remaining_bytes, std::size_t url_max_bytes) {
+    using ninfer::product::media_acquire::SourceKind;
+    ninfer::product::media_acquire::Policy policy;
+    policy.max_bytes = std::min(policy.max_bytes, remaining_bytes);
+    if (source.kind == SourceKind::Path) {
+        // No protocol parser yields one; the server never reads its own files for a client.
+        throw std::logic_error("the server reads no local media files");
+    }
+    if (source.kind == SourceKind::Url) {
+        if (url_max_bytes == 0) {
+            ApiError error;
+            error.status  = 400;
+            error.param   = "messages";
+            error.code    = "media_urls_disabled";
+            error.message = "this server fetches no media URLs: send the image or video as a "
+                            "data URL, or start the server with --media-urls SIZE";
+            throw ApiException(std::move(error));
+        }
+        policy.max_bytes = std::min(policy.max_bytes, url_max_bytes);
+    }
+    return policy;
+}
+
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -168,14 +193,14 @@ constexpr std::size_t kBranchMemoRecords = 8192;
 
 ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
                                  const std::function<bool()>& is_cancelled,
-                                 std::size_t& remaining_bytes) {
+                                 std::size_t& remaining_bytes, std::size_t url_max_bytes) {
     if (remaining_bytes == 0) {
         throw_media_error(ninfer::product::media_acquire::Error(
             ninfer::product::media_acquire::ErrorKind::BudgetExceeded,
             "request media exceeds aggregate byte limit"));
     }
-    ninfer::product::media_acquire::Policy policy;
-    policy.max_bytes    = std::min(policy.max_bytes, remaining_bytes);
+    ninfer::product::media_acquire::Policy policy =
+        media_acquire_policy(part.source, remaining_bytes, url_max_bytes);
     policy.deadline     = deadline;
     policy.is_cancelled = is_cancelled;
     std::vector<std::uint8_t> source_bytes;
@@ -474,6 +499,33 @@ GenerationService::submit_group(std::vector<StagedRequest> staged) const {
     return prepared;
 }
 
+void GenerationService::acquire_read_media(std::span<ContentPart*> media, std::size_t maximum_bytes,
+                                           std::function<bool()> is_cancelled) const {
+    const auto lifetime    = acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout);
+    const auto interrupted = [&] {
+        return !engine_->is_available() || (is_cancelled && is_cancelled());
+    };
+    std::size_t remaining =
+        std::min({maximum_bytes, options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes});
+    try {
+        for (ContentPart* part : media) {
+            check_preparation_control(lifetime->deadline, interrupted);
+            auto acquired     = acquire_media(*part, lifetime->deadline, interrupted, remaining,
+                                              options_.media_url_max_bytes);
+            part->source.kind = ninfer::product::media_acquire::SourceKind::Bytes;
+            part->source.value.clear();
+            part->source.bytes      = std::move(acquired.bytes);
+            part->source.media_type = std::move(acquired.media_type);
+        }
+    } catch (const ApiException&) {
+        if (!engine_->is_available()) {
+            throw_request_error(ninfer::RequestError(ninfer::RequestErrorKind::Unavailable,
+                                                     "engine stopped during media acquisition"));
+        }
+        throw;
+    }
+}
+
 StagedRequest GenerationService::stage_read(const BranchRead& read,
                                             ninfer::GenerationObservationOptions observation,
                                             std::function<bool()> is_cancelled,
@@ -481,14 +533,13 @@ StagedRequest GenerationService::stage_read(const BranchRead& read,
     StagedRequest staged = stage(*read.request, GenerationConsumerMode::Aggregate, observation,
                                  std::move(is_cancelled), context_cache);
     if (!read.continuation.empty()) {
-        const std::span<const ninfer::TokenId> base = staged.submission.prompt.token_ids();
-        std::vector<ninfer::TokenId> tokens(base.begin(), base.end());
-        tokens.insert(tokens.end(), read.continuation.begin(), read.continuation.end());
-        staged.prepared.prompt_tokens = static_cast<int>(tokens.size());
         try {
             staged.submission.prompt =
-                engine_->prepare_tokens(std::move(tokens), true, false,
-                                        read.request->speculative_drafting, read.request->lora);
+                engine_->append_read_tokens(std::move(staged.submission.prompt), read.continuation);
+            staged.prepared.prompt_tokens =
+                static_cast<int>(staged.submission.prompt.summary().prompt_tokens);
+        } catch (const ninfer::RequestError& exception) {
+            throw_request_error(exception);
         } catch (const std::out_of_range& exception) {
             throw_invalid_input(std::invalid_argument(exception.what()), "invalid_prompt");
         }
@@ -652,7 +703,7 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             ninfer::PromptInput input =
                 to_prompt_input(request, semantics, [&](const ContentPart& part) {
                     return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
-                                         remaining_media_bytes);
+                                         remaining_media_bytes, options_.media_url_max_bytes);
                 });
             std::vector<PromptCacheMarker> protocol_markers =
                 std::move(input.context_cache.markers);
@@ -732,7 +783,8 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
         ninfer::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
-                return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
+                return acquire_media(part, deadline, is_cancelled, remaining_media_bytes,
+                                     options_.media_url_max_bytes);
             });
         check_preparation_control(deadline, is_cancelled);
         const PreparationControl control{
@@ -766,7 +818,8 @@ std::string GenerationService::render_prompt(const GenerationRequest& request,
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
         ninfer::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
-                return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
+                return acquire_media(part, deadline, is_cancelled, remaining_media_bytes,
+                                     options_.media_url_max_bytes);
             });
         const PreparationControl control{
             .deadline     = deadline,

@@ -1694,6 +1694,48 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
     return PreparedPrompt(std::move(prepared));
 }
 
+PreparedPrompt Frontend::append_read_tokens(PreparedPrompt prompt,
+                                            std::span<const TokenId> tokens) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    const std::size_t previous = prompt.data_->token_ids.size();
+    if (previous > impl_->max_context || tokens.size() > impl_->max_context - previous) {
+        throw_context_length_exceeded(impl_->max_context);
+    }
+    for (const TokenId token : tokens) {
+        if (!impl_->tokenizer->is_valid_token(token)) {
+            throw std::out_of_range("read token is outside the checkpoint vocabulary");
+        }
+    }
+    auto& data              = *prompt.data_;
+    const std::size_t count = previous + tokens.size();
+    // mRoPE uses axis-major positions. Appended text resumes at the media-adjusted cursor,
+    // while the original image grids, payloads and content identities remain intact.
+    std::vector<std::int32_t> positions(count * 3);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        std::copy_n(data.positions.begin() + axis * previous, previous,
+                    positions.begin() + axis * count);
+        for (std::size_t index = previous; index < count; ++index) {
+            const auto position = static_cast<std::int64_t>(index) + data.rope_delta;
+            if (position < 0 || position > std::numeric_limits<std::int32_t>::max()) {
+                throw std::invalid_argument("read position exceeds int32 range");
+            }
+            positions[axis * count + index] = static_cast<std::int32_t>(position);
+        }
+    }
+    // These views refer into token_ids: clear them before its storage can move. Reads never draft.
+    data.ngram_sources.clear();
+    data.ngram_boundaries.clear();
+    data.ngram_archive_sources.clear();
+    data.ngram_snapshot.reset();
+    data.ngram_index.reset();
+    data.token_ids.insert(data.token_ids.end(), tokens.begin(), tokens.end());
+    data.token_types.resize(count, 0);
+    data.positions = std::move(positions);
+    detail::prompt_block_keys(data, data.block_hashes, data.block_extras);
+    return prompt;
+}
+
 std::vector<TokenId> Frontend::tokenize_text(std::string_view text, bool parse_special) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     return impl_->tokenizer->encode(text, {.parse_added_tokens = parse_special});
