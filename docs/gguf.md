@@ -57,7 +57,8 @@ arithmetic, and `IQ1_M` experts NInfer's tile loader.
 ## Serving
 
 A converted artifact starts like any other; MTP, DFlash2 and Vision work as with the official
-artifact. The GSQ-RCO IQ3_S conversion is published as
+artifact. A Qwen3.8-27B GGUF with a [condensed vocabulary](weight-conversion.md#a-condensed-vocabulary)
+converts with zero rows up to whole 128-row tiles and drafts with MTP or context lookup only. The GSQ-RCO IQ3_S conversion is published as
 [WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3):
 
 ```bash

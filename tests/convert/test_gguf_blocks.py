@@ -293,7 +293,7 @@ def test_ssm_out_values_and_imatrix_importance_name_the_same_grouped_column(tmp_
     assert np.array_equal(importance.astype(np.int64), column)
 
 
-def _header(head_type: int):
+def _header(head_type: int, vocabulary: int = gguf_blocks.VOCABULARY):
     """A dense Qwen3.8-27B GGUF's header and tensor table, stored blocks as Q8_0; no data."""
 
     from types import SimpleNamespace
@@ -301,7 +301,7 @@ def _header(head_type: int):
     from tools.convert.sources.gguf import TYPE_IDS, TensorInfo
 
     tensors, offset = {}, 0
-    for name, (shape, kind) in gguf_blocks.expected_tensors(False).items():
+    for name, (shape, kind) in gguf_blocks.expected_tensors(False, vocabulary).items():
         kinds = (kind,) if isinstance(kind, str) else kind
         type_id = (head_type if name == "output.weight"
                    else TYPE_Q8_0 if "blocks" in kinds else TYPE_IDS[kinds[0]])
@@ -317,13 +317,102 @@ def test_the_output_head_may_be_stored_blocks_or_bf16_words():
     gguf_blocks.validate(_header(TYPE_Q8_0))
     gguf_blocks.validate(_header(TYPE_BF16))
     for refused in (TYPE_F16, TYPE_F32):
-        with pytest.raises(ValueError, match="output.weight is"):
+        with pytest.raises(ValueError, match=r"output.weight is F(16|32) \(ggml type [01]\), "
+                                             r"expected a block type of .* or BF16$"):
             gguf_blocks.validate(_header(refused))
     table = _header(TYPE_BF16)
     info = table.tensors["token_embd.weight"]
     table.tensors["token_embd.weight"] = type(info)(info.name, info.shape, TYPE_BF16, info.offset)
     with pytest.raises(ValueError, match="token_embd.weight is BF16"):
         gguf_blocks.validate(table)
+
+
+def test_a_condensed_token_table_is_read_at_its_own_rows():
+    # A pruned vocabulary keeps fewer token rows; the head must have the same rows as the table.
+    from tools.convert.sources.gguf import TYPE_BF16
+
+    condensed = _header(TYPE_Q8_0, 141141)
+    assert gguf_blocks.stored_vocabulary(condensed) == 141141
+    gguf_blocks.validate(condensed)
+    gguf_blocks.validate(_header(TYPE_BF16, 141141))
+    info = condensed.tensors["output.weight"]
+    condensed.tensors["output.weight"] = type(info)(
+        info.name, (gguf_blocks.VOCABULARY, info.shape[1]), info.type_id, info.offset
+    )
+    wrong_rows = r"output.weight is Q8_0 \(248320, 5120\), expected \(141141"
+    with pytest.raises(ValueError, match=wrong_rows):
+        gguf_blocks.validate(condensed)
+    assert [gguf_blocks.padded_rows(n) for n in (1, 128, 129, 141141, 248320)] == [
+        128, 128, 256, 141184, 248320
+    ]
+
+
+def test_rows_past_the_stored_ones_are_zero_blocks(tmp_path):
+    # A table padded to whole 128-row tiles: stored rows byte for byte, then all-zero blocks, whose
+    # zero scale decodes every value to zero, in reads that start before, at or after the boundary.
+    path, blocks = _q8_0_file(tmp_path, 6, 64, 14)
+    stored = blocks.reshape(6, -1)
+    with GGUFFile(path) as gguf:
+        source = gguf_blocks.block_source(
+            gguf, "w", (128, 64), lambda b, e: np.arange(b, e), stored_rows=6
+        )
+        assert source.shape == (128, 64)
+        across = source.read_encoded(4, 10).codes.numpy()
+        assert np.array_equal(across[:2], stored[4:6]) and not across[2:].any()
+        assert not source.read_encoded(100, 128).codes.numpy().any()
+        assert np.array_equal(source.read_encoded(0, 6).codes.numpy(), stored)
+        padding = source.read_encoded(6, 8).codes.numpy().reshape(2, 2, 34)
+        assert not _q8_0_values(padding).any()
+        values = source.rows(4, 10).numpy()
+        assert np.array_equal(values[:2], _q8_0_values(blocks[4:6])) and not values[2:].any()
+        assert not source.rows(120, 128).numpy().any()
+        with pytest.raises(ValueError, match="7 stored rows do not fit 6 logical rows"):
+            gguf_blocks.block_source(
+                gguf, "w", (6, 64), lambda b, e: np.arange(b, e), stored_rows=7
+            )
+
+
+def _vocabulary_model(vocab_size: int, tokens: list[str], components=("text",)):
+    """What check_vocabulary reads of a Model: its config, components, token count and tokenizer."""
+
+    import json
+    from types import SimpleNamespace
+
+    tokenizer = {"model": {"vocab": {t: i for i, t in enumerate(tokens[:-1])}},
+                 "added_tokens": [{"id": len(tokens) - 1, "content": tokens[-1], "special": True}]}
+    return SimpleNamespace(
+        config={"vocab_size": vocab_size},
+        components={name: {} for name in components},
+        token_count=len(tokens),
+        resources={"resource/text/tokenizer.json": json.dumps(tokenizer).encode()},
+    )
+
+
+def test_the_model_resources_must_describe_the_token_table():
+    from types import SimpleNamespace
+
+    stored = ["a", "b", "ab", "<|im_end|>", "[PAD4]", "[PAD5]"]
+    gguf = SimpleNamespace(path="condensed.gguf", kv={"tokenizer.ggml.tokens": stored})
+    tokens = stored[:4]
+    # The official table needs the official vocab_size, and nothing else of the tokenizer.
+    gguf_blocks.check_vocabulary(_vocabulary_model(248320, tokens), gguf, 248320)
+    with pytest.raises(ValueError, match="declares vocab_size 128$"):
+        gguf_blocks.check_vocabulary(_vocabulary_model(128, tokens), gguf, 248320)
+    # A condensed one: the padded row count, a tokenizer within the rows and in the GGUF's order.
+    gguf_blocks.check_vocabulary(_vocabulary_model(128, tokens), gguf, 6)
+    gguf_blocks.check_vocabulary(_vocabulary_model(128, tokens, ("text", "mtp")), gguf, 6)
+    with pytest.raises(ValueError, match="declares vocab_size 6; write the --model directory"):
+        gguf_blocks.check_vocabulary(_vocabulary_model(6, tokens), gguf, 6)
+    with pytest.raises(ValueError, match="the dflash2 drafter predicts the official 248320-row"):
+        gguf_blocks.check_vocabulary(
+            _vocabulary_model(128, tokens, ("text", "mtp", "dflash2")), gguf, 6
+        )
+    with pytest.raises(ValueError, match="the tokenizer has 7 tokens, the GGUF 6 rows"):
+        gguf_blocks.check_vocabulary(_vocabulary_model(128, stored + ["x"]), gguf, 6)
+    with pytest.raises(ValueError, match=r"2 tokenizer tokens differ .* first id 1: 'ab' in "
+                                         r"tokenizer.json, 'b' in the GGUF"):
+        reordered = _vocabulary_model(128, ["a", "ab", "b", "<|im_end|>"])
+        gguf_blocks.check_vocabulary(reordered, gguf, 6)
 
 
 def test_a_bf16_output_head_keeps_its_exact_words(tmp_path):
@@ -341,13 +430,18 @@ def test_a_bf16_output_head_keeps_its_exact_words(tmp_path):
     write_gguf(path, {"general.architecture": "qwen35"},
                [("output.weight", (rows, columns), TYPE_BF16, words.tobytes())])
     inputs = ("text/final_hidden", "mtp/final_hidden")
+    # The head gains zero rows up to a whole 128-row tile, as a condensed vocabulary's does.
+    padded = gguf_blocks.padded_rows(rows)
     with GGUFFile(path) as gguf:
         source, stored_blocks = gguf_blocks.head_source(gguf)
         assert not stored_blocks and source.read_encoded is None
+        assert source.shape == (padded, columns)
         assert np.array_equal(source.rows(2, 4).view(torch.int16).numpy().view(np.uint16),
                               words[2:4])
+        across = source.rows(4, 9).view(torch.int16).numpy().view(np.uint16)
+        assert np.array_equal(across[:2], words[4:6]) and not across[2:].any()
         model = Model({"text": {"config": {}}})
-        model.add(Parameter("text/output_head", (rows, columns), source, inputs=inputs))
+        model.add(Parameter("text/output_head", (padded, columns), source, inputs=inputs))
         recipe = Recipe(model)
         # As qwen3_8_27b_gguf assigns a direct source: the parameter's direct format.
         recipe.assign("text/output_head", format=model.parameters["text/output_head"].direct_format,
@@ -356,7 +450,8 @@ def test_a_bf16_output_head_keeps_its_exact_words(tmp_path):
     with Artifact(tmp_path / "head.ninfer") as artifact:
         obj = artifact.object(artifact.directory.bindings["text/output_head"]["object"])
         assert obj.format == "bf16"
-        assert artifact.read_object(obj.id) == words.tobytes()
+        zero_rows = bytes(2 * (padded - rows) * columns)
+        assert artifact.read_object(obj.id) == words.tobytes() + zero_rows
         uses = [u for u in artifact.directory.uses if u["parameter"] == "text/output_head"]
         assert sorted(u["input"] for u in uses) == sorted(inputs)
         assert all(u["activation_policy"] == "A16Only" and "auxiliaries" not in u for u in uses)

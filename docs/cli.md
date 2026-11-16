@@ -232,7 +232,9 @@ code; MTP stays ahead elsewhere.
 
 A [DSpine](maintainer/dspine.md) drafter is an artifact of its own, which `--spec dspine
 --draft-model PATH --draft-tokens N` loads beside the model it was trained for; startup refuses a
-model of another hidden width, vocabulary or layer count. Tencent's drafter for Qwen3.8-27B is
+model of another hidden width, vocabulary or layer count. A Qwen3.5-core model converted from a GGUF
+with a [condensed vocabulary](weight-conversion.md#a-condensed-vocabulary) refuses DFlash, DFlash2
+and DSpine, whose drafters predict the official token ids, and drafts with MTP or context lookup. Tencent's drafter for Qwen3.8-27B is
 published converted as
 [Qwen3.8-27B-DSpine-b16-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3),
 and `python -m tools.convert --model CHECKPOINT --recipe dspine_q8 --out drafter.ninfer` converts
