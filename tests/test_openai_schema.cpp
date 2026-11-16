@@ -364,6 +364,24 @@ int test_standard_field_policy() {
     const OpenAIChatRequest zero        = parse(zero_limit);
     failures += check(zero.output_tokens_explicit && zero.generation.max_tokens == 0,
                       "an explicit zero output limit reaches Engine's no-generation path");
+
+    // llama.cpp's n_predict overrides both OpenAI spellings; any negative value is no limit.
+    Json n_predict                     = base_request();
+    n_predict["n_predict"]             = 7;
+    n_predict["max_completion_tokens"] = 48;
+    n_predict["max_tokens"]            = 9;
+    const OpenAIChatRequest predicted  = parse(n_predict);
+    failures += check(predicted.output_tokens_explicit && predicted.generation.max_tokens == 7 &&
+                          !predicted.generation.derive_output_budget,
+                      "n_predict wins over max_completion_tokens and max_tokens");
+    n_predict["n_predict"]            = -2;
+    const OpenAIChatRequest unlimited = parse(n_predict);
+    failures += check(unlimited.output_tokens_explicit && unlimited.generation.derive_output_budget,
+                      "a negative n_predict is no limit");
+    Json negative_limit          = base_request();
+    negative_limit["max_tokens"] = -2;
+    failures += check(api_error([&] { (void)parse(negative_limit); }).param == "max_tokens",
+                      "max_tokens below -1 was accepted");
     return failures;
 }
 

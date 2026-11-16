@@ -937,13 +937,20 @@ void parse_response_observations(const Json& body, OpenAIChatRequest& output) {
 }
 
 void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAIChatRequest& output) {
-    std::optional<int> limit = optional_int(body, "max_completion_tokens");
-    const char* param        = "max_completion_tokens";
+    // llama.cpp's n_predict overrides the OpenAI limits, as llama.cpp's server reads it here too;
+    // any negative n_predict is its "no limit".
+    std::optional<int> limit = optional_int(body, "n_predict");
+    const bool n_predict     = limit.has_value();
+    const char* param        = "n_predict";
+    if (!limit) {
+        limit = optional_int(body, "max_completion_tokens");
+        param = "max_completion_tokens";
+    }
     if (!limit) {
         limit = optional_int(body, "max_tokens");
         param = "max_tokens";
     }
-    if (limit && *limit == -1) {
+    if (limit && (*limit == -1 || (n_predict && *limit < 0))) {
         // llama.cpp's "no limit", which its WebUI sends by default: the largest budget that still
         // lets every lane hold such a request at once (the remaining context with one lane),
         // whatever --default-max-tokens says. A whole-context reservation would serialize them.
