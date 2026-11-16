@@ -852,6 +852,8 @@ GenerationRequest make_decision_read(const DecisionRequest& request,
     out.sampling.frequency_penalty = 0.0;
     out.logprobs                   = true;
     out.readout_tokens             = std::move(label_tokens);
+    // A read whose most likely token is a stop token still has its record.
+    out.raw_output = true;
     // One token drafts nothing; --spec's drafter would only run over the prompt.
     out.speculative_drafting = false;
     // The server's default graft would be a hidden prefix the question does not expect.

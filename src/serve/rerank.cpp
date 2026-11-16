@@ -104,6 +104,8 @@ GenerationRequest make_rerank_judgement(const RerankRequest& request, const std:
     out.sampling.temperature = 0.0;
     out.logprobs             = true;
     out.readout_tokens       = answers.tokens;
+    // A judgement whose most likely token is a stop token still has its record.
+    out.raw_output = true;
     // One token drafts nothing; --spec's drafter would only run over the prompt.
     out.speculative_drafting = false;
     // The server's default graft would be a hidden prefix the judging prompt does not expect.

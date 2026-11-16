@@ -2610,6 +2610,47 @@ int test_same_token_stop_priority(const Frontend& frontend) {
     return failures;
 }
 
+// A one-token read whose first token is a stop token: a raw session publishes the token and keeps
+// its logprob record with the readout; a decoded session leaves both out.
+int test_raw_stop_token_record(const Frontend& frontend) {
+    auto prompt = frontend.prepare_tokens({0});
+    ninfer::runtime::RawTokenLogprob raw;
+    raw.id      = 6;
+    raw.logprob = -0.25F;
+    raw.top_ids.fill(-1);
+    raw.top_ids[0]        = 6;
+    raw.top_values[0]     = -0.25F;
+    raw.top_ids[1]        = 1;
+    raw.top_values[1]     = -2.0F;
+    raw.readout_count     = 2;
+    raw.readout_values[0] = -2.0F;
+    raw.readout_values[1] = -4.5F;
+    int failures          = 0;
+    for (const bool raw_output : {false, true}) {
+        auto session = frontend.make_output_session(prompt, {},
+                                                    ninfer::OutputOptions{.raw = raw_output});
+        const auto decision =
+            session.preview_model(std::array<ninfer::TokenId, 1>{6}, 1,
+                                  ninfer::FinishReason::OutputLimit, std::span(&raw, 1));
+        failures += check(decision.finish_reason == ninfer::FinishReason::StopToken,
+                          "the default stop token did not end the read");
+        const auto output = session.commit_preview();
+        const std::vector<ninfer::TokenLogprob> records = session.take_content_logprobs();
+        if (raw_output) {
+            failures += check(channel_text(output, ninfer::OutputChannel::Content) == "<eos>",
+                              "a raw session did not publish the stop token");
+            failures += check(records.size() == 1 && records[0].id == 6 &&
+                                  records[0].top_ids[0] == 6 &&
+                                  records[0].readout == std::vector<float>{-2.0F, -4.5F},
+                              "a raw session lost the stop token's logprob record");
+        } else {
+            failures += check(output.empty() && records.empty(),
+                              "a decoded session published the stop token or its record");
+        }
+    }
+    return failures;
+}
+
 int test_terminal_flush(const Frontend& frontend) {
     auto prompt = frontend.prepare_tokens({0});
     ninfer::StopPolicy stop;
@@ -4654,6 +4695,7 @@ int main() {
     failures += test_cross_round_stop(frontend);
     failures += test_stop_hold_in_one_round(frontend);
     failures += test_same_token_stop_priority(frontend);
+    failures += test_raw_stop_token_record(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_open_reasoning_tool_recovery();
