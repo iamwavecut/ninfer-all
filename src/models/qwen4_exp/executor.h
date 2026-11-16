@@ -354,6 +354,9 @@ public:
     [[nodiscard]] std::string expert_execution_profile() const;
     // GGUF host or disk experts with a CPU share: its threads and vector backend; else empty.
     [[nodiscard]] std::string expert_cpu_description() const;
+    // Whether passes replay CUDA Graphs: ExecutorOptions::cuda_graphs, off for GGUF host experts'
+    // staged misses where a device's copies queue behind one another (serialized_copy_queue).
+    [[nodiscard]] bool cuda_graphs() const noexcept;
     // The widest verification whose missing experts CPU threads share: with a CPU share, every
     // miss of a call of up to kNarrowMissTokens tokens, and with GGUF host experts those of few
     // pairs up to kCpuMissTokens; 0 without a CPU share. Wider calls copy every miss to the GPU.

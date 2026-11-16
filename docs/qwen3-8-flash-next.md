@@ -951,7 +951,10 @@ not.
   shared by the sequences: a step of another sequence than the last captures it again and updates
   the graph in place; the token's position reaches the sparse-attention kernels in device memory.
   Disk experts need the host between a layer's routing and its experts, so their steps stay eager.
-  `--no-cuda-graph` decodes eagerly everywhere.
+  Under WDDM (Windows, and WSL2) so do the passes of GGUF host experts with staged misses: there a
+  graph's copies queued after a layer's wait for the misses could hold back the service's copies
+  that end it, and the startup log says that graphs are off. `--no-cuda-graph` decodes eagerly
+  everywhere.
 - With MTP, a verification of one request (at most eight tokens, so its experts take the vector
   products) replays graphs of its own the same way, and so does the draft chain of one request on
   one GPU, host experts included; several requests' rounds, the MTP catch-up and disk experts run

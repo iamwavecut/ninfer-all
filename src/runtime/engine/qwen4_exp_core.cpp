@@ -464,6 +464,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                            double(memory.host_kv_bytes) / 1048576.0,
                            double(memory.kv_bytes) / 1048576.0);
     }
+    if (options.use_cuda_graph && !instance->executor->cuda_graphs()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: CUDA Graphs off: under WDDM the staged misses of "
+                           "GGUF host experts run in eager passes");
+    }
     if (const std::string cpu = instance->executor->expert_cpu_description(); !cpu.empty()) {
         const std::string share =
             !options.hybrid_experts.dma_share
