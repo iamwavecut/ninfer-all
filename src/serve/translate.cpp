@@ -230,6 +230,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         .requested_preserve_thinking = preserve,
         .chat_template_kwargs_json   = kwargs.dump(),
     };
+    result.structured_output_instruction = server.structured_output_instruction;
     // The server's default effort yields to everything the request decides: its own thinking
     // switch, a forced call, and an assistant prefill.
     std::optional<RequestedReasoningEffort> applied = effort;
@@ -419,7 +420,9 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
         };
         input.context_cache.markers.insert(input.context_cache.markers.begin(), automatic);
     }
-    product::apply_structured_output_instruction(input, request.structured_output);
+    if (semantics.structured_output_instruction) {
+        product::apply_structured_output_instruction(input, request.structured_output);
+    }
     return input;
 }
 
