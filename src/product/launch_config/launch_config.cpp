@@ -5,6 +5,9 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <set>
+
+#include <nlohmann/json.hpp>
 
 namespace ninfer::product {
 namespace {
@@ -38,6 +41,32 @@ std::string unquote(std::string value) {
 
 ConfigFile parse_config_text(std::string_view text) {
     ConfigFile out;
+    if (trim(text).starts_with('{')) {
+        ConfigFile::Section top{.name = "*", .entries = {}};
+        std::set<std::string> keys;
+        try {
+            const auto value = nlohmann::ordered_json::parse(
+                text, [&](int, nlohmann::ordered_json::parse_event_t event,
+                          nlohmann::ordered_json& item) {
+                    if (event == nlohmann::ordered_json::parse_event_t::key &&
+                        !keys.insert(lower(item.get<std::string>())).second) {
+                        throw std::invalid_argument("duplicate JSON configuration key");
+                    }
+                    return true;
+                });
+            for (const auto& [key, item] : value.items()) {
+                if (!item.is_string() && !item.is_boolean() && !item.is_number()) {
+                    throw std::invalid_argument(key + ": a launch option must be a scalar");
+                }
+                top.entries.emplace_back(lower(key),
+                                         item.is_string() ? item.get<std::string>() : item.dump());
+            }
+        } catch (const nlohmann::json::exception& error) {
+            throw std::invalid_argument(std::string("invalid launch JSON: ") + error.what());
+        }
+        out.sections.push_back(std::move(top));
+        return out;
+    }
     std::size_t line_number      = 0;
     ConfigFile::Section* current = nullptr;
     ConfigFile::Section top{.name = "*", .entries = {}};

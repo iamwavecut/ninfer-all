@@ -133,10 +133,10 @@ __launch_bounds__(Block) __global__
     }
 }
 
-template <int Block>
-__global__ void layer_norm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                  const __nv_bfloat16* bias, __nv_bfloat16* out, std::int32_t d,
-                                  std::int64_t rows, float eps) {
+template <int Block, typename Direct>
+__global__ void layer_norm_kernel(const __nv_bfloat16* x, const Direct* weight, const Direct* bias,
+                                  __nv_bfloat16* out, std::int32_t d, std::int64_t rows,
+                                  float eps) {
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
     const std::int64_t base = row * d;
@@ -175,8 +175,8 @@ __global__ void layer_norm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* w
     const float inv  = rsqrtf(m2s[0] / static_cast<float>(d) + eps);
     for (std::int32_t i = static_cast<std::int32_t>(threadIdx.x); i < d; i += Block) {
         const float value = (__bfloat162float(x[base + i]) - mean) * inv;
-        out[base + i] =
-            __float2bfloat16_rn(value * __bfloat162float(weight[i]) + __bfloat162float(bias[i]));
+        out[base + i]     = __float2bfloat16_rn(value * static_cast<float>(weight[i]) +
+                                                static_cast<float>(bias[i]));
     }
 }
 

@@ -47,7 +47,7 @@ std::vector<double> gated_rmsnorm_oracle(const std::vector<float>& input,
 
 int run_case(const char* label, const Shape& shape, std::uint32_t seed, float input_scale = 4.0F,
              bool bf16x2_unaligned = false, bool graph = false,
-             ops::GateActivation activation = ops::GateActivation::Silu) {
+             ops::GateActivation activation = ops::GateActivation::Silu, bool fp32_weight = false) {
     const std::size_t count = shape.elements();
     std::vector<float> input(count), weight(shape.d), gate(count);
     fill_uniform(input, seed, -input_scale, input_scale);
@@ -56,12 +56,14 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     gate.front() = 0.0F;
     gate.back() = -0.0F;
     round_to_bf16(input);
-    round_to_bf16(weight);
+    if (!fp32_weight) round_to_bf16(weight);
     round_to_bf16(gate);
     std::vector<double> reference = gated_rmsnorm_oracle(input, weight, gate, shape, activation);
 
     DeviceInput device_input  = make_input(input, bf16x2_unaligned);
     DeviceInput device_weight = make_input(weight, bf16x2_unaligned);
+    DeviceBuffer direct_weight;
+    if (fp32_weight) direct_weight = to_device(weight);
     DeviceInput device_gate   = make_input(gate, bf16x2_unaligned);
     const std::size_t leading = bf16x2_unaligned ? sizeof(std::uint16_t) : 0;
     GuardedDeviceBuffer output(leading + count * sizeof(std::uint16_t));
@@ -69,7 +71,8 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     void* output_data = static_cast<std::uint8_t*>(output.data()) + leading;
 
     Tensor input_tensor = tensor_for(device_input.data, shape);
-    Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
+    Tensor weight_tensor(fp32_weight ? direct_weight.p : device_weight.data,
+                         fp32_weight ? DType::FP32 : DType::BF16, {shape.d});
     Tensor gate_tensor   = tensor_for(device_gate.data, shape);
     Tensor output_tensor = tensor_for(output_data, shape);
     ops::gated_rmsnorm(input_tensor, weight_tensor, gate_tensor, activation, kEps, output_tensor,
@@ -107,6 +110,9 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     failures += verify_output_storage(std::string(label) + " output", output, bf16x2_unaligned);
     failures += verify_preserved(std::string(label) + " preserves input", device_input);
     failures += verify_preserved(std::string(label) + " preserves weight", device_weight);
+    if (fp32_weight)
+        failures += verify_exact((std::string(label) + " FP32 weight").c_str(),
+                                 from_device<float>(direct_weight, weight.size()), weight);
     failures += verify_preserved(std::string(label) + " preserves gate", device_gate);
     return failures;
 }
@@ -138,6 +144,9 @@ int main() {
     }
     failures += run_case("gated_rmsnorm sigmoid unaligned [128,48]", {128, 48}, 1590U, 4.0F, true,
                          false, ops::GateActivation::Sigmoid);
+    for (auto activation : {ops::GateActivation::Silu, ops::GateActivation::Sigmoid})
+        failures += run_case("gated_rmsnorm FP32 gamma", {128, 48, 9}, 1591U, 4.0F, true, true,
+                             activation, true);
     std::cout << (failures ? "FAIL" : "OK") << " gated_rmsnorm\n";
     return failures ? 1 : 0;
 }

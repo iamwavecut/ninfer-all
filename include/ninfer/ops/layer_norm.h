@@ -13,7 +13,8 @@ namespace ninfer::ops {
  *   variance  = (1/D) * sum_d (x[d,r] - mean_r)^2
  *   ideal[d,r] = (x[d,r]-mean_r)/sqrt(variance+eps) * weight[d] + bias[d].
  *
- * `x` and `out` are same-shaped contiguous BF16 tensors; weight and bias are contiguous BF16 [D];
+ * `x` and `out` are same-shaped contiguous BF16 tensors; weight and bias are contiguous [D]
+ * vectors of the same dtype, BF16 or FP32;
  * eps is positive and finite. All inputs and output must be non-overlapping. The oracle evaluates
  * `ideal` naively in FP64 from the represented inputs. The BF16 output is promoted and compared
  * directly with that result; output storage rounding belongs to the Op's numerical criterion, not

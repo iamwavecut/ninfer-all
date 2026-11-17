@@ -8,10 +8,10 @@ namespace ninfer::ops {
 
 void vision_pos_embed_add(const Tensor& table, const Tensor& indices, const Tensor& weights,
                           Tensor& x, cudaStream_t stream) {
-    if (table.dtype != DType::BF16 || x.dtype != DType::BF16 || indices.dtype != DType::I32 ||
-        weights.dtype != DType::FP32) {
+    if ((table.dtype != DType::BF16 && table.dtype != DType::FP32) || x.dtype != DType::BF16 ||
+        indices.dtype != DType::I32 || weights.dtype != DType::FP32) {
         throw std::invalid_argument(
-            "vision_pos_embed_add: table/x must be BF16, indices I32, weights FP32");
+            "vision_pos_embed_add: table must be BF16 or FP32, x BF16, indices I32, weights FP32");
     }
     if (table.ne[2] != 1 || table.ne[3] != 1 || x.ne[2] != 1 || x.ne[3] != 1 ||
         indices.ne[0] != 4 || indices.ne[1] != x.ne[1] || indices.ne[2] != 1 ||

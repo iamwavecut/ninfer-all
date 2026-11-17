@@ -25,8 +25,8 @@ std::int64_t checked_numel(const Tensor& t) {
 } // namespace
 
 void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
-    if (bias.dtype != DType::BF16 || x.dtype != DType::BF16) {
-        throw std::invalid_argument("add_bias: bias/x must be BF16");
+    if ((bias.dtype != DType::BF16 && bias.dtype != DType::FP32) || x.dtype != DType::BF16) {
+        throw std::invalid_argument("add_bias: bias must be BF16 or FP32, x must be BF16");
     }
     const std::int64_t n = checked_numel(x);
     (void)checked_numel(bias);

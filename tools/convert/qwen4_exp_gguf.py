@@ -380,19 +380,37 @@ def _bf16_rows(gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowM
 
     info = gguf.info(tensor)
     flat = (prod(info.shape[:-1]), info.shape[-1])
-    if info.type_id == TYPE_BF16:
-        words = gguf.read_bf16_words(tensor).reshape(flat)
-        index = select(0, shape[0])
-        values = torch.from_numpy(np.ascontiguousarray(words[index]).view(np.int16)).view(
-            torch.bfloat16
-        )
-    else:
-        values = torch.from_numpy(
-            np.ascontiguousarray(_words(gguf, tensor).reshape(flat)[select(0, shape[0])])
-        ).to(torch.bfloat16)
-    if columns is not None:
-        values = values[:, torch.from_numpy(np.argsort(columns))]
-    return array_source(values.reshape(shape), f"{tensor}[{info.type_name}]{list(shape)}")
+    dtype = {TYPE_BF16: np.dtype("<u2"), TYPE_F16: np.dtype("<f2"),
+             TYPE_F32: np.dtype("<f4")}[info.type_id]
+    if flat[1] != shape[1]:
+        raise ValueError(f"{tensor}: direct source and logical row widths differ")
+    permutation = None if columns is None else np.argsort(columns)
+
+    def read(begin: int, end: int) -> torch.Tensor:
+        if begin == end:
+            return torch.empty(0, dtype=torch.bfloat16)
+        first, last = begin // shape[1], -(-end // shape[1])
+        index = np.asarray(select(first, last), dtype=np.int64)
+        if index.shape != (last - first,) or index.min() < 0 or index.max() >= flat[0]:
+            raise ValueError(f"{tensor}: selected direct rows exceed the source shape")
+        unique, inverse = np.unique(index, return_inverse=True)
+        words = np.empty((unique.size, flat[1]), dtype=dtype)
+        splits = np.flatnonzero(np.diff(unique) != 1) + 1
+        row_bytes = flat[1] * dtype.itemsize
+        # Read only consecutive selected runs; preflight and chunked output never retain a matrix.
+        for low, high in zip((0, *splits.tolist()), (*splits.tolist(), unique.size)):
+            raw = gguf.tensor_bytes(tensor, int(unique[low]) * row_bytes,
+                                    (int(unique[high - 1]) + 1) * row_bytes)
+            words[low:high] = raw.view(dtype).reshape(high - low, flat[1])
+        words = words[inverse]
+        if permutation is not None:
+            words = words[:, permutation]
+        words = np.ascontiguousarray(words)
+        values = (torch.from_numpy(words.view(np.int16)).view(torch.bfloat16)
+                  if info.type_id == TYPE_BF16 else torch.from_numpy(words).to(torch.bfloat16))
+        return values.reshape(-1)[begin - first * shape[1]:end - first * shape[1]]
+
+    return LogicalSource(shape, f"{tensor}[{info.type_name}]{list(shape)}", read)
 
 
 def matrix_source(
@@ -555,11 +573,14 @@ def _moe_sources(out: dict, gguf: GGUFFile, g: str, m: str, experts: int,
 
 
 def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None,
-                 routed: bool = True) -> dict[str, tuple[LogicalSource, bool]]:
+                 routed: bool = True, *, norm_source=None,
+                 direct_dtype=torch.bfloat16) -> dict[str, tuple[LogicalSource, bool]]:
     """Every text parameter's GGUF source; True marks encoded block rows. A skeleton GGUF supplies
     every parameter but the routed experts (`routed` false)."""
 
     out: dict[str, tuple[LogicalSource, bool]] = {}
+
+    norm = norm_source or _norm
 
     def matrix(name: str, tensor: str, shape: tuple[int, int], select: RowMap = rows(),
                columns: np.ndarray | None = None):
@@ -569,7 +590,7 @@ def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | 
         out[name] = (source, False)
 
     def hc(prefix: str, stored: str, inject: bool):
-        direct(prefix + "norm", _norm(gguf, stored + "norm.weight", True))
+        direct(prefix + "norm", norm(gguf, stored + "norm.weight", True))
         out[prefix + "down"] = hc_matrix_source(gguf, stored + "down.weight", (LOWRANK, WIDTH)), True
         out[prefix + "up"] = hc_matrix_source(gguf, stored + "up.weight", (WIDTH, LOWRANK)), True
         if inject:
@@ -592,13 +613,13 @@ def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | 
             matrix(a + "key", g + "attn_k.weight", (KV_ROWS, HIDDEN))
             matrix(a + "value", g + "attn_v.weight", (KV_ROWS, HIDDEN))
             matrix(a + "output", g + "attn_output.weight", (HIDDEN, QUERY_ROWS))
-            direct(a + "query_norm", _norm(gguf, g + "attn_q_norm.weight", True))
-            direct(a + "key_norm", _norm(gguf, g + "attn_k_norm.weight", True))
+            direct(a + "query_norm", norm(gguf, g + "attn_q_norm.weight", True))
+            direct(a + "key_norm", norm(gguf, g + "attn_k_norm.weight", True))
             i = p + "indexer/"
             matrix(i + "query", g + "indexer.q_proj.weight", (INDEXER_HEADS * INDEXER_DIM, HIDDEN))
             matrix(i + "key", g + "indexer.k_proj.weight", (INDEXER_DIM, HIDDEN))
-            direct(i + "query_norm", _norm(gguf, g + "indexer.q_norm.weight", True))
-            direct(i + "key_norm", _norm(gguf, g + "indexer.k_norm.weight", True))
+            direct(i + "query_norm", norm(gguf, g + "indexer.q_norm.weight", True))
+            direct(i + "key_norm", norm(gguf, g + "indexer.k_norm.weight", True))
         else:
             n = p + "gdn/"
             qkv = g + "attn_qkv.weight"
@@ -615,25 +636,28 @@ def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | 
             ssm_a = untile(_words(gguf, g + "ssm_a"), 1).astype(np.float64)
             if not np.all(ssm_a < 0):
                 raise ValueError(f"{g}ssm_a must be strictly negative (-exp(A_log))")
-            direct(n + "a_log", _direct(np.log(-ssm_a).astype(np.float32), torch.float32,
-                                        g + "ssm_a"))
+            if config.get("gdn_a_is_log", True):
+                direct(n + "a_log", _direct(np.log(-ssm_a).astype(np.float32), torch.float32,
+                                            g + "ssm_a"))
+            else:
+                direct(n + "decay", _direct(ssm_a.astype(np.float32), torch.float32, g + "ssm_a"))
             direct(n + "dt_bias", _direct(untile(_words(gguf, g + "ssm_dt.bias"), 1),
                                           torch.float32, g + "ssm_dt.bias"))
             taps = _words(gguf, g + "ssm_conv1d.weight")
             channels = np.concatenate([taps[: 2 * GDN_KEY_DIM],
                                        untile(taps[2 * GDN_KEY_DIM:], GDN_HEAD_DIM)])
-            direct(n + "convolution", _direct(channels.T, torch.bfloat16, g + "ssm_conv1d.weight"))
-            direct(n + "norm", _norm(gguf, g + "ssm_norm.weight", False))
+            direct(n + "convolution", _direct(channels.T, direct_dtype, g + "ssm_conv1d.weight"))
+            direct(n + "norm", norm(gguf, g + "ssm_norm.weight", False))
         _moe_sources(out, gguf, g, p + "moe/", config["num_experts"], routed)
         if layer in config["ple_layers"]:
             q = p + "ple/"
             matrix(q + "key", g + "ple_key.weight", (WIDTH, HIDDEN))
             matrix(q + "value", g + "ple_value.weight", (HIDDEN, HIDDEN))
             for role in ("norm_key", "norm_query", "norm_conv"):
-                direct(q + role, _norm(gguf, g + f"ple_{role}.weight", True))
+                direct(q + role, norm(gguf, g + f"ple_{role}.weight", True))
             # Each channel's taps stay contiguous, oldest first (the HF conv squeezed).
             direct(q + "convolution", _direct(_words(gguf, g + "ple_conv1d.weight"),
-                                              torch.bfloat16, g + "ple_conv1d.weight"))
+                                              direct_dtype, g + "ple_conv1d.weight"))
     return out
 
 

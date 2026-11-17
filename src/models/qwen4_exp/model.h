@@ -50,6 +50,7 @@ using qwen3_5::WeightUseId;
 struct HyperConnectionWeights {
     WeightId norm, down, up;
     std::optional<WeightId> inject; // absent for the final mixer
+    std::optional<WeightId> prefill_inject; // distinct original operand, when stored
 };
 
 struct SparseAttentionWeights {
@@ -74,6 +75,7 @@ struct LatentWeights {
 
 struct MoeWeights {
     WeightId router, shared_score;
+    std::optional<WeightId> expert_scales;
     // Edge0's latent experts: then each expert's gate and up are [640, width], its down [width, 640].
     std::optional<LatentWeights> latent;
     // One per expert; empty when the experts stay in the files, which `located` then describes.

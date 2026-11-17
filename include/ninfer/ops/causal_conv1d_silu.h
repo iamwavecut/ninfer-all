@@ -12,9 +12,9 @@ namespace ninfer::ops {
  *
  *   ideal[c,t] = SiLU(sum_{j=0..3} weight[c,j] * u[c,t-3+j]).
  *
- * `x` and `out` are contiguous BF16 [C,T], `weight` is contiguous BF16 [C,4], and a state is
- * contiguous BF16 [C,3] ordered oldest to newest. The oracle evaluates `ideal` naively in FP64 from
- * the represented inputs. The BF16 output is promoted and compared directly with that result;
+ * `x` and `out` are contiguous BF16 [C,T], `weight` is contiguous BF16 or FP32 [C,4], and a state
+ * is contiguous BF16 [C,3] ordered oldest to newest. The oracle evaluates `ideal` naively in FP64
+ * from the represented inputs. The BF16 output is promoted and compared directly with that result;
  * output storage rounding belongs to the Op's numerical criterion, not the oracle. Kernel
  * accumulator and staging precision are implementation choices. Input, weight, output, and state
  * storage do not overlap except for the explicitly allowed exact alias between state input and

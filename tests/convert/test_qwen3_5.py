@@ -7,7 +7,7 @@ import pytest
 from safetensors.torch import save_file
 import torch
 
-from tools.convert.qwen3_5 import build_model, draft_config, text_config
+from tools.convert.qwen3_5 import build_model, draft_config, text_config, vision_config
 from tools.convert.sources.safetensors import SafetensorsSource
 
 
@@ -85,6 +85,18 @@ def _checkpoint(path, config, tensors):
         (path / role).write_text(json.dumps(value))
     (path / "chat_template.jinja").write_text("{{ messages }}")
     return SafetensorsSource(path)
+
+
+def test_vision_direct_format_preserves_fp32_metadata():
+    config = _config()
+    text = text_config(config, mtp=False)
+    assert "direct_format" not in vision_config(config, text)
+    for format in ("bf16", "fp32"):
+        config["vision_config"]["direct_format"] = format
+        assert vision_config(config, text)["direct_format"] == format
+    config["vision_config"]["direct_format"] = "fp16"
+    with pytest.raises(ValueError, match="direct_format"):
+        vision_config(config, text)
 
 
 def _values(model, name):

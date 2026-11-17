@@ -48,25 +48,28 @@ std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
 
 int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint32_t seed,
              float input_scale = 4.0F, bool bf16x2_unaligned = false, bool replay = false,
-             int width = 0) {
+             int width = 0, bool fp32_weight = false) {
     const std::size_t count = shape.elements();
     std::vector<float> input(count), weight(shape.d);
     fill_uniform(input, seed, -input_scale, input_scale);
     fill_uniform(weight, seed + 1U, -1.5F, 1.5F);
     round_to_bf16(input);
-    round_to_bf16(weight);
+    if (!fp32_weight) round_to_bf16(weight);
     weight[0] =
         unit_offset ? -1.0F : 0.0F; // Exact zero gain, without an intermediate BF16 gain cast.
 
     DeviceInput device_input  = make_input(input, bf16x2_unaligned);
     DeviceInput device_weight = make_input(weight, bf16x2_unaligned);
+    DeviceBuffer direct_weight;
+    if (fp32_weight) direct_weight = to_device(weight);
     const std::size_t leading = bf16x2_unaligned ? sizeof(std::uint16_t) : 0;
     GuardedDeviceBuffer output(leading + count * sizeof(std::uint16_t));
     output.fill(0xff);
     void* output_data = static_cast<std::uint8_t*>(output.data()) + leading;
 
     Tensor input_tensor = tensor_for(device_input.data, shape);
-    Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
+    Tensor weight_tensor(fp32_weight ? direct_weight.p : device_weight.data,
+                         fp32_weight ? DType::FP32 : DType::BF16, {shape.d});
     Tensor output_tensor = tensor_for(output_data, shape);
     if (width) {
         input_tensor = Tensor(device_input.data, DType::BF16,
@@ -94,6 +97,9 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
                                   device_input.expected.size() * 2, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(device_weight.storage.p, device_weight.expected.data(),
                                   device_weight.expected.size() * 2, cudaMemcpyHostToDevice));
+            if (fp32_weight)
+                CUDA_CHECK(cudaMemcpy(direct_weight.p, weight.data(), weight.size() * sizeof(float),
+                                      cudaMemcpyHostToDevice));
         }
         output.fill(0xff);
         cuda_synchronize();
@@ -112,6 +118,9 @@ int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint3
         failures += verify_output_storage(std::string(label) + " output", output, bf16x2_unaligned);
         failures += verify_preserved(std::string(label) + " preserves input", device_input);
         failures += verify_preserved(std::string(label) + " preserves weight", device_weight);
+        if (fp32_weight)
+            failures += verify_exact((std::string(label) + " FP32 weight").c_str(),
+                                     from_device<float>(direct_weight, weight.size()), weight);
     }
     return failures;
 }
@@ -139,6 +148,12 @@ int main() {
     failures += run_case("rmsnorm offset unaligned [128,32]", {128, 32}, true, 1301U, 4.0F, true);
     failures += run_case("rmsnorm plain unaligned [128,8]", {128, 8}, false, 1302U, 4.0F, true);
     failures += run_case("rmsnorm plain near-zero [128,32]", {128, 32}, false, 1303U, 1.0e-5F);
+    for (bool offset : {false, true}) {
+        failures += run_case("rmsnorm FP32 gamma hidden", {5120, 1, 9}, offset, 1310U, 4.0F, false,
+                             true, 0, true);
+        failures += run_case("rmsnorm FP32 gamma QK", {256, 4, 17}, offset, 1311U, 4.0F, true, true,
+                             0, true);
+    }
     for (int t = 1; t <= 128; ++t) {
         const bool graph = t == 1 || t == 2 || t == 7 || t == 8 || t == 15 || t == 16 || t == 31 ||
                            t == 32 || t == 63 || t == 64 || t == 65 || t == 96 || t == 127 ||

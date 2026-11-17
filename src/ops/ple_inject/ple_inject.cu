@@ -3,6 +3,7 @@
 // convolution input; the convolution and stack update; the history advance, which the record form
 // leaves to ple_history_advance.
 #include "ninfer/ops/ple_inject.h"
+#include "ops/common/direct_weight.cuh"
 
 #include "core/device_launch.h"
 #include "core/layout.h"
@@ -57,10 +58,8 @@ __device__ void block_sum(float (&values)[Count], float* shared) {
 // convolution input N ([tokens][streams * hidden]).
 __global__ void __launch_bounds__(kThreads)
     ple_gate_kernel(const float* __restrict__ stack, const __nv_bfloat16* __restrict__ key,
-                    const __nv_bfloat16* __restrict__ value,
-                    const __nv_bfloat16* __restrict__ norm_key,
-                    const __nv_bfloat16* __restrict__ norm_query,
-                    const __nv_bfloat16* __restrict__ norm_conv, float eps,
+                    const __nv_bfloat16* __restrict__ value, DirectWeight norm_key,
+                    DirectWeight norm_query, DirectWeight norm_conv, float eps, bool unit_offset,
                     float* __restrict__ gate, float* __restrict__ normalized) {
     __shared__ float shared[16 * (kThreads / 32) + 16];
     const int t                 = blockIdx.x;
@@ -98,9 +97,9 @@ __global__ void __launch_bounds__(kThreads)
     float dots[kStreams] = {};
     for (int i = threadIdx.x; i < kWidth; i += kThreads) {
         const int c   = i / kHidden;
-        const float k = __bfloat162float(keys[i]) * key_scale[c] *
-                        (1.0f + __bfloat162float(norm_key[i]));
-        const float q = xs[i] * query_scale[c] * (1.0f + __bfloat162float(norm_query[i]));
+        const float k =
+            __bfloat162float(keys[i]) * key_scale[c] * ((unit_offset ? 1.0f : 0.0f) + norm_key[i]);
+        const float q = xs[i] * query_scale[c] * ((unit_offset ? 1.0f : 0.0f) + norm_query[i]);
 #pragma unroll
         for (int s = 0; s < kStreams; ++s) {
             if (s == c) dots[s] += k * q;
@@ -121,7 +120,7 @@ __global__ void __launch_bounds__(kThreads)
         const int c = i / kHidden;
         const float g = gates[c] * __bfloat162float(values[i - c * kHidden]);
         normalized[static_cast<std::int64_t>(t) * kWidth + i] =
-            g * conv_scale[c] * (1.0f + __bfloat162float(norm_conv[i]));
+            g * conv_scale[c] * ((unit_offset ? 1.0f : 0.0f) + norm_conv[i]);
     }
 }
 
@@ -129,7 +128,7 @@ __global__ void __launch_bounds__(kThreads)
 // before the call from `history`, and the stack update.
 __global__ void __launch_bounds__(256)
     ple_conv_kernel(float* __restrict__ stack, const __nv_bfloat16* __restrict__ value,
-                    const __nv_bfloat16* __restrict__ conv, const float* __restrict__ history,
+                    DirectWeight conv, const float* __restrict__ history,
                     const float* __restrict__ gate, const float* __restrict__ normalized,
                     int tokens) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -144,7 +143,7 @@ __global__ void __launch_bounds__(256)
         const float n      = position >= 0
                                  ? normalized[static_cast<std::int64_t>(position) * kWidth + channel]
                                  : history[static_cast<std::int64_t>(kHistory + position) * kWidth + channel];
-        sum = fmaf(__bfloat162float(conv[static_cast<std::int64_t>(channel) * kTaps + j]), n, sum);
+        sum                = fmaf(conv[static_cast<std::int64_t>(channel) * kTaps + j], n, sum);
     }
     const float convolved = sum * sigmoid_f(sum);
     const float g         = gate[t * kStreams + c] *
@@ -189,13 +188,14 @@ void inject(Tensor& stack, const Tensor& key, const Tensor& value, const PleInje
         return static_cast<const __nv_bfloat16*>(tensor->data);
     };
     ple_gate_kernel<<<tokens, kThreads, 0, stream>>>(
-        static_cast<const float*>(stack.data), bf16(&key), bf16(&value), bf16(weights.norm_key),
-        bf16(weights.norm_query), bf16(weights.norm_conv), eps, static_cast<float*>(gate.data),
+        static_cast<const float*>(stack.data), bf16(&key), bf16(&value),
+        direct_weight(*weights.norm_key), direct_weight(*weights.norm_query),
+        direct_weight(*weights.norm_conv), eps, weights.unit_offset, static_cast<float*>(gate.data),
         static_cast<float*>(normalized.data));
     CUDA_CHECK(cudaGetLastError());
     const std::int64_t elements = static_cast<std::int64_t>(tokens) * kWidth;
     ple_conv_kernel<<<static_cast<unsigned>(div_up(elements, std::int64_t{256})), 256, 0, stream>>>(
-        static_cast<float*>(stack.data), bf16(&value), bf16(weights.conv),
+        static_cast<float*>(stack.data), bf16(&value), direct_weight(*weights.conv),
         static_cast<const float*>(history.data), static_cast<const float*>(gate.data),
         static_cast<const float*>(normalized.data), tokens);
     CUDA_CHECK(cudaGetLastError());
@@ -211,10 +211,15 @@ void require_inputs(const Tensor& stack, const Tensor& key, const Tensor& value,
     require(eps > 0.0f, "eps must be positive");
     require_tensor(&key, DType::BF16, kWidth, tokens, "key must be BF16 [10240, tokens]");
     require_tensor(&value, DType::BF16, kHidden, tokens, "value must be BF16 [2560, tokens]");
-    require_tensor(weights.norm_key, DType::BF16, kWidth, 1, "norm_key must be BF16 [10240]");
-    require_tensor(weights.norm_query, DType::BF16, kWidth, 1, "norm_query must be BF16 [10240]");
-    require_tensor(weights.norm_conv, DType::BF16, kWidth, 1, "norm_conv must be BF16 [10240]");
-    require_tensor(weights.conv, DType::BF16, kTaps, kWidth, "conv must be BF16 [4, 10240]");
+    const auto direct = [](const Tensor* tensor, int n0, int n1, const char* label) {
+        require(tensor != nullptr && (tensor->dtype == DType::BF16 || tensor->dtype == DType::FP32),
+                label);
+        require_tensor(tensor, tensor->dtype, n0, n1, label);
+    };
+    direct(weights.norm_key, kWidth, 1, "norm_key must be BF16 or FP32 [10240]");
+    direct(weights.norm_query, kWidth, 1, "norm_query must be BF16 or FP32 [10240]");
+    direct(weights.norm_conv, kWidth, 1, "norm_conv must be BF16 or FP32 [10240]");
+    direct(weights.conv, kTaps, kWidth, "conv must be BF16 or FP32 [4, 10240]");
     require_tensor(&history, DType::FP32, kWidth, kHistory, "history must be FP32 [10240, 9]");
 }
 

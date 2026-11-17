@@ -17,6 +17,14 @@ void add_bias_launch(const Tensor& bias, Tensor& x, cudaStream_t stream) {
         rowsPerBlock * std::numeric_limits<unsigned short>::max();
     const std::int64_t n    = x.numel();
     const std::int64_t rows = n / x.ne[0];
+    if (bias.dtype == DType::FP32) {
+        const int grid = static_cast<int>(std::min<std::int64_t>(
+            div_up(n, static_cast<std::int64_t>(block)), std::numeric_limits<int>::max()));
+        add_bias_kernel<<<grid, block, 0, stream>>>(
+            static_cast<const float*>(bias.data), static_cast<__nv_bfloat16*>(x.data), x.ne[0], n);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const auto addresses =
         reinterpret_cast<std::uintptr_t>(bias.data) | reinterpret_cast<std::uintptr_t>(x.data);
     if ((x.ne[0] % 8) == 0 && (addresses & (alignof(Bf16x8Pack) - 1)) == 0 &&

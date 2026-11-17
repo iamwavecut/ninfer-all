@@ -58,6 +58,7 @@ struct MissLayer {
         std::span<const ExpertLocation> located; // disk experts: where each expert's bytes are
     };
     std::array<Projection, 3> projections;   // gate, up, down
+    std::vector<float> expert_scales;        // optional FP32 [experts, 3], ordinary MoE products
     const void* const* gate_table = nullptr; // the device table the cached stage reads
     // Device memory holding this layer's cached experts (ExpertCache::storage): a gate entry
     // inside any of its blocks is resident.

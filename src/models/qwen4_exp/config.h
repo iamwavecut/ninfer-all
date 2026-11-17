@@ -34,6 +34,12 @@ struct TextConfig {
     std::uint32_t num_hidden_layers       = 0;
     std::uint32_t max_position_embeddings = 0;
     bool tie_word_embeddings              = false;
+    // Direct scalar operands may retain FP32 precision and already include the norm's unit gain.
+    bool fp32_direct                      = false;
+    bool norm_unit_offset                 = true;
+    bool hc_prefill_inject                = false;
+    bool gdn_a_is_log                     = true;
+    bool expert_output_scales             = false;
     float rms_norm_eps                    = 0;
     std::int32_t eos_token_id             = 0;
     std::vector<MixerKind> layer_types;
