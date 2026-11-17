@@ -19,6 +19,7 @@ spelling and defaults.
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [GGUF block formats](gguf.md) | GGUF releases with a ggml type per tensor: the twenty block formats, their products, serving and measurements |
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md) | converting the GSQ-RCO GGUF releases and their n-gram table; experts on one or several GPUs, in host memory or on disk; measurements |
+| [Native Flash-Next with DFlash2](flash-next-native-dflash2.md) | GGUF text and NVIDIA FP8 PLE sources, explicit operand-preservation choices, Q8PLE and DFlash2 attachment |
 | [Edge0](edge0.md) | Edge0-145B and Edge0-120B, latent-MoE models on the Flash-Next skeleton: converting the release folders, placements, tensor parallelism by groups, what differs from Flash-Next |
 | [Gemma 4 26B-A4B](gemma4.md) | converting Google's QAT GGUF release with its MTP assistant and vision tower, what runs, speculative decoding, images and video, the defaults, measurements against llama.cpp and the numerical checks |
 | [Flint](flint.md) | converting a GGUF of Recursive's Flint, what runs, reasoning and GLM-4.7 tool calls, expert residency, measurements against llama.cpp and the numerical checks |
