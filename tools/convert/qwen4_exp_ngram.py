@@ -168,7 +168,7 @@ def encoded_table_digest(source: LogicalSource, *, rows_per_chunk: int = 1 << 18
 
 
 def configure_ngram(model, recipe, table) -> None:
-    """Select HF FP8 rows, Strata's FP8 table or an IQ4_NL GGUF table for either text recipe."""
+    """Select HF FP8 rows, Strata's FP8 table or IQ4_NL/Q8_0 GGUF rows for either text recipe."""
     from .qwen4_exp_gguf import configure_ngram_gguf
     from .sources.gguf import GGUFFile
 
@@ -188,7 +188,7 @@ def configure_ngram(model, recipe, table) -> None:
         configure_ngram_gguf(model, recipe, table)
         return
     if not isinstance(table, SafetensorsSource):
-        raise ValueError("--source ngram must name an HF safetensors table or an IQ4_NL GGUF")
+        raise ValueError("--source ngram must name an HF safetensors table or an IQ4_NL/Q8_0 GGUF")
     descriptor = model.components["ngram"]["config"]
     source = hf_ngram_source(table, descriptor)
     size = source.shape[0] * (source.shape[1] + 2)

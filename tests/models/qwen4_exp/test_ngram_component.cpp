@@ -182,6 +182,7 @@ int run() {
     const std::string digest(64, 'a');
     const std::string other(64, 'b');
     const Table iq4;
+    const Table q8{"gguf_q8_0", 170, "gguf_blocks_v1"};
     const Table bf16{"bf16", kWidth * 2, "contiguous_le_v1"};
     const Table fp8{"fp8_e4m3fn_row_fp16", kWidth + 2, "row_interleaved_v1"};
     const Directory dir;
@@ -210,6 +211,20 @@ int run() {
 
     const ninfer::artifact::Reader embedded_reader(embedded);
     const ninfer::artifact::Reader bare_reader(bare);
+
+    const auto q8_path = dir.write(
+        "q8.ninfer", {{"ngram", {{"config", descriptor(config, q8.format, other)}}}},
+        &q8, rows, false);
+    const auto q8_source = ngram_table_source(ninfer::artifact::Reader(q8_path), q8_path, config);
+    require(q8_source.format == ninfer::ops::NgramRowFormat::Q8_0 &&
+                q8_source.layout.row_bytes == 170 && q8_source.layout.rows == rows &&
+                q8_source.layout.segments[0].bytes == rows * 170,
+            "Q8_0 table did not select unchanged 170-byte GGUF rows");
+    const auto q8_external = ngram_table_source(bare_reader, bare, config, q8_path);
+    require(q8_external.format == ninfer::ops::NgramRowFormat::Q8_0 &&
+                q8_external.table_digest == other && q8_external.model_digest == digest &&
+                q8_external.table_format == q8.format && q8_external.model_format == iq4.format,
+            "external Q8_0 table lost the selected or original descriptor");
 
     const auto fp8_path = dir.write(
         "fp8.ninfer", {{"ngram", {{"config", descriptor(config, fp8.format, digest)}}}},

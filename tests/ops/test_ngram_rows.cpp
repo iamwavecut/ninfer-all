@@ -111,6 +111,46 @@ int run_iq4nl(int heads, int tokens, std::uint32_t seed) {
     return failures;
 }
 
+int run_q8_0(int heads, int tokens) {
+    const int rows = heads * tokens;
+    const int row_bytes = static_cast<int>(ops::ngram_row_bytes(ops::NgramRowFormat::Q8_0));
+    if (row_bytes != 170) return 1;
+    std::vector<std::uint8_t> staged(static_cast<std::size_t>(rows) * row_bytes);
+    std::vector<std::uint16_t> expected(static_cast<std::size_t>(rows) * kWidth);
+    constexpr std::uint16_t scales[] = {0, 0x8000, 1, 0x8001, 0x3ff, 0x400,
+                                      0x3555, 0xbc01, 0x7bff, 0xfbff, 0x3c80};
+    for (int r = 0; r < rows; ++r) {
+        for (int b = 0; b < kWidth / 32; ++b) {
+            auto* block = staged.data() + static_cast<std::size_t>(r) * row_bytes + b * 34;
+            const auto scale = scales[(r * 5 + b) % 11];
+            block[0] = static_cast<std::uint8_t>(scale);
+            block[1] = static_cast<std::uint8_t>(scale >> 8);
+            for (int j = 0; j < 32; ++j) {
+                const int code = (r * kWidth + b * 32 + j) % 256 - 128;
+                block[2 + j] = static_cast<std::uint8_t>(code);
+                // An FP16 scale times an int8 is exact in FP32. Round that value once to
+                // BF16 using integer ties-to-even, independently of CUDA's conversion.
+                const float value = static_cast<float>(decode_fp16(scale) * code);
+                std::uint32_t bits;
+                std::memcpy(&bits, &value, sizeof(bits));
+                expected[static_cast<std::size_t>(r) * kWidth + b * 32 + j] =
+                    static_cast<std::uint16_t>((bits + 0x7fffU + ((bits >> 16) & 1U)) >> 16);
+            }
+        }
+    }
+    GuardedDeviceBuffer d_rows(staged.size()), d_out(expected.size() * 2);
+    d_rows.copy_from_host(staged.data(), staged.size());
+    Tensor t_rows(d_rows.data(), DType::U8, {row_bytes, rows});
+    Tensor t_out(d_out.data(), DType::BF16, {heads * kWidth, tokens});
+    ops::ngram_embed_rows(t_rows, ops::NgramRowFormat::Q8_0, heads, t_out, nullptr);
+    cuda_synchronize();
+    int failures = verify_exact("ngram q8_0 rows",
+                               from_device<std::uint16_t>(d_out.data(), expected.size()), expected);
+    failures += d_rows.verify_guards("ngram q8_0 rows input");
+    failures += d_out.verify_guards("ngram q8_0 rows output");
+    return failures;
+}
+
 int run_bf16(int heads, int tokens, std::uint32_t seed) {
     const int rows = heads * tokens;
     std::vector<std::uint16_t> staged(static_cast<std::size_t>(rows) * kWidth);
@@ -142,6 +182,8 @@ int main() {
     failures += run_fp8(16, 33, 6101u);
     failures += run_iq4nl(16, 1, 6300u);
     failures += run_iq4nl(16, 29, 6301u);
+    failures += run_q8_0(16, 1);
+    failures += run_q8_0(16, 29);
     failures += run_bf16(16, 1, 6200u);
     failures += run_bf16(16, 17, 6201u);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " ngram_embed_rows\n";

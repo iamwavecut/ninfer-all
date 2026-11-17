@@ -507,7 +507,7 @@ both tables' rows.
 ### Another table of the same shape
 
 A model reads any n-gram table artifact of its hash constants, row count and row width, in any row
-format the runtime decodes (IQ4_NL, FP8 with an FP16 row scale, BF16): the table its `ngram`
+format the runtime decodes (IQ4_NL, Q8_0, FP8 with an FP16 row scale, BF16): the table its `ngram`
 component names, or another one. The engine checks the table's shape against the model's
 configuration, not its values; for another table it warns at startup with both tables' formats and
 digests. A table of the same shape with other values starts too and degrades the output, as a wrong
@@ -525,6 +525,27 @@ with INT8 KV and device experts, the GSQ-RCO Q2_0 release scores 2.542153 with i
 2.531971 (0.40% lower) with Edge0's 48.38 GiB FP8 table; Edge0's figures are in
 [its guide](edge0.md#with-flash-nexts-table). Q2_0's greedy answer to the sky prompt keeps its
 content and changes its wording with the FP8 table; it decodes at 87.6 and 87.5 tokens per second.
+
+### Q8PLE tables
+
+`qwen3_8_flash_next_gguf` accepts a GGUF containing Q8_0
+`per_layer_token_embd.weight` as `--source ngram=PATH`. Its five 32-value blocks per
+row stay byte-for-byte Q8_0: 170 bytes per row, including the five FP16 scales.
+The 320,001,536-row table occupies 54,400,261,120 payload bytes. Conversion records
+the SHA-256 of those bytes; it neither requantizes the table nor changes the text
+weights, drafter or KV settings. As with IQ4_NL, `--components ngram` writes a
+separate table and `--components text,ngram` embeds it in the model.
+
+```bash
+python3.11 -m tools.convert --model /models/flash-next-config \
+  --recipe qwen3_8_flash_next_gguf --components ngram \
+  --source ngram=/models/ple-q8.gguf --device cpu --out /models/ple-q8.ninfer
+```
+
+The runtime reads the stored signed codes and FP16 scales, rounding each decoded
+value once to the BF16 embedding. The existing disk, RAM and hot-row placements
+use the selected table's row size. Supplying an external Q8PLE table to a model
+converted against IQ4_NL retains the usual format/digest notice described above.
 
 ### Without the n-gram table
 
