@@ -497,7 +497,8 @@ def latent_sources(pack: Edge0Pack, build: str, layer: int, m: str
     return out
 
 
-def mtp_sources(mtp: MtpPack) -> dict[str, tuple[LogicalSource, bool]]:
+def mtp_sources(mtp: MtpPack, *, hc_source=None, norm_source=None, prefill_inject=False
+                ) -> dict[str, tuple[LogicalSource, bool]]:
     """Every parameter of the `mtp` component from the release's runtime files; True marks encoded
     block rows."""
 
@@ -514,7 +515,7 @@ def mtp_sources(mtp: MtpPack) -> dict[str, tuple[LogicalSource, bool]]:
         out[name] = block_rows_source(shape, tensor, GGML_Q8_0, read), True
 
     def norm(name: str, tensor: str, count: int):
-        out[name] = _norm(mtp.f32(tensor, count), tensor), False
+        out[name] = (norm_source or _norm)(mtp.f32(tensor, count), tensor), False
 
     def hc(prefix: str, stored: str, inject: bool):
         norm(prefix + "norm", stored + "hc_norm.weight", WIDTH)
@@ -524,7 +525,12 @@ def mtp_sources(mtp: MtpPack) -> dict[str, tuple[LogicalSource, bool]]:
             roles.append(("inject", "block_inject_weight", (STREAMS, WIDTH)))
         for role, tensor, shape in roles:
             tensor = stored + tensor + ".weight"
-            out[prefix + role] = _q8_from_bf16(mtp.bf16_words(tensor, shape), tensor), True
+            source = (hc_source(tensor, shape) if hc_source is not None else
+                      _q8_from_bf16(mtp.bf16_words(tensor, shape), tensor))
+            out[prefix + role] = source, True
+
+        if inject and prefill_inject:
+            bf16(prefix + "prefill_inject", stored + "block_inject_weight.weight", (STREAMS, WIDTH))
 
     def bf16(name: str, tensor: str, shape: tuple[int, int]):
         words = np.ascontiguousarray(mtp.bf16_words(tensor, shape))

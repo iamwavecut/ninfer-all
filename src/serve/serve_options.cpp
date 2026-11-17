@@ -200,7 +200,7 @@ std::string serve_usage_text(const char* argv0) {
            "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n"
            "  --help, -h                    show this help and exit\n"
            "  --version                     print the build version and exit\n"
-           "  --config FILE                 read options from a launch configuration file\n"
+           "  --config FILE                 read options from an INI or flat JSON launch file\n"
            "                                (`key = value` lines, docs/cli.md); repeatable,\n"
            "                                each later file and the command line override\n"
            "                                earlier ones; a file's `model` names the artifact\n"

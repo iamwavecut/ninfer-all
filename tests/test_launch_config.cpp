@@ -44,6 +44,17 @@ std::vector<std::string> options(std::string_view key, std::string_view value) {
 }
 
 void format() {
+    const auto json =
+        parse_config_text(R"({"model":"a.ninfer","Max-Context":262144,"vision":true})");
+    expect(json.sections.size() == 1 && json.sections[0].entries.size() == 3 &&
+               json.sections[0].entries[1].first == "max-context" &&
+               json.sections[0].entries[1].second == "262144" &&
+               json.sections[0].entries[2].second == "true",
+           "flat JSON retains typed scalar options in order");
+    for (const char* bad :
+         {R"({"x":null})", R"({"x":[]})", R"({"x":{}})", R"({"x":1,"X":2})", R"({"x":})"}) {
+        expect(rejects([&] { (void)parse_config_text(bad); }), "invalid launch JSON accepted");
+    }
     const ConfigFile file = parse_config_text("version = 1\n"
                                               "  ; comment\n"
                                               "# comment\n"
@@ -101,6 +112,13 @@ void command_line() {
     const std::string first  = write("first.ini", "model = a.ninfer\nmax-context = 1\n"
                                                   "cuda-backend = 12\nversion = 1\n");
     const std::string second = write("second.ini", "artifact = b.ninfer\nthinking = false\n");
+    const std::string json =
+        write("launch.json", R"({"model":"packed.ninfer","kv-dtype":"bf16","max-concurrency":2})");
+    const auto from_json = read({"ninfer-serve", "--config", json});
+    expect(from_json.artifact == "packed.ninfer" &&
+               from_json.layers[0].arguments ==
+                   std::vector<std::string>({"--kv-dtype", "bf16", "--max-concurrency", "2"}),
+           "JSON launch uses the existing CLI option layers");
 
     const CommandLine both = read({"ninfer", "--config", first, "--prompt", "x", "--config", second});
     expect(both.program == "ninfer" && both.artifact == "b.ninfer",

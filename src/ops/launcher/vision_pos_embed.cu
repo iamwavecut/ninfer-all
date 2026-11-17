@@ -25,6 +25,17 @@ int small_p_tiles(int patches) {
 void vision_pos_embed_add_launch(const Tensor& table, const Tensor& indices, const Tensor& weights,
                                  Tensor& x, cudaStream_t stream) {
     constexpr int block = 128;
+    if (table.dtype == DType::FP32) {
+        const std::int64_t n = x.numel();
+        const int grid       = static_cast<int>(std::min<std::int64_t>(
+            div_up(n, static_cast<std::int64_t>(block)), std::numeric_limits<int>::max()));
+        vision_pos_embed_add_kernel<<<grid, block, 0, stream>>>(
+            static_cast<const float*>(table.data), static_cast<const std::int32_t*>(indices.data),
+            static_cast<const float*>(weights.data), static_cast<__nv_bfloat16*>(x.data), x.ne[0],
+            x.ne[1], table.ne[1], n);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const bool paired =
         x.ne[0] == 1152 &&
         ((reinterpret_cast<std::uintptr_t>(table.data) | reinterpret_cast<std::uintptr_t>(x.data)) &

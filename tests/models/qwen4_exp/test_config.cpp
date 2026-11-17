@@ -50,6 +50,23 @@ int run() {
     require(config.ngram_heads() == 16, "16 n-gram heads");
     const NgramHashConstants constants = derive_ngram_hash_constants(config.ngram);
     require(constants.rows == 320001536ULL, "n-gram table rows");
+    require(!config.fp32_direct && config.norm_unit_offset && !config.hc_prefill_inject &&
+                config.gdn_a_is_log && !config.expert_output_scales,
+            "existing artifacts retain their weight conventions");
+    Json basalt                 = fixture();
+    basalt["fp32_direct"]       = true;
+    basalt["norm_unit_offset"]  = false;
+    basalt["hc_prefill_inject"] = true;
+    basalt["gdn_a_is_log"]      = false;
+    basalt["expert_output_scales"] = true;
+    const auto preserved        = parse_text_config(basalt);
+    require(preserved.fp32_direct && !preserved.norm_unit_offset && preserved.hc_prefill_inject &&
+                !preserved.gdn_a_is_log && preserved.expert_output_scales,
+            "Basalt's stored weight conventions parse");
+    for (const char* field : {"fp32_direct", "norm_unit_offset", "hc_prefill_inject",
+                              "gdn_a_is_log", "expert_output_scales"}) {
+        expect_refusal([&](Json& c) { c[field] = 1; }, std::string(field) + " must be boolean");
+    }
 
     // A 3..5 source slice starts at a QSA block and contains no PLE. Local layer numbers
     // describe this stack; they do not imply the full checkpoint's every-fourth phase.
@@ -89,6 +106,12 @@ int run() {
     latent["latent_moe"] = {{"width", 1792}, {"groups", 8}, {"expert_scales", true},
                             {"column_scale", false}};
     const auto edge0 = parse_text_config(latent);
+    expect_refusal(
+        [&](Json& c) {
+            c["latent_moe"]           = latent["latent_moe"];
+            c["expert_output_scales"] = true;
+        },
+        "ordinary expert scales on a latent MoE");
     require(edge0.latent_moe && edge0.latent_moe->width == 1792 && edge0.latent_moe->groups == 8 &&
                 edge0.latent_moe->expert_scales && !edge0.latent_moe->column_scale,
             "Edge0's latent MoE parses");

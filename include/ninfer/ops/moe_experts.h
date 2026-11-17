@@ -40,6 +40,10 @@ void moe_experts_bf16(const Tensor& m, const Tensor& ids, const Tensor& weights,
  * `gate` and `up` hold each expert's 640 rows of 2560 values, `down` its 2560 rows of 640; the
  * routed tables have `experts` entries (up to 512), the shared expert's tables one. Every entry
  * points at device-readable memory in the table's block type, rows `row_bytes` apart.
+ * Optional FP32 `expert_scales` holds three positive finite multipliers per routed expert:
+ *   e_j(x) = s_down[j] * down_j . (silu(s_gate[j] * (gate_j . x)) * s_up[j] * (up_j . x)).
+ * A null scale table means all ones; the shared expert has no outer multipliers. The table uses
+ * original expert ids even when pointer tables describe cache slots or expert-parallel parts.
  *
  * The products quantize their activation to ggml's q8_1 as llama.cpp does (the format's
  * arithmetic): m once per token, the middle silu(gate . m) * (up . m) after its BF16 store. Each
@@ -48,7 +52,8 @@ void moe_experts_bf16(const Tensor& m, const Tensor& ids, const Tensor& weights,
  * The oracle independently decodes stored blocks and evaluates the complete expert mathematics
  * in FP64 from the public BF16 input, without the implementation's internal q8_1 quantization or
  * BF16 middle cast; y is compared as FP32 by relative L2 and gross error. Q2_0 has an independent
- * CPU decoder in its qualification; other formats' existing fixtures still use the GPU decoder.
+ * CPU decoder in its qualification, as does NVFP4; other formats' existing fixtures still use the
+ * GPU decoder.
  *
  * Up to eight tokens run ggml-style vector products. A wider call needs `device_resident` banks
  * and runs all three projections through ggml's integer tensor-core matrix kernel (with the same
@@ -90,9 +95,13 @@ struct GgufMoeWeights {
     // IQ1_M tables of a wide call take the matrix kernel too once the call routes enough rows to
     // each expert; false keeps them on the vector products (EngineOptions::iq1m_expert_matrix).
     bool iq1m_matrix = true;
+    // Device FP32 [experts, 3]: gate/up before SwiGLU, down after its product; null means ones.
+    const float* expert_scales = nullptr;
 };
 
-[[nodiscard]] std::size_t moe_experts_gguf_workspace_bytes(std::int32_t tokens);
+// `scaled` is true when any call using the arena has a non-null expert scale table.
+[[nodiscard]] std::size_t moe_experts_gguf_workspace_bytes(std::int32_t tokens,
+                                                           bool scaled = false);
 void moe_experts_gguf(const Tensor& m, const Tensor& ids, const Tensor& weights,
                       const Tensor& shared, const GgufMoeWeights& banks, WorkspaceArena& workspace,
                       Tensor& y, cudaStream_t stream);
@@ -190,7 +199,8 @@ void moe_experts_gguf_decode_finish(const GgufMoeDecode& state, const Tensor& id
  * its run on its own, so the combined y is close to the whole call's, not identical. `parts` of
  * combine are device memory of the stream's device.
  */
-[[nodiscard]] std::size_t moe_experts_gguf_part_workspace_bytes(std::int32_t tokens);
+[[nodiscard]] std::size_t moe_experts_gguf_part_workspace_bytes(std::int32_t tokens,
+                                                                bool scaled = false);
 void moe_experts_gguf_part(const Tensor& m, const Tensor& ids, const Tensor& weights,
                            const Tensor* shared, const GgufMoeWeights& banks,
                            std::int32_t expert_begin, std::int32_t expert_end,

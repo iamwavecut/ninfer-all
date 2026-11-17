@@ -22,8 +22,9 @@ namespace ninfer::ops {
  *
  *   score_b = sum_{h<4} relu(q_h . K_b),   q_h = rope(groupnorm(q[h], query_norm), p)
  *
- * the min(512, blocks) best blocks, ties to the lower block index. groupnorm is the zero-centred
- * RMSNorm x / sqrt(mean x^2 + eps) * (1 + w) over 128 values; rope rotates the first 64 dims
+ * the min(512, blocks) best blocks, ties to the lower block index. groupnorm is
+ * RMSNorm x / sqrt(mean x^2 + eps) * (offset + w) over 128 values, where offset is one for
+ * unit_offset and zero for stored multiplicative gamma; rope rotates the first 64 dims
  * rotate-half at angle fl32(fl32(position) * f_i), f_i = fl32(1e7^(-2i/64)), i < 32, and passes
  * dims 64..127 through. Under `yarn` (a factor above one; the model's attention takes the same
  * rotation) f_i is instead the pair's YaRN inverse frequency, rope_yarn_frequencies(64, 32, 1e7,
@@ -46,8 +47,9 @@ namespace ninfer::ops {
  * equal the oracle's up to blocks whose FP64 scores tie the 512th within 1e-5 relative.
  */
 struct QsaIndexerWeights {
-    const Tensor* query_norm = nullptr; // BF16 [128]
-    const Tensor* key_norm   = nullptr; // BF16 [128]
+    const Tensor* query_norm = nullptr; // BF16 or FP32 [128]
+    const Tensor* key_norm   = nullptr; // BF16 or FP32 [128]
+    bool unit_offset         = true;
 };
 
 // Pools every block that completes in [first_position, first_position + tokens) into `pooled`

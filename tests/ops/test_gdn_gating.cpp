@@ -46,7 +46,7 @@ std::vector<double> read_fp32(const void* device, std::size_t elements) {
 
 void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
                    const std::vector<float>& a_log, const std::vector<float>& dt_bias,
-                   std::vector<double>& g, std::vector<double>& beta) {
+                   std::vector<double>& g, std::vector<double>& beta, bool a_is_log) {
     const std::size_t heads = a_log.size();
     g.resize(a.size());
     beta.resize(b.size());
@@ -55,15 +55,15 @@ void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
         const double av        = static_cast<double>(a[i]);
         const double bv        = static_cast<double>(b[i]);
         const double bias      = static_cast<double>(dt_bias[head]);
-        const double scale     = std::exp(static_cast<double>(a_log[head]));
-        g[i]                   = -scale * softplus(av + bias);
+        const double scale = a_is_log ? -std::exp(static_cast<double>(a_log[head])) : a_log[head];
+        g[i]               = scale * softplus(av + bias);
         beta[i]                = sigmoid(bv);
     }
 }
 
 // `heads`: 48 for a whole layer, fewer for a tensor-parallel rank's share.
 int run_case(std::int32_t heads, std::int32_t tokens, std::uint32_t seed,
-             bool stress_transcendentals) {
+             bool stress_transcendentals, bool a_is_log = true) {
     const std::size_t elements = static_cast<std::size_t>(heads) * tokens;
     std::vector<float> a(elements), b(elements), a_log(heads), dt_bias(heads);
     fill_uniform(a, seed, -8.0F, 8.0F);
@@ -77,11 +77,17 @@ int run_case(std::int32_t heads, std::int32_t tokens, std::uint32_t seed,
             b[i] = values[(i / 5) % 5];
         }
     }
+    if (!a_is_log) {
+        for (auto& value : a_log) value = -std::exp(value);
+        a_log[0]   = -1.0e-30f;
+        dt_bias[0] = 0.0f;
+        a[0]       = 1.0e30f;
+    }
     round_to_bf16(a);
     round_to_bf16(b);
 
     std::vector<double> reference_g, reference_beta;
-    gating_oracle(a, b, a_log, dt_bias, reference_g, reference_beta);
+    gating_oracle(a, b, a_log, dt_bias, reference_g, reference_beta, a_is_log);
 
     const std::vector<std::uint16_t> a_bits = bf16_bits(a);
     const std::vector<std::uint16_t> b_bits = bf16_bits(b);
@@ -102,13 +108,18 @@ int run_case(std::int32_t heads, std::int32_t tokens, std::uint32_t seed,
     Tensor tensor_beta(device_beta.data(), DType::FP32, {heads, tokens});
 
     ops::gdn_gating(tensor_a, tensor_b, tensor_a_log, tensor_dt_bias, tensor_g, tensor_beta,
-                    nullptr);
+                    nullptr, a_is_log);
     cuda_synchronize();
 
-    const std::string label = std::string("gdn_gating H=") + std::to_string(heads) + " T=" +
-                              std::to_string(tokens) +
-                              (stress_transcendentals ? " transcendental-range" : "");
+    const std::string label = std::string("gdn_gating H=") + std::to_string(heads) +
+                              " T=" + std::to_string(tokens) +
+                              (stress_transcendentals ? " transcendental-range" : "") +
+                              (a_is_log ? "" : " direct coefficient");
     int failures = 0;
+    if (!a_is_log)
+        failures += verify_exact((label + " tiny coefficient").c_str(),
+                                 from_device<float>(device_g.data(), 1),
+                                 std::vector<float>{static_cast<float>(reference_g[0])});
     failures += verify_pointwise((label + " g").c_str(), read_fp32(device_g.data(), elements),
                                  reference_g, kGdnGatingFp32);
     failures += verify_pointwise((label + " beta").c_str(), read_fp32(device_beta.data(), elements),
@@ -142,6 +153,8 @@ int main() {
     failures += run_case(48, 17, 0x505u, true);
     failures += run_case(24, 7, 0x606u, false);
     failures += run_case(18, 129, 0x707u, false);
+    failures += run_case(48, 1, 0x808u, false, false);
+    failures += run_case(48, 17, 0x909u, true, false);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating correctness\n";
     return failures == 0 ? 0 : 1;

@@ -49,6 +49,10 @@ releases have no Q4_K experts.
 
 ## Convert
 
+For an existing Flash-Next `.basalt` pack, use the [Basalt converter](basalt-conversion.md).
+It preserves the pack's Q8PLE, dense overrides, experts, MTP and Vision components instead of
+assembling the published donor combination below.
+
 `--model` needs only the HF checkpoint's configuration and tokenizer files (`config.json`,
 `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`) from
 [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next).

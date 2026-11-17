@@ -11,6 +11,7 @@ VisionWeights bind_vision(Bindings& bindings, const VisionConfig& config,
     struct {
         Bindings& bindings;
         artifact::Residency residency;
+        QType direct_format;
 
         WeightId parameter(std::string name, artifact::Shape shape,
                            std::vector<std::string> inputs) const {
@@ -19,9 +20,9 @@ VisionWeights bind_vision(Bindings& bindings, const VisionConfig& config,
         }
 
         WeightId direct(std::string name, artifact::Shape shape) const {
-            return bindings.direct(std::move(name), std::move(shape), QType::BF16, residency);
+            return bindings.direct(std::move(name), std::move(shape), direct_format, residency);
         }
-    } const b{bindings, residency};
+    } const b{bindings, residency, config.direct_format};
     VisionWeights out;
     out.patch_embedding =
         b.parameter("vision/patch_embedding", {h, config.patch_width()}, {"vision/patch_input"});

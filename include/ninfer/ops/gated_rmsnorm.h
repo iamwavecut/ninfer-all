@@ -17,8 +17,8 @@ enum class GateActivation : unsigned char { Silu, Sigmoid };
  *
  * where act is SiLU(z) = z / (1 + exp(-z)) or sigmoid(z) = 1 / (1 + exp(-z)) as `gate` selects.
  *
- * `x`, `z`, and `out` are same-shaped contiguous BF16 tensors, `weight` is contiguous BF16 [D],
- * and eps is positive and finite. This form does not apply a unit offset to weight. Inputs and
+ * `x`, `z`, and `out` are same-shaped contiguous BF16 tensors, `weight` is contiguous BF16 or FP32
+ * [D], and eps is positive and finite. This form does not apply a unit offset to weight. Inputs and
  * output must not overlap. The oracle evaluates `ideal` naively in FP64 from the represented
  * inputs. The BF16 output is promoted and compared directly with that result; output storage
  * rounding belongs to the Op's numerical criterion, not the oracle. Kernel reduction, staging,

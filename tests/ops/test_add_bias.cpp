@@ -32,32 +32,38 @@ std::vector<double> add_bias_oracle(const std::vector<float>& bias,
     return expected;
 }
 
-int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::uint32_t seed) {
+int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::uint32_t seed,
+             bool fp32_bias = false) {
     const std::size_t count = static_cast<std::size_t>(rows) * columns;
     std::vector<float> bias(rows), input(count);
     fill_uniform(bias, seed, -2.0f, 2.0f);
     fill_uniform(input, seed + 1, -8.0f, 8.0f);
-    round_to_bf16(bias);
+    if (!fp32_bias) { round_to_bf16(bias); }
     round_to_bf16(input);
 
     const auto expected   = add_bias_oracle(bias, input);
     const auto bias_bits  = encode_bf16(bias);
     const auto input_bits = encode_bf16(input);
-    GuardedDeviceBuffer device_bias(bias_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_bias(bias.size() *
+                                    (fp32_bias ? sizeof(float) : sizeof(std::uint16_t)));
     GuardedDeviceBuffer device_input(input_bits.size() * sizeof(std::uint16_t));
-    device_bias.copy_from_host(bias_bits.data(), device_bias.bytes());
+    device_bias.copy_from_host(fp32_bias ? static_cast<const void*>(bias.data()) : bias_bits.data(),
+                               device_bias.bytes());
     device_input.copy_from_host(input_bits.data(), device_input.bytes());
 
-    Tensor bias_tensor(device_bias.data(), DType::BF16, {rows});
+    Tensor bias_tensor(device_bias.data(), fp32_bias ? DType::FP32 : DType::BF16, {rows});
     Tensor input_tensor(device_input.data(), DType::BF16, {rows, columns});
     ops::add_bias(bias_tensor, input_tensor, nullptr);
     cuda_synchronize();
 
     int failures = verify_pointwise(label, from_device_bf16(device_input.data(), count), expected,
                                     add_bias_bf16_criterion());
-    failures +=
-        verify_exact("add_bias bias unchanged",
-                     from_device<std::uint16_t>(device_bias.data(), bias_bits.size()), bias_bits);
+    failures += fp32_bias
+                    ? verify_exact("add_bias bias unchanged",
+                                   from_device<float>(device_bias.data(), bias.size()), bias)
+                    : verify_exact("add_bias bias unchanged",
+                                   from_device<std::uint16_t>(device_bias.data(), bias_bits.size()),
+                                   bias_bits);
     failures += device_bias.verify_guards("add_bias bias");
     failures += device_input.verify_guards("add_bias input");
     return failures;
@@ -75,6 +81,9 @@ int main() {
     failures += run_case("add_bias [1152,1]", 1152, 1, 101u);
     failures += run_case("add_bias [3456,64]", 3456, 64, 201u);
     failures += run_case("add_bias [4304,257]", 4304, 257, 301u);
+    failures += run_case("add_bias FP32 [1152,1]", 1152, 1, 401u, true);
+    failures += run_case("add_bias FP32 [3456,64]", 3456, 64, 501u, true);
+    failures += run_case("add_bias FP32 [4304,257]", 4304, 257, 601u, true);
     std::cout << (failures ? "FAIL" : "OK") << " add_bias\n";
     return failures ? 1 : 0;
 }

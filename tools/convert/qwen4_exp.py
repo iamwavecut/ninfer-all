@@ -103,6 +103,13 @@ def text_config(source: dict) -> dict:
     if type(tied) is not bool:
         raise ValueError("text.tie_word_embeddings must be boolean")
     result["tie_word_embeddings"] = tied
+    for key, default in (("fp32_direct", False), ("norm_unit_offset", True),
+                         ("hc_prefill_inject", False), ("gdn_a_is_log", True),
+                         ("expert_output_scales", False)):
+        if key in raw:
+            if type(raw[key]) is not bool:
+                raise ValueError(f"text.{key} must be boolean")
+            result[key] = raw[key]
     result["rms_norm_eps"] = _f32(raw.get("rms_norm_eps", 1e-6), "text.rms_norm_eps")
     result["eos_token_id"] = _nonnegative(raw.get("eos_token_id"), "text.eos_token_id")
     if result["eos_token_id"] >= result["vocab_size"]:
@@ -158,6 +165,8 @@ def text_config(source: dict) -> dict:
         raise ValueError("text.ple_embed_dim must divide among the n-gram heads")
     latent = latent_moe_config(raw)
     if latent is not None:
+        if result.get("expert_output_scales", False):
+            raise ValueError("text.expert_output_scales requires ordinary, not latent experts")
         if latent["groups"] > result["num_experts"]:
             raise ValueError("text.latent_moe.groups exceeds the expert count")
         result["latent_moe"] = latent
@@ -207,6 +216,9 @@ def _hyper_connection(builder, prefix, source_prefix, store, config, *, inject):
     if inject:
         builder.add(prefix + "inject", store, source_prefix + "block_inject_weight.weight",
                     (config["hc_count"], width), inputs=(prefix + "normalized",))
+        if config.get("hc_prefill_inject", False):
+            builder.add(prefix + "prefill_inject", store, source_prefix + "block_inject_weight.weight",
+                        (config["hc_count"], width), inputs=(prefix + "normalized",))
 
 
 def _indexer(builder, prefix, source_prefix, store, config):
@@ -456,10 +468,22 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
             _indexer(builder, p, sp, base, config)
         else:
             builder.gdn(p, sp, base, config)
+            if not config.get("gdn_a_is_log", True):
+                from dataclasses import replace
+                parameter = model.parameters.pop(p + "gdn/a_log")
+                model.add(replace(parameter, name=p + "gdn/decay"))
         if "latent_moe" in config:
             _latent_moe(builder, p, sp, base, config)
         else:
             builder.moe(p, sp, base, config)
+            if config.get("expert_output_scales", False):
+                from .model import Parameter
+                from .sources.logical import LogicalSource
+                name, shape = p + "moe/expert_scales", (config["num_experts"], 3)
+                def unavailable(begin, end, name=name):
+                    raise ValueError(f"{name}: the recipe must supply stored expert scales")
+                model.add(Parameter(name, shape, LogicalSource(shape, name, unavailable), None,
+                                    (), "fp32", residency="text"))
         if i in config["ple_layers"]:
             _ple(builder, p, sp, base, config)
     if "vision" in selected:
@@ -468,6 +492,12 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
         _mtp(builder, mtp_store, config, records["mtp"]["config"]["num_experts"])
     if "ngram" in selected and "ngram" in records:
         _ngram_table(model)
+    if config.get("fp32_direct", False):
+        from dataclasses import replace
+        for name, parameter in model.parameters.items():
+            role = name.rsplit("/", 1)[-1]
+            if name.startswith(("text/", "mtp/")) and ("norm" in role or role == "convolution"):
+                model.parameters[name] = replace(parameter, direct_format="fp32")
     add_profile(model)
     return model
 

@@ -35,18 +35,21 @@ std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
 
 struct Inputs {
     std::vector<float> stack, key, value, norm_key, norm_query, norm_conv, conv, history;
+    bool unit_offset = true;
 };
 
 // Advances `stack` and `history` (FP64) through `tokens` positions starting at `first`.
 void oracle(const Inputs& in, int first, int tokens, std::vector<double>& stack,
             std::vector<double>& history) {
-    const auto groupnorm = [](const std::vector<double>& x, const std::vector<float>& w) {
+    const auto groupnorm = [&](const std::vector<double>& x, const std::vector<float>& w) {
         std::vector<double> out(kWidth);
         for (int c = 0; c < kStreams; ++c) {
             double sum = 0;
             for (int d = 0; d < kHidden; ++d) sum += x[c * kHidden + d] * x[c * kHidden + d];
             const double scale = 1.0 / std::sqrt(sum / kHidden + double(kEps));
-            for (int d = 0; d < kHidden; ++d) out[c * kHidden + d] = x[c * kHidden + d] * scale * (1.0 + w[c * kHidden + d]);
+            for (int d = 0; d < kHidden; ++d)
+                out[c * kHidden + d] = x[c * kHidden + d] * scale *
+                                       ((in.unit_offset ? 1.0 : 0.0) + w[c * kHidden + d]);
         }
         return out;
     };
@@ -90,9 +93,10 @@ void oracle(const Inputs& in, int first, int tokens, std::vector<double>& stack,
     }
 }
 
-int run_case(const std::string& label, int tokens, const std::vector<int>& splits, bool zero_history,
-             bool graph, std::uint32_t seed) {
+int run_case(const std::string& label, int tokens, const std::vector<int>& splits,
+             bool zero_history, bool graph, std::uint32_t seed, bool fp32_weights = false) {
     Inputs in;
+    in.unit_offset = !fp32_weights;
     in.stack.resize(static_cast<std::size_t>(kWidth) * tokens);
     in.key.resize(static_cast<std::size_t>(kWidth) * tokens);
     in.value.resize(static_cast<std::size_t>(kHidden) * tokens);
@@ -111,16 +115,24 @@ int run_case(const std::string& label, int tokens, const std::vector<int>& split
     if (!zero_history) fill_uniform(in.history, seed + 7, -1.5f, 1.5f);
     // Token 0's key is zero: its score is exactly zero and its gate one half.
     for (int i = 0; i < kWidth; ++i) in.key[i] = 0.0f;
-    for (auto* v : {&in.key, &in.value, &in.norm_key, &in.norm_query, &in.norm_conv, &in.conv}) {
-        round_to_bf16(*v);
+    round_to_bf16(in.key);
+    round_to_bf16(in.value);
+    if (fp32_weights) {
+        for (auto* v : {&in.norm_key, &in.norm_query, &in.norm_conv})
+            for (auto& value : *v) value += 1.0f;
+        in.conv[0] = 1.0009765625f;
+    } else {
+        for (auto* v : {&in.norm_key, &in.norm_query, &in.norm_conv, &in.conv}) round_to_bf16(*v);
     }
     std::vector<double> expected_stack(in.stack.begin(), in.stack.end());
     std::vector<double> expected_history(in.history.begin(), in.history.end());
     oracle(in, 0, tokens, expected_stack, expected_history);
 
+    const auto weight_bytes = fp32_weights ? 4 : 2;
     GuardedDeviceBuffer d_stack(in.stack.size() * 4), d_key(in.key.size() * 2),
-        d_value(in.value.size() * 2), d_nk(kWidth * 2), d_nq(kWidth * 2), d_nc(kWidth * 2),
-        d_conv(in.conv.size() * 2), d_history(in.history.size() * 4);
+        d_value(in.value.size() * 2), d_nk(kWidth * weight_bytes), d_nq(kWidth * weight_bytes),
+        d_nc(kWidth * weight_bytes), d_conv(in.conv.size() * weight_bytes),
+        d_history(in.history.size() * 4);
     const auto copy_bf16 = [](GuardedDeviceBuffer& buffer, const std::vector<float>& values) {
         const auto bits = encode_bf16(values);
         buffer.copy_from_host(bits.data(), buffer.bytes());
@@ -129,16 +141,23 @@ int run_case(const std::string& label, int tokens, const std::vector<int>& split
     d_history.copy_from_host(in.history.data(), d_history.bytes());
     copy_bf16(d_key, in.key);
     copy_bf16(d_value, in.value);
-    copy_bf16(d_nk, in.norm_key);
-    copy_bf16(d_nq, in.norm_query);
-    copy_bf16(d_nc, in.norm_conv);
-    copy_bf16(d_conv, in.conv);
-    Tensor t_nk(d_nk.data(), DType::BF16, {kWidth});
-    Tensor t_nq(d_nq.data(), DType::BF16, {kWidth});
-    Tensor t_nc(d_nc.data(), DType::BF16, {kWidth});
-    Tensor t_conv(d_conv.data(), DType::BF16, {kTaps, kWidth});
+    const auto copy_weight = [&](GuardedDeviceBuffer& buffer, const std::vector<float>& values) {
+        if (fp32_weights)
+            buffer.copy_from_host(values.data(), buffer.bytes());
+        else
+            copy_bf16(buffer, values);
+    };
+    copy_weight(d_nk, in.norm_key);
+    copy_weight(d_nq, in.norm_query);
+    copy_weight(d_nc, in.norm_conv);
+    copy_weight(d_conv, in.conv);
+    const auto dtype = fp32_weights ? DType::FP32 : DType::BF16;
+    Tensor t_nk(d_nk.data(), dtype, {kWidth});
+    Tensor t_nq(d_nq.data(), dtype, {kWidth});
+    Tensor t_nc(d_nc.data(), dtype, {kWidth});
+    Tensor t_conv(d_conv.data(), dtype, {kTaps, kWidth});
     Tensor t_history(d_history.data(), DType::FP32, {kWidth, kHistory});
-    const ops::PleInjectWeights weights{&t_nk, &t_nq, &t_nc, &t_conv};
+    const ops::PleInjectWeights weights{&t_nk, &t_nq, &t_nc, &t_conv, in.unit_offset};
     WorkspaceArena workspace(ops::ple_inject_workspace_bytes(tokens));
 
     const auto run = [&](cudaStream_t stream) {
@@ -297,6 +316,9 @@ int main() {
     failures += run_case("ple_inject T=12 as 5+1+6", 12, {5, 1, 6}, false, false, 5102u);
     failures += run_case("ple_inject T=40 start", 40, {40}, true, false, 5103u);
     failures += run_case("ple_inject T=7 as 1x7 graph", 7, {1, 1, 1, 1, 1, 1, 1}, false, true, 5104u);
+    failures += run_case("ple_inject FP32 gamma/conv T=1", 1, {1}, false, false, 5110u, true);
+    failures += run_case("ple_inject FP32 gamma/conv T=12 as 5+1+6", 12, {5, 1, 6}, false, true,
+                         5111u, true);
     // Verification widths: a prefix shorter than the history window, one past it, and all of it.
     failures += run_record(4, 2, 5200u);
     failures += run_record(16, 11, 5201u);

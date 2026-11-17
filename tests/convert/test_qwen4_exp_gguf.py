@@ -297,6 +297,6 @@ def test_bf16_ssm_out_rows_take_the_grouped_column_order(tmp_path):
         source, encoded = qwen4_exp_gguf.matrix_source(
             gguf, "blk.0.ssm_out.weight", (3, k), qwen4_exp_gguf.rows(),
             gguf_blocks.tiled_input_columns())
+        grouped = source.rows(0, 3).view(torch.int16).numpy().view(np.uint16)
     assert not encoded and source.read_encoded is None
-    grouped = source.rows(0, 3).view(torch.int16).numpy().view(np.uint16)
     assert np.array_equal(grouped[:, gguf_blocks.tiled_input_columns()], words)

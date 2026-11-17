@@ -50,7 +50,7 @@ std::vector<double> layer_norm_oracle(const std::vector<float>& x, const std::ve
 }
 
 int run_case(const char* label, std::int32_t rows, std::uint32_t seed, bool near_constant = false,
-             bool bf16x2_unaligned = false) {
+             bool bf16x2_unaligned = false, bool fp32_affine = false) {
     const std::size_t n = static_cast<std::size_t>(kVisionWidth) * rows;
     std::vector<float> x(n), weight(kVisionWidth), bias(kVisionWidth);
     fill_uniform(x, seed, -4.0F, 4.0F);
@@ -65,21 +65,30 @@ int run_case(const char* label, std::int32_t rows, std::uint32_t seed, bool near
         }
     }
     round_to_bf16(x);
-    round_to_bf16(weight);
-    round_to_bf16(bias);
+    if (!fp32_affine) {
+        round_to_bf16(weight);
+        round_to_bf16(bias);
+    }
     const std::vector<double> reference = layer_norm_oracle(x, weight, bias, rows);
 
     norm::DeviceInput device_x      = norm::make_input(x, bf16x2_unaligned);
     norm::DeviceInput device_weight = norm::make_input(weight, bf16x2_unaligned);
     norm::DeviceInput device_bias   = norm::make_input(bias, bf16x2_unaligned);
+    DeviceBuffer fp32_weight, fp32_bias;
+    if (fp32_affine) {
+        fp32_weight = to_device(weight);
+        fp32_bias   = to_device(bias);
+    }
     const std::size_t leading       = bf16x2_unaligned ? sizeof(std::uint16_t) : 0;
     GuardedDeviceBuffer output(leading + n * sizeof(std::uint16_t));
     output.fill(0xff);
     void* output_data = static_cast<std::uint8_t*>(output.data()) + leading;
 
     Tensor tx(device_x.data, DType::BF16, {kVisionWidth, rows});
-    Tensor tw(device_weight.data, DType::BF16, {kVisionWidth});
-    Tensor tb(device_bias.data, DType::BF16, {kVisionWidth});
+    Tensor tw(fp32_affine ? fp32_weight.p : device_weight.data,
+              fp32_affine ? DType::FP32 : DType::BF16, {kVisionWidth});
+    Tensor tb(fp32_affine ? fp32_bias.p : device_bias.data, fp32_affine ? DType::FP32 : DType::BF16,
+              {kVisionWidth});
     Tensor tout(output_data, DType::BF16, {kVisionWidth, rows});
     ops::layer_norm(tx, tw, tb, kEps, tout, nullptr);
     cuda_synchronize();
@@ -91,6 +100,12 @@ int run_case(const char* label, std::int32_t rows, std::uint32_t seed, bool near
     failures += norm::verify_preserved(std::string(label) + " preserves x", device_x);
     failures += norm::verify_preserved(std::string(label) + " preserves weight", device_weight);
     failures += norm::verify_preserved(std::string(label) + " preserves bias", device_bias);
+    if (fp32_affine) {
+        failures += verify_exact((std::string(label) + " preserves FP32 weight").c_str(),
+                                 from_device<float>(fp32_weight, weight.size()), weight);
+        failures += verify_exact((std::string(label) + " preserves FP32 bias").c_str(),
+                                 from_device<float>(fp32_bias, bias.size()), bias);
+    }
     return failures;
 }
 
@@ -111,6 +126,10 @@ int main() {
     // Alignment is not part of the public contract; this exercises the scalar fallback at the
     // registered width rather than adding a fictitious model shape.
     failures += run_case("layer_norm unaligned [1152,7]", 7, 3202U, false, true);
+    failures += run_case("layer_norm FP32 [1152,1]", 1, 3301U, false, false, true);
+    failures += run_case("layer_norm FP32 [1152,256]", 256, 3302U, false, false, true);
+    failures += run_case("layer_norm FP32 near-constant [1152,4]", 4, 3303U, true, false, true);
+    failures += run_case("layer_norm FP32 unaligned [1152,7]", 7, 3304U, false, true, true);
 
     std::cout << (failures ? "FAIL" : "OK") << " layer_norm correctness\n";
     return failures ? 1 : 0;

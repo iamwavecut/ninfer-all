@@ -738,6 +738,13 @@ struct ExpertMisses::Impl {
                 const Piece& piece   = pieces[index];
                 auto& job            = cpu_experts[piece.job];
                 const std::size_t at = std::size_t(piece.token) * kWidth;
+                if (!layer.expert_scales.empty()) {
+                    const float* scale = layer.expert_scales.data() + 3 * std::size_t(job.expert);
+                    for (int i = 0; i < kWidth; ++i) {
+                        job.gate[at + i] *= scale[0];
+                        job.up[at + i] *= scale[1];
+                    }
+                }
                 ops::gguf_cpu_swiglu_bf16(job.gate.data() + at, job.up.data() + at, kWidth,
                                           job.middle_bf16.data() + at, backend);
                 job.middle.quantize_bf16(piece.token, job.middle_bf16.data() + at, 0, kWidth / 32);
@@ -757,6 +764,14 @@ struct ExpertMisses::Impl {
                                            down_p.rows, down_p.k};
                 ops::gguf_cpu_rows(w, job.middle, task.begin, task.end,
                                    products + std::size_t(job.first) * kHidden, kHidden, backend);
+                if (!layer.expert_scales.empty()) {
+                    const float scale = layer.expert_scales[3 * std::size_t(job.expert) + 2];
+                    for (std::size_t t = 0; t < job.tokens.size(); ++t) {
+                        for (int r = task.begin; r < task.end; ++r) {
+                            products[(std::size_t(job.first) + t) * kHidden + r] *= scale;
+                        }
+                    }
+                }
             },
             [] {}, pin);
         *static_cast<std::int32_t*>(rank.product_count->data()) = first;

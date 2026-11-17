@@ -189,12 +189,19 @@ VisionConfig vision(const Json& value) {
                     {"model_type", "depth", "hidden_size", "intermediate_size", "num_heads",
                      "patch_size", "temporal_patch_size", "spatial_merge_size",
                      "num_position_embeddings"},
-                    {}, "vision config");
+                    {"direct_format"}, "vision config");
     if (value.at("model_type") != "qwen3_5_vision" &&
         value.at("model_type") != "qwen3_5_moe_vision") {
         throw ArtifactError("unknown Vision model_type");
     }
     VisionConfig out;
+    if (value.contains("direct_format")) {
+        if (value.at("direct_format") == "fp32") {
+            out.direct_format = QType::FP32;
+        } else if (value.at("direct_format") != "bf16") {
+            throw ArtifactError("Vision direct_format must be bf16 or fp32");
+        }
+    }
     out.depth                   = dimension(value, "depth");
     out.hidden_size             = dimension(value, "hidden_size");
     out.intermediate_size       = dimension(value, "intermediate_size");

@@ -57,7 +57,7 @@ void require_same_gate_shape(const Tensor& ref, const Tensor& t, const char* lab
 } // namespace
 
 void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
-                Tensor& g, Tensor& beta, cudaStream_t stream) {
+                Tensor& g, Tensor& beta, cudaStream_t stream, bool a_is_log) {
     if (a.dtype != DType::BF16 || b.dtype != DType::BF16) {
         throw std::invalid_argument("gdn_gating: a/b must be BF16");
     }
@@ -95,7 +95,7 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
         throw std::invalid_argument("gdn_gating: all tensor data pointers must be non-null");
     }
 
-    detail::gdn_gating_launch(a, b, A_log, dt_bias, g, beta, stream);
+    detail::gdn_gating_launch(a, b, A_log, dt_bias, g, beta, stream, a_is_log);
 }
 
 } // namespace ninfer::ops

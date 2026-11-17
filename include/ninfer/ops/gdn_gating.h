@@ -11,6 +11,8 @@ namespace ninfer::ops {
  *
  *   g[h,t]    = -exp(A_log[h]) * softplus(a[h,t] + dt_bias[h])
  *   beta[h,t] = sigmoid(b[h,t]).
+ * With a_is_log=false, A_log stores the negative decay coefficient directly and g uses
+ * A_log[h] * softplus(a[h,t] + dt_bias[h]), preserving an already exponentiated weight.
  *
  * `a` and `b` are contiguous BF16 [H,T] for any H > 0 (48 for a whole layer, a tensor-parallel
  * rank's share of its value heads otherwise), `A_log` and `dt_bias` are contiguous FP32 [H], and
@@ -20,6 +22,6 @@ namespace ninfer::ops {
  * effect.
  */
 void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
-                Tensor& g, Tensor& beta, cudaStream_t stream);
+                Tensor& g, Tensor& beta, cudaStream_t stream, bool a_is_log = true);
 
 } // namespace ninfer::ops

@@ -18,11 +18,12 @@ namespace ninfer::ops {
  *
  * For one sequence of `tokens` consecutive positions: `stack` FP32 [hidden, streams, tokens],
  * `key` BF16 [streams * hidden, tokens] (key_proj of the embedding, before its norm), `value`
- * BF16 [hidden, tokens], the zero-centred norm weights `norm_key`, `norm_query`, `norm_conv` BF16
- * [streams * hidden], `conv` BF16 [taps, streams * hidden] (each channel's taps contiguous, oldest
- * first) and `history` FP32 [streams * hidden, (taps - 1) * dilation] holding the normalised
+ * BF16 [hidden, tokens], norm weights `norm_key`, `norm_query`, `norm_conv` BF16 or FP32
+ * [streams * hidden], `conv` BF16 or FP32 [taps, streams * hidden] (each channel's taps contiguous,
+ * oldest first) and `history` FP32 [streams * hidden, (taps - 1) * dilation] holding the normalised
  * convolution input of the preceding positions, oldest first (zeros at a sequence start). With
- * groupnorm(x, w)[c, d] = x[c, d] / sqrt(mean_d x[c, d]^2 + eps) * (1 + w[c * hidden + d]):
+ * groupnorm(x, w)[c, d] = x[c, d] / sqrt(mean_d x[c, d]^2 + eps) * (offset + w[c * hidden + d]),
+ * where offset is one for unit_offset and zero for stored multiplicative gamma:
  *
  *   k = groupnorm(key, norm_key),  q = groupnorm(stack, norm_query)
  *   s[c]  = sum_d k[c, d] q[c, d] / sqrt(hidden),   s'[c] = sign(s) sqrt(max(|s|, 1e-6))
@@ -40,6 +41,7 @@ struct PleInjectWeights {
     const Tensor* norm_query = nullptr;
     const Tensor* norm_conv  = nullptr;
     const Tensor* conv       = nullptr;
+    bool unit_offset         = true;
 };
 
 [[nodiscard]] std::size_t ple_inject_workspace_bytes(std::int32_t tokens);

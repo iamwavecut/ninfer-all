@@ -88,8 +88,8 @@ struct CausalConvSplitOutput3Dynamic {
 
 } // namespace detail
 
-template <class Output>
-__global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+template <class Output, class Weight = __nv_bfloat16>
+__global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const Weight* weight,
                                              const __nv_bfloat16* conv_state, Output out,
                                              std::int32_t C, std::int32_t T) {
     const std::int64_t C64      = static_cast<std::int64_t>(C);
@@ -111,10 +111,10 @@ __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_
     const __nv_bfloat16 x3    = x[in_idx];
 
     float acc = 0.0f;
-    acc += __bfloat162float(weight[c]) * __bfloat162float(x0);
-    acc += __bfloat162float(weight[C64 + c]) * __bfloat162float(x1);
-    acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(x2);
-    acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x3);
+    acc += static_cast<float>(weight[c]) * __bfloat162float(x0);
+    acc += static_cast<float>(weight[C64 + c]) * __bfloat162float(x1);
+    acc += static_cast<float>(weight[2 * C64 + c]) * __bfloat162float(x2);
+    acc += static_cast<float>(weight[3 * C64 + c]) * __bfloat162float(x3);
     *out.column(c64).at(t) = __float2bfloat16_rn(silu(acc));
 }
 
@@ -382,9 +382,9 @@ causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat
 // Batched serial-column form. One block row owns one request and one thread owns a channel, so
 // request-local state is loaded before that row publishes any snapshot. It is used for W=1 and
 // for masked B=1 widths outside the parallel small-W domain.
-template <bool Masked>
+template <bool Masked, class Weight = __nv_bfloat16>
 __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
-    const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
+    const __nv_bfloat16* x, const Weight* weight, __nv_bfloat16* conv_states,
     const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
     const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
     std::int64_t slot_stride) {
@@ -399,10 +399,10 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
     __nv_bfloat16 s0            = init[c64];
     __nv_bfloat16 s1            = init[C64 + c64];
     __nv_bfloat16 s2            = init[2 * C64 + c64];
-    const float w0              = __bfloat162float(weight[c64]);
-    const float w1              = __bfloat162float(weight[C64 + c64]);
-    const float w2              = __bfloat162float(weight[2 * C64 + c64]);
-    const float w3              = __bfloat162float(weight[3 * C64 + c64]);
+    const float w0              = static_cast<float>(weight[c64]);
+    const float w1              = static_cast<float>(weight[C64 + c64]);
+    const float w2              = static_cast<float>(weight[2 * C64 + c64]);
+    const float w3              = static_cast<float>(weight[3 * C64 + c64]);
     const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
 
     for (std::int32_t column = 0; column < width; ++column) {

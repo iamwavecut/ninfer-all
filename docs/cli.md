@@ -470,7 +470,7 @@ ninfer-serve --config configs/bonsai2-27b-dflash2.ini
 ninfer-serve --config configs/bonsai2-27b-dflash2.ini --max-context 131072 --port 9000
 ```
 
-The format is llama.cpp's preset format, which [`--models-preset`](serving.md#several-models-router)
+INI files use llama.cpp's preset format, which [`--models-preset`](serving.md#several-models-router)
 also reads:
 
 - Each line is `key = value`. The key is the option without its leading dashes, in any case. The
@@ -483,6 +483,17 @@ also reads:
   `cuda-backend` selects the portable package's CUDA backend. `version` is ignored.
 - A file has no `[section]` and no `config` key. `ninfer_bench` names its artifact with `weights`.
 - Relative paths start in the directory the program runs in, not in the file's directory.
+
+`--config` also accepts a flat JSON object with the same option names and string, number or boolean
+values. Nested objects, arrays, nulls and duplicate keys are rejected; use INI for repeated values.
+JSON files follow the same path and override rules:
+
+```json
+{"model":"models/model.ninfer","max-concurrency":2,"kv-dtype":"bf16","vision":true}
+```
+
+The [Basalt serving converter](basalt-conversion.md#serving-json) produces this format and a separate
+report for settings that need an explicit cross-engine choice.
 
 `--config` can repeat. The files apply in the order given and the command line applies last, at any
 position of `--config` on the command line. A later layer overrides an earlier one by these rules:

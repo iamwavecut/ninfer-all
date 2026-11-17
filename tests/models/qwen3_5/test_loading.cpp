@@ -451,6 +451,33 @@ void drafters_need_the_official_vocabulary() {
             "a model with its own vocabulary did not load without a drafter");
 }
 
+void vision_direct_format() {
+    artifact::Directory directory;
+    auto& config = directory.components["vision"].config;
+    config       = {{"model_type", "qwen3_5_vision"},
+                    {"depth", 1},
+                    {"hidden_size", 8},
+                    {"intermediate_size", 12},
+                    {"num_heads", 2},
+                    {"patch_size", 2},
+                    {"temporal_patch_size", 1},
+                    {"spatial_merge_size", 2},
+                    {"num_position_embeddings", 4}};
+    require(qwen::parse_vision_config(directory).direct_format == QType::BF16,
+            "existing Vision config lost its BF16 default");
+    config["direct_format"] = "fp32";
+    require(qwen::parse_vision_config(directory).direct_format == QType::FP32,
+            "Vision did not preserve FP32 direct parameters");
+    config["direct_format"] = "bf16";
+    require(qwen::parse_vision_config(directory).direct_format == QType::BF16,
+            "Vision did not accept explicit BF16 direct parameters");
+    for (const Json value : {Json("fp16"), Json(32), Json(nullptr)}) {
+        config["direct_format"] = value;
+        rejects([&] { (void)qwen::parse_vision_config(directory); },
+                "Vision accepted an invalid direct_format");
+    }
+}
+
 void invalid_model_data() {
     ModelFixture fixture;
     const Json original = fixture.file.root;
@@ -486,6 +513,7 @@ int main() {
         input_gathers();
         bf16_head_beside_gguf_blocks();
         drafters_need_the_official_vocabulary();
+        vision_direct_format();
         invalid_model_data();
         std::cout << "model config, binding, resources and Use checks passed\n";
         return 0;
