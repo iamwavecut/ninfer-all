@@ -223,6 +223,9 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--rows-per-chunk", type=int, default=512)
+    parser.add_argument("--ngram-sha256", help="require this SHA-256 of the encoded Flash-Next table before writing")
+    parser.add_argument("--compat-bf16", action="store_true",
+                        help="preservation recipe only: explicitly reproduce Basalt's BF16 compatibility casts")
     parser.add_argument(
         "--max-file-bytes",
         type=int,
@@ -230,6 +233,10 @@ def main(argv=None):
         "(default: one file)",
     )
     args = parser.parse_args(argv)
+    if args.compat_bf16 and args.recipe != "qwen3_8_flash_next_gguf_preserve":
+        raise ValueError("--compat-bf16 requires qwen3_8_flash_next_gguf_preserve")
+    if args.ngram_sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", args.ngram_sha256):
+        raise ValueError("--ngram-sha256 requires 64 hexadecimal digits")
     if "OMP_NUM_THREADS" not in os.environ:
         import torch
 
@@ -241,6 +248,8 @@ def main(argv=None):
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
         architectures = base.config.get("architectures") or [None]
+        if args.ngram_sha256 is not None and architectures[0] not in QWEN4_EXP_ARCHITECTURES:
+            raise ValueError("--ngram-sha256 requires Qwen3.8-Flash-Next")
         if is_dspine(base.config):
             if (paths or overrides or args.layers or args.proposal
                     or (args.components or "dspine") != "dspine"):
@@ -420,6 +429,11 @@ def main(argv=None):
         if build_model is build_qwen4_exp and "gguf" in paths:
             # An expert-pruned release takes the model's config with its own expert count.
             base.config = with_gguf_expert_count(base.config, paths["gguf"])
+        if args.recipe == "qwen3_8_flash_next_gguf_preserve":
+            if not flash_next or ("text" in components and "gguf" not in paths):
+                raise ValueError("the preservation recipe requires Flash-Next and --source gguf for text")
+            from .qwen4_exp_preserve import model_config
+            base.config = model_config(base.config)
         if build_model is build_qwen4_exp and "mtp" in components and isinstance(
             companions.get("mtp"), GGUFFile
         ):
@@ -433,11 +447,20 @@ def main(argv=None):
             **({"layers": args.layers} if flash_next else {}),
         )
         recipe = Recipe(model)
-        _function(args.recipe)(model, recipe, sources)
+        if args.recipe == "qwen3_8_flash_next_gguf_preserve":
+            _function(args.recipe)(model, recipe, sources, compat_bf16=args.compat_bf16)
+        else:
+            _function(args.recipe)(model, recipe, sources)
         if args.proposal:
             add_official_proposal(recipe, ranking=args.ranking, rows=args.proposal_rows)
         if args.override:
             _function(args.override)(model, recipe, sources)
+
+        if args.ngram_sha256 is not None:
+            expected = args.ngram_sha256.lower()
+            actual = model.components.get("ngram", {}).get("config", {}).get("table_sha256")
+            if actual != expected:
+                raise ValueError(f"n-gram table SHA-256 mismatch: expected {expected}, got {actual}")
 
         def progress(index, total, job):
             label = job.parameters[0]
@@ -453,6 +476,8 @@ def main(argv=None):
             "recipe": args.recipe,
             "sources": sources.provenance(),
         }
+        if args.compat_bf16:
+            provenance["compat_bf16"] = True
         if args.override:
             provenance["override"] = args.override
         if args.layers is not None:

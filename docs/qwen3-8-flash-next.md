@@ -49,6 +49,10 @@ releases have no Q4_K experts.
 
 ## Convert
 
+For native GGUF text weights plus NVIDIA's original FP8 PLE source, use the
+[preservation and DFlash2 recipe](flash-next-native-dflash2.md). It builds Q8PLE directly,
+keeps the specified Basalt operand conventions and attaches DFlash2 without a `.basalt` input.
+
 For an existing Flash-Next `.basalt` pack, use the [Basalt converter](basalt-conversion.md).
 It preserves the pack's Q8PLE, dense overrides, experts, MTP and Vision components instead of
 assembling the published donor combination below.

@@ -500,13 +500,14 @@ def column_source(
     return LogicalSource(shape, label, _flat(values, shape[1]), encoded), True
 
 
-def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, bool]]:
+def mtp_sources(gguf: GGUFFile, experts: int, *, norm_source=None) -> dict[str, tuple[LogicalSource, bool]]:
     """Every parameter of the `mtp` component from an MTP GGUF; True marks encoded block rows.
     Every norm drops its stored `1 + w`; the hyper-connection matrices are Q8_0 rows."""
 
     out: dict[str, tuple[LogicalSource, bool]] = {}
     g = f"blk.{MTP_BLOCK}."
     n = g + "nextn."
+    norm = norm_source or _norm
 
     def matrix(name: str, tensor: str, shape: tuple[int, int], select: RowMap = rows()):
         out[name] = matrix_source(gguf, tensor, shape, select)
@@ -515,7 +516,7 @@ def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, 
         out[name] = (source, False)
 
     def hc(prefix: str, stored: str, inject: bool):
-        direct(prefix + "norm", _norm(gguf, stored + "norm.weight", True))
+        direct(prefix + "norm", norm(gguf, stored + "norm.weight", True))
         out[prefix + "down"] = hc_matrix_source(gguf, stored + "down.weight", (LOWRANK, WIDTH)), True
         out[prefix + "up"] = hc_matrix_source(gguf, stored + "up.weight", (WIDTH, LOWRANK)), True
         if inject:
@@ -523,8 +524,8 @@ def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, 
                 hc_matrix_source(gguf, stored + "inject.weight", (STREAMS, WIDTH)), True
             )
 
-    direct("mtp/embedding_norm", _norm(gguf, n + "enorm.weight", True))
-    direct("mtp/hidden_norm", _norm(gguf, n + "hnorm.weight", True))
+    direct("mtp/embedding_norm", norm(gguf, n + "enorm.weight", True))
+    direct("mtp/hidden_norm", norm(gguf, n + "hnorm.weight", True))
     out["mtp/fc_embedding"] = column_source(gguf, n + "eh_proj.weight", 0, HIDDEN)
     out["mtp/fc_hidden"] = column_source(gguf, n + "eh_proj.weight", HIDDEN, 2 * HIDDEN)
     hc("mtp/final_mixer/", n + "hc_head_", inject=False)
@@ -537,13 +538,13 @@ def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, 
     matrix(a + "key", g + "attn_k.weight", (KV_ROWS, HIDDEN))
     matrix(a + "value", g + "attn_v.weight", (KV_ROWS, HIDDEN))
     matrix(a + "output", g + "attn_output.weight", (HIDDEN, QUERY_ROWS))
-    direct(a + "query_norm", _norm(gguf, g + "attn_q_norm.weight", True))
-    direct(a + "key_norm", _norm(gguf, g + "attn_k_norm.weight", True))
+    direct(a + "query_norm", norm(gguf, g + "attn_q_norm.weight", True))
+    direct(a + "key_norm", norm(gguf, g + "attn_k_norm.weight", True))
     i = p + "indexer/"
     matrix(i + "query", g + "indexer.q_proj.weight", (INDEXER_HEADS * INDEXER_DIM, HIDDEN))
     matrix(i + "key", g + "indexer.k_proj.weight", (INDEXER_DIM, HIDDEN))
-    direct(i + "query_norm", _norm(gguf, g + "indexer.q_norm.weight", True))
-    direct(i + "key_norm", _norm(gguf, g + "indexer.k_norm.weight", True))
+    direct(i + "query_norm", norm(gguf, g + "indexer.q_norm.weight", True))
+    direct(i + "key_norm", norm(gguf, g + "indexer.k_norm.weight", True))
     _moe_sources(out, gguf, g, p + "moe/", experts)
     return out
 
@@ -718,7 +719,7 @@ def configure_ngram_gguf(model, recipe, table):
                       source=source)
 
 
-def qwen3_8_flash_next_gguf(model, recipe, sources):
+def qwen3_8_flash_next_gguf(model, recipe, sources, *, preserve=False, compat_bf16=False):
     """A Qwen3.8-Flash-Next GGUF release (GSQ-RCO's two shards or a llama.cpp split) in its own
     block formats: the first shard as `--source gguf=SHARD1.gguf` (for the text component) and the
     n-gram table shard, the release's last, as `--source ngram=SHARD.gguf`, which is always read, since the model records the digest of the
@@ -739,8 +740,11 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
     if not isinstance(gguf, GGUFFile):
         raise ValueError("--source gguf must name the model's first .gguf shard")
     validate(gguf, config, model.source_layers)
+    from . import qwen4_exp_preserve as kept
     formats: dict[str, str] = {}
-    for name, (text_source, encoded) in text_sources(gguf, config, model.source_layers).items():
+    found = (kept.text_sources(gguf, model, compat_bf16=compat_bf16) if preserve
+             else text_sources(gguf, config, model.source_layers))
+    for name, (text_source, encoded) in found.items():
         formats[name] = _assign(recipe, name, text_source, encoded, model)
     if "mtp" in model.components:
         from .official_recipes import flash_next_mtp_formats
@@ -749,10 +753,15 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
         mtp = sources["mtp"]
         experts = model.components["mtp"]["config"]["num_experts"]
         if isinstance(mtp, SafetensorsSource):
+            if preserve:
+                raise ValueError("the preservation recipe requires an MTP GGUF; "
+                                 "omit MTP when attaching DFlash2")
             formats.update(flash_next_mtp_formats(model, recipe))
         elif isinstance(mtp, GGUFFile):
             validate_mtp(mtp, experts)
-            for name, (mtp_source, encoded) in mtp_sources(mtp, experts).items():
+            found_mtp = (kept.mtp_sources(mtp, experts, model, compat_bf16=compat_bf16) if preserve
+                         else mtp_sources(mtp, experts))
+            for name, (mtp_source, encoded) in found_mtp.items():
                 formats[name] = _assign(recipe, name, mtp_source, encoded, model)
         else:
             raise ValueError("--source mtp must name an MTP GGUF or HF safetensors subset")
@@ -760,9 +769,11 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
         vision = _vision_source(model, sources)
         for name, parameter in model.parameters.items():
             if name.startswith("vision/"):
-                formats[name] = parameter.direct_format
-                recipe.assign(name, format=parameter.direct_format, method=cast_direct,
-                              source=model.source(name, vision))
+                direct = preserve and not parameter.inputs
+                formats[name] = "fp32" if direct else parameter.direct_format
+                operand = model.source(name, vision)
+                recipe.assign(name, format=formats[name], method=cast_direct,
+                              source=kept.vision_source(operand) if preserve and not direct else operand)
     if set(formats) != set(model.parameters) - {"ngram/table"}:
         missing = sorted(set(model.parameters) - set(formats) - {"ngram/table"})[:5]
         raise ValueError(f"the GGUF leaves logical parameters without a source: {missing}")
@@ -785,6 +796,15 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
         _group_attention(recipe, "mtp/layer/", formats)
         _group_moe(recipe, "mtp/layer/moe/", model.components["mtp"]["config"]["num_experts"],
                    formats)
+
+
+def qwen3_8_flash_next_gguf_preserve(model, recipe, sources, *, compat_bf16=False):
+    """Keep quantized GGUF rows, stored FP32 norms, native decay and Basalt HC8 operands."""
+    if "text" in model.components and not all((model.config.get("fp32_direct"),
+            not model.config.get("norm_unit_offset", True), model.config.get("hc_prefill_inject"),
+            not model.config.get("gdn_a_is_log", True))):
+        raise ValueError("build the preservation model with qwen4_exp_preserve.model_config first")
+    qwen3_8_flash_next_gguf(model, recipe, sources, preserve=True, compat_bf16=compat_bf16)
 
 
 def qwen3_8_flash_next_gsq_q2(model, recipe, sources):
@@ -895,6 +915,7 @@ def table_digest(gguf: GGUFFile) -> str:
 
 RECIPES = {
     "qwen3_8_flash_next_gguf": qwen3_8_flash_next_gguf,
+    "qwen3_8_flash_next_gguf_preserve": qwen3_8_flash_next_gguf_preserve,
     "qwen3_8_flash_next_gsq_q2": qwen3_8_flash_next_gsq_q2,
 }
 
@@ -912,6 +933,7 @@ __all__ = [
     "with_mtp_expert_count",
     "ngram_source",
     "qwen3_8_flash_next_gguf",
+    "qwen3_8_flash_next_gguf_preserve",
     "qwen3_8_flash_next_gsq_q2",
     "table_digest",
     "text_sources",
