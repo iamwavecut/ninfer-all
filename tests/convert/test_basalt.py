@@ -524,10 +524,9 @@ def test_config_keeps_fp16_and_slot_semantics(full, per, total):
               "engine": {"max-context": 262144, "kv": "fp16", "spec": 7,
                          "resident-experts": True, "expert-cache": "auto", "prefill": "auto"}}
     out, report = translate(source, "model.ninfer", has_mtp=True)
-    assert "kv-dtype" not in out and out["max-context"] == per and out["kv-capacity"] == total
+    assert out["kv-dtype"] == "fp16" and out["max-context"] == per and out["kv-capacity"] == total
     assert out["spec"] == "mtp" and out["draft-tokens"] == 6 and out["draft-min-p"] == 0
-    assert set(report["unresolved"]) == {"kv"}
-    assert report["unresolved"]["kv"]["value"] == "fp16"
+    assert not report["unresolved"]
 
 
 def test_config_reports_unknowns_and_preserves_model_precedence():

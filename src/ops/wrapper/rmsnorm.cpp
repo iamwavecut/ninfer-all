@@ -49,9 +49,11 @@ namespace {
 
 void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                   const Tensor* z, bool sigmoid_gate, Tensor& out, cudaStream_t stream) {
-    if (x.dtype != DType::BF16 || (weight.dtype != DType::BF16 && weight.dtype != DType::FP32) ||
-        out.dtype != DType::BF16 || (z != nullptr && z->dtype != DType::BF16)) {
-        throw std::invalid_argument("rmsnorm: x/z/out must be BF16; weight must be BF16 or FP32");
+    if ((x.dtype != DType::BF16 && x.dtype != DType::FP32) || out.dtype != x.dtype ||
+        (weight.dtype != DType::BF16 && weight.dtype != DType::FP32) ||
+        (z != nullptr && (x.dtype != DType::BF16 || z->dtype != DType::BF16))) {
+        throw std::invalid_argument(
+            "rmsnorm: x/out must share BF16 or FP32; gating requires BF16; weight BF16 or FP32");
     }
     if (!(eps > 0.0f) || !std::isfinite(eps)) {
         throw std::invalid_argument("rmsnorm: eps must be positive and finite");

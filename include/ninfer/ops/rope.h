@@ -37,8 +37,10 @@ namespace ninfer::ops {
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
           cudaStream_t stream);
 
-// Single-tensor form with the same formula and storage contract. The head count comes directly
-// from x; Q versus K role does not change the transformation.
+// Single-tensor form with the same formula and storage contract, also accepting FP32 at
+// D256/R64 for Text 1-D and Text MRoPE, including YaRN. FP32 output stays FP32; unrotated
+// dimensions remain bit-exact. The head count comes directly from x; Q versus K role does not
+// change the transformation. The pair form remains BF16.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream);
 
 /**

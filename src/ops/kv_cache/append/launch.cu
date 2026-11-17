@@ -110,10 +110,20 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     const std::int64_t elements = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
                                   (kKVCacheAppendFullHeadDim / VecElems);
     const int fill_grid = static_cast<int>(div_up(elements, static_cast<std::int64_t>(Block)));
+    if (cache.storage == KvCacheStorage::Float16) {
+        using Stored = KvKeyCodeT<KvCacheStorage::Float16>;
+        kv_cache_append_full_16bit_kernel<Geometry, Metadata, float, Stored>
+            <<<fill_grid, Block, 0, stream>>>(
+                static_cast<const float*>(k.data), static_cast<const float*>(v.data),
+                static_cast<const std::int32_t*>(positions.data), metadata,
+                static_cast<Stored*>(cache_k.data), static_cast<Stored*>(cache_v.data), tokens);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     using CacheKey   = KvKeyCodeT<KvCacheStorage::BFloat16>;
     using CacheValue = KvValueCodeT<KvCacheStorage::BFloat16>;
     assert_kv_code_planes<KvCacheStorage::BFloat16, CacheKey, CacheValue>();
-    kv_cache_append_full_bf16_kernel<Geometry, Metadata><<<fill_grid, Block, 0, stream>>>(
+    kv_cache_append_full_16bit_kernel<Geometry, Metadata><<<fill_grid, Block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
         static_cast<const std::int32_t*>(positions.data), metadata,
         static_cast<CacheKey*>(cache_k.data), static_cast<CacheValue*>(cache_v.data), tokens);

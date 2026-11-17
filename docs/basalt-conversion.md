@@ -74,19 +74,24 @@ choice determine per-request context and aggregate capacity. Seed-inclusive spec
 map to NInfer's draft count. Pack sampling defaults apply before explicit launch values. Jev uses
 NInfer's shared scheduler rather than Basalt's separate lane reservation.
 
-Some settings have different semantics. In particular, Basalt FP16 KV is not NInfer BF16 KV, and
-elastic allocation is not a fixed capacity reservation. Flash-Next Vision is resident in NInfer;
+Basalt `kv: "fp16"` maps directly to NInfer `kv-dtype: "fp16"`: FP32 key/value projections and
+key normalization/rotation, rounded once into native FP16 cache planes. Main and MTP attention
+consume those planes; remaining activation and state representations retain NInfer's conventions.
+See [native FP16 KV](qwen3-8-flash-next.md#native-fp16-kv).
+
+Some settings have different semantics. Elastic allocation is not a fixed capacity reservation.
+Flash-Next Vision is resident in NInfer;
 expert-cache sizing and host residency have their own allocation policies. These differences are
 reported rather than used to silently lower context, change precision, or select a new drafter.
 
 For a deliberate choice, name the source field with `--acknowledge SOURCE_OPTION` and provide
-the destination value with `--set TARGET_OPTION=JSON_VALUE`. For example, **only if BF16 KV is
-the desired replacement**:
+the destination value with `--set TARGET_OPTION=JSON_VALUE`. For example, to choose resident
+Vision explicitly when the source used dynamic Vision placement:
 
 ```bash
 python -m tools.convert.basalt_config serve.json --pack model.basalt \
   --artifact model.ninfer --output ninfer.json \
-  --acknowledge kv --set kv-dtype=bf16
+  --acknowledge vision --set vision=true --set vision-residency=resident
 ```
 
 Use the source-option names printed in your report; further decisions may be required. An

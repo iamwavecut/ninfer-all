@@ -95,6 +95,12 @@ EngineOptions with_expert_disk_reads(EngineOptions options) {
 // partial-sum exchange is the Qwen3.5 Program's and Flash-Next's; the other families divide only
 // their routed experts and sum them their own way.
 EngineOptions with_family_attention(EngineOptions options) {
+    if (options.kv_cache == KvCacheStorage::Float16 &&
+        !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        throw std::invalid_argument(
+            "--kv-dtype fp16 requires Qwen4ExpForCausalLM (Flash-Next/Edge0); other families keep "
+            "their existing cache profiles");
+    }
     if ((options.tensor_attention != TensorAttention::Heads || options.invariant_attention) &&
         own_family_artifact(options.artifact_path)) {
         throw std::invalid_argument(

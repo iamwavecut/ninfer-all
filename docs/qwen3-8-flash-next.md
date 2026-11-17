@@ -560,6 +560,27 @@ practical use. On the Q2_0 release it nearly doubles WikiText-2 perplexity, 2.66
 fourteen windows of the comparison below; short factual answers survive, but nothing measured
 improves.
 
+### Native FP16 KV
+
+`--kv-dtype fp16` selects IEEE binary16 K/V storage for Flash-Next and Edge0. The default remains
+`bf16`; this option changes runtime cache precision, independent of the artifact's expert and
+n-gram formats. It also accepts the flat launch setting `"kv-dtype": "fp16"`.
+
+Key/value projections output FP32; key RMSNorm and RoPE stay FP32 until append rounds K and V
+once, nearest-even, into FP16. Sparse attention reads those half values directly with FP32
+accumulation, without a BF16 intermediate or the quantized formats' Hadamard rotation. Main and
+MTP layers, paged storage, host streaming and tensor-parallel KV-head shares use the same path.
+Queries, residual activations, the indexer, GDN state and a DFlash2 drafter's local cache keep their
+existing representations. This follows Basalt's cache-production boundary, rather than its entire
+engine's arithmetic; it does not promise identical generated answers.
+
+FP16 and BF16 both use two bytes per value. With 12 attention layers, two KV heads and 256 values
+per head, main K/V is 24,576 bytes per token: 6 GiB for one full 262,144-position context, before
+MTP and other state. Streaming changes where those bytes reside. FP16 keeps three more fraction
+bits but has a smaller exponent range: values can underflow or overflow where BF16 would remain
+finite. The option is a precision choice, rather than a compression or speed guarantee. Other
+model families retain their existing cache paths and reject this Flash-Next option explicitly.
+
 ### Streamed sparse-attention KV
 
 Each query of a sparse-attention layer reads 512 blocks of four positions that the indexer selects

@@ -134,12 +134,14 @@ Projection make_projection(const Model& model, std::initializer_list<WeightId> i
     return make_projection(inputs);
 }
 
-std::size_t projection_workspace(const Projection& p, std::int32_t tokens) {
+std::size_t projection_workspace(const Projection& p, std::int32_t tokens, bool fp32_out = false) {
     std::size_t bytes = 0;
     for (const auto& piece : p.pieces) {
         std::size_t need = ops::linear_workspace_capacity_bytes(
             piece.weight.weight.qtype, piece.rows, p.k, piece.weight.policy, 1, tokens);
-        if (p.pieces.size() > 1) { need += round_up(std::uint64_t(piece.rows) * tokens * 2); }
+        if (p.pieces.size() > 1) {
+            need += round_up(std::uint64_t(piece.rows) * tokens * (fp32_out ? 4 : 2));
+        }
         bytes = std::max(bytes, need);
     }
     return bytes;
@@ -156,12 +158,13 @@ void project(const Projection& p, const Tensor& x, Tensor& out, WorkspaceArena& 
     }
     for (const auto& piece : p.pieces) {
         auto scope  = workspace.scope();
-        Tensor part = workspace.alloc(DType::BF16, {piece.rows, tokens});
+        const auto element_bytes = dtype_size(out.dtype);
+        Tensor part              = workspace.alloc(out.dtype, {piece.rows, tokens});
         ops::linear(x, piece.weight.weight, part, piece.weight.policy, workspace, stream);
-        CUDA_CHECK(cudaMemcpy2DAsync(static_cast<std::byte*>(out.data) + std::size_t(piece.row) * 2,
-                                     std::size_t(p.rows) * 2, part.data,
-                                     std::size_t(piece.rows) * 2, std::size_t(piece.rows) * 2,
-                                     tokens, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            static_cast<std::byte*>(out.data) + std::size_t(piece.row) * element_bytes,
+            std::size_t(p.rows) * element_bytes, part.data, std::size_t(piece.rows) * element_bytes,
+            std::size_t(piece.rows) * element_bytes, tokens, cudaMemcpyDeviceToDevice, stream));
     }
 }
 
@@ -193,8 +196,13 @@ void project_together(std::span<const ProjectionInto> list, const Tensor& x,
             throw std::invalid_argument("projections of one input read its width");
         }
         for (const auto& piece : into.projection->pieces) {
-            products.push_back(
-                {.weight = &piece.weight.weight, .out = into.out, .row = piece.row});
+            products.push_back({.weight   = &piece.weight.weight,
+                                .out      = into.out,
+                                .row      = piece.row,
+                                .f32      = into.out->dtype == DType::FP32
+                                                ? static_cast<float*>(into.out->data)
+                                                : nullptr,
+                                .f32_rows = into.out->dtype == DType::FP32 ? into.out->ne[0] : 0});
         }
     }
     ops::detail::gguf_project(x, products, workspace, stream);
@@ -202,11 +210,14 @@ void project_together(std::span<const ProjectionInto> list, const Tensor& x,
 
 // The workspace project_together needs for these projections at up to `tokens` columns.
 std::size_t projections_workspace(std::initializer_list<const Projection*> list,
-                                  std::int32_t tokens) {
+                                  std::int32_t tokens,
+                                  std::span<const Projection* const> fp32_outputs = {}) {
     std::size_t bytes = 0;
     std::vector<ops::detail::GgufShape> shapes;
     for (const Projection* p : list) {
-        bytes = std::max(bytes, projection_workspace(*p, tokens));
+        const bool fp32 =
+            std::find(fp32_outputs.begin(), fp32_outputs.end(), p) != fp32_outputs.end();
+        bytes = std::max(bytes, projection_workspace(*p, tokens, fp32));
         if (!gguf_projection(*p)) { continue; }
         for (const auto& piece : p->pieces) {
             shapes.push_back({piece.weight.weight.qtype, piece.rows, p->k});
@@ -1891,12 +1902,16 @@ struct Executor::Impl {
                                         true, 1, t));
             }
             if (plan.qsa) {
-                bytes = std::max({bytes,
-                                  projections_workspace({&plan.qsa->query, &plan.qsa->gate,
-                                                         &plan.qsa->key, &plan.qsa->value,
-                                                         &plan.qsa->index},
-                                                        t),
-                                  projection_workspace(plan.qsa->output, t)});
+                std::array<const Projection*, 2> fp32_outputs{};
+                if (options.kv_cache == KvCacheStorage::Float16) {
+                    fp32_outputs = {&plan.qsa->key, &plan.qsa->value};
+                }
+                bytes = std::max(
+                    {bytes,
+                     projections_workspace({&plan.qsa->query, &plan.qsa->gate, &plan.qsa->key,
+                                            &plan.qsa->value, &plan.qsa->index},
+                                           t, fp32_outputs),
+                     projection_workspace(plan.qsa->output, t)});
                 bytes = std::max({bytes,
                                   ops::qsa_indexer_select_workspace_bytes(
                                       t, static_cast<std::int32_t>(pooled_slots)),
@@ -1972,6 +1987,8 @@ struct Executor::Impl {
                             options.tensor_parallel_prompt_partials == TensorParallelPartials::Fp32;
         const std::uint64_t h     = config.hidden_size;
         const std::uint64_t width = std::uint64_t(config.hc_count) * h;
+        // Flash-Next FP32 K/V plus BF16 index projections occupy 5,376 bytes/column;
+        // even the 6,144-row BF16 floor below covers them and the FP32 key-norm plane.
         const std::uint64_t plane = std::max<std::uint64_t>(width, 6144); // widest BF16 plane rows
         const std::uint64_t row_b = options.ngram ? ops::ngram_row_bytes(options.ngram->format) : 0;
         if (tensor()) {
@@ -3526,13 +3543,15 @@ struct Executor::Impl {
 
     [[nodiscard]] static bool gguf_only(const Projection& p) { return gguf_projection(p); }
 
-    // The parts' columns of `out` (BF16 [p.rows, *]) <- p's projection of those of `x` (BF16
+    // The parts' columns of `out` (output_type [p.rows, *]) <- p's projection of those of `x` (BF16
     // [p.k, *]), a call per group of projection_groups.
     static void project_columns(const Projection& p, void* x, void* out,
-                                std::span<const Part> parts, WorkspaceArena& ws, cudaStream_t s) {
+                                std::span<const Part> parts, WorkspaceArena& ws, cudaStream_t s,
+                                DType output_type = DType::BF16) {
         for (const ColumnRun& group : projection_groups(parts, gguf_only(p))) {
             const Tensor in(columns(x, p.k, group.column, 2), DType::BF16, {p.k, group.count});
-            Tensor o(columns(out, p.rows, group.column, 2), DType::BF16, {p.rows, group.count});
+            Tensor o(columns(out, p.rows, group.column, dtype_size(output_type)), output_type,
+                     {p.rows, group.count});
             project(p, in, o, ws, s);
         }
     }
@@ -3545,6 +3564,7 @@ struct Executor::Impl {
     struct ColumnsInto {
         const Projection* projection = nullptr;
         void* out                    = nullptr;
+        DType dtype                  = DType::BF16;
     };
     static void project_columns(std::initializer_list<ColumnsInto> list, void* x,
                                 std::span<const Part> parts, WorkspaceArena& ws, cudaStream_t s) {
@@ -3558,7 +3578,7 @@ struct Executor::Impl {
             } else if (into.projection->pieces.size() == 1) {
                 single.push_back(&into);
             } else {
-                project_columns(*into.projection, x, into.out, parts, ws, s);
+                project_columns(*into.projection, x, into.out, parts, ws, s, into.dtype);
             }
         }
         if (!single.empty()) {
@@ -3576,8 +3596,8 @@ struct Executor::Impl {
                         throw std::invalid_argument("projections of one input read its width");
                     }
                     const std::int32_t rows = c->projection->rows;
-                    outs.push_back(Tensor(columns(c->out, rows, group.column, 2), DType::BF16,
-                                          {rows, group.count}));
+                    outs.push_back(Tensor(columns(c->out, rows, group.column, dtype_size(c->dtype)),
+                                          c->dtype, {rows, group.count}));
                 }
                 for (std::size_t i = 0; i < outs.size(); ++i) {
                     const auto& operand = single[i]->projection->pieces.front().weight;
@@ -3599,8 +3619,8 @@ struct Executor::Impl {
             into.clear();
             for (const ColumnsInto* c : gguf) {
                 const std::int32_t rows = c->projection->rows;
-                outs.push_back(Tensor(columns(c->out, rows, group.column, 2), DType::BF16,
-                                      {rows, group.count}));
+                outs.push_back(Tensor(columns(c->out, rows, group.column, dtype_size(c->dtype)),
+                                      c->dtype, {rows, group.count}));
             }
             for (std::size_t i = 0; i < outs.size(); ++i) {
                 into.push_back({gguf[i]->projection, &outs[i]});
@@ -3827,10 +3847,15 @@ struct Executor::Impl {
         void* attention = nullptr;
     };
 
+    [[nodiscard]] DType kv_input_type() const {
+        return options.kv_cache == KvCacheStorage::Float16 ? DType::FP32 : DType::BF16;
+    }
+
     [[nodiscard]] QsaPlanes qsa_planes(const QsaPlan& a, const RankState& rank, std::int32_t t,
                                        void* index) const {
         const std::uint64_t kv_bytes =
-            round_up(std::uint64_t(config.head_dim) * std::uint64_t(a.kv_heads) * std::uint64_t(t) * 2);
+            round_up(std::uint64_t(config.head_dim) * std::uint64_t(a.kv_heads) * std::uint64_t(t) *
+                     dtype_size(kv_input_type()));
         auto* kv = static_cast<std::byte*>(rank.c);
         return {.q         = rank.a,
                 .gate      = rank.b,
@@ -3861,22 +3886,25 @@ struct Executor::Impl {
         const auto d         = static_cast<std::int32_t>(config.head_dim);
         const auto nk        = a.kv_heads;
         const auto nq        = query_heads(a);
+        const auto kv_type   = kv_input_type();
+        const auto kv_bytes  = dtype_size(kv_type);
         project_columns({{&a.query, p.q},
                          {&a.gate, p.gate},
-                         {&a.key, p.k},
-                         {&a.value, p.v},
+                         {&a.key, p.k, kv_type},
+                         {&a.value, p.v, kv_type},
                          {&a.index, p.index}},
                         rank.mixed, parts, ws, s);
         // The parts' columns; a media prompt's three-axis positions hold every column of the pass.
         const ColumnRun span = mrope ? ColumnRun{.column = 0, .count = t} : covered(parts);
         Tensor q3(columns(p.q, d * nq, span.column, 2), DType::BF16, {d, nq, span.count});
-        Tensor k3(columns(p.k, d * nk, span.column, 2), DType::BF16, {d, nk, span.count});
+        Tensor k3(columns(p.k, d * nk, span.column, kv_bytes), kv_type, {d, nk, span.count});
         Tensor qo(columns(p.qo, d * nq, span.column, 2), DType::BF16, {d, nq, span.count});
-        Tensor ko(columns(p.ko, d * nk, span.column, 2), DType::BF16, {d, nk, span.count});
+        Tensor ko(columns(p.ko, d * nk, span.column, kv_bytes), kv_type, {d, nk, span.count});
         const ops::RopeYarn& yarn = options.rope_yarn;
         // A tensor-parallel share of the heads leaves the fused norm and rotation's head counts.
         const bool share = nk != static_cast<std::int32_t>(config.num_key_value_heads);
-        if (mrope || yarn.active() || share || config.fp32_direct || !config.norm_unit_offset) {
+        if (mrope || yarn.active() || share || config.fp32_direct || !config.norm_unit_offset ||
+            kv_type == DType::FP32) {
             // A media prompt: the three-axis positions of its images and video, each pair of
             // rotated dimensions on axis i % 3 (the interleaved MRoPE sections). Under YaRN, text
             // too: the fused norm and rotation fixes the unscaled one, so the rotation is its own
@@ -3890,6 +3918,9 @@ struct Executor::Impl {
             if (yarn.active()) {
                 ops::rope(mrope ? axes : line, rotary, config.rope_theta, yarn, qo, s);
                 ops::rope(mrope ? axes : line, rotary, config.rope_theta, yarn, ko, s);
+            } else if (kv_type == DType::FP32) {
+                ops::rope(mrope ? axes : line, rotary, config.rope_theta, qo, s);
+                ops::rope(mrope ? axes : line, rotary, config.rope_theta, ko, s);
             } else {
                 ops::rope(mrope ? axes : line, rotary, config.rope_theta, qo, ko, s);
             }
@@ -3913,8 +3944,10 @@ struct Executor::Impl {
         const auto nk        = a.kv_heads;
         const auto nq        = query_heads(a);
         const Tensor qo(columns(p.qo, d * nq, column, 2), DType::BF16, {d, nq, n});
-        const Tensor ko(columns(p.ko, d * nk, column, 2), DType::BF16, {d, nk, n});
-        const Tensor v3(columns(p.v, d * nk, column, 2), DType::BF16, {d, nk, n});
+        const auto kv_type  = kv_input_type();
+        const auto kv_bytes = dtype_size(kv_type);
+        const Tensor ko(columns(p.ko, d * nk, column, kv_bytes), kv_type, {d, nk, n});
+        const Tensor v3(columns(p.v, d * nk, column, kv_bytes), kv_type, {d, nk, n});
         Tensor index(in.index != nullptr ? in.index : columns(p.index, a.index.rows, column, 2),
                      DType::BF16, {a.index.rows, n});
         auto* const part_positions = const_cast<std::int32_t*>(in.positions);

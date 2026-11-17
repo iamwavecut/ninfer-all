@@ -44,6 +44,11 @@ int launch_configuration_tests() {
         std::ofstream(path) << text;
         return path.string();
     };
+    const auto half =
+        write("fp16.json", R"({"model":"model.ninfer","prompt":"hello","kv-dtype":"fp16"})");
+    failures +=
+        check(parse({"ninfer", "--config", half}).kv_cache == ninfer::KvCacheStorage::Float16,
+              "flat JSON did not preserve native FP16 selection");
     const std::string base = write("base.ini", "; a launch profile\n"
                                                "model = from-file.ninfer\n"
                                                "prompt = \"from file\"\n"
@@ -562,6 +567,13 @@ int run_tests() {
                   }),
                   "CLI accepted an unsupported DFlash2 draft count");
     }
+    failures += check(
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "fp16"}).kv_cache ==
+            ninfer::KvCacheStorage::Float16,
+        "--kv-dtype fp16 did not select native FP16 KV");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).kv_cache ==
+                          ninfer::KvCacheStorage::BFloat16,
+                      "CLI default KV storage changed");
     const ninfer::cli::Options nvfp4 =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
     failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,

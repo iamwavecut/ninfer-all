@@ -94,11 +94,12 @@ def translate(config, artifact, *, has_mtp, model_index=0, expert_bytes=None,
     notes.append("Explicit KV capacity preserves the context ceiling; NInfer budgets that pool at startup, "
                  "rather than Basalt's elastic backing borrowed from its expert-cache tail.")
     kv = take("kv", "fp16")
-    if kv == "int8":
+    if kv in ("int8", "fp16"):
         out["kv-dtype"] = kv
-        notes.append("INT8 KV precision retained; the engines' block layouts and scales differ.")
+        notes.append("Native FP16 KV selected: FP32 K/V projections and key norm/RoPE, rounded once on append."
+                     if kv == "fp16" else "INT8 KV precision retained; the engines' block layouts and scales differ.")
     else:
-        issue("kv", kv, "No identical KV codec. NInfer's BF16 is not FP16; choose --set kv-dtype=... "
+        issue("kv", kv, "No matching KV codec. Choose --set kv-dtype=... "
               "explicitly rather than silently changing precision.", ("kv-dtype",))
     window = integer(take("spec", 8 if has_mtp else 0), "spec", 0, 8)
     if window > 1 and not has_mtp:

@@ -22,7 +22,10 @@ struct KVCacheAppendPrefixExecutionEnvelope {
 /**
  * Append every K/V row to single-sequence paged growing-cache storage.
  *
- * k/v are contiguous BF16 [256,4|2,T] and positions is contiguous sequential device I32 [T].
+ * k/v are contiguous BF16 [256,1..4,T] and positions is contiguous sequential device I32 [T].
+ * Float16 storage instead requires FP32 k/v of the same shape and rounds each value directly
+ * to IEEE binary16, nearest-even, once at append (including IEEE overflow and subnormals).
+ * Both planes are FP16, without scales or key rotation; no BF16 intermediate is introduced.
  * BF16 cache mode copies K and V bit-for-bit; both planes are BF16. INT8-G64 cache rows
  * use one scale for each contiguous 64-value group. For codec input values x, the persistent
  * INT8 group encoding is
@@ -99,14 +102,15 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * order is ops/kv_cache/e8_root_codec.cuh's; decode yields eight int8 codes times s.
  *
  * KvCacheStorage::Bf16Packed (bf16p) is exact: each D256 K and V row of BF16 values is stored as
- * 256 bytes of sign and 7 fraction bits, 128 bytes of 4-bit exponent offsets from the row's base and
- * an 8-byte side record of the base, the escape count and up to six escaped exponents
- * (ops/kv_cache/bf16p_codec.cuh). Decoding yields the appended BF16 bits. A row whose exponents need
- * more escapes is stored as the poison row, which decodes to BF16 NaN everywhere.
+ * 256 bytes of sign and 7 fraction bits, 128 bytes of 4-bit exponent offsets from the row's base
+ * and an 8-byte side record of the base, the escape count and up to six escaped exponents
+ * (ops/kv_cache/bf16p_codec.cuh). Decoding yields the appended BF16 bits. A row whose exponents
+ * need more escapes is stored as the poison row, which decodes to BF16 NaN everywhere.
  *
- * V uses represented BF16 source values directly as x under every profile, including rk8v4: values
- * are never rotated, so no inverse preparation is applied to the attention output. For every
- * quantized profile, K is a paired physical representation for causal Attention: its
+ * Except for Float16's FP32 source, V starts from represented BF16 source values. Values remain
+ * unrotated except under NVFP4 and K8V4, which apply the same fixed orthogonal preparation as K
+ * and its inverse to the attention output. For every quantized profile, K is a paired physical
+ * representation for causal Attention: its
  * implementation-owned fixed orthogonal preparation selects x, and the causal consumer applies the
  * matching private Q preparation. The transform and raw K code/scale bytes are not standalone
  * mathematical outputs. Standalone and

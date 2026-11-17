@@ -1,4 +1,5 @@
 #include "ninfer/engine_options.h"
+#include "core/paged_kv_storage.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <iostream>
@@ -17,6 +18,19 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
+    const auto half = ninfer::paged_kv_storage_layout(ninfer::KvCacheStorage::Float16, 256);
+    const auto bf16 = ninfer::paged_kv_storage_layout(ninfer::KvCacheStorage::BFloat16, 256);
+    failures +=
+        check(half.key.data_dtype == ninfer::DType::FP16 && half.value == half.key &&
+                  !half.key.has_scale() && half.planes_per_layer() == 2 &&
+                  half.physical_bytes_per_token_head() == 1024 &&
+                  half.physical_bytes_per_token_head() == bf16.physical_bytes_per_token_head(),
+              "native FP16 must have two unscaled half planes, with BF16's byte footprint");
+    bool geometry_rejected = false;
+    try {
+        (void)ninfer::paged_kv_storage_layout(ninfer::KvCacheStorage::Float16, 128);
+    } catch (const std::invalid_argument&) { geometry_rejected = true; }
+    failures += check(geometry_rejected, "native FP16 accepted an unsupported cache geometry");
     const ninfer::runtime::SequenceCapacityCurve curve{
         .main_page_tokens                     = 64,
         .minimum_main_page_groups             = 2,
