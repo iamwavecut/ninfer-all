@@ -19,6 +19,9 @@ enum class NgramRowFormat : std::uint8_t {
     // value i = d * kvalues_iq4nl[nibble i] with the low nibbles of the 16 bytes for values 0..15
     // and their high nibbles for 16..31 (a GGUF `per_layer_token_embd` row, byte for byte).
     Iq4Nl,
+    // Five ggml Q8_0 blocks of 32 values, 170 bytes: each an FP16 scale d followed by
+    // 32 signed int8 codes, value i = d * code i. The stored GGUF bytes are unchanged.
+    Q8_0,
 };
 
 [[nodiscard]] std::uint32_t ngram_row_bytes(NgramRowFormat format);
@@ -29,7 +32,7 @@ enum class NgramRowFormat : std::uint8_t {
  * addressed them; `embedding` is BF16 [heads * 160, tokens], head h of token t at
  * [h * 160, h * 160 + 160). The oracle decodes each stored row exactly (an FP8 code times its
  * FP16 scale in FP64) and the output is compared after its BF16 store: BF16 rows are copied
- * bit-exactly, FP8 and IQ4_NL rows round once to nearest even. No workspace or state.
+ * bit-exactly, FP8, IQ4_NL and Q8_0 rows round once to nearest even. No workspace or state.
  */
 void ngram_embed_rows(const Tensor& rows, NgramRowFormat format, std::int32_t heads,
                       Tensor& embedding, cudaStream_t stream);

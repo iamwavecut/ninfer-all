@@ -678,14 +678,14 @@ def _group_moe(recipe, m: str, experts: int, formats: dict[str, str]) -> None:
 
 
 def configure_ngram_gguf(model, recipe, table):
-    """Bind IQ4_NL table rows and record the digest of their stored bytes."""
+    """Bind IQ4_NL or Q8_0 table rows and hash their unchanged stored bytes."""
     if not isinstance(table, GGUFFile):
         raise ValueError("--source ngram must name the release's n-gram table shard (.gguf)")
     descriptor = model.components["ngram"]["config"]
     source = ngram_source(table, descriptor["rows"])
     descriptor["format"] = source.read_encoded(0, 1).format
-    if descriptor["format"] != "gguf_iq4_nl":
-        raise ValueError("the n-gram GGUF table must contain IQ4_NL rows")
+    if descriptor["format"] not in ("gguf_iq4_nl", "gguf_q8_0"):
+        raise ValueError("the n-gram GGUF table must contain IQ4_NL or Q8_0 rows")
     size = table.info(NGRAM_TENSOR).nbytes
     print(f"hashing the n-gram table ({size / 1e9:.1f} GB)", flush=True)
     descriptor["table_sha256"] = table_digest(table)
