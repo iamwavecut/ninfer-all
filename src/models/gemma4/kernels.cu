@@ -72,7 +72,8 @@ __device__ __forceinline__ float gelu_tanh(float x) {
     return 0.5f * x * (1.0f + tanhf(inner));
 }
 
-// Row kernels hold one float4 of a [hidden] row per thread (hidden % 4 == 0, hidden / 4 <= 1024).
+// Row kernels hold N float4s of a [hidden] row per thread, quads i, i + blockDim.x, ... of thread i
+// (hidden % 4 == 0, hidden / 4 <= 1024 * N). Width 2816 runs N = 1, width 5376 N = 2.
 __device__ __forceinline__ float4 load_bf16x4(const __nv_bfloat16* p) {
     const uint2 w   = *reinterpret_cast<const uint2*>(p);
     const float2 lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&w.x));
@@ -113,7 +114,8 @@ __device__ __forceinline__ float4 fixed4(const unsigned long long* p, int i) {
 
 // The q8_1 form of this thread's four values, elements 4i..4i+3 of row `row` of width k: eight
 // consecutive threads hold one 32-value block (hidden % 32 == 0 keeps every group of eight either
-// in or out of the row). Every lane of the warp calls it; `valid` lanes store.
+// in or out of the row; blockDim.x, a multiple of 32, keeps a row kernel's later quads in the same
+// groups). Every lane of the warp calls it; `valid` lanes store.
 __device__ __forceinline__ void store_q8x4(const Q8Rows& q, int k, std::int64_t row, int i, float4 v,
                                            bool valid) {
     float amax = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
@@ -139,20 +141,33 @@ __global__ void scale_kernel(float* x, std::int64_t n, float s) {
     if (i < n) { x[i] *= s; }
 }
 
+template <int N>
 __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                 int hidden, float eps, __nv_bfloat16* __restrict__ out, Q8Rows q8) {
-    const int q      = hidden >> 2, i = threadIdx.x;
+    const int q      = hidden >> 2;
     const float* row = x + std::int64_t(blockIdx.x) * hidden;
-    const float4 v   = i < q ? ld4(row, i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    // The weight is loaded before the reduction, whose barriers would hold the load behind it.
-    const float4 wv = i < q && w != nullptr ? ld4(w, i) : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
-    const float inv = rsqrtf(block_sum(dot4(v, v)) / float(hidden) + eps);
-    float4 y        = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    if (i < q) {
-        y = mul4(scale4(v, inv), wv);
-        if (out != nullptr) { store_bf16x4(out + std::int64_t(blockIdx.x) * hidden + 4 * i, y); }
+    float4 v[N], wv[N];
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const int i = threadIdx.x + j * blockDim.x;
+        v[j]        = i < q ? ld4(row, i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        // The weight is loaded before the reduction, whose barriers would hold the load behind it.
+        wv[j] = i < q && w != nullptr ? ld4(w, i) : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
     }
-    if (q8.qs != nullptr) { store_q8x4(q8, hidden, blockIdx.x, i, y, i < q); }
+    float ss = dot4(v[0], v[0]);
+#pragma unroll
+    for (int j = 1; j < N; ++j) { ss += dot4(v[j], v[j]); }
+    const float inv = rsqrtf(block_sum(ss) / float(hidden) + eps);
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const int i = threadIdx.x + j * blockDim.x;
+        float4 y    = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (i < q) {
+            y = mul4(scale4(v[j], inv), wv[j]);
+            if (out != nullptr) { store_bf16x4(out + std::int64_t(blockIdx.x) * hidden + 4 * i, y); }
+        }
+        if (q8.qs != nullptr) { store_q8x4(q8, hidden, blockIdx.x, i, y, i < q); }
+    }
 }
 
 // Block (t, head): Hq query heads then Hkv key/value heads; D/2 threads, thread i the pair
@@ -829,36 +844,58 @@ __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
 // h += rms_norm(o) * w_post; then the FFN inputs of the new h (see AttnResidualArgs). Every
 // operand is loaded before the first reduction: the reductions' barriers would otherwise hold each
 // load behind the reduction before it.
+template <int N>
 __global__ void attn_residual_kernel(AttnResidualArgs a) {
-    const int q = a.hidden >> 2, i = threadIdx.x;
+    const int q = a.hidden >> 2;
     const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
-    const float4 zero         = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const bool valid          = i < q;
-    const float4 o            = valid ? load_bf16x4(a.o + row + 4 * i) : zero;
-    const float4 h0           = valid ? ld4(a.h + row, i) : zero;
-    const float4 w_post       = valid ? ld4(a.w_post, i) : zero;
-    const float4 ffn_norm     = valid ? ld4(a.ffn_norm, i) : zero;
-    const float4 pre_norm     = valid && a.pre_norm != nullptr ? ld4(a.pre_norm, i) : zero;
-    const float4 router_scale = valid && a.router_x != nullptr ? ld4(a.router_scale, i) : zero;
-    const float inv_o = rsqrtf(block_sum(dot4(o, o)) / float(a.hidden) + a.eps);
-    float4 h = zero;
-    if (valid) {
-        h = add4(h0, mul4(scale4(o, inv_o), w_post));
-        reinterpret_cast<float4*>(a.h + row)[i] = h;
+    const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o[N], h[N], w_post[N], ffn_norm[N], pre_norm[N], router_scale[N];
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const int i     = threadIdx.x + j * blockDim.x;
+        const bool valid = i < q;
+        o[j]            = valid ? load_bf16x4(a.o + row + 4 * i) : zero;
+        h[j]            = valid ? ld4(a.h + row, i) : zero;
+        w_post[j]       = valid ? ld4(a.w_post, i) : zero;
+        ffn_norm[j]     = valid ? ld4(a.ffn_norm, i) : zero;
+        pre_norm[j]     = valid && a.pre_norm != nullptr ? ld4(a.pre_norm, i) : zero;
+        router_scale[j] = valid && a.router_x != nullptr ? ld4(a.router_scale, i) : zero;
     }
-    const float inv  = rsqrtf(block_sum(dot4(h, h)) / float(a.hidden) + a.eps);
-    const float4 n   = scale4(h, inv);
-    const float4 mlp = valid ? mul4(n, ffn_norm) : zero;
-    if (valid && a.mlp_in != nullptr) { store_bf16x4(a.mlp_in + row + 4 * i, mlp); }
-    if (a.mlp_q.qs != nullptr) { store_q8x4(a.mlp_q, a.hidden, blockIdx.x, i, mlp, valid); }
-    if (a.pre_norm != nullptr) {
-        const float4 moe = valid ? mul4(n, pre_norm) : zero;
-        if (valid && a.moe_in != nullptr) { store_bf16x4(a.moe_in + row + 4 * i, moe); }
-        if (a.moe_q.qs != nullptr) { store_q8x4(a.moe_q, a.hidden, blockIdx.x, i, moe, valid); }
+    float ss = dot4(o[0], o[0]);
+#pragma unroll
+    for (int j = 1; j < N; ++j) { ss += dot4(o[j], o[j]); }
+    const float inv_o = rsqrtf(block_sum(ss) / float(a.hidden) + a.eps);
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const int i = threadIdx.x + j * blockDim.x;
+        if (i < q) {
+            h[j] = add4(h[j], mul4(scale4(o[j], inv_o), w_post[j]));
+            reinterpret_cast<float4*>(a.h + row)[i] = h[j];
+        } else {
+            h[j] = zero;
+        }
     }
-    if (valid && a.router_x != nullptr) {
-        reinterpret_cast<float4*>(a.router_x + row)[i] =
-            scale4(mul4(n, router_scale), rsqrtf(float(a.hidden)));
+    ss = dot4(h[0], h[0]);
+#pragma unroll
+    for (int j = 1; j < N; ++j) { ss += dot4(h[j], h[j]); }
+    const float inv = rsqrtf(block_sum(ss) / float(a.hidden) + a.eps);
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const int i      = threadIdx.x + j * blockDim.x;
+        const bool valid = i < q;
+        const float4 n   = scale4(h[j], inv);
+        const float4 mlp = valid ? mul4(n, ffn_norm[j]) : zero;
+        if (valid && a.mlp_in != nullptr) { store_bf16x4(a.mlp_in + row + 4 * i, mlp); }
+        if (a.mlp_q.qs != nullptr) { store_q8x4(a.mlp_q, a.hidden, blockIdx.x, i, mlp, valid); }
+        if (a.pre_norm != nullptr) {
+            const float4 moe = valid ? mul4(n, pre_norm[j]) : zero;
+            if (valid && a.moe_in != nullptr) { store_bf16x4(a.moe_in + row + 4 * i, moe); }
+            if (a.moe_q.qs != nullptr) { store_q8x4(a.moe_q, a.hidden, blockIdx.x, i, moe, valid); }
+        }
+        if (valid && a.router_x != nullptr) {
+            reinterpret_cast<float4*>(a.router_x + row)[i] =
+                scale4(mul4(n, router_scale[j]), rsqrtf(float(a.hidden)));
+        }
     }
 }
 
@@ -1075,50 +1112,81 @@ __global__ void geglu_rows_kernel(const float* __restrict__ x, int pairs, int wi
 }
 
 // Every operand is loaded before the first reduction, as in attn_residual_kernel.
+template <int N>
 __global__ void ffn_combine_kernel(FfnCombineArgs a) {
-    const int q = a.hidden >> 2, i = threadIdx.x;
+    const int q = a.hidden >> 2;
     const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
     const float hidden = float(a.hidden);
     const float4 zero  = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const bool valid   = i < q;
-    float4 y           = valid ? load_bf16x4(a.dense + row + 4 * i) : zero;
     const bool moe     = a.moe_rows != nullptr || a.moe_fixed != nullptr;
-    const float4 w_dense = valid && a.w_dense != nullptr ? ld4(a.w_dense, i) : zero;
-    const float4 w_moe   = valid && moe ? ld4(a.w_moe, i) : zero;
-    const float4 h0      = valid ? ld4(a.h + row, i) : zero;
-    const float4 w_post  = valid ? ld4(a.w_post, i) : zero;
-    const float4 w_next  = valid && a.next_norm != nullptr ? ld4(a.next_norm, i) : zero;
-    const float scalar   = a.scalar[0];
-    float4 m             = zero;
-    if (moe && valid) {
-        if (a.moe_rows != nullptr) {
-            for (int k = 0; k < a.top_k; ++k) {
-                const std::int64_t pair = std::int64_t(blockIdx.x) * a.top_k + k;
-                m = add4(m, scale4(ld4(a.moe_rows + pair * a.hidden, i), a.moe_weights[pair]));
+    const float scalar = a.scalar[0];
+    float4 y[N], m[N], w_dense[N], w_moe[N], h[N], w_post[N], w_next[N];
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const int i      = threadIdx.x + j * blockDim.x;
+        const bool valid = i < q;
+        y[j]       = valid ? load_bf16x4(a.dense + row + 4 * i) : zero;
+        w_dense[j] = valid && a.w_dense != nullptr ? ld4(a.w_dense, i) : zero;
+        w_moe[j]   = valid && moe ? ld4(a.w_moe, i) : zero;
+        h[j]       = valid ? ld4(a.h + row, i) : zero;
+        w_post[j]  = valid ? ld4(a.w_post, i) : zero;
+        w_next[j]  = valid && a.next_norm != nullptr ? ld4(a.next_norm, i) : zero;
+        m[j]       = zero;
+        if (moe && valid) {
+            if (a.moe_rows != nullptr) {
+                for (int k = 0; k < a.top_k; ++k) {
+                    const std::int64_t pair = std::int64_t(blockIdx.x) * a.top_k + k;
+                    m[j] = add4(m[j], scale4(ld4(a.moe_rows + pair * a.hidden, i), a.moe_weights[pair]));
+                }
+            } else {
+                m[j] = fixed4(a.moe_fixed + row, i);
             }
-        } else {
-            m = fixed4(a.moe_fixed + row, i);
         }
     }
     if (a.w_dense != nullptr || moe) {
         // The dense and expert norms in one reduction.
-        const float2 ss = block_sum2(dot4(y, y), dot4(m, m));
-        if (valid) {
-            if (a.w_dense != nullptr) { y = mul4(scale4(y, rsqrtf(ss.x / hidden + a.eps)), w_dense); }
-            if (moe) { y = add4(y, mul4(scale4(m, rsqrtf(ss.y / hidden + a.eps)), w_moe)); }
+        float sy = dot4(y[0], y[0]), sm = dot4(m[0], m[0]);
+#pragma unroll
+        for (int j = 1; j < N; ++j) {
+            sy += dot4(y[j], y[j]);
+            sm += dot4(m[j], m[j]);
+        }
+        const float2 ss = block_sum2(sy, sm);
+#pragma unroll
+        for (int j = 0; j < N; ++j) {
+            if (threadIdx.x + j * blockDim.x < q) {
+                if (a.w_dense != nullptr) { y[j] = mul4(scale4(y[j], rsqrtf(ss.x / hidden + a.eps)), w_dense[j]); }
+                if (moe) { y[j] = add4(y[j], mul4(scale4(m[j], rsqrtf(ss.y / hidden + a.eps)), w_moe[j])); }
+            }
         }
     }
-    const float inv_y = rsqrtf(block_sum(dot4(y, y)) / hidden + a.eps);
-    float4 h = zero;
-    if (valid) {
-        h = scale4(add4(h0, mul4(scale4(y, inv_y), w_post)), scalar);
-        reinterpret_cast<float4*>(a.h + row)[i] = h;
+    float ss = dot4(y[0], y[0]);
+#pragma unroll
+    for (int j = 1; j < N; ++j) { ss += dot4(y[j], y[j]); }
+    const float inv_y = rsqrtf(block_sum(ss) / hidden + a.eps);
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const int i = threadIdx.x + j * blockDim.x;
+        if (i < q) {
+            h[j] = scale4(add4(h[j], mul4(scale4(y[j], inv_y), w_post[j])), scalar);
+            reinterpret_cast<float4*>(a.h + row)[i] = h[j];
+        } else {
+            h[j] = zero;
+        }
     }
     if (a.next_norm == nullptr) { return; }
-    const float inv  = rsqrtf(block_sum(dot4(h, h)) / hidden + a.eps);
-    const float4 nxt = valid ? mul4(scale4(h, inv), w_next) : zero;
-    if (valid && a.next_out != nullptr) { store_bf16x4(a.next_out + row + 4 * i, nxt); }
-    if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, valid); }
+    ss = dot4(h[0], h[0]);
+#pragma unroll
+    for (int j = 1; j < N; ++j) { ss += dot4(h[j], h[j]); }
+    const float inv = rsqrtf(block_sum(ss) / hidden + a.eps);
+#pragma unroll
+    for (int j = 0; j < N; ++j) {
+        const int i      = threadIdx.x + j * blockDim.x;
+        const bool valid = i < q;
+        const float4 nxt = valid ? mul4(scale4(h[j], inv), w_next[j]) : zero;
+        if (valid && a.next_out != nullptr) { store_bf16x4(a.next_out + row + 4 * i, nxt); }
+        if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, valid); }
+    }
 }
 
 __global__ void add_fixed_kernel(unsigned long long* sums, const unsigned long long* products,
@@ -1171,16 +1239,27 @@ void scale(float* x, std::int64_t n, float s, cudaStream_t stream) {
     check_launch("scale");
 }
 
-int row_threads(int hidden) {
-    if (hidden % 4 != 0 || hidden / 4 > 1024) {
-        throw std::invalid_argument("gemma4 row kernels: hidden must be whole float4s, at most 4096");
+// A row kernel's float4s per thread: one up to width 4096, two up to 8192.
+int row_quads(int hidden) {
+    if (hidden % 4 != 0 || hidden <= 0 || hidden / 4 > 2048) {
+        throw std::invalid_argument("gemma4 row kernels: hidden must be whole float4s, at most 8192");
     }
-    return (hidden / 4 + 31) / 32 * 32;
+    return hidden / 4 > 1024 ? 2 : 1;
+}
+
+// The block of a row kernel holding `per` float4s a thread: whole warps.
+int row_threads(int hidden, int per) {
+    return ((hidden / 4 + per - 1) / per + 31) / 32 * 32;
 }
 
 void rms_norm(const float* x, const float* w, int hidden, int tokens, float eps,
               __nv_bfloat16* out, cudaStream_t stream, Q8Rows q) {
-    rms_norm_kernel<<<tokens, row_threads(hidden), 0, stream>>>(x, w, hidden, eps, out, q);
+    const int per = row_quads(hidden);
+    if (per == 1) {
+        rms_norm_kernel<1><<<tokens, row_threads(hidden, 1), 0, stream>>>(x, w, hidden, eps, out, q);
+    } else {
+        rms_norm_kernel<2><<<tokens, row_threads(hidden, 2), 0, stream>>>(x, w, hidden, eps, out, q);
+    }
     check_launch("rms_norm");
 }
 
@@ -1313,7 +1392,12 @@ void decode_attention(const DecodeAttentionArgs& args, cudaStream_t stream) {
 }
 
 void attn_residual(const AttnResidualArgs& args, cudaStream_t stream) {
-    attn_residual_kernel<<<args.tokens, row_threads(args.hidden), 0, stream>>>(args);
+    const int per = row_quads(args.hidden);
+    if (per == 1) {
+        attn_residual_kernel<1><<<args.tokens, row_threads(args.hidden, 1), 0, stream>>>(args);
+    } else {
+        attn_residual_kernel<2><<<args.tokens, row_threads(args.hidden, 2), 0, stream>>>(args);
+    }
     check_launch("attn_residual");
 }
 
@@ -1361,7 +1445,12 @@ void geglu_rows(const float* x, int pairs, int width, __nv_bfloat16* out, cudaSt
 }
 
 void ffn_combine(const FfnCombineArgs& args, cudaStream_t stream) {
-    ffn_combine_kernel<<<args.tokens, row_threads(args.hidden), 0, stream>>>(args);
+    const int per = row_quads(args.hidden);
+    if (per == 1) {
+        ffn_combine_kernel<1><<<args.tokens, row_threads(args.hidden, 1), 0, stream>>>(args);
+    } else {
+        ffn_combine_kernel<2><<<args.tokens, row_threads(args.hidden, 2), 0, stream>>>(args);
+    }
     check_launch("ffn_combine");
 }
 
