@@ -20,7 +20,8 @@ namespace ninfer::ops {
  * as each row's input contiguous, in BF16 words or in ggml Q8_0 blocks (32 consecutive inputs of a
  * row as a binary16 scale d and 32 signed codes q, value d * q): `down` [streams * hidden,
  * lowrank], `up` [lowrank, streams * hidden], and `inject` [streams * hidden, streams] (absent for
- * the final mixer). With n = streams and xs = stack[:, :, t] flattened stream-major, the read
+ * the final mixer), each matrix in its own format. With n = streams and xs = stack[:, :, t]
+ * flattened stream-major, the read
  * computes in exact arithmetic over the represented values
  *
  *   xn[c, d]  = xs[c, d] / sqrt(mean_d xs[c, d]^2 + eps) * (offset + norm[c * hidden + d])
