@@ -59,9 +59,10 @@ release folders (`text_config.latent_moe`): each text layer's routed experts are
 groups.
 Native Qwen MoE, Gemma MoE and Flint also support host/disk expert placements, with whole-layer
 device banks beside the optional persistent cache and the same CPU share of decode misses.
-Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditionalGeneration`;
-`src/models/gemma4`, `runtime/engine/gemma4_core`) is a third explicit family converted from
-Google's QAT GGUF (or a mixed-format GGUF of the same model) with its ggml blocks kept as stored.
+Gemma 4 26B-A4B and the dense Gemma 4 31B (`Gemma4ForCausalLM`, the text component of
+`Gemma4ForConditionalGeneration`; `src/models/gemma4`, `runtime/engine/gemma4_core`) are a third
+explicit family converted from Google's QAT GGUFs (or a mixed-format GGUF of the same model) with
+their ggml blocks kept as stored.
 It shares the Qwen3.5 frontend (tokenizer, chat template, output channels and Gemma's tool-call
 markup), runs one to eight sequences in prompt chunks of 2048 tokens (narrower where memory is
 short) with an F16 KV cache or any
@@ -69,7 +70,8 @@ short) with an F16 KV cache or any
 `mtp` component, `--spec mtp`),
 encodes images and video with the release's vision tower (the artifact's `vision` component, from
 its llama.cpp mmproj; resident, streamed from pinned memory, or FP32 on CPU threads), and has no
-pipeline stages; several GPUs divide its routed experts (`--tensor-parallel`).
+pipeline stages; several GPUs divide the 26B's routed experts (`--tensor-parallel`), and the 31B,
+which has none, runs on one GPU.
 Flint (`FlintForCausalLM`; `src/models/flint`, `runtime/engine/flint_core`) is a fourth explicit
 family converted from a llama.cpp GGUF of Recursive's release (Unsloth's UD-Q4_K_XL) with its ggml
 blocks kept as stored. It shares the Qwen3.5 frontend in a Flint dialect (its pre-tokenizer, the

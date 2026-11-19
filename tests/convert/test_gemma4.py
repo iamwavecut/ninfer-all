@@ -74,13 +74,17 @@ def _q8_0(generator, rows, columns):
     return blocks.reshape(rows, -1)
 
 
-def _release(tmp_path, value_q8=False):
+DENSE = dict(enable_moe_block=False, num_experts=None, top_k_experts=None,
+             moe_intermediate_size=None)
+
+
+def _release(tmp_path, value_q8=False, dense=False):
     """A two-block Gemma 4 release: the HF text files and a GGUF in llama.cpp's naming. With
     `value_q8` the sliding block's V is Q8_0 beside Q4_0 Q and K, as a mixed-format quantization
-    stores it."""
+    stores it. With `dense` the blocks have the MLP alone, as the 31B's do."""
     hf = tmp_path / "hf"
     hf.mkdir()
-    (hf / "config.json").write_text(json.dumps(_hf_config()))
+    (hf / "config.json").write_text(json.dumps(_hf_config(**(DENSE if dense else {}))))
     vocab = {f"t{i}": i for i in range(VOCAB - 2)}
     (hf / "tokenizer.json").write_text(json.dumps({
         "model": {"type": "BPE", "vocab": vocab, "merges": []},
@@ -118,13 +122,17 @@ def _release(tmp_path, value_q8=False):
               _q4_0(generator, HIDDEN, HEADS * d))
         for name in ("attn_q_norm", "attn_k_norm"):
             vector(g + name + ".weight", (d,))
-        for name in ("attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm",
-                     "post_ffw_norm_1", "pre_ffw_norm_2", "post_ffw_norm_2"):
+        norms = ("attn_norm", "post_attention_norm", "ffn_norm", "post_ffw_norm")
+        if not dense:
+            norms += ("post_ffw_norm_1", "pre_ffw_norm_2", "post_ffw_norm_2")
+        for name in norms:
             vector(g + name + ".weight", (HIDDEN,))
         vector(g + "layer_output_scale.weight", (1,))
         block(g + "ffn_gate.weight", (WIDTH, HIDDEN), TYPE_Q4_0, _q4_0(generator, WIDTH, HIDDEN))
         block(g + "ffn_up.weight", (WIDTH, HIDDEN), TYPE_Q4_0, _q4_0(generator, WIDTH, HIDDEN))
         block(g + "ffn_down.weight", (HIDDEN, WIDTH), TYPE_Q4_0, _q4_0(generator, HIDDEN, WIDTH))
+        if dense:
+            continue
         vector(g + "ffn_gate_inp.weight", (EXPERTS, HIDDEN))
         vector(g + "ffn_gate_inp.scale", (HIDDEN,))
         vector(g + "ffn_down_exps.scale", (EXPERTS,))
@@ -186,6 +194,34 @@ def test_the_artifact_stores_the_gguf_rows_and_vectors_as_they_are(tmp_path):
         assert np.array_equal(router, stored["blk.0.ffn_gate_inp.weight"].reshape(-1))
         scale = np.frombuffer(stored_bytes("text/layers/1/moe/expert_scale"), dtype=np.float32)
         assert np.array_equal(scale, stored["blk.1.ffn_down_exps.scale"])
+
+
+def test_a_dense_release_converts_with_the_mlp_alone(tmp_path):
+    from tools.artifact.reader import Artifact
+    from tools.convert.pipeline import convert
+    from tools.convert.recipe import Recipe
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, path, stored = _release(tmp_path, dense=True)
+    output = tmp_path / "gemma.ninfer"
+    with SafetensorsSource(hf) as base, GGUFFile(path) as gguf:
+        model = gemma4.build_model(base, gguf)
+        recipe = Recipe(model)
+        gemma4.gemma4_gguf(model, recipe, {"base": base, "gguf": gguf})
+        convert(model, recipe, output, device="cpu")
+    with Artifact(output) as artifact:
+        directory = artifact.directory
+        config = directory.components["text"]["config"]
+        assert config["enable_moe_block"] is False
+        assert "num_experts" not in config
+        bindings = directory.bindings
+        assert not any("/moe/" in name or name.endswith("mlp/post_norm") for name in bindings)
+        for i in range(2):
+            down = artifact.read_object(bindings[f"text/layers/{i}/mlp/down"]["object"])
+            assert down == stored[f"blk.{i}.ffn_down.weight"].tobytes()
+            norm = artifact.read_object(bindings[f"text/layers/{i}/post_ffn_norm"]["object"])
+            assert np.array_equal(np.frombuffer(norm, dtype=np.float32),
+                                  stored[f"blk.{i}.post_ffw_norm.weight"])
 
 
 ASSISTANT = 256  # the assistant's width

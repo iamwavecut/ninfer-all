@@ -218,6 +218,20 @@ python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf --componen
 ninfer-serve --config configs/gemma4-26b-a4b.ini
 ```
 
+## Gemma 4 31B
+
+The dense 31B from the same QAT release ([Gemma 4 31B](gemma4.md#gemma-4-31b)); its 16.4 GiB of
+weights need a 24 GB card and run on one GPU.
+
+```bash
+hf download WaveCut/gemma-4-31B-it-QAT-Q4_0-MTP-NInfer-v3 gemma-4-31B-it-QAT-Q4_0-MTP-ninfer-v3.ninfer \
+  --local-dir models
+
+# One request over a 56K-token context, two drafts a round, images and video (59,392 tokens
+# is the longest with both on an RTX 3090).
+ninfer-serve --config configs/gemma4-31b.ini
+```
+
 ## Flint
 
 Unsloth's UD-Q4_K_XL GGUF as one artifact ([Flint](flint.md)); 23.4 GiB of weights fit a 32 GB card.

@@ -211,9 +211,11 @@ __global__ void pool_kernel(PoolArgs a) {
 __global__ void scatter_rows_kernel(const __nv_bfloat16* __restrict__ src, int per_unit,
                                     int width, const std::int32_t* __restrict__ rows,
                                     float* __restrict__ dst) {
-    const int t = blockIdx.x, i = threadIdx.x;
+    const int t = blockIdx.x;
     const std::int64_t row = rows[t / per_unit] + t % per_unit;
-    reinterpret_cast<float4*>(dst + row * width)[i] = load_bf16x4(src + std::int64_t(t) * width + 4 * i);
+    for (int i = threadIdx.x; i < width / 4; i += blockDim.x) {
+        reinterpret_cast<float4*>(dst + row * width)[i] = load_bf16x4(src + std::int64_t(t) * width + 4 * i);
+    }
 }
 
 } // namespace
@@ -266,7 +268,9 @@ void pool(const PoolArgs& a, cudaStream_t stream) {
 void scatter_rows(const __nv_bfloat16* src, int tokens, int per_unit, int width,
                   const std::int32_t* rows, float* dst, cudaStream_t stream) {
     if (tokens <= 0) { return; }
-    scatter_rows_kernel<<<tokens, row_threads(width), 0, stream>>>(src, per_unit, width, rows, dst);
+    // The text model's width (2816 or 5376): a loop over the row's float4s.
+    if (width % 4 != 0) { throw std::invalid_argument("gemma4 vision scatter_rows: width % 4"); }
+    scatter_rows_kernel<<<tokens, 256, 0, stream>>>(src, per_unit, width, rows, dst);
     check_launch("scatter_rows");
 }
 

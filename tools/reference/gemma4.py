@@ -1,11 +1,11 @@
-"""FP64 reference forward of Gemma 4 26B-A4B (Gemma4ForCausalLM, text) over a llama.cpp GGUF.
+"""FP64 reference forward of Gemma 4 26B-A4B and 31B (Gemma4ForCausalLM, text) over a llama.cpp GGUF.
 
 An independent transcription of the text model in transformers' modeling_gemma4.py for golden
 values: the embedding scaled by sqrt(H); per block the RMS-normed attention (sliding-window blocks
 with their own heads, full-attention blocks whose keys double as values after an unweighted RMS
 norm, proportional RoPE), the dense GeGLU MLP beside the routed experts (softmax over all experts,
-top-k renormalized, per-expert output scale), the sandwich norms and the layer scalar; then the final
-norm, the tied head and the logit soft cap. Every value is FP64 over the GGUF's exactly decoded
+top-k renormalized, per-expert output scale; the dense 31B has the MLP alone), the sandwich norms
+and the layer scalar; then the final norm, the tied head and the logit soft cap. Every value is FP64 over the GGUF's exactly decoded
 blocks, so the only difference from a real engine is the engine's own arithmetic.
 
     python -m tools.reference.gemma4 --gguf gemma-4-26B_q4_0-it.gguf --tokens ids.json \\
@@ -13,7 +13,8 @@ blocks, so the only difference from a real engine is the engine's own arithmetic
 
 `ids.json` is the token ids to run (a JSON list, <bos> first). It prints the NLL of every target
 (token i + 1 given tokens 0..i) and their total; `--out` keeps every block's output, the routed
-experts and the logits. 26 tokens take about three minutes on CPU, mostly decoding expert blocks.
+experts and the logits. 26 tokens of the 26B take about three minutes on CPU, mostly decoding
+expert blocks.
 
 `--assistant` also runs the multi-token-prediction assistant (transformers'
 Gemma4AssistantForCausalLM with SinglePositionMultiTokenCandidateGenerator): from the target's
@@ -88,8 +89,9 @@ def forward(gguf: GGUFFile, ids: list[int], layers: int | None = None) -> dict[s
     sliding = kv["gemma4.attention.sliding_window_pattern"]
     window = int(kv["gemma4.attention.sliding_window"])
     eps = float(kv["gemma4.attention.layer_norm_rms_epsilon"])
-    top_k = int(kv["gemma4.expert_used_count"])
-    width = int(kv["gemma4.expert_feed_forward_length"])
+    moe_model = "gemma4.expert_used_count" in kv
+    top_k = int(kv["gemma4.expert_used_count"]) if moe_model else 0
+    width = int(kv["gemma4.expert_feed_forward_length"]) if moe_model else 0
     cap = float(kv.get("gemma4.final_logit_softcapping", 0.0))
     blocks = int(kv["gemma4.block_count"]) if layers is None else layers
     n = len(ids)
@@ -149,6 +151,16 @@ def forward(gguf: GGUFFile, ids: list[int], layers: int | None = None) -> dict[s
         gate = m @ w.matrix(p + "ffn_gate.weight").T
         up = m @ w.matrix(p + "ffn_up.weight").T
         dense = (gelu_tanh(gate) * up) @ w.matrix(p + "ffn_down.weight").T
+        layer_scale = (
+            w.vector(p + "layer_output_scale.weight")
+            if w.has(p + "layer_output_scale.weight")
+            else np.ones(1)
+        )
+        if not moe_model:
+            # The dense model: x = (x + rms(mlp, post_ffw_norm)) * layer_scale.
+            x = (x + rms(dense, eps, w.vector(p + "post_ffw_norm.weight"))) * layer_scale
+            out[f"l_out-{il}"] = x.copy()
+            continue
         dense = rms(dense, eps, w.vector(p + "post_ffw_norm_1.weight"))
 
         router_in = rms(x, eps) / math.sqrt(hidden) * w.vector(p + "ffn_gate_inp.scale")
@@ -180,11 +192,6 @@ def forward(gguf: GGUFFile, ids: list[int], layers: int | None = None) -> dict[s
         out[f"moe_ids-{il}"] = chosen
         out[f"moe_out-{il}"] = moe.copy()
         moe = rms(moe, eps, w.vector(p + "post_ffw_norm_2.weight"))
-        layer_scale = (
-            w.vector(p + "layer_output_scale.weight")
-            if w.has(p + "layer_output_scale.weight")
-            else np.ones(1)
-        )
         x = (x + rms(dense + moe, eps, w.vector(p + "post_ffw_norm.weight"))) * layer_scale
         out[f"l_out-{il}"] = x.copy()
 
