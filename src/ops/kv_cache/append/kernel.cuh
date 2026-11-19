@@ -108,11 +108,18 @@ kv_cache_append_full_16bit_kernel(const Input* __restrict__ k, const Input* __re
             physical_page, kv_head, position & kPagedKVPageMask, d);
     if constexpr (std::is_same_v<Stored, __half>) {
         static_assert(std::is_same_v<Input, float>);
-#pragma unroll
-        for (int i = 0; i < VecElems; ++i) {
-            cache_k[cache_off + i] = __float2half_rn(k[src_off + i]);
-            cache_v[cache_off + i] = __float2half_rn(v[src_off + i]);
-        }
+        // One 16-byte store of eight halves per plane: a streamed layer's cache is pinned host
+        // memory, where two-byte stores cross the bus one by one.
+        const auto half8 = [](const float* x) {
+            const float4 low  = load_vec<float4>(x);
+            const float4 high = load_vec<float4>(x + 4);
+            return make_int4(static_cast<int>(pack_f16x2(low.x, low.y)),
+                             static_cast<int>(pack_f16x2(low.z, low.w)),
+                             static_cast<int>(pack_f16x2(high.x, high.y)),
+                             static_cast<int>(pack_f16x2(high.z, high.w)));
+        };
+        store_vec(&cache_k[cache_off], half8(&k[src_off]));
+        store_vec(&cache_v[cache_off], half8(&v[src_off]));
     } else {
         store_vec(&cache_k[cache_off], k_value);
         store_vec(&cache_v[cache_off], v_value);
