@@ -256,13 +256,15 @@ void launch_yarn(const Tensor& positions, int rotary_dim, float theta, const Rop
     const RopeYarnKernelTable table = yarn_table(rotary_dim, theta, yarn);
     const bool launched =
         k != nullptr ? launch_yarn_heads<24, 4>(positions, q, k, table, stream) ||
-                           launch_yarn_heads<16, 2>(positions, q, k, table, stream)
+                           launch_yarn_heads<16, 2>(positions, q, k, table, stream) ||
+                           launch_yarn_heads<12, 2>(positions, q, k, table, stream)
                      : launch_yarn_heads<24, 0>(positions, q, nullptr, table, stream) ||
                            launch_yarn_heads<4, 0>(positions, q, nullptr, table, stream) ||
+                           launch_yarn_heads<12, 0>(positions, q, nullptr, table, stream) ||
                            launch_yarn_heads<16, 0>(positions, q, nullptr, table, stream) ||
                            launch_yarn_heads<2, 0>(positions, q, nullptr, table, stream);
     if (!launched) {
-        throw std::invalid_argument("rope: YaRN covers the 24/4 and 16/2 Text head geometries");
+        throw std::invalid_argument("rope: YaRN covers the 24/4, 16/2 and 12/2 Text head geometries");
     }
 }
 
