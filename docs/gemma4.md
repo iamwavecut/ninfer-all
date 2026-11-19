@@ -69,10 +69,16 @@ the context cache the shared paged KV pool, the disk tier and session slots. Sev
 the routed experts of the MoE model instead (`--devices 0,1 --tensor-parallel`, experts on the
 devices; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
-The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to the Q4_K gate/up experts of a
-release such as HauhauCS's whose expert tables are 16-byte aligned (`MoeTable::aligned16`): device
-banks, and the delivery's banks and slots that bring host or disk experts to the device. The QAT
-Q4_0 release has no Q4_K experts.
+Prompt chunks stage the matrix kernel's tiles through `cp.async` (`gguf_matrix/<format>` and
+`gguf_moe_matrix/<format>`, [device profiles](device-profiles.md#what-is-calibrated)) at every
+column tile, 16 to 128 columns, for the QAT release's Q4_0 projections and experts, and for the
+Q4_K, Q5_0, Q5_K and Q8_0 matrices of a mixed-format GGUF such as HauhauCS's, where the card's
+profile takes them. The 26B's 704-wide expert rows and the 2,112-wide rows of its dense MLP start
+on 4 bytes only; staged, they copy 4 bytes at a time. Experts need 16-byte aligned expert pointers
+(`MoeTable::aligned16`): device banks, and the delivery's banks and slots that bring host or disk
+experts to the device. The values are those of the synchronous loop. On an RTX 3090 (350 W) a
+3,655-token prompt of the QAT release prefills at 7.61-7.62k instead of 6.43-6.51k tokens/s with
+the synchronous loop, and a 296-token prompt at 3.35k instead of 3.19k, with the same perplexity.
 
 ## Converting
 

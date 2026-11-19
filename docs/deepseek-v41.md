@@ -110,8 +110,14 @@ device, which also holds the model, serves fewer experts, so that every device's
 same time over its bus; [expert
 parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
-The Q4_K async prompt tiles (`gguf_matrix/q4_k`, `gguf_moe_matrix/q4_k`) do not apply to this
-family: its routed experts are IQ1_S, IQ1_M, IQ2_XXS and IQ2_S, none Q4_K.
+Prompt chunks stage the matrix kernel's tiles through `cp.async` (`gguf_matrix/<format>` and
+`gguf_moe_matrix/<format>`, [device profiles](device-profiles.md#what-is-calibrated)) at every
+column tile, 16 to 128 columns, for the Q8_0 and Q5_K dense projections and for IQ1_M expert banks
+that the delivery's banks and slots bring to the device (16-byte aligned expert pointers,
+`MoeTable::aligned16`), where the card's profile takes them; IQ1_S, IQ2_XXS, IQ2_XS and IQ2_S keep
+the synchronous loop. The values are those of the synchronous loop. On an RTX 3090 (350 W) a
+3,552-token prompt of the Coder build, bound by the copies of host experts, prefills at 627-629
+instead of 613-616 tokens/s with the synchronous loop, with the same perplexity.
 
 ## Converting
 
