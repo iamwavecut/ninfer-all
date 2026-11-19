@@ -256,6 +256,17 @@ rope_generic_kernel(const std::int32_t* positions, std::int32_t axes, Value* q, 
         } else if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
             fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair,
                                                        &sin_cache[pair], &cos_cache[pair]);
+        } else if (axes != 2 && rotary_dim == 64 && theta == 1.0e7F) {
+            // The text kernels' table, which powf misses by an ulp on seven of the 32 pairs: FP32
+            // keys of an FP16 cache and tensor-parallel head shares, which this kernel rotates,
+            // turn by the angles of the queries the fixed kernels rotate.
+            if (axes == 3) {
+                fixed_sincos<RopeKernelMode::TextMrope>(positions, tokens, token, pair,
+                                                        &sin_cache[pair], &cos_cache[pair]);
+            } else {
+                fixed_sincos<RopeKernelMode::Text1D>(positions, tokens, token, pair,
+                                                     &sin_cache[pair], &cos_cache[pair]);
+            }
         } else {
             int axis       = 0;
             float exponent = 0.0F;

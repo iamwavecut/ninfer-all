@@ -478,7 +478,11 @@ int run_single_case(const Geometry& geometry, int heads, int first_position, int
     return failures;
 }
 
-int run_fp32_case(const Geometry& geometry, int heads, int first_position) {
+// float_phase: the angle is the one the BF16 query kernels turn by, the correctly rounded float
+// frequency times the float position, rounded to float, so keys and queries agree at any position;
+// only sin, cos and the products round after it.
+int run_fp32_case(const Geometry& geometry, int heads, int first_position,
+                  bool float_phase = false) {
     const int dense = geometry.head_dim * heads, stride = dense + 8;
     std::vector<float> input(dense_elements(geometry.head_dim, heads, geometry.tokens));
     fill_uniform(input, 0x3011U, -4.f, 4.f);
@@ -521,6 +525,20 @@ int run_fp32_case(const Geometry& geometry, int heads, int first_position) {
                 const auto lo          = dense_index(geometry.head_dim, heads, t, h, pair);
                 const auto hi          = lo + geometry.rotary_dim / 2;
                 const int axis         = geometry.axes == 3 ? pair % 3 : 0;
+                if (float_phase) {
+                    const auto frequency = static_cast<float>(
+                        std::pow(double(geometry.theta), -2.0 * pair / geometry.rotary_dim));
+                    const double phi = static_cast<float>(
+                        static_cast<float>(positions[axis * geometry.tokens + t]) * frequency);
+                    const double x = input[lo], y = input[hi];
+                    const double want = d < geometry.rotary_dim / 2
+                                            ? x * std::cos(phi) - y * std::sin(phi)
+                                            : y * std::cos(phi) + x * std::sin(phi);
+                    if (!std::isfinite(actual) ||
+                        std::abs(actual - want) > kRopeFp32Roundoff * std::hypot(x, y))
+                        ++failures;
+                    continue;
+                }
                 const double frequency = yarn_frequency(
                     geometry, pair,
                     std::pow(double(geometry.theta), -2.0 * pair / geometry.rotary_dim));
@@ -639,6 +657,8 @@ int main() {
         for (int tokens : {1, 8, 9, 128})
             failures += run_fp32_case({"Flash-Next K", 256, 64, axes, tokens, kTextTheta}, 2, 31);
         failures += run_fp32_case({"Flash-Next K long", 256, 64, axes, 9, kTextTheta}, 1, 200000);
+        failures += run_fp32_case({"Flash-Next K query angles", 256, 64, axes, 9, kTextTheta}, 2,
+                                  262130, true);
         failures += run_fp32_case(
             {"Flash-Next K YaRN", 256, 64, axes, 9, kTextTheta, 2.25f, 262144}, 2, 4096);
         failures += run_fp32_case(
