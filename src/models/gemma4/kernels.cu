@@ -141,9 +141,16 @@ __global__ void scale_kernel(float* x, std::int64_t n, float s) {
     if (i < n) { x[i] *= s; }
 }
 
+// The block of a row kernel (rms_norm, attn_residual, ffn_combine): row_threads() launches up to
+// 1,024 threads, as row_quads() takes rows of up to 2,048 float4s, two a thread. The bound keeps
+// each kernel's registers within that block in every build; without it CUDA 13.4's sm_120a
+// ffn_combine_kernel<2> needs more registers than the 31B's 672-thread rows have.
+constexpr int kRowThreads = 1024;
+
 template <int N>
-__global__ void rms_norm_kernel(const float* __restrict__ x, const float* __restrict__ w,
-                                int hidden, float eps, __nv_bfloat16* __restrict__ out, Q8Rows q8) {
+__launch_bounds__(kRowThreads) __global__
+    void rms_norm_kernel(const float* __restrict__ x, const float* __restrict__ w, int hidden,
+                         float eps, __nv_bfloat16* __restrict__ out, Q8Rows q8) {
     const int q      = hidden >> 2;
     const float* row = x + std::int64_t(blockIdx.x) * hidden;
     float4 v[N], wv[N];
@@ -845,7 +852,7 @@ __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
 // operand is loaded before the first reduction: the reductions' barriers would otherwise hold each
 // load behind the reduction before it.
 template <int N>
-__global__ void attn_residual_kernel(AttnResidualArgs a) {
+__launch_bounds__(kRowThreads) __global__ void attn_residual_kernel(AttnResidualArgs a) {
     const int q = a.hidden >> 2;
     const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
     const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1133,7 +1140,7 @@ __global__ void geglu_rows_kernel(const float* __restrict__ x, int pairs, int wi
 
 // Every operand is loaded before the first reduction, as in attn_residual_kernel.
 template <int N>
-__global__ void ffn_combine_kernel(FfnCombineArgs a) {
+__launch_bounds__(kRowThreads) __global__ void ffn_combine_kernel(FfnCombineArgs a) {
     const int q = a.hidden >> 2;
     const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
     const float hidden = float(a.hidden);
