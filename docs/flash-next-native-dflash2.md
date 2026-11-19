@@ -68,7 +68,7 @@ python3.11 scripts/pods/attach_dflash2.py \
 
 ninfer-serve /models/flash-next-q8ple-dflash2.ninfer \
   --model-id flash-next --expert-residency host --ngram-residency disk \
-  --max-context 262144 --max-concurrency 2 --kv-resident all --kv-dtype fp16 \
+  --max-context 262144 --max-concurrency 2 --kv-resident all --kv-dtype bf16 \
   --spec dflash2 --draft-tokens 7 --vision
 ```
 
@@ -79,7 +79,7 @@ The example deliberately omits MTP from the target. A stock MTP GGUF is a differ
 a separately self-distilled MTP section. DFlash2 requires its trained target vocabulary and hidden
 geometry; its attachment checks those contracts. Pipeline stages are unsupported for this path.
 
-The launch keeps FP16 KV and full device-resident context explicit. Main K/V alone uses 6 GiB
+The launch keeps BF16 KV and full device-resident context explicit. Main K/V alone uses 6 GiB
 per full 262,144-token sequence, plus recurrent state, draft rings, weights, workspace and the
 expert cache. Host experts consume substantial pinned RAM; `--expert-residency disk` changes
 placement when that budget is unsuitable, without changing the encoded weights. The Q8PLE table
