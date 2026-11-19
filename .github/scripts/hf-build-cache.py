@@ -41,7 +41,11 @@ def prefix(family, ref):
     return f'{ROOT}/{ref_key(ref)}/{family}'
 
 
-def unpack(archive, directory):
+def unpack(archive, directory, over=None):
+    """Extract a snapshot into the cache directory.
+
+    over maps the files an earlier restore supplied to their sizes (a baseline). A file that still
+    has its recorded size is that snapshot's copy, which this snapshot's member replaces."""
     with tarfile.open(archive) as package:
         members = []
         for item in package:
@@ -52,10 +56,14 @@ def unpack(archive, directory):
             # Snapshots restored into one directory overlap: a Windows shard that started from the
             # aggregate still holds its copies of other shards' entries. A file at least as new as
             # the member stays, so an old copy of a ccache manifest cannot replace the one its
-            # owner shard has since extended with the current headers' entry.
+            # owner shard has since extended with the current headers' entry. The base snapshot's
+            # copy always yields: a hit in another build renews its time without the current
+            # headers' entry, so a newer time does not make it the newer manifest.
             if item.isfile():
                 try:
-                    if (directory / path).stat().st_mtime >= item.mtime:
+                    existing = (directory / path).stat()
+                    from_base = over is not None and over.get(item.name) == existing.st_size
+                    if existing.st_mtime >= item.mtime and not from_base:
                         continue
                 except FileNotFoundError:
                     pass
@@ -215,7 +223,7 @@ def save(api, directory, family, ref, verify=False, baseline=None):
         return True
 
 
-def fetch(api, base, item, directory, work):
+def fetch(api, base, item, directory, work, over=None):
     """Unpack a verified snapshot, following a replacement published while reading it."""
     for _ in range(3):
         archive = work / 'cache.tar'
@@ -223,7 +231,7 @@ def fetch(api, base, item, directory, work):
             api.download_bucket_files(BUCKET, files=[(item['archive'], archive)], raise_on_missing_files=True)
             if archive.stat().st_size != item['bytes'] or digest(archive) != item['sha256']:
                 raise ValueError('Cache checksum differs')
-            unpack(archive, directory)
+            unpack(archive, directory, over)
         except Exception as error:
             print(json.dumps({'state': 'checkpoint-rejected', 'error': type(error).__name__}), flush=True)
             newer = current(api, base, work)
@@ -236,7 +244,7 @@ def fetch(api, base, item, directory, work):
     return False
 
 
-def restore(api, directory, family, ref, required=False, fallback_families=(), extra_refs=()):
+def restore(api, directory, family, ref, required=False, fallback_families=(), extra_refs=(), over=None):
     """Unpack the family's snapshot of the branch, or else of master, then those of extra_refs.
 
     An extra ref is a branch whose objects this build can reuse, such as the one master merged.
@@ -251,7 +259,7 @@ def restore(api, directory, family, ref, required=False, fallback_families=(), e
             if item is None:
                 continue
             had_snapshots = True
-            if fetch(api, base, item, directory, work):
+            if fetch(api, base, item, directory, work, over):
                 restored = True
                 break
         if had_snapshots and not restored:
@@ -261,7 +269,7 @@ def restore(api, directory, family, ref, required=False, fallback_families=(), e
                 continue
             base = prefix(family, extra)
             item = current(api, base, work)
-            if item is not None and fetch(api, base, item, directory, work):
+            if item is not None and fetch(api, base, item, directory, work, over):
                 restored = True
     if restored or had_snapshots:
         return restored
@@ -270,7 +278,7 @@ def restore(api, directory, family, ref, required=False, fallback_families=(), e
     for fallback in dict.fromkeys(fallback_families):
         if fallback == family:
             raise ValueError('A cache family cannot fall back to itself')
-        if restore(api, directory, fallback, ref, extra_refs=extra_refs):
+        if restore(api, directory, fallback, ref, extra_refs=extra_refs, over=over):
             return True
     if required:
         raise ValueError('No verified cache checkpoint exists')
@@ -417,6 +425,9 @@ def main():
                         help='On master, also unpack the snapshot of the branch the head commit merged')
     reader.add_argument('--baseline', type=Path,
                         help='Afterwards record the cache files, for a save with --exclude-baseline')
+    reader.add_argument('--over-baseline', type=Path,
+                        help='Replace the files this baseline recorded while they keep its sizes, '
+                             'however new (shard snapshots over the aggregate)')
     need = reader.add_mutually_exclusive_group()
     need.add_argument('--optional', action='store_true', help='Continue without an unavailable reader cache')
     need.add_argument('--required', action='store_true')
@@ -454,7 +465,8 @@ def main():
             baseline = read_baseline(args.exclude_baseline) if args.exclude_baseline else None
             save(api, args.directory, args.family, ref, args.verify_upload, baseline)
         elif args.action == 'restore':
-            restore(api, args.directory, args.family, ref, args.required, args.fallback_family, extra_refs)
+            over = read_baseline(args.over_baseline) if args.over_baseline else None
+            restore(api, args.directory, args.family, ref, args.required, args.fallback_family, extra_refs, over)
         else:
             prune(api, live_refs, args.dry_run)
     except Exception as error:

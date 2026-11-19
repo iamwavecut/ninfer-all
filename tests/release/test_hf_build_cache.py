@@ -211,6 +211,51 @@ class CheckpointTests(unittest.TestCase):
             self.assertTrue(CACHE.restore(self.bucket, target, family, self.ref, required=True))
         self.assertEqual((target / 'manifest').read_text(), 'previous and current headers')
 
+    def test_package_restore_prefers_a_shard_copy_over_a_renewed_aggregate_copy(self):
+        # Another build's hit renewed the aggregate's manifest after the owner shard extended its
+        # own copy with the current headers' entry: the package job must still take the shard's.
+        aggregate, owner = self.family, self.family + '-shard-0'
+        manifest = self.source / 'manifest'
+        manifest.write_text('previous and current headers')
+        os.utime(manifest, (2000, 2000))
+        CACHE.save(self.bucket, self.source, owner, self.ref)
+        manifest.write_text('previous headers')
+        os.utime(manifest, (3000, 3000))
+        CACHE.save(self.bucket, self.source, aggregate, self.ref)
+        package, baseline = self.root / 'package', self.root / 'baseline.tsv'
+        self.assertTrue(CACHE.restore(self.bucket, package, aggregate, self.ref, required=True))
+        CACHE.write_baseline(package, baseline)
+        self.assertTrue(CACHE.restore(self.bucket, package, owner, self.ref, required=True,
+                                      over=CACHE.read_baseline(baseline)))
+        self.assertEqual((package / 'manifest').read_text(), 'previous and current headers')
+        # Without the baseline the newer time keeps the aggregate's copy.
+        plain = self.root / 'plain'
+        for family in (aggregate, owner):
+            self.assertTrue(CACHE.restore(self.bucket, plain, family, self.ref, required=True))
+        self.assertEqual((plain / 'manifest').read_text(), 'previous headers')
+
+    def test_shard_copy_that_replaced_the_aggregate_keeps_the_newer_owner_rule(self):
+        # Once a shard replaced the aggregate's copy, a stale copy in a later shard cannot replace it.
+        aggregate, owner, seeded = (self.family, self.family + '-shard-0',
+                                    self.family + '-shard-1')
+        manifest = self.source / 'manifest'
+        manifest.write_text('previous headers')
+        os.utime(manifest, (1000, 1000))
+        CACHE.save(self.bucket, self.source, aggregate, self.ref)
+        manifest.write_text('previous and older branch headers')
+        os.utime(manifest, (1500, 1500))
+        CACHE.save(self.bucket, self.source, seeded, self.ref)
+        manifest.write_text('previous and current headers, longer')
+        os.utime(manifest, (2000, 2000))
+        CACHE.save(self.bucket, self.source, owner, self.ref)
+        package, baseline = self.root / 'package', self.root / 'baseline.tsv'
+        self.assertTrue(CACHE.restore(self.bucket, package, aggregate, self.ref, required=True))
+        CACHE.write_baseline(package, baseline)
+        for family in (owner, seeded):
+            self.assertTrue(CACHE.restore(self.bucket, package, family, self.ref, required=True,
+                                          over=CACHE.read_baseline(baseline)))
+        self.assertEqual((package / 'manifest').read_text(), 'previous and current headers, longer')
+
     def test_baseline_leaves_out_the_files_another_snapshot_supplied_unchanged(self):
         # A shard restores the aggregate first: its own snapshot holds only what the shard changed.
         for name, content in (('result', 'object of another shard'), ('manifest', 'headers')):

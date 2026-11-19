@@ -116,18 +116,21 @@ jobs:
         run: |
           # Every phase starts from the aggregate of the last finished build, and on master also from
           # the branch the head commit merged. A shard then adds its own snapshot and later saves
-          # only what differs from the aggregate; the package job adds every shard's snapshot.
+          # only what differs from the aggregate; the package job adds every shard's snapshot over
+          # the aggregate's copies, which a hit in another build may have made newer.
           $restore = @('.github/scripts/hf-build-cache.py', 'restore', '--directory', '.cache/objects', '--merged-branch')
           if ('${{ inputs.phase }}' -eq 'objects') {
             python @restore --family $env:HF_CACHE_AGGREGATE --baseline build-cache-baseline.tsv
             if ($LASTEXITCODE -ne 0) { throw 'Aggregate cache restore failed' }
             "HF_CACHE_BASELINE=$pwd/build-cache-baseline.tsv" >> $env:GITHUB_ENV
           }
-          python @restore --family $env:HF_CACHE_FAMILY
+          $own = @('--family', $env:HF_CACHE_FAMILY)
+          if ('${{ inputs.phase }}' -eq 'package') { $own += @('--baseline', 'build-cache-baseline.tsv') }
+          python @restore @own
           if ($LASTEXITCODE -ne 0) { throw 'Object cache restore failed' }
           if ('${{ inputs.phase }}' -eq 'package') {
             for ($shard = 0; $shard -lt ${{ inputs.count }}; $shard++) {
-              python @restore --family "$env:HF_CACHE_AGGREGATE-shard-$shard" --required
+              python @restore --family "$env:HF_CACHE_AGGREGATE-shard-$shard" --required --over-baseline build-cache-baseline.tsv
               if ($LASTEXITCODE -ne 0) { throw "Shard $shard cache restore failed" }
             }
           }

@@ -112,19 +112,21 @@ jobs:
         run: |
           # Every phase starts from the aggregate of the last finished build, and on master also from
           # the branch the head commit merged. A shard then adds its own snapshot and later saves
-          # only what differs from the aggregate; the package job adds every shard's snapshot.
+          # only what differs from the aggregate; the package job adds every shard's snapshot over
+          # the aggregate's copies, which a hit in another build may have made newer.
           restore=(python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --merged-branch)
           if [[ "$PHASE" == objects ]]; then
             "${restore[@]}" --family "$HF_CACHE_AGGREGATE" --baseline build-cache-baseline.tsv
             echo "HF_CACHE_BASELINE=$PWD/build-cache-baseline.tsv" >> "$GITHUB_ENV"
             "${restore[@]}" --family "$HF_CACHE_FAMILY"
+          elif [[ "$PHASE" == package ]]; then
+            "${restore[@]}" --family "$HF_CACHE_AGGREGATE" --baseline build-cache-baseline.tsv
+            for (( shard = 0; shard < COUNT; shard++ )); do
+              "${restore[@]}" --family "$HF_CACHE_AGGREGATE-shard-$shard" --required \
+                --over-baseline build-cache-baseline.tsv
+            done
           else
             "${restore[@]}" --family "$HF_CACHE_AGGREGATE"
-          fi
-          if [[ "$PHASE" == package ]]; then
-            for (( shard = 0; shard < COUNT; shard++ )); do
-              "${restore[@]}" --family "$HF_CACHE_AGGREGATE-shard-$shard" --required
-            done
           fi
       - name: Verify object-cache reuse and CUDA invalidation
         timeout-minutes: 10
