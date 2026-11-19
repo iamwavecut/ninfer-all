@@ -1,7 +1,8 @@
 // hyper_connection_read/write against an FP64 oracle of the Qwen3.8-Flash-Next gated residual, at
 // the model's shapes (4 streams, hidden 2560, lowrank 320) and decode, verify and prefill widths,
 // with and without the inject rows (the final mixer has none), with BF16 and with Q8_0 matrices
-// (the oracle reads the values the blocks represent), eagerly and under graph replay; and
+// (the oracle reads the values the blocks represent) and with Q8_0 matrices beside a BF16 inject,
+// eagerly and under graph replay; and
 // hyper_connection_expand, which must widen the embedding into every stream exactly, and its MTP
 // form, which adds each stream's own term.
 #include "core/arena.h"
@@ -108,12 +109,15 @@ Oracle oracle(const std::vector<float>& stack, const std::vector<float>& norm,
     return out;
 }
 
+// bf16_inject: Q8_0 down and up beside a BF16 inject (a Basalt pack's prompt injection).
 int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed, bool fused = false,
-             bool fp32_y = false, bool q8 = false, bool fp32_norm = false) {
+             bool fp32_y = false, bool q8 = false, bool fp32_norm = false,
+             bool bf16_inject = false) {
     const std::string label = "hyper_connection T=" + std::to_string(tokens) +
                               (with_inject ? "" : " mixer") + (graph ? " graph" : "") +
                               (fused ? (fp32_y ? " write_read FP32" : " write_read BF16") : "") +
-                              (q8 ? " Q8_0" : "") + (fp32_norm ? " FP32 gamma" : "");
+                              (q8 ? " Q8_0" : "") + (fp32_norm ? " FP32 gamma" : "") +
+                              (bf16_inject ? " BF16 inject" : "");
     std::vector<float> stack(static_cast<std::size_t>(kWidth) * tokens), norm(kWidth),
         down(static_cast<std::size_t>(kLowrank) * kWidth), up(static_cast<std::size_t>(kWidth) * kLowrank),
         inject(static_cast<std::size_t>(kStreams) * kWidth), y(static_cast<std::size_t>(kHidden) * tokens);
@@ -134,9 +138,13 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed, bool 
     }
     std::vector<std::uint8_t> down_q8, up_q8, inject_q8;
     if (q8) {
-        down_q8   = encode_q8_0(down);
-        up_q8     = encode_q8_0(up);
-        inject_q8 = encode_q8_0(inject);
+        down_q8 = encode_q8_0(down);
+        up_q8   = encode_q8_0(up);
+        if (bf16_inject) {
+            round_to_bf16(inject);
+        } else {
+            inject_q8 = encode_q8_0(inject);
+        }
     } else {
         for (auto* v : {&down, &up, &inject}) round_to_bf16(*v);
     }
@@ -146,11 +154,13 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed, bool 
     fill_uniform(previous, seed + 7, -0.5f, 2.0f);
     previous[0] = 0.0f;
 
-    const auto matrix_bytes = [&](const std::vector<float>& values) {
-        return q8 ? values.size() / 32 * 34 : values.size() * 2;
+    const auto matrix_bytes = [&](const std::vector<float>& values, bool matrix_q8) {
+        return matrix_q8 ? values.size() / 32 * 34 : values.size() * 2;
     };
+    const bool inject_q8_format = q8 && !bf16_inject;
     GuardedDeviceBuffer d_stack(stack.size() * 4), d_norm(norm.size() * (fp32_norm ? 4 : 2)),
-        d_down(matrix_bytes(down)), d_up(matrix_bytes(up)), d_inject(matrix_bytes(inject)),
+        d_down(matrix_bytes(down, q8)), d_up(matrix_bytes(up, q8)),
+        d_inject(matrix_bytes(inject, inject_q8_format)),
         d_mixed(static_cast<std::size_t>(kHidden) * tokens * 2),
         d_weights(static_cast<std::size_t>(kStreams) * tokens * 4),
         d_y(y.size() * (fp32_y ? 4 : 2));
@@ -166,7 +176,11 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed, bool 
     if (q8) {
         d_down.copy_from_host(down_q8.data(), d_down.bytes());
         d_up.copy_from_host(up_q8.data(), d_up.bytes());
-        d_inject.copy_from_host(inject_q8.data(), d_inject.bytes());
+        if (inject_q8_format) {
+            d_inject.copy_from_host(inject_q8.data(), d_inject.bytes());
+        } else {
+            copy_bf16(d_inject, inject);
+        }
     } else {
         copy_bf16(d_down, down);
         copy_bf16(d_up, up);
@@ -186,7 +200,10 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed, bool 
     const ops::HyperConnectionWeights weights{&t_norm,
                                               {d_down.data(), format},
                                               {d_up.data(), format},
-                                              {with_inject ? d_inject.data() : nullptr, format},
+                                              {with_inject ? d_inject.data() : nullptr,
+                                               inject_q8_format
+                                                   ? ops::HyperConnectionMatrix::Format::Q8_0
+                                                   : ops::HyperConnectionMatrix::Format::BF16},
                                               !fp32_norm};
     WorkspaceArena workspace(
         ops::hyper_connection_read_workspace_bytes(kStreams, kHidden, kLowrank, tokens));
@@ -418,6 +435,13 @@ int main() {
     failures += run_case(4, true, true, 4653u, true, false, true);
     failures += run_case(1, true, false, 4660u, false, false, true, true);
     failures += run_case(9, true, true, 4661u, true, true, true, true);
+    // Q8_0 down and up beside a BF16 inject: the narrow widths, the GEMM seam, a prefill
+    // interior and the fused write/read.
+    for (const int tokens : {1, 4, 8, 9, 300}) {
+        failures += run_case(tokens, true, false, 4670u + tokens, false, false, true, false, true);
+    }
+    failures += run_case(3, true, false, 4690u, true, true, true, false, true);
+    failures += run_case(5, true, true, 4691u, true, false, true, true, true);
     failures += run_expand(1, false, 4400u);
     failures += run_expand(7, false, 4401u);
     failures += run_expand(1, true, 4402u);

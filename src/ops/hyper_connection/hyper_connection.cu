@@ -851,8 +851,6 @@ void read(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
     const bool has_inject = weights.inject.data != nullptr;
     require(has_inject == (inject_weights != nullptr),
             "inject weights and their output come together");
-    require(!has_inject || q8(weights.inject) == q8(weights.down),
-            "inject and down share a format");
     if (has_inject) {
         require_matrix(weights.inject, "inject must be a 16-byte aligned [10240, 4]");
         require(inject_weights->dtype == DType::FP32 && inject_weights->is_contiguous() &&
@@ -920,10 +918,25 @@ void read(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
     }
     normalize(stack, y, previous_inject, *weights.norm, eps, weights.unit_offset, normalized_p,
               nullptr, stream);
+    // The inject rows join the down GEMV when they share its format; an inject of the other
+    // format (a BF16 prompt injection beside Q8_0 matrices) runs as the wide path's inject rows.
+    const bool joined = has_inject && q8(weights.inject) == q8(weights.down);
+    if (has_inject && !joined) {
+        if (q8(weights.inject)) {
+            hc_inject_q8_kernel<<<dim3(kStreams, 1), kDownQ8Warps * 32, 0, stream>>>(
+                normalized_p, static_cast<const std::uint8_t*>(weights.inject.data), tokens,
+                inject_out);
+        } else {
+            hc_down_kernel<<<dim3(kStreams, 1), kDownWarps * 32, 0, stream>>>(
+                normalized_p, nullptr, static_cast<const __nv_bfloat16*>(weights.inject.data),
+                tokens, kLowrank, nullptr, inject_out);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
     const NarrowRead read{.normalized = normalized_p,
                           .down       = weights.down.data,
-                          .inject     = weights.inject.data,
-                          .rows       = kLowrank + (has_inject ? kStreams : 0),
+                          .inject     = joined ? weights.inject.data : nullptr,
+                          .rows       = kLowrank + (joined ? kStreams : 0),
                           .up         = weights.up.data,
                           .down_q8    = q8(weights.down),
                           .up_q8      = q8(weights.up),
