@@ -9,7 +9,9 @@ KvFormat kv_format(KvCacheStorage storage) {
     const auto rot   = [](KvCoding c) { return KvPlane{c, true}; };
     const auto plain = [](KvCoding c) { return KvPlane{c, false}; };
     switch (storage) {
-    case KvCacheStorage::BFloat16: return {storage, f16, f16, f16};
+    // The unquantized cache is F16, which --kv-dtype fp16 names and bf16 (the default) selects.
+    case KvCacheStorage::BFloat16:
+    case KvCacheStorage::Float16: return {storage, f16, f16, f16};
     case KvCacheStorage::Int8Group64:
         return {storage, rot(KvCoding::Int8G64), plain(KvCoding::Int8G64), plain(KvCoding::Int8G64)};
     case KvCacheStorage::Fp8E4M3Row256:

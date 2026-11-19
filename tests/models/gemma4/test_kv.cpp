@@ -135,6 +135,7 @@ double error_bound(KvCoding c) {
 const char* storage_name(KvCacheStorage s) {
     switch (s) {
     case KvCacheStorage::BFloat16: return "bf16";
+    case KvCacheStorage::Float16: return "fp16";
     case KvCacheStorage::Int8Group64: return "int8";
     case KvCacheStorage::Fp8E4M3Row256: return "fp8";
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64: return "rk8v4";
