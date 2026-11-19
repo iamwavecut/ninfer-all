@@ -90,6 +90,7 @@ include("{ROOT.as_posix()}/cmake/NinferRuntime.cmake")
 add_library(ninfer_product_launch_config STATIC
   "{ROOT.as_posix()}/src/product/launch_config/launch_config.cpp")
 ninfer_internal_includes(ninfer_product_launch_config)
+target_include_directories(ninfer_product_launch_config PRIVATE "{ROOT.as_posix()}/third_party")
 ninfer_runtime_program(fixture fixture_app SOURCES "${{CMAKE_CURRENT_SOURCE_DIR}}/app.cpp")
 target_include_directories(fixture_app PRIVATE "{ROOT.as_posix()}/src")
 target_include_directories(fixture PRIVATE "{ROOT.as_posix()}/src")
