@@ -241,7 +241,7 @@ std::string usage_text(const char* argv0) {
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  bf16 (default), int8, fp8, rk8v4, rk4v4,\n"
            "                                rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
-           "                                fp16: native Flash-Next K/V\n" +
+           "                                fp16: Flash-Next, Gemma 4 and Flint\n" +
            std::string(product::kKvResidentHelp) +
            "\n"
            "SPECULATIVE DECODING\n"

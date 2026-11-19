@@ -65,7 +65,7 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
-    throw std::invalid_argument("--kv-dtype must be bf16, fp16 (Flash-Next), int8, fp8, rk8v4, "
+    throw std::invalid_argument("--kv-dtype must be bf16, fp16 (Flash-Next, Gemma 4, Flint), int8, fp8, rk8v4, "
                                 "rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4, or bf16p");
 }
 

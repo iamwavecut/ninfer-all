@@ -237,7 +237,7 @@ Options parse_arguments(const std::vector<std::string>& arguments,
             } else if (dtype == "bf16p") {
                 out.kv = ninfer::KvCacheStorage::Bf16Packed;
             } else {
-                usage_error("--kv-dtype must be bf16, fp16 (Flash-Next), int8, fp8, rk8v4, rk4v4, "
+                usage_error("--kv-dtype must be bf16, fp16 (Flash-Next, Gemma 4, Flint), int8, fp8, rk8v4, rk4v4, "
                             "rk4v4-e8, "
                             "rk2v4-e8, nvfp4, k8v4 or bf16p");
             }

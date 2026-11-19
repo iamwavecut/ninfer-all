@@ -582,8 +582,9 @@ FP16 and BF16 both use two bytes per value. With 12 attention layers, two KV hea
 per head, main K/V is 24,576 bytes per token: 6 GiB for one full 262,144-position context, before
 MTP and other state. Streaming changes where those bytes reside. FP16 keeps three more fraction
 bits but has a smaller exponent range: values can underflow or overflow where BF16 would remain
-finite. The option is a precision choice, rather than a compression or speed guarantee. Other
-model families retain their existing cache paths and reject this Flash-Next option explicitly.
+finite. The option is a precision choice, rather than a compression or speed guarantee. Gemma 4
+and Flint keep their F16 caches under this name too; Qwen3.5-core models and DeepSeek-V4.1 refuse
+it.
 
 ### Streamed sparse-attention KV
 
