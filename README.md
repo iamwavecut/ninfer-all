@@ -184,7 +184,7 @@ Every card by name, with what has run on it:
 
 </details>
 
-## Supported Models <a id="artifacts"></a>
+## Supported Models
 
 Each name links to its Hugging Face card. `hf download REPO FILE.ninfer --local-dir models` fetches a file.
 The Bonsai, GSQ-RCO, Flash-Next, Edge0, Gemma 4, Flint and DeepSeek-V4.1-Flash artifacts use formats that only this engine reads.
