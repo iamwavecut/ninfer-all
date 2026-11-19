@@ -586,6 +586,30 @@ finite. The option is a precision choice, rather than a compression or speed gua
 and Flint keep their F16 caches under this name too; Qwen3.5-core models and DeepSeek-V4.1 refuse
 it.
 
+FP16 against BF16 on Flash-Next Q2_0 with host experts and the IQ4_NL table, on an RTX 3090
+(`ninfer-perplexity`, total NLL in nats). A recall text lists unique random five-digit rooms and
+codes, then the same lines in another order; its row is the NLL of the second list, each code up to
+half the text back:
+
+| text | scored tokens | BF16 | FP16 | FP16 against BF16 |
+|---|---:|---:|---:|---:|
+| WikiText, first 40 KB | 9,481 | 9,110.74 | 9,118.63 | +0.09% |
+| recall 32K, seed 1 | 16,350 | 9,856.67 | 9,831.75 | -0.25% |
+| recall 32K, seed 2 | 16,350 | 10,004.82 | 9,791.49 | -2.1% |
+| recall 64K, seed 1 | 32,745 | 19,888.54 | 20,088.04 | +1.0% |
+| recall 64K, seed 2 | 32,745 | 22,142.36 | 22,119.06 | -0.1% |
+| recall 128K, seed 1 | 65,505 | 53,286.61 | 57,751.11 | +8.4% |
+| recall 128K, seed 2 | 65,505 | 43,566.38 | 44,017.20 | +1.0% |
+
+Forty eight-way choice reads over each list (`/v1/systemone`) picked the right code 40 times of 40
+in both formats from 8K to 128K tokens, and a request took as long in one as in the other (19 and
+20 s at 8K, 31 at 32K, 48 at 64K, 83 and 84 at 128K, `ninfer-serve --max-context 131072`). Prefill
+runs at the same rate in both (587.6 against 588.5 tok/s over the 64K recall text, the KV streamed
+from pinned memory past 32,768 positions). With FP32 keys and values, a BF16 query and FP64
+attention over 1K to 256K synthetic keys, FP16 storage leaves a 2.4 to 3.1 times smaller output
+error than BF16 at every length; in the model the differences go both ways, with no trend in
+length, so BF16 stays the default.
+
 ### Streamed sparse-attention KV
 
 Each query of a sparse-attention layer reads 512 blocks of four positions that the indexer selects
