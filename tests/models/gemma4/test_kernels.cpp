@@ -10,6 +10,9 @@
 //    at the state's end): qkv_post's rotation at the branch position with the value stored at the
 //    row's own slot, keys derived at the branch positions, and the prompt masks of a sliding ring
 //    and of a linear cache, where a row sees the state as its position does and its own branch.
+//  - the row kernels (rms_norm, attn_residual, ffn_combine) at the 26B's width 2816 (one float4 a
+//    thread) and the 31B's 5376 (two): the FP32 residual, the BF16 rows and the q8_1 rows, dense
+//    and MoE blocks.
 
 #include "core/device_buffer.h"
 #include "models/gemma4/kernels.h"
@@ -207,6 +210,245 @@ void attention(const AttentionCase& c, std::mt19937& rng) {
     const bool ok = rms < 6e-3 && qrms < 1.5e-2;
     std::cout << (ok ? "OK   " : "FAIL ") << name << " rms=" << rms << " q8 rms=" << qrms << '\n';
     failures += ok ? 0 : 1;
+}
+
+// FP64 RMS norm of row x [H] times w (null: one).
+std::vector<double> rms_row(const double* x, int hidden, double eps, const float* w) {
+    double ss = 0;
+    for (int i = 0; i < hidden; ++i) { ss += x[i] * x[i]; }
+    const double inv = 1.0 / std::sqrt(ss / hidden + eps);
+    std::vector<double> y(hidden);
+    for (int i = 0; i < hidden; ++i) { y[i] = x[i] * inv * (w != nullptr ? w[i] : 1.0); }
+    return y;
+}
+
+// Worst error of FP32 rows against the oracle, relative to the oracle's RMS.
+double rel_error(const std::vector<float>& got, const std::vector<double>& want) {
+    double ss = 0, worst = 0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        ss += want[i] * want[i];
+        worst = std::max(worst, std::abs(double(got[i]) - want[i]));
+    }
+    return worst / std::sqrt(ss / double(want.size()));
+}
+
+// BF16 rows: every value within BF16 rounding of the oracle (2^-8 relative, plus a margin for the
+// FP32 arithmetic before the rounding).
+int bf16_wrong(const std::vector<__nv_bfloat16>& got, const std::vector<double>& want) {
+    int wrong = 0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        const double g = __bfloat162float(got[i]);
+        if (std::abs(g - want[i]) > std::abs(want[i]) * (1.0 / 256 + 1e-5) + 1e-30) { ++wrong; }
+    }
+    return wrong;
+}
+
+// q8_1 rows [T][H] + [T][H / 32] (d, sum): every code within d/2 of its value (plus the F16 d's
+// rounding), every d and sum within F16 rounding of the block's.
+int q8_wrong(const std::vector<std::int8_t>& qs, const std::vector<half2>& ds,
+             const std::vector<double>& want) {
+    int wrong = 0;
+    for (std::size_t b = 0; b < ds.size(); ++b) {
+        const double d = __half2float(ds[b].x), sum = __half2float(ds[b].y);
+        double amax = 0, s = 0;
+        for (int j = 0; j < 32; ++j) {
+            amax = std::max(amax, std::abs(want[b * 32 + j]));
+            s += want[b * 32 + j];
+        }
+        if (std::abs(d - amax / 127) > amax / 127 * 1e-3 + 1e-30) { ++wrong; }
+        if (std::abs(sum - s) > amax * 32 * 1e-3 + 1e-6) { ++wrong; }
+        for (int j = 0; j < 32; ++j) {
+            if (std::abs(qs[b * 32 + j] * d - want[b * 32 + j]) > 0.51 * d + amax * 1e-3) { ++wrong; }
+        }
+    }
+    return wrong;
+}
+
+// rms_norm, attn_residual and ffn_combine over `tokens` rows of width `hidden` against FP64.
+void row_kernels(int hidden, int tokens, bool moe, std::mt19937& rng) {
+    const float eps = 1e-6f;
+    const std::size_t n = std::size_t(tokens) * hidden;
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::uniform_real_distribution<float> unit(0.5f, 1.5f);
+    auto vec = [&](std::size_t count, bool gamma) {
+        std::vector<float> v(count);
+        for (auto& x : v) { x = gamma ? unit(rng) : normal(rng); }
+        return v;
+    };
+    auto bf16 = [](const std::vector<float>& v) {
+        std::vector<__nv_bfloat16> out(v.size());
+        for (std::size_t i = 0; i < v.size(); ++i) { out[i] = __float2bfloat16(v[i]); }
+        return out;
+    };
+    auto up = [](const void* data, std::size_t bytes) {
+        DeviceBuffer d(bytes);
+        d.copy_from_host(data, bytes);
+        return d;
+    };
+    const std::string name = "row kernels H=" + std::to_string(hidden) + " T=" +
+                             std::to_string(tokens) + (moe ? " moe" : " dense");
+    const std::size_t q8_bytes = n + n / 32 * 4;
+    auto q8_rows = [&](DeviceBuffer& buf) {
+        k::Q8Rows r;
+        r.qs = static_cast<std::int8_t*>(buf.p);
+        r.ds = reinterpret_cast<half2*>(static_cast<std::uint8_t*>(buf.p) + n);
+        return r;
+    };
+    auto q8_read = [&](DeviceBuffer& buf, std::vector<std::int8_t>& qs, std::vector<half2>& ds) {
+        std::vector<std::uint8_t> raw(q8_bytes);
+        buf.copy_to_host(raw.data(), q8_bytes);
+        qs.assign(reinterpret_cast<std::int8_t*>(raw.data()), reinterpret_cast<std::int8_t*>(raw.data()) + n);
+        ds.resize(n / 32);
+        std::copy_n(reinterpret_cast<const half2*>(raw.data() + n), n / 32, ds.data());
+    };
+
+    // rms_norm.
+    {
+        const auto x = vec(n, false), w = vec(hidden, true);
+        DeviceBuffer dx = up(x.data(), n * 4), dw = up(w.data(), hidden * 4);
+        DeviceBuffer out(n * 2), q8(q8_bytes);
+        k::rms_norm(static_cast<const float*>(dx.p), static_cast<const float*>(dw.p), hidden, tokens,
+                    eps, static_cast<__nv_bfloat16*>(out.p), nullptr, q8_rows(q8));
+        check(cudaDeviceSynchronize(), "rms_norm");
+        std::vector<double> want(n);
+        for (int t = 0; t < tokens; ++t) {
+            std::vector<double> row(x.begin() + std::size_t(t) * hidden, x.begin() + std::size_t(t + 1) * hidden);
+            const auto y = rms_row(row.data(), hidden, eps, w.data());
+            std::copy(y.begin(), y.end(), want.begin() + std::size_t(t) * hidden);
+        }
+        std::vector<__nv_bfloat16> got(n);
+        out.copy_to_host(got.data(), n * 2);
+        std::vector<std::int8_t> qs;
+        std::vector<half2> ds;
+        q8_read(q8, qs, ds);
+        expect(bf16_wrong(got, want) == 0, name + " rms_norm bf16");
+        expect(q8_wrong(qs, ds, want) == 0, name + " rms_norm q8");
+    }
+
+    // attn_residual, then ffn_combine on its residual.
+    const auto h0 = vec(n, false), o = vec(n, false), w_post = vec(hidden, true),
+               ffn_norm = vec(hidden, true), pre_norm = vec(hidden, true),
+               router_scale = vec(hidden, true);
+    const auto o16 = bf16(o);
+    DeviceBuffer dh = up(h0.data(), n * 4), dO = up(o16.data(), n * 2),
+                 dwp = up(w_post.data(), hidden * 4), dfn = up(ffn_norm.data(), hidden * 4),
+                 dpn = up(pre_norm.data(), hidden * 4), drs = up(router_scale.data(), hidden * 4);
+    DeviceBuffer mlp_in(n * 2), moe_q8(q8_bytes), router_x(n * 4);
+    k::AttnResidualArgs ra;
+    ra.h        = static_cast<float*>(dh.p);
+    ra.o        = static_cast<const __nv_bfloat16*>(dO.p);
+    ra.w_post   = static_cast<const float*>(dwp.p);
+    ra.hidden   = hidden;
+    ra.tokens   = tokens;
+    ra.eps      = eps;
+    ra.ffn_norm = static_cast<const float*>(dfn.p);
+    ra.mlp_in   = static_cast<__nv_bfloat16*>(mlp_in.p);
+    if (moe) {
+        ra.pre_norm     = static_cast<const float*>(dpn.p);
+        ra.moe_q        = q8_rows(moe_q8);
+        ra.router_scale = static_cast<const float*>(drs.p);
+        ra.router_x     = static_cast<float*>(router_x.p);
+    }
+    k::attn_residual(ra, nullptr);
+    check(cudaDeviceSynchronize(), "attn_residual");
+    std::vector<double> h(n), mlp(n), moe_in(n), rx(n);
+    for (int t = 0; t < tokens; ++t) {
+        const std::size_t r = std::size_t(t) * hidden;
+        std::vector<double> orow(hidden);
+        for (int i = 0; i < hidden; ++i) { orow[i] = __bfloat162float(o16[r + i]); }
+        const auto on = rms_row(orow.data(), hidden, eps, w_post.data());
+        for (int i = 0; i < hidden; ++i) { h[r + i] = double(h0[r + i]) + on[i]; }
+        const auto nn = rms_row(h.data() + r, hidden, eps, nullptr);
+        for (int i = 0; i < hidden; ++i) {
+            mlp[r + i]    = nn[i] * ffn_norm[i];
+            moe_in[r + i] = nn[i] * pre_norm[i];
+            rx[r + i]     = nn[i] * router_scale[i] / std::sqrt(double(hidden));
+        }
+    }
+    {
+        std::vector<float> got_h(n);
+        dh.copy_to_host(got_h.data(), n * 4);
+        std::vector<__nv_bfloat16> got_mlp(n);
+        mlp_in.copy_to_host(got_mlp.data(), n * 2);
+        expect(rel_error(got_h, h) < 1e-5, name + " attn_residual h");
+        expect(bf16_wrong(got_mlp, mlp) == 0, name + " attn_residual mlp_in");
+        if (moe) {
+            std::vector<std::int8_t> qs;
+            std::vector<half2> ds;
+            q8_read(moe_q8, qs, ds);
+            std::vector<float> got_rx(n);
+            router_x.copy_to_host(got_rx.data(), n * 4);
+            expect(q8_wrong(qs, ds, moe_in) == 0, name + " attn_residual moe q8");
+            expect(rel_error(got_rx, rx) < 1e-5, name + " attn_residual router_x");
+        }
+    }
+
+    // ffn_combine: y = dense (dense) or rms(dense) * w_dense + rms(moe) * w_moe (MoE, FP32 expert
+    // rows weighted here); h = (h + rms(y) * w_post) * scalar; next = rms(h) * next_norm.
+    constexpr int kTopK = 2;
+    const auto dense = vec(n, false), w_dense = vec(hidden, true), w_moe = vec(hidden, true),
+               w_post2 = vec(hidden, true), next_norm = vec(hidden, true),
+               moe_rows = vec(n * kTopK, false), moe_w = vec(std::size_t(tokens) * kTopK, true);
+    const std::vector<float> scalar{0.75f};
+    const auto dense16 = bf16(dense);
+    std::vector<float> h_now(n);
+    dh.copy_to_host(h_now.data(), n * 4);
+    DeviceBuffer dd = up(dense16.data(), n * 2), dwd = up(w_dense.data(), hidden * 4),
+                 dwm = up(w_moe.data(), hidden * 4), dwp2 = up(w_post2.data(), hidden * 4),
+                 dnn = up(next_norm.data(), hidden * 4), dmr = up(moe_rows.data(), n * kTopK * 4),
+                 dmw = up(moe_w.data(), std::size_t(tokens) * kTopK * 4), dsc = up(scalar.data(), 4);
+    DeviceBuffer next_out(n * 2), next_q8(q8_bytes);
+    k::FfnCombineArgs ca;
+    ca.h         = static_cast<float*>(dh.p);
+    ca.hidden    = hidden;
+    ca.tokens    = tokens;
+    ca.eps       = eps;
+    ca.dense     = static_cast<const __nv_bfloat16*>(dd.p);
+    ca.w_post    = static_cast<const float*>(dwp2.p);
+    ca.scalar    = static_cast<const float*>(dsc.p);
+    ca.next_norm = static_cast<const float*>(dnn.p);
+    ca.next_out  = static_cast<__nv_bfloat16*>(next_out.p);
+    ca.next_q    = q8_rows(next_q8);
+    if (moe) {
+        ca.w_dense     = static_cast<const float*>(dwd.p);
+        ca.w_moe       = static_cast<const float*>(dwm.p);
+        ca.moe_rows    = static_cast<const float*>(dmr.p);
+        ca.moe_weights = static_cast<const float*>(dmw.p);
+        ca.top_k       = kTopK;
+    }
+    k::ffn_combine(ca, nullptr);
+    check(cudaDeviceSynchronize(), "ffn_combine");
+    std::vector<double> h2(n), next(n);
+    for (int t = 0; t < tokens; ++t) {
+        const std::size_t r = std::size_t(t) * hidden;
+        std::vector<double> y(hidden);
+        for (int i = 0; i < hidden; ++i) { y[i] = __bfloat162float(dense16[r + i]); }
+        if (moe) {
+            const auto yn = rms_row(y.data(), hidden, eps, w_dense.data());
+            std::vector<double> m(hidden, 0.0);
+            for (int j = 0; j < kTopK; ++j) {
+                const std::size_t pair = std::size_t(t) * kTopK + j;
+                for (int i = 0; i < hidden; ++i) { m[i] += double(moe_rows[pair * hidden + i]) * moe_w[pair]; }
+            }
+            const auto mn = rms_row(m.data(), hidden, eps, w_moe.data());
+            for (int i = 0; i < hidden; ++i) { y[i] = yn[i] + mn[i]; }
+        }
+        const auto yn = rms_row(y.data(), hidden, eps, w_post2.data());
+        for (int i = 0; i < hidden; ++i) { h2[r + i] = (double(h_now[r + i]) + yn[i]) * scalar[0]; }
+        const auto nx = rms_row(h2.data() + r, hidden, eps, next_norm.data());
+        std::copy(nx.begin(), nx.end(), next.begin() + r);
+    }
+    std::vector<float> got_h(n);
+    dh.copy_to_host(got_h.data(), n * 4);
+    std::vector<__nv_bfloat16> got_next(n);
+    next_out.copy_to_host(got_next.data(), n * 2);
+    std::vector<std::int8_t> qs;
+    std::vector<half2> ds;
+    q8_read(next_q8, qs, ds);
+    expect(rel_error(got_h, h2) < 1e-5, name + " ffn_combine h");
+    expect(bf16_wrong(got_next, next) == 0, name + " ffn_combine next bf16");
+    expect(q8_wrong(qs, ds, next) == 0, name + " ffn_combine next q8");
+    std::cout << "ran  " << name << '\n';
 }
 
 void route(int tokens, std::mt19937& rng) {
@@ -582,6 +824,16 @@ int main() {
         qkv(512, 1.0f, {5, 1000, 7}, rng);
         qkv(512, 1.1434f, {5, 1000, 7}, rng);
         qkv(256, 1.21f, {0, 1023, 300}, rng);
+        // The 31B's heads: 32 query heads over 16 (sliding) and over 4 (full, keys derived).
+        attention({256, 32, 16, 1280, 1024, 16, {700, 1900}}, rng);
+        attention({512, 32, 4, 0, 0, 123, {40, 4999}, true}, rng);
+        // Row kernels: the 26B's width (MoE blocks) and the 31B's (dense blocks), decode rows and
+        // a prompt chunk's.
+        for (const int tokens : {1, 5}) {
+            row_kernels(2816, tokens, true, rng);
+            row_kernels(2816, tokens, false, rng);
+            row_kernels(5376, tokens, false, rng);
+        }
         for (const int tokens : {1, 3, 8}) { route(tokens, rng); }
         route_nan(false, rng);
         route_nan(true, rng);
