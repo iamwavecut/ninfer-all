@@ -2507,6 +2507,15 @@ struct Executor::Impl {
         kernels::hc_post(h, y, c.post, c.comb, t, streams, hidden, stream);
     }
 
+    // Whether every expert of the gate/up and of the down tables of block `p` in delivery `from`
+    // starts on 16 bytes (MoeTable::aligned16, which the matrix kernel's asynchronous tiles need):
+    // aliases 0 to 2 point into the gate/up blob, 3 into the down blob.
+    [[nodiscard]] static std::pair<bool, bool> delivered_aligned16(const LayerPlan& p,
+                                                                   const ExpertDelivery& from) {
+        const auto l = std::size_t(p.delivery_layer);
+        return {from.alias_aligned(l, 2, 16), from.alias_aligned(l, 3, 16)};
+    }
+
     // One rank's part of a MoE call of block `p` under expert parallelism: the call's pairs routed
     // to the experts `range` the rank serves, through its delivery `from` (whose tables hold those
     // experts alone), weighted into the 2^-32 fixed-point sum `fixed` ([T][H]). Up to 8 tokens read
@@ -2528,8 +2537,10 @@ struct Executor::Impl {
         const ExpertDelivery::Call call =
             from.begin(std::size_t(p.delivery_layer), mine, std::uint32_t(pairs), on);
         const auto* tables = from.tables(std::size_t(p.delivery_layer));
-        const gguf::MoeTable gate_up{tables + 2 * n, p.gate_up_row_bytes, 2 * w, hidden};
-        const gguf::MoeTable down{tables + 3 * n, p.down_row_bytes, hidden, w};
+        const auto [gate_up_aligned, down_aligned] = delivered_aligned16(p, from);
+        const gguf::MoeTable gate_up{tables + 2 * n, p.gate_up_row_bytes, 2 * w, hidden,
+                                     gate_up_aligned};
+        const gguf::MoeTable down{tables + 3 * n, p.down_row_bytes, hidden, w, down_aligned};
         const int max_active = std::max(1, std::min(pairs, n));
         auto* gu             = static_cast<float*>(take(std::size_t(pairs) * 2 * w * 4));
         auto* middle         = static_cast<__nv_bfloat16*>(take(std::size_t(pairs) * w * 2));
@@ -2730,8 +2741,11 @@ struct Executor::Impl {
         }
         const auto* tables = p.delivery_layer >= 0 ? delivery->tables(std::size_t(p.delivery_layer))
                                                    : static_cast<const void* const*>(p.tables.p);
-        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * w, hidden};
-        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, w};
+        const auto [gate_up_aligned, down_aligned] =
+            p.delivery_layer >= 0 ? delivered_aligned16(p, *delivery) : std::pair{false, false};
+        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * w, hidden,
+                                     gate_up_aligned};
+        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, w, down_aligned};
         const int max_active = std::min(pairs, e);
         auto* gu             = alloc<float>(std::size_t(pairs) * 2 * w);
         auto* middle         = alloc<__nv_bfloat16>(std::size_t(pairs) * w);

@@ -207,7 +207,7 @@ struct MoeTable {
     std::int64_t row_bytes     = 0;
     int rows                   = 0;
     int k                      = 0;
-    bool aligned16             = false;
+    bool aligned16             = false; // every expert's base pointer is 16-byte aligned
 };
 
 // Where a product over experts puts pair p's row r.

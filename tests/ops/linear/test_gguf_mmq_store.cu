@@ -330,21 +330,26 @@ void run_public_gather_case(const TypeCase& c, bool accumulate) {
     compare_outputs(c, k, columns, rows, padding, accumulate, initial, expected, actual);
 }
 
-// The formats with the asynchronous tile loop, their device-route keys and launch choices.
+// The formats with the asynchronous tile loop, their device-route keys and launch choices: the
+// staging copy's width for rows of `row_bytes` (0 for the compiled loop).
 template <ggml_type T>
-bool dense_async_offered(int rows, int columns) {
-    return gguf::detail::select_matrix_launch<T>(rows, columns).async;
+int dense_async_offered(int rows, int columns, std::int64_t row_bytes) {
+    return gguf::detail::select_matrix_launch<T>(
+               rows, columns, gguf::detail::async_copy_width<T>(row_bytes, 0))
+        .async;
 }
 template <ggml_type T>
-bool moe_async_offered(int rows, int k, int columns) {
-    return gguf::detail::select_moe_launch<T>(rows, k, columns, true, true).async;
+int moe_async_offered(int rows, int k, int columns, std::int64_t row_bytes) {
+    return gguf::detail::select_moe_launch<T>(rows, k, columns, true,
+                                              gguf::detail::async_copy_width<T>(row_bytes, 0))
+        .async;
 }
 struct AsyncCase {
     gguf::GgmlType type;
     const char* dense_key;
     const char* moe_key;
-    bool (*dense)(int, int);
-    bool (*moe)(int, int, int);
+    int (*dense)(int, int, std::int64_t);
+    int (*moe)(int, int, int, std::int64_t);
 };
 const AsyncCase kAsyncCases[] = {
     {gguf::GgmlType::Q4_K, "gguf_matrix/q4_k", "gguf_moe_matrix/q4_k",
@@ -375,7 +380,7 @@ std::int64_t row_bytes_of(const TypeCase& c, int k) {
 
 struct RouteRun {
     std::vector<std::vector<std::uint8_t>> parts;
-    bool async = false;
+    int async = 0;
     std::size_t fixup_bytes = 0;
 };
 
@@ -387,12 +392,12 @@ std::vector<std::uint8_t> device_bytes(const void* device, std::size_t bytes) {
 
 RouteRun run_route(const char* schedule, const TypeCase& c, const AsyncCase& a, int rows, int k,
                    int columns, const DeviceBuffer& weight, const DeviceBuffer& activation,
-                   const std::vector<__nv_bfloat16>& initial) {
+                   const std::vector<__nv_bfloat16>& initial, bool tail) {
     const ninfer::ops::DeviceRouteForce force(a.dense_key, schedule);
     RouteRun run;
     run.fixup_bytes = gguf::matrix_fixup_bytes(c.type, rows, columns);
-    run.async = a.dense(rows, columns);
     const std::int64_t row_bytes = row_bytes_of(c, k);
+    run.async = a.dense(rows, columns, row_bytes);
     const std::size_t plane_bytes = std::size_t(rows) * columns * sizeof(float);
     const std::size_t fixup_bytes = std::max<std::size_t>(run.fixup_bytes, 1);
     DeviceBuffer plane(plane_bytes);
@@ -407,7 +412,7 @@ RouteRun run_route(const char* schedule, const TypeCase& c, const AsyncCase& a, 
     accumulated.copy_from_host(initial.data(), accumulated.bytes);
 
     gguf::matrix_product(c.type, weight.p, row_bytes, rows, k, activation.p, columns,
-                         static_cast<float*>(plane.p), rows, fixup.p, nullptr);
+                         static_cast<float*>(plane.p), rows, fixup.p, nullptr, tail);
     check(cudaDeviceSynchronize(), "async route float product");
     run.parts.push_back(device_bytes(plane.p, plane_bytes));
     run.parts.push_back(device_bytes(fixup.p, fixup_bytes));
@@ -416,7 +421,8 @@ RouteRun run_route(const char* schedule, const TypeCase& c, const AsyncCase& a, 
         DeviceBuffer& destination = accumulate ? accumulated : stored;
         gguf::matrix_product_bf16(c.type, weight.p, row_bytes, rows, k, activation.p, columns,
                                   static_cast<__nv_bfloat16*>(destination.p), rows,
-                                  static_cast<float*>(partial.p), fixup.p, nullptr, accumulate);
+                                  static_cast<float*>(partial.p), fixup.p, nullptr, accumulate,
+                                  tail);
         check(cudaDeviceSynchronize(), "async route BF16 product");
         run.parts.push_back(device_bytes(destination.p, destination.bytes));
         run.parts.push_back(device_bytes(partial.p, plane_bytes));
@@ -425,18 +431,24 @@ RouteRun run_route(const char* schedule, const TypeCase& c, const AsyncCase& a, 
     return run;
 }
 
-void compare_moe_routes(const TypeCase& c, const AsyncCase& a, int pairs, bool expect_async) {
+// Eight experts of 640 rows in one bank followed by zeros (a row's last 256-value step reads into
+// the next row, past the last one into the zeros); `expect_copy` is the async route's staging copy.
+void compare_moe_routes(const TypeCase& c, const AsyncCase& a, int pairs, int expect_copy,
+                        int k = 2560) {
     constexpr int rows = 640;
-    constexpr int k = 2560;
     constexpr int experts = 8;
     constexpr int per_token = 2;
-    std::vector<DeviceBuffer> banks;
+    const std::int64_t row_bytes = row_bytes_of(c, k);
+    const std::size_t expert_bytes = std::size_t(rows) * std::size_t(row_bytes);
+    DeviceBuffer bank(experts * expert_bytes + 4096);
+    check(cudaMemset(bank.p, 0, bank.bytes), "moe route bank");
     std::vector<const void*> pointers;
     for (int expert = 0; expert < experts; ++expert) {
         const auto host = make_weight(c, rows, k, 0x7C11u + static_cast<unsigned>(expert));
-        banks.emplace_back(host.size());
-        banks.back().copy_from_host(host.data(), host.size());
-        pointers.push_back(banks.back().p);
+        auto* base = static_cast<char*>(bank.p) + expert * expert_bytes;
+        check(cudaMemcpy(base, host.data(), host.size(), cudaMemcpyHostToDevice),
+              "moe route expert");
+        pointers.push_back(base);
     }
     DeviceBuffer table_storage(experts * sizeof(const void*));
     table_storage.copy_from_host(pointers.data(), table_storage.bytes);
@@ -458,14 +470,13 @@ void compare_moe_routes(const TypeCase& c, const AsyncCase& a, int pairs, bool e
     gguf::quantize_moe_matrix_activation(c.type, static_cast<const __nv_bfloat16*>(input.p), k,
                                          routing, pairs, per_token, activation.p, nullptr);
     check(cudaDeviceSynchronize(), "moe route activation");
-    const std::int64_t row_bytes = row_bytes_of(c, k);
     const std::size_t plane_bytes = std::size_t(rows) * pairs * sizeof(float);
     std::vector<std::uint8_t> results[2];
-    bool offered[2] = {false, false};
+    int offered[2] = {0, 0};
     int index = 0;
     for (const char* schedule : {"", "async"}) {
         const ninfer::ops::DeviceRouteForce force(a.moe_key, schedule);
-        offered[index] = a.moe(rows, k, pairs / experts);
+        offered[index] = a.moe(rows, k, pairs / experts, row_bytes);
         DeviceBuffer plane(plane_bytes);
         check(cudaMemset(plane.p, 0xA5, plane_bytes), "moe route plane");
         const gguf::MoeTable table{reinterpret_cast<const void* const*>(table_storage.p), row_bytes,
@@ -475,16 +486,21 @@ void compare_moe_routes(const TypeCase& c, const AsyncCase& a, int pairs, bool e
         check(cudaDeviceSynchronize(), "moe route product");
         results[index++] = device_bytes(plane.p, plane_bytes);
     }
-    if (offered[0]) { throw std::runtime_error("the compiled MoE route took the async tiles"); }
-    if (offered[1] != expect_async) {
-        throw std::runtime_error(std::string("the async MoE route was ") +
-                                 (expect_async ? "not offered" : "offered unexpectedly"));
+    const std::string label = std::string(c.name) + " K=" + std::to_string(k) +
+                              " pairs=" + std::to_string(pairs);
+    if (offered[0]) {
+        throw std::runtime_error(label + ": the compiled MoE route took the async tiles");
+    }
+    if (offered[1] != expect_copy) {
+        throw std::runtime_error(label + ": the async MoE route copies " +
+                                 std::to_string(offered[1]) + " bytes, expected " +
+                                 std::to_string(expect_copy));
     }
     if (results[0] != results[1]) {
-        throw std::runtime_error("the MoE plane differs between the compiled and async routes");
+        throw std::runtime_error(label +
+                                 ": the MoE plane differs between the compiled and async routes");
     }
-    std::cout << "OK GGUF MoE MMQ async " << c.name << " pairs=" << pairs
-              << " async=" << offered[1] << '\n';
+    std::cout << "OK GGUF MoE MMQ async " << label << " copy=" << offered[1] << '\n';
 }
 
 // The column tile a product of `columns` columns (or pairs an expert) takes: the narrowest that
@@ -496,8 +512,8 @@ int column_tile(int columns) {
 // Whether the device offers the async loop at each column tile under a forced `async` schedule. A
 // narrower tile stages less shared memory, so it is offered wherever a wider one is.
 template <typename Offer>
-std::map<int, bool> offered_tiles(const TypeCase& c, const char* key, Offer offer) {
-    std::map<int, bool> offered;
+std::map<int, int> offered_tiles(const TypeCase& c, const char* key, Offer offer) {
+    std::map<int, int> offered;
     const ninfer::ops::DeviceRouteForce force(key, "async");
     for (const int tile : {16, 32, 64, 128}) { offered[tile] = offer(tile); }
     for (const int tile : {16, 32, 64}) {
@@ -513,16 +529,27 @@ std::map<int, bool> offered_tiles(const TypeCase& c, const char* key, Offer offe
 // Eight experts with 8 to 1,024 pairs each, every column tile at a full and a partial width.
 void compare_moe_widths(const TypeCase& c, const AsyncCase& a) {
     const auto offered =
-        offered_tiles(c, a.moe_key, [&](int columns) { return a.moe(640, 2560, columns); });
+        offered_tiles(c, a.moe_key, [&](int columns) { return a.moe(640, 2560, columns, 0); });
     for (const int pairs : {64, 128, 192, 256, 384, 512, 1024, 4096, 8192}) {
         compare_moe_routes(c, a, pairs, offered.at(column_tile(pairs / 8)));
     }
+    // Rows of 704 values (Gemma 4's expert down projections) are whole 32-value blocks but not
+    // whole 256-value steps: for the 32-value formats they start on 4 bytes only, and the async
+    // loop copies 4 bytes at a time.
+    if (gguf::block_shape(c.type).elements == 32) {
+        for (const int pairs : {128, 512, 1024}) {
+            compare_moe_routes(c, a, pairs, offered.at(column_tile(pairs / 8)) != 0 ? 4 : 0, 704);
+        }
+    }
 }
 
+// `expect_copy`: the async route's staging copy in bytes (0: the compiled loop). With `tail`, k is
+// not a whole number of 256-value steps and zeros follow the last row.
 void compare_routes(const TypeCase& c, const AsyncCase& a,
                     const std::vector<std::uint8_t>& host_weight, int rows, int k, int columns,
-                    bool expect_async) {
-    DeviceBuffer weight(host_weight.size());
+                    int expect_copy, bool tail = false) {
+    DeviceBuffer weight(host_weight.size() + 4096);
+    check(cudaMemset(weight.p, 0, weight.bytes), "async route weight");
     weight.copy_from_host(host_weight.data(), host_weight.size());
     std::mt19937 rng(0x5A17u + static_cast<unsigned>(k + columns + rows));
     std::uniform_real_distribution<float> sample(-0.25f, 0.25f);
@@ -532,20 +559,29 @@ void compare_routes(const TypeCase& c, const AsyncCase& a,
     for (auto& value : initial) { value = __float2bfloat16(sample(rng)); }
     DeviceBuffer input(host_input.size() * sizeof(__nv_bfloat16));
     input.copy_from_host(host_input.data(), input.bytes);
-    DeviceBuffer activation(gguf::matrix_activation_bytes(k, columns));
-    gguf::quantize_matrix_activation(c.type, static_cast<const __nv_bfloat16*>(input.p), k,
-                                     columns, nullptr, activation.p, nullptr);
+    DeviceBuffer activation(
+        gguf::matrix_activation_bytes(tail ? gguf::matrix_padded_k(k) : k, columns));
+    if (tail) {
+        gguf::quantize_matrix_activation_padded(c.type, static_cast<const __nv_bfloat16*>(input.p),
+                                                k, columns, nullptr, activation.p, nullptr);
+    } else {
+        gguf::quantize_matrix_activation(c.type, static_cast<const __nv_bfloat16*>(input.p), k,
+                                         columns, nullptr, activation.p, nullptr);
+    }
 
-    const RouteRun compiled = run_route("", c, a, rows, k, columns, weight, activation, initial);
-    const RouteRun async = run_route("async", c, a, rows, k, columns, weight, activation, initial);
+    const RouteRun compiled =
+        run_route("", c, a, rows, k, columns, weight, activation, initial, tail);
+    const RouteRun async =
+        run_route("async", c, a, rows, k, columns, weight, activation, initial, tail);
     const std::string label = std::string(c.name) + " rows=" + std::to_string(rows) + " K=" +
                               std::to_string(k) + " T=" + std::to_string(columns);
     if (compiled.async) {
         throw std::runtime_error(label + ": the compiled route took the async tiles");
     }
-    if (async.async != expect_async) {
-        throw std::runtime_error(label + ": the async route was " +
-                                 (expect_async ? "not offered" : "offered unexpectedly"));
+    if (async.async != expect_copy) {
+        throw std::runtime_error(label + ": the async route copies " +
+                                 std::to_string(async.async) + " bytes, expected " +
+                                 std::to_string(expect_copy));
     }
     if (compiled.fixup_bytes != async.fixup_bytes) {
         throw std::runtime_error(label + ": the route changed the stream-K fixup geometry");
@@ -557,7 +593,7 @@ void compare_routes(const TypeCase& c, const AsyncCase& a,
         }
     }
     std::cout << "OK GGUF MMQ async " << label << " fixup=" << (compiled.fixup_bytes != 0)
-              << " async=" << async.async << '\n';
+              << " copy=" << async.async << '\n';
 }
 
 }
@@ -634,7 +670,8 @@ int main() {
                 continue;
             }
             const auto offered =
-                offered_tiles(c, a.dense_key, [&](int columns) { return a.dense(128, columns); });
+                offered_tiles(c, a.dense_key,
+                              [&](int columns) { return a.dense(128, columns, 0); });
             if (!offered.at(128)) {
                 std::cout << "NOTE: " << c.name << " async tiles are not offered at 128 columns on "
                           << "this device; those arms ran the compiled route\n";
@@ -656,6 +693,16 @@ int main() {
                     plain_seen |= !fixup;
                     compare_routes(c, a, host_weight, rows, k, columns,
                                    offered.at(column_tile(columns)));
+                }
+            }
+            // Gemma 4's 704- and 2112-wide inputs: 32-value formats' rows start on 4 bytes only.
+            if (gguf::block_shape(c.type).elements == 32) {
+                for (const int k : {704, 2112}) {
+                    const auto host_weight = make_weight(c, 256, k, 0x3B07u + unsigned(k));
+                    for (const int columns : {9, 64, 129}) {
+                        compare_routes(c, a, host_weight, 256, k, columns,
+                                       offered.at(column_tile(columns)) != 0 ? 4 : 0, true);
+                    }
                 }
             }
             compare_moe_widths(c, a);

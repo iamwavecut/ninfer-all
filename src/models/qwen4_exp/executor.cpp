@@ -368,8 +368,7 @@ struct ExpertTable {
 
     // A null entry (another rank's expert) is never read.
     void seal() {
-        aligned16 = row_bytes % 16 == 0 &&
-                    std::any_of(pointers.begin(), pointers.end(),
+        aligned16 = std::any_of(pointers.begin(), pointers.end(),
                                 [](const void* pointer) { return pointer != nullptr; }) &&
                     std::all_of(pointers.begin(), pointers.end(), [](const void* pointer) {
                         return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0;
@@ -605,9 +604,9 @@ struct MoePlan {
     // staged misses' first stage): every entry it reads is a cache slot's plane, as in pooled().
     [[nodiscard]] ops::GgufMoeWeights cached() const {
         ops::GgufMoeWeights out = banks();
-        out.gate.aligned16      = gate.row_bytes % 16 == 0;
-        out.up.aligned16        = up.row_bytes % 16 == 0;
-        out.down.aligned16      = down.row_bytes % 16 == 0;
+        out.gate.aligned16      = true;
+        out.up.aligned16        = true;
+        out.down.aligned16      = true;
         out.device_resident     = true;
         return out;
     }

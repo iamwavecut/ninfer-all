@@ -1303,7 +1303,7 @@ struct ExpertMisses::Impl {
         if (wide) {
             for (auto* table : {&call.missing_banks.gate, &call.missing_banks.up,
                                 &call.missing_banks.down}) {
-                table->aligned16 = table->row_bytes % 16 == 0;
+                table->aligned16 = true;
             }
         }
         call.products     = cpu_input ? static_cast<const float*>(rank.products->data()) : nullptr;

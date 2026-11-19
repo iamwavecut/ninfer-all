@@ -35,10 +35,12 @@ memory, and the loop takes three barriers an iteration instead of four. The valu
 covers the formats whose 256-value step is a whole number of 8-byte words
 (`ggml_cuda_mmq_async_row_bytes`): Q4_0, Q5_0, Q8_0, IQ4_NL, Q4_K and Q5_K copy 16 bytes at a time,
 Q2_0, IQ4_XS and IQ1_M 8 bytes at a time (`cp_async_ca_8`, added to `cp-async.cuh` with a `#pragma
-once` so the kernel header can include it). Q6_K (210-byte blocks), Q3_K, Q2_K, IQ1_S, IQ2_*, IQ3_*
-and Q1_0 steps start on 2- or 4-byte boundaries and keep the synchronous loop. The form needs
-`cp.async` (sm_80 and later builds), the format's step bytes of shared memory per row on top of the
-loop's own (Q4_K takes 92.5 KiB at J = 128; Q8_0 fits the 99 KiB of an RTX 3090 only at J = 64 and
-narrower), and a row count that is a whole number of row tiles, since the copy has no row clamp. The
-bridge selects it per format through the `gguf_matrix/<format>` and `gguf_moe_matrix/<format>`
-device routes.
+once` so the kernel header can include it). Rows that start on 4 bytes only, whose value count is
+not a whole number of 256-value steps (Gemma 4's 704- and 2112-wide rows in the 32-value formats),
+copy 4 bytes at a time (`cp_async_ca_4`); the copy width is the kernel's `async_tiles` argument, 0
+for the synchronous loop. Q6_K (210-byte blocks), Q3_K, Q2_K, IQ1_S, IQ2_*, IQ3_* and Q1_0 steps
+start on 2- or 4-byte boundaries and keep the synchronous loop. The form needs `cp.async` (sm_80 and
+later builds), the format's step bytes of shared memory per row on top of the loop's own (Q4_K takes
+92.5 KiB at J = 128; Q8_0 fits the 99 KiB of an RTX 3090 only at J = 64 and narrower), and a row
+count that is a whole number of row tiles, since the copy has no row clamp. The bridge selects it
+per format through the `gguf_matrix/<format>` and `gguf_moe_matrix/<format>` device routes.

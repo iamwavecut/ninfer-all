@@ -76,7 +76,7 @@ struct GgufExpertTable {
     QType format               = QType::GGUF_Q8_0;
     const void* const* experts = nullptr; // device array of expert base pointers
     std::int64_t row_bytes     = 0;
-    bool aligned16             = false;
+    bool aligned16             = false; // every expert's base pointer is 16-byte aligned
 };
 
 struct GgufMoeWeights {
