@@ -905,7 +905,7 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
-// NInfer: the tile loop at J = 128 stages its next tiles through cp.async (README.ninfer.md).
+// NInfer: the tile loop at J = 16, 32, 64 and 128 stages its next tiles through cp.async (README.ninfer.md).
 #if defined(CP_ASYNC_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define MMQ_ASYNC_TILES_AVAILABLE
 #endif
@@ -935,7 +935,7 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_async_word(const ggml_typ
 
 static constexpr __host__ __device__ bool ggml_cuda_mmq_async_tiles_supported(
         const ggml_type type, const int J, const bool fallback) {
-    return ggml_cuda_mmq_async_row_bytes(type) != 0 && J == 128 && !fallback;
+    return ggml_cuda_mmq_async_row_bytes(type) != 0 && J % 16 == 0 && J <= 128 && !fallback;
 }
 
 static __host__ bool ggml_cuda_mmq_async_tiles_available(const int cc) {
@@ -1002,7 +1002,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         float * dst_partial = nullptr, const int partial_stride = 0) {
 
     static_assert(!async_tiles || ggml_cuda_mmq_async_tiles_supported(type, J, fallback),
-                  "async tiles are staged for steps of whole 8-byte words at J = 128 only");
+                  "async tiles are staged for steps of whole 8-byte words at J = 16, 32, 64 and 128 only");
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;

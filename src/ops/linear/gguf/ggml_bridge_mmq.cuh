@@ -10,6 +10,7 @@
 #include <climits>
 #include <cstdint>
 #include <mutex>
+#include <type_traits>
 
 namespace ninfer::ops::gguf::detail {
 
@@ -93,7 +94,8 @@ MatrixLaunch select_matrix_launch(int rows, int columns, bool aligned = true) {
     }
     if (best.J == 0) { throw std::invalid_argument("gguf matrix product: no tile fits this device"); }
     if constexpr (async_matrix_built<type>()) {
-        if (best.J == 128 && aligned && rows % best.I == 0 &&
+        if (ggml_cuda_mmq_async_tiles_supported(type, best.J, false) && aligned &&
+            rows % best.I == 0 &&
             ggml_cuda_mmq_async_tiles_available(device.cc) &&
             device_route_schedule(async_matrix_key<type>(), columns) == "async") {
             const std::size_t async_shared = mmq_get_nbytes_shared(
@@ -214,31 +216,24 @@ void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, i
     const auto* y             = static_cast<const int*>(activation);
     auto* f                   = static_cast<float*>(fixup);
     const int stride_row      = static_cast<int>(row_bytes / block_bytes);
-    switch (launch.J) {
-    case 16:
-        launch_matrix<type, 16, Dst, accumulate>(launch, x, stride_row, rows, k, y, columns, out,
-                                                  out_column_stride, f, stream, partial);
-        return;
-    case 32:
-        launch_matrix<type, 32, Dst, accumulate>(launch, x, stride_row, rows, k, y, columns, out,
-                                                  out_column_stride, f, stream, partial);
-        return;
-    case 64:
-        launch_matrix<type, 64, Dst, accumulate>(launch, x, stride_row, rows, k, y, columns, out,
-                                                  out_column_stride, f, stream, partial);
-        return;
-    case 128:
+    const auto run = [&](auto tile) {
+        constexpr int J = decltype(tile)::value;
         if constexpr (async_matrix_built<type>()) {
             if (launch.async) {
-                launch_matrix<type, 128, Dst, accumulate, true>(launch, x, stride_row, rows, k, y,
-                                                                columns, out, out_column_stride, f,
-                                                                stream, partial);
+                launch_matrix<type, J, Dst, accumulate, true>(launch, x, stride_row, rows, k, y,
+                                                              columns, out, out_column_stride, f,
+                                                              stream, partial);
                 return;
             }
         }
-        launch_matrix<type, 128, Dst, accumulate>(launch, x, stride_row, rows, k, y, columns, out,
-                                                  out_column_stride, f, stream, partial);
-        return;
+        launch_matrix<type, J, Dst, accumulate>(launch, x, stride_row, rows, k, y, columns, out,
+                                                out_column_stride, f, stream, partial);
+    };
+    switch (launch.J) {
+    case 16: return run(std::integral_constant<int, 16>{});
+    case 32: return run(std::integral_constant<int, 32>{});
+    case 64: return run(std::integral_constant<int, 64>{});
+    case 128: return run(std::integral_constant<int, 128>{});
     default:
         break;
     }
@@ -314,7 +309,8 @@ MatrixLaunch select_moe_launch(int rows, int k, int columns, bool tail, bool ali
         if (J >= columns) { break; }
     }
     if constexpr (async_matrix_built<type>()) {
-        if (best.J == 128 && aligned && k % MMQ_ITER_K == 0 &&
+        if (ggml_cuda_mmq_async_tiles_supported(type, best.J, false) && aligned &&
+            k % MMQ_ITER_K == 0 &&
             ggml_cuda_mmq_async_tiles_available(device.cc) &&
             device_route_schedule(async_moe_matrix_key<type>(), columns) == "async") {
             const std::size_t async_shared = mmq_get_nbytes_shared(
@@ -382,26 +378,22 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
     }
     const auto* y        = static_cast<const int*>(activation);
     const int stride_row = static_cast<int>(row_bytes / block_bytes);
-    switch (launch.J) {
-    case 16:
-        return launch_moe_matrix<type, 16>(launch, experts, stride_row, rows, k, routing,
-                                           max_active, pairs, y, out, stream);
-    case 32:
-        return launch_moe_matrix<type, 32>(launch, experts, stride_row, rows, k, routing,
-                                           max_active, pairs, y, out, stream);
-    case 64:
-        return launch_moe_matrix<type, 64>(launch, experts, stride_row, rows, k, routing,
-                                           max_active, pairs, y, out, stream);
-    case 128:
+    const auto run = [&](auto tile) {
+        constexpr int J = decltype(tile)::value;
         if constexpr (async_matrix_built<type>()) {
             if (launch.async) {
-                return launch_moe_matrix<type, 128, true>(launch, experts, stride_row, rows, k,
-                                                          routing, max_active, pairs, y, out,
-                                                          stream);
+                return launch_moe_matrix<type, J, true>(launch, experts, stride_row, rows, k,
+                                                        routing, max_active, pairs, y, out, stream);
             }
         }
-        return launch_moe_matrix<type, 128>(launch, experts, stride_row, rows, k, routing,
-                                            max_active, pairs, y, out, stream);
+        launch_moe_matrix<type, J>(launch, experts, stride_row, rows, k, routing, max_active,
+                                   pairs, y, out, stream);
+    };
+    switch (launch.J) {
+    case 16: return run(std::integral_constant<int, 16>{});
+    case 32: return run(std::integral_constant<int, 32>{});
+    case 64: return run(std::integral_constant<int, 64>{});
+    case 128: return run(std::integral_constant<int, 128>{});
     default:
         break;
     }

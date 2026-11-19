@@ -596,8 +596,8 @@ constexpr AsyncMatrixFormat kAsyncMatrixFormats[] = {
 void calibrate_gguf_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
                            const CalibrationOptions& options, const AsyncMatrixFormat& format) {
     constexpr std::int32_t max_tokens = 4096;
-    const std::vector<std::int32_t> widths = {65,  128,  129,  256,  512,  768,
-                                              1024, 1280, 1536, 2048, 3072, 4096};
+    const std::vector<std::int32_t> widths = {9,    16,   17,   32,   33,   64,   65,   128, 129,
+                                              256,  512,  768,  1024, 1280, 1536, 2048, 3072, 4096};
     const std::string key = std::string("gguf_matrix/") + format.name;
     if (!format.dense || (!options.only.empty() && key.rfind(options.only, 0) != 0)) { return; }
     SyntheticWeight wide    = gguf_vector_weight(format.qtype, 17408, 5120);
@@ -652,7 +652,7 @@ void calibrate_gguf_moe_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
     constexpr std::int32_t k = 2560;
     constexpr int experts = 64;
     constexpr int per_token = 2;
-    const std::vector<std::int32_t> widths = {65, 128, 256, 512, 1024};
+    const std::vector<std::int32_t> widths = {8, 16, 17, 32, 33, 48, 64, 65, 128, 256, 512, 1024};
     const std::string key = std::string("gguf_moe_matrix/") + format.name;
     if (!options.only.empty() && key.rfind(options.only, 0) != 0) { return; }
     const GgufBlockShape block = gguf_block_shape(format.qtype);

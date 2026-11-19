@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -486,6 +487,38 @@ void compare_moe_routes(const TypeCase& c, const AsyncCase& a, int pairs, bool e
               << " async=" << offered[1] << '\n';
 }
 
+// The column tile a product of `columns` columns (or pairs an expert) takes: the narrowest that
+// holds them, at most 128.
+int column_tile(int columns) {
+    return columns <= 16 ? 16 : columns <= 32 ? 32 : columns <= 64 ? 64 : 128;
+}
+
+// Whether the device offers the async loop at each column tile under a forced `async` schedule. A
+// narrower tile stages less shared memory, so it is offered wherever a wider one is.
+template <typename Offer>
+std::map<int, bool> offered_tiles(const TypeCase& c, const char* key, Offer offer) {
+    std::map<int, bool> offered;
+    const ninfer::ops::DeviceRouteForce force(key, "async");
+    for (const int tile : {16, 32, 64, 128}) { offered[tile] = offer(tile); }
+    for (const int tile : {16, 32, 64}) {
+        if (offered[2 * tile] && !offered[tile]) {
+            throw std::runtime_error(std::string(c.name) + " " + key + ": async tiles offered at " +
+                                     std::to_string(2 * tile) + " columns but not at " +
+                                     std::to_string(tile));
+        }
+    }
+    return offered;
+}
+
+// Eight experts with 8 to 1,024 pairs each, every column tile at a full and a partial width.
+void compare_moe_widths(const TypeCase& c, const AsyncCase& a) {
+    const auto offered =
+        offered_tiles(c, a.moe_key, [&](int columns) { return a.moe(640, 2560, columns); });
+    for (const int pairs : {64, 128, 192, 256, 384, 512, 1024, 4096, 8192}) {
+        compare_moe_routes(c, a, pairs, offered.at(column_tile(pairs / 8)));
+    }
+}
+
 void compare_routes(const TypeCase& c, const AsyncCase& a,
                     const std::vector<std::uint8_t>& host_weight, int rows, int k, int columns,
                     bool expect_async) {
@@ -597,22 +630,14 @@ int main() {
                                     [&](const TypeCase& t) { return t.type == a.type; });
             const bool q4k = a.type == gguf::GgmlType::Q4_K;
             if (a.dense_key == nullptr) {
-                const bool moe_offered = [&] {
-                    const ninfer::ops::DeviceRouteForce force(a.moe_key, "async");
-                    return a.moe(640, 2560, 128);
-                }();
-                for (const int pairs : {1024, 4096, 8192}) {
-                    compare_moe_routes(c, a, pairs, moe_offered);
-                }
+                compare_moe_widths(c, a);
                 continue;
             }
-            const bool async_offered = [&] {
-                const ninfer::ops::DeviceRouteForce force(a.dense_key, "async");
-                return a.dense(128, 129);
-            }();
-            if (!async_offered) {
-                std::cout << "NOTE: " << c.name << " async tiles are not offered on this device; "
-                          << "both arms ran the compiled route\n";
+            const auto offered =
+                offered_tiles(c, a.dense_key, [&](int columns) { return a.dense(128, columns); });
+            if (!offered.at(128)) {
+                std::cout << "NOTE: " << c.name << " async tiles are not offered at 128 columns on "
+                          << "this device; those arms ran the compiled route\n";
             }
             bool fixup_seen = false;
             bool plain_seen = false;
@@ -622,23 +647,18 @@ int main() {
                 const int k = shape.second;
                 const auto host_weight =
                     make_weight(c, rows, k, 0x3A11u + static_cast<unsigned>(rows));
-                const std::vector<int> widths = q4k ? std::vector<int>{64, 65, 128, 129, 256, 1280, 4096}
-                                                    : std::vector<int>{64, 65, 129, 1280};
+                const std::vector<int> widths =
+                    q4k ? std::vector<int>{9, 16, 17, 32, 33, 48, 64, 65, 128, 129, 256, 1280, 4096}
+                        : std::vector<int>{9, 24, 48, 64, 65, 129, 1280};
                 for (const int columns : widths) {
                     const bool fixup = gguf::matrix_fixup_bytes(c.type, rows, columns) != 0;
-                    fixup_seen |= fixup && columns > 64;
-                    plain_seen |= !fixup && columns > 64;
+                    fixup_seen |= fixup;
+                    plain_seen |= !fixup;
                     compare_routes(c, a, host_weight, rows, k, columns,
-                                   async_offered && columns > 64);
+                                   offered.at(column_tile(columns)));
                 }
             }
-            const bool moe_offered = [&] {
-                const ninfer::ops::DeviceRouteForce force(a.moe_key, "async");
-                return a.moe(640, 2560, 128);
-            }();
-            for (const int pairs : {1024, 4096, 8192}) {
-                compare_moe_routes(c, a, pairs, moe_offered);
-            }
+            compare_moe_widths(c, a);
             if (!fixup_seen || !plain_seen) {
                 throw std::runtime_error(std::string(c.name) +
                                          ": the async comparison lost its fixup or its plain "
