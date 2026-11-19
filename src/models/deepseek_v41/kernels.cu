@@ -1015,6 +1015,26 @@ __device__ int attention_keys(const AttentionArgs& a, int t, int* keys) {
     return win + s_compressed;
 }
 
+// How many keys a row attends to: attention_keys's count, without writing the list.
+__device__ int attention_key_count(const AttentionArgs& a, int t) {
+    __shared__ int s_compressed;
+    const int p   = a.positions[t];
+    const int lo  = max(max(0, min(a.window_floor, p)), p - a.window_size + 1);
+    const int win = p + 1 - lo;
+    if (threadIdx.x == 0) { s_compressed = 0; }
+    __syncthreads();
+    int count = 0;
+    if (a.compressed != nullptr) {
+        for (int i = threadIdx.x; i < a.k; i += blockDim.x) {
+            count += a.topk[std::int64_t(t) * a.k + i] >= 0 ? 1 : 0;
+        }
+    }
+    count = warp_count(count);
+    if ((threadIdx.x & 31) == 0 && count != 0) { atomicAdd(&s_compressed, count); }
+    __syncthreads();
+    return win + s_compressed;
+}
+
 __device__ __forceinline__ int active_splits(int keys, int splits) {
     return min(splits, max(1, (keys + kTile - 1) / kTile));
 }
@@ -1182,11 +1202,10 @@ __global__ void __launch_bounds__(kAttnThreads) sparse_attention_kernel(Attentio
 
 // Block (head, row) of 128 threads, four dimensions each: merges the splits and the sink.
 __global__ void attention_combine_kernel(AttentionArgs a) {
-    __shared__ int keys[kMaxKeys];
     __shared__ float weight[64];
     __shared__ float s_inv;
     const int head = blockIdx.x, t = blockIdx.y;
-    const int n      = attention_keys(a, t, keys);
+    const int n      = attention_key_count(a, t);
     const int active = active_splits(n, a.splits);
     const std::int64_t rows  = std::int64_t(a.tokens) * a.heads * a.splits;
     const std::int64_t first = (std::int64_t(t) * a.heads + head) * a.splits;

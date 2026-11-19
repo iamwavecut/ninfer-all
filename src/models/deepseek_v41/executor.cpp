@@ -2474,7 +2474,9 @@ struct Executor::Impl {
         auto* scale = alloc<float>(t);
         kernels::guard_columns(static_cast<__nv_bfloat16*>(x.data), hidden, t, scale, stream);
         auto* y = alloc<float>(std::size_t(t) * hidden);
-        const auto shared = [&] {
+        // `xq`: x's vector activation when the routed experts quantized it (up to 8 tokens), which
+        // the shared expert's gate and up rows read instead of quantizing x a second time.
+        const auto shared = [&](const void* xq) {
             auto shared_scope = workspace->scope();
             auto* gu          = alloc<float>(std::size_t(t) * 2 * width);
             if (p.stq) {
@@ -2495,7 +2497,7 @@ struct Executor::Impl {
                 parts[i].row      = rows;
                 rows += p.shared_gate_up[i].n;
             }
-            ops::detail::gguf_project(x, {parts, p.shared_gate_up.size()}, *workspace, stream);
+            ops::detail::gguf_project(x, {parts, p.shared_gate_up.size()}, *workspace, stream, xq);
             Tensor middle = alloc_bf16(width, t);
             kernels::clamped_swiglu(gu, 2 * width, t, width, config.swiglu_limit, scale, 1,
                                     static_cast<__nv_bfloat16*>(middle.data), width, stream);
@@ -2630,7 +2632,7 @@ struct Executor::Impl {
         auto* fixed = alloc<unsigned long long>(std::size_t(t) * hidden);
         expert_part(p, *delivery, expert_ranges[0], xq, xb, scale, ids, weights, t, fixed,
                     *workspace, stream);
-        shared();
+        shared(t <= gguf::kMaxVectorColumns ? xq : nullptr);
         std::vector<const unsigned long long*> parts;
         for (void* received : expert_exchange->collect(part, slot, stream)) {
             parts.push_back(static_cast<const unsigned long long*>(received));
@@ -2661,7 +2663,7 @@ struct Executor::Impl {
         if (p.stq) {
             // An STQ drafter block's resident experts: a pair per routed expert of a row through its
             // gate, up and down matrices, the rows weighted into y.
-            shared();
+            shared(nullptr);
             auto* gu     = alloc<float>(std::size_t(pairs) * 2 * w);
             auto* middle = alloc<__nv_bfloat16>(std::size_t(pairs) * w);
             auto* rows   = alloc<float>(std::size_t(pairs) * hidden);
@@ -2769,7 +2771,7 @@ struct Executor::Impl {
                     return part;
                 };
                 compute(stage(call->cached_experts));
-                shared();
+                shared(xq);
                 delivery->await(stream);
                 compute(stage(call->missing_experts));
                 if (call->cpu != nullptr) {
@@ -2777,13 +2779,13 @@ struct Executor::Impl {
                 }
             } else {
                 compute(routing);
-                shared();
+                shared(xq);
             }
             combine.fixed = fixed;
             kernels::moe_combine(combine, stream);
             return;
         }
-        shared();
+        shared(xq);
         if (call) { delivery->await(stream); }
         if (matrix_route(p, true, p.gate_up_type, 2 * w, hidden, t)) {
             void* act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;

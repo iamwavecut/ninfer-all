@@ -266,7 +266,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
 }
 
 void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
-                  WorkspaceArena& workspace, cudaStream_t stream) {
+                  WorkspaceArena& workspace, cudaStream_t stream, const void* quantized_x) {
     require_activation(x, "gguf product");
     if (products.empty()) { return; }
     for (const auto& p : products) { require_product(x, p); }
@@ -283,9 +283,10 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     if (t <= gguf::kMaxVectorColumns) {
         struct Activation {
             const std::int32_t* columns;
-            void* data;
+            const void* data;
         };
         std::vector<Activation> activations;
+        if (quantized_x != nullptr) { activations.push_back({nullptr, quantized_x}); }
         for (const auto& p : products) {
             const Weight& w = *p.weight;
             auto found      = std::find_if(activations.begin(), activations.end(),
