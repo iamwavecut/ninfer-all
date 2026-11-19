@@ -112,6 +112,8 @@ constexpr void assert_kv_planes() {
 // BFloat16 profile is symmetric, both code planes BF16. If a merge ever flips the value plane to
 // FP16, this fails at compile time in every translation unit that includes the header.
 static_assert(std::is_same_v<KvKeyCodeT<ninfer::KvCacheStorage::BFloat16>, __nv_bfloat16>);
+static_assert(std::is_same_v<KvKeyCodeT<ninfer::KvCacheStorage::Float16>, __half>);
+static_assert(std::is_same_v<KvValueCodeT<ninfer::KvCacheStorage::Float16>, __half>);
 static_assert(std::is_same_v<KvValueCodeT<ninfer::KvCacheStorage::BFloat16>, __nv_bfloat16>,
               "the BF16 KV cache must store V as BF16, symmetric with K");
 

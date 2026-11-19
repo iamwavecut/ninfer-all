@@ -100,8 +100,16 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
     }
 }
 
+D256KVCacheProfile causal_cache_profile(KvCacheStorage storage) {
+    if (storage == KvCacheStorage::Float16) {
+        throw std::invalid_argument(
+            "causal_softmax_attention: native FP16 KV is a sparse-attention profile");
+    }
+    return d256_kv_cache_profile(storage);
+}
+
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
-    const D256KVCacheProfile profile = d256_kv_cache_profile(cache.storage);
+    const D256KVCacheProfile profile = causal_cache_profile(cache.storage);
     if (cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -153,7 +161,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
-    const D256KVCacheProfile profile = d256_kv_cache_profile(cache.storage);
+    const D256KVCacheProfile profile = causal_cache_profile(cache.storage);
     if (cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
@@ -430,6 +438,7 @@ namespace detail {
 CausalAttentionRoute causal_attention_resolve_route(std::int32_t call_q_heads, std::int32_t width,
                                                     std::int32_t batch_size, KvCacheStorage storage,
                                                     CausalAttentionExecutionEnvelope envelope) {
+    (void)causal_cache_profile(storage);
     // A tensor-parallel share takes the routes measured for its model.
     const std::int32_t q_heads = causal_attention_model_query_heads(call_q_heads);
     if (envelope.small_prefill && batch_size == 1 && width > kMaximumVerifyTokens &&
@@ -454,6 +463,8 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t call_q_heads, s
         if (batch_size == 1) {
             std::uint32_t prompt_limit = 0;
             switch (storage) {
+            case KvCacheStorage::Float16:
+                throw std::invalid_argument("native FP16 KV requires sparse attention");
             case KvCacheStorage::BFloat16:
             case KvCacheStorage::Bf16Packed:
                 prompt_limit = width <= 4 ? 128 : width <= 8 ? 256 : 640;
@@ -626,7 +637,7 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
     const std::int32_t q_heads = geometry.query_heads;
     // Propagate d256_kv_cache_profile's own diagnostic for an unrecognized storage selection
     // rather than folding it into the generic message below.
-    (void)d256_kv_cache_profile(cache_storage);
+    (void)causal_cache_profile(cache_storage);
     if (cache_storage == KvCacheStorage::Bf16Packed && current_device_volta()) {
         throw std::invalid_argument("--kv-dtype bf16p needs sm_75 or newer");
     }

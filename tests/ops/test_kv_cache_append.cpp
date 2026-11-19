@@ -83,6 +83,8 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
         throw std::invalid_argument("test_cache_layout: rk2v4-e8 uses full_append_case_e8_root");
     case KvCacheStorage::Bf16Packed:
         throw std::invalid_argument("test_cache_layout: bf16p is covered by test_kv_bf16p.cpp");
+    case KvCacheStorage::Float16:
+        throw std::invalid_argument("test_cache_layout: fp16 uses native_half_append_case");
     }
     throw std::invalid_argument("unsupported test KV storage");
 }
@@ -2051,6 +2053,84 @@ public:
     }
 };
 
+int native_half_append_case(int heads, int tokens) {
+    constexpr int first = 62, pages = 5;
+    constexpr std::uint16_t sentinel = 0x35a5;
+    const std::vector<int> table{3, 1, 4};
+    const std::array<float, 16> boundary{
+        0.f,           -0.f,           0x1p-25f,       0x1.8p-24f,     0x1p-24f, 0x1p-14f,
+        1.0009765625f, 1.00048828125f, 1.00146484375f, -1.0009765625f, 65504.f,  65520.f,
+        65536.f,       -65536.f,       0x1p-30f,       -0x1p-24f};
+    const std::size_t count = std::size_t(kFullHeadDim) * heads * tokens;
+    std::vector<float> key(count), value(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        key[i]   = boundary[i % boundary.size()];
+        value[i] = -boundary[(i + 3) % boundary.size()];
+    }
+    std::vector<int> positions(tokens);
+    for (int t = 0; t < tokens; ++t) positions[t] = first + t;
+    std::vector<std::uint16_t> expected_k(std::size_t(pages) * kPage * heads * kFullHeadDim,
+                                          sentinel),
+        expected_v(expected_k);
+    for (int t = 0; t < tokens; ++t)
+        for (int h = 0; h < heads; ++h)
+            for (int d = 0; d < kFullHeadDim; ++d) {
+                const auto src  = full_input_index(d, h, t, heads);
+                const auto dst  = full_cache_index(kFullHeadDim, d, h, positions[t],
+                                                   table[positions[t] / kPage], heads);
+                expected_k[dst] = f32_to_f16_bits(key[src]);
+                expected_v[dst] = f32_to_f16_bits(value[src]);
+            }
+    GuardedDeviceBuffer dk(count * sizeof(float)), dv(count * sizeof(float)),
+        dp(positions.size() * sizeof(int)), dt(table.size() * sizeof(int)),
+        ck(expected_k.size() * 2), cv(expected_v.size() * 2);
+    dk.copy_from_host(key.data(), dk.bytes());
+    dv.copy_from_host(value.data(), dv.bytes());
+    dp.copy_from_host(positions.data(), dp.bytes());
+    dt.copy_from_host(table.data(), dt.bytes());
+    const std::vector<std::uint16_t> empty(expected_k.size(), sentinel);
+    ck.copy_from_host(empty.data(), ck.bytes());
+    cv.copy_from_host(empty.data(), cv.bytes());
+    const Tensor k(dk.data(), DType::FP32, {kFullHeadDim, heads, tokens}),
+        v(dv.data(), DType::FP32, {kFullHeadDim, heads, tokens}),
+        p(dp.data(), DType::I32, {tokens});
+    PagedKVLayerView cache{};
+    cache.k_pages      = Tensor(ck.data(), DType::FP16, {kFullHeadDim, kPage, heads, pages});
+    cache.v_pages      = Tensor(cv.data(), DType::FP16, {kFullHeadDim, kPage, heads, pages});
+    cache.block_table  = Tensor(dt.data(), DType::I32, {3});
+    cache.head_dim     = kFullHeadDim;
+    cache.num_kv_heads = heads;
+    cache.storage      = KvCacheStorage::Float16;
+    DeviceContext device;
+    DecodeGraphDefinition definition;
+    definition.capture(device.stream, [&] { ops::kv_cache_append(k, v, p, cache, device.stream); });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    graph.launch(device.stream);
+    cuda_synchronize(device.stream);
+    int failures = verify_exact("native FP16 K",
+                                from_device<std::uint16_t>(ck.data(), empty.size()), expected_k);
+    failures += verify_exact("native FP16 V", from_device<std::uint16_t>(cv.data(), empty.size()),
+                             expected_v);
+    failures += verify_exact("native FP16 source K", from_device<float>(dk.data(), count), key);
+    failures += verify_exact("native FP16 source V", from_device<float>(dv.data(), count), value);
+    failures += verify_exact("native FP16 positions", from_device<int>(dp.data(), positions.size()),
+                             positions);
+    failures += verify_exact("native FP16 table", from_device<int>(dt.data(), table.size()), table);
+    bool rejected = false;
+    try {
+        const Tensor wrong(dk.data(), DType::BF16, {kFullHeadDim, heads, tokens});
+        ops::kv_cache_append(wrong, v, p, cache, device.stream);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) {
+        std::cerr << "native FP16 append accepted a BF16 source\n";
+        ++failures;
+    }
+    for (auto* memory : {&dk, &dv, &dp, &dt, &ck, &cv})
+        failures += memory->verify_guards("native FP16 append");
+    return failures;
+}
+
 int cyclic_variable_prefix_tests() {
     int failures = 0;
     CyclicPrefixFixture dflash2(2048);
@@ -2109,6 +2189,9 @@ int main(int argc, char** argv) {
         std::cout << (nvfp4_only ? "nvfp4" : "k8v4") << " kv_cache_append independent: PASS\n";
         return 0;
     }
+
+    for (int heads : {1, 2})
+        for (int tokens : {1, 8, 9, 129}) failures += native_half_append_case(heads, tokens);
 
     // Four and two KV heads are the models'; three and one are tensor-parallel ranks' shares.
     for (const int kv_heads : {4, 3, 2, 1}) {

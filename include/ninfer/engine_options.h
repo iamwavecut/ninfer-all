@@ -622,6 +622,9 @@ struct EngineOptions {
     // Prefill with the fast INT8-KV prompt-attention kernel and round prefill_chunk down to whole
     // prompt-attention waves. Off keeps the default kernel and the requested chunk.
     bool fast_prefill_kernel           = false;
+    // Float16 is native Flash-Next/Edge0 K/V: FP32 projections, key norm and rotation, then one
+    // binary16 store. Gemma 4 and Flint keep their F16 caches under either name; the Qwen3.5
+    // Program and DeepSeek-V4.1 refuse it. BF16 stays the default.
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

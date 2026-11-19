@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -227,12 +228,13 @@ __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, i
     }
 }
 
-static __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
-                                           __nv_bfloat16* q, __nv_bfloat16* k,
-                                           std::int32_t head_dim, std::int32_t rotary_dim,
-                                           float theta, std::int32_t q_heads, std::int32_t k_heads,
-                                           std::int32_t tokens, std::int64_t q_token_stride,
-                                           std::int64_t k_token_stride) {
+template <typename Value = __nv_bfloat16, bool Yarn = false>
+static __global__ void
+rope_generic_kernel(const std::int32_t* positions, std::int32_t axes, Value* q, Value* k,
+                    std::int32_t head_dim, std::int32_t rotary_dim, float theta,
+                    std::int32_t q_heads, std::int32_t k_heads, std::int32_t tokens,
+                    std::int64_t q_token_stride, std::int64_t k_token_stride,
+                    const RopeYarnKernelTable table = {}) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;
@@ -240,9 +242,31 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
     __shared__ float sin_cache[kRopeMaxHalf];
     if (threadIdx.x < static_cast<unsigned>(half)) {
         const int pair = static_cast<int>(threadIdx.x);
-        if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
+        if constexpr (Yarn) {
+            const int axis = axes == 3 ? pair % 3 : 0;
+            float position =
+                static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]);
+            if (position > table.interpolation_threshold) {
+                position = table.interpolation_threshold +
+                           (position - table.interpolation_threshold) * table.interpolation_scale;
+            }
+            sincosf(position * table.inverse_frequency[pair], &sin_cache[pair], &cos_cache[pair]);
+            sin_cache[pair] *= table.attention_factor;
+            cos_cache[pair] *= table.attention_factor;
+        } else if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
             fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair,
                                                        &sin_cache[pair], &cos_cache[pair]);
+        } else if (axes != 2 && rotary_dim == 64 && theta == 1.0e7F) {
+            // The text kernels' table, which powf misses by an ulp on seven of the 32 pairs: FP32
+            // keys of an FP16 cache and tensor-parallel head shares, which this kernel rotates,
+            // turn by the angles of the queries the fixed kernels rotate.
+            if (axes == 3) {
+                fixed_sincos<RopeKernelMode::TextMrope>(positions, tokens, token, pair,
+                                                        &sin_cache[pair], &cos_cache[pair]);
+            } else {
+                fixed_sincos<RopeKernelMode::Text1D>(positions, tokens, token, pair,
+                                                     &sin_cache[pair], &cos_cache[pair]);
+            }
         } else {
             int axis       = 0;
             float exponent = 0.0F;
@@ -263,17 +287,22 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
          combined_head += block_warps) {
         const bool is_q             = combined_head < q_heads;
         const int head              = is_q ? combined_head : combined_head - q_heads;
-        __nv_bfloat16* data         = is_q ? q : k;
+        Value* data                 = is_q ? q : k;
         const std::int64_t stride_t = is_q ? q_token_stride : k_token_stride;
         const std::int64_t base     = static_cast<std::int64_t>(token) * stride_t +
                                   static_cast<std::int64_t>(head) * head_dim;
         for (int pair = lane; pair < half; pair += 32) {
-            const float first        = __bfloat162float(data[base + pair]);
-            const float second       = __bfloat162float(data[base + pair + half]);
+            const float first        = static_cast<float>(data[base + pair]);
+            const float second       = static_cast<float>(data[base + pair + half]);
             const float c            = cos_cache[pair];
             const float s            = sin_cache[pair];
-            data[base + pair]        = __float2bfloat16_rn(first * c - second * s);
-            data[base + pair + half] = __float2bfloat16_rn(second * c + first * s);
+            if constexpr (std::is_same_v<Value, float>) {
+                data[base + pair]        = first * c - second * s;
+                data[base + pair + half] = second * c + first * s;
+            } else {
+                data[base + pair]        = __float2bfloat16_rn(first * c - second * s);
+                data[base + pair + half] = __float2bfloat16_rn(second * c + first * s);
+            }
         }
     }
 }

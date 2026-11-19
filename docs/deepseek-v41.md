@@ -99,7 +99,7 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   positions with the release's image routing bias and leaves them out of the Engram
   ([below](#images)).
 
-Not built for this family: the quantized `--kv-dtype` formats (the caches are BF16), MTP, DFlash
+Not built for this family: the `--kv-dtype` formats (the caches hold the release's FP8/FP4 codes), MTP, DFlash
 and n-gram copy drafts, DSpark drafts while several requests decode, rotation scaling
 (`--rope-yarn`, `--rope-scaling-factor`: the compressed blocks carry the release's own YaRN), video
 and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool, the

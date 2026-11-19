@@ -25,6 +25,9 @@ constexpr ReductionCriterion rmsnorm_bf16_criterion() {
             /*gross_relative_to_max_reference*/ kBf16GrossRelativeFloor};
 }
 
+// FP32 reduction/rsqrt and products, without a BF16 output storage boundary.
+constexpr ReductionCriterion rmsnorm_fp32_criterion() { return {2.e-6, 1.e-7, 4.e-6}; }
+
 std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
                                    const std::vector<float>& weight, const Shape& shape,
                                    bool unit_offset) {
@@ -44,6 +47,47 @@ std::vector<double> rmsnorm_oracle(const std::vector<float>& input,
         }
     }
     return output;
+}
+
+int run_fp32_case(const Shape& shape, bool unit_offset, bool fp32_weight) {
+    std::vector<float> input(shape.elements()), weight(shape.d);
+    fill_uniform(input, 1381U, -4.f, 4.f);
+    fill_uniform(weight, 1382U, -1.5f, 1.5f);
+    if (!fp32_weight) round_to_bf16(weight);
+    weight[0] = unit_offset ? -1.f : 0.f;
+    std::vector<std::uint16_t> weight_bits(weight.size());
+    for (std::size_t i = 0; i < weight.size(); ++i) weight_bits[i] = f32_to_bf16(weight[i]);
+    GuardedDeviceBuffer dx(input.size() * sizeof(float)), dw(weight.size() * (fp32_weight ? 4 : 2)),
+        dy(dx.bytes());
+    dx.copy_from_host(input.data(), dx.bytes());
+    dw.copy_from_host(fp32_weight ? static_cast<const void*>(weight.data()) : weight_bits.data(),
+                      dw.bytes());
+    const Tensor x(dx.data(), DType::FP32, {shape.d, shape.rows, shape.tokens});
+    const Tensor w(dw.data(), fp32_weight ? DType::FP32 : DType::BF16, {shape.d});
+    Tensor y(dy.data(), DType::FP32, {shape.d, shape.rows, shape.tokens});
+    DeviceContext device;
+    DecodeGraphDefinition definition;
+    definition.capture(device.stream,
+                       [&] { ops::rmsnorm(x, w, kEps, unit_offset, y, device.stream); });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    graph.launch(device.stream);
+    cuda_synchronize(device.stream);
+    const auto expected = rmsnorm_oracle(input, weight, shape, unit_offset);
+    const auto actual   = from_device<float>(dy.data(), input.size());
+    int failures =
+        verify_reduction("rmsnorm FP32", std::vector<double>(actual.begin(), actual.end()),
+                         expected, rmsnorm_fp32_criterion());
+    failures +=
+        verify_exact("rmsnorm FP32 input", from_device<float>(dx.data(), input.size()), input);
+    if (fp32_weight)
+        failures += verify_exact("rmsnorm FP32 weight",
+                                 from_device<float>(dw.data(), weight.size()), weight);
+    else
+        failures += verify_exact("rmsnorm BF16 weight",
+                                 from_device<std::uint16_t>(dw.data(), weight.size()), weight_bits);
+    return failures + dx.verify_guards("rmsnorm FP32 input") +
+           dw.verify_guards("rmsnorm FP32 weight") + dy.verify_guards("rmsnorm FP32 output");
 }
 
 int run_case(const char* label, const Shape& shape, bool unit_offset, std::uint32_t seed,
@@ -134,6 +178,10 @@ int main() {
     }
 
     int failures = 0;
+    for (int tokens : {1, 8, 9, 128, 1024})
+        for (bool offset : {false, true})
+            for (bool fp32_weight : {false, true})
+                failures += run_fp32_case({256, tokens == 1 ? 1 : 2, tokens}, offset, fp32_weight);
     failures += run_case("rmsnorm offset [5120,1]", {5120, 1}, true, 1101U);
     failures += run_case("rmsnorm offset [5120,128]", {5120, 128}, true, 1102U);
     failures += run_case("rmsnorm offset [5120,1024]", {5120, 1024}, true, 1107U);

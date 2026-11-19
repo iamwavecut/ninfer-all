@@ -9,6 +9,7 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -261,18 +262,17 @@ __launch_bounds__(512) __global__
 
 // Functional fallback outside the aligned fast domains. It intentionally favors a simple complete
 // implementation over another family of shape-specific paths.
-template <RmsEpilogue Epilogue, typename Weight = __nv_bfloat16>
+template <RmsEpilogue Epilogue, typename Weight = __nv_bfloat16, typename Value = __nv_bfloat16>
 __launch_bounds__(256) __global__
-    void rmsnorm_generic_kernel(const __nv_bfloat16* x, const Weight* weight,
-                                const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
-                                std::int64_t rows, float eps) {
+    void rmsnorm_generic_kernel(const Value* x, const Weight* weight, const __nv_bfloat16* z,
+                                Value* out, std::int32_t d, std::int64_t rows, float eps) {
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
 
     const std::int64_t base = row * static_cast<std::int64_t>(d);
     float sum               = 0.0f;
     for (std::int64_t i = threadIdx.x; i < static_cast<std::int64_t>(d); i += blockDim.x) {
-        const float xv = __bfloat162float(x[base + i]);
+        const float xv = static_cast<float>(x[base + i]);
         sum += xv * xv;
     }
 
@@ -287,11 +287,16 @@ __launch_bounds__(256) __global__
     const float inv = rsqrtf(scratch[0] / static_cast<float>(d) + eps);
     for (std::int64_t i = threadIdx.x; i < static_cast<std::int64_t>(d); i += blockDim.x) {
         const std::int64_t index = base + i;
-        const float xv           = __bfloat162float(x[index]);
+        const float xv           = static_cast<float>(x[index]);
         const float wv           = static_cast<float>(weight[i]);
         float zv                 = 0.0f;
         if constexpr (rms_has_gate(Epilogue)) { zv = __bfloat162float(z[index]); }
-        out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
+        const float result = rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv);
+        if constexpr (std::is_same_v<Value, float>) {
+            out[index] = result;
+        } else {
+            out[index] = __float2bfloat16_rn(result);
+        }
     }
 }
 

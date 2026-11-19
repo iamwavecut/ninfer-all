@@ -55,6 +55,7 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
 
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
+    if (text == "fp16") { return KvCacheStorage::Float16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
     if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     if (text == "rk8v4") { return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; }
@@ -64,8 +65,8 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
-    throw std::invalid_argument(
-        "--kv-dtype must be bf16, int8, fp8, rk8v4, rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4, or bf16p");
+    throw std::invalid_argument("--kv-dtype must be bf16, fp16 (Flash-Next, Gemma 4, Flint), int8, fp8, rk8v4, "
+                                "rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4, or bf16p");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -321,10 +322,13 @@ std::string usage_text(std::string_view program) {
         << "  --embedding-residency <device|host>  token embedding on the GPU (default) or in "
            "mapped pinned host memory\n"
         << "  --expert-cache-mib <N|auto> persistent device expert cache (default: auto)\n"
-        << "  --expert-dma-share <F|auto> host or disk experts: the GPU's share of a decode call's\n"
-           "                              cache misses, the CPU computing the rest (default: auto)\n"
+        << "  --expert-dma-share <F|auto> host or disk experts: the GPU's share of a decode "
+           "call's\n"
+           "                              cache misses, the CPU computing the rest (default: "
+           "auto)\n"
         << "  --expert-cpu-threads <N>    host or disk experts: CPU workers (default: automatic)\n"
-        << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p>  KV cache storage "
+        << "  --kv-dtype <bf16|fp16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p>  KV "
+           "cache storage "
            "(default: bf16)\n"
         << "  --fast-prefill-kernel       fast INT8/FP8-KV prompt kernel, wave-aligned chunks\n"
         << "  --spec <mtp|dflash|dflash2|dspine> speculative backend (default: none)\n"
@@ -340,10 +344,13 @@ std::string usage_text(std::string_view program) {
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --no-prefill-a8             full prefill tiles keep their A16 routes\n"
-        << "  --prefill-cublas            hand wide prefill GEMMs to cuBLAS (quality trade; wants a "
+        << "  --prefill-cublas            hand wide prefill GEMMs to cuBLAS (quality trade; wants "
+           "a "
            "larger --prefill-chunk)\n"
-        << "  --no-prefill-cublas-projections  keep attention/GDN input projections off that route\n"
-        << "  --lookup-ngram <n>          context-lookup drafting from the last n tokens (0 = off)\n"
+        << "  --no-prefill-cublas-projections  keep attention/GDN input projections off that "
+           "route\n"
+        << "  --lookup-ngram <n>          context-lookup drafting from the last n tokens (0 = "
+           "off)\n"
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
         << "  --output-file <path>        write report to a file\n"
@@ -1068,6 +1075,8 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "k8v4";
     case KvCacheStorage::Bf16Packed:
         return "bf16p";
+    case KvCacheStorage::Float16:
+        return "fp16";
     }
     return "unknown";
 }

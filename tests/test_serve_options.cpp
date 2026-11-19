@@ -39,6 +39,10 @@ int launch_configuration_tests() {
         std::ofstream(path) << text;
         return path.string();
     };
+    const auto half = write("fp16.json", R"({"model":"model.ninfer","kv-dtype":"fp16"})");
+    failures +=
+        check(parse({"ninfer-serve", "--config", half}).kv_cache == ninfer::KvCacheStorage::Float16,
+              "flat serving JSON did not preserve native FP16 selection");
     const std::string base = write("base.ini", "model = from-file.ninfer\n"
                                                "host = 0.0.0.0\n"
                                                "port = 9000\n"
@@ -476,6 +480,9 @@ int main() {
 
     failures += check(!defaults.default_reasoning_effort,
                       "a reasoning effort is unexpectedly configured by default");
+    const ServeOptions fp16 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp16"});
+    failures += check(make_engine_options(fp16).kv_cache == ninfer::KvCacheStorage::Float16,
+                      "--kv-dtype fp16 did not reach the Engine as native FP16 KV");
     const ServeOptions fp8 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp8"});
     failures += check(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256,
                       "--kv-dtype fp8 did not select row-scaled E4M3 KV");

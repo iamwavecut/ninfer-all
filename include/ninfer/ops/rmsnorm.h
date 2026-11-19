@@ -13,9 +13,10 @@ namespace ninfer::ops {
  *   gain[d]  = unit_offset ? 1 + weight[d] : weight[d]
  *   ideal[d,r] = x[d,r] * inv_r * gain[d].
  *
- * `x` and `out` are same-shaped contiguous BF16 tensors, weight is contiguous BF16 or FP32 [D], and
+ * `x` and `out` are same-shaped contiguous tensors of the same dtype, BF16 or FP32;
+ * weight is contiguous BF16 or FP32 [D], and
  * eps is positive and finite. Input, weight, and output must not overlap. The oracle evaluates
- * `ideal` naively in FP64 from the represented inputs. The BF16 output is promoted and compared
+ * `ideal` naively in FP64 from the represented inputs. The output is promoted and compared
  * directly with that result; output storage rounding belongs to the Op's numerical criterion, not
  * the oracle. Kernel reduction, staging, and accumulator precision are implementation choices.
  * There is no workspace or persistent state side effect.

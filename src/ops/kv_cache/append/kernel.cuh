@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -68,14 +69,13 @@ kv_cache_append_full_fp8_row(const __nv_bfloat16* __restrict__ k,
     }
 }
 
-template <typename Geometry, typename Metadata>
-__global__ void kv_cache_append_full_bf16_kernel(const __nv_bfloat16* __restrict__ k,
-                                                 const __nv_bfloat16* __restrict__ v,
-                                                 const std::int32_t* __restrict__ positions,
-                                                 Metadata metadata,
-                                                 __nv_bfloat16* __restrict__ cache_k,
-                                                 __nv_bfloat16* __restrict__ cache_v,
-                                                 std::int32_t width) {
+template <typename Geometry, typename Metadata, typename Input = __nv_bfloat16,
+          typename Stored = __nv_bfloat16>
+__global__ void
+kv_cache_append_full_16bit_kernel(const Input* __restrict__ k, const Input* __restrict__ v,
+                                  const std::int32_t* __restrict__ positions, Metadata metadata,
+                                  Stored* __restrict__ cache_k, Stored* __restrict__ cache_v,
+                                  std::int32_t width) {
     constexpr int VecElems = 8;
     const int tokens       = metadata.valid_tokens(width);
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -95,16 +95,37 @@ __global__ void kv_cache_append_full_bf16_kernel(const __nv_bfloat16* __restrict
     const std::int64_t src_off =
         static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kKVCacheAppendFullHeadDim) *
                                            (kv_head + Geometry::KVHeads * token);
-    const int4 k_value = load_vec<int4>(&k[src_off]);
-    const int4 v_value = load_vec<int4>(&v[src_off]);
+    int4 k_value{}, v_value{};
+    if constexpr (!std::is_same_v<Stored, __half>) {
+        k_value = load_vec<int4>(&k[src_off]);
+        v_value = load_vec<int4>(&v[src_off]);
+    }
     physical_page      = __shfl_sync(0xffffffffu, physical_page, 0);
     physical_page = metadata.local_page(physical_page);
     if (physical_page < 0) return; // another rank's page (a position-split cache)
     const std::int64_t cache_off =
         paged_kv_element_offset<kKVCacheAppendFullHeadDim, Geometry::KVHeads>(
             physical_page, kv_head, position & kPagedKVPageMask, d);
-    store_vec(&cache_k[cache_off], k_value);
-    store_vec(&cache_v[cache_off], v_value);
+    if constexpr (std::is_same_v<Stored, __half>) {
+        static_assert(std::is_same_v<Input, float>);
+        // One 16-byte store of eight halves per plane: a streamed layer's cache is pinned host
+        // memory, where narrower stores cross the bus one by one. A plain int4 store through the
+        // halves' pointer compiles to four 4-byte stores, with which an RTX 3090 appends 1,024
+        // tokens of two heads to host pages in 11.7 ms instead of 0.38; __stwb is one st.v4.
+        const auto half8 = [](const float* x) {
+            const float4 low  = load_vec<float4>(x);
+            const float4 high = load_vec<float4>(x + 4);
+            return make_int4(static_cast<int>(pack_f16x2(low.x, low.y)),
+                             static_cast<int>(pack_f16x2(low.z, low.w)),
+                             static_cast<int>(pack_f16x2(high.x, high.y)),
+                             static_cast<int>(pack_f16x2(high.z, high.w)));
+        };
+        __stwb(reinterpret_cast<int4*>(&cache_k[cache_off]), half8(&k[src_off]));
+        __stwb(reinterpret_cast<int4*>(&cache_v[cache_off]), half8(&v[src_off]));
+    } else {
+        store_vec(&cache_k[cache_off], k_value);
+        store_vec(&cache_v[cache_off], v_value);
+    }
 }
 
 template <typename Geometry, typename Metadata>

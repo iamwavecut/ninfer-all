@@ -155,7 +155,8 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     }
     if (options.kv_cache != KvCacheStorage::BFloat16) {
         throw std::invalid_argument("DeepSeek-V4.1 keeps its attention caches in the release's "
-                                    "FP8/FP4 forms (--kv-dtype bf16 only)");
+                                    "FP8/FP4 codes, which its attention arithmetic defines "
+                                    "(--kv-dtype bf16, the default, only)");
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||

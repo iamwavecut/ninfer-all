@@ -1,8 +1,11 @@
 #include "core/device_launch.h"
+#include "core/device.h"
+#include "core/decode_graph.h"
 #include "ninfer/ops/rope.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +28,7 @@ constexpr float kVisionTheta = 10'000.0F;
 // RoPE BF16 profile therefore bounds each output by the FP64 norm of its public input pair rather
 // than by the cancelled output value.
 constexpr double kRopePointwisePairRtol = 6.9e-3;
+constexpr double kRopeFp32Roundoff      = 8 * std::numeric_limits<float>::epsilon();
 
 struct Geometry {
     const char* label;
@@ -182,7 +186,7 @@ std::vector<int> make_positions(int axes, int tokens, int first_position) {
     return positions;
 }
 
-// This is the sole RoPE oracle. It consumes the exact logical BF16 values represented by the
+// This is the sole RoPE oracle. It consumes the exact logical floating values represented by the
 // public input and evaluates the documented split-half rotation naively in FP64. It does not
 // reproduce output storage rounding, production staging, coefficient tables, range reduction,
 // kernel split, or reduction order.
@@ -474,6 +478,89 @@ int run_single_case(const Geometry& geometry, int heads, int first_position, int
     return failures;
 }
 
+// float_phase: the angle is the one the BF16 query kernels turn by, the correctly rounded float
+// frequency times the float position, rounded to float, so keys and queries agree at any position;
+// only sin, cos and the products round after it.
+int run_fp32_case(const Geometry& geometry, int heads, int first_position,
+                  bool float_phase = false) {
+    const int dense = geometry.head_dim * heads, stride = dense + 8;
+    std::vector<float> input(dense_elements(geometry.head_dim, heads, geometry.tokens));
+    fill_uniform(input, 0x3011U, -4.f, 4.f);
+    input[geometry.rotary_dim] = -0.f;
+    std::vector<float> storage(std::size_t(stride) * geometry.tokens, 123.125f);
+    for (int t = 0; t < geometry.tokens; ++t)
+        std::copy_n(input.data() + std::size_t(t) * dense, dense,
+                    storage.data() + std::size_t(t) * stride);
+    const auto positions = make_positions(geometry.axes, geometry.tokens, first_position);
+    const auto expected  = rope_oracle(input, positions, geometry, heads);
+    GuardedDeviceBuffer dx(storage.size() * sizeof(float)), dp(positions.size() * sizeof(int));
+    dx.copy_from_host(storage.data(), dx.bytes());
+    dp.copy_from_host(positions.data(), dp.bytes());
+    const Tensor p(dp.data(), DType::I32, {geometry.tokens, geometry.axes});
+    Tensor x(dx.data(), DType::FP32, {geometry.head_dim, heads, geometry.tokens});
+    x.nb[2] = stride * sizeof(float);
+    DeviceContext device;
+    DecodeGraphDefinition definition;
+    definition.capture(device.stream, [&] {
+        ops::rope(p, geometry.rotary_dim, geometry.theta, geometry.yarn(), x, device.stream);
+    });
+    DecodeGraphExecutable graph;
+    graph.instantiate(definition);
+    graph.launch(device.stream);
+    cuda_synchronize(device.stream);
+    const auto got = from_device<float>(dx.data(), storage.size());
+    int failures   = 0;
+    for (int t = 0; t < geometry.tokens; ++t) {
+        for (int h = 0; h < heads; ++h) {
+            for (int d = 0; d < geometry.head_dim; ++d) {
+                const auto at      = dense_index(geometry.head_dim, heads, t, h, d);
+                const float actual = got[std::size_t(t) * stride + h * geometry.head_dim + d];
+                if (d >= geometry.rotary_dim) {
+                    if (std::bit_cast<std::uint32_t>(actual) !=
+                        std::bit_cast<std::uint32_t>(input[at]))
+                        ++failures;
+                    continue;
+                }
+                const int pair         = d % (geometry.rotary_dim / 2);
+                const auto lo          = dense_index(geometry.head_dim, heads, t, h, pair);
+                const auto hi          = lo + geometry.rotary_dim / 2;
+                const int axis         = geometry.axes == 3 ? pair % 3 : 0;
+                if (float_phase) {
+                    const auto frequency = static_cast<float>(
+                        std::pow(double(geometry.theta), -2.0 * pair / geometry.rotary_dim));
+                    const double phi = static_cast<float>(
+                        static_cast<float>(positions[axis * geometry.tokens + t]) * frequency);
+                    const double x = input[lo], y = input[hi];
+                    const double want = d < geometry.rotary_dim / 2
+                                            ? x * std::cos(phi) - y * std::sin(phi)
+                                            : y * std::cos(phi) + x * std::sin(phi);
+                    if (!std::isfinite(actual) ||
+                        std::abs(actual - want) > kRopeFp32Roundoff * std::hypot(x, y))
+                        ++failures;
+                    continue;
+                }
+                const double frequency = yarn_frequency(
+                    geometry, pair,
+                    std::pow(double(geometry.theta), -2.0 * pair / geometry.rotary_dim));
+                const double phase =
+                    geometry.rotated_position(positions[axis * geometry.tokens + t]) * frequency;
+                // Float frequency/phase rounding grows with absolute position; cancellation is
+                // bounded by the input pair norm rather than by a near-zero rotated coordinate.
+                const double bound = kRopeFp32Roundoff * (1 + std::abs(phase)) *
+                                     std::hypot(input[lo], input[hi]) *
+                                     yarn_attention_factor(geometry);
+                if (!std::isfinite(actual) || std::abs(actual - expected[at]) > bound) ++failures;
+            }
+        }
+        for (int d = dense; d < stride; ++d)
+            if (got[std::size_t(t) * stride + d] != 123.125f) ++failures;
+    }
+    failures += verify_exact("rope FP32 positions", from_device<int>(dp.data(), positions.size()),
+                             positions);
+    if (failures) std::cerr << geometry.label << " FP32 failures=" << failures << '\n';
+    return failures + dx.verify_guards("rope FP32") + dp.verify_guards("rope FP32 positions");
+}
+
 int run_vision_packed_case() {
     constexpr int kHeadDim = 72;
     constexpr int kHeads   = 16;
@@ -561,6 +648,23 @@ int main() {
     }
 
     int failures = 0;
+
+    for (int axes : {1, 3}) {
+        failures += run_single_case(
+            {"Flash-Next TP Q YaRN", 256, 64, axes, 9, kTextTheta, 2.25f, 262144}, 12, 4096);
+        failures += run_single_case(
+            {"Flash-Next TP K YaRN", 256, 64, axes, 9, kTextTheta, 2.25f, 262144}, 1, 4096);
+        for (int tokens : {1, 8, 9, 128})
+            failures += run_fp32_case({"Flash-Next K", 256, 64, axes, tokens, kTextTheta}, 2, 31);
+        failures += run_fp32_case({"Flash-Next K long", 256, 64, axes, 9, kTextTheta}, 1, 200000);
+        failures += run_fp32_case({"Flash-Next K query angles", 256, 64, axes, 9, kTextTheta}, 2,
+                                  262130, true);
+        failures += run_fp32_case(
+            {"Flash-Next K YaRN", 256, 64, axes, 9, kTextTheta, 2.25f, 262144}, 2, 4096);
+        failures += run_fp32_case(
+            {"Flash-Next K interpolation", 256, 64, axes, 9, kTextTheta, 1.f, 0, 2.f, 4096}, 1,
+            4089);
+    }
 
     // Text pair form: both registered checkpoint geometries, decode/prefill, and 1-D/MRoPE.
     for (int axes : {1, 3}) {

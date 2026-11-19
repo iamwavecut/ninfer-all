@@ -49,6 +49,21 @@ template <RmsEpilogue Epilogue>
 void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
                     std::int32_t d, std::int64_t rows, float eps, bool aligned2,
                     cudaStream_t stream) {
+    if (x.dtype == DType::FP32) {
+        if (weight.dtype == DType::FP32) {
+            rmsnorm_generic_kernel<Epilogue, float, float>
+                <<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+                    static_cast<const float*>(x.data), static_cast<const float*>(weight.data),
+                    nullptr, static_cast<float*>(out.data), d, rows, eps);
+        } else {
+            rmsnorm_generic_kernel<Epilogue, __nv_bfloat16, float>
+                <<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+                    static_cast<const float*>(x.data),
+                    static_cast<const __nv_bfloat16*>(weight.data), nullptr,
+                    static_cast<float*>(out.data), d, rows, eps);
+        }
+        return;
+    }
     const auto* x_bf16 = static_cast<const __nv_bfloat16*>(x.data);
     const auto* w_bf16 = static_cast<const __nv_bfloat16*>(weight.data);
     const auto* z_bf16 = z != nullptr ? static_cast<const __nv_bfloat16*>(z->data) : nullptr;

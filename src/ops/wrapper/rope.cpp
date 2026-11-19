@@ -51,7 +51,7 @@ void require_tensor_layout(const Tensor& tensor, const char* label, std::int32_t
         tensor.ne[3] != 1) {
         throw std::invalid_argument(std::string("rope: invalid ") + label + " shape");
     }
-    constexpr std::int64_t elem = 2;
+    const std::int64_t elem = dtype_size(tensor.dtype);
     if (tensor.nb[0] != elem || tensor.nb[1] != elem * head_dim ||
         tensor.nb[2] < elem * static_cast<std::int64_t>(head_dim) * heads ||
         (tensor.nb[2] % elem) != 0) {
@@ -149,13 +149,18 @@ void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& 
 void rope(const Tensor& positions, int rotary_dim, float theta, const RopeYarn& yarn, Tensor& x,
           cudaStream_t stream) {
     require_common(positions, rotary_dim, theta);
-    if (x.dtype != DType::BF16) { throw std::invalid_argument("rope: tensor must be BF16"); }
+    if (x.dtype != DType::BF16 && x.dtype != DType::FP32) {
+        throw std::invalid_argument("rope: tensor must be BF16 or FP32");
+    }
     (void)numel_allow_zero(positions, "positions");
     const std::int64_t x_numel  = numel_allow_zero(x, "tensor");
     const std::int32_t tokens   = x.ne[2];
     const int axes              = position_axes(positions, tokens);
     const std::int32_t head_dim = axes == 2 ? kVisionDim : x.ne[0];
     const std::int32_t heads    = x.ne[1];
+    if (x.dtype == DType::FP32 && (head_dim != kTextHeadDim || rotary_dim != 64 || axes == 2)) {
+        throw std::invalid_argument("rope: FP32 covers D256/R64 Text only");
+    }
     require_model_mode(axes, rotary_dim, head_dim);
     require_yarn(yarn, axes, rotary_dim, head_dim);
     require_tensor_layout(x, "tensor", head_dim, heads, tokens);

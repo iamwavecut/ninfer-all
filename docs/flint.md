@@ -62,7 +62,8 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   artifact's files, with a device cache and a CPU share of decode misses
   ([below](#expert-residency)).
 
-Not built for this family: the quantized `--kv-dtype` formats (the KV cache is F16), MTP, DFlash
+Not built for this family: the quantized `--kv-dtype` formats (the KV cache is F16, `bf16` or
+`fp16`), MTP, DFlash
 and n-gram copy drafts, rotation scaling (`--rope-yarn`, `--rope-scaling-factor`: the
 full-attention blocks have no rotation to scale), strict tool arguments and structured output beside
 tools (Flint's tool markup has no grammar here), images and video (Flint reads text only), pipeline

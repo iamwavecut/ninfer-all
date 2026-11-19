@@ -30,7 +30,7 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   attention derives each key from it as it reads it, with the same rotations the keys were stored
   with.
 - **Every quantized KV-cache format of the engine.** `--kv-dtype` keeps the caches in F16 (`bf16`, the
-  default) or in int8, fp8, rk8v4, nvfp4, k8v4, rk4v4, rk4v4-e8 or rk2v4-e8, the engine's own
+  default, or `fp16`) or in int8, fp8, rk8v4, nvfp4, k8v4, rk4v4, rk4v4-e8 or rk2v4-e8, the engine's own
   codecs; see [below](#kv-cache-formats). `bf16p` packs BF16 rows, so Gemma, whose plain cache
   is F16, refuses it.
 - **Speculative decoding with the release's assistant.** The multi-token-prediction drafter Google
@@ -172,7 +172,7 @@ does not fit is refused at startup with the numbers.
 ## KV-cache formats
 
 `--kv-dtype` selects the caches' storage. The 16-bit default keeps F16 rows (the prompt kernels'
-type). Every other format of the engine stores its codes and scales per 256-wide block with the
+type), which `bf16` and `fp16` both select. Every other format of the engine stores its codes and scales per 256-wide block with the
 engine's D256 codecs (`ops/kv_cache`), each block's codes and scales in two planes:
 
 | `--kv-dtype` | sliding blocks: keys | sliding blocks: values | full-attention plane |

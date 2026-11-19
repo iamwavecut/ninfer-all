@@ -48,7 +48,9 @@ struct KvFormat {
     KvCacheStorage storage = KvCacheStorage::BFloat16;
     KvPlane key, value; // sliding-window blocks
     KvPlane full;       // the full-attention blocks' one plane
-    [[nodiscard]] bool quantized() const noexcept { return storage != KvCacheStorage::BFloat16; }
+    [[nodiscard]] bool quantized() const noexcept {
+        return storage != KvCacheStorage::BFloat16 && storage != KvCacheStorage::Float16;
+    }
 };
 
 [[nodiscard]] KvFormat kv_format(KvCacheStorage storage);

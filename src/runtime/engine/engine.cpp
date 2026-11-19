@@ -95,6 +95,12 @@ EngineOptions with_expert_disk_reads(EngineOptions options) {
 // partial-sum exchange is the Qwen3.5 Program's and Flash-Next's; the other families divide only
 // their routed experts and sum them their own way.
 EngineOptions with_family_attention(EngineOptions options) {
+    // Flash-Next stores FP32 keys and values once in F16; Gemma 4 and Flint keep F16 caches under
+    // either name; DeepSeek-V4.1 refuses it in its core. The Qwen3.5 Program's attention reads BF16.
+    if (options.kv_cache == KvCacheStorage::Float16 && !own_family_artifact(options.artifact_path)) {
+        throw std::invalid_argument(
+            "--kv-dtype fp16 applies to Qwen4ExpForCausalLM, Gemma 4 and Flint artifacts");
+    }
     if ((options.tensor_attention != TensorAttention::Heads || options.invariant_attention) &&
         own_family_artifact(options.artifact_path)) {
         throw std::invalid_argument(

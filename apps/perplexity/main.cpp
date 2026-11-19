@@ -128,7 +128,8 @@ std::string usage_text() {
            "       [--ngram-hot-profile PATH] [--no-ngram-table] [--ngram-dedupe on|off]\n"
            "       [--iq1m-experts matrix|vector]\n"
            "       [--kv-resident N|all|auto]   (Qwen3.8-Flash-Next)\n"
-           "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p] [--output "
+           "       [--kv-dtype bf16|fp16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p] "
+           "[--output "
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16]\n"
@@ -215,6 +216,8 @@ Options parse_arguments(const std::vector<std::string>& arguments,
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
                 out.kv = ninfer::KvCacheStorage::BFloat16;
+            } else if (dtype == "fp16") {
+                out.kv = ninfer::KvCacheStorage::Float16;
             } else if (dtype == "int8") {
                 out.kv = ninfer::KvCacheStorage::Int8Group64;
             } else if (dtype == "fp8") {
@@ -234,7 +237,8 @@ Options parse_arguments(const std::vector<std::string>& arguments,
             } else if (dtype == "bf16p") {
                 out.kv = ninfer::KvCacheStorage::Bf16Packed;
             } else {
-                usage_error("--kv-dtype must be bf16, int8, fp8, rk8v4, rk4v4, rk4v4-e8, "
+                usage_error("--kv-dtype must be bf16, fp16 (Flash-Next, Gemma 4, Flint), int8, fp8, rk8v4, rk4v4, "
+                            "rk4v4-e8, "
                             "rk2v4-e8, nvfp4, k8v4 or bf16p");
             }
         } else if (option == "--output") {
@@ -381,6 +385,8 @@ std::string kv_name(ninfer::KvCacheStorage value) {
     switch (value) {
     case ninfer::KvCacheStorage::BFloat16:
         return "bf16";
+    case ninfer::KvCacheStorage::Float16:
+        return "fp16";
     case ninfer::KvCacheStorage::Int8Group64:
         return "int8-g64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:

@@ -24,11 +24,10 @@ def test_real_defaults_use_gpu_zero_automatic_workers_and_profile_cache():
     assert unprofiled["expert-cache-mib"] == 0
 
 
-def test_fp16_never_becomes_bf16_or_an_invalid_target_option():
+def test_fp16_maps_to_native_fp16_without_a_precision_substitution():
     out, report = translated({"kv": "fp16"})
-    assert "kv-dtype" not in out
-    assert report["unresolved"]["kv"]["value"] == "fp16"
-    assert report["unresolved"]["kv"]["choose_target"] == ["kv-dtype"]
+    assert out["kv-dtype"] == "fp16"
+    assert "kv" not in report["unresolved"]
 
 
 @pytest.mark.parametrize("mode", ["dynamic", "cpu", "1"])
@@ -113,13 +112,13 @@ def test_cli_requires_both_acknowledgement_and_target_choice(tmp_path, monkeypat
 
     monkeypatch.setattr(config, "BasaltFile", Pack)
     source, output = tmp_path / "basalt.json", tmp_path / "ninfer.json"
-    source.write_text(json.dumps({"engine": {"kv": "fp16", "resident-experts": True}}))
+    source.write_text(json.dumps({"engine": {"kv": "q4", "resident-experts": True}}))
     args = [str(source), "--pack", "pack.basalt", "--artifact", "model.ninfer", "--output", str(output)]
     with pytest.raises(SystemExit):
         config.main(args + ["--acknowledge", "kv"])
     assert not output.exists()
     report = json.loads(output.with_name(output.name + ".report.json").read_text())
-    assert report["source_options"]["kv"] == "fp16"
+    assert report["source_options"]["kv"] == "q4"
     with pytest.raises(SystemExit):
         config.main(args + ["--set", "kv-dtype=bf16"])
     assert not output.exists()

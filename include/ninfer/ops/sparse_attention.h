@@ -24,16 +24,17 @@ namespace ninfer::ops {
  * indexer's blocks; `cache` is the sequence's paged KV layer of K heads of 256 (both, K = 2, or
  * one, K = 1: a tensor-parallel share of a KV head and its 12 query heads) holding every
  * selected and tail position, its block table covering every position the caller reaches, in any
- * storage kv_cache_append writes (BF16, the INT8 family, FP8 rows, NVFP4, K8V4), in pages of 64
- * positions or, for a streamed layer, its device pool of 4-position pages after kv_stream_resolve
- * made every block the call reads resident (kv_stream.h); `out` is BF16
- * [256, 12 K, tokens]. The oracle evaluates the softmax and the weighted sum in FP64 from the
- * represented cache and queries: a quantized cache's decoded keys lie in the rotated basis
- * kv_cache_append stores them in, against the query under the same normalized Hadamard transform,
- * and its decoded values as stored, NVFP4 and K8V4 values rotated as well with the transform
- * applied back to the result. The kernel stages a quantized cache's decoded rows in FP16; the
- * output is compared after its BF16 store. Up to eight queries keep partial softmaxes in FP32
- * workspace; no state.
+ * storage kv_cache_append writes (BF16, native FP16, the INT8 family, FP8 rows, NVFP4, K8V4), in
+ * pages of 64 positions or, for a streamed layer, its device pool of 4-position pages after
+ * kv_stream_resolve made every block the call reads resident (kv_stream.h); `out` is BF16 [256, 12
+ * K, tokens]. The oracle evaluates the softmax and the weighted sum in FP64 from the represented
+ * cache and queries: a quantized cache's decoded keys lie in the rotated basis kv_cache_append
+ * stores them in, against the query under the same normalized Hadamard transform, and its decoded
+ * values as stored, NVFP4 and K8V4 values rotated as well with the transform applied back to the
+ * result. The kernel stages a quantized cache's decoded rows in FP16; the output is compared after
+ * its BF16 store. Native FP16 rows are read directly without a BF16 staging cast or Hadamard
+ * transform, with FP32 accumulation. Up to eight queries keep partial softmaxes in FP32 workspace;
+ * no state.
  */
 [[nodiscard]] std::size_t sparse_softmax_attention_workspace_bytes(std::int32_t tokens);
 

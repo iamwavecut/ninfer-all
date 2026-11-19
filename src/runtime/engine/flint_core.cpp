@@ -120,8 +120,10 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
                                     "archive, --mtp-attention-window or proposal head, and "
                                     "--draft-min-p only with --spec dspine");
     }
-    if (options.kv_cache != KvCacheStorage::BFloat16) {
-        throw std::invalid_argument("Flint keeps its KV cache in F16 (no --kv-dtype formats)");
+    if (options.kv_cache != KvCacheStorage::BFloat16 &&
+        options.kv_cache != KvCacheStorage::Float16) {
+        throw std::invalid_argument(
+            "Flint keeps its KV cache in F16 (--kv-dtype fp16, or bf16, the default)");
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
@@ -442,6 +444,7 @@ struct FlintCore::Impl {
     FlintInstance& instance;
     DeviceContext& device;
     const std::uint32_t max_context;
+    const KvCacheStorage kv_cache; // the requested name of the F16 cache (bf16 or fp16)
     const std::size_t max_outstanding;
     const std::chrono::milliseconds pending_timeout;
     const std::uint32_t domain;
@@ -521,7 +524,7 @@ struct FlintCore::Impl {
     std::thread worker;
 
     Impl(FlintInstance& i, DeviceContext& d, const EngineOptions& options)
-        : instance(i), device(d), max_context(options.max_context),
+        : instance(i), device(d), max_context(options.max_context), kv_cache(options.kv_cache),
           max_outstanding(std::size_t(options.max_concurrency) + options.max_pending_requests),
           pending_timeout(options.pending_timeout_ms),
           domain(i.model->resources().public_token_count),
@@ -2663,7 +2666,7 @@ MemorySummary FlintCore::memory_summary() const {
     out.device      = impl_->device.rank(0).device;
     out.max_context = impl_->max_context;
     out.kv_capacity = impl_->max_context;
-    out.kv_cache    = KvCacheStorage::BFloat16; // F16 rows of the same width
+    out.kv_cache    = impl_->kv_cache; // F16 rows either way
     out.host_kv_capacity_bytes = impl_->host_budget;
     {
         std::lock_guard lock(impl_->stats_mutex);

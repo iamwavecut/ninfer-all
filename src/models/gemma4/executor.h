@@ -58,7 +58,7 @@ struct ExecutorOptions {
     // media unit (an image or a video frame) has, which also bounds a batch of units the device
     // tower encodes at once. 0: text only.
     std::uint32_t vision_max_patches = 0;
-    // The caches' storage (kv_format.h); BFloat16 selects the F16 cache.
+    // The caches' storage (kv_format.h); BFloat16 and Float16 select the F16 cache.
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     // One checkpoint of every sequence's rings (snapshot/restore), allocated with the caches.
     bool checkpoints = true;

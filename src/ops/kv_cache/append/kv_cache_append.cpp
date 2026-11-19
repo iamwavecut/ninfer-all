@@ -61,9 +61,9 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
     require_shape(cache.block_table, logical_pages, 1, 1, 1, kAppendOp, "block table");
     require_contiguous_nonnull(cache.block_table, kAppendOp, "block table");
 
-    if (cache.storage == KvCacheStorage::BFloat16) {
+    if (cache.storage == KvCacheStorage::BFloat16 || cache.storage == KvCacheStorage::Float16) {
         if (cache.k_scale_pages.data != nullptr || cache.v_scale_pages.data != nullptr) {
-            throw std::invalid_argument("kv_cache_append: BF16 cache must not have scales");
+            throw std::invalid_argument("kv_cache_append: 16-bit cache must not have scales");
         }
         return static_cast<std::uint32_t>(capacity);
     }
@@ -173,8 +173,10 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
 
 void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                      PagedKVLayerView cache, cudaStream_t stream) {
-    if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
-        throw std::invalid_argument("kv_cache_append: k/v must be BF16");
+    const auto input_type = cache.storage == KvCacheStorage::Float16 ? DType::FP32 : DType::BF16;
+    if (k.dtype != input_type || v.dtype != input_type) {
+        throw std::invalid_argument(
+            "kv_cache_append: FP16 cache reads FP32 k/v; other caches read BF16");
     }
     if (positions.dtype != DType::I32) {
         throw std::invalid_argument("kv_cache_append: positions must be I32");
