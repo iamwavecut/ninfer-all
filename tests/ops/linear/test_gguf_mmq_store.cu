@@ -55,6 +55,9 @@ const TypeCase kCases[] = {
     {QType::GGUF_Q2_0, gguf::GgmlType::Q2_0, "q2_0", {0}},
 };
 
+// IQ1_M has the routed-expert matrix kernel only, so it is not among the dense cases above.
+const TypeCase kIq1m = {QType::GGUF_IQ1_M, gguf::GgmlType::IQ1_M, "iq1_m", {}};
+
 void check(cudaError_t status, const char* label) {
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string(label) + ": " + cudaGetErrorString(status));
@@ -83,6 +86,14 @@ std::vector<std::uint8_t> make_weight(const TypeCase& c, int rows, int k, std::u
         for (const int offset : c.half_fields) {
             const std::uint16_t bits = half_bits(scale(rng));
             std::memcpy(base + offset, &bits, sizeof(bits));
+        }
+        if (c.type == gguf::GgmlType::IQ1_M) {
+            // The FP16 scale is spread over the top nibbles of the four scale words (bytes 48-55).
+            const std::uint16_t bits = half_bits(scale(rng));
+            for (int w = 0; w < 4; ++w) {
+                std::uint8_t& high = base[48 + 2 * w + 1];
+                high = static_cast<std::uint8_t>((high & 0x0f) | (((bits >> (4 * w)) & 0xf) << 4));
+            }
         }
     }
     return bytes;
@@ -347,6 +358,13 @@ const AsyncCase kAsyncCases[] = {
      dense_async_offered<GGML_TYPE_Q8_0>, moe_async_offered<GGML_TYPE_Q8_0>},
     {gguf::GgmlType::IQ4_NL, "gguf_matrix/iq4_nl", "gguf_moe_matrix/iq4_nl",
      dense_async_offered<GGML_TYPE_IQ4_NL>, moe_async_offered<GGML_TYPE_IQ4_NL>},
+    // Steps of whole 8-byte words: staged in 8-byte copies.
+    {gguf::GgmlType::Q2_0, "gguf_matrix/q2_0", "gguf_moe_matrix/q2_0",
+     dense_async_offered<GGML_TYPE_Q2_0>, moe_async_offered<GGML_TYPE_Q2_0>},
+    {gguf::GgmlType::IQ4_XS, "gguf_matrix/iq4_xs", "gguf_moe_matrix/iq4_xs",
+     dense_async_offered<GGML_TYPE_IQ4_XS>, moe_async_offered<GGML_TYPE_IQ4_XS>},
+    {gguf::GgmlType::IQ1_M, nullptr, "gguf_moe_matrix/iq1_m", nullptr,
+     moe_async_offered<GGML_TYPE_IQ1_M>},
 };
 
 std::int64_t row_bytes_of(const TypeCase& c, int k) {
@@ -572,9 +590,22 @@ int main() {
         std::cout << "OK GGUF MMQ BF16 store, sm=" << sm_count << '\n';
 
         for (const AsyncCase& a : kAsyncCases) {
-            const TypeCase& c = *std::find_if(std::begin(kCases), std::end(kCases),
-                                              [&](const TypeCase& t) { return t.type == a.type; });
+            const TypeCase& c =
+                a.type == kIq1m.type
+                    ? kIq1m
+                    : *std::find_if(std::begin(kCases), std::end(kCases),
+                                    [&](const TypeCase& t) { return t.type == a.type; });
             const bool q4k = a.type == gguf::GgmlType::Q4_K;
+            if (a.dense_key == nullptr) {
+                const bool moe_offered = [&] {
+                    const ninfer::ops::DeviceRouteForce force(a.moe_key, "async");
+                    return a.moe(640, 2560, 128);
+                }();
+                for (const int pairs : {1024, 4096, 8192}) {
+                    compare_moe_routes(c, a, pairs, moe_offered);
+                }
+                continue;
+            }
             const bool async_offered = [&] {
                 const ninfer::ops::DeviceRouteForce force(a.dense_key, "async");
                 return a.dense(128, 129);

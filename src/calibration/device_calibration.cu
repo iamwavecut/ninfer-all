@@ -445,7 +445,8 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
     const bool known = qtype == QType::GGUF_Q4_K || qtype == QType::GGUF_Q6_K ||
                        qtype == QType::GGUF_Q5_K || qtype == QType::GGUF_Q4_0 ||
                        qtype == QType::GGUF_Q5_0 || qtype == QType::GGUF_Q8_0 ||
-                       qtype == QType::GGUF_IQ4_NL;
+                       qtype == QType::GGUF_IQ4_NL || qtype == QType::GGUF_IQ4_XS ||
+                       qtype == QType::GGUF_Q2_0 || qtype == QType::GGUF_IQ1_M;
     if (!known || block.elements == 0 || k % block.elements != 0) {
         throw std::invalid_argument("calibration: unsupported GGUF vector weight format");
     }
@@ -460,6 +461,15 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
     for (std::uint64_t index = 0; index < blocks; ++index) {
         const std::size_t base = static_cast<std::size_t>(index) * block.bytes;
         const std::uint16_t d = 0x3c00;
+        if (qtype == QType::GGUF_IQ1_M) {
+            // IQ1_M spreads its FP16 scale over the top nibbles of its four scale words (bytes 48
+            // to 55): nibble i of d tops word i.
+            for (int i = 0; i < 4; ++i) {
+                std::uint8_t& high = host[base + 48 + 2 * i + 1];
+                high = static_cast<std::uint8_t>((high & 0x0f) | (((d >> (4 * i)) & 0xf) << 4));
+            }
+            continue;
+        }
         std::memcpy(host.data() + base + (qtype == QType::GGUF_Q6_K ? 208 : 0), &d, sizeof(d));
         if (qtype == QType::GGUF_Q4_K || qtype == QType::GGUF_Q5_K) {
             const std::uint16_t dmin = 0x3800;
@@ -569,6 +579,7 @@ struct AsyncMatrixFormat {
     QType qtype;
     const char* name;
     ops::gguf::GgmlType ggml;
+    bool dense = true; // false: the routed-expert matrix kernel only (IQ1_M)
 };
 constexpr AsyncMatrixFormat kAsyncMatrixFormats[] = {
     {QType::GGUF_Q4_K, "q4_k", ops::gguf::GgmlType::Q4_K},
@@ -577,6 +588,9 @@ constexpr AsyncMatrixFormat kAsyncMatrixFormats[] = {
     {QType::GGUF_Q5_0, "q5_0", ops::gguf::GgmlType::Q5_0},
     {QType::GGUF_Q8_0, "q8_0", ops::gguf::GgmlType::Q8_0},
     {QType::GGUF_IQ4_NL, "iq4_nl", ops::gguf::GgmlType::IQ4_NL},
+    {QType::GGUF_Q2_0, "q2_0", ops::gguf::GgmlType::Q2_0},
+    {QType::GGUF_IQ4_XS, "iq4_xs", ops::gguf::GgmlType::IQ4_XS},
+    {QType::GGUF_IQ1_M, "iq1_m", ops::gguf::GgmlType::IQ1_M, false},
 };
 
 void calibrate_gguf_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
@@ -585,7 +599,7 @@ void calibrate_gguf_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
     const std::vector<std::int32_t> widths = {65,  128,  129,  256,  512,  768,
                                               1024, 1280, 1536, 2048, 3072, 4096};
     const std::string key = std::string("gguf_matrix/") + format.name;
-    if (!options.only.empty() && key.rfind(options.only, 0) != 0) { return; }
+    if (!format.dense || (!options.only.empty() && key.rfind(options.only, 0) != 0)) { return; }
     SyntheticWeight wide    = gguf_vector_weight(format.qtype, 17408, 5120);
     SyntheticWeight tall    = gguf_vector_weight(format.qtype, 5120, 17408);
     DeviceBuffer wide_input = bf16_buffer(static_cast<std::size_t>(5120) * max_tokens);

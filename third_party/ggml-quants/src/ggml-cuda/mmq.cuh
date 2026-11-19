@@ -910,18 +910,27 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 #define MMQ_ASYNC_TILES_AVAILABLE
 #endif
 
-// The raw bytes of one row's MMQ_ITER_K values, staged whole in 16-byte copies: only formats whose
-// step is a whole number of 16-byte words (a row of k % 256 == 0 values then starts on one too).
+// The raw bytes of one row's MMQ_ITER_K values, staged whole: only formats whose step is a whole
+// number of 8-byte words (a row of k % 256 == 0 values then starts on one too).
 static constexpr __host__ __device__ int ggml_cuda_mmq_async_row_bytes(const ggml_type type) {
     switch (type) {
+        case GGML_TYPE_Q2_0:   return 4 * 18;
         case GGML_TYPE_Q4_0:   return 8 * 18;
         case GGML_TYPE_Q5_0:   return 8 * 22;
         case GGML_TYPE_Q8_0:   return 8 * 34;
+        case GGML_TYPE_IQ1_M:  return 56;
+        case GGML_TYPE_IQ4_XS: return 136;
         case GGML_TYPE_IQ4_NL: return 8 * 18;
         case GGML_TYPE_Q4_K:   return 144;
         case GGML_TYPE_Q5_K:   return 176;
         default:               return 0;
     }
+}
+
+// The width of each staging copy: 16 bytes where the step is a whole number of them, else 8. A row
+// and its weights' base pointer must start on a word.
+static constexpr __host__ __device__ int ggml_cuda_mmq_async_word(const ggml_type type) {
+    return ggml_cuda_mmq_async_row_bytes(type) % 16 == 0 ? 16 : 8;
 }
 
 static constexpr __host__ __device__ bool ggml_cuda_mmq_async_tiles_supported(
@@ -958,9 +967,10 @@ static __device__ __forceinline__ void ggml_cuda_mmq_stage_tile_x(
     constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int bs         = ggml_cuda_type_traits<type>::bs;
     constexpr int row_bytes  = ggml_cuda_mmq_async_row_bytes(type);
-    static_assert(row_bytes % 16 == 0 && row_bytes == bs * (MMQ_ITER_K / ggml_cuda_type_traits<type>::qk),
-                  "an async row is MMQ_ITER_K values in whole 16-byte words");
-    constexpr int row_chunks = row_bytes / 16;
+    constexpr int word       = ggml_cuda_mmq_async_word(type);
+    static_assert(row_bytes % word == 0 && row_bytes == bs * (MMQ_ITER_K / ggml_cuda_type_traits<type>::qk),
+                  "an async row is MMQ_ITER_K values in whole words");
+    constexpr int row_chunks = row_bytes / word;
     constexpr int chunks     = I * row_chunks;
     const unsigned int dst   = ggml_cuda_cvta_generic_to_shared(x_raw);
 #pragma unroll
@@ -971,7 +981,11 @@ static __device__ __forceinline__ void ggml_cuda_mmq_stage_tile_x(
             const int i = l / row_chunks;
             const char * row = x + (int64_t(kbx0) + int64_t(i)*stride) * bs;
 
-            cp_async_cg_16<0>(dst + l*16, row + (l - i*row_chunks)*16);
+            if constexpr (word == 16) {
+                cp_async_cg_16<0>(dst + l*16, row + (l - i*row_chunks)*16);
+            } else {
+                cp_async_ca_8(dst + l*8, row + (l - i*row_chunks)*8);
+            }
         }
     }
 }
@@ -988,7 +1002,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         float * dst_partial = nullptr, const int partial_stride = 0) {
 
     static_assert(!async_tiles || ggml_cuda_mmq_async_tiles_supported(type, J, fallback),
-                  "async tiles are staged for whole 16-byte steps at J = 128 only");
+                  "async tiles are staged for steps of whole 8-byte words at J = 128 only");
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;

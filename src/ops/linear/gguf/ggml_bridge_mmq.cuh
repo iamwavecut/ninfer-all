@@ -32,9 +32,12 @@ struct MatrixLaunch {
 template <ggml_type type>
 constexpr const char* async_matrix_key() {
     switch (type) {
+    case GGML_TYPE_Q2_0: return "gguf_matrix/q2_0";
     case GGML_TYPE_Q4_0: return "gguf_matrix/q4_0";
     case GGML_TYPE_Q5_0: return "gguf_matrix/q5_0";
     case GGML_TYPE_Q8_0: return "gguf_matrix/q8_0";
+    case GGML_TYPE_IQ1_M: return "gguf_matrix/iq1_m";
+    case GGML_TYPE_IQ4_XS: return "gguf_matrix/iq4_xs";
     case GGML_TYPE_IQ4_NL: return "gguf_matrix/iq4_nl";
     case GGML_TYPE_Q4_K: return "gguf_matrix/q4_k";
     case GGML_TYPE_Q5_K: return "gguf_matrix/q5_k";
@@ -45,9 +48,12 @@ constexpr const char* async_matrix_key() {
 template <ggml_type type>
 constexpr const char* async_moe_matrix_key() {
     switch (type) {
+    case GGML_TYPE_Q2_0: return "gguf_moe_matrix/q2_0";
     case GGML_TYPE_Q4_0: return "gguf_moe_matrix/q4_0";
     case GGML_TYPE_Q5_0: return "gguf_moe_matrix/q5_0";
     case GGML_TYPE_Q8_0: return "gguf_moe_matrix/q8_0";
+    case GGML_TYPE_IQ1_M: return "gguf_moe_matrix/iq1_m";
+    case GGML_TYPE_IQ4_XS: return "gguf_moe_matrix/iq4_xs";
     case GGML_TYPE_IQ4_NL: return "gguf_moe_matrix/iq4_nl";
     case GGML_TYPE_Q4_K: return "gguf_moe_matrix/q4_k";
     case GGML_TYPE_Q5_K: return "gguf_moe_matrix/q5_k";
@@ -200,8 +206,9 @@ void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, i
         row_bytes < std::int64_t(k / qk) * block_bytes) {
         throw std::invalid_argument("gguf matrix product: unsupported geometry");
     }
-    // The asynchronous loop copies whole 16-byte words of each row's 256-value steps.
-    const bool aligned = row_bytes % 16 == 0 && reinterpret_cast<std::uintptr_t>(weight) % 16 == 0;
+    // The asynchronous loop copies whole words (8 or 16 bytes) of each row's 256-value steps.
+    constexpr int word = ggml_cuda_mmq_async_word(type);
+    const bool aligned = row_bytes % word == 0 && reinterpret_cast<std::uintptr_t>(weight) % word == 0;
     const MatrixLaunch launch = select_matrix_launch<type>(rows, columns, aligned);
     const auto* x             = static_cast<const char*>(weight);
     const auto* y             = static_cast<const int*>(activation);

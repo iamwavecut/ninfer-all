@@ -27,12 +27,17 @@ The combine-loop barrier in `fattn-mma-f16.cuh` includes the exact condition fro
 The local MMQ writeback supports BF16 Store and Accumulate. Split stream-K tiles retain FP32
 partials and the existing summation order, adding the residual before one final BF16 rounding.
 
-The Q4_K tile loop at J = 128 has an asynchronous form (`mul_mat_q_process_tile` with
-`async_tiles`, `ggml_cuda_mmq_async_tiles_supported`, `mmq_get_nbytes_shared` with its extra
-argument): the next activation tile and the raw weight tile are staged through `cp.async` while the
-current one is multiplied, the weights unpack from shared memory, and the loop takes three barriers
-an iteration instead of four. The values are unchanged. The form needs `cp.async` (sm_80 and later
-builds), 92.5 KiB of shared memory and a row count that is a whole number of row tiles, since the
-copy has no row clamp. The bridge selects it through the `gguf_matrix/q4_k` and
-`gguf_moe_matrix/q4_k` device routes; `cp-async.cuh` gains a `#pragma once` so the kernel header can
-include it.
+The tile loop at J = 128 has an asynchronous form (`mul_mat_q_process_tile` with `async_tiles`,
+`ggml_cuda_mmq_async_tiles_supported`, `mmq_get_nbytes_shared` with its extra argument): the next
+activation tile and the raw weight tile are staged through `cp.async` while the current one is
+multiplied, the weights unpack from shared memory, and the loop takes three barriers an iteration
+instead of four. The values are unchanged. It covers the formats whose 256-value step is a whole
+number of 8-byte words (`ggml_cuda_mmq_async_row_bytes`): Q4_0, Q5_0, Q8_0, IQ4_NL, Q4_K and Q5_K
+copy 16 bytes at a time, Q2_0, IQ4_XS and IQ1_M 8 bytes at a time (`cp_async_ca_8`, added to
+`cp-async.cuh` with a `#pragma once` so the kernel header can include it). Q6_K (210-byte blocks),
+Q3_K, Q2_K, IQ1_S, IQ2_*, IQ3_* and Q1_0 steps start on 2- or 4-byte boundaries and keep the
+synchronous loop. The form needs `cp.async` (sm_80 and later builds), the format's step bytes of
+shared memory per row on top of the loop's own (Q4_K takes 92.5 KiB; Q8_0 does not fit the 99 KiB of
+an RTX 3090), and a row count that is a whole number of row tiles, since the copy has no row clamp.
+The bridge selects it per format through the `gguf_matrix/<format>` and `gguf_moe_matrix/<format>`
+device routes.
