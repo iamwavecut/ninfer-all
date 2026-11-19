@@ -261,9 +261,9 @@ __launch_bounds__(512) __global__
 
 // Functional fallback outside the aligned fast domains. It intentionally favors a simple complete
 // implementation over another family of shape-specific paths.
-template <RmsEpilogue Epilogue>
+template <RmsEpilogue Epilogue, typename Weight = __nv_bfloat16>
 __launch_bounds__(256) __global__
-    void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+    void rmsnorm_generic_kernel(const __nv_bfloat16* x, const Weight* weight,
                                 const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
                                 std::int64_t rows, float eps) {
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
@@ -288,7 +288,7 @@ __launch_bounds__(256) __global__
     for (std::int64_t i = threadIdx.x; i < static_cast<std::int64_t>(d); i += blockDim.x) {
         const std::int64_t index = base + i;
         const float xv           = __bfloat162float(x[index]);
-        const float wv           = __bfloat162float(weight[i]);
+        const float wv           = static_cast<float>(weight[i]);
         float zv                 = 0.0f;
         if constexpr (rms_has_gate(Epilogue)) { zv = __bfloat162float(z[index]); }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));

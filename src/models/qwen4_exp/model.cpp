@@ -24,6 +24,8 @@ namespace {
 using qwen3_5::loading::Bindings;
 using Shape = artifact::Shape;
 
+QType scalar_format(const TextConfig& c) { return c.fp32_direct ? QType::FP32 : QType::BF16; }
+
 FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config,
                                  bool vision) {
     const auto resource = [&](std::string_view role, const char* component = "text") {
@@ -60,10 +62,16 @@ HyperConnectionWeights bind_hc(Bindings& b, const TextConfig& c, const std::stri
                                bool inject) {
     const std::uint64_t width = std::uint64_t(c.hc_count) * c.hidden_size;
     HyperConnectionWeights out;
-    out.norm = b.direct(p + "norm", {width});
+    out.norm = b.direct(p + "norm", {width}, scalar_format(c));
     out.down = b.parameter(p + "down", {c.hc_lowrank, width}, {p + "normalized"});
     out.up   = b.parameter(p + "up", {width, c.hc_lowrank}, {p + "low"});
-    if (inject) { out.inject = b.parameter(p + "inject", {c.hc_count, width}, {p + "normalized"}); }
+    if (inject) {
+        out.inject = b.parameter(p + "inject", {c.hc_count, width}, {p + "normalized"});
+        if (c.hc_prefill_inject) {
+            out.prefill_inject = b.parameter(p + "prefill_inject", {c.hc_count, width},
+                                             {p + "normalized"}, QType::BF16);
+        }
+    }
     return out;
 }
 
@@ -73,16 +81,18 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& c, const std::string& p) {
     const std::uint64_t vd = std::uint64_t(c.linear_num_value_heads) * c.linear_value_head_dim;
     const std::string g = p + "gdn/", input = p + "mixer_input";
     GdnWeights out;
-    out.a_log        = b.direct(g + "a_log", {c.linear_num_value_heads}, QType::FP32);
+    out.a_log =
+        b.direct(g + (c.gdn_a_is_log ? "a_log" : "decay"), {c.linear_num_value_heads}, QType::FP32);
     out.dt_bias      = b.direct(g + "dt_bias", {c.linear_num_value_heads}, QType::FP32);
-    out.convolution  = b.direct(g + "convolution", {c.linear_conv_kernel_dim, 2 * kd + vd});
+    out.convolution =
+        b.direct(g + "convolution", {c.linear_conv_kernel_dim, 2 * kd + vd}, scalar_format(c));
     out.a_projection = b.parameter(g + "a_projection", {c.linear_num_value_heads, h}, {input});
     out.b_projection = b.parameter(g + "b_projection", {c.linear_num_value_heads, h}, {input});
     out.query        = b.parameter(g + "query", {kd, h}, {input});
     out.key          = b.parameter(g + "key", {kd, h}, {input});
     out.value        = b.parameter(g + "value", {vd, h}, {input});
     out.z            = b.parameter(g + "z", {vd, h}, {input});
-    out.norm         = b.direct(g + "norm", {c.linear_value_head_dim});
+    out.norm         = b.direct(g + "norm", {c.linear_value_head_dim}, scalar_format(c));
     out.output       = b.parameter(g + "output", {h, vd}, {g + "gated_output"});
     return out;
 }
@@ -97,14 +107,14 @@ SparseAttentionWeights bind_attention(Bindings& b, const TextConfig& c, const st
     out.gate        = b.parameter(a + "gate", {q, h}, {input});
     out.key         = b.parameter(a + "key", {kv, h}, {input});
     out.value       = b.parameter(a + "value", {kv, h}, {input});
-    out.query_norm  = b.direct(a + "query_norm", {c.head_dim});
-    out.key_norm    = b.direct(a + "key_norm", {c.head_dim});
+    out.query_norm  = b.direct(a + "query_norm", {c.head_dim}, scalar_format(c));
+    out.key_norm    = b.direct(a + "key_norm", {c.head_dim}, scalar_format(c));
     out.output      = b.parameter(a + "output", {h, q}, {a + "gated_output"});
     out.index_query = b.parameter(
         i + "query", {std::uint64_t(c.indexer_n_heads) * c.indexer_head_dim, h}, {input});
     out.index_key        = b.parameter(i + "key", {c.indexer_head_dim, h}, {input});
-    out.index_query_norm = b.direct(i + "query_norm", {c.indexer_head_dim});
-    out.index_key_norm   = b.direct(i + "key_norm", {c.indexer_head_dim});
+    out.index_query_norm = b.direct(i + "query_norm", {c.indexer_head_dim}, scalar_format(c));
+    out.index_key_norm   = b.direct(i + "key_norm", {c.indexer_head_dim}, scalar_format(c));
     return out;
 }
 
@@ -134,11 +144,15 @@ HyperConnectionWeights bind_hc_replica(Bindings& b, const TextConfig& c, const s
                                        bool inject, std::size_t rank) {
     const std::uint64_t width = std::uint64_t(c.hc_count) * c.hidden_size;
     HyperConnectionWeights out;
-    out.norm = replica(b, p + "norm", {width}, {}, QType::BF16, rank);
+    out.norm = replica(b, p + "norm", {width}, {}, scalar_format(c), rank);
     out.down = replica(b, p + "down", {c.hc_lowrank, width}, {p + "normalized"}, {}, rank);
     out.up   = replica(b, p + "up", {width, c.hc_lowrank}, {p + "low"}, {}, rank);
     if (inject) {
         out.inject = replica(b, p + "inject", {c.hc_count, width}, {p + "normalized"}, {}, rank);
+        if (c.hc_prefill_inject) {
+            out.prefill_inject = replica(b, p + "prefill_inject", {c.hc_count, width},
+                                         {p + "normalized"}, QType::BF16, rank);
+        }
     }
     return out;
 }
@@ -165,13 +179,15 @@ GdnWeights bind_gdn_share(Bindings& b, const TextConfig& c, const std::string& p
     out.z            = b.piece(g + "z", {vd, h}, input, {}, rank, row_piece(value));
     out.a_projection = b.piece(g + "a_projection", {nv, h}, input, {}, rank, row_piece(heads));
     out.b_projection = b.piece(g + "b_projection", {nv, h}, input, {}, rank, row_piece(heads));
-    out.a_log   = b.piece(g + "a_log", {nv}, {}, QType::FP32, rank, column_piece({heads}));
+    out.a_log   = b.piece(g + (c.gdn_a_is_log ? "a_log" : "decay"), {nv}, {}, QType::FP32, rank,
+                          column_piece({heads}));
     out.dt_bias = b.piece(g + "dt_bias", {nv}, {}, QType::FP32, rank, column_piece({heads}));
     out.convolution =
-        b.piece(g + "convolution", {c.linear_conv_kernel_dim, 2 * kd + vd}, {}, QType::BF16, rank,
-                column_piece({key, shifted(key, kd), shifted(value, 2 * kd)}));
-    out.norm   = rank == 0 ? b.direct(g + "norm", {c.linear_value_head_dim})
-                           : replica(b, g + "norm", {c.linear_value_head_dim}, {}, QType::BF16, rank);
+        b.piece(g + "convolution", {c.linear_conv_kernel_dim, 2 * kd + vd}, {}, scalar_format(c),
+                rank, column_piece({key, shifted(key, kd), shifted(value, 2 * kd)}));
+    out.norm = rank == 0
+                   ? b.direct(g + "norm", {c.linear_value_head_dim}, scalar_format(c))
+                   : replica(b, g + "norm", {c.linear_value_head_dim}, {}, scalar_format(c), rank);
     out.output = b.piece(g + "output", {h, vd}, {g + "gated_output"}, {}, rank, column_piece({value}));
     return out;
 }
@@ -197,7 +213,8 @@ SparseAttentionWeights bind_attention_share(Bindings& b, const TextConfig& c, co
                            const std::vector<std::string>& inputs,
                            std::optional<QType> format) {
         if (rank != 0) { return replica(b, name, shape, inputs, format, rank); }
-        return shape.size() == 1 ? b.direct(name, shape) : b.parameter(name, shape, inputs);
+        return shape.size() == 1 ? b.direct(name, shape, format.value_or(QType::BF16))
+                                 : b.parameter(name, shape, inputs);
     };
     SparseAttentionWeights out;
     out.query      = b.piece(a + "query", {q, h}, input, {}, rank, row_piece(query));
@@ -206,12 +223,12 @@ SparseAttentionWeights bind_attention_share(Bindings& b, const TextConfig& c, co
     out.value      = b.piece(a + "value", {kv, h}, input, {}, rank, row_piece(heads));
     out.output     = b.piece(a + "output", {h, q}, {a + "gated_output"}, {}, rank,
                              column_piece({query}));
-    out.query_norm = whole(a + "query_norm", {c.head_dim}, {}, QType::BF16);
-    out.key_norm   = whole(a + "key_norm", {c.head_dim}, {}, QType::BF16);
+    out.query_norm       = whole(a + "query_norm", {c.head_dim}, {}, scalar_format(c));
+    out.key_norm         = whole(a + "key_norm", {c.head_dim}, {}, scalar_format(c));
     out.index_query      = whole(i + "query", {iq, h}, input, {});
     out.index_key        = whole(i + "key", {c.indexer_head_dim, h}, input, {});
-    out.index_query_norm = whole(i + "query_norm", {c.indexer_head_dim}, {}, QType::BF16);
-    out.index_key_norm   = whole(i + "key_norm", {c.indexer_head_dim}, {}, QType::BF16);
+    out.index_query_norm = whole(i + "query_norm", {c.indexer_head_dim}, {}, scalar_format(c));
+    out.index_key_norm   = whole(i + "key_norm", {c.indexer_head_dim}, {}, scalar_format(c));
     return out;
 }
 
@@ -222,11 +239,11 @@ PleWeights bind_ple_replica(Bindings& b, const TextConfig& c, const std::string&
     PleWeights out;
     out.key         = replica(b, q + "key", {width, c.ple_embed_dim}, {input}, {}, rank);
     out.value       = replica(b, q + "value", {c.hidden_size, c.ple_embed_dim}, {input}, {}, rank);
-    out.norm_key    = replica(b, q + "norm_key", {width}, {}, QType::BF16, rank);
-    out.norm_query  = replica(b, q + "norm_query", {width}, {}, QType::BF16, rank);
-    out.norm_conv   = replica(b, q + "norm_conv", {width}, {}, QType::BF16, rank);
+    out.norm_key    = replica(b, q + "norm_key", {width}, {}, scalar_format(c), rank);
+    out.norm_query  = replica(b, q + "norm_query", {width}, {}, scalar_format(c), rank);
+    out.norm_conv   = replica(b, q + "norm_conv", {width}, {}, scalar_format(c), rank);
     out.convolution =
-        replica(b, q + "convolution", {width, c.ple_conv_kernel_size}, {}, QType::BF16, rank);
+        replica(b, q + "convolution", {width, c.ple_conv_kernel_size}, {}, scalar_format(c), rank);
     return out;
 }
 
@@ -602,6 +619,9 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
     MoeWeights out;
     out.router       = b.parameter(m + "router", {c.num_experts, h}, {input});
     out.shared_score = b.parameter(m + "shared_score", {1, h}, {input});
+    if (c.expert_output_scales) {
+        out.expert_scales = b.direct(m + "expert_scales", {c.num_experts, 3}, QType::FP32);
+    }
     // A latent MoE's experts read and write its latent width: gate and up [w, width] from the
     // group's encoded input, down [width, w] into the group's sum.
     std::uint64_t k = h;
@@ -694,6 +714,10 @@ void bind_shared_run(Bindings& b, const TextConfig& c, const std::string& p,
                      const TensorShare& share, std::size_t rank, MoeWeights& out) {
     const std::uint64_t h = c.hidden_size, s = c.shared_expert_intermediate_size;
     const std::string m = p + "moe/", input = p + "ffn_input";
+    if (c.expert_output_scales && rank != 0) {
+        out.expert_scales =
+            replica(b, m + "expert_scales", {c.num_experts, 3}, {}, QType::FP32, rank);
+    }
     const Range run{share.shared_begin, share.shared_end};
     out.shared_gate = b.piece(m + "shared/gate", {s, h}, {input}, {}, rank, row_piece(run));
     out.shared_up   = b.piece(m + "shared/up", {s, h}, {input}, {}, rank, row_piece(run));
@@ -712,10 +736,11 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& p) {
     PleWeights out;
     out.key         = b.parameter(q + "key", {width, c.ple_embed_dim}, {input});
     out.value       = b.parameter(q + "value", {c.hidden_size, c.ple_embed_dim}, {input});
-    out.norm_key    = b.direct(q + "norm_key", {width});
-    out.norm_query  = b.direct(q + "norm_query", {width});
-    out.norm_conv   = b.direct(q + "norm_conv", {width});
-    out.convolution = b.direct(q + "convolution", {width, c.ple_conv_kernel_size});
+    out.norm_key    = b.direct(q + "norm_key", {width}, scalar_format(c));
+    out.norm_query  = b.direct(q + "norm_query", {width}, scalar_format(c));
+    out.norm_conv   = b.direct(q + "norm_conv", {width}, scalar_format(c));
+    out.convolution =
+        b.direct(q + "convolution", {width, c.ple_conv_kernel_size}, scalar_format(c));
     return out;
 }
 
@@ -723,8 +748,8 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const MtpConfig& mtp,
                     ExpertResidency residency, std::span<const double> split) {
     const std::uint64_t h = c.hidden_size, width = std::uint64_t(c.hc_count) * h;
     MtpWeights out;
-    out.embedding_norm  = b.direct("mtp/embedding_norm", {h});
-    out.hidden_norm     = b.direct("mtp/hidden_norm", {width});
+    out.embedding_norm  = b.direct("mtp/embedding_norm", {h}, scalar_format(c));
+    out.hidden_norm     = b.direct("mtp/hidden_norm", {width}, scalar_format(c));
     out.fc_embedding    = b.parameter("mtp/fc_embedding", {h, h}, {"mtp/embedding_normalized"});
     out.fc_hidden       = b.parameter("mtp/fc_hidden", {h, h}, {"mtp/hidden_normalized"});
     const std::string p = "mtp/layer/";
@@ -735,6 +760,7 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const MtpConfig& mtp,
     experts.num_experts = mtp.num_experts;
     // The MTP block keeps the base model's experts.
     experts.latent_moe.reset();
+    experts.expert_output_scales = false;
     out.layer.moe       = bind_moe(b, experts, p, residency, split);
     out.final_mixer     = bind_hc(b, c, "mtp/final_mixer/", false);
     return out;
@@ -746,6 +772,7 @@ std::vector<WeightId> layer_weights(const LayerWeights& layer, bool with_experts
     for (const HyperConnectionWeights* hc : {&layer.attn_hc, &layer.mlp_hc}) {
         out.insert(out.end(), {hc->norm, hc->down, hc->up});
         if (hc->inject) { out.push_back(*hc->inject); }
+        if (hc->prefill_inject) { out.push_back(*hc->prefill_inject); }
     }
     if (const auto* gdn = std::get_if<GdnWeights>(&layer.mixer)) {
         out.insert(out.end(),
@@ -757,6 +784,7 @@ std::vector<WeightId> layer_weights(const LayerWeights& layer, bool with_experts
                                a->index_key_norm});
     }
     const MoeWeights& m = layer.moe;
+    if (m.expert_scales) { out.push_back(*m.expert_scales); }
     out.insert(out.end(), {m.router, m.shared_score, m.shared_gate, m.shared_up, m.shared_down});
     if (m.latent) {
         out.insert(out.end(), {m.latent->encode, m.latent->decode, m.latent->labels});

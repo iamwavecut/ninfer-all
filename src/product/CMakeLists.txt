@@ -28,3 +28,4 @@ add_library(ninfer_product_launch_config STATIC
   launch_config/launch_config.cpp
 )
 ninfer_internal_includes(ninfer_product_launch_config)
+target_link_libraries(ninfer_product_launch_config PRIVATE ninfer::json)

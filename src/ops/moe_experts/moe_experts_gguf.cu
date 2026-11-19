@@ -70,10 +70,19 @@ bool fusable(const GgufExpertTable& gate, const GgufExpertTable& up) {
 // out = silu(gate) * up, rounded to BF16, over [pairs][rows] planes: the vector kernels' SiLU
 // (ops/common/silu.h), so every path computes the same middle.
 __global__ void swiglu_kernel(const float* __restrict__ gate, const float* __restrict__ up,
-                              __nv_bfloat16* __restrict__ out, std::int64_t count) {
+                              __nv_bfloat16* __restrict__ out, std::int64_t count,
+                              const std::int32_t* ids = nullptr, const float* scales = nullptr,
+                              int rows = kWidth) {
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) { return; }
-    out[i] = __float2bfloat16(portable_silu(gate[i]) * up[i]);
+    if (scales != nullptr) {
+        const int e = ids[i / rows];
+        out[i]      = e < 0 ? __float2bfloat16(0.0F)
+                            : __float2bfloat16(portable_silu(gate[i] * scales[3 * e]) *
+                                               (up[i] * scales[3 * e + 1]));
+    } else {
+        out[i] = __float2bfloat16(portable_silu(gate[i]) * up[i]);
+    }
 }
 
 // fixed[t][r] += each of token t's pairs' contribution weights[p] * down[p][r] in 2^-32 fixed
@@ -82,7 +91,8 @@ __global__ void accumulate_fixed_kernel(const float* __restrict__ down,
                                         const float* __restrict__ weights,
                                         const std::int32_t* __restrict__ ids, int per_token,
                                         int rows, std::int64_t count,
-                                        unsigned long long* __restrict__ fixed) {
+                                        unsigned long long* __restrict__ fixed,
+                                        const float* scales = nullptr) {
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) { return; }
     const std::int64_t t = i / rows, r = i % rows;
@@ -90,7 +100,9 @@ __global__ void accumulate_fixed_kernel(const float* __restrict__ down,
     for (int j = 0; j < per_token; ++j) {
         const std::int64_t p = t * per_token + j;
         if (ids[p] < 0) { continue; } // a pair another stage adds
-        sum += fixed_product(down[p * rows + r], weights[p]);
+        const float value =
+            scales ? down[p * rows + r] * scales[3 * ids[p] + 2] : down[p * rows + r];
+        sum += fixed_product(value, weights[p]);
     }
     fixed[i] += static_cast<unsigned long long>(sum);
 }
@@ -221,10 +233,12 @@ void run_bank(const Tensor& routing_ids, std::int32_t pairs, std::int32_t expert
               const float* pair_weights, const __nv_bfloat16* m, const void* activation,
               std::int32_t tokens, const GgufExpertTable& gate, const GgufExpertTable& up,
               const GgufExpertTable& down, int width, bool device_resident, bool iq1m_matrix,
-              WorkspaceArena& workspace, unsigned long long* fixed, cudaStream_t stream) {
+              WorkspaceArena& workspace, unsigned long long* fixed, cudaStream_t stream,
+              const float* scales = nullptr) {
     require(tokens <= kVectorTokens || device_resident,
             "a call of more than eight tokens needs device-resident banks");
     auto scope = workspace.scope();
+    const auto* ids_p = static_cast<const std::int32_t*>(routing_ids.data);
     const auto matrix = [&](const GgufExpertTable& t, bool gate_up, int rows, int k) {
         return matrix_capable(tokens, pairs, experts, iq1m_matrix, gate_up, t, rows, k);
     };
@@ -284,14 +298,38 @@ void run_bank(const Tensor& routing_ids, std::int32_t pairs, std::int32_t expert
                                      gate_x.data, gate_p, stream);
             gguf::moe_matrix_product(up_type, up_table, split.matrix, active, pairs, true,
                                      up_x.data, static_cast<float*>(up_plane.data), stream);
+            if (divided && scales != nullptr) {
+                gguf::moe_vector_product(gate_type, gate_table, split.vector, active, per_token,
+                                         per_token, activation, tokens,
+                                         gguf::MoeOutput{.f32 = gate_p}, chunk, stream);
+                gguf::moe_vector_product(up_type, up_table, split.vector, active, per_token,
+                                         per_token, activation, tokens,
+                                         gguf::MoeOutput{.f32 = static_cast<float*>(up_plane.data)},
+                                         chunk, stream);
+            }
             const std::int64_t count = std::int64_t(width) * pairs;
             swiglu_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
-                gate_p, static_cast<const float*>(up_plane.data), middle_p, count);
+                gate_p, static_cast<const float*>(up_plane.data), middle_p, count, ids_p, scales,
+                width);
             CUDA_CHECK(cudaGetLastError());
-            if (divided) {
+            if (divided && scales == nullptr) {
                 vector_gate_up(split.vector, active, per_token, activation, tokens, gate, up,
                                gate_table, up_table, gate_p, middle_p, chunk, stream);
             }
+        } else if (scales != nullptr) {
+            Tensor up_plane = workspace.alloc(DType::FP32, {width, pairs});
+            gguf::moe_vector_product(detail::gguf_type(gate.format), gate_table, split.all, active,
+                                     per_token, per_token, activation, tokens,
+                                     gguf::MoeOutput{.f32 = gate_p}, chunk, stream);
+            gguf::moe_vector_product(detail::gguf_type(up.format), up_table, split.all, active,
+                                     per_token, per_token, activation, tokens,
+                                     gguf::MoeOutput{.f32 = static_cast<float*>(up_plane.data)},
+                                     chunk, stream);
+            const std::int64_t count = std::int64_t(width) * pairs;
+            swiglu_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
+                gate_p, static_cast<const float*>(up_plane.data), middle_p, count, ids_p, scales,
+                width);
+            CUDA_CHECK(cudaGetLastError());
         } else {
             vector_gate_up(split.all, active, per_token, activation, tokens, gate, up, gate_table,
                            up_table, gate_p, middle_p, chunk, stream);
@@ -307,26 +345,34 @@ void run_bank(const Tensor& routing_ids, std::int32_t pairs, std::int32_t expert
         gguf::moe_vector_product(down_type, down_table, routing, active, 1, per_token,
                                  middle_q.data, pairs, out, chunk, stream);
     };
-    if (!down_matrix) {
+    if (!down_matrix && scales == nullptr) {
         down_vector(split.all, gguf::MoeOutput{.weighted = fixed, .weights = pair_weights});
         return;
     }
     // The middle in routing order, its values padded to whole 256-value steps. In a divided call
     // the vector products write their experts' rows beside the matrix kernel's, and one pass adds
     // every pair's weighted row into the fixed-point sum, rounded as the vector products round it.
-    Tensor middle_x = workspace.alloc(
-        DType::U8, {static_cast<std::int32_t>(gguf::moe_matrix_activation_bytes(width, pairs))});
-    gguf::quantize_moe_matrix_activation(down_type, middle_p, width, split.all, pairs, 1,
-                                         middle_x.data, stream);
+    Tensor middle_x;
+    if (down_matrix) {
+        middle_x = workspace.alloc(
+            DType::U8,
+            {static_cast<std::int32_t>(gguf::moe_matrix_activation_bytes(width, pairs))});
+        gguf::quantize_moe_matrix_activation(down_type, middle_p, width, split.all, pairs, 1,
+                                             middle_x.data, stream);
+    }
     Tensor down_plane = workspace.alloc(DType::FP32, {kHidden, pairs});
     auto* down_p      = static_cast<float*>(down_plane.data);
-    gguf::moe_matrix_product(down_type, down_table, split.matrix, active, pairs, true,
-                             middle_x.data, down_p, stream);
-    if (divided) { down_vector(split.vector, gguf::MoeOutput{.f32 = down_p}); }
+    if (down_matrix) {
+        gguf::moe_matrix_product(down_type, down_table, split.matrix, active, pairs, true,
+                                 middle_x.data, down_p, stream);
+    }
+    if (!down_matrix || divided) {
+        down_vector(down_matrix ? split.vector : split.all, gguf::MoeOutput{.f32 = down_p});
+    }
     const std::int64_t count = std::int64_t(kHidden) * tokens;
     accumulate_fixed_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
         down_p, pair_weights, static_cast<const std::int32_t*>(routing_ids.data), per_token,
-        kHidden, count, fixed);
+        kHidden, count, fixed, scales);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -387,7 +433,7 @@ void run_shared_vector(const float* shared_weights, const void* activation, std:
 
 } // namespace
 
-std::size_t moe_experts_gguf_workspace_bytes(std::int32_t tokens) {
+std::size_t moe_experts_gguf_workspace_bytes(std::int32_t tokens, bool scaled) {
     require(tokens > 0, "tokens must be positive");
     const std::int32_t pairs = tokens * kTopK;
     WorkspaceLayoutBuilder layout;
@@ -409,6 +455,7 @@ std::size_t moe_experts_gguf_workspace_bytes(std::int32_t tokens) {
     {
         auto planes = layout.scope();
         (void)layout.alloc(DType::FP32, {kWidth, pairs});
+        if (scaled && !wide) { (void)layout.alloc(DType::FP32, {kWidth, pairs}); }
         if (wide) {
             const auto activation_bytes =
                 static_cast<std::int32_t>(gguf::moe_matrix_activation_bytes(kHidden, pairs));
@@ -420,6 +467,8 @@ std::size_t moe_experts_gguf_workspace_bytes(std::int32_t tokens) {
     if (wide) {
         (void)layout.alloc(DType::U8, {static_cast<std::int32_t>(
                                           gguf::moe_matrix_activation_bytes(kWidth, pairs))});
+        (void)layout.alloc(DType::FP32, {kHidden, pairs});
+    } else if (scaled) {
         (void)layout.alloc(DType::FP32, {kHidden, pairs});
     }
     if (!wide || tokens <= kGgufMoeSplitTokens) {
@@ -472,7 +521,8 @@ void moe_experts_gguf_add(const GgufMoeStage& stage, const Tensor& m, const Tens
     const auto* m_p           = static_cast<const __nv_bfloat16*>(m.data);
     run_bank(ids, tokens * kTopK, banks.experts, kTopK, static_cast<const float*>(weights.data),
              m_p, stage.activation, tokens, banks.gate, banks.up, banks.down, kWidth,
-             banks.device_resident, banks.iq1m_matrix, workspace, stage.fixed, stream);
+             banks.device_resident, banks.iq1m_matrix, workspace, stage.fixed, stream,
+             banks.expert_scales);
     if (shared != nullptr) {
         require(shared->dtype == DType::FP32 && shared->is_contiguous() &&
                     shared->numel() == tokens,
@@ -549,8 +599,8 @@ Prepared prepared_at(void* base, std::int32_t k, std::int32_t columns) {
 } // namespace
 
 bool moe_experts_gguf_decode_supported(const GgufMoeWeights& banks, std::int32_t tokens) {
-    return tokens > 0 && tokens <= kVectorTokens && fusable(banks.gate, banks.up) &&
-           down_fits(banks.down);
+    return banks.expert_scales == nullptr && tokens > 0 && tokens <= kVectorTokens &&
+           fusable(banks.gate, banks.up) && down_fits(banks.down);
 }
 
 std::size_t moe_experts_gguf_decode_workspace_bytes(std::int32_t tokens) {
@@ -879,12 +929,12 @@ void moe_experts_gguf(const Tensor& m, const Tensor& ids, const Tensor& weights,
     moe_experts_gguf_finish(stage, y, stream);
 }
 
-std::size_t moe_experts_gguf_part_workspace_bytes(std::int32_t tokens) {
+std::size_t moe_experts_gguf_part_workspace_bytes(std::int32_t tokens, bool scaled) {
     require(tokens > 0, "tokens must be positive");
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::I32, {kTopK, tokens});
     (void)layout.alloc(DType::U8, {static_cast<std::int32_t>(
-                                      std::max(moe_experts_gguf_workspace_bytes(tokens),
+                                      std::max(moe_experts_gguf_workspace_bytes(tokens, scaled),
                                                moe_experts_gguf_decode_workspace_bytes(tokens)))});
     return layout.peak_bytes(1);
 }

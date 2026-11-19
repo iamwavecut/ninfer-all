@@ -91,9 +91,10 @@ void require_selector_shape(const Tensor& selector, std::int32_t batch, const ch
 
 std::int64_t validate_common(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
                              const Tensor& out) {
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_state.dtype != DType::BF16 ||
-        out.dtype != DType::BF16) {
-        throw std::invalid_argument("causal_conv1d: x/weight/conv_state/out must be BF16");
+    if (x.dtype != DType::BF16 || (weight.dtype != DType::BF16 && weight.dtype != DType::FP32) ||
+        conv_state.dtype != DType::BF16 || out.dtype != DType::BF16) {
+        throw std::invalid_argument(
+            "causal_conv1d: x/conv_state/out must be BF16; weight BF16 or FP32");
     }
 
     const std::int64_t n = numel_allow_zero(x, "x");
@@ -240,10 +241,11 @@ void require_split_nonoverlap(const Tensor& x, const Tensor& weight, const Tenso
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                         Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
+    if (x.dtype != DType::BF16 || (weight.dtype != DType::BF16 && weight.dtype != DType::FP32) ||
         conv_state_in.dtype != DType::BF16 || conv_state_out.dtype != DType::BF16 ||
         out.dtype != DType::BF16) {
-        throw std::invalid_argument("causal_conv1d: x/weight/conv_state/out must be BF16");
+        throw std::invalid_argument(
+            "causal_conv1d: x/conv_state/out must be BF16; weight BF16 or FP32");
     }
 
     const std::int64_t n = numel_allow_zero(x, "x");
@@ -278,9 +280,10 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
 void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                               Tensor& conv_state_out, Tensor& out0, Tensor& out1, Tensor& out2,
                               cudaStream_t stream) {
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
+    if (x.dtype != DType::BF16 || (weight.dtype != DType::BF16 && weight.dtype != DType::FP32) ||
         conv_state_in.dtype != DType::BF16 || conv_state_out.dtype != DType::BF16) {
-        throw std::invalid_argument("causal_conv1d: x/weight/conv_state must be BF16");
+        throw std::invalid_argument(
+            "causal_conv1d: x/conv_state must be BF16; weight BF16 or FP32");
     }
     require_x_shape(x);
     require_weight_shape(weight, x.ne[0]);
@@ -344,9 +347,10 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                  const Tensor& snapshot_base_slots, Tensor& out,
                                  cudaStream_t stream) {
     const bool masked = valid_columns.data != nullptr;
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_states.dtype != DType::BF16 ||
-        out.dtype != DType::BF16) {
-        throw std::invalid_argument("causal_conv1d: x/weight/conv_states/out must be BF16");
+    if (x.dtype != DType::BF16 || (weight.dtype != DType::BF16 && weight.dtype != DType::FP32) ||
+        conv_states.dtype != DType::BF16 || out.dtype != DType::BF16) {
+        throw std::invalid_argument(
+            "causal_conv1d: x/conv_states/out must be BF16; weight BF16 or FP32");
     }
     if (initial_state_slots.dtype != DType::I32 || snapshot_base_slots.dtype != DType::I32 ||
         (masked && valid_columns.dtype != DType::I32)) {

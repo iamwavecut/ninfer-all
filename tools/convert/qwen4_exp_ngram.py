@@ -1,5 +1,4 @@
-"""Flash-Next's n-gram table as independent FP8/FP16 rows: streamed from the HF checkpoint's
-sharded rows, or kept from Strata's FP8 table GGUF."""
+"""Flash-Next n-gram rows: HF BF16, NVIDIA FP8 reblocked to Q8_0, or stored GGUF rows."""
 
 from __future__ import annotations
 
@@ -9,9 +8,11 @@ import re
 from pathlib import Path
 import struct
 
+import numpy as np
 import torch
 
 from tools.artifact.codecs.fp8_row import encode_fp8_row_interleaved
+from .gguf_blocks import dequantize_q8_0, quantize_q8_0
 from .methods import fp8_row_maxabs, import_encoded
 from .quantization.fp8_row import quantize_bf16_rows
 from .sources.logical import EncodedRows, LogicalSource
@@ -52,8 +53,8 @@ def attach_hot_profile(model, path: Path | None) -> None:
     model.components["ngram"].setdefault("resources", {})["hot_profile"] = object_id
 
 
-def hf_ngram_source(store: SafetensorsSource, descriptor: dict) -> LogicalSource:
-    """Concatenate numbered BF16 shards without materializing the complete table."""
+def hf_ngram_source(store: SafetensorsSource, descriptor: dict, *, fp8=False) -> LogicalSource:
+    """Concatenate numbered shards without materializing the complete table."""
     from .qwen4_exp import ngram_config, text_config
 
     expected = ngram_config(store.config)
@@ -65,6 +66,8 @@ def hf_ngram_source(store: SafetensorsSource, descriptor: dict) -> LogicalSource
     names = {}
     for name in store.weight_map:
         if name.startswith(prefix):
+            if fp8 and name == prefix + "weight_scale":
+                continue
             match = pattern.fullmatch(name)
             if match is None:
                 raise ValueError(f"unexpected HF n-gram tensor: {name}")
@@ -76,9 +79,10 @@ def hf_ngram_source(store: SafetensorsSource, descriptor: dict) -> LogicalSource
     ordered = [names[i] for i in range(len(names))]
     for name in ordered:
         info = store.describe(name)
-        if info.dtype != "BF16" or len(info.shape) != 2 or info.shape[0] <= 0 or info.shape[1] != width:
-            raise ValueError(f"{name}: expected BF16 n-gram rows of width {width}")
-        if info.bytes != info.shape[0] * width * 2:
+        dtype, word_bytes = ("F8_E4M3", 1) if fp8 else ("BF16", 2)
+        if info.dtype != dtype or len(info.shape) != 2 or info.shape[0] <= 0 or info.shape[1] != width:
+            raise ValueError(f"{name}: expected {dtype} n-gram rows of width {width}")
+        if info.bytes != info.shape[0] * width * word_bytes:
             raise ValueError(f"{name}: n-gram shard byte count differs from its shape")
         edges.append(edges[-1] + info.shape[0] * width)
     if edges[-1] != rows * width:
@@ -91,9 +95,65 @@ def hf_ngram_source(store: SafetensorsSource, descriptor: dict) -> LogicalSource
             stop = min(end, edges[shard + 1])
             parts.append(store.read_flat(ordered[shard], begin - edges[shard], stop - edges[shard]))
             begin = stop
-        return torch.cat(parts) if parts else torch.empty(0, dtype=torch.bfloat16)
+        # cat on FP8 is unavailable on some CPU PyTorch builds; copy its code bytes instead.
+        dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+        if fp8:
+            return torch.cat([part.view(torch.uint8) for part in parts]).view(dtype) if parts else torch.empty(0, dtype=dtype)
+        return torch.cat(parts) if parts else torch.empty(0, dtype=dtype)
 
     return LogicalSource((rows, width), f"{store.path}:HF n-gram shards", read)
+
+
+def nvidia_q8_ngram_source(store: SafetensorsSource, descriptor: dict) -> LogicalSource:
+    """NVIDIA E4M3FN codes × one BF16 scale, then ggml's reference Q8_0 reblock.
+
+    Keep the multiplication in FP32, without an intermediate BF16 rounding. Q8 codes use
+    the unrounded block scale; only the stored scale narrows to FP16. This is Basalt's PLE
+    conversion boundary, distinct from its HC8 nearest-even, rounded-scale quantizer.
+    """
+    source = hf_ngram_source(store, descriptor, fp8=True)
+    scales = [name for name in store.weight_map if name.endswith("ngram_embedding.weight_scale")]
+    if len(scales) != 1:
+        raise ValueError("NVIDIA PLE requires exactly one ngram_embedding.weight_scale")
+    info = store.describe(scales[0])
+    if info.dtype != "BF16" or info.shape != (1,):
+        raise ValueError("NVIDIA PLE weight_scale must be one BF16 value")
+    scale = float(store.read_flat(scales[0]).float()[0])
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError("NVIDIA PLE weight_scale must be finite and positive")
+    width = descriptor["row_width"]
+    if width % 32:
+        raise ValueError("Q8_0 PLE rows must have a whole number of 32-value blocks")
+
+    def encoded(first, last):
+        if first == last:
+            return EncodedRows("gguf_q8_0", torch.empty((0, width // 32 * 34), dtype=torch.uint8),
+                               torch.empty(0, dtype=torch.float16))
+        values = source.rows(first, last).float().numpy() * np.float32(scale)
+        if not np.isfinite(values).all():
+            raise ValueError("NVIDIA PLE contains non-finite FP8 codes")
+        blocks = quantize_q8_0(values)
+        stored_scales = blocks.reshape(-1, 34)[:, :2].copy().view("<f2")
+        if not np.isfinite(stored_scales).all():
+            raise ValueError("NVIDIA PLE Q8_0 block scale exceeds FP16")
+        return EncodedRows("gguf_q8_0", torch.from_numpy(blocks), torch.empty(0, dtype=torch.float16))
+
+    def values(begin, end):
+        first, last = begin // width, -(-end // width)
+        decoded = dequantize_q8_0(encoded(first, last).codes.numpy()).reshape(-1)
+        return torch.from_numpy(decoded[begin - first * width:end - first * width])
+
+    return LogicalSource(source.shape, f"{store.path}:NVIDIA FP8 PLE as Q8_0", values, encoded)
+
+
+def q8_table_digest(source: LogicalSource, *, rows_per_chunk=65536) -> str:
+    """Hash the exact, ordered Q8_0 bytes independently of writer chunk boundaries."""
+    if rows_per_chunk <= 0:
+        raise ValueError("rows_per_chunk must be positive")
+    digest = hashlib.sha256()
+    for first in range(0, source.shape[0], rows_per_chunk):
+        digest.update(source.read_encoded(first, min(first + rows_per_chunk, source.shape[0])).codes.numpy())
+    return digest.hexdigest()
 
 
 def fp8_table_digest(source: LogicalSource, *, rows_per_chunk: int = 4096) -> str:
@@ -168,7 +228,7 @@ def encoded_table_digest(source: LogicalSource, *, rows_per_chunk: int = 1 << 18
 
 
 def configure_ngram(model, recipe, table) -> None:
-    """Select HF FP8 rows, Strata's FP8 table or an IQ4_NL GGUF table for either text recipe."""
+    """Select HF FP8 rows, Strata's FP8 table or IQ4_NL/Q8_0 GGUF rows for either text recipe."""
     from .qwen4_exp_gguf import configure_ngram_gguf
     from .sources.gguf import GGUFFile
 
@@ -188,8 +248,17 @@ def configure_ngram(model, recipe, table) -> None:
         configure_ngram_gguf(model, recipe, table)
         return
     if not isinstance(table, SafetensorsSource):
-        raise ValueError("--source ngram must name an HF safetensors table or an IQ4_NL GGUF")
+        raise ValueError("--source ngram must name an HF safetensors table or an IQ4_NL/Q8_0 GGUF")
     descriptor = model.components["ngram"]["config"]
+    if any(name.endswith("ngram_embedding.weight_scale") for name in table.weight_map):
+        source = nvidia_q8_ngram_source(table, descriptor)
+        print("hashing NVIDIA FP8 PLE reblocked to Q8_0", flush=True)
+        descriptor["format"] = "gguf_q8_0"
+        descriptor["table_sha256"] = q8_table_digest(source)
+        print(f"Q8_0 table SHA-256: {descriptor['table_sha256']}", flush=True)
+        if "ngram/table" in model.parameters:
+            recipe.assign("ngram/table", format="gguf_q8_0", method=import_encoded, source=source)
+        return
     source = hf_ngram_source(table, descriptor)
     size = source.shape[0] * (source.shape[1] + 2)
     print(f"hashing quantized FP8 n-gram rows ({size / 1e9:.1f} GB)", flush=True)

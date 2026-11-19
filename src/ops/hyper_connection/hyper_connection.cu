@@ -15,6 +15,7 @@
 // rounded to BF16, as the checkpoint's own arithmetic keeps them, Q8_0 matrices rounded to BF16
 // first) and keep the four inject rows on the FP32 GEMVs.
 #include "ninfer/ops/hyper_connection.h"
+#include "ops/common/direct_weight.cuh"
 
 #include "core/device_launch.h"
 #include "core/layout.h"
@@ -83,15 +84,14 @@ __device__ __forceinline__ void load_f32x8(const float* p, float (&out)[8]) {
     out[4] = b.x, out[5] = b.y, out[6] = b.z, out[7] = b.w;
 }
 
-// One block per (stream, token), four values per thread: xn = x * rsqrt(mean x^2 + eps) * (1 + g),
+// One block per (stream, token), four values per thread: xn = x * rsqrt(mean x^2 + eps) * gain,
 // and its BF16 rounding when asked for. The fused form first writes the block output to the
 // FP32 stack; the register values have that same rounding and feed the norm without reloading.
 template <bool Write, typename Output = float>
 __global__ void __launch_bounds__(kNormThreads)
     hc_norm_kernel(float* __restrict__ stack, const Output* __restrict__ y,
-                   const float* __restrict__ previous_inject,
-                   const __nv_bfloat16* __restrict__ norm,
-                   float eps, float* __restrict__ normalized,
+                   const float* __restrict__ previous_inject, DirectWeight norm, float eps,
+                   bool unit_offset, float* __restrict__ normalized,
                    __nv_bfloat16* __restrict__ normalized_bf16) {
     const int c             = blockIdx.x;
     const int t             = blockIdx.y;
@@ -114,10 +114,22 @@ __global__ void __launch_bounds__(kNormThreads)
 #pragma unroll
     for (int w = 0; w < kNormThreads / 32; ++w) { sum += partial[w]; }
     const float scale = rsqrtf(sum / kHidden + eps);
-    const auto* g   = reinterpret_cast<const __nv_bfloat162*>(norm + c * kHidden) + 2 * threadIdx.x;
-    const float2 g0 = __bfloat1622float2(g[0]), g1 = __bfloat1622float2(g[1]);
-    const float4 xn = make_float4(x.x * scale * (1.0f + g0.x), x.y * scale * (1.0f + g0.y),
-                                  x.z * scale * (1.0f + g1.x), x.w * scale * (1.0f + g1.y));
+    float2 g0, g1;
+    if (norm.fp32) {
+        const auto g = reinterpret_cast<const float4*>(static_cast<const float*>(norm.data) +
+                                                       c * kHidden)[threadIdx.x];
+        g0           = make_float2(g.x, g.y);
+        g1           = make_float2(g.z, g.w);
+    } else {
+        const auto* g = reinterpret_cast<const __nv_bfloat162*>(
+                            static_cast<const __nv_bfloat16*>(norm.data) + c * kHidden) +
+                        2 * threadIdx.x;
+        g0            = __bfloat1622float2(g[0]);
+        g1            = __bfloat1622float2(g[1]);
+    }
+    const float offset = unit_offset ? 1.0f : 0.0f;
+    const float4 xn    = make_float4(x.x * scale * (offset + g0.x), x.y * scale * (offset + g0.y),
+                                     x.z * scale * (offset + g1.x), x.w * scale * (offset + g1.y));
     reinterpret_cast<float4*>(normalized + base)[threadIdx.x] = xn;
     if (normalized_bf16 != nullptr) {
         auto* out = reinterpret_cast<__nv_bfloat162*>(normalized_bf16 + base) + 2 * threadIdx.x;
@@ -734,10 +746,11 @@ void require(bool condition, const char* message) {
 bool aligned16(const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0; }
 
 // The kernels read the weights in 16-byte vectors.
-void require_bf16(const Tensor* tensor, std::int32_t n0, std::int32_t n1, const char* name) {
+void require_norm(const Tensor* tensor, std::int32_t n0, std::int32_t n1, const char* name) {
     require(tensor != nullptr && tensor->data != nullptr && aligned16(tensor->data), name);
-    require(tensor->dtype == DType::BF16 && tensor->is_contiguous() && tensor->ne[0] == n0 &&
-                tensor->ne[1] == n1 && tensor->ne[2] == 1 && tensor->ne[3] == 1,
+    require((tensor->dtype == DType::BF16 || tensor->dtype == DType::FP32) &&
+                tensor->is_contiguous() && tensor->ne[0] == n0 && tensor->ne[1] == n1 &&
+                tensor->ne[2] == 1 && tensor->ne[3] == 1,
             name);
 }
 
@@ -776,22 +789,23 @@ void require_write_inputs(const Tensor& y, const Tensor& inject_weights, std::in
 }
 
 void normalize(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
-               const Tensor& norm, float eps, float* normalized,
+               const Tensor& norm, float eps, bool unit_offset, float* normalized,
                __nv_bfloat16* normalized_bf16, cudaStream_t stream) {
     auto* xs = static_cast<float*>(stack.data);
-    const auto* norm_p = static_cast<const __nv_bfloat16*>(norm.data);
+    const auto norm_p = direct_weight(norm);
     const dim3 grid(kStreams, stack.ne[2]);
     if (y == nullptr) {
         hc_norm_kernel<false, float><<<grid, kNormThreads, 0, stream>>>(
-            xs, nullptr, nullptr, norm_p, eps, normalized, normalized_bf16);
+            xs, nullptr, nullptr, norm_p, eps, unit_offset, normalized, normalized_bf16);
     } else if (y->dtype == DType::FP32) {
         hc_norm_kernel<true><<<grid, kNormThreads, 0, stream>>>(
-            xs, static_cast<const float*>(y->data), static_cast<const float*>(previous_inject->data),
-            norm_p, eps, normalized, normalized_bf16);
+            xs, static_cast<const float*>(y->data),
+            static_cast<const float*>(previous_inject->data), norm_p, eps, unit_offset, normalized,
+            normalized_bf16);
     } else {
         hc_norm_kernel<true><<<grid, kNormThreads, 0, stream>>>(
             xs, static_cast<const __nv_bfloat16*>(y->data),
-            static_cast<const float*>(previous_inject->data), norm_p, eps, normalized,
+            static_cast<const float*>(previous_inject->data), norm_p, eps, unit_offset, normalized,
             normalized_bf16);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -831,14 +845,12 @@ void read(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
     require(tokens > 0, "tokens must be positive");
     if (y != nullptr) { require_write_inputs(*y, *previous_inject, tokens); }
     require(eps > 0.0f, "eps must be positive");
-    require_bf16(weights.norm, kWidth, 1, "norm must be BF16 [10240]");
+    require_norm(weights.norm, kWidth, 1, "norm must be BF16 or FP32 [10240]");
     require_matrix(weights.down, "down must be a 16-byte aligned [10240, 320]");
     require_matrix(weights.up, "up must be a 16-byte aligned [320, 10240]");
     const bool has_inject = weights.inject.data != nullptr;
     require(has_inject == (inject_weights != nullptr),
             "inject weights and their output come together");
-    require(!has_inject || q8(weights.inject) == q8(weights.down),
-            "inject and down share a format");
     if (has_inject) {
         require_matrix(weights.inject, "inject must be a 16-byte aligned [10240, 4]");
         require(inject_weights->dtype == DType::FP32 && inject_weights->is_contiguous() &&
@@ -876,7 +888,8 @@ void read(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
         };
         const __nv_bfloat16* down_w = operand(weights.down, kWidth, kLowrank);
         const __nv_bfloat16* up_w   = operand(weights.up, kLowrank, kWidth);
-        normalize(stack, y, previous_inject, *weights.norm, eps, normalized_p, xn16, stream);
+        normalize(stack, y, previous_inject, *weights.norm, eps, weights.unit_offset, normalized_p,
+                  xn16, stream);
         if (has_inject && q8(weights.inject)) {
             hc_inject_q8_kernel<<<dim3(kStreams, chunks), kDownQ8Warps * 32, 0, stream>>>(
                 normalized_p, static_cast<const std::uint8_t*>(weights.inject.data), tokens,
@@ -903,11 +916,27 @@ void read(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    normalize(stack, y, previous_inject, *weights.norm, eps, normalized_p, nullptr, stream);
+    normalize(stack, y, previous_inject, *weights.norm, eps, weights.unit_offset, normalized_p,
+              nullptr, stream);
+    // The inject rows join the down GEMV when they share its format; an inject of the other
+    // format (a BF16 prompt injection beside Q8_0 matrices) runs as the wide path's inject rows.
+    const bool joined = has_inject && q8(weights.inject) == q8(weights.down);
+    if (has_inject && !joined) {
+        if (q8(weights.inject)) {
+            hc_inject_q8_kernel<<<dim3(kStreams, 1), kDownQ8Warps * 32, 0, stream>>>(
+                normalized_p, static_cast<const std::uint8_t*>(weights.inject.data), tokens,
+                inject_out);
+        } else {
+            hc_down_kernel<<<dim3(kStreams, 1), kDownWarps * 32, 0, stream>>>(
+                normalized_p, nullptr, static_cast<const __nv_bfloat16*>(weights.inject.data),
+                tokens, kLowrank, nullptr, inject_out);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
     const NarrowRead read{.normalized = normalized_p,
                           .down       = weights.down.data,
-                          .inject     = weights.inject.data,
-                          .rows       = kLowrank + (has_inject ? kStreams : 0),
+                          .inject     = joined ? weights.inject.data : nullptr,
+                          .rows       = kLowrank + (joined ? kStreams : 0),
                           .up         = weights.up.data,
                           .down_q8    = q8(weights.down),
                           .up_q8      = q8(weights.up),

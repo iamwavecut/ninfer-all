@@ -56,11 +56,11 @@ float pair_frequency(int i, const Yarn& yarn) {
 }
 
 std::vector<double> norm_rope(std::vector<double> x, const std::vector<float>& w, int position,
-                              const Yarn& yarn) {
+                              const Yarn& yarn, bool unit_offset) {
     double sum = 0;
     for (double v : x) sum += v * v;
     const double scale = 1.0 / std::sqrt(sum / kDim + double(kEps));
-    for (int d = 0; d < kDim; ++d) x[d] = x[d] * scale * (1.0 + w[d]);
+    for (int d = 0; d < kDim; ++d) x[d] = x[d] * scale * ((unit_offset ? 1.0 : 0.0) + w[d]);
     const double attention = yarn.factor > 1.0 ? 0.1 * std::log(yarn.factor) + 1.0 : 1.0;
     for (int i = 0; i < 32; ++i) {
         const float frequency = pair_frequency(i, yarn);
@@ -77,6 +77,7 @@ struct Sequence {
     int length;
     std::vector<float> projection; // [length][640]
     std::vector<float> query_norm, key_norm;
+    bool unit_offset = true;
 };
 
 std::vector<double> pooled_oracle(const Sequence& seq, int block, const Yarn& yarn) {
@@ -87,7 +88,7 @@ std::vector<double> pooled_oracle(const Sequence& seq, int block, const Yarn& ya
         }
     }
     for (double& v : mean) v /= 4.0;
-    return norm_rope(mean, seq.key_norm, block * 4, yarn);
+    return norm_rope(mean, seq.key_norm, block * 4, yarn, seq.unit_offset);
 }
 
 int check_selection(const std::string& label, const Sequence& seq, const std::vector<std::vector<double>>& pooled,
@@ -104,7 +105,7 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
             std::vector<double> raw(kDim);
             for (int d = 0; d < kDim; ++d) raw[d] = seq.projection[
                 static_cast<std::size_t>(column < 0 ? position : column) * kProjection + h * kDim + d];
-            q[h] = norm_rope(raw, seq.query_norm, position, yarn);
+            q[h] = norm_rope(raw, seq.query_norm, position, yarn, seq.unit_offset);
         }
         for (int b = 0; b < blocks; ++b) {
             double s = 0;
@@ -148,34 +149,44 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
     return 0;
 }
 
-int run(std::uint32_t seed, const Yarn& yarn = {}) {
+int run(std::uint32_t seed, const Yarn& yarn = {}, bool fp32_norm = false) {
     Sequence seq{2600, std::vector<float>(static_cast<std::size_t>(2600) * kProjection), std::vector<float>(kDim), std::vector<float>(kDim)};
     fill_uniform(seq.projection, seed, -2.0f, 2.0f);
     fill_uniform(seq.query_norm, seed + 1, -0.5f, 0.5f);
     fill_uniform(seq.key_norm, seed + 2, -0.5f, 0.5f);
     round_to_bf16(seq.projection);
-    round_to_bf16(seq.query_norm);
-    round_to_bf16(seq.key_norm);
+    seq.unit_offset = !fp32_norm;
+    if (fp32_norm) {
+        for (auto* v : {&seq.query_norm, &seq.key_norm})
+            for (auto& value : *v) value += 1.0f;
+    } else {
+        round_to_bf16(seq.query_norm);
+        round_to_bf16(seq.key_norm);
+    }
     std::vector<std::vector<double>> pooled(seq.length / 4);
     for (int b = 0; b < seq.length / 4; ++b) pooled[b] = pooled_oracle(seq, b, yarn);
 
     const int capacity = 700;
-    GuardedDeviceBuffer d_projection(seq.projection.size() * 2), d_qn(kDim * 2), d_kn(kDim * 2),
-        d_pooled(static_cast<std::size_t>(capacity) * kDim * 4), d_tail(3 * kDim * 4),
-        d_selected(kProjection * 2 + static_cast<std::size_t>(kTop) * 64 * 4), d_counts(64 * 4);
+    GuardedDeviceBuffer d_projection(seq.projection.size() * 2), d_qn(kDim * (fp32_norm ? 4 : 2)),
+        d_kn(kDim * (fp32_norm ? 4 : 2)), d_pooled(static_cast<std::size_t>(capacity) * kDim * 4),
+        d_tail(3 * kDim * 4), d_selected(kProjection * 2 + static_cast<std::size_t>(kTop) * 64 * 4),
+        d_counts(64 * 4);
     const auto bits = encode_bf16(seq.projection);
     d_projection.copy_from_host(bits.data(), d_projection.bytes());
     const auto qn = encode_bf16(seq.query_norm), kn = encode_bf16(seq.key_norm);
-    d_qn.copy_from_host(qn.data(), d_qn.bytes());
-    d_kn.copy_from_host(kn.data(), d_kn.bytes());
+    d_qn.copy_from_host(fp32_norm ? static_cast<const void*>(seq.query_norm.data()) : qn.data(),
+                        d_qn.bytes());
+    d_kn.copy_from_host(fp32_norm ? static_cast<const void*>(seq.key_norm.data()) : kn.data(),
+                        d_kn.bytes());
     CUDA_CHECK(cudaMemset(d_pooled.data(), 0, d_pooled.bytes()));
     CUDA_CHECK(cudaMemset(d_tail.data(), 0, d_tail.bytes()));
-    Tensor t_qn(d_qn.data(), DType::BF16, {kDim}), t_kn(d_kn.data(), DType::BF16, {kDim});
+    const auto dtype = fp32_norm ? DType::FP32 : DType::BF16;
+    Tensor t_qn(d_qn.data(), dtype, {kDim}), t_kn(d_kn.data(), dtype, {kDim});
     Tensor t_pooled(d_pooled.data(), DType::FP32, {kDim, capacity});
     Tensor t_tail(d_tail.data(), DType::FP32, {kDim, 3});
     GuardedDeviceBuffer d_first(4);
     const Tensor t_first(d_first.data(), DType::I32, {1});
-    const ops::QsaIndexerWeights weights{&t_qn, &t_kn};
+    const ops::QsaIndexerWeights weights{&t_qn, &t_kn, seq.unit_offset};
     WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(64, capacity));
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -352,6 +363,7 @@ int main() {
         return 77;
     }
     int failures = run(8100u);
+    failures += run(8101u, {}, true);
     // Scalar below 64 tokens (80 on an A100), narrow and wide SIMT tiles or the A100's tensor tile
     // above, by the device's SM count: each card meets the routes it selects.
     for (int tokens : {1, 3, 4, 5, 8, 9, 15, 16, 17, 37, 63, 64, 79, 80, 127, 128, 129, 512}) {

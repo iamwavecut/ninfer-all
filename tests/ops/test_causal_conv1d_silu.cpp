@@ -54,20 +54,23 @@ struct LogicalInput {
     std::vector<float> weight;
 };
 
-LogicalInput make_input(std::int32_t C, std::int32_t T, std::uint32_t seed) {
+LogicalInput make_input(std::int32_t C, std::int32_t T, std::uint32_t seed,
+                        bool fp32_weight = false) {
     LogicalInput input{
         make_values(static_cast<std::size_t>(C) * static_cast<std::size_t>(T), seed, -3.0F, 3.0F),
         make_values(static_cast<std::size_t>(C) * 4U, seed + 1U, -1.0F, 1.0F),
     };
+    if (fp32_weight) fill_uniform(input.weight, seed + 1U, -1.0f, 1.0f);
 
     // Deterministic cancellation and sign cases remain logical inputs to the same oracle. They
     // catch tap-order mistakes without introducing a route-specific reference.
     const std::array<std::int32_t, 3> channels{0, C / 2, C - 1};
     for (const std::int32_t c : channels) {
-        input.weight[offset(c, 0, C)] = 1.0F;
-        input.weight[offset(c, 1, C)] = -1.0F;
-        input.weight[offset(c, 2, C)] = 1.0F;
-        input.weight[offset(c, 3, C)] = -1.0F;
+        const float magnitude         = fp32_weight ? 1.0009765625f : 1.0f;
+        input.weight[offset(c, 0, C)] = magnitude;
+        input.weight[offset(c, 1, C)] = -magnitude;
+        input.weight[offset(c, 2, C)] = magnitude;
+        input.weight[offset(c, 3, C)] = -magnitude;
         for (std::int32_t t = 0; t < T; ++t) {
             input.x[offset(c, t, C)] = (t & 1) == 0 ? 0.75F : -0.75F;
         }
@@ -300,8 +303,9 @@ int split_rejection_case(std::int32_t T) {
 // One registered geometry, one column count, one state form. `offset_pairs` shifts every
 // destination by one BF16 pair, which the contract admits and the arena never produces.
 int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int32_t value_dim,
-               std::int32_t T, bool alias_state, bool offset_pairs, std::uint32_t seed) {
-    const LogicalInput input       = make_input(C, T, seed);
+               std::int32_t T, bool alias_state, bool offset_pairs, std::uint32_t seed,
+               bool fp32_weight = false) {
+    const LogicalInput input       = make_input(C, T, seed, fp32_weight);
     const std::vector<float> state = make_state(C, seed + 2U);
     const OracleResult oracle      = causal_conv_oracle(input.x, input.weight, state, C, T, false);
     const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
@@ -315,7 +319,8 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     const std::size_t v_bytes = static_cast<std::size_t>(value_dim) * T * sizeof(std::uint16_t);
 
     GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(weight_bits.size() *
+                               (fp32_weight ? sizeof(float) : sizeof(std::uint16_t)));
     GuardedDeviceBuffer state_in(state_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer state_out(state_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer q(q_bytes + pad);
@@ -323,7 +328,9 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     GuardedDeviceBuffer v(v_bytes + pad);
 
     x.copy_from_host(x_bits.data(), x.bytes());
-    weight.copy_from_host(weight_bits.data(), weight.bytes());
+    weight.copy_from_host(fp32_weight ? static_cast<const void*>(input.weight.data())
+                                      : weight_bits.data(),
+                          weight.bytes());
     state_in.copy_from_host(state_bits.data(), state_in.bytes());
     state_out.fill(0x5a);
     q.fill(kOutputPoison);
@@ -347,7 +354,7 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     };
 
     Tensor tx(x.data(), DType::BF16, {C, T});
-    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor tw(weight.data(), fp32_weight ? DType::FP32 : DType::BF16, {C, 4});
     Tensor ts_in(state_in.data(), DType::BF16, {C, 3});
     Tensor ts_out((alias_state ? state_in : state_out).data(), DType::BF16, {C, 3});
     Tensor tq(at(q), DType::BF16, {q_dim, T});
@@ -357,9 +364,9 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     ops::causal_conv1d_silu_split(tx, tw, ts_in, ts_out, tq, tk, tv, nullptr);
     cuda_synchronize();
 
-    const std::string tag     = "causal_conv1d_silu_split C=" + std::to_string(C) +
-                                " T=" + std::to_string(T) + (alias_state ? " alias" : "") +
-                                (offset_pairs ? " offset" : "");
+    const std::string tag = "causal_conv1d_silu_split C=" + std::to_string(C) +
+                            " T=" + std::to_string(T) + (alias_state ? " alias" : "") +
+                            (offset_pairs ? " offset" : "") + (fp32_weight ? " FP32 weight" : "");
     const std::size_t q_count = static_cast<std::size_t>(q_dim) * static_cast<std::size_t>(T);
     const std::size_t k_count = static_cast<std::size_t>(k_dim) * static_cast<std::size_t>(T);
     const std::size_t v_count = static_cast<std::size_t>(value_dim) * static_cast<std::size_t>(T);
@@ -377,7 +384,12 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     failures +=
         verify_bits(tag + " final state", (alias_state ? state_in : state_out).data(), final_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
-    failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+    if (fp32_weight)
+        failures +=
+            verify_exact((tag + " weight preserved").c_str(),
+                         from_device<float>(weight.data(), input.weight.size()), input.weight);
+    else
+        failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
     if (!alias_state) {
         failures += verify_bits(tag + " initial state preserved", state_in.data(), state_bits);
     }
@@ -391,8 +403,9 @@ int split_case(std::int32_t C, std::int32_t q_dim, std::int32_t k_dim, std::int3
     return failures;
 }
 
-int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t seed) {
-    const LogicalInput input       = make_input(C, T, seed);
+int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t seed,
+                  bool fp32_weight = false) {
+    const LogicalInput input       = make_input(C, T, seed, fp32_weight);
     const std::vector<float> state = make_state(C, seed + 2U);
     const OracleResult oracle      = causal_conv_oracle(input.x, input.weight, state, C, T, false);
     const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
@@ -401,7 +414,8 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
     const std::vector<std::uint16_t> final_bits  = bf16_bits(oracle.final_state);
 
     GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(weight_bits.size() *
+                               (fp32_weight ? sizeof(float) : sizeof(std::uint16_t)));
     GuardedDeviceBuffer state_in(state_bits.size() * sizeof(std::uint16_t));
     std::unique_ptr<GuardedDeviceBuffer> state_out;
     if (call == StateCall::DistinctEntry) {
@@ -411,12 +425,14 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
     }
     GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
     x.copy_from_host(x_bits.data(), x.bytes());
-    weight.copy_from_host(weight_bits.data(), weight.bytes());
+    weight.copy_from_host(fp32_weight ? static_cast<const void*>(input.weight.data())
+                                      : weight_bits.data(),
+                          weight.bytes());
     state_in.copy_from_host(state_bits.data(), state_in.bytes());
     output.fill(kOutputPoison);
 
     Tensor tx(x.data(), DType::BF16, {C, T});
-    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor tw(weight.data(), fp32_weight ? DType::FP32 : DType::BF16, {C, 4});
     Tensor ts_in(state_in.data(), DType::BF16, {C, 3});
     Tensor ts_out(state_out == nullptr ? state_in.data() : state_out->data(), DType::BF16, {C, 3});
     Tensor tout(output.data(), DType::BF16, {C, T});
@@ -431,14 +447,20 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
     cuda_synchronize();
 
     const std::string tag = "causal_conv1d_silu C=" + std::to_string(C) +
-                            " T=" + std::to_string(T) + " " + call_name(call);
+                            " T=" + std::to_string(T) + " " + call_name(call) +
+                            (fp32_weight ? " FP32 weight" : "");
     int failures = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
     failures += verify_bits(tag + " final state",
                             state_out == nullptr ? state_in.data() : state_out->data(), final_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
-    failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+    if (fp32_weight)
+        failures +=
+            verify_exact((tag + " weight preserved").c_str(),
+                         from_device<float>(weight.data(), input.weight.size()), input.weight);
+    else
+        failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
     if (call == StateCall::DistinctEntry) {
         failures += verify_bits(tag + " initial state preserved", state_in.data(), state_bits);
     }
@@ -595,10 +617,10 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
                           const std::vector<std::int32_t>& initial_slots,
                           const std::vector<std::int32_t>& snapshot_bases,
                           const std::vector<std::int32_t>& valid_columns, std::int32_t slots,
-                          std::uint32_t seed) {
+                          std::uint32_t seed, bool fp32_weight = false) {
     const std::int32_t batch        = static_cast<std::int32_t>(initial_slots.size());
     const bool masked               = !valid_columns.empty();
-    const LogicalInput input        = make_input(C, width * batch, seed);
+    const LogicalInput input        = make_input(C, width * batch, seed, fp32_weight);
     const std::size_t slot_elements = static_cast<std::size_t>(C) * 3U;
     const std::size_t row_elements  = static_cast<std::size_t>(C) * width;
 
@@ -637,7 +659,8 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     const std::vector<std::uint16_t> expected_bits = bf16_bits(expected_states);
 
     GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
-    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(weight_bits.size() *
+                               (fp32_weight ? sizeof(float) : sizeof(std::uint16_t)));
     GuardedDeviceBuffer state(state_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer initial(initial_slots.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer bases(snapshot_bases.size() * sizeof(std::int32_t));
@@ -648,14 +671,16 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     }
     GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
     x.copy_from_host(x_bits.data(), x.bytes());
-    weight.copy_from_host(weight_bits.data(), weight.bytes());
+    weight.copy_from_host(fp32_weight ? static_cast<const void*>(input.weight.data())
+                                      : weight_bits.data(),
+                          weight.bytes());
     state.copy_from_host(state_bits.data(), state.bytes());
     initial.copy_from_host(initial_slots.data(), initial.bytes());
     bases.copy_from_host(snapshot_bases.data(), bases.bytes());
     output.fill(kOutputPoison);
 
     Tensor tx(x.data(), DType::BF16, {C, width, batch});
-    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor tw(weight.data(), fp32_weight ? DType::FP32 : DType::BF16, {C, 4});
     Tensor tstate(state.data(), DType::BF16, {C, 3, slots});
     Tensor tvalid;
     if (masked) { tvalid = Tensor(valid->data(), DType::I32, {batch}); }
@@ -667,13 +692,18 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
 
     const std::string tag = "causal_conv1d_silu batched snapshot C=" + std::to_string(C) +
                             " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
-                            (masked ? " masked" : " dense");
+                            (masked ? " masked" : " dense") + (fp32_weight ? " FP32 weight" : "");
     int failures = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               expected_output);
     failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
     failures += verify_bits(tag + " x preserved", x.data(), x_bits);
-    failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+    if (fp32_weight)
+        failures +=
+            verify_exact((tag + " weight preserved").c_str(),
+                         from_device<float>(weight.data(), input.weight.size()), input.weight);
+    else
+        failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
     failures += verify_exact((tag + " initial selectors preserved").c_str(),
                              from_device<std::int32_t>(initial.data(), initial_slots.size()),
                              initial_slots);
@@ -723,6 +753,16 @@ int main() {
     // The peer 35B-A3B geometry is a separate real channel extent.
     constexpr std::int32_t kQwen35Channels = 8192;
     failures += ordinary_case(kQwen35Channels, 257, StateCall::InPlaceEntry, 3257U);
+    for (const std::int32_t T : {1, 7, 40}) {
+        failures += ordinary_case(kQwen35Channels, T, StateCall::InPlaceEntry, 3300U + T, true);
+        failures += ordinary_case(kQwen35Channels, T, StateCall::DistinctEntry, 3400U + T, true);
+        failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, true, true, 3500U + T, true);
+        failures +=
+            batched_snapshot_case(kQwen35Channels, T, {T - 1}, {0}, {}, T + 1, 3600U + T, true);
+    }
+    failures +=
+        batched_snapshot_case(kQwen35Channels, 6, {5, 12}, {0, 6}, {6, 2}, 13, 3700U, true);
+    failures += batched_snapshot_case(kQwen35Channels, 6, {5, 12}, {0, 6}, {}, 13, 3701U, true);
 
     // Snapshot decode, small-T boundary/interior, sequence route, slot 0 initialization, and
     // continuation from selected slots. A nonzero destination base proves that snapshots are not

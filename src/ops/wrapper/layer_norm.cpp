@@ -31,9 +31,10 @@ bool vector_of(const Tensor& t, std::int32_t d) {
 
 void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias, float eps, Tensor& out,
                 cudaStream_t stream) {
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || bias.dtype != DType::BF16 ||
-        out.dtype != DType::BF16) {
-        throw std::invalid_argument("layer_norm: x/weight/bias/out must be BF16");
+    if (x.dtype != DType::BF16 || out.dtype != DType::BF16 || weight.dtype != bias.dtype ||
+        (weight.dtype != DType::BF16 && weight.dtype != DType::FP32)) {
+        throw std::invalid_argument(
+            "layer_norm: x/out must be BF16, weight/bias must share BF16 or FP32 dtype");
     }
     if (!(eps > 0.0f) || !std::isfinite(eps)) {
         throw std::invalid_argument("layer_norm: eps must be positive and finite");

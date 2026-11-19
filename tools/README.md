@@ -14,6 +14,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Task | Location |
 |---|---|
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
+| Convert a Basalt Flash-Next pack and serving JSON | [`convert/basalt.py`](convert/basalt.py), [`convert/basalt_config.py`](convert/basalt_config.py); [guide](../docs/basalt-conversion.md) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Count the bytes one decoded token reads (roofline denominator) | [`decode_byte_accounting.py`](decode_byte_accounting.py) |
 | Measure the card's sustained memory bandwidth | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu) |

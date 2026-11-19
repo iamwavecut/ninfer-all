@@ -114,7 +114,12 @@ def _tiny_table_config():
     return config
 
 
-def test_the_table_artifact_stores_the_rows_and_their_digest(tmp_path):
+@pytest.mark.parametrize("type_id,format_name,block_bytes", [
+    (TYPE_IQ4_NL, "gguf_iq4_nl", 18), (8, "gguf_q8_0", 34),
+])
+def test_the_table_artifact_stores_the_rows_and_their_digest(
+    tmp_path, type_id, format_name, block_bytes,
+):
     from tools.artifact.reader import Artifact
     from tools.convert.pipeline import convert
     from tools.convert.recipe import Recipe
@@ -125,12 +130,12 @@ def test_the_table_artifact_stores_the_rows_and_their_digest(tmp_path):
 
     generator = np.random.default_rng(8)
     rows = 424
-    blocks = generator.integers(0, 256, size=(rows, 5, 18), dtype=np.uint8)
+    blocks = generator.integers(0, 256, size=(rows, 5, block_bytes), dtype=np.uint8)
     blocks[:, :, :2] = generator.uniform(0.01, 0.02, size=(rows, 5)).astype(np.float16).view(
         np.uint8).reshape(rows, 5, 2)
     shard = tmp_path / "shard2.gguf"
     write_gguf(shard, {"general.architecture": "qwen4exp"},
-               [(qwen4_exp_gguf.NGRAM_TENSOR, (rows, 160), TYPE_IQ4_NL, blocks.tobytes())])
+               [(qwen4_exp_gguf.NGRAM_TENSOR, (rows, 160), type_id, blocks.tobytes())])
     expected = hashlib.sha256(blocks.tobytes()).hexdigest()
     with GGUFFile(shard) as table:
         assert qwen4_exp_gguf.table_digest(table) == expected
@@ -143,7 +148,7 @@ def test_the_table_artifact_stores_the_rows_and_their_digest(tmp_path):
         directory = artifact.directory
         descriptor = directory.components["ngram"]["config"]
         assert set(directory.components) == {"ngram"}
-        assert descriptor["format"] == "gguf_iq4_nl" and descriptor["table_sha256"] == expected
+        assert descriptor["format"] == format_name and descriptor["table_sha256"] == expected
         assert descriptor["rows"] == rows and descriptor["row_width"] == 160
         stored = directory.bindings["ngram/table"]["object"]
         assert hashlib.sha256(artifact.read_object(stored)).hexdigest() == expected
@@ -292,6 +297,6 @@ def test_bf16_ssm_out_rows_take_the_grouped_column_order(tmp_path):
         source, encoded = qwen4_exp_gguf.matrix_source(
             gguf, "blk.0.ssm_out.weight", (3, k), qwen4_exp_gguf.rows(),
             gguf_blocks.tiled_input_columns())
+        grouped = source.rows(0, 3).view(torch.int16).numpy().view(np.uint16)
     assert not encoded and source.read_encoded is None
-    grouped = source.rows(0, 3).view(torch.int16).numpy().view(np.uint16)
     assert np.array_equal(grouped[:, gguf_blocks.tiled_input_columns()], words)

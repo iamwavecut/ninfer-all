@@ -5,6 +5,7 @@
 // CTA per query runs a four-pass radix select of the 512th key and two ordered passes that keep
 // ties at the lower block index and write the blocks in increasing order.
 #include "ninfer/ops/qsa_indexer.h"
+#include "ops/common/direct_weight.cuh"
 #include "ninfer/ops/rope.h"
 
 #include "core/device_launch.h"
@@ -69,11 +70,11 @@ __device__ __forceinline__ void yarn_sincos(const QsaRope& rope, int pair, int p
     *cosine *= rope.attention_factor;
 }
 
-// Zero-centred RMSNorm of a 128-vector held one value per thread of a 128-thread group, then the
+// RMSNorm of a 128-vector held one value per thread of a 128-thread group, then the
 // rotate-half rotation of its first 64 dims at `position`. `values` is the group's shared row.
 template <bool Yarn>
-__device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float eps, int position,
-                              int lane128, float* reduce, const QsaRope& rope) {
+__device__ void norm_rope_row(float* values, DirectWeight weight, float eps, bool unit_offset,
+                              int position, int lane128, float* reduce, const QsaRope& rope) {
     const float x = values[lane128];
     float square  = x * x;
 #pragma unroll
@@ -84,7 +85,7 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
     __syncthreads();
     const float total = reduce[0] + reduce[1] + reduce[2] + reduce[3];
     const float normed =
-        x * rsqrtf(total / kHeadDim + eps) * (1.0f + __bfloat162float(weight[lane128]));
+        x * rsqrtf(total / kHeadDim + eps) * ((unit_offset ? 1.0f : 0.0f) + weight[lane128]);
     __syncthreads();
     values[lane128] = normed;
     __syncthreads();
@@ -109,7 +110,7 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
 template <bool Yarn>
 __global__ void __launch_bounds__(kHeadDim)
     qsa_pool_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
-                    int tokens, const __nv_bfloat16* __restrict__ key_norm, float eps,
+                    int tokens, DirectWeight key_norm, float eps, bool unit_offset,
                     const float* __restrict__ tail, int capacity, float* __restrict__ pooled,
                     const QsaRope rope) {
     __shared__ float row[kHeadDim];
@@ -130,7 +131,7 @@ __global__ void __launch_bounds__(kHeadDim)
     }
     row[d] = sum * 0.25f;
     __syncthreads();
-    norm_rope_row<Yarn>(row, key_norm, eps, block * kBlock, d, reduce, rope);
+    norm_rope_row<Yarn>(row, key_norm, eps, unit_offset, block * kBlock, d, reduce, rope);
     pooled[static_cast<std::int64_t>(block) * kHeadDim + d] = row[d];
 }
 
@@ -160,9 +161,8 @@ __device__ __forceinline__ unsigned order_key(float value) {
 // normalization/reduction and angle boundaries; only its materialization location changes.
 template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
-    qsa_query_kernel(const __nv_bfloat16* projection, const int* first,
-                     const __nv_bfloat16* query_norm, float eps, float* queries,
-                     const QsaRope rope) {
+    qsa_query_kernel(const __nv_bfloat16* projection, const int* first, DirectWeight query_norm,
+                     float eps, bool unit_offset, float* queries, const QsaRope rope) {
     __shared__ float row[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
     const int tid = threadIdx.x, head = tid / kHeadDim, lane = tid % kHeadDim;
@@ -170,7 +170,8 @@ __global__ void __launch_bounds__(kThreads)
     if ((position + 1) / kBlock <= kTopBlocks) { return; }
     row[tid] = __bfloat162float(projection[static_cast<std::int64_t>(t) * kProjection + tid]);
     __syncthreads();
-    norm_rope_row<Yarn>(row + head * kHeadDim, query_norm, eps, position, lane, reduce[head], rope);
+    norm_rope_row<Yarn>(row + head * kHeadDim, query_norm, eps, unit_offset, position, lane,
+                        reduce[head], rope);
     queries[static_cast<std::int64_t>(t) * kHeads * kHeadDim + tid] = row[tid];
 }
 
@@ -475,7 +476,7 @@ __global__ void __launch_bounds__(kTileThreads, 1)
 template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
     qsa_score_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
-                     const __nv_bfloat16* __restrict__ query_norm, float eps,
+                     DirectWeight query_norm, float eps, bool unit_offset,
                      const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
                      int capacity, const QsaRope rope) {
     __shared__ __align__(16) float query[kHeads * kHeadDim];
@@ -502,7 +503,7 @@ __global__ void __launch_bounds__(kThreads)
         __syncthreads();
         const float total = reduce[head][0] + reduce[head][1] + reduce[head][2] + reduce[head][3];
         const float normed =
-            x * rsqrtf(total / kHeadDim + eps) * (1.0f + __bfloat162float(query_norm[lane]));
+            x * rsqrtf(total / kHeadDim + eps) * ((unit_offset ? 1.0f : 0.0f) + query_norm[lane]);
         __syncthreads();
         row[lane] = normed;
         __syncthreads();
@@ -639,7 +640,8 @@ const int* require_position(const Tensor& first_position) {
 }
 
 void require_norm(const Tensor* norm, const char* message) {
-    require(norm != nullptr && norm->data != nullptr && norm->dtype == DType::BF16 &&
+    require(norm != nullptr && norm->data != nullptr &&
+                (norm->dtype == DType::BF16 || norm->dtype == DType::FP32) &&
                 norm->is_contiguous() && norm->ne[0] == kHeadDim && norm->ne[1] == 1,
             message);
 }
@@ -702,7 +704,7 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
                         Tensor& pooled, Tensor& tail, cudaStream_t stream) {
     require_projection(projection);
     const int* first = require_position(first_position);
-    require_norm(weights.key_norm, "key_norm must be BF16 [128]");
+    require_norm(weights.key_norm, "key_norm must be BF16 or FP32 [128]");
     require(eps > 0.0f, "eps must be positive");
     require_pooled(pooled);
     require(tail.dtype == DType::FP32 && tail.is_contiguous() && tail.data != nullptr &&
@@ -714,9 +716,8 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
     auto* const pool_kernel = rope.scaled ? qsa_pool_kernel<true> : qsa_pool_kernel<false>;
     pool_kernel<<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(projection.data), first, tokens,
-        static_cast<const __nv_bfloat16*>(weights.key_norm->data), eps,
-        static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data),
-        rope);
+        direct_weight(*weights.key_norm), eps, weights.unit_offset,
+        static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data), rope);
     CUDA_CHECK(cudaGetLastError());
     qsa_tail_kernel<<<1, kHeadDim, 0, stream>>>(static_cast<const __nv_bfloat16*>(projection.data),
                                                 first, tokens, static_cast<float*>(tail.data));
@@ -740,7 +741,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                         Tensor& counts, cudaStream_t stream) {
     require_projection(projection);
     const int* first = require_position(first_position);
-    require_norm(weights.query_norm, "query_norm must be BF16 [128]");
+    require_norm(weights.query_norm, "query_norm must be BF16 or FP32 [128]");
     require(eps > 0.0f, "eps must be positive");
     require_pooled(pooled);
     const QsaRope rope = make_rope(yarn);
@@ -765,7 +766,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                 rope.scaled ? qsa_score_kernel<true> : qsa_score_kernel<false>;
             score_kernel<<<grid, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
-                static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
+                direct_weight(*weights.query_norm), eps, weights.unit_offset,
                 static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity,
                 rope);
         } else {
@@ -774,7 +775,7 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                 rope.scaled ? qsa_query_kernel<true> : qsa_query_kernel<false>;
             query_kernel<<<tokens, kThreads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projection.data), first,
-                static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
+                direct_weight(*weights.query_norm), eps, weights.unit_offset,
                 static_cast<float*>(queries.data), rope);
             CUDA_CHECK(cudaGetLastError());
             const int tile_tokens = route == ScoreRoute::Narrow ? kNarrowTokens : kWideTokens;

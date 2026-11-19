@@ -17,6 +17,14 @@ void layer_norm_launch(const Tensor& x, const Tensor& weight, const Tensor& bias
     if (rows > std::numeric_limits<unsigned>::max()) {
         throw std::overflow_error("layer_norm: launch grid exceeds CUDA limit");
     }
+    if (weight.dtype == DType::FP32) {
+        layer_norm_kernel<block><<<static_cast<unsigned>(rows), block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const float*>(weight.data),
+            static_cast<const float*>(bias.data), static_cast<__nv_bfloat16*>(out.data), x.ne[0],
+            rows, eps);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const bool paired = x.ne[0] == 1152 && ((reinterpret_cast<std::uintptr_t>(x.data) |
                                              reinterpret_cast<std::uintptr_t>(weight.data) |
                                              reinterpret_cast<std::uintptr_t>(bias.data) |

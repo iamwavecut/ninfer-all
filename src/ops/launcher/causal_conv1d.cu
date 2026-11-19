@@ -54,9 +54,17 @@ void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
     const auto out_state_addr   = reinterpret_cast<std::uintptr_t>(conv_state_out.data);
     const auto out_addr         = reinterpret_cast<std::uintptr_t>(out.data);
 
-    if (((x_addr | w_addr | in_addr | out_state_addr | out_addr) & (alignof(__nv_bfloat162) - 1)) ==
-            0 &&
-        (C & 1) == 0) {
+    if (weight.dtype == DType::FP32) {
+        const CausalConvContiguousOutput<__nv_bfloat16> out_map{
+            static_cast<__nv_bfloat16*>(out.data), C};
+        causal_conv1d_prefill_kernel<<<prefill_output_grid_for(C, T, kOutputBlock), kOutputBlock, 0,
+                                       stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const float*>(weight.data),
+            static_cast<const __nv_bfloat16*>(conv_state_in.data), out_map, C, T);
+        CUDA_CHECK(cudaGetLastError());
+    } else if (((x_addr | w_addr | in_addr | out_state_addr | out_addr) &
+                (alignof(__nv_bfloat162) - 1)) == 0 &&
+               (C & 1) == 0) {
         const CausalConvContiguousOutput<__nv_bfloat162> out_map{
             reinterpret_cast<__nv_bfloat162*>(out.data), C / 2};
         causal_conv1d_prefill_pairs_kernel<<<prefill_output_grid_for(C / 2, T, kPairBlock),
@@ -86,6 +94,10 @@ void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
 
 void causal_conv1d_smallt_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+    if (weight.dtype == DType::FP32) {
+        causal_conv1d_prefill_launch(x, weight, conv_state_in, conv_state_out, out, stream);
+        return;
+    }
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
     const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(T));
@@ -139,6 +151,11 @@ void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
                                        const Tensor& conv_state_in, Tensor& conv_state_out,
                                        Tensor& out0, Tensor& out1, Tensor& out2,
                                        CausalConvSplitGeometry geometry, cudaStream_t stream) {
+    if (weight.dtype == DType::FP32) {
+        causal_conv1d_prefill_split_launch(x, weight, conv_state_in, conv_state_out, out0, out1,
+                                           out2, geometry, stream);
+        return;
+    }
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
     require_split_cover(geometry, C);
@@ -168,17 +185,29 @@ void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
     if (geometry.rows0 % 2 != 0 || geometry.rows1 % 2 != 0 || geometry.rows2 % 2 != 0) {
         throw std::invalid_argument("causal_conv1d: a pair must not straddle two destinations");
     }
-    // Pairs: the map counts rows in pairs.
-    with_split_output(reinterpret_cast<__nv_bfloat162*>(out0.data),
-                      reinterpret_cast<__nv_bfloat162*>(out1.data),
-                      reinterpret_cast<__nv_bfloat162*>(out2.data), geometry, 2, [&](auto out_map) {
-                          causal_conv1d_prefill_pairs_kernel<<<
-                              prefill_output_grid_for(C / 2, T, kPairBlock), kPairBlock, 0,
-                              stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                        static_cast<const __nv_bfloat16*>(weight.data),
-                                        static_cast<const __nv_bfloat16*>(conv_state_in.data),
-                                        out_map, C, T);
-                      });
+    if (weight.dtype == DType::FP32) {
+        with_split_output(
+            static_cast<__nv_bfloat16*>(out0.data), static_cast<__nv_bfloat16*>(out1.data),
+            static_cast<__nv_bfloat16*>(out2.data), geometry, 1, [&](auto out_map) {
+                causal_conv1d_prefill_kernel<<<prefill_output_grid_for(C, T, kPairBlock),
+                                               kPairBlock, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const float*>(weight.data),
+                    static_cast<const __nv_bfloat16*>(conv_state_in.data), out_map, C, T);
+            });
+    } else {
+        // Pairs: the map counts rows in pairs.
+        with_split_output(
+            reinterpret_cast<__nv_bfloat162*>(out0.data),
+            reinterpret_cast<__nv_bfloat162*>(out1.data),
+            reinterpret_cast<__nv_bfloat162*>(out2.data), geometry, 2, [&](auto out_map) {
+                causal_conv1d_prefill_pairs_kernel<<<prefill_output_grid_for(C / 2, T, kPairBlock),
+                                                     kPairBlock, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const __nv_bfloat16*>(weight.data),
+                    static_cast<const __nv_bfloat16*>(conv_state_in.data), out_map, C, T);
+            });
+    }
     CUDA_CHECK(cudaGetLastError());
 
     causal_conv1d_prefill_state_kernel<<<grid_for(C, kChannelBlock, "prefill state"), kChannelBlock,
@@ -191,6 +220,10 @@ void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
 
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
                                  Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+    if (weight.dtype == DType::FP32) {
+        causal_conv1d_prefill_launch(x, weight, conv_state_in, conv_state_out, out, stream);
+        return;
+    }
     constexpr int kBlock = 256;
     const std::int32_t C = x.ne[0];
 
@@ -263,7 +296,23 @@ void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor
     const std::int64_t slot_stride =
         static_cast<std::int64_t>(conv_states.ne[0]) * static_cast<std::int64_t>(conv_states.ne[1]);
 
-    if (B == 1 && valid_columns.data == nullptr && T == 1) {
+    if (weight.dtype == DType::FP32) {
+        const dim3 grid(grid_for(C, 256, "FP32 snapshot"), static_cast<unsigned>(B));
+        const auto launch = [&]<bool Masked>() {
+            causal_conv1d_batched_sequence_snapshot_kernel<Masked, float><<<grid, 256, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data), static_cast<const float*>(weight.data),
+                static_cast<__nv_bfloat16*>(conv_states.data),
+                static_cast<const std::int32_t*>(valid_columns.data),
+                static_cast<const std::int32_t*>(initial_state_slots.data),
+                static_cast<const std::int32_t*>(snapshot_base_slots.data),
+                static_cast<__nv_bfloat16*>(out.data), C, T, slot_stride);
+        };
+        if (valid_columns.data == nullptr) {
+            launch.template operator()<false>();
+        } else {
+            launch.template operator()<true>();
+        }
+    } else if (B == 1 && valid_columns.data == nullptr && T == 1) {
         constexpr int kBlock = 256;
         causal_conv1d_snapshot_decode_kernel<<<grid_for(C, kBlock, "snapshot decode"), kBlock, 0,
                                                stream>>>(

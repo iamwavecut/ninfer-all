@@ -54,6 +54,12 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
     const auto* z_bf16 = z != nullptr ? static_cast<const __nv_bfloat16*>(z->data) : nullptr;
     auto* out_bf16     = static_cast<__nv_bfloat16*>(out.data);
 
+    if (weight.dtype == DType::FP32) {
+        rmsnorm_generic_kernel<Epilogue, float><<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+            x_bf16, static_cast<const float*>(weight.data), z_bf16, out_bf16, d, rows, eps);
+        return;
+    }
+
     // The hoisted weight and gate cost registers. Measured at 512-thread blocks, only the
     // gated epilogue loses a block per SM for them: warp 35 -> 50 and the wide row 38 -> 48, both
     // three blocks to two, while every other instantiation stays at three. So only that epilogue

@@ -16,24 +16,27 @@ namespace ninfer::ops {
  * input from it and writes its output back into every stream with a per-stream weight.
  *
  * `stack` is FP32 [hidden, streams, tokens] (stream c of token t at column-major offset
- * (t * streams + c) * hidden). `norm` [streams * hidden] is BF16; the matrices are stored as each
- * row's input contiguous, in BF16 words or in ggml Q8_0 blocks (32 consecutive inputs of a row as
- * a binary16 scale d and 32 signed codes q, value d * q): `down` [streams * hidden, lowrank], `up`
- * [lowrank, streams * hidden], and `inject` [streams * hidden, streams] (absent for the final
- * mixer). With n = streams and xs = stack[:, :, t] flattened stream-major, the read computes in
- * exact arithmetic over the represented values
+ * (t * streams + c) * hidden). `norm` [streams * hidden] is BF16 or FP32; the matrices are stored
+ * as each row's input contiguous, in BF16 words or in ggml Q8_0 blocks (32 consecutive inputs of a
+ * row as a binary16 scale d and 32 signed codes q, value d * q): `down` [streams * hidden,
+ * lowrank], `up` [lowrank, streams * hidden], and `inject` [streams * hidden, streams] (absent for
+ * the final mixer), each matrix in its own format. With n = streams and xs = stack[:, :, t]
+ * flattened stream-major, the read
+ * computes in exact arithmetic over the represented values
  *
- *   xn[c, d]  = xs[c, d] / sqrt(mean_d xs[c, d]^2 + eps) * (1 + norm[c * hidden + d])
+ *   xn[c, d]  = xs[c, d] / sqrt(mean_d xs[c, d]^2 + eps) * (offset + norm[c * hidden + d])
  *   lo        = silu((down . xn) / n)                                         (lowrank)
  *   gate      = sigmoid(up . lo)                                              (streams * hidden)
  *   mixed[d]  = (1 / n) * sum_c gate[c * hidden + d] * xn[c, d]               BF16 [hidden, tokens]
- *   inject[c] = 2 * sigmoid((inject . xn)[c] / n)                             FP32 [streams, tokens]
+ *   inject[c] = 2 * sigmoid((inject . xn)[c] / n)                             FP32 [streams,
+ * tokens]
  *
- * and the write updates stack[c, d] += y[d] * inject[c] for the block output y (BF16 or FP32
- * [hidden, tokens]; the MoE's output is FP32). The oracle evaluates these in FP64 from the represented inputs; `mixed` is
- * compared after its BF16 store, `inject` and the written stack as FP32. Private arithmetic,
- * including the FP32 intermediates in workspace, is implementation-defined. The shapes this
- * implements are streams 4, hidden 2560 and lowrank 320.
+ * where offset is one for unit_offset and zero for stored multiplicative gamma. The write
+ * updates stack[c, d] += y[d] * inject[c] for the block output y (BF16 or FP32
+ * [hidden, tokens]; the MoE's output is FP32). The oracle evaluates these in FP64 from the
+ * represented inputs; `mixed` is compared after its BF16 store, `inject` and the written stack as
+ * FP32. Private arithmetic, including the FP32 intermediates in workspace, is
+ * implementation-defined. The shapes this implements are streams 4, hidden 2560 and lowrank 320.
  */
 // One matrix of a hyper-connection, 16-byte aligned, in the geometry above.
 struct HyperConnectionMatrix {
@@ -47,6 +50,7 @@ struct HyperConnectionWeights {
     HyperConnectionMatrix down;
     HyperConnectionMatrix up;
     HyperConnectionMatrix inject; // the final mixer has none
+    bool unit_offset = true;
 };
 
 [[nodiscard]] std::size_t hyper_connection_read_workspace_bytes(std::int32_t streams,

@@ -380,19 +380,37 @@ def _bf16_rows(gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowM
 
     info = gguf.info(tensor)
     flat = (prod(info.shape[:-1]), info.shape[-1])
-    if info.type_id == TYPE_BF16:
-        words = gguf.read_bf16_words(tensor).reshape(flat)
-        index = select(0, shape[0])
-        values = torch.from_numpy(np.ascontiguousarray(words[index]).view(np.int16)).view(
-            torch.bfloat16
-        )
-    else:
-        values = torch.from_numpy(
-            np.ascontiguousarray(_words(gguf, tensor).reshape(flat)[select(0, shape[0])])
-        ).to(torch.bfloat16)
-    if columns is not None:
-        values = values[:, torch.from_numpy(np.argsort(columns))]
-    return array_source(values.reshape(shape), f"{tensor}[{info.type_name}]{list(shape)}")
+    dtype = {TYPE_BF16: np.dtype("<u2"), TYPE_F16: np.dtype("<f2"),
+             TYPE_F32: np.dtype("<f4")}[info.type_id]
+    if flat[1] != shape[1]:
+        raise ValueError(f"{tensor}: direct source and logical row widths differ")
+    permutation = None if columns is None else np.argsort(columns)
+
+    def read(begin: int, end: int) -> torch.Tensor:
+        if begin == end:
+            return torch.empty(0, dtype=torch.bfloat16)
+        first, last = begin // shape[1], -(-end // shape[1])
+        index = np.asarray(select(first, last), dtype=np.int64)
+        if index.shape != (last - first,) or index.min() < 0 or index.max() >= flat[0]:
+            raise ValueError(f"{tensor}: selected direct rows exceed the source shape")
+        unique, inverse = np.unique(index, return_inverse=True)
+        words = np.empty((unique.size, flat[1]), dtype=dtype)
+        splits = np.flatnonzero(np.diff(unique) != 1) + 1
+        row_bytes = flat[1] * dtype.itemsize
+        # Read only consecutive selected runs; preflight and chunked output never retain a matrix.
+        for low, high in zip((0, *splits.tolist()), (*splits.tolist(), unique.size)):
+            raw = gguf.tensor_bytes(tensor, int(unique[low]) * row_bytes,
+                                    (int(unique[high - 1]) + 1) * row_bytes)
+            words[low:high] = raw.view(dtype).reshape(high - low, flat[1])
+        words = words[inverse]
+        if permutation is not None:
+            words = words[:, permutation]
+        words = np.ascontiguousarray(words)
+        values = (torch.from_numpy(words.view(np.int16)).view(torch.bfloat16)
+                  if info.type_id == TYPE_BF16 else torch.from_numpy(words).to(torch.bfloat16))
+        return values.reshape(-1)[begin - first * shape[1]:end - first * shape[1]]
+
+    return LogicalSource(shape, f"{tensor}[{info.type_name}]{list(shape)}", read)
 
 
 def matrix_source(
@@ -482,13 +500,14 @@ def column_source(
     return LogicalSource(shape, label, _flat(values, shape[1]), encoded), True
 
 
-def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, bool]]:
+def mtp_sources(gguf: GGUFFile, experts: int, *, norm_source=None) -> dict[str, tuple[LogicalSource, bool]]:
     """Every parameter of the `mtp` component from an MTP GGUF; True marks encoded block rows.
     Every norm drops its stored `1 + w`; the hyper-connection matrices are Q8_0 rows."""
 
     out: dict[str, tuple[LogicalSource, bool]] = {}
     g = f"blk.{MTP_BLOCK}."
     n = g + "nextn."
+    norm = norm_source or _norm
 
     def matrix(name: str, tensor: str, shape: tuple[int, int], select: RowMap = rows()):
         out[name] = matrix_source(gguf, tensor, shape, select)
@@ -497,7 +516,7 @@ def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, 
         out[name] = (source, False)
 
     def hc(prefix: str, stored: str, inject: bool):
-        direct(prefix + "norm", _norm(gguf, stored + "norm.weight", True))
+        direct(prefix + "norm", norm(gguf, stored + "norm.weight", True))
         out[prefix + "down"] = hc_matrix_source(gguf, stored + "down.weight", (LOWRANK, WIDTH)), True
         out[prefix + "up"] = hc_matrix_source(gguf, stored + "up.weight", (WIDTH, LOWRANK)), True
         if inject:
@@ -505,8 +524,8 @@ def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, 
                 hc_matrix_source(gguf, stored + "inject.weight", (STREAMS, WIDTH)), True
             )
 
-    direct("mtp/embedding_norm", _norm(gguf, n + "enorm.weight", True))
-    direct("mtp/hidden_norm", _norm(gguf, n + "hnorm.weight", True))
+    direct("mtp/embedding_norm", norm(gguf, n + "enorm.weight", True))
+    direct("mtp/hidden_norm", norm(gguf, n + "hnorm.weight", True))
     out["mtp/fc_embedding"] = column_source(gguf, n + "eh_proj.weight", 0, HIDDEN)
     out["mtp/fc_hidden"] = column_source(gguf, n + "eh_proj.weight", HIDDEN, 2 * HIDDEN)
     hc("mtp/final_mixer/", n + "hc_head_", inject=False)
@@ -519,13 +538,13 @@ def mtp_sources(gguf: GGUFFile, experts: int) -> dict[str, tuple[LogicalSource, 
     matrix(a + "key", g + "attn_k.weight", (KV_ROWS, HIDDEN))
     matrix(a + "value", g + "attn_v.weight", (KV_ROWS, HIDDEN))
     matrix(a + "output", g + "attn_output.weight", (HIDDEN, QUERY_ROWS))
-    direct(a + "query_norm", _norm(gguf, g + "attn_q_norm.weight", True))
-    direct(a + "key_norm", _norm(gguf, g + "attn_k_norm.weight", True))
+    direct(a + "query_norm", norm(gguf, g + "attn_q_norm.weight", True))
+    direct(a + "key_norm", norm(gguf, g + "attn_k_norm.weight", True))
     i = p + "indexer/"
     matrix(i + "query", g + "indexer.q_proj.weight", (INDEXER_HEADS * INDEXER_DIM, HIDDEN))
     matrix(i + "key", g + "indexer.k_proj.weight", (INDEXER_DIM, HIDDEN))
-    direct(i + "query_norm", _norm(gguf, g + "indexer.q_norm.weight", True))
-    direct(i + "key_norm", _norm(gguf, g + "indexer.k_norm.weight", True))
+    direct(i + "query_norm", norm(gguf, g + "indexer.q_norm.weight", True))
+    direct(i + "key_norm", norm(gguf, g + "indexer.k_norm.weight", True))
     _moe_sources(out, gguf, g, p + "moe/", experts)
     return out
 
@@ -555,11 +574,14 @@ def _moe_sources(out: dict, gguf: GGUFFile, g: str, m: str, experts: int,
 
 
 def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None,
-                 routed: bool = True) -> dict[str, tuple[LogicalSource, bool]]:
+                 routed: bool = True, *, norm_source=None,
+                 direct_dtype=torch.bfloat16) -> dict[str, tuple[LogicalSource, bool]]:
     """Every text parameter's GGUF source; True marks encoded block rows. A skeleton GGUF supplies
     every parameter but the routed experts (`routed` false)."""
 
     out: dict[str, tuple[LogicalSource, bool]] = {}
+
+    norm = norm_source or _norm
 
     def matrix(name: str, tensor: str, shape: tuple[int, int], select: RowMap = rows(),
                columns: np.ndarray | None = None):
@@ -569,7 +591,7 @@ def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | 
         out[name] = (source, False)
 
     def hc(prefix: str, stored: str, inject: bool):
-        direct(prefix + "norm", _norm(gguf, stored + "norm.weight", True))
+        direct(prefix + "norm", norm(gguf, stored + "norm.weight", True))
         out[prefix + "down"] = hc_matrix_source(gguf, stored + "down.weight", (LOWRANK, WIDTH)), True
         out[prefix + "up"] = hc_matrix_source(gguf, stored + "up.weight", (WIDTH, LOWRANK)), True
         if inject:
@@ -592,13 +614,13 @@ def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | 
             matrix(a + "key", g + "attn_k.weight", (KV_ROWS, HIDDEN))
             matrix(a + "value", g + "attn_v.weight", (KV_ROWS, HIDDEN))
             matrix(a + "output", g + "attn_output.weight", (HIDDEN, QUERY_ROWS))
-            direct(a + "query_norm", _norm(gguf, g + "attn_q_norm.weight", True))
-            direct(a + "key_norm", _norm(gguf, g + "attn_k_norm.weight", True))
+            direct(a + "query_norm", norm(gguf, g + "attn_q_norm.weight", True))
+            direct(a + "key_norm", norm(gguf, g + "attn_k_norm.weight", True))
             i = p + "indexer/"
             matrix(i + "query", g + "indexer.q_proj.weight", (INDEXER_HEADS * INDEXER_DIM, HIDDEN))
             matrix(i + "key", g + "indexer.k_proj.weight", (INDEXER_DIM, HIDDEN))
-            direct(i + "query_norm", _norm(gguf, g + "indexer.q_norm.weight", True))
-            direct(i + "key_norm", _norm(gguf, g + "indexer.k_norm.weight", True))
+            direct(i + "query_norm", norm(gguf, g + "indexer.q_norm.weight", True))
+            direct(i + "key_norm", norm(gguf, g + "indexer.k_norm.weight", True))
         else:
             n = p + "gdn/"
             qkv = g + "attn_qkv.weight"
@@ -615,25 +637,28 @@ def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | 
             ssm_a = untile(_words(gguf, g + "ssm_a"), 1).astype(np.float64)
             if not np.all(ssm_a < 0):
                 raise ValueError(f"{g}ssm_a must be strictly negative (-exp(A_log))")
-            direct(n + "a_log", _direct(np.log(-ssm_a).astype(np.float32), torch.float32,
-                                        g + "ssm_a"))
+            if config.get("gdn_a_is_log", True):
+                direct(n + "a_log", _direct(np.log(-ssm_a).astype(np.float32), torch.float32,
+                                            g + "ssm_a"))
+            else:
+                direct(n + "decay", _direct(ssm_a.astype(np.float32), torch.float32, g + "ssm_a"))
             direct(n + "dt_bias", _direct(untile(_words(gguf, g + "ssm_dt.bias"), 1),
                                           torch.float32, g + "ssm_dt.bias"))
             taps = _words(gguf, g + "ssm_conv1d.weight")
             channels = np.concatenate([taps[: 2 * GDN_KEY_DIM],
                                        untile(taps[2 * GDN_KEY_DIM:], GDN_HEAD_DIM)])
-            direct(n + "convolution", _direct(channels.T, torch.bfloat16, g + "ssm_conv1d.weight"))
-            direct(n + "norm", _norm(gguf, g + "ssm_norm.weight", False))
+            direct(n + "convolution", _direct(channels.T, direct_dtype, g + "ssm_conv1d.weight"))
+            direct(n + "norm", norm(gguf, g + "ssm_norm.weight", False))
         _moe_sources(out, gguf, g, p + "moe/", config["num_experts"], routed)
         if layer in config["ple_layers"]:
             q = p + "ple/"
             matrix(q + "key", g + "ple_key.weight", (WIDTH, HIDDEN))
             matrix(q + "value", g + "ple_value.weight", (HIDDEN, HIDDEN))
             for role in ("norm_key", "norm_query", "norm_conv"):
-                direct(q + role, _norm(gguf, g + f"ple_{role}.weight", True))
+                direct(q + role, norm(gguf, g + f"ple_{role}.weight", True))
             # Each channel's taps stay contiguous, oldest first (the HF conv squeezed).
             direct(q + "convolution", _direct(_words(gguf, g + "ple_conv1d.weight"),
-                                              torch.bfloat16, g + "ple_conv1d.weight"))
+                                              direct_dtype, g + "ple_conv1d.weight"))
     return out
 
 
@@ -678,14 +703,14 @@ def _group_moe(recipe, m: str, experts: int, formats: dict[str, str]) -> None:
 
 
 def configure_ngram_gguf(model, recipe, table):
-    """Bind IQ4_NL table rows and record the digest of their stored bytes."""
+    """Bind IQ4_NL or Q8_0 table rows and hash their unchanged stored bytes."""
     if not isinstance(table, GGUFFile):
         raise ValueError("--source ngram must name the release's n-gram table shard (.gguf)")
     descriptor = model.components["ngram"]["config"]
     source = ngram_source(table, descriptor["rows"])
     descriptor["format"] = source.read_encoded(0, 1).format
-    if descriptor["format"] != "gguf_iq4_nl":
-        raise ValueError("the n-gram GGUF table must contain IQ4_NL rows")
+    if descriptor["format"] not in ("gguf_iq4_nl", "gguf_q8_0"):
+        raise ValueError("the n-gram GGUF table must contain IQ4_NL or Q8_0 rows")
     size = table.info(NGRAM_TENSOR).nbytes
     print(f"hashing the n-gram table ({size / 1e9:.1f} GB)", flush=True)
     descriptor["table_sha256"] = table_digest(table)
@@ -694,7 +719,7 @@ def configure_ngram_gguf(model, recipe, table):
                       source=source)
 
 
-def qwen3_8_flash_next_gguf(model, recipe, sources):
+def qwen3_8_flash_next_gguf(model, recipe, sources, *, preserve=False, compat_bf16=False):
     """A Qwen3.8-Flash-Next GGUF release (GSQ-RCO's two shards or a llama.cpp split) in its own
     block formats: the first shard as `--source gguf=SHARD1.gguf` (for the text component) and the
     n-gram table shard, the release's last, as `--source ngram=SHARD.gguf`, which is always read, since the model records the digest of the
@@ -715,8 +740,11 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
     if not isinstance(gguf, GGUFFile):
         raise ValueError("--source gguf must name the model's first .gguf shard")
     validate(gguf, config, model.source_layers)
+    from . import qwen4_exp_preserve as kept
     formats: dict[str, str] = {}
-    for name, (text_source, encoded) in text_sources(gguf, config, model.source_layers).items():
+    found = (kept.text_sources(gguf, model, compat_bf16=compat_bf16) if preserve
+             else text_sources(gguf, config, model.source_layers))
+    for name, (text_source, encoded) in found.items():
         formats[name] = _assign(recipe, name, text_source, encoded, model)
     if "mtp" in model.components:
         from .official_recipes import flash_next_mtp_formats
@@ -725,10 +753,15 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
         mtp = sources["mtp"]
         experts = model.components["mtp"]["config"]["num_experts"]
         if isinstance(mtp, SafetensorsSource):
+            if preserve:
+                raise ValueError("the preservation recipe requires an MTP GGUF; "
+                                 "omit MTP when attaching DFlash2")
             formats.update(flash_next_mtp_formats(model, recipe))
         elif isinstance(mtp, GGUFFile):
             validate_mtp(mtp, experts)
-            for name, (mtp_source, encoded) in mtp_sources(mtp, experts).items():
+            found_mtp = (kept.mtp_sources(mtp, experts, model, compat_bf16=compat_bf16) if preserve
+                         else mtp_sources(mtp, experts))
+            for name, (mtp_source, encoded) in found_mtp.items():
                 formats[name] = _assign(recipe, name, mtp_source, encoded, model)
         else:
             raise ValueError("--source mtp must name an MTP GGUF or HF safetensors subset")
@@ -736,9 +769,11 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
         vision = _vision_source(model, sources)
         for name, parameter in model.parameters.items():
             if name.startswith("vision/"):
-                formats[name] = parameter.direct_format
-                recipe.assign(name, format=parameter.direct_format, method=cast_direct,
-                              source=model.source(name, vision))
+                direct = preserve and not parameter.inputs
+                formats[name] = "fp32" if direct else parameter.direct_format
+                operand = model.source(name, vision)
+                recipe.assign(name, format=formats[name], method=cast_direct,
+                              source=kept.vision_source(operand) if preserve and not direct else operand)
     if set(formats) != set(model.parameters) - {"ngram/table"}:
         missing = sorted(set(model.parameters) - set(formats) - {"ngram/table"})[:5]
         raise ValueError(f"the GGUF leaves logical parameters without a source: {missing}")
@@ -761,6 +796,15 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
         _group_attention(recipe, "mtp/layer/", formats)
         _group_moe(recipe, "mtp/layer/moe/", model.components["mtp"]["config"]["num_experts"],
                    formats)
+
+
+def qwen3_8_flash_next_gguf_preserve(model, recipe, sources, *, compat_bf16=False):
+    """Keep quantized GGUF rows, stored FP32 norms, native decay and Basalt HC8 operands."""
+    if "text" in model.components and not all((model.config.get("fp32_direct"),
+            not model.config.get("norm_unit_offset", True), model.config.get("hc_prefill_inject"),
+            not model.config.get("gdn_a_is_log", True))):
+        raise ValueError("build the preservation model with qwen4_exp_preserve.model_config first")
+    qwen3_8_flash_next_gguf(model, recipe, sources, preserve=True, compat_bf16=compat_bf16)
 
 
 def qwen3_8_flash_next_gsq_q2(model, recipe, sources):
@@ -871,6 +915,7 @@ def table_digest(gguf: GGUFFile) -> str:
 
 RECIPES = {
     "qwen3_8_flash_next_gguf": qwen3_8_flash_next_gguf,
+    "qwen3_8_flash_next_gguf_preserve": qwen3_8_flash_next_gguf_preserve,
     "qwen3_8_flash_next_gsq_q2": qwen3_8_flash_next_gsq_q2,
 }
 
@@ -888,6 +933,7 @@ __all__ = [
     "with_mtp_expert_count",
     "ngram_source",
     "qwen3_8_flash_next_gguf",
+    "qwen3_8_flash_next_gguf_preserve",
     "qwen3_8_flash_next_gsq_q2",
     "table_digest",
     "text_sources",

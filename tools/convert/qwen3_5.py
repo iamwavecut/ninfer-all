@@ -169,6 +169,10 @@ def vision_config(source: dict, text: dict) -> dict:
     positions = result["num_position_embeddings"]
     if h % heads or (h // heads) % 4 or isqrt(positions) ** 2 != positions:
         raise ValueError("Vision head or square position geometry is invalid")
+    if "direct_format" in raw:
+        if raw["direct_format"] not in ("bf16", "fp32"):
+            raise ValueError("Vision direct_format must be bf16 or fp32")
+        result["direct_format"] = raw["direct_format"]
     return result
 
 

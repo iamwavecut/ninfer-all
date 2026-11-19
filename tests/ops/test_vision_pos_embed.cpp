@@ -30,7 +30,7 @@ std::vector<std::uint16_t> as_bf16_bits(const std::vector<float>& values) {
     return bits;
 }
 
-int run_case(std::int32_t patches, std::uint32_t seed) {
+int run_case(std::int32_t patches, std::uint32_t seed, bool fp32_table = false) {
     constexpr std::int32_t kDimensions = 1152;
     constexpr std::int32_t kTableRows  = 2304;
 
@@ -41,7 +41,7 @@ int run_case(std::int32_t patches, std::uint32_t seed) {
     fill_uniform(table_values, seed, -2.0f, 2.0f);
     fill_uniform(x_values, seed + 1u, -8.0f, 8.0f);
     fill_uniform(weights, seed + 2u, 0.05f, 1.0f);
-    round_to_bf16(table_values);
+    if (!fp32_table) { round_to_bf16(table_values); }
     round_to_bf16(x_values);
 
     for (std::int32_t patch = 0; patch < patches; ++patch) {
@@ -77,28 +77,38 @@ int run_case(std::int32_t patches, std::uint32_t seed) {
 
     const auto table_bits = as_bf16_bits(table_values);
     const auto x_bits     = as_bf16_bits(x_values);
-    GuardedDeviceBuffer device_table(table_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_table(table_values.size() *
+                                     (fp32_table ? sizeof(float) : sizeof(std::uint16_t)));
     GuardedDeviceBuffer device_indices(indices.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer device_weights(weights.size() * sizeof(float));
     GuardedDeviceBuffer device_x(x_bits.size() * sizeof(std::uint16_t));
-    device_table.copy_from_host(table_bits.data(), table_bits.size() * sizeof(std::uint16_t));
+    device_table.copy_from_host(fp32_table ? static_cast<const void*>(table_values.data())
+                                           : table_bits.data(),
+                                device_table.bytes());
     device_indices.copy_from_host(indices.data(), indices.size() * sizeof(std::int32_t));
     device_weights.copy_from_host(weights.data(), weights.size() * sizeof(float));
     device_x.copy_from_host(x_bits.data(), x_bits.size() * sizeof(std::uint16_t));
 
-    Tensor table_tensor(device_table.data(), DType::BF16, {kDimensions, kTableRows});
+    Tensor table_tensor(device_table.data(), fp32_table ? DType::FP32 : DType::BF16,
+                        {kDimensions, kTableRows});
     Tensor indices_tensor(device_indices.data(), DType::I32, {4, patches});
     Tensor weights_tensor(device_weights.data(), DType::FP32, {4, patches});
     Tensor x_tensor(device_x.data(), DType::BF16, {kDimensions, patches});
     ops::vision_pos_embed_add(table_tensor, indices_tensor, weights_tensor, x_tensor, nullptr);
     cuda_synchronize();
 
-    const std::string label = "vision_pos_embed D=1152 R=2304 P=" + std::to_string(patches);
+    const std::string label = std::string(fp32_table ? "FP32 " : "BF16 ") +
+                              "vision_pos_embed D=1152 R=2304 P=" + std::to_string(patches);
     int failures = verify_pointwise(label.c_str(), from_device_bf16(device_x.data(), x_bits.size()),
                                     reference, kVisionPositionEmbeddingTolerance);
-    failures += verify_exact((label + " preserves table").c_str(),
-                             from_device<std::uint16_t>(device_table.data(), table_bits.size()),
-                             table_bits);
+    failures +=
+        fp32_table
+            ? verify_exact((label + " preserves table").c_str(),
+                           from_device<float>(device_table.data(), table_values.size()),
+                           table_values)
+            : verify_exact((label + " preserves table").c_str(),
+                           from_device<std::uint16_t>(device_table.data(), table_bits.size()),
+                           table_bits);
     failures +=
         verify_exact((label + " preserves indices").c_str(),
                      from_device<std::int32_t>(device_indices.data(), indices.size()), indices);
@@ -122,6 +132,8 @@ int main() {
     int failures = 0;
     failures += run_case(17, 1u);
     failures += run_case(1024, 11u);
+    failures += run_case(17, 21u, true);
+    failures += run_case(1024, 31u, true);
     std::cout << (failures ? "FAIL" : "OK") << " vision_pos_embed\n";
     return failures ? 1 : 0;
 }

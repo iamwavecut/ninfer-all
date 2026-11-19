@@ -33,10 +33,11 @@ void require_equal(const std::filesystem::path& artifact, std::uint64_t actual,
 
 ops::NgramRowFormat row_format(const std::filesystem::path& artifact, const std::string& format) {
     if (format == "gguf_iq4_nl") { return ops::NgramRowFormat::Iq4Nl; }
+    if (format == "gguf_q8_0") { return ops::NgramRowFormat::Q8_0; }
     if (format == "bf16") { return ops::NgramRowFormat::Bf16; }
     if (format == "fp8_e4m3fn_row_fp16") { return ops::NgramRowFormat::Fp8E4M3RowScale; }
     throw ArtifactError(artifact.string() + ": the n-gram table is stored as " + format +
-                        "; the runtime decodes gguf_iq4_nl, bf16 and fp8_e4m3fn_row_fp16 rows");
+                        "; the runtime decodes gguf_iq4_nl, gguf_q8_0, bf16 and fp8_e4m3fn_row_fp16 rows");
 }
 
 // What a `ngram` component says about its table, checked against the model's text config.
