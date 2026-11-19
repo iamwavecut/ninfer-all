@@ -494,8 +494,8 @@ struct Executor::Impl {
                             table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
                                                std::int64_t(x - first) * hidden * p.down_row_bytes;
                         }
-                        bool gate_up_aligned = p.gate_up_row_bytes % 16 == 0;
-                        bool down_aligned    = p.down_row_bytes % 16 == 0;
+                        bool gate_up_aligned = true;
+                        bool down_aligned    = true;
                         for (std::size_t i = 0; i < table.size(); ++i) {
                             const auto address = reinterpret_cast<std::uintptr_t>(table[i]);
                             const bool aligned = table[i] == nullptr || address % 16 == 0;
@@ -791,9 +791,8 @@ struct Executor::Impl {
                 const auto aligned = [&](std::size_t alias) {
                     return delivery->alias_aligned(l, alias, 16);
                 };
-                p.gate_up_aligned16 =
-                    p.gate_up_row_bytes % 16 == 0 && aligned(0) && aligned(1) && aligned(2);
-                p.down_aligned16 = p.down_row_bytes % 16 == 0 && aligned(3);
+                p.gate_up_aligned16 = aligned(0) && aligned(1) && aligned(2);
+                p.down_aligned16    = aligned(3);
             }
         }
     }

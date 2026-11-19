@@ -442,8 +442,12 @@ std::vector<std::int32_t> decode_widths() {
 SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
                                    std::uint32_t seed = 0) {
     const GgufBlockShape block = gguf_block_shape(qtype);
-    if ((qtype != QType::GGUF_Q4_K && qtype != QType::GGUF_Q6_K) || block.elements == 0 ||
-        k % block.elements != 0) {
+    const bool known = qtype == QType::GGUF_Q4_K || qtype == QType::GGUF_Q6_K ||
+                       qtype == QType::GGUF_Q5_K || qtype == QType::GGUF_Q4_0 ||
+                       qtype == QType::GGUF_Q5_0 || qtype == QType::GGUF_Q8_0 ||
+                       qtype == QType::GGUF_IQ4_NL || qtype == QType::GGUF_IQ4_XS ||
+                       qtype == QType::GGUF_Q2_0 || qtype == QType::GGUF_IQ1_M;
+    if (!known || block.elements == 0 || k % block.elements != 0) {
         throw std::invalid_argument("calibration: unsupported GGUF vector weight format");
     }
     const std::uint64_t blocks = static_cast<std::uint64_t>(n) * (k / block.elements);
@@ -457,8 +461,17 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
     for (std::uint64_t index = 0; index < blocks; ++index) {
         const std::size_t base = static_cast<std::size_t>(index) * block.bytes;
         const std::uint16_t d = 0x3c00;
+        if (qtype == QType::GGUF_IQ1_M) {
+            // IQ1_M spreads its FP16 scale over the top nibbles of its four scale words (bytes 48
+            // to 55): nibble i of d tops word i.
+            for (int i = 0; i < 4; ++i) {
+                std::uint8_t& high = host[base + 48 + 2 * i + 1];
+                high = static_cast<std::uint8_t>((high & 0x0f) | (((d >> (4 * i)) & 0xf) << 4));
+            }
+            continue;
+        }
         std::memcpy(host.data() + base + (qtype == QType::GGUF_Q6_K ? 208 : 0), &d, sizeof(d));
-        if (qtype == QType::GGUF_Q4_K) {
+        if (qtype == QType::GGUF_Q4_K || qtype == QType::GGUF_Q5_K) {
             const std::uint16_t dmin = 0x3800;
             std::memcpy(host.data() + base + 2, &dmin, sizeof(dmin));
         }
@@ -560,23 +573,43 @@ void calibrate_gguf_vector(ops::DeviceRouteProfile& profile, Timer& timer,
     }
 }
 
+// The formats whose matrix products have the asynchronous tile loop (ggml_bridge_mmq.cuh
+// async_matrix_key), with their key suffixes and bridge types.
+struct AsyncMatrixFormat {
+    QType qtype;
+    const char* name;
+    ops::gguf::GgmlType ggml;
+    bool dense = true; // false: the routed-expert matrix kernel only (IQ1_M)
+};
+constexpr AsyncMatrixFormat kAsyncMatrixFormats[] = {
+    {QType::GGUF_Q4_K, "q4_k", ops::gguf::GgmlType::Q4_K},
+    {QType::GGUF_Q5_K, "q5_k", ops::gguf::GgmlType::Q5_K},
+    {QType::GGUF_Q4_0, "q4_0", ops::gguf::GgmlType::Q4_0},
+    {QType::GGUF_Q5_0, "q5_0", ops::gguf::GgmlType::Q5_0},
+    {QType::GGUF_Q8_0, "q8_0", ops::gguf::GgmlType::Q8_0},
+    {QType::GGUF_IQ4_NL, "iq4_nl", ops::gguf::GgmlType::IQ4_NL},
+    {QType::GGUF_Q2_0, "q2_0", ops::gguf::GgmlType::Q2_0},
+    {QType::GGUF_IQ4_XS, "iq4_xs", ops::gguf::GgmlType::IQ4_XS},
+    {QType::GGUF_IQ1_M, "iq1_m", ops::gguf::GgmlType::IQ1_M, false},
+};
+
 void calibrate_gguf_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
-                           const CalibrationOptions& options) {
+                           const CalibrationOptions& options, const AsyncMatrixFormat& format) {
     constexpr std::int32_t max_tokens = 4096;
-    const std::vector<std::int32_t> widths = {65,  128,  129,  256,  512,  768,
-                                              1024, 1280, 1536, 2048, 3072, 4096};
-    const std::string key = "gguf_matrix/q4_k";
-    if (!options.only.empty() && key.rfind(options.only, 0) != 0) { return; }
-    SyntheticWeight wide    = gguf_vector_weight(QType::GGUF_Q4_K, 17408, 5120);
-    SyntheticWeight tall    = gguf_vector_weight(QType::GGUF_Q4_K, 5120, 17408);
+    const std::vector<std::int32_t> widths = {9,    16,   17,   32,   33,   64,   65,   128, 129,
+                                              256,  512,  768,  1024, 1280, 1536, 2048, 3072, 4096};
+    const std::string key = std::string("gguf_matrix/") + format.name;
+    if (!format.dense || (!options.only.empty() && key.rfind(options.only, 0) != 0)) { return; }
+    SyntheticWeight wide    = gguf_vector_weight(format.qtype, 17408, 5120);
+    SyntheticWeight tall    = gguf_vector_weight(format.qtype, 5120, 17408);
     DeviceBuffer wide_input = bf16_buffer(static_cast<std::size_t>(5120) * max_tokens);
     DeviceBuffer tall_input = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
     DeviceBuffer output     = bf16_buffer(static_cast<std::size_t>(17408 + 5120) * max_tokens);
     WorkspaceArena workspace(std::max<std::size_t>({
-        ops::linear_workspace_capacity_bytes(QType::GGUF_Q4_K, 17408, 5120,
+        ops::linear_workspace_capacity_bytes(format.qtype, 17408, 5120,
                                              ops::LinearPolicy::A16Only, widths.front(),
                                              max_tokens),
-        ops::linear_workspace_capacity_bytes(QType::GGUF_Q4_K, 5120, 17408,
+        ops::linear_workspace_capacity_bytes(format.qtype, 5120, 17408,
                                              ops::LinearPolicy::A16Only, widths.front(),
                                              max_tokens),
         256}));
@@ -614,20 +647,20 @@ __global__ void cast_f32_to_bf16_kernel(const float* __restrict__ in,
 }
 
 void calibrate_gguf_moe_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
-                               const CalibrationOptions& options) {
+                               const CalibrationOptions& options, const AsyncMatrixFormat& format) {
     constexpr std::int32_t rows = 640;
     constexpr std::int32_t k = 2560;
     constexpr int experts = 64;
     constexpr int per_token = 2;
-    const std::vector<std::int32_t> widths = {65, 128, 256, 512, 1024};
-    const std::string key = "gguf_moe_matrix/q4_k";
+    const std::vector<std::int32_t> widths = {8, 16, 17, 32, 33, 48, 64, 65, 128, 256, 512, 1024};
+    const std::string key = std::string("gguf_moe_matrix/") + format.name;
     if (!options.only.empty() && key.rfind(options.only, 0) != 0) { return; }
-    const GgufBlockShape block = gguf_block_shape(QType::GGUF_Q4_K);
+    const GgufBlockShape block = gguf_block_shape(format.qtype);
     std::vector<SyntheticWeight> weights;
     std::vector<const void*> pointers;
     weights.reserve(experts);
     for (int expert = 0; expert < experts; ++expert) {
-        weights.push_back(gguf_vector_weight(QType::GGUF_Q4_K, rows, k,
+        weights.push_back(gguf_vector_weight(format.qtype, rows, k,
                                              0x2f6b91c3U + static_cast<std::uint32_t>(expert)));
         pointers.push_back(weights.back().storage.p);
     }
@@ -655,7 +688,7 @@ void calibrate_gguf_moe_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
             static_cast<const std::int32_t*>(ids_device.p), pairs, experts,
             entry.routing_workspace.p, nullptr);
         ops::gguf::quantize_moe_matrix_activation(
-            ops::gguf::GgmlType::Q4_K, static_cast<const __nv_bfloat16*>(input.p), k,
+            format.ggml, static_cast<const __nv_bfloat16*>(input.p), k,
             entry.routing, pairs, per_token, entry.activation.p, nullptr);
         prepared.emplace(columns, std::move(entry));
     }
@@ -669,7 +702,7 @@ void calibrate_gguf_moe_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
         [&](std::int32_t columns, cudaStream_t stream) {
             const std::int32_t pairs = columns * experts;
             const Prepared& entry = prepared.at(columns);
-            ops::gguf::moe_matrix_product(ops::gguf::GgmlType::Q4_K, table, entry.routing,
+            ops::gguf::moe_matrix_product(format.ggml, table, entry.routing,
                                           experts, pairs, true, entry.activation.p,
                                           static_cast<float*>(plane.p), stream);
             const std::size_t count = static_cast<std::size_t>(rows) * pairs;
@@ -1909,8 +1942,10 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
         calibrate_gguf_moe_vector(profile, timer, options);
         calibrate_gguf_moe_up(profile, timer, options);
         if (projections && !ops::turing_shapes_here()) {
-            calibrate_gguf_matrix(profile, timer, options);
-            calibrate_gguf_moe_matrix(profile, timer, options);
+            for (const AsyncMatrixFormat& format : kAsyncMatrixFormats) {
+                calibrate_gguf_matrix(profile, timer, options, format);
+                calibrate_gguf_moe_matrix(profile, timer, options, format);
+            }
         }
     }
     if (projections && options.nvfp4 && !gguf_only) { calibrate_nvfp4_fused(profile, timer, options); }

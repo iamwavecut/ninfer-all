@@ -2474,7 +2474,9 @@ struct Executor::Impl {
         auto* scale = alloc<float>(t);
         kernels::guard_columns(static_cast<__nv_bfloat16*>(x.data), hidden, t, scale, stream);
         auto* y = alloc<float>(std::size_t(t) * hidden);
-        const auto shared = [&] {
+        // `xq`: x's vector activation when the routed experts quantized it (up to 8 tokens), which
+        // the shared expert's gate and up rows read instead of quantizing x a second time.
+        const auto shared = [&](const void* xq) {
             auto shared_scope = workspace->scope();
             auto* gu          = alloc<float>(std::size_t(t) * 2 * width);
             if (p.stq) {
@@ -2495,7 +2497,7 @@ struct Executor::Impl {
                 parts[i].row      = rows;
                 rows += p.shared_gate_up[i].n;
             }
-            ops::detail::gguf_project(x, {parts, p.shared_gate_up.size()}, *workspace, stream);
+            ops::detail::gguf_project(x, {parts, p.shared_gate_up.size()}, *workspace, stream, xq);
             Tensor middle = alloc_bf16(width, t);
             kernels::clamped_swiglu(gu, 2 * width, t, width, config.swiglu_limit, scale, 1,
                                     static_cast<__nv_bfloat16*>(middle.data), width, stream);
@@ -2503,6 +2505,15 @@ struct Executor::Impl {
         };
         routed(p, x, scale, x32, t, y, shared);
         kernels::hc_post(h, y, c.post, c.comb, t, streams, hidden, stream);
+    }
+
+    // Whether every expert of the gate/up and of the down tables of block `p` in delivery `from`
+    // starts on 16 bytes (MoeTable::aligned16, which the matrix kernel's asynchronous tiles need):
+    // aliases 0 to 2 point into the gate/up blob, 3 into the down blob.
+    [[nodiscard]] static std::pair<bool, bool> delivered_aligned16(const LayerPlan& p,
+                                                                   const ExpertDelivery& from) {
+        const auto l = std::size_t(p.delivery_layer);
+        return {from.alias_aligned(l, 2, 16), from.alias_aligned(l, 3, 16)};
     }
 
     // One rank's part of a MoE call of block `p` under expert parallelism: the call's pairs routed
@@ -2526,8 +2537,10 @@ struct Executor::Impl {
         const ExpertDelivery::Call call =
             from.begin(std::size_t(p.delivery_layer), mine, std::uint32_t(pairs), on);
         const auto* tables = from.tables(std::size_t(p.delivery_layer));
-        const gguf::MoeTable gate_up{tables + 2 * n, p.gate_up_row_bytes, 2 * w, hidden};
-        const gguf::MoeTable down{tables + 3 * n, p.down_row_bytes, hidden, w};
+        const auto [gate_up_aligned, down_aligned] = delivered_aligned16(p, from);
+        const gguf::MoeTable gate_up{tables + 2 * n, p.gate_up_row_bytes, 2 * w, hidden,
+                                     gate_up_aligned};
+        const gguf::MoeTable down{tables + 3 * n, p.down_row_bytes, hidden, w, down_aligned};
         const int max_active = std::max(1, std::min(pairs, n));
         auto* gu             = static_cast<float*>(take(std::size_t(pairs) * 2 * w * 4));
         auto* middle         = static_cast<__nv_bfloat16*>(take(std::size_t(pairs) * w * 2));
@@ -2630,7 +2643,7 @@ struct Executor::Impl {
         auto* fixed = alloc<unsigned long long>(std::size_t(t) * hidden);
         expert_part(p, *delivery, expert_ranges[0], xq, xb, scale, ids, weights, t, fixed,
                     *workspace, stream);
-        shared();
+        shared(t <= gguf::kMaxVectorColumns ? xq : nullptr);
         std::vector<const unsigned long long*> parts;
         for (void* received : expert_exchange->collect(part, slot, stream)) {
             parts.push_back(static_cast<const unsigned long long*>(received));
@@ -2661,7 +2674,7 @@ struct Executor::Impl {
         if (p.stq) {
             // An STQ drafter block's resident experts: a pair per routed expert of a row through its
             // gate, up and down matrices, the rows weighted into y.
-            shared();
+            shared(nullptr);
             auto* gu     = alloc<float>(std::size_t(pairs) * 2 * w);
             auto* middle = alloc<__nv_bfloat16>(std::size_t(pairs) * w);
             auto* rows   = alloc<float>(std::size_t(pairs) * hidden);
@@ -2728,8 +2741,11 @@ struct Executor::Impl {
         }
         const auto* tables = p.delivery_layer >= 0 ? delivery->tables(std::size_t(p.delivery_layer))
                                                    : static_cast<const void* const*>(p.tables.p);
-        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * w, hidden};
-        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, w};
+        const auto [gate_up_aligned, down_aligned] =
+            p.delivery_layer >= 0 ? delivered_aligned16(p, *delivery) : std::pair{false, false};
+        const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * w, hidden,
+                                     gate_up_aligned};
+        const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, w, down_aligned};
         const int max_active = std::min(pairs, e);
         auto* gu             = alloc<float>(std::size_t(pairs) * 2 * w);
         auto* middle         = alloc<__nv_bfloat16>(std::size_t(pairs) * w);
@@ -2769,7 +2785,7 @@ struct Executor::Impl {
                     return part;
                 };
                 compute(stage(call->cached_experts));
-                shared();
+                shared(xq);
                 delivery->await(stream);
                 compute(stage(call->missing_experts));
                 if (call->cpu != nullptr) {
@@ -2777,13 +2793,13 @@ struct Executor::Impl {
                 }
             } else {
                 compute(routing);
-                shared();
+                shared(xq);
             }
             combine.fixed = fixed;
             kernels::moe_combine(combine, stream);
             return;
         }
-        shared();
+        shared(xq);
         if (call) { delivery->await(stream); }
         if (matrix_route(p, true, p.gate_up_type, 2 * w, hidden, t)) {
             void* act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;

@@ -46,6 +46,32 @@ static __device__ __forceinline__ void cp_async_cg_16(const unsigned int dst, co
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// NInfer: a 4-byte copy through L1 (cp.async.ca), for MMQ weight rows that start on 4-byte but not
+// on 8-byte boundaries (a Q4_0 row of 704 values is 396 bytes). Both pointers must be 4-byte aligned.
+static __device__ __forceinline__ void cp_async_ca_4(const unsigned int dst, const void * src) {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;"
+        : : "r"(dst), "l"(src));
+#else
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+// NInfer: an 8-byte copy through L1 (cp.async.ca), for MMQ weight tiles whose 256-value step is a
+// whole number of 8-byte words but not of 16-byte ones. Both pointers must be 8-byte aligned.
+static __device__ __forceinline__ void cp_async_ca_8(const unsigned int dst, const void * src) {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;"
+        : : "r"(dst), "l"(src));
+#else
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
 // Makes each thread wait until its asynchronous data copies are done.
 // This does NOT provide any additional synchronization.
 // In particular, when copying data with multiple warps a call to __syncthreads will be needed.

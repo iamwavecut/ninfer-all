@@ -30,8 +30,14 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
     add("gguf_moe_up/q4_k", {"scalar", "cooperative"});
     add("gguf_moe_up/q6_k", {"scalar", "cooperative"});
     if (!volta && !turing_shapes) {
-        add("gguf_matrix/q4_k", {"async"});
-        add("gguf_moe_matrix/q4_k", {"async"});
+        // The asynchronous MMQ tile loop per format (ggml_cuda_mmq_async_row_bytes); IQ1_M has
+        // the routed-expert matrix kernel only.
+        for (const char* format :
+             {"q4_k", "q5_k", "q4_0", "q5_0", "q8_0", "iq4_nl", "q2_0", "iq4_xs"}) {
+            add(std::string("gguf_matrix/") + format, {"async"});
+            add(std::string("gguf_moe_matrix/") + format, {"async"});
+        }
+        add("gguf_moe_matrix/iq1_m", {"async"});
     }
 
     if (!volta) {

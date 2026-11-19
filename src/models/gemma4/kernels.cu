@@ -1023,9 +1023,29 @@ __global__ void route_topk_kernel(const float* __restrict__ logits, int experts,
     }
 }
 
+// The rank of `mine`, expert e's logit, among a token's values[0, 4 * quads) (larger first, lower
+// id on equal values), as route_topk_kernel ranks it: the values past the experts are -inf, which
+// never rank before an expert. Float4 reads, eight in flight, replace the scalar loop's dependent
+// shared-memory loads.
+__device__ __forceinline__ int rank_among(const float* values, float mine, int e, int quads) {
+    const float4* v4 = reinterpret_cast<const float4*>(values);
+    int rank         = 0;
+#pragma unroll 8
+    for (int j4 = 0; j4 < quads; ++j4) {
+        const float4 o = v4[j4];
+        const int j    = 4 * j4;
+        rank += (o.x > mine) | ((o.x == mine) & (j < e));
+        rank += (o.y > mine) | ((o.y == mine) & (j + 1 < e));
+        rank += (o.z > mine) | ((o.z == mine) & (j + 2 < e));
+        rank += (o.w > mine) | ((o.w == mine) & (j + 3 < e));
+    }
+    return rank;
+}
+
 // Decode routing after the logits, in one block of at least max(experts, tokens * top_k)
 // threads: each token's top_k as route_topk_kernel picks them, then the pairs grouped by expert as
-// moe_sort_routes lists them (bounds, pairs per expert, active experts ascending).
+// moe_sort_routes lists them (bounds, pairs per expert, active experts ascending). Every token's
+// logits are staged at once, so a thread ranks its expert in all of them between two barriers.
 __global__ void route_select_kernel(const float* __restrict__ logits, int tokens, int experts,
                                     int top_k, const float* __restrict__ expert_scale,
                                     std::int32_t* __restrict__ ids, float* __restrict__ weights,
@@ -1033,29 +1053,29 @@ __global__ void route_select_kernel(const float* __restrict__ logits, int tokens
                                     std::int32_t* __restrict__ sorted,
                                     std::int32_t* __restrict__ active,
                                     std::int32_t* __restrict__ active_count) {
-    __shared__ float v[kTopkMaxExperts];
+    __shared__ __align__(16) float v[kRouteTokens][kTopkMaxExperts];
     __shared__ float chosen[kRouteTokens * 8];
     __shared__ int chosen_id[kRouteTokens * 8];
     __shared__ int cursor[kTopkMaxExperts];
     __shared__ int warp_total[kTopkMaxExperts / 32][2];
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
-    for (int t = 0; t < tokens; ++t) {
-        if (e < experts) { v[e] = ops::route_order(logits[std::int64_t(t) * experts + e]); }
-        __syncthreads();
-        if (e < experts) {
-            const float mine = v[e];
-            int rank         = 0;
-            for (int j = 0; j < experts; ++j) {
-                const float other = v[j];
-                rank += (other > mine || (other == mine && j < e)) ? 1 : 0;
-            }
+    const int quads = (experts + 3) / 4;
+    for (int i = e; i < tokens * 4 * quads; i += blockDim.x) {
+        const int t = i / (4 * quads), j = i % (4 * quads);
+        v[t][j] = j < experts ? ops::route_order(logits[std::int64_t(t) * experts + j]) : -INFINITY;
+    }
+    __syncthreads();
+    if (e < experts) {
+        for (int t = 0; t < tokens; ++t) {
+            const float mine = v[t][e];
+            const int rank   = rank_among(v[t], mine, e, quads);
             if (rank < top_k) {
                 chosen[t * top_k + rank]    = mine;
                 chosen_id[t * top_k + rank] = e;
             }
         }
-        __syncthreads();
     }
+    __syncthreads();
     const int pairs = tokens * top_k;
     if (e < pairs) {
         const int base = (e / top_k) * top_k;

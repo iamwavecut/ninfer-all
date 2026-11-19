@@ -3,8 +3,8 @@
 //    head, D 512 with eight), linear and sliding-window ring caches, one and many splits, short
 //    and long contexts and two sequences in one batch; the BF16 rows and the q8_1 rows; and keys
 //    derived from the values (K = V blocks: RoPE(V * k_norm), proportional over 64 of 256 pairs).
-//  - route_select: the logits, the top-k ids and weights and the expert grouping of the pairs;
-//    route and route_select with a NaN row (an overflowed hidden state): that token selects
+//  - route_select: the logits, the top-k ids and weights and the expert grouping of the pairs, and
+//    the same ids and weights as route() bit for bit; route and route_select with a NaN row (an overflowed hidden state): that token selects
 //    experts 0..top_k-1, the other tokens as they do without it.
 //  - a branch pass's rows (several branches one after another past the state, each continuing it
 //    at the state's end): qkv_post's rotation at the branch position with the value stored at the
@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -521,6 +522,18 @@ void route(int tokens, std::mt19937& rng) {
         }
     }
     ok = ok && listed == count && int(seen.size()) == pairs && bounds[0] == 0 && bounds[kExperts] == pairs;
+    // route_select ranks every token at once; route() ranks one token a block. Both must pick the
+    // same experts in the same order with the same weights, bit for bit.
+    DeviceBuffer logits2(std::size_t(tokens) * kExperts * 4), ids2(pairs * 4), weights2(pairs * 4);
+    k::route(static_cast<const float*>(dx.p), kHidden, tokens, static_cast<const float*>(dr.p),
+             static_cast<const float*>(dsc.p), kExperts, kTopK, static_cast<float*>(logits2.p),
+             static_cast<std::int32_t*>(ids2.p), static_cast<float*>(weights2.p), nullptr);
+    check(cudaDeviceSynchronize(), "route");
+    std::vector<std::int32_t> ref_ids(pairs);
+    std::vector<float> ref_w(pairs);
+    ids2.copy_to_host(ref_ids.data(), pairs * 4);
+    weights2.copy_to_host(ref_w.data(), pairs * 4);
+    ok = ok && ref_ids == got_ids && std::memcmp(ref_w.data(), got_w.data(), pairs * 4) == 0;
     std::cout << (ok ? "OK   " : "FAIL ") << "route_select T=" << tokens << '\n';
     failures += ok ? 0 : 1;
 }

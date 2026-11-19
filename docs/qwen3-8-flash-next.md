@@ -42,10 +42,16 @@ tower), and MTP speculative decoding (`--spec mtp`). The three published NInfer 
 include Unsloth's shared-Q8_0 MTP block. The upstream GSQ-RCO GGUF sources omit it, so new
 conversions must supply it separately; see [MTP](#mtp-speculative-decoding).
 
-The Q4_K async prompt tiles (`gguf_moe_matrix/q4_k`) apply to Q4_K expert banks whose tables are
-16-byte aligned (`MoeTable::aligned16`): device banks, a rank's share under tensor parallelism, and
-the slot pools that host and disk experts' prompt chunks fill. The published Q2_0, IQ3_S and IQ1_M
-releases have no Q4_K experts.
+Prompt chunks stage the matrix kernel's tiles through `cp.async` (`gguf_matrix/<format>` and
+`gguf_moe_matrix/<format>`, [device profiles](device-profiles.md#what-is-calibrated)) at every
+column tile, 16 to 128 columns, for Q2_0, IQ4_XS, IQ4_NL, Q4_0, Q5_0, Q8_0, Q4_K and Q5_K matrices
+and expert banks and for IQ1_M expert banks, where the card's profile takes them. Expert banks need
+16-byte aligned expert pointers (`MoeTable::aligned16`): device banks, a rank's share under tensor
+parallelism, and the slot pools and caches that host and disk experts fill. IQ3_S, IQ2_* and Q6_K
+keep the synchronous loop. The values are those of the synchronous loop. On an RTX 3090 (350 W)
+with the Q2_0 release's experts in host memory a 3,740-token prompt prefills at 2.38-2.39k instead
+of 2.28-2.29k tokens/s with the synchronous loop, and 16-token windows score at 283 instead of
+267 tokens/s, with the same perplexity.
 
 ## Convert
 

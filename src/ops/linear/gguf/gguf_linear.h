@@ -58,9 +58,12 @@ struct GgufShape {
                                                        std::int32_t max_tokens);
 
 // Runs every product against one BF16 activation x [K,T], quantizing x once per activation layout
-// (and once more per distinct input gather).
+// (and once more per distinct input gather). A caller that already holds x's vector activation
+// (gguf::quantize_vector_activation of x without a gather) passes it as `quantized_x`; up to
+// gguf::kMaxVectorColumns columns the products without a gather then read it instead of a new one.
 void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
-                  WorkspaceArena& workspace, cudaStream_t stream);
+                  WorkspaceArena& workspace, cudaStream_t stream,
+                  const void* quantized_x = nullptr);
 
 void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                  cudaStream_t stream);

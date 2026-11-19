@@ -574,16 +574,20 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
                 }
                 __syncwarp();
 
+                // P's fragments do not depend on n: load them once per tile, not once per n.
+                unsigned pfk[PVKs][4];
+#    pragma unroll
+                for (int k = 0; k < PVKs; ++k) {
+                    const int pcol = k * 16 + a_coloff;
+                    ldmatrix_x4(pfk[k][0], pfk[k][1], pfk[k][2], pfk[k][3],
+                                smem_addr(&p_sw[a_rowoff * Bc +
+                                                causal_small_t_tc_swz32(a_rowoff, pcol)]));
+                }
 #    pragma unroll
                 for (int n = 0; n < PVNt; ++n) {
 #    pragma unroll
                     for (int k = 0; k < PVKs; ++k) {
-                        unsigned pf[4];
-                        const int pcol = k * 16 + a_coloff;
-                        ldmatrix_x4(
-                            pf[0], pf[1], pf[2], pf[3],
-                            smem_addr(
-                                &p_sw[a_rowoff * Bc + causal_small_t_tc_swz32(a_rowoff, pcol)]));
+                        const unsigned* pf = pfk[k];
                         unsigned vf[2];
                         const int vrow = k * 16 + b_koff + b_rin;
                         const int vcol = n * 8;
