@@ -59,7 +59,9 @@ a drafter / with MTP 3 / with DFlash2 5:
 | Qwen3.8-27B | `rk4v4-e8` | 1,048,576 | 872,448 | 405,504 | 417,792 | | | | |
 | Qwen3.8-27B IQ3_S | `rk4v4` | | | | | 241,664 / 176,128 / 32,768 | 8,192 / does not fit | | |
 | Gemma 4 26B-A4B Q4_0 | `bf16` | | | | | 61,440 / 28,672 (MTP 2) | | | |
+| Gemma 4 31B Q4_0 | `bf16` | | | | 101,376 / 87,040 (MTP 2) | | | | |
 
+The Gemma 4 31B row was bisected in 1,024-token steps ([its section](gemma4.md#gemma-4-31b)).
 Gemma 4's windows at eight sequences on an RTX 3090 are in [its section](#gemma-4-26b-a4b). An RTX
 5070 Ti that also drives a desktop started IQ3_S with `rk4v4-e8` at 122,880 tokens without a
 drafter and 98,304 with MTP 3 ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)).

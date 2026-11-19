@@ -2,7 +2,7 @@
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
 their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next and Edge0's latent-MoE models built on it,
-Gemma 4 26B-A4B, Recursive's Flint and DeepSeek-V4.1-Flash, on NVIDIA GPUs from Volta to consumer Blackwell, from 8 GB of memory. It serves the OpenAI, Anthropic
+Gemma 4 26B-A4B and 31B, Recursive's Flint and DeepSeek-V4.1-Flash, on NVIDIA GPUs from Volta to consumer Blackwell, from 8 GB of memory. It serves the OpenAI, Anthropic
 and llama.cpp APIs from one GPU, or from up to eight as pipeline stages on Linux. The same chat model
 answers [typed decisions](docs/serving.md#typed-decisions): choice, yes/no and score questions about
 a state, each option with its probability, through TypeSafe's System One and OpenAI's Decisions APIs.
@@ -25,7 +25,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Novelties only: a new model, family, artifact, platform, option, endpoint, format or mode, or a measured speedup of a path that worked. No fixes of any kind (crashes, wrong output, failed starts, missed cases, regressions and the speedups that win them back, the options and defaults they bring), no guards, diagnostics, internal, CI, build, test or documentation changes, and no chronicle: a date without a novelty gets no line. One line per date, a few words per item, each linked to the document with its details; no descriptions, mechanisms, measurements or hardware. Full rule: CONTRIBUTING.md, "Documentation describes the current state". -->
 
-- **2026-11-19:** [Basalt Flash-Next pack and serving-JSON conversion](docs/basalt-conversion.md), [Q8PLE n-gram tables](docs/qwen3-8-flash-next.md#q8ple-tables) and their [conversion from NVIDIA's FP8 PLE](docs/flash-next-native-dflash2.md#q8ple-directly-from-nvidia-fp8) with a [source-preserving Flash-Next recipe](docs/flash-next-native-dflash2.md).
+- **2026-11-19:** [Gemma 4 31B](docs/gemma4.md#gemma-4-31b) with its MTP assistant and vision tower, [published](#artifacts); [Basalt Flash-Next pack and serving-JSON conversion](docs/basalt-conversion.md), [Q8PLE n-gram tables](docs/qwen3-8-flash-next.md#q8ple-tables) and their [conversion from NVIDIA's FP8 PLE](docs/flash-next-native-dflash2.md#q8ple-directly-from-nvidia-fp8) with a [source-preserving Flash-Next recipe](docs/flash-next-native-dflash2.md).
 - **2026-11-16:** [System One image boxes and image URLs](docs/serving.md#image-boxes), [`--media-urls`](docs/serving.md#media-urls) that sets the size of a fetched media URL (URLs are refused without it), and Qwen3.8-27B GGUFs with a [condensed vocabulary](docs/weight-conversion.md#a-condensed-vocabulary).
 - **2026-11-13:** [Edge0-145B and Edge0-120B](docs/edge0.md), latent-MoE models on the Flash-Next skeleton, converted from Edge0's release folders and [published](#artifacts) for all four releases with the base model's Vision tower, ggml's [NVFP4 blocks](docs/gguf.md), Flash-Next and Edge0 models reading [either family's n-gram table](docs/qwen3-8-flash-next.md#another-table-of-the-same-shape), [DSpine drafting](docs/cli.md#speculative-decoding) in every family from a drafter artifact of its own (`--spec dspine --draft-model`) with [Tencent's Qwen3.8-27B drafter converted](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3), [`--adaptive-mtp` for DFlash, DFlash2 and DSpine](docs/serving.md#adaptive-mtp) on Qwen3.5-core models, and DeepSeek-V4.1 [hot Engram rows in RAM](docs/deepseek-v41.md#the-hot-row-profile) (`--ngram-residency ram-hot`), with a hot-row profile in the published Engram table and in [Edge0's FP8 n-gram table](docs/edge0.md).
 - **2026-11-12:** [Launch configuration files](docs/cli.md#launch-configuration-files) (`--config`), with [one for each launch recipe](docs/recipes.md) in `configs/`.
@@ -157,7 +157,7 @@ Every card by name, with what has run on it:
 | 11 GB | Ternary Bonsai 2 27B (200,704 tokens with `rk4v4`; 143,360 with MTP) | RTX 2080 Ti |
 | 12 GB | Ternary Bonsai 2 27B (266,240 tokens); Qwen3.8-27B GSQ-RCO IQ3_S (8,192 tokens, no MTP) | RTX 3060 |
 | 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4` | Tesla V100-SXM2-16GB |
-| 24 GB | the official Qwen3.8-27B and its MXFP8 tune; Qwen3.6-35B-A3B `groupwise-int` on an RTX 3090; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash with its experts in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
+| 24 GB | Gemma 4 31B Q4_0 (101,376 tokens; 87,040 with MTP); the official Qwen3.8-27B and its MXFP8 tune; Qwen3.6-35B-A3B `groupwise-int` on an RTX 3090; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash with its experts in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
 | 32 GB | Qwen3.6-35B-A3B NVFP4 (Blackwell only) | RTX 5090 |
 | 48 GB | Flash-Next Q2_0 with every expert on one card | L40S, RTX PRO 6000 |
 
@@ -206,6 +206,7 @@ formats that only this engine reads.
 | Edge0-145B: [NVFP4](https://huggingface.co/WaveCut/Edge0-145B-NVFP4-NInfer-v3) · [q3k](https://huggingface.co/WaveCut/Edge0-145B-q3k-NInfer-v3) · [n-gram tables](#flash-next-n-gram-tables) | 54.41 · 47.43 | NVFP4 · Q3_K/IQ4_NL latent experts, Q8_0 encoders and decoders | ✓ | ✓ | — | — | Edge0's release byte for byte, the base model's Vision tower; experts in host memory or on disk on one 48 GB card |
 | Edge0-120B: [NVFP4](https://huggingface.co/WaveCut/Edge0-120B-NVFP4-NInfer-v3) · [q3k](https://huggingface.co/WaveCut/Edge0-120B-q3k-NInfer-v3) · [n-gram tables](#flash-next-n-gram-tables) | 39.58 · 34.60 | NVFP4 · Q3_K/IQ4_NL latent experts, Q4_0 encoders and decoders | ✓ | ✓ | — | — | Edge0's release byte for byte, the base model's Vision tower; every expert on one 48 GB card |
 | [Gemma 4 26B-A4B it QAT](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) | 14.75 | GGUF Q4_0 blocks | ✓ | ✓ | — | — | Google's QAT GGUF byte for byte; the MTP column is Google's QAT assistant |
+| [Gemma 4 31B it QAT](https://huggingface.co/WaveCut/gemma-4-31B-it-QAT-Q4_0-MTP-NInfer-v3) | 17.77 | GGUF Q4_0 blocks | ✓ | ✓ | — | — | Google's QAT GGUF byte for byte, the dense model; the MTP column is Google's QAT assistant for it |
 | [Flint UD-Q4_K_XL](https://huggingface.co/WaveCut/Flint-UD-Q4_K_XL-NInfer-v3) | 23.38 | GGUF blocks, Q8_0 to IQ3_S | — | — | — | — | Unsloth's UD-Q4_K_XL GGUF byte for byte; drafts by context lookup |
 | DeepSeek-V4.1-Flash-1017 GSQ-RCO: [IQ1_M](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-NInfer-v3) · [Engram table](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3) | 117.18 · 103.32 | GGUF blocks, IQ1_S to IQ2_S experts | ✓ | — | — | — | ISTA-DASLab's GGUF byte for byte; experts in host memory or on disk; the release's vision tower (images); the release's DSpark drafter in beamster's STQ encoding (`--spec dspark`), or context lookup |
 | DeepSeek-V4.1-Flash-1017 GSQ-RCO Coder: [IQ2_XXS](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-NInfer-v3) · [Engram table](https://huggingface.co/WaveCut/DeepSeek-V4.1-Flash-Engram-IQ4_NL-NInfer-v3) | 71.85 · 103.32 | GGUF blocks, IQ1_M to IQ2_XS experts | ✓ | — | — | — | ISTA-DASLab's expert-pruned coding build byte for byte, 192 of 384 experts per block; otherwise as the IQ1_M artifact |
@@ -390,6 +391,10 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   for speculative decoding. On an RTX 3090 it prefills a 10,000-token prompt at 6,045 tok/s and decodes at 215
   tok/s, 190 after 10,000 tokens, against llama.cpp's 4,697, 169 and 152 on the same GGUF; with two
   drafts a round chat answers decode at 291 tok/s instead of 209 ([Gemma 4](docs/gemma4.md)).
+- **Gemma 4 31B.** The dense model from Google's QAT Q4_0 GGUF (16.4 GiB on the GPU) with its own
+  QAT assistant and the vision tower, on one 24 GB card: on an RTX 3090 it holds 101,376 tokens of
+  F16 context and decodes 42 tok/s plainly, 95 to 110 tok/s with two drafts a round
+  ([Gemma 4 31B](docs/gemma4.md#gemma-4-31b)).
 - **Flint.** Recursive's 39.8B coding MoE (2.5B active), from a llama.cpp GGUF such as Unsloth's
   UD-Q4_K_XL, imported block for block (23.4 GiB): sliding-window and position-free full-attention
   blocks with learned sinks, 256 routed experts beside a shared one, up to eight concurrent
