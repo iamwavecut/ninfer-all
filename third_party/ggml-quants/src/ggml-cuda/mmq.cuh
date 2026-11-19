@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common.cuh"
-#include "cp-async.cuh" // NInfer: the asynchronous Q4_K tile loop
+#include "cp-async.cuh" // NInfer: the asynchronous tile loop
 
 #include <climits>
 #include <cstdint>
@@ -905,14 +905,28 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
-// NInfer: the Q4_K tile loop at J = 128 stages its next tiles through cp.async (README.ninfer.md).
+// NInfer: the tile loop at J = 128 stages its next tiles through cp.async (README.ninfer.md).
 #if defined(CP_ASYNC_AVAILABLE) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define MMQ_ASYNC_TILES_AVAILABLE
 #endif
 
+// The raw bytes of one row's MMQ_ITER_K values, staged whole in 16-byte copies: only formats whose
+// step is a whole number of 16-byte words (a row of k % 256 == 0 values then starts on one too).
+static constexpr __host__ __device__ int ggml_cuda_mmq_async_row_bytes(const ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:   return 8 * 18;
+        case GGML_TYPE_Q5_0:   return 8 * 22;
+        case GGML_TYPE_Q8_0:   return 8 * 34;
+        case GGML_TYPE_IQ4_NL: return 8 * 18;
+        case GGML_TYPE_Q4_K:   return 144;
+        case GGML_TYPE_Q5_K:   return 176;
+        default:               return 0;
+    }
+}
+
 static constexpr __host__ __device__ bool ggml_cuda_mmq_async_tiles_supported(
         const ggml_type type, const int J, const bool fallback) {
-    return type == GGML_TYPE_Q4_K && J == 128 && !fallback;
+    return ggml_cuda_mmq_async_row_bytes(type) != 0 && J == 128 && !fallback;
 }
 
 static __host__ bool ggml_cuda_mmq_async_tiles_available(const int cc) {
@@ -936,11 +950,17 @@ static __device__ __forceinline__ void ggml_cuda_mmq_stage_tile_y(int * tile_y, 
     }
 }
 
-template <int I, int nthreads>
+// Rows i < I of x from block kbx0 (stride blocks apart), MMQ_ITER_K values each, into x_raw in
+// row order with no gaps: load_tiles then reads x_raw as a matrix of row stride ITER_K / qk blocks.
+template <ggml_type type, int I, int nthreads>
 static __device__ __forceinline__ void ggml_cuda_mmq_stage_tile_x(
         int * x_raw, const char * __restrict__ x, const int kbx0, const int stride) {
     constexpr int warp_size  = ggml_cuda_get_physical_warp_size();
-    constexpr int row_chunks = sizeof(block_q4_K) / 16;
+    constexpr int bs         = ggml_cuda_type_traits<type>::bs;
+    constexpr int row_bytes  = ggml_cuda_mmq_async_row_bytes(type);
+    static_assert(row_bytes % 16 == 0 && row_bytes == bs * (MMQ_ITER_K / ggml_cuda_type_traits<type>::qk),
+                  "an async row is MMQ_ITER_K values in whole 16-byte words");
+    constexpr int row_chunks = row_bytes / 16;
     constexpr int chunks     = I * row_chunks;
     const unsigned int dst   = ggml_cuda_cvta_generic_to_shared(x_raw);
 #pragma unroll
@@ -949,7 +969,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_stage_tile_x(
 
         if (l < chunks) {
             const int i = l / row_chunks;
-            const char * row = (const char *) ((const block_q4_K *) x + kbx0 + i*stride);
+            const char * row = x + (int64_t(kbx0) + int64_t(i)*stride) * bs;
 
             cp_async_cg_16<0>(dst + l*16, row + (l - i*row_chunks)*16);
         }
@@ -968,7 +988,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         float * dst_partial = nullptr, const int partial_stride = 0) {
 
     static_assert(!async_tiles || ggml_cuda_mmq_async_tiles_supported(type, J, fallback),
-                  "async tiles are staged for Q4_K at J = 128 only");
+                  "async tiles are staged for whole 16-byte steps at J = 128 only");
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / warp_size;
@@ -993,6 +1013,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback, prec_src1);
     constexpr int blocks_per_iter = ITER_K / qk;
+    static_assert(!async_tiles || ITER_K == MMQ_ITER_K, "async tiles stage MMQ_ITER_K values a row");
 
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
 
@@ -1003,12 +1024,12 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         int * tile_y_next = tile_x + I*ggml_cuda_mmq_get_sram_stride(type, J, fallback, prec_src1);
         int * x_raw       = tile_y_next + J*MMQ_TILE_Y_K;
 
-        ggml_cuda_mmq_stage_tile_x<I, nwarps * warp_size>(x_raw, x, offset_x + kb0_start, stride_row_x);
+        ggml_cuda_mmq_stage_tile_x<type, I, nwarps * warp_size>(x_raw, x, offset_x + kb0_start, stride_row_x);
         ggml_cuda_mmq_stage_tile_y<J, nwarps * warp_size>(tile_y, y + ncols_y * (kb0_start * qk / ne_block) * sz);
         cp_async_wait_all();
         __syncthreads();
         for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-            load_tiles((const char *) x_raw, tile_x, 0, tile_x_max_i, 1);
+            load_tiles((const char *) x_raw, tile_x, 0, tile_x_max_i, blocks_per_iter);
             __syncthreads();
 
             ggml_cuda_mmq_stage_tile_y<J, nwarps * warp_size>(tile_y_next, y + ncols_y * ((kb0 * qk / ne_block) * sz + sz));
@@ -1017,7 +1038,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             __syncthreads();
 
             const int kb0_next = kb0 + blocks_per_iter < kb0_stop ? kb0 + blocks_per_iter : kb0;
-            ggml_cuda_mmq_stage_tile_x<I, nwarps * warp_size>(x_raw, x, offset_x + kb0_next, stride_row_x);
+            ggml_cuda_mmq_stage_tile_x<type, I, nwarps * warp_size>(x_raw, x, offset_x + kb0_next, stride_row_x);
             ggml_cuda_mmq_stage_tile_y<J, nwarps * warp_size>(tile_y, y + ncols_y * (kb0_next * qk / ne_block) * sz);
             vec_dot(tile_x, tile_y_next, sum, MMQ_TILE_NE_K);
             cp_async_wait_all();
@@ -1536,7 +1557,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
     const size_t nbs_y_padded = GGML_PAD(nbs_y, config.nthreads*sizeof(int));
     const size_t nbs_async = async_tiles && ggml_cuda_mmq_async_tiles_supported(config.type, config.J, config.fallback) ?
-        nbs_y_padded + config.I*sizeof(block_q4_K) : 0;
+        nbs_y_padded + size_t(config.I)*ggml_cuda_mmq_async_row_bytes(config.type) : 0;
     return nbs_ids + nbs_x + nbs_y_padded + nbs_async;
 }
 
