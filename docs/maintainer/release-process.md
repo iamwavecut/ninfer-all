@@ -266,8 +266,11 @@ aggregate first and records its files as the baseline, then its own snapshot; it
 periodic checkpoints (`HF_CACHE_BASELINE`), only what differs from the aggregate. A finished shard
 build keeps only the entries it used. The final job of each platform and Toolkit restores the
 aggregate and every shard, links and packages the same multiarch executables, and saves the
-aggregate, which then holds the entries of the whole build. Where restored snapshots hold the same
-file, the newer copy stays, and an old ccache manifest cannot hide the entry its owner shard added.
+aggregate, which then holds the entries of the whole build. The final job records the aggregate's
+files as a baseline too, and a shard's copy replaces every file that still has its recorded size:
+a hit in another build renews the aggregate's manifest without adding the current headers' entry.
+Where shard snapshots hold the same file, the newer copy stays, and an old ccache manifest cannot
+hide the entry its owner shard added.
 Only Windows shard zero and the subsequent final job write the shared vcpkg family. Linux and
 Windows object jobs run eight at a time each, so they and CI's two CUDA jobs stay within GitHub's
 20 concurrent jobs.
