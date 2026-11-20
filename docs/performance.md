@@ -25,11 +25,13 @@ drafts with the tokens committed per verify round in brackets.
 | Card | Memory | Build | Power limit | Measured on |
 |---|---:|---|---|---|
 | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
-| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
+| RTX PRO 6000 Blackwell Server Edition | 96 GB | `120a` | 600 W | [GGUF across cards](performance/gguf-cards-2026-11.md) |
+| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [GGUF across cards](performance/gguf-cards-2026-11.md) |
 | RTX 5070 Ti | 16 GB | `120a` | 300 W | [field report](performance/field-reports.md#rtx-5070-ti-windows-11) |
-| RTX 5060 Ti, two and four | 16 GB each | `120a` | | [field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards) |
-| RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md) |
-| L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
+| RTX 5060 Ti, one, two and four | 16 GB each | `120a` | 180 W | [field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards), [GGUF across cards](performance/gguf-cards-2026-11.md) |
+| RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md), [GGUF across cards](performance/gguf-cards-2026-11.md) |
+| L40S | 48 GB | `89` | 350 W | [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF across cards](performance/gguf-cards-2026-11.md) |
+| A100-SXM4-80GB, A100-SXM4-40GB | 80 GB, 40 GB | `80` | 400 W | [GGUF across cards](performance/gguf-cards-2026-11.md) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | A40 | 48 GB | `86` | 300 W | [Flint](flint.md#measurements), [Edge0](edge0.md#measurements) |
 | RTX 3090 | 24 GB | `86` | 300 to 420 W by campaign | every page |
@@ -874,7 +876,9 @@ Every release on one A40, with each expert placement that fits it, with and with
 ## Gemma 4 26B-A4B
 
 Google's [QAT Q4_0 release](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3)
-with its MTP assistant, F16 KV (`bf16`) unless a row names another.
+with its MTP assistant, F16 KV (`bf16`) unless a row names another. The 26B and the dense 31B on
+eight cards from one release build, with and without the `cp.async` MMQ tiles, are in
+[GGUF models across cards](performance/gguf-cards-2026-11.md).
 
 ### Engine rates
 
@@ -980,7 +984,8 @@ llama.cpp keeps the experts of its first four blocks on the CPU (`-ncmoe 4`, the
 | RTX 3090 (370 W) | llama.cpp, `-ncmoe 4` | 2,633 | 2,553 | 79.9 | 77.1 |
 
 [Flint's measurements](flint.md#measurements) name the hosts and add disk experts and context
-lookup.
+lookup; [GGUF models across cards](performance/gguf-cards-2026-11.md) has eight cards from one
+release build.
 
 ## DeepSeek-V4.1-Flash
 
@@ -1070,6 +1075,7 @@ cache each card holds, context lookup, startup and what limits each engine.
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
 | [Flint](flint.md#measurements) | against llama.cpp, host and disk experts, context lookup, typed decisions | RTX 3090, 4090, 5090, A40 |
+| [GGUF models across cards, November 2026](performance/gguf-cards-2026-11.md) | Gemma 4 26B-A4B and 31B, Flint, Flash-Next and DeepSeek-V4.1 from one release build: prompt and decode rates, the `cp.async` MMQ tiles against the compiled loop, perplexity per card | RTX PRO 6000 Server Edition, RTX 5090, 4090, 3090, 5060 Ti, L40S, A100 80 GB and 40 GB |
 | [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token, Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards | RTX 5070 Ti, 4090, 4080, 5060 Ti |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090, from measured sizes | RTX 3090 |
