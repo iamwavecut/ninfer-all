@@ -3002,7 +3002,12 @@ struct Executor::Impl {
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const {
         std::uint64_t bytes = sequence_history_bytes();
         for (const VisitPlan* p : cache_plans()) {
-            if (p->full) {
+            if (p->full && p->k_codes.p != nullptr) {
+                // A quantized visit's planes: per head, `position` slots of codes and scales.
+                for (const KvArea* area : {&p->k_codes, &p->k_scales, &p->v_codes, &p->v_scales}) {
+                    bytes += std::uint64_t(kv_heads) * position * area->position_bytes;
+                }
+            } else if (p->full) {
                 bytes += 2 * std::uint64_t(kv_heads) * position * kD * sizeof(__half);
             } else {
                 for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; }
