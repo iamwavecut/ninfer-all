@@ -24,6 +24,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "models/inkling2/kv_format.h"
+
 namespace ninfer::models::inkling2::kernels {
 
 // Rows in the GGUF vector kernels' q8_1 activation form (ggml_bridge.h's vector activation):
@@ -184,6 +186,9 @@ struct KvArgs {
     __half* v_cache = nullptr;
     std::int64_t seq_stride = 0, head_stride = 0;
     int ring = 0;
+    // Row t's values land at slot t (head_stride t wide): a quantized visit's staging scratch,
+    // which kv_store then reads; without it, slot `position % ring` (ring 0: position).
+    bool row_slots = false;
 };
 void kv_post(const KvArgs& args, cudaStream_t stream);
 
@@ -212,6 +217,10 @@ struct AttentionArgs {
     int extent = 0;
     const __half* k_cache = nullptr;
     const __half* v_cache = nullptr;
+    // Quantized planes take the caches' place (a full-attention visit of a --kv-dtype rk8v4 /
+    // rk4v4 run, whose F16 caches the executor does not allocate): a plane whose coding is not
+    // F16 has its codes and scales read instead of the halves.
+    KvPlaneView k_plane, v_plane;
     std::int64_t seq_stride = 0, head_stride = 0;
     int ring = 0, window = 0;
     int query_heads = 0, kv_heads = 0;

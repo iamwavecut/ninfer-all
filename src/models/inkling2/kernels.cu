@@ -2,6 +2,7 @@
 
 #include "core/device_launch.h"
 #include "models/inkling2/config.h"
+#include "models/inkling2/kv_codec.cuh"
 #include "models/inkling2/situ.h"
 
 #include <cublas_v2.h>
@@ -690,7 +691,7 @@ __global__ void kv_post_kernel(KvArgs a) {
     const float vn = rsqrtf(sums[1] / float(kD) + a.eps);
     const int sequence = row_sequence(a.rows, t);
     const int position = physical(a.rows, t);
-    const int slot     = a.ring != 0 ? position % a.ring : position;
+    const int slot     = a.row_slots ? t : (a.ring != 0 ? position % a.ring : position);
     const std::int64_t at = std::int64_t(sequence) * a.seq_stride + std::int64_t(kh) * a.head_stride +
                             std::int64_t(slot) * kD + d;
     a.k_cache[at] = __float2half(k * kf);
@@ -826,11 +827,24 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
             const int rest   = w % (kTile * (kD / 8));
             const int r = rest / (kD / 8), c = rest % (kD / 8);
             uint4 word = make_uint4(0, 0, 0, 0);
+            const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
             if (r < count) {
                 const int p    = tile + r;
                 const int slot = a.ring != 0 ? p % a.ring : p;
-                const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
-                word = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
+                if (plane.coding != KvCoding::F16) {
+                    const std::int64_t codes_row =
+                        std::int64_t(sequence) * plane.code_seq +
+                        std::int64_t(kv_head) * plane.code_head +
+                        std::int64_t(slot) * plane.code_row;
+                    const std::int64_t scales_row =
+                        std::int64_t(sequence) * plane.scale_seq +
+                        std::int64_t(kv_head) * plane.scale_head +
+                        std::int64_t(slot) * plane.scale_row;
+                    word = chunk_word(plane, plane.codes + codes_row, plane.scales + scales_row, c);
+                } else {
+                    const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
+                    word = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
+                }
             }
             *reinterpret_cast<uint4*>(matrix == 0 ? &k_s[r][c * 8] : &v_s[r][c * 8]) = word;
         }

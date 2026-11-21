@@ -157,8 +157,12 @@ struct VisitPlan {
     bool restart      = false; // the core's first visit of a later pass
     bool control      = false; // a later pass's core visit
     bool start        = false; // the layer starts a residual block
-    // The F16 K and V caches: [sequences][kv heads][slots][D].
+    // The F16 K and V caches: [sequences][kv heads][slots][D]. A quantized full visit has none;
+    // its rows live in its code and scale planes.
     KvArea k, v;
+    // The quantized planes' codes and scales (a full visit of a quantized run): the same
+    // [sequences][kv heads][slots] addressing, one row of codes and one of scales per slot.
+    KvArea k_codes, k_scales, v_codes, v_scales;
     int slots = 0, ring = 0;
     std::int64_t seq_stride = 0, head_stride = 0;
     std::vector<DeviceBuffer> checkpoint; // sliding: every sequence's rings, K then V
@@ -234,6 +238,7 @@ struct Executor::Impl {
         global_slots = 0, prefill_ring = 0;
     int kvd = 0, slot_floats = 0; // K's (and V's) width, a history slot's floats
     float eps = 1e-6f;
+    KvFormat kv; // the caches' storage: F16, or the quantized full-attention visits of rk8v4/rk4v4
     DeviceBuffer staging_k, staging_v;
     bool growing = false;
     std::vector<KvArea*> sequence_areas;
@@ -306,6 +311,7 @@ struct Executor::Impl {
         }
         stream = device.stream;
         const int device_id = device.rank(0).device;
+        kv = kv_format(o.kv_cache);
         growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
                   vmm::granularity(device_id) != 0;
         hidden      = int(config.hidden_size);
@@ -403,11 +409,30 @@ struct Executor::Impl {
             p.head_stride  = std::int64_t(p.slots) * kD;
             p.seq_stride   = p.head_stride * kv_heads;
             const bool grows = growing && p.full;
-            for (KvArea* area : {&p.k, &p.v}) {
-                *area = KvArea(std::size_t(sequences), kv_heads,
-                               std::size_t(p.head_stride) * sizeof(__half), row_f16, grows,
-                               device_id);
-                kv_bytes += area->bytes;
+            if (p.full && kv.quantized()) {
+                // One code and one scale area per plane; the rows are the codings' bytes.
+                const auto area = [&](KvCoding coding) {
+                    const std::size_t code  = std::size_t(kv_code_bytes(coding));
+                    const std::size_t scale = std::size_t(kv_scale_bytes(coding));
+                    KvArea codes(std::size_t(sequences), kv_heads, code, code, grows, device_id);
+                    kv_bytes += codes.bytes;
+                    KvArea scales(std::size_t(sequences), kv_heads, scale, scale, grows, device_id);
+                    kv_bytes += scales.bytes;
+                    return std::pair<KvArea, KvArea>(std::move(codes), std::move(scales));
+                };
+                auto k     = area(kv.key.coding);
+                p.k_codes  = std::move(k.first);
+                p.k_scales = std::move(k.second);
+                auto v      = area(kv.value.coding);
+                p.v_codes   = std::move(v.first);
+                p.v_scales  = std::move(v.second);
+            } else {
+                for (KvArea* area : {&p.k, &p.v}) {
+                    *area = KvArea(std::size_t(sequences), kv_heads,
+                                   std::size_t(p.head_stride) * sizeof(__half), row_f16, grows,
+                                   device_id);
+                    kv_bytes += area->bytes;
+                }
             }
             if (!p.full && options.checkpoints) {
                 for (int c = 0; c < 2; ++c) {
@@ -447,8 +472,14 @@ struct Executor::Impl {
         if (options.dspark) { plan_spark(device_id, sequences); }
         for (VisitPlan& p : visits) {
             if (!p.full) { continue; }
-            sequence_areas.push_back(&p.k);
-            sequence_areas.push_back(&p.v);
+            if (p.k_codes.p != nullptr) {
+                for (KvArea* area : {&p.k_codes, &p.k_scales, &p.v_codes, &p.v_scales}) {
+                    sequence_areas.push_back(area);
+                }
+            } else {
+                sequence_areas.push_back(&p.k);
+                sequence_areas.push_back(&p.v);
+            }
         }
         if (spark) {
             for (SparkLayer& l : spark->layers) {
@@ -1418,6 +1449,7 @@ struct Executor::Impl {
         add(t * query_heads * 16 * 4);    // r
         add(t * q_floats * 2);            // attention out BF16
         add(t * h * 4);                   // output product
+        if (kv.quantized()) { add(t * 2 * kvd * 2); } // a quantized visit's F16 staging (kv_store reads it)
         // Controllers of three inputs: [rms x; rms m], the rank's hidden state, forget and gain.
         add(3 * t * 2 * h * 4);
         add(3 * t * rank * 4);
@@ -2155,10 +2187,12 @@ struct Executor::Impl {
         }
         // K and V into the cache: a prompt chunk's sliding visit attends over the staging ring
         // (the window before the chunk comes over from the sequence's ring, the chunk's keys land
-        // there, and the window that ends the chunk's kept rows goes back).
+        // there, and the window that ends the chunk's kept rows goes back). A quantized full
+        // visit stages its rows as F16 (one slot per row) for kv_store to encode into its planes.
         const std::int64_t stage_stride = std::int64_t(prefill_ring) * kD;
         const std::int64_t seq_offset   = std::int64_t(c.sequence) * vp.seq_stride;
-        const bool staging              = c.chunk && !vp.full;
+        const bool staging   = c.chunk && !vp.full;
+        const bool quantized = vp.full && kv.quantized();
         kernels::RingCopyArgs keep;
         keep.kv_heads = kv_heads;
         kernels::KvArgs ka;
@@ -2176,7 +2210,15 @@ struct Executor::Impl {
         ka.kv_heads    = kv_heads;
         ka.qk_clip     = config.qk_clip;
         ka.eps         = eps;
-        if (staging) {
+        if (quantized) {
+            auto* stage = static_cast<__half*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 2).data);
+            ka.k_cache     = stage;
+            ka.v_cache     = stage + std::size_t(t) * kvd;
+            ka.seq_stride  = 0;
+            ka.head_stride = t;
+            ka.ring        = 0;
+            ka.row_slots   = true;
+        } else if (staging) {
             keep.src_k           = static_cast<const __half*>(vp.k.p) + seq_offset;
             keep.src_v           = static_cast<const __half*>(vp.v.p) + seq_offset;
             keep.dst_k           = static_cast<__half*>(staging_k.p);
@@ -2201,6 +2243,35 @@ struct Executor::Impl {
             ka.ring        = vp.ring;
         }
         kernels::kv_post(ka, stream);
+        KvPlaneView k_view, v_view; // a quantized full visit's planes, else null codings
+        if (quantized) {
+            const auto view = [&](const KvArea& codes, const KvArea& scales, KvCoding coding) {
+                KvPlaneView plane;
+                plane.codes   = static_cast<const std::uint8_t*>(codes.p);
+                plane.scales  = static_cast<const std::uint8_t*>(scales.p);
+                plane.code_row  = kv_code_bytes(coding);
+                plane.scale_row = kv_scale_bytes(coding);
+                plane.code_head  = std::int64_t(vp.slots) * plane.code_row;
+                plane.scale_head = std::int64_t(vp.slots) * plane.scale_row;
+                plane.code_seq  = plane.code_head * kv_heads;
+                plane.scale_seq = plane.scale_head * kv_heads;
+                plane.coding    = coding;
+                return plane;
+            };
+            k_view = view(vp.k_codes, vp.k_scales, kv.key.coding);
+            v_view = view(vp.v_codes, vp.v_scales, kv.value.coding);
+            for (const auto& [src, plane] :
+                 {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
+                kernels::KvStoreArgs store;
+                store.rows            = c.rows;
+                store.src             = src;
+                store.src_head_stride = t;
+                store.rows_count      = t;
+                store.heads           = kv_heads;
+                store.dst             = plane;
+                kernels::kv_store(store, stream);
+            }
+        }
         if (c.chunk) {
             const auto [begin, end] = kept_history(c);
             kernels::keep_history(kv, 2 * kvd, 2 * kvd, c.rows.positions, begin, end, site(v, 0),
@@ -2225,6 +2296,8 @@ struct Executor::Impl {
             aa.extent      = int(lp.full ? config.relative_extent : config.sliding_window);
             aa.k_cache     = ka.k_cache;
             aa.v_cache     = ka.v_cache;
+            aa.k_plane     = k_view;
+            aa.v_plane     = v_view;
             aa.seq_stride  = ka.seq_stride;
             aa.head_stride = ka.head_stride;
             aa.ring        = ka.ring;
@@ -2942,6 +3015,18 @@ struct Executor::Impl {
         const std::size_t head_bytes = std::size_t(global_slots) * kD * sizeof(__half);
         for (const VisitPlan* p : cache_plans()) {
             if (p->full) {
+                if (p->k_codes.p != nullptr) {
+                    for (const KvArea* area :
+                         {&p->k_codes, &p->k_scales, &p->v_codes, &p->v_scales}) {
+                        const std::size_t plane_head = std::size_t(global_slots) * area->row_bytes;
+                        auto* base = static_cast<std::uint8_t*>(area->p) +
+                                     sequence * plane_head * kv_heads;
+                        for (int h = 0; h < kv_heads; ++h) {
+                            copy(base + h * plane_head, std::size_t(position) * area->row_bytes);
+                        }
+                    }
+                    continue;
+                }
                 for (const KvArea* area : {&p->k, &p->v}) {
                     auto* base = static_cast<std::uint8_t*>(area->p) + sequence * head_bytes * kv_heads;
                     for (int h = 0; h < kv_heads; ++h) {
