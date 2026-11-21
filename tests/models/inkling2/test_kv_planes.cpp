@@ -171,15 +171,15 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
     const int key_scale_bytes   = mi::kv_scale_bytes(key);
     const int value_code_bytes  = mi::kv_code_bytes(value);
     const int value_scale_bytes = mi::kv_scale_bytes(value);
-    // The rows kv_post would write: [sequences][heads][slots][128] halves, Gaussian.
-    std::vector<__half> kc(std::size_t(sequences) * kKv * slots * kD),
-        vc(std::size_t(sequences) * kKv * slots * kD);
+    // The rows kv_post would stage, in kv_post's row-slots layout: [heads][rows][128] halves
+    // (a quantized visit stages head h's row r at stage + h * rows + r * 128), Gaussian.
+    std::vector<__half> ks(std::size_t(kKv) * t * kD), vs(std::size_t(kKv) * t * kD);
     {
         std::normal_distribution<float> n(0.0f, 1.0f);
-        for (auto& v : kc) { v = __float2half(1.5f * n(rng)); }
-        for (auto& v : vc) { v = __float2half(n(rng)); }
+        for (auto& v : ks) { v = __float2half(1.5f * n(rng)); }
+        for (auto& v : vs) { v = __float2half(n(rng)); }
     }
-    DeviceBuffer dk = upload(kc), dv = upload(vc),
+    DeviceBuffer dk = upload(ks), dv = upload(vs),
                  dkc(std::size_t(sequences) * kKv * slots * key_code_bytes),
                  dks(std::size_t(sequences) * kKv * slots * key_scale_bytes),
                  dvc(std::size_t(sequences) * kKv * slots * value_code_bytes),
@@ -204,7 +204,7 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
         k::KvStoreArgs args;
         args.rows            = rows_dev.rows;
         args.src             = src;
-        args.src_head_stride = slots;
+        args.src_head_stride = t;
         args.rows_count      = t;
         args.heads           = kKv;
         args.dst             = plane(codes, scales, cb, sb, coding);
@@ -269,17 +269,16 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
                                 v_scales.data() + base * value_scale_bytes);
     };
 
-    // The store: each stored row's decoded values against its halves.
+    // The store: each stored row's decoded values against the staging halves it encoded.
     Error ek, ev;
     for (int r = 0; r < t; ++r) {
         const int s = sequence_of(rc, r), slot = physical(rc, r);
         for (int h = 0; h < kKv; ++h) {
             const auto kd = decode(true, s, h, slot), vd = decode(false, s, h, slot);
-            const std::size_t half_at_rc = (std::size_t(s) * kKv + std::size_t(h)) * slots * kD +
-                                           std::size_t(slot) * kD;
+            const std::size_t stage_at = std::size_t(h) * t * kD + std::size_t(r) * kD;
             for (int d = 0; d < kD; ++d) {
-                ek.add(kd[d], __half2float(kc[half_at_rc + std::size_t(d)]));
-                ev.add(vd[d], __half2float(vc[half_at_rc + std::size_t(d)]));
+                ek.add(kd[d], __half2float(ks[stage_at + std::size_t(d)]));
+                ev.add(vd[d], __half2float(vs[stage_at + std::size_t(d)]));
             }
         }
     }
