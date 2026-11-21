@@ -115,7 +115,7 @@ means the card calibrates once at its first start.
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
 | ✅ | RTX 3090 Ti | 24 GB | GeForce | ✓ | Flash-Next over two cards |
-| ✅ | RTX 3090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, 35B-A3B, Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk; the reference card) |
+| ✅ | RTX 3090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, 35B-A3B, Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk; the reference card), Inkling 2 Mini (experts on the GPU, in host memory, on disk) |
 | ⬜ | RTX 3080 Ti | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 3080 | 12 / 10 GB | GeForce | 10 GB (68 SMs) | |
 | ⬜ | RTX 3070 Ti | 8 GB | GeForce | ✓ | |

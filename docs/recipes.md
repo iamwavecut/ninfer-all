@@ -48,7 +48,7 @@ is `true`):
 | `--vision`, `--vision-residency`, `--vision-max-merged` | image and video input, where the tower lives (`overlay` borrows device memory per image), and the merged-token budget of one item |
 | `--max-concurrency` | requests admitted at once, 1 to 8 |
 | `--devices` | one pipeline stage per listed GPU (Linux) |
-| `--expert-residency`, `--expert-cache-mib` | native Qwen MoE, Gemma 4, Qwen3.8-Flash-Next, Flint and DeepSeek-V4.1-Flash: where the routed experts live and their persistent device cache budget ([expert residency](cli.md#common-options)) |
+| `--expert-residency`, `--expert-cache-mib` | native Qwen MoE, Gemma 4, Qwen3.8-Flash-Next, Flint, DeepSeek-V4.1-Flash and Inkling 2: where the routed experts live and their persistent device cache budget ([expert residency](cli.md#common-options)) |
 | `--ngram-table`, `--ngram-residency` | Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash: the n-gram (Engram) table's file and where its rows live |
 | `--disk-kv-path`, `--disk-kv-gib`, `--disk-kv-restore` | the disk tier of the context cache |
 
@@ -272,6 +272,24 @@ ISTA-DASLab's expert-pruned Coder build reads the same table; its routed experts
 hf download WaveCut/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-NInfer-v3 \
   DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-IQ2_XXS-ninfer-v3.ninfer --local-dir models
 ninfer-serve --config configs/deepseek-v4.1-flash-coder-host.ini
+```
+
+## Inkling 2 Mini
+
+Unsloth's UD-IQ4_XS GGUF with the release's vision tower and DSpark drafter as one artifact
+([Inkling 2 Mini](inkling2.md)); 15.0 GiB of weights with the drafter.
+
+```bash
+hf download WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3 Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer \
+  --local-dir models
+
+# A 24 GB GPU: one request over a 64K-token context with images, drafted by DSpark; an RTX 3090
+# keeps 3.1 GiB free and decodes 137 tok/s.
+ninfer-serve --config configs/inkling2-mini.ini
+
+# Less GPU memory: the experts in 13.1 GiB of pinned host memory, the most used cached on the GPU,
+# a 32K-token context; on an RTX 3090 the cache holds all of them and decodes 123 tok/s.
+ninfer-serve --config configs/inkling2-mini-host.ini
 ```
 
 ## Qwen3.6-35B-A3B NVFP4

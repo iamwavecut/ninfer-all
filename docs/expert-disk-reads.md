@@ -4,7 +4,7 @@ With `--expert-residency disk` the routed experts stay in the artifact's files, 
 the experts that its device cache lacks. Two options change how those reads reach the GPU:
 `--expert-mirror` spreads them over a second drive, and `--expert-direct` lets the drive write them
 into device memory. Both apply to every family that has disk experts: native Qwen MoE models,
-Qwen3.8-Flash-Next, Gemma 4, Flint and DeepSeek-V4.1. Neither option changes a result: the experts
+Qwen3.8-Flash-Next, Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2. Neither option changes a result: the experts
 arrive byte for byte as stored, so tokens, log probabilities and perplexity keep their bits.
 
 Both options require `--expert-residency disk`; startup refuses `--expert-mirror` and
@@ -82,7 +82,7 @@ then uses no pinned host staging:
 
 | Reader | Families | Window per device |
 |---|---|---|
-| Expert delivery | native Qwen MoE, Gemma 4, Flint, DeepSeek-V4.1 | 128 MiB, plus the larger of 8 MiB and the largest expert (rounded up to 4 KiB) |
+| Expert delivery | native Qwen MoE, Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 | 128 MiB, plus the larger of 8 MiB and the largest expert (rounded up to 4 KiB) |
 | Expert stream | Qwen3.8-Flash-Next, native experts | 256 MiB |
 | Expert misses | Qwen3.8-Flash-Next, GGUF experts | the larger of 64 MiB and the largest expert projection |
 

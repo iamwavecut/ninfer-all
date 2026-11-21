@@ -124,10 +124,10 @@ on long prompts: a perplexity run does not reach every prompt path.
 ### Every family
 
 A change to a shared mechanism covers every model family that uses that mechanism: Qwen3.5-core
-(dense and MoE releases), Qwen3.8-Flash-Next, Gemma 4, Flint and DeepSeek-V4.1. Shared mechanisms
-include KV formats, rotary scaling, prompt chunking, CUDA Graphs, concurrency, speculative decoding,
-sampling, expert residency and the CPU share, pipeline stages, tensor parallelism, serving features,
-and kernels that several families call.
+(dense and MoE releases), Qwen3.8-Flash-Next, Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2. Shared
+mechanisms include KV formats, rotary scaling, prompt chunking, CUDA Graphs, concurrency,
+speculative decoding, sampling, expert residency and the CPU share, pipeline stages, tensor
+parallelism, serving features, and kernels that several families call.
 
 - Write the change once where the families share code. A speedup that one checkpoint, shape or
   family gets while the others could use it is incomplete.
