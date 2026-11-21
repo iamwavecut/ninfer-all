@@ -1,6 +1,6 @@
 # Inkling 2 Mini
 
-NInfer runs Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+NInfer-all runs Thinking Machines' [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 (`Inkling2LoopForConditionalGeneration`; its text component `Inkling2ForCausalLM`), a looped
 mixture-of-experts model of 26.4B parameters with 3.4B active per token (5.4B with its three
 passes), from a llama.cpp GGUF: Unsloth's
@@ -163,18 +163,18 @@ prefix.
 (upstream b12588 with Unsloth's Inkling 2 changes; mainline llama.cpp b12602 does not load the
 GGUF, whose looped layers use Unsloth's layout) on the same UD-IQ4_XS GGUF (flash attention on, F16
 KV), one sequence, three repetitions each, on an RTX 3090 (350 W, CUDA 12.8, build `86`, experts on
-the GPU), November 21, 2026. NInfer's prompts are Inkling-tokenized text,
+the GPU), November 21, 2026. NInfer-all's prompts are Inkling-tokenized text,
 llama-bench's its own tokens. Decode after 10,000 tokens follows a 10,000-token prompt
-(`-pg 10000,128` for NInfer, `tg128 @ d10000` for llama.cpp).
+(`-pg 10000,128` for NInfer-all, `tg128 @ d10000` for llama.cpp).
 
 | Engine | Prefill 2,048 | Prefill 10,000 | Decode 128 | Decode after 10,000 |
 |---|---:|---:|---:|---:|
-| NInfer | 2,659 | 2,031 | 111.4 | 95.9 |
+| NInfer-all | 2,659 | 2,031 | 111.4 | 95.9 |
 | llama.cpp | 1,301 | 1,228 | 58.6 | 55.9 |
 
-NInfer against llama.cpp: 2.04, 1.65, 1.90 and 1.72 times. NInfer's spreads stay under 0.2%,
+NInfer-all against llama.cpp: 2.04, 1.65, 1.90 and 1.72 times. NInfer-all's spreads stay under 0.2%,
 llama.cpp's under 3.9% (its prefill of 2,048 tokens ±50.6 tok/s). Before the split depth mixes,
-the batched controllers and the sorted route ([what runs](#what-runs)) NInfer decoded 88.9 and
+the batched controllers and the sorted route ([what runs](#what-runs)) NInfer-all decoded 88.9 and
 79.0 tok/s and prefilled 2,663 and 2,030; the prefill rates moved by -0.15% and +0.06%.
 
 - **DSpark.** The CLI on the same card, 384 tokens a request, reasoning first, without `--spec`
@@ -215,21 +215,22 @@ the batched controllers and the sorted route ([what runs](#what-runs)) NInfer de
 
 ### Across cards
 
-The release packages of master on rented cards, November 21, 2026: `e64a7089`, and `b0b49ba6` (the
-same Linux code with an MSVC fix) on the RTX 3090, the A100 80GB PCIe, the RTX 4000 Ada, the RTX
-A4500 and both Server Editions; `cuda12.9` before Blackwell and `cuda13.4` on it. They ran the
-benchmarks above and the CLI's 384-token greedy essay with DSpark (the default) and with `--spec
-none`, one run each, with the experts on the GPU. Every card ran at its default power limit on an
-x16 link: PCIe 5.0 with pinned host-to-device copies of 56.3 and 56.9 GB/s for the two Server
-Editions, PCIe 4.0 with 23.4 to 28.6 GB/s for the rest (the other Blackwell cards, PCIe 5.0
-devices, linked at 4.0 on these hosts). The RTX A4500 had no built-in device profile; it ran with
-the one `ninfer-calibrate` measured on it first, which the build now carries. llama-bench ran with
-one thread per CPU of the container's quota where the host set one: with its default of one
-thread per host CPU, 120 threads on the RTX 5090 host's 17 CPUs prefilled 2,048 tokens at 1,677
-tok/s and 128 threads on the A100 host's 13.6 CPUs at 966, against 2,446 and 1,249 with the quota's
-count.
+The release packages of master on cards rented from RunPod and Vast.ai, November 21, 2026:
+`e64a7089`, and `b0b49ba6` (the same Linux code with an MSVC fix) on the RTX 3090, the A100 80GB
+PCIe, the RTX 4000 Ada, the RTX A4500, both Server Editions and the Vast.ai cards; `cuda12.9` before
+Blackwell and `cuda13.4` on it. They ran the benchmarks above and the CLI's 384-token greedy essay
+with DSpark (the default) and with `--spec none`, one run each. Every card ran at its default power
+limit. The cards of 20 GB and more and the Tesla V100-SXM2-32GB kept the experts on the GPU, on x16
+links: PCIe 5.0 with pinned host-to-device copies of 56.3 and 56.9 GB/s for the two Server Editions,
+PCIe 3.0 with 12.4 GB/s for the V100, PCIe 4.0 with 23.4 to 28.6 GB/s for the rest (the other
+Blackwell cards, PCIe 5.0 devices, linked at 4.0 on these hosts). The RTX A4500 had no built-in
+device profile; it ran with the one `ninfer-calibrate` measured on it first, which the build now
+carries. llama-bench ran with one thread per CPU of the container's quota where the host set one:
+with its default of one thread per host CPU, 120 threads on the RTX 5090 host's 17 CPUs prefilled
+2,048 tokens at 1,677 tok/s and 128 threads on the A100 host's 13.6 CPUs at 966, against 2,446 and
+1,249 with the quota's count.
 
-NInfer / llama.cpp, tok/s:
+NInfer-all / llama.cpp, tok/s:
 
 | Card | Power limit | Prefill 2,048 | Prefill 10,000 | Decode 128 | Decode after 10,000 |
 |---|---:|---:|---:|---:|---:|
@@ -246,17 +247,18 @@ NInfer / llama.cpp, tok/s:
 | A40 | 300 W | 2,432 / 1,224 | 1,897 / 1,051 | 85.3 / 50.8 | 75.5 / 47.4 |
 | A100-SXM4-80GB | 400 W | 2,388 / 1,249 | 1,925 / 1,136 | 107.1 / 47.6 | 91.5 / 46.1 |
 | A100 80GB PCIe | 300 W | 2,376 / 1,230 | 1,916 / 1,119 | 106.1 / 47.0 | 90.7 / 45.3 |
+| Tesla V100-SXM2-32GB | 300 W | 2,124 / 566 | 1,589 / 471 | 72.8 / 35.3 | 64.4 / 34.2 |
 | RTX A5000 | 230 W | 2,001 / 1,061 | 1,509 / 981 | 94.3 / 54.6 | 80.7 / 51.0 |
 | RTX 4000 Ada | 130 W | 1,907 / 1,139 | 1,450 / 924 | 64.7 / 45.7 | 57.4 / 42.2 |
 | RTX A4500 | 200 W | 1,683 / 963 | 1,280 / 843 | 81.5 / 49.5 | 70.1 / 46.4 |
 
-NInfer prefills 1.68 to 3.42 times as fast as llama.cpp at 2,048 tokens and 1.52 to 2.96 times at
-10,000, and decodes 1.42 to 2.26 times as fast, 1.36 to 2.00 times after 10,000 tokens. The prefill
-gap is widest on the RTX 5090 and both PRO 6000s (3.34 to 3.42 times at 2,048 tokens), where
-llama.cpp prefills at about the RTX 4090's rate; on the other cards it is 1.68 to 2.19 times. The
-decode gap is narrowest on the RTX 4000 Ada (1.42 times). Both A100s prefill no faster than the A40
-in either engine (NInfer 2,376 and 2,388 against 2,432 tok/s), while their decode follows their
-memory bandwidth (106.1 and 107.1 against 85.3).
+NInfer-all prefills 1.68 to 3.75 times as fast as llama.cpp at 2,048 tokens and 1.52 to 3.38 times
+at 10,000, and decodes 1.42 to 2.26 times as fast, 1.36 to 2.00 times after 10,000 tokens. The
+prefill gap is widest on the Tesla V100 (3.75 times at 2,048 tokens), then on the RTX 5090 and both
+PRO 6000s (3.34 to 3.42 times), where llama.cpp prefills at about the RTX 4090's rate; on the other
+cards it is 1.68 to 2.19 times. The decode gap is narrowest on the RTX 4000 Ada (1.42 times). Both
+A100s prefill no faster than the A40 in either engine (NInfer-all 2,376 and 2,388 against 2,432
+tok/s), while their decode follows their memory bandwidth (106.1 and 107.1 against 85.3).
 
 The essay, tok/s; on every card DSpark's text equals plain decoding's:
 
@@ -275,15 +277,80 @@ The essay, tok/s; on every card DSpark's text equals plain decoding's:
 | A40 | 84.4 | 97.3 | 1.15x | 1.70 |
 | A100-SXM4-80GB | 105.7 | 123.1 | 1.16x | 1.74 |
 | A100 80GB PCIe | 105.0 | 122.1 | 1.16x | 1.73 |
+| Tesla V100-SXM2-32GB | 72.1 | 82.6 | 1.15x | 1.70 |
 | RTX A5000 | 92.8 | 101.0 | 1.09x | 1.73 |
 | RTX 4000 Ada | 64.0 | 69.4 | 1.08x | 1.67 |
 | RTX A4500 | 81.3 | 88.7 | 1.09x | 2.10 |
 
 Five cards (A40, A100-SXM4-80GB, L40S, RTX PRO 4500 Blackwell and RTX 3090) ran twice, the first
-four on another host of the same type with the quota's thread count, the RTX 3090 against the
-source build above. NInfer's rates moved by at most 2.9% (the PRO 4500's prefill of 2,048 tokens),
-under 0.9% on the 3090, and the tables hold the second runs. llama.cpp on the 3090, with its
-quota's 31 threads, prefilled 2,048 tokens at 1,402 tok/s against 1,301 in the table above.
+four on another host of the same type with the quota's thread count, the RTX 3090 against the source
+build above. NInfer-all's rates moved by at most 2.9% (the PRO 4500's prefill of 2,048 tokens),
+under 0.9% on the 3090, and the tables hold the second runs. llama.cpp on the 3090, with its quota's
+31 threads, prefilled 2,048 tokens at 1,402 tok/s against 1,301 in the table above.
+
+#### Experts in host memory
+
+The model's 15.0 GiB of weights do not fit on the cards of 8, 12 and 16 GB. On these NInfer-all kept
+the routed experts in pinned host memory (`--expert-residency host`) beside the device cache it
+sizes itself, and llama-bench ran with `--fit-target 1024 --fit-ctx 10240`: llama.cpp fits the model
+to the card itself, with llama-server's default margin of 1024 MiB, and keeps on the CPU what does
+not fit. The cards ran on Vast.ai hosts at their default power limits on PCIe 4.0: x16 links with
+pinned host-to-device copies of 24.5 to 28.9 GB/s, the x8 links of the RTX 4060 Ti, RTX 5060 Ti and
+RTX 5060 at 13.4, 14.4 and 14.5 GB/s. CPU threads compute part of both engines' expert work;
+llama-bench ran one thread per CPU of the container's quota.
+
+NInfer-all / llama.cpp, tok/s:
+
+| Card | Power limit | Host CPU, llama.cpp threads | Prefill 2,048 | Prefill 10,000 | Decode 128 | Decode after 10,000 |
+|---|---:|---|---:|---:|---:|---:|
+| RTX 5080 | 360 W | Ryzen 9 7900, 23 | 4,044 / 1,607 | 3,238 / 1,377 | 116.5 / 41.3 | 104.1 / 48.2 |
+| RTX 4080 Super | 320 W | Ryzen 9 5950X, 30 | 3,788 / 1,708 | 2,953 / 1,379 | 104.4 / 59.2 | 92.1 / 57.5 |
+| RTX 5070 | 250 W | Core i5-11600KF, 11 | 2,542 / 778 | 2,048 / 724 | 83.5 / 35.6 | 78.9 / 34.9 |
+| RTX 5060 Ti 16 GB | 180 W | Ryzen 5 7500F, 11 | 1,871 / 892 | 1,502 / 793 | 72.1 / 45.6 | 64.4 / 43.8 |
+| RTX 4060 Ti 16 GB | 165 W | Ryzen 9 7900X, 11 | 1,689 / 918 | 1,308 / 719 | 53.8 / 39.4 | 47.2 / 31.0 |
+| RTX A4000 | 140 W | EPYC 7B13, 30 | 1,363 / 629 | 1,002 / 486 | 57.2 / 37.7 | 49.1 / 34.7 |
+| RTX 3060 12 GB | 170 W | Threadripper PRO 3945WX, 5 | 1,002 / 430 | 759 / 387 | 48.8 / 24.8 | 42.3 / 24.0 |
+| RTX 5060 8 GB | 145 W | Ryzen 9 5950X, 30 | 1,267 / 305 | 1,074 / 293 | 33.1 / 14.7 | 28.8 / 14.4 |
+
+NInfer-all prefills 1.84 to 4.15 times as fast as llama.cpp at 2,048 tokens and 1.82 to 3.66 times
+at 10,000, and decodes 1.37 to 2.82 times as fast, 1.41 to 2.26 times after 10,000 tokens; the
+widest gaps are on the RTX 5060, RTX 5070 and RTX 5080, the narrowest on the RTX 4060 Ti, on an x8
+link, and on the RTX A4000, whose host ran at a load average of 52 to 69 from other tenants.
+NInfer-all's device cache held 9.8 to 10.3 GiB of the 13.1 GiB of experts on the 16 GB cards, 6.2
+and 6.4 GiB on the 12 GB ones and 2.2 GiB on the 8 GB one; on the essay it served 98.5 to 99.1%,
+94.5 and 94.8%, and 76.7% of the expert routes. NInfer-all's spreads stayed at or under 2.8%.
+llama.cpp's decode spread most on the RTX 5080, 34.7 to 46.0 tok/s between repetitions, and there it
+decoded faster after 10,000 tokens than without them (48.2 against 41.3).
+
+The essay with the experts in host memory, tok/s; DSpark's text equals plain decoding's on every
+card:
+
+| Card | Plain | DSpark | DSpark against plain | Tokens a round |
+|---|---:|---:|---:|---:|
+| RTX 5080 | 114.1 | 126.1 | 1.11x | 1.64 |
+| RTX 4080 Super | 102.1 | 112.9 | 1.11x | 1.72 |
+| RTX 5070 | 80.9 | 79.2 | 0.98x | 1.75 |
+| RTX 5060 Ti 16 GB | 70.3 | 72.1 | 1.03x | 2.07 |
+| RTX 4060 Ti 16 GB | 52.3 | 55.7 | 1.07x | 1.66 |
+| RTX A4000 | 59.5 | 63.2 | 1.06x | 1.68 |
+| RTX 3060 12 GB | 47.4 | 48.8 | 1.03x | 1.69 |
+| RTX 5060 8 GB | 33.6 | 32.5 | 0.97x | 1.71 |
+
+With the experts in host memory DSpark gains 0.97 to 1.11 times, less than on the cards that keep
+them on the GPU; the RTX 5070 and RTX 5060 decode 2.1% and 3.3% slower with it. The RTX 4080 Super
+ran NInfer-all on two hosts, a Threadripper 3990X and a Ryzen 9 5950X: its benchmark rates moved by
+at most 2.9% (decode after 10,000 tokens, 89.5 against 92.1 tok/s), the CLI's plain essay by 4.0%
+(98.2 against 102.1), and the tables hold the second host. The first plan put every expert of
+llama.cpp on the CPU (`-ot exps=CPU`); so it prefilled 10,000 tokens at 346 tok/s and decoded at
+18.1 on the RTX 5070, against 724 and 35.6 with its fit, and at 338 and 7.7 on the first RTX 4080
+Super host, against 1,379 and 59.2 with the fit on the second.
+
+The RTX 5060 also ran with the experts on disk (`--expert-residency disk`, the host's NVMe, the
+artifact evicted from the page cache before each start, which the runs then refill: 5.1 of its 15.6
+GiB were cached during the second essay): it prefilled 2,048 and 10,000 tokens at 617 and 591 tok/s
+and decoded at 9.6 tok/s, 8.3 after 10,000 tokens; the essay decoded at 8.8 tok/s, 8.7 with DSpark,
+with the same text as with host experts. CPU threads computed 22.1% of the essay's expert routes
+from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
 
 ## Numerical checks
 
@@ -296,8 +363,8 @@ quota's 31 threads, prefilled 2,048 tokens at 1,402 tok/s against 1,301 in the t
   rotations, the recurrent head's steps, ties to the lower id).
   `ninfer_inkling2_vision_kernels_test` qualifies the tower's kernels.
 - **Against an FP64 forward.** `tools/reference/inkling2.py` runs the model in FP64 over the GGUF's
-  exactly decoded blocks. On 1,150 WikiText tokens (past the 1,024-position window) NInfer scores a
-  mean NLL of 1.560199 against its 1.559721 (+0.03%).
+  exactly decoded blocks. On 1,150 WikiText tokens (past the 1,024-position window) NInfer-all
+  scores a mean NLL of 1.560199 against its 1.559721 (+0.03%).
 - **Against llama.cpp.** Perplexity on 120 KB of WikiText (`--context 4096 --stride 2048`) over the
   six 4,096-token windows both score alike: a mean NLL of 1.733757 against llama.cpp's 1.734757
   (-0.06%); per window -0.30% to +0.08% (llama.cpp's windows read from its four-digit running
@@ -314,8 +381,8 @@ quota's 31 threads, prefilled 2,048 tokens at 1,402 tok/s against 1,301 in the t
   `tools/reference/inkling2_vision.py` there) runs examples/cli/media/natural_scene.png, a
   40 x 26-patch grid, through the device tower against the FP64 reference: worst row cosine
   0.999172, relative RMS error 0.90%; the overlay tower gives the same rows bit for bit.
-- **DSpark.** With 7 drafts a round over 256 greedy tokens of the essay prompt, NInfer's drafter had
-  133 drafts accepted of 832, llama.cpp's implementation 133 of 850.
+- **DSpark.** With 7 drafts a round over 256 greedy tokens of the essay prompt, NInfer-all's drafter
+  had 133 drafts accepted of 832, llama.cpp's implementation 133 of 850.
 
 ## Expert residency
 

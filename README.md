@@ -53,7 +53,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
   Dense Qwen3.5-core models gain `--tensor-parallel`.
 - **2026-10-24:** [Flint](docs/flint.md#measurements) decodes 348 tok/s on an RTX 5090 and 210 on an RTX 4090 with host experts.
 - **2026-10-23:** NInfer supports [Flint](docs/flint.md) from Unsloth's UD-Q4_K_XL GGUF.
-  [Native releases](https://github.com/iamwavecut/ninfer-all/releases) cover Windows and Debian 13 with CUDA 12.9 and 13.4.
+  [Native releases](https://github.com/iamwavecut/ninfer-all/releases/latest) cover Windows and Debian 13 with CUDA 12.9 and 13.4.
 - **2026-10-22:** [Typed decisions](docs/serving.md#typed-decisions) are available at `/v1/decisions` and `/v1/systemone`.
   Every model family supports YaRN.
 - **2026-10-20:** [CPU threads compute a share of host experts](docs/qwen3-8-flash-next.md#the-cpu-share) beside the GPU.
@@ -156,10 +156,10 @@ Every card by name, with what has run on it:
 
 | GPU memory | Runs | Measured on |
 |---|---|---|
-| 8 GB | Ternary Bonsai 2 27B (24,576 tokens with `rk4v4`, no MTP); Qwen3.8-Flash-Next with its experts in host memory or on disk | RTX 3060 Ti |
+| 8 GB | Ternary Bonsai 2 27B (24,576 tokens with `rk4v4`, no MTP); Qwen3.8-Flash-Next and Inkling 2 Mini with their experts in host memory or on disk | RTX 3060 Ti; RTX 5060 for Inkling 2 Mini |
 | 11 GB | Ternary Bonsai 2 27B (200,704 tokens with `rk4v4`; 143,360 with MTP) | RTX 2080 Ti |
-| 12 GB | Ternary Bonsai 2 27B (266,240 tokens); Qwen3.8-27B GSQ-RCO IQ3_S (8,192 tokens, no MTP) | RTX 3060 |
-| 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4` | Tesla V100-SXM2-16GB |
+| 12 GB | Ternary Bonsai 2 27B (266,240 tokens); Qwen3.8-27B GSQ-RCO IQ3_S (8,192 tokens, no MTP); Inkling 2 Mini with its experts in host memory | RTX 3060; also the RTX 5070 for Inkling 2 Mini |
+| 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4`; Inkling 2 Mini with its experts in host memory | Tesla V100-SXM2-16GB; RTX 5080, 5060 Ti, 4080 Super, 4060 Ti and A4000 for Inkling 2 Mini |
 | 24 GB | Gemma 4 31B Q4_0 (101,376 tokens; 87,040 with MTP); the official Qwen3.8-27B and its MXFP8 tune; Qwen3.6-35B-A3B `groupwise-int` on an RTX 3090; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash with its experts in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
 | 32 GB | Qwen3.6-35B-A3B NVFP4 (Blackwell only) | RTX 5090 |
 | 48 GB | Flash-Next Q2_0 with every expert on one card | L40S, RTX PRO 6000 |
@@ -298,8 +298,9 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 Ternary Bonsai 2 27B decodes 397 tok/s on an RTX 5090 with DFlash2 and holds a 978,944-token context with
 every planted code found. Qwen3.8-Flash-Next decodes 138 tok/s with every expert on one RTX PRO 6000, and
 96 tok/s with its experts in host memory on one RTX 5090. DeepSeek-V4.1-Flash decodes 52 tok/s on one
-RTX 5090, 48 on one RTX PRO 6000 and 39 on one RTX 4090 with its 106.7 GiB of experts in host memory. Every table of
-every card is on the [performance page](docs/performance.md).
+RTX 5090, 48 on one RTX PRO 6000 and 39 on one RTX 4090 with its 106.7 GiB of experts in host memory. Inkling 2 Mini
+decodes 182 tok/s on an RTX 5090, 1.4 to 2.8 times llama.cpp's rate on 25 cards, and runs on an 8 GB card with its
+experts in host memory. Every table of every card is on the [performance page](docs/performance.md).
 
 *Click a section to expand it.*
 
@@ -409,6 +410,48 @@ the card in the STQ encoding the artifact carries), an RTX PRO 6000 decoded five
 fast, the other three requests 0.85 to 1.02 times, prefilling at plain speed
 ([the drafter](docs/deepseek-v41.md#the-stq-drafter)). With `--vision` it reads images through
 the release's vision tower ([images](docs/deepseek-v41.md#images)).
+
+</details>
+
+<details>
+<summary><b>Inkling 2 Mini</b> — 182 tok/s on an RTX 5090, 1.4 to 2.8 times llama.cpp's decode, from 8 GB</summary>
+
+Unsloth's UD-IQ4_XS GGUF with the vision tower and the DSpark drafter (a 15.6 GiB artifact), one request, F16 KV,
+November 21, 2026, against llama.cpp on the same GGUF (Unsloth's build `b12588-mix-c0c3de8`; mainline
+llama.cpp does not load it). A prompt of 10,000 tokens and a decode of 128, in tok/s, NInfer-all / llama.cpp:
+
+| Card | Experts | Prefill of 10,000 tokens | Decode |
+|---|---|---:|---:|
+| RTX 5090 | on the card | 6,664 / 2,318 | 182.1 / 96.9 |
+| RTX 4090 | on the card | 4,537 / 2,307 | 140.1 / 75.0 |
+| RTX 3090 | on the card | 2,046 / 1,236 | 112.0 / 59.5 |
+| RTX 5080 | in host memory | 3,238 / 1,377 | 116.5 / 41.3 |
+| RTX 3060 12 GB | in host memory | 759 / 387 | 48.8 / 24.8 |
+| RTX 5060 8 GB | in host memory | 1,074 / 293 | 33.1 / 14.7 |
+
+On cards of 8 to 16 GB the routed experts stay in pinned host memory and the card caches the most used,
+while llama.cpp places the model with its own `--fit`. From disk (`--expert-residency disk`) the RTX 5060
+prefills 591 tok/s and decodes 9.6. While one request runs, the release's DSpark drafter decodes the same
+text 1.06 to 1.33 times as fast with the experts on the card. Every card, the drafter and the hosts are in
+[Inkling 2 Mini's measurements](docs/inkling2.md#across-cards).
+
+With the [Docker image](#docker), or the same `--config` on a
+[native release](https://github.com/iamwavecut/ninfer-all/releases/latest):
+
+```bash
+hf download WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3 Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --local-dir models
+
+# 24 GB and more: every expert on the card, images, DSpark, a 64K-token context.
+docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
+  -v "$PWD/models:/models" -v ninfer-cache:/cache \
+  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve --config /opt/ninfer/configs/inkling2-mini.ini
+
+# 8 to 16 GB: the experts in 13.1 GiB of pinned host memory, a 32K-token context
+# (the 8 GB RTX 5060 above ran with --max-context 12288).
+docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
+  -v "$PWD/models:/models" -v ninfer-cache:/cache \
+  ghcr.io/iamwavecut/ninfer-all:cuda13.4 serve --config /opt/ninfer/configs/inkling2-mini-host.ini
+```
 
 </details>
 
