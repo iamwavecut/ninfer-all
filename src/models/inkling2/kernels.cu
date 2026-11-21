@@ -1236,6 +1236,102 @@ __global__ void situ_rows_kernel(const float* __restrict__ gu, std::int64_t stri
     out[p * width + r] = __float2bfloat16(situ(g, u, gate_cap, up_cap));
 }
 
+// ---- BF16 experts --------------------------------------------------------------------------------
+
+constexpr int kBfWarps = 4, kBfRowsPerWarp = 2, kBfPairs = 32, kBfChunk = 256;
+constexpr int kBfRows = kBfWarps * kBfRowsPerWarp;
+
+__device__ __forceinline__ void bf16x8(const uint4& v, float (&f)[8]) {
+    const auto* h = reinterpret_cast<const __nv_bfloat162*>(&v);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 x = __bfloat1622float2(h[i]);
+        f[2 * i]       = x.x;
+        f[2 * i + 1]   = x.y;
+    }
+}
+
+// Block (row tile, active slot a): expert e = active[a]'s rows [8 tile, 8 tile + 8), each warp
+// two of them, against the expert's pairs 32 at a time. The pairs' inputs pass through shared
+// memory 256 columns at a time; lane l multiplies columns [8 l, 8 l + 8) of each, in order, into
+// one FP32 sum per (row, pair), and the warp adds its lanes' sums.
+__global__ void __launch_bounds__(kBfWarps * 32)
+    bf16_expert_rows_kernel(const void* const* __restrict__ table, int rows, int k,
+                            const std::int32_t* __restrict__ bounds,
+                            const std::int32_t* __restrict__ sorted,
+                            const std::int32_t* __restrict__ active,
+                            const std::int32_t* __restrict__ active_count,
+                            const __nv_bfloat16* __restrict__ x, int x_div,
+                            float* __restrict__ out) {
+    if (int(blockIdx.y) >= *active_count) { return; }
+    const int e     = active[blockIdx.y];
+    const int begin = bounds[e], end = bounds[e + 1];
+    const auto* w   = static_cast<const __nv_bfloat16*>(table[e]);
+    const int warp = int(threadIdx.x) >> 5, lane = int(threadIdx.x) & 31;
+    const int row0 = int(blockIdx.x) * kBfRows + warp * kBfRowsPerWarp;
+    __shared__ __align__(16) __nv_bfloat16 xs[kBfPairs][kBfChunk];
+    for (int g = begin; g < end; g += kBfPairs) {
+        const int n = min(kBfPairs, end - g);
+        float acc[kBfRowsPerWarp][kBfPairs];
+#pragma unroll
+        for (int r = 0; r < kBfRowsPerWarp; ++r) {
+#pragma unroll
+            for (int p = 0; p < kBfPairs; ++p) { acc[r][p] = 0.0f; }
+        }
+        for (int c = 0; c < k; c += kBfChunk) {
+            const int vectors = min(kBfChunk, k - c) / 8;
+            __syncthreads();
+            for (int i = int(threadIdx.x); i < n * vectors; i += int(blockDim.x)) {
+                const int p = i / vectors, v = i % vectors;
+                const std::int64_t src = std::int64_t(sorted[g + p] / x_div) * k + c + 8 * v;
+                reinterpret_cast<uint4*>(xs[p])[v] = *reinterpret_cast<const uint4*>(x + src);
+            }
+            __syncthreads();
+            if (lane >= vectors) { continue; }
+            float wf[kBfRowsPerWarp][8];
+#pragma unroll
+            for (int r = 0; r < kBfRowsPerWarp; ++r) {
+                const int row = min(row0 + r, rows - 1); // a row past the end is never written
+                bf16x8(*reinterpret_cast<const uint4*>(w + std::int64_t(row) * k + c + 8 * lane),
+                       wf[r]);
+            }
+#pragma unroll
+            for (int p = 0; p < kBfPairs; ++p) {
+                if (p >= n) { break; }
+                float xf[8];
+                bf16x8(reinterpret_cast<const uint4*>(xs[p])[lane], xf);
+#pragma unroll
+                for (int r = 0; r < kBfRowsPerWarp; ++r) {
+                    float sum = acc[r][p];
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { sum = fmaf(wf[r][j], xf[j], sum); }
+                    acc[r][p] = sum;
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < kBfRowsPerWarp; ++r) {
+            const int row = row0 + r;
+#pragma unroll
+            for (int p = 0; p < kBfPairs; ++p) {
+                if (p >= n) { break; }
+                const float v = warp_sum(acc[r][p]);
+                if (lane == 0 && row < rows) { out[std::int64_t(sorted[g + p]) * rows + row] = v; }
+            }
+        }
+    }
+}
+
+// Block (row, part): FP32 values [256 part, 256 part + 256) of table row ids[row].
+__global__ void bf16_rows_f32_kernel(const __nv_bfloat16* __restrict__ table, int k,
+                                     const std::int32_t* __restrict__ ids, float* __restrict__ out,
+                                     std::int64_t out_stride) {
+    const int i = int(blockIdx.y) * blockDim.x + int(threadIdx.x);
+    if (i >= k) { return; }
+    const std::int64_t r = blockIdx.x;
+    out[r * out_stride + i] = __bfloat162float(table[std::int64_t(ids[r]) * k + i]);
+}
+
 __global__ void softcap_kernel(const float* in, __nv_bfloat16* out, std::int64_t n, float cap) {
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) { out[i] = __float2bfloat16(cap * tanhf(in[i] / cap)); }
@@ -1784,6 +1880,28 @@ void situ_rows(const float* gu, std::int64_t stride, int pairs, int width, const
     situ_rows_kernel<<<dim3(pairs, blocks_for(width, kSituThreads)), kSituThreads, 0, stream>>>(
         gu, stride, width, pair_scale, gate_cap, up_cap, out);
     check_launch("situ_rows");
+}
+
+void bf16_expert_rows(const void* const* table, int rows, int k, const std::int32_t* bounds,
+                      const std::int32_t* sorted, const std::int32_t* active,
+                      const std::int32_t* active_count, int max_active, const __nv_bfloat16* x,
+                      int x_div, float* out, cudaStream_t stream) {
+    if (rows <= 0 || k <= 0 || k % 8 != 0 || x_div <= 0) {
+        throw std::invalid_argument("inkling2 bf16_expert_rows: rows, k a multiple of 8, x_div");
+    }
+    if (max_active <= 0) { return; }
+    bf16_expert_rows_kernel<<<dim3(blocks_for(rows, kBfRows), unsigned(max_active)), kBfWarps * 32,
+                              0, stream>>>(table, rows, k, bounds, sorted, active, active_count, x,
+                                           x_div, out);
+    check_launch("bf16_expert_rows");
+}
+
+void bf16_rows_f32(const __nv_bfloat16* table, int k, const std::int32_t* ids, int rows,
+                   float* out, std::int64_t out_stride, cudaStream_t stream) {
+    if (rows <= 0) { return; }
+    bf16_rows_f32_kernel<<<dim3(unsigned(rows), blocks_for(k, 256)), 256, 0, stream>>>(
+        table, k, ids, out, out_stride);
+    check_launch("bf16_rows_f32");
 }
 
 void softcap_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, float cap,

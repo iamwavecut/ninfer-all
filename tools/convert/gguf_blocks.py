@@ -522,14 +522,23 @@ def bf16_source(
     gguf: GGUFFile, tensor: str, shape: tuple[int, int], stored_rows: int | None = None
 ) -> LogicalSource:
     """A stored BF16 matrix as its exact words, read a run of rows at a time; rows past
-    ``stored_rows`` (when ``shape[0]`` is larger) are zero padding."""
+    ``stored_rows`` (when ``shape[0]`` is larger) are zero padding. A stack of matrices (an
+    expert bank ``[experts, rows, k]``) is addressed by its flattened rows, matrix-major, as the
+    file stores them."""
 
     real = shape[0] if stored_rows is None else stored_rows
+    info = gguf.info(tensor)
+    stored = int(np.prod(info.shape[:-1])) if len(info.shape) > 1 else 1
+    if info.type_id != TYPE_BF16 or info.shape[-1] != shape[1] or stored != real:
+        raise ValueError(f"{tensor}: stored {info.type_name} {list(info.shape)}, expected BF16 "
+                         f"rows x columns ({real}, {shape[1]})")
+    row_bytes = 2 * shape[1]
 
     def values(first: int, last: int) -> torch.Tensor:
         parts = []
         if first < min(last, real):
-            words = gguf.read_bf16_words(tensor, first, min(last, real))
+            raw = gguf.tensor_bytes(tensor, first * row_bytes, min(last, real) * row_bytes)
+            words = np.frombuffer(raw, dtype="<u2").copy()
             parts.append(
                 torch.from_numpy(words.view(np.int16)).view(torch.bfloat16).reshape(-1, shape[1])
             )

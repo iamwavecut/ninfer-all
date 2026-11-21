@@ -21,6 +21,10 @@
 //    the sorted route of up to eight rows against route and gguf::moe_sort_routes.
 //  - situ_rows: the BF16 middles equal to the host's situ() bit for bit, and within BF16 rounding
 //    of FP64; softcap, f32_to_bf16, place_rows, ring_copy, add_fixed.
+//  - bf16_expert_rows (UD-Q8_K_XL's BF16 expert banks): [gate; up] rows from each token's input
+//    and down rows from each pair's own, decode and prompt pair counts, against FP64 sums of the
+//    BF16 values; another device's pairs (-1) keep their rows, and a second call gives the same
+//    bits. bf16_rows_f32: the table's rows exactly.
 //  - the routed experts of a call on the CPU (CpuExperts) against the GPU's vector kernels over
 //    the release's formats (NVFP4 with per-expert scales, Q5_K/Q5_0, Q4_K/Q5_0, IQ4_XS/IQ4_NL): the
 //    same 2^-32 fixed-point sums bit for bit, all on the CPU and half on each (add_fixed).
@@ -1082,6 +1086,86 @@ void situ_case(std::mt19937& rng) {
                                              num(worst) + " BF16 steps");
 }
 
+// BF16 experts: `experts` banks of `rows` x `k` BF16 rows, the pairs of `tokens` tokens (top 8 of
+// the banks, some marked -1 as another device's), inputs per token (x_div 8) or per pair (1).
+void bf16_experts_case(int tokens, int rows, int k_, int x_div, int experts, std::mt19937& rng) {
+    const int pairs = tokens * kTopK, inputs = x_div == 1 ? pairs : tokens;
+    std::vector<std::int32_t> ids(pairs);
+    std::vector<int> order(experts);
+    std::iota(order.begin(), order.end(), 0);
+    for (int t = 0; t < tokens; ++t) {
+        std::shuffle(order.begin(), order.end(), rng);
+        for (int j = 0; j < kTopK; ++j) { ids[t * kTopK + j] = order[j]; }
+    }
+    for (int p = 5; p < pairs; p += 11) { ids[p] = -1; }
+    std::vector<bf16> w(std::size_t(experts) * rows * k_), x(std::size_t(inputs) * k_);
+    {
+        const auto wf = normal(w.size(), 0.05f, rng), xf = normal(x.size(), 1.0f, rng);
+        for (std::size_t i = 0; i < w.size(); ++i) { w[i] = __float2bfloat16(wf[i]); }
+        for (std::size_t i = 0; i < x.size(); ++i) { x[i] = __float2bfloat16(xf[i]); }
+    }
+    DeviceBuffer d_w = upload(w), d_x = upload(x), d_ids = upload(ids);
+    std::vector<const void*> table(experts);
+    for (int e = 0; e < experts; ++e) { table[e] = as<bf16>(d_w) + std::int64_t(e) * rows * k_; }
+    DeviceBuffer d_table = upload(table);
+    DeviceBuffer space(gguf::moe_routing_bytes(experts, pairs));
+    const gguf::MoeRouting routing =
+        gguf::moe_sort_routes(as<std::int32_t>(d_ids), pairs, experts, space.p, nullptr);
+    const float sentinel = 12345.0f;
+    const std::vector<float> fill(std::size_t(pairs) * rows, sentinel);
+    DeviceBuffer out = upload(fill);
+    const auto run = [&] {
+        k::bf16_expert_rows(static_cast<const void* const*>(d_table.p), rows, k_, routing.bounds,
+                            routing.sorted, routing.active, routing.active_count,
+                            std::min(pairs, experts), as<bf16>(d_x), x_div, as<float>(out), nullptr);
+        sync("bf16_expert_rows");
+        return download<float>(out, std::size_t(pairs) * rows);
+    };
+    const auto got = run(), again = run();
+    // A prompt call checks every 13th row; decode calls check them all.
+    const int step = pairs > 64 ? 13 : 1;
+    Error e;
+    std::size_t kept_wrong = 0;
+    for (int p = 0; p < pairs; ++p) {
+        if (ids[p] < 0) {
+            for (int r = 0; r < rows; ++r) { kept_wrong += got[std::size_t(p) * rows + r] != sentinel; }
+            continue;
+        }
+        const bf16* xp = x.data() + std::size_t(x_div == 1 ? p : p / kTopK) * k_;
+        const bf16* we = w.data() + std::size_t(ids[p]) * rows * k_;
+        for (int r = 0; r < rows; r += step) {
+            double sum = 0;
+            for (int j = 0; j < k_; ++j) {
+                sum += double(__bfloat162float(we[std::size_t(r) * k_ + j])) *
+                       double(__bfloat162float(xp[j]));
+            }
+            e.add(got[std::size_t(p) * rows + r], sum);
+        }
+    }
+    report(e.rel() < 2e-6 && kept_wrong == 0 && same_bits(got, again),
+           "bf16_expert_rows " + std::to_string(rows) + "x" + std::to_string(k_) + ", " +
+               std::to_string(pairs) + " pairs over " + std::to_string(experts) + " experts (x per " +
+               (x_div == 1 ? "pair" : "token") + "): rel " + num(e.rel()) + ", " +
+               std::to_string(kept_wrong) + " foreign rows changed");
+
+    // bf16_rows_f32 of some table rows (the expert bank as a [experts rows][k] table).
+    const std::vector<std::int32_t> pick{0, 7, rows * experts - 1, 3};
+    DeviceBuffer d_pick = upload(pick), d_rows(pick.size() * std::size_t(k_ + 16) * 4);
+    k::bf16_rows_f32(as<bf16>(d_w), k_, as<std::int32_t>(d_pick), int(pick.size()),
+                     as<float>(d_rows), k_ + 16, nullptr);
+    sync("bf16_rows_f32");
+    const auto table_rows = download<float>(d_rows, pick.size() * std::size_t(k_ + 16));
+    std::size_t wrong = 0;
+    for (std::size_t i = 0; i < pick.size(); ++i) {
+        for (int j = 0; j < k_; ++j) {
+            wrong += table_rows[i * (k_ + 16) + j] !=
+                     __bfloat162float(w[std::size_t(pick[i]) * k_ + j]);
+        }
+    }
+    report(wrong == 0, "bf16_rows_f32 of " + std::to_string(pick.size()) + " rows of width " +
+                           std::to_string(k_) + ": " + std::to_string(wrong) + " values differ");
+}
+
 void elementwise_case(std::mt19937& rng) {
     constexpr std::int64_t n = 200058;
     auto x = normal(n, 20.0f, rng);
@@ -1410,6 +1494,10 @@ int main() {
         route_case(64, true, rng);
         situ_case(rng);
         elementwise_case(rng);
+        for (const int tokens : {1, 8, 300}) {
+            bf16_experts_case(tokens, 2 * kWidth, kHidden, kTopK, 16, rng);
+            bf16_experts_case(tokens, kHidden, kWidth, 1, 16, rng);
+        }
 
         cpu_experts_case("NVFP4/NVFP4", QType::GGUF_NVFP4, QType::GGUF_NVFP4, true, 1, rng);
         cpu_experts_case("NVFP4/NVFP4", QType::GGUF_NVFP4, QType::GGUF_NVFP4, true, 5, rng);

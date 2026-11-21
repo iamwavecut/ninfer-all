@@ -457,6 +457,29 @@ def test_a_bf16_output_head_keeps_its_exact_words(tmp_path):
         assert all(u["activation_policy"] == "A16Only" and "auxiliaries" not in u for u in uses)
 
 
+def test_a_bf16_expert_bank_is_read_by_its_flattened_rows(tmp_path):
+    from tools.convert.sources.gguf import TYPE_BF16
+
+    experts, rows, columns = 3, 4, 16
+    words = np.random.default_rng(7).integers(0, 1 << 16, size=(experts, rows, columns),
+                                              dtype=np.uint16)
+    path = tmp_path / "bank.gguf"
+    write_gguf(path, {"general.architecture": "inkling2"},
+               [("blk.0.ffn_gate_up_exps.weight", (experts, rows, columns), TYPE_BF16,
+                 words.tobytes())])
+    flat = words.reshape(experts * rows, columns)
+    with GGUFFile(path) as gguf:
+        source = gguf_blocks.bf16_source(gguf, "blk.0.ffn_gate_up_exps.weight",
+                                         (experts * rows, columns))
+        assert source.read_encoded is None
+        # A run across two experts' matrices, then the last expert's rows.
+        for first, last in ((2, 7), (8, 12)):
+            got = source.rows(first, last).view(torch.int16).numpy().view(np.uint16)
+            assert np.array_equal(got, flat[first:last])
+        with pytest.raises(ValueError, match="expected BF16"):
+            gguf_blocks.bf16_source(gguf, "blk.0.ffn_gate_up_exps.weight", (experts, columns))
+
+
 def test_a_block_output_head_stays_stored_blocks(tmp_path):
     path, blocks = _q8_0_file(tmp_path, 4, 64, 13, "output.weight")
     with GGUFFile(path) as gguf:
