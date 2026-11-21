@@ -319,6 +319,18 @@ int main(int argc, char** argv) {
                 refit.tensor_split    = *shared;
                 const auto refit_plan = qwen::plan_load(reader, refit, path);
                 const auto& heads     = refit_plan.weights().text.tensor_shares;
+                // An uneven split (#384's 0.53/0.47) ends the head shares on whole 128-row tiles,
+                // the only ones a GGUF head's matrix product takes.
+                LoadOptions lopsided_head     = tp;
+                lopsided_head.tensor_split    = {0.53, 0.47};
+                const auto lopsided_head_plan = qwen::plan_load(reader, lopsided_head, path);
+                const auto& refit_head    = refit_plan.weights().text.output_head_shares;
+                const auto& lopsided_rows = lopsided_head_plan.weights().text.output_head_shares;
+                for (const auto& head_rows : {refit_head.rows, lopsided_rows.rows}) {
+                    require(head_rows.size() == 3 && head_rows[1] % 128 == 0 && head_rows[1] > 0 &&
+                                head_rows[1] < head_rows[2],
+                            "a head share does not end on a whole 128-row tile");
+                }
                 require(heads[0].kv_head_end - heads[0].kv_head_begin ==
                             heads[1].kv_head_end - heads[1].kv_head_begin,
                         "the refit moved a KV head to share a shortfall smaller than its KV");
