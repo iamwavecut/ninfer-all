@@ -359,7 +359,10 @@ bounded pinned staging. Use `--max-concurrency 1` for native host execution. Und
 and WSL2, recognised by `/dev/dxg`) a device's copies may queue behind one another whatever their
 streams, so the tables, the CPU/GPU partition and the CPU's sum that a decode graph takes after it
 waited for the host reach the device through mapped host memory and a copy kernel; a queued copy
-there would hold back the expert copies that end the wait. The bytes are the same either way.
+there would hold back the expert copies that end the wait. The bytes are the same either way. For
+the same reason the staged misses of GGUF host experts reach the device there by a copy kernel
+that reads them in place, not by the copy engine: a decode or verification call's misses and
+admissions, while a replayed layer waits for them; prompt chunks keep the copy engine.
 
 ### The CPU share
 
@@ -1032,10 +1035,7 @@ not.
   shared by the sequences: a step of another sequence than the last captures it again and updates
   the graph in place; the token's position reaches the sparse-attention kernels in device memory.
   Disk experts need the host between a layer's routing and its experts, so their steps stay eager.
-  Under WDDM (Windows, and WSL2) so do the passes of GGUF host experts with staged misses: there a
-  graph's copies queued after a layer's wait for the misses could hold back the service's copies
-  that end it, and the startup log says that graphs are off. `--no-cuda-graph` decodes eagerly
-  everywhere.
+  `--no-cuda-graph` decodes eagerly everywhere.
 - With MTP, a verification of one request (at most eight tokens, so its experts take the vector
   products) replays graphs of its own the same way, and so does the draft chain of one request on
   one GPU, host experts included; several requests' rounds, the MTP catch-up and disk experts run
