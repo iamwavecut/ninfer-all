@@ -1,8 +1,10 @@
 #pragma once
 
 // The forward pass of Inkling 2 over a loaded Model: 48 visits of its 24 stored layers (the
-// prelude, the looped core three times, the coda), each visit with its own F16 keys and values
-// and its own short-convolution history. A sliding-window visit keeps a ring of the last window
+// prelude, the looped core three times, the coda), each visit with its own keys and values and
+// its own short-convolution history. The caches are F16, or — with kv_cache rk8v4 / rk4v4 — the
+// eight full-attention visits' planes are quantized (kv_format.h) while every windowed visit
+// keeps its F16 ring. A sliding-window visit keeps a ring of the last window
 // (and a round's drafts) per sequence, a full-attention visit every position. Every visit's
 // convolution sites keep a ring of their last kHistory raw inputs (FP32) per sequence. Prompt
 // chunks run up to prefill_chunk tokens of one sequence; decode steps run one token of each of
@@ -25,6 +27,7 @@
 #include "core/expert_disk.h"
 #include "core/tensor.h"
 #include "models/expert_profile.h"
+#include "models/inkling2/kv_format.h"
 #include "models/inkling2/model.h"
 
 #include <cuda_runtime.h>
@@ -49,6 +52,10 @@ struct ExecutorOptions {
     std::uint32_t prefill_chunk = 2048; // prompt tokens per forward()
     std::uint32_t sequences     = 1;
     bool cuda_graphs            = true;
+    // The KV cache's storage (kv_format.h): F16 (bf16, the default, or fp16), or the quantized
+    // full-attention visits of rk8v4 / rk4v4 — the windowed visits' rings stay F16 whatever this
+    // says.
+    KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     // Proposed tokens a verification may carry per sequence after its anchor (0: no
     // verification); a verification's rows, the anchors and drafts of all its sequences, are at
     // most 8.

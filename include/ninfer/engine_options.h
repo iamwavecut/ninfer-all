@@ -634,6 +634,10 @@ struct EngineOptions {
     // binary16 store. Gemma 4 and Flint keep their F16 caches under either name; the Qwen3.5
     // Program and DeepSeek-V4.1 refuse it. BF16 stays the default.
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // The storage was left to the Engine (no --kv-dtype): Inkling 2 then stores MXFP8 (Mxfp8),
+    // the KV format its release trained with; the other families keep kv_cache. options() report
+    // the storage.
+    bool kv_cache_automatic = false;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

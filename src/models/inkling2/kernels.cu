@@ -2,6 +2,7 @@
 
 #include "core/device_launch.h"
 #include "models/inkling2/config.h"
+#include "models/inkling2/kv_codec.cuh"
 #include "models/inkling2/situ.h"
 
 #include <cublas_v2.h>
@@ -180,14 +181,6 @@ int row_threads(int hidden) {
 }
 
 // ---- Rows and their history ---------------------------------------------------------------------
-
-__device__ __forceinline__ int row_sequence(const Rows& r, int t) {
-    return r.sequences != nullptr ? r.sequences[t] : r.sequence;
-}
-
-__device__ __forceinline__ int physical(const Rows& r, int t) {
-    return r.chunk ? r.first + t : r.positions[t];
-}
 
 // Where the input `lag` positions before row t lies: a row of the call (>= 0), the history ring
 // (-1, `position` its position) or before position 0 (-2).
@@ -690,11 +683,29 @@ __global__ void kv_post_kernel(KvArgs a) {
     const float vn = rsqrtf(sums[1] / float(kD) + a.eps);
     const int sequence = row_sequence(a.rows, t);
     const int position = physical(a.rows, t);
-    const int slot     = a.ring != 0 ? position % a.ring : position;
-    const std::int64_t at = std::int64_t(sequence) * a.seq_stride + std::int64_t(kh) * a.head_stride +
-                            std::int64_t(slot) * kD + d;
-    a.k_cache[at] = __float2half(k * kf);
-    a.v_cache[at] = __float2half(v * vn);
+    const int slot     = a.row_slots ? t : (a.ring != 0 ? position % a.ring : position);
+    if (a.k_plane.coding == KvCoding::Mxfp8) {
+        // A warp holds one group of 32 dimensions of the row: its exponent byte, then its codes.
+        const float kx = k * kf, vx = v * vn;
+        const unsigned ke = kv::mxfp8_exponent(ops::warp_max(fabsf(kx), 0xffffffffu));
+        const unsigned ve = kv::mxfp8_exponent(ops::warp_max(fabsf(vx), 0xffffffffu));
+        const KvPlaneView& kp = a.k_plane;
+        const KvPlaneView& vp = a.v_plane;
+        const std::int64_t row = std::int64_t(slot);
+        kp.codes[sequence * kp.code_seq + kh * kp.code_head + row * kp.code_row + d] = kv::mxfp8_code(kx, ke);
+        vp.codes[sequence * vp.code_seq + kh * vp.code_head + row * vp.code_row + d] = kv::mxfp8_code(vx, ve);
+        if ((d & 31) == 0) {
+            kp.scales[sequence * kp.scale_seq + kh * kp.scale_head + row * kp.scale_row + d / 32] =
+                std::uint8_t(ke);
+            vp.scales[sequence * vp.scale_seq + kh * vp.scale_head + row * vp.scale_row + d / 32] =
+                std::uint8_t(ve);
+        }
+    } else {
+        const std::int64_t at = std::int64_t(sequence) * a.seq_stride +
+                                std::int64_t(kh) * a.head_stride + std::int64_t(slot) * kD + d;
+        a.k_cache[at] = __float2half(k * kf);
+        a.v_cache[at] = __float2half(v * vn);
+    }
     if (a.keep) {
         const int p = a.rows.positions[t];
         history_slot(a.k_history, sequence, p)[c] = a.kv[std::int64_t(t) * a.kv_stride + c];
@@ -826,11 +837,24 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
             const int rest   = w % (kTile * (kD / 8));
             const int r = rest / (kD / 8), c = rest % (kD / 8);
             uint4 word = make_uint4(0, 0, 0, 0);
+            const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
             if (r < count) {
                 const int p    = tile + r;
                 const int slot = a.ring != 0 ? p % a.ring : p;
-                const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
-                word = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
+                if (plane.coding != KvCoding::F16) {
+                    const std::int64_t codes_row =
+                        std::int64_t(sequence) * plane.code_seq +
+                        std::int64_t(kv_head) * plane.code_head +
+                        std::int64_t(slot) * plane.code_row;
+                    const std::int64_t scales_row =
+                        std::int64_t(sequence) * plane.scale_seq +
+                        std::int64_t(kv_head) * plane.scale_head +
+                        std::int64_t(slot) * plane.scale_row;
+                    word = chunk_word(plane, plane.codes + codes_row, plane.scales + scales_row, c);
+                } else {
+                    const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
+                    word = *reinterpret_cast<const uint4*>(cache + base + std::int64_t(slot) * kD + c * 8);
+                }
             }
             *reinterpret_cast<uint4*>(matrix == 0 ? &k_s[r][c * 8] : &v_s[r][c * 8]) = word;
         }

@@ -24,6 +24,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "models/inkling2/kv_format.h"
+
 namespace ninfer::models::inkling2::kernels {
 
 // Rows in the GGUF vector kernels' q8_1 activation form (ggml_bridge.h's vector activation):
@@ -138,6 +140,16 @@ struct ControlApply {
 };
 void control_apply(const ControlApply& args, cudaStream_t stream);
 
+// The call's rows: which sequence a row belongs to, and its physical position (a prompt chunk's
+// rows lie first + t, a decode or verification call's at their positions).
+__device__ __forceinline__ int row_sequence(const Rows& r, int t) {
+    return r.sequences != nullptr ? r.sequences[t] : r.sequence;
+}
+
+__device__ __forceinline__ int physical(const Rows& r, int t) {
+    return r.chunk ? r.first + t : r.positions[t];
+}
+
 // Q and the relative feature of each row from the [Q; gate; relative] product (FP32 rows
 // `stride` apart, Q at column 0, the relative feature at `relative_column`): per head
 //   q = clip(q * query_clip[h], qk_clip) * tau,   r = clip(r * relative_clip[h], relative_clip) * tau
@@ -184,6 +196,12 @@ struct KvArgs {
     __half* v_cache = nullptr;
     std::int64_t seq_stride = 0, head_stride = 0;
     int ring = 0;
+    // Row t's values land at slot t (head_stride t wide): a quantized visit's staging scratch,
+    // which kv_store then reads; without it, slot `position % ring` (ring 0: position).
+    bool row_slots = false;
+    // MXFP8 planes (kv_codec.cuh; a full visit of an mxfp8 run): the rows are encoded into them
+    // at slot `position`, and k_cache / v_cache are unused.
+    KvPlaneView k_plane, v_plane;
 };
 void kv_post(const KvArgs& args, cudaStream_t stream);
 
@@ -212,6 +230,10 @@ struct AttentionArgs {
     int extent = 0;
     const __half* k_cache = nullptr;
     const __half* v_cache = nullptr;
+    // Quantized planes take the caches' place (a full-attention visit of a --kv-dtype rk8v4 /
+    // rk4v4 run, whose F16 caches the executor does not allocate): a plane whose coding is not
+    // F16 has its codes and scales read instead of the halves.
+    KvPlaneView k_plane, v_plane;
     std::int64_t seq_stride = 0, head_stride = 0;
     int ring = 0, window = 0;
     int query_heads = 0, kv_heads = 0;

@@ -577,6 +577,19 @@ int run_tests() {
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).kv_cache ==
                           ninfer::KvCacheStorage::BFloat16,
                       "CLI default KV storage changed");
+    // Without --kv-dtype the Engine chooses (Inkling 2: MXFP8); with it, the named storage.
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).kv_cache_automatic,
+                      "CLI without --kv-dtype did not leave the storage to the Engine");
+    {
+        const ninfer::cli::Options mxfp8 =
+            parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "mxfp8"});
+        failures += check(mxfp8.kv_cache == ninfer::KvCacheStorage::Mxfp8 && !mxfp8.kv_cache_automatic,
+                          "--kv-dtype mxfp8 did not select MXFP8 KV explicitly");
+        failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype",
+                                  "bf16"})
+                               .kv_cache_automatic,
+                          "--kv-dtype bf16 left the storage to the Engine");
+    }
     const ninfer::cli::Options nvfp4 =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "nvfp4"});
     failures += check(nvfp4.kv_cache == ninfer::KvCacheStorage::Nvfp4Group16,

@@ -156,6 +156,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.fast_prefill_kernel        = options.fast_prefill_kernel;
         engine_options.kv_cache      = options.kv_cache;
+        engine_options.kv_cache_automatic = !options.kv_cache_explicit;
         engine_options.context_cache.enabled = false;
         engine_options.speculative           = options.speculative;
         engine_options.use_cuda_graph        = options.use_cuda_graph;

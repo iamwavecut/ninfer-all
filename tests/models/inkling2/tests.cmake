@@ -4,6 +4,11 @@ ninfer_add_test(ninfer_inkling2_kernels_test
 set_tests_properties(ninfer_inkling2_kernels_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_op_oracle_options(ninfer_inkling2_kernels_test)
 
+ninfer_add_test(ninfer_inkling2_kv_planes_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_planes.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_inkling2_kv_planes_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_inkling2_vision_kernels_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_kernels.cpp"
   LIBRARIES ninfer_model_runtime)

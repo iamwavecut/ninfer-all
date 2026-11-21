@@ -43,6 +43,15 @@ int launch_configuration_tests() {
     failures +=
         check(parse({"ninfer-serve", "--config", half}).kv_cache == ninfer::KvCacheStorage::Float16,
               "flat serving JSON did not preserve native FP16 selection");
+    failures += check(!parse({"ninfer-serve", "--config", half}).kv_cache_automatic,
+                      "a configured kv-dtype left the storage to the Engine");
+    {
+        const auto mxfp8 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "mxfp8"});
+        failures += check(mxfp8.kv_cache == ninfer::KvCacheStorage::Mxfp8 && !mxfp8.kv_cache_automatic,
+                          "--kv-dtype mxfp8 did not select MXFP8 KV explicitly");
+        failures += check(parse({"ninfer-serve", "model.ninfer"}).kv_cache_automatic,
+                          "serving without --kv-dtype did not leave the storage to the Engine");
+    }
     const std::string base = write("base.ini", "model = from-file.ninfer\n"
                                                "host = 0.0.0.0\n"
                                                "port = 9000\n"

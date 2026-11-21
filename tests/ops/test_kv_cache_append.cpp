@@ -85,6 +85,8 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
         throw std::invalid_argument("test_cache_layout: bf16p is covered by test_kv_bf16p.cpp");
     case KvCacheStorage::Float16:
         throw std::invalid_argument("test_cache_layout: fp16 uses native_half_append_case");
+    case KvCacheStorage::Mxfp8:
+        throw std::invalid_argument("test_cache_layout: mxfp8 is Inkling 2's own cache");
     }
     throw std::invalid_argument("unsupported test KV storage");
 }

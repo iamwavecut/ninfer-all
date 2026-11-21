@@ -130,6 +130,8 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     // bf16p: BF16 rows packed losslessly into 392 bytes (bf16p_codec.cuh). Opt-in.
     if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
+    // mxfp8: E4M3 values over a power-of-two scale per 32 (Inkling 2, its default).
+    if (text == "mxfp8") { return KvCacheStorage::Mxfp8; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -241,7 +243,8 @@ std::string usage_text(const char* argv0) {
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  bf16 (default), int8, fp8, rk8v4, rk4v4,\n"
            "                                rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
-           "                                fp16: Flash-Next, Gemma 4 and Flint\n" +
+           "                                fp16: Flash-Next, Gemma 4 and Flint; mxfp8:\n"
+           "                                Inkling 2 (its default)\n" +
            std::string(product::kKvResidentHelp) +
            "\n"
            "SPECULATIVE DECODING\n"
@@ -419,6 +422,7 @@ Options parse_arguments(const std::vector<std::string>& arguments,
     bool device_explicit      = false;
     bool ngram_width_explicit       = false;
     bool spec_explicit              = false;
+    bool kv_dtype_explicit          = false;
     bool vision_max_merged_explicit = false;
     std::optional<std::size_t> kv_headroom_mib;
 
@@ -519,7 +523,8 @@ Options parse_arguments(const std::vector<std::string>& arguments,
         } else if (product::parse_kv_resident_option(arg, options.kv_resident_positions,
                                                      [&] { return value(arg); })) {
         } else if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_cache(value(arg));
+            options.kv_cache   = parse_kv_cache(value(arg));
+            kv_dtype_explicit  = true;
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
             spec_explicit               = true;
@@ -773,6 +778,7 @@ Options parse_arguments(const std::vector<std::string>& arguments,
     }
     product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
     product::apply_automatic_speculation(options.speculative, spec_explicit);
+    options.kv_cache_automatic = !kv_dtype_explicit;
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency != VisionResidency::Resident && !options.enable_vision) {
         throw product::OptionConflict({"vision-residency", "vision"},

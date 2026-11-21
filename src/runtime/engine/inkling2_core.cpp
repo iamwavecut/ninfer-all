@@ -142,10 +142,14 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                     "--adaptive-mtp only with --spec dspark and --draft-min-p only "
                                     "with --spec dspine or dspark");
     }
-    if (options.kv_cache != KvCacheStorage::BFloat16 &&
-        options.kv_cache != KvCacheStorage::Float16) {
+    if (options.kv_cache != KvCacheStorage::Mxfp8 && options.kv_cache != KvCacheStorage::BFloat16 &&
+        options.kv_cache != KvCacheStorage::Float16 &&
+        options.kv_cache != KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 &&
+        options.kv_cache != KvCacheStorage::RotatedLloyd4KeyInt4Value) {
         throw std::invalid_argument(
-            "Inkling 2 keeps its KV cache in F16 (--kv-dtype fp16, or bf16, the default)");
+            "Inkling 2 keeps its KV cache in MXFP8 (--kv-dtype mxfp8, the default) or F16 "
+            "(--kv-dtype bf16 or fp16), or quantizes the eight full-attention visits' planes "
+            "(--kv-dtype rk8v4 or rk4v4; the sliding-window visits' rings stay F16)");
     }
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
@@ -230,6 +234,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.max_context   = options.max_context;
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs   = options.use_cuda_graph;
+    executor.kv_cache      = options.kv_cache;
     executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
     executor.dspine        = dspine;
     executor.dspark        = dspark;
@@ -302,10 +307,15 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     }
     instance->free_after_weights = free_after_weights;
     instance->free_after_startup = free_bytes();
+    const char* kv_name = executor.kv_cache == KvCacheStorage::Mxfp8                     ? "mxfp8"
+                          : executor.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ? "rk8v4"
+                          : executor.kv_cache == KvCacheStorage::RotatedLloyd4KeyInt4Value ? "rk4v4"
+                          : executor.kv_cache == KvCacheStorage::Float16                   ? "fp16"
+                                                                                           : "bf16";
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "Inkling 2: %u sequence(s), prompt chunks of %u tokens, F16 KV %.0f MiB%s, "
+                       "Inkling 2: %u sequence(s), prompt chunks of %u tokens, %s KV %.0f MiB%s, "
                        "workspace %.0f MiB",
-                       executor.sequences, executor.prefill_chunk,
+                       executor.sequences, executor.prefill_chunk, kv_name,
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
                        instance->executor->memory().kv_grows
                            ? " at most, growing with the sequences beside an elastic expert cache"
@@ -569,7 +579,7 @@ struct Inkling2Core::Impl {
     Inkling2Instance& instance;
     DeviceContext& device;
     const std::uint32_t max_context;
-    const KvCacheStorage kv_cache; // the requested name of the F16 cache (bf16 or fp16)
+    const KvCacheStorage kv_cache; // the storage (mxfp8, rk8v4, rk4v4, or bf16 / fp16 naming F16)
     const std::size_t max_outstanding;
     const std::chrono::milliseconds pending_timeout;
     const std::uint32_t domain;
@@ -2972,7 +2982,7 @@ MemorySummary Inkling2Core::memory_summary() const {
     out.device      = impl_->device.rank(0).device;
     out.max_context = impl_->max_context;
     out.kv_capacity = impl_->max_context;
-    out.kv_cache    = impl_->kv_cache; // F16 rows either way
+    out.kv_cache    = impl_->kv_cache;
     out.host_kv_capacity_bytes = impl_->host_budget;
     {
         std::lock_guard lock(impl_->stats_mutex);

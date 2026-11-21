@@ -465,6 +465,8 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t call_q_heads, s
             switch (storage) {
             case KvCacheStorage::Float16:
                 throw std::invalid_argument("native FP16 KV requires sparse attention");
+            case KvCacheStorage::Mxfp8:
+                throw std::invalid_argument("MXFP8 KV is Inkling 2's own cache");
             case KvCacheStorage::BFloat16:
             case KvCacheStorage::Bf16Packed:
                 prompt_limit = width <= 4 ? 128 : width <= 8 ? 256 : 640;

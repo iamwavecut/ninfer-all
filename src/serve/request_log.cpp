@@ -139,6 +139,8 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "bf16";
     case ninfer::KvCacheStorage::Float16:
         return "fp16";
+    case ninfer::KvCacheStorage::Mxfp8:
+        return "mxfp8";
     case ninfer::KvCacheStorage::Int8Group64:
         return "int8-group64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:
