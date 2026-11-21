@@ -4,7 +4,8 @@ NInfer-all runs Thinking Machines' [Inkling 2 Mini](https://huggingface.co/think
 (`Inkling2LoopForConditionalGeneration`; its text component `Inkling2ForCausalLM`), a looped
 mixture-of-experts model of 26.4B parameters with 3.4B active per token (5.4B with its three
 passes), from a llama.cpp GGUF: Unsloth's
-[UD-IQ4_XS](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), IsValorum's
+[UD-IQ4_XS](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (or its UD-IQ1_M, UD-Q2_K_XL and
+UD-Q3_K_XL), IsValorum's
 [APEX-I MiniPlus](https://huggingface.co/IsValorum/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-GGUF) or
 another quantization of the release, with the release's vision tower (BF16 or Q8_0) and DSpark
 drafter. It is the engine's first looped
@@ -146,6 +147,12 @@ python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
 It writes 13,740,465,920 bytes (12.8 GiB) of 1,173 objects. Each conversion took about two minutes
 on a rented A40's container.
 
+Unsloth's UD-IQ1_M, UD-Q2_K_XL and UD-Q3_K_XL convert like UD-IQ4_XS (`--source gguf=` names the
+file) to 8,785,600,768, 10,080,361,216 and 14,392,937,728 bytes, in about 30 seconds each on a
+rented RTX 3090 host. UD-Q2_K_XL stores layer 20's down bank in MXFP4, which the expert products
+do not take: the converter writes the same values as Q8_0 blocks, each code's doubled value as
+the int8 code and 2^(e - 128) as the F16 scale, checking every block against the MXFP4 decode.
+
 ## Running
 
 ```bash
@@ -263,6 +270,24 @@ A40 (300 W, PCIe 4.0 x16, CUDA 12.8, build `86`), November 21, 2026:
   every expert) gave the device run's 384 greedy tokens byte for byte.
 - **Images.** The image prompt of examples/cli/messages/image_natural.json (greedy) names the
   mailbox's 24 and the sun on the right, as UD-IQ4_XS does.
+
+### Smaller quantizations
+
+Unsloth's UD-IQ1_M (8.2 GiB), UD-Q2_K_XL (9.4 GiB) and UD-Q3_K_XL (13.4 GiB), each with the Q8_0
+tower and the DSpark drafter, on a rented RTX 3090 (350 W, PCIe 4.0 x16, CUDA 12.8), November 21,
+2026, one run each:
+
+| Quantization | Unsloth's KLD to UD-Q8_K_XL | Mean NLL, 40 KB WikiText | Essay, `--spec none` | Essay, DSpark | GPU plan: 8K, `--spec none` / 32K, tower and DSpark |
+|---|---:|---:|---:|---:|---:|
+| UD-IQ1_M | 0.0867 | 1.929600 (+3.75%) | 124.3 tok/s | 128.9 (1.67 a round) | 9.2 / 10.9 GiB |
+| UD-Q2_K_XL | 0.0595 | 1.901978 (+2.26%) | 121.3 | 130.3 (1.92) | 10.4 / 12.1 GiB |
+| UD-Q3_K_XL | 0.0174 | 1.861615 (+0.09%) | 113.5 | 126.1 (2.03) | 14.4 / 16.1 GiB |
+
+The NLL differences are against UD-IQ4_XS's 1.859871 (`--kv-dtype bf16`, 9,718 scored tokens).
+With `--expert-residency host` (6.3, 7.5 and 11.4 GiB pinned) or `disk` each gave the device
+run's 384 greedy tokens, reasoning included, byte for byte, as did DSpark; the 3090's cache held
+every expert. Each names the mailbox's 24 and the sun on the right in the image prompt of
+examples/cli/messages/image_natural.json. No card under 24 GB has run them.
 
 ### Across cards
 

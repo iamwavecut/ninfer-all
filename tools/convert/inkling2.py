@@ -10,10 +10,11 @@ of 6 layers, and a core layer's passes after the first take messages from the pr
 rank-64 controllers. The MoE routes 8 of 128 experts by sigmoid score plus a selection bias and runs
 SiTU (gated by a capped sigmoid product) over [gate; up] rows with a per-expert scale of each
 product. The recipe imports the GGUF's block matrices row for row, as stored; a row of the artifact
-is byte for byte a row of the GGUF. BF16 and F32 tensors (sink and dynamic-tap projections, router,
-convolutions, clips, the distance tables, mixing queries, norms, controllers, expert scales) become
-FP32, exactly, as do Q8_0 ones, whose values d * q FP32 holds (IsValorum's APEX GGUFs store the
-sink and dynamic-tap projections in Q8_0).
+is byte for byte a row of the GGUF, except that an MXFP4 expert bank (UD-Q2_K_XL's layer 20 down
+bank), which the expert products do not take, becomes the same values in Q8_0 blocks. BF16 and F32
+tensors (sink and dynamic-tap projections, router, convolutions, clips, the distance tables, mixing
+queries, norms, controllers, expert scales) become FP32, exactly, as do Q8_0 ones, whose values d *
+q FP32 holds (IsValorum's APEX GGUFs store the sink and dynamic-tap projections in Q8_0).
 
 The GGUFs come in two layouts that convert to the same artifact: llama.cpp's (`inkling2_loop`, 24
 blocks, a block's four message queries in `blk.N.loop_msg_query` and its controllers
@@ -43,6 +44,7 @@ target's head.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -50,11 +52,11 @@ import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
-from .gguf_blocks import GGML_Q8_0, block_source, dequantize_q8_0
+from .gguf_blocks import GGML_MXFP4, GGML_Q8_0, block_source, dequantize_q8_0, mxfp4_as_q8_0
 from .methods import cast_direct, import_encoded
 from .resources import _dump_json, token_domain
 from .sources.gguf import GGUFFile
-from .sources.logical import LogicalSource, array_source
+from .sources.logical import EncodedRows, LogicalSource, array_source
 from .ternary import rows
 
 ARCHITECTURES = ("Inkling2LoopForConditionalGeneration",)
@@ -305,7 +307,19 @@ def _matrix(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSourc
     stored = (int(np.prod(info.shape[:-1])), info.shape[-1])
     if stored != shape:
         raise ValueError(f"{tensor}: stored {info.shape}, expected rows x columns {shape}")
-    return block_source(gguf, tensor, shape, rows())
+    source = block_source(gguf, tensor, shape, rows())
+    if info.type_id != GGML_MXFP4:
+        return source
+
+    # The expert products have no MXFP4 kernel (UD-Q2_K_XL stores one down bank so): the same
+    # values as Q8_0 blocks, each code's doubled value times 2^(e - 128) as d.
+    def encoded(begin: int, end: int) -> EncodedRows:
+        stored_rows = source.read_encoded(begin, end)
+        blocks = mxfp4_as_q8_0(stored_rows.codes.numpy())
+        return replace(stored_rows, format="gguf_q8_0", codes=torch.from_numpy(blocks))
+
+    return replace(source, label=f"{tensor}[gguf_mxfp4 as gguf_q8_0]{list(shape)}",
+                   read_encoded=encoded)
 
 
 def message_queries(gguf: GGUFFile, config: dict, layer: int) -> LogicalSource:
