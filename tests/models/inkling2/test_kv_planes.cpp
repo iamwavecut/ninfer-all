@@ -188,8 +188,8 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
     const auto plane = [&](DeviceBuffer& codes, DeviceBuffer& scales, int cb, int sb,
                            mi::KvCoding coding) {
         mi::KvPlaneView view;
-        view.codes      = static_cast<const std::uint8_t*>(codes.p);
-        view.scales     = static_cast<const std::uint8_t*>(scales.p);
+        view.codes      = static_cast<std::uint8_t*>(codes.p);
+        view.scales     = static_cast<std::uint8_t*>(scales.p);
         view.code_row   = cb;
         view.scale_row  = sb;
         view.code_head  = std::int64_t(slots) * cb;

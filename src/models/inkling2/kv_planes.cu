@@ -33,14 +33,14 @@ __launch_bounds__(kWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
     const int r    = unit / a.heads;
     const int slot = physical(a.rows, r);
     const int sequence = row_sequence(a.rows, r);
-    const __half* src  = a.src + head * a.src_head_stride + std::int64_t(r) * kKvRowDims;
+    const __half* src = a.src + head * a.src_head_stride + std::int64_t(r) * kKvRowDims;
     float x[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) { x[i] = __half2float(src[lane + 32 * i]); }
-    std::uint8_t* codes  = const_cast<std::uint8_t*>(a.dst.codes) + sequence * a.dst.code_seq +
-                          head * a.dst.code_head + std::int64_t(slot) * a.dst.code_row;
-    std::uint8_t* scales = const_cast<std::uint8_t*>(a.dst.scales) + sequence * a.dst.scale_seq +
-                           head * a.dst.scale_head + std::int64_t(slot) * a.dst.scale_row;
+    std::uint8_t* codes  = a.dst.codes + sequence * a.dst.code_seq + head * a.dst.code_head +
+                          std::int64_t(slot) * a.dst.code_row;
+    std::uint8_t* scales = a.dst.scales + sequence * a.dst.scale_seq + head * a.dst.scale_head +
+                           std::int64_t(slot) * a.dst.scale_row;
     kv::encode_row<C>(x, codes, scales, lane);
 }
 

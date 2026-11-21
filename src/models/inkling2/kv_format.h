@@ -72,8 +72,8 @@ struct KvFormat {
 // A quantized plane of a visit: one row's codes at codes + sequence * code_seq +
 // head * code_head + slot * code_row, its scales likewise (executor.cpp's code and scale areas).
 struct KvPlaneView {
-    const std::uint8_t* codes   = nullptr;
-    const std::uint8_t* scales  = nullptr;
+    std::uint8_t* codes  = nullptr;
+    std::uint8_t* scales = nullptr;
     std::int64_t code_row = 0, scale_row = 0, code_head = 0, scale_head = 0, code_seq = 0,
                  scale_seq = 0;
     KvCoding coding = KvCoding::F16;

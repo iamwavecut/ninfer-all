@@ -2247,8 +2247,8 @@ struct Executor::Impl {
         if (quantized) {
             const auto view = [&](const KvArea& codes, const KvArea& scales, KvCoding coding) {
                 KvPlaneView plane;
-                plane.codes   = static_cast<const std::uint8_t*>(codes.p);
-                plane.scales  = static_cast<const std::uint8_t*>(scales.p);
+                plane.codes   = static_cast<std::uint8_t*>(codes.p);
+                plane.scales  = static_cast<std::uint8_t*>(scales.p);
                 plane.code_row  = kv_code_bytes(coding);
                 plane.scale_row = kv_scale_bytes(coding);
                 plane.code_head  = std::int64_t(vp.slots) * plane.code_row;
