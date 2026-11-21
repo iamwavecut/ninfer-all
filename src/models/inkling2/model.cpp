@@ -109,7 +109,8 @@ bool component_is(const artifact::Reader& reader, std::string_view component,
     const auto& config = found->second.config;
     return config.is_object() && config.contains("architectures") &&
            config.at("architectures").is_array() && config.at("architectures").size() == 1 &&
-           config.at("architectures")[0] == architecture;
+           config.at("architectures")[0].is_string() &&
+           config.at("architectures")[0].get_ref<const std::string&>() == architecture;
 }
 
 } // namespace
