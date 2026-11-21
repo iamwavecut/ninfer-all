@@ -290,6 +290,10 @@ ninfer-serve --config configs/inkling2-mini.ini
 # Less GPU memory: the experts in 13.1 GiB of pinned host memory, the most used cached on the GPU,
 # a 32K-token context; on an RTX 3090 the cache holds all of them and decodes 123 tok/s.
 ninfer-serve --config configs/inkling2-mini-host.ini
+
+# 8 GB, with a 12K-token context: the CLI with these settings on an RTX 5060 cached 2.2 GiB of
+# experts and decoded the essay at 33.6 tok/s, 8.8 with --expert-residency disk.
+ninfer-serve --config configs/inkling2-mini-host.ini --max-context 12288
 ```
 
 ## Qwen3.6-35B-A3B NVFP4

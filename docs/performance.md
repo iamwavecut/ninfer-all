@@ -1065,25 +1065,59 @@ cache each card holds, context lookup, startup and what limits each engine.
 
 ## Inkling 2 Mini
 
-Thinking Machines' looped Inkling 2 Mini from Unsloth's
-[UD-IQ4_XS GGUF](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3), F16 KV, one
-sequence, on an RTX 3090 (350 W, the `86` build, experts on the GPU), November 21, 2026.
+Thinking Machines' looped Inkling 2 Mini from Unsloth's [UD-IQ4_XS
+GGUF](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3), F16 KV, one sequence, at
+their default power limits, November 21, 2026: seventeen cards with the experts on the GPU and eight
+of 8 to 16 GB with them in pinned host memory.
 
 ### Engine rates
 
-Prompt and decode in tok/s; llama.cpp b12588's `llama-bench` on the same GGUF with flash attention,
+Prompt of 10,000 tokens and decode of 128 in tok/s, the release packages against `llama-bench`
+from Unsloth's llama.cpp prebuilt `b12588-mix-c0c3de8` on the same GGUF with flash attention,
 three repetitions each:
 
-| Engine | Prompt 2,048 | Prompt 10,000 | Decode | after 10,000 |
+| Card | NInfer-all prompt | llama.cpp prompt | NInfer-all decode | llama.cpp decode |
 |---|---:|---:|---:|---:|
-| NInfer | 2,659 | 2,031 | 111.4 | 95.9 |
-| llama.cpp | 1,301 | 1,228 | 58.6 | 55.9 |
+| RTX PRO 6000 Blackwell Workstation Edition | 7,235 | 2,443 | 178.4 | 97.2 |
+| RTX 5090 | 6,664 | 2,318 | 182.1 | 96.9 |
+| RTX PRO 6000 Blackwell Server Edition | 6,434 | 2,176 | 158.0 | 84.4 |
+| RTX 4090 | 4,537 | 2,307 | 140.1 | 75.0 |
+| L40S | 3,985 | 2,201 | 113.8 | 65.2 |
+| RTX 6000 Ada | 3,640 | 2,278 | 134.6 | 72.0 |
+| RTX PRO 4500 Blackwell | 3,067 | 1,681 | 125.5 | 78.4 |
+| RTX PRO 4500 Blackwell Server Edition | 2,568 | 1,512 | 112.4 | 71.1 |
+| RTX 3090 | 2,046 | 1,236 | 112.0 | 59.5 |
+| RTX A6000 | 1,980 | 1,151 | 99.1 | 55.9 |
+| A40 | 1,897 | 1,051 | 85.3 | 50.8 |
+| A100-SXM4-80GB | 1,925 | 1,136 | 107.1 | 47.6 |
+| A100 80GB PCIe | 1,916 | 1,119 | 106.1 | 47.0 |
+| Tesla V100-SXM2-32GB | 1,589 | 471 | 72.8 | 35.3 |
+| RTX A5000 | 1,509 | 981 | 94.3 | 54.6 |
+| RTX 4000 Ada | 1,450 | 924 | 64.7 | 45.7 |
+| RTX A4500 | 1,280 | 843 | 81.5 | 49.5 |
 
-The release's DSpark drafter, which drafts by default while one request runs, decodes 384-token
-greedy answers 1.14 to 1.41 times as fast as plain decoding and sampled ones 0.99 to 1.24 times.
-With the experts in pinned host memory the 3090's cache holds every expert and decodes at 100.3
-tok/s, 117.8 with DSpark. [Inkling 2 Mini's measurements](inkling2.md#measurements) add the
-drafter, context lookup, concurrency, expert residency and expert parallelism over two cards.
+With the experts in pinned host memory, against llama.cpp's own placement for the card
+(`--fit-target 1024 --fit-ctx 10240`):
+
+| Card | NInfer-all prompt | llama.cpp prompt | NInfer-all decode | llama.cpp decode |
+|---|---:|---:|---:|---:|
+| RTX 5080 | 3,238 | 1,377 | 116.5 | 41.3 |
+| RTX 4080 Super | 2,953 | 1,379 | 104.4 | 59.2 |
+| RTX 5070 | 2,048 | 724 | 83.5 | 35.6 |
+| RTX 5060 Ti 16 GB | 1,502 | 793 | 72.1 | 45.6 |
+| RTX 4060 Ti 16 GB | 1,308 | 719 | 53.8 | 39.4 |
+| RTX A4000 | 1,002 | 486 | 57.2 | 37.7 |
+| RTX 3060 12 GB | 759 | 387 | 48.8 | 24.8 |
+| RTX 5060 8 GB | 1,074 | 293 | 33.1 | 14.7 |
+
+The release's DSpark drafter, which drafts by default while one request runs, decodes a 384-token
+greedy essay 1.06 to 1.33 times as fast as plain decoding on the cards with the experts on the GPU
+and 0.97 to 1.11 times with them in host memory; on the RTX 3090 greedy answers decode 1.14 to 1.41
+times as fast and sampled ones 0.99 to 1.24 times. With the experts in pinned host memory the 3090's
+cache holds every expert and decodes at 100.3 tok/s, 117.8 with DSpark. [Inkling 2 Mini's
+measurements](inkling2.md#measurements) add the prompt of 2,048 tokens, decode after 10,000, the
+drafter on each card, context lookup, concurrency, expert residency and expert parallelism over two
+cards.
 
 ## Measurement pages
 
@@ -1097,7 +1131,7 @@ drafter, context lookup, concurrency, expert residency and expert parallelism ov
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
 | [Flint](flint.md#measurements) | against llama.cpp, host and disk experts, context lookup, typed decisions | RTX 3090, 4090, 5090, A40 |
-| [Inkling 2 Mini](inkling2.md#measurements) | against llama.cpp, the DSpark drafter, context lookup, concurrency, host and disk experts with the built-in routing profile, expert parallelism | RTX 3090, 2x RTX 3090 |
+| [Inkling 2 Mini](inkling2.md#measurements) | against llama.cpp on twenty-five cards, eight of them with host experts, the DSpark drafter, context lookup, concurrency, host and disk experts with the built-in routing profile, expert parallelism | RTX PRO 6000 Workstation and Server Editions, RTX 5090, 4090, 3090, 2x RTX 3090, PRO 4500 and its Server Edition, 6000 Ada, 4000 Ada, L40S, A6000, A40, A100 80 GB SXM4 and PCIe, A5000, A4500, A4000, RTX 5080, 5070, 5060 Ti, 5060, 4080 Super, 4060 Ti, 3060, Tesla V100-SXM2-32GB |
 | [GGUF models across cards, November 2026](performance/gguf-cards-2026-11.md) | Gemma 4 26B-A4B and 31B, Flint, Flash-Next and DeepSeek-V4.1 from one release build: prompt and decode rates, the `cp.async` MMQ tiles against the compiled loop, perplexity per card | RTX PRO 6000 Server Edition, RTX 5090, 4090, 3090, 5060 Ti, L40S, A100 80 GB and 40 GB |
 | [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token, Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards | RTX 5070 Ti, 4090, 4080, 5060 Ti |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |
