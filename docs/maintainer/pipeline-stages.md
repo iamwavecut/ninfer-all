@@ -862,7 +862,8 @@ routed experts of each MoE block: rank r holds experts `[e_r, e_{r+1})`, a conti
 of `--tensor-split`'s weights (`split_shares` over single experts). Rank 0 runs attention, the
 router, the shared expert, the head, the drafters and Vision, as one device does (Inkling 2 also
 its depth mixes and controllers; it has no shared expert, and its pairs' expert scales travel with
-the weights). Inkling 2's division is built but has not run on more than one GPU yet.
+the weights). Inkling 2's decode text over two RTX 3090s equals one card's byte for byte, and its
+DSpark rounds draft there by default ([measurements](../inkling2.md#measurements)).
 
 - **A MoE call** (`ExpertParallelExchange`, `core/expert_parallel.h`). Rank 0 routes the call, then
   sends what the experts read (the q8_1 activation of a call of up to eight tokens, or the BF16 rows

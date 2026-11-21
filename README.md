@@ -519,7 +519,8 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   non-causal blocks over the target's tapped states and a recurrent head that corrects the target
   head's logits; without `--spec` it drafts while the Engine serves one request at a time, 3 drafts
   a round adapting to their survival, and the output is plain decoding's. On an RTX 3090 it decodes
-  greedy answers 1.14 to 1.41 times as fast and sampled ones 0.99 to 1.24 times.
+  greedy answers 1.14 to 1.41 times as fast and sampled ones 0.99 to 1.24 times; over two RTX
+  3090s with `--tensor-parallel`, where it also drafts by default, 1.33 to 1.70 and 1.18 times.
 - A DSpine drafter is an artifact of its own (`--spec dspine --draft-model PATH`): 1 to 15 drafts
   on Qwen3.5-core models and Qwen3.8-Flash-Next, 1 to 7 on Gemma 4, Flint, DeepSeek-V4.1 and
   Inkling 2.
@@ -605,8 +606,7 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
   any weight format, sized to the card, and reads only those per token
   ([tensor parallelism](docs/maintainer/pipeline-stages.md#tensor-parallelism)), Qwen3.8-Flash-Next
   its GDN key heads, attention KV heads and routed experts. Gemma 4, Flint, DeepSeek-V4.1-Flash and
-  Inkling 2 divide only their routed experts this way (Inkling 2's division has not run on more
-  than one GPU yet).
+  Inkling 2 divide only their routed experts this way.
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel
   for an NVFP4 KV cache, and programmatic dependent launches on Blackwell.
 

@@ -90,7 +90,7 @@ struct SpeculativeOptions {
     // kAutomaticDraftMinP, a round of several requests with a CPU share verifying at most the
     // tokens of the widest call the CPU shares (64 with GGUF host experts), Edge0's form also with
     // device experts at max_concurrency 1; Gemma 4 with host or disk experts with its assistant,
-    // kAutomaticDraftTokens a round; Inkling 2 at max_concurrency 1 without tensor parallelism
+    // kAutomaticDraftTokens a round; Inkling 2 at max_concurrency 1, also over tensor parallelism,
     // with its DSpark drafter, kAutomaticDSparkTokens a round adapting (Adaptive) and ending at the
     // first draft at or below kAutomaticDSparkMinP; others run without drafts. options() report
     // the backend.
