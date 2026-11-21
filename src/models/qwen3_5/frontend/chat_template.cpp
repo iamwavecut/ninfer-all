@@ -600,10 +600,16 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
     }
     // Select a recovery point from the template's observed serialization. A single ordinary
     // next-turn probe distinguishes retained history from a rewritten open turn, including
-    // templates whose defaults or aliases differ from the typed request hint. This only chooses
-    // the checkpoint to retain: subsequent requests still require exact token/state identity.
+    // templates whose defaults or aliases differ from the typed request hint. A history assistant
+    // whose turn is still open (Gemma 4's tool calls, answered inside the model's turn) is probed
+    // too: where a next turn keeps it, the prompt's end is the checkpoint. The generation prompt's
+    // own open turn is not history. This only chooses the checkpoint to retain: subsequent
+    // requests still require exact token/state identity.
     bool retain_open_turn = context.value("preserve_thinking", false);
-    if (first_tail_assistant && layout.messages[*first_tail_assistant].closed) {
+    if (first_tail_assistant &&
+        (layout.messages[*first_tail_assistant].closed ||
+         layout.messages[*first_tail_assistant].begin <
+             generation_begin.value_or(output.text.size()))) {
         try {
             const auto next_turn = next_turn_render.valid()
                                        ? next_turn_render.get()

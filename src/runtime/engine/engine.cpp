@@ -52,11 +52,33 @@ bool own_family_artifact(const std::filesystem::path& path) {
 }
 
 // Those families keep context caches of their own, which the checkpoint catalog's options
-// configure; the hybrid prefix cache, the server's default, belongs to the Qwen3.5 Program.
+// configure; the hybrid prefix cache, the server's default, belongs to the Qwen3.5 Program, and so
+// do its Host tier file, prompt grafts, saves of evicted sessions and model suspend. Of the own
+// families only Flash-Next keeps a disk tier.
 EngineOptions with_family_context_cache(EngineOptions options) {
-    if (own_family_artifact(options.artifact_path)) {
-        options.context_cache.mode = ContextCacheMode::Legacy;
+    if (!own_family_artifact(options.artifact_path)) { return options; }
+    const char* option = nullptr;
+    if (!options.context_cache.hybrid.persistent_file.empty()) {
+        option = "--prefix-cache-file";
+    } else if (!options.grafts.empty()) {
+        option = "--graft";
+    } else if (options.slot_auto_save.enabled) {
+        option = "--auto-save-evicted";
+    } else if (options.suspend.enabled) {
+        option = "--model-suspend";
     }
+    if (option != nullptr) {
+        throw std::invalid_argument(std::string(option) +
+                                    " applies to Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM "
+                                    "artifacts");
+    }
+    if (!options.context_cache.disk_kv_path.empty() &&
+        !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        throw std::invalid_argument(
+            "--disk-kv-path applies to Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM and "
+            "Qwen4ExpForCausalLM artifacts");
+    }
+    options.context_cache.mode = ContextCacheMode::Legacy;
     return options;
 }
 

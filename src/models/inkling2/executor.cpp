@@ -5,6 +5,7 @@
 #include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
+#include "core/mapped_host_copy.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -1217,6 +1218,11 @@ struct Executor::Impl {
         }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
+        // Where a device's copies queue behind one another whatever their streams
+        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for the
+        // misses can hold the copies the graph queued after it ahead of the delivery's own, which
+        // end that wait. Eager passes wait on the host and queue nothing behind the wait.
+        if (serialized_copy_queue()) { options.cuda_graphs = false; }
         for (auto& p : layers) {
             if (p.delivery_layer < 0) { continue; }
             const auto l       = std::size_t(p.delivery_layer);

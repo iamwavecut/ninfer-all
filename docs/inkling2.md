@@ -98,8 +98,9 @@ tokenization, the chat template, output parsing and the serving protocols.
 Not built for this family: the quantized `--kv-dtype` formats (the KV cache is F16, `bf16` or
 `fp16`), MTP, DFlash, n-gram copy drafts and their archive, `--draft-confidence`, rotation scaling
 (the attention has no rotation), thinking budgets, video, pipeline stages, and of the context
-cache the shared paged KV pool, the disk tier and session slots. DSpark drafts for one request at a
-time; with several requests decoding, each decodes a token a step.
+cache the shared paged KV pool, the disk tier and session slots; the server refuses their options
+and `--default-thinking-budget` at startup ([Serving](serving.md#slots)). DSpark drafts for one
+request at a time; with several requests decoding, each decodes a token a step.
 
 ## Converting
 

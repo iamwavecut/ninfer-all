@@ -415,6 +415,9 @@ struct FlintCore::Request {
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
+    // The prompt tokens and the prompt time the stats hold so far (count_prefill).
+    std::uint32_t prefill_counted = 0;
+    Clock::time_point prefill_counted_at;
     SpeculativeStats speculative; // an Engine with --lookup-ngram only
 };
 
@@ -426,6 +429,9 @@ struct FlintCore::Impl {
         // runtime::lookup_draft's copy source, as its distance from the end of `fed`.
         std::size_t lookup_lag = 0;
         models::flint::SequenceSnapshot snapshot;
+        // What `anchor` is: the prompt's turn closure, or its end where a next turn keeps it
+        // (the rewrite checkpoint's response replay).
+        PrefixReusePath anchor_path = PrefixReusePath::PrivateTurnClosure;
         std::uint64_t last_used = 0;
         bool disposable         = false; // its last request's
     };
@@ -825,7 +831,9 @@ struct FlintCore::Impl {
             }
             bool worked = true;
             try {
-                admit();
+                // An admitted prompt shows as running while its first step computes, which
+                // can take as long as the whole prompt.
+                if (admit()) { publish_stats(); }
                 worked = step();
                 check_progress();
             } catch (...) { fail_engine(std::current_exception()); }
@@ -1006,7 +1014,7 @@ struct FlintCore::Impl {
         const bool anchored = !slot.anchor.empty() && slot.anchor.size() <= slot.fed.size() &&
                               std::equal(slot.anchor.begin(), slot.anchor.end(), slot.fed.begin());
         if (anchored) {
-            store_image(s, slot.anchor, &slot.snapshot, PrefixReusePath::PrivateTurnClosure);
+            store_image(s, slot.anchor, &slot.snapshot, slot.anchor_path);
         }
         if (slot.fed != slot.anchor && !slot.disposable) {
             store_image(s, slot.fed, nullptr, PrefixReusePath::PrivateEndpoint);
@@ -1023,18 +1031,27 @@ struct FlintCore::Impl {
         stats.state_h2d_bytes += image.bytes;
     }
 
+    // The reuse path of an anchor at the request's anchor_at: its turn closure before the prompt's
+    // end, else the end, which the template keeps for a next turn.
+    static PrefixReusePath anchor_path(const Request& r) {
+        return r.anchor_at < r.prompt_tokens.size() ? PrefixReusePath::PrivateTurnClosure
+                                                   : PrefixReusePath::PrivateResponseReplay;
+    }
+
     [[nodiscard]] std::uint32_t reuse(const Slot& slot, const Request& prompt) const {
         if (!reuse_prefixes) { return 0; }
         return std::max(prefix_reuse(slot.fed, prompt), prefix_reuse(slot.anchor, prompt));
     }
 
-    void admit() {
+    // Moves queued requests into free sequences; returns whether a request left the queue.
+    bool admit() {
+        bool moved = false;
         for (;;) {
             std::optional<std::uint32_t> best;
             std::shared_ptr<Request> request;
             {
                 std::lock_guard lock(queue_mutex);
-                if (pending.empty()) { return; }
+                if (pending.empty()) { return moved; }
                 for (std::uint32_t s = 0; s < slots.size(); ++s) {
                     if (slots[s].request) { continue; }
                     if (!best) {
@@ -1049,9 +1066,10 @@ struct FlintCore::Impl {
                         best = s;
                     }
                 }
-                if (!best) { return; }
+                if (!best) { return moved; }
                 request = std::move(pending.front());
                 pending.pop_front();
+                moved = true;
             }
             if (Clock::now() > request->deadline) {
                 complete(request, std::make_exception_ptr(
@@ -1102,7 +1120,7 @@ struct FlintCore::Impl {
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
                 reused       = anchored;
-                r.reuse_path = PrefixReusePath::PrivateTurnClosure;
+                r.reuse_path = slot.anchor_path;
             } else if (live > 0) {
                 reused       = live;
                 r.reuse_path = PrefixReusePath::PrivateEndpoint;
@@ -1493,12 +1511,14 @@ struct FlintCore::Impl {
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         r.prefilled += n;
         r.progress = Clock::now();
+        count_prefill(r, r.prefilled - r.reused, r.progress);
         if (reuse_prefixes && r.reusable &&
             std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
             store_image(r.slot, slot.fed, nullptr, PrefixReusePath::SharedStablePrefix);
         }
-        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at && r.prefilled < prompt_n) {
+        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at) {
             executor.snapshot(r.slot, slot.snapshot);
+            slot.anchor_path = anchor_path(r);
             slot.anchor = slot.fed;
         }
         if (r.observation.prompt_progress) {
@@ -1554,6 +1574,7 @@ struct FlintCore::Impl {
             if (slot.fed == r.prompt_tokens) {
                 if (slot.anchor != slot.fed) {
                     executor.snapshot(r.slot, slot.snapshot);
+                    slot.anchor_path = PrefixReusePath::PrivateResponseReplay;
                     slot.anchor = slot.fed;
                 }
             } else {
@@ -1657,6 +1678,19 @@ struct FlintCore::Impl {
         finish_prompt(request);
     }
 
+    // Adds the prompt tokens the request computed since its last count (`computed` in all) and
+    // the time since to the stats, so the throughput line shows a long prompt while it runs.
+    void count_prefill(Request& r, std::uint32_t computed, Clock::time_point now) {
+        const Clock::time_point from = std::max(r.prefill_start, r.prefill_counted_at);
+        std::lock_guard lock(stats_mutex);
+        if (computed > r.prefill_counted) {
+            stats.computed_prefill_tokens += computed - r.prefill_counted;
+            r.prefill_counted = computed;
+        }
+        if (now > from) { stats.prefill_seconds_total += seconds(from, now); }
+        r.prefill_counted_at = now;
+    }
+
     // The prompt is in (and a branched read's branches): the request takes its first token and
     // decodes from there.
     void finish_prompt(const std::shared_ptr<Request>& request) {
@@ -1666,11 +1700,7 @@ struct FlintCore::Impl {
         CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
         executor.check_experts();
         r.prefill_end = Clock::now();
-        {
-            std::lock_guard lock(stats_mutex);
-            stats.computed_prefill_tokens += prompt_n - r.reused;
-            stats.prefill_seconds_total += seconds(r.prefill_start, r.prefill_end);
-        }
+        count_prefill(r, prompt_n - r.reused, r.prefill_end);
         const auto& exec = r.options.execution;
         const std::uint32_t capacity =
             effective_output_capacity(exec.requested_output_tokens, max_context, prompt_n);

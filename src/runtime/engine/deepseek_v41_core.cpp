@@ -694,6 +694,9 @@ struct DeepSeekV41Core::Request {
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
+    // The prompt tokens and the prompt time the stats hold so far (count_prefill).
+    std::uint32_t prefill_counted = 0;
+    Clock::time_point prefill_counted_at;
     SpeculativeStats speculative; // an Engine with --spec dspark or --lookup-ngram
 };
 
@@ -707,6 +710,9 @@ struct DeepSeekV41Core::Impl {
         // The pictures among fed and anchor (an image token does not tell one from another).
         std::vector<MediaMark> media, anchor_media;
         models::deepseek_v41::SequenceSnapshot snapshot;
+        // What `anchor` is: the prompt's turn closure, or its end where a next turn keeps it
+        // (the rewrite checkpoint's response replay).
+        PrefixReusePath anchor_path = PrefixReusePath::PrivateTurnClosure;
         // The sequence's state after its first hold_tokens tokens, where a stop string's match
         // began in the request it serves (0: none): the visible text of a turn the stop string
         // ends continues that state, not the live one, which has read the tokens the cut removed.
@@ -1116,7 +1122,9 @@ struct DeepSeekV41Core::Impl {
             }
             bool worked = true;
             try {
-                admit();
+                // An admitted prompt shows as running while its first step computes, which
+                // can take as long as the whole prompt.
+                if (admit()) { publish_stats(); }
                 worked = step();
                 check_progress();
             } catch (...) { fail_engine(std::current_exception()); }
@@ -1314,7 +1322,7 @@ struct DeepSeekV41Core::Impl {
                               std::equal(slot.anchor.begin(), slot.anchor.end(), slot.fed.begin());
         if (anchored) {
             store_image(s, slot.anchor, slot.anchor_media, &slot.snapshot,
-                        PrefixReusePath::PrivateTurnClosure);
+                        slot.anchor_path);
         }
         // A request stopped inside a prefill step leaves the decoder blocks' state incomplete.
         if (slot.fed != slot.anchor && !slot.disposable && instance.executor->resumable(s)) {
@@ -1339,19 +1347,28 @@ struct DeepSeekV41Core::Impl {
         return instance.executor->resumable(s) ? prefix_reuse(slot.fed, slot.media, prompt) : 0;
     }
 
+    // The reuse path of an anchor at the request's anchor_at: its turn closure before the prompt's
+    // end, else the end, which the template keeps for a next turn.
+    static PrefixReusePath anchor_path(const Request& r) {
+        return r.anchor_at < r.prompt_tokens.size() ? PrefixReusePath::PrivateTurnClosure
+                                                   : PrefixReusePath::PrivateResponseReplay;
+    }
+
     [[nodiscard]] std::uint32_t reuse(std::uint32_t s, const Request& prompt) const {
         if (!reuse_prefixes) { return 0; }
         return std::max(live_reuse(s, prompt),
                         prefix_reuse(slots[s].anchor, slots[s].anchor_media, prompt));
     }
 
-    void admit() {
+    // Moves queued requests into free sequences; returns whether a request left the queue.
+    bool admit() {
+        bool moved = false;
         for (;;) {
             std::optional<std::uint32_t> best;
             std::shared_ptr<Request> request;
             {
                 std::lock_guard lock(queue_mutex);
-                if (pending.empty()) { return; }
+                if (pending.empty()) { return moved; }
                 for (std::uint32_t s = 0; s < slots.size(); ++s) {
                     if (slots[s].request) { continue; }
                     if (!best) {
@@ -1366,9 +1383,10 @@ struct DeepSeekV41Core::Impl {
                         best = s;
                     }
                 }
-                if (!best) { return; }
+                if (!best) { return moved; }
                 request = std::move(pending.front());
                 pending.pop_front();
+                moved = true;
             }
             if (Clock::now() > request->deadline) {
                 complete(request, std::make_exception_ptr(
@@ -1423,7 +1441,7 @@ struct DeepSeekV41Core::Impl {
                 slot.fed     = slot.anchor;
                 slot.media   = slot.anchor_media;
                 reused       = anchored;
-                r.reuse_path = PrefixReusePath::PrivateTurnClosure;
+                r.reuse_path = slot.anchor_path;
             } else if (live > 0) {
                 reused       = live;
                 r.reuse_path = PrefixReusePath::PrivateEndpoint;
@@ -1867,12 +1885,14 @@ struct DeepSeekV41Core::Impl {
         }
         r.prefilled += n;
         r.progress = Clock::now();
+        count_prefill(r, r.prefilled - r.reused, r.progress);
         if (reuse_prefixes && r.reusable &&
             std::binary_search(r.shared_at.begin(), r.shared_at.end(), r.prefilled)) {
             store_image(r.slot, slot.fed, slot.media, nullptr, PrefixReusePath::SharedStablePrefix);
         }
-        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at && r.prefilled < prompt_n) {
+        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at) {
             executor.snapshot(r.slot, slot.snapshot);
+            slot.anchor_path = anchor_path(r);
             slot.anchor       = slot.fed;
             slot.anchor_media = slot.media;
         }
@@ -1965,6 +1985,7 @@ struct DeepSeekV41Core::Impl {
             if (slot.fed == r.prompt_tokens) {
                 if (slot.anchor != slot.fed) {
                     executor.snapshot(r.slot, slot.snapshot);
+                    slot.anchor_path = PrefixReusePath::PrivateResponseReplay;
                     slot.anchor       = slot.fed;
                     slot.anchor_media = slot.media;
                 }
@@ -2070,6 +2091,19 @@ struct DeepSeekV41Core::Impl {
         finish_prompt(request);
     }
 
+    // Adds the prompt tokens the request computed since its last count (`computed` in all) and
+    // the time since to the stats, so the throughput line shows a long prompt while it runs.
+    void count_prefill(Request& r, std::uint32_t computed, Clock::time_point now) {
+        const Clock::time_point from = std::max(r.prefill_start, r.prefill_counted_at);
+        std::lock_guard lock(stats_mutex);
+        if (computed > r.prefill_counted) {
+            stats.computed_prefill_tokens += computed - r.prefill_counted;
+            r.prefill_counted = computed;
+        }
+        if (now > from) { stats.prefill_seconds_total += seconds(from, now); }
+        r.prefill_counted_at = now;
+    }
+
     // The prompt is in (and a branched read's branches): the request takes its first token and
     // decodes from there.
     void finish_prompt(const std::shared_ptr<Request>& request) {
@@ -2079,11 +2113,7 @@ struct DeepSeekV41Core::Impl {
         CUDA_CHECK(ninfer::wait_for_stream(executor.head_stream()));
         executor.check_experts();
         r.prefill_end = Clock::now();
-        {
-            std::lock_guard lock(stats_mutex);
-            stats.computed_prefill_tokens += prompt_n - r.reused;
-            stats.prefill_seconds_total += seconds(r.prefill_start, r.prefill_end);
-        }
+        count_prefill(r, prompt_n - r.reused, r.prefill_end);
         const auto& exec = r.options.execution;
         const std::uint32_t capacity =
             effective_output_capacity(exec.requested_output_tokens, max_context, prompt_n);

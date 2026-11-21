@@ -1228,6 +1228,60 @@ int test_rewrite_checkpoint_trace() {
     return failures;
 }
 
+// Gemma 4's shape: a tool call and its response stay inside the model's open turn, and after a
+// tool response the generation prompt adds nothing. A next turn keeps that whole prompt, so the
+// checkpoint is its end (a response replay), not the start of the model's turn; where a next turn
+// rewrites the open turn, the turn closure stays.
+int test_open_turn_rewrite_checkpoint() {
+    // `rewrite_history`: an earlier tool response is shortened once a later message follows it.
+    const auto open_turn = [](bool rewrite_history) {
+        return fi::CompiledChatTemplate::resolve(
+            std::string("{%- set ns = namespace(open=false) -%}"
+                        "{%- for m in messages -%}"
+                        "{%- if m.role == 'assistant' -%}"
+                        "{%- if not ns.open -%}{{- '<|turn>model\\n' -}}{%- set ns.open = true -%}"
+                        "{%- endif -%}"
+                        "{%- for c in m.tool_calls | default([]) -%}"
+                        "{{- '<|tool_call>call:' + c.function.name + '<tool_call|>' -}}"
+                        "{%- endfor -%}{{- m.content -}}"
+                        "{%- if not m.tool_calls -%}{{- '<turn|>\\n' -}}{%- set ns.open = false -%}"
+                        "{%- endif -%}"
+                        "{%- elif m.role == 'tool' -%}") +
+            (rewrite_history
+                 ? "{{- '<|tool_response>' + (m.content if loop.last else 'elided') + "
+                   "'<tool_response|>' -}}"
+                 : "{{- '<|tool_response>' + m.content + '<tool_response|>' -}}") +
+            "{%- else -%}"
+            "{%- if ns.open -%}{{- '<turn|>\\n' -}}{%- set ns.open = false -%}{%- endif -%}"
+            "{{- '<|turn>' + m.role + '\\n' + m.content + '<turn|>\\n' -}}"
+            "{%- endif -%}"
+            "{%- endfor -%}"
+            "{%- if add_generation_prompt and not ns.open -%}"
+            "{{- '<|turn>model\\n' -}}{%- endif -%}");
+    };
+    auto call = chat_message(ninfer::ChatRole::Assistant, "");
+    call.tool_calls.push_back({.id = "c1", .name = "get_record", .arguments_json = R"({"id":1})"});
+    const std::vector<fi::ChatMessage> loop{chat_message(ninfer::ChatRole::User, "question"), call,
+                                            chat_message(ninfer::ChatRole::Tool, "record one")};
+    const std::string model_header = "<|turn>model\n";
+
+    const fi::RenderedChat kept = open_turn(false).render(loop);
+    int failures =
+        check(kept.text.ends_with("<tool_response|>") && kept.rewrite_checkpoint &&
+                  kept.rewrite_checkpoint->kind ==
+                      ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                  kept.rewrite_checkpoint->offset == kept.text.size(),
+              "an open model turn that a next turn keeps did not checkpoint the prompt's end");
+
+    const fi::RenderedChat rewritten = open_turn(true).render(loop);
+    failures += check(rewritten.rewrite_checkpoint &&
+                          rewritten.rewrite_checkpoint->kind ==
+                              ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                          rewritten.rewrite_checkpoint->offset == rewritten.text.find(model_header),
+                      "an open model turn that a next turn rewrites lost its turn closure");
+    return failures;
+}
+
 int test_selected_template_recovery_boundary() {
     auto assistant              = chat_message(ninfer::ChatRole::Assistant, "answer");
     assistant.reasoning_content = "retained reasoning";
@@ -4668,6 +4722,7 @@ int main() {
     failures += test_selected_template_instruction_prefix();
     failures += test_assistant_continuation();
     failures += test_rewrite_checkpoint_trace();
+    failures += test_open_turn_rewrite_checkpoint();
     failures += test_adjacent_tool_message_boundary();
     failures += test_literal_cache_boundary();
     failures += test_reasoning_effort_substitution();
