@@ -8,13 +8,43 @@
 // index c / chunks-per-group of the row's scales.
 
 #include "models/inkling2/kv_format.h"
+#include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 
 namespace ninfer::models::inkling2::kv {
+
+// MXFP8, the release's rule (vLLM's mxfp8_quantize for Inkling 2): a group of 32 values has the
+// scale 2^(e - 127), e the exponent of amax / 448 rounded up to a power of two (0 when amax / 448
+// is at most 2^-127, at most 254, 255 for NaN); a value's code is x * 2^(127 - e) clamped to
+// +-448 and rounded to E4M3, nearest even. Inkling's keys are clipped to qk_clip and its values
+// RMS-normed, so their exponents stay far below 246, the largest the decode below represents.
+__device__ __forceinline__ unsigned mxfp8_exponent(float amax) {
+    const float raw = amax * (1.0f / 448.0f);
+    if (raw != raw) { return 255u; }
+    if (raw <= 0x1p-127f) { return 0u; }
+    const unsigned e = ((__float_as_uint(raw) + 0x007FFFFFu) & 0x7F800000u) >> 23;
+    return min(e, 254u);
+}
+
+// The code of x in a group of exponent e.
+__device__ __forceinline__ std::uint8_t mxfp8_code(float x, unsigned e) {
+    // 2^(127 - e): e 0 gives 2^127, as the rule's inverse does; NaN groups encode zeros times NaN.
+    const float inverse = e == 255u ? 0.0f : __uint_as_float((254u - e) << 23);
+    const float v       = fminf(fmaxf(x * inverse, -448.0f), 448.0f);
+    return __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+}
+
+// The group's scale times 2^8, for codes read as FP16 times 2^-8 (ops' x2m8 expansion): exact
+// for e up to 246; 255 is NaN.
+__device__ __forceinline__ float mxfp8_scale_x256(unsigned e) {
+    return e == 255u ? __uint_as_float(0x7FC00000u) : __uint_as_float((e + 8u) << 23);
+}
+
 
 // Chunks of eight values: eight int8 codes (one uint2), eight packed nibbles or eight Lloyd-Max
 // indices (one word). Per coding: Raw, the bytes of one chunk; Scale, the chunk's group scale;
@@ -83,6 +113,29 @@ struct Chunk<KvCoding::Lloyd4> {
     }
 };
 
+template <>
+struct Chunk<KvCoding::Mxfp8> {
+    using Raw = uint2;
+    using Scale = std::uint8_t;
+    static constexpr int kBytes = 8, kPerGroup = 4; // 32-dimension groups
+    __device__ static Raw load(const std::uint8_t* codes, int c) {
+        return *reinterpret_cast<const uint2*>(codes + c * kBytes);
+    }
+    __device__ static Scale scale(const std::uint8_t* scales, int c) { return scales[c / kPerGroup]; }
+    __device__ static void decode(Raw r, Scale s, float (&f)[8]) {
+        // Codes times 2^-8 as FP16 pairs, then times the group's scale times 2^8: exact in FP32.
+        const float sf = mxfp8_scale_x256(s);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const unsigned word = j < 2 ? r.x : r.y;
+            const float2 pair   = __half22float2(
+                ops::kv_cache_fp8_code2_to_half2_x2m8(word >> (16 * (j & 1))));
+            f[2 * j]     = pair.x * sf;
+            f[2 * j + 1] = pair.y * sf;
+        }
+    }
+};
+
 // One 128-wide row per warp: lane l holds dimensions l + 32 r of the row in x[r] (the layout
 // kv_post writes). Encodes x into the row's codes and scales; reading rows back happens in the
 // attention's tile loader, which decodes eight-value chunks (Chunk above) as it needs them.
@@ -110,6 +163,13 @@ __device__ __forceinline__ void encode_row(const float (&x)[4], std::uint8_t* co
                 codes[16 * r + (lane >> 1)] = ops::kv_cache_int4_pack(c, std::int8_t(partner));
             }
             if (lane == 0) { reinterpret_cast<__half*>(scales)[r] = q.scale; }
+        }
+    } else if constexpr (C == KvCoding::Mxfp8) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const unsigned e = mxfp8_exponent(ops::warp_max(fabsf(x[r]), kAll));
+            codes[32 * r + lane] = mxfp8_code(x[r], e);
+            if (lane == 0) { scales[r] = std::uint8_t(e); }
         }
     } else if constexpr (C == KvCoding::Lloyd4) {
 #pragma unroll
@@ -147,6 +207,10 @@ __device__ __forceinline__ uint4 chunk_word(const KvPlaneView& plane, const std:
     case KvCoding::Lloyd4:
         kv::Chunk<KvCoding::Lloyd4>::decode(kv::Chunk<KvCoding::Lloyd4>::load(codes, c),
                                             kv::Chunk<KvCoding::Lloyd4>::scale(scales, c), f);
+        break;
+    case KvCoding::Mxfp8:
+        kv::Chunk<KvCoding::Mxfp8>::decode(kv::Chunk<KvCoding::Mxfp8>::load(codes, c),
+                                           kv::Chunk<KvCoding::Mxfp8>::scale(scales, c), f);
         break;
     case KvCoding::F16: break;
     }

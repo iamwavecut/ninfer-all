@@ -1469,7 +1469,7 @@ struct Executor::Impl {
         add(t * query_heads * 16 * 4);    // r
         add(t * q_floats * 2);            // attention out BF16
         add(t * h * 4);                   // output product
-        if (kvfmt.quantized()) { add(t * 2 * kvd * 2); } // a quantized visit's F16 staging (kv_store reads it)
+        if (kvfmt.staged()) { add(t * 2 * kvd * 2); } // a quantized visit's F16 staging (kv_store reads it)
         // Controllers of three inputs: [rms x; rms m], the rank's hidden state, forget and gain.
         add(3 * t * 2 * h * 4);
         add(3 * t * rank * 4);
@@ -2207,12 +2207,31 @@ struct Executor::Impl {
         }
         // K and V into the cache: a prompt chunk's sliding visit attends over the staging ring
         // (the window before the chunk comes over from the sequence's ring, the chunk's keys land
-        // there, and the window that ends the chunk's kept rows goes back). A quantized full
-        // visit stages its rows as F16 (one slot per row) for kv_store to encode into its planes.
+        // there, and the window that ends the chunk's kept rows goes back). A full visit of an
+        // mxfp8 run has kv_post encode its rows into its planes; one of rk8v4 or rk4v4 stages
+        // them as F16 (one slot per row) for kv_store to encode.
         const std::int64_t stage_stride = std::int64_t(prefill_ring) * kD;
         const std::int64_t seq_offset   = std::int64_t(c.sequence) * vp.seq_stride;
         const bool staging   = c.chunk && !vp.full;
         const bool quantized = vp.full && kvfmt.quantized();
+        KvPlaneView k_view, v_view; // a quantized full visit's planes, else null codings
+        if (quantized) {
+            const auto view = [&](const KvArea& codes, const KvArea& scales, KvCoding coding) {
+                KvPlaneView plane;
+                plane.codes   = static_cast<std::uint8_t*>(codes.p);
+                plane.scales  = static_cast<std::uint8_t*>(scales.p);
+                plane.code_row  = kv_code_bytes(coding);
+                plane.scale_row = kv_scale_bytes(coding);
+                plane.code_head  = std::int64_t(vp.slots) * plane.code_row;
+                plane.scale_head = std::int64_t(vp.slots) * plane.scale_row;
+                plane.code_seq  = plane.code_head * kv_heads;
+                plane.scale_seq = plane.scale_head * kv_heads;
+                plane.coding    = coding;
+                return plane;
+            };
+            k_view = view(vp.k_codes, vp.k_scales, kvfmt.key.coding);
+            v_view = view(vp.v_codes, vp.v_scales, kvfmt.value.coding);
+        }
         kernels::RingCopyArgs keep;
         keep.kv_heads = kv_heads;
         kernels::KvArgs ka;
@@ -2230,7 +2249,10 @@ struct Executor::Impl {
         ka.kv_heads    = kv_heads;
         ka.qk_clip     = config.qk_clip;
         ka.eps         = eps;
-        if (quantized) {
+        if (quantized && kvfmt.mxfp8()) {
+            ka.k_plane = k_view;
+            ka.v_plane = v_view;
+        } else if (quantized) {
             auto* stage = static_cast<__half*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 2).data);
             ka.k_cache     = stage;
             ka.v_cache     = stage + std::size_t(t) * kvd;
@@ -2263,23 +2285,7 @@ struct Executor::Impl {
             ka.ring        = vp.ring;
         }
         kernels::kv_post(ka, stream);
-        KvPlaneView k_view, v_view; // a quantized full visit's planes, else null codings
-        if (quantized) {
-            const auto view = [&](const KvArea& codes, const KvArea& scales, KvCoding coding) {
-                KvPlaneView plane;
-                plane.codes   = static_cast<std::uint8_t*>(codes.p);
-                plane.scales  = static_cast<std::uint8_t*>(scales.p);
-                plane.code_row  = kv_code_bytes(coding);
-                plane.scale_row = kv_scale_bytes(coding);
-                plane.code_head  = std::int64_t(vp.slots) * plane.code_row;
-                plane.scale_head = std::int64_t(vp.slots) * plane.scale_row;
-                plane.code_seq  = plane.code_head * kv_heads;
-                plane.scale_seq = plane.scale_head * kv_heads;
-                plane.coding    = coding;
-                return plane;
-            };
-            k_view = view(vp.k_codes, vp.k_scales, kvfmt.key.coding);
-            v_view = view(vp.v_codes, vp.v_scales, kvfmt.value.coding);
+        if (quantized && kvfmt.staged()) {
             for (const auto& [src, plane] :
                  {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
                 kernels::KvStoreArgs store;

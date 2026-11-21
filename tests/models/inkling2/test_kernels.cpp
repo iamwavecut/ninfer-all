@@ -10,7 +10,8 @@
 //    factor below and above its floor; kv_post: the short convolutions over the call's rows and
 //    the history ring (decode rows of several sequences, a verification's consecutive rows, a
 //    prompt chunk after earlier positions), the dynamic taps, K's clip, V's norm, the cache slots
-//    and the history a decode call keeps.
+//    and the history a decode call keeps; MXFP8 planes (a full visit of an mxfp8 run), decoded on
+//    the host from their codes and exponent bytes, within MXFP8's error of the oracle.
 //  - attention: relative bias inside its extent only, per-query sinks far below, near and above the
 //    scores, the sigmoid gate; sliding-window rings and full caches, one and many splits, prompt
 //    chunks after cached positions and branch rows; BF16 and q8_1 outputs.
@@ -533,7 +534,29 @@ int source_row(const RowsCase& c, int t, int lag) {
 
 int physical(const RowsCase& c, int t) { return c.chunk ? c.first + t : c.positions[t]; }
 
-void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19937& rng) {
+// MXFP8 planes of `slots` positions of each sequence's eight heads: codes, then exponent bytes.
+mi::KvPlaneView mxfp8_plane(DeviceBuffer& codes, DeviceBuffer& scales, int slots) {
+    mi::KvPlaneView view;
+    view.codes      = static_cast<std::uint8_t*>(codes.p);
+    view.scales     = static_cast<std::uint8_t*>(scales.p);
+    view.code_row   = kD;
+    view.scale_row  = kD / 32;
+    view.code_head  = std::int64_t(slots) * view.code_row;
+    view.scale_head = std::int64_t(slots) * view.scale_row;
+    view.code_seq   = view.code_head * kKv;
+    view.scale_seq  = view.scale_head * kKv;
+    view.coding     = mi::KvCoding::Mxfp8;
+    return view;
+}
+
+double e4m3_value(std::uint8_t code) {
+    const int e = (code >> 3) & 15, m = code & 7;
+    const double magnitude = e == 0 ? m * std::ldexp(1.0, -9) : (1.0 + m / 8.0) * std::ldexp(1.0, e - 7);
+    return code & 0x80 ? -magnitude : magnitude;
+}
+
+void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19937& rng,
+             bool mxfp8 = false) {
     const int t = int(c.positions.size());
     const int sequences = c.sequences.empty() ? 1 : *std::max_element(c.sequences.begin(), c.sequences.end()) + 1;
     const int channels = kKv * kD;
@@ -576,12 +599,34 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
     a.seq_stride  = seq_stride;
     a.head_stride = head_stride;
     a.ring        = 0;
+    // MXFP8 planes of every position (the cache's halves stay zero), read back as values below.
+    DeviceBuffer mk(mxfp8 ? std::size_t(sequences) * kKv * ring * kD : 16),
+        mks(mxfp8 ? std::size_t(sequences) * kKv * ring * 4 : 16), mv(mk.bytes), mvs(mks.bytes);
+    if (mxfp8) {
+        a.k_plane = mxfp8_plane(mk, mks, ring);
+        a.v_plane = mxfp8_plane(mv, mvs, ring);
+    }
     k::kv_post(a, nullptr);
     sync("kv_post");
-    const auto got_k  = download<__half>(kc, std::size_t(sequences) * seq_stride);
-    const auto got_v  = download<__half>(vc, std::size_t(sequences) * seq_stride);
+    auto got_k        = download<__half>(kc, std::size_t(sequences) * seq_stride);
+    auto got_v        = download<__half>(vc, std::size_t(sequences) * seq_stride);
     const auto kept_k = download<float>(d_kh, std::size_t(sequences) * seq_hist);
     const auto kept_v = download<float>(d_vh, std::size_t(sequences) * seq_hist);
+    std::vector<double> plane_k, plane_v; // the planes' values in the cache's layout
+    if (mxfp8) {
+        const auto codes_k  = download<std::uint8_t>(mk, mk.bytes), codes_v = download<std::uint8_t>(mv, mv.bytes);
+        const auto scales_k = download<std::uint8_t>(mks, mks.bytes), scales_v = download<std::uint8_t>(mvs, mvs.bytes);
+        plane_k.resize(got_k.size());
+        plane_v.resize(got_v.size());
+        for (std::size_t i = 0; i < plane_k.size(); ++i) {
+            plane_k[i] = e4m3_value(codes_k[i]) * std::ldexp(1.0, scales_k[i / 32] - 127);
+            plane_v[i] = e4m3_value(codes_v[i]) * std::ldexp(1.0, scales_v[i / 32] - 127);
+        }
+    }
+    const auto stored = [&](bool key, std::int64_t at) {
+        if (mxfp8) { return key ? plane_k[std::size_t(at)] : plane_v[std::size_t(at)]; }
+        return double(__half2float(key ? got_k[std::size_t(at)] : got_v[std::size_t(at)]));
+    };
     Error ek, ev;
     int clipped = 0;
     std::size_t kept_wrong = 0;
@@ -619,8 +664,8 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
             const double vs = rms_scale(vv.data(), kD, kEps);
             const std::int64_t at = s * seq_stride + h * head_stride + std::int64_t(physical(c, r)) * kD;
             for (int d = 0; d < kD; ++d) {
-                ek.add(__half2float(got_k[at + d]), kk[d] * f);
-                ev.add(__half2float(got_v[at + d]), vv[d] * vs);
+                ek.add(stored(true, at + d), kk[d] * f);
+                ev.add(stored(false, at + d), vv[d] * vs);
             }
         }
         if (!c.chunk) {
@@ -631,10 +676,12 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
             }
         }
     }
-    report(ek.rel() < 1e-3 && ev.rel() < 1e-3 && kept_wrong == 0,
-           "kv_post " + name + (dynamic ? " with dynamic taps" : "") + ", " + std::to_string(clipped) +
-               " clipped heads: K " + num(ek.rel()) + ", V " + num(ev.rel()) +
-               (c.chunk ? "" : ", history values wrong " + std::to_string(kept_wrong)));
+    // MXFP8 keeps three bits of each value's significand: a relative error near 2^-4 / sqrt(3).
+    const double bound = mxfp8 ? 4e-2 : 1e-3;
+    report(ek.rel() < bound && ev.rel() < bound && kept_wrong == 0,
+           "kv_post " + name + (dynamic ? " with dynamic taps" : "") + (mxfp8 ? ", MXFP8 planes" : "") +
+               ", " + std::to_string(clipped) + " clipped heads: K " + num(ek.rel()) + ", V " +
+               num(ev.rel()) + (c.chunk ? "" : ", history values wrong " + std::to_string(kept_wrong)));
 }
 
 // ---- Attention ----------------------------------------------------------------------------------
@@ -1465,6 +1512,9 @@ int main() {
             kv_case("chunk at position 0", origin, dynamic, rng);
             kv_case("branches", branches, dynamic, rng);
         }
+        kv_case("decode rows", decode, true, rng, true);
+        kv_case("verification rows", verify, true, rng, true);
+        kv_case("prompt chunk", chunk, true, rng, true);
 
         const int ring = kWindow + 64;
         attention_case({"window ring, decode", {{5, 1100, 3000}, {0, 1, 2}}, ring, kWindow, 1}, rng);

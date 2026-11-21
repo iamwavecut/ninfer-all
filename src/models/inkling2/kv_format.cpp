@@ -16,6 +16,8 @@ KvFormat kv_format(KvCacheStorage storage) {
     // rk4v4: 4-bit Lloyd-Max keys at the same value plane.
     case KvCacheStorage::RotatedLloyd4KeyInt4Value:
         return {storage, {KvCoding::Lloyd4}, {KvCoding::Int4G32}};
+    // mxfp8: the release's MXFP8 keys and values.
+    case KvCacheStorage::Mxfp8: return {storage, {KvCoding::Mxfp8}, {KvCoding::Mxfp8}};
     case KvCacheStorage::Int8Group64:
     case KvCacheStorage::Fp8E4M3Row256:
     case KvCacheStorage::Nvfp4Group16:
@@ -31,7 +33,8 @@ KvFormat kv_format(KvCacheStorage storage) {
                                                    : storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 ? "rk4v4-e8"
                                                    : storage == KvCacheStorage::RotatedE8RootKeyInt4Value ? "rk2v4-e8"
                                                    : "bf16p") +
-            " is not built for this family (rk8v4 or rk4v4, or the F16 cache)");
+            " is not built for this family (mxfp8, the default, rk8v4 or rk4v4, or the F16 "
+            "cache)");
     }
     throw std::invalid_argument("inkling2: unknown KV-cache storage");
 }

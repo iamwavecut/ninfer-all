@@ -1,7 +1,9 @@
 // Inkling 2's quantized KV planes (kv_format.h, kv_planes.h) against independent oracles, for
-// rk8v4 (int8 G64 keys, packed int4 G32 values) and rk4v4 (Lloyd-Max 4-bit keys):
+// rk8v4 (int8 G64 keys, packed int4 G32 values), rk4v4 (Lloyd-Max 4-bit keys) and mxfp8 (E4M3
+// codes over a UE8M0 scale per 32):
 //  - kv_store: the stored codes, decoded on the host with their stored scales, stay near the F16
-//    rows stored (a coding's own error bound);
+//    rows stored (a coding's own error bound); MXFP8's codes and scales equal the release's rule
+//    (vLLM's mxfp8_quantize) applied on the host, bit for bit;
 //  - attention over the planes: a full-attention visit's decode rows, verification rows, prompt
 //    chunk and branches against an FP64 attention over the host-decoded rows, the slots being the
 //    rows' physical positions.
@@ -23,6 +25,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -131,6 +134,36 @@ double half_at(const std::uint8_t* scales, int group) {
     return __half2float(h);
 }
 
+// An E4M3 (FN) code's value.
+double e4m3(std::uint8_t code) {
+    const int e = (code >> 3) & 15, m = code & 7;
+    const double magnitude = e == 0 ? m * std::ldexp(1.0, -9) : (1.0 + m / 8.0) * std::ldexp(1.0, e - 7);
+    return code & 0x80 ? -magnitude : magnitude;
+}
+
+// The release's MXFP8 rule on the host: a group's exponent byte (amax / 448 in FP32, rounded up
+// to a power of two by its bits) and a value's code (x times 2^(127 - e) in FP32, clamped to
+// +-448, the nearest E4M3 value, ties to the even code).
+unsigned mxfp8_exponent(float amax) {
+    const float raw = amax * (1.0f / 448.0f);
+    if (raw != raw) { return 255; }
+    if (raw <= std::ldexp(1.0f, -127)) { return 0; }
+    std::uint32_t bits;
+    std::memcpy(&bits, &raw, 4);
+    return std::min<unsigned>(((bits + 0x007FFFFFu) & 0x7F800000u) >> 23, 254);
+}
+
+std::uint8_t mxfp8_code(float x, unsigned e) {
+    const float v   = std::min(std::max(x * std::ldexp(1.0f, 127 - int(e)), -448.0f), 448.0f);
+    const double a  = std::fabs(double(v));
+    std::uint8_t best = 0;
+    for (std::uint8_t c = 1; c < 0x7F; ++c) { // every finite positive code, 0x7F being NaN
+        const double d = std::fabs(e4m3(c) - a), b = std::fabs(e4m3(best) - a);
+        if (d < b || (d == b && (c & 1) == 0)) { best = c; }
+    }
+    return std::signbit(v) ? std::uint8_t(best | 0x80) : best;
+}
+
 // One D128 plane row's represented values from its codes and scales.
 std::vector<double> decode_plane_row(mi::KvCoding coding, const std::uint8_t* codes,
                                      const std::uint8_t* scales) {
@@ -150,6 +183,9 @@ std::vector<double> decode_plane_row(mi::KvCoding coding, const std::uint8_t* co
             x[d]        = double(test::lloyd4_code(std::uint8_t(n))) * half_at(scales, d / 64);
             break;
         }
+        case mi::KvCoding::Mxfp8:
+            x[d] = e4m3(codes[d]) * std::ldexp(1.0, int(scales[d / 32]) - 127);
+            break;
         case mi::KvCoding::F16: break;
         }
     }
@@ -287,6 +323,35 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
     report(ek.rel() < key_bound && ev.rel() < value_bound,
            std::string(name) + " kv_store round-trip: k " + num(ek.rel()) + ", v " + num(ev.rel()) +
                " (bounds " + num(key_bound) + "/" + num(value_bound) + ")");
+    if (key == mi::KvCoding::Mxfp8 && value == mi::KvCoding::Mxfp8) {
+        // The release's rule on the staged halves: every code and exponent byte, exactly.
+        std::size_t wrong = 0, groups = 0;
+        for (int r = 0; r < t; ++r) {
+            const int s = sequence_of(rc, r), slot = physical(rc, r);
+            for (int h = 0; h < kKv; ++h) {
+                const std::size_t base = row_at(s, h, slot), stage_at = std::size_t(h) * t * kD + std::size_t(r) * kD;
+                for (const auto& [staged, codes, scales] :
+                     {std::tuple{&ks, &k_codes, &k_scales}, std::tuple{&vs, &v_codes, &v_scales}}) {
+                    for (int g = 0; g < kD / 32; ++g) {
+                        float amax = 0.0f;
+                        for (int d = 32 * g; d < 32 * g + 32; ++d) {
+                            amax = std::max(amax, std::fabs(__half2float((*staged)[stage_at + std::size_t(d)])));
+                        }
+                        const unsigned e = mxfp8_exponent(amax);
+                        ++groups;
+                        wrong += (*scales)[base * 4 + std::size_t(g)] != e ? 1 : 0;
+                        for (int d = 32 * g; d < 32 * g + 32; ++d) {
+                            const float x = __half2float((*staged)[stage_at + std::size_t(d)]);
+                            wrong += (*codes)[base * kD + std::size_t(d)] != mxfp8_code(x, e) ? 1 : 0;
+                        }
+                    }
+                }
+            }
+        }
+        report(wrong == 0, std::string(name) + " codes and exponents against the release's rule: " +
+                               std::to_string(wrong) + " wrong over " + std::to_string(groups) +
+                               " groups");
+    }
     if (ek.rel() >= key_bound && std::getenv("KV_DBG")) {
         for (int h = 0; h < kKv; ++h) {
             Error e;
@@ -383,8 +448,11 @@ int main() {
         branches.starts    = {0, 0, 0, 0, 4, 4, 4, 7, 7};
         for (const auto& [key, value, key_bound, value_bound, attention_bound] :
              {std::tuple{mi::KvCoding::Int8G64, mi::KvCoding::Int4G32, 8.0e-3, 1.1e-1, 2.5e-2},
-              std::tuple{mi::KvCoding::Lloyd4, mi::KvCoding::Int4G32, 1.2e-1, 1.1e-1, 8.0e-2}}) {
-            const char* name = key == mi::KvCoding::Int8G64 ? "rk8v4" : "rk4v4";
+              std::tuple{mi::KvCoding::Lloyd4, mi::KvCoding::Int4G32, 1.2e-1, 1.1e-1, 8.0e-2},
+              std::tuple{mi::KvCoding::Mxfp8, mi::KvCoding::Mxfp8, 4.0e-2, 4.0e-2, 2.5e-2}}) {
+            const char* name = key == mi::KvCoding::Int8G64 ? "rk8v4"
+                               : key == mi::KvCoding::Lloyd4 ? "rk4v4"
+                                                             : "mxfp8";
             case_run(name, key, value, decode_rows, 1, key_bound, value_bound, attention_bound, rng);
             case_run(name, key, value, decode_rows, 9, key_bound, value_bound, attention_bound, rng);
             case_run(name, key, value, verify, 4, key_bound, value_bound, attention_bound, rng);

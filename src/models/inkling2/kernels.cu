@@ -684,10 +684,28 @@ __global__ void kv_post_kernel(KvArgs a) {
     const int sequence = row_sequence(a.rows, t);
     const int position = physical(a.rows, t);
     const int slot     = a.row_slots ? t : (a.ring != 0 ? position % a.ring : position);
-    const std::int64_t at = std::int64_t(sequence) * a.seq_stride + std::int64_t(kh) * a.head_stride +
-                            std::int64_t(slot) * kD + d;
-    a.k_cache[at] = __float2half(k * kf);
-    a.v_cache[at] = __float2half(v * vn);
+    if (a.k_plane.coding == KvCoding::Mxfp8) {
+        // A warp holds one group of 32 dimensions of the row: its exponent byte, then its codes.
+        const float kx = k * kf, vx = v * vn;
+        const unsigned ke = kv::mxfp8_exponent(ops::warp_max(fabsf(kx), 0xffffffffu));
+        const unsigned ve = kv::mxfp8_exponent(ops::warp_max(fabsf(vx), 0xffffffffu));
+        const KvPlaneView& kp = a.k_plane;
+        const KvPlaneView& vp = a.v_plane;
+        const std::int64_t row = std::int64_t(slot);
+        kp.codes[sequence * kp.code_seq + kh * kp.code_head + row * kp.code_row + d] = kv::mxfp8_code(kx, ke);
+        vp.codes[sequence * vp.code_seq + kh * vp.code_head + row * vp.code_row + d] = kv::mxfp8_code(vx, ve);
+        if ((d & 31) == 0) {
+            kp.scales[sequence * kp.scale_seq + kh * kp.scale_head + row * kp.scale_row + d / 32] =
+                std::uint8_t(ke);
+            vp.scales[sequence * vp.scale_seq + kh * vp.scale_head + row * vp.scale_row + d / 32] =
+                std::uint8_t(ve);
+        }
+    } else {
+        const std::int64_t at = std::int64_t(sequence) * a.seq_stride +
+                                std::int64_t(kh) * a.head_stride + std::int64_t(slot) * kD + d;
+        a.k_cache[at] = __float2half(k * kf);
+        a.v_cache[at] = __float2half(v * vn);
+    }
     if (a.keep) {
         const int p = a.rows.positions[t];
         history_slot(a.k_history, sequence, p)[c] = a.kv[std::int64_t(t) * a.kv_stride + c];

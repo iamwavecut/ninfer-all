@@ -573,6 +573,8 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
         NINFER_SPARSE_ATTENTION_CASE(RotatedE8RootKeyInt4Value)
         NINFER_SPARSE_ATTENTION_CASE(Bf16Packed)
 #undef NINFER_SPARSE_ATTENTION_CASE
+    case KvCacheStorage::Mxfp8: // Inkling 2's own cache
+        break;
     }
     require(false, "unsupported cache storage");
 }

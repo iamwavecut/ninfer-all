@@ -70,6 +70,7 @@ struct BenchOptions {
     bool fast_prefill_kernel    = false;
     std::uint32_t prefill_chunk = 0; // 0: the Engine's automatic chunk
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    bool kv_cache_explicit      = false; // --kv-dtype given (else Inkling 2 stores MXFP8)
     SpeculativeOptions speculative;
     ExpertResidency expert_residency = ExpertResidency::Device;
     EmbeddingResidency embedding_residency = EmbeddingResidency::Device;

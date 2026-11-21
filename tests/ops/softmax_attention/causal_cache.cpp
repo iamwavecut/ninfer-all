@@ -201,6 +201,8 @@ TestCacheLayout test_cache_layout(KvCacheStorage storage) {
                 {DType::U8, kNvfp4CodeBytes, DType::U8, kNvfp4QuantGroups}};
     case KvCacheStorage::Bf16Packed:
         throw std::invalid_argument("bf16p is covered by test_kv_bf16p.cpp");
+    case KvCacheStorage::Mxfp8:
+        throw std::invalid_argument("mxfp8 is Inkling 2's own cache");
     }
     throw std::invalid_argument("unsupported test KV storage");
 }
@@ -2530,6 +2532,8 @@ const char* cache_name(KvCacheStorage storage) {
         return "k8v4";
     case KvCacheStorage::Bf16Packed:
         return "bf16p";
+    case KvCacheStorage::Mxfp8:
+        return "mxfp8";
     }
     return "unknown";
 }

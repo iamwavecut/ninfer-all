@@ -87,6 +87,8 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
         return "bf16";
     case ninfer::KvCacheStorage::Float16:
         return "fp16";
+    case ninfer::KvCacheStorage::Mxfp8:
+        return "mxfp8";
     case ninfer::KvCacheStorage::Int8Group64:
         return "int8-group64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:
@@ -406,6 +408,7 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
+        engine_options.kv_cache_automatic       = cli.kv_cache_automatic;
         engine_options.speculative              = cli.speculative;
         engine_options.gumbel_sampling          = cli.gumbel_sampling;
         engine_options.enable_vision            = cli.enable_vision;

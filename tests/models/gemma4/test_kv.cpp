@@ -145,6 +145,7 @@ const char* storage_name(KvCacheStorage s) {
     case KvCacheStorage::RotatedInt4KeyInt4ValueE8: return "rk4v4-e8";
     case KvCacheStorage::RotatedE8RootKeyInt4Value: return "rk2v4-e8";
     case KvCacheStorage::Bf16Packed: return "bf16p";
+    case KvCacheStorage::Mxfp8: return "mxfp8";
     }
     return "?";
 }

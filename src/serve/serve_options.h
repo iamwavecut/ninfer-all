@@ -96,6 +96,7 @@ struct ServeOptions {
     NgramTableOptions ngram_table;
     std::optional<std::uint32_t> kv_resident_positions; // Flash-Next: --kv-resident
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    bool kv_cache_automatic                = false; // no --kv-dtype (EngineOptions::kv_cache_automatic)
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;

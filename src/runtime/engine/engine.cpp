@@ -127,6 +127,15 @@ EngineOptions with_family_attention(EngineOptions options) {
             "--kv-dtype fp16 applies to Qwen4ExpForCausalLM, Gemma 4, Flint and Inkling 2 "
             "artifacts");
     }
+    // Inkling 2's release trained with an MXFP8 KV cache, so without --kv-dtype the family stores
+    // MXFP8; no other family implements it.
+    const bool inkling2 = runtime::is_inkling2_artifact(options.artifact_path);
+    if (inkling2 && options.kv_cache_automatic) {
+        options.kv_cache = KvCacheStorage::Mxfp8;
+    }
+    if (options.kv_cache == KvCacheStorage::Mxfp8 && !inkling2) {
+        throw std::invalid_argument("--kv-dtype mxfp8 applies to Inkling2ForCausalLM artifacts");
+    }
     if ((options.tensor_attention != TensorAttention::Heads || options.invariant_attention) &&
         own_family_artifact(options.artifact_path)) {
         throw std::invalid_argument(

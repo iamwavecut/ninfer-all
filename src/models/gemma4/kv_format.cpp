@@ -32,6 +32,8 @@ KvFormat kv_format(KvCacheStorage storage) {
         // bf16p packs BF16 rows; Gemma's unquantized cache holds FP16.
         throw std::invalid_argument(
             "gemma4: --kv-dtype bf16p packs BF16 rows, and Gemma's unquantized KV cache is FP16");
+    case KvCacheStorage::Mxfp8:
+        throw std::invalid_argument("gemma4: --kv-dtype mxfp8 is Inkling 2's KV storage");
     }
     throw std::invalid_argument("gemma4: unknown KV-cache storage");
 }

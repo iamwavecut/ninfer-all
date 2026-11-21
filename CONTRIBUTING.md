@@ -166,7 +166,8 @@ measured on the affected families, card classes and KV formats.
   measurements.
 - A change that wins on some and loses on others selects itself from measured conditions (device
   profile, request shape, free memory), or stays behind an option until it can.
-- A lossy mode is never the default.
+- A lossy mode is never the default, except the KV format a release trained with: Inkling 2 stores
+  its full-attention KV in MXFP8 ([Inkling 2](docs/inkling2.md#kv-cache)).
 
 ### Comparable measurements
 

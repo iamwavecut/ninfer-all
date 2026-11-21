@@ -125,6 +125,9 @@ struct PagedKVStorageLayout {
                     {DType::U8, 128, DType::U8, 16}};
         }
         break;
+    case KvCacheStorage::Mxfp8:
+        // Inkling 2's own planes (models/inkling2/kv_format.h); no paged form.
+        break;
     }
     throw std::invalid_argument("unsupported paged KV-cache storage geometry");
 }

@@ -134,6 +134,8 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     // bf16p: BF16 rows packed losslessly into 392 bytes (bf16p_codec.cuh). Opt-in.
     if (value == "bf16p") { return KvCacheStorage::Bf16Packed; }
+    // mxfp8: E4M3 values over a power-of-two scale per 32 (Inkling 2, its default).
+    if (value == "mxfp8") { return KvCacheStorage::Mxfp8; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -357,7 +359,8 @@ std::string serve_usage_text(const char* argv0) {
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  KV storage: bf16 (default), int8, fp8, rk8v4,\n"
            "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
-           "                                fp16: Flash-Next, Gemma 4 and Flint\n" +
+           "                                fp16: Flash-Next, Gemma 4 and Flint; mxfp8:\n"
+           "                                Inkling 2 (its default)\n" +
            std::string(product::kKvResidentHelp) +
            "\n"
            "CONTEXT CACHE\n"
@@ -764,6 +767,7 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
     bool long_anchor_spacing_explicit = false;
     bool ngram_width_explicit         = false;
     bool spec_explicit                = false;
+    bool kv_dtype_explicit            = false;
     bool vision_max_merged_explicit   = false;
     std::optional<std::size_t> kv_headroom_mib;
     // Last flag seen that belongs to only one prefix-cache mode, for the cross-mode error.
@@ -1326,7 +1330,8 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             continue;
         }
         if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+            options.kv_cache  = parse_kv_dtype(require_value("--kv-dtype"));
+            kv_dtype_explicit = true;
             continue;
         }
         if (arg == "--spec") {
@@ -2018,6 +2023,7 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
     }
     product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
     product::apply_automatic_speculation(options.speculative, spec_explicit);
+    options.kv_cache_automatic = !kv_dtype_explicit;
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency != VisionResidency::Resident && !options.enable_vision) {
         throw product::OptionConflict({"vision-residency", "vision"},

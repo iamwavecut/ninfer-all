@@ -199,6 +199,9 @@ struct KvArgs {
     // Row t's values land at slot t (head_stride t wide): a quantized visit's staging scratch,
     // which kv_store then reads; without it, slot `position % ring` (ring 0: position).
     bool row_slots = false;
+    // MXFP8 planes (kv_codec.cuh; a full visit of an mxfp8 run): the rows are encoded into them
+    // at slot `position`, and k_cache / v_cache are unused.
+    KvPlaneView k_plane, v_plane;
 };
 void kv_post(const KvArgs& args, cudaStream_t stream);
 
