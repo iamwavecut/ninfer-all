@@ -14,6 +14,7 @@
 #include "models/dspine/runtime.h"
 #include "models/inkling2/cpu_experts.h"
 #include "models/inkling2/kernels.h"
+#include "models/inkling2/kv_planes.h"
 #include "models/inkling2/vision.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_policy.h"
@@ -238,7 +239,7 @@ struct Executor::Impl {
         global_slots = 0, prefill_ring = 0;
     int kvd = 0, slot_floats = 0; // K's (and V's) width, a history slot's floats
     float eps = 1e-6f;
-    KvFormat kv; // the caches' storage: F16, or the quantized full-attention visits of rk8v4/rk4v4
+    KvFormat kvfmt; // the caches' storage: F16, or the quantized full-attention visits of rk8v4/rk4v4
     DeviceBuffer staging_k, staging_v;
     bool growing = false;
     std::vector<KvArea*> sequence_areas;
@@ -311,7 +312,7 @@ struct Executor::Impl {
         }
         stream = device.stream;
         const int device_id = device.rank(0).device;
-        kv = kv_format(o.kv_cache);
+        kvfmt = kv_format(o.kv_cache);
         growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
                   vmm::granularity(device_id) != 0;
         hidden      = int(config.hidden_size);
@@ -409,7 +410,7 @@ struct Executor::Impl {
             p.head_stride  = std::int64_t(p.slots) * kD;
             p.seq_stride   = p.head_stride * kv_heads;
             const bool grows = growing && p.full;
-            if (p.full && kv.quantized()) {
+            if (p.full && kvfmt.quantized()) {
                 // One code and one scale area per plane; the rows are the codings' bytes.
                 const auto area = [&](KvCoding coding) {
                     const std::size_t code  = std::size_t(kv_code_bytes(coding));
@@ -420,10 +421,10 @@ struct Executor::Impl {
                     kv_bytes += scales.bytes;
                     return std::pair<KvArea, KvArea>(std::move(codes), std::move(scales));
                 };
-                auto k     = area(kv.key.coding);
+                auto k     = area(kvfmt.key.coding);
                 p.k_codes  = std::move(k.first);
                 p.k_scales = std::move(k.second);
-                auto v      = area(kv.value.coding);
+                auto v      = area(kvfmt.value.coding);
                 p.v_codes   = std::move(v.first);
                 p.v_scales  = std::move(v.second);
             } else {
@@ -1449,7 +1450,7 @@ struct Executor::Impl {
         add(t * query_heads * 16 * 4);    // r
         add(t * q_floats * 2);            // attention out BF16
         add(t * h * 4);                   // output product
-        if (kv.quantized()) { add(t * 2 * kvd * 2); } // a quantized visit's F16 staging (kv_store reads it)
+        if (kvfmt.quantized()) { add(t * 2 * kvd * 2); } // a quantized visit's F16 staging (kv_store reads it)
         // Controllers of three inputs: [rms x; rms m], the rank's hidden state, forget and gain.
         add(3 * t * 2 * h * 4);
         add(3 * t * rank * 4);
@@ -2192,7 +2193,7 @@ struct Executor::Impl {
         const std::int64_t stage_stride = std::int64_t(prefill_ring) * kD;
         const std::int64_t seq_offset   = std::int64_t(c.sequence) * vp.seq_stride;
         const bool staging   = c.chunk && !vp.full;
-        const bool quantized = vp.full && kv.quantized();
+        const bool quantized = vp.full && kvfmt.quantized();
         kernels::RingCopyArgs keep;
         keep.kv_heads = kv_heads;
         kernels::KvArgs ka;
@@ -2258,8 +2259,8 @@ struct Executor::Impl {
                 plane.coding    = coding;
                 return plane;
             };
-            k_view = view(vp.k_codes, vp.k_scales, kv.key.coding);
-            v_view = view(vp.v_codes, vp.v_scales, kv.value.coding);
+            k_view = view(vp.k_codes, vp.k_scales, kvfmt.key.coding);
+            v_view = view(vp.v_codes, vp.v_scales, kvfmt.value.coding);
             for (const auto& [src, plane] :
                  {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
                 kernels::KvStoreArgs store;
