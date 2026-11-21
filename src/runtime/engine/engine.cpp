@@ -16,6 +16,7 @@
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/deepseek_v41_core.h"
 #include "runtime/engine/flint_core.h"
+#include "runtime/engine/inkling2_core.h"
 #include "runtime/engine/gemma4_core.h"
 #include "runtime/engine/qwen4_exp_core.h"
 #include "runtime/engine/slot_spill_guard.h"
@@ -42,11 +43,12 @@
 namespace ninfer {
 namespace {
 
-// Gemma 4, Flint, DeepSeek-V4.1 and Flash-Next: families with a core of their own, not the
-// Qwen3.5 load and Program.
+// Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Flash-Next: families with a core of their own, not
+// the Qwen3.5 load and Program.
 bool own_family_artifact(const std::filesystem::path& path) {
     return runtime::is_gemma4_artifact(path) || runtime::is_flint_artifact(path) ||
-           runtime::is_deepseek_v41_artifact(path) || runtime::is_qwen4_exp_artifact(path);
+           runtime::is_deepseek_v41_artifact(path) || runtime::is_inkling2_artifact(path) ||
+           runtime::is_qwen4_exp_artifact(path);
 }
 
 // Those families keep context caches of their own, which the checkpoint catalog's options
@@ -95,11 +97,13 @@ EngineOptions with_expert_disk_reads(EngineOptions options) {
 // partial-sum exchange is the Qwen3.5 Program's and Flash-Next's; the other families divide only
 // their routed experts and sum them their own way.
 EngineOptions with_family_attention(EngineOptions options) {
-    // Flash-Next stores FP32 keys and values once in F16; Gemma 4 and Flint keep F16 caches under
-    // either name; DeepSeek-V4.1 refuses it in its core. The Qwen3.5 Program's attention reads BF16.
+    // Flash-Next stores FP32 keys and values once in F16; Gemma 4, Flint and Inkling 2 keep F16
+    // caches under either name; DeepSeek-V4.1 refuses it in its core. The Qwen3.5 Program's
+    // attention reads BF16.
     if (options.kv_cache == KvCacheStorage::Float16 && !own_family_artifact(options.artifact_path)) {
         throw std::invalid_argument(
-            "--kv-dtype fp16 applies to Qwen4ExpForCausalLM, Gemma 4 and Flint artifacts");
+            "--kv-dtype fp16 applies to Qwen4ExpForCausalLM, Gemma 4, Flint and Inkling 2 "
+            "artifacts");
     }
     if ((options.tensor_attention != TensorAttention::Heads || options.invariant_attention) &&
         own_family_artifact(options.artifact_path)) {
@@ -137,11 +141,33 @@ EngineOptions with_family_attention(EngineOptions options) {
 // latent experts and decoders makes a token's step cost enough that MTP's verification pays on
 // prose too (Edge0-120B-q3k on an A40: 1.28 times as fast on prose, 1.84 on code, 1.49 after a
 // 5,415-token document, 1.23 on prose over two tensor-parallel ranks), while eight requests at
-// once decoded 0.84-0.87 times as fast with drafts as without.
+// once decoded 0.84-0.87 times as fast with drafts as without. Inkling 2 drafts with its DSpark
+// drafter whenever it serves one request at a time: three passes of its core make a token's step
+// cost enough that verification pays with device experts too. Three drafts a round adapting from
+// one to three, each round ending after its first draft at or below 0.5, decoded 1.14 times as
+// fast on greedy prose, 1.41 on code and 1.26 after a 5,748-token document on an RTX 3090, and
+// 0.99-1.05 times as fast on prose and 1.24 on code at the release's temperature; with slower
+// decode kernels, a fixed three drafts had decoded sampled prose 0.87-0.95 times as fast, one
+// draft 1.06-1.12 times.
 EngineOptions with_family_speculation(EngineOptions options) {
     SpeculativeOptions& speculative = options.speculative;
     if (!speculative.automatic || speculative.backend != SpeculativeBackend::None ||
         options.purpose != EnginePurpose::Generation) {
+        return options;
+    }
+    if (runtime::is_inkling2_artifact(options.artifact_path)) {
+        // Inkling 2 drafts with the DSpark drafter its artifact carries while it serves one request
+        // at a time, a lone round's width adapting to how far the drafts survive.
+        if (options.max_concurrency != 1 || options.tensor_parallel ||
+            !artifact::Reader(options.artifact_path).directory().components.contains("dspark")) {
+            return options;
+        }
+        speculative.backend      = SpeculativeBackend::DSpark;
+        speculative.draft_tokens = SpeculativeOptions::kAutomaticDSparkTokens;
+        speculative.mtp_policy   = MtpDraftPolicy::Adaptive;
+        if (!speculative.draft_min_p) {
+            speculative.draft_min_p = SpeculativeOptions::kAutomaticDSparkMinP;
+        }
         return options;
     }
     const bool flash_next = runtime::is_qwen4_exp_artifact(options.artifact_path);
@@ -462,10 +488,12 @@ public:
     // Flint: likewise.
     using FlintCore = runtime::FlintCore;
     using DeepSeekV41Core = runtime::DeepSeekV41Core;
+    using Inkling2Core    = runtime::Inkling2Core;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<HybridGenerationCore>, std::unique_ptr<ScoringCore>,
                               std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Gemma4Core>,
-                              std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>>;
+                              std::unique_ptr<FlintCore>, std::unique_ptr<DeepSeekV41Core>,
+                              std::unique_ptr<Inkling2Core>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(with_family_speculation(
@@ -498,6 +526,19 @@ public:
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<FlintCore>(*flint, device, options);
+            finalize_phase.complete();
+            return;
+        }
+        if (runtime::is_inkling2_artifact(options.artifact_path)) {
+            auto constructed    = runtime::construct_inkling2(options, device);
+            inkling             = std::move(constructed.instance);
+            load                = std::move(constructed.load);
+            load.cuda_sync_mode = device.sync_mode();
+            model_metadata      = std::move(constructed.model_metadata);
+            sampling_defaults   = inkling->frontend.sampling_defaults();
+            StartupPhaseScope finalize_phase(options.startup_observer,
+                                             StartupPhase::EngineFinalize);
+            core = std::make_unique<Inkling2Core>(*inkling, device, options);
             finalize_phase.complete();
             return;
         }
@@ -547,7 +588,8 @@ public:
         }
         if (options.speculative.draft_min_p.value_or(0.0F) != 0) {
             throw std::invalid_argument("--draft-min-p requires Qwen3.8-Flash-Next drafts or a "
-                                        "DSpine drafter of Gemma 4, Flint or DeepSeek-V4.1");
+                                        "DSpine drafter of Gemma 4, Flint, DeepSeek-V4.1 or "
+                                        "Inkling 2");
         }
         auto constructed  = runtime::construct_model(options, device);
         // construct_model returns the resolved options for this instance. Anything the model had
@@ -689,6 +731,7 @@ public:
         return gemma      ? gemma->frontend
                : flint    ? flint->frontend
                : deepseek ? deepseek->frontend
+               : inkling  ? inkling->frontend
                : flash    ? flash->frontend
                           : active->frontend;
     }
@@ -697,6 +740,7 @@ public:
         return gemma      ? gemma->capacity
                : flint    ? flint->capacity
                : deepseek ? deepseek->capacity
+               : inkling  ? inkling->capacity
                : flash    ? flash->capacity
                           : active->capacity;
     }
@@ -710,6 +754,7 @@ public:
     std::unique_ptr<runtime::Gemma4Instance> gemma;
     std::unique_ptr<runtime::FlintInstance> flint;
     std::unique_ptr<runtime::DeepSeekV41Instance> deepseek;
+    std::unique_ptr<runtime::Inkling2Instance> inkling;
     LoadSummary load;
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
@@ -933,7 +978,8 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
                           std::is_same_v<CoreState, std::unique_ptr<Impl::Qwen4ExpCore>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::Gemma4Core>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::FlintCore>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::DeepSeekV41Core>>) {
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::DeepSeekV41Core>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::Inkling2Core>>) {
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
@@ -1197,14 +1243,16 @@ GenerationHandle Engine::submit_branches(std::vector<GenerationBranch> branches,
 bool Engine::runs_branches() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::Generation) { return false; }
-    if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek) { return true; }
+    if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek || impl_->inkling) {
+        return true;
+    }
     return impl_->active->program->runs_branched_reads();
 }
 
 bool Engine::read_endpoints_need_drafting() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::Generation || impl_->flash || impl_->gemma ||
-        impl_->flint || impl_->deepseek) {
+        impl_->flint || impl_->deepseek || impl_->inkling) {
         return false;
     }
     return impl_->options.speculative.backend != SpeculativeBackend::None;
@@ -1212,7 +1260,7 @@ bool Engine::read_endpoints_need_drafting() const {
 
 std::uint32_t Engine::branch_token_limit() const {
     if (!runs_branches()) { return 0; }
-    if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek) {
+    if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek || impl_->inkling) {
         return std::numeric_limits<std::uint32_t>::max();
     }
     return impl_->active->program->prefill_batch_capacity();
@@ -1247,7 +1295,7 @@ std::uint32_t Engine::concurrent_output_budget(const PreparedPrompt& prompt) con
         throw std::logic_error("concurrent_output_budget requires a Generation Engine");
     }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
-    if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek) {
+    if (impl_->flash || impl_->gemma || impl_->flint || impl_->deepseek || impl_->inkling) {
         // One sequence at a time: the whole window past the prompt.
         const std::uint32_t prompt_tokens = prompt.impl_->summary.prompt_tokens;
         return prompt_tokens >= impl_->capacity() ? 0U : impl_->capacity() - prompt_tokens + 1U;

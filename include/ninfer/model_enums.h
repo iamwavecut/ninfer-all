@@ -30,7 +30,7 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
-    DSpark, // DeepSeek-V4.1's DSpark drafter
+    DSpark, // the release's DSpark drafter (DeepSeek-V4.1, Inkling 2)
     DSpine, // a standalone DSpine drafter artifact (SpeculativeOptions::draft_model)
 };
 
