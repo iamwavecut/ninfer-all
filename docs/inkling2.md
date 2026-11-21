@@ -4,8 +4,8 @@ NInfer-all runs Thinking Machines' [Inkling 2 Mini](https://huggingface.co/think
 (`Inkling2LoopForConditionalGeneration`; its text component `Inkling2ForCausalLM`), a looped
 mixture-of-experts model of 26.4B parameters with 3.4B active per token (5.4B with its three
 passes), from a llama.cpp GGUF: Unsloth's
-[UD-IQ4_XS](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (or its UD-IQ1_M, UD-Q2_K_XL and
-UD-Q3_K_XL), IsValorum's
+[UD-IQ4_XS](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (or its UD-IQ1_M, UD-Q2_K_XL,
+UD-Q3_K_XL and UD-Q8_K_XL), IsValorum's
 [APEX-I MiniPlus](https://huggingface.co/IsValorum/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-GGUF) or
 another quantization of the release, with the release's vision tower (BF16 or Q8_0) and DSpark
 drafter. It is the engine's first looped
@@ -39,7 +39,11 @@ tokenization, the chat template, output parsing and the serving protocols.
   MiniPlus stores its sink and dynamic-tap projections in Q8_0, which the converter decodes to FP32
   exactly.
   Vector kernels multiply up to eight tokens, integer matrix kernels the prompt chunks, the expert
-  products the routed experts only.
+  products the routed experts only. A GGUF's BF16 matrices keep their words: UD-Q8_K_XL stores
+  attention, the token table, the head and layers 20-23's expert banks in BF16. A model with any
+  BF16 matrix runs every call on BF16 rows: Linear's A16 route multiplies the BF16 matrices into
+  FP32, a SIMT kernel the BF16 experts (FP32 sums of each expert's pairs, 32 at a time), and the
+  integer matrix kernels the GGUF matrices at every width.
 - **The looped state.** A decode or verification call of at most 16 rows spreads each depth mix
   and residual update over one-warp blocks of 128 channels instead of one block per row. Each warp
   keeps its sums, and every reader adds them in the order the one-block kernel adds its warps', so
@@ -152,6 +156,8 @@ file) to 8,785,600,768, 10,080,361,216 and 14,392,937,728 bytes, in about 30 sec
 rented RTX 3090 host. UD-Q2_K_XL stores layer 20's down bank in MXFP4, which the expert products
 do not take: the converter writes the same values as Q8_0 blocks, each code's doubled value as
 the int8 code and 2^(e - 128) as the F16 scale, checking every block against the MXFP4 decode.
+UD-Q8_K_XL converts the same way to 23,685,230,592 bytes in 55 seconds on a rented RTX A6000 host;
+its BF16 matrices, expert banks included, are copied word for word.
 
 ## Running
 
@@ -288,6 +294,24 @@ With `--expert-residency host` (6.3, 7.5 and 11.4 GiB pinned) or `disk` each gav
 run's 384 greedy tokens, reasoning included, byte for byte, as did DSpark; the 3090's cache held
 every expert. Each names the mailbox's 24 and the sun on the right in the image prompt of
 examples/cli/messages/image_natural.json. No card under 24 GB has run them.
+
+### UD-Q8_K_XL
+
+Unsloth's UD-Q8_K_XL (22.1 GiB), the reference of Unsloth's KL measurements, keeps BF16 attention,
+token table, head and layers 20-23's experts, and NVFP4 experts in layers 0-19. On a rented RTX
+A6000 (300 W, PCIe 4.0 x16, CUDA 12.8), November 21, 2026, one run each:
+
+- **Memory.** 21.3 GiB of weights, 22.0 GiB with the tower and the drafter; one sequence plans
+  22.9 GiB of the GPU at 8,192 tokens with `--spec none` and 24.7 GiB at 32,768 with the tower and
+  the drafter. `--expert-residency host` pins 18.3 GiB of host memory and keeps 3.07 GiB of weights
+  and two 1,944 MiB layer banks on the GPU.
+- **Speed.** The 384-token greedy essay decodes at 67.3 tok/s with `--spec none`, 72.9 with DSpark
+  (1.76 tokens a round), 63.8 with host experts and 63.5 with disk experts (the A6000's cache held
+  every expert). A 9,742-token prompt prefills at 1,710 tok/s, then decodes at 61.6 tok/s.
+- **Quality.** A mean NLL of 1.857855 on the 40 KB WikiText slice (`--kv-dtype bf16`, 9,718
+  scored tokens), against UD-IQ4_XS's 1.859871 (-0.11%). Host, disk and DSpark runs give the
+  device run's 384 greedy tokens byte for byte; the image prompt gives the mailbox's 24 and the sun
+  on the right.
 
 ### Across cards
 
@@ -478,7 +502,8 @@ threads compute, through the transport Gemma 4 and Flint use
 rounds and the growing KV): a whole-layer bank for a prompt chunk's missing experts, a cache of the
 experts decode routes most (`--expert-cache-mib`), and a CPU share of a decode call's misses
 (`--expert-dma-share`, `--expert-cpu-threads`) computed from the stored blocks into the same 2^-32
-fixed-point sums as the GPU's, so outputs do not depend on the split. At startup the cache takes
+fixed-point sums as the GPU's, so outputs do not depend on the split. A model with BF16 matrices
+(UD-Q8_K_XL) has no CPU share: its calls read BF16 rows, and the GPU copies every miss. At startup the cache takes
 the most routed experts of the build's routing profile for this geometry, recorded over four chat
 requests unlike the measured ones (`--expert-profile PATH` reads another); from then on it follows
 the routes.

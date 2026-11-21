@@ -15,6 +15,7 @@
 #include "models/inkling2/cpu_experts.h"
 #include "models/inkling2/kernels.h"
 #include "models/inkling2/vision.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
@@ -81,13 +82,14 @@ std::vector<Weight> matrices(const Model& model, std::initializer_list<WeightId>
 }
 
 void require_gguf(const Model& model, WeightId id, const Weight& w) {
-    if (!is_gguf(w.qtype)) {
-        throw std::invalid_argument(model.weight(id).name + ": Inkling 2 runs GGUF block matrices (" +
-                                    std::to_string(int(w.qtype)) + ")");
+    if (!is_gguf(w.qtype) && w.qtype != QType::BF16) {
+        throw std::invalid_argument(model.weight(id).name + ": Inkling 2 runs GGUF block or BF16 "
+                                    "matrices (" + std::to_string(int(w.qtype)) + ")");
     }
 }
 
 std::int64_t row_bytes(const Weight& w) {
+    if (w.qtype == QType::BF16) { return std::int64_t(w.k) * 2; }
     const auto block = gguf_block_shape(w.qtype);
     return std::int64_t(w.k / block.elements) * block.bytes;
 }
@@ -137,6 +139,7 @@ struct LayerPlan {
                 *gate_up_scale = nullptr, *down_scale = nullptr;
     int delivery_layer = -1;
     gguf::GgmlType gate_up_type{}, down_type{};
+    bool bf16 = false; // BF16 experts (both banks), multiplied by kernels::bf16_expert_rows
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     DeviceBuffer tables; // pointers: [E] gate, [E] up, [E] gate_up, [E] down
     bool gate_up_aligned16 = true, down_aligned16 = true;
@@ -258,6 +261,8 @@ struct Executor::Impl {
     // head: the vocabulary's rows; head_tiles: the stored rows the matrix kernel reads for them,
     // whole 128-row tiles (the GGUF pads the vocabulary past them).
     Weight embedding, head, head_tiles;
+    // A model with BF16 matrices runs every call on BF16 rows: the BF16 products read no q8_1 form.
+    bool bf16_rows = false;
     const float *embedding_norm = nullptr, *final_norm = nullptr, *output_mix = nullptr;
     std::vector<std::uint32_t> positions;
     // The position at which each sequence's rings last came whole from a prompt, a checkpoint or
@@ -341,6 +346,7 @@ struct Executor::Impl {
         output_mix     = fp32(model, w.output_mix, hidden);
         require_gguf(model, w.token_embedding, embedding);
         require_gguf(model, w.output_head, head);
+        bf16_rows = embedding.qtype == QType::BF16 || head.qtype == QType::BF16;
         if (options.dspine && (model.dspine() == nullptr || options.draft_tokens == 0 ||
                                options.draft_tokens + 1 > model.dspine()->config().block_size)) {
             throw std::invalid_argument("inkling2 executor: DSpine drafting needs the model's "
@@ -519,6 +525,10 @@ struct Executor::Impl {
         require_gguf(model, aw.value, p.value);
         require_gguf(model, aw.output, p.output);
         for (const Weight& m : p.query) { require_gguf(model, aw.query, m); }
+        for (const Weight* m : {&p.key, &p.value, &p.output}) {
+            bf16_rows = bf16_rows || m->qtype == QType::BF16;
+        }
+        for (const Weight& m : p.query) { bf16_rows = bf16_rows || m.qtype == QType::BF16; }
         const MoeWeights& mw = lw.moe;
         const int e = int(config.num_experts), width = int(config.moe_intermediate_size);
         p.router      = fp32(model, mw.router, e * hidden);
@@ -531,17 +541,21 @@ struct Executor::Impl {
                                          std::uint32_t last) {
                 const Weight gate_up = matrix(model, {gate_up_id});
                 const Weight down    = matrix(model, {down_id});
-                if (!is_gguf(gate_up.qtype) || !is_gguf(down.qtype)) {
-                    throw std::invalid_argument("Inkling 2 experts must be GGUF block matrices");
+                const bool bf16      = gate_up.qtype == QType::BF16 && down.qtype == QType::BF16;
+                if (!bf16 && (!is_gguf(gate_up.qtype) || !is_gguf(down.qtype))) {
+                    throw std::invalid_argument("Inkling 2 experts must be GGUF block matrices or "
+                                                "BF16 (both banks)");
                 }
-                const auto gate_up_type = ops::detail::gguf_type(gate_up.qtype);
-                const auto down_type    = ops::detail::gguf_type(down.qtype);
+                const auto gate_up_type = bf16 ? gguf::GgmlType{} : ops::detail::gguf_type(gate_up.qtype);
+                const auto down_type    = bf16 ? gguf::GgmlType{} : ops::detail::gguf_type(down.qtype);
                 if (p.gate_up_row_bytes == 0) {
+                    p.bf16              = bf16;
                     p.gate_up_type      = gate_up_type;
                     p.down_type         = down_type;
                     p.gate_up_row_bytes = row_bytes(gate_up);
                     p.down_row_bytes    = row_bytes(down);
-                } else if (gate_up_type != p.gate_up_type || down_type != p.down_type) {
+                } else if (bf16 != p.bf16 || gate_up_type != p.gate_up_type ||
+                           down_type != p.down_type) {
                     throw std::invalid_argument("Inkling 2: one layer's experts in different "
                                                 "formats");
                 }
@@ -581,13 +595,17 @@ struct Executor::Impl {
         } else {
             p.delivery_layer    = int(i);
             const auto& bank    = model.expert_banks()[i];
-            p.gate_up_type      = ops::detail::gguf_type(bank.gate_up_type);
-            p.down_type         = ops::detail::gguf_type(bank.down_type);
+            p.bf16 = bank.gate_up_type == QType::BF16 && bank.down_type == QType::BF16;
+            if (!p.bf16) {
+                p.gate_up_type = ops::detail::gguf_type(bank.gate_up_type);
+                p.down_type    = ops::detail::gguf_type(bank.down_type);
+            }
             p.gate_up_row_bytes = std::int64_t(bank.gate_up_row_bytes);
             p.down_row_bytes    = std::int64_t(bank.down_row_bytes);
         }
-        if (!gguf::moe_matrix_supported(p.gate_up_type, 2 * width, hidden, true) ||
-            !gguf::moe_matrix_supported(p.down_type, hidden, width, true)) {
+        bf16_rows = bf16_rows || p.bf16;
+        if (!p.bf16 && (!gguf::moe_matrix_supported(p.gate_up_type, 2 * width, hidden, true) ||
+                        !gguf::moe_matrix_supported(p.down_type, hidden, width, true))) {
             throw std::invalid_argument("Inkling 2: no integer expert kernel for these expert "
                                         "formats");
         }
@@ -618,10 +636,14 @@ struct Executor::Impl {
         o.commit_rows     = std::min<std::uint32_t>(options.sequences, 8);
         o.feature_columns = std::max<std::uint32_t>(std::min(options.prefill_chunk, window),
                                                     std::uint32_t(decode_rows()));
-        const ops::detail::GgufShape shape{head_tiles.qtype, head_tiles.n, head_tiles.k};
         const auto columns = static_cast<std::int32_t>(o.draft_tokens * o.draft_rows);
-        o.head_bytes       = ops::detail::gguf_project_workspace_bytes({&shape, 1}, 1, columns) +
-                       round_up(std::size_t(columns) * head_tiles.n * 4, 256);
+        if (head_tiles.qtype == QType::BF16) {
+            o.head_bytes = round_up(std::size_t(columns) * head_tiles.n * 4, 256);
+        } else {
+            const ops::detail::GgufShape shape{head_tiles.qtype, head_tiles.n, head_tiles.k};
+            o.head_bytes = ops::detail::gguf_project_workspace_bytes({&shape, 1}, 1, columns) +
+                           round_up(std::size_t(columns) * head_tiles.n * 4, 256);
+        }
         return o;
     }
 
@@ -641,9 +663,7 @@ struct Executor::Impl {
             const int n  = ids.ne[0];
             auto scope   = workspace->scope();
             auto* scratch = static_cast<float*>(workspace->alloc_bytes(std::size_t(n) * hidden * 4).data);
-            gguf::dequantize_rows(ops::detail::gguf_type(embedding.qtype), embedding.qdata,
-                                  row_bytes(embedding), hidden,
-                                  static_cast<const std::int32_t*>(ids.data), n, scratch, hidden, on);
+            table_rows(embedding, static_cast<const std::int32_t*>(ids.data), n, scratch, hidden, on);
             kernels::rms_norm(scratch, embedding_norm, hidden, n, eps,
                               static_cast<__nv_bfloat16*>(rows.data), on);
         };
@@ -655,7 +675,9 @@ struct Executor::Impl {
             const std::int64_t rows = logits.ne[0];
             auto* out               = static_cast<float*>(logits.data);
             ops::detail::GgufProduct product;
-            if (n <= gguf::kMaxVectorColumns) {
+            if (head.qtype == QType::BF16) {
+                project_f32(x, head_tiles, out, int(rows), 0, work, on);
+            } else if (n <= gguf::kMaxVectorColumns) {
                 product.weight   = &head;
                 product.f32      = out;
                 product.f32_rows = std::int32_t(rows);
@@ -873,8 +895,7 @@ struct Executor::Impl {
             for (int i = 0; i < n; ++i) { host[i] = first + i; }
             CUDA_CHECK(cudaMemcpyAsync(ids, host.data(), std::size_t(n) * 4, cudaMemcpyHostToDevice,
                                        stream));
-            gguf::dequantize_rows(ops::detail::gguf_type(head.qtype), head.qdata, row_bytes(head),
-                                  hidden, ids, n, rows, hidden, stream);
+            table_rows(head, ids, n, rows, hidden, stream);
             kernels::gemm_f32(cols, n, hidden, inputs, rows, out, stream);
             kernels::spark_table(out, n,
                                  static_cast<__nv_bfloat16*>(d.table_m.p) + std::int64_t(first) * rank,
@@ -966,9 +987,7 @@ struct Executor::Impl {
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);
-        gguf::dequantize_rows(ops::detail::gguf_type(embedding.qtype), embedding.qdata,
-                              row_bytes(embedding), hidden,
-                              static_cast<const std::int32_t*>(d_tokens.p), 1, h, hidden, stream);
+        table_rows(embedding, static_cast<const std::int32_t*>(d_tokens.p), 1, h, hidden, stream);
         kernels::rms_norm(h, embedding_norm, hidden, 1, eps, nullptr, stream, {}, h);
         for (int i = 1; i < b; ++i) {
             CUDA_CHECK(cudaMemcpyAsync(h + std::int64_t(i) * hidden, d.mask_embedding,
@@ -1045,10 +1064,18 @@ struct Executor::Impl {
         auto* final_rows = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);
         kernels::rms_norm(h, d.final_norm, hidden, b, deps, nullptr, stream, {}, final_rows);
         // The head's products of the rows the k steps read (1..k), in their rows of `base`.
-        const Q8Act head_in = alloc_q8(hidden, k);
-        kernels::rms_norm(h + hidden, d.final_norm, hidden, k, deps, nullptr, stream, head_in.rows);
         auto* base = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * vocab * 4).data);
-        vector_f32(head_in.base, head, k, base + vocab, vocab);
+        if (head.qtype == QType::BF16) {
+            auto* head_in = static_cast<__nv_bfloat16*>(
+                workspace->alloc_bytes(std::size_t(k) * hidden * 2).data);
+            kernels::rms_norm(h + hidden, d.final_norm, hidden, k, deps, head_in, stream);
+            project_f32(Tensor(head_in, DType::BF16, {hidden, k}), head_tiles, base + vocab, vocab);
+        } else {
+            const Q8Act head_in = alloc_q8(hidden, k);
+            kernels::rms_norm(h + hidden, d.final_norm, hidden, k, deps, nullptr, stream,
+                              head_in.rows);
+            vector_f32(head_in.base, head, k, base + vocab, vocab);
+        }
         auto* scratch = static_cast<float*>(
             workspace->alloc_bytes(kernels::spark_step_floats(vocab) * 4).data);
         CUDA_CHECK(cudaMemsetAsync(d.state.p, 0, d.state.bytes, stream));
@@ -1176,7 +1203,8 @@ struct Executor::Impl {
             }
             scales.push_back(std::move(s));
         }
-        if (computes && dma_share < 1) {
+        // A model with BF16 matrices has no q8_1 decode calls for the CPU to read.
+        if (computes && dma_share < 1 && !bf16_rows) {
             cpu_experts = std::make_unique<CpuExperts>(
                 std::move(cpu_layers), std::move(scales), hidden, int(config.moe_intermediate_size),
                 int(config.top_k_experts), config.gate_cap, config.up_cap);
@@ -1340,20 +1368,33 @@ struct Executor::Impl {
         const std::size_t q_floats = std::size_t(query_heads) * kD;
         const std::size_t width    = config.moe_intermediate_size;
         const std::size_t rank     = config.gate_rank;
-        std::size_t query_rows = 0, gguf_scratch = 0;
+        std::size_t query_rows = 0, gguf_scratch = 0, bf16_plane = 0;
         for (const LayerPlan& p : layers) {
             query_rows = std::max<std::size_t>(query_rows, p.query_rows);
+            // A BF16 matrix writing columns wider than its rows goes through a plane (project_f32).
+            for (const Weight& part : p.query) {
+                if (part.qtype == QType::BF16 && part.n != p.query_rows) {
+                    bf16_plane = std::max<std::size_t>(bf16_plane, part.n);
+                }
+            }
+            for (const Weight* m : {&p.key, &p.value}) {
+                if (m->qtype == QType::BF16) { bf16_plane = std::max<std::size_t>(bf16_plane, m->n); }
+            }
             std::vector<const Weight*> products{&p.key, &p.value, &p.output};
             for (const Weight& part : p.query) { products.push_back(&part); }
             for (const Weight* m : products) {
+                if (!is_gguf(m->qtype)) { continue; }
                 const ops::detail::GgufShape shape{m->qtype, m->n, m->k};
                 gguf_scratch = std::max(gguf_scratch, ops::detail::gguf_project_workspace_bytes(
                                                           {&shape, 1}, 1, int(t)));
             }
         }
-        const ops::detail::GgufShape hs{head_tiles.qtype, head_tiles.n, head_tiles.k};
-        gguf_scratch = std::max(gguf_scratch,
-                                ops::detail::gguf_project_workspace_bytes({&hs, 1}, 1, kHeadRows));
+        if (is_gguf(head_tiles.qtype)) {
+            const ops::detail::GgufShape hs{head_tiles.qtype, head_tiles.n, head_tiles.k};
+            gguf_scratch = std::max(
+                gguf_scratch, ops::detail::gguf_project_workspace_bytes({&hs, 1}, 1, kHeadRows));
+        }
+        gguf_scratch += round_up(t * bf16_plane * 4, kAlign);
         std::size_t bytes = 0;
         const auto add    = [&](std::size_t n) { bytes += round_up(n, kAlign); };
         // Call scope.
@@ -1411,17 +1452,19 @@ struct Executor::Impl {
         return std::max<int>(int(options.prefill_chunk), gguf::kMaxVectorColumns);
     }
 
-    // A MoE call's packed input: the activation the experts read (up to 8 tokens: their q8_1
-    // vector form; wider: BF16 [T][H]), then the ids, weights and pair scales, 256-aligned.
+    // A MoE call's packed input: the activation the experts read (a call of up to 8 tokens with a
+    // q8_1 form: that form; others: BF16 [T][H]), then the ids, weights and pair scales,
+    // 256-aligned.
     struct ExpertInput {
         std::size_t activation = 0, ids = 0, weights = 0, scales = 0, bytes = 0;
     };
 
-    [[nodiscard]] ExpertInput expert_input(int t) const {
+    // `q8`: the call carries its q8_1 vector form (up to 8 tokens), which it then sends instead
+    // of its BF16 rows.
+    [[nodiscard]] ExpertInput expert_input(int t, bool q8) const {
         const std::size_t pairs = std::size_t(t) * config.top_k_experts;
         ExpertInput out;
-        out.activation = t <= gguf::kMaxVectorColumns ? gguf::vector_activation_bytes(hidden, t)
-                                                      : std::size_t(t) * hidden * 2;
+        out.activation = q8 ? gguf::vector_activation_bytes(hidden, t) : std::size_t(t) * hidden * 2;
         out.ids     = round_up(out.activation, kAlign);
         out.weights = out.ids + round_up(pairs * 4, kAlign);
         out.scales  = out.weights + round_up(pairs * 4, kAlign);
@@ -1451,7 +1494,7 @@ struct Executor::Impl {
         if (!model.expert_parallel()) { return; }
         const int t = max_moe_tokens();
         const std::size_t input =
-            std::max(expert_input(t).bytes, expert_input(gguf::kMaxVectorColumns).bytes);
+            std::max(expert_input(t, false).bytes, expert_input(gguf::kMaxVectorColumns, true).bytes);
         const std::size_t part = std::size_t(t) * hidden * 8;
         expert_pack            = DeviceBuffer(input);
         expert_exchange        = std::make_unique<ExpertParallelExchange>(device, input, part);
@@ -1466,6 +1509,8 @@ struct Executor::Impl {
 
     void divide_head() {
         const int columns = gguf::kMaxVectorColumns;
+        // Only the q8_1 decode head divides; a model with BF16 matrices has no such calls.
+        if (bf16_rows) { return; }
         if (!models::DividedHead::divides(head, device.size())) { return; }
         const auto speed        = rank_copy_bandwidth(device);
         const auto free         = rank_free_bytes(device);
@@ -1491,9 +1536,25 @@ struct Executor::Impl {
                            config.up_cap, middle, on);
     }
 
+    // A BF16 layer's routed experts over the pairs of `routing`: FP32 [gate; up] rows `gu`, their
+    // SiTU middles, then each pair's FP32 product row in `rows` ([pairs][hidden]).
+    void bf16_experts(const void* const* tables, const gguf::MoeRouting& routing, int max_active,
+                      const __nv_bfloat16* x, float* gu, __nv_bfloat16* middle,
+                      const float* pair_scale, int pairs, float* rows, cudaStream_t on) const {
+        const int e = int(config.num_experts), k = int(config.top_k_experts);
+        const int width = int(config.moe_intermediate_size);
+        kernels::bf16_expert_rows(tables + 2 * e, 2 * width, hidden, routing.bounds, routing.sorted,
+                                  routing.active, routing.active_count, max_active, x, k, gu, on);
+        situ(gu, pairs, pair_scale, middle, on);
+        kernels::bf16_expert_rows(tables + 3 * e, hidden, width, routing.bounds, routing.sorted,
+                                  routing.active, routing.active_count, max_active, middle, 1, rows,
+                                  on);
+    }
+
     // One rank's part of a MoE call of layer `p`: the call's pairs routed to the experts the rank
     // holds (`range`), through its `tables`, weighted into the 2^-32 fixed-point sum `fixed`
-    // ([T][H]). Up to 8 tokens read the call's q8_1 activation `act`, wider calls its BF16 rows `x`.
+    // ([T][H]). Up to 8 tokens read the call's q8_1 activation `act` when it has one, other calls
+    // its BF16 rows `x`.
     void expert_part(const LayerPlan& p, const void* const* tables,
                      std::pair<std::uint32_t, std::uint32_t> range, const void* act,
                      const __nv_bfloat16* x, const std::int32_t* ids, const float* weights,
@@ -1516,7 +1577,13 @@ struct Executor::Impl {
             static_cast<__nv_bfloat16*>(space.alloc_bytes(std::size_t(pairs) * width * 2).data);
         auto* gu =
             static_cast<float*>(space.alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
-        if (t <= gguf::kMaxVectorColumns) {
+        if (p.bf16) {
+            auto* rows = static_cast<float*>(space.alloc_bytes(std::size_t(pairs) * hidden * 4).data);
+            bf16_experts(tables, routing, max_active, x, gu, middle, pair_scale, pairs, rows, on);
+            gguf::moe_weighted_rows(rows, mine, weights, t, k, hidden, fixed, on);
+            return;
+        }
+        if (act != nullptr && t <= gguf::kMaxVectorColumns) {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
             void* act2      = space.alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, on));
@@ -1558,9 +1625,9 @@ struct Executor::Impl {
                           int t, kernels::ResidualArgs& residual) {
         const std::size_t pairs  = std::size_t(t) * config.top_k_experts;
         const std::size_t part   = std::size_t(t) * hidden * 8;
-        const ExpertInput layout = expert_input(t);
+        const ExpertInput layout = expert_input(t, act != nullptr);
         auto* pack               = static_cast<std::byte*>(expert_pack.p);
-        CUDA_CHECK(cudaMemcpyAsync(pack, t <= gguf::kMaxVectorColumns ? act : x, layout.activation,
+        CUDA_CHECK(cudaMemcpyAsync(pack, act != nullptr ? act : x, layout.activation,
                                    cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(
             cudaMemcpyAsync(pack + layout.ids, ids, pairs * 4, cudaMemcpyDeviceToDevice, stream));
@@ -1575,7 +1642,8 @@ struct Executor::Impl {
             auto* input      = static_cast<std::byte*>(
                 expert_exchange->receive(r, layout.bytes, slot, peer.stream));
             expert_part(p, static_cast<const void* const*>(p.peer_tables[r].p),
-                        model.expert_range(r), input, reinterpret_cast<const __nv_bfloat16*>(input),
+                        model.expert_range(r), act != nullptr ? input : nullptr,
+                        reinterpret_cast<const __nv_bfloat16*>(input),
                         reinterpret_cast<const std::int32_t*>(input + layout.ids),
                         reinterpret_cast<const float*>(input + layout.weights),
                         reinterpret_cast<const float*>(input + layout.scales), t,
@@ -1624,13 +1692,52 @@ struct Executor::Impl {
     }
 
     // out[:, c] = W x_c for BF16 rows x [K, T]: FP32 columns `column_stride` apart, from `row`.
+    // A BF16 W (rows a multiple of 4) multiplies through Linear's A16 route, which writes 16-byte
+    // aligned [N, T] planes: straight into `out` when it is one, else into a scratch plane whose
+    // first min(N, column_stride - row) rows of each column are then copied out.
     void project_f32(const Tensor& x, const Weight& w, float* out, int column_stride, int row = 0) {
+        project_f32(x, w, out, column_stride, row, *workspace, stream);
+    }
+    void project_f32(const Tensor& x, const Weight& w, float* out, int column_stride, int row,
+                     WorkspaceArena& work, cudaStream_t on) const {
+        if (w.qtype == QType::BF16) {
+            if (w.n % 4 != 0) {
+                throw std::invalid_argument("inkling2: a BF16 matrix of rows not a multiple of 4");
+            }
+            const int t = x.ne[1];
+            if (column_stride == w.n && reinterpret_cast<std::uintptr_t>(out + row) % 16 == 0) {
+                Tensor y(out + row, DType::FP32, {w.n, t});
+                ops::linear(x, w, y, on);
+                return;
+            }
+            auto scope  = work.scope();
+            auto* plane = static_cast<float*>(work.alloc_bytes(std::size_t(w.n) * t * 4).data);
+            Tensor y(plane, DType::FP32, {w.n, t});
+            ops::linear(x, w, y, on);
+            const int kept = std::min(w.n, column_stride - row);
+            CUDA_CHECK(cudaMemcpy2DAsync(out + row, std::size_t(column_stride) * 4, plane,
+                                         std::size_t(w.n) * 4, std::size_t(kept) * 4,
+                                         std::size_t(t), cudaMemcpyDeviceToDevice, on));
+            return;
+        }
         ops::detail::GgufProduct product;
         product.weight   = &w;
         product.f32      = out;
         product.f32_rows = column_stride;
         product.row      = row;
-        ops::detail::gguf_project(x, {&product, 1}, *workspace, stream);
+        ops::detail::gguf_project(x, {&product, 1}, work, on);
+    }
+
+    // Rows ids[0, n) of the token table or the head as FP32 rows `ld` apart, every value exact.
+    void table_rows(const Weight& w, const std::int32_t* ids, int n, float* out, std::int64_t ld,
+                    cudaStream_t on) const {
+        if (w.qtype == QType::BF16) {
+            kernels::bf16_rows_f32(static_cast<const __nv_bfloat16*>(w.qdata), w.k, ids, n, out, ld,
+                                   on);
+            return;
+        }
+        gguf::dequantize_rows(ops::detail::gguf_type(w.qtype), w.qdata, row_bytes(w), w.k, ids, n,
+                              out, ld, on);
     }
 
     // W x into FP32 [T][column_stride] from row `row`, x in the call's form: q8_1 rows (up to 8)
@@ -1861,9 +1968,7 @@ struct Executor::Impl {
         States& s = c.states;
         s.cur     = 0;
         float* h  = s.buffers[0];
-        gguf::dequantize_rows(ops::detail::gguf_type(embedding.qtype), embedding.qdata,
-                              row_bytes(embedding), hidden,
-                              static_cast<const std::int32_t*>(d_tokens.p), c.t, h, hidden, stream);
+        table_rows(embedding, static_cast<const std::int32_t*>(d_tokens.p), c.t, h, hidden, stream);
         kernels::rms_norm(h, embedding_norm, hidden, c.t, eps, nullptr, stream, {}, h);
         // A piece at a time through the device rows, each copy ordered after the placement before.
         for (const ImageRows& piece : images) {
@@ -2315,6 +2420,16 @@ struct Executor::Impl {
             return;
         }
         if (delivery) { delivery->await(stream); }
+        if (p.bf16) {
+            auto* rows = static_cast<float*>(
+                workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
+            bf16_experts(tables, routing, max_active, c.ffn_bf16, gu, middle, pair_scale, pairs,
+                         rows, stream);
+            ra.moe_rows    = rows;
+            ra.moe_weights = weights;
+            ra.top_k       = k;
+            return;
+        }
         void* rows_act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
         gguf::quantize_moe_matrix_activation(p.gate_up_type, c.ffn_bf16, hidden, routing, pairs, k,
                                              rows_act, stream);
@@ -2425,7 +2540,7 @@ struct Executor::Impl {
         Call c;
         c.t        = t;
         // A branch pass gathers its branches' last rows from the BF16 final rows.
-        c.q8       = t <= gguf::kMaxVectorColumns && !branching;
+        c.q8       = t <= gguf::kMaxVectorColumns && !branching && !bf16_rows;
         c.chunk    = true;
         c.sequence = sequence;
         c.first    = int(first);
@@ -2530,7 +2645,7 @@ struct Executor::Impl {
         auto scope = workspace->scope();
         Call c;
         c.t              = b;
-        c.q8             = true;
+        c.q8             = !bf16_rows;
         c.keep           = true;
         c.rows.positions = static_cast<const std::int32_t*>(d_positions.p);
         c.rows.sequences = static_cast<const std::int32_t*>(d_sequences.p);
@@ -2538,7 +2653,11 @@ struct Executor::Impl {
         c.plane          = std::int64_t(b) * hidden;
         c.spark_rows     = b;
         run_with_taps(c, {}, 0, spine ? b : 0);
-        head_logits_q8(c.ffn_q, b, b);
+        if (c.q8) {
+            head_logits_q8(c.ffn_q, b, b);
+        } else {
+            head_logits(c.ffn_bf16, b, 0);
+        }
         if (spine && keep) {
             spine->commit_rows(Tensor(d_sequences.p, DType::I32, {b}),
                                Tensor(d_positions.p, DType::I32, {b}), 0, stream);

@@ -308,6 +308,21 @@ void route(const RouteArgs& args, cudaStream_t stream);
 void situ_rows(const float* gu, std::int64_t stride, int pairs, int width, const float* pair_scale,
                float gate_cap, float up_cap, __nv_bfloat16* out, cudaStream_t stream);
 
+// BF16 expert products: out[p][r] = sum_j W_e[r][j] x[p / x_div][j] in FP32 for every pair p of
+// an active expert e (the routing's grouping: pairs sorted[bounds[e], bounds[e + 1]), experts
+// active[0, *active_count), at most max_active of them), W_e the `rows` x `k` BF16 rows at
+// table[e] (16-byte aligned), x BF16 rows of k values (a token's for x_div top_k, a pair's own
+// for 1), k % 8 == 0. Other pairs' rows of out are left as they are. Each sum adds a lane's
+// eight-column runs in column order, then the warp's lanes: the same bits on every call.
+void bf16_expert_rows(const void* const* table, int rows, int k, const std::int32_t* bounds,
+                      const std::int32_t* sorted, const std::int32_t* active,
+                      const std::int32_t* active_count, int max_active, const __nv_bfloat16* x,
+                      int x_div, float* out, cudaStream_t stream);
+
+// Rows ids[0, rows) of a BF16 table [*][k] as FP32 rows `out_stride` apart, exactly.
+void bf16_rows_f32(const __nv_bfloat16* table, int k, const std::int32_t* ids, int rows,
+                   float* out, std::int64_t out_stride, cudaStream_t stream);
+
 // out = bf16(cap tanh(in / cap)) for `n` logits.
 void softcap_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, float cap,
                   cudaStream_t stream);

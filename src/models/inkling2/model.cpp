@@ -69,16 +69,22 @@ std::vector<ExpertBlob> expert_blobs(const artifact::Reader& reader,
     }
     const auto& part = parts.front();
     const auto& geometry = reader.geometry(part.object);
-    if (!is_gguf(geometry.format) || geometry.shape.size() != 2 || geometry.shape[1] != k ||
-        part.begin % k || part.end - part.begin != experts * rows * k) {
-        throw artifact::ArtifactError(reference.name + ": experts must be stored GGUF block rows");
+    const bool bf16 = geometry.format == QType::BF16;
+    if ((!is_gguf(geometry.format) && !bf16) || geometry.shape.size() != 2 ||
+        geometry.shape[1] != k || part.begin % k || part.end - part.begin != experts * rows * k) {
+        throw artifact::ArtifactError(reference.name +
+                                      ": experts must be stored GGUF block rows or BF16 rows");
     }
     format = geometry.format;
-    const auto block = gguf_block_shape(format);
-    if (k % block.elements) {
-        throw artifact::ArtifactError(reference.name + ": partial stored quantization block");
+    if (bf16) {
+        row_bytes = k * 2;
+    } else {
+        const auto block = gguf_block_shape(format);
+        if (k % block.elements) {
+            throw artifact::ArtifactError(reference.name + ": partial stored quantization block");
+        }
+        row_bytes = k / block.elements * block.bytes;
     }
-    row_bytes = k / block.elements * block.bytes;
     reader.validate_object(part.object);
     const auto start = part.begin / k * row_bytes;
     for (std::uint64_t e = 0; e < experts; ++e) {

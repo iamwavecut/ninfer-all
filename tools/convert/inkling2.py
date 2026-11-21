@@ -11,10 +11,12 @@ rank-64 controllers. The MoE routes 8 of 128 experts by sigmoid score plus a sel
 SiTU (gated by a capped sigmoid product) over [gate; up] rows with a per-expert scale of each
 product. The recipe imports the GGUF's block matrices row for row, as stored; a row of the artifact
 is byte for byte a row of the GGUF, except that an MXFP4 expert bank (UD-Q2_K_XL's layer 20 down
-bank), which the expert products do not take, becomes the same values in Q8_0 blocks. BF16 and F32
-tensors (sink and dynamic-tap projections, router, convolutions, clips, the distance tables, mixing
-queries, norms, controllers, expert scales) become FP32, exactly, as do Q8_0 ones, whose values d *
-q FP32 holds (IsValorum's APEX GGUFs store the sink and dynamic-tap projections in Q8_0).
+bank), which the expert products do not take, becomes the same values in Q8_0 blocks. A BF16
+matrix (UD-Q8_K_XL's attention projections, token table, head and last four layers' experts) keeps
+its words and multiplies BF16 inputs. Other BF16 and F32 tensors (sink and dynamic-tap projections,
+router, convolutions, clips, the distance tables, mixing queries, norms, controllers, expert
+scales) become FP32, exactly, as do Q8_0 ones, whose values d * q FP32 holds (IsValorum's APEX
+GGUFs store the sink and dynamic-tap projections in Q8_0).
 
 The GGUFs come in two layouts that convert to the same artifact: llama.cpp's (`inkling2_loop`, 24
 blocks, a block's four message queries in `blk.N.loop_msg_query` and its controllers
@@ -52,10 +54,11 @@ import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
-from .gguf_blocks import GGML_MXFP4, GGML_Q8_0, block_source, dequantize_q8_0, mxfp4_as_q8_0
+from .gguf_blocks import (GGML_MXFP4, GGML_Q8_0, bf16_source, block_source, dequantize_q8_0,
+                          mxfp4_as_q8_0)
 from .methods import cast_direct, import_encoded
 from .resources import _dump_json, token_domain
-from .sources.gguf import GGUFFile
+from .sources.gguf import TYPE_BF16, GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 from .ternary import rows
 
@@ -301,12 +304,16 @@ def _exact_bf16(gguf: GGUFFile, tensor: str, shape: tuple[int, ...]) -> LogicalS
 
 
 def _matrix(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
+    """A matrix as stored: ggml block rows (encoded), or BF16 words (values, no read_encoded)."""
+
     info = gguf.info(tensor)
-    if info.type_id not in GGUF_FORMATS_BY_TYPE:
-        raise ValueError(f"{tensor}: expected ggml block rows, found {info.type_name}")
+    if info.type_id not in GGUF_FORMATS_BY_TYPE and info.type_id != TYPE_BF16:
+        raise ValueError(f"{tensor}: expected ggml block rows or BF16, found {info.type_name}")
     stored = (int(np.prod(info.shape[:-1])), info.shape[-1])
     if stored != shape:
         raise ValueError(f"{tensor}: stored {info.shape}, expected rows x columns {shape}")
+    if info.type_id == TYPE_BF16:
+        return bf16_source(gguf, tensor, shape)
     source = block_source(gguf, tensor, shape, rows())
     if info.type_id != GGML_MXFP4:
         return source
@@ -687,8 +694,9 @@ def inkling2_gguf(model, recipe, sources):
         raise ValueError("the inkling2_gguf recipe requires an Inkling 2 model")
     formats = {}
     for name, parameter in model.parameters.items():
-        if (name.startswith("vision/") and parameter.projection
-                and parameter.source.read_encoded is None):
+        # A BF16 matrix (the tower's, or a text matrix the GGUF stores in BF16) keeps its words and
+        # multiplies BF16 inputs.
+        if parameter.projection and parameter.source.read_encoded is None:
             formats[name] = "bf16"
             recipe.assign(name, format="bf16", method=cast_direct, source=parameter.source,
                           activation_policy="A16Only")
