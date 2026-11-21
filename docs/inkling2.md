@@ -95,10 +95,13 @@ tokenization, the chat template, output parsing and the serving protocols.
   0,1 --tensor-parallel`, [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)),
   and DSpark drafts there by default too ([measurements](#measurements)).
 
-Not built for this family: the quantized `--kv-dtype` formats (the KV cache is F16, `bf16` or
-`fp16`), MTP, DFlash, n-gram copy drafts and their archive, `--draft-confidence`, rotation scaling
-(the attention has no rotation), thinking budgets, video, pipeline stages, and of the context
-cache the shared paged KV pool, the disk tier and session slots. DSpark drafts for one request at a
+Not built for this family: MTP, DFlash, n-gram copy drafts and their archive, `--draft-confidence`,
+rotation scaling (the attention has no rotation), thinking budgets, video, pipeline stages, and of
+the context cache the shared paged KV pool, the disk tier and session slots. The quantized
+`--kv-dtype rk8v4` and `rk4v4` quantize the eight full-attention visits' planes (the windowed
+visits' rings, the convolution histories and a DSpark drafter's caches stay F16); the other
+quantized formats (`int8`, `fp8`, `nvfp4`, `k8v4`, `rk4v4-e8`, `rk2v4-e8`, `bf16p`) are not built.
+DSpark drafts for one request at a
 time; with several requests decoding, each decodes a token a step.
 
 ## Converting

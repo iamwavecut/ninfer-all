@@ -140,6 +140,16 @@ struct ControlApply {
 };
 void control_apply(const ControlApply& args, cudaStream_t stream);
 
+// The call's rows: which sequence a row belongs to, and its physical position (a prompt chunk's
+// rows lie first + t, a decode or verification call's at their positions).
+__device__ __forceinline__ int row_sequence(const Rows& r, int t) {
+    return r.sequences != nullptr ? r.sequences[t] : r.sequence;
+}
+
+__device__ __forceinline__ int physical(const Rows& r, int t) {
+    return r.chunk ? r.first + t : r.positions[t];
+}
+
 // Q and the relative feature of each row from the [Q; gate; relative] product (FP32 rows
 // `stride` apart, Q at column 0, the relative feature at `relative_column`): per head
 //   q = clip(q * query_clip[h], qk_clip) * tau,   r = clip(r * relative_clip[h], relative_clip) * tau

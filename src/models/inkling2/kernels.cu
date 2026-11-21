@@ -182,14 +182,6 @@ int row_threads(int hidden) {
 
 // ---- Rows and their history ---------------------------------------------------------------------
 
-__device__ __forceinline__ int row_sequence(const Rows& r, int t) {
-    return r.sequences != nullptr ? r.sequences[t] : r.sequence;
-}
-
-__device__ __forceinline__ int physical(const Rows& r, int t) {
-    return r.chunk ? r.first + t : r.positions[t];
-}
-
 // Where the input `lag` positions before row t lies: a row of the call (>= 0), the history ring
 // (-1, `position` its position) or before position 0 (-2).
 __device__ __forceinline__ int history_source(const Rows& r, int t, int lag, int& position) {
