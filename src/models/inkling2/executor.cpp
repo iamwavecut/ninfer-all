@@ -362,13 +362,23 @@ struct Executor::Impl {
         const auto schedule  = config.visits();
         const int sequences  = int(options.sequences);
         const std::size_t row_f16 = std::size_t(kD) * sizeof(__half);
+        // Bytes of one full visit's K and V rows of one slot: F16 halves, or a quantized row's
+        // codes and scales.
+        const auto plane_bytes = [](KvCoding c) {
+            return std::size_t(kv_code_bytes(c)) + std::size_t(kv_scale_bytes(c));
+        };
+        const std::size_t full_slot_bytes =
+            kvfmt.quantized()
+                ? std::size_t(kv_heads) * (plane_bytes(kvfmt.key.coding) +
+                                           plane_bytes(kvfmt.value.coding)) * std::size_t(sequences)
+                : 2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
         {
             std::size_t needed = 0;
             for (const auto& [layer, pass] : schedule) {
-                const std::size_t kv = 2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
                 needed += config.full_attention[layer]
-                              ? std::size_t(global_slots) * kv
-                              : (options.checkpoints ? 2 : 1) * std::size_t(ring) * kv;
+                              ? std::size_t(global_slots) * full_slot_bytes
+                              : (options.checkpoints ? 2 : 1) * std::size_t(ring) *
+                                    2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
             }
             needed += (options.checkpoints ? 2 : 1) * std::size_t(sequences) * schedule.size() *
                       kR * std::size_t(slot_floats) * 4;
