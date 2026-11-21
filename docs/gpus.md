@@ -19,7 +19,7 @@ and verification status.
 | Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer, not 13.2.0 or 13.2.1 | `cuda13.4` | measured; built-in device profiles |
 | Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | both, native `89` | measured; built-in device profiles |
 | Ampere | 8.6 | `86` (the default) | 12.8 or newer | both | measured (the reference card); built-in device profiles |
-| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | both | built-in device profiles; not benchmarked |
+| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | both | measured; built-in device profiles |
 | Turing | 7.5 | `75` | 12.8 or newer | both | measured; built-in device profiles |
 | Volta | 7.0 | `70` | 12.8 or 12.9 | `cuda12.9` | measured; built-in device profiles |
 | Hopper; data-center Blackwell; GB10 | 9.0; 10.x; 12.1 | none | | | no build |
@@ -65,7 +65,7 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk), Edge0 (three-layer slices) |
+| ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk), Edge0 (three-layer slices), Inkling 2 Mini |
 | ⬜ | RTX 5090 D | 32 GB | GeForce | | |
 | ⬜ | RTX 5090 D V2 | 24 GB | GeForce | ✓ | |
 | ✅ | RTX 5080 | 16 GB | GeForce | ✓ | IQ3_S under WSL2 ([field report](performance/field-reports.md#rtx-5080-wsl2)) |
@@ -74,21 +74,21 @@ means the card calibrates once at its first start.
 | ✅ | RTX 5060 Ti | 16 / 8 GB | GeForce | ✓ | Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards ([field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards)) |
 | ⬜ | RTX 5060 | 8 GB | GeForce | ✓ | |
 | ⬜ | RTX 5050 | 8 GB | GeForce | | |
-| ✅ | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | Workstation | ✓ | Bonsai 2, Qwen3.8-27B, Flash-Next, DeepSeek-V4.1-Flash (experts in host memory, on disk; DSpark drafts) |
+| ✅ | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | Workstation | ✓ | Bonsai 2, Qwen3.8-27B, Flash-Next, DeepSeek-V4.1-Flash (experts in host memory, on disk; DSpark drafts), Inkling 2 Mini |
 | ⬜ | RTX PRO 6000 Blackwell Max-Q | 96 GB | Workstation | ✓ | |
 | ⬜ | RTX PRO 5000 Blackwell | 72 / 48 GB | Workstation | 48 GB | |
-| ⬜ | RTX PRO 4500 Blackwell | 32 GB | Workstation | ✓ | |
+| ✅ | RTX PRO 4500 Blackwell | 32 GB | Workstation | ✓ | Inkling 2 Mini |
 | ✅ | RTX PRO 4000 Blackwell | 24 GB | Workstation | ✓ | Qwen3.8-27B NVFP4 and a 27B with FP8 layers, on one card and with tensor parallelism over two |
 | ⬜ | RTX PRO 4000 Blackwell SFF | 24 GB | Workstation | | |
 | ⬜ | RTX PRO 2000 Blackwell | 16 GB | Workstation | | |
-| ⬜ | RTX PRO 6000 Blackwell Server Edition | 96 GB | Data center | ✓ | |
-| ⬜ | RTX PRO 4500 Blackwell Server Edition | 32 GB | Data center | ✓ | |
+| ✅ | RTX PRO 6000 Blackwell Server Edition | 96 GB | Data center | ✓ | Inkling 2 Mini |
+| ✅ | RTX PRO 4500 Blackwell Server Edition | 32 GB | Data center | ✓ | Inkling 2 Mini |
 
 ### Ada Lovelace (8.9, the image's `86` build or `89`)
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, Flint (experts in host memory), DeepSeek-V4.1-Flash (experts in host memory, on disk); Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)) |
+| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, Flint (experts in host memory), DeepSeek-V4.1-Flash (experts in host memory, on disk), Inkling 2 Mini; Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)) |
 | ⬜ | RTX 4090 D | 24 GB | GeForce | | |
 | ⬜ | RTX 4080 Super | 16 GB | GeForce | ✓ | |
 | ✅ | RTX 4080 | 16 GB | GeForce | ✓ | IQ3_S ([field report](performance/field-reports.md#rtx-4080-and-rtx-4090-windows-11)) |
@@ -98,14 +98,14 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 4070 | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 4060 Ti | 16 / 8 GB | GeForce | ✓ | |
 | ⬜ | RTX 4060 | 8 GB | GeForce | ✓ | |
-| ⬜ | RTX 6000 Ada | 48 GB | Workstation | ✓ | |
+| ✅ | RTX 6000 Ada | 48 GB | Workstation | ✓ | Inkling 2 Mini |
 | ⬜ | RTX 5880 Ada | 48 GB | Workstation | | |
 | ⬜ | RTX 5000 Ada | 32 GB | Workstation | ✓ | |
 | ⬜ | RTX 4500 Ada | 24 GB | Workstation | | |
-| ⬜ | RTX 4000 Ada | 20 GB | Workstation | ✓ | |
+| ✅ | RTX 4000 Ada | 20 GB | Workstation | ✓ | Inkling 2 Mini |
 | ⬜ | RTX 4000 SFF Ada | 20 GB | Workstation | | |
 | ⬜ | RTX 2000 Ada | 16 GB | Workstation | | |
-| ✅ | L40S | 48 GB | Data center | ✓ | Flash-Next |
+| ✅ | L40S | 48 GB | Data center | ✓ | Flash-Next, Inkling 2 Mini |
 | ⬜ | L40 | 48 GB | Data center | | |
 | ⬜ | L20 | 48 GB | Data center | | |
 | ⬜ | L4 | 24 GB | Data center | ✓ | |
@@ -124,24 +124,24 @@ means the card calibrates once at its first start.
 | ✅ | RTX 3060 | 12 GB | GeForce | ✓ | Bonsai 2, IQ3_S, Flash-Next (experts in host memory, on disk) |
 | ⬜ | RTX 3060 | 8 GB | GeForce | the 12 GB card's (28 SMs) | |
 | ⬜ | RTX 3050 | 8 GB | GeForce | ✓ | |
-| ✅ | RTX A6000 | 48 GB | Workstation | ✓ | Flash-Next (experts on the GPU, in host memory, on disk) |
+| ✅ | RTX A6000 | 48 GB | Workstation | ✓ | Flash-Next (experts on the GPU, in host memory, on disk), Inkling 2 Mini |
 | ⬜ | RTX A5500 | 24 GB | Workstation | | |
-| ⬜ | RTX A5000 | 24 GB | Workstation | ✓ | |
-| ⬜ | RTX A4500 | 20 GB | Workstation | | |
+| ✅ | RTX A5000 | 24 GB | Workstation | ✓ | Inkling 2 Mini |
+| ✅ | RTX A4500 | 20 GB | Workstation | ✓ | Inkling 2 Mini |
 | ✅ | RTX A4000 | 16 GB | Workstation | ✓ | Qwen3.8-27B NVFP4 and groupwise, with tensor parallelism over two and four cards |
 | ⬜ | RTX A2000 | 12 GB | Workstation | ✓ | |
 | ⬜ | RTX A1000 | 8 GB | Workstation | | |
-| ✅ | A40 | 48 GB | Data center | ✓ | Flint; Edge0-145B and Edge0-120B (experts on the GPU, in host memory, on disk; two tensor-parallel ranks on one card) |
+| ✅ | A40 | 48 GB | Data center | ✓ | Flint; Edge0-145B and Edge0-120B (experts on the GPU, in host memory, on disk; two tensor-parallel ranks on one card); Inkling 2 Mini |
 | ⬜ | A10 | 24 GB | Data center | ✓ | |
 | ⬜ | A10G | 24 GB | Data center | | |
 | ⬜ | A16 | 16 GB per GPU | Data center | | |
 | ⬜ | A2 | 16 GB | Data center | | |
 
-### Ampere, A100 class (8.0, build `80`, not in the image)
+### Ampere, A100 class (8.0, build `80`)
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ⬜ | A100 (PCIe, SXM4) | 80 / 40 GB | Data center | ✓ | |
+| ✅ | A100 (PCIe, SXM4) | 80 / 40 GB | Data center | ✓ | Inkling 2 Mini |
 | ⬜ | A800 | 80 / 40 GB | Data center | | |
 | ⬜ | A30 | 24 GB | Data center | | |
 

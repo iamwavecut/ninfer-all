@@ -158,9 +158,12 @@ prefix.
 
 ## Measurements
 
-`ninfer_bench` against llama.cpp b12588's `llama-bench` on the same UD-IQ4_XS GGUF (flash
-attention on, F16 KV), one sequence, three repetitions each, on an RTX 3090 (350 W, CUDA 12.8,
-build `86`, experts on the GPU), November 21, 2026. NInfer's prompts are Inkling-tokenized text,
+`ninfer_bench` against `llama-bench` from Unsloth's llama.cpp prebuilt
+[`b12588-mix-c0c3de8`](https://github.com/unslothai/llama.cpp/releases/tag/b12588-mix-c0c3de8)
+(upstream b12588 with Unsloth's Inkling 2 changes; mainline llama.cpp b12602 does not load the
+GGUF, whose looped layers use Unsloth's layout) on the same UD-IQ4_XS GGUF (flash attention on, F16
+KV), one sequence, three repetitions each, on an RTX 3090 (350 W, CUDA 12.8, build `86`, experts on
+the GPU), November 21, 2026. NInfer's prompts are Inkling-tokenized text,
 llama-bench's its own tokens. Decode after 10,000 tokens follows a 10,000-token prompt
 (`-pg 10000,128` for NInfer, `tg128 @ d10000` for llama.cpp).
 
@@ -209,6 +212,78 @@ the batched controllers and the sorted route ([what runs](#what-runs)) NInfer de
   one card (1.14x), each request's text equal to its text alone. With one request and an
   8,192-token context the server's devices use about 11,100 and 7,600 MiB against one card's
   18,300 MiB. Prompt rates over the split were not measured beyond a 33-token prompt.
+
+### Across cards
+
+The release packages of master on rented cards, November 21, 2026: `e64a7089`, and `b0b49ba6` (the
+same Linux code with an MSVC fix) on the RTX 3090, the A100 80GB PCIe, the RTX 4000 Ada, the RTX
+A4500 and both Server Editions; `cuda12.9` before Blackwell and `cuda13.4` on it. They ran the
+benchmarks above and the CLI's 384-token greedy essay with DSpark (the default) and with `--spec
+none`, one run each, with the experts on the GPU. Every card ran at its default power limit on an
+x16 link: PCIe 5.0 with pinned host-to-device copies of 56.3 and 56.9 GB/s for the two Server
+Editions, PCIe 4.0 with 23.4 to 28.6 GB/s for the rest (the other Blackwell cards, PCIe 5.0
+devices, linked at 4.0 on these hosts). The RTX A4500 had no built-in device profile; it ran with
+the one `ninfer-calibrate` measured on it first, which the build now carries. llama-bench ran with
+one thread per CPU of the container's quota where the host set one: with its default of one
+thread per host CPU, 120 threads on the RTX 5090 host's 17 CPUs prefilled 2,048 tokens at 1,677
+tok/s and 128 threads on the A100 host's 13.6 CPUs at 966, against 2,446 and 1,249 with the quota's
+count.
+
+NInfer / llama.cpp, tok/s:
+
+| Card | Power limit | Prefill 2,048 | Prefill 10,000 | Decode 128 | Decode after 10,000 |
+|---|---:|---:|---:|---:|---:|
+| RTX PRO 6000 Blackwell Workstation Edition | 600 W | 8,965 / 2,687 | 7,235 / 2,443 | 178.4 / 97.2 | 160.2 / 93.8 |
+| RTX 5090 | 575 W | 8,367 / 2,446 | 6,664 / 2,318 | 182.1 / 96.9 | 163.6 / 90.1 |
+| RTX PRO 6000 Blackwell Server Edition | 600 W | 7,848 / 2,312 | 6,434 / 2,176 | 158.0 / 84.4 | 143.5 / 81.0 |
+| RTX 4090 | 450 W | 5,847 / 2,665 | 4,537 / 2,307 | 140.1 / 75.0 | 125.3 / 71.0 |
+| L40S | 350 W | 5,053 / 2,509 | 3,985 / 2,201 | 113.8 / 65.2 | 102.8 / 61.3 |
+| RTX 6000 Ada | 300 W | 4,722 / 2,428 | 3,640 / 2,278 | 134.6 / 72.0 | 120.2 / 68.0 |
+| RTX PRO 4500 Blackwell | 200 W | 3,872 / 1,939 | 3,067 / 1,681 | 125.5 / 78.4 | 112.1 / 74.1 |
+| RTX PRO 4500 Blackwell Server Edition | 165 W | 3,228 / 1,742 | 2,568 / 1,512 | 112.4 / 71.1 | 100.6 / 67.3 |
+| RTX 3090 | 350 W | 2,656 / 1,402 | 2,046 / 1,236 | 112.0 / 59.5 | 96.7 / 56.1 |
+| RTX A6000 | 300 W | 2,577 / 1,307 | 1,980 / 1,151 | 99.1 / 55.9 | 86.5 / 52.4 |
+| A40 | 300 W | 2,432 / 1,224 | 1,897 / 1,051 | 85.3 / 50.8 | 75.5 / 47.4 |
+| A100-SXM4-80GB | 400 W | 2,388 / 1,249 | 1,925 / 1,136 | 107.1 / 47.6 | 91.5 / 46.1 |
+| A100 80GB PCIe | 300 W | 2,376 / 1,230 | 1,916 / 1,119 | 106.1 / 47.0 | 90.7 / 45.3 |
+| RTX A5000 | 230 W | 2,001 / 1,061 | 1,509 / 981 | 94.3 / 54.6 | 80.7 / 51.0 |
+| RTX 4000 Ada | 130 W | 1,907 / 1,139 | 1,450 / 924 | 64.7 / 45.7 | 57.4 / 42.2 |
+| RTX A4500 | 200 W | 1,683 / 963 | 1,280 / 843 | 81.5 / 49.5 | 70.1 / 46.4 |
+
+NInfer prefills 1.68 to 3.42 times as fast as llama.cpp at 2,048 tokens and 1.52 to 2.96 times at
+10,000, and decodes 1.42 to 2.26 times as fast, 1.36 to 2.00 times after 10,000 tokens. The prefill
+gap is widest on the RTX 5090 and both PRO 6000s (3.34 to 3.42 times at 2,048 tokens), where
+llama.cpp prefills at about the RTX 4090's rate; on the other cards it is 1.68 to 2.19 times. The
+decode gap is narrowest on the RTX 4000 Ada (1.42 times). Both A100s prefill no faster than the A40
+in either engine (NInfer 2,376 and 2,388 against 2,432 tok/s), while their decode follows their
+memory bandwidth (106.1 and 107.1 against 85.3).
+
+The essay, tok/s; on every card DSpark's text equals plain decoding's:
+
+| Card | Plain | DSpark | DSpark against plain | Tokens a round |
+|---|---:|---:|---:|---:|
+| RTX PRO 6000 Blackwell Workstation Edition | 176.0 | 231.3 | 1.31x | 2.08 |
+| RTX 5090 | 179.4 | 213.3 | 1.19x | 1.71 |
+| RTX PRO 6000 Blackwell Server Edition | 155.8 | 207.0 | 1.33x | 2.08 |
+| RTX 4090 | 138.4 | 159.2 | 1.15x | 1.72 |
+| L40S | 112.8 | 129.5 | 1.15x | 1.89 |
+| RTX 6000 Ada | 132.9 | 151.6 | 1.14x | 1.89 |
+| RTX PRO 4500 Blackwell | 124.2 | 132.9 | 1.07x | 1.65 |
+| RTX PRO 4500 Blackwell Server Edition | 111.2 | 118.2 | 1.06x | 1.68 |
+| RTX 3090 | 110.6 | 125.7 | 1.14x | 1.91 |
+| RTX A6000 | 97.6 | 110.1 | 1.13x | 1.70 |
+| A40 | 84.4 | 97.3 | 1.15x | 1.70 |
+| A100-SXM4-80GB | 105.7 | 123.1 | 1.16x | 1.74 |
+| A100 80GB PCIe | 105.0 | 122.1 | 1.16x | 1.73 |
+| RTX A5000 | 92.8 | 101.0 | 1.09x | 1.73 |
+| RTX 4000 Ada | 64.0 | 69.4 | 1.08x | 1.67 |
+| RTX A4500 | 81.3 | 88.7 | 1.09x | 2.10 |
+
+Five cards (A40, A100-SXM4-80GB, L40S, RTX PRO 4500 Blackwell and RTX 3090) ran twice, the first
+four on another host of the same type with the quota's thread count, the RTX 3090 against the
+source build above. NInfer's rates moved by at most 2.9% (the PRO 4500's prefill of 2,048 tokens),
+under 0.9% on the 3090, and the tables hold the second runs. llama.cpp on the 3090, with its
+quota's 31 threads, prefilled 2,048 tokens at 1,402 tok/s against 1,301 in the table above.
 
 ## Numerical checks
 
