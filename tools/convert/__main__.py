@@ -35,6 +35,9 @@ from .deepseek_v41 import ARCHITECTURES as DEEPSEEK_V41_ARCHITECTURES
 from .deepseek_v41 import RECIPES as DEEPSEEK_V41_RECIPES
 from .deepseek_v41 import GGUFShards
 from .deepseek_v41 import build_model as build_deepseek_v41
+from .inkling2 import ARCHITECTURES as INKLING2_ARCHITECTURES
+from .inkling2 import RECIPES as INKLING2_RECIPES
+from .inkling2 import build_model as build_inkling2
 from .dspine import RECIPES as DSPINE_RECIPES
 from .dspine import build_model as build_dspine
 from .dspine import is_dspine
@@ -141,7 +144,7 @@ def _layers(value: str):
 def _function(value: str):
     recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES, **QWEN4_EXP_GGUF_RECIPES,
                **EDGE0_RECIPES, **GEMMA4_RECIPES, **FLINT_RECIPES, **DEEPSEEK_V41_RECIPES,
-               **DSPINE_RECIPES}
+               **INKLING2_RECIPES, **DSPINE_RECIPES}
     if value in recipes:
         return recipes[value]
     filename, function = _recipe_parts(value)
@@ -320,6 +323,46 @@ def main(argv=None):
             source_paths = {"base": {"path": str(args.model)},
                             "engram": {"path": str(paths["engram"])}}
             for name in ("gguf", "dspark", "vision", "bias_vl"):
+                if name in paths:
+                    source_paths[name] = {"path": str(paths[name])}
+            report = convert(
+                model, recipe, args.out, name=args.name,
+                provenance={"converter": "ninfer-v3", "recipe": args.recipe,
+                            "sources": source_paths},
+                device=args.device, rows_per_chunk=args.rows_per_chunk,
+                max_file_bytes=args.max_file_bytes,
+                progress=lambda index, total, job: print(
+                    f"[{index+1}/{total}] {job.parameters[0]}"
+                    + (f" (+{len(job.parameters)-1})" if len(job.parameters) > 1 else "")
+                    + f": {job.spec.format} {job.spec.shape}", flush=True))
+            print(f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, "
+                  f"{report['seconds']:.1f}s", flush=True)
+            return
+        if architectures[0] in INKLING2_ARCHITECTURES:
+            wanted = (args.components or "text").split(",")
+            if ("gguf" not in paths or args.layers or wanted[0] != "text"
+                    or not set(wanted) <= {"text", "vision", "dspark"}
+                    or len(set(wanted)) != len(wanted)
+                    or ("vision" in wanted) != ("vision" in paths)
+                    or ("dspark" in wanted) != ("dspark" in paths)):
+                raise ValueError("Inkling 2 converts its text component from --source gguf=FILE; "
+                                 "--components text,vision adds its vision tower from --source "
+                                 "vision=MMPROJ.gguf and text,dspark its drafter from --source "
+                                 "dspark=DRAFTER.gguf")
+            gguf = stack.enter_context(GGUFFile(paths["gguf"]))
+            vision = stack.enter_context(GGUFFile(paths["vision"])) if "vision" in paths else None
+            dspark = stack.enter_context(GGUFFile(paths["dspark"])) if "dspark" in paths else None
+            model = build_inkling2(base, gguf, vision=vision, dspark=dspark,
+                                   resource_overrides=overrides)
+            recipe = Recipe(model)
+            inkling_sources = ({"base": base, "gguf": gguf} | ({"vision": vision} if vision else {})
+                               | ({"dspark": dspark} if dspark else {}))
+            _function(args.recipe)(model, recipe, inkling_sources)
+            if args.override:
+                _function(args.override)(model, recipe, inkling_sources)
+            source_paths = {"base": {"path": str(args.model)},
+                            "gguf": {"path": str(paths["gguf"])}}
+            for name in ("vision", "dspark"):
                 if name in paths:
                     source_paths[name] = {"path": str(paths[name])}
             report = convert(
