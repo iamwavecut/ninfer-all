@@ -411,13 +411,16 @@ struct Executor::Impl {
             p.seq_stride   = p.head_stride * kv_heads;
             const bool grows = growing && p.full;
             if (p.full && kvfmt.quantized()) {
-                // One code and one scale area per plane; the rows are the codings' bytes.
+                // One code and one scale area per plane; a row is one head's whole block of
+                // slots (the F16 caches' row shape), position_bytes one slot's codes or scales.
                 const auto area = [&](KvCoding coding) {
                     const std::size_t code  = std::size_t(kv_code_bytes(coding));
                     const std::size_t scale = std::size_t(kv_scale_bytes(coding));
-                    KvArea codes(std::size_t(sequences), kv_heads, code, code, grows, device_id);
+                    KvArea codes(std::size_t(sequences), kv_heads,
+                                 std::size_t(p.slots) * code, code, grows, device_id);
                     kv_bytes += codes.bytes;
-                    KvArea scales(std::size_t(sequences), kv_heads, scale, scale, grows, device_id);
+                    KvArea scales(std::size_t(sequences), kv_heads,
+                                  std::size_t(p.slots) * scale, scale, grows, device_id);
                     kv_bytes += scales.bytes;
                     return std::pair<KvArea, KvArea>(std::move(codes), std::move(scales));
                 };
@@ -3019,11 +3022,11 @@ struct Executor::Impl {
                 if (p->k_codes.p != nullptr) {
                     for (const KvArea* area :
                          {&p->k_codes, &p->k_scales, &p->v_codes, &p->v_scales}) {
-                        const std::size_t plane_head = std::size_t(global_slots) * area->row_bytes;
                         auto* base = static_cast<std::uint8_t*>(area->p) +
-                                     sequence * plane_head * kv_heads;
+                                     sequence * area->row_bytes * kv_heads;
                         for (int h = 0; h < kv_heads; ++h) {
-                            copy(base + h * plane_head, std::size_t(position) * area->row_bytes);
+                            copy(base + h * area->row_bytes,
+                                 std::size_t(position) * area->position_bytes);
                         }
                     }
                     continue;
