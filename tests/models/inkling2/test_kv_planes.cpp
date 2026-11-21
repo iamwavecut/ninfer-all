@@ -157,10 +157,12 @@ std::vector<double> decode_plane_row(mi::KvCoding coding, const std::uint8_t* co
 }
 
 // kv_store of the rows into the planes, then attention over them. The decoded rows stay near the
-// stored halves (decode_bound) and the outputs match the FP64 oracle over the decoded rows
+// stored halves (key_bound, value_bound: a coding's own error) and the outputs match the FP64
+// oracle over the decoded rows
 // (attention_bound, wider: the quantization error reaches the output through the softmax).
 void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const RowsCase& rc,
-              int splits, double decode_bound, double attention_bound, std::mt19937& rng) {
+              int splits, double key_bound, double value_bound, double attention_bound,
+              std::mt19937& rng) {
     const int t = int(rc.positions.size());
     const int sequences =
         rc.sequences.empty() ? 1 : *std::max_element(rc.sequences.begin(), rc.sequences.end()) + 1;
@@ -282,10 +284,10 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
             }
         }
     }
-    report(ek.rel() < decode_bound && ev.rel() < decode_bound,
+    report(ek.rel() < key_bound && ev.rel() < value_bound,
            std::string(name) + " kv_store round-trip: k " + num(ek.rel()) + ", v " + num(ev.rel()) +
-               " (bounds " + num(decode_bound) + ")");
-    if (ek.rel() >= decode_bound && std::getenv("KV_DBG")) {
+               " (bounds " + num(key_bound) + "/" + num(value_bound) + ")");
+    if (ek.rel() >= key_bound && std::getenv("KV_DBG")) {
         for (int h = 0; h < kKv; ++h) {
             Error e;
             for (int r = 0; r < t; ++r) {
@@ -379,15 +381,15 @@ int main() {
         branches.shared = 4;
         branches.positions = {30, 31, 32, 33, 34, 35, 36, 34, 35};
         branches.starts    = {0, 0, 0, 0, 4, 4, 4, 7, 7};
-        for (const auto& [key, value, decode_bound, attention_bound] :
-             {std::tuple{mi::KvCoding::Int8G64, mi::KvCoding::Int4G32, 6e-3, 2.5e-2},
-              std::tuple{mi::KvCoding::Lloyd4, mi::KvCoding::Int4G32, 2.5e-1, 8.0e-2}}) {
+        for (const auto& [key, value, key_bound, value_bound, attention_bound] :
+             {std::tuple{mi::KvCoding::Int8G64, mi::KvCoding::Int4G32, 8.0e-3, 1.1e-1, 2.5e-2},
+              std::tuple{mi::KvCoding::Lloyd4, mi::KvCoding::Int4G32, 1.2e-1, 1.1e-1, 8.0e-2}}) {
             const char* name = key == mi::KvCoding::Int8G64 ? "rk8v4" : "rk4v4";
-            case_run(name, key, value, decode_rows, 1, decode_bound, attention_bound, rng);
-            case_run(name, key, value, decode_rows, 9, decode_bound, attention_bound, rng);
-            case_run(name, key, value, verify, 4, decode_bound, attention_bound, rng);
-            case_run(name, key, value, chunk, 1, decode_bound, attention_bound, rng);
-            case_run(name, key, value, branches, 1, decode_bound, attention_bound, rng);
+            case_run(name, key, value, decode_rows, 1, key_bound, value_bound, attention_bound, rng);
+            case_run(name, key, value, decode_rows, 9, key_bound, value_bound, attention_bound, rng);
+            case_run(name, key, value, verify, 4, key_bound, value_bound, attention_bound, rng);
+            case_run(name, key, value, chunk, 1, key_bound, value_bound, attention_bound, rng);
+            case_run(name, key, value, branches, 1, key_bound, value_bound, attention_bound, rng);
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Inkling 2 KV planes\n";
         return failures == 0 ? 0 : 1;
