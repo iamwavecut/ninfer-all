@@ -2216,7 +2216,7 @@ struct Executor::Impl {
             ka.k_cache     = stage;
             ka.v_cache     = stage + std::size_t(t) * kvd;
             ka.seq_stride  = 0;
-            ka.head_stride = t;
+            ka.head_stride = std::int64_t(t) * kD;
             ka.ring        = 0;
             ka.row_slots   = true;
         } else if (staging) {
@@ -2266,7 +2266,7 @@ struct Executor::Impl {
                 kernels::KvStoreArgs store;
                 store.rows            = c.rows;
                 store.src             = src;
-                store.src_head_stride = t;
+                store.src_head_stride = std::int64_t(t) * kD;
                 store.rows_count      = t;
                 store.heads           = kv_heads;
                 store.dst             = plane;

@@ -204,7 +204,7 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
         k::KvStoreArgs args;
         args.rows            = rows_dev.rows;
         args.src             = src;
-        args.src_head_stride = t;
+        args.src_head_stride = t * kD;
         args.rows_count      = t;
         args.heads           = kKv;
         args.dst             = plane(codes, scales, cb, sb, coding);
@@ -285,6 +285,19 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
     report(ek.rel() < decode_bound && ev.rel() < decode_bound,
            std::string(name) + " kv_store round-trip: k " + num(ek.rel()) + ", v " + num(ev.rel()) +
                " (bounds " + num(decode_bound) + ")");
+    if (ek.rel() >= decode_bound && std::getenv("KV_DBG")) {
+        for (int h = 0; h < kKv; ++h) {
+            Error e;
+            for (int r = 0; r < t; ++r) {
+                const auto kd = decode(true, sequence_of(rc, r), h, physical(rc, r));
+                const std::size_t stage_at = std::size_t(h) * t * kD + std::size_t(r) * kD;
+                for (int d = 0; d < kD; ++d) {
+                    e.add(kd[d], __half2float(ks[stage_at + std::size_t(d)]));
+                }
+            }
+            std::fprintf(stderr, "DBG head %d: rel %g\n", h, e.rel());
+        }
+    }
 
     // The attention against the oracle over the decoded rows.
     const int group = kHeads / kKv;
