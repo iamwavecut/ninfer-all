@@ -444,8 +444,9 @@ StructuredCompiler::compile(const StructuredOutputOptions& options,
     if (options.kind == StructuredOutputKind::None) { return {}; }
     std::lock_guard lock(impl_->mutex);
     try {
-        const bool enveloped =
-            !envelope.reasoning_close.empty() || !envelope.alternative_format.empty();
+        const bool enveloped = !envelope.reasoning_close.empty() ||
+                               !envelope.alternative_format.empty() ||
+                               !envelope.response_alternative_format.empty();
         const bool json = options.kind == StructuredOutputKind::JsonObject ||
                           options.kind == StructuredOutputKind::JsonSchema;
         std::unique_ptr<StringConstraintState> strings;
@@ -495,15 +496,25 @@ StructuredCompiler::compile(const StructuredOutputOptions& options,
             if (!envelope.reasoning_close.empty()) {
                 // any_text excludes the first closing delimiter, including split-token and
                 // overlapping prefixes. A wildcard repetition would allow reasoning to consume
-                // the delimiter and bypass the final-content constraint.
-                content =
-                    Json{{"type", "sequence"},
-                         {"elements",
-                          Json::array(
-                              {Json{{"type", "any_text"},
-                                    {"excludes", Json::array({envelope.reasoning_close})}},
-                               Json{{"type", "const_string"}, {"value", envelope.reasoning_close}},
-                               content})}};
+                // the delimiter and bypass the final-content constraint. A reasoning format
+                // excludes it too.
+                Json reasoning =
+                    envelope.reasoning_format.empty()
+                        ? Json{{"type", "any_text"},
+                               {"excludes", Json::array({envelope.reasoning_close})}}
+                        : Json::parse(envelope.reasoning_format);
+                content = Json{
+                    {"type", "sequence"},
+                    {"elements",
+                     Json::array({std::move(reasoning),
+                                  Json{{"type", "const_string"}, {"value", envelope.reasoning_close}},
+                                  content})}};
+            }
+            if (!envelope.response_alternative_format.empty()) {
+                content = Json{{"type", "or"},
+                               {"elements",
+                                Json::array({content,
+                                             Json::parse(envelope.response_alternative_format)})}};
             }
             grammar = impl_->compiler.CompileStructuralTag(
                 Json{{"type", "structural_tag"}, {"format", content}}.dump());

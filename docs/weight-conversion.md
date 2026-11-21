@@ -81,6 +81,7 @@ The built-in recipes are ordinary Python functions in
 | `gemma4_gguf` | Gemma 4 26B-A4B or the dense 31B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way, with `vision` the tower from the release's mmproj | `gguf`, `mtp`, `vision` (mmproj GGUF) |
 | `flint_gguf` | Flint from a llama.cpp GGUF (Unsloth's UD-Q4_K_XL or another quantization): every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] rows of the dense MLP and the shared expert always, the router (BF16 in the GGUF), norms and sinks as FP32 | `gguf` |
 | `deepseek_v41_gguf` | DeepSeek-V4.1-Flash from ISTA-DASLab's split GSQ-RCO GGUF, in llama.cpp's layout or the earlier one: every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, the BF16 and F32 tensors (router, compressors, indexers, hyper-connection matrices, norms, sinks) as FP32, the Engram gate as the FP32 product of its BF16 factors; the Engram GGUF's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the first shard), `engram` (the Engram GGUF), `dspark`, `vision`, `bias_vl` (the earlier layout's image routing bias) |
+| `inkling2_gguf` | Inkling 2 Mini from a llama.cpp GGUF (Unsloth's UD-IQ4_XS or another quantization), in llama.cpp's 24-block layout or the earlier 48-block one: every matrix in its block format, row for row, byte for byte, the BF16 and F32 tensors (router, convolutions, clips, distance tables, mixing queries, controllers, norms, expert scales) as FP32; with `vision` the tower from the release's mmproj (BF16 matrices), with `dspark` the release's drafter from its GGUF | `gguf`, `vision` (mmproj GGUF), `dspark` (the drafter's GGUF) |
 
 The QUASAR Qwen3.8-27B NVFP4 checkpoint, which quantizes every Linear layer to NVFP4, has a driver
 of its own, `python3 -m tools.convert.quasar_nvfp4 --model DIR --dflash2 REFERENCE.ninfer --out
@@ -400,6 +401,20 @@ profile made by `ninfer-ngram-profile` beside the stored Engram table as
 `engram.resources.hot_profile`, after checking its row IDs and the Engram hash and token map it was
 counted for against `--source gguf`, which a table alone then also needs; the table's bytes and
 digest stay the same. Commands, runtime defaults and measurements: [DeepSeek-V4.1-Flash](deepseek-v41.md).
+
+### Inkling 2 GGUF releases
+
+`inkling2_gguf` ([`inkling2.py`](../tools/convert/inkling2.py)) imports Inkling 2 Mini from a
+llama.cpp GGUF of `thinkingmachines/Inkling-2-Mini` with `--model` holding the release's
+`config.json`, tokenizer, `chat_template.jinja` and `generation_config.json` and `--source gguf=`
+the GGUF. It reads both layouts of Unsloth's repository: llama.cpp's `inkling2_loop` (24 blocks,
+the loop's message queries and controllers per block) and the earlier `inkling2` of its root files
+(48 unrolled blocks in the metadata, the queries global). Both convert to the same payload byte for
+byte. It checks the GGUF's metadata against the config (the stored and visited layers, the
+sliding-window pattern, the attention and expert geometry, the softcap) and imports every row as
+stored. `--components text,vision,dspark` adds the vision tower from `--source vision=` (the
+release's mmproj, projector `inkling2v`) and the DSpark drafter from `--source dspark=` (llama.cpp
+architecture `dflash`). Commands, runtime defaults and measurements: [Inkling 2 Mini](inkling2.md).
 
 ## Change part of a recipe
 

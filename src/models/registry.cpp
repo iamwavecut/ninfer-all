@@ -30,6 +30,8 @@ std::string_view architecture_name(Architecture architecture) noexcept {
         return "FlintForCausalLM";
     case Architecture::DeepSeekV41:
         return "DeepseekV41ForCausalLM";
+    case Architecture::Inkling2:
+        return "Inkling2ForCausalLM";
     }
     return {};
 }

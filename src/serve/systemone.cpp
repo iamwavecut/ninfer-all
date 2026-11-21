@@ -853,7 +853,8 @@ GenerationRequest make_decision_read(const DecisionRequest& request,
     out.logprobs                   = true;
     out.readout_tokens             = std::move(label_tokens);
     // A read whose most likely token is a stop token still has its record.
-    out.raw_output = true;
+    out.raw_output  = true;
+    out.open_answer = true;
     // One token drafts nothing, and --spec's drafter would only run over the prompt. The reads of
     // a wide label's next digits resume from this read's endpoint, which a Qwen3.5-core Engine
     // with --spec publishes only for a drafting request: such a read is prepared for drafting, and

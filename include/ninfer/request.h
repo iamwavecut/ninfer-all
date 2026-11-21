@@ -387,6 +387,11 @@ struct PromptOptions {
     // Function the caller selected. Its call opener is appended to the generation prompt, so the
     // answer can only continue inside that call. Requires a new assistant turn with thinking off.
     std::string forced_tool_name;
+    // The generation prompt opens the answer itself, for a read of its first token (a typed
+    // decision, a rerank judgement): Inkling 2, whose model writes each block's header itself,
+    // gets its text block's header and opener. The other families' prompts already end where the
+    // answer starts when thinking is off. A new assistant turn without a forced call.
+    bool open_answer = false;
     // Name of an EngineOptions::grafts entry to place in front of the rendered prompt; empty for
     // none. The rendered prompt should carry no system turn of its own: the graft already holds one.
     std::string graft;

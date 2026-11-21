@@ -1,0 +1,234 @@
+[
+ {
+  "name": "user",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "thinking off",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "thinking": false,
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+ },
+ {
+  "name": "effort low",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "assistant",
+    "content": "Hello!",
+    "reasoning_content": "Greet back."
+   },
+   {
+    "role": "user",
+    "content": "How are you?"
+   }
+  ],
+  "reasoning_effort": "low",
+  "expected": "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_thinking|>Greet back.<|end_message|><|message_model|><|content_text|>Hello!<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>How are you?<|end_message|>"
+ },
+ {
+  "name": "calls",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Weather by city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "q": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "high",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris and Rome?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Two calls.",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "name": "get_weather",
+      "arguments": {
+       "city": "Paris",
+       "days": 3
+      }
+     },
+     {
+      "id": "c2",
+      "name": "get_weather",
+      "arguments": {
+       "city": "Rome"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "sunny",
+    "tool_call_id": "c1"
+   },
+   {
+    "role": "tool",
+    "content": "rain",
+    "tool_call_id": "c2"
+   },
+   {
+    "role": "assistant",
+    "content": "Paris is sunny, Rome rainy."
+   },
+   {
+    "role": "user",
+    "content": "Thanks"
+   }
+  ],
+  "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather by city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"search\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Paris and Rome?<|end_message|><|message_model|><|content_thinking|>Two calls.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\",\"days\":3}}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Rome\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>sunny<|end_message|><|message_tool|>get_weather<|content_text|>rain<|end_message|><|message_model|><|content_text|>Paris is sunny, Rome rainy.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks<|end_message|>"
+ },
+ {
+  "name": "nested arguments",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "q": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "max",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Find it"
+   },
+   {
+    "role": "assistant",
+    "content": "Searching.",
+    "tool_calls": [
+     {
+      "id": "s",
+      "name": "search",
+      "arguments": {
+       "q": "café \"x\"",
+       "a": [
+        1,
+        2.5,
+        null
+       ],
+       "B": {
+        "z": true,
+        "y": "中"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "none",
+    "tool_call_id": "s"
+   }
+  ],
+  "expected": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"\",\"name\":\"search\",\"parameters\":{\"properties\":{\"q\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Find it<|end_message|><|message_model|><|content_text|>Searching.<|end_message|><|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"B\":{\"z\":true,\"y\":\"中\"},\"a\":[1,2.5,null],\"q\":\"café \\\"x\\\"\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>search<|content_text|>none<|end_message|>"
+ },
+ {
+  "name": "image",
+  "reasoning_effort": "minimal",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Look:"
+     },
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "What is it?"
+     }
+    ]
+   }
+  ],
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>Look:<|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|><|message_user|><|content_text|>What is it?<|end_message|>"
+ },
+ {
+  "name": "effort medium",
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   }
+  ],
+  "reasoning_effort": "medium",
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>x<|end_message|>"
+ },
+ {
+  "name": "effort xhigh",
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   }
+  ],
+  "reasoning_effort": "xhigh",
+  "expected": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>x<|end_message|>"
+ }
+]

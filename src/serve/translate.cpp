@@ -394,6 +394,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.lora                             = semantics.lora;
     input.options.add_vision_id                    = false;
     input.options.speculative_drafting             = request.speculative_drafting;
+    input.options.open_answer                      = request.open_answer;
     const std::vector<const ToolDefinition*> tools = effective_tools(request);
     input.options.tool_jsons.reserve(tools.size());
     for (std::size_t index = 0; index < tools.size(); ++index) {

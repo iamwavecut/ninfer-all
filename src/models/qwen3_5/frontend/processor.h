@@ -134,11 +134,47 @@ struct DeepSeekImagePlan {
 [[nodiscard]] std::vector<std::uint8_t> deepseek_pad(std::span<const std::uint8_t> rgb, int width,
                                                      int height, int out_width, int out_height);
 
+// Inkling 2's image preprocessing (the release's Inkling2ImageProcessor, llama.cpp's inkling2v;
+// processor_config.json of the artifact's vision component): patches of `patch` pixels, `merge` x
+// `merge` patches per prompt position, an image padded on its right and bottom to whole cells with
+// the raw value -1, values (x - 127.5) / 127.5. The release does not resize: an image of more than
+// max_tokens cells (the release's bound, or --vision-max-merged below it) is first resized, PIL
+// bicubic, to the aligned size llama.cpp bounds it to; a low-detail image takes at most a quarter
+// of that. Images only.
+struct InklingMediaOptions {
+    int patch                = 20;
+    int merge                = 2;
+    std::uint32_t max_tokens = 4096;
+};
+
+// An image's plan: its pixel size after any resize, and its patch grid (whole cells, the padding
+// past that size included).
+struct InklingImagePlan {
+    int width = 0, height = 0, grid_w = 0, grid_h = 0;
+    [[nodiscard]] std::uint64_t cells(int merge) const noexcept {
+        return std::uint64_t(grid_w / merge) * std::uint64_t(grid_h / merge);
+    }
+};
+
+// The plan of an image of width x height pixels under a budget of `budget` cells.
+[[nodiscard]] InklingImagePlan inkling_image_plan(int width, int height,
+                                                  const InklingMediaOptions& options,
+                                                  std::uint32_t budget);
+
+// The BF16 patches of RGB bytes [height][width][3] under `plan`: per patch of the row-major grid,
+// its channel, row and column values, the padding -1 before normalization.
+[[nodiscard]] std::vector<std::uint16_t> inkling_patches(std::span<const std::uint8_t> rgb,
+                                                         int width, int height,
+                                                         const InklingImagePlan& plan,
+                                                         const InklingMediaOptions& options);
+
 struct ProcessorOptions {
     // Present for Gemma 4, whose media take its own geometry and placeholders.
     std::optional<GemmaMediaOptions> gemma;
     // Present for DeepSeek-V4.1, likewise.
     std::optional<DeepSeekMediaOptions> deepseek;
+    // Present for Inkling 2, likewise.
+    std::optional<InklingMediaOptions> inkling;
     std::uint64_t image_min_pixels = 32ULL * 32ULL;
     std::uint64_t image_max_pixels = 1024ULL * 1024ULL;
     std::uint64_t video_min_pixels = 128ULL * 32ULL * 32ULL;
@@ -206,6 +242,8 @@ inline constexpr MediaPads kQwenMediaPads{"<|image_pad|>", "<|video_pad|>"};
 inline constexpr MediaPads kGemmaMediaPads{"<|image|>", "<|video|>"};
 // DeepSeek-V4.1 takes no video.
 inline constexpr MediaPads kDeepSeekMediaPads{"<｜deepseek_image｜>", "<｜deepseek_image｜>"};
+// Inkling 2 takes no video; its template writes the image token after <|content_image|>.
+inline constexpr MediaPads kInklingMediaPads{"<|unused_200054|>", "<|unused_200054|>"};
 
 EncodedChat
 encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,

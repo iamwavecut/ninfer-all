@@ -132,9 +132,10 @@ struct BoundaryEncodedText {
 
 class OrdinaryRunCache;
 
-// The pre-tokenizer of a byte-level tokenizer: Qwen's one split, or Flint's or DeepSeek's three
-// (digits in groups of up to three, CJK runs, then o200k's words or DeepSeek's).
-enum class ByteLevelSplit : std::uint8_t { Qwen, Flint, DeepSeek };
+// The pre-tokenizer of a byte-level tokenizer: Qwen's one split, Flint's or DeepSeek's three
+// (digits in groups of up to three, CJK runs, then o200k's words or DeepSeek's), or o200k_base's
+// one (Inkling 2: its words, digits in groups of up to three).
+enum class ByteLevelSplit : std::uint8_t { Qwen, Flint, DeepSeek, O200k };
 
 class Tokenizer {
 public:
@@ -174,6 +175,8 @@ private:
     // Byte-level: whether ordinary text is NFC-normalized first, and how it splits into words.
     bool nfc_              = true;
     ByteLevelSplit split_ = ByteLevelSplit::Qwen;
+    // model.ignore_merges: a word the vocabulary holds whole is that token, before any merge.
+    bool whole_words_ = false;
     std::vector<std::string> decoded_token_bytes_;
     std::vector<bool> valid_token_ids_;
     std::vector<bool> special_token_ids_;

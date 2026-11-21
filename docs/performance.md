@@ -1063,6 +1063,28 @@ DeepSeek-V4.1-Flash has no pipeline stages; several GPUs divide only its routed 
 [DeepSeek-V4.1-Flash's measurements](deepseek-v41.md#measurements) add the hosts, the device
 cache each card holds, context lookup, startup and what limits each engine.
 
+## Inkling 2 Mini
+
+Thinking Machines' looped Inkling 2 Mini from Unsloth's
+[UD-IQ4_XS GGUF](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3), F16 KV, one
+sequence, on an RTX 3090 (350 W, the `86` build, experts on the GPU), November 21, 2026.
+
+### Engine rates
+
+Prompt and decode in tok/s; llama.cpp b12588's `llama-bench` on the same GGUF with flash attention,
+three repetitions each:
+
+| Engine | Prompt 2,048 | Prompt 10,000 | Decode | after 10,000 |
+|---|---:|---:|---:|---:|
+| NInfer | 2,659 | 2,031 | 111.4 | 95.9 |
+| llama.cpp | 1,301 | 1,228 | 58.6 | 55.9 |
+
+The release's DSpark drafter, which drafts by default while one request runs, decodes 384-token
+greedy answers 1.14 to 1.41 times as fast as plain decoding and sampled ones 0.99 to 1.24 times.
+With the experts in pinned host memory the 3090's cache holds every expert and decodes at 100.3
+tok/s, 117.8 with DSpark. [Inkling 2 Mini's measurements](inkling2.md#measurements) add the
+drafter, context lookup, concurrency and expert residency.
+
 ## Measurement pages
 
 | Page | What it measures | Hardware |
@@ -1075,6 +1097,7 @@ cache each card holds, context lookup, startup and what limits each engine.
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
 | [Flint](flint.md#measurements) | against llama.cpp, host and disk experts, context lookup, typed decisions | RTX 3090, 4090, 5090, A40 |
+| [Inkling 2 Mini](inkling2.md#measurements) | against llama.cpp, the DSpark drafter, context lookup, concurrency, host and disk experts with the built-in routing profile | RTX 3090 |
 | [GGUF models across cards, November 2026](performance/gguf-cards-2026-11.md) | Gemma 4 26B-A4B and 31B, Flint, Flash-Next and DeepSeek-V4.1 from one release build: prompt and decode rates, the `cp.async` MMQ tiles against the compiled loop, perplexity per card | RTX PRO 6000 Server Edition, RTX 5090, 4090, 3090, 5060 Ti, L40S, A100 80 GB and 40 GB |
 | [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token, Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards | RTX 5070 Ti, 4090, 4080, 5060 Ti |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |

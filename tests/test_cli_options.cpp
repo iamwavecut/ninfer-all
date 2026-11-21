@@ -204,19 +204,22 @@ int run_tests() {
                      "--draft-min-p", "0.3"});
     }), "CLI accepted draft confidence without MTP");
     {
-        // DeepSeek's DSpark drafter: its whole block without --draft-tokens, no copy drafts beside
-        // it unless asked, and neither a proposal head nor MTP's confidence floor.
+        // The DSpark drafter: its whole block without --draft-tokens, no copy drafts beside it
+        // unless asked, no proposal head, and a floor the family's Engine core accepts or refuses
+        // (Inkling 2 takes one, DeepSeek does not).
         const auto block = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark"});
         const auto three = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark",
                                   "--draft-tokens", "3"});
+        const auto floor = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark",
+                                  "--draft-min-p", "0.3"});
         failures += check(block.speculative.backend == ninfer::SpeculativeBackend::DSpark &&
                               block.speculative.draft_tokens == 0 &&
                               block.speculative.ngram_draft_tokens == 0 &&
-                              three.speculative.draft_tokens == 3,
+                              three.speculative.draft_tokens == 3 &&
+                              floor.speculative.draft_min_p == 0.3F,
                           "CLI did not preserve --spec dspark");
         for (const std::vector<std::string> tail :
-             {std::vector<std::string>{"--lm-head-draft"}, {"--draft-min-p", "0.3"},
-              {"--draft-tokens", "16"}}) {
+             {std::vector<std::string>{"--lm-head-draft"}, {"--draft-tokens", "16"}}) {
             std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dspark"};
             args.insert(args.end(), tail.begin(), tail.end());
             failures += check(rejects([&] { (void)parse(args); }),

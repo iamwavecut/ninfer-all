@@ -3,6 +3,7 @@
 #include "models/qwen3_5/frontend/deepseek_output.h"
 #include "models/qwen3_5/frontend/flint_output.h"
 #include "models/qwen3_5/frontend/gemma_output.h"
+#include "models/qwen3_5/frontend/inkling_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/prompt_layout.h"
 #include "text/unicode.h"
@@ -64,6 +65,9 @@ ForcedCallOpener forced_call_opener(ToolCallSyntax syntax) {
         return {.head = std::string(kDeepSeekCallsSeparator) + std::string(kDeepSeekCallsOpen) +
                         "\n" + std::string(kDeepSeekInvokeOpen),
                 .tail = "\">\n"};
+    case ToolCallSyntax::Inkling:
+        // A call block's header names the function; the model writes the call's JSON after it.
+        return {.head = std::string(kInklingHeader), .tail = kInklingCallOpen};
     }
     throw std::invalid_argument("invalid tool call syntax");
 }
@@ -292,6 +296,11 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
     const bool continuation =
         options.continuation == PromptContinuationMode::ContinueFinalAssistant;
     Json context = template_parameters(options, special_tokens_, accepted_efforts_);
+    if (options.tool_call_syntax == ToolCallSyntax::Inkling &&
+        context.value("enable_thinking", true) == false && !context.contains("reasoning_effort")) {
+        // Inkling's template has no thinking switch: its effort level 0 is the model's own.
+        context["reasoning_effort"] = "none";
+    }
     if (continuation) {
         const auto& final = messages.back();
         if (final.role != ChatRole::Assistant || final.has_media() ||
@@ -669,6 +678,16 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         // role-marker format: after it Flint answers at once.
         output.text.append(kFlintThinkOpen);
         output.text.append(kFlintThinkClose);
+    }
+    if (options.open_answer && options.tool_call_syntax == ToolCallSyntax::Inkling) {
+        // Inkling's template has no generation prompt, and the model writes each block's header
+        // itself: a read of the answer's first token reads it after a text block's opener.
+        if (continuation || !options.add_generation_prompt || !options.forced_tool_name.empty()) {
+            throw std::invalid_argument("an opened answer requires a new assistant turn without "
+                                        "a forced call");
+        }
+        output.text.append(kInklingHeader);
+        output.text.append(kInklingText);
     }
     if (!options.forced_tool_name.empty()) {
         // The syntax's call opens with the function name; everything the model produces after

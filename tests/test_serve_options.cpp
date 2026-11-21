@@ -202,6 +202,14 @@ int main() {
         failures += check(rejected, "server accepted an invalid --draft-confidence");
     }
     {
+        // Inkling 2's DSpark drafter takes the floor of its drafts' probabilities.
+        const auto spark = parse({"ninfer-serve", "model.ninfer", "--spec", "dspark",
+                                  "--draft-tokens", "2", "--draft-min-p", "0.3"}).speculative;
+        failures += check(spark.backend == ninfer::SpeculativeBackend::DSpark &&
+                              spark.draft_tokens == 2 && spark.draft_min_p == 0.3F,
+                          "server did not preserve --spec dspark --draft-min-p");
+    }
+    {
         // A DSpine drafter: the artifact --draft-model names beside --spec dspine, nowhere else.
         const auto spine = parse({"ninfer-serve", "model.ninfer", "--spec", "dspine",
                                   "--draft-model", "drafter.ninfer", "--draft-tokens", "7",
@@ -1685,6 +1693,10 @@ int main() {
                              "drafter.ninfer", "--draft-tokens", "15", "--adaptive-mtp"})
                               .speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive,
                       "--adaptive-mtp was refused with a masked drafter");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "dspark", "--draft-tokens",
+                             "7", "--adaptive-mtp"})
+                              .speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive,
+                      "--adaptive-mtp was refused with the DSpark drafter");
     bool adaptive_without_drafter_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--adaptive-mtp"});

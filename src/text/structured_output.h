@@ -19,11 +19,16 @@ public:
 // Reject unsupported constraints instead of letting a compiler silently weaken a schema.
 void validate_structured_output(const StructuredOutputOptions& options);
 
-// Model-owned framing around the final response. The alternate format is an XGrammar
-// structural-tag descriptor (e.g. a model's native tool-call serialization), not a user API.
+// Model-owned framing around the final response. The formats are XGrammar structural-tag
+// descriptors (e.g. a model's native tool-call serialization), not a user API.
 struct StructuredOutputEnvelope {
     std::string reasoning_close;
+    // What comes before reasoning_close, in place of any text without it.
+    std::string reasoning_format;
+    // In place of the final response, after reasoning_close.
     std::string alternative_format;
+    // In place of the whole response: reasoning_close and the final response.
+    std::string response_alternative_format;
 };
 
 class GrammarState {

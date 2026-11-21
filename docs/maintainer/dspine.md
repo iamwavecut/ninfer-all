@@ -11,9 +11,10 @@ head's candidates into drafts.
 
 NInfer runs a DSpine drafter as its own artifact beside the model: `--spec dspine --draft-model
 PATH` (`draft-model` in a launch file). Every family takes one: the Qwen3.5 core (dense and MoE
-releases), Qwen3.8-Flash-Next with its Edge0 form, Gemma 4, Flint and DeepSeek-V4.1. A drafter is
-trained for one target, and startup refuses a drafter whose hidden width, vocabulary or target layer
-count differs from the model's. Tencent publishes one drafter, for Qwen3.8-27B
+releases), Qwen3.8-Flash-Next with its Edge0 form, Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2. A
+drafter is trained for one target, and startup refuses a drafter whose hidden width, vocabulary or
+target layer count differs from the model's (Inkling 2's vocabulary: the head's 201,024 stored
+rows, of which it scores 200,058; the drafter reads zero logits in the others). Tencent publishes one drafter, for Qwen3.8-27B
 ([converted](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3)). The other families'
 paths have run only in synthetic tests, against drafters of their geometry with random weights.
 
@@ -26,7 +27,7 @@ defines the conditioning, verification and publication that DSpine shares, and
 | [`tools/convert/dspine.py`](../../tools/convert/dspine.py) | the checkpoint's validation and the `dspine` component |
 | [`models/dspine/config.h`](../../src/models/dspine/config.h), [`model.h`](../../src/models/dspine/model.h) | the config and the materialized drafter |
 | [`models/dspine/drafter.h`](../../src/models/dspine/drafter.h) | the context projection, the drafted block and the head-write table |
-| [`models/dspine/runtime.h`](../../src/models/dspine/runtime.h) | lanes, features and staging for Gemma 4, Flint and DeepSeek-V4.1 |
+| [`models/dspine/runtime.h`](../../src/models/dspine/runtime.h) | lanes, features and staging for Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 |
 | [`ops/dspine.h`](../../include/ninfer/ops/dspine.h) | the bridge and refinement Ops |
 
 ## The artifact
@@ -102,6 +103,7 @@ context K and V projected from `c_t`. The family defines a tap:
 | Qwen3.8-Flash-Next | the mean of the four hyper-connection streams after block l (DFlash2's taps) |
 | Gemma 4, Flint | the residual after block l |
 | DeepSeek-V4.1 | the mean of the residual streams after block l |
+| Inkling 2 | the state after visit l: its target layers are the 48 visits, each core layer counted once a pass |
 
 A feature is rounded to BF16 when it is stored. The context of a sequence lives in a ring of K/V
 slots per drafter layer. Its capacity is the smallest of 2048, 4096 and 8192 that holds
@@ -206,7 +208,7 @@ differences can change acceptance only, not the output distribution.
 |---|---|---|---|---|
 | Qwen3.5 core | 1 to min(15, block − 1); with `--adaptive-mtp` the window K or K/2 a round | greedy, or sampled at the request's temperature | DFlash2's: greedy prefix, or rejection sampling against the recorded q | refused |
 | Qwen3.8-Flash-Next, Edge0 | 1 to min(15, block − 1) | greedy | coupled, as MTP's | verifies through the first draft of confidence at or below P |
-| Gemma 4, Flint, DeepSeek-V4.1 | 1 to 7 | greedy | coupled: the target's keyed draws in plain decode rows | as Flash-Next |
+| Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 | 1 to 7 | greedy | coupled: the target's keyed draws in plain decode rows | as Flash-Next |
 
 Every family commits only tokens that the target selects, so the output is the target's at any
 temperature. `--gumbel-sampling` changes only the target's draws: the greedy proposals stay greedy
@@ -236,7 +238,7 @@ commits and CUDA Graphs, with DSpine's ring capacity, on one device or on the he
 tensor parallelism; pipeline stages are refused. The context cache's store name carries the
 drafter's artifact digest and ring capacity.
 
-**Gemma 4, Flint and DeepSeek-V4.1** keep their own sequences, so
+**Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2** keep their own sequences, so
 [`dspine::Runtime`](../../src/models/dspine/runtime.h) holds the drafter's state beside them: a ring
 lane per sequence and one more per sequence with checkpoints, the head-write table, the features of
 a pass, and pinned staging. A pass stores the taps of the rows it computes. A prompt chunk commits

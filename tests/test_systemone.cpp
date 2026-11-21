@@ -321,6 +321,7 @@ void prompts() {
            "one greedy token with the labels read out, no thinking, no graft, no penalties, no "
            "drafter");
     expect(choice.raw_output, "a read whose model picks a stop token loses its record");
+    expect(choice.open_answer, "a read opens the answer it reads (Inkling 2's text block)");
     {
         // 27 options take two-digit labels: the second digit's reads resume from this read's
         // endpoint, which a request publishes on an Engine with --spec only while it drafts.

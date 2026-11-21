@@ -54,10 +54,17 @@ constexpr std::string_view kDeepSeekSplitPatterns[] = {
     "| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
 };
 
-// What a byte-level tokenizer.json describes: NFC or no normalization, and its pre-tokenizer.
+// o200k_base's one split (Inkling 2): Flint's words, then digits in groups of up to three, then
+// runs of anything but whitespace, letters and numbers.
+constexpr std::string_view kO200kSplitPattern =
+    R"o200k([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)o200k";
+
+// What a byte-level tokenizer.json describes: NFC or no normalization, its pre-tokenizer, and
+// whether a word the vocabulary holds whole skips the merges (model.ignore_merges).
 struct ByteLevelPipeline {
-    bool nfc            = true;
+    bool nfc             = true;
     ByteLevelSplit split = ByteLevelSplit::Qwen;
+    bool whole_words     = false;
 };
 
 ByteLevelPipeline validate_pipeline(const Json& root, const Json& model) {
@@ -95,7 +102,9 @@ ByteLevelPipeline validate_pipeline(const Json& root, const Json& model) {
         const auto& splits = pre["pretokenizers"];
         const auto& bytes  = splits.back();
         if (splits.size() == 2) {
-            require(isolates(splits[0], kQwenSplitPattern), "pre_tokenizer.Split");
+            const bool o200k = isolates(splits[0], kO200kSplitPattern);
+            require(o200k || isolates(splits[0], kQwenSplitPattern), "pre_tokenizer.Split");
+            if (o200k) { pipeline.split = ByteLevelSplit::O200k; }
         } else {
             require(splits.size() == std::size(kFlintSplitPatterns) + 1, "pre_tokenizer");
             const auto all = [&](std::span<const std::string_view> patterns) {
@@ -122,7 +131,9 @@ ByteLevelPipeline validate_pipeline(const Json& root, const Json& model) {
     for (const char* field : {"continuing_subword_prefix", "end_of_word_suffix"}) {
         require(!model.contains(field) || model[field].is_null() || model[field] == "", field);
     }
-    require(model.value("ignore_merges", Json(false)) == false, "model.ignore_merges");
+    const Json whole_words = model.value("ignore_merges", Json(false));
+    require(whole_words.is_boolean() || whole_words.is_null(), "model.ignore_merges");
+    pipeline.whole_words = whole_words.is_boolean() && whole_words.get<bool>();
     return pipeline;
 }
 
@@ -537,14 +548,25 @@ bool is_non_space_non_letter_mark_number(std::int32_t codepoint) noexcept {
            !uni::is_mark(codepoint) && !uni::is_number(codepoint);
 }
 
-bool ascii_ci_matches(std::string_view text, std::size_t offset, std::string_view suffix) {
-    if (offset + suffix.size() > text.size()) { return false; }
-    for (std::size_t i = 0; i < suffix.size(); ++i) {
-        const unsigned char lhs = static_cast<unsigned char>(text[offset + i]);
-        const unsigned char rhs = static_cast<unsigned char>(suffix[i]);
-        if (std::tolower(lhs) != std::tolower(rhs)) { return false; }
+// The end of (?i:'s|'t|'re|'ve|'m|'ll|'d) at `at` (an apostrophe) within `end`, or npos. The
+// regex engine folds case as Unicode does, where only U+017F (long s) folds to one of these
+// letters beside their ASCII capitals.
+std::size_t contraction_end(std::string_view text, std::size_t at, std::size_t end) {
+    if (at >= end || text[at] != '\'') { return std::string_view::npos; }
+    constexpr std::string_view suffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
+    for (const std::string_view suffix : suffixes) {
+        const std::size_t from = at + 1;
+        if (suffix == "s" && from + 2 <= end && text.compare(from, 2, "\xc5\xbf") == 0) {
+            return from + 2;
+        }
+        if (from + suffix.size() > end) { continue; }
+        bool same = true;
+        for (std::size_t i = 0; i < suffix.size() && same; ++i) {
+            same = std::tolower(static_cast<unsigned char>(text[from + i])) == suffix[i];
+        }
+        if (same) { return from + suffix.size(); }
     }
-    return true;
+    return std::string_view::npos;
 }
 
 uni::CodepointSpan qwen_codepoint_at(std::string_view text, std::size_t offset) {
@@ -556,11 +578,9 @@ std::size_t qwen_word_end(std::string_view text, std::size_t begin) {
     const std::size_t after_first  = begin + first.length;
     const std::int32_t cp          = first.value;
 
-    if (cp == '\'') {
-        constexpr std::string_view suffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
-        for (std::string_view suffix : suffixes) {
-            if (ascii_ci_matches(text, after_first, suffix)) { return after_first + suffix.size(); }
-        }
+    if (const std::size_t contraction = contraction_end(text, begin, text.size());
+        contraction != std::string_view::npos) {
+        return contraction;
     }
 
     const bool has_next     = after_first < text.size();
@@ -653,22 +673,17 @@ std::size_t flint_piece_end(std::string_view text, std::size_t begin) {
     return end;
 }
 
-// The end of the o200k word pattern's match at `at` within a piece ending at `end`, as a
-// backtracking engine takes its alternatives in order; npos where none matches.
-std::size_t flint_match(std::string_view text, std::size_t at, std::size_t end) {
+// The end of the o200k word forms' match at `at` within a piece ending at `end` (an optional
+// prefix of anything but a line break, a letter or a number, then [upper]*[lower]+ or
+// [upper]+[lower]*, then an English contraction), as a backtracking engine takes them in order;
+// npos where neither matches.
+std::size_t o200k_word_match(std::string_view text, std::size_t at, std::size_t end) {
     constexpr std::size_t none = std::string_view::npos;
     const auto cp = [&](std::size_t offset) { return qwen_codepoint_at(text, offset); };
-    // An English contraction after a word, ASCII case-insensitive.
+    // An English contraction after a word.
     const auto contraction = [&](std::size_t word_end) {
-        if (word_end >= end || text[word_end] != '\'') { return word_end; }
-        constexpr std::string_view suffixes[] = {"s", "t", "re", "ve", "m", "ll", "d"};
-        for (const std::string_view suffix : suffixes) {
-            if (word_end + 1 + suffix.size() <= end &&
-                ascii_ci_matches(text, word_end + 1, suffix)) {
-                return word_end + 1 + suffix.size();
-            }
-        }
-        return word_end;
+        const std::size_t after = contraction_end(text, word_end, end);
+        return after == none ? word_end : after;
     };
     // [upper]*[lower]+: the longest run of upper letters that lower ones can follow.
     const auto mixed_word = [&](std::size_t from) {
@@ -715,33 +730,46 @@ std::size_t flint_match(std::string_view text, std::size_t at, std::size_t end) 
     if (matched == none) { matched = mixed_word(at); }
     if (matched == none && prefix) { matched = upper_word(after); }
     if (matched == none) { matched = upper_word(at); }
-    if (matched != none) { return matched; }
+    return matched;
+}
+
+// \s*[\r\n]+ | \s+(?!\S) | \s+ at `at` within a piece ending at `end`, the piece's end ending the
+// text; npos where `at` is not whitespace.
+std::size_t whitespace_match(std::string_view text, std::size_t at, std::size_t end) {
+    constexpr std::size_t none = std::string_view::npos;
+    if (!uni::is_whitespace(qwen_codepoint_at(text, at).value)) { return none; }
+    std::size_t run_end = at, last_begin = at, last_newline_end = none, count = 0;
+    while (run_end < end) {
+        const uni::CodepointSpan value = qwen_codepoint_at(text, run_end);
+        if (!uni::is_whitespace(value.value)) { break; }
+        last_begin = run_end;
+        run_end += value.length;
+        ++count;
+        if (is_newline(value.value)) { last_newline_end = run_end; }
+    }
+    if (last_newline_end != none) { return last_newline_end; }
+    if (run_end == end) { return run_end; }
+    return count >= 2 ? last_begin : run_end;
+}
+
+// The end of Flint's o200k word pattern's match at `at` within a piece ending at `end`, as a
+// backtracking engine takes its alternatives in order; npos where none matches.
+std::size_t flint_match(std::string_view text, std::size_t at, std::size_t end) {
+    constexpr std::size_t none = std::string_view::npos;
+    if (const std::size_t word = o200k_word_match(text, at, end); word != none) { return word; }
+    const auto cp = [&](std::size_t offset) { return qwen_codepoint_at(text, offset); };
     //  ?[\p{P}\p{S}]+[\r\n]*
     const auto punctuation = [](std::int32_t value) {
         return uni::is_punctuation(value) || uni::is_symbol(value);
     };
+    const std::int32_t c = cp(at).value;
     std::size_t marks = c == ' ' && at + 1 < end && punctuation(cp(at + 1).value) ? at + 1 : at;
     if (punctuation(cp(marks).value)) {
         while (marks < end && punctuation(cp(marks).value)) { marks += cp(marks).length; }
         while (marks < end && is_newline(cp(marks).value)) { marks += cp(marks).length; }
         return marks;
     }
-    // \s*[\r\n]+ | \s+(?!\S) | \s+, the piece's end ending the text.
-    if (uni::is_whitespace(c)) {
-        std::size_t run_end = at, last_begin = at, last_newline_end = none, count = 0;
-        while (run_end < end) {
-            const uni::CodepointSpan value = cp(run_end);
-            if (!uni::is_whitespace(value.value)) { break; }
-            last_begin = run_end;
-            run_end += value.length;
-            ++count;
-            if (is_newline(value.value)) { last_newline_end = run_end; }
-        }
-        if (last_newline_end != none) { return last_newline_end; }
-        if (run_end == end) { return run_end; }
-        return count >= 2 ? last_begin : run_end;
-    }
-    return none;
+    return whitespace_match(text, at, end);
 }
 
 // `piece_end` carries the end of the current piece of the first two splits from one word to the
@@ -764,7 +792,6 @@ std::size_t flint_word_end(std::string_view text, std::size_t begin, std::size_t
 // The end of DeepSeek's word pattern's match at `at` within a piece ending at `end`, its
 // alternatives taken in order; npos where none matches.
 std::size_t deepseek_match(std::string_view text, std::size_t at, std::size_t end) {
-    constexpr std::size_t none = std::string_view::npos;
     const auto cp           = [&](std::size_t offset) { return qwen_codepoint_at(text, offset); };
     const auto ascii_letter = [](std::int32_t value) {
         return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
@@ -808,28 +835,50 @@ std::size_t deepseek_match(std::string_view text, std::size_t at, std::size_t en
         while (marks < end && is_newline(cp(marks).value)) { marks += cp(marks).length; }
         return marks;
     }
-    // \s*[\r\n]+ | \s+(?!\S) | \s+, the piece's end ending the text.
-    if (uni::is_whitespace(c)) {
-        std::size_t run_end = at, last_begin = at, last_newline_end = none, count = 0;
-        while (run_end < end) {
-            const uni::CodepointSpan value = cp(run_end);
-            if (!uni::is_whitespace(value.value)) { break; }
-            last_begin = run_end;
-            run_end += value.length;
-            ++count;
-            if (is_newline(value.value)) { last_newline_end = run_end; }
-        }
-        if (last_newline_end != none) { return last_newline_end; }
-        if (run_end == end) { return run_end; }
-        return count >= 2 ? last_begin : run_end;
-    }
-    return none;
+    return whitespace_match(text, at, end);
 }
 
-// Flint's or DeepSeek's word at `begin`; `piece_end` carries the end of the current piece of the
-// first two splits from one word to the next.
+// The end of o200k_base's match at `begin` (Inkling 2), its alternatives taken in order: the
+// word forms, up to three numbers, a run of anything but whitespace, letters and numbers (a space
+// before it, line breaks after it), then whitespace. Some alternative matches at every code point.
+std::size_t o200k_word_end(std::string_view text, std::size_t begin) {
+    constexpr std::size_t none = std::string_view::npos;
+    const std::size_t end      = text.size();
+    if (const std::size_t word = o200k_word_match(text, begin, end); word != none) { return word; }
+    const auto cp = [&](std::size_t offset) { return qwen_codepoint_at(text, offset); };
+    const uni::CodepointSpan first = cp(begin);
+    // \p{N}{1,3}
+    if (uni::is_number(first.value)) {
+        std::size_t digits = begin;
+        for (int count = 0; count < 3 && digits < end && uni::is_number(cp(digits).value);
+             ++count) {
+            digits += cp(digits).length;
+        }
+        return digits;
+    }
+    //  ?[^\s\p{L}\p{N}]+[\r\n/]*: the run takes every '/' after it, so only line breaks remain.
+    const auto mark = [](std::int32_t value) {
+        return !uni::is_whitespace(value) && !uni::is_letter(value) && !uni::is_number(value);
+    };
+    const std::size_t after = begin + first.length;
+    std::size_t marks       = first.value == ' ' && after < end && mark(cp(after).value) ? after
+                                                                                          : begin;
+    if (mark(cp(marks).value)) {
+        while (marks < end && mark(cp(marks).value)) { marks += cp(marks).length; }
+        while (marks < end && is_newline(cp(marks).value)) { marks += cp(marks).length; }
+        return marks;
+    }
+    if (const std::size_t space = whitespace_match(text, begin, end); space != none) {
+        return space;
+    }
+    return after;
+}
+
+// Flint's, DeepSeek's or o200k_base's word at `begin`; `piece_end` carries the end of the current
+// piece of Flint's and DeepSeek's first two splits from one word to the next.
 std::size_t split_word_end(ByteLevelSplit split, std::string_view text, std::size_t begin,
                            std::size_t& piece_end) {
+    if (split == ByteLevelSplit::O200k) { return o200k_word_end(text, begin); }
     if (split == ByteLevelSplit::Flint) { return flint_word_end(text, begin, piece_end); }
     if (begin >= piece_end) { piece_end = flint_piece_end(text, begin); }
     if (uni::is_number(qwen_codepoint_at(text, begin).value)) { return piece_end; }
@@ -889,10 +938,14 @@ std::array<int, 256> load_byte_token_ids(const std::unordered_map<std::string, i
     return ids;
 }
 
-// `offset` is where `normalized` starts in the run whose token_ends and word_ends it extends.
+// `offset` is where `normalized` starts in the run whose token_ends and word_ends it extends. With
+// `whole_words` (model.ignore_merges), a word whose byte symbols the vocabulary holds whole is
+// that one token.
 bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalized,
                                ByteLevelSplit split, const BpeMergeTable& merge_rules,
-                               const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
+                               const std::array<int, 256>& byte_token_ids,
+                               const std::unordered_map<std::string, int>* whole_words,
+                               std::size_t max_tokens,
                                std::vector<std::size_t>* token_ends = nullptr,
                                std::vector<BpeWordEnd>* word_ends   = nullptr,
                                std::size_t offset                   = 0) {
@@ -905,6 +958,23 @@ bool append_normalized_bpe_ids(std::vector<int>& ids, std::string_view normalize
                                     ? qwen_word_end(normalized, begin)
                                     : split_word_end(split, normalized, begin, piece_end);
         const std::string_view word(normalized.data() + begin, end - begin);
+        if (whole_words != nullptr && word.size() > 1) {
+            static const std::array<std::string, 256> byte_encoder = build_byte_level_encoder();
+            std::string symbols;
+            symbols.reserve(word.size() * 2);
+            for (const char byte : word) { symbols += byte_encoder[static_cast<unsigned char>(byte)]; }
+            if (const auto whole = whole_words->find(symbols); whole != whole_words->end()) {
+                ids.push_back(whole->second);
+                if (token_ends != nullptr) { token_ends->push_back(offset + end); }
+                if (ids.size() == max_tokens) { return false; }
+                if (word_ends != nullptr) {
+                    word_ends->push_back(
+                        BpeWordEnd{.normalized_offset = offset + end, .token_frontier = ids.size()});
+                }
+                begin = end;
+                continue;
+            }
+        }
         std::vector<BpeNode> nodes(word.size());
         for (std::size_t index = 0; index < word.size(); ++index) {
             const unsigned char byte = static_cast<unsigned char>(word[index]);
@@ -1186,6 +1256,10 @@ constexpr std::size_t kWordLookaheadBytes = 4;
 // ideograph or kana, punctuation or a symbol decide it alone; the same decide a DeepSeek word.
 bool reusable_word_end(ByteLevelSplit split, std::int32_t next) noexcept {
     if (split == ByteLevelSplit::Qwen) { return !uni::is_whitespace(next); }
+    // o200k_base has no CJK split: an ideograph or kana is a letter its word may continue with.
+    if (split == ByteLevelSplit::O200k) {
+        return uni::is_number(next) || uni::is_punctuation(next) || uni::is_symbol(next);
+    }
     return uni::is_number(next) || is_flint_cjk(next) || uni::is_punctuation(next) ||
            uni::is_symbol(next);
 }
@@ -1366,8 +1440,9 @@ bool append_sentencepiece_run(BoundaryEncodedText& encoded, std::string_view tex
 bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
                           std::size_t text_offset, std::span<const IndexedByteBoundary> boundaries,
                           bool nfc, ByteLevelSplit split, const BpeMergeTable& merge_rules,
-                          const std::array<int, 256>& byte_token_ids, std::size_t max_tokens,
-                          OrdinaryRunCache* cache) {
+                          const std::array<int, 256>& byte_token_ids,
+                          const std::unordered_map<std::string, int>* whole_words,
+                          std::size_t max_tokens, OrdinaryRunCache* cache) {
     const std::size_t token_base = encoded.input_ids.size();
     if (text.empty()) {
         for (const IndexedByteBoundary boundary : boundaries) {
@@ -1420,7 +1495,7 @@ bool append_ordinary_text(BoundaryEncodedText& encoded, std::string_view text,
         }
     }
     if (!append_normalized_bpe_ids(encoded.input_ids, std::string_view(normalized).substr(restart),
-                                   split, merge_rules, byte_token_ids, max_tokens,
+                                   split, merge_rules, byte_token_ids, whole_words, max_tokens,
                                    ends ? &token_ends : nullptr, ends ? &word_ends : nullptr,
                                    restart)) {
         return false;
@@ -1530,6 +1605,7 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
     const ByteLevelPipeline pipeline = validate_pipeline(root, model);
     nfc_                             = pipeline.nfc;
     split_                           = pipeline.split;
+    whole_words_                     = pipeline.whole_words;
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_label);
     decoded_token_bytes_         = std::move(vocab_metadata.id_to_token);
@@ -1683,6 +1759,7 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(
                                            byte_token_ids_, options.max_tokens, run_cache_.get())
                 : append_ordinary_text(encoded, text.substr(begin, end - begin), begin, requests,
                                        nfc_, split_, bpe_merge_rules_, byte_token_ids_,
+                                       whole_words_ ? &vocab_token_to_id_ : nullptr,
                                        options.max_tokens, run_cache_.get());
         boundary_cursor = request_end;
         return complete;

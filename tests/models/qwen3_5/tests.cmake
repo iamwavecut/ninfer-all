@@ -62,6 +62,11 @@ ninfer_add_test(ninfer_deepseek_frontend_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
+ninfer_add_test(ninfer_inkling_frontend_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_inkling_frontend.cpp"
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+
 ninfer_add_test(ninfer_qwen3_5_chat_template_prefix_stability_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_chat_template_prefix_stability.cpp"
   NEEDS_SOURCE_DIR

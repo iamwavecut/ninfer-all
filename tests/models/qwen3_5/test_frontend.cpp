@@ -463,7 +463,7 @@ int test_declared_frontend_semantics() {
              {"/pre_tokenizer/pretokenizers/1/add_prefix_space", true},
              {"/decoder/type", "WordPiece"},
              {"/model/dropout", 0.1},
-             {"/model/ignore_merges", true}}) {
+             {"/model/ignore_merges", "yes"}}) {
         auto changed                                = tokenizer;
         changed[nlohmann::json::json_pointer(path)] = value;
         source.tokenizer_json                       = changed.dump();

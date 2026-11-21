@@ -84,6 +84,7 @@ void parsing() {
                judgement.graft && judgement.graft->empty() &&
                judgement.readout_tokens == answers.tokens,
            "one answer token with its alternatives and the answers' readout, no thinking or graft");
+    expect(judgement.open_answer, "a judgement opens the answer it reads (Inkling 2's text block)");
 }
 
 void scoring() {

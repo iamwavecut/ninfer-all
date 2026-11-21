@@ -42,9 +42,11 @@ struct SpeculativeOptions {
     std::uint32_t draft_tokens = 0;
     // Qwen3.8-Flash-Next: MTP ends drafting and verification at the first draft whose absolute
     // probability is at or below this floor; DFlash2 verifies through the first draft whose
-    // selector confidence is at or below it. Zero keeps the full window. Unset keeps it with
-    // --spec, and is kAutomaticDraftMinP when the Engine chooses MTP (automatic) and
-    // kAutomaticDFlash2MinP when it chooses DFlash2.
+    // selector confidence is at or below it. Inkling 2's DSpark drafter (and DSpine on the families
+    // with a core of their own) verifies through the first draft whose drafter probability is at or
+    // below it. Zero keeps the full window. Unset keeps it with --spec, and is kAutomaticDraftMinP
+    // when the Engine chooses MTP (automatic), kAutomaticDFlash2MinP when it chooses DFlash2 and
+    // kAutomaticDSparkMinP when it chooses Inkling 2's DSpark.
     std::optional<float> draft_min_p;
     // DeepSeek-V4.1 DSpark: verify a round's drafts up to the first its confidence head scores below
     // this, in [0,1]; 0 keeps every draft. Unset keeps the drafter's default floor (0.5).
@@ -66,7 +68,8 @@ struct SpeculativeOptions {
     // configured backend, preferred whenever it finds a match.
     std::uint32_t lookup_ngram = 0;
     // MTP only; Adaptive verifies 1..draft_tokens drafts per round (Qwen3.8-Flash-Next: a lone
-    // request's round; a round of several drafts up to kAutomaticDraftTokens).
+    // request's round; a round of several drafts up to kAutomaticDraftTokens). Inkling 2's DSpark
+    // drafter adapts a lone request's round the same way.
     MtpDraftPolicy mtp_policy = MtpDraftPolicy::Fixed;
     // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
@@ -87,12 +90,17 @@ struct SpeculativeOptions {
     // kAutomaticDraftMinP, a round of several requests with a CPU share verifying at most the
     // tokens of the widest call the CPU shares (64 with GGUF host experts), Edge0's form also with
     // device experts at max_concurrency 1; Gemma 4 with host or disk experts with its assistant,
-    // kAutomaticDraftTokens a round; others run without drafts. options() report the backend.
+    // kAutomaticDraftTokens a round; Inkling 2 at max_concurrency 1 without tensor parallelism
+    // with its DSpark drafter, kAutomaticDSparkTokens a round adapting (Adaptive) and ending at the
+    // first draft at or below kAutomaticDSparkMinP; others run without drafts. options() report
+    // the backend.
     bool automatic = false;
     static constexpr std::uint32_t kAutomaticDraftTokens   = 3;
     static constexpr float kAutomaticDraftMinP             = 0.5F;
     static constexpr std::uint32_t kAutomaticDFlash2Tokens = 4;
     static constexpr float kAutomaticDFlash2MinP           = 0.7F;
+    static constexpr std::uint32_t kAutomaticDSparkTokens  = 3;
+    static constexpr float kAutomaticDSparkMinP            = 0.5F;
 };
 
 enum class DiagnosticLevel : std::uint8_t {
