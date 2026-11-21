@@ -327,9 +327,11 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         const auto residency = options.vision == VisionPlacement::Pinned
                                    ? artifact::Residency::Pinned : artifact::Residency::Device;
         const std::uint64_t vh = vc.hidden_size, vw = vc.intermediate_size;
+        // BF16 matrices, or GGUF block rows as a llama.cpp mmproj stores them (Q8_0); the tower
+        // checks which.
         const auto dense = [&](const std::string& name, artifact::Shape shape,
                                const std::string& input) {
-            return b.parameter(name, std::move(shape), {input}, QType::BF16, residency);
+            return b.parameter(name, std::move(shape), {input}, std::nullopt, residency);
         };
         VisionWeights& v   = vision_weights.emplace();
         v.patch_embedding  = dense("vision/patch_embedding", {vh, vc.patch_features()},

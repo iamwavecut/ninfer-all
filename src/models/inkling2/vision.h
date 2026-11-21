@@ -8,7 +8,8 @@
 // output projection with bias) times its learned scale, and its GELU MLP (biases) times its
 // learned scale. The class row is dropped, each 2 x 2 cell of patches becomes one row, and the
 // projector (two matrices without biases, the erf GELU between) takes it to the text model's
-// width. Matrices multiply BF16 inputs into FP32 results (cuBLAS).
+// width. Matrices multiply BF16 inputs into FP32 results (cuBLAS); a matrix of GGUF block rows (a
+// llama.cpp Q8_0 mmproj) first decodes to BF16 rows in the workspace.
 //
 // The matrices are resident on the device, or (VisionPlacement::Pinned) the blocks' stay in pinned
 // host memory and pass through a window of two device slots, a block's matrices uploading on a copy
@@ -17,6 +18,7 @@
 #include "core/arena.h"
 #include "core/device_buffer.h"
 #include "core/device_launch.h"
+#include "core/qtype.h"
 #include "models/inkling2/model.h"
 
 #include <cublas_v2.h>
@@ -56,9 +58,17 @@ public:
 
 private:
     struct Matrix {
-        const void* data = nullptr; // BF16 [n][k], device or pinned host
+        // [n][k]: BF16 values or rows of GGUF blocks, on the device or in pinned host memory.
+        const void* data = nullptr;
         int n = 0, k = 0;
-        [[nodiscard]] std::size_t bytes() const noexcept { return std::size_t(n) * k * 2; }
+        QType format = QType::BF16;
+        [[nodiscard]] bool blocks() const noexcept { return is_gguf(format); }
+        [[nodiscard]] std::size_t row_bytes() const noexcept {
+            if (!blocks()) { return std::size_t(k) * 2; }
+            const auto block = gguf_block_shape(format);
+            return std::size_t(k) / block.elements * block.bytes;
+        }
+        [[nodiscard]] std::size_t bytes() const noexcept { return std::size_t(n) * row_bytes(); }
     };
     struct Layer {
         Matrix query, key, value, output, up, down;
@@ -71,10 +81,10 @@ private:
 
     // out[t][j] = sum_k w[j][k] x[t][k] (FP32, row stride ldc) for the w rows.
     void gemm(const __nv_bfloat16* x, int tokens, const Matrix& w, float* out, int ldc,
-              cudaStream_t stream) const;
+              WorkspaceArena& workspace, cudaStream_t stream) const;
     [[nodiscard]] Layer staged(std::size_t i, int slot) const;
     void upload(std::size_t i, int slot) const;
-    [[nodiscard]] const void* own(const void* host, std::size_t bytes);
+    [[nodiscard]] const void* own(const Matrix& host);
 
     VisionConfig config_;
     std::uint32_t max_patches_ = 0;

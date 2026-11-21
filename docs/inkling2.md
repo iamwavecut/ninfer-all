@@ -4,8 +4,10 @@ NInfer-all runs Thinking Machines' [Inkling 2 Mini](https://huggingface.co/think
 (`Inkling2LoopForConditionalGeneration`; its text component `Inkling2ForCausalLM`), a looped
 mixture-of-experts model of 26.4B parameters with 3.4B active per token (5.4B with its three
 passes), from a llama.cpp GGUF: Unsloth's
-[UD-IQ4_XS](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) or another quantization of the
-release, with the release's vision tower and DSpark drafter. It is the engine's first looped
+[UD-IQ4_XS](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), IsValorum's
+[APEX-I MiniPlus](https://huggingface.co/IsValorum/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-GGUF) or
+another quantization of the release, with the release's vision tower (BF16 or Q8_0) and DSpark
+drafter. It is the engine's first looped
 transformer and its own model family: its own executor (`src/models/inkling2`) and Engine core
 (`src/runtime/engine/inkling2_core`), sharing the Qwen3.5 frontend in an Inkling dialect for
 tokenization, the chat template, output parsing and the serving protocols.
@@ -29,8 +31,12 @@ tokenization, the chat template, output parsing and the serving protocols.
 - **The weights stay the GGUF's blocks.** Every matrix keeps its ggml format, imported row for row
   without requantization: in UD-IQ4_XS the routed experts are NVFP4 in 20 of the 24 layers (Q5_K,
   Q4_K or IQ4_XS [gate; up] banks and Q5_0 or IQ4_NL down banks in the other 4), attention Q8_0
-  (Q6_K or Q5_K in 7 layers' projections), the token table Q8_0 and the head Q6_K. The router,
-  convolutions, distance tables, mixing queries, controllers, norms and expert scales are FP32.
+  (Q6_K or Q5_K in 7 layers' projections), the token table Q8_0 and the head Q6_K. In MiniPlus the
+  [gate; up] banks are IQ3_XXS or IQ3_S and the down banks Q5_0 or IQ4_NL, attention Q4_K (Q6_K
+  output projections in 4 layers, Q8_0 gates), the token table Q4_K and the head Q6_K. The router,
+  convolutions, distance tables, mixing queries, controllers, norms and expert scales are FP32;
+  MiniPlus stores its sink and dynamic-tap projections in Q8_0, which the converter decodes to FP32
+  exactly.
   Vector kernels multiply up to eight tokens, integer matrix kernels the prompt chunks, the expert
   products the routed experts only.
 - **The looped state.** A decode or verification call of at most 16 rows spreads each depth mix
@@ -74,8 +80,10 @@ tokenization, the chat template, output parsing and the serving protocols.
 - **Images.** The release's vision tower (the artifact's `vision` component, `--vision`): a ViT
   with a class row, learned position rows resized to each image and 2D-rotated heads, then 2 x 2
   patch merging and a two-layer projector, up to 4,096 positions an image (fewer with
-  `--vision-max-merged`). Its matrices stay on the GPU or, with `--vision-residency overlay`, in
-  pinned host memory through two device slots.
+  `--vision-max-merged`). Its matrices are BF16 or, from a Q8_0 mmproj, the GGUF's blocks, which
+  the tower decodes to BF16 rows before each product; cuBLAS multiplies BF16 inputs into FP32
+  results either way. They stay on the GPU or, with `--vision-residency overlay`, in pinned host
+  memory through two device slots.
 - **Expert residency.** The routed experts stay on the GPU, in pinned host memory or in the
   artifact's files, with a device cache and a CPU share of decode misses
   ([below](#expert-residency)). Several GPUs divide the routed experts on the devices (`--devices
@@ -98,24 +106,45 @@ mkdir -p models/inkling2/hf
 for f in config.json tokenizer.json tokenizer_config.json chat_template.jinja generation_config.json; do
   curl -fsSL -o models/inkling2/hf/$f https://huggingface.co/thinkingmachines/Inkling-2-Mini/resolve/main/$f
 done
-hf download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-UD-IQ4_XS.gguf mmproj-BF16.gguf \
+hf download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-UD-IQ4_XS.gguf \
   dspark-Inkling-2-Mini-Q8_0.gguf --local-dir models/inkling2
+hf download ggml-org/Inkling-2-Mini-GGUF mmproj-Inkling-2-Mini-Q8_0.gguf --local-dir models/inkling2
 
 python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
   --source gguf=models/inkling2/Inkling-2-Mini-UD-IQ4_XS.gguf \
-  --source vision=models/inkling2/mmproj-BF16.gguf \
+  --source vision=models/inkling2/mmproj-Inkling-2-Mini-Q8_0.gguf \
   --source dspark=models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf \
   --components text,vision,dspark --name Inkling-2-Mini-UD-IQ4_XS \
   --out models/Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --device cpu
 ```
 
-The conversion takes about 25 seconds on a 64-CPU container and writes one 16,790,806,016-byte
-(15.6 GiB) `.ninfer` file of 1,185 objects: the text model, the vision tower (BF16 matrices) and
-the DSpark drafter (Q8_0). Unsloth's repository holds each quantization in two layouts, the root
-file's `inkling2` (48 unrolled blocks in its metadata) and llama.cpp's `inkling2_loop` (24 blocks,
-`Mainline_Support/*.gguf_file`). Both convert to the same artifact: from UD-IQ4_XS the two payloads
-are equal byte for byte, and the headers differ only in the recorded source path and the random
-artifact id.
+The conversion writes one 16,494,910,976-byte (15.4 GiB) `.ninfer` file of 1,185 objects: the text
+model, the vision tower (Q8_0 matrices) and the DSpark drafter (Q8_0). With Unsloth's
+`mmproj-BF16.gguf` as the `vision` source the tower keeps BF16 matrices and the file has
+16,790,806,016 bytes (15.6 GiB). Unsloth's repository holds each quantization in two layouts, the
+root file's `inkling2` (48 unrolled blocks in its metadata) and llama.cpp's `inkling2_loop` (24
+blocks, `Mainline_Support/*.gguf_file`). Both convert to the same artifact: from UD-IQ4_XS the two
+payloads are equal byte for byte, and the headers differ only in the recorded source path and the
+random artifact id.
+
+IsValorum's APEX-I MiniPlus V2.1 converts the same way with its own Q8_0 mmproj and Unsloth's
+drafter, which its repository does not carry:
+
+```bash
+hf download IsValorum/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-GGUF \
+  Inkling-2-Mini-APEX-I-MiniPlus-V2.1.gguf mmproj-Inkling-2-Mini-Q8_0.gguf \
+  --local-dir models/inkling2/apex
+
+python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
+  --source gguf=models/inkling2/apex/Inkling-2-Mini-APEX-I-MiniPlus-V2.1.gguf \
+  --source vision=models/inkling2/apex/mmproj-Inkling-2-Mini-Q8_0.gguf \
+  --source dspark=models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf \
+  --components text,vision,dspark --name Inkling-2-Mini-APEX-I-MiniPlus-V2.1 \
+  --out models/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-ninfer-v3.ninfer --device cpu
+```
+
+It writes 13,740,465,920 bytes (12.8 GiB) of 1,173 objects. Each conversion took about two minutes
+on a rented A40's container.
 
 ## Running
 
@@ -212,6 +241,28 @@ the batched controllers and the sorted route ([what runs](#what-runs)) NInfer-al
   one card (1.14x), each request's text equal to its text alone. With one request and an
   8,192-token context the server's devices use about 11,100 and 7,600 MiB against one card's
   18,300 MiB. Prompt rates over the split were not measured beyond a 33-token prompt.
+
+### APEX-I MiniPlus
+
+IsValorum's APEX-I MiniPlus V2.1 (12.8 GiB with its Q8_0 tower and the DSpark drafter) on a rented
+A40 (300 W, PCIe 4.0 x16, CUDA 12.8, build `86`), November 21, 2026:
+
+- **Speed.** `ninfer_bench`, three repetitions: prefill of 2,048 tokens 2,776 tok/s, of 10,000
+  tokens 2,128; decode of 128 tokens 104.3 tok/s, 90.2 after 10,000. The CLI's 384-token greedy
+  essay, one run each: 103.1 tok/s with `--spec none`, 115.6 with DSpark (1.69 tokens a round),
+  with the same text. UD-IQ4_XS on another A40 host ([below](#across-cards)) gave 2,432, 1,897,
+  85.3 and 75.5, and 84.4 and 97.3 on the essay; this was not an A/B on one host.
+- **Quality.** Perplexity on the first 40,000 bytes of WikiText (`--kv-dtype bf16`, 9,718 scored
+  tokens): a mean NLL of 1.870942 (perplexity 6.494411) against UD-IQ4_XS's 1.859871 (6.422907),
+  +0.60%.
+- **Memory.** With every expert on the GPU: 12.1 GiB of weights, 12.8 GiB with the tower and the
+  drafter. One sequence plans 13.8 GiB of the GPU at 8,192 tokens and 14.5 GiB at 32,768 without
+  the drafter, 14.7 and 15.5 GiB with the tower and the drafter; no 16 GB card has run it.
+  `--expert-residency host` pins 10.9 GiB of host memory for the routed experts and keeps 1.16 GiB
+  of weights and two 1,002 MiB layer banks on the GPU; `host` and `disk` (the A40's cache held
+  every expert) gave the device run's 384 greedy tokens byte for byte.
+- **Images.** The image prompt of examples/cli/messages/image_natural.json (greedy) names the
+  mailbox's 24 and the sun on the right, as UD-IQ4_XS does.
 
 ### Across cards
 
@@ -379,8 +430,16 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
 - **The vision tower.** `ninfer_inkling2_vision_real_test` (`NINFER_INKLING_VISION_ARTIFACT`,
   `NINFER_INKLING_VISION_IMAGE` and `NINFER_INKLING_VISION_DIR`, with the rows of
   `tools/reference/inkling2_vision.py` there) runs examples/cli/media/natural_scene.png, a
-  40 x 26-patch grid, through the device tower against the FP64 reference: worst row cosine
-  0.999172, relative RMS error 0.90%; the overlay tower gives the same rows bit for bit.
+  40 x 26-patch grid, through the device tower against the FP64 reference of the artifact's
+  mmproj: worst row cosine 0.999172 and relative RMS error 0.90% with the BF16 tower, 0.999283 and
+  0.93% with the Q8_0 tower; the overlay tower gives the same rows bit for bit. Against the BF16
+  tower's reference the Q8_0 tower scores 0.998210 and 1.66%, and the two FP64 references differ by
+  0.999272 and 1.39%: the Q8_0 matrices' own rounding. ggml-org's and IsValorum's Q8_0 mmprojs hold
+  the same tensors byte for byte and give the same rows. The GGUF product, which quantizes each
+  input to q8_1 as llama.cpp does, scored 0.974362 and 2.67% against the Q8_0 reference, so the
+  tower decodes the blocks to BF16 rows instead. On examples/cli/messages/image_natural.json
+  (greedy) both towers name the mailbox's 24 and the sun on the right; the Q8_0 tower's text
+  departs from the BF16 tower's 324 characters into the reasoning.
 - **DSpark.** With 7 drafts a round over 256 greedy tokens of the essay prompt, NInfer-all's drafter
   had 133 drafts accepted of 832, llama.cpp's implementation 133 of 850.
 

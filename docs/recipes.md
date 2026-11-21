@@ -296,6 +296,23 @@ ninfer-serve --config configs/inkling2-mini-host.ini
 ninfer-serve --config configs/inkling2-mini-host.ini --max-context 12288
 ```
 
+IsValorum's APEX-I MiniPlus V2.1 (12.8 GiB, IQ3 experts, its Q8_0 vision tower) takes the same
+configs with its path on the command line, which wins over the file's `model`:
+
+```bash
+hf download WaveCut/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-NInfer-v3 \
+  Inkling-2-Mini-APEX-I-MiniPlus-V2.1-ninfer-v3.ninfer --local-dir models
+
+# 16 GB: every expert on the GPU, images and DSpark over an 8K-token context, 14.7 GiB planned
+# (no 16 GB card has run it).
+ninfer-serve models/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-ninfer-v3.ninfer \
+  --config configs/inkling2-mini.ini --max-context 8192
+
+# Less: the experts in 10.9 GiB of pinned host memory.
+ninfer-serve models/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-ninfer-v3.ninfer \
+  --config configs/inkling2-mini-host.ini
+```
+
 ## Qwen3.6-35B-A3B NVFP4
 
 RTX 50 series and RTX PRO 6000 only.
