@@ -13,8 +13,9 @@ constexpr std::string_view kQwenEnd     = "<|im_end|>";
 constexpr std::string_view kGemmaStart  = "<|turn>";
 constexpr std::string_view kGemmaEnd    = "<turn|>";
 
-// Flint's and DeepSeek's turns: a role marker and the turn's text up to the next one; no marker
-// closes a turn (DeepSeek's assistant turns end with <｜end▁of▁sentence｜>, inside the turn).
+// Flint's, DeepSeek's and Inkling's turns: a role marker and the turn's text up to the next one;
+// no marker closes a turn (DeepSeek's assistant turns end with <｜end▁of▁sentence｜>, Inkling's
+// blocks with <|end_message|>, inside the turn).
 struct RoleMarker {
     std::string_view marker;
     ChatRole role;
@@ -29,6 +30,11 @@ constexpr RoleMarker kFlintRoles[] = {{"<|system|>", ChatRole::System},
 constexpr RoleMarker kDeepSeekRoles[]   = {{"<｜System｜>", ChatRole::System},
                                            {"<｜User｜>", ChatRole::User},
                                            {"<｜Assistant｜>", ChatRole::Assistant}};
+// Inkling 2 writes each part of a message as its own block under the message's role marker.
+constexpr RoleMarker kInklingRoles[]    = {{"<|message_system|>", ChatRole::System},
+                                           {"<|message_user|>", ChatRole::User},
+                                           {"<|message_model|>", ChatRole::Assistant},
+                                           {"<|message_tool|>", ChatRole::Tool}};
 constexpr std::string_view kVisionStart = "<|vision_start|>";
 constexpr std::string_view kVisionEnd   = "<|vision_end|>";
 
@@ -61,12 +67,15 @@ const RoleMarker* find_role(const text::TemplateOutput& output, std::span<const 
 }
 
 // DeepSeek's template writes one <｜deepseek_image｜> per image, in input order; the processor
-// expands it into the image's span of the same token.
+// expands it into the image's span of the same token. Inkling's writes its image token the same
+// way, after an image block's opener.
 constexpr std::string_view kDeepSeekImage = "<｜deepseek_image｜>";
+constexpr std::string_view kInklingImage  = "<|unused_200054|>";
 
-// Flint's and DeepSeek's layout: each turn ends where the next begins, which closes it, since a
-// role marker is a token a turn's text cannot run into. Flint's template writes no media;
-// DeepSeek's writes `image_placeholder` for each image.
+// Flint's, DeepSeek's and Inkling's layout: each turn ends where the next begins, which closes it,
+// since a role marker is a token a turn's text cannot run into (an Inkling message of several
+// parts is a turn per part). Flint's template writes no media; DeepSeek's and Inkling's write
+// `image_placeholder` for each image.
 PromptLayout inspect_marker_layout(const text::TemplateOutput& output,
                                    std::span<const Modality> media,
                                    std::span<const RoleMarker> roles,
@@ -155,6 +164,9 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
     std::size_t role_at = std::string::npos;
     if (find_marker(output, kQwenStart, 0) == std::string::npos &&
         find_marker(output, kGemmaStart, 0) == std::string::npos) {
+        if (find_role(output, kInklingRoles, 0, role_at) != nullptr) {
+            return inspect_marker_layout(output, media, kInklingRoles, kInklingImage);
+        }
         if (find_role(output, kFlintRoles, 0, role_at) != nullptr) {
             return inspect_marker_layout(output, media, kFlintRoles, {});
         }

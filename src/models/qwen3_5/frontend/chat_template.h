@@ -98,6 +98,7 @@ enum class ToolCallSyntax : std::uint8_t {
     Gemma,    // <|tool_call>call:NAME{ ...
     Flint,    // <tool_call>NAME<arg_key> ...
     DeepSeek, // \n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="NAME">\n ...
+    Inkling,  // <|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}
 };
 
 struct ChatRenderOptions {
@@ -113,6 +114,8 @@ struct ChatRenderOptions {
     std::vector<std::string> tool_jsons;
     // Function whose call the generation prompt opens; the opener is written in `tool_call_syntax`.
     std::string forced_tool_name;
+    // PromptOptions::open_answer: Inkling's generation prompt ends with a text block's opener.
+    bool open_answer                = false;
     ToolCallSyntax tool_call_syntax = ToolCallSyntax::Qwen;
     std::vector<PromptCacheMarker> cache_markers;
 };

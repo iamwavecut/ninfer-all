@@ -297,6 +297,8 @@ struct GenerationRequest {
     // token included, so a one-token read (the typed decisions, rerank) has its first token's
     // record whatever token the model chose. The output text is then raw.
     bool raw_output = false;
+    // ninfer::PromptOptions::open_answer: the prompt opens the answer for a one-token read.
+    bool open_answer = false;
     // ninfer::ExecutionOptions::speculative_drafting: false keeps --spec's drafter off a one-token
     // read that no read continues (rerank, typed decisions with one-character labels).
     bool speculative_drafting = true;

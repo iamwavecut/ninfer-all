@@ -20,6 +20,7 @@ struct ToolCallOutputContract;
 struct GemmaMarkers;
 struct FlintMarkers;
 struct DeepSeekMarkers;
+struct InklingMarkers;
 } // namespace frontend
 class Frontend;
 
@@ -104,7 +105,8 @@ private:
                   std::shared_ptr<text::GrammarState> grammar               = {},
                   std::shared_ptr<const frontend::GemmaMarkers> gemma       = {},
                   std::shared_ptr<const frontend::FlintMarkers> flint       = {},
-                  std::shared_ptr<const frontend::DeepSeekMarkers> deepseek = {});
+                  std::shared_ptr<const frontend::DeepSeekMarkers> deepseek = {},
+                  std::shared_ptr<const frontend::InklingMarkers> inkling   = {});
     std::unique_ptr<Impl> impl_;
 
     friend class Frontend;
