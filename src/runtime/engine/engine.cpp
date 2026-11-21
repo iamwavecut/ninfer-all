@@ -148,7 +148,10 @@ EngineOptions with_family_attention(EngineOptions options) {
 // fast on greedy prose, 1.41 on code and 1.26 after a 5,748-token document on an RTX 3090, and
 // 0.99-1.05 times as fast on prose and 1.24 on code at the release's temperature; with slower
 // decode kernels, a fixed three drafts had decoded sampled prose 0.87-0.95 times as fast, one
-// draft 1.06-1.12 times.
+// draft 1.06-1.12 times. Its expert parallelism drafts too: the drafter runs on rank 0 and a
+// verification of up to eight tokens crosses the devices once per MoE block as a decode step does,
+// so on two RTX 3090s without peer access the same rounds decoded 1.33 times as fast on greedy
+// prose, 1.70 on code and 1.18 on sampled prose as the split without drafts.
 EngineOptions with_family_speculation(EngineOptions options) {
     SpeculativeOptions& speculative = options.speculative;
     if (!speculative.automatic || speculative.backend != SpeculativeBackend::None ||
@@ -157,8 +160,9 @@ EngineOptions with_family_speculation(EngineOptions options) {
     }
     if (runtime::is_inkling2_artifact(options.artifact_path)) {
         // Inkling 2 drafts with the DSpark drafter its artifact carries while it serves one request
-        // at a time, a lone round's width adapting to how far the drafts survive.
-        if (options.max_concurrency != 1 || options.tensor_parallel ||
+        // at a time, on one device or over its expert parallelism, a lone round's width adapting
+        // to how far the drafts survive.
+        if (options.max_concurrency != 1 ||
             !artifact::Reader(options.artifact_path).directory().components.contains("dspark")) {
             return options;
         }

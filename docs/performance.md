@@ -1083,7 +1083,7 @@ The release's DSpark drafter, which drafts by default while one request runs, de
 greedy answers 1.14 to 1.41 times as fast as plain decoding and sampled ones 0.99 to 1.24 times.
 With the experts in pinned host memory the 3090's cache holds every expert and decodes at 100.3
 tok/s, 117.8 with DSpark. [Inkling 2 Mini's measurements](inkling2.md#measurements) add the
-drafter, context lookup, concurrency and expert residency.
+drafter, context lookup, concurrency, expert residency and expert parallelism over two cards.
 
 ## Measurement pages
 
@@ -1097,7 +1097,7 @@ drafter, context lookup, concurrency and expert residency.
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
 | [Flint](flint.md#measurements) | against llama.cpp, host and disk experts, context lookup, typed decisions | RTX 3090, 4090, 5090, A40 |
-| [Inkling 2 Mini](inkling2.md#measurements) | against llama.cpp, the DSpark drafter, context lookup, concurrency, host and disk experts with the built-in routing profile | RTX 3090 |
+| [Inkling 2 Mini](inkling2.md#measurements) | against llama.cpp, the DSpark drafter, context lookup, concurrency, host and disk experts with the built-in routing profile, expert parallelism | RTX 3090, 2x RTX 3090 |
 | [GGUF models across cards, November 2026](performance/gguf-cards-2026-11.md) | Gemma 4 26B-A4B and 31B, Flint, Flash-Next and DeepSeek-V4.1 from one release build: prompt and decode rates, the `cp.async` MMQ tiles against the compiled loop, perplexity per card | RTX PRO 6000 Server Edition, RTX 5090, 4090, 3090, 5060 Ti, L40S, A100 80 GB and 40 GB |
 | [Field reports](performance/field-reports.md) | users' own measurements: Qwen3.8-27B IQ3_S and its Swift 1.5 fine-tune against llama.cpp, long Qwen Code and agent sessions with DFlash2 and MTP, prefix-cache hits and the time to the first token, Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards | RTX 5070 Ti, 4090, 4080, 5060 Ti |
 | [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |

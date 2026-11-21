@@ -78,9 +78,9 @@ tokenization, the chat template, output parsing and the serving protocols.
   pinned host memory through two device slots.
 - **Expert residency.** The routed experts stay on the GPU, in pinned host memory or in the
   artifact's files, with a device cache and a CPU share of decode misses
-  ([below](#expert-residency)). Several GPUs divide the routed experts (`--devices 0,1
-  --tensor-parallel`, [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families));
-  this path has not run on more than one GPU yet.
+  ([below](#expert-residency)). Several GPUs divide the routed experts on the devices (`--devices
+  0,1 --tensor-parallel`, [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)),
+  and DSpark drafts there by default too ([measurements](#measurements)).
 
 Not built for this family: the quantized `--kv-dtype` formats (the KV cache is F16, `bf16` or
 `fp16`), MTP, DFlash, n-gram copy drafts and their archive, `--draft-confidence`, rotation scaling
@@ -194,6 +194,21 @@ the batched controllers and the sorted route ([what runs](#what-runs)) NInfer de
 - **Concurrency.** `ninfer-serve --max-concurrency 4`, four greedy chat requests of up to 256 tokens
   at once: 970 tokens in 4.9 s, 198.1 tok/s together (53.4-56.5 each); the first request's text
   equals its text alone, which decoded at 111.0 tok/s.
+- **Expert parallelism.** Two RTX 3090s (350 W, CUDA 12.8, build `86`) without peer access, so
+  the exchange stages through pinned host memory; `--devices 0,1 --tensor-parallel` gives each
+  card 64 experts by measured bandwidth (0-63 and 64-127). One request at a time through
+  `ninfer-serve`, 384 tokens, two passes alternating with one card. Without drafts the split
+  decodes 89.4-91.6 tok/s through the server; in the CLI (`--spec none`) it decodes 86.7-91.6
+  against one card's 110.2-111.8 on the same prompts, 0.78-0.82 times as fast, since every MoE
+  block crosses the bus twice (86.7 with 32 experts on the first card and 96 on the second). DSpark with the automatic settings
+  decodes the greedy essay at 120.0 and 120.7 tok/s against 90.4 and 91.1 (1.33x), the Python
+  task at 154.6 and 155.2 against 90.7 and 91.6 (1.70x) and the essay at seed 7 at 105.3 and
+  105.9 against 89.4 and 90.2 (1.18x), with plain decoding's text; one card with DSpark decodes
+  them at 125.2-125.5, 144.1-144.9 and 114.4-115.0. Four greedy requests of 256 tokens at once
+  (`--max-concurrency 4`, no drafts) decode 238.5 tok/s together on the split against 209.4 on
+  one card (1.14x), each request's text equal to its text alone. With one request and an
+  8,192-token context the server's devices use about 11,100 and 7,600 MiB against one card's
+  18,300 MiB. Prompt rates over the split were not measured beyond a 33-token prompt.
 
 ## Numerical checks
 
@@ -212,6 +227,13 @@ the batched controllers and the sorted route ([what runs](#what-runs)) NInfer de
   six 4,096-token windows both score alike: a mean NLL of 1.733757 against llama.cpp's 1.734757
   (-0.06%); per window -0.30% to +0.08% (llama.cpp's windows read from its four-digit running
   perplexities). On 40 KB, device, host and disk experts give the same perplexity, 6.415115.
+- **Expert parallelism.** With a three-token prompt every call stays within eight tokens, where one
+  card also sums the experts in fixed point: the split's 384 greedy tokens equal one card's byte
+  for byte, with and without DSpark. A prompt chunk weighs the experts' rows in fixed point on the
+  split and in FP32 on one card, so after the 33-token essay prompt the split's greedy text departs
+  from one card's after about 150 tokens; 64/64 and 32/96 experts give the same text, with and
+  without DSpark, and the same perplexity. On the first 40 KiB of WikiText (`--kv-dtype bf16`)
+  the split scores a mean NLL of 1.866484 against one card's 1.866193 (+0.016%).
 - **The vision tower.** `ninfer_inkling2_vision_real_test` (`NINFER_INKLING_VISION_ARTIFACT`,
   `NINFER_INKLING_VISION_IMAGE` and `NINFER_INKLING_VISION_DIR`, with the rows of
   `tools/reference/inkling2_vision.py` there) runs examples/cli/media/natural_scene.png, a
