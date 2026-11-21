@@ -1,8 +1,11 @@
 #include "models/inkling2/vision.h"
 
 #include "core/device_buffer.h"
+#include "core/weight.h"
 #include "core/weight_view.h"
 #include "models/inkling2/vision_kernels.h"
+#include "ops/linear/gguf/ggml_bridge.h"
+#include "ops/linear/gguf/gguf_linear.h"
 
 #include <algorithm>
 #include <cmath>
@@ -76,11 +79,22 @@ VisionTower::VisionTower(const Model& model, std::uint32_t max_patches)
     const int h = int(config_.hidden_size), width = int(config_.intermediate_size);
     const int big = int(config_.projection_hidden), text = int(config_.text_hidden_size);
     const auto matrix = [&](WeightId id, int n, int k) {
-        const Tensor tensor = weight_tensor(model.weight(id).view, {k, n});
-        if (tensor.dtype != DType::BF16) {
-            throw std::invalid_argument(model.weight(id).name + ": the tower runs BF16 matrices");
+        const BoundWeight& bound = model.weight(id);
+        const QType format = contiguous_weight_region(bound.view).parent->geometry.format;
+        if (is_gguf(format)) {
+            const Weight weight = native_weight(bound.view);
+            ops::detail::require_gguf(weight, bound.name.c_str());
+            if (weight.n != n || weight.k != k) {
+                throw std::invalid_argument(bound.name + ": stored rows differ from the tower's");
+            }
+            return Matrix{weight.qdata, n, k, format};
         }
-        return Matrix{tensor.data, n, k};
+        const Tensor tensor = weight_tensor(bound.view, {k, n});
+        if (tensor.dtype != DType::BF16) {
+            throw std::invalid_argument(bound.name +
+                                        ": the tower runs BF16 matrices or GGUF block rows");
+        }
+        return Matrix{tensor.data, n, k, QType::BF16};
     };
     patch_embedding_ = matrix(w.patch_embedding, h, int(config_.patch_features()));
     projector_up_    = matrix(w.projector_up, big, int(config_.merged_features()));
@@ -89,7 +103,7 @@ VisionTower::VisionTower(const Model& model, std::uint32_t max_patches)
         // The patch projection and the projector stay resident: copies, which the same cuBLAS
         // calls multiply as the resident tower does, so both give the same rows.
         for (Matrix* m : {&patch_embedding_, &projector_up_, &projector_out_}) {
-            m->data = own(m->data, m->bytes());
+            m->data = own(*m);
         }
     }
     class_embedding_ = fp32(model, w.class_embedding, h);
@@ -120,10 +134,14 @@ VisionTower::VisionTower(const Model& model, std::uint32_t max_patches)
         layers_.push_back(layer);
     }
     if (streamed_) {
-        const Layer& first = layers_.front();
-        for (const Matrix* m :
-             {&first.query, &first.key, &first.value, &first.output, &first.up, &first.down}) {
-            slot_bytes_ += round_up(m->bytes());
+        // A slot holds the largest block.
+        for (const Layer& layer : layers_) {
+            std::size_t bytes = 0;
+            for (const Matrix* m :
+                 {&layer.query, &layer.key, &layer.value, &layer.output, &layer.up, &layer.down}) {
+                bytes += round_up(m->bytes());
+            }
+            slot_bytes_ = std::max(slot_bytes_, bytes);
         }
         for (int i = 0; i < 2; ++i) {
             slots_[i] = DeviceBuffer(slot_bytes_);
@@ -153,22 +171,46 @@ VisionTower::~VisionTower() {
     if (blas_ != nullptr) { cublasDestroy(blas_); }
 }
 
-const void* VisionTower::own(const void* host, std::size_t bytes) {
-    DeviceBuffer& buffer = owned_.emplace_back(bytes);
-    buffer.copy_from_host(host, bytes);
-    owned_bytes_ += bytes;
+const void* VisionTower::own(const Matrix& host) {
+    DeviceBuffer& buffer = owned_.emplace_back(host.bytes());
+    buffer.copy_from_host(host.data, host.bytes());
+    owned_bytes_ += host.bytes();
     return buffer.p;
 }
 
 std::size_t VisionTower::workspace_bytes() const {
-    return scratch_bytes(config_, max_patches_) + (std::size_t(4) << 20);
+    // A GGUF matrix's BF16 rows come on top of the phase that multiplies it.
+    std::size_t decoded = 0;
+    const auto add = [&](const Matrix& m) {
+        if (m.blocks()) { decoded = std::max(decoded, round_up(std::size_t(m.n) * m.k * 2)); }
+    };
+    for (const Matrix* m : {&patch_embedding_, &projector_up_, &projector_out_}) { add(*m); }
+    for (const Layer& layer : layers_) {
+        for (const Matrix* m :
+             {&layer.query, &layer.key, &layer.value, &layer.output, &layer.up, &layer.down}) {
+            add(*m);
+        }
+    }
+    return scratch_bytes(config_, max_patches_) + decoded + (std::size_t(4) << 20);
 }
 
 void VisionTower::gemm(const __nv_bfloat16* x, int tokens, const Matrix& w, float* out, int ldc,
-                       cudaStream_t stream) const {
+                       WorkspaceArena& workspace, cudaStream_t stream) const {
+    auto decode_scope = workspace.scope();
+    const void* rows  = w.data;
+    if (w.blocks()) {
+        // GGUF rows decode to BF16 and multiply as a BF16 matrix does, so the input stays BF16:
+        // ggml's q8_1 input (the GGUF product's) moved the tower's rows by 2.7% RMS.
+        auto* decoded = static_cast<__nv_bfloat16*>(
+            workspace.alloc_bytes(std::size_t(w.n) * w.k * 2).data);
+        ops::gguf::dequantize_rows(ops::detail::gguf_type(w.format), w.data,
+                                   std::int64_t(w.row_bytes()), w.k, nullptr, w.n, decoded, w.k,
+                                   stream);
+        rows = decoded;
+    }
     check_blas(cublasSetStream(blas_, stream), "cublasSetStream");
     const float alpha = 1.0f, beta = 0.0f;
-    check_blas(cublasGemmEx(blas_, CUBLAS_OP_T, CUBLAS_OP_N, w.n, tokens, w.k, &alpha, w.data,
+    check_blas(cublasGemmEx(blas_, CUBLAS_OP_T, CUBLAS_OP_N, w.n, tokens, w.k, &alpha, rows,
                             CUDA_R_16BF, w.k, x, CUDA_R_16BF, w.k, &beta, out, CUDA_R_32F, ldc,
                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
                "cublasGemmEx");
@@ -223,7 +265,7 @@ void VisionTower::encode(const __nv_bfloat16* patches, int grid_w, int grid_h, _
     {
         auto embed_scope = workspace.scope();
         float* projected = f32(std::size_t(patches_n) * h);
-        gemm(patches, patches_n, patch_embedding_, projected, h, stream);
+        gemm(patches, patches_n, patch_embedding_, projected, h, workspace, stream);
         vk::embed(projected, positions_, int(config_.posemb_grid), grid_w, grid_h, class_embedding_,
                   class_position_, h, residual, stream);
     }
@@ -245,9 +287,9 @@ void VisionTower::encode(const __nv_bfloat16* patches, int grid_w, int grid_h, _
             vk::layer_norm(residual, layer.attention_norm, layer.attention_norm_bias, n, h, eps, x,
                            stream);
             float* qkv = f32(std::size_t(n) * 3 * h);
-            gemm(x, n, layer.query, qkv, 3 * h, stream);
-            gemm(x, n, layer.key, qkv + h, 3 * h, stream);
-            gemm(x, n, layer.value, qkv + 2 * h, 3 * h, stream);
+            gemm(x, n, layer.query, qkv, 3 * h, workspace, stream);
+            gemm(x, n, layer.key, qkv + h, 3 * h, workspace, stream);
+            gemm(x, n, layer.value, qkv + 2 * h, 3 * h, workspace, stream);
             __nv_bfloat16* rotated = bf16(std::size_t(n) * 3 * h);
             vk::rotate_qkv(qkv, layer.query_bias, layer.key_bias, layer.value_bias, n, grid_w, h, d,
                            static_cast<const float*>(inv_freq_.p), rotated, stream);
@@ -273,17 +315,17 @@ void VisionTower::encode(const __nv_bfloat16* patches, int grid_w, int grid_h, _
                                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
                            "cublasGemmStridedBatchedEx (values)");
             }
-            gemm(attended, n, layer.output, qkv, h, stream);
+            gemm(attended, n, layer.output, qkv, h, workspace, stream);
             vk::residual(residual, qkv, layer.output_bias, layer.attention_scale, n, h, stream);
         }
         {
             auto mlp_scope = workspace.scope();
             vk::layer_norm(residual, layer.mlp_norm, layer.mlp_norm_bias, n, h, eps, x, stream);
             float* up = f32(std::size_t(n) * width);
-            gemm(x, n, layer.up, up, width, stream);
+            gemm(x, n, layer.up, up, width, workspace, stream);
             __nv_bfloat16* mid = bf16(std::size_t(n) * width);
             vk::gelu(up, layer.up_bias, n, width, mid, stream);
-            gemm(mid, n, layer.down, up, h, stream);
+            gemm(mid, n, layer.down, up, h, workspace, stream);
             vk::residual(residual, up, layer.down_bias, layer.mlp_scale, n, h, stream);
         }
         if (streamed_) { CUDA_CHECK(cudaEventRecord(used_[slot], stream)); }
@@ -293,9 +335,9 @@ void VisionTower::encode(const __nv_bfloat16* patches, int grid_w, int grid_h, _
     vk::merge(residual, grid_w, grid_h, h, merged, stream);
     float* up          = f32(std::size_t(cells) * std::max(big, text));
     __nv_bfloat16* mid = bf16(std::size_t(cells) * big);
-    gemm(merged, cells, projector_up_, up, big, stream);
+    gemm(merged, cells, projector_up_, up, big, workspace, stream);
     vk::gelu(up, nullptr, cells, big, mid, stream);
-    gemm(mid, cells, projector_out_, up, text, stream);
+    gemm(mid, cells, projector_out_, up, text, workspace, stream);
     vk::f32_to_bf16(up, std::int64_t(cells) * text, out, stream);
 }
 

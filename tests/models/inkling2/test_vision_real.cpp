@@ -5,16 +5,17 @@
 //                                   (patches.bin, BF16 words, and grid.json) and each tower's span
 //                                   rows (device.bin, overlay.bin: FP32 [span][text hidden]); when
 //                                   reference.bin is there too (tools/reference/inkling2_vision.py
-//                                   --mmproj <the release's mmproj> --patches patches.bin --grid W H
+//                                   --mmproj <the source mmproj> --patches patches.bin --grid W H
 //                                   --out reference.bin: FP64 projector rows, raw), the towers'
 //                                   rows are checked against it
 // The frontend prepares a user turn holding the image: a span of one <|unused_200054|> token per
 // 2 x 2 cell of its patch grid within the release's 4096 cells, and the item's patches are the
 // grid's. The resident tower then encodes them, and the tower whose matrices stream from pinned
 // memory gives the same rows bit for bit. Against the FP64 oracle, the tower, which rounds its
-// matrices' inputs, Q, K, V and the attention probabilities to BF16 (its products stay FP32), keeps
-// every row's cosine at 0.98 or more and the relative RMS error within 3%. The experts stay in the
-// artifact's files (disk residency): the tower needs none of them.
+// matrices' inputs, Q, K, V, the attention probabilities and a Q8_0 matrix's decoded rows to BF16
+// (its products stay FP32), keeps every row's cosine at 0.98 or more and the relative RMS error
+// within 3%. The experts stay in the artifact's files (disk residency): the tower needs none of
+// them.
 
 #include "artifact/reader.h"
 #include "core/arena.h"

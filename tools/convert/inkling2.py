@@ -12,7 +12,8 @@ SiTU (gated by a capped sigmoid product) over [gate; up] rows with a per-expert 
 product. The recipe imports the GGUF's block matrices row for row, as stored; a row of the artifact
 is byte for byte a row of the GGUF. BF16 and F32 tensors (sink and dynamic-tap projections, router,
 convolutions, clips, the distance tables, mixing queries, norms, controllers, expert scales) become
-FP32, exactly.
+FP32, exactly, as do Q8_0 ones, whose values d * q FP32 holds (IsValorum's APEX GGUFs store the
+sink and dynamic-tap projections in Q8_0).
 
 The GGUFs come in two layouts that convert to the same artifact: llama.cpp's (`inkling2_loop`, 24
 blocks, a block's four message queries in `blk.N.loop_msg_query` and its controllers
@@ -23,10 +24,12 @@ controllers `loop_{attn,k,v,mlp}_*`).
 The release's vision tower forms the `vision` component beside `text` (`--components text,vision`,
 `--source vision=mmproj-BF16.gguf`, projector `inkling2v`): a ViT with a class row, learned
 position rows resized to each image and 2D-rotated heads, then 2x2 patch merging and a two-layer
-projector, its matrices BF16 and its vectors FP32. The release's DSpark drafter (`--components
-text,dspark`, `--source dspark=dspark-Inkling-2-Mini-Q8_0.gguf`, llama.cpp architecture `dflash`)
-forms the `dspark` component: three blocks over the target's tapped hidden states, each with its own
-context projections, and a recurrent Markov head that corrects the target's head.
+projector, its vectors FP32 and its matrices BF16 or, from a quantized mmproj such as ggml-org's
+`mmproj-Inkling-2-Mini-Q8_0.gguf`, the GGUF's block rows as stored. The release's DSpark drafter
+(`--components text,dspark`, `--source dspark=dspark-Inkling-2-Mini-Q8_0.gguf`, llama.cpp
+architecture `dflash`) forms the `dspark` component: three blocks over the target's tapped hidden
+states, each with its own context projections, and a recurrent Markov head that corrects the
+target's head.
 
     python -m tools.convert --model HF_DIR --recipe inkling2_gguf \\
         --source gguf=Inkling-2-Mini-UD-IQ4_XS.gguf \\
@@ -47,7 +50,7 @@ import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
-from .gguf_blocks import block_source
+from .gguf_blocks import GGML_Q8_0, block_source, dequantize_q8_0
 from .methods import cast_direct, import_encoded
 from .resources import _dump_json, token_domain
 from .sources.gguf import GGUFFile
@@ -269,12 +272,16 @@ def _load_resources(root: Path, vocab: int, overrides: dict):
 
 
 def _direct(gguf: GGUFFile, tensor: str, shape: tuple[int, ...]) -> LogicalSource:
-    """F32 as stored, BF16 and F16 widened exactly."""
+    """F32 as stored, BF16 and F16 widened exactly, Q8_0 blocks decoded exactly."""
 
     info = gguf.info(tensor)
-    if info.type_name not in ("F32", "BF16", "F16"):
-        raise ValueError(f"{tensor}: expected a float vector or matrix, found {info.type_name}")
-    values = gguf.read_direct(tensor).astype(np.float32)
+    if info.type_id == GGML_Q8_0:
+        values = dequantize_q8_0(gguf.read_blocks(tensor))
+    elif info.type_name in ("F32", "BF16", "F16"):
+        values = gguf.read_direct(tensor).astype(np.float32)
+    else:
+        raise ValueError(f"{tensor}: expected a float or Q8_0 vector or matrix, found "
+                         f"{info.type_name}")
     if values.size != int(np.prod(shape)):
         raise ValueError(f"{tensor}: stored {info.shape}, expected {shape}")
     return array_source(torch.from_numpy(np.ascontiguousarray(values.reshape(shape))), tensor)
@@ -552,8 +559,9 @@ def build_model(base, gguf: GGUFFile, *, vision: GGUFFile | None = None,
 
 
 def _vision(model, vision: GGUFFile, vc: dict, config: dict) -> None:
-    """The tower's BF16 matrices and FP32 vectors (llama.cpp writes the release's BF16 patch
-    embedding, position rows and norms as F32: each must be a BF16 value)."""
+    """The tower's matrices, BF16 or the mmproj's block rows as stored, and its FP32 vectors
+    (llama.cpp writes the release's BF16 patch embedding, position rows and norms as F32: each
+    must be a BF16 value)."""
 
     from .model import Parameter
 
@@ -562,8 +570,10 @@ def _vision(model, vision: GGUFFile, vc: dict, config: dict) -> None:
     grid = vc["posemb_grid_size"]
 
     def dense(name, tensor, shape, inputs):
-        model.add(Parameter(name, shape, _exact_bf16(vision, tensor, shape),
-                            inputs=tuple(inputs), residency="vision"))
+        blocks = vision.info(tensor).type_id in GGUF_FORMATS_BY_TYPE
+        source = (_matrix(vision, tensor, shape) if blocks
+                  else _exact_bf16(vision, tensor, shape))
+        model.add(Parameter(name, shape, source, inputs=tuple(inputs), residency="vision"))
 
     def exact(name, tensor, shape):
         model.add(Parameter(name, shape, _direct(vision, tensor, shape), direct_format="fp32",
@@ -653,16 +663,18 @@ def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict) -> None:
 
 
 def inkling2_gguf(model, recipe, sources):
-    """Every matrix keeps its GGUF blocks, the vision tower's its BF16 values; vectors are FP32
-    (the drafter's Markov embedding BF16, as stored). A layer's query, gate and relative
-    projections, which read one input, share one parent when the GGUF stores them in one format,
-    as do the drafter's Q, K and V, its context K and V, and its MLP's gate and up rows."""
+    """Every matrix keeps its GGUF blocks, the vision tower's its BF16 values or, from a
+    quantized mmproj, its blocks; vectors are FP32 (the drafter's Markov embedding BF16, as
+    stored). A layer's query, gate and relative projections, which read one input, share one
+    parent when the GGUF stores them in one format, as do the drafter's Q, K and V, its context
+    K and V, and its MLP's gate and up rows."""
 
     if model.config.get("architectures") != [TEXT_ARCHITECTURE]:
         raise ValueError("the inkling2_gguf recipe requires an Inkling 2 model")
     formats = {}
     for name, parameter in model.parameters.items():
-        if name.startswith("vision/") and parameter.projection:
+        if (name.startswith("vision/") and parameter.projection
+                and parameter.source.read_encoded is None):
             formats[name] = "bf16"
             recipe.assign(name, format="bf16", method=cast_direct, source=parameter.source,
                           activation_policy="A16Only")
@@ -672,8 +684,10 @@ def inkling2_gguf(model, recipe, sources):
                           source=parameter.source)
             continue
         fmt = formats[name] = parameter.source.read_encoded(0, 1).format
+        # The tower decodes its blocks to BF16 rows and keeps its inputs BF16.
+        policy = "A16Only" if name.startswith("vision/") else "AllowA8"
         recipe.assign(name, format=fmt, method=import_encoded, source=parameter.source,
-                      **({"activation_policy": "AllowA8"} if parameter.projection else {}))
+                      **({"activation_policy": policy} if parameter.projection else {}))
 
     def group(names):
         if len({formats[name] for name in names}) == 1:

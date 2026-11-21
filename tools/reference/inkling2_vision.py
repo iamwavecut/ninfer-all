@@ -14,7 +14,8 @@ position, pair i at theta^(-2i / (D / 2)); the class row at (0, 0), patch (x, y)
 unmasked softmax attention with scale 1 / sqrt(D) over every row. The class row is dropped, each 2 x
 2 cell of patches becomes one row of 4 hidden values (value dy * 2 hidden + dx * hidden + c), cells
 row by row, and the projector (mm.1, the erf GELU, mm.2, no biases) takes it to the text width.
-Every value is FP64 over the GGUF's BF16/F32 values.
+Every value is FP64 over the GGUF's BF16/F32 values and its exactly decoded blocks (a Q8_0
+mmproj).
 
     python -m tools.reference.inkling2_vision --mmproj MMPROJ.gguf \\
         --patches patches.bin --grid W H --out rows.bin
@@ -40,7 +41,8 @@ from pathlib import Path
 
 import numpy as np
 
-from tools.convert.sources.gguf import GGUFFile
+from tools.convert.gguf_blocks import dequantize_blocks
+from tools.convert.sources.gguf import TYPE_BF16, TYPE_F16, TYPE_F32, GGUFFile
 
 
 def bf16_words(words: np.ndarray) -> np.ndarray:
@@ -109,7 +111,12 @@ def tower(mmproj: GGUFFile, patches: np.ndarray, grid_w: int, grid_h: int) -> np
     n = grid_w * grid_h
     if patches.shape[0] != n or grid_w % m or grid_h % m:
         raise ValueError("the patches do not fill a grid of whole merge cells")
-    read = lambda name: mmproj.read_direct(name).astype(np.float64)
+    def read(name: str) -> np.ndarray:
+        info = mmproj.info(name)
+        if info.type_id in (TYPE_F32, TYPE_F16, TYPE_BF16):
+            return mmproj.read_direct(name).astype(np.float64)
+        blocks = mmproj.read_blocks(name, 0, None)
+        return dequantize_blocks(info.type_id, blocks).numpy().astype(np.float64)
 
     positions = read("v.position_embd.weight")
     grid = int(round(math.sqrt(positions.shape[0])))

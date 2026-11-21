@@ -26,7 +26,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Novelties only: a new model, family, artifact, platform, option, endpoint, format or mode, or a measured speedup of a path that worked. No fixes of any kind (crashes, wrong output, failed starts, missed cases, regressions and the speedups that win them back, the options and defaults they bring), no guards, diagnostics, internal, CI, build, test or documentation changes, and no chronicle: a date without a novelty gets no line. One line per date, a few words per item, each linked to the document with its details; no descriptions, mechanisms, measurements or hardware. Full rule: CONTRIBUTING.md, "Documentation describes the current state". -->
 
-- **2026-11-21:** [Inkling 2 Mini](docs/inkling2.md), the first looped transformer, from Unsloth's UD-IQ4_XS GGUF with the release's vision tower and DSpark drafter, [published](#supported-models).
+- **2026-11-21:** [Inkling 2 Mini](docs/inkling2.md), the first looped transformer, from Unsloth's UD-IQ4_XS GGUF with the release's vision tower and DSpark drafter, [published](#supported-models); its [Q8_0 vision tower](docs/inkling2.md#converting) from a llama.cpp mmproj, and IsValorum's [APEX-I MiniPlus](docs/inkling2.md#apex-i-miniplus), [published](#supported-models).
 - **2026-11-20:** Faster GGUF prompt chunks with [`cp.async` tiles](docs/device-profiles.md#what-is-calibrated) for Q4_0, Q5_0, Q8_0, IQ4_NL, Q5_K, Q2_0, IQ4_XS and IQ1_M weights; [device profiles](docs/gpus.md) for nine more GPUs.
 - **2026-11-19:** [Gemma 4 31B](docs/gemma4.md#gemma-4-31b) with its MTP assistant and vision tower, [published](#supported-models); [Basalt Flash-Next pack and serving-JSON conversion](docs/basalt-conversion.md), [Q8PLE n-gram tables](docs/qwen3-8-flash-next.md#q8ple-tables) and their [conversion from NVIDIA's FP8 PLE](docs/flash-next-native-dflash2.md#q8ple-directly-from-nvidia-fp8) with a [source-preserving Flash-Next recipe](docs/flash-next-native-dflash2.md), and [native FP16 KV](docs/qwen3-8-flash-next.md#native-fp16-kv) for Flash-Next and Edge0 (`--kv-dtype fp16`).
 - **2026-11-16:** [System One image boxes and image URLs](docs/serving.md#image-boxes), [`--media-urls`](docs/serving.md#media-urls) that sets the size of a fetched media URL (URLs are refused without it), and Qwen3.8-27B GGUFs with a [condensed vocabulary](docs/weight-conversion.md#a-condensed-vocabulary).
@@ -261,7 +261,8 @@ their Notes link it, and [N-gram tables](#n-gram-tables) lists them all.
 
 | Model | Size, GiB | Weights | Vision | MTP | DFlash2 | Proposal head | Notes |
 |---|---:|---|:-:|:-:|:-:|:-:|---|
-| [Inkling 2 Mini UD-IQ4_XS](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3) | 15.64 | GGUF blocks, NVFP4 experts in 20 of 24 layers | ✓ | — | — | — | Unsloth's UD-IQ4_XS GGUF byte for byte; vision tower (images); DSpark drafter, by default for one request at a time, or context lookup |
+| [Inkling 2 Mini UD-IQ4_XS](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3) | 15.36 | GGUF blocks, NVFP4 experts in 20 of 24 layers | ✓ | — | — | — | Unsloth's UD-IQ4_XS GGUF byte for byte; Q8_0 vision tower (images); DSpark drafter, by default for one request at a time, or context lookup |
+| [Inkling 2 Mini APEX-I MiniPlus V2.1](https://huggingface.co/WaveCut/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-NInfer-v3) | 12.80 | GGUF blocks, IQ3_XXS and IQ3_S experts | ✓ | — | — | — | IsValorum's APEX-I MiniPlus GGUF byte for byte with its Q8_0 vision tower; Unsloth's DSpark drafter; otherwise as UD-IQ4_XS |
 
 Tencent's [DSpine drafter for Qwen3.8-27B](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3)
 (2.27 GiB, Q8 layers and a BF16 code bridge) is an artifact of its own, which
@@ -416,7 +417,7 @@ the release's vision tower ([images](docs/deepseek-v41.md#images)).
 <details>
 <summary><b>Inkling 2 Mini</b> — 182 tok/s on an RTX 5090, 1.4 to 2.8 times llama.cpp's decode, from 8 GB</summary>
 
-Unsloth's UD-IQ4_XS GGUF with the vision tower and the DSpark drafter (a 15.6 GiB artifact), one request, F16 KV,
+Unsloth's UD-IQ4_XS GGUF with the vision tower and the DSpark drafter (a 15.4 GiB artifact), one request, F16 KV,
 November 21, 2026, against llama.cpp on the same GGUF (Unsloth's build `b12588-mix-c0c3de8`; mainline
 llama.cpp does not load it). A prompt of 10,000 tokens and a decode of 128, in tok/s, NInfer-all / llama.cpp:
 
@@ -522,16 +523,17 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
   Strata 0.2.6 decodes at 34 to 40 tok/s and prefills at 635 to 690
   ([DeepSeek-V4.1-Flash](docs/deepseek-v41.md)).
 - **Inkling 2 Mini.** Thinking Machines' looped 26.4B MoE (3.4B active per token), the engine's
-  first looped transformer, from Unsloth's UD-IQ4_XS GGUF imported block for block (15.6 GiB): 24
-  stored layers run as 48 visits, the 12 core layers three times with messages between passes,
-  sliding-window and full attention with a learned distance table and sinks, depth attention over
-  the earlier layers' states, 128 routed experts, up to eight concurrent requests with prefix reuse
-  through host memory, the model's own reasoning and tool-call blocks, structured output, typed
-  decisions, images through the release's vision tower, the release's DSpark drafter and
-  context-lookup drafting, and experts on the GPU, in pinned host memory or in the artifact's
-  files. On an RTX 3090 it prefills a 10,000-token prompt at 2,031 tok/s and decodes at 111.4
-  tok/s, 95.9 after 10,000 tokens, against llama.cpp's 1,228, 58.6 and 55.9 on the same GGUF;
-  DSpark decodes greedy answers 1.14 to 1.41 times as fast ([Inkling 2 Mini](docs/inkling2.md)).
+  first looped transformer, from Unsloth's UD-IQ4_XS GGUF (15.4 GiB) or IsValorum's APEX-I MiniPlus
+  (12.8 GiB) imported block for block: 24 stored layers run as 48 visits, the 12 core layers three
+  times with messages between passes, sliding-window and full attention with a learned distance
+  table and sinks, depth attention over the earlier layers' states, 128 routed experts, up to eight
+  concurrent requests with prefix reuse through host memory, the model's own reasoning and tool-call
+  blocks, structured output, typed decisions, images through the release's vision tower, the
+  release's DSpark drafter and context-lookup drafting, and experts on the GPU, in pinned host
+  memory or in the artifact's files. On an RTX 3090 it prefills a 10,000-token prompt at 2,031 tok/s
+  and decodes at 111.4 tok/s, 95.9 after 10,000 tokens, against llama.cpp's 1,228, 58.6 and 55.9 on
+  the same GGUF; DSpark decodes greedy answers 1.14 to 1.41 times as fast
+  ([Inkling 2 Mini](docs/inkling2.md)).
 - **CPU share of host and disk experts.** With Flash-Next, Gemma 4, Flint, Inkling 2 or native Qwen3.5/3.6
   MoE experts off the GPU, or DeepSeek-V4.1-Flash's experts in host memory, CPU threads compute a
   share of each decode call's cache misses from host memory while the GPU copies the rest, bit for
