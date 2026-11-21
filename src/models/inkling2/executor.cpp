@@ -1452,19 +1452,19 @@ struct Executor::Impl {
         return std::max<int>(int(options.prefill_chunk), gguf::kMaxVectorColumns);
     }
 
-    // A MoE call's packed input: the activation the experts read (up to 8 tokens: their q8_1
-    // vector form; wider: BF16 [T][H]), then the ids, weights and pair scales, 256-aligned.
+    // A MoE call's packed input: the activation the experts read (a call of up to 8 tokens with a
+    // q8_1 form: that form; others: BF16 [T][H]), then the ids, weights and pair scales,
+    // 256-aligned.
     struct ExpertInput {
         std::size_t activation = 0, ids = 0, weights = 0, scales = 0, bytes = 0;
     };
 
-    [[nodiscard]] ExpertInput expert_input(int t) const {
+    // `q8`: the call carries its q8_1 vector form (up to 8 tokens), which it then sends instead
+    // of its BF16 rows.
+    [[nodiscard]] ExpertInput expert_input(int t, bool q8) const {
         const std::size_t pairs = std::size_t(t) * config.top_k_experts;
         ExpertInput out;
-        // A model with BF16 matrices sends BF16 rows at every width (its calls have no q8_1 form).
-        out.activation = t <= gguf::kMaxVectorColumns && !bf16_rows
-                             ? gguf::vector_activation_bytes(hidden, t)
-                             : std::size_t(t) * hidden * 2;
+        out.activation = q8 ? gguf::vector_activation_bytes(hidden, t) : std::size_t(t) * hidden * 2;
         out.ids     = round_up(out.activation, kAlign);
         out.weights = out.ids + round_up(pairs * 4, kAlign);
         out.scales  = out.weights + round_up(pairs * 4, kAlign);
@@ -1494,7 +1494,7 @@ struct Executor::Impl {
         if (!model.expert_parallel()) { return; }
         const int t = max_moe_tokens();
         const std::size_t input =
-            std::max(expert_input(t).bytes, expert_input(gguf::kMaxVectorColumns).bytes);
+            std::max(expert_input(t, false).bytes, expert_input(gguf::kMaxVectorColumns, true).bytes);
         const std::size_t part = std::size_t(t) * hidden * 8;
         expert_pack            = DeviceBuffer(input);
         expert_exchange        = std::make_unique<ExpertParallelExchange>(device, input, part);
@@ -1625,7 +1625,7 @@ struct Executor::Impl {
                           int t, kernels::ResidualArgs& residual) {
         const std::size_t pairs  = std::size_t(t) * config.top_k_experts;
         const std::size_t part   = std::size_t(t) * hidden * 8;
-        const ExpertInput layout = expert_input(t);
+        const ExpertInput layout = expert_input(t, act != nullptr);
         auto* pack               = static_cast<std::byte*>(expert_pack.p);
         CUDA_CHECK(cudaMemcpyAsync(pack, act != nullptr ? act : x, layout.activation,
                                    cudaMemcpyDeviceToDevice, stream));
