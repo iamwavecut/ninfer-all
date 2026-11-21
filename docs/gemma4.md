@@ -58,7 +58,8 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   caches and logits keep their bits.
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
   with `chat_template_kwargs: {"enable_thinking": true}`, and the reasoning arrives as
-  `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply and the
+  `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply (the
+  server refuses `--default-thinking-budget`) and the
   [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply under `conclude`
   as under `stop`.
 - **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with

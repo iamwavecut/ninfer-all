@@ -312,6 +312,9 @@ public:
     void stop() noexcept { engine_->stop(); }
 
 private:
+    // Throws std::invalid_argument for an option the loaded family does not implement.
+    void refuse_family_options() const;
+
     enum class CacheParticipation : std::uint8_t {
         Disabled,
         ReadWrite,

@@ -770,7 +770,9 @@ allocation the model owns -- weights, KV cache and recurrent state, workspace, o
 Graphs, block tables and Host caches stay as they are. A resume maps fresh memory at the same
 addresses, uploads the weights and copies the retained state back, so conversations retained before
 the suspend reuse their prefixes afterwards exactly as before. It needs CUDA virtual memory
-management on every device and cannot be combined with `--wddm-evictable-budget`.
+management on every device and cannot be combined with `--wddm-evictable-budget`. Gemma 4,
+Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next have no suspend and refuse the flag at
+startup.
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/models/qwen3.8-27b/suspend -d '{}'
@@ -846,7 +848,9 @@ with a checksum that restore verifies before it allocates anything. Slots belong
 checkpoint catalog: `--slot-save-path` selects it in place of the default hybrid prefix cache, and
 the slot options are refused with `--use-alt-prefix-caching` and `--no-prefix-reuse`. They are
 independent of the disk tier
-(`--disk-kv-path`), which spills evicted conversations on its own, keyed by prompt digest.
+(`--disk-kv-path`), which spills evicted conversations on its own, keyed by prompt digest. Gemma 4,
+Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next keep context caches with no slots and refuse
+`--slot-save-path` and `--auto-save-evicted` at startup.
 
 Errors: `409 slot_busy` while the slot or any context-cache transaction is in use (retry),
 `409 slot_session_mismatch` for a failed `if_digest`, `400 invalid_slot`, `invalid_action`,
@@ -1168,7 +1172,8 @@ because requests can explicitly enable thinking. A request overrides this defaul
 integer: `thinking_budget` on Chat Completions and Responses (a NInfer extension, accepted at top
 level), or `thinking:{"type":"enabled","budget_tokens":N}` on Anthropic Messages (a value of at
 least 1024 and below `max_tokens`, per that protocol). A request that does not think receives no
-cap, whatever it sends.
+cap, whatever it sends. Gemma 4, Flint and Inkling 2 cannot close their reasoning early: the server
+refuses the flag for them at startup and ignores a request's budget.
 
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
@@ -2525,7 +2530,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--cuda-graph-allowance-mib N` | total CUDA Graph driver-state allowance in MiB, subtracted from the KV sizing budget | computed |
 | `--wddm-evictable-budget` | Windows builds: budget the KV cache against dedicated memory less the weights and a 512 MiB desktop floor, committing the device arenas at startup; another process taking memory can then slow generation | off |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--use-alt-prefix-caching` | the hybrid prefix cache ([spec](maintainer/hybrid-prefix-cache-spec.md)), the default: content-addressed 64-token KV blocks shared across requests plus sparse state snapshots. It configures itself: `--kv-capacity` defaults to `auto` (free VRAM becomes Device block cache) and `--host-cache-mib` sizes the one pinned Host pool that blocks and snapshots share. Without this flag or `--use-original-prefix-caching`, an option only the checkpoint catalog serves selects the catalog instead: its capacities (`--device-state-slots`, `--host-state-slots`, `--host-kv-mib`, `--max-private-continuations`, `--max-shared-prefixes`, `--max-long-anchors-per-continuation`), its anchors and policies (`--auto-long-anchors`, `--long-anchor-spacing`, `--branch-anchors`, `--no-endpoint-anchors`, `--progress-anchor-tokens`, `--auto-prefix-grid`, `--derive-session-keys`, `--context-cache-policy`, `--release-diverged-checkpoints`, `--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`), the disk tier, slot files, several `--devices`, `--no-prefix-reuse` or a `--graft`. Named, the flag keeps the hybrid cache over several `--devices` (pipeline stages or `--tensor-parallel`) and rejects the other options instead. Gemma 4 and Qwen3.8-Flash-Next keep their own context caches, which the catalog options configure. Requests that share a new prefix with one still prefilling wait for its snapshot instead of prefilling the prefix again, which needs `--concurrent-prefill` to admit them meanwhile. On an RTX 3090 with Qwen3.8-27B (`rk4v4`, 131K context) the agentic replay of `bench/agentic_ab` (seed 42, half scale) ran with an average time to first token of 55.6 s instead of 97.9 s on the catalog, served 84 % of prompt tokens from the cache instead of 46 %, and finished in 43.6 instead of 60.2 minutes; its one history-edit turn took 389 s instead of 183 s, and decode ran 1.4 % slower | default |
+| `--use-alt-prefix-caching` | the hybrid prefix cache ([spec](maintainer/hybrid-prefix-cache-spec.md)), the default: content-addressed 64-token KV blocks shared across requests plus sparse state snapshots. It configures itself: `--kv-capacity` defaults to `auto` (free VRAM becomes Device block cache) and `--host-cache-mib` sizes the one pinned Host pool that blocks and snapshots share. Without this flag or `--use-original-prefix-caching`, an option only the checkpoint catalog serves selects the catalog instead: its capacities (`--device-state-slots`, `--host-state-slots`, `--host-kv-mib`, `--max-private-continuations`, `--max-shared-prefixes`, `--max-long-anchors-per-continuation`), its anchors and policies (`--auto-long-anchors`, `--long-anchor-spacing`, `--branch-anchors`, `--no-endpoint-anchors`, `--progress-anchor-tokens`, `--auto-prefix-grid`, `--derive-session-keys`, `--context-cache-policy`, `--release-diverged-checkpoints`, `--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`), the disk tier, slot files, several `--devices`, `--no-prefix-reuse` or a `--graft`. Named, the flag keeps the hybrid cache over several `--devices` (pipeline stages or `--tensor-parallel`) and rejects the other options instead. Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next keep their own context caches, which the catalog options configure; they refuse this flag, the hybrid options below (`--prefix-cache-file` among them) and `--graft` at startup. Requests that share a new prefix with one still prefilling wait for its snapshot instead of prefilling the prefix again, which needs `--concurrent-prefill` to admit them meanwhile. On an RTX 3090 with Qwen3.8-27B (`rk4v4`, 131K context) the agentic replay of `bench/agentic_ab` (seed 42, half scale) ran with an average time to first token of 55.6 s instead of 97.9 s on the catalog, served 84 % of prompt tokens from the cache instead of 46 %, and finished in 43.6 instead of 60.2 minutes; its one history-edit turn took 389 s instead of 183 s, and decode ran 1.4 % slower | default |
 | `--use-original-prefix-caching` | select the checkpoint catalog in place of the hybrid prefix cache. Rejected together with `--use-alt-prefix-caching` and with the hybrid options below | off |
 | `--device-snapshot-slots N` | hybrid: Device state snapshot slots (`1..64`). Left at its default, the count drops, to one at the least, when the `--kv-capacity` asked for (or under `auto` one `--max-context` window beside the headroom) would not fit beside it, and startup logs `device snapshot slots 3 -> 1 to fit the requested KV capacity`; a given count is kept, and a capacity that does not fit beside it fails naming this option and the size of one slot | `max-concurrency + 2`, fewer where the KV capacity needs their memory |
 | `--cache-taps-per-request N` | hybrid: new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
@@ -2893,7 +2898,9 @@ each [DSpine](maintainer/dspine.md) drafter beside it) gets its own subdirectory
 stride and YaRN setting its own files, so one model or profile never restores another's KV. `--disk-kv-gib` (default 64) is the total budget, split
 65/25/10 across Main KV, Backend KV and StateImages (85/15 without a backend); the least recently
 used page goes first. The files are sparse until written, and a torn page fails its CRC and reads as
-a miss.
+a miss. Of the families with context caches of their own, only Qwen3.8-Flash-Next keeps a disk
+tier ([Qwen3.8-Flash-Next](qwen3-8-flash-next.md)); Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2
+refuse `--disk-kv-path` at startup.
 
 With `--disk-kv-restore`, a request with no resident prefix looks for the longest frontier `E` on
 disk whose StateImage and KV chain match its own prompt, is admitted as reusing `E`, and has `[0, E)`

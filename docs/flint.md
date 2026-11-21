@@ -48,8 +48,9 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   then answers at once; [typed decisions](serving.md#typed-decisions) read their labels there.
   Without it, a one-label question puts about 10^-11 of the first token's probability on the
   labels, the rest on `<think>`. Flint has no early-close control, so thinking budgets do not
-  apply and the [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply
-  under `conclude` as under `stop`.
+  apply (the server refuses `--default-thinking-budget`) and the
+  [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply under
+  `conclude` as under `stop`.
 - **Sampling defaults.** The release's: temperature 1.0, top-p 0.95, top-k 20.
 - **Speculative decoding by context lookup.** Recursive publishes no draft model. `--lookup-ngram
   N` proposes what followed the last N tokens' earlier occurrence in the sequence (up to
@@ -67,7 +68,8 @@ Not built for this family: the quantized `--kv-dtype` formats (the KV cache is F
 and n-gram copy drafts, rotation scaling (`--rope-yarn`, `--rope-scaling-factor`: the
 full-attention blocks have no rotation to scale), strict tool arguments and structured output beside
 tools (Flint's tool markup has no grammar here), images and video (Flint reads text only), pipeline
-stages, and of the context cache the shared paged KV pool, the disk tier and session slots. Several
+stages, and of the context cache the shared paged KV pool, the disk tier and session slots, whose
+options the server refuses at startup ([Serving](serving.md#slots)). Several
 GPUs divide the routed experts instead (`--devices 0,1 --tensor-parallel`, experts on the devices;
 [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 

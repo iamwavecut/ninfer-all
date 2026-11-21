@@ -395,6 +395,7 @@ GenerationService::GenerationService(
     engine_options.diagnostic_observer   = std::move(diagnostic_observer);
     engine_options.slot_auto_save.listener = std::move(auto_save_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    refuse_family_options();
     // A request that says nothing about thinking gets its template's default. Qwen's templates
     // think unless told not to; Gemma 4's chat template keeps thinking off unless enable_thinking
     // asks for it, so without --no-thinking or a request flag a Gemma 4 server answers directly.
@@ -409,6 +410,29 @@ GenerationService::GenerationService(
     count_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     branch_memo_ = std::make_shared<BranchMemo>(kBranchMemoRecords);
+}
+
+void GenerationService::refuse_family_options() const {
+    // Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Flash-Next keep context caches of their own,
+    // with neither the hybrid prefix cache nor session slots; Gemma 4, Flint and Inkling 2 cannot
+    // close their reasoning early. Those options would start and do nothing.
+    const std::string architecture = engine_->load_summary().architecture;
+    if (!options_.hybrid_cache_flag.empty() &&
+        engine_->options().context_cache.mode != ninfer::ContextCacheMode::Hybrid) {
+        throw std::invalid_argument(options_.hybrid_cache_flag +
+                                    " configures the hybrid prefix cache, which " + architecture +
+                                    " artifacts do not have");
+    }
+    if (!options_.slot_save_path.empty() && engine_->slot_states().empty()) {
+        throw std::invalid_argument("--slot-save-path saves session slots, which " + architecture +
+                                    " artifacts do not have");
+    }
+    if (options_.default_thinking_budget &&
+        (architecture == "Gemma4ForCausalLM" || architecture == "FlintForCausalLM" ||
+         architecture == "Inkling2ForCausalLM")) {
+        throw std::invalid_argument("--default-thinking-budget closes reasoning early, which " +
+                                    architecture + " artifacts cannot do");
+    }
 }
 
 std::size_t GenerationService::admitted_requests() const {
