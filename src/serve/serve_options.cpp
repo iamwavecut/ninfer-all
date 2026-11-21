@@ -1852,6 +1852,11 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                 {"use-alt-prefix-caching", "prefix-reuse"},
                 "--use-alt-prefix-caching cannot be combined with --no-prefix-reuse");
         }
+        if (hybrid_cache_selected) {
+            options.hybrid_cache_flag = "--use-alt-prefix-caching";
+        } else if (hybrid_option_flag != nullptr) {
+            options.hybrid_cache_flag = hybrid_option_flag;
+        }
         std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
         if (!file.empty()) {
             if (host_cache_budget_explicit && !options.context_cache.host_cache_auto &&

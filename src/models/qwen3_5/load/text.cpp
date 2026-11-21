@@ -676,7 +676,9 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& confi
 
 // Tensor parallelism: the rows of vocabulary head `name` ([count, columns], read through `inputs`)
 // each rank projects at decode, in proportion to the split (evenly without one) and ending where
-// the stored blocks and the head's Linear route allow, each bound as a piece on its rank.
+// the stored blocks and the head's Linear route allow and on whole 128-row tiles (a GGUF head's
+// matrix product takes only those, for a wide MTP verification, for instance), each bound as a
+// piece on its rank.
 HeadShareWeights bind_head_shares(Bindings& b, const std::string& name, std::uint64_t count,
                                   std::uint64_t columns, const std::vector<std::string>& inputs,
                                   const LoadOptions& options) {
@@ -684,7 +686,7 @@ HeadShareWeights bind_head_shares(Bindings& b, const std::string& name, std::uin
     if (weights.empty()) { weights.assign(options.ranks, 1.0); }
     const std::vector<bool> allowed = b.row_ends(name, {count, columns});
     std::vector<std::uint64_t> ends;
-    for (std::uint64_t row = 1; row < count; ++row) {
+    for (std::uint64_t row = 128; row < count; row += 128) {
         if (allowed[row]) { ends.push_back(row); }
     }
     HeadShareWeights out;

@@ -101,10 +101,16 @@ experts, which put a host-to-device copy behind a device-side wait for the host,
 with queued copies; it uses mapped host memory and a copy kernel on Windows and under WSL2
 ([native host banks](qwen3-8-flash-next.md#the-expert-cache)). GGUF host experts with staged
 misses, whose service copies the missing experts while a replayed layer waits for them on the
-device, hung while the warm-up prepared the CUDA Graphs on Windows; there and under WSL2 their
-passes run eagerly. This repository has no Windows or WSL2 host:
-`ninfer_qwen4_exp_hybrid_experts_test` runs both exchanges on Linux and only the mapped one under
-WDDM, where it has not run yet. A process started
+device, hung while the warm-up prepared the CUDA Graphs on Windows; on Windows and under WSL2 the
+service copies a decode or verification call's experts with a kernel that reads them in place
+(`NINFER_MISS_COPY_KERNEL=0` forces the copy engine, `1` the kernel on any driver). Native Qwen
+MoE, Gemma MoE, Flint, DeepSeek-V4.1-Flash and Inkling 2 with host or disk experts deliver the
+missing experts while a replayed graph waits for them on the device, so on Windows and under WSL2
+they run their passes eagerly, without CUDA Graphs, and wait for the misses on the host. This
+repository has no Windows or WSL2 host: `ninfer_qwen4_exp_hybrid_experts_test` and
+`ninfer_qwen4_exp_expert_misses_test` run both forms on Linux and only the kernel under WDDM,
+where they have not run yet, and the eager passes of the other families have not run there
+either. A process started
 by a low-priority parent (a Task Scheduler task at its default priority, a service, some IDE
 terminals) inherits I/O priority Low, and Windows throttles its reads; the Engine raises such a
 priority to normal before it reads the artifact and logs that it did, or warns when Windows refuses

@@ -16,11 +16,19 @@
 // through host staging, striped over a drive mirror, and by the direct path's host window, which
 // runs every step of direct reads but the kernel modules' DMA; each staged projection must hold
 // its expert's bytes.
+//
+// Narrow calls copy with the copy engine and with the copy kernel (MissOptions::copy_kernel); the
+// narrow call after a wide one stages experts whose host bytes start 1, 4 and 0 bytes past a
+// 16-byte boundary, and each staged projection must hold its expert's bytes. A replayed call's
+// graph copies to the host after the call's wait, as a decode graph does: where a device's copies
+// queue behind one another (WDDM), a copy-engine service would wait behind that copy, so there
+// only the copy kernel runs. NINFER_MISS_COPY_KERNEL=0|1 runs only the copy it names.
 
 #include "models/qwen4_exp/expert_misses.h"
 
 #include "core/device.h"
 #include "core/device_buffer.h"
+#include "core/mapped_host_copy.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor.h"
@@ -42,6 +50,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -131,7 +140,7 @@ struct Fixture {
     DeviceBuffer gate_table, ids, input;
     std::unique_ptr<ExpertMisses> misses;
 
-    Fixture(DeviceContext& device, double cpu_share) {
+    Fixture(DeviceContext& device, double cpu_share, std::optional<bool> copy_kernel) {
         MissLayer layer;
         layer.rank    = 0;
         layer.experts = kExperts;
@@ -159,6 +168,7 @@ struct Fixture {
         MissOptions options;
         options.cpu_share   = cpu_share;
         options.cpu_threads = 2;
+        options.copy_kernel = copy_kernel;
         std::vector<MissLayer> layers;
         layers.push_back(std::move(layer));
         misses = std::make_unique<ExpertMisses>(device, std::move(layers),
@@ -217,10 +227,14 @@ void eager_late(Fixture& f, cudaStream_t stream, bool cpu, const std::string& la
 void replay_late(Fixture& f, cudaStream_t stream, bool cpu, const std::string& label) {
     cudaGraph_t graph     = nullptr;
     cudaGraphExec_t exec  = nullptr;
+    PinnedHostBuffer landed(sizeof(std::int32_t));
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
     busy(stream);
     const auto call = f.begin(stream);
     f.misses->await(0, stream);
+    // A copy queued after the wait, as a decode graph's head and draft copies are.
+    CUDA_CHECK(cudaMemcpyAsync(landed.data(), call.missing_ids.data, sizeof(std::int32_t),
+                               cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
     CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
     const MissStats before = f.misses->stats();
@@ -269,7 +283,14 @@ struct WideFixture {
     std::unique_ptr<ExpertMisses> misses;
     std::array<std::int64_t, 3> bytes{};
 
-    WideFixture(DeviceContext& device, double cpu_share, bool mixed, const DiskMode& disk = {}) {
+    // Host experts: expert e's bytes start this far past a 16-byte boundary.
+    [[nodiscard]] static std::size_t skew(int e) {
+        constexpr std::array<std::size_t, 3> kSkews = {1, 4, 0};
+        return kSkews[std::size_t(e) % kSkews.size()];
+    }
+
+    WideFixture(DeviceContext& device, double cpu_share, bool mixed, const DiskMode& disk,
+                std::optional<bool> copy_kernel) {
         MissLayer layer;
         layer.rank    = 0;
         layer.experts = kExperts;
@@ -288,9 +309,11 @@ struct WideFixture {
         } else {
             for (int e = 0; e < kExperts; ++e) {
                 for (std::size_t p = 0; p < 3; ++p) {
-                    auto matrix = std::make_unique<PinnedHostBuffer>(std::size_t(bytes[p]));
-                    std::memset(matrix->data(), 1 + 3 * e + int(p), matrix->size());
-                    layer.projections[p].host.push_back(matrix->data());
+                    auto matrix = std::make_unique<PinnedHostBuffer>(std::size_t(bytes[p]) + 16);
+                    std::memset(matrix->data(), 0, matrix->size());
+                    auto* at = static_cast<unsigned char*>(matrix->data()) + skew(e);
+                    std::memset(at, 1 + 3 * e + int(p), std::size_t(bytes[p]));
+                    layer.projections[p].host.push_back(at);
                     matrices.push_back(std::move(matrix));
                 }
             }
@@ -314,6 +337,7 @@ struct WideFixture {
         if (disk.mirror) { options.disk.mirror = mirror; }
         options.disk.direct      = disk.direct ? ExpertDirect::On : ExpertDirect::Off;
         options.disk.host_window = disk.direct;
+        options.copy_kernel      = copy_kernel;
         std::vector<MissLayer> layers;
         layers.push_back(std::move(layer));
         misses = std::make_unique<ExpertMisses>(device, std::move(layers), paths, options, nullptr);
@@ -365,9 +389,22 @@ struct WideFixture {
     }
 };
 
+// Whether projection k of expert e at `at` holds the expert's bytes, every one of them, with zeros
+// after a down.
+bool holds_expert(const WideFixture& f, int e, int k, const void* at) {
+    const std::size_t size = std::size_t(f.bytes[std::size_t(k)]);
+    std::vector<unsigned char> copy(size + (k == 2 ? 256 : 0));
+    CUDA_CHECK(cudaMemcpy(copy.data(), at, copy.size(), cudaMemcpyDefault));
+    const auto expected = static_cast<unsigned char>(1 + 3 * e + k);
+    for (std::size_t i = 0; i < copy.size(); ++i) {
+        if (copy[i] != (i < size ? expected : 0)) { return false; }
+    }
+    return true;
+}
+
 void wide_call(DeviceContext& device, cudaStream_t stream, double cpu_share, bool mixed,
-               const std::string& label, const DiskMode& disk = {}) {
-    WideFixture f(device, cpu_share, mixed, disk);
+               const std::string& label, const DiskMode& disk, std::optional<bool> copy_kernel) {
+    WideFixture f(device, cpu_share, mixed, disk, copy_kernel);
     const int tokens = WideFixture::kTokens;
     const MissStats before = f.misses->stats();
     const Tensor routed(f.ids.p, DType::I32, {kTop, tokens});
@@ -494,6 +531,29 @@ void wide_call(DeviceContext& device, cudaStream_t stream, double cpu_share, boo
     expect(narrow_after.requests == narrow_before.requests + 1, label + ": the narrow call was served");
     expect(narrow_after.computed - narrow_before.computed == (cpu_share > 0 ? 5U : 0U),
            label + ": the CPU takes its share of the narrow call");
+    // The GPU's share: the staged experts in device memory hold their bytes; the others are read
+    // across the bus where they are.
+    std::array<std::int32_t, kTop> narrow_missing{};
+    CUDA_CHECK(cudaMemcpy(narrow_missing.data(), narrow.missing_ids.data, sizeof(narrow_missing),
+                          cudaMemcpyDeviceToHost));
+    std::uint64_t staged = 0;
+    for (const std::int32_t e : narrow_missing) {
+        if (e < 0) { continue; }
+        for (int k = 0; k < 3; ++k) {
+            const auto* tables = k == 0   ? narrow.missing_banks.gate.experts
+                                 : k == 1 ? narrow.missing_banks.up.experts
+                                          : narrow.missing_banks.down.experts;
+            const void* at     = tables[e];
+            cudaPointerAttributes attributes{};
+            CUDA_CHECK(cudaPointerGetAttributes(&attributes, at));
+            if (attributes.type != cudaMemoryTypeDevice) { continue; }
+            staged += k == 0;
+            expect(holds_expert(f, e, k, at),
+                   label + ": a narrow call's staged projection holds its expert's bytes");
+        }
+    }
+    expect(staged == narrow_after.staged - narrow_before.staged,
+           label + ": the narrow call's staged experts sit in device memory");
     f.misses->raise_failure();
 }
 
@@ -528,25 +588,41 @@ int run() {
     RankBinding bind(device, 0);
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    for (const bool cpu : {false, true}) {
-        const std::string label = cpu ? "CPU share" : "GPU only";
-        Fixture f(device, cpu ? 0.5 : 0.0);
-        expect(f.misses->cpu_enabled() == cpu, label + ": the CPU share as configured");
-        eager_late(f, stream, cpu, label + ", eager");
-        replay_late(f, stream, cpu, label + ", replayed");
-#ifdef __linux__
-        idle_sleeps(label);
-#endif
-        wide_call(device, stream, cpu ? 0.5 : 0.0, false, label + ", wide");
-        wide_call(device, stream, cpu ? 0.5 : 0.0, true, label + ", wide with few-pair experts");
+    // The copies a narrow call takes: the one the environment forces, else the copy kernel and,
+    // where copies do not queue behind one another, the copy engine too.
+    std::vector<std::optional<bool>> copies;
+    if (std::getenv("NINFER_MISS_COPY_KERNEL") != nullptr) {
+        copies.push_back(std::nullopt);
+    } else {
+        if (!serialized_copy_queue()) { copies.push_back(false); }
+        copies.push_back(true);
     }
-    // Disk experts: a wide call of disk experts runs every missing expert on the GPU.
-    for (const DiskMode mode : {DiskMode{true, false, false}, DiskMode{true, true, false},
-                                DiskMode{true, false, true}, DiskMode{true, true, true}}) {
-        const std::string label = std::string("disk") + (mode.mirror ? ", mirror" : "") +
-                                  (mode.direct ? ", direct (host window)" : "");
-        wide_call(device, stream, 0.0, false, label + ", wide", mode);
-        wide_call(device, stream, 0.0, true, label + ", wide with few-pair experts", mode);
+    for (const std::optional<bool> copy_kernel : copies) {
+        const std::string copy = !copy_kernel ? "copies as forced"
+                                 : *copy_kernel ? "copy kernel"
+                                                : "copy engine";
+        for (const bool cpu : {false, true}) {
+            const std::string label = copy + ", " + (cpu ? "CPU share" : "GPU only");
+            Fixture f(device, cpu ? 0.5 : 0.0, copy_kernel);
+            expect(f.misses->cpu_enabled() == cpu, label + ": the CPU share as configured");
+            eager_late(f, stream, cpu, label + ", eager");
+            replay_late(f, stream, cpu, label + ", replayed");
+#ifdef __linux__
+            idle_sleeps(label);
+#endif
+            wide_call(device, stream, cpu ? 0.5 : 0.0, false, label + ", wide", {}, copy_kernel);
+            wide_call(device, stream, cpu ? 0.5 : 0.0, true, label + ", wide with few-pair experts",
+                      {}, copy_kernel);
+        }
+        // Disk experts: a wide call of disk experts runs every missing expert on the GPU.
+        for (const DiskMode mode : {DiskMode{true, false, false}, DiskMode{true, true, false},
+                                    DiskMode{true, false, true}, DiskMode{true, true, true}}) {
+            const std::string label = copy + ", disk" + (mode.mirror ? ", mirror" : "") +
+                                      (mode.direct ? ", direct (host window)" : "");
+            wide_call(device, stream, 0.0, false, label + ", wide", mode, copy_kernel);
+            wide_call(device, stream, 0.0, true, label + ", wide with few-pair experts", mode,
+                      copy_kernel);
+        }
     }
     CUDA_CHECK(cudaStreamDestroy(stream));
     if (failures != 0) { return 1; }

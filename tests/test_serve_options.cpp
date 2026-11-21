@@ -1066,6 +1066,13 @@ int main() {
                           !hybrid_minimal.context_cache.hybrid.tap_ladder_tokens &&
                           !hybrid_minimal.context_cache.hybrid.tap_min_gap_tokens,
                       "hybrid mode alone must size KV automatically and leave tuning derived");
+    // The option that named the hybrid cache reaches the server, which refuses it for a family
+    // without that cache; the default names none.
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).hybrid_cache_flag.empty() &&
+                          hybrid.hybrid_cache_flag == "--use-alt-prefix-caching" &&
+                          parse({"ninfer-serve", "model.ninfer", "--cache-tap-ladder", "8192"})
+                                  .hybrid_cache_flag == "--cache-tap-ladder",
+                      "the option naming the hybrid prefix cache was not recorded");
     const ServeOptions hybrid_explicit_kv =
         parse({"ninfer-serve", "model.ninfer", "--use-alt-prefix-caching", "--max-context", "8192",
                "--kv-capacity", "16384", "--host-cache-mib", "0"});

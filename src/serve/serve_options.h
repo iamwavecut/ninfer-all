@@ -99,6 +99,9 @@ struct ServeOptions {
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;
+    // The option that named the hybrid prefix cache (--use-alt-prefix-caching or one of its
+    // settings); empty when it is the default. A family without the hybrid cache refuses it.
+    std::string hybrid_cache_flag;
     bool enable_vision      = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
     std::uint32_t vision_max_merged_tokens = 16384;
