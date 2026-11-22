@@ -218,6 +218,19 @@ int main() {
         expect(periodic_tail(tail), "bounded tail is periodic");
         expect(tail.size() <= 8U * kLoopTailChars, "tail stays bounded");
     }
+    // A period is read in the last 1,024 characters, a counter in the last 2,048.
+    {
+        std::string digits;
+        while (digits.size() < kLoopPeriodChars + 64) { digits += "58747693387"; }
+        expect(periodic_tail(digits), "a period in the last 1,024 characters");
+        expect(!periodic_tail(digits.substr(0, kLoopPeriodChars - 1)), "fewer than 1,024 characters hold no period");
+        std::string counter;
+        for (int i = 1; counter.size() < kLoopPeriodChars + 64; ++i) {
+            counter += "'time" + std::to_string(i) + "',";
+        }
+        expect(counter.size() < kLoopTailChars && !counting_tail(counter),
+               "a counter below 2,048 characters");
+    }
     if (failures != 0) { return 1; }
     std::cout << "OK reasoning loop (varied " << novel << ", looping " << loop << ", recap "
               << recap << ")\n";

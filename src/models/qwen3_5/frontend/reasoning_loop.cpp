@@ -199,8 +199,8 @@ void append_tail(std::string_view bytes, std::string& tail) {
 }
 
 bool periodic_tail(std::string_view text) {
-    const TailSpan span = tail_span(text, kLoopTailChars);
-    if (span.characters < kLoopTailChars) { return false; }
+    const TailSpan span = tail_span(text, kLoopPeriodChars);
+    if (span.characters < kLoopPeriodChars) { return false; }
     return character_period(text.substr(span.begin)) != 0;
 }
 

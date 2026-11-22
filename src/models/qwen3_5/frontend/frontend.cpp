@@ -1116,13 +1116,34 @@ public:
             return;
         }
         if (options.architecture == Architecture::Inkling2) {
-            // Inkling writes its blocks' headers itself and decides whether it reasons, at the
-            // effort level its prompt names; it has no early-close control, so thinking budgets do
-            // not apply.
+            // Inkling opens its own <|content_thinking|> block and closes it with <|end_message|>.
+            // Early-close control (for --reasoning-loop conclude and --default-thinking-budget)
+            // injects concise conclusion guidance followed by <|end_message|> so Inkling exits
+            // reasoning cleanly and immediately emits either a text answer or a tool call.
             inkling = std::make_shared<const fi::InklingMarkers>(fi::InklingMarkers::from(*tokenizer));
             if (!inkling->complete()) {
                 throw std::invalid_argument("Inkling's tokenizer lacks its block markers");
             }
+            std::string guidance =
+                "\n\nConsidering the limited time by the user, I have to act or give the solution "
+                "based on the thinking directly now.\n";
+            if (!options.thinking_budget_message.empty()) {
+                guidance = options.thinking_budget_message;
+                if (const auto close = guidance.find(fi::kInklingEnd); close != std::string::npos) {
+                    guidance.erase(close);
+                }
+            }
+            std::vector<TokenId> encoded = tokenizer->encode(guidance);
+            encoded.push_back(inkling->end);
+            for (const TokenId token : encoded) {
+                if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
+                    defaults.token_ids.end()) {
+                    throw std::invalid_argument("thinking budget message contains a default "
+                                                "terminal token");
+                }
+            }
+            thinking_control_tokens =
+                std::make_shared<const std::vector<TokenId>>(std::move(encoded));
             return;
         }
         if (options.architecture == Architecture::DeepSeekV41) {

@@ -1182,8 +1182,9 @@ because requests can explicitly enable thinking. A request overrides this defaul
 integer: `thinking_budget` on Chat Completions and Responses (a NInfer extension, accepted at top
 level), or `thinking:{"type":"enabled","budget_tokens":N}` on Anthropic Messages (a value of at
 least 1024 and below `max_tokens`, per that protocol). A request that does not think receives no
-cap, whatever it sends. Gemma 4, Flint and Inkling 2 cannot close their reasoning early: the server
-refuses the flag for them at startup and ignores a request's budget.
+cap, whatever it sends; an Inkling 2 chat request, whose model opens its thinking blocks itself,
+always takes the cap. Gemma 4 and Flint cannot close their reasoning early: the server refuses the
+flag for them at startup and ignores a request's budget.
 
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
@@ -1221,8 +1222,12 @@ Logs report the requested budget, and the effective budget when it differs. A re
 enforce its budget reports the requested value only. The server does not promise that the model will
 emit nonempty content or a tool call after the marker. `model_thinking_tokens` in the request log
 counts the model's thinking tokens for every Qwen thinking request, with or without a budget.
-Gemma 4, Flint and Inkling 2 take no thinking budget and report 0. DeepSeek-V4.1 counts its thinking tokens,
+Gemma 4 and Flint take no thinking budget and report 0. DeepSeek-V4.1 counts its thinking tokens,
 and a reached budget closes its reasoning with the guidance and its `</think>` token, as Qwen's does.
+Inkling 2 counts the tokens of every thinking block it opens in a response (not their headers and
+end markers); a reached budget closes the open block with the guidance and `<|end_message|>`, and
+the rest of the response can open no thinking block (`<|content_thinking|>` is masked) and runs
+without drafts.
 
 `--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests against a
 model that keeps rewriting the same passages in its thinking, which token penalties do not catch
@@ -1230,9 +1235,9 @@ because every pass varies a little.
 
 - **Check.** Every 512 model-origin thinking tokens, at the end of a decode round that does not
   end on a `</think>` still waiting for its next byte, the guard tests three signs of a loop.
-  First, the last 2,048 characters of the thinking repeat one period of at most 64 characters, as a
-  loop written without spaces does. Second, they do so once every run of digits is read as one
-  number, the period holds a number, and through at least eight periods every number of the period
+  First, the last 1,024 characters of the thinking repeat one period of at most 64 characters, as a
+  loop written without spaces does. Second, the last 2,048 do so once every run of digits is read as
+  one number, the period holds a number, and through at least eight periods every number of the period
   moves by a step of its own, one of them nonzero, as a loop that counts (`'time1','time2',...` or
   `item 1 of 50, item 2 of 50, ...`) does. A counter beside a number that changes otherwise
   (`step 7 checks value 4821`) is an enumeration of worked values and does not fire. Numbers of the
@@ -1241,18 +1246,25 @@ because every pass varies a little.
   each a word of its own, and at least 25 % of the last 2,000 words lie inside a 12-word passage
   that occurs at least three times in the last 30,000 words. A passage repeated twice (a recap) does
   not count. The word measure and its thresholds are those of Strata's `reasoning_loop_recovery` and
-  its periodic-tail check (measured on other models; NInfer has not re-tuned them). The counting
-  check fired on none of 1,950 s1K-1.1 thinking trajectories and 14,822 Bespoke-Stratos-17k
-  assistant replies of 4,096 characters or more, checked every 2,000 bytes.
+  its periodic-tail check (measured on other models; NInfer has not re-tuned them, and reads the
+  period in 1,024 characters where Strata reads 2,048). The counting check fired on none of 1,950
+  s1K-1.1 thinking trajectories and 14,822 Bespoke-Stratos-17k assistant replies of 4,096
+  characters or more, checked every 2,000 bytes. Replayed token by token (Qwen3.5 tokenizer) through
+  the whole guard, the 2,000 s1K-1.1 trajectories and the 13,035 Bespoke-Stratos-17k thoughts of
+  4,096 characters or more fire it 1,527 times: the word measure 137 of the 1,000 DeepSeek-R1
+  trajectories, 576 of the 1,000 Gemini ones and 813 of the Bespoke thoughts, the period once, the
+  counter never. Most of these are math whose formulas repeat (every symbol is a word).
 - **`stop`** ends the reply there with `finish_reason` `length` (Anthropic `max_tokens`).
 - **`conclude`** commits the same control span a reached thinking budget does (Qwen's early-close
   guidance plus `</think>`), so the model answers from the thinking it has; no prompt is read again.
   When the remaining output budget cannot hold the span and one more token, or the request's
   thinking budget could not be enforced (early close unavailable, above), it stops instead.
 - **Gemma 4, Flint and Inkling 2.** The guard reads the thought channel (Flint: the `<think>`
-  block; Inkling 2: its `<|content_thinking|>` blocks) the model opens and counts its tokens. None
-  has an early-close control, so `conclude` stops there as `stop` does. DeepSeek-V4.1 concludes as Qwen does, with the same guidance and its own
-  `</think>` token.
+  block; Inkling 2: its `<|content_thinking|>` blocks, counted across the blocks of one response)
+  the model opens and counts its tokens. Gemma 4 and Flint have no early-close control, so
+  `conclude` stops there as `stop` does; Inkling 2 concludes with the guidance and
+  `<|end_message|>`, as a reached budget does. DeepSeek-V4.1 concludes as Qwen does, with the same
+  guidance and its own `</think>` token.
 - It applies to constrained requests too (tool constraints, `response_format`): the control span
   goes through the same grammar-checked path as a thinking budget, so a constrained request can
   still answer or call a tool after `conclude`. With `stop`, a constrained request ends as an
@@ -2939,7 +2951,11 @@ when copying it back costs less than computing it again; each family's guide say
 holds ([Gemma 4](gemma4.md#prefix-reuse), [Flint](flint.md#prefix-reuse),
 [DeepSeek-V4.1](deepseek-v41.md#prefix-reuse), [Inkling 2](inkling2.md#prefix-reuse),
 [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#sequences-kv-and-the-context-cache)). A prompt on any
-sequence resumes from the longest image it starts with. Beyond that:
+sequence resumes from the longest image it starts with. An image larger than the budget is not
+kept, on disk either: Gemma 4 31B's of a 6,434-token prompt takes 3.1 GiB. Where a chat request's
+last message ends, a sequence keeps a snapshot on the device instead of an image, which a repeat of
+the prompt resumes from, and so does the next turn when the template renders what followed
+differently; it goes to an image when another request takes the sequence. Beyond that:
 
 - **A document, then another question.** A prompt whose last message holds at least 768 tokens
   also keeps an image inside it, at the last multiple of 256 tokens at least 512 tokens before the

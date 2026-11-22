@@ -566,6 +566,8 @@ struct Inkling2Core::Impl {
         const std::uint32_t* mask                = nullptr; // a grammar's next-token mask
         // The typed readout's token ids, on a request's first generated token only.
         const std::vector<TokenId>* readout = nullptr;
+        // A token the row cannot take (<|content_thinking|> once an early close was applied).
+        std::optional<TokenId> ban_token;
     };
 
     Inkling2Instance& instance;
@@ -633,6 +635,7 @@ struct Inkling2Core::Impl {
     std::uint32_t decode_rounds_per_prefill = 1;
 
     DeviceBuffer sample_config, sample_position, sample_out, token_counts, score_targets, score_out;
+    DeviceBuffer bf16_neg_mask; // BF16 -8192 (0xC600), the logit of a banned token (ban)
     // A row's logits kept while its grammar mask is late (one per sequence), and those of the rows
     // sampled together afterwards, side by side.
     DeviceBuffer saved_logits, deferred_logits;
@@ -735,6 +738,10 @@ struct Inkling2Core::Impl {
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
         CUDA_CHECK(ninfer::copy_and_wait(logprob_flag.p, &enabled, sizeof(enabled),
+                                         cudaMemcpyHostToDevice));
+        bf16_neg_mask = DeviceBuffer(sizeof(std::uint16_t));
+        const std::uint16_t kBf16NegLarge = 0xC600U;
+        CUDA_CHECK(ninfer::copy_and_wait(bf16_neg_mask.p, &kBf16NegLarge, sizeof(kBf16NegLarge),
                                          cudaMemcpyHostToDevice));
         std::size_t workspace = std::max<std::size_t>(
             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
@@ -1290,7 +1297,10 @@ struct Inkling2Core::Impl {
                     r.reuse_path = path;
                 }
             } else if (anchored > live) {
-                retire(s);
+                if (slot.fed != slot.anchor && !slot.disposable &&
+                    slot.anchor_path != PrefixReusePath::PrivateResponseReplay) {
+                    store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
+                }
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
                 slot.media   = slot.anchor_media;
@@ -1442,6 +1452,20 @@ struct Inkling2Core::Impl {
         if (streaming) { r.cv.notify_all(); }
     }
 
+    // Masks `token` in `count` logit columns from `column` on: -8192 (BF16 0xC600) leaves it no
+    // probability without the non-finite value the samplers refuse (an Inkling 2 response that a
+    // reached thinking budget or the loop guard closed opens no thinking block again).
+    void ban(const Tensor& logits, std::size_t column, std::size_t count,
+             std::optional<TokenId> token, cudaStream_t stream) const {
+        if (!token || *token < 0 || static_cast<std::uint32_t>(*token) >= domain) { return; }
+        for (std::size_t c = column; c < column + count; ++c) {
+            auto* at = static_cast<std::uint16_t*>(logits.data) +
+                       c * static_cast<std::size_t>(logits.ne[0]) + static_cast<std::size_t>(*token);
+            CUDA_CHECK(cudaMemcpyAsync(at, bf16_neg_mask.p, sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
     void sample(std::span<const SampleRow> rows, std::int32_t purpose, std::span<TokenId> out,
                 std::span<runtime::RawTokenLogprob> logprobs, const Tensor* source = nullptr) {
         const cudaStream_t stream = instance.executor->head_stream();
@@ -1490,6 +1514,7 @@ struct Inkling2Core::Impl {
         const Tensor logical(sample_position.p, DType::I32, {width});
         const Tensor logits =
             source != nullptr ? *source : instance.executor->logits(static_cast<std::uint32_t>(n));
+        for (std::size_t b = 0; b < n; ++b) { ban(logits, b, 1, rows[b].ban_token, stream); }
         const auto* device_configs = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const bool gather = std::any_of(rows.begin(), rows.end(),
                                         [](const SampleRow& row) { return row.logprobs; });
@@ -1594,7 +1619,8 @@ struct Inkling2Core::Impl {
                          .readout  = exec.logprobs && !exec.readout_tokens.empty() &&
                                              r.first_token == Clock::time_point{}
                                          ? &exec.readout_tokens
-                                         : nullptr};
+                                         : nullptr,
+                         .ban_token = r.output.banned_token()};
     }
 
     // --expert-profile-out: every route since warm-up, rewritten at each request boundary.
@@ -2076,6 +2102,21 @@ struct Inkling2Core::Impl {
             return accepted;
         }
         r.feed.assign(1, tokens[accepted > 0 ? accepted - 1 : 0]);
+        if (decision.continuation == ContinuationAction::ApplyTargetControl) {
+            // A reached thinking budget or the loop guard's conclusion closes Inkling's thinking
+            // block: append the control span (<guidance><|end_message|>) to the next step's feed.
+            const auto pending_control = r.output.pending_control_tokens();
+            const std::vector<TokenId> control(pending_control.begin(), pending_control.end());
+            const OutputDecision forced = r.output.preview_control(control, r.budget->remaining());
+            if (forced.accepted_tokens != control.size() || forced.finished()) {
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   "thinking control preview returned an invalid decision");
+            }
+            r.generated.insert(r.generated.end(), control.begin(), control.end());
+            r.budget->commit(static_cast<std::uint32_t>(control.size()));
+            push_events(r, r.output.commit_preview(), std::nullopt);
+            r.feed.insert(r.feed.end(), control.begin(), control.end());
+        }
         if (r.cancelled.load(std::memory_order_acquire)) {
             finish_now(request, FinishReason::Cancelled);
         }
@@ -2152,7 +2193,7 @@ struct Inkling2Core::Impl {
     // One step of every decoding request. Those whose context or drafter proposes a continuation
     // run one speculative round together, the rest one batched decode step.
     void decode_step() {
-        std::vector<std::shared_ptr<Request>> batch, speculative, drafting;
+        std::vector<std::shared_ptr<Request>> alone, batch, speculative, drafting;
         std::vector<std::vector<TokenId>> proposals;
         // Which of the round's proposals came from a context lookup.
         std::vector<char> looked_up;
@@ -2175,6 +2216,10 @@ struct Inkling2Core::Impl {
                 }
                 continue;
             }
+            if (request->feed.size() > 1) {
+                alone.push_back(request);
+                continue;
+            }
             if (steps > 0 && speculates(*request)) {
                 std::vector<TokenId> proposal(steps);
                 const std::uint32_t found =
@@ -2193,7 +2238,8 @@ struct Inkling2Core::Impl {
             }
             batch.push_back(request);
         }
-        if (batch.empty() && speculative.empty() && drafting.empty() && deferred.empty()) {
+        if (alone.empty() && batch.empty() && speculative.empty() && drafting.empty() &&
+            deferred.empty()) {
             return;
         }
         const auto start = Clock::now();
@@ -2235,15 +2281,37 @@ struct Inkling2Core::Impl {
             }
         }
         if (!deferred.empty()) { sample_deferred(deferred); }
+        for (const auto& request : alone) {
+            Request& r = *request;
+            if (r.constrained && !r.mask) { schedule_mask(r); }
+            instance.executor->forward(r.slot, r.feed, 1);
+            Slot& slot = slots[r.slot];
+            slot.fed.insert(slot.fed.end(), r.feed.begin(), r.feed.end());
+            r.position += static_cast<std::uint32_t>(r.feed.size());
+            if (!mask_ready(r)) {
+                defer_sample(r, instance.executor->logits(1), 0, ops::kSamplePurposeDecode);
+                continue;
+            }
+            const SampleRow row = sample_row(r);
+            TokenId token       = 0;
+            runtime::RawTokenLogprob logprob;
+            sample(std::span(&row, 1), ops::kSamplePurposeDecode, std::span(&token, 1),
+                   std::span(&logprob, 1));
+            try {
+                if (!mask_usable(request)) { continue; }
+                accept(request, token, row.logprobs ? &logprob : nullptr);
+                next_mask(request);
+            } catch (...) { fail(request, std::current_exception()); }
+        }
         if (!batch.empty()) { plain_step(batch); }
         if (!speculative.empty()) { speculative_round(speculative, proposals, looked_up); }
-        if (measured && batch.empty() && deferred.empty()) {
+        if (measured && batch.empty() && deferred.empty() && alone.empty()) {
             spark_controller->observe_execution(1, spark_round_width, seconds(start, Clock::now()));
         }
         spark_round_width = 0;
         std::lock_guard lock(stats_mutex);
         stats.decode_rounds += 1;
-        stats.decode_row_rounds += batch.size() + speculative.size();
+        stats.decode_row_rounds += alone.size() + batch.size() + speculative.size();
         stats.decode_seconds_total += seconds(start, Clock::now());
     }
 
@@ -2486,6 +2554,9 @@ struct Inkling2Core::Impl {
                                    stream));
         const auto rows_n         = static_cast<std::int32_t>(b);
         const Tensor logits       = executor.logits(static_cast<std::uint32_t>(verified_columns));
+        for (std::size_t j = 0; j < b; ++j) {
+            ban(logits, std::size_t(starts[j]), widths[j], rows[j].ban_token, stream);
+        }
         const auto* device_config = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), rows_n});
         // The tokens' logprob records, from the distributions their columns are drawn from,
@@ -2899,14 +2970,35 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
             identity.rewrite_checkpoint->frontier < prompt_n) {
             request->anchor_at = identity.rewrite_checkpoint->frontier;
         }
-        // Shared prefixes worth an image of their own: a structural or declared boundary, not one
-        // the engine merely observed (the prompt's end, a grid point).
+        // Where the template closes the prompt's last message: the turn closure, or the end.
+        const std::uint32_t closed_at = request->anchor_at;
+        // The protocol's default boundary (DefaultAutomatic: OpenAI and Anthropic put it where the
+        // prompt's last message ends) is where a repeat of the prompt resumes, and the next turn
+        // when the template rewrites what follows it. The sequence's anchor moves there: a device
+        // snapshot, copied to the host as an image only when another request takes the sequence.
+        if (!options.execution.branches) {
+            for (const auto& opportunity : data.context_cache.opportunities) {
+                const bool only_default =
+                    has_shared_candidate_evidence(opportunity.evidence,
+                                                  SharedCandidateEvidence::DefaultAutomatic) &&
+                    !has_shared_candidate_evidence(
+                        opportunity.evidence, SharedCandidateEvidence::ExplicitBoundary |
+                                                  SharedCandidateEvidence::RequestedAutomatic |
+                                                  SharedCandidateEvidence::EngineStructural);
+                if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && only_default &&
+                    opportunity.frontier > 0 && opportunity.frontier < request->anchor_at) {
+                    request->anchor_at = opportunity.frontier;
+                }
+            }
+        }
+        // Shared prefixes worth an image of their own: a declared or structural boundary. The
+        // default one at the prompt's end moved the anchor above instead; an image there copied
+        // the whole state to the host on every turn.
         for (const auto& opportunity : data.context_cache.opportunities) {
             const auto evidence   = opportunity.evidence;
             const bool structural = has_shared_candidate_evidence(
                 evidence, SharedCandidateEvidence::ExplicitBoundary |
                               SharedCandidateEvidence::RequestedAutomatic |
-                              SharedCandidateEvidence::DefaultAutomatic |
                               SharedCandidateEvidence::EngineStructural);
             const std::uint32_t frontier = opportunity.frontier;
             if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && structural &&
@@ -2917,11 +3009,19 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
         std::sort(request->shared_at.begin(), request->shared_at.end());
         request->shared_at.erase(std::unique(request->shared_at.begin(), request->shared_at.end()),
                                  request->shared_at.end());
+        // The checkpoint lies in the last message as the template closes it: with the anchor
+        // moved inside that closure, the message before it would count as the last one (in a
+        // long system message, a checkpoint and a prompt step more). The moved anchor is a kept
+        // state like the shared ones.
+        std::vector<std::uint32_t> kept = request->shared_at;
+        if (request->anchor_at < closed_at) {
+            kept.insert(std::upper_bound(kept.begin(), kept.end(), request->anchor_at),
+                        request->anchor_at);
+        }
         if (const std::uint32_t at = impl_->checkpoint_on_steps(
-                MessageCheckpoint::at(data.tap_hints.hints, request->anchor_at, request->shared_at,
-                                      request->media),
-                request->shared_at, request->media);
-            at >= Impl::kMinStoredTokens && impl_->image_pays(at)) {
+                MessageCheckpoint::at(data.tap_hints.hints, closed_at, kept, request->media), kept,
+                request->media);
+            at >= Impl::kMinStoredTokens && at < request->anchor_at && impl_->image_pays(at)) {
             request->checkpoint_at = at;
             request->shared_at.insert(
                 std::upper_bound(request->shared_at.begin(), request->shared_at.end(), at), at);

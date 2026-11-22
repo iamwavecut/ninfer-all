@@ -66,9 +66,12 @@ tokenization, the chat template, output parsing and the serving protocols.
   reasoning block arrives as `reasoning_content`. The chat template states a thinking effort level
   in a system block: `reasoning_effort` `none`, `minimal`, `low`, `medium`, `high` or `xhigh` (0,
   0.1, 0.2, 0.7, 0.9, 0.99; `high` without one). `enable_thinking: false` sets `none`, the
-  model's own lowest level, which the release notes do not fully disable reasoning. Thinking
-  budgets do not apply: the model opens its thinking blocks itself and has no early-close control,
-  as with Gemma 4 and Flint.
+  model's own lowest level, which the release notes do not fully disable reasoning. A thinking
+  budget (`--thinking-budget`, `--default-thinking-budget`, a request's) counts the tokens of the
+  thinking blocks the model opens, at `none` too (which a forced tool call also sets); once
+  reached, the engine closes the open block with Qwen's early-close guidance and `<|end_message|>`,
+  masks `<|content_thinking|>` for the rest of the response and decodes it without drafts.
+  `--reasoning-loop conclude` closes it the same way ([Serving](serving.md#openai-chat-completions)).
 - **Sampling defaults.** The release's: temperature 1.0.
 - **Speculative decoding.** The release's DSpark drafter (the artifact's `dspark` component,
   `--spec dspark`) proposes a block of up to 7 drafts from the target's tapped hidden states: three
@@ -96,9 +99,8 @@ tokenization, the chat template, output parsing and the serving protocols.
   and DSpark drafts there by default too ([measurements](#measurements)).
 
 Not built for this family: MTP, DFlash, n-gram copy drafts and their archive, `--draft-confidence`,
-rotation scaling (the attention has no rotation), thinking budgets, video, pipeline stages, and of
-the context cache the shared paged KV pool; the server refuses their options and
-`--default-thinking-budget` at startup ([Serving](serving.md#context-cache-of-the-other-families)). Of the
+rotation scaling (the attention has no rotation), video, pipeline stages, and of
+the context cache the shared paged KV pool; the server refuses their options at startup ([Serving](serving.md#context-cache-of-the-other-families)). Of the
 `--kv-dtype` formats, MXFP8 (the default), `int8`, `rk8v4`, `rk4v4` and F16 (`bf16` or `fp16`) are
 built ([KV cache](#kv-cache)); `fp8`, `nvfp4`, `k8v4`, `rk4v4-e8`, `rk2v4-e8` and `bf16p` are not,
 for the reasons [Flint's KV cache](flint.md#kv-cache) lists. DSpark drafts for one request at a

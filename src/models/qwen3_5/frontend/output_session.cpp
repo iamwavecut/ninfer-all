@@ -646,16 +646,19 @@ public:
         return model_opens_reasoning() ? decoder.in_reasoning : thinking.in_reasoning;
     }
 
-    // Moves the committed round's words into the history (bounded); drops it once thinking ends.
+    // Moves the committed round's words into the history (bounded). For models that can reopen
+    // thinking blocks across a single response (e.g. Inkling), retain loop history across natural
+    // block closes so alternating short thinking/text blocks cannot evade detection.
     void commit_loop_words() {
-        if (!loop_reasoning(state, semantic) || semantic.loop == ReasoningLoopAction::Off ||
-            semantic.loop_detected) {
+        if (semantic.loop == ReasoningLoopAction::Off || semantic.loop_detected ||
+            (!model_opens_reasoning() && !loop_reasoning(state, semantic))) {
             loop_words.clear();
             loop_words.shrink_to_fit();
             semantic.loop_round.clear();
             semantic.loop_tail.clear();
             return;
         }
+        if (semantic.loop_round.empty()) { return; }
         loop_words.insert(loop_words.end(), semantic.loop_round.begin(), semantic.loop_round.end());
         semantic.loop_round.clear();
         if (loop_words.size() > 2 * kLoopHistoryWords) {
@@ -880,7 +883,13 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         // A token that confirms a held close (its first byte is a line break, or it ends the
         // turn) is the first one after the thinking, so neither count includes it.
         const bool presentation_held = holds_presentation_close(impl_->preview_state);
-        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        if (impl_->preview_state.in_reasoning) {
+            ++impl_->preview_state.reasoning_tokens;
+            if (impl_->inkling && token != impl_->inkling->end && token != impl_->inkling->header &&
+                !impl_->inkling->content(token)) {
+                ++impl_->preview_semantic.model_thinking_tokens;
+            }
+        }
         SemanticThinkingState& thinking = impl_->preview_semantic;
         // DeepSeek's </think> token closes its reasoning whatever follows it; a line break after
         // it is what closes the channel for the scans, and the content's leading break is dropped.
@@ -1018,6 +1027,22 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         }
         count_fed_token(impl_->preview_state);
         release_logprobs(impl_->preview_state, impl_->preview_logprobs);
+        // Enforce Inkling's thinking budget per token so a speculative span starting outside
+        // reasoning (e.g. in a header) cannot cross <|content_thinking|>, exceed the budget, or
+        // open and close an entire thinking block within one round.
+        if (impl_->inkling && impl_->early_close_available && impl_->preview_state.in_reasoning &&
+            !impl_->preview_semantic.applied && impl_->preview_semantic.budget &&
+            impl_->preview_semantic.model_thinking_tokens >= *impl_->preview_semantic.budget) {
+            const std::uint64_t control =
+                impl_->thinking_control_tokens ? impl_->thinking_control_tokens->size() : 0U;
+            const std::uint64_t remaining = total_budget_remaining - count;
+            if (control > 0 && remaining >= control + 1U) {
+                note_stop_hold(false);
+                impl_->preview_semantic.control_pending = true;
+                return complete(count, FinishReason::None,
+                                runtime::ContinuationAction::ApplyTargetControl);
+            }
+        }
     }
     note_stop_hold(false);
 
@@ -1045,9 +1070,11 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
     // and Flint count the tokens of the reasoning they opened; they have no early-close control,
     // so they stop. A held close marker defers the check to the next round, which resolves it.
     SemanticThinkingState& semantic     = impl_->preview_semantic;
-    const std::uint32_t thinking_tokens = impl_->model_opens_reasoning()
-                                              ? impl_->preview_state.reasoning_tokens
-                                              : semantic.model_thinking_tokens;
+    const std::uint32_t thinking_tokens = impl_->inkling
+                                              ? semantic.model_thinking_tokens
+                                              : impl_->model_opens_reasoning()
+                                                    ? impl_->preview_state.reasoning_tokens
+                                                    : semantic.model_thinking_tokens;
     if (semantic.loop != ReasoningLoopAction::Off &&
         impl_->loop_reasoning(impl_->preview_state, semantic) && !semantic.applied &&
         !semantic.loop_detected && !holds_semantic_close(semantic) &&
@@ -1086,10 +1113,17 @@ std::uint32_t
 OutputSession::model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept {
     // A pending control span (a reached budget's or the loop guard's) licenses no model token.
     if (impl_ != nullptr && impl_->semantic.control_pending) { return 0; }
-    if (impl_ == nullptr || !impl_->semantic.budget || !impl_->semantic.in_reasoning ||
-        impl_->semantic.applied || !impl_->early_close_available) {
+    if (impl_ == nullptr || !impl_->semantic.budget || impl_->semantic.applied ||
+        !impl_->early_close_available) {
         return total_budget_remaining;
     }
+    if (impl_->inkling) {
+        if (!impl_->state.in_reasoning) { return total_budget_remaining; }
+        if (impl_->semantic.model_thinking_tokens >= *impl_->semantic.budget) { return 0; }
+        return std::min(total_budget_remaining,
+                        *impl_->semantic.budget - impl_->semantic.model_thinking_tokens);
+    }
+    if (!impl_->semantic.in_reasoning) { return total_budget_remaining; }
     if (impl_->semantic.control_pending ||
         impl_->semantic.model_thinking_tokens >= *impl_->semantic.budget) {
         return 0;
@@ -1110,7 +1144,9 @@ std::uint32_t OutputSession::control_suffix_tokens() const noexcept {
         impl_->semantic.applied) {
         return 0;
     }
-    return impl_->semantic.control_pending || impl_->semantic.in_reasoning
+    const bool active_reasoning =
+        impl_->inkling ? impl_->state.in_reasoning : impl_->semantic.in_reasoning;
+    return impl_->semantic.control_pending || active_reasoning
                ? static_cast<std::uint32_t>(impl_->thinking_control_tokens->size())
                : 0U;
 }
@@ -1143,6 +1179,17 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
             impl_->preview_execution_split_after = static_cast<std::uint32_t>(index + 1U);
         }
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
+        if (impl_->inkling) {
+            const std::string_view raw_bytes =
+                !impl_->preserve_special && decoded.special ? std::string_view{} : decoded.bytes;
+            const std::string_view presentation_bytes = inkling_bytes(
+                *impl_->inkling, impl_->preview_state, token, raw_bytes,
+                impl_->inkling_tools.has_value());
+            feed_token_bytes(impl_->preview_state, presentation_bytes, impl_->policy,
+                             impl_->preview_output, static_cast<std::uint32_t>(index + 1), nullptr);
+            count_fed_token(impl_->preview_state);
+            continue;
+        }
         // DeepSeek's </think> token closes its reasoning whatever follows it, as in its own output.
         const bool deepseek_close = impl_->deepseek && token == impl_->deepseek->think_close;
         const std::string_view thinking_bytes =
@@ -1160,7 +1207,7 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     if (impl_->preview_semantic.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the thinking phase");
     }
-    if (impl_->split_reasoning && impl_->preview_state.in_reasoning) {
+    if ((impl_->split_reasoning || impl_->inkling) && impl_->preview_state.in_reasoning) {
         throw std::logic_error("canonical thinking control did not close the reasoning channel");
     }
     impl_->preview_semantic.control_pending = false;
@@ -1297,7 +1344,20 @@ std::uint32_t OutputSession::reasoning_tokens() const noexcept {
 }
 
 bool OutputSession::reasoning_closed() const noexcept {
-    return impl_ != nullptr && impl_->started_in_reasoning && !impl_->prefix_execution.tracking;
+    if (impl_ == nullptr) { return false; }
+    if (impl_->inkling) {
+        return impl_->semantic.applied ||
+               (impl_->state.reasoning_tokens > 0 && !impl_->state.in_reasoning);
+    }
+    return impl_->started_in_reasoning && !impl_->prefix_execution.tracking;
+}
+
+std::optional<TokenId> OutputSession::banned_token() const noexcept {
+    if (impl_ == nullptr || !impl_->inkling || !impl_->semantic.applied) { return std::nullopt; }
+    // Keep <|content_thinking|> banned (and speculation disabled) for the remainder of an
+    // early-closed response so a multi-token speculative span cannot close a text/tool block,
+    // traverse a header, and re-open thinking unmasked.
+    return impl_->inkling->thinking;
 }
 
 ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
@@ -1305,7 +1365,7 @@ ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
     return ThinkingBudgetStats{
         .requested_budget = impl_->requested_budget,
         // Without early close the cap is never enforced, so there is no effective budget.
-        .effective_budget = impl_->early_close_available ? impl_->semantic.budget : std::nullopt,
+        .effective_budget      = impl_->early_close_available ? impl_->semantic.budget : std::nullopt,
         .model_thinking_tokens = impl_->semantic.model_thinking_tokens,
         .injected_tokens       = impl_->semantic.injected_tokens,
         .applied               = impl_->semantic.applied,

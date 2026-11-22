@@ -1482,7 +1482,10 @@ struct Qwen4ExpCore::Impl {
                     r.reuse_path = path;
                 }
             } else if (anchored > live) {
-                retire(s);
+                if (slot.fed != slot.anchor && !slot.disposable &&
+                    slot.anchor_path != PrefixReusePath::PrivateResponseReplay) {
+                    store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
+                }
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
                 slot.media   = slot.anchor_media;
@@ -3435,6 +3438,27 @@ Qwen4ExpCore::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
             identity.rewrite_checkpoint->frontier < prompt_n) {
             request->anchor_at = identity.rewrite_checkpoint->frontier;
         }
+        // Where the template closes the prompt's last message: the turn closure, or the end.
+        const std::uint32_t closed_at = request->anchor_at;
+        // The protocol's default boundary (DefaultAutomatic: OpenAI and Anthropic put it where the
+        // prompt's last message ends) is where a repeat of the prompt resumes, and the next turn
+        // when the template rewrites what follows it. The sequence's anchor moves there: a device
+        // snapshot, copied to the host as an image only when another request takes the sequence.
+        if (!options.execution.branches) {
+            for (const auto& opportunity : data.context_cache.opportunities) {
+                const bool only_default =
+                    has_shared_candidate_evidence(opportunity.evidence,
+                                                  SharedCandidateEvidence::DefaultAutomatic) &&
+                    !has_shared_candidate_evidence(
+                        opportunity.evidence, SharedCandidateEvidence::ExplicitBoundary |
+                                                  SharedCandidateEvidence::RequestedAutomatic |
+                                                  SharedCandidateEvidence::EngineStructural);
+                if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && only_default &&
+                    opportunity.frontier > 0 && opportunity.frontier < request->anchor_at) {
+                    request->anchor_at = opportunity.frontier;
+                }
+            }
+        }
         request->disposable = data.tap_hints.disposable;
         // Shared prefixes worth an image of their own: a structural or declared boundary, not one
         // the engine merely observed (the prompt's end, a grid point). A branched read's prompt
@@ -3446,7 +3470,6 @@ Qwen4ExpCore::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
             const bool structural = has_shared_candidate_evidence(
                 opportunity.evidence, SharedCandidateEvidence::ExplicitBoundary |
                                           SharedCandidateEvidence::RequestedAutomatic |
-                                          SharedCandidateEvidence::DefaultAutomatic |
                                           SharedCandidateEvidence::EngineStructural);
             const std::uint32_t frontier = opportunity.frontier;
             if (request->reusable &&
@@ -3458,9 +3481,19 @@ Qwen4ExpCore::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
         std::sort(request->shared_at.begin(), request->shared_at.end());
         request->shared_at.erase(std::unique(request->shared_at.begin(), request->shared_at.end()),
                                  request->shared_at.end());
-        if (const std::uint32_t at = MessageCheckpoint::at(data.tap_hints.hints, request->anchor_at,
-                                                           request->shared_at, request->media);
-            request->reusable && !options.execution.branches && at >= Impl::kMinStoredTokens) {
+        // The checkpoint lies in the last message as the template closes it: with the anchor
+        // moved inside that closure, the message before it would count as the last one (in a
+        // long system message, a checkpoint and a prompt step more). The moved anchor is a kept
+        // state like the shared ones.
+        std::vector<std::uint32_t> kept = request->shared_at;
+        if (request->anchor_at < closed_at) {
+            kept.insert(std::upper_bound(kept.begin(), kept.end(), request->anchor_at),
+                        request->anchor_at);
+        }
+        if (const std::uint32_t at =
+                MessageCheckpoint::at(data.tap_hints.hints, closed_at, kept, request->media);
+            request->reusable && !options.execution.branches && at >= Impl::kMinStoredTokens &&
+            at < request->anchor_at) {
             request->checkpoint_at = at;
             request->shared_at.insert(
                 std::upper_bound(request->shared_at.begin(), request->shared_at.end(), at), at);

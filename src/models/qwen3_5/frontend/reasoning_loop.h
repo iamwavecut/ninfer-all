@@ -28,7 +28,8 @@ inline constexpr std::uint32_t kLoopRepeats     = 3;   // occurrences that make 
 inline constexpr std::size_t kLoopWindowWords = 2000; // the recent words whose coverage is measured
 inline constexpr std::size_t kLoopHistoryWords = 30000; // how far back passages are counted
 inline constexpr double kLoopCoverage          = 0.25;  // coverage at which the guard fires
-inline constexpr std::size_t kLoopTailChars    = 2048;  // reasoning characters read at the end
+inline constexpr std::size_t kLoopTailChars    = 2048;  // reasoning characters a counter is read in
+inline constexpr std::size_t kLoopPeriodChars  = 1024;  // reasoning characters a period is read in
 inline constexpr std::size_t kLoopTailPeriod   = 64;    // a period at most this long repeats
 inline constexpr std::size_t kLoopCounterSteps = 8;     // periods a counter moves through at least
 
@@ -48,10 +49,10 @@ void append_words(std::string_view bytes, std::string& partial, std::vector<std:
 // kLoopTailChars characters whenever that many have been emitted.
 void append_tail(std::string_view bytes, std::string& tail);
 
-// True when the last kLoopTailChars characters of `text` are one period of at most kLoopTailPeriod
-// characters repeated (Strata's #1753). The comparison is byte-exact where Strata folds case, which
-// no loop this catches depends on. False while fewer than kLoopTailChars characters have been
-// emitted.
+// True when the last kLoopPeriodChars characters of `text` are one period of at most
+// kLoopTailPeriod characters repeated (Strata's #1753 reads 2,048 characters). The comparison is
+// byte-exact where Strata folds case, which no loop this catches depends on. False while fewer
+// than kLoopPeriodChars characters have been emitted.
 [[nodiscard]] bool periodic_tail(std::string_view text);
 
 // True when the last kLoopTailChars characters of `text`, with every run of ASCII digits read as

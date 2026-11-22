@@ -440,8 +440,7 @@ void GenerationService::refuse_family_options() const {
                                     " artifacts do not have");
     }
     if (options_.default_thinking_budget &&
-        (architecture == "Gemma4ForCausalLM" || architecture == "FlintForCausalLM" ||
-         architecture == "Inkling2ForCausalLM")) {
+        (architecture == "Gemma4ForCausalLM" || architecture == "FlintForCausalLM")) {
         throw std::invalid_argument("--default-thinking-budget closes reasoning early, which " +
                                     architecture + " artifacts cannot do");
     }
@@ -776,7 +775,21 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             prompt = engine_->prepare(std::move(input), control);
         }
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
-        prepared.enable_thinking = prompt.summary().starts_in_reasoning;
+        // Inkling 2 opens its thinking blocks itself, whatever the prompt ends with, so its chat
+        // requests keep their thinking budget.
+        const bool model_opens_thinking =
+            !request.raw_prompt &&
+            engine_->load_summary().architecture == "Inkling2ForCausalLM";
+        prepared.enable_thinking = prompt.summary().starts_in_reasoning || model_opens_thinking;
+        if (model_opens_thinking && semantics.enable_thinking == false) {
+            // `enable_thinking: false` or a forced call set the lowest effort, at which Inkling may
+            // still open a thinking block: the budget and the loop guard hold for it as well.
+            request_options.execution.thinking.budget = request.thinking_budget
+                                                            ? request.thinking_budget
+                                                            : options_.default_thinking_budget;
+            request_options.execution.thinking.loop = options_.reasoning_loop;
+            prepared.thinking_budget                = request_options.execution.thinking.budget;
+        }
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
