@@ -339,6 +339,18 @@ void check_steps() {
     const std::vector<ContextMediaMark> media{{.begin = 4000, .count = 200, .key = 1}};
     check(MessageCheckpoint::on_steps(4608, none, media, 2048) == 0,
           "a step end inside a media unit is dropped");
+    // A prompt resumed at 6,000 runs its steps from there: 8,048, 10,096. Counted from 0 the
+    // checkpoint would land at 8,192 and add a step (6,000-8,048-8,192-10,096).
+    check(MessageCheckpoint::on_steps(9600, none, {}, 2048, 6000) == 8048,
+          "steps run from the resume point");
+    check(MessageCheckpoint::on_steps(7000, none, {}, 2048, 6000) == 0,
+          "no step end between the resume point and the checkpoint: none");
+    check(MessageCheckpoint::on_steps(6000, none, {}, 2048, 6000) == 0,
+          "a checkpoint at the resume point: none");
+    // A shared prefix above the resume point ends a step: 7,000, then 9,048.
+    const std::vector<std::uint32_t> above{300, 7000};
+    check(MessageCheckpoint::on_steps(9600, above, {}, 2048, 6000) == 9048,
+          "steps from the resume point restart at a frontier above it");
 }
 
 void check_message_checkpoint() {

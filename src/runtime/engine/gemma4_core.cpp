@@ -486,6 +486,10 @@ struct Gemma4Core::Request {
     std::vector<std::uint32_t> shared_at;
     // The checkpoint among them (MessageCheckpoint), 0 for none.
     std::uint32_t checkpoint_at = 0;
+    // The checkpoint as MessageCheckpoint::at places it in the last message, before
+    // place_checkpoint() moves it to a prompt step's end (0: none), and where the template closes
+    // that message.
+    std::uint32_t message_checkpoint = 0, closed_at = 0;
     // Media: one mark per unit (an image or a video frame), its soft tokens' span and the identity
     // of what they show, which a reused prefix must share as well as its tokens.
     std::vector<MediaMark> media;
@@ -1072,10 +1076,41 @@ struct Gemma4Core::Impl {
     // (MessageCheckpoint::on_steps); where they stay on the GPU, as placed.
     [[nodiscard]] std::uint32_t checkpoint_on_steps(std::uint32_t at,
                                                     std::span<const std::uint32_t> frontiers,
-                                                    std::span<const ContextMediaMark> media) const {
+                                                    std::span<const ContextMediaMark> media,
+                                                    std::uint32_t from) const {
         if (instance.model->expert_residency() == ExpertResidency::Device) { return at; }
         return MessageCheckpoint::on_steps(at, frontiers, media,
-                                           instance.executor->options().prefill_chunk);
+                                           instance.executor->options().prefill_chunk, from);
+    }
+
+    // The states a request keeps besides its checkpoint: the shared prefixes, and the anchor when
+    // it moved inside the last message's closure.
+    [[nodiscard]] static std::vector<std::uint32_t> kept_states(const Request& r) {
+        std::vector<std::uint32_t> kept = r.shared_at;
+        if (r.checkpoint_at != 0) {
+            kept.erase(std::find(kept.begin(), kept.end(), r.checkpoint_at));
+        }
+        if (r.anchor_at < r.closed_at) {
+            kept.insert(std::upper_bound(kept.begin(), kept.end(), r.anchor_at), r.anchor_at);
+        }
+        return kept;
+    }
+
+    // The message checkpoint on the prompt steps that run from `from`: placed when the request is
+    // made (from 0) and again where its prompt resumes, whose steps would otherwise end on both
+    // sides of a checkpoint placed for steps from 0 and add one.
+    void place_checkpoint(Request& r, std::uint32_t from) const {
+        const std::vector<std::uint32_t> kept = kept_states(r);
+        if (r.checkpoint_at != 0) {
+            r.shared_at.erase(std::find(r.shared_at.begin(), r.shared_at.end(), r.checkpoint_at));
+            r.checkpoint_at = 0;
+        }
+        if (r.message_checkpoint == 0) { return; }
+        if (const std::uint32_t at = checkpoint_on_steps(r.message_checkpoint, kept, r.media, from);
+            at > from && at >= kMinStoredTokens && at < r.anchor_at && image_pays(at)) {
+            r.checkpoint_at = at;
+            r.shared_at.insert(std::upper_bound(r.shared_at.begin(), r.shared_at.end(), at), at);
+        }
     }
 
     // Whether a shared prefix or a checkpoint of `tokens` is worth an image: saving it and copying
@@ -1285,6 +1320,7 @@ struct Gemma4Core::Impl {
         slot.last_used  = ++use_clock;
         slot.disposable = r.disposable;
         r.reused = r.prefilled = reused;
+        if (reused > 0) { place_checkpoint(r, reused); }
         if (drafts > 0) {
             r.speculative.backend      = dspine ? SpeculativeBackend::DSpine : SpeculativeBackend::Mtp;
             r.speculative.enabled      = true;
@@ -1716,6 +1752,7 @@ struct Gemma4Core::Impl {
                 slot.media   = std::move(media);
                 r.reuse_path = path;
                 r.reused = r.prefilled = from_store;
+                place_checkpoint(r, from_store);
                 std::lock_guard lock(stats_mutex);
                 stats.reused_prompt_tokens += from_store;
             }
@@ -2915,19 +2952,10 @@ Gemma4Core::make_request(GroupMember& member, std::optional<std::uint32_t>& budg
         // moved inside that closure, the message before it would count as the last one (in a
         // long system message, a checkpoint and a prompt step more). The moved anchor is a kept
         // state like the shared ones.
-        std::vector<std::uint32_t> kept = request->shared_at;
-        if (request->anchor_at < closed_at) {
-            kept.insert(std::upper_bound(kept.begin(), kept.end(), request->anchor_at),
-                        request->anchor_at);
-        }
-        if (const std::uint32_t at = impl_->checkpoint_on_steps(
-                MessageCheckpoint::at(data.tap_hints.hints, closed_at, kept, request->media), kept,
-                request->media);
-            at >= Impl::kMinStoredTokens && at < request->anchor_at && impl_->image_pays(at)) {
-            request->checkpoint_at = at;
-            request->shared_at.insert(
-                std::upper_bound(request->shared_at.begin(), request->shared_at.end(), at), at);
-        }
+        request->closed_at          = closed_at;
+        request->message_checkpoint = MessageCheckpoint::at(
+            data.tap_hints.hints, closed_at, Impl::kept_states(*request), request->media);
+        impl_->place_checkpoint(*request, 0);
     }
     request->prompt_summary  = prompt_summary;
     request->prepare_seconds = prepare_seconds;

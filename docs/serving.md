@@ -2966,10 +2966,10 @@ differently; it goes to an image when another request takes the sequence. Beyond
   5,130-token user message: a different question reused 4,608 tokens, and its prompt took about
   480 ms instead of 2,565 ms. With experts in host memory or the artifact's files each prompt step
   copies or reads the experts it routes to, so a checkpoint between two step ends would cost every
-  such prompt one more pass of them; the checkpoint then moves down to the end of a prompt step
-  (Gemma 4, Flint and Inkling 2: every prompt chunk, 2,048 tokens by default, and at the prompt's
-  other kept states; DeepSeek-V4.1: every span, 16,384 tokens with host experts on an RTX 3090),
-  and a prompt with no such end in reach keeps none. On DeepSeek-V4.1 with host experts, a
+  such prompt one more pass of them; the checkpoint then moves down to the end of a prompt step,
+  counted from where the prompt resumes (Gemma 4, Flint and Inkling 2: every prompt chunk, 2,048
+  tokens by default, and at the prompt's other kept states; DeepSeek-V4.1: every span, 16,384
+  tokens with host experts on an RTX 3090), and a prompt with no such end in reach keeps none. On DeepSeek-V4.1 with host experts, a
   checkpoint inside the span had made a 4,808-token prompt take 7.4 s instead of 5.2 s, and a
   different question then 2.0 s instead of 4.6 s. Qwen3.8-Flash-Next keeps the state inside its
   span and needs no move. The prompt that keeps a checkpoint pays for it: Inkling 2's first
