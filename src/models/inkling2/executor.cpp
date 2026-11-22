@@ -473,8 +473,15 @@ struct Executor::Impl {
             staging_v.fill(0);
             kv_bytes += 2 * staging;
         }
-        const int sms = device.multiprocessor_count();
-        decode_splits_full    = std::clamp(2 * sms / std::max(1, kv_heads), 1, 128);
+        // A full visit's decode or verification row splits its keys so that one row's blocks
+        // number about 16 per multiprocessor, at most 128 (the combine's width); the kernel uses
+        // fewer while the keys are short (active_splits). Every row of every call splits alike,
+        // so a verification row computes what a decode step at its position computes. On an RTX
+        // 3090, 32 blocks a multiprocessor decoded at 16's rates after 8K-120K tokens, and 2 (the
+        // earlier count) 4-40% slower.
+        const int sms         = device.multiprocessor_count();
+        decode_splits_full =
+            std::clamp((16 * sms + kv_heads - 1) / std::max(1, kv_heads), 1, 128);
         decode_splits_sliding = 16;
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
         d_tokens    = DeviceBuffer(rows * 4);
@@ -1467,6 +1474,7 @@ struct Executor::Impl {
         add(t * query_heads * 4);         // sinks
         add(t * q_floats * 4);            // q
         add(t * query_heads * 16 * 4);    // r
+        add(kernels::attention_workspace_floats(int(t), query_heads, 1) * 4); // far field states
         add(t * q_floats * 2);            // attention out BF16
         add(t * h * 4);                   // output product
         if (kvfmt.staged()) { add(t * 2 * kvd * 2); } // a quantized visit's F16 staging (kv_store reads it)
@@ -2332,6 +2340,12 @@ struct Executor::Impl {
             aa.kv_heads    = kv_heads;
             aa.scale       = 1.0f / std::sqrt(float(kD));
             aa.splits      = c.chunk ? 1 : (lp.full ? decode_splits_full : decode_splits_sliding);
+            // A prompt chunk far enough into a full visit runs its far field on tensor cores.
+            if (c.chunk && lp.full && ka.ring == 0 &&
+                c.first > int(config.relative_extent)) {
+                aa.far = static_cast<float*>(workspace->alloc_bytes(
+                    kernels::attention_workspace_floats(t, query_heads, 1) * 4).data);
+            }
             if (!c.chunk && aa.splits > 1) {
                 aa.partial = static_cast<float*>(workspace->alloc_bytes(
                     kernels::attention_workspace_floats(t, query_heads, aa.splits) * 4).data);

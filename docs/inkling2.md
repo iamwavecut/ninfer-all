@@ -50,6 +50,15 @@ tokenization, the chat template, output parsing and the serving protocols.
   the values are the same bits. A controller's nine products run in two launches, and the route
   kernel also groups the pairs by expert for the expert kernels. These kernels took decode on an
   RTX 3090 from 88.9 to 111.4 tok/s with the same tokens ([measurements](#measurements)).
+- **Long contexts.** A prompt chunk of a full-attention visit first computes, on tensor cores, its
+  rows' attention over the keys at least 1,024 positions (the relative table's extent) before every
+  row of a group of 32: F16 queries and probabilities, keys and values as stored (a plane format's
+  chunks decoded to F16), FP32 scores, softmax and sums. The SIMT kernel starts each row from that
+  state and reads the nearer keys with their relative bias. A full visit's decode and verification
+  rows split their keys into about 16 blocks a multiprocessor (at most 128, each at least 64 keys),
+  the same split for every row of every call, so a verification row computes what a decode step
+  computes. On an RTX 3090 a 120,103-token prompt prefills at 1.52k tok/s instead of 501 and then
+  decodes at 65.4 tok/s instead of 46.8 ([measurements](#long-contexts)).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens, prefix reuse across turns and requests with host-memory images
   ([below](#prefix-reuse)), branched reads for [typed decisions](serving.md#typed-decisions) and
@@ -298,6 +307,27 @@ the batched controllers and the sorted route ([what runs](#what-runs)) NInfer-al
   one card (1.14x), each request's text equal to its text alone. With one request and an
   8,192-token context the server's devices use about 11,100 and 7,600 MiB against one card's
   18,300 MiB. Prompt rates over the split were not measured beyond a 33-token prompt.
+
+### Long contexts
+
+`ninfer-serve --max-context 131072` on an RTX 3090 (350 W, PCIe 4.0 x16, CUDA 13.4.3, build
+`75;80;86;89;120a`, MXFP8 KV, experts on the GPU), November 22, 2026: one greedy request of 256
+tokens after each of three fixed prompts, one run each, with the [long-context
+kernels](#what-runs) and the build before them. The server's own prefill and decode rates:
+
+| Prompt tokens | Prefill, before | Prefill | `--spec none` decode, before | `--spec none` decode | DSpark decode, before | DSpark decode |
+|---:|---:|---:|---:|---:|---:|---:|
+| 7,968 | 1.91k | 2.19k | 96.7 | 100.6 | 101.3 | 110.4 |
+| 32,008 | 1.20k | 2.01k | 78.6 | 90.1 | 111.9 | 118.1 |
+| 120,103 | 501 | 1.52k | 46.8 | 65.4 | 62.8 | 57.4 |
+
+DSpark's text equals `--spec none`'s in both builds at every length. The text itself changed with
+the far field's F16 probabilities and the new splits, so DSpark accepted other drafts: after the
+120,103-token prompt, 108 of 209 against 150 of 227. A round there took about 30 ms against 39 ms
+before, but at 1.7 tokens a round it decodes more slowly than plain decoding's 15.3 ms a token; a
+round costs 1.7 decode steps after 7,968 tokens and 2.0 after 32,008 and 120,103. Mean NLL over the first 200,000 bytes of
+WikiText `00.txt` (49,478 tokens, 16,384-token windows at an 8,192-token stride) is 1.739363
+against 1.739591 before (-0.013%), and `ninfer-perplexity` scored them in 102 s against 125 s.
 
 ### APEX-I MiniPlus
 

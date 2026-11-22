@@ -5,8 +5,8 @@
 //    rows stored (a coding's own error bound); MXFP8's codes and scales equal the release's rule
 //    (vLLM's mxfp8_quantize) applied on the host, bit for bit;
 //  - attention over the planes: a full-attention visit's decode rows, verification rows, prompt
-//    chunk and branches against an FP64 attention over the host-decoded rows, the slots being the
-//    rows' physical positions.
+//    chunk, branches and a chunk with a far field against an FP64 attention over the host-decoded
+//    rows, the slots being the rows' physical positions.
 
 #include "../../ops/kv_cache_lloyd4_oracle.h"
 #include "core/device_buffer.h"
@@ -198,7 +198,7 @@ std::vector<double> decode_plane_row(mi::KvCoding coding, const std::uint8_t* co
 // (attention_bound, wider: the quantization error reaches the output through the softmax).
 void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const RowsCase& rc,
               int splits, double key_bound, double value_bound, double attention_bound,
-              std::mt19937& rng) {
+              std::mt19937& rng, bool far = false) {
     const int t = int(rc.positions.size());
     const int sequences =
         rc.sequences.empty() ? 1 : *std::max_element(rc.sequences.begin(), rc.sequences.end()) + 1;
@@ -250,6 +250,30 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
     };
     store(as<__half>(dk), dkc, dks, key_code_bytes, key_scale_bytes, key);
     store(as<__half>(dv), dvc, dvs, value_code_bytes, value_scale_bytes, value);
+    if (far) {
+        // The positions before the chunk hold stored rows too, for the far field to read.
+        RowsCase before;
+        for (int p = 0; p < rc.first; ++p) { before.positions.push_back(p); }
+        std::vector<__half> pk(std::size_t(kKv) * rc.first * kD), pv(pk.size());
+        std::normal_distribution<float> n(0.0f, 1.0f);
+        for (auto& v : pk) { v = __float2half(1.5f * n(rng)); }
+        for (auto& v : pv) { v = __float2half(n(rng)); }
+        DeviceBuffer dpk = upload(pk), dpv = upload(pv);
+        RowsDevice before_dev(before);
+        for (const auto& [src, codes, scales, cb, sb, coding] :
+             {std::tuple{&dpk, &dkc, &dks, key_code_bytes, key_scale_bytes, key},
+              std::tuple{&dpv, &dvc, &dvs, value_code_bytes, value_scale_bytes, value}}) {
+            k::KvStoreArgs args;
+            args.rows            = before_dev.rows;
+            args.src             = as<__half>(*src);
+            args.src_head_stride = std::int64_t(rc.first) * kD;
+            args.rows_count      = rc.first;
+            args.heads           = kKv;
+            args.dst             = plane(*codes, *scales, cb, sb, coding);
+            k::kv_store(args, nullptr);
+        }
+        check(cudaDeviceSynchronize(), "kv_store before the chunk");
+    }
     check(cudaDeviceSynchronize(), "kv_store");
 
     // The attention's other inputs, as test_kernels.cpp's attention cases take them.
@@ -263,6 +287,7 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
     DeviceBuffer dq = upload(q), dr = upload(r), dt = upload(table), dg = upload(gate),
                  ds = upload(sinks),
                  partial(k::attention_workspace_floats(t, kHeads, splits) * 4),
+                 far_states(k::attention_workspace_floats(t, kHeads, 1) * 4),
                  out(std::size_t(t) * kHeads * kD * 2);
     {
         k::AttentionArgs a;
@@ -281,6 +306,7 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
         a.scale          = scale;
         a.splits         = splits;
         a.partial        = as<float>(partial);
+        a.far            = far ? as<float>(far_states) : nullptr;
         a.gate           = as<float>(dg);
         a.gate_stride    = gate_stride;
         a.out            = as<bf16>(out);
@@ -420,8 +446,9 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
         }
     }
     report(eb.rel() < attention_bound,
-           std::string(name) + " attention (" + std::to_string(biased) + " biased scores): " +
-               num(eb.rel()) + " (bound " + num(attention_bound) + ")");
+           std::string(name) + (far ? " far-field" : "") + " attention (" +
+               std::to_string(biased) + " biased scores): " + num(eb.rel()) + " (bound " +
+               num(attention_bound) + ")");
 }
 
 } // namespace
@@ -440,6 +467,10 @@ int main() {
         chunk.chunk = true;
         chunk.first = 600;
         for (int i = 0; i < 21; ++i) { chunk.positions.push_back(600 + i); }
+        RowsCase far_chunk;
+        far_chunk.chunk = true;
+        far_chunk.first = 1600;
+        for (int i = 0; i < 40; ++i) { far_chunk.positions.push_back(1600 + i); }
         RowsCase branches;
         branches.chunk  = true;
         branches.first  = 30;
@@ -457,6 +488,7 @@ int main() {
             case_run(name, key, value, verify, 4, key_bound, value_bound, attention_bound, rng);
             case_run(name, key, value, chunk, 1, key_bound, value_bound, attention_bound, rng);
             case_run(name, key, value, branches, 1, key_bound, value_bound, attention_bound, rng);
+            case_run(name, key, value, far_chunk, 1, key_bound, value_bound, attention_bound, rng, true);
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Inkling 2 KV planes\n";
         return failures == 0 ? 0 : 1;
