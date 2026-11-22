@@ -509,9 +509,11 @@ position of `--config` on the command line. A later layer overrides an earlier o
   layer is an error.
 - Two choices stay errors across layers: `--device` with `--devices` inside one layer, and in
   `ninfer-serve` a hybrid prefix cache option (`--device-snapshot-slots`, `--cache-taps-per-request`,
-  `--cache-tap-ladder`, `--cache-tap-min-gap`, `--prefix-cache-file`) together with an option that
-  selects the checkpoint catalog (`--use-original-prefix-caching`, `--no-prefix-reuse`, `--devices`
-  with several devices, `--graft`).
+  `--cache-tap-ladder`, `--cache-tap-min-gap`) together with an option that selects the checkpoint
+  catalog (`--use-original-prefix-caching`, `--no-prefix-reuse`, `--devices` with several devices,
+  `--graft`). `--prefix-cache-file` beside such an option is refused at startup, except by the
+  families that save their own context caches to it (Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and
+  Qwen3.8-Flash-Next).
 
 Every switch of every program also takes a `--no-` form, so the command line can turn off a switch
 that a file turns on. `ninfer-serve` records the merged options, with the API key redacted, as

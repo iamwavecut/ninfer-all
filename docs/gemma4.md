@@ -66,7 +66,7 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   top-k held at the sampler's 20 candidates.
 
 Not built for this family: DFlash and ngram copy drafts, pipeline stages over several GPUs, and of
-the context cache the shared paged KV pool, the disk tier and session slots. Several GPUs divide
+the context cache the shared paged KV pool. Several GPUs divide
 the routed experts of the MoE model instead (`--devices 0,1 --tensor-parallel`, experts on the
 devices; [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
@@ -323,6 +323,9 @@ keeps instead of prefilling those tokens again:
   the assistant. Requests with the same system prompt resume after it on any sequence, also when
   they arrive together, since a prompt that has not started prefilling looks for images again at
   its first chunk. A disposable request (a decision read) leaves no image of its end.
+- **Documents, files and slots.** A long last message also keeps a state inside it, where a later
+  prompt with the same document and another question resumes; images go to a disk tier, a prefix
+  cache file and session slot files ([Serving](serving.md#context-cache-of-the-other-families)).
 
 A sliding-window state cannot be cut back at will: the rings at a position hold the window before
 it, and each block's window reaches further back through the blocks below. A prompt therefore

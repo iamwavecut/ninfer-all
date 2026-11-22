@@ -102,8 +102,8 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
 Not built for this family: the `--kv-dtype` formats (the caches hold the release's FP8/FP4 codes), MTP, DFlash
 and n-gram copy drafts, DSpark drafts while several requests decode, rotation scaling
 (`--rope-yarn`, `--rope-scaling-factor`: the compressed blocks carry the release's own YaRN), video
-and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool, the
-disk tier and session slots. Several GPUs divide the routed experts instead (`--devices 0,1
+and the CPU vision tower, pipeline stages, and of the context cache the shared paged KV pool.
+Several GPUs divide the routed experts instead (`--devices 0,1
 --tensor-parallel` with host or disk experts: each device its own banks, cache and copies, no CPU
 share, prompts in [spans](#prompt-spans) as on one device; without `--tensor-split` the first
 device, which also holds the model, serves fewer experts, so that every device's misses take the
@@ -723,6 +723,10 @@ keeps instead of prefilling those tokens again:
   Flash-Next keeps the state inside its span instead; here a span keeps one state, the one its
   prefill tail and drafter taps are planned for (`state_at`), and a second one is not
   implemented.
+- **Documents, files and slots.** A long last message also keeps a state at a span's end inside
+  it, where a later prompt with the same document and another question resumes; a prompt shorter
+  than a span keeps none. Images go to a disk tier, a prefix cache file and session slot files
+  ([Serving](serving.md#context-cache-of-the-other-families)).
 
 A window state cannot be cut back, so a prompt resumes only where a state was kept, not at an
 arbitrary common prefix.

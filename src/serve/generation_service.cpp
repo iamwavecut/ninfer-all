@@ -415,10 +415,21 @@ GenerationService::GenerationService(
 
 void GenerationService::refuse_family_options() const {
     // Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Flash-Next keep context caches of their own,
-    // with neither the hybrid prefix cache nor session slots; Gemma 4, Flint and Inkling 2 cannot
-    // close their reasoning early. Those options would start and do nothing.
+    // with a prefix cache file and session slots but not the hybrid prefix cache; Gemma 4, Flint
+    // and Inkling 2 cannot close their reasoning early. Those options would start and do nothing.
     const std::string architecture = engine_->load_summary().architecture;
-    if (!options_.hybrid_cache_flag.empty() &&
+    const bool own_cache =
+        architecture == "Gemma4ForCausalLM" || architecture == "FlintForCausalLM" ||
+        architecture == "DeepseekV41ForCausalLM" || architecture == "Inkling2ForCausalLM" ||
+        architecture == "Qwen4ExpForCausalLM";
+    const bool own_cache_file = own_cache && options_.hybrid_cache_flag == "--prefix-cache-file";
+    if (!own_cache && !options_.catalog_cache_flag.empty()) {
+        throw std::invalid_argument(options_.hybrid_cache_flag +
+                                    " configures the hybrid prefix cache, and " +
+                                    options_.catalog_cache_flag +
+                                    " selects the checkpoint catalog");
+    }
+    if (!options_.hybrid_cache_flag.empty() && !own_cache_file &&
         engine_->options().context_cache.mode != ninfer::ContextCacheMode::Hybrid) {
         throw std::invalid_argument(options_.hybrid_cache_flag +
                                     " configures the hybrid prefix cache, which " + architecture +

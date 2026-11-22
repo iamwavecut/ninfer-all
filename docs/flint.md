@@ -69,8 +69,8 @@ and `rk4v4`, MTP, DFlash
 and n-gram copy drafts, rotation scaling (`--rope-yarn`, `--rope-scaling-factor`: the
 full-attention blocks have no rotation to scale), strict tool arguments and structured output beside
 tools (Flint's tool markup has no grammar here), images and video (Flint reads text only), pipeline
-stages, and of the context cache the shared paged KV pool, the disk tier and session slots, whose
-options the server refuses at startup ([Serving](serving.md#slots)). Several
+stages, and of the context cache the shared paged KV pool, whose options the server refuses at
+startup ([Serving](serving.md#context-cache-of-the-other-families)). Several
 GPUs divide the routed experts instead (`--devices 0,1 --tensor-parallel`, experts on the devices;
 [expert parallelism](maintainer/pipeline-stages.md#expert-parallelism-of-the-other-moe-families)).
 
@@ -193,6 +193,9 @@ keeps instead of prefilling those tokens again:
   boundary), and the state there goes to an image too when saving it and copying it back take less
   time than computing its tokens again (about 50 tokens on). A disposable request (a decision read)
   leaves no image of its end.
+- **Documents, files and slots.** A long last message also keeps a state inside it, where a later
+  prompt with the same document and another question resumes; images go to a disk tier, a prefix
+  cache file and session slot files ([Serving](serving.md#context-cache-of-the-other-families)).
 
 A sliding-window state cannot be cut back at will: the rings at a position hold the window before
 it, and each block's window reaches further back through the blocks below. A prompt therefore

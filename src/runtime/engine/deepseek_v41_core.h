@@ -26,9 +26,12 @@
 #include "ninfer/request.h"
 #include "ninfer/types_fwd.h"
 #include "runtime/contract/request.h"
+#include "runtime/engine/session_slot_record.h"
 
 #include <chrono>
 #include <cstdint>
+#include <string>
+#include <span>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -94,6 +97,14 @@ public:
     DeepSeekV41Core& operator=(const DeepSeekV41Core&) = delete;
 
     void stop() noexcept;
+
+    // Session slots (session_slots.h): slot i is sequence i. Each runs between the worker's steps.
+    [[nodiscard]] SessionSlotRecord save_slot(std::uint32_t slot,
+                                              const std::string& expected_digest);
+    [[nodiscard]] std::pair<std::uint32_t, std::string>
+    restore_slot(std::uint32_t slot, std::span<const std::uint8_t> record);
+    std::uint32_t erase_slot(std::uint32_t slot, const std::string& expected_digest);
+    [[nodiscard]] std::vector<SlotState> slot_states() const;
 
     Submission submit(models::qwen3_5::PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,

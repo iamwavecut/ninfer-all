@@ -594,7 +594,29 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                                 product::format_pretty_bytes(stage.expert_cache_bytes));
     }
 
-    if (cache.enabled) {
+    const std::string& architecture = service.load_summary().architecture;
+    const bool own_cache = architecture == "Gemma4ForCausalLM" ||
+                           architecture == "FlintForCausalLM" ||
+                           architecture == "DeepseekV41ForCausalLM" ||
+                           architecture == "Inkling2ForCausalLM" ||
+                           architecture == "Qwen4ExpForCausalLM";
+    if (cache.enabled && own_cache) {
+        // These families keep state images of their own (runtime/engine/context_image_store.h),
+        // not the checkpoint catalog's cells.
+        const std::string disk =
+            cache.disk_kv_path.empty()
+                ? std::string("off")
+                : cache.disk_kv_path.string() + " (" +
+                      product::format_pretty_bytes(cache.disk_kv_capacity_bytes != 0
+                                                       ? cache.disk_kv_capacity_bytes
+                                                       : (std::uint64_t(64) << 30)) +
+                      (cache.disk_kv_restore ? ", restores)" : ", write-only)");
+        const auto& file = cache.hybrid.persistent_file;
+        logger_->info("context cache | host images {} | disk tier {} | prefix cache file {} | "
+                      "slots {}",
+                      product::format_pretty_bytes(memory.host_kv_capacity_bytes), disk,
+                      file.empty() ? std::string("off") : file.string(), engine.max_concurrency);
+    } else if (cache.enabled) {
         // Report what was actually pinned, not what was requested: on Windows the host KV cache
         // is clamped against free VRAM at startup (program_impl.h), and can land at zero while
         // `cache.host_kv_capacity_bytes` still holds the pre-clamp --host-kv-mib target. The

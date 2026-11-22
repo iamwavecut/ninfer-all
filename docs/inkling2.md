@@ -97,8 +97,8 @@ tokenization, the chat template, output parsing and the serving protocols.
 
 Not built for this family: MTP, DFlash, n-gram copy drafts and their archive, `--draft-confidence`,
 rotation scaling (the attention has no rotation), thinking budgets, video, pipeline stages, and of
-the context cache the shared paged KV pool, the disk tier and session slots; the server refuses
-their options and `--default-thinking-budget` at startup ([Serving](serving.md#slots)). Of the
+the context cache the shared paged KV pool; the server refuses their options and
+`--default-thinking-budget` at startup ([Serving](serving.md#context-cache-of-the-other-families)). Of the
 `--kv-dtype` formats, MXFP8 (the default), `int8`, `rk8v4`, `rk4v4` and F16 (`bf16` or `fp16`) are
 built ([KV cache](#kv-cache)); `fp8`, `nvfp4`, `k8v4`, `rk4v4-e8`, `rk2v4-e8` and `bf16p` are not,
 for the reasons [Flint's KV cache](flint.md#kv-cache) lists. DSpark drafts for one request at a
@@ -199,7 +199,9 @@ state at the end of the prompt's shared prefixes (the leading system messages an
 declarations, a declared cache boundary), go to images in pinned host memory within
 `--host-cache-mib`. Every visit's state belongs to the image: its rings, its full-attention rows and
 its convolution histories. A prompt resumes only where a state was kept, not at an arbitrary common
-prefix.
+prefix. A long last message also keeps a state inside it, where a later prompt with the same
+document and another question resumes, and the images go to a disk tier, a prefix cache file and
+session slot files ([Serving](serving.md#context-cache-of-the-other-families)).
 
 ## KV cache
 

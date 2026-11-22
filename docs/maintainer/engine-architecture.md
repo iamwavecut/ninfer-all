@@ -59,6 +59,10 @@ Engine core（`runtime/engine/qwen4_exp_core`），共享 Qwen3.5 的 Frontend �
 循环 Transformer：24 个存储层按 48 次访问执行）是另外四个显式模型族：各自拥有 load、executor 与
 Engine core（`runtime/engine/gemma4_core`、`flint_core`、`deepseek_v41_core`、`inkling2_core`），
 以各自的方言共享 Qwen3.5 的 Frontend，只在一个 GPU 上运行。
+这五个 Engine core 的上下文缓存共用 `runtime/engine/context_image_store.h`：序列整体状态在 pinned
+host 内存中的 image、磁盘层、prefix cache 文件和长消息内的 checkpoint，executor 只提供
+`image_bytes`、`save_image`、`load_image`；会话 slot 的保存、恢复与清除在
+`runtime/engine/session_slots.h`，由 worker 在两步之间执行。
 
 V3 artifact 保存配置、物理对象、逻辑参数的 Binding、使用位置的 Use，以及 Frontend 资源。
 Converter 负责源映射、量化或保值导入、融合存储、packing 和 layout 转换；loader 根据实际绑定
@@ -686,6 +690,7 @@ checkpoint catalog。
 | Frontend 与模型状态布局 | `src/models/qwen3_5/frontend/`, `state/` |
 | Qwen3.8-Flash-Next 模型族与其 Engine core | `src/models/qwen4_exp/`, `src/runtime/engine/qwen4_exp_core.*` |
 | Gemma 4、Flint、DeepSeek-V4.1-Flash、Inkling 2 模型族与其 Engine core | `src/models/gemma4/`, `src/models/flint/`, `src/models/deepseek_v41/`, `src/models/inkling2/`, `src/runtime/engine/{gemma4,flint,deepseek_v41,inkling2}_core.*` |
+| 这五个模型族的上下文缓存与会话 slot | `src/runtime/engine/context_image_store.h`, `src/runtime/engine/session_slots.h` |
 | 每卡 route profile 与 calibration | `src/runtime/engine/device_profile.*`, `src/calibration/`, `src/ops/common/device_route.*` |
 | device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV, raw transfers | `src/core/` |
 | generic `.ninfer` framing, descriptors, binding primitives, materialization | `src/artifact/` |

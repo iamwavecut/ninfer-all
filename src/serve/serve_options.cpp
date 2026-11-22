@@ -487,7 +487,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --prefix-cache-file PATH      hybrid: restore the Host tier from PATH at\n"
            "                                startup when this binary wrote it for the same\n"
            "                                artifact and KV format, and save it there when\n"
-           "                                the server stops (Ctrl+C twice) (default off)\n"
+           "                                the server stops (Ctrl+C twice) (default off);\n"
+           "                                Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and\n"
+           "                                Flash-Next save their own context caches, also\n"
+           "                                beside the checkpoint catalog's options\n"
            "\n"
            "SPECULATIVE DECODING\n"
            "  --spec none|mtp|dflash|dflash2|dspark|dspine\n"
@@ -995,7 +998,9 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             if (options.context_cache.hybrid.persistent_file.empty()) {
                 throw std::invalid_argument("--prefix-cache-file must not be empty");
             }
-            hybrid_option_flag = "--prefix-cache-file";
+            // The families with an Engine core of their own save their cache to it too, so it
+            // names the hybrid cache only when no other hybrid setting does.
+            if (hybrid_option_flag == nullptr) { hybrid_option_flag = "--prefix-cache-file"; }
             continue;
         }
         if (arg == "--cache-tap-min-gap") {
@@ -1862,33 +1867,41 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         } else if (hybrid_option_flag != nullptr) {
             options.hybrid_cache_flag = hybrid_option_flag;
         }
-        std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
-        if (!file.empty()) {
-            if (host_cache_budget_explicit && !options.context_cache.host_cache_auto &&
-                options.context_cache.host_cache_budget_bytes == 0) {
-                throw product::OptionConflict(
-                    {"prefix-cache-file", "host-cache-mib"},
-                    "--prefix-cache-file saves the Host tier, which --host-cache-mib 0 removes");
-            }
-            // Resolved now, so the save at shutdown writes where startup read, and checked now,
-            // so an unusable location fails at launch rather than after a session of caching.
-            file = std::filesystem::absolute(file).lexically_normal();
-            std::error_code error;
-            if (std::filesystem::is_directory(file, error)) {
-                throw std::invalid_argument("--prefix-cache-file " + file.string() +
-                                            " is a directory; name a file in it");
-            }
-            if (!std::filesystem::is_directory(file.parent_path(), error)) {
-                throw std::invalid_argument("--prefix-cache-file " + file.string() +
-                                            ": the directory " + file.parent_path().string() +
-                                            " does not exist");
-            }
-        }
+    } else if (hybrid_option_flag != nullptr &&
+               std::string_view(hybrid_option_flag) == "--prefix-cache-file") {
+        // The families with an Engine core of their own also save their context caches to it,
+        // which the catalog's options configure; the server refuses it for the other families
+        // once it knows the artifact's.
+        options.hybrid_cache_flag  = hybrid_option_flag;
+        options.catalog_cache_flag =
+            original_cache_selected ? "--use-original-prefix-caching" : catalog_option;
     } else if (hybrid_option_flag != nullptr) {
         throw std::invalid_argument(
             std::string(hybrid_option_flag) + " configures the hybrid prefix cache, and " +
             (original_cache_selected ? "--use-original-prefix-caching" : catalog_option) +
             " selects the checkpoint catalog");
+    }
+    if (std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
+        !file.empty()) {
+        if (host_cache_budget_explicit && !options.context_cache.host_cache_auto &&
+            options.context_cache.host_cache_budget_bytes == 0) {
+            throw product::OptionConflict(
+                {"prefix-cache-file", "host-cache-mib"},
+                "--prefix-cache-file saves the Host tier, which --host-cache-mib 0 removes");
+        }
+        // Resolved now, so the save at shutdown writes where startup read, and checked now, so
+        // an unusable location fails at launch rather than after a session of caching.
+        file = std::filesystem::absolute(file).lexically_normal();
+        std::error_code error;
+        if (std::filesystem::is_directory(file, error)) {
+            throw std::invalid_argument("--prefix-cache-file " + file.string() +
+                                        " is a directory; name a file in it");
+        }
+        if (!std::filesystem::is_directory(file.parent_path(), error)) {
+            throw std::invalid_argument("--prefix-cache-file " + file.string() +
+                                        ": the directory " + file.parent_path().string() +
+                                        " does not exist");
+        }
     }
     if (kv_headroom_mib.has_value()) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {

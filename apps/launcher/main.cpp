@@ -19,6 +19,8 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -285,6 +287,19 @@ ninfer::launcher::Backend configuration(const fs::path& root, int major, bool pr
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifndef _WIN32
+    // ninfer-serve takes SIGINT and SIGTERM on a thread of its own (apps/serve/main.cpp), which
+    // sees them only while every other thread blocks them; the driver's threads start at cuInit
+    // below, before the backend can block them, and would take the default action (the process
+    // ends at once, without the stop that saves the prefix cache). Threads inherit the mask.
+    if (std::string_view(NINFER_COMMAND) == "ninfer-serve") {
+        sigset_t signals;
+        sigemptyset(&signals);
+        sigaddset(&signals, SIGINT);
+        sigaddset(&signals, SIGTERM);
+        pthread_sigmask(SIG_BLOCK, &signals, nullptr);
+    }
+#endif
     try {
         auto options = parse(argc, argv);
         const auto root = executable().parent_path();

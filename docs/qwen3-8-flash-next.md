@@ -755,7 +755,9 @@ A request that does not draft (a decision read) runs its prompt without the MTP 
 sequence's snapshots and images carry no MTP state and serve only requests that do not draft.
 With `--disk-kv-restore` a
 prompt also resumes from an image on
-disk, which a later run finds there too.
+disk, which a later run finds there too. A long last message also keeps an image inside it, where a
+later prompt with the same document and another question resumes, and the images also go to a
+prefix cache file and session slot files ([Serving](serving.md#context-cache-of-the-other-families)).
 
 Structured output (`--structured-output` for the server, `--json`/`--json-schema` for the CLI) works
 as for Gemma 4 ([Structured output](gemma4.md#structured-output)): the grammar's token mask applies

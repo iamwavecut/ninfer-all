@@ -101,8 +101,13 @@ struct ServeOptions {
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;
     // The option that named the hybrid prefix cache (--use-alt-prefix-caching or one of its
-    // settings); empty when it is the default. A family without the hybrid cache refuses it.
+    // settings, --prefix-cache-file only when no other does); empty when it is the default. A
+    // family without the hybrid cache refuses it, except --prefix-cache-file in the families with
+    // an Engine core of their own, which save their own cache to it.
     std::string hybrid_cache_flag;
+    // The option that selected the checkpoint catalog beside --prefix-cache-file, which only the
+    // families with an Engine core of their own then accept.
+    std::string catalog_cache_flag;
     bool enable_vision      = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
     std::uint32_t vision_max_merged_tokens = 16384;

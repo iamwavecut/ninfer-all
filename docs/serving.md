@@ -848,9 +848,19 @@ with a checksum that restore verifies before it allocates anything. Slots belong
 checkpoint catalog: `--slot-save-path` selects it in place of the default hybrid prefix cache, and
 the slot options are refused with `--use-alt-prefix-caching` and `--no-prefix-reuse`. They are
 independent of the disk tier
-(`--disk-kv-path`), which spills evicted conversations on its own, keyed by prompt digest. Gemma 4,
-Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next keep context caches with no slots and refuse
-`--slot-save-path` and `--auto-save-evicted` at startup.
+(`--disk-kv-path`), which spills evicted conversations on its own, keyed by prompt digest.
+
+On Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next a slot is one of the Engine's
+`--max-concurrency` sequences, and its session what the sequence holds once no request runs on it.
+A save copies the session into the [context cache](#context-cache-of-the-other-families) and
+writes its images to the file: its checkpoint (where a next turn that renders the last reply again
+resumes) and its end. A restore reads them back into the cache and the end into the sequence, so
+the next turn resumes as it would have on the live server. A file restores only on a server of the
+same artifact, KV format and drafter, and ends with a checksum that restore verifies first; the
+host cache (`--host-cache-mib`) must hold its images. These families refuse `--auto-save-evicted`
+at startup. Inkling 2 on an RTX 3090, a 4,073-token session: two images in 587 MiB, saved in 1.8 s
+and restored in 0.76 s; after a restart and a restore, the next turn reused the same 4,026 tokens
+as on the live server, with the same tokens and log probabilities.
 
 Errors: `409 slot_busy` while the slot or any context-cache transaction is in use (retry),
 `409 slot_session_mismatch` for a failed `if_digest`, `400 invalid_slot`, `invalid_action`,
@@ -2531,13 +2541,13 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--cuda-graph-allowance-mib N` | total CUDA Graph driver-state allowance in MiB, subtracted from the KV sizing budget | computed |
 | `--wddm-evictable-budget` | Windows builds: budget the KV cache against dedicated memory less the weights and a 512 MiB desktop floor, committing the device arenas at startup; another process taking memory can then slow generation | off |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--use-alt-prefix-caching` | the hybrid prefix cache ([spec](maintainer/hybrid-prefix-cache-spec.md)), the default: content-addressed 64-token KV blocks shared across requests plus sparse state snapshots. It configures itself: `--kv-capacity` defaults to `auto` (free VRAM becomes Device block cache) and `--host-cache-mib` sizes the one pinned Host pool that blocks and snapshots share. Without this flag or `--use-original-prefix-caching`, an option only the checkpoint catalog serves selects the catalog instead: its capacities (`--device-state-slots`, `--host-state-slots`, `--host-kv-mib`, `--max-private-continuations`, `--max-shared-prefixes`, `--max-long-anchors-per-continuation`), its anchors and policies (`--auto-long-anchors`, `--long-anchor-spacing`, `--branch-anchors`, `--no-endpoint-anchors`, `--progress-anchor-tokens`, `--auto-prefix-grid`, `--derive-session-keys`, `--context-cache-policy`, `--release-diverged-checkpoints`, `--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`), the disk tier, slot files, several `--devices`, `--no-prefix-reuse` or a `--graft`. Named, the flag keeps the hybrid cache over several `--devices` (pipeline stages or `--tensor-parallel`) and rejects the other options instead. Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next keep their own context caches, which the catalog options configure; they refuse this flag, the hybrid options below (`--prefix-cache-file` among them) and `--graft` at startup. Requests that share a new prefix with one still prefilling wait for its snapshot instead of prefilling the prefix again, which needs `--concurrent-prefill` to admit them meanwhile. On an RTX 3090 with Qwen3.8-27B (`rk4v4`, 131K context) the agentic replay of `bench/agentic_ab` (seed 42, half scale) ran with an average time to first token of 55.6 s instead of 97.9 s on the catalog, served 84 % of prompt tokens from the cache instead of 46 %, and finished in 43.6 instead of 60.2 minutes; its one history-edit turn took 389 s instead of 183 s, and decode ran 1.4 % slower | default |
+| `--use-alt-prefix-caching` | the hybrid prefix cache ([spec](maintainer/hybrid-prefix-cache-spec.md)), the default: content-addressed 64-token KV blocks shared across requests plus sparse state snapshots. It configures itself: `--kv-capacity` defaults to `auto` (free VRAM becomes Device block cache) and `--host-cache-mib` sizes the one pinned Host pool that blocks and snapshots share. Without this flag or `--use-original-prefix-caching`, an option only the checkpoint catalog serves selects the catalog instead: its capacities (`--device-state-slots`, `--host-state-slots`, `--host-kv-mib`, `--max-private-continuations`, `--max-shared-prefixes`, `--max-long-anchors-per-continuation`), its anchors and policies (`--auto-long-anchors`, `--long-anchor-spacing`, `--branch-anchors`, `--no-endpoint-anchors`, `--progress-anchor-tokens`, `--auto-prefix-grid`, `--derive-session-keys`, `--context-cache-policy`, `--release-diverged-checkpoints`, `--thorough-admission-search`, `--recency-eviction`, `--value-aware-demote`), the disk tier, slot files, several `--devices`, `--no-prefix-reuse` or a `--graft`. Named, the flag keeps the hybrid cache over several `--devices` (pipeline stages or `--tensor-parallel`) and rejects the other options instead. Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next keep their own context caches, which the catalog options configure; they refuse this flag, the hybrid options below other than `--prefix-cache-file`, and `--graft` at startup. Requests that share a new prefix with one still prefilling wait for its snapshot instead of prefilling the prefix again, which needs `--concurrent-prefill` to admit them meanwhile. On an RTX 3090 with Qwen3.8-27B (`rk4v4`, 131K context) the agentic replay of `bench/agentic_ab` (seed 42, half scale) ran with an average time to first token of 55.6 s instead of 97.9 s on the catalog, served 84 % of prompt tokens from the cache instead of 46 %, and finished in 43.6 instead of 60.2 minutes; its one history-edit turn took 389 s instead of 183 s, and decode ran 1.4 % slower | default |
 | `--use-original-prefix-caching` | select the checkpoint catalog in place of the hybrid prefix cache. Rejected together with `--use-alt-prefix-caching` and with the hybrid options below | off |
 | `--device-snapshot-slots N` | hybrid: Device state snapshot slots (`1..64`). Left at its default, the count drops, to one at the least, when the `--kv-capacity` asked for (or under `auto` one `--max-context` window beside the headroom) would not fit beside it, and startup logs `device snapshot slots 3 -> 1 to fit the requested KV capacity`; a given count is kept, and a capacity that does not fit beside it fails naming this option and the size of one slot | `max-concurrency + 2`, fewer where the KV capacity needs their memory |
 | `--cache-taps-per-request N` | hybrid: new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
 | `--cache-tap-ladder N` | hybrid: history-snapshot ladder base G; flexible taps at `prompt − G·2^k` | `max(4096, 2 * prefill-chunk)` |
 | `--cache-tap-min-gap N` | hybrid: minimum tokens between ladder snapshots | `max(1024, prefill-chunk)` |
-| `--prefix-cache-file PATH` | hybrid: at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-cache-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `ninfer-serve` binary is ignored and replaced at shutdown. The startup log reports what was restored. Saving writes up to `--host-cache-mib` of data. | off: nothing is saved or restored |
+| `--prefix-cache-file PATH` | hybrid: at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-cache-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `ninfer-serve` binary is ignored and replaced at shutdown. The startup log reports what was restored. Saving writes up to `--host-cache-mib` of data. Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next save and restore the images of their [context cache](#context-cache-of-the-other-families) instead, also beside the checkpoint catalog's options (`--host-kv-mib`, `--disk-kv-path`, `--slot-save-path`); the other families refuse it beside them at startup. | off: nothing is saved or restored |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
@@ -2899,9 +2909,8 @@ each [DSpine](maintainer/dspine.md) drafter beside it) gets its own subdirectory
 stride and YaRN setting its own files, so one model or profile never restores another's KV. `--disk-kv-gib` (default 64) is the total budget, split
 65/25/10 across Main KV, Backend KV and StateImages (85/15 without a backend); the least recently
 used page goes first. The files are sparse until written, and a torn page fails its CRC and reads as
-a miss. Of the families with context caches of their own, only Qwen3.8-Flash-Next keeps a disk
-tier ([Qwen3.8-Flash-Next](qwen3-8-flash-next.md)); Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2
-refuse `--disk-kv-path` at startup.
+a miss. Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next keep a disk tier of their
+own ([below](#context-cache-of-the-other-families)).
 
 With `--disk-kv-restore`, a request with no resident prefix looks for the longest frontier `E` on
 disk whose StateImage and KV chain match its own prompt, is admitted as reusing `E`, and has `[0, E)`
@@ -2919,6 +2928,56 @@ through a DirectStorage queue, every page of a staging batch in flight at once, 
 from the mapped files. Each page is still checked against its CRC, and a batch that fails or does
 not complete within 10 seconds falls back to the mapped reads. This path has been checked to compile
 against Windows headers but has not been run.
+
+### Context cache of the other families
+
+Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next keep a context cache of their own:
+images of a sequence's whole state in pinned host memory, within `--host-kv-mib` (or
+`--host-cache-mib`, 8 GiB by default). A sequence's state goes to an image before another request
+takes the sequence, and so does the state where the frontend marks a prefix that requests share,
+when copying it back costs less than computing it again; each family's guide says what an image
+holds ([Gemma 4](gemma4.md#prefix-reuse), [Flint](flint.md#prefix-reuse),
+[DeepSeek-V4.1](deepseek-v41.md#prefix-reuse), [Inkling 2](inkling2.md#prefix-reuse),
+[Qwen3.8-Flash-Next](qwen3-8-flash-next.md#sequences-kv-and-the-context-cache)). A prompt on any
+sequence resumes from the longest image it starts with. Beyond that:
+
+- **A document, then another question.** A prompt whose last message holds at least 768 tokens
+  also keeps an image inside it, at the last multiple of 256 tokens at least 512 tokens before the
+  message ends; with a shorter last message after one that long, at the boundary between them;
+  never inside an image or video, and none within 64 tokens of another state the prompt keeps. A
+  later prompt with the same document and a different question of up to 512 tokens resumes there,
+  in the same message or the next. Inkling 2 on an RTX 3090, a record table and a question in one
+  5,130-token user message: a different question reused 4,608 tokens, and its prompt took about
+  480 ms instead of 2,565 ms. With experts in host memory or the artifact's files each prompt step
+  copies or reads the experts it routes to, so a checkpoint between two step ends would cost every
+  such prompt one more pass of them; the checkpoint then moves down to the end of a prompt step
+  (Gemma 4, Flint and Inkling 2: every prompt chunk, 2,048 tokens by default, and at the prompt's
+  other kept states; DeepSeek-V4.1: every span, 16,384 tokens with host experts on an RTX 3090),
+  and a prompt with no such end in reach keeps none. On DeepSeek-V4.1 with host experts, a
+  checkpoint inside the span had made a 4,808-token prompt take 7.4 s instead of 5.2 s, and a
+  different question then 2.0 s instead of 4.6 s. Qwen3.8-Flash-Next keeps the state inside its
+  span and needs no move. The prompt that keeps a checkpoint pays for it: Inkling 2's first
+  question above took 2,597 ms instead of 2,472 ms without one (its last chunk runs in two steps
+  and the image is copied), and on DeepSeek-V4.1 a 20,459-token prompt with its checkpoint at
+  16,384 took 17.0 s instead of 14.9 s, since the state kept there makes blocks 21 to 39 run the
+  two chunks before it ([the prefill tail](deepseek-v41.md#the-prefill-tail)); a different question
+  then took 4.6 s instead of 13.7 s.
+- **Disk tier.** With `--disk-kv-path DIR` the least recently used images go to files, one each,
+  in a directory per artifact, KV format and drafter beneath `DIR`, within `--disk-kv-gib`;
+  without it they are dropped. A clean stop writes the images still only in host memory there too.
+  With `--disk-kv-restore` a prompt also resumes from a file, also one a previous run left; without
+  it the tier only writes. Inkling 2 with a 400 MiB host budget: the
+  different question read its 320 MiB image back from disk, and its prompt took about 690 ms.
+- **Prefix cache file.** With `--prefix-cache-file PATH` the server writes every image to `PATH` at
+  a clean stop, the most recently used first, and reads them back at startup while the host budget
+  holds them; a file another build wrote is not read. Inkling 2 after the probe above: 29 images in
+  8.46 GB.
+- **Session slots.** `POST /slots/{id}` saves and restores a sequence's session through the same
+  images ([Slots](#slots)).
+
+A prompt resumed from an image read back from the disk tier, the prefix cache file or a slot file
+gets the same greedy tokens and log probabilities as one resumed from the image the live server
+kept (Inkling 2, four questions after a restart, each way).
 
 ## Execution behavior
 
