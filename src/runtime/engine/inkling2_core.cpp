@@ -566,7 +566,7 @@ struct Inkling2Core::Impl {
         const std::uint32_t* mask                = nullptr; // a grammar's next-token mask
         // The typed readout's token ids, on a request's first generated token only.
         const std::vector<TokenId>* readout = nullptr;
-        // Single token id suppressed in logits (e.g. <|content_thinking|> after forced conclusion).
+        // A token the row cannot take (<|content_thinking|> once an early close was applied).
         std::optional<TokenId> ban_token;
     };
 
@@ -635,7 +635,7 @@ struct Inkling2Core::Impl {
     std::uint32_t decode_rounds_per_prefill = 1;
 
     DeviceBuffer sample_config, sample_position, sample_out, token_counts, score_targets, score_out;
-    DeviceBuffer bf16_neg_mask; // 2-byte device constant 0xC600 (-8192.0f in BF16) for ban_token
+    DeviceBuffer bf16_neg_mask; // BF16 -8192 (0xC600), the logit of a banned token (ban)
     // A row's logits kept while its grammar mask is late (one per sequence), and those of the rows
     // sampled together afterwards, side by side.
     DeviceBuffer saved_logits, deferred_logits;
@@ -1452,6 +1452,20 @@ struct Inkling2Core::Impl {
         if (streaming) { r.cv.notify_all(); }
     }
 
+    // Masks `token` in `count` logit columns from `column` on: -8192 (BF16 0xC600) leaves it no
+    // probability without the non-finite value the samplers refuse (an Inkling 2 response that a
+    // reached thinking budget or the loop guard closed opens no thinking block again).
+    void ban(const Tensor& logits, std::size_t column, std::size_t count,
+             std::optional<TokenId> token, cudaStream_t stream) const {
+        if (!token || *token < 0 || static_cast<std::uint32_t>(*token) >= domain) { return; }
+        for (std::size_t c = column; c < column + count; ++c) {
+            auto* at = static_cast<std::uint16_t*>(logits.data) +
+                       c * static_cast<std::size_t>(logits.ne[0]) + static_cast<std::size_t>(*token);
+            CUDA_CHECK(cudaMemcpyAsync(at, bf16_neg_mask.p, sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+
     void sample(std::span<const SampleRow> rows, std::int32_t purpose, std::span<TokenId> out,
                 std::span<runtime::RawTokenLogprob> logprobs, const Tensor* source = nullptr) {
         const cudaStream_t stream = instance.executor->head_stream();
@@ -1500,19 +1514,7 @@ struct Inkling2Core::Impl {
         const Tensor logical(sample_position.p, DType::I32, {width});
         const Tensor logits =
             source != nullptr ? *source : instance.executor->logits(static_cast<std::uint32_t>(n));
-        // Suppress a banned token (e.g. <|content_thinking|> after early-close conclusion) with a
-        // finite large negative BF16 value (-8192.0f = 0xC600) so exp(x - max) == 0 without
-        // triggering non-finite numerical fault guards.
-        for (std::size_t b = 0; b < n; ++b) {
-            if (rows[b].ban_token && *rows[b].ban_token >= 0 &&
-                static_cast<std::uint32_t>(*rows[b].ban_token) < domain) {
-                auto* dst = static_cast<std::uint16_t*>(logits.data) +
-                            b * static_cast<std::size_t>(logits.ne[0]) +
-                            static_cast<std::size_t>(*rows[b].ban_token);
-                CUDA_CHECK(cudaMemcpyAsync(dst, bf16_neg_mask.p, sizeof(std::uint16_t),
-                                           cudaMemcpyDeviceToDevice, stream));
-            }
-        }
+        for (std::size_t b = 0; b < n; ++b) { ban(logits, b, 1, rows[b].ban_token, stream); }
         const auto* device_configs = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const bool gather = std::any_of(rows.begin(), rows.end(),
                                         [](const SampleRow& row) { return row.logprobs; });
@@ -2128,7 +2130,6 @@ struct Inkling2Core::Impl {
         // A structured row speculates while its masks are cheap enough for the round to fill its
         // columns during the verification; otherwise it decodes plainly, a mask ahead.
         return drafts > 0 && (!r.constrained || r.mask_cost.speculates()) && r.feed.size() == 1 &&
-               !r.output.banned_token().has_value() &&
                r.position + drafts + 1 <= max_context &&
                r.output.model_token_budget_remaining(r.budget->remaining()) > 1 &&
                !(r.options.execution.post_thinking_sampling && !r.post_thinking);
@@ -2553,6 +2554,9 @@ struct Inkling2Core::Impl {
                                    stream));
         const auto rows_n         = static_cast<std::int32_t>(b);
         const Tensor logits       = executor.logits(static_cast<std::uint32_t>(verified_columns));
+        for (std::size_t j = 0; j < b; ++j) {
+            ban(logits, std::size_t(starts[j]), widths[j], rows[j].ban_token, stream);
+        }
         const auto* device_config = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), rows_n});
         // The tokens' logprob records, from the distributions their columns are drawn from,
