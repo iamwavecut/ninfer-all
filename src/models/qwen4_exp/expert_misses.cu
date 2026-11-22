@@ -55,6 +55,7 @@ constexpr std::uint64_t kMissWindowBytes = 64ULL << 20;
 constexpr int kRanges          = int(std::tuple_size_v<ExpertCache::Ranges>);
 
 constexpr std::int64_t kKeepAliveNs = std::chrono::nanoseconds(kMissKeepAlive).count();
+constexpr std::int64_t kCpuSpinNs   = std::chrono::nanoseconds(std::chrono::milliseconds(500)).count();
 // How often a sleeping service looks for a request: a replayed layer posts one from the device,
 // and no host call wakes the service for it.
 constexpr std::chrono::milliseconds kAsleepPoll{10};
@@ -420,6 +421,10 @@ struct ExpertMisses::Impl {
     mutable std::mutex stats_mutex;
     MissStats counters;
     std::atomic<std::int64_t> deadline{0};
+    // The CPU workers spin until cpu_until (steady ns), kCpuSpinNs after the last call whose
+    // misses they computed; calls with none (every expert cached, no CPU share) leave them
+    // asleep, and a call that has some wakes them.
+    std::atomic<std::int64_t> cpu_until{0};
     std::atomic<bool> stopping{false};
     std::mutex wake_mutex;
     std::condition_variable wake;
@@ -1264,6 +1269,7 @@ struct ExpertMisses::Impl {
         std::uint64_t cpu_pairs = 0;
         double cpu_work_done    = 0;
         if (cpu_count > 0) {
+            cpu_until.store(now_ns() + kCpuSpinNs, std::memory_order_relaxed);
             if (disk) { issue(); }
             cpu_experts.resize(cpu_count);
             for (std::size_t i = 0; i < cpu_count; ++i) {
@@ -1342,11 +1348,16 @@ struct ExpertMisses::Impl {
     }
 
     void serve() {
-        bool awake = false;
+        bool spinning = false;
         while (!stopping.load(std::memory_order_acquire)) {
-            if (!any_requested() && now_ns() > deadline.load(std::memory_order_acquire)) {
-                if (awake && pool) { pool->spin(false); }
-                awake = false;
+            const std::int64_t now = now_ns();
+            const bool asleep = !any_requested() && now > deadline.load(std::memory_order_acquire);
+            const bool spin   = !asleep && now < cpu_until.load(std::memory_order_relaxed);
+            if (pool && spinning != spin) {
+                spinning = spin;
+                pool->spin(spin);
+            }
+            if (asleep) {
                 // Asleep, the service still looks at the doorbells every kAsleepPoll: the device
                 // may reach a replayed layer long after its pass's keep_alive().
                 std::unique_lock lock(wake_mutex);
@@ -1356,8 +1367,6 @@ struct ExpertMisses::Impl {
                 });
                 continue;
             }
-            if (!awake && pool) { pool->spin(true); }
-            awake = true;
             bool worked = false;
             for (auto& rank : ranks) {
                 if (!rank.used) { continue; }
@@ -1617,6 +1626,7 @@ struct ExpertMisses::Impl {
         };
         std::int32_t cpu_pairs = 0;
         if (cpu_count > 0) {
+            cpu_until.store(now_ns() + kCpuSpinNs, std::memory_order_relaxed);
             cpu_experts.resize(cpu_count);
             double work = 0;
             for (std::size_t i = 0; i < cpu_count; ++i) {
