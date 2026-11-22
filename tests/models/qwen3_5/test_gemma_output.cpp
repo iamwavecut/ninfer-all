@@ -4,12 +4,28 @@
 // them stays content, and an unreadable or unterminated call returns to content. A forced call is
 // already open in the prompt (`<|tool_call>call:NAME{`): the decoder starts inside it, a turn that
 // ends on the closed arguments completes it, and a failed one returns only the model's own bytes.
+//
+// Thinking control: a thinking budget counts the tokens of the thought channel the model opens,
+// stops a round at the budget's last token, closes the channel with the guidance and <channel|>,
+// and bans <|channel> for the rest of the response.
 
+#include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/gemma_output.h"
+#include "models/qwen3_5/frontend/output_session.h"
+#include "models/qwen3_5/frontend/resources.h"
+#include "models/qwen3_5/frontend/tokenizer.h"
+#include "models/registry.h"
 
 #include <nlohmann/json.hpp>
 
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <exception>
 #include <iostream>
+#include <limits>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -44,6 +60,127 @@ GemmaToolCallDecoder::Terminal run_bytewise(const std::string& text, std::string
     std::vector<std::string> pieces;
     for (const char byte : text) { pieces.emplace_back(1, byte); }
     return run(pieces, streamed, forced_tool_name);
+}
+
+// Gemma's channel, call and turn markers as special tokens after the 256 bytes, and a template
+// that renders the turns between them.
+constexpr std::array<std::string_view, 8> kMarkers = {
+    "<bos>", "<eos>", "<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|\"|>", "<turn|>"};
+constexpr int kEosId = 257, kChannelOpenId = 258, kChannelCloseId = 259;
+constexpr std::string_view kTemplate =
+    "{{ bos_token }}{% for m in messages %}<|turn>{{ m.role }}\n{{ m.content }}<turn|>\n"
+    "{% endfor %}{% if add_generation_prompt %}<|turn>model\n{% endif %}";
+
+ninfer::models::qwen3_5::Frontend gemma_frontend() {
+    namespace fi        = ninfer::models::qwen3_5::frontend;
+    using Json          = nlohmann::json;
+    static const auto files = [] {
+        // Byte-fallback pieces <0x00>..<0xFF> as ids 0..255, as Gemma's vocabulary carries them.
+        Json vocab = Json::object();
+        for (int byte = 0; byte < 256; ++byte) {
+            char name[8];
+            std::snprintf(name, sizeof(name), "<0x%02X>", byte);
+            vocab[name] = byte;
+        }
+        Json added   = Json::array();
+        Json decoder = Json::object();
+        int id       = 256;
+        for (const std::string_view marker : kMarkers) {
+            const Json entry = {{"content", std::string(marker)}, {"single_word", false},
+                                {"lstrip", false},                {"rstrip", false},
+                                {"normalized", false},            {"special", true}};
+            Json token  = entry;
+            token["id"] = id;
+            added.push_back(token);
+            decoder[std::to_string(id)] = entry;
+            ++id;
+        }
+        const Json tokenizer =
+            Json{{"normalizer",
+                  {{"type", "Replace"}, {"pattern", {{"String", " "}}}, {"content", "\xe2\x96\x81"}}},
+                 {"pre_tokenizer", nullptr},
+                 {"model",
+                  {{"type", "BPE"},
+                   {"byte_fallback", true},
+                   {"vocab", vocab},
+                   {"merges", Json::array()}}},
+                 {"added_tokens", added}};
+        const Json config = {{"added_tokens_decoder", decoder},
+                             {"bos_token", "<bos>"},
+                             {"eos_token", "<eos>"}};
+        return std::array<std::string, 3>{tokenizer.dump(), config.dump(),
+                                          Json{{"eos_token_id", kEosId}}.dump()};
+    }();
+    static const std::string chat(kTemplate);
+    ninfer::models::qwen3_5::FrontendResources resources{.tokenizer_json         = files[0],
+                                                         .tokenizer_config_json  = files[1],
+                                                         .chat_template_jinja    = chat,
+                                                         .generation_config_json = files[2]};
+    resources.tokenizer = std::make_shared<const fi::Tokenizer>(
+        fi::TokenizerResources{files[0], files[1], files[2]});
+    resources.public_token_count = static_cast<std::uint32_t>(resources.tokenizer->vocab_size());
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.architecture   = ninfer::models::Architecture::Gemma4;
+    options.vision_enabled = false;
+    options.max_context    = std::numeric_limits<std::uint32_t>::max();
+    return ninfer::models::qwen3_5::make_frontend(resources, options);
+}
+
+std::vector<ninfer::TokenId> tokens_of(std::initializer_list<ninfer::TokenId> markers,
+                                       std::string_view text = {}) {
+    std::vector<ninfer::TokenId> out(markers);
+    for (const char byte : text) { out.push_back(static_cast<unsigned char>(byte)); }
+    return out;
+}
+
+void test_thinking_control() {
+    const auto frontend = gemma_frontend();
+    ninfer::PromptInput input;
+    input.messages.push_back(
+        {.role  = ninfer::ChatRole::User,
+         .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "Hi"}}});
+    input.options.continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
+    const auto prompt = frontend.prepare(std::move(input));
+    expect(frontend.thinking_control_token_count() > 1, "Gemma has an early-close control span");
+    auto session = frontend.make_output_session(
+        prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+        ninfer::ThinkingControlOptions{.budget = 3});
+    std::string reasoning, content;
+    const auto take = [&](const auto& deltas) {
+        for (const ninfer::OutputDelta& delta : deltas) {
+            (delta.channel == ninfer::OutputChannel::Reasoning ? reasoning : content) += delta.text;
+        }
+    };
+    // The channel's name and newline are its header, not reasoning.
+    const auto open     = tokens_of({kChannelOpenId}, "thought\nabcdef");
+    const auto decision = session.preview_model(open, 256, ninfer::FinishReason::OutputLimit);
+    take(session.commit_preview());
+    // <|channel>, the 8 header bytes and 3 thinking tokens.
+    expect(decision.accepted_tokens == 12 && !decision.finished() &&
+               decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+           "the budget stops the round at its third thinking token, accepted " +
+               std::to_string(decision.accepted_tokens));
+    const auto pending = session.pending_control_tokens();
+    expect(!pending.empty() && pending.back() == kChannelCloseId,
+           "the control span ends with <channel|>");
+    if (pending.empty()) { return; }
+    const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+    (void)session.preview_control(control, 245);
+    take(session.commit_preview());
+    const auto stats = session.thinking_stats();
+    expect(stats.applied && stats.model_thinking_tokens == 3 &&
+               session.banned_token() == std::optional<ninfer::TokenId>(kChannelOpenId),
+           "the control closes the channel, counts only the model's tokens and bans <|channel>");
+    const auto answer = tokens_of({}, "OK");
+    (void)session.preview_model(answer, 200, ninfer::FinishReason::OutputLimit);
+    take(session.commit_preview());
+    const ninfer::TokenId eos = kEosId;
+    (void)session.preview_model(std::span(&eos, 1), 198, ninfer::FinishReason::OutputLimit);
+    take(session.commit_preview());
+    expect(reasoning.starts_with("abc") &&
+               reasoning.find("Considering the limited time") != std::string::npos &&
+               content == "OK",
+           "reasoning '" + reasoning + "', content '" + content + "'");
 }
 
 } // namespace
@@ -225,6 +362,12 @@ int main() {
         expect(second.tool_calls.size() == 1 && second.tool_calls[0].name == "b" &&
                    failed == "junk<tool_call|>",
                "failed forced region then a free call: '" + failed + "'");
+    }
+    try {
+        test_thinking_control();
+    } catch (const std::exception& error) {
+        std::cerr << "FAIL " << error.what() << '\n';
+        ++failures;
     }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " Gemma output\n";
     return failures == 0 ? 0 : 1;

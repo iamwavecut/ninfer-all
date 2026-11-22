@@ -415,8 +415,8 @@ GenerationService::GenerationService(
 
 void GenerationService::refuse_family_options() const {
     // Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Flash-Next keep context caches of their own,
-    // with a prefix cache file and session slots but not the hybrid prefix cache; Gemma 4, Flint
-    // and Inkling 2 cannot close their reasoning early. Those options would start and do nothing.
+    // with a prefix cache file and session slots but not the hybrid prefix cache. Those options
+    // would start and do nothing.
     const std::string architecture = engine_->load_summary().architecture;
     const bool own_cache =
         architecture == "Gemma4ForCausalLM" || architecture == "FlintForCausalLM" ||
@@ -438,11 +438,6 @@ void GenerationService::refuse_family_options() const {
     if (!options_.slot_save_path.empty() && engine_->slot_states().empty()) {
         throw std::invalid_argument("--slot-save-path saves session slots, which " + architecture +
                                     " artifacts do not have");
-    }
-    if (options_.default_thinking_budget &&
-        (architecture == "Gemma4ForCausalLM" || architecture == "FlintForCausalLM")) {
-        throw std::invalid_argument("--default-thinking-budget closes reasoning early, which " +
-                                    architecture + " artifacts cannot do");
     }
 }
 
@@ -775,11 +770,15 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             prompt = engine_->prepare(std::move(input), control);
         }
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
-        // Inkling 2 opens its thinking blocks itself, whatever the prompt ends with, so its chat
+        // Inkling 2 opens its thinking blocks itself, whatever the prompt ends with; Flint and
+        // Gemma 4 open their reasoning themselves while the template leaves thinking on. Their chat
         // requests keep their thinking budget.
+        const std::string architecture = engine_->load_summary().architecture;
         const bool model_opens_thinking =
             !request.raw_prompt &&
-            engine_->load_summary().architecture == "Inkling2ForCausalLM";
+            (architecture == "Inkling2ForCausalLM" ||
+             ((architecture == "FlintForCausalLM" || architecture == "Gemma4ForCausalLM") &&
+              semantics.enable_thinking != false));
         prepared.enable_thinking = prompt.summary().starts_in_reasoning || model_opens_thinking;
         if (model_opens_thinking && semantics.enable_thinking == false) {
             // `enable_thinking: false` or a forced call set the lowest effort, at which Inkling may

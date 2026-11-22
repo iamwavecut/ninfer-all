@@ -16,15 +16,27 @@
 // Tool calls: FlintToolCallDecoder pulls GLM-4.7 calls out of streamed content (markers split at
 // every byte), types their text values by the declared parameters, returns an unreadable or
 // unterminated call to content, and starts a forced call inside its opener.
+//
+// Thinking control: a thinking budget counts the tokens of the <think> block the model opens, stops
+// a round at the budget's last token (inside a round that opens the block too), closes the block
+// with the guidance and </think>, and bans <think> for the rest of the response.
 
 #include "models/qwen3_5/frontend/chat_template.h"
+#include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen3_5/frontend/output_session.h"
+#include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/frontend/flint_output.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/registry.h"
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstdint>
+#include <limits>
+#include <optional>
+#include <span>
 #include <fstream>
 #include <iostream>
 #include <set>
@@ -82,12 +94,8 @@ std::string byte_level_symbol(std::uint8_t byte) {
     return out;
 }
 
-// A byte vocabulary without merges behind Flint's pipeline: no normalizer and its pre-tokenizer.
-fi::Tokenizer byte_tokenizer() {
-    Json vocab = Json::object();
-    for (int byte = 0; byte < 256; ++byte) {
-        vocab[byte_level_symbol(static_cast<std::uint8_t>(byte))] = byte;
-    }
+// Flint's pre-tokenizer: its three splits, then ByteLevel.
+Json flint_pre_tokenizer() {
     const Json split = [] {
         Json splits = Json::array();
         for (const char* pattern :
@@ -107,9 +115,18 @@ fi::Tokenizer byte_tokenizer() {
                           {"use_regex", false}});
         return splits;
     }();
+    return {{"type", "Sequence"}, {"pretokenizers", split}};
+}
+
+// A byte vocabulary without merges behind Flint's pipeline: no normalizer and its pre-tokenizer.
+fi::Tokenizer byte_tokenizer() {
+    Json vocab = Json::object();
+    for (int byte = 0; byte < 256; ++byte) {
+        vocab[byte_level_symbol(static_cast<std::uint8_t>(byte))] = byte;
+    }
     const std::string tokenizer_json =
         Json{{"normalizer", nullptr},
-             {"pre_tokenizer", {{"type", "Sequence"}, {"pretokenizers", split}}},
+             {"pre_tokenizer", flint_pre_tokenizer()},
              {"decoder", {{"type", "ByteLevel"}}},
              {"model", {{"type", "BPE"}, {"vocab", vocab}, {"merges", Json::array()}}},
              {"added_tokens", Json::array()}}
@@ -324,6 +341,148 @@ void test_tool_calls() {
     }
 }
 
+// Flint's role and reasoning markers as special tokens after the 256 bytes.
+constexpr std::array<std::string_view, 9> kMarkers = {
+    "<|begin_of_text|>", "<|end_of_text|>", "<|system|>", "<|user|>",   "<|assistant|>",
+    "<|observation|>",   "<think>",         "</think>",   "<|developer|>"};
+constexpr int kEosId = 257, kThinkOpenId = 262, kThinkCloseId = 263;
+
+ninfer::models::qwen3_5::Frontend flint_frontend() {
+    static const std::string chat = read_fixture("chat_template.jinja");
+    static const auto files = [] {
+        Json vocab = Json::object();
+        for (int byte = 0; byte < 256; ++byte) {
+            vocab[byte_level_symbol(static_cast<std::uint8_t>(byte))] = byte;
+        }
+        Json added   = Json::array();
+        Json decoder = Json::object();
+        int id       = 256;
+        for (const std::string_view marker : kMarkers) {
+            const Json entry = {{"content", std::string(marker)}, {"single_word", false},
+                                {"lstrip", false},                {"rstrip", false},
+                                {"normalized", false},            {"special", true}};
+            Json token  = entry;
+            token["id"] = id;
+            added.push_back(token);
+            decoder[std::to_string(id)] = entry;
+            ++id;
+        }
+        const Json tokenizer =
+            Json{{"normalizer", nullptr},
+                 {"pre_tokenizer", flint_pre_tokenizer()},
+                 {"decoder", {{"type", "ByteLevel"}}},
+                 {"model", {{"type", "BPE"}, {"vocab", vocab}, {"merges", Json::array()}}},
+                 {"added_tokens", added}};
+        const Json config = {{"added_tokens_decoder", decoder},
+                             {"bos_token", "<|begin_of_text|>"},
+                             {"eos_token", "<|end_of_text|>"}};
+        return std::array<std::string, 3>{tokenizer.dump(), config.dump(),
+                                          Json{{"eos_token_id", kEosId}}.dump()};
+    }();
+    ninfer::models::qwen3_5::FrontendResources resources{.tokenizer_json         = files[0],
+                                                         .tokenizer_config_json  = files[1],
+                                                         .chat_template_jinja    = chat,
+                                                         .generation_config_json = files[2]};
+    resources.tokenizer = std::make_shared<const fi::Tokenizer>(
+        fi::TokenizerResources{files[0], files[1], files[2]});
+    resources.public_token_count = static_cast<std::uint32_t>(resources.tokenizer->vocab_size());
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.architecture   = ninfer::models::Architecture::Flint;
+    options.vision_enabled = false;
+    options.max_context    = std::numeric_limits<std::uint32_t>::max();
+    return ninfer::models::qwen3_5::make_frontend(resources, options);
+}
+
+std::vector<ninfer::TokenId> tokens_of(std::initializer_list<ninfer::TokenId> markers,
+                                       std::string_view text = {}) {
+    std::vector<ninfer::TokenId> out(markers);
+    for (const char byte : text) { out.push_back(static_cast<unsigned char>(byte)); }
+    return out;
+}
+
+void test_thinking_control() {
+    const auto frontend = flint_frontend();
+    ninfer::PromptInput input;
+    input.messages.push_back(
+        {.role  = ninfer::ChatRole::User,
+         .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "Hi"}}});
+    input.options.continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
+    const auto prompt = frontend.prepare(std::move(input));
+    expect(frontend.thinking_control_token_count() > 1, "Flint has an early-close control span");
+    {
+        auto session = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+            ninfer::ThinkingControlOptions{.budget = 4});
+        const auto open     = tokens_of({kThinkOpenId}, "abcdef");
+        const auto decision = session.preview_model(open, 256, ninfer::FinishReason::OutputLimit);
+        std::string reasoning, content;
+        const auto take = [&](const auto& deltas) {
+            for (const ninfer::OutputDelta& delta : deltas) {
+                (delta.channel == ninfer::OutputChannel::Reasoning ? reasoning : content) +=
+                    delta.text;
+            }
+        };
+        take(session.commit_preview());
+        expect(decision.accepted_tokens == 5 && !decision.finished() &&
+                   decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+               "the budget stops the round at its fourth thinking token");
+        const auto pending = session.pending_control_tokens();
+        expect(!pending.empty() && pending.back() == kThinkCloseId,
+               "the control span ends with </think>");
+        expect(session.model_token_budget_remaining(250) == 0,
+               "a pending control licenses no model token");
+        if (!pending.empty()) {
+            const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+            (void)session.preview_control(control, 251);
+            take(session.commit_preview());
+            const auto stats = session.thinking_stats();
+            expect(stats.applied && stats.model_thinking_tokens == 4 &&
+                       stats.injected_tokens == control.size() &&
+                       session.banned_token() == std::optional<ninfer::TokenId>(kThinkOpenId),
+                   "the control closes the block, counts only the model's tokens and bans <think>");
+            const auto answer = tokens_of({}, "OK");
+            (void)session.preview_model(answer, 200, ninfer::FinishReason::OutputLimit);
+            take(session.commit_preview());
+            const ninfer::TokenId eos = kEosId;
+            (void)session.preview_model(std::span(&eos, 1), 198, ninfer::FinishReason::OutputLimit);
+            take(session.commit_preview());
+            expect(reasoning.starts_with("abcd") &&
+                       reasoning.find("Considering the limited time") != std::string::npos &&
+                       reasoning.find("</think>") == std::string::npos && content == "OK",
+                   "reasoning '" + reasoning + "', content '" + content + "'");
+        }
+    }
+    {
+        // A round that opens the block, runs past the budget and closes it stops at the budget.
+        auto session = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+            ninfer::ThinkingControlOptions{.budget = 2});
+        const auto span     = tokens_of({}, "Hm");
+        auto rest           = tokens_of({kThinkOpenId}, "abcd");
+        rest.push_back(kThinkCloseId);
+        std::vector<ninfer::TokenId> round(span);
+        round.insert(round.end(), rest.begin(), rest.end());
+        const auto decision = session.preview_model(round, 256, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        expect(decision.accepted_tokens == 5 &&
+                   decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl &&
+                   session.thinking_stats().model_thinking_tokens == 2,
+               "the budget holds inside a round that opens the block");
+    }
+    {
+        // Without a budget the model's own close ends the reasoning and nothing is banned.
+        auto session = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+        auto round = tokens_of({kThinkOpenId}, "abc");
+        round.push_back(kThinkCloseId);
+        const auto decision = session.preview_model(round, 256, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        expect(decision.continuation == ninfer::runtime::ContinuationAction::Decode &&
+                   !session.banned_token() && session.thinking_stats().model_thinking_tokens == 3,
+               "an unbudgeted block counts its tokens and bans nothing");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -332,6 +491,7 @@ int main() {
         test_run_reuse();
         test_chat_template();
         test_tool_calls();
+        test_thinking_control();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

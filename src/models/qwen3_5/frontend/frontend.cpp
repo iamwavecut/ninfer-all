@@ -52,7 +52,8 @@ constexpr std::string_view kThinkingControl =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.\n</think>\n\n";
 static_assert(kThinkingControl.ends_with(fi::kCanonicalReasoningCloseSerialization));
-// DeepSeek-V4.1's early-close guidance, which its </think> token follows.
+// The early-close guidance of DeepSeek-V4.1, Flint and Gemma 4, which each one's close marker
+// follows (</think>, </think> and <channel|>).
 constexpr std::string_view kDeepSeekThinkingGuidance =
     "\n\nConsidering the limited time by the user, I have to give the solution based on the "
     "thinking directly now.";
@@ -925,6 +926,29 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
     return out;
 }
 
+// The control span that closes reasoning a model opened: the guidance (or
+// --thinking-budget-message, without its own spelling of the close) and the close marker's token.
+std::shared_ptr<const std::vector<TokenId>>
+model_close_control(const FrontendOptions& options, const fi::Tokenizer& tokenizer,
+                    const StopPolicy& defaults, std::string_view close_spelling, TokenId close) {
+    std::string guidance(kDeepSeekThinkingGuidance);
+    if (!options.thinking_budget_message.empty()) {
+        guidance = options.thinking_budget_message;
+        if (const auto at = guidance.find(close_spelling); at != std::string::npos) {
+            guidance.erase(at);
+        }
+    }
+    std::vector<TokenId> encoded = tokenizer.encode(guidance);
+    encoded.push_back(close);
+    for (const TokenId token : encoded) {
+        if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
+            defaults.token_ids.end()) {
+            throw std::invalid_argument("thinking budget message contains a default terminal token");
+        }
+    }
+    return std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+}
+
 } // namespace
 
 ModelSamplingDefaults default_sampling(Architecture architecture) {
@@ -1102,17 +1126,26 @@ public:
             defaults.token_ids.push_back(token);
         }
         if (options.architecture == Architecture::Gemma4) {
-            // Gemma's reasoning channel has no early-close control: thinking budgets do not apply.
+            // Gemma opens its thought channel itself when thinking is on. A reached thinking
+            // budget (or --reasoning-loop conclude) closes it with the guidance (or
+            // --thinking-budget-message) and <channel|>, and the model answers.
             gemma = std::make_shared<const fi::GemmaMarkers>(fi::GemmaMarkers::from(*tokenizer));
+            if (gemma->channel_open >= 0 && gemma->channel_close >= 0) {
+                thinking_control_tokens = model_close_control(options, *tokenizer, defaults,
+                                                              "<channel|>", gemma->channel_close);
+            }
             return;
         }
         if (options.architecture == Architecture::Flint) {
-            // Flint opens its reasoning when it decides to, with no early-close control: thinking
-            // budgets do not apply either.
+            // Flint opens its reasoning when it decides to. A reached thinking budget (or
+            // --reasoning-loop conclude) closes it with the guidance (or --thinking-budget-message)
+            // and </think>, and the model answers.
             flint = std::make_shared<const fi::FlintMarkers>(fi::FlintMarkers::from(*tokenizer));
             if (flint->think_open < 0 || flint->think_close < 0) {
                 throw std::invalid_argument("Flint's tokenizer lacks its <think> markers");
             }
+            thinking_control_tokens = model_close_control(options, *tokenizer, defaults,
+                                                          kThinkClose, flint->think_close);
             return;
         }
         if (options.architecture == Architecture::Inkling2) {
@@ -1155,25 +1188,8 @@ public:
             if (deepseek->think_close < 0) {
                 throw std::invalid_argument("DeepSeek-V4.1's tokenizer lacks its </think> marker");
             }
-            std::string guidance(kDeepSeekThinkingGuidance);
-            if (!options.thinking_budget_message.empty()) {
-                guidance = options.thinking_budget_message;
-                // The close is the token appended below, not the message's own spelling of it.
-                if (const auto close = guidance.find(kThinkClose); close != std::string::npos) {
-                    guidance.erase(close);
-                }
-            }
-            std::vector<TokenId> encoded = tokenizer->encode(guidance);
-            encoded.push_back(deepseek->think_close);
-            for (const TokenId token : encoded) {
-                if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
-                    defaults.token_ids.end()) {
-                    throw std::invalid_argument("thinking budget message contains a default "
-                                                "terminal token");
-                }
-            }
-            thinking_control_tokens =
-                std::make_shared<const std::vector<TokenId>>(std::move(encoded));
+            thinking_control_tokens = model_close_control(options, *tokenizer, defaults,
+                                                          kThinkClose, deepseek->think_close);
             return;
         }
         std::string control_suffix(kThinkingControl);

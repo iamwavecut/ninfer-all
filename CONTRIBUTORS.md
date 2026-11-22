@@ -25,6 +25,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [dzaurov](https://github.com/dzaurov) | Default device snapshot slots that give way to the KV capacity, `output_config.effort` beside disabled Thinking in the Messages API, the n-gram writer interop test's skip without its Python modules, and the RTX 5080 field report | [#283](https://github.com/iamwavecut/ninfer-all/pull/283), [#284](https://github.com/iamwavecut/ninfer-all/pull/284), [#285](https://github.com/iamwavecut/ninfer-all/pull/285) |
 | [CommanderTurtle](https://github.com/CommanderTurtle) | System One `box` questions: normalized bounding boxes read as four coordinate distributions, and images kept through the digits of a long label | [#362](https://github.com/iamwavecut/ninfer-all/pull/362) |
 | [fakezeta](https://github.com/fakezeta) | Qwen3.8-27B GGUFs with a condensed vocabulary: token tables and output heads padded to whole 128-row tiles, and the tokenizer, configuration ids and proposal ranking moved to the condensed ids | [#359](https://github.com/iamwavecut/ninfer-all/pull/359) |
+| [lededev](https://github.com/lededev) | The `sm_89` FP8 fast prompt kernel with a shared split-merge route, and the HTTP graceful stop (`POST /shutdown` behind `--admin-token`) | [#333](https://github.com/iamwavecut/ninfer-all/pull/333), [#414](https://github.com/iamwavecut/ninfer-all/pull/414) |
 
 ## Work carried from other forks
 

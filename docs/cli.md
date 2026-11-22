@@ -66,9 +66,10 @@ words lie inside a 12-word passage seen three times, the last 1,024 characters r
 at most 64 characters, or the last 2,048 do so with their numbers masked while every number of the period
 keeps its own step and one of them moves (a loop that counts, `'time1','time2',...`; a counter
 beside values that change otherwise is an enumeration and does not fire). `conclude` stops
-instead when the output left cannot hold the control span and one more token; Gemma 4 and Flint
-have no early-close control, so there it always stops (Inkling 2 closes its thinking block with the
-guidance and `<|end_message|>`). The run summary prints `reasoning loop`
+instead when the output left cannot hold the control span and one more token (Inkling 2 closes its
+thinking block with the guidance and `<|end_message|>`, Flint its `<think>` block with the guidance
+and `</think>`, Gemma 4 its thought channel with the guidance and `<channel|>`). The run summary
+prints `reasoning loop`
 when the guard fires. The option cannot be combined with `--no-thinking`. The check and its
 limits are described in [serving](serving.md#openai-chat-completions), under `--reasoning-loop`.
 

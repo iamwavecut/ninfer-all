@@ -1213,9 +1213,9 @@ because requests can explicitly enable thinking. A request overrides this defaul
 integer: `thinking_budget` on Chat Completions and Responses (a NInfer extension, accepted at top
 level), or `thinking:{"type":"enabled","budget_tokens":N}` on Anthropic Messages (a value of at
 least 1024 and below `max_tokens`, per that protocol). A request that does not think receives no
-cap, whatever it sends; an Inkling 2 chat request, whose model opens its thinking blocks itself,
-always takes the cap. Gemma 4 and Flint cannot close their reasoning early: the server refuses the
-flag for them at startup and ignores a request's budget.
+cap, whatever it sends. The models of Inkling 2, Flint and Gemma 4 open their reasoning themselves:
+an Inkling 2 chat request always takes the cap, a Flint one unless it turns thinking off, and a
+Gemma 4 one when it turns thinking on.
 
 Add `--default-thinking-budget 512` to the startup command to cap model-origin thinking at 512
 tokens for every thinking-enabled request.
@@ -1253,12 +1253,14 @@ Logs report the requested budget, and the effective budget when it differs. A re
 enforce its budget reports the requested value only. The server does not promise that the model will
 emit nonempty content or a tool call after the marker. `model_thinking_tokens` in the request log
 counts the model's thinking tokens for every Qwen thinking request, with or without a budget.
-Gemma 4 and Flint take no thinking budget and report 0. DeepSeek-V4.1 counts its thinking tokens,
-and a reached budget closes its reasoning with the guidance and its `</think>` token, as Qwen's does.
-Inkling 2 counts the tokens of every thinking block it opens in a response (not their headers and
-end markers); a reached budget closes the open block with the guidance and `<|end_message|>`, and
-the rest of the response can open no thinking block (`<|content_thinking|>` is masked) and runs
-without drafts.
+DeepSeek-V4.1 counts its thinking tokens, and a reached budget closes its reasoning with the
+guidance and its `</think>` token, as Qwen's does. Inkling 2 counts the tokens of every thinking
+block it opens in a response (not their headers and end markers); a reached budget closes the open
+block with the guidance and `<|end_message|>`, and the rest of the response can open no thinking
+block (`<|content_thinking|>` is masked). Flint counts the tokens of the `<think>` block it opens
+and Gemma 4 those of its thought channel (not the channel's name); a reached budget closes the
+block with the guidance and `</think>` (Gemma 4: `<channel|>`), and the rest of the response can
+open no other (`<think>` or `<|channel>` is masked).
 
 `--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests against a
 model that keeps rewriting the same passages in its thinking, which token penalties do not catch
@@ -1292,10 +1294,10 @@ because every pass varies a little.
   thinking budget could not be enforced (early close unavailable, above), it stops instead.
 - **Gemma 4, Flint and Inkling 2.** The guard reads the thought channel (Flint: the `<think>`
   block; Inkling 2: its `<|content_thinking|>` blocks, counted across the blocks of one response)
-  the model opens and counts its tokens. Gemma 4 and Flint have no early-close control, so
-  `conclude` stops there as `stop` does; Inkling 2 concludes with the guidance and
-  `<|end_message|>`, as a reached budget does. DeepSeek-V4.1 concludes as Qwen does, with the same
-  guidance and its own `</think>` token.
+  the model opens and counts its tokens, and `conclude` closes it as a reached budget does: Inkling
+  2 with the guidance and `<|end_message|>`, Flint with the guidance and `</think>`, Gemma 4 with
+  the guidance and `<channel|>`. DeepSeek-V4.1 concludes as Qwen does, with the same guidance and
+  its own `</think>` token.
 - It applies to constrained requests too (tool constraints, `response_format`): the control span
   goes through the same grammar-checked path as a thinking budget, so a constrained request can
   still answer or call a tool after `conclude`. With `stop`, a constrained request ends as an
