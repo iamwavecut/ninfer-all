@@ -220,6 +220,7 @@ void kv_post(const KvArgs& args, cudaStream_t stream);
 // already in the cache): every row sees the keys the last row sees, its position and the `window`
 // before it (0: every earlier one), the block's own later rows included; eight rows to a block,
 // split over `splits` ranges.
+inline constexpr int kMaxRowGroup = 4;
 struct AttentionArgs {
     Rows rows;
     const float* q = nullptr; // [T][query_heads][128]
@@ -241,6 +242,11 @@ struct AttentionArgs {
     int splits  = 1;
     bool uniform = false;
     float* partial = nullptr; // decode: attention_workspace_floats
+    // A full visit's decode or verification call (window 0, no ring): up to `row_group` (1 to
+    // kMaxRowGroup) consecutive rows of one sequence share a block, which reads each key tile once
+    // for them, in `row_groups` blocks (0: one a row; at least the call's groups). Each row splits
+    // and reads its keys as a block of its own row does, so its output is the same.
+    int row_group = 1, row_groups = 0;
     // A prompt chunk of a full visit (window 0, no ring): attention_workspace_floats(T,
     // query_heads, 1) for the far field's softmax states, computed on tensor cores first: the keys
     // before the chunk at least `extent` before every row of a group of 32 rows. Null: none.
