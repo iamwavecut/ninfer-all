@@ -210,7 +210,9 @@ state at the end of the prompt's shared prefixes (the leading system messages an
 declarations, a declared cache boundary), go to images in pinned host memory within
 `--host-cache-mib`. Every visit's state belongs to the image: its rings, its full-attention rows and
 its convolution histories. A prompt resumes only where a state was kept, not at an arbitrary common
-prefix. A long last message also keeps a state inside it, where a later prompt with the same
+prefix, except on its sequence: a next prompt that departs from what the sequence read after its
+last prompt (a reply the template renders otherwise) resumes where it departs, the sequence taken
+back there, while its rings and convolution histories still hold that position. A long last message also keeps a state inside it, where a later prompt with the same
 document and another question resumes, and the images go to a disk tier, a prefix cache file and
 session slot files ([Serving](serving.md#context-cache-of-the-other-families)).
 

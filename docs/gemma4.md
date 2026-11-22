@@ -330,7 +330,9 @@ keeps instead of prefilling those tokens again:
 A sliding-window state cannot be cut back at will: the rings at a position hold the window before
 it, and each block's window reaches further back through the blocks below. A prompt therefore
 resumes only where a state was kept (a sequence's end, its checkpoint, a stored image), not at an
-arbitrary common prefix.
+arbitrary common prefix. A sequence's own state can go back a little: a next prompt that departs
+from what the sequence read after its last prompt (a reply the template renders otherwise) resumes
+where it departs, the sequence taken back there, while its rings still hold that position's window.
 
 A turn that a stop string ends is the exception. Its state has read the tokens the cut removed, so
 the sequence goes back to where the stop string's match began, the state its visible text
