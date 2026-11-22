@@ -13,10 +13,13 @@ namespace ninfer::artifact {
 
 // Pinned: the object lives only in one page-locked Host block laid out by the plan (for weights
 // streamed to the device on demand); it never receives a device placement.
+// PinnedOrFiles: Pinned where the host can pin it, else left in the artifact's files, which its
+// reader then reads (host or disk experts): the block ends where the pinnable memory, the available
+// memory or MaterializeOptions::files_after_bytes ends, and its view is then empty.
 // Registered: Host bytes registered separately for DMA, with the same object/view lifetime.
 // Mapped: the object lives only in a page-locked Host block mapped into the primary device's
 // address space; its view addresses that mapping, so device kernels read the bytes in place.
-enum class Residency { Device, Host, Values, Pinned, Registered, Mapped };
+enum class Residency { Device, Host, Values, Pinned, PinnedOrFiles, Registered, Mapped };
 
 struct ParameterReference {
     std::string name;
@@ -90,7 +93,9 @@ public:
     [[nodiscard]] std::string object_id(ObjectHandle object) const;
     // Places an object in the pinned Host block, in first-request order so a caller's logical
     // groups stay contiguous. It excludes device and Host placements of the same object.
-    void require_pinned(ObjectHandle object);
+    // `files_fallback`: the object may stay in the artifact's files (Residency::PinnedOrFiles);
+    // an object any caller requires pinned is pinned.
+    void require_pinned(ObjectHandle object, bool files_fallback = false);
     // Places an object in the mapped Host block (Residency::Mapped). It excludes every other
     // placement of the same object.
     void require_mapped(ObjectHandle object);
@@ -113,6 +118,7 @@ private:
         std::uint64_t tail       = 0;
         std::optional<std::size_t> device_rank;
         std::optional<std::uint64_t> pinned_order;
+        bool pinned_required = false; // some caller requires the object pinned
         bool mapped = false;
         std::vector<std::byte> host_data;
     };

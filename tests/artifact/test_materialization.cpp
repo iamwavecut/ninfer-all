@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "core/device_buffer.h"
 #include "core/evictable_weight_pool.h"
+#include "core/host_pages.h"
 #include "core/qtype.h"
 #include "cuda_availability.h"
 
@@ -80,6 +81,82 @@ void materialization(DeviceContext& device) {
     std::array<std::byte, 1> code{};
     CUDA_CHECK(cudaMemcpy(code.data(), native.qdata, 1, cudaMemcpyDeviceToHost));
     require(code[0] == std::byte{0x52}, "native row pointer addressed a different row");
+}
+
+// Residency::PinnedOrFiles: objects that may stay in the artifact's files follow the required
+// ones, the block ends where MaterializeOptions::files_after_bytes does, and an object it does not
+// hold has no pinned parent and an empty view. HostPages pins a prefix in parts and gives the rest
+// back.
+void pinned_or_files(DeviceContext& device) {
+    Fixture fixture;
+    fixture.write(true);
+    const auto page_locked = [](const void* p) {
+        cudaPointerAttributes attributes{};
+        CUDA_CHECK(cudaPointerGetAttributes(&attributes, p));
+        return attributes.type == cudaMemoryTypeHost;
+    };
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const auto divisors = reader.find("divisors");
+        binder.require_pinned(divisors, true);
+        const auto row  = binder.parameter("row", {1, 130}, Residency::Pinned);
+        const auto plan = std::move(binder).finish();
+        require(plan.pinned_objects.size() == 2 && plan.pinned_objects[0].object == reader.find("q5") &&
+                    !plan.pinned_objects[0].files_fallback && plan.pinned_objects[1].files_fallback,
+                "an object that may stay in the files was planned ahead of a required one");
+        auto backing = materialize(reader, MaterializationPlan(plan), device, nullptr, nullptr,
+                                   {.files_after_bytes = 0});
+        require(backing.pinned(reader.find("q5")) && !backing.pinned(divisors) &&
+                    backing.stats().files_bytes == 8 && backing.stats().files_object_count == 1 &&
+                    backing.stats().pinned_bytes == 528,
+                "a zero budget pinned an object that may stay in the files");
+        const auto view = bind_view(row, backing);
+        require(page_locked(view.parts.front().parent->data) &&
+                    std::equal(backing.pinned_block().begin(), backing.pinned_block().end(),
+                               fixture.payload.begin() + 256),
+                "the required object lost its pinned bytes beside a file object");
+    }
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const auto row      = binder.parameter("row", {1, 130}, Residency::PinnedOrFiles);
+        const auto divisors = reader.find("divisors");
+        binder.require_pinned(divisors, true);
+        const auto plan = std::move(binder).finish();
+        auto held = materialize(reader, MaterializationPlan(plan), device, nullptr, nullptr,
+                                {.files_after_bytes = 528});
+        require(held.pinned(reader.find("q5")) && !held.pinned(divisors) &&
+                    held.stats().files_bytes == 8 && held.stats().pinned_object_count == 1,
+                "the budget did not end the block after the objects it holds");
+        const auto view = bind_view(row, held);
+        require(!view.parts.empty() && page_locked(view.parts.front().parent->data) &&
+                    std::equal(view.parts.front().parent->data,
+                               view.parts.front().parent->data + 528,
+                               fixture.payload.begin() + 256),
+                "a pinned PinnedOrFiles object does not hold its bytes");
+        auto files = materialize(reader, MaterializationPlan(plan), device, nullptr, nullptr,
+                                 {.files_after_bytes = 0});
+        require(!files.pinned(reader.find("q5")) && files.pinned_block().empty() &&
+                    files.stats().files_object_count == 2 && files.stats().pinned_bytes == 0 &&
+                    bind_view(row, files).parts.empty(),
+                "an object left in the files kept a pinned parent or a view");
+        auto all = materialize(reader, MaterializationPlan(plan), device);
+        require(all.pinned(reader.find("q5")) && all.pinned(divisors) &&
+                    all.stats().files_bytes == 0 && all.stats().files_object_count == 0,
+                "without a budget the host left objects it could pin in the files");
+    }
+    {
+        constexpr std::size_t kPart = 64 << 10;
+        HostPages pages(3 * kPart);
+        for (std::size_t i = 0; i < pages.size(); i += 4096) { pages.data()[i] = std::byte(i >> 12); }
+        const std::array<std::size_t, 3> ends{kPart, 2 * kPart, 3 * kPart};
+        require(pages.pin_prefix(ends, 2 * kPart + 100) == 2 * kPart && pages.size() == 2 * kPart,
+                "pin_prefix pinned past its limit");
+        require(page_locked(pages.data()) && page_locked(pages.data() + kPart + 8) &&
+                    pages.data()[kPart] == std::byte(kPart >> 12),
+                "pin_prefix lost a part's pages or bytes");
+    }
 }
 
 // Overlay Vision residency plans: an evict-ranked object lands in a chunk-aligned arena tail that
@@ -613,6 +690,7 @@ int main(int argc, char** argv) {
         materialization(device);
         failure_and_host_only(device);
         overlay_placement(device);
+        pinned_or_files(device);
         selected_upload(device);
         selected_nvfp4(device);
         selected_panel(device);

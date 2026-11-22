@@ -59,8 +59,8 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
         }
         if (residency == Residency::Device) {
             require_device(part.object);
-        } else if (residency == Residency::Pinned) {
-            require_pinned(part.object);
+        } else if (residency == Residency::Pinned || residency == Residency::PinnedOrFiles) {
+            require_pinned(part.object, residency == Residency::PinnedOrFiles);
         } else if (residency == Residency::Mapped) {
             require_mapped(part.object);
         } else if (residency == Residency::Host || residency == Residency::Registered) {
@@ -231,11 +231,12 @@ void Binder::device_rank(ObjectHandle object, std::size_t rank) {
     demand.device_rank = rank;
 }
 
-void Binder::require_pinned(ObjectHandle object) {
+void Binder::require_pinned(ObjectHandle object, bool files_fallback) {
     const auto& geometry = reader_.geometry(object);
     auto& demand         = demands_.at(object.index);
     demand.alignment     = std::max(demand.alignment, geometry.alignment);
     if (!demand.pinned_order) { demand.pinned_order = next_pinned_order_++; }
+    demand.pinned_required = demand.pinned_required || !files_fallback;
 }
 
 void Binder::require_mapped(ObjectHandle object) {
@@ -417,8 +418,13 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         for (const std::size_t index : resident[rank]) { place_device(index); }
         place_selected(rank);
     }
+    // The objects that must be pinned lead; those that may stay in the files follow, so the
+    // block can end before them.
     std::sort(pinned.begin(), pinned.end(), [&](std::size_t a, std::size_t b) {
-        return *demands_[a].pinned_order < *demands_[b].pinned_order;
+        const auto& x = demands_[a];
+        const auto& y = demands_[b];
+        if (x.pinned_required != y.pinned_required) { return x.pinned_required; }
+        return *x.pinned_order < *y.pinned_order;
     });
     for (const std::size_t index : pinned) {
         const ObjectHandle handle{index};
@@ -426,7 +432,8 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         const auto bytes   = reader_.geometry(handle).bytes;
         const auto offset =
             align_up(plan.pinned_capacity_bytes, demand.alignment, "pinned Host offset");
-        plan.pinned_objects.push_back({handle, offset, bytes, demand.alignment});
+        plan.pinned_objects.push_back(
+            {handle, offset, bytes, demand.alignment, !demand.pinned_required});
         plan.pinned_capacity_bytes = checked_add(offset, bytes, "pinned Host capacity");
     }
     for (const std::size_t index : mapped) {

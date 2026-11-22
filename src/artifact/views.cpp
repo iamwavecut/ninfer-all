@@ -9,11 +9,18 @@ WeightView bind_view(const ParameterReference& reference,
     }
     WeightView out;
     out.shape             = reference.shape;
+    // An object the pinned block does not hold stays in the artifact's files: no backing.
+    if (reference.residency == Residency::PinnedOrFiles) {
+        for (const auto& part : reference.binding.parts) {
+            if (!materialized.pinned(part.object)) { return out; }
+        }
+    }
     std::uint64_t covered = 0;
     for (const auto& part : reference.binding.parts) {
         const auto& parent = reference.residency == Residency::Device
                                  ? materialized.device_parent(part.object)
-                             : reference.residency == Residency::Pinned
+                             : reference.residency == Residency::Pinned ||
+                                       reference.residency == Residency::PinnedOrFiles
                                  ? materialized.pinned_parent(part.object)
                              : reference.residency == Residency::Mapped
                                  ? materialized.mapped_parent(part.object)

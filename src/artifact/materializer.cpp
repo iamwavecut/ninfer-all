@@ -5,6 +5,7 @@
 #include "artifact/transcode.h"
 #include "artifact/reader.h"
 #include "core/device_wait.h"
+#include "core/host_memory.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/startup.h"
@@ -682,6 +683,89 @@ UploadTotals upload_device_objects(const Reader& reader,
     return totals;
 }
 
+// Where the pinned block holds each placement it keeps: every placement that must be pinned at its
+// plan offset, then the Residency::PinnedOrFiles ones in order while they fit within
+// MaterializeOptions::files_after_bytes, the memory the host has available and, on Windows, what
+// it can still pin for the device less kPinHeadroom for what later startup pins. The latter lie
+// in parts of at least kPinPartBytes, each starting on a page of its own, so each registers apart
+// and the first part the host refuses ends the block without splitting an object.
+struct PinnedLayout {
+    std::vector<std::uint64_t> offsets;  // the kept placements', the plan's leading ones
+    std::vector<std::size_t> part_ends;  // every part's end, the required prefix's first
+    std::uint64_t required_end = 0, end = 0;
+    bool fallback = false; // some placement may stay in the files
+};
+
+constexpr std::uint64_t kPinPartBytes = 1ULL << 30;
+constexpr std::uint64_t kPinHeadroom  = 4ULL << 30;
+constexpr std::uint64_t kPinPage      = 64ULL << 10; // a multiple of every host page size
+
+PinnedLayout lay_out_pinned(const Reader& reader, const MaterializationPlan& plan,
+                            const MaterializeOptions& options, const DeviceContext& device) {
+    PinnedLayout out;
+    std::uint64_t previous_end = 0;
+    std::vector<bool> placed(plan.object_count + plan.selected_count, false);
+    std::size_t first_fallback = plan.pinned_objects.size();
+    for (std::size_t i = 0; i < plan.pinned_objects.size(); ++i) {
+        const auto& placement = plan.pinned_objects[i];
+        reader.validate_object(placement.object);
+        const auto& geometry = reader.geometry(placement.object);
+        if (placement.object.index >= placed.size() || placed[placement.object.index] ||
+            geometry.bytes != placement.bytes || placement.offset < previous_end ||
+            placement.alignment == 0 || placement.offset % placement.alignment != 0 ||
+            placement.offset > plan.pinned_capacity_bytes ||
+            placement.bytes > plan.pinned_capacity_bytes - placement.offset ||
+            (!placement.files_fallback && i > first_fallback)) {
+            throw ArtifactError("invalid or duplicate pinned Host placement");
+        }
+        placed[placement.object.index] = true;
+        previous_end                   = placement.offset + placement.bytes;
+        if (placement.files_fallback) {
+            first_fallback = std::min(first_fallback, i);
+        } else {
+            out.required_end = previous_end;
+        }
+    }
+    for (std::size_t i = 0; i < first_fallback; ++i) {
+        out.offsets.push_back(plan.pinned_objects[i].offset);
+    }
+    out.end = out.required_end;
+    if (first_fallback == plan.pinned_objects.size()) { return out; }
+    out.fallback = true;
+    std::uint64_t limit = std::numeric_limits<std::uint64_t>::max();
+    if (const auto available = available_host_memory_bytes()) { limit = *available; }
+    if (const auto pinnable = pinnable_host_memory_bytes(device.props.luid)) {
+        limit = std::min(limit, *pinnable > kPinHeadroom ? *pinnable - kPinHeadroom : 0);
+    }
+    const std::uint64_t budget =
+        options.files_after_bytes.value_or(std::numeric_limits<std::uint64_t>::max());
+    // Each part closes where the next one starts, so its registration covers the padding.
+    std::uint64_t cursor = out.required_end, part_start = 0, taken = 0;
+    bool new_part = true;
+    for (std::size_t i = first_fallback; i < plan.pinned_objects.size(); ++i) {
+        const auto& placement = plan.pinned_objects[i];
+        const std::uint64_t at =
+            align_up(new_part ? align_up(cursor, kPinPage, "pinned Host offset") : cursor,
+                     placement.alignment, "pinned Host offset");
+        const std::uint64_t end = checked_add(at, placement.bytes, "pinned Host capacity");
+        if (end > limit || placement.bytes > budget - taken) { break; }
+        if (new_part) {
+            if (cursor > 0) { out.part_ends.push_back(at); }
+            part_start = at;
+            new_part   = false;
+        }
+        out.offsets.push_back(at);
+        taken += placement.bytes;
+        cursor   = end;
+        new_part = cursor - part_start >= kPinPartBytes;
+    }
+    if (cursor > 0 && (out.part_ends.empty() || out.part_ends.back() < cursor)) {
+        out.part_ends.push_back(cursor);
+    }
+    out.end = cursor;
+    return out;
+}
+
 } // namespace
 
 const WeightParent& MaterializedArtifact::device_parent(ObjectHandle handle) const {
@@ -714,6 +798,10 @@ const WeightParent& MaterializedArtifact::pinned_parent(ObjectHandle handle) con
     return *objects_[handle.index].pinned;
 }
 
+bool MaterializedArtifact::pinned(ObjectHandle handle) const noexcept {
+    return handle.index < objects_.size() && objects_[handle.index].pinned.has_value();
+}
+
 const WeightParent& MaterializedArtifact::mapped_parent(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || !objects_[handle.index].mapped) {
         throw ArtifactError("object has no mapped Host weight backing");
@@ -742,8 +830,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     // The objects kept on the host (the pinned block's, and Host objects nobody has read yet) are
     // read first and count toward the same progress.
     std::uint64_t host_total = 0;
-    for (const auto& placement : plan.pinned_objects) {
-        host_total = checked_add(host_total, placement.bytes, "pinned payload bytes");
+    const PinnedLayout pinned_layout = lay_out_pinned(reader, plan, options, device);
+    for (std::size_t i = 0; i < pinned_layout.offsets.size(); ++i) {
+        host_total = checked_add(host_total, plan.pinned_objects[i].bytes, "pinned payload bytes");
     }
     for (const auto& placement : plan.mapped_objects) {
         host_total = checked_add(host_total, placement.bytes, "mapped payload bytes");
@@ -834,8 +923,16 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         return pages;
     };
-    if (!plan.pinned_objects.empty()) {
-        out.pinned_ = host_block(plan.pinned_objects, plan.pinned_capacity_bytes, "pinned");
+    if (pinned_layout.end > 0) {
+        if (pinned_layout.end > std::numeric_limits<std::size_t>::max()) {
+            throw ArtifactError("pinned Host backing exceeds size_t");
+        }
+        out.pinned_ = std::make_unique<HostPages>(static_cast<std::size_t>(pinned_layout.end));
+        for (std::size_t i = 0; i < pinned_layout.offsets.size(); ++i) {
+            const auto& placement = plan.pinned_objects[i];
+            host_reads.push_back({reader.directory().tensor(placement.object).offset,
+                                  placement.bytes, out.pinned_->data() + pinned_layout.offsets[i]});
+        }
     }
     if (!plan.mapped_objects.empty()) {
         out.mapped_ = host_block(plan.mapped_objects, plan.mapped_capacity_bytes, "mapped");
@@ -877,21 +974,37 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         out.stats_.pinned_bytes =
             checked_add(out.stats_.pinned_bytes, plan.mapped_capacity_bytes, "mapped Host bytes");
     }
-    if (out.pinned_) {
+    std::uint64_t pinned = 0;
+    if (out.pinned_ && !pinned_layout.fallback) {
         out.pinned_->pin();
-        for (const auto& placement : plan.pinned_objects) {
-            const auto& geometry = reader.geometry(placement.object);
-            const std::span<std::byte> destination(out.pinned_->data() + placement.offset,
-                                                   static_cast<std::size_t>(placement.bytes));
-            const auto divisor =
-                read_divisor(reader, placement.object, geometry, destination, out.stats_);
-            out.objects_.at(placement.object.index).pinned =
-                WeightParent{geometry, destination.data(), divisor};
+        pinned = pinned_layout.end;
+    } else if (out.pinned_) {
+        // The required prefix, then each part of objects that may stay in the files while the
+        // host pins it; the pages past the last pinned part go back.
+        pinned = out.pinned_->pin_prefix(pinned_layout.part_ends, pinned_layout.end);
+        if (pinned < pinned_layout.required_end) {
+            throw ArtifactError("failed to pin " + std::to_string(pinned_layout.required_end >> 20) +
+                                " MiB of host memory: the host refused it");
         }
-        out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes,
-                                              plan.pinned_capacity_bytes, "pinned Host bytes");
-        out.stats_.pinned_object_count = plan.pinned_objects.size();
     }
+    for (std::size_t i = 0; i < plan.pinned_objects.size(); ++i) {
+        const auto& placement = plan.pinned_objects[i];
+        if (i >= pinned_layout.offsets.size() ||
+            pinned_layout.offsets[i] + placement.bytes > pinned) {
+            out.stats_.files_bytes =
+                checked_add(out.stats_.files_bytes, placement.bytes, "file object bytes");
+            ++out.stats_.files_object_count;
+            continue;
+        }
+        const auto& geometry = reader.geometry(placement.object);
+        const std::span<std::byte> destination(out.pinned_->data() + pinned_layout.offsets[i],
+                                               static_cast<std::size_t>(placement.bytes));
+        const auto divisor = read_divisor(reader, placement.object, geometry, destination, out.stats_);
+        out.objects_.at(placement.object.index).pinned =
+            WeightParent{geometry, destination.data(), divisor};
+        ++out.stats_.pinned_object_count;
+    }
+    out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, pinned, "pinned Host bytes");
     for (auto& placement : plan.host_objects) {
         auto& storage = out.objects_.at(placement.object.index);
         if (!storage.host_data.empty()) { throw ArtifactError("duplicate Host placement"); }
