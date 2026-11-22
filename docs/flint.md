@@ -48,10 +48,11 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   the assistant marker, the switch GLM's templates use for the same role-marker format, and Flint
   then answers at once; [typed decisions](serving.md#typed-decisions) read their labels there.
   Without it, a one-label question puts about 10^-11 of the first token's probability on the
-  labels, the rest on `<think>`. Flint has no early-close control, so thinking budgets do not
-  apply (the server refuses `--default-thinking-budget`) and the
-  [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply under
-  `conclude` as under `stop`.
+  labels, the rest on `<think>`. A thinking budget (`--thinking-budget`,
+  `--default-thinking-budget`, a request's) counts the tokens of the `<think>` block the model
+  opens; once reached, the engine closes the block with Qwen's early-close guidance and `</think>`,
+  masks `<think>` for the rest of the response, and the model answers. `--reasoning-loop conclude`
+  closes it the same way ([Serving](serving.md#openai-chat-completions)).
 - **Sampling defaults.** The release's: temperature 1.0, top-p 0.95, top-k 20.
 - **Speculative decoding by context lookup.** Recursive publishes no draft model. `--lookup-ngram
   N` proposes what followed the last N tokens' earlier occurrence in the sequence (up to

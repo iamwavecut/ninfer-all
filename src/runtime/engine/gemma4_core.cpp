@@ -547,6 +547,8 @@ struct Gemma4Core::Impl {
         const std::uint32_t* mask                = nullptr; // a grammar's next-token mask
         // The typed readout's token ids, on a request's first generated token only.
         const std::vector<TokenId>* readout = nullptr;
+        // A token the row cannot take (<|channel> once an early close was applied).
+        std::optional<TokenId> ban_token;
     };
 
     Gemma4Instance& instance;
@@ -613,6 +615,7 @@ struct Gemma4Core::Impl {
     std::size_t vocab_rows = 0; // logits per row
     DeviceBuffer token_mask;
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
+    DeviceBuffer bf16_neg_mask; // BF16 -8192 (0xC600), the logit of a banned token (ban)
     DeviceBuffer readout_ids, readout_values;
     std::unique_ptr<PinnedHostBuffer> host_readout;
     std::unique_ptr<PinnedHostBuffer> host_mask, host_sample, host_logprobs;
@@ -708,6 +711,10 @@ struct Gemma4Core::Impl {
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
         CUDA_CHECK(ninfer::copy_and_wait(logprob_flag.p, &enabled, sizeof(enabled),
+                                         cudaMemcpyHostToDevice));
+        bf16_neg_mask = DeviceBuffer(sizeof(std::uint16_t));
+        const std::uint16_t kBf16NegLarge = 0xC600U;
+        CUDA_CHECK(ninfer::copy_and_wait(bf16_neg_mask.p, &kBf16NegLarge, sizeof(kBf16NegLarge),
                                          cudaMemcpyHostToDevice));
         std::size_t workspace = std::max<std::size_t>(
             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
@@ -1551,6 +1558,18 @@ struct Gemma4Core::Impl {
         if (streaming) { r.cv.notify_all(); }
     }
 
+
+    // Gives `token` the logit -8192 in `count` columns from `column`: the row cannot draw it.
+    void ban(const Tensor& logits, std::size_t column, std::size_t count,
+             std::optional<TokenId> token, cudaStream_t stream) const {
+        if (!token || *token < 0 || static_cast<std::uint32_t>(*token) >= domain) { return; }
+        for (std::size_t c = column; c < column + count; ++c) {
+            auto* at = static_cast<std::uint16_t*>(logits.data) +
+                       c * static_cast<std::size_t>(logits.ne[0]) + static_cast<std::size_t>(*token);
+            CUDA_CHECK(cudaMemcpyAsync(at, bf16_neg_mask.p, sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
     void sample(std::span<const SampleRow> rows, std::int32_t purpose, std::span<TokenId> out,
                 std::span<runtime::RawTokenLogprob> logprobs, const Tensor* source = nullptr) {
         const cudaStream_t stream = instance.executor->head_stream();
@@ -1599,6 +1618,7 @@ struct Gemma4Core::Impl {
         const Tensor logical(sample_position.p, DType::I32, {width});
         const Tensor logits =
             source != nullptr ? *source : instance.executor->logits(static_cast<std::uint32_t>(n));
+        for (std::size_t b = 0; b < n; ++b) { ban(logits, b, 1, rows[b].ban_token, stream); }
         const auto* device_configs = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const bool gather = std::any_of(rows.begin(), rows.end(),
                                         [](const SampleRow& row) { return row.logprobs; });
@@ -1703,7 +1723,8 @@ struct Gemma4Core::Impl {
                          .readout  = exec.logprobs && !exec.readout_tokens.empty() &&
                                              r.first_token == Clock::time_point{}
                                          ? &exec.readout_tokens
-                                         : nullptr};
+                                         : nullptr,
+                         .ban_token = r.output.banned_token()};
     }
 
     // --expert-profile-out: every route since warm-up, rewritten at each request boundary.
@@ -2127,6 +2148,21 @@ struct Gemma4Core::Impl {
             return accepted;
         }
         r.feed.assign(1, tokens[accepted > 0 ? accepted - 1 : 0]);
+        if (decision.continuation == ContinuationAction::ApplyTargetControl) {
+            // A reached thinking budget or the loop guard's conclusion closes the reasoning the
+            // model opened: append the control span (<guidance><channel|>) to the next step's feed.
+            const auto pending_control = r.output.pending_control_tokens();
+            const std::vector<TokenId> control(pending_control.begin(), pending_control.end());
+            const OutputDecision forced = r.output.preview_control(control, r.budget->remaining());
+            if (forced.accepted_tokens != control.size() || forced.finished()) {
+                throw RequestError(RequestErrorKind::Unavailable,
+                                   "thinking control preview returned an invalid decision");
+            }
+            r.generated.insert(r.generated.end(), control.begin(), control.end());
+            r.budget->commit(static_cast<std::uint32_t>(control.size()));
+            push_events(r, r.output.commit_preview(), std::nullopt);
+            r.feed.insert(r.feed.end(), control.begin(), control.end());
+        }
         if (r.cancelled.load(std::memory_order_acquire)) {
             finish_now(request, FinishReason::Cancelled);
         }
@@ -2159,7 +2195,7 @@ struct Gemma4Core::Impl {
     // One step of every decoding request. Those that speculate run one round together, the rest one
     // batched decode step.
     void decode_step() {
-        std::vector<std::shared_ptr<Request>> batch, speculative;
+        std::vector<std::shared_ptr<Request>> alone, batch, speculative;
         std::size_t decoding = 0;
         for (const Slot& slot : slots) {
             if (slot.request && slot.request->decoding) { ++decoding; }
@@ -2179,16 +2215,44 @@ struct Gemma4Core::Impl {
                 }
                 continue;
             }
+            if (request->feed.size() > 1) {
+                alone.push_back(request);
+                continue;
+            }
             (steps > 0 && speculates(*request) ? speculative : batch).push_back(request);
         }
-        if (batch.empty() && speculative.empty() && deferred.empty()) { return; }
+        if (alone.empty() && batch.empty() && speculative.empty() && deferred.empty()) { return; }
         const auto start = Clock::now();
         if (!deferred.empty()) { sample_deferred(deferred); }
+        for (const auto& request : alone) {
+            // The control span that closes the reasoning, after the token before it: one forward
+            // of all of them, then the token after.
+            Request& r = *request;
+            if (r.constrained && !r.mask) { schedule_mask(r); }
+            instance.executor->forward(r.slot, r.feed, 1);
+            Slot& slot = slots[r.slot];
+            slot.fed.insert(slot.fed.end(), r.feed.begin(), r.feed.end());
+            r.position += static_cast<std::uint32_t>(r.feed.size());
+            if (!mask_ready(r)) {
+                defer_sample(r, instance.executor->logits(1), 0, ops::kSamplePurposeDecode);
+                continue;
+            }
+            const SampleRow row = sample_row(r);
+            TokenId token       = 0;
+            runtime::RawTokenLogprob logprob;
+            sample(std::span(&row, 1), ops::kSamplePurposeDecode, std::span(&token, 1),
+                   std::span(&logprob, 1));
+            try {
+                if (!mask_usable(request)) { continue; }
+                accept(request, token, row.logprobs ? &logprob : nullptr);
+                next_mask(request);
+            } catch (...) { fail(request, std::current_exception()); }
+        }
         if (!batch.empty()) { plain_step(batch); }
         if (!speculative.empty()) { speculative_round(speculative, steps); }
         std::lock_guard lock(stats_mutex);
         stats.decode_rounds += 1;
-        stats.decode_row_rounds += batch.size() + speculative.size();
+        stats.decode_row_rounds += alone.size() + batch.size() + speculative.size();
         stats.decode_seconds_total += seconds(start, Clock::now());
     }
 
@@ -2520,6 +2584,9 @@ struct Gemma4Core::Impl {
                                    stream));
         const auto rows_n         = static_cast<std::int32_t>(b);
         const Tensor logits       = executor.logits(static_cast<std::uint32_t>(verified_columns));
+        for (std::size_t j = 0; j < b; ++j) {
+            ban(logits, std::size_t(starts[j]), widths[j], rows[j].ban_token, stream);
+        }
         const auto* device_config = static_cast<const ops::SamplingConfig*>(sample_config.p);
         const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), rows_n});
         // The tokens' logprob records, from the distributions their columns are drawn from,

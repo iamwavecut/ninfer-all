@@ -4493,8 +4493,8 @@ int test_forced_tool_call(const Frontend& frontend) {
 }
 
 // Gemma 4's thought channel, which the model opens itself, feeds the reasoning-loop guard: a pass
-// rewritten over and over stops the reply at a check, Conclude stops as well (Gemma has no
-// early-close control), and varied thinking or Off never fires.
+// rewritten over and over stops the reply at a check under Stop, Conclude closes the channel with
+// the early-close control instead, and varied thinking or Off never fires.
 int test_gemma_reasoning_loop_guard() {
     const GemmaFixture fixture = gemma_fixture();
     const Frontend frontend    = make_gemma_frontend(fixture);
@@ -4533,7 +4533,10 @@ int test_gemma_reasoning_loop_guard() {
         ninfer::runtime::OutputDecision last{};
         std::string reasoning;
         std::uint32_t budget = 1'000'000;
-        for (std::size_t at = 0; at < tokens.size() && !last.finished(); at += 200) {
+        for (std::size_t at = 0;
+             at < tokens.size() && !last.finished() &&
+             last.continuation != ninfer::runtime::ContinuationAction::ApplyTargetControl;
+             at += 200) {
             const std::size_t n = std::min<std::size_t>(200, tokens.size() - at);
             last = session.preview_model(std::span<const ninfer::TokenId>(tokens.data() + at, n),
                                          budget, ninfer::FinishReason::OutputLimit);
@@ -4545,14 +4548,24 @@ int test_gemma_reasoning_loop_guard() {
     };
 
     int failures = 0;
-    for (const auto action :
-         {ninfer::ReasoningLoopAction::Stop, ninfer::ReasoningLoopAction::Conclude}) {
-        const auto [decision, stats, reasoning, no_control] = run(action, looping);
+    {
+        const auto [decision, stats, reasoning, no_control] =
+            run(ninfer::ReasoningLoopAction::Stop, looping);
         failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
                               stats.loop_detected && stats.loop_coverage >= 0.25F &&
                               stats.loop_thinking_tokens >= 512 && !stats.applied && no_control &&
                               reasoning.starts_with("step 0 checks value"),
                           "a looping Gemma thought channel did not stop at a check");
+    }
+    {
+        const auto [decision, stats, reasoning, no_control] =
+            run(ninfer::ReasoningLoopAction::Conclude, looping);
+        failures += check(!decision.finished() &&
+                              decision.continuation ==
+                                  ninfer::runtime::ContinuationAction::ApplyTargetControl &&
+                              stats.loop_detected && stats.loop_thinking_tokens >= 512 &&
+                              !no_control && reasoning.starts_with("step 0 checks value"),
+                          "a looping Gemma thought channel under Conclude did not ask for the close");
     }
     {
         const auto [decision, stats, reasoning, no_control] =
