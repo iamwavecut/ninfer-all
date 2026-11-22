@@ -14,7 +14,8 @@
 //    the host from their codes and exponent bytes, within MXFP8's error of the oracle.
 //  - attention: relative bias inside its extent only, per-query sinks far below, near and above the
 //    scores, the sigmoid gate; sliding-window rings and full caches, one and many splits, prompt
-//    chunks after cached positions and branch rows; BF16 and q8_1 outputs.
+//    chunks after cached positions and branch rows, with and without the far field on tensor
+//    cores; BF16 and q8_1 outputs.
 //  - residual over plain products, 2^-32 fixed-point sums and weighted pair rows, starting a block
 //    or adding to it, keeping the history, with the next depth mix fused; keep_products and
 //    keep_history.
@@ -691,6 +692,7 @@ struct AttentionCase {
     RowsCase rows;
     int ring = 0, window = 0, splits = 1;
     float sink_offset = 0.0f;
+    bool far = false; // a full visit's chunk: its far field on tensor cores (AttentionArgs::far)
 };
 
 void attention_case(const AttentionCase& c, std::mt19937& rng) {
@@ -718,6 +720,7 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
     DeviceBuffer dk = upload(kc), dv = upload(vc), dq = upload(q), dr = upload(r), dt = upload(table),
                  dg = upload(gate), ds = upload(sinks),
                  partial(k::attention_workspace_floats(t, kHeads, c.splits) * 4),
+                 far(k::attention_workspace_floats(t, kHeads, 1) * 4),
                  out(std::size_t(t) * kHeads * kD * 2),
                  q8(std::size_t(t) * kHeads * kD + std::size_t(t) * (kHeads * kD / 32) * 4);
     RowsDevice rows(rc);
@@ -740,6 +743,7 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
     a.scale       = scale;
     a.splits      = c.splits;
     a.partial     = as<float>(partial);
+    a.far         = c.far ? as<float>(far) : nullptr;
     a.gate        = as<float>(dg);
     a.gate_stride = gate_stride;
     a.out         = as<bf16>(out);
@@ -812,7 +816,8 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
     }
     report(eb.rel() < 6e-3 && eq.rel() < 1.5e-2,
            "attention " + c.name + ", splits " + std::to_string(c.splits) +
-               (c.sink_offset != 0.0f ? ", sinks " + num(c.sink_offset) : "") + " (" +
+               (c.sink_offset != 0.0f ? ", sinks " + num(c.sink_offset) : "") +
+               (c.far ? ", far field" : "") + " (" +
                std::to_string(biased) + " biased, " + std::to_string(unbiased) +
                " unbiased scores): bf16 " + num(eb.rel()) + ", q8_1 " + num(eq.rel()));
 }
@@ -1529,6 +1534,17 @@ int main() {
         attention_case({"full cache, chunk after 600", {iota(600, 21), {}, true, 600}, 0, 0, 1}, rng);
         attention_case({"full cache, chunk at 0", {iota(0, 64), {}, true, 0}, 0, 0, 1}, rng);
         attention_case({"full cache, branches", branches, 0, 0, 1}, rng);
+        // Chunks far enough in for a far field: one group of 32 rows and part of one, three groups
+        // with a short last one, and branches after 1,600 positions.
+        attention_case({"full cache, chunk after 1100", {iota(1100, 37), {}, true, 1100}, 0, 0, 1, 0.0f, true}, rng);
+        attention_case({"full cache, chunk after 3000", {iota(3000, 70), {}, true, 3000}, 0, 0, 1, 0.0f, true}, rng);
+        attention_case({"full cache, chunk after 3000", {iota(3000, 70), {}, true, 3000}, 0, 0, 1, -30.0f, true}, rng);
+        {
+            RowsCase far_branches{{}, {}, true, 1600, 4, {}};
+            far_branches.positions = {1600, 1601, 1602, 1603, 1604, 1605, 1606, 1604, 1605};
+            far_branches.starts    = {0, 0, 0, 0, 4, 4, 4, 7, 7};
+            attention_case({"full cache, branches after 1600", far_branches, 0, 0, 1, 0.0f, true}, rng);
+        }
         attention_case({"window ring, branches", branches, ring, kWindow, 1}, rng);
 
         residual_case("decode rows", decode, Product::Plain, false, 0, rng);

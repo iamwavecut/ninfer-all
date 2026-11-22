@@ -241,6 +241,10 @@ struct AttentionArgs {
     int splits  = 1;
     bool uniform = false;
     float* partial = nullptr; // decode: attention_workspace_floats
+    // A prompt chunk of a full visit (window 0, no ring): attention_workspace_floats(T,
+    // query_heads, 1) for the far field's softmax states, computed on tensor cores first: the keys
+    // before the chunk at least `extent` before every row of a group of 32 rows. Null: none.
+    float* far = nullptr;
     const float* gate = nullptr;
     std::int64_t gate_stride = 0;
     __nv_bfloat16* out = nullptr;
