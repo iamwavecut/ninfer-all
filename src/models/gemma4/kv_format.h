@@ -2,17 +2,9 @@
 
 // Gemma 4's KV-cache storage (--kv-dtype). A cache row is one KV head of one position, in blocks of
 // 256 dimensions (one for a sliding-window block, two for a full-attention block), each block's
-// codes and scales in two planes. The codings are the engine's own D256 codecs
-// (ops/kv_cache/*_codec.cuh), with their bytes and scale boundaries:
-//
-//   Int8G64   signed int8, one FP16 scale per 64 dimensions, FP16-RNE(absmax / 127)
-//   Int4G32   two signed 4-bit codes per byte, one FP16 scale per 32, FP16-RNE(absmax / 7)
-//   Fp8Row    E4M3FN codes, one FP16 scale per 256
-//   Nvfp4G16  two E2M1 codes per byte, one E4M3 scale per 16
-//   Lloyd4    4-bit Lloyd-Max indices with a G64 FP16 least-squares scale (rk4v4 keys)
-//   Int4E8    4-bit codes of the nearest E8 point, G64 FP16 scale (rk4v4-e8 keys)
-//   RootE8    two bytes per 8 dimensions: E8 root, radius and residual axis, G64 FP16 scale
-//             (rk2v4-e8 keys)
+// codes and scales in two planes. The codings are the engine's row codings at D = 256
+// (ops/kv_cache/kv_row.h): Int8G64, Int4G32, Fp8Row, Nvfp4G16, Lloyd4 (rk4v4 keys), Int4E8
+// (rk4v4-e8 keys) and RootE8 (rk2v4-e8 keys).
 //
 // A rotated plane stores the normalized Sylvester-Hadamard transform of each block, as the engine's
 // formats store keys (and NVFP4 values): the attention turns its queries (and its output, for
@@ -25,19 +17,11 @@
 // int4 value coding for the 4-bit and 2-bit key formats (rk4v4, rk4v4-e8, rk2v4-e8).
 
 #include "ninfer/kv_cache_storage.h"
-
-#include <cstdint>
-
-// The sizes below are also compile-time constants of the CUDA kernels.
-#if defined(__CUDACC__)
-#    define NINFER_GEMMA4_KV_HOST_DEVICE __host__ __device__
-#else
-#    define NINFER_GEMMA4_KV_HOST_DEVICE
-#endif
+#include "ops/kv_cache/kv_row.h"
 
 namespace ninfer::models::gemma4 {
 
-enum class KvCoding : std::uint8_t { F16, Int8G64, Int4G32, Fp8Row, Nvfp4G16, Lloyd4, Int4E8, RootE8 };
+using ops::kv_row::KvCoding;
 
 struct KvPlane {
     KvCoding coding = KvCoding::F16;
@@ -58,32 +42,12 @@ struct KvFormat {
 inline constexpr int kKvBlockDims = 256;
 
 // Bytes of one block's codes and of its scales.
-[[nodiscard]] NINFER_GEMMA4_KV_HOST_DEVICE constexpr int kv_code_bytes(KvCoding c) noexcept {
-    switch (c) {
-    case KvCoding::F16: return 512;
-    case KvCoding::Int8G64:
-    case KvCoding::Fp8Row: return 256;
-    case KvCoding::Int4G32:
-    case KvCoding::Nvfp4G16:
-    case KvCoding::Lloyd4:
-    case KvCoding::Int4E8: return 128;
-    case KvCoding::RootE8: return 64;
-    }
-    return 0;
+[[nodiscard]] NINFER_KV_ROW_HOST_DEVICE constexpr int kv_code_bytes(KvCoding c) noexcept {
+    return ops::kv_row::code_bytes(c, kKvBlockDims);
 }
 
-[[nodiscard]] NINFER_GEMMA4_KV_HOST_DEVICE constexpr int kv_scale_bytes(KvCoding c) noexcept {
-    switch (c) {
-    case KvCoding::F16: return 0;
-    case KvCoding::Int8G64:
-    case KvCoding::Lloyd4:
-    case KvCoding::Int4E8:
-    case KvCoding::RootE8: return 4 * 2;
-    case KvCoding::Int4G32: return 8 * 2;
-    case KvCoding::Fp8Row: return 2;
-    case KvCoding::Nvfp4G16: return 16;
-    }
-    return 0;
+[[nodiscard]] NINFER_KV_ROW_HOST_DEVICE constexpr int kv_scale_bytes(KvCoding c) noexcept {
+    return ops::kv_row::scale_bytes(c, kKvBlockDims);
 }
 
 } // namespace ninfer::models::gemma4

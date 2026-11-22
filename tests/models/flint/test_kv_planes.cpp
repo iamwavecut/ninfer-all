@@ -112,8 +112,7 @@ std::vector<double> decode_row(KvCoding coding, const std::uint8_t* codes,
         case KvCoding::Lloyd4:
             x[d] = double(test::lloyd4_code(std::uint8_t(nibble))) * half_at(scales, d / 64);
             break;
-        case KvCoding::Mxfp8:
-        case KvCoding::F16: throw std::logic_error("not a Flint plane coding");
+        default: throw std::logic_error("not a Flint plane coding");
         }
     }
     return x;

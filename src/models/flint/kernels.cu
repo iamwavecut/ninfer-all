@@ -965,8 +965,7 @@ void kv_store(const KvStoreArgs& args, cudaStream_t stream) {
     case KvCoding::Lloyd4:
         kv_store_kernel<KvCoding::Lloyd4><<<grid, block, 0, stream>>>(args);
         break;
-    case KvCoding::Mxfp8:
-    case KvCoding::F16: throw std::invalid_argument("flint kv_store: not a Flint plane coding");
+    default: throw std::invalid_argument("flint kv_store: not a Flint plane coding");
     }
     check_launch("kv_store");
 }
@@ -985,8 +984,7 @@ void kv_load(const KvLoadArgs& args, cudaStream_t stream) {
     case KvCoding::Lloyd4:
         kv_load_kernel<KvCoding::Lloyd4><<<grid, 256, 0, stream>>>(args);
         break;
-    case KvCoding::Mxfp8:
-    case KvCoding::F16: throw std::invalid_argument("flint kv_load: not a Flint plane coding");
+    default: throw std::invalid_argument("flint kv_load: not a Flint plane coding");
     }
     check_launch("kv_load");
 }
