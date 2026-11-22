@@ -21,10 +21,21 @@ struct NvmlMemory {
     unsigned long long free;
     unsigned long long used;
 };
+// nvmlMemory_v2_t (driver 510 and newer): `used` leaves out the memory the driver reserves, as
+// nvidia-smi reports it; the first form counts the reservation (about 450 MiB on an idle RTX 3090).
+struct NvmlMemoryV2 {
+    unsigned int version;
+    unsigned long long total;
+    unsigned long long reserved;
+    unsigned long long free;
+    unsigned long long used;
+};
+constexpr unsigned int kMemoryV2 = static_cast<unsigned int>(sizeof(NvmlMemoryV2)) | (2U << 24U);
 using InitFn        = NvmlReturn (*)();
 using ByPciFn       = NvmlReturn (*)(const char*, NvmlDevice*);
 using UtilizationFn = NvmlReturn (*)(NvmlDevice, NvmlUtilization*);
 using MemoryFn      = NvmlReturn (*)(NvmlDevice, NvmlMemory*);
+using MemoryV2Fn    = NvmlReturn (*)(NvmlDevice, NvmlMemoryV2*);
 using TemperatureFn = NvmlReturn (*)(NvmlDevice, int, unsigned int*);
 using UnsignedFn    = NvmlReturn (*)(NvmlDevice, unsigned int*);
 using ClockFn       = NvmlReturn (*)(NvmlDevice, int, unsigned int*);
@@ -51,8 +62,12 @@ public:
                 r.utilization_percent        = rates.gpu;
                 r.memory_utilization_percent = rates.memory;
             }
+            NvmlMemoryV2 memory2{.version = kMemoryV2};
             NvmlMemory memory{};
-            if (memory_ != nullptr && memory_(handle, &memory) == kSuccess) {
+            if (memory_v2_ != nullptr && memory_v2_(handle, &memory2) == kSuccess) {
+                r.memory_used_bytes  = memory2.used;
+                r.memory_total_bytes = memory2.total;
+            } else if (memory_ != nullptr && memory_(handle, &memory) == kSuccess) {
                 r.memory_used_bytes  = memory.used;
                 r.memory_total_bytes = memory.total;
             }
@@ -88,6 +103,7 @@ private:
         utilization_ = reinterpret_cast<UtilizationFn>(
             nvml_symbol(library, "nvmlDeviceGetUtilizationRates"));
         memory_      = reinterpret_cast<MemoryFn>(nvml_symbol(library, "nvmlDeviceGetMemoryInfo"));
+        memory_v2_ = reinterpret_cast<MemoryV2Fn>(nvml_symbol(library, "nvmlDeviceGetMemoryInfo_v2"));
         temperature_ = reinterpret_cast<TemperatureFn>(nvml_symbol(library, "nvmlDeviceGetTemperature"));
         power_       = reinterpret_cast<UnsignedFn>(nvml_symbol(library, "nvmlDeviceGetPowerUsage"));
         power_limit_ = reinterpret_cast<UnsignedFn>(
@@ -112,6 +128,7 @@ private:
     std::vector<std::pair<int, NvmlDevice>> devices_;
     UtilizationFn utilization_ = nullptr;
     MemoryFn memory_           = nullptr;
+    MemoryV2Fn memory_v2_      = nullptr;
     TemperatureFn temperature_ = nullptr;
     UnsignedFn power_          = nullptr;
     UnsignedFn power_limit_    = nullptr;
