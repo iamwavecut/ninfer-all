@@ -120,15 +120,16 @@ struct MessageCheckpoint {
     // The checkpoint `at` moved down to the end of a prompt step, for an Engine whose prompt steps
     // each copy or read the experts the step routes to (experts off the GPU): a checkpoint
     // between two step ends would add a step, and a pass of the experts, to every prompt that
-    // keeps one. Steps run from 0, end at each of `frontiers` (sorted, the request's other kept
-    // states) and every `step` tokens after the last end. 0 when no step end other than a
-    // frontier lies at or below `at`, or when that end lies inside a media unit.
+    // keeps one. Steps run from `from` (where the prompt resumes), end at each of `frontiers`
+    // (sorted, the request's other kept states) and every `step` tokens after the last end. 0
+    // when no step end other than a frontier lies above `from` and at or below `at`, or when that
+    // end lies inside a media unit.
     [[nodiscard]] static std::uint32_t on_steps(std::uint32_t at,
                                                 std::span<const std::uint32_t> frontiers,
                                                 std::span<const ContextMediaMark> media,
-                                                std::uint32_t step) {
-        if (at == 0 || step == 0) { return 0; }
-        std::uint32_t position = 0, last = 0;
+                                                std::uint32_t step, std::uint32_t from = 0) {
+        if (at <= from || step == 0) { return 0; }
+        std::uint32_t position = from, last = 0;
         auto next = frontiers.begin();
         for (;;) {
             while (next != frontiers.end() && *next <= position) { ++next; }
@@ -138,7 +139,7 @@ struct MessageCheckpoint {
             last     = end;
             position = end;
         }
-        if (last < kSeparation) { return 0; }
+        if (last < from + kSeparation) { return 0; }
         for (const std::uint32_t other : frontiers) {
             if (other + kSeparation > last && last + kSeparation > other) { return 0; }
         }
