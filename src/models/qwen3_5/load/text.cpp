@@ -289,7 +289,7 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     const auto residency = prefix.starts_with("mtp/") && b.resident_mtp_experts
                                ? artifact::Residency::Device
                            : b.expert_residency == ExpertResidency::Host
-                               ? artifact::Residency::Pinned
+                               ? artifact::Residency::PinnedOrFiles
                            : b.expert_residency == ExpertResidency::Disk
                                ? artifact::Residency::Values
                                : artifact::Residency::Device;

@@ -340,6 +340,13 @@ int run_tests() {
                               fixed_after.hybrid_experts.dma_share == 0.5F,
                           "CLI did not preserve an automatic hybrid DMA share");
     }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency",
+                             "host", "--expert-host-mib", "0"}).hybrid_experts.host_bytes == 0ULL &&
+                          rejects([&] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                           "--expert-host-mib", "-1"});
+                          }),
+                      "CLI did not parse --expert-host-mib");
     for (const auto* share : {"-0.1", "1.1", "nan", "inf", "0.5x", "Auto"}) {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-dma-share", share});

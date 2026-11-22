@@ -29,6 +29,9 @@ inline constexpr const char* kHybridExpertHelp =
     "  --expert-profile-out FILE     record expert counts for this artifact after requests\n"
     "  --expert-mirror DIR           disk experts: DIR on a second drive holds copies of the\n"
     "                                artifact's files; reads alternate by 1 MiB stripe\n"
+    "  --expert-host-mib N           host experts: pin at most N MiB of them; the rest are\n"
+    "                                read from the artifact's files as disk experts are\n"
+    "                                (default: as many as the host can pin)\n"
     "  --expert-direct auto|on|off   disk experts on Linux: the NVMe drive writes experts\n"
     "                                straight into device memory through the kernel modules\n"
     "                                in kernel/ninfer-direct (auto, the default: when they are\n"
@@ -97,6 +100,14 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
         const std::string path(value());
         if (path.empty()) { throw std::invalid_argument("--expert-mirror takes a directory"); }
         out.mirror = path;
+    } else if (option == "--expert-host-mib") {
+        const std::string text(value());
+        std::uint64_t mib       = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), mib);
+        if (error != std::errc{} || end != text.data() + text.size() || mib > (1ULL << 40)) {
+            throw std::invalid_argument("--expert-host-mib takes a whole number of MiB");
+        }
+        out.host_bytes = mib << 20;
     } else if (option == "--expert-direct") {
         const std::string_view mode(value());
         if (mode == "auto") {

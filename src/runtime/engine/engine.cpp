@@ -104,13 +104,17 @@ EngineOptions with_family_steering(EngineOptions options) {
     return options;
 }
 
-// A drive mirror and the direct path change how disk experts are read.
+// A drive mirror and the direct path change how disk experts are read; a host budget, how many
+// host experts are pinned.
 EngineOptions with_expert_disk_reads(EngineOptions options) {
     const auto& hybrid = options.hybrid_experts;
     if ((!hybrid.mirror.empty() || hybrid.direct == ExpertDirect::On) &&
         options.expert_residency != ExpertResidency::Disk) {
         throw std::invalid_argument(
             "--expert-mirror and --expert-direct on require --expert-residency disk");
+    }
+    if (hybrid.host_bytes && options.expert_residency != ExpertResidency::Host) {
+        throw std::invalid_argument("--expert-host-mib requires --expert-residency host");
     }
     return options;
 }
