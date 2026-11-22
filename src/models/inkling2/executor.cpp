@@ -474,14 +474,15 @@ struct Executor::Impl {
             kv_bytes += 2 * staging;
         }
         // A full visit's decode or verification row splits its keys so that one row's blocks
-        // number about 16 per multiprocessor, at most 128 (the combine's width); the kernel uses
-        // fewer while the keys are short (active_splits). Every row of every call splits alike,
-        // so a verification row computes what a decode step at its position computes. On an RTX
-        // 3090, 32 blocks a multiprocessor decoded at 16's rates after 8K-120K tokens, and 2 (the
-        // earlier count) 4-40% slower.
+        // number about 32 per multiprocessor, at most 512 (the combine's capacity); the kernel
+        // uses fewer while the keys are short (active_splits). Every row of every call splits
+        // alike, so a verification row computes what a decode step at its position computes. On
+        // an RTX 3090 after 120K tokens 32 (328 splits) decoded at 67.1 tok/s, 16 at 66.7, 64
+        // (512) at 67.0 but 1.2% slower after 32K, and 128 splits at 65.5; 2 a multiprocessor
+        // decoded 4-40% slower.
         const int sms         = device.multiprocessor_count();
         decode_splits_full =
-            std::clamp((16 * sms + kv_heads - 1) / std::max(1, kv_heads), 1, 128);
+            std::clamp((32 * sms + kv_heads - 1) / std::max(1, kv_heads), 1, 512);
         decode_splits_sliding = 16;
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
         d_tokens    = DeviceBuffer(rows * 4);
@@ -1852,6 +1853,7 @@ struct Executor::Impl {
         int first = 0;              // a prompt chunk's first position
         int kept  = 0;              // a prompt chunk's rows the sequence keeps
         bool keep = false;          // a decode or verification call keeps its rows' history
+        int row_group = 1;          // a verification's rows a full visit's attention block takes
         kernels::Rows rows;
         States states;
         // The attention's three normed inputs (input 0 alone when `distinct` is 1): BF16 rows,
@@ -2346,6 +2348,12 @@ struct Executor::Impl {
                 aa.far = static_cast<float*>(workspace->alloc_bytes(
                     kernels::attention_workspace_floats(t, query_heads, 1) * 4).data);
             }
+            if (!c.chunk && lp.full && ka.ring == 0 && c.row_group > 1) {
+                // The groups: at most ceil(t / row_group), one more for each further sequence.
+                aa.row_group  = c.row_group;
+                aa.row_groups = std::min(t, (t + c.row_group - 1) / c.row_group +
+                                                std::min(t, int(options.sequences)) - 1);
+            }
             if (!c.chunk && aa.splits > 1) {
                 aa.partial = static_cast<float*>(workspace->alloc_bytes(
                     kernels::attention_workspace_floats(t, query_heads, aa.splits) * 4).data);
@@ -2753,11 +2761,12 @@ struct Executor::Impl {
     // `keep` (a decode step) each row's drafter taps go into its sequence's lane; a verification
     // keeps them for commit(). Both keep every row's convolution history (positions a later call
     // rewrites when commit() keeps fewer).
-    void decode_body(int b, bool keep) {
+    void decode_body(int b, bool keep, int row_group = 1) {
         workspace->reset();
         auto scope = workspace->scope();
         Call c;
         c.t              = b;
+        c.row_group      = row_group;
         c.q8             = !bf16_rows;
         c.keep           = true;
         c.rows.positions = static_cast<const std::int32_t*>(d_positions.p);
@@ -2860,7 +2869,9 @@ struct Executor::Impl {
         }
         for (int j = 0; j < n; ++j) { back(sequences[j], positions[sequences[j]] + row_widths[j]); }
         stage(tokens, pos, seq);
-        run_graph(16 + std::uint32_t(rows), [&] { decode_body(rows, false); });
+        // A full visit's attention reads each key tile once for up to four rows of a sequence.
+        run_graph(16 + std::uint32_t(rows),
+                  [&] { decode_body(rows, false, std::min(rows, kernels::kMaxRowGroup)); });
         verify_widths = std::move(row_widths);
     }
 

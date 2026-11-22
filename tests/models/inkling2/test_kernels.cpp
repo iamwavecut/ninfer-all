@@ -15,7 +15,7 @@
 //  - attention: relative bias inside its extent only, per-query sinks far below, near and above the
 //    scores, the sigmoid gate; sliding-window rings and full caches, one and many splits, prompt
 //    chunks after cached positions and branch rows, with and without the far field on tensor
-//    cores; BF16 and q8_1 outputs.
+//    cores, verification rows in groups with the bits of single rows; BF16 and q8_1 outputs.
 //  - residual over plain products, 2^-32 fixed-point sums and weighted pair rows, starting a block
 //    or adding to it, keeping the history, with the next depth mix fused; keep_products and
 //    keep_history.
@@ -693,6 +693,7 @@ struct AttentionCase {
     int ring = 0, window = 0, splits = 1;
     float sink_offset = 0.0f;
     bool far = false; // a full visit's chunk: its far field on tensor cores (AttentionArgs::far)
+    int row_group = 1; // a full visit's decode or verification rows grouped (AttentionArgs::row_group)
 };
 
 void attention_case(const AttentionCase& c, std::mt19937& rng) {
@@ -744,6 +745,7 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
     a.splits      = c.splits;
     a.partial     = as<float>(partial);
     a.far         = c.far ? as<float>(far) : nullptr;
+    a.row_group   = c.row_group;
     a.gate        = as<float>(dg);
     a.gate_stride = gate_stride;
     a.out         = as<bf16>(out);
@@ -760,6 +762,25 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
     std::vector<half2> got_d(std::size_t(t) * (width / 32));
     check(cudaMemcpy(got_q.data(), a.out_q.qs, got_q.size(), cudaMemcpyDeviceToHost), "q8 qs");
     check(cudaMemcpy(got_d.data(), a.out_q.ds, got_d.size() * 4, cudaMemcpyDeviceToHost), "q8 ds");
+    // Grouped rows give each row the bits of a block of its own.
+    std::size_t differ = 0;
+    if (c.row_group > 1) {
+        a.row_group = 1;
+        k::attention(a, nullptr);
+        sync("attention q8, single rows");
+        std::vector<std::int8_t> one_q(got_q.size());
+        std::vector<half2> one_d(got_d.size());
+        check(cudaMemcpy(one_q.data(), a.out_q.qs, one_q.size(), cudaMemcpyDeviceToHost), "q8 qs");
+        check(cudaMemcpy(one_d.data(), a.out_q.ds, one_d.size() * 4, cudaMemcpyDeviceToHost), "q8 ds");
+        a.out_q = {};
+        a.out   = as<bf16>(out);
+        k::attention(a, nullptr);
+        sync("attention, single rows");
+        const auto one = download<bf16>(out, std::size_t(t) * kHeads * kD);
+        differ += std::memcmp(one.data(), got.data(), got.size() * sizeof(bf16)) != 0;
+        differ += std::memcmp(one_q.data(), got_q.data(), got_q.size()) != 0;
+        differ += std::memcmp(one_d.data(), got_d.data(), got_d.size() * sizeof(half2)) != 0;
+    }
 
     const int group = kHeads / kKv;
     Error eb, eq;
@@ -814,10 +835,14 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
             }
         }
     }
-    report(eb.rel() < 6e-3 && eq.rel() < 1.5e-2,
+    report(eb.rel() < 6e-3 && eq.rel() < 1.5e-2 && differ == 0,
            "attention " + c.name + ", splits " + std::to_string(c.splits) +
                (c.sink_offset != 0.0f ? ", sinks " + num(c.sink_offset) : "") +
-               (c.far ? ", far field" : "") + " (" +
+               (c.far ? ", far field" : "") +
+               (c.row_group > 1 ? ", rows in groups of " + std::to_string(c.row_group) +
+                                      (differ == 0 ? " (single rows' bits)" : " (bits differ)")
+                                : "") +
+               " (" +
                std::to_string(biased) + " biased, " + std::to_string(unbiased) +
                " unbiased scores): bf16 " + num(eb.rel()) + ", q8_1 " + num(eq.rel()));
 }
@@ -1527,6 +1552,16 @@ int main() {
         attention_case({"full cache, decode", {{0, 900, 1500}, {0, 1, 2}}, 0, 0, 1}, rng);
         attention_case({"full cache, decode", {{0, 900, 1500}, {0, 1, 2}}, 0, 0, 48}, rng);
         attention_case({"full cache, verification", {{2000, 2001, 2002, 2003}, {0, 0, 0, 0}}, 0, 0, 16}, rng);
+        // Grouped verification rows: one group, groups across two sequences, rows whose keys
+        // split into different counts (126-129 at 16 splits) and lengths (8,191-8,194 at 128).
+        attention_case({"full cache, verification", {{2000, 2001, 2002, 2003}, {0, 0, 0, 0}}, 0, 0, 16, 0.0f, false, 4}, rng);
+        attention_case({"full cache, verification", {{2000, 2001, 2002, 1500, 1501, 1502, 1503, 1504}, {0, 0, 0, 1, 1, 1, 1, 1}}, 0, 0, 128, 0.0f, false, 4}, rng);
+        attention_case({"full cache, verification", {{126, 127, 128, 129}, {0, 0, 0, 0}}, 0, 0, 16, 0.0f, false, 4}, rng);
+        attention_case({"full cache, verification", {{8190, 8191, 8192, 8193}, {0, 0, 0, 0}}, 0, 0, 128, 0.0f, false, 4}, rng);
+        attention_case({"full cache, verification", {{3000, 3001}, {0, 0}}, 0, 0, 128, -30.0f, false, 2}, rng);
+        // More splits than the combine's 128 threads: 300 at 20,000 keys, 512 at 40,000.
+        attention_case({"full cache, decode", {{20000}, {0}}, 0, 0, 300}, rng);
+        attention_case({"full cache, verification", {{40000, 40001, 40002}, {0, 0, 0}}, 0, 0, 512, 0.0f, false, 3}, rng);
         attention_case({"window ring, verification", {{2000, 2001, 2002}, {0, 0, 0}}, ring, kWindow, 4}, rng);
         attention_case({"full cache, decode", {{700, 1300}, {0, 1}}, 0, 0, 7, -30.0f}, rng);
         attention_case({"full cache, decode", {{700, 1300}, {0, 1}}, 0, 0, 7, 12.0f}, rng);
