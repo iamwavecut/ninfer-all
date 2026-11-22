@@ -43,6 +43,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
+    offer_answer_now(request.generation);
     try {
         const ninfer::GenerationObservationOptions observation{
             .phase_timings   = true,
@@ -54,6 +55,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                                    : GenerationConsumerMode::Aggregate,
                                     observation, [&req] { return client_disconnected(req); });
         prepared.model_hold = std::make_shared<ModelRegistry::Lease>(std::move(lease));
+        enroll_answer_now(prepared, request.generation, res);
     } catch (const ApiException& exception) {
         record_request_rejected(make_request_rejection_log_context(
             req_id, "openai_chat_completions", request.generation, metadata, exception.error()));

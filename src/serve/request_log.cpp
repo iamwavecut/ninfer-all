@@ -667,6 +667,9 @@ std::string format_request_done(const RequestLogContext& context,
             << " loop_thinking=" << outcome.thinking.loop_thinking_tokens
             << " loop_coverage=" << outcome.thinking.loop_coverage;
     }
+    if (outcome.thinking.answer_now) {
+        out << " answer_now_thinking=" << outcome.thinking.answer_now_thinking_tokens;
+    }
     return out.str();
 }
 
@@ -988,6 +991,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"reasoning_loop_detected", outcome.thinking.loop_detected},
              {"reasoning_loop_thinking_tokens", outcome.thinking.loop_thinking_tokens},
              {"reasoning_loop_coverage", outcome.thinking.loop_coverage},
+             {"answer_now", outcome.thinking.answer_now},
+             {"answer_now_thinking_tokens", outcome.thinking.answer_now_thinking_tokens},
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] = Json{

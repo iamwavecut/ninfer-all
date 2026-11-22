@@ -8,10 +8,12 @@
 #include "ninfer/observability/execution.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <new>
 #include <optional>
 #include <stdexcept>
@@ -107,6 +109,43 @@ enum class ReasoningLoopAction : std::uint8_t {
               // output budget cannot hold the control span and one more token
 };
 
+// A caller's live request to close a running request's reasoning now and answer ("answer now").
+// Any thread may call request(); the request's output session reads it at the end of each round
+// and, while reasoning is open, injects the thinking-close control as a reached thinking budget
+// does. The session marks the signal answering once it commits the first output after reasoning,
+// or the first output of a reply that does not reason; a later request() is then refused.
+class AnswerNowSignal {
+public:
+    enum class State : std::uint8_t {
+        Waiting,   // no request yet; the reply may still reason
+        Requested, // the reply concludes at the end of its next round in reasoning
+        Answering, // the reply is past its reasoning: a request is refused
+    };
+
+    // True when the request is accepted: the reply had not started answering.
+    bool request() noexcept {
+        State expected = State::Waiting;
+        return state_.compare_exchange_strong(expected, State::Requested,
+                                              std::memory_order_acq_rel) ||
+               expected == State::Requested;
+    }
+
+    [[nodiscard]] bool requested() const noexcept {
+        return state_.load(std::memory_order_acquire) == State::Requested;
+    }
+
+    [[nodiscard]] State state() const noexcept { return state_.load(std::memory_order_acquire); }
+
+    // The output session's mark: a request() that has not arrived yet is refused.
+    void mark_answering() noexcept {
+        State expected = State::Waiting;
+        state_.compare_exchange_strong(expected, State::Answering, std::memory_order_acq_rel);
+    }
+
+private:
+    std::atomic<State> state_{State::Waiting};
+};
+
 struct ThinkingControlOptions {
     // Positive maximum accepted model-origin tokens while the Qwen thinking phase remains open.
     // Omitted means unlimited. Injected target-control tokens consume the total output budget but
@@ -118,6 +157,10 @@ struct ThinkingControlOptions {
     // Whether canonical early-close guidance and control tokens can be inserted.
     bool early_close_available = true;
     ReasoningLoopAction loop   = ReasoningLoopAction::Off;
+    // The caller's answer-now signal, or none. It concludes like ReasoningLoopAction::Conclude: a
+    // request whose remaining output budget cannot hold the control span and one more token, or
+    // whose frontend has no close control, keeps reasoning.
+    std::shared_ptr<AnswerNowSignal> answer_now;
 };
 
 enum class StructuredOutputKind : std::uint8_t {

@@ -25,6 +25,7 @@ add_library(ninfer_serve STATIC
   anthropic_messages_http.cpp
   openai_responses_store.cpp
   translate.cpp
+  answer_now.cpp
   generation_service.cpp
   branch_memo.cpp
   request_events.cpp

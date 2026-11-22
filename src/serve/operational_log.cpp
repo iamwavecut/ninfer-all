@@ -350,6 +350,11 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << static_cast<int>(outcome.thinking.loop_coverage * 100.0F + 0.5F) << "% repeated), "
             << (outcome.thinking.applied ? "concluded" : "stopped");
     }
+    if (outcome.thinking.answer_now) {
+        out << " | answer now after "
+            << product::format_pretty_count(outcome.thinking.answer_now_thinking_tokens)
+            << " thinking tokens";
+    }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
 

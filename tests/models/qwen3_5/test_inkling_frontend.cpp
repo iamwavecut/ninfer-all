@@ -57,6 +57,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <random>
 #include <set>
 #include <sstream>
@@ -943,6 +944,44 @@ void test_thinking_control_and_loop() {
                    decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl &&
                    session.thinking_stats().model_thinking_tokens == 2,
                "Inkling enforces budget per token inside speculative spans crossing <|content_thinking|>");
+    }
+    // Answer now: a request after the header, before the thinking block, is accepted and closes the
+    // block at the end of the first round inside it; a text block marks the reply answering.
+    {
+        auto signal  = std::make_shared<ninfer::AnswerNowSignal>();
+        auto session = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+            ninfer::ThinkingControlOptions{.answer_now = signal});
+        (void)session.preview_model(std::vector<ninfer::TokenId>{kModelId}, 256,
+                                    ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        expect(signal->request(), "Inkling refused answer now before its thinking block");
+        const auto thinking = joined({{kThinkingId}, bytes("ab")});
+        const auto decision =
+            session.preview_model(thinking, 255, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        expect(decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+               "Inkling answer now did not close the open thinking block");
+        const auto pending = session.pending_control_tokens();
+        const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+        expect(!control.empty() && control.back() == kEndId,
+               "Inkling answer now control span does not end the block");
+        if (!control.empty()) {
+            (void)session.preview_control(control, 252);
+            (void)session.commit_preview();
+            const auto stats = session.thinking_stats();
+            expect(stats.applied && stats.answer_now && stats.answer_now_thinking_tokens == 2 &&
+                       session.banned_token() == std::optional<ninfer::TokenId>(kThinkingId),
+                   "Inkling answer now accounting or opener ban is incorrect");
+        }
+        auto later  = std::make_shared<ninfer::AnswerNowSignal>();
+        auto answer = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+            ninfer::ThinkingControlOptions{.answer_now = later});
+        (void)answer.preview_model(joined({{kModelId, kTextId}, bytes("OK")}), 256,
+                                   ninfer::FinishReason::OutputLimit);
+        (void)answer.commit_preview();
+        expect(!later->request(), "Inkling accepted answer now inside its text block");
     }
     // Reasoning loop guard retains history across natural <|end_message|> closes so alternating
     // short thinking/text blocks cannot evade detection.
