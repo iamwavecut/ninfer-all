@@ -3102,12 +3102,12 @@ against Windows headers but has not been run.
 
 ### Context cache of the other families
 
-Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next keep a context cache of their own:
-images of a sequence's whole state in pinned host memory, within `--host-kv-mib` (or
-`--host-cache-mib`, 8 GiB by default). A sequence's state goes to an image before another request
-takes the sequence, and so does the state where the frontend marks a prefix that requests share,
-when copying it back costs less than computing it again; each family's guide says what an image
-holds ([Gemma 4](gemma4.md#prefix-reuse), [Flint](flint.md#prefix-reuse),
+Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next (with [dense Qwen4](qwen4-dense.md))
+keep a context cache of their own: images of a sequence's whole state in pinned host memory, within
+`--host-kv-mib` (or `--host-cache-mib`, 8 GiB by default). A sequence's state goes to an image
+before another request takes the sequence, and so does the state where the frontend marks a prefix
+that requests share, when copying it back costs less than computing it again; each family's guide
+says what an image holds ([Gemma 4](gemma4.md#prefix-reuse), [Flint](flint.md#prefix-reuse),
 [DeepSeek-V4.1](deepseek-v41.md#prefix-reuse), [Inkling 2](inkling2.md#prefix-reuse),
 [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#sequences-kv-and-the-context-cache)). A prompt on any
 sequence resumes from the longest image it starts with. An image larger than the budget is not

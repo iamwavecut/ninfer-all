@@ -610,7 +610,8 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                            architecture == "FlintForCausalLM" ||
                            architecture == "DeepseekV41ForCausalLM" ||
                            architecture == "Inkling2ForCausalLM" ||
-                           architecture == "Qwen4ExpForCausalLM";
+                           architecture == "Qwen4ExpForCausalLM" ||
+                           architecture == "Qwen4ForCausalLM";
     if (cache.enabled && own_cache) {
         // These families keep state images of their own (runtime/engine/context_image_store.h),
         // not the checkpoint catalog's cells.

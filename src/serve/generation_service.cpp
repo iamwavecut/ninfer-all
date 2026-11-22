@@ -414,14 +414,14 @@ GenerationService::GenerationService(
 }
 
 void GenerationService::refuse_family_options() const {
-    // Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Flash-Next keep context caches of their own,
-    // with a prefix cache file and session slots but not the hybrid prefix cache. Those options
-    // would start and do nothing.
+    // Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Flash-Next (also dense Qwen4) keep context
+    // caches of their own, with a prefix cache file and session slots but not the hybrid prefix
+    // cache. Those options would start and do nothing.
     const std::string architecture = engine_->load_summary().architecture;
     const bool own_cache =
         architecture == "Gemma4ForCausalLM" || architecture == "FlintForCausalLM" ||
         architecture == "DeepseekV41ForCausalLM" || architecture == "Inkling2ForCausalLM" ||
-        architecture == "Qwen4ExpForCausalLM";
+        architecture == "Qwen4ExpForCausalLM" || architecture == "Qwen4ForCausalLM";
     const bool own_cache_file = own_cache && options_.hybrid_cache_flag == "--prefix-cache-file";
     if (!own_cache && !options_.catalog_cache_flag.empty()) {
         throw std::invalid_argument(options_.hybrid_cache_flag +
