@@ -3438,6 +3438,25 @@ Qwen4ExpCore::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
             identity.rewrite_checkpoint->frontier < prompt_n) {
             request->anchor_at = identity.rewrite_checkpoint->frontier;
         }
+        // The protocol's default boundary (DefaultAutomatic: OpenAI and Anthropic put it where the
+        // prompt's last message ends) is where a repeat of the prompt resumes, and the next turn
+        // when the template rewrites what follows it. The sequence's anchor moves there: a device
+        // snapshot, copied to the host as an image only when another request takes the sequence.
+        if (!options.execution.branches) {
+            for (const auto& opportunity : data.context_cache.opportunities) {
+                const bool only_default =
+                    has_shared_candidate_evidence(opportunity.evidence,
+                                                  SharedCandidateEvidence::DefaultAutomatic) &&
+                    !has_shared_candidate_evidence(
+                        opportunity.evidence, SharedCandidateEvidence::ExplicitBoundary |
+                                                  SharedCandidateEvidence::RequestedAutomatic |
+                                                  SharedCandidateEvidence::EngineStructural);
+                if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && only_default &&
+                    opportunity.frontier > 0 && opportunity.frontier < request->anchor_at) {
+                    request->anchor_at = opportunity.frontier;
+                }
+            }
+        }
         request->disposable = data.tap_hints.disposable;
         // Shared prefixes worth an image of their own: a structural or declared boundary, not one
         // the engine merely observed (the prompt's end, a grid point). A branched read's prompt

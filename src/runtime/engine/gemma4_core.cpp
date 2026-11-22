@@ -2872,9 +2872,28 @@ Gemma4Core::make_request(GroupMember& member, std::optional<std::uint32_t>& budg
             identity.rewrite_checkpoint->frontier < prompt_n) {
             request->anchor_at = identity.rewrite_checkpoint->frontier;
         }
-        // Shared prefixes worth an image of their own: explicit, requested-automatic, or structural
-        // boundaries, excluding DefaultAutomatic (which protocols place at prompt_n - 1 and would
-        // otherwise trigger a full state D2H copy on every turn; see resource_manager.h).
+        // The protocol's default boundary (DefaultAutomatic: OpenAI and Anthropic put it where the
+        // prompt's last message ends) is where a repeat of the prompt resumes, and the next turn
+        // when the template rewrites what follows it. The sequence's anchor moves there: a device
+        // snapshot, copied to the host as an image only when another request takes the sequence.
+        if (!options.execution.branches) {
+            for (const auto& opportunity : data.context_cache.opportunities) {
+                const bool only_default =
+                    has_shared_candidate_evidence(opportunity.evidence,
+                                                  SharedCandidateEvidence::DefaultAutomatic) &&
+                    !has_shared_candidate_evidence(
+                        opportunity.evidence, SharedCandidateEvidence::ExplicitBoundary |
+                                                  SharedCandidateEvidence::RequestedAutomatic |
+                                                  SharedCandidateEvidence::EngineStructural);
+                if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && only_default &&
+                    opportunity.frontier > 0 && opportunity.frontier < request->anchor_at) {
+                    request->anchor_at = opportunity.frontier;
+                }
+            }
+        }
+        // Shared prefixes worth an image of their own: a declared or structural boundary. The
+        // default one at the prompt's end moved the anchor above instead; an image there copied
+        // the whole state to the host on every turn.
         for (const auto& opportunity : data.context_cache.opportunities) {
             const auto evidence   = opportunity.evidence;
             const bool structural = has_shared_candidate_evidence(
