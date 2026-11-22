@@ -35,6 +35,8 @@ add_library(ninfer_core STATIC
   tensor_split.cpp
   dtype.cpp
   gpu_clock_floor.cpp
+  gpu_telemetry.cpp
+  nvml_library.cpp
   host_memory.cpp
   io_priority.cpp
   host_pages.cpp
@@ -73,7 +75,7 @@ ninfer_cuda_archive(ninfer_core)
 # The virtual-memory and evictable pools call the driver API as well.
 target_link_libraries(ninfer_core PUBLIC
   ninfer_core_device ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads CUDA::cuda_driver)
-# gpu_clock_floor.cpp loads NVML at run time.
+# nvml_library.cpp loads NVML at run time.
 target_link_libraries(ninfer_core PRIVATE ${CMAKE_DL_LIBS})
 if(WIN32 AND NINFER_DIRECTSTORAGE)
   target_link_libraries(ninfer_core PUBLIC ninfer_directstorage)

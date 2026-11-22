@@ -2,22 +2,14 @@
 
 #include <cuda_runtime_api.h>
 
-#include <algorithm>
+#include "core/nvml_library.h"
 
-#if defined(_WIN32)
-#    ifndef NOMINMAX
-#        define NOMINMAX
-#    endif
-#    include <windows.h>
-#else
-#    include <dlfcn.h>
-#endif
+#include <algorithm>
 
 namespace ninfer {
 namespace {
 
-// The NVML entry points this needs, declared from its stable C ABI: the library is the driver's,
-// loaded at run time, so a build needs no NVML headers and a host without NVML still starts.
+// The NVML entry points this needs, declared from its stable C ABI (core/nvml_library.h).
 using NvmlReturn   = int;
 using NvmlDevice   = void*;
 using InitFn       = NvmlReturn (*)();
@@ -36,11 +28,7 @@ constexpr int kNvmlClockGraphics       = 0;
 struct GpuClockFloor::Nvml {
     ~Nvml() {
         if (initialized) { shutdown(); }
-#if defined(_WIN32)
-        if (library != nullptr) { FreeLibrary(static_cast<HMODULE>(library)); }
-#else
-        if (library != nullptr) { dlclose(library); }
-#endif
+        close_nvml_library(library);
     }
 
     [[nodiscard]] std::string error(NvmlReturn result) const {
@@ -61,28 +49,8 @@ struct GpuClockFloor::Nvml {
 
 std::shared_ptr<GpuClockFloor::Nvml> GpuClockFloor::load_nvml(std::string& problem) {
     auto nvml = std::make_shared<Nvml>();
-#if defined(_WIN32)
-    // The driver installs nvml.dll in System32; drivers before 2019 kept it in NVSMI.
-    HMODULE module = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (module == nullptr) {
-        wchar_t root[MAX_PATH];
-        const DWORD length = GetEnvironmentVariableW(L"ProgramW6432", root, MAX_PATH);
-        if (length > 0 && length < MAX_PATH) {
-            const std::wstring path =
-                std::wstring(root) + L"\\NVIDIA Corporation\\NVSMI\\nvml.dll";
-            module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        }
-    }
-    nvml->library      = module;
-    const auto symbol  = [&](const char* name) {
-        return module != nullptr ? reinterpret_cast<void*>(GetProcAddress(module, name)) : nullptr;
-    };
-#else
-    nvml->library     = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
-    const auto symbol = [&](const char* name) {
-        return nvml->library != nullptr ? dlsym(nvml->library, name) : nullptr;
-    };
-#endif
+    nvml->library     = open_nvml_library();
+    const auto symbol = [&](const char* name) { return nvml_symbol(nvml->library, name); };
     if (nvml->library == nullptr) {
         problem = "the NVIDIA management library (NVML) is not available";
         return nullptr;

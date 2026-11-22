@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <span>
 #include <string>
 
 namespace ninfer::serve {
@@ -31,6 +32,50 @@ void append_sample(std::string& out, const char* name, const std::string& labels
     char text[32];
     std::snprintf(text, sizeof(text), "%llu", static_cast<unsigned long long>(value));
     out.append(name).append("{").append(labels).append("} ").append(text).append("\n");
+}
+
+void append_value(std::string& out, const char* name, const std::string& labels, double value) {
+    char text[40];
+    std::snprintf(text, sizeof(text), "%.17g", std::isfinite(value) ? value : 0.0);
+    out.append(name).append("{").append(labels).append("} ").append(text).append("\n");
+}
+
+// Each GPU family's samples, one per device that NVML read the field of; a family no device has
+// is left out.
+void append_gpus(std::string& out, std::span<const ninfer::GpuReading> gpus) {
+    const auto family = [&](const char* name, const char* help, auto field) {
+        bool header = false;
+        for (const ninfer::GpuReading& gpu : gpus) {
+            const auto value = field(gpu);
+            if (!value) { continue; }
+            if (!header) {
+                append_family(out, name, "gauge", help);
+                header = true;
+            }
+            append_value(out, name, "device=\"" + std::to_string(gpu.device) + "\"",
+                         static_cast<double>(*value));
+        }
+    };
+    family("ninfer:gpu_utilization_percent",
+           "Share of the last sample period in which a kernel ran on the GPU, 0-100 (NVML).",
+           [](const ninfer::GpuReading& g) { return g.utilization_percent; });
+    family("ninfer:gpu_memory_utilization_percent",
+           "Share of the last sample period in which device memory was read or written, 0-100 (NVML).",
+           [](const ninfer::GpuReading& g) { return g.memory_utilization_percent; });
+    family("ninfer:gpu_memory_used_bytes", "Device memory in use by all processes.",
+           [](const ninfer::GpuReading& g) { return g.memory_used_bytes; });
+    family("ninfer:gpu_memory_total_bytes", "Device memory the driver reports.",
+           [](const ninfer::GpuReading& g) { return g.memory_total_bytes; });
+    family("ninfer:gpu_temperature_celsius", "GPU die temperature.",
+           [](const ninfer::GpuReading& g) { return g.temperature_celsius; });
+    family("ninfer:gpu_power_watts", "Board power draw.",
+           [](const ninfer::GpuReading& g) { return g.power_watts; });
+    family("ninfer:gpu_power_limit_watts", "Enforced board power limit.",
+           [](const ninfer::GpuReading& g) { return g.power_limit_watts; });
+    family("ninfer:gpu_sm_clock_mhz", "SM clock.",
+           [](const ninfer::GpuReading& g) { return g.sm_clock_mhz; });
+    family("ninfer:gpu_memory_clock_mhz", "Memory clock.",
+           [](const ninfer::GpuReading& g) { return g.memory_clock_mhz; });
 }
 
 // The context cache's Engine counters. Selections count admissions by the source they started
@@ -131,7 +176,8 @@ void ServeMetrics::record_rejection() {
     ++requests_rejected_total_;
 }
 
-std::string ServeMetrics::render(const LoadCapacity& capacity, const LoadSample& sample) const {
+std::string ServeMetrics::render(const LoadCapacity& capacity, const LoadSample& sample,
+                                 std::span<const ninfer::GpuReading> gpus) const {
     const ninfer::RuntimeStats& stats = sample.stats;
     const double page_tokens =
         capacity.kv_capacity_pages == 0
@@ -235,6 +281,7 @@ std::string ServeMetrics::render(const LoadCapacity& capacity, const LoadSample&
            "Prompt tokens those steps left to later steps.",
            static_cast<double>(stats.paced_prefill_deferred_tokens));
     append_context_cache(out, stats);
+    append_gpus(out, gpus);
     return out;
 }
 

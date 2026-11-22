@@ -1,6 +1,7 @@
 #include "serve/http_server.h"
 #include "serve/slot_files.h"
 
+#include "core/gpu_telemetry.h"
 #include "product/logging/logging.h"
 #include "serve/anthropic_messages.h"
 #include "serve/http_transport.h"
@@ -19,6 +20,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -1062,8 +1064,10 @@ void HttpServer::handle_metrics(const httplib::Request& req, httplib::Response& 
     try {
         const ModelRegistry::Lease lease = lease_query_model(req);
         res.set_header("Cache-Control", "no-store");
-        res.set_content(metrics_.render(model_facts(lease).capacity, load_sample(lease.service())),
-                        "text/plain; version=0.0.4; charset=utf-8");
+        const std::vector<ninfer::GpuReading> gpus = ninfer::read_gpu_telemetry();
+        res.set_content(
+            metrics_.render(model_facts(lease).capacity, load_sample(lease.service()), gpus),
+            "text/plain; version=0.0.4; charset=utf-8");
     } catch (const ApiException& exception) { write_openai_error(res, exception.error()); }
 }
 
