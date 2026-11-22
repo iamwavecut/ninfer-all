@@ -246,6 +246,13 @@ endif()
 if(NINFER_PTXAS_VERBOSE)
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
 endif()
+# Source-line tables change no machine code, but the driver expands every module of a compressed
+# fatbin into host memory, line tables included, when CUDA starts.
+option(NINFER_CUDA_LINEINFO
+       "Record each kernel's source lines (-lineinfo) for compute-sanitizer reports and the Nsight Compute source view" OFF)
+if(NINFER_CUDA_LINEINFO)
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

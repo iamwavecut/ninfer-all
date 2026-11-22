@@ -106,6 +106,9 @@ compute-sanitizer --tool initcheck --error-exitcode 9 \
   build/tests/ninfer_tests ninfer_softmax_attention_test
 ```
 
+A build with `-DNINFER_CUDA_LINEINFO=ON` gives each report the source file and line; a default build
+names the kernel and the SASS offset only.
+
 A wait that the sanitizer stretches past 120 s ends the test with the device stall message; set
 `NINFER_DEVICE_STALL_SECONDS=0` ([Device stall watch](../docs/cli.md#device-stall-watch)) for long
 runs.

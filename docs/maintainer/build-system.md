@@ -359,8 +359,10 @@ read carries no device code.
 `ninfer_nvfp4_non_rdc` explicitly disables separable compilation and device-symbol resolution. It
 contains the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend
 on `setmaxnreg` register transfer, which RDC would discard. Their owning family manifests register
-these sources into that target; host launchers connect them to the normal Ops. All four CUDA
-archive targets retain `-lineinfo`.
+these sources into that target; host launchers connect them to the normal Ops. No CUDA target
+records source lines unless `NINFER_CUDA_LINEINFO=ON` ([build options](../build-linux.md#build-options)):
+the driver expands every module of these compressed fatbins into host memory when CUDA starts,
+line tables included, and the tables change no machine code.
 
 Whole-program compilation is not a speed lever on every card. On the RTX 3090 (sm_86, CUDA 12.8, 27B
 DFlash2 bundle, rk4v4 KV, three interleaved rounds) the base line measured the switch at
