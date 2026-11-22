@@ -2955,7 +2955,11 @@ sequence resumes from the longest image it starts with. An image larger than the
 kept, on disk either: Gemma 4 31B's of a 6,434-token prompt takes 3.1 GiB. Where a chat request's
 last message ends, a sequence keeps a snapshot on the device instead of an image, which a repeat of
 the prompt resumes from, and so does the next turn when the template renders what followed
-differently; it goes to an image when another request takes the sequence. Beyond that:
+differently; it goes to an image when another request takes the sequence. A next turn that keeps
+what the template put after that message resumes past it: Gemma 4, Flint and Inkling 2 take the
+sequence back to where the new prompt departs from what it read, when their sliding-window rings
+still hold that position's window; DeepSeek-V4.1, whose images take about 1 KB a position, keeps an
+image where the last message ends and its snapshot where the prompt ends. Beyond that:
 
 - **A document, then another question.** A prompt whose last message holds at least 768 tokens
   also keeps an image inside it, at the last multiple of 256 tokens at least 512 tokens before the

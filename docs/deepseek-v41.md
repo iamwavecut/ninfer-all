@@ -711,7 +711,9 @@ keeps instead of prefilling those tokens again:
 
 - **On its sequence.** A sequence keeps its state when its request ends, and a checkpoint of its
   window rings and compressor tails where the prompt's last user turn closes; the next turn of a
-  conversation resumes from either.
+  conversation resumes from either. The state where the prompt's last message ends also goes to an
+  image each turn (an image takes about 1 KB a position), for a repeat of the prompt and a next turn
+  whose template renders what follows that message differently.
 - **From host memory.** Before another request takes a sequence, what it held goes to an image in
   pinned host memory: the window rings, the compressor tails and the compressed caches up to its
   length. A prompt on any sequence resumes from the longest image it starts with. `--host-kv-mib`

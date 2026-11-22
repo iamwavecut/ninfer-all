@@ -1103,6 +1103,32 @@ struct Inkling2Core::Impl {
         return static_cast<std::uint32_t>(held.size());
     }
 
+    // Where the prompt departs from what a sequence read (`held`, with `held_media`): their
+    // common prefix, at most what prefix_reuse() allows, cut back to the start of a media unit it
+    // would split; 0 when the media units before it differ.
+    static std::uint32_t departure(const std::vector<TokenId>& held,
+                                   const std::vector<MediaMark>& held_media,
+                                   const Request& prompt) {
+        const auto& tokens = prompt.prompt_tokens;
+        if (held.empty() || tokens.empty()) { return 0; }
+        const std::size_t most =
+            std::min(held.size(), prompt.branches ? tokens.size() : tokens.size() - 1);
+        std::size_t at = std::size_t(
+            std::mismatch(held.begin(), held.begin() + std::ptrdiff_t(most), tokens.begin()).first -
+            held.begin());
+        for (const MediaMark& mark : held_media) {
+            if (mark.begin < at && at < mark.begin + mark.count) { at = mark.begin; }
+        }
+        std::size_t a = 0, b = 0;
+        while (a < held_media.size() && held_media[a].begin < at) { ++a; }
+        while (b < prompt.media.size() && prompt.media[b].begin < at) { ++b; }
+        if (a != b || !std::equal(held_media.begin(), held_media.begin() + std::ptrdiff_t(a),
+                                  prompt.media.begin())) {
+            return 0;
+        }
+        return static_cast<std::uint32_t>(at);
+    }
+
     // The stored image that serves the most of the prompt, and how much.
     [[nodiscard]] std::pair<std::size_t, std::uint32_t> find_stored(const Request& prompt) const {
         return store.best([&](const Store::Image& image) {
@@ -1317,7 +1343,20 @@ struct Inkling2Core::Impl {
             const std::uint32_t live       = prefix_reuse(slot.fed, slot.media, r);
             const std::uint32_t anchored   = prefix_reuse(slot.anchor, slot.anchor_media, r);
             const auto [image, from_store] = find_stored(r);
-            if (from_store > std::max(live, anchored)) {
+            // A prompt that departs from what the sequence read after its last prompt (a reply the
+            // template renders otherwise, a regenerated one) resumes where it departs, the
+            // sequence taken back there, when its rings still hold that position's window: the
+            // closure of the last prompt, which the anchor at the default boundary would compute
+            // again, and the reply's tokens the prompt keeps.
+            const std::uint32_t departs = live == 0 ? departure(slot.fed, slot.media, r) : 0;
+            if (departs > std::max(anchored, from_store) &&
+                executor.rewind(s, static_cast<std::uint32_t>(slot.fed.size()) - departs)) {
+                slot.fed.resize(departs);
+                std::erase_if(slot.media,
+                              [departs](const MediaMark& mark) { return mark.begin >= departs; });
+                reused       = departs;
+                r.reuse_path = PrefixReusePath::PrivateEndpoint;
+            } else if (from_store > std::max(live, anchored)) {
                 std::vector<TokenId> tokens  = store.images()[image].tokens;
                 std::vector<MediaMark> media = store.images()[image].media;
                 const PrefixReusePath path   = store.images()[image].path;

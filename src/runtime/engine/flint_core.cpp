@@ -957,6 +957,18 @@ struct FlintCore::Impl {
         return static_cast<std::uint32_t>(held.size());
     }
 
+    // Where the prompt departs from what a sequence read: their common prefix, at most what
+    // prefix_reuse() allows.
+    static std::uint32_t departure(const std::vector<TokenId>& held, const Request& prompt) {
+        const auto& tokens = prompt.prompt_tokens;
+        if (held.empty() || tokens.empty()) { return 0; }
+        const std::size_t most =
+            std::min(held.size(), prompt.branches ? tokens.size() : tokens.size() - 1);
+        return static_cast<std::uint32_t>(
+            std::mismatch(held.begin(), held.begin() + std::ptrdiff_t(most), tokens.begin()).first -
+            held.begin());
+    }
+
     // The stored image that serves the most of the prompt, and how much.
     [[nodiscard]] std::pair<std::size_t, std::uint32_t> find_stored(const Request& prompt) const {
         return store.best([&](const Store::Image& image) {
@@ -1162,7 +1174,18 @@ struct FlintCore::Impl {
             const std::uint32_t live       = prefix_reuse(slot.fed, r);
             const std::uint32_t anchored   = prefix_reuse(slot.anchor, r);
             const auto [image, from_store] = find_stored(r);
-            if (from_store > std::max(live, anchored)) {
+            // A prompt that departs from what the sequence read after its last prompt (a reply the
+            // template renders otherwise, a regenerated one) resumes where it departs, the
+            // sequence taken back there, when its rings still hold that position's window: the
+            // closure of the last prompt, which the anchor at the default boundary would compute
+            // again, and the reply's tokens the prompt keeps.
+            const std::uint32_t departs = live == 0 ? departure(slot.fed, r) : 0;
+            if (departs > std::max(anchored, from_store) &&
+                executor.rewind(s, static_cast<std::uint32_t>(slot.fed.size()) - departs)) {
+                slot.fed.resize(departs);
+                reused       = departs;
+                r.reuse_path = PrefixReusePath::PrivateEndpoint;
+            } else if (from_store > std::max(live, anchored)) {
                 std::vector<TokenId> tokens = store.images()[image].tokens;
                 const PrefixReusePath path  = store.images()[image].path;
                 retire(s);
