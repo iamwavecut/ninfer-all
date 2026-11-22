@@ -790,6 +790,10 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             prepared.thinking_budget                = request_options.execution.thinking.budget;
         }
         if (!prepared.enable_thinking) {
+            // A reply that does not reason refuses an answer-now request.
+            if (request_options.execution.thinking.answer_now) {
+                request_options.execution.thinking.answer_now->mark_answering();
+            }
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
             prepared.effective_thinking_budget.reset();

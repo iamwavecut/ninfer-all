@@ -605,6 +605,7 @@ off.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `POST /v1/answer_now` | end a running reply's thinking now; the reply answers in the same response (see [Answer now](#answer-now)) |
 
 Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
 `http://127.0.0.1:8080`, while OpenAI SDKs take `http://127.0.0.1:8080/v1`. A client given the
@@ -1316,6 +1317,28 @@ because every pass varies a little.
   `reasoning_loop_thinking_tokens`, `reasoning_loop_coverage`) record each firing; `server_start`
   records the mode as `reasoning_loop`. It can mistake a long, deliberately repeated checklist for a
   loop; keep it off where the thinking legitimately repeats whole passages.
+
+### Answer now
+
+`POST /v1/answer_now` with `{"request_id": "<id>"}` ends the thinking of a running reply, and the
+reply goes on to its answer in the same response. The id is the reply's response header:
+`x-request-id` for Chat Completions and Responses, `request-id` for Anthropic Messages; every one of
+these replies, streaming or not, carries it from its first byte. The reply closes its thinking at
+the end of its next decode round with the control span a reached thinking budget commits (above),
+so no prompt is read again; a reply still queued or reading its prompt accepts the call and closes
+at its first round. Gemma 4, Flint and Inkling 2 close the reasoning block they opened, as their
+budget does, and can open no other in that response.
+
+| Response | Meaning |
+|---|---|
+| `200 {"request_id": "<id>", "status": "accepted"}` | the reply closes its thinking at the end of its next round in thinking; a repeated call is accepted again |
+| `404 request_not_found` | no running reply has this id: it has finished, or the id is wrong |
+| `409 already_answering` | the reply has published answer text, or it does not reason (thinking off) |
+
+A reply whose remaining output budget cannot hold the control span and one more token, or whose
+thinking budget could not be enforced (early close unavailable, above), keeps thinking. The console
+line and the request log (`answer_now`, `answer_now_thinking_tokens`) record the thinking tokens
+before the close. Raw-prompt completions have no thinking to end and are not enrolled.
 
 For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The other standard
 values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) reach the template unchanged.
@@ -2773,7 +2796,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, the rotation past the native window the Engine resolved (`engine.rope`: type `none` or `yarn`, factor, native window; Qwen3.8-Flash-Next reports it, the other families `null`), n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, redacted argv, and `arguments`: the redacted options the server runs with, its `--config` files merged under the command line ([launch configuration files](cli.md#launch-configuration-files)) |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, reasoning-loop guard firing, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, reasoning-loop guard firing, answer-now closes, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 

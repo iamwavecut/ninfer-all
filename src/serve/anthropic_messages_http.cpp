@@ -74,12 +74,14 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
+    offer_answer_now(request.generation);
     try {
         prepared            = service->prepare(request.generation,
                                                request.stream ? GenerationConsumerMode::Streaming
                                                               : GenerationConsumerMode::Aggregate,
                                                {}, [&req] { return client_disconnected(req); });
         prepared.model_hold = std::make_shared<ModelRegistry::Lease>(std::move(lease));
+        enroll_answer_now(prepared, request.generation, res);
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(

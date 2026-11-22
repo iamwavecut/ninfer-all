@@ -242,6 +242,9 @@ struct SemanticThinkingState {
     bool loop_detected                 = false;
     std::uint32_t loop_thinking_tokens = 0;
     float loop_coverage                = 0.0F;
+    // The caller's answer-now request closed the reasoning after this many thinking tokens.
+    bool answer_now                          = false;
+    std::uint32_t answer_now_thinking_tokens = 0;
 };
 
 void feed_semantic_thinking(SemanticThinkingState& state, std::string_view bytes) {
@@ -573,6 +576,7 @@ public:
         }
         requested_budget          = thinking.budget;
         early_close_available     = thinking.early_close_available;
+        answer_now                = thinking.answer_now;
         state.in_reasoning        = split_reasoning;
         prefix_execution.tracking = starts_in_reasoning;
         started_in_reasoning      = starts_in_reasoning;
@@ -686,6 +690,7 @@ public:
     bool started_in_reasoning  = false;
     bool early_close_available = true;
     std::optional<std::uint32_t> requested_budget;
+    std::shared_ptr<AnswerNowSignal> answer_now;
     DecoderState state;
     DecoderState preview_state;
     SemanticThinkingState semantic;
@@ -1085,6 +1090,24 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
                                               : impl_->model_opens_reasoning()
                                                     ? impl_->preview_state.reasoning_tokens
                                                     : semantic.model_thinking_tokens;
+    // Answer now: a caller's request closes the open reasoning at the end of this round with the
+    // control span a reached budget injects. Without room for the span and one more token, or
+    // without a close control, the reply keeps reasoning. A held close marker defers it to the
+    // next round, which resolves the marker.
+    if (impl_->answer_now && impl_->answer_now->requested() && impl_->early_close_available &&
+        !semantic.applied && !semantic.answer_now &&
+        impl_->loop_reasoning(impl_->preview_state, semantic) && !holds_semantic_close(semantic)) {
+        const std::uint64_t control =
+            impl_->thinking_control_tokens ? impl_->thinking_control_tokens->size() : 0U;
+        const std::uint64_t remaining = total_budget_remaining - count;
+        if (control > 0 && remaining >= control + 1U) {
+            semantic.answer_now                 = true;
+            semantic.answer_now_thinking_tokens = thinking_tokens;
+            semantic.control_pending            = true;
+            return complete(count, FinishReason::None,
+                            runtime::ContinuationAction::ApplyTargetControl);
+        }
+    }
     if (semantic.loop != ReasoningLoopAction::Off &&
         impl_->loop_reasoning(impl_->preview_state, semantic) && !semantic.applied &&
         !semantic.loop_detected && !holds_semantic_close(semantic) &&
@@ -1292,6 +1315,10 @@ PublishedOutput OutputSession::commit_preview() {
     impl_->preview_ready = false;
 
     for (OutputDelta& delta : output) {
+        // The first answer byte ends the window in which a caller may still ask to answer now.
+        if (impl_->answer_now && delta.channel == OutputChannel::Content && !delta.text.empty()) {
+            impl_->answer_now->mark_answering();
+        }
         if (delta.channel == OutputChannel::Content) {
             delta.text = impl_->gemma_tools      ? impl_->gemma_tools->feed(delta.text)
                          : impl_->flint_tools    ? impl_->flint_tools->feed(delta.text)
@@ -1400,6 +1427,8 @@ ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
         .loop_detected         = impl_->semantic.loop_detected,
         .loop_thinking_tokens  = impl_->semantic.loop_thinking_tokens,
         .loop_coverage         = impl_->semantic.loop_coverage,
+        .answer_now            = impl_->semantic.answer_now,
+        .answer_now_thinking_tokens = impl_->semantic.answer_now_thinking_tokens,
     };
 }
 

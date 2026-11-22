@@ -95,6 +95,10 @@ struct ThinkingBudgetStats {
     bool loop_detected                 = false;
     std::uint32_t loop_thinking_tokens = 0;
     float loop_coverage                = 0.0F;
+    // The caller's answer-now request closed the reasoning after this many model-origin thinking
+    // tokens (ThinkingControlOptions::answer_now).
+    bool answer_now                          = false;
+    std::uint32_t answer_now_thinking_tokens = 0;
 };
 
 enum class PrefixReusePath : std::uint8_t {

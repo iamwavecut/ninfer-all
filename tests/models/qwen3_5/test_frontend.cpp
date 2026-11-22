@@ -3419,6 +3419,87 @@ int test_reasoning_loop_periodic_tail(const Frontend& frontend) {
                  "a periodic reasoning tail did not fire the reasoning-loop guard");
 }
 
+// Answer now through a real output session: a request that arrives while thinking is open closes it
+// at the end of the round with the budget's control span, the model then answers in content and
+// the signal refuses later requests; a request with no room for the span and one more token keeps
+// thinking; a reply already answering refuses the request.
+int test_answer_now(const Frontend& frontend) {
+    int failures = 0;
+    {
+        auto prompt = thinking_prompt(frontend);
+        auto signal = std::make_shared<ninfer::AnswerNowSignal>();
+        auto session = frontend.make_output_session(
+            prompt, {}, {}, ninfer::ThinkingControlOptions{.answer_now = signal});
+        const auto first = session.preview_model(std::array<ninfer::TokenId, 2>{0, 0}, 64,
+                                                 ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(first.continuation == ninfer::runtime::ContinuationAction::Decode &&
+                              signal->state() == ninfer::AnswerNowSignal::State::Waiting,
+                          "thinking without an answer-now request requested control");
+        failures += check(signal->request(), "an answer-now request during thinking was refused");
+        const auto round = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 62,
+                                                 ninfer::FinishReason::OutputLimit);
+        failures +=
+            check(round.accepted_tokens == 1 && !round.finished() &&
+                      round.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                  "answer now did not close the thinking at the end of the round");
+        (void)session.commit_preview();
+        const std::span<const ninfer::TokenId> pending = session.pending_control_tokens();
+        const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+        failures += check(!control.empty() && session.model_token_budget_remaining(61) == 0,
+                          "answer now exposed no control span or licensed model tokens");
+        (void)session.preview_control(control, 61);
+        const auto control_output = session.commit_preview();
+        failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
+                              kThinkingControlGuidance,
+                          "answer now did not inject the thinking-close guidance");
+        (void)session.preview_model(std::array<ninfer::TokenId, 1>{0},
+                                    61U - static_cast<std::uint32_t>(control.size()),
+                                    ninfer::FinishReason::OutputLimit);
+        const auto answer = session.commit_preview();
+        const ninfer::ThinkingBudgetStats stats = session.thinking_stats();
+        failures += check(channel_text(answer, ninfer::OutputChannel::Content) == "x" &&
+                              stats.applied && stats.answer_now &&
+                              stats.answer_now_thinking_tokens == 3 &&
+                              stats.model_thinking_tokens == 3 &&
+                              stats.injected_tokens == control.size() && !stats.loop_detected,
+                          "answer now accounting or the answer after it is incorrect");
+        failures += check(signal->state() == ninfer::AnswerNowSignal::State::Requested,
+                          "the answered request lost its accepted state");
+    }
+    {
+        // The span and one more token do not fit: the reply keeps thinking.
+        auto prompt = thinking_prompt(frontend);
+        auto signal = std::make_shared<ninfer::AnswerNowSignal>();
+        auto session = frontend.make_output_session(
+            prompt, {}, {}, ninfer::ThinkingControlOptions{.answer_now = signal});
+        (void)signal->request();
+        const auto round = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 3,
+                                                 ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(round.continuation == ninfer::runtime::ContinuationAction::Decode &&
+                              !session.thinking_stats().answer_now,
+                          "answer now without room for its control span closed the thinking");
+    }
+    {
+        // A reply past its thinking refuses the request.
+        auto prompt = thinking_prompt(frontend);
+        auto signal = std::make_shared<ninfer::AnswerNowSignal>();
+        auto session = frontend.make_output_session(
+            prompt, {}, {}, ninfer::ThinkingControlOptions{.answer_now = signal});
+        std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode("short");
+        tokens.push_back(kFixtureThinkCloseToken);
+        const std::vector<ninfer::TokenId> answer = fixture_tokenizer().encode("\n\nanswer");
+        tokens.insert(tokens.end(), answer.begin(), answer.end());
+        (void)session.preview_model(tokens, 64, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        failures += check(signal->state() == ninfer::AnswerNowSignal::State::Answering &&
+                              !signal->request(),
+                          "a reply already answering accepted an answer-now request");
+    }
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     ninfer::StopPolicy stop;
@@ -4775,6 +4856,7 @@ int main() {
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_tokens_without_budget(frontend);
     failures += test_thinking_budget_control(frontend);
+    failures += test_answer_now(frontend);
     failures += test_thinking_budget_ignores_quoted_close(frontend);
     failures += test_held_close_accounting(frontend);
     failures += test_constrained_close_is_exact(frontend);

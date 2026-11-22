@@ -273,12 +273,14 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     };
     GenerationService* const service = &lease.service();
     PreparedRequest prepared;
+    offer_answer_now(resolved.generation);
     try {
         prepared = service->prepare(
             resolved.generation,
             request.stream ? GenerationConsumerMode::Streaming : GenerationConsumerMode::Aggregate,
             {}, [&req] { return client_disconnected(req); }, std::move(resolved.cache_hints));
         prepared.model_hold = std::make_shared<ModelRegistry::Lease>(std::move(lease));
+        enroll_answer_now(prepared, resolved.generation, res);
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
