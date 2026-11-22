@@ -94,6 +94,8 @@ public:
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
     // True once a session that began inside a reasoning block has committed its close.
     [[nodiscard]] bool reasoning_closed() const noexcept;
+    // Token ID suppressed after early-close conclusion so Inkling cannot re-open thinking.
+    [[nodiscard]] std::optional<TokenId> banned_token() const noexcept;
     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
 
 private:

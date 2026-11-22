@@ -884,6 +884,100 @@ void test_image_prompt() {
     expect(refused, "a video is refused");
 }
 
+void test_thinking_control_and_loop() {
+    const auto frontend = inkling_frontend();
+    const auto prompt   = frontend.prepare(user_prompt("Hi"));
+    // Thinking budget triggers early-close control (<guidance><|end_message|>) and suppresses
+    // re-opening <|content_thinking|> until a non-thinking block opens.
+    {
+        auto session = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+            ninfer::ThinkingControlOptions{.budget = 4});
+        const auto open = joined({{kModelId, kThinkingId}, bytes("abcd")});
+        const auto decision =
+            session.preview_model(open, 256, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        expect(!decision.finished() &&
+                   decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+               "Inkling thinking budget requests ApplyTargetControl");
+        const auto pending = session.pending_control_tokens();
+        expect(!pending.empty() && pending.back() == kEndId,
+               "Inkling thinking control span ends with <|end_message|>");
+        if (!pending.empty()) {
+            const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+            (void)session.preview_control(control, 250);
+            (void)session.commit_preview();
+            const auto stats = session.thinking_stats();
+            expect(session.reasoning_closed() && stats.applied &&
+                       stats.model_thinking_tokens == 4 && stats.injected_tokens == control.size() &&
+                       session.banned_token() == std::optional<ninfer::TokenId>(kThinkingId),
+                   "Inkling control excludes injected tokens from model_thinking_tokens and bans "
+                   "<|content_thinking|>");
+            const auto header = std::vector<ninfer::TokenId>{kModelId};
+            (void)session.preview_model(header, 200, ninfer::FinishReason::OutputLimit);
+            (void)session.commit_preview();
+            expect(session.banned_token() == std::optional<ninfer::TokenId>(kThinkingId),
+                   "Inkling keeps <|content_thinking|> banned inside next header");
+            const auto answer = joined({{kTextId}, bytes("OK"), {kEndId, kEosId}});
+            (void)session.preview_model(answer, 199, ninfer::FinishReason::OutputLimit);
+            const auto out = session.commit_preview();
+            expect(session.banned_token() == std::optional<ninfer::TokenId>(kThinkingId) &&
+                       !out.empty(),
+                   "Inkling keeps <|content_thinking|> banned across post-conclusion blocks");
+        }
+    }
+    // Speculative round starting in a header crossing <|content_thinking|>, excess reasoning, and
+    // <|end_message|> must still stop at the exact budget token and request ApplyTargetControl.
+    {
+        auto session = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+            ninfer::ThinkingControlOptions{.budget = 2});
+        const auto header = std::vector<ninfer::TokenId>{kModelId};
+        (void)session.preview_model(header, 256, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        const auto spec_span = joined({{kThinkingId}, bytes("abcd"), {kEndId}});
+        const auto decision =
+            session.preview_model(spec_span, 255, ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        expect(decision.accepted_tokens == 3 && !decision.finished() &&
+                   decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl &&
+                   session.thinking_stats().model_thinking_tokens == 2,
+               "Inkling enforces budget per token inside speculative spans crossing <|content_thinking|>");
+    }
+    // Reasoning loop guard retains history across natural <|end_message|> closes so alternating
+    // short thinking/text blocks cannot evade detection.
+    {
+        auto session = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64},
+            ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Conclude});
+        const std::string pass =
+            "Wait, let me double-check the edge case where the input list is empty. If the list is "
+            "empty, the function returns zero, which matches the expected output. ";
+        bool triggered = false;
+        std::uint32_t budget = 100000;
+        for (int block = 0; block < 32 && !triggered; ++block) {
+            std::string body;
+            for (int r = 0; r < 3; ++r) { body += pass; }
+            const auto chunk = joined({{kModelId, kThinkingId}, bytes(body), {kEndId, kModelId, kTextId},
+                                       bytes("ok"), {kEndId}});
+            for (std::size_t at = 0; at < chunk.size() && !triggered; at += 128) {
+                const std::size_t n = std::min<std::size_t>(128, chunk.size() - at);
+                const auto d = session.preview_model(
+                    std::span<const ninfer::TokenId>(chunk.data() + at, n), budget,
+                    ninfer::FinishReason::OutputLimit);
+                (void)session.commit_preview();
+                budget -= d.accepted_tokens;
+                if (d.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl ||
+                    d.finished()) {
+                    triggered = true;
+                }
+            }
+        }
+        expect(triggered && session.thinking_stats().loop_detected,
+               "Inkling loop guard catches repeated passages across reopened thinking blocks");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -896,6 +990,7 @@ int main() {
         test_tool_calls();
         test_image_processing();
         test_image_prompt();
+        test_thinking_control_and_loop();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

@@ -440,8 +440,7 @@ void GenerationService::refuse_family_options() const {
                                     " artifacts do not have");
     }
     if (options_.default_thinking_budget &&
-        (architecture == "Gemma4ForCausalLM" || architecture == "FlintForCausalLM" ||
-         architecture == "Inkling2ForCausalLM")) {
+        (architecture == "Gemma4ForCausalLM" || architecture == "FlintForCausalLM")) {
         throw std::invalid_argument("--default-thinking-budget closes reasoning early, which " +
                                     architecture + " artifacts cannot do");
     }
@@ -776,7 +775,14 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             prompt = engine_->prepare(std::move(input), control);
         }
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
-        prepared.enable_thinking = prompt.summary().starts_in_reasoning;
+        const auto& arch = engine_->load_summary().architecture;
+        // Inkling 2 opens thinking blocks itself regardless of prompt opener, so keep its thinking
+        // budget active on all chat requests even if `enable_thinking=false` was requested.
+        const bool inkling_self_thinking =
+            !request.raw_prompt &&
+            (arch.find("Inkling") != std::string::npos ||
+             arch.find("inkling") != std::string::npos);
+        prepared.enable_thinking = prompt.summary().starts_in_reasoning || inkling_self_thinking;
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();

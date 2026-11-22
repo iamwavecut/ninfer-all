@@ -1259,7 +1259,10 @@ struct Gemma4Core::Impl {
                     r.reuse_path = path;
                 }
             } else if (anchored > live) {
-                retire(s);
+                if (slot.fed != slot.anchor && !slot.disposable &&
+                    slot.anchor_path != PrefixReusePath::PrivateResponseReplay) {
+                    store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
+                }
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
                 slot.media   = slot.anchor_media;
@@ -2869,14 +2872,14 @@ Gemma4Core::make_request(GroupMember& member, std::optional<std::uint32_t>& budg
             identity.rewrite_checkpoint->frontier < prompt_n) {
             request->anchor_at = identity.rewrite_checkpoint->frontier;
         }
-        // Shared prefixes worth an image of their own: a structural or declared boundary, not one
-        // the engine merely observed (the prompt's end, a grid point).
+        // Shared prefixes worth an image of their own: explicit, requested-automatic, or structural
+        // boundaries, excluding DefaultAutomatic (which protocols place at prompt_n - 1 and would
+        // otherwise trigger a full state D2H copy on every turn; see resource_manager.h).
         for (const auto& opportunity : data.context_cache.opportunities) {
             const auto evidence   = opportunity.evidence;
             const bool structural = has_shared_candidate_evidence(
                 evidence, SharedCandidateEvidence::ExplicitBoundary |
                               SharedCandidateEvidence::RequestedAutomatic |
-                              SharedCandidateEvidence::DefaultAutomatic |
                               SharedCandidateEvidence::EngineStructural);
             const std::uint32_t frontier = opportunity.frontier;
             if (opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix && structural &&

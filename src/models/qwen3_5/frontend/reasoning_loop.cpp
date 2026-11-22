@@ -149,33 +149,20 @@ void append_words(std::string_view bytes, std::string& partial, std::vector<std:
     }
 }
 
-double repeated_passage_coverage(std::span<const std::uint64_t> words) {
-    const std::size_t n = words.size();
-    if (n < kLoopWindowWords || n < kLoopPassageWords) { return 0.0; }
-    // Polynomial hash of every passage, rolled along the words.
-    constexpr std::uint64_t kBase = 0x9E3779B97F4A7C15ULL;
-    std::uint64_t top             = 1; // kBase^(kLoopPassageWords - 1)
-    for (std::size_t i = 1; i < kLoopPassageWords; ++i) { top *= kBase; }
-    const std::size_t passages = n - kLoopPassageWords + 1;
-    std::vector<std::uint64_t> hashes(passages);
-    std::uint64_t hash = 0;
-    for (std::size_t i = 0; i < kLoopPassageWords; ++i) { hash = hash * kBase + words[i]; }
-    hashes[0] = hash;
-    for (std::size_t i = 1; i < passages; ++i) {
-        hash      = (hash - words[i - 1] * top) * kBase + words[i + kLoopPassageWords - 1];
-        hashes[i] = hash;
-    }
-    std::unordered_map<std::uint64_t, std::uint32_t> counts;
-    counts.reserve(passages);
-    for (const std::uint64_t h : hashes) { ++counts[h]; }
+namespace {
 
-    // Mark the window's words that lie inside a repeated passage (a difference array over starts).
-    const std::size_t window_start = n - kLoopWindowWords;
-    std::vector<int> delta(kLoopWindowWords + 1, 0);
+double window_coverage_from_counts(const std::vector<std::uint64_t>& hashes,
+                                   const std::unordered_map<std::uint64_t, std::uint32_t>& counts,
+                                   std::size_t n, std::size_t window_words) {
+    if (n < window_words || hashes.empty()) { return 0.0; }
+    const std::size_t passages     = hashes.size();
+    const std::size_t window_start = n - window_words;
+    std::vector<int> delta(window_words + 1, 0);
     const std::size_t first =
         window_start >= kLoopPassageWords - 1 ? window_start - (kLoopPassageWords - 1) : 0;
     for (std::size_t i = first; i < passages; ++i) {
-        if (counts[hashes[i]] < kLoopRepeats) { continue; }
+        const auto it = counts.find(hashes[i]);
+        if (it == counts.end() || it->second < kLoopRepeats) { continue; }
         const std::size_t begin = std::max(i, window_start) - window_start;
         const std::size_t end   = std::min(i + kLoopPassageWords, n) - window_start;
         ++delta[begin];
@@ -183,32 +170,16 @@ double repeated_passage_coverage(std::span<const std::uint64_t> words) {
     }
     std::size_t covered = 0;
     int depth           = 0;
-    for (std::size_t p = 0; p < kLoopWindowWords; ++p) {
+    for (std::size_t p = 0; p < window_words; ++p) {
         depth += delta[p];
         covered += depth > 0 ? 1U : 0U;
     }
-    return static_cast<double>(covered) / static_cast<double>(kLoopWindowWords);
+    return static_cast<double>(covered) / static_cast<double>(window_words);
 }
 
-void append_tail(std::string_view bytes, std::string& tail) {
-    tail.append(bytes);
-    // A character is at most four bytes, so the last 4 * kLoopTailChars bytes always hold the last
-    // kLoopTailChars characters; the buffer is cut only once it is twice that.
-    constexpr std::size_t kKeep = 4U * kLoopTailChars;
-    if (tail.size() > 2U * kKeep) { tail.erase(0, tail.size() - kKeep); }
-}
-
-bool periodic_tail(std::string_view text) {
-    const TailSpan span = tail_span(text, kLoopTailChars);
-    if (span.characters < kLoopTailChars) { return false; }
-    return character_period(text.substr(span.begin)) != 0;
-}
-
-bool counting_tail(std::string_view text) {
-    const TailSpan span = tail_span(text, kLoopTailChars);
-    if (span.characters < kLoopTailChars) { return false; }
-    // Every run of ASCII digits becomes one 0xff byte, which UTF-8 never holds, and its value is
-    // kept, held far above any counter's.
+bool counting_tail_window(std::string_view text, std::size_t tail_chars) {
+    const TailSpan span = tail_span(text, tail_chars);
+    if (span.characters < tail_chars) { return false; }
     constexpr std::uint64_t kHeld = 1'000'000'000'000'000ULL;
     std::string masked;
     std::vector<std::uint64_t> numbers;
@@ -230,11 +201,7 @@ bool counting_tail(std::string_view text) {
     if (period == 0) { return false; }
     const auto slots = static_cast<std::size_t>(
         std::count(masked.begin(), masked.begin() + std::ptrdiff_t(period), static_cast<char>(0xff)));
-    if (slots == 0) { return false; } // a plain period, which periodic_tail reads
-    // Runs i and i + slots are one number of two consecutive periods. The first and the last run
-    // may be cut by the tail's ends, so neither is read. Every number of the period keeps one step
-    // (a constant's is zero) and one of them moves: a counter beside numbers that change otherwise
-    // is an enumeration of worked values ("step 7 checks value 4821"), not a loop.
+    if (slots == 0) { return false; }
     bool moves = false;
     for (std::size_t first = 1; first <= slots; ++first) {
         std::int64_t step = 0;
@@ -250,6 +217,61 @@ bool counting_tail(std::string_view text) {
         moves = moves || step != 0;
     }
     return moves;
+}
+
+} // namespace
+
+LoopCoverage repeated_passage_coverage_detail(std::span<const std::uint64_t> words) {
+    const std::size_t n = words.size();
+    if (n < kLoopShortWindow || n < kLoopPassageWords) { return {}; }
+    constexpr std::uint64_t kBase = 0x9E3779B97F4A7C15ULL;
+    std::uint64_t top             = 1;
+    for (std::size_t i = 1; i < kLoopPassageWords; ++i) { top *= kBase; }
+    const std::size_t passages = n - kLoopPassageWords + 1;
+    std::vector<std::uint64_t> hashes(passages);
+    std::uint64_t hash = 0;
+    for (std::size_t i = 0; i < kLoopPassageWords; ++i) { hash = hash * kBase + words[i]; }
+    hashes[0] = hash;
+    for (std::size_t i = 1; i < passages; ++i) {
+        hash      = (hash - words[i - 1] * top) * kBase + words[i + kLoopPassageWords - 1];
+        hashes[i] = hash;
+    }
+    // Single hash-map build shared by both long and short windows.
+    std::unordered_map<std::uint64_t, std::uint32_t> counts;
+    counts.reserve(passages);
+    for (const std::uint64_t h : hashes) { ++counts[h]; }
+    return LoopCoverage{
+        .long_window  = window_coverage_from_counts(hashes, counts, n, kLoopWindowWords),
+        .short_window = window_coverage_from_counts(hashes, counts, n, kLoopShortWindow),
+    };
+}
+
+double repeated_passage_coverage(std::span<const std::uint64_t> words) {
+    return repeated_passage_coverage_detail(words).long_window;
+}
+
+void append_tail(std::string_view bytes, std::string& tail) {
+    tail.append(bytes);
+    // A character is at most four bytes, so the last 4 * kLoopTailChars bytes always hold the last
+    // kLoopTailChars characters; the buffer is cut only once it is twice that.
+    constexpr std::size_t kKeep = 4U * kLoopTailChars;
+    if (tail.size() > 2U * kKeep) { tail.erase(0, tail.size() - kKeep); }
+}
+
+bool periodic_tail(std::string_view text) {
+    for (const std::size_t limit : {kLoopShortTailChars, kLoopTailChars}) {
+        const TailSpan span = tail_span(text, limit);
+        if (span.characters >= limit && character_period(text.substr(span.begin)) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool counting_tail(std::string_view text) {
+    // Require full kLoopTailChars (2048 chars) so short numbered enumerations (e.g. test suites)
+    // do not false-positive.
+    return counting_tail_window(text, kLoopTailChars);
 }
 
 } // namespace ninfer::models::qwen3_5

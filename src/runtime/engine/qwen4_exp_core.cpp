@@ -1482,7 +1482,10 @@ struct Qwen4ExpCore::Impl {
                     r.reuse_path = path;
                 }
             } else if (anchored > live) {
-                retire(s);
+                if (slot.fed != slot.anchor && !slot.disposable &&
+                    slot.anchor_path != PrefixReusePath::PrivateResponseReplay) {
+                    store_image(s, slot.fed, slot.media, nullptr, PrefixReusePath::PrivateEndpoint);
+                }
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
                 slot.media   = slot.anchor_media;
@@ -3446,7 +3449,6 @@ Qwen4ExpCore::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
             const bool structural = has_shared_candidate_evidence(
                 opportunity.evidence, SharedCandidateEvidence::ExplicitBoundary |
                                           SharedCandidateEvidence::RequestedAutomatic |
-                                          SharedCandidateEvidence::DefaultAutomatic |
                                           SharedCandidateEvidence::EngineStructural);
             const std::uint32_t frontier = opportunity.frontier;
             if (request->reusable &&
