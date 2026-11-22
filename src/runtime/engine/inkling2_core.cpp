@@ -2970,6 +2970,8 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
             identity.rewrite_checkpoint->frontier < prompt_n) {
             request->anchor_at = identity.rewrite_checkpoint->frontier;
         }
+        // Where the template closes the prompt's last message: the turn closure, or the end.
+        const std::uint32_t closed_at = request->anchor_at;
         // The protocol's default boundary (DefaultAutomatic: OpenAI and Anthropic put it where the
         // prompt's last message ends) is where a repeat of the prompt resumes, and the next turn
         // when the template rewrites what follows it. The sequence's anchor moves there: a device
@@ -3007,11 +3009,19 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
         std::sort(request->shared_at.begin(), request->shared_at.end());
         request->shared_at.erase(std::unique(request->shared_at.begin(), request->shared_at.end()),
                                  request->shared_at.end());
+        // The checkpoint lies in the last message as the template closes it: with the anchor
+        // moved inside that closure, the message before it would count as the last one (in a
+        // long system message, a checkpoint and a prompt step more). The moved anchor is a kept
+        // state like the shared ones.
+        std::vector<std::uint32_t> kept = request->shared_at;
+        if (request->anchor_at < closed_at) {
+            kept.insert(std::upper_bound(kept.begin(), kept.end(), request->anchor_at),
+                        request->anchor_at);
+        }
         if (const std::uint32_t at = impl_->checkpoint_on_steps(
-                MessageCheckpoint::at(data.tap_hints.hints, request->anchor_at, request->shared_at,
-                                      request->media),
-                request->shared_at, request->media);
-            at >= Impl::kMinStoredTokens && impl_->image_pays(at)) {
+                MessageCheckpoint::at(data.tap_hints.hints, closed_at, kept, request->media), kept,
+                request->media);
+            at >= Impl::kMinStoredTokens && at < request->anchor_at && impl_->image_pays(at)) {
             request->checkpoint_at = at;
             request->shared_at.insert(
                 std::upper_bound(request->shared_at.begin(), request->shared_at.end(), at), at);
