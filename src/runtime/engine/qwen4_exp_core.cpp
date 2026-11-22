@@ -776,10 +776,10 @@ struct Qwen4ExpCore::Impl {
     // the page cache fill the host's memory (1.1 s for the image of a 32K-token prompt on an RTX
     // 4090 host, while the next prompt waited; pageable memory faulted in as slowly, and huge
     // pages took minutes), so later images reuse the pages of those the store let go. Startup
-    // pins a reserve; while the worker has nothing to run, the store pins it back up a chunk at a
-    // time (pin_ahead), so the next request seldom pins its own. Pinning starts once the worker
-    // has been idle for the grace period, so a client that sends its next request at once does
-    // not wait.
+    // pins a reserve; while the worker has nothing to run, the store pins more a chunk at a time,
+    // up to its budget (pin_ahead), so later requests seldom pin their own. Pinning starts once
+    // the worker has been idle for the grace period, so a client that sends its next request at
+    // once does not wait.
     using Store = ContextImageStore<models::qwen4_exp::SequenceImage, FlashNextImageHeader>;
     Store store;
     // Session slots (session_slots.h).

@@ -735,8 +735,8 @@ looks for images again at its first step. An image is the paged KV and pooled ke
 of its positions, its recurrent state, and the MTP block's, about 114 MB plus 26 KiB a position in
 BF16 KV. The images live in 8 MiB pages of pinned memory that stay pinned for later images: the
 pages of two images of a whole context (within a quarter of the budget) are pinned at startup.
-Once the Engine has had nothing to run for 50 ms, it pins free pages back up to that many in 64 MiB
-chunks, within the budget; a request that arrives meanwhile waits for the chunk in progress (about
+Once the Engine has had nothing to run for 50 ms, it pins more pages in 64 MiB chunks until the
+whole budget is pinned; a request that arrives meanwhile waits for the chunk in progress (about
 32 ms, [measured](#media-conversations-on-one-rtx-4090)), and the store pins pages itself only when
 the free ones fall short. Pinning while a request waits is slow where the
 experts and the page cache fill the host's memory: on an RTX 4090 host with IQ3_S host experts,

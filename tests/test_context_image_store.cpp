@@ -131,6 +131,26 @@ void check_host_budget() {
     check(loads(store, a, 100, 1) && loads(store, c, 300, 3), "the kept images read back");
 }
 
+void check_pin_ahead() {
+    // Startup pins the reserve (4 pages); the idle worker pins the rest of a 21-page budget, eight
+    // pages and then what is left, and stored images take those pages without pinning more.
+    Store store;
+    configure(store, 21, {}, false);
+    check(store.host_pinned() == 4 * kPage, "startup pins the reserve");
+    int chunks = 0;
+    while (store.pins_ahead() && chunks < 10) {
+        store.pin_ahead();
+        ++chunks;
+    }
+    check(chunks == 3 && store.host_pinned() == 21 * kPage, "idle pinning fills the budget");
+    const auto a = prompt(100), b = prompt(200);
+    (void)store.put(a, {}, PrefixReusePath::PrivateEndpoint, 100, save(100, 1));
+    (void)store.put(b, {}, PrefixReusePath::PrivateEndpoint, 200, save(200, 2));
+    check(store.host_used() == 8 * kPage && store.host_pinned() == 21 * kPage &&
+              !store.pins_ahead(),
+          "stored images take the pinned pages");
+}
+
 void check_disk_tier(const std::filesystem::path& root) {
     const auto dir = root / "disk";
     const auto a = prompt(100), b = prompt(200), c = prompt(300);
@@ -400,6 +420,7 @@ int main() {
         check_message_checkpoint();
         check_steps();
         check_host_budget();
+        check_pin_ahead();
         check_disk_tier(root);
         check_records(root);
         check_cache_file(root);
