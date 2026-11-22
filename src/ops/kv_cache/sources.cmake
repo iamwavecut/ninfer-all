@@ -4,4 +4,5 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/append/nvfp4_launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/append/k8v4_launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/append/bf16p_launch.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/row128_rotate.cu"
 )

@@ -1,6 +1,6 @@
 // Inkling 2's quantized KV planes (kv_format.h, kv_planes.h) against independent oracles, for
-// rk8v4 (int8 G64 keys, packed int4 G32 values), rk4v4 (Lloyd-Max 4-bit keys) and mxfp8 (E4M3
-// codes over a UE8M0 scale per 32):
+// int8 (int8 G64 keys and values), rk8v4 (int8 G64 keys, packed int4 G32 values), rk4v4 (Lloyd-Max
+// 4-bit keys) and mxfp8 (E4M3 codes over a UE8M0 scale per 32):
 //  - kv_store: the stored codes, decoded on the host with their stored scales, stay near the F16
 //    rows stored (a coding's own error bound); MXFP8's codes and scales equal the release's rule
 //    (vLLM's mxfp8_quantize) applied on the host, bit for bit;
@@ -446,13 +446,12 @@ int main() {
         branches.shared = 4;
         branches.positions = {30, 31, 32, 33, 34, 35, 36, 34, 35};
         branches.starts    = {0, 0, 0, 0, 4, 4, 4, 7, 7};
-        for (const auto& [key, value, key_bound, value_bound, attention_bound] :
-             {std::tuple{mi::KvCoding::Int8G64, mi::KvCoding::Int4G32, 8.0e-3, 1.1e-1, 2.5e-2},
-              std::tuple{mi::KvCoding::Lloyd4, mi::KvCoding::Int4G32, 1.2e-1, 1.1e-1, 8.0e-2},
-              std::tuple{mi::KvCoding::Mxfp8, mi::KvCoding::Mxfp8, 4.0e-2, 4.0e-2, 2.5e-2}}) {
-            const char* name = key == mi::KvCoding::Int8G64 ? "rk8v4"
-                               : key == mi::KvCoding::Lloyd4 ? "rk4v4"
-                                                             : "mxfp8";
+        using C = mi::KvCoding;
+        for (const auto& [name, key, value, key_bound, value_bound, attention_bound] :
+             {std::tuple{"int8", C::Int8G64, C::Int8G64, 8.0e-3, 8.0e-3, 2.5e-2},
+              std::tuple{"rk8v4", C::Int8G64, C::Int4G32, 8.0e-3, 1.1e-1, 2.5e-2},
+              std::tuple{"rk4v4", C::Lloyd4, C::Int4G32, 1.2e-1, 1.1e-1, 8.0e-2},
+              std::tuple{"mxfp8", C::Mxfp8, C::Mxfp8, 4.0e-2, 4.0e-2, 2.5e-2}}) {
             case_run(name, key, value, decode_rows, 1, key_bound, value_bound, attention_bound, rng);
             case_run(name, key, value, decode_rows, 9, key_bound, value_bound, attention_bound, rng);
             case_run(name, key, value, verify, 4, key_bound, value_bound, attention_bound, rng);

@@ -7,6 +7,7 @@
 // scale at index c / chunks-per-group of the row's scales.
 
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
+#include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/kv_cache/row128.h"
 
@@ -135,6 +136,22 @@ struct Chunk<KvCoding::Mxfp8> {
         }
     }
 };
+
+// The unnormalized 128-point Sylvester-Hadamard transform of a warp's row (lane l holds dimensions
+// l + 32 r in x[r]): the lane bits by shuffles, then the two register bits.
+__device__ __forceinline__ void hadamard128(float (&x)[4], int lane) {
+    hadamard_d32_columns_inplace<4>(x, lane);
+#pragma unroll
+    for (int span = 1; span < 4; span <<= 1) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            if ((r & span) != 0) { continue; }
+            const float a = x[r], b = x[r + span];
+            x[r]          = __fadd_rn(a, b);
+            x[r + span]   = __fsub_rn(a, b);
+        }
+    }
+}
 
 // One 128-wide row per warp: lane l holds dimensions l + 32 r of the row in x[r]. Encodes x into
 // the row's codes and scales; reading rows back happens in an attention's tile loader, which

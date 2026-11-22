@@ -2,6 +2,7 @@
 
 #include "core/device_launch.h"
 #include "ops/common/route_order.cuh"
+#include "ops/kv_cache/row128_codec.cuh"
 #include "ops/common/silu.h"
 
 #include <cuda_bf16.h>
@@ -272,6 +273,20 @@ __device__ __forceinline__ float key_reduce16(float (&v)[16], int lane) {
     return v[0] + __shfl_xor_sync(0xFFFFFFFFu, v[0], 1);
 }
 
+// A plane row's codes and scales.
+__device__ __forceinline__ const std::uint8_t* row_codes(const KvPlaneView& p, int sequence,
+                                                         int head, int slot) {
+    return p.codes + sequence * p.code_seq + head * p.code_head + std::int64_t(slot) * p.code_row;
+}
+
+__device__ __forceinline__ const std::uint8_t* row_scales(const KvPlaneView& p, int sequence,
+                                                          int head, int slot) {
+    return p.scales + sequence * p.scale_seq + head * p.scale_head +
+           std::int64_t(slot) * p.scale_row;
+}
+
+// KC, VC: the key and value codings, F16 for the F16 caches.
+template <KvCoding KC, KvCoding VC>
 __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(DecodeAttentionArgs a) {
     const int b        = blockIdx.x; // rows fastest: a verification's rows read the same keys
     const int kv_head  = blockIdx.y;
@@ -315,9 +330,18 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
         if (r < count) {
             const int p    = tile + r;
             const int slot = a.ring != 0 ? p % a.ring : p;
-            const std::int64_t at = base + std::int64_t(slot) * kD + c * 8;
-            k_next = *reinterpret_cast<const uint4*>(a.k_cache + at);
-            v_next = *reinterpret_cast<const uint4*>(a.v_cache + at);
+            if constexpr (KC == KvCoding::F16) {
+                const std::int64_t at = base + std::int64_t(slot) * kD + c * 8;
+                k_next = *reinterpret_cast<const uint4*>(a.k_cache + at);
+                v_next = *reinterpret_cast<const uint4*>(a.v_cache + at);
+            } else {
+                k_next = ops::kv128::chunk_word<KC>(row_codes(a.k_plane, sequence, kv_head, slot),
+                                                    row_scales(a.k_plane, sequence, kv_head, slot),
+                                                    c);
+                v_next = ops::kv128::chunk_word<VC>(row_codes(a.v_plane, sequence, kv_head, slot),
+                                                    row_scales(a.v_plane, sequence, kv_head, slot),
+                                                    c);
+            }
         }
     };
     // After the score butterfly lanes 2j and 2j + 1 hold key `lane_key`.
@@ -439,6 +463,48 @@ __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
         a.out_q.ds[std::int64_t(b) * (width / 32) + at / 32] =
             make_half2(__float2half(dq), __float2half(sum));
     }
+}
+
+// ---- Quantized KV planes ------------------------------------------------------------------------
+
+constexpr int kStoreWarps = 4; // warps per block, one (row, head) each
+
+template <KvCoding C>
+__launch_bounds__(kStoreWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int unit = blockIdx.x * kStoreWarps + warp;
+    if (unit >= a.rows * a.heads) { return; }
+    const int head     = unit % a.heads;
+    const int r        = unit / a.heads;
+    const int slot     = a.dst_slots != nullptr ? a.dst_slots[r] : a.dst_first + r;
+    const int sequence = a.sequences != nullptr ? a.sequences[r] : a.sequence;
+    const __half* src  = a.src + head * a.src_head_stride + std::int64_t(a.src_first + r) * kD;
+    float x[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { x[i] = __half2float(src[lane + 32 * i]); }
+    if (a.dst.rotated) {
+        ops::kv128::hadamard128(x, lane);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { x[i] = __fmul_rn(x[i], ops::kv128::kRotatedRowScale); }
+    }
+    ops::kv128::encode_row<C>(x, const_cast<std::uint8_t*>(row_codes(a.dst, sequence, head, slot)),
+                              const_cast<std::uint8_t*>(row_scales(a.dst, sequence, head, slot)),
+                              lane);
+}
+
+// Thread (slot, head, chunk): one 16-byte word of eight decoded values.
+template <KvCoding C>
+__global__ void kv_load_kernel(KvLoadArgs a) {
+    constexpr int kChunks = kD / 8;
+    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t n = std::int64_t(a.end - a.begin) * a.heads * kChunks;
+    if (i >= n) { return; }
+    const int c    = int(i % kChunks);
+    const int head = int(i / kChunks % a.heads);
+    const int slot = a.begin + int(i / kChunks / a.heads);
+    *reinterpret_cast<uint4*>(a.dst + head * a.dst_head_stride + std::int64_t(slot) * kD + 8 * c) =
+        ops::kv128::chunk_word<C>(row_codes(a.src, a.sequence, head, slot),
+                                  row_scales(a.src, a.sequence, head, slot), c);
 }
 
 // ---- Routing ------------------------------------------------------------------------------------
@@ -860,12 +926,69 @@ void decode_attention(const DecodeAttentionArgs& args, cudaStream_t stream) {
         throw std::invalid_argument("flint decode attention: width 128, eight query heads per KV "
                                     "head, sinks and 1..128 splits");
     }
-    decode_attention_kernel<<<dim3(args.batch, args.kv_heads, args.splits), kDecodeThreads, 0,
-                              stream>>>(args);
+    const dim3 grid(args.batch, args.kv_heads, args.splits);
+    const KvCoding kc = args.k_plane.coding, vc = args.v_plane.coding;
+    if (kc == KvCoding::F16 && vc == KvCoding::F16) {
+        decode_attention_kernel<KvCoding::F16, KvCoding::F16><<<grid, kDecodeThreads, 0, stream>>>(
+            args);
+    } else if (args.ring != 0) {
+        throw std::invalid_argument("flint decode attention: quantized planes are linear caches");
+    } else if (kc == KvCoding::Int8G64 && vc == KvCoding::Int8G64) {
+        decode_attention_kernel<KvCoding::Int8G64, KvCoding::Int8G64>
+            <<<grid, kDecodeThreads, 0, stream>>>(args);
+    } else if (kc == KvCoding::Int8G64 && vc == KvCoding::Int4G32) {
+        decode_attention_kernel<KvCoding::Int8G64, KvCoding::Int4G32>
+            <<<grid, kDecodeThreads, 0, stream>>>(args);
+    } else if (kc == KvCoding::Lloyd4 && vc == KvCoding::Int4G32) {
+        decode_attention_kernel<KvCoding::Lloyd4, KvCoding::Int4G32>
+            <<<grid, kDecodeThreads, 0, stream>>>(args);
+    } else {
+        throw std::invalid_argument("flint decode attention: no kernel for these KV codings");
+    }
     check_launch("decode_attention");
     decode_combine_kernel<<<dim3(args.query_heads, args.batch, 1), kCombineThreads, 0, stream>>>(
         args);
     check_launch("decode_combine");
+}
+
+void kv_store(const KvStoreArgs& args, cudaStream_t stream) {
+    const int units = args.rows * args.heads;
+    if (units <= 0) { return; }
+    const dim3 grid((units + kStoreWarps - 1) / kStoreWarps), block(kStoreWarps * 32);
+    switch (args.dst.coding) {
+    case KvCoding::Int8G64:
+        kv_store_kernel<KvCoding::Int8G64><<<grid, block, 0, stream>>>(args);
+        break;
+    case KvCoding::Int4G32:
+        kv_store_kernel<KvCoding::Int4G32><<<grid, block, 0, stream>>>(args);
+        break;
+    case KvCoding::Lloyd4:
+        kv_store_kernel<KvCoding::Lloyd4><<<grid, block, 0, stream>>>(args);
+        break;
+    case KvCoding::Mxfp8:
+    case KvCoding::F16: throw std::invalid_argument("flint kv_store: not a Flint plane coding");
+    }
+    check_launch("kv_store");
+}
+
+void kv_load(const KvLoadArgs& args, cudaStream_t stream) {
+    const std::int64_t n = std::int64_t(args.end - args.begin) * args.heads * (kD / 8);
+    if (n <= 0) { return; }
+    const unsigned grid = blocks_for(n, 256);
+    switch (args.src.coding) {
+    case KvCoding::Int8G64:
+        kv_load_kernel<KvCoding::Int8G64><<<grid, 256, 0, stream>>>(args);
+        break;
+    case KvCoding::Int4G32:
+        kv_load_kernel<KvCoding::Int4G32><<<grid, 256, 0, stream>>>(args);
+        break;
+    case KvCoding::Lloyd4:
+        kv_load_kernel<KvCoding::Lloyd4><<<grid, 256, 0, stream>>>(args);
+        break;
+    case KvCoding::Mxfp8:
+    case KvCoding::F16: throw std::invalid_argument("flint kv_load: not a Flint plane coding");
+    }
+    check_launch("kv_load");
 }
 
 void route(const float* x, int hidden, int tokens, const float* router, int experts, int top_k,

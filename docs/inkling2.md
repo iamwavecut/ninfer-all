@@ -99,10 +99,10 @@ Not built for this family: MTP, DFlash, n-gram copy drafts and their archive, `-
 rotation scaling (the attention has no rotation), thinking budgets, video, pipeline stages, and of
 the context cache the shared paged KV pool, the disk tier and session slots; the server refuses
 their options and `--default-thinking-budget` at startup ([Serving](serving.md#slots)). Of the
-`--kv-dtype` formats, MXFP8 (the default), `rk8v4`, `rk4v4` and F16 (`bf16` or `fp16`) are built
-([KV cache](#kv-cache)); `int8`, `fp8`, `nvfp4`, `k8v4`, `rk4v4-e8`, `rk2v4-e8` and `bf16p` are
-not. DSpark drafts for one request at a time; with several requests decoding, each decodes a token
-a step.
+`--kv-dtype` formats, MXFP8 (the default), `int8`, `rk8v4`, `rk4v4` and F16 (`bf16` or `fp16`) are
+built ([KV cache](#kv-cache)); `fp8`, `nvfp4`, `k8v4`, `rk4v4-e8`, `rk2v4-e8` and `bf16p` are not,
+for the reasons [Flint's KV cache](flint.md#kv-cache) lists. DSpark drafts for one request at a
+time; with several requests decoding, each decodes a token a step.
 
 ## Converting
 
@@ -210,20 +210,23 @@ to a power of two. This is the KV format the release trained with
 ([#394](https://github.com/iamwavecut/ninfer-all/issues/394)) and the rule vLLM's Inkling 2 kernels
 quantize MXFP8 with; the stored codes and scales equal that rule bit for bit
 (`ninfer_inkling2_kv_planes_test`). A token's full-attention K and V take 16.5 KiB instead of F16's
-32 KiB. `rk8v4` (int8 G64 keys, packed int4 G32 values) and `rk4v4` (4-bit Lloyd-Max keys over the
-same values) store the same visits unrotated, since the K and V come out of their convolutions
-clipped and RMS-normed. Whatever the format, the windowed visits' rings of 1,024 positions, the
-convolution histories and a DSpark drafter's caches stay F16: rounding the rings to MXFP8 as well
-raised the mean NLL (+0.029% over 67,977 tokens and +0.091% over 9,718, against +0.024% and
-+0.015% for the full visits alone) and saves no memory, since a ring does not grow with the
-context.
+32 KiB. `int8` (int8 codes over one FP16 scale per 64 values, keys and values), `rk8v4` (the same
+keys, values as packed int4 over one scale per 32) and `rk4v4` (4-bit Lloyd-Max keys over the same
+values) store the same visits unrotated: the K and V come out of their convolutions clipped and
+RMS-normed, and rotating the keys as [Flint's](flint.md#kv-cache) `rk4v4` does raised the mean NLL
+over 67,977 tokens (`rk8v4` 1.784842 against 1.784735, `rk4v4` 1.785690 against 1.785611). Whatever
+the format, the windowed visits' rings of 1,024 positions, the convolution histories and a DSpark
+drafter's caches stay F16: rounding the rings to MXFP8 as well raised the mean NLL (+0.029% over
+67,977 tokens and +0.091% over 9,718, against +0.024% and +0.015% for the full visits alone) and
+saves no memory, since a ring does not grow with the context.
 
 | `--kv-dtype` | A token | KV of one sequence at 4,096 / 40,960 tokens | Mean NLL, 9,718 tokens | Mean NLL, 67,977 tokens | 30K prompt: prefill, then decode |
 |---|---:|---:|---:|---:|---:|
 | `bf16` or `fp16` (F16) | 32 KiB | 352 / 1,708 MiB | 1.858657 | 1.784503 | 1.28k, 83.1 tok/s |
 | `mxfp8` (default) | 16.5 KiB | 286 / 1,084 MiB | 1.858934 (+0.015%) | 1.784935 (+0.024%) | 1.25k, 80.4 tok/s |
+| `int8` | 16.5 KiB | 286 / 1,084 MiB | 1.858933 (+0.015%) | 1.784764 (+0.015%) | 1.26k, 80.4 tok/s |
 | `rk8v4` | 12.75 KiB | 270 / 933 MiB | 1.858810 (+0.008%) | 1.784735 (+0.013%) | 1.25k, 80.2 tok/s |
-| `rk4v4` | 8.75 KiB | 253 MiB / not measured | 1.859427 (+0.041%) | not measured | not measured |
+| `rk4v4` | 8.75 KiB | 253 / 772 MiB | 1.859427 (+0.041%) | 1.785611 (+0.062%) | 1.25k, 79.9 tok/s |
 
 UD-IQ4_XS on an RTX 3090 (350 W, PCIe 4.0 x16), a CUDA 13.4.3 build for `75;80;86;89;120a`,
 November 22, 2026. The NLL columns score the first 40,000 bytes and all 277,332 bytes of the
@@ -231,8 +234,9 @@ WikiText file `00.txt` in 4,096-token windows at a 2,048-token stride; this buil
 40,000 bytes differs from the 1.859871 a CUDA 12.8 build measured ([below](#smaller-quantizations)),
 so each format is compared with the F16 run of the same build. Speed: one server per format with
 `--spec none`, one run each; a 5K prompt prefilled at 2.10-2.11k tok/s and then decoded 100.2-101.4
-tok/s in all three. On this text `rk8v4` raised the NLL less than MXFP8 in a smaller cache; MXFP8
-stays the default because the release trained with it.
+tok/s in all five. On this text `rk8v4` raised the NLL less than MXFP8 in a smaller cache, and
+`int8` no more than MXFP8 in the same 16.5 KiB; MXFP8 stays the default because the release
+trained with it.
 
 ## Measurements
 

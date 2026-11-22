@@ -3,6 +3,8 @@
 // Flint's own normalization, attention-input, routing and decode-attention kernels. Activations are
 // token-major: an FP32 residual h[t][i], BF16 projection inputs x[t][k] (a [K, T] Tensor).
 
+#include "models/flint/kv_format.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -82,11 +84,13 @@ void ring_copy(const RingCopyArgs& args, cudaStream_t stream);
 // One token per row b of `batch` at positions[b] of sequence sequences[b]: attention over its
 // sequence's F16 cache (linear: positions 0..p; ring: the window ending at p), each query head's
 // sink logit joining its softmax denominator, split over `splits` key ranges and merged. Width 128
-// with eight query heads per KV head.
+// with eight query heads per KV head. With quantized planes (k_plane's coding not F16, a linear
+// cache only) the keys and values are decoded from them as each tile loads.
 struct DecodeAttentionArgs {
     const float* q         = nullptr; // [B][Hq][D]
     const __half* k_cache  = nullptr;
     const __half* v_cache  = nullptr;
+    KvPlaneView k_plane, v_plane;
     const float* sinks     = nullptr; // [Hq]
     std::int64_t seq_stride = 0, head_stride = 0; // elements, as QkvArgs
     const std::int32_t* sequences = nullptr;      // [B]
@@ -99,6 +103,32 @@ struct DecodeAttentionArgs {
     __nv_bfloat16* out = nullptr;   // [B][Hq * D], or
     Q8Rows out_q;                   // the same rows in q8_1 form
 };
+// Encodes F16 rows into a quantized plane (kv_format.h), rotating them first into a rotated one,
+// one warp a (row, head): row r of head h
+// at src + h * src_head_stride + (src_first + r) * 128 goes to slot (dst_slots ? dst_slots[r] :
+// dst_first + r) of sequence (sequences ? sequences[r] : sequence).
+struct KvStoreArgs {
+    const __half* src             = nullptr;
+    std::int64_t src_head_stride  = 0;
+    int src_first                 = 0;
+    const std::int32_t* dst_slots = nullptr;
+    int dst_first                 = 0;
+    const std::int32_t* sequences = nullptr;
+    int sequence = 0, rows = 0, heads = 0;
+    KvPlaneView dst;
+};
+void kv_store(const KvStoreArgs& args, cudaStream_t stream);
+
+// Decodes slots [begin, end) of one sequence's quantized plane into F16 rows: slot s of head h at
+// dst + h * dst_head_stride + s * 128.
+struct KvLoadArgs {
+    KvPlaneView src;
+    int sequence = 0, begin = 0, end = 0, heads = 0;
+    __half* dst                  = nullptr;
+    std::int64_t dst_head_stride = 0;
+};
+void kv_load(const KvLoadArgs& args, cudaStream_t stream);
+
 [[nodiscard]] std::size_t decode_attention_workspace_floats(int batch, int query_heads,
                                                             int head_dim, int splits);
 void decode_attention(const DecodeAttentionArgs& args, cudaStream_t stream);

@@ -17,6 +17,7 @@
 #include "core/tensor.h"
 #include "models/expert_profile.h"
 #include "models/flint/model.h"
+#include "ninfer/kv_cache_storage.h"
 
 #include <cuda_runtime.h>
 
@@ -60,6 +61,9 @@ struct ExecutorOptions {
     std::uint32_t expert_cpu_threads = 0;
     // Disk experts: a drive mirror and the direct path (core/expert_disk.h).
     ExpertDiskReads expert_disk{};
+    // The full-attention blocks' KV storage (kv_format.h); BFloat16 and Float16 select the F16
+    // cache.
+    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
 };
 
 struct ExecutorMemory {

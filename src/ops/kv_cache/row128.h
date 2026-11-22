@@ -9,7 +9,9 @@
 //   Lloyd4    4-bit Lloyd-Max indices with a G64 FP16 least-squares scale (rk4v4 keys)
 //   Mxfp8     E4M3 codes, one UE8M0 power-of-two scale per 32 (row128_codec.cuh)
 //
-// The rows are stored as they are, unrotated. Device side: row128_codec.cuh.
+// A plane stores its rows as they are, or rotated: each row as H x / 8, H the unnormalized
+// 128-point Sylvester-Hadamard transform, the attention turning its queries by H / 16 instead (the
+// two scales multiply to 1/128, so the scores keep their values). Device side: row128_codec.cuh.
 
 #include <cstdint>
 
@@ -50,6 +52,10 @@ inline constexpr int kKvRowDims = 128;
     return 0;
 }
 
+// A rotated plane stores H x times kRotatedRowScale; its queries are turned by H times
+// kRotatedQueryScale (row128_rotate.h).
+inline constexpr float kRotatedRowScale = 0.125f, kRotatedQueryScale = 0.0625f;
+
 // A quantized plane: one row's codes at codes + sequence * code_seq + head * code_head +
 // slot * code_row, its scales likewise.
 struct KvPlaneView {
@@ -58,6 +64,7 @@ struct KvPlaneView {
     std::int64_t code_row = 0, scale_row = 0, code_head = 0, scale_head = 0, code_seq = 0,
                  scale_seq = 0;
     KvCoding coding = KvCoding::F16;
+    bool rotated    = false;
 };
 
 } // namespace ninfer::ops::kv128
