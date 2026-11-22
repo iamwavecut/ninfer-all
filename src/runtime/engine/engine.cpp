@@ -128,10 +128,15 @@ EngineOptions with_family_attention(EngineOptions options) {
             "artifacts");
     }
     // Inkling 2's release trained with an MXFP8 KV cache, so without --kv-dtype the family stores
-    // MXFP8; no other family implements it.
+    // MXFP8; no other family implements it. Flint and DeepSeek-V4.1 keep one cache of their own,
+    // which a caller's quantized default (ninfer-perplexity's int8) must not refuse.
     const bool inkling2 = runtime::is_inkling2_artifact(options.artifact_path);
     if (inkling2 && options.kv_cache_automatic) {
         options.kv_cache = KvCacheStorage::Mxfp8;
+    }
+    if (options.kv_cache_automatic && (runtime::is_flint_artifact(options.artifact_path) ||
+                                       runtime::is_deepseek_v41_artifact(options.artifact_path))) {
+        options.kv_cache = KvCacheStorage::BFloat16;
     }
     if (options.kv_cache == KvCacheStorage::Mxfp8 && !inkling2) {
         throw std::invalid_argument("--kv-dtype mxfp8 applies to Inkling2ForCausalLM artifacts");
