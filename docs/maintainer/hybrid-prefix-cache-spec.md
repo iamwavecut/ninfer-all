@@ -38,8 +38,8 @@ Coexistence rules:
   `--graft`. With `--use-alt-prefix-caching` named, several `--devices` keep Hybrid and the other
   options are rejected instead; Hybrid-only
   options are rejected with the catalog. `--host-cache-mib` applies to both modes (in Hybrid mode
-  it sizes the Host slab pool). Gemma 4 and Qwen3.8-Flash-Next run context caches of their own,
-  and their Engine reports the Legacy mode.
+  it sizes the Host slab pool). Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next
+  run context caches of their own, and their Engine reports the Legacy mode.
 - Hybrid mode reuses the active-execution machinery unchanged: `LogicalKVPageStore`,
   `KVAddressSpaceStore`, execution rows, the active `StateStore` images, prefill/decode/speculative
   paths. It replaces only admission-source selection, retention, capture and pressure. Tree nodes

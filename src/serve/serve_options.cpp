@@ -995,7 +995,9 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             if (options.context_cache.hybrid.persistent_file.empty()) {
                 throw std::invalid_argument("--prefix-cache-file must not be empty");
             }
-            hybrid_option_flag = "--prefix-cache-file";
+            // The families with an Engine core of their own save their cache to it too, so it
+            // names the hybrid cache only when no other hybrid setting does.
+            if (hybrid_option_flag == nullptr) { hybrid_option_flag = "--prefix-cache-file"; }
             continue;
         }
         if (arg == "--cache-tap-min-gap") {

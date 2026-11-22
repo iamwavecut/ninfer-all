@@ -20,12 +20,14 @@
 #include "runtime/engine/gemma4_core.h"
 #include "runtime/engine/qwen4_exp_core.h"
 #include "runtime/engine/slot_spill_guard.h"
+#include "core/snapshot_checksum.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -51,16 +53,14 @@ bool own_family_artifact(const std::filesystem::path& path) {
            runtime::is_qwen4_exp_artifact(path);
 }
 
-// Those families keep context caches of their own, which the checkpoint catalog's options
-// configure; the hybrid prefix cache, the server's default, belongs to the Qwen3.5 Program, and so
-// do its Host tier file, prompt grafts, saves of evicted sessions and model suspend. Of the own
-// families only Flash-Next keeps a disk tier.
+// Those families keep context caches of their own (context_image_store.h), which the checkpoint
+// catalog's options configure, with a disk tier (--disk-kv-path) and a prefix cache file
+// (--prefix-cache-file) of their own; the hybrid prefix cache, the server's default, belongs to the
+// Qwen3.5 Program, and so do prompt grafts, saves of evicted sessions and model suspend.
 EngineOptions with_family_context_cache(EngineOptions options) {
     if (!own_family_artifact(options.artifact_path)) { return options; }
     const char* option = nullptr;
-    if (!options.context_cache.hybrid.persistent_file.empty()) {
-        option = "--prefix-cache-file";
-    } else if (!options.grafts.empty()) {
+    if (!options.grafts.empty()) {
         option = "--graft";
     } else if (options.slot_auto_save.enabled) {
         option = "--auto-save-evicted";
@@ -71,12 +71,6 @@ EngineOptions with_family_context_cache(EngineOptions options) {
         throw std::invalid_argument(std::string(option) +
                                     " applies to Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM "
                                     "artifacts");
-    }
-    if (!options.context_cache.disk_kv_path.empty() &&
-        !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
-        throw std::invalid_argument(
-            "--disk-kv-path applies to Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM and "
-            "Qwen4ExpForCausalLM artifacts");
     }
     options.context_cache.mode = ContextCacheMode::Legacy;
     return options;
@@ -755,7 +749,29 @@ public:
         for (PendingWrite& item : matching) { write_spill(item); }
     }
 
-    // Session slots are private catalog cells, which only the Legacy context cache has.
+    // Calls `f` with the Engine core of a family that has one of its own (session_slots.h) and
+    // returns true; false for the Qwen3.5-core and scoring cores.
+    template <class F>
+    bool with_own_core(F&& f) const {
+        return std::visit(
+            [&](const auto& state) {
+                using CoreState = std::remove_cvref_t<decltype(state)>;
+                if constexpr (std::is_same_v<CoreState, std::unique_ptr<Qwen4ExpCore>> ||
+                              std::is_same_v<CoreState, std::unique_ptr<Gemma4Core>> ||
+                              std::is_same_v<CoreState, std::unique_ptr<FlintCore>> ||
+                              std::is_same_v<CoreState, std::unique_ptr<DeepSeekV41Core>> ||
+                              std::is_same_v<CoreState, std::unique_ptr<Inkling2Core>>) {
+                    if (state == nullptr) { throw std::logic_error("Engine core is unavailable"); }
+                    f(*state);
+                    return true;
+                } else {
+                    return false;
+                }
+            },
+            core);
+    }
+
+    // The Qwen3.5-core session slots are private catalog cells of the Legacy context cache.
     [[nodiscard]] GenerationCore& generation_core() {
         auto* generation = std::get_if<std::unique_ptr<GenerationCore>>(&core);
         if (generation == nullptr || *generation == nullptr) {
@@ -1366,13 +1382,28 @@ SlotSaveResult Engine::save_slot(std::uint32_t slot, const std::string& path,
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     const auto started = std::chrono::steady_clock::now();
     std::scoped_lock io(impl_->slot_io_mutex);
+    SlotSaveResult result;
+    if (impl_->with_own_core([&](auto& core) {
+            runtime::SessionSlotRecord record = core.save_slot(slot, expected_digest);
+            // The file ends with the records' checksum, which a restore checks first.
+            const std::uint64_t checksum = snapshot_checksum(record.bytes);
+            const auto* tail             = reinterpret_cast<const std::uint8_t*>(&checksum);
+            record.bytes.insert(record.bytes.end(), tail, tail + sizeof(checksum));
+            write_snapshot_file(path, record.bytes);
+            result.tokens         = record.tokens;
+            result.bytes          = record.bytes.size();
+            result.session_digest = std::move(record.session_digest);
+        })) {
+        result.seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        return result;
+    }
     auto snapshot = impl_->generation_core().save_slot(
         slot, slot_model_binding(impl_->options, impl_->load), expected_digest, path,
         [&] { impl_->spill_guard.claim(path); });
     write_snapshot_file(path, snapshot.bytes);
     impl_->spill_guard.note_authoritative(path, snapshot.tokens);
 
-    SlotSaveResult result;
     result.tokens         = snapshot.tokens;
     result.bytes          = snapshot.bytes.size();
     result.session_digest = std::move(snapshot.session_digest);
@@ -1396,15 +1427,31 @@ SlotRestoreResult Engine::restore_slot(std::uint32_t slot, const std::string& pa
     if (!file.good()) { throw std::invalid_argument("failed to read session snapshot file"); }
     file.close();
 
+    SlotRestoreResult result;
+    result.bytes = bytes.size();
+    if (impl_->with_own_core([&](auto& core) {
+            std::uint64_t checksum = 0;
+            const std::size_t body = bytes.size() - std::min(bytes.size(), sizeof(checksum));
+            if (body != 0) { std::memcpy(&checksum, bytes.data() + body, sizeof(checksum)); }
+            const std::span<const std::uint8_t> records(bytes.data(), body);
+            if (body == 0 || snapshot_checksum(records) != checksum) {
+                throw std::invalid_argument("session snapshot file is corrupt");
+            }
+            auto [tokens, digest] = core.restore_slot(slot, records);
+            result.tokens         = tokens;
+            result.session_digest = std::move(digest);
+        })) {
+        result.seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        return result;
+    }
     auto [tokens, digest] = impl_->generation_core().restore_slot(
         slot, std::span<const std::uint8_t>(bytes.data(), bytes.size()),
         slot_model_binding(impl_->options, impl_->load), path,
         [&] { impl_->spill_guard.claim(path); });
     impl_->spill_guard.note_authoritative(path, tokens);
 
-    SlotRestoreResult result;
     result.tokens         = tokens;
-    result.bytes          = bytes.size();
     result.session_digest = std::move(digest);
     result.seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -1414,6 +1461,11 @@ SlotRestoreResult Engine::restore_slot(std::uint32_t slot, const std::string& pa
 std::uint32_t Engine::erase_slot(std::uint32_t slot, const std::string& expected_digest) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     std::scoped_lock io(impl_->slot_io_mutex);
+    std::uint32_t erased = 0;
+    if (impl_->with_own_core(
+            [&](auto& core) { erased = core.erase_slot(slot, expected_digest); })) {
+        return erased;
+    }
     return impl_->generation_core().erase_slot(
         slot, expected_digest,
         [&](const std::string& bound_path) { impl_->spill_guard.claim(bound_path); });
@@ -1421,6 +1473,8 @@ std::uint32_t Engine::erase_slot(std::uint32_t slot, const std::string& expected
 
 std::vector<SlotState> Engine::slot_states() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::vector<SlotState> states;
+    if (impl_->with_own_core([&](auto& core) { states = core.slot_states(); })) { return states; }
     // A Hybrid context cache or a scoring Engine has no catalog cells to list.
     const auto* generation = impl_->legacy_generation_core();
     return generation != nullptr ? generation->slot_states() : std::vector<SlotState>{};
