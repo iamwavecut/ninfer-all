@@ -1,8 +1,9 @@
 // Adaptive MTP only chooses how many drafts a round verifies; greedy output is the same at every
 // width. What these checks defend is the choice: the survival estimate, the measured cost model,
 // that the controller widens under full acceptance and settles low under none, and that a packed
-// round's plan spends its rows where drafts survive, and that a masked drafter's round keeps the
-// width whose drafts repay its measured cost.
+// round's plan spends its rows where drafts survive, that a masked drafter's round keeps the
+// width whose drafts repay its measured cost, and that the speculation gate runs whichever of rounds
+// and plain steps commits tokens faster.
 
 #include "runtime/contract/mtp_adaptive.h"
 
@@ -23,6 +24,7 @@ using ninfer::runtime::MtpAdaptiveBatchController;
 using ninfer::runtime::MtpAdaptiveSignal;
 using ninfer::runtime::MtpPackedPlanner;
 using ninfer::runtime::MtpRoundCostModel;
+using ninfer::runtime::SpeculationGate;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -226,6 +228,61 @@ void the_packed_plan_spends_rows_on_survival() {
     require(std::abs(partial.cost(4) - 0.012F) < 1e-6F, "an unmeasured total was not interpolated");
 }
 
+// Steps of a lone request under the gate: a round commits `round_tokens` in `round_seconds`, a plain
+// step one token in `plain_seconds`. Returns the tokens per second of the steps run.
+double gated_rate(SpeculationGate& gate, int steps, double round_tokens, double round_seconds,
+                  double plain_seconds, int* plain_steps = nullptr) {
+    double tokens = 0.0, seconds = 0.0;
+    for (int step = 0; step < steps; ++step) {
+        if (gate.speculates()) {
+            // Rounds commit whole tokens: alternate around the mean.
+            const auto whole = static_cast<std::uint32_t>(round_tokens + (step % 2 == 0 ? 0.5 : -0.5) + 0.5);
+            gate.observe(whole, round_seconds);
+            tokens += whole;
+            seconds += round_seconds;
+        } else {
+            gate.observe(1, plain_seconds);
+            tokens += 1.0;
+            seconds += plain_seconds;
+            if (plain_steps != nullptr) { ++*plain_steps; }
+        }
+    }
+    return tokens / seconds;
+}
+
+void the_gate_runs_the_faster_mode() {
+    // Inkling 2 on an RTX 3090 after 32K tokens: a round 21.1 ms for 2.5 tokens, a step 11.07 ms.
+    SpeculationGate winning;
+    int plain = 0;
+    const double won = gated_rate(winning, 2000, 2.5, 0.0211, 0.01107, &plain);
+    require(winning.switches() == 0, "rounds that commit faster were given up");
+    // Rounds that lead the measured plain rate by more than a tenth are not probed again.
+    require(plain == 5, "rounds far ahead of plain decoding were probed again");
+    require(won > 0.995 * 2.5 / 0.0211, "the probes cost more than 0.5% of the rounds' rate");
+
+    // Rounds just ahead of plain steps (5%) keep being probed, and keep running.
+    SpeculationGate close;
+    int close_plain = 0;
+    (void)gated_rate(close, 2000, 1.5, 0.0143, 0.0100, &close_plain);
+    require(close.switches() == 0, "rounds 5% ahead were given up");
+    require(close_plain > 5 && close_plain < 2000 / 10, "close rounds were probed once or too often");
+
+    // After 120K tokens: a round 27.3 ms for 1.6 tokens (58.6 tok/s), a step 14.9 ms (67.1 tok/s).
+    SpeculationGate losing;
+    const double lost = gated_rate(losing, 2000, 1.6, 0.0273, 0.0149);
+    require(losing.switches() == 1 && !losing.speculates(), "slower rounds kept running");
+    require(lost > 0.95 / 0.0149, "the gate's rate stayed below plain decoding's");
+
+    // Rounds that become faster again win back within a run and a probe.
+    const double regained = gated_rate(losing, 2000, 3.0, 0.0200, 0.0149);
+    require(losing.switches() == 2 && losing.speculates(), "faster rounds were not taken back");
+    require(regained > 0.9 * 3.0 / 0.0200, "the gate took too long to speculate again");
+
+    // A new request starts speculating.
+    losing.reset();
+    require(losing.speculates() && losing.switches() == 0, "a reset gate did not speculate");
+}
+
 } // namespace
 
 int main() {
@@ -235,10 +292,12 @@ int main() {
         the_controller_widens_and_narrows();
         the_masked_width_follows_survival_and_cost();
         the_packed_plan_spends_rows_on_survival();
+        the_gate_runs_the_faster_mode();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
     }
-    std::puts("adaptive MTP: survival, costs, width selection, masked widths and packed plans ok");
+    std::puts("adaptive MTP: survival, costs, width selection, masked widths, packed plans and the "
+              "speculation gate ok");
     return 0;
 }
