@@ -376,7 +376,11 @@ struct ExpertDelivery::Impl {
     Storage products, cpu_flag;
     std::vector<std::byte> cpu_bytes;
     cudaEvent_t copies_begun = nullptr, copies_done = nullptr; // a call's copies, timed
+    // The CPU workers spin (spinning) until cpu_until, 500 ms after the last call whose misses
+    // they computed; a call with none (every expert cached, a wide call, no CPU share) keeps
+    // them asleep, and a call that has some wakes them.
     bool spinning = false;
+    std::chrono::steady_clock::time_point cpu_until{};
     std::optional<CudaHostHandshake> handshake;
     cudaStream_t copies = nullptr;
     cudaEvent_t copied[2]{};
@@ -1706,6 +1710,7 @@ struct ExpertDelivery::Impl {
         std::vector<std::int32_t> lent_taken;
         const auto cpu = !wide && layer.cpu && (request.flags & kCpuCall) ? cpu_share(li, needed, held)
                                                                           : std::vector<std::int32_t>{};
+        if (!cpu.empty()) { cpu_until = started + std::chrono::milliseconds(500); }
         std::vector<std::int32_t> to_bank;
         for (int e = 0; e < experts; ++e) {
             if (!(needed[e] & kMiss)) { continue; }
@@ -1904,19 +1909,17 @@ struct ExpertDelivery::Impl {
         auto active_until = std::chrono::steady_clock::now();
         while (!stopping.load(std::memory_order_acquire)) {
             const auto request = handshake->pending(served);
+            const auto now     = std::chrono::steady_clock::now();
+            if (spinning && now >= cpu_until) {
+                pool->spin(false);
+                spinning = false;
+            }
             if (!request) {
-                if (std::chrono::steady_clock::now() < active_until) { std::this_thread::yield(); }
-                else {
-                    // Idle: the CPU workers sleep until the next request.
-                    if (spinning) {
-                        pool->spin(false);
-                        spinning = false;
-                    }
-                    std::this_thread::sleep_for(std::chrono::microseconds(20));
-                }
+                if (now < active_until) { std::this_thread::yield(); }
+                else { std::this_thread::sleep_for(std::chrono::microseconds(20)); }
                 continue;
             }
-            if (pool && !spinning) {
+            if (pool && !spinning && now < cpu_until) {
                 pool->spin(true);
                 spinning = true;
             }
