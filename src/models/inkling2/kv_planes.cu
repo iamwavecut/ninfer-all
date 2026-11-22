@@ -55,7 +55,7 @@ void kv_store(const KvStoreArgs& args, cudaStream_t stream) {
     case KvCoding::Int4G32: kv_store_kernel<KvCoding::Int4G32><<<grid, block, 0, stream>>>(args); break;
     case KvCoding::Lloyd4: kv_store_kernel<KvCoding::Lloyd4><<<grid, block, 0, stream>>>(args); break;
     case KvCoding::Mxfp8: kv_store_kernel<KvCoding::Mxfp8><<<grid, block, 0, stream>>>(args); break;
-    case KvCoding::F16: throw std::invalid_argument("inkling2 kv_store: F16 needs no plane");
+    default: throw std::invalid_argument("inkling2 kv_store: not an Inkling 2 plane coding");
     }
     check_launch("kv_store");
 }

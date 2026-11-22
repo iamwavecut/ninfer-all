@@ -186,7 +186,7 @@ std::vector<double> decode_plane_row(mi::KvCoding coding, const std::uint8_t* co
         case mi::KvCoding::Mxfp8:
             x[d] = e4m3(codes[d]) * std::ldexp(1.0, int(scales[d / 32]) - 127);
             break;
-        case mi::KvCoding::F16: break;
+        default: break;
         }
     }
     return x;

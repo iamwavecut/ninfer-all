@@ -179,8 +179,9 @@ does not fit is refused at startup with the numbers.
 ## KV-cache formats
 
 `--kv-dtype` selects the caches' storage. The 16-bit default keeps F16 rows (the prompt kernels'
-type), which `bf16` and `fp16` both select. Every other format of the engine stores its codes and scales per 256-wide block with the
-engine's D256 codecs (`ops/kv_cache`), each block's codes and scales in two planes:
+type), which `bf16` and `fp16` both select. Every other format of the engine stores its codes and
+scales per 256-wide block in the engine's KV row codings (`ops/kv_cache/kv_row.h`, the same that
+Inkling 2's and Flint's 128-wide planes use), each block's codes and scales in two planes:
 
 | `--kv-dtype` | sliding blocks: keys | sliding blocks: values | full-attention plane |
 |---|---|---|---|

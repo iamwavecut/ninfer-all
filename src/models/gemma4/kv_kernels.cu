@@ -180,7 +180,7 @@ void dispatch(KvCoding coding, Args&&... args) {
     case KvCoding::Lloyd4: Launch<KvCoding::Lloyd4>::run(args...); return;
     case KvCoding::Int4E8: Launch<KvCoding::Int4E8>::run(args...); return;
     case KvCoding::RootE8: Launch<KvCoding::RootE8>::run(args...); return;
-    case KvCoding::F16: break;
+    default: break;
     }
     throw std::invalid_argument("gemma4 kv: not a quantized coding");
 }
