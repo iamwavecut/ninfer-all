@@ -1626,11 +1626,12 @@ struct Executor::Impl {
                 qa.head_stride = stage_stride;
                 qa.ring        = prefill_ring;
             } else {
+                // full_k and full_v start at the sequence's rows (or the staging's), so the
+                // kernel adds no sequence offset.
                 qa.k_cache     = const_cast<__half*>(full_k);
                 qa.v_cache     = const_cast<__half*>(full_v);
-                qa.seq_stride  = quantized ? 0 : p.seq_stride;
+                qa.seq_stride  = 0;
                 qa.head_stride = p.head_stride;
-                qa.sequence    = int(sequence);
             }
             kernels::qkv_post(qa, stream);
             const bool attends = !(kv_only && p.full && li + 1 == layers.size() && !last_tap);
