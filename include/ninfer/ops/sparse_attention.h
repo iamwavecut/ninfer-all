@@ -12,21 +12,23 @@
 namespace ninfer::ops {
 
 /**
- * Qwen3.8-Flash-Next's sparse attention for one sequence: query p attends only to the 4-token
- * blocks its indexer selected (qsa_indexer_select) and to its own incomplete block, positions
- * 4 floor((p + 1) / 4) .. p:
+ * The sparse attention of Qwen3.8-Flash-Next and dense Qwen4 for one sequence: query p attends
+ * only to the 4-token blocks its indexer selected (qsa_indexer_select) and to its own incomplete
+ * block, positions 4 floor((p + 1) / 4) .. p:
  *
- *   out[h] = sum_{j in S_p} softmax_j(scale * q[h] . k[kv(h), j]) v[kv(h), j],   kv(h) = h / 12
+ *   out[h] = sum_{j in S_p} softmax_j(scale * q[h] . k[kv(h), j]) v[kv(h), j],   kv(h) = h / G
  *
- * `q` is BF16 [256, 12 K, tokens] (normalised and rotated) for the consecutive positions
+ * with G query heads per KV head: 12 (Flash-Next, two KV heads) or 6 (dense Qwen4, four), the
+ * ratio of q's heads to the cache's, at most 24 query heads in all.
+ * `q` is BF16 [256, G K, tokens] (normalised and rotated) for the consecutive positions
  * `first_position` .., read from a device I32 word so that a call captured in a graph replays at
  * whatever position the word holds; `selected` I32 [512, tokens] and `counts` I32 [tokens] are the
- * indexer's blocks; `cache` is the sequence's paged KV layer of K heads of 256 (both, K = 2, or
- * one, K = 1: a tensor-parallel share of a KV head and its 12 query heads) holding every
+ * indexer's blocks; `cache` is the sequence's paged KV layer of K heads of 256 (every KV head of
+ * the layer, or a tensor-parallel share of whole KV heads and their query heads) holding every
  * selected and tail position, its block table covering every position the caller reaches, in any
  * storage kv_cache_append writes (BF16, native FP16, the INT8 family, FP8 rows, NVFP4, K8V4), in
  * pages of 64 positions or, for a streamed layer, its device pool of 4-position pages after
- * kv_stream_resolve made every block the call reads resident (kv_stream.h); `out` is BF16 [256, 12
+ * kv_stream_resolve made every block the call reads resident (kv_stream.h); `out` is BF16 [256, G
  * K, tokens]. The oracle evaluates the softmax and the weighted sum in FP64 from the represented
  * cache and queries: a quantized cache's decoded keys lie in the rotated basis kv_cache_append
  * stores them in, against the query under the same normalized Hadamard transform, and its decoded

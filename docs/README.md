@@ -21,6 +21,7 @@ spelling and defaults.
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md) | converting the GSQ-RCO GGUF releases and their n-gram table; experts on one or several GPUs, in host memory or on disk; measurements |
 | [Native Flash-Next with DFlash2](flash-next-native-dflash2.md) | GGUF text and NVIDIA FP8 PLE sources, explicit operand-preservation choices, Q8PLE and DFlash2 attachment |
 | [Edge0](edge0.md) | Edge0-145B and Edge0-120B, latent-MoE models on the Flash-Next skeleton: converting the release folders, placements, tensor parallelism by groups, what differs from Flash-Next |
+| [Dense Qwen4](qwen4-dense.md) | `Qwen4ForCausalLM`, the Flash-Next blocks with a SwiGLU MLP: the geometry it accepts, converting a safetensors checkpoint, one GPU, pipeline stages and tensor parallelism, and the checks on a synthetic checkpoint (no release is public) |
 | [Gemma 4 26B-A4B and 31B](gemma4.md) | converting Google's QAT GGUF releases with their MTP assistants and vision tower, what runs, speculative decoding, images and video, the defaults, measurements against llama.cpp and the numerical checks |
 | [Flint](flint.md) | converting a GGUF of Recursive's Flint, what runs, reasoning and GLM-4.7 tool calls, expert residency, measurements against llama.cpp and the numerical checks |
 | [DeepSeek-V4.1-Flash](deepseek-v41.md) | converting the GSQ-RCO IQ1_M and Coder GGUFs and their Engram table, what runs, reasoning and DSML tool calls, host and disk experts, the Engram table's residency, measurements and the numerical checks |
@@ -76,7 +77,7 @@ other references own narrower contracts:
 | [Numeric formats](maintainer/tensor-formats.md) | represented values, codes/scales, conversion arithmetic and numerical interpretation |
 | [Storage layouts](maintainer/storage-layouts.md) | packing, plane offsets, padding, encoded sizes and view addressing |
 | [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense/MoE mathematics, instance config, logical parameters, MTP, Vision and state semantics |
-| [Qwen4Exp model](maintainer/qwen4-exp-model.md) | Flash-Next mathematics, byte census, state sizes, the n-gram table's storage and the implementation status |
+| [Qwen4Exp model](maintainer/qwen4-exp-model.md) | Flash-Next and dense Qwen4 mathematics, byte census, state sizes, the n-gram table's storage and the implementation status |
 | [Pipeline stages](maintainer/pipeline-stages.md) | `--devices`: whole-layer stages over several GPUs, and `--tensor-parallel`: every layer divided over them; what each covers, verification and measurements |
 | [Quality trades](maintainer/quality-trade-experiments.md) | the precision options and what each costs and buys |
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |

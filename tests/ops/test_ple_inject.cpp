@@ -1,4 +1,5 @@
-// ple_inject against an FP64 oracle of Qwen3.8-Flash-Next's PLE block at the model's shapes: one
+// ple_inject against an FP64 oracle of the PLE block at the hidden widths of Qwen3.8-Flash-Next
+// (2560) and dense Qwen4 (5120): one
 // call per sequence chunk and the same sequence split across calls (the convolution history
 // carries the positions before a call), from a zero and from a populated history, under graph
 // replay, and a token whose gate score is exactly zero; and the record form of a speculative
@@ -20,12 +21,17 @@ using namespace ninfer::test;
 namespace {
 
 constexpr int kStreams  = 4;
-constexpr int kHidden   = 2560;
-constexpr int kWidth    = kStreams * kHidden;
+int kHidden             = 2560; // set per suite by use_hidden
+int kWidth              = kStreams * kHidden;
 constexpr int kTaps     = 4;
 constexpr int kDilation = 3;
 constexpr int kHistory  = 9;
 constexpr float kEps    = 1e-6f;
+
+void use_hidden(int hidden) {
+    kHidden = hidden;
+    kWidth  = kStreams * hidden;
+}
 
 std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
@@ -158,7 +164,7 @@ int run_case(const std::string& label, int tokens, const std::vector<int>& split
     Tensor t_conv(d_conv.data(), dtype, {kTaps, kWidth});
     Tensor t_history(d_history.data(), DType::FP32, {kWidth, kHistory});
     const ops::PleInjectWeights weights{&t_nk, &t_nq, &t_nc, &t_conv, in.unit_offset};
-    WorkspaceArena workspace(ops::ple_inject_workspace_bytes(tokens));
+    WorkspaceArena workspace(ops::ple_inject_workspace_bytes(kHidden, tokens));
 
     const auto run = [&](cudaStream_t stream) {
         int begin = 0;
@@ -211,7 +217,8 @@ int run_case(const std::string& label, int tokens, const std::vector<int>& split
 // prefix).
 int run_record(int tokens, int commit, std::uint32_t seed) {
     const std::string label =
-        "ple_inject_record T=" + std::to_string(tokens) + " commit " + std::to_string(commit);
+        "ple_inject_record H=" + std::to_string(kHidden) + " T=" + std::to_string(tokens) +
+        " commit " + std::to_string(commit);
     Inputs in;
     in.stack.resize(static_cast<std::size_t>(kWidth) * tokens);
     in.key.resize(static_cast<std::size_t>(kWidth) * tokens);
@@ -262,7 +269,7 @@ int run_record(int tokens, int commit, std::uint32_t seed) {
     Tensor t_history(d_history.data(), DType::FP32, {kWidth, kHistory});
     Tensor t_direct(d_direct.data(), DType::FP32, {kWidth, kHistory});
     const ops::PleInjectWeights weights{&t_nk, &t_nq, &t_nc, &t_conv};
-    WorkspaceArena workspace(ops::ple_inject_workspace_bytes(tokens));
+    WorkspaceArena workspace(ops::ple_inject_workspace_bytes(kHidden, tokens));
 
     Tensor t_stack(d_stack.data(), DType::FP32, {kHidden, kStreams, tokens});
     Tensor t_key(d_key.data(), DType::BF16, {kWidth, tokens});
@@ -310,6 +317,7 @@ int main() {
         return 77;
     }
     int failures = 0;
+    use_hidden(2560);
     failures += run_case("ple_inject T=1 start", 1, {1}, true, false, 5100u);
     failures += run_case("ple_inject T=1", 1, {1}, false, false, 5101u);
     failures += run_case("ple_inject T=12", 12, {12}, false, false, 5102u);
@@ -323,6 +331,16 @@ int main() {
     failures += run_record(4, 2, 5200u);
     failures += run_record(16, 11, 5201u);
     failures += run_record(9, 9, 5202u);
+    // Dense Qwen4's hidden width: chunked, graph-replayed, FP32 weights and the record form.
+    use_hidden(5120);
+    failures += run_case("ple_inject H=5120 T=1 start", 1, {1}, true, false, 5300u);
+    failures += run_case("ple_inject H=5120 T=12 as 5+1+6", 12, {5, 1, 6}, false, false, 5301u);
+    failures += run_case("ple_inject H=5120 T=40 start", 40, {40}, true, false, 5302u);
+    failures += run_case("ple_inject H=5120 T=7 as 1x7 graph", 7, {1, 1, 1, 1, 1, 1, 1}, false,
+                         true, 5303u);
+    failures += run_case("ple_inject H=5120 FP32 gamma/conv T=12 as 5+1+6", 12, {5, 1, 6}, false,
+                         true, 5304u, true);
+    failures += run_record(16, 11, 5305u);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " ple_inject\n";
     return failures == 0 ? 0 : 1;
 }

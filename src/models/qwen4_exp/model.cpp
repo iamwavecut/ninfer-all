@@ -247,6 +247,28 @@ PleWeights bind_ple_replica(Bindings& b, const TextConfig& c, const std::string&
     return out;
 }
 
+// Dense Qwen4's SwiGLU MLP of layer `p` (or the MTP block's), `intermediate` rows wide.
+DenseWeights bind_dense(Bindings& b, const TextConfig& c, const std::string& p,
+                        std::uint64_t intermediate) {
+    const std::uint64_t h = c.hidden_size;
+    const std::vector<std::string> input{p + "ffn_input"};
+    return {b.parameter(p + "mlp/gate", {intermediate, h}, input),
+            b.parameter(p + "mlp/up", {intermediate, h}, input),
+            b.parameter(p + "mlp/down", {h, intermediate}, {p + "mlp/product"})};
+}
+
+// Tensor parallelism: a rank's run of layer `p`'s MLP (TensorShare::ffn_begin): those rows of gate
+// and up and those input columns of down.
+DenseWeights bind_dense_share(Bindings& b, const TextConfig& c, const std::string& p,
+                              const TensorShare& share, std::size_t rank) {
+    const std::uint64_t h = c.hidden_size, i = c.intermediate_size;
+    const Range run{share.ffn_begin, share.ffn_end};
+    const std::vector<std::string> input{p + "ffn_input"};
+    return {b.piece(p + "mlp/gate", {i, h}, input, {}, rank, row_piece(run)),
+            b.piece(p + "mlp/up", {i, h}, input, {}, rank, row_piece(run)),
+            b.piece(p + "mlp/down", {h, i}, {p + "mlp/product"}, {}, rank, column_piece({run}))};
+}
+
 // The positions in (0, count) where every layer `allowed` lists cuts whole stored runs.
 template <class Allowed>
 std::vector<std::uint64_t> common_ends(std::uint64_t count, const TextConfig& c, MixerKind kind,
@@ -305,10 +327,11 @@ std::vector<double> shared_runs(const TextConfig& c, std::span<const std::uint64
     return out;
 }
 
-// Each rank's runs of every layer, by `split`: its Gated DeltaNet key heads and routed experts, and
-// its sparse-attention KV heads, which go to as many of the first ranks as the two heads allow, in
-// proportion to their weights. A run ends only where every layer's projections cut whole stored
-// runs: the key, value and gate rows, the convolution channels and the output projection's columns.
+// Each rank's runs of every layer, by `split`: its Gated DeltaNet key heads and routed experts
+// (dense Qwen4: MLP rows), and its sparse-attention KV heads, which go to as many of the first ranks
+// as the heads allow, in proportion to their weights. A run ends only where every layer's
+// projections cut whole stored runs: the key, value and gate rows, the convolution channels and the
+// output projection's columns.
 std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& c,
                                             std::span<const double> split) {
     const std::uint64_t h     = c.hidden_size;
@@ -352,27 +375,33 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& c,
     // the runs, and weights measured at startup move from one start to the next (two ranks at an
     // even split hold two and a half of its five tiles, which rounded to three or two by the
     // measurement's noise).
-    const std::uint64_t width = c.shared_expert_intermediate_size;
-    const std::uint64_t tile  = width / 128 >= split.size() ? 128 : 1;
-    std::vector<bool> shared_allowed(width + 1, true);
+    // Dense Qwen4's MLP rows end where every layer's gate and up rows and down columns cut whole
+    // stored runs, and follow the split's weights.
+    const std::uint64_t width = c.dense() ? c.intermediate_size : c.shared_expert_intermediate_size;
+    const std::string run_prefix = c.dense() ? "mlp/" : "moe/shared/";
+    const std::string product    = c.dense() ? "mlp/product" : "moe/shared/product";
+    const std::uint64_t tile     = !c.dense() && width / 128 >= split.size() ? 128 : 1;
+    std::vector<bool> run_allowed(width + 1, true);
     for (std::uint32_t layer = 0; layer < c.num_hidden_layers; ++layer) {
-        const std::string m  = "text/layers/" + std::to_string(layer) + "/moe/";
-        const auto gate_rows = b.row_ends(m + "shared/gate", {width, h});
-        const auto up_rows   = b.row_ends(m + "shared/up", {width, h});
-        const auto down      = b.column_ends(m + "shared/down", {h, width}, {m + "shared/product"});
+        const std::string m  = "text/layers/" + std::to_string(layer) + "/";
+        const auto gate_rows = b.row_ends(m + run_prefix + "gate", {width, h});
+        const auto up_rows   = b.row_ends(m + run_prefix + "up", {width, h});
+        const auto down      = b.column_ends(m + run_prefix + "down", {h, width}, {m + product});
         for (std::uint64_t at = 0; at <= width; ++at) {
-            shared_allowed[at] = shared_allowed[at] && gate_rows[at] && up_rows[at] && down[at];
+            run_allowed[at] = run_allowed[at] && gate_rows[at] && up_rows[at] && down[at];
         }
     }
-    std::vector<std::uint64_t> shared_ends;
+    std::vector<std::uint64_t> run_ends;
     for (std::uint64_t at = tile; at < width; at += tile) {
-        if (shared_allowed[at]) { shared_ends.push_back(at); }
+        if (run_allowed[at]) { run_ends.push_back(at); }
     }
     const std::size_t ranks    = split.size();
     // A latent MoE's ranks hold whole groups, which each layer cuts by its labels so that the
     // experts follow the split (latent_group_ends); the shared runs follow that share.
-    const auto experts         = expert_ends(c.num_experts, split);
-    const auto shared          = split_shares(width, shared_ends, shared_runs(c, experts));
+    const auto experts = c.dense() ? std::vector<std::uint64_t>(ranks + 1, 0)
+                                   : expert_ends(c.num_experts, split);
+    const auto runs    = c.dense() ? split_shares(width, run_ends, split)
+                                   : split_shares(width, run_ends, shared_runs(c, experts));
     const auto key_heads       = split_shares(c.linear_num_key_heads, key_ends, split);
     const std::size_t kv_ranks = std::min(ranks, kv_ends.size() + 1);
     const auto kv_heads        = split_shares(c.num_key_value_heads, kv_ends, split.first(kv_ranks));
@@ -382,8 +411,10 @@ std::vector<TensorShare> plan_tensor_shares(Bindings& b, const TextConfig& c,
         out[r].key_head_end   = static_cast<std::uint32_t>(key_heads[r + 1]);
         out[r].expert_begin   = static_cast<std::uint32_t>(experts[r]);
         out[r].expert_end     = static_cast<std::uint32_t>(experts[r + 1]);
-        out[r].shared_begin   = static_cast<std::uint32_t>(shared[r]);
-        out[r].shared_end     = static_cast<std::uint32_t>(shared[r + 1]);
+        auto& run_begin       = c.dense() ? out[r].ffn_begin : out[r].shared_begin;
+        auto& run_end         = c.dense() ? out[r].ffn_end : out[r].shared_end;
+        run_begin             = static_cast<std::uint32_t>(runs[r]);
+        run_end               = static_cast<std::uint32_t>(runs[r + 1]);
         if (r < kv_ranks) {
             out[r].kv_head_begin = static_cast<std::uint32_t>(kv_heads[r]);
             out[r].kv_head_end   = static_cast<std::uint32_t>(kv_heads[r + 1]);
@@ -763,6 +794,11 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const MtpConfig& mtp,
     out.layer.attn_hc   = bind_hc(b, c, p + "attn_hc/", true);
     out.layer.mlp_hc    = bind_hc(b, c, p + "mlp_hc/", true);
     out.layer.mixer     = bind_attention(b, c, p);
+    if (c.dense()) {
+        out.layer.dense = bind_dense(b, c, p, mtp.intermediate_size);
+        out.final_mixer = bind_hc(b, c, "mtp/final_mixer/", false);
+        return out;
+    }
     TextConfig experts  = c;
     experts.num_experts = mtp.num_experts;
     // The MTP block keeps the base model's experts.
@@ -790,9 +826,15 @@ std::vector<WeightId> layer_weights(const LayerWeights& layer, bool with_experts
                                a->key_norm, a->index_query, a->index_key, a->index_query_norm,
                                a->index_key_norm});
     }
+    if (layer.dense) {
+        out.insert(out.end(), {layer.dense->gate, layer.dense->up, layer.dense->down});
+    }
     const MoeWeights& m = layer.moe;
     if (m.expert_scales) { out.push_back(*m.expert_scales); }
-    out.insert(out.end(), {m.router, m.shared_score, m.shared_gate, m.shared_up, m.shared_down});
+    if (!layer.dense) {
+        out.insert(out.end(),
+                   {m.router, m.shared_score, m.shared_gate, m.shared_up, m.shared_down});
+    }
     if (m.latent) {
         out.insert(out.end(), {m.latent->encode, m.latent->decode, m.latent->labels});
         if (m.latent->expert_scales) { out.push_back(*m.latent->expert_scales); }
@@ -975,7 +1017,11 @@ std::vector<double> default_tensor_split(const artifact::Reader& reader, const L
                    (options.vision && name.starts_with("vision/"));
         },
         [](std::string_view name) {
-            return name.starts_with("text/") && name.find("/moe/experts/") != std::string_view::npos;
+            // What the split divides: the routed experts, or dense Qwen4's MLP rows (the mixers'
+            // heads divide with them; the MLP is the bulk of a dense layer).
+            return name.starts_with("text/") &&
+                   (name.find("/moe/experts/") != std::string_view::npos ||
+                    name.find("/mlp/") != std::string_view::npos);
         },
         rank_free, speed);
 }
@@ -1013,7 +1059,12 @@ bool is_qwen4_exp(const artifact::Reader& reader) {
     const auto& config = text->second.config;
     return config.is_object() && config.contains("architectures") &&
            config.at("architectures").is_array() && config.at("architectures").size() == 1 &&
-           config.at("architectures")[0] == "Qwen4ExpForCausalLM";
+           (config.at("architectures")[0] == "Qwen4ExpForCausalLM" ||
+            config.at("architectures")[0] == "Qwen4ForCausalLM");
+}
+
+const char* family_name(const TextConfig& config) noexcept {
+    return config.dense() ? "dense Qwen4" : "Qwen3.8-Flash-Next";
 }
 
 // Host GGUF experts (Residency::PinnedOrFiles): when the pinned block holds every one, they stay
@@ -1069,10 +1120,17 @@ void settle_host_experts(TextWeights& weights, std::optional<MtpWeights>& mtp,
 std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOptions& options,
                                   DeviceContext& device, const StartupObserver* observer) {
     if (!is_qwen4_exp(reader)) {
-        throw artifact::ArtifactError("the artifact's text component is not Qwen4ExpForCausalLM");
+        throw artifact::ArtifactError(
+            "the artifact's text component is not Qwen4ExpForCausalLM or Qwen4ForCausalLM");
     }
+    TextConfig config = parse_text_config(reader.directory().component("text").config);
+    const std::string family = family_name(config);
     if (options.ranks == 0 || options.ranks != device.size()) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next stages must match the device ranks");
+        throw std::invalid_argument(family + " stages must match the device ranks");
+    }
+    if (config.dense() && options.experts != ExpertResidency::Device) {
+        throw std::invalid_argument("dense Qwen4 has no routed experts: --expert-residency "
+                                    "host and disk apply to MoE models");
     }
     const bool tensor_parallel = !options.tensor_split.empty();
     if (tensor_parallel) {
@@ -1081,15 +1139,14 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                 "tensor parallelism needs one share per device rank and at least two ranks");
         }
         if (options.experts != ExpertResidency::Device) {
-            throw std::invalid_argument(
-                "--tensor-parallel divides Qwen3.8-Flash-Next's layers over "
-                "the devices: it needs --expert-residency device");
+            throw std::invalid_argument("--tensor-parallel divides " + family +
+                                        "'s layers over the devices: it needs "
+                                        "--expert-residency device");
         }
         if (!options.stage_layers.empty()) {
             throw std::invalid_argument("--tensor-parallel and --stage-layers exclude each other");
         }
     }
-    TextConfig config = parse_text_config(reader.directory().component("text").config);
     artifact::Binder binder(reader);
     std::optional<qwen3_5::VisionConfig> vision_config;
     if (options.vision) {
@@ -1125,11 +1182,11 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                                         "parallelism, not over pipeline stages");
         }
         if (options.mtp || options.dflash2) {
-            throw std::invalid_argument("Qwen3.8-Flash-Next drafts with one drafter: its MTP "
-                                        "block, its DFlash2 drafter or a DSpine drafter");
+            throw std::invalid_argument(family + " drafts with one drafter: its MTP block, its "
+                                        "DFlash2 drafter or a DSpine drafter");
         }
         dspine::check_target(dspine::read_config(options.dspine), config.hidden_size,
-                             config.vocab_size, config.num_hidden_layers, "Qwen3.8-Flash-Next");
+                             config.vocab_size, config.num_hidden_layers, family.c_str());
     }
     FrontendResources resources = bind_resources(binder, config, options.vision);
     Bindings b(binder);
@@ -1184,8 +1241,14 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             layer.mixer = tensor_parallel ? bind_attention_share(b, config, p, shares[0], 0)
                                           : bind_attention(b, config, p);
         }
-        layer.moe = bind_moe(b, config, p, options.experts, options.tensor_split);
-        if (tensor_parallel) { bind_shared_run(b, config, p, shares[0], 0, layer.moe); }
+        if (config.dense()) {
+            layer.dense = tensor_parallel
+                              ? bind_dense_share(b, config, p, shares[0], 0)
+                              : bind_dense(b, config, p, config.intermediate_size);
+        } else {
+            layer.moe = bind_moe(b, config, p, options.experts, options.tensor_split);
+            if (tensor_parallel) { bind_shared_run(b, config, p, shares[0], 0, layer.moe); }
+        }
         if (ple_layer(i)) { layer.ple = bind_ple(b, config, p); }
         weights.layers.push_back(std::move(layer));
     }
@@ -1209,6 +1272,12 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                 layer.mixer = bind_gdn_share(b, config, p, share, rank);
             } else if (share.kv_head_end > share.kv_head_begin) {
                 layer.mixer = bind_attention_share(b, config, p, share, rank);
+            }
+            if (config.dense()) {
+                layer.dense = bind_dense_share(b, config, p, share, rank);
+                if (ple_layer(i)) { layer.ple = bind_ple_replica(b, config, p, rank); }
+                layers.push_back(std::move(layer));
+                continue;
             }
             layer.moe.router =
                 replica(b, m + "router", {config.num_experts, config.hidden_size}, {input}, {}, rank);
@@ -1288,7 +1357,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     }
 
     InstanceInfo info;
-    info.name = reader.directory().metadata.value("name", std::string("Qwen3.8-Flash-Next"));
+    info.name = reader.directory().metadata.value("name", family);
     info.metadata_json   = reader.directory().metadata.dump();
     info.provenance_json = reader.directory().provenance.dump();
     info.artifact_id     = reader.artifact_id();

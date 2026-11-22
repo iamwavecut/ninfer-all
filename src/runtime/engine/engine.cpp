@@ -118,13 +118,13 @@ EngineOptions with_expert_disk_reads(EngineOptions options) {
 // partial-sum exchange is the Qwen3.5 Program's and Flash-Next's; the other families divide only
 // their routed experts and sum them their own way.
 EngineOptions with_family_attention(EngineOptions options) {
-    // Flash-Next stores FP32 keys and values once in F16; Gemma 4, Flint and Inkling 2 keep F16
-    // caches under either name; DeepSeek-V4.1 refuses it in its core. The Qwen3.5 Program's
-    // attention reads BF16.
+    // Flash-Next and dense Qwen4 store FP32 keys and values once in F16; Gemma 4, Flint and
+    // Inkling 2 keep F16 caches under either name; DeepSeek-V4.1 refuses it in its core. The
+    // Qwen3.5 Program's attention reads BF16.
     if (options.kv_cache == KvCacheStorage::Float16 && !own_family_artifact(options.artifact_path)) {
         throw std::invalid_argument(
-            "--kv-dtype fp16 applies to Qwen4ExpForCausalLM, Gemma 4, Flint and Inkling 2 "
-            "artifacts");
+            "--kv-dtype fp16 applies to Qwen4ExpForCausalLM, Qwen4ForCausalLM, Gemma 4, Flint "
+            "and Inkling 2 artifacts");
     }
     // Inkling 2's release trained with an MXFP8 KV cache, so without --kv-dtype the family stores
     // MXFP8; no other family implements it. Flint and DeepSeek-V4.1 keep one cache of their own,
@@ -150,15 +150,15 @@ EngineOptions with_family_attention(EngineOptions options) {
         own_family_artifact(options.artifact_path) &&
         !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
         throw std::invalid_argument(
-            "--tensor-parallel-transport applies to Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM "
-            "and Qwen4ExpForCausalLM artifacts");
+            "--tensor-parallel-transport applies to Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM, "
+            "Qwen4ExpForCausalLM and Qwen4ForCausalLM artifacts");
     }
     if (options.tensor_parallel_prompt_partials != TensorParallelPartials::Fp32 &&
         own_family_artifact(options.artifact_path) &&
         !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
         throw std::invalid_argument(
             "--tensor-parallel-prompt-partials applies to Qwen3_5ForCausalLM, "
-            "Qwen3_5MoeForCausalLM and Qwen4ExpForCausalLM artifacts");
+            "Qwen3_5MoeForCausalLM, Qwen4ExpForCausalLM and Qwen4ForCausalLM artifacts");
     }
     return options;
 }
@@ -627,9 +627,9 @@ public:
             throw std::invalid_argument("expert routing profiles require host or disk experts");
         }
         if (options.speculative.draft_min_p.value_or(0.0F) != 0) {
-            throw std::invalid_argument("--draft-min-p requires Qwen3.8-Flash-Next drafts or a "
-                                        "DSpine drafter of Gemma 4, Flint, DeepSeek-V4.1 or "
-                                        "Inkling 2");
+            throw std::invalid_argument("--draft-min-p requires Qwen3.8-Flash-Next or dense "
+                                        "Qwen4 drafts or a DSpine drafter of Gemma 4, Flint, "
+                                        "DeepSeek-V4.1 or Inkling 2");
         }
         auto constructed  = runtime::construct_model(options, device);
         // construct_model returns the resolved options for this instance. Anything the model had

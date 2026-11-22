@@ -11,7 +11,8 @@
 namespace ninfer::ops {
 
 /**
- * Hyper-connection read and write of Qwen3.8-Flash-Next (transformers Qwen4ExpTextGatedResidual):
+ * Hyper-connection read and write of Qwen3.8-Flash-Next and dense Qwen4 (transformers
+ * Qwen4ExpTextGatedResidual):
  * the residual is a stack of `streams` copies of the hidden width, and each block reads one mixed
  * input from it and writes its output back into every stream with a per-stream weight.
  *
@@ -36,7 +37,8 @@ namespace ninfer::ops {
  * [hidden, tokens]; the MoE's output is FP32). The oracle evaluates these in FP64 from the
  * represented inputs; `mixed` is compared after its BF16 store, `inject` and the written stack as
  * FP32. Private arithmetic, including the FP32 intermediates in workspace, is
- * implementation-defined. The shapes this implements are streams 4, hidden 2560 and lowrank 320.
+ * implementation-defined. The shapes this implements are streams 4 with hidden 2560 and lowrank
+ * 320, or hidden 5120 and lowrank 640; the stack's hidden width selects one.
  */
 // One matrix of a hyper-connection, 16-byte aligned, in the geometry above.
 struct HyperConnectionMatrix {

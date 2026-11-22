@@ -186,10 +186,11 @@ void decode_row(KvCacheStorage storage, const HostPlane& k, const HostPlane& v,
     }
 }
 
-// `kv_heads` 2 is the layer; 1 a tensor-parallel share of one KV head and its 12 query heads.
+// `group` query heads per KV head: 12 for Qwen3.8-Flash-Next's two KV heads, 6 for dense Qwen4's
+// four. Fewer `kv_heads` than the layer's are a tensor-parallel share with their query heads.
 int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t seed,
-        int kv_heads = kKvHeads) {
-    const int q_heads = 12 * kv_heads;
+        int kv_heads = kKvHeads, int group = kQHeads / kKvHeads) {
+    const int q_heads = group * kv_heads;
     // Native half and bf16p also go through append, but neither rotates keys.
     const bool append_cache = storage != KvCacheStorage::BFloat16;
     const bool native_half  = storage == KvCacheStorage::Float16;
@@ -351,7 +352,7 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
             for (int j = 0; j < 4; ++j) positions.push_back(selected[static_cast<std::size_t>(t) * kTop + i] * 4 + j);
         for (int j = tail; j <= p; ++j) positions.push_back(j);
         for (int h = 0; h < q_heads; ++h) {
-            const int kv = h / 12;
+            const int kv = h / group;
             std::array<double, kDim> query{};
             for (int d = 0; d < kDim; ++d) query[d] = q[(static_cast<std::size_t>(t) * q_heads + h) * kDim + d];
             if (rotated_keys) hadamard(query.data());
@@ -390,7 +391,8 @@ int run(KvCacheStorage storage, int first_position, int tokens, std::uint32_t se
     cuda_synchronize();
     const std::string label = std::string("sparse attention ") + storage_name(storage) +
                               " p=" + std::to_string(first_position) + " T=" + std::to_string(tokens) +
-                              " kv_heads=" + std::to_string(kv_heads);
+                              " kv_heads=" + std::to_string(kv_heads) +
+                              " group=" + std::to_string(group);
     int failures = verify_reduction(label, from_device_bf16(d_out.data(), q.size()), expected,
                                     {4.0e-3, 1.0e-4, 2.0 * 3.90625e-3});
     for (auto* memory : {d_k.get(), d_v.get(), d_ks.get(), d_vs.get(), &d_q, &d_out, &d_selected,
@@ -425,6 +427,17 @@ int main() {
         // A tensor-parallel share of one KV head: an unsplit and a split call.
         failures += run(storage, 2047, 9, 9106u, 1);
         failures += run(storage, 6001, 8, 9107u, 1);
+        // Dense Qwen4's four KV heads of six query heads each: the layer, unsplit and split.
+        failures += run(storage, 2047, 9, 9108u, 4, 6);
+        failures += run(storage, 6001, 8, 9109u, 4, 6);
+    }
+    // Tensor-parallel shares of dense Qwen4's KV heads: three, two and one of them, so the merge
+    // runs at 18, 12 and 6 query heads.
+    for (const KvCacheStorage storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64}) {
+        for (const int kv_heads : {3, 2, 1}) {
+            failures += run(storage, 2047, 9, 9110u + kv_heads, kv_heads, 6);
+            failures += run(storage, 6001, 8, 9120u + kv_heads, kv_heads, 6);
+        }
     }
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " sparse_softmax_attention\n";
     return failures == 0 ? 0 : 1;

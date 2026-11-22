@@ -16,6 +16,8 @@ from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
 from .qwen3_5 import build_model as build_qwen3_5
 from .qwen4_exp import _ARCHITECTURES as QWEN4_EXP_ARCHITECTURES
+from .qwen4_exp import has_ple as qwen4_has_ple
+from .qwen4_exp import is_dense as qwen4_is_dense
 from .qwen4_exp import build_model as build_qwen4_exp
 from .qwen4_exp_gguf import RECIPES as QWEN4_EXP_GGUF_RECIPES
 from .qwen4_exp_gguf import with_gguf_expert_count, with_mtp_expert_count
@@ -194,9 +196,10 @@ def main(argv=None):
     parser.add_argument(
         "--components",
         help="comma-separated text,vision,mtp,dflash,dflash2 (default text); for "
-        "Qwen3.8-Flash-Next text,ngram (the default: the model with its n-gram table), text (the "
-        "model alone, its table read from a table artifact at run time) or ngram (that table "
-        "artifact), and vision or mtp (from --source mtp=MTP.gguf or an HF safetensors subset) beside text; "
+        "Qwen3.8-Flash-Next and dense Qwen4 with PLE text,ngram (the default: the model with its "
+        "n-gram table), text (the model alone, its table read from a table artifact at run time) "
+        "or ngram (that table artifact), and vision or mtp (from --source mtp=MTP.gguf or an HF "
+        "safetensors subset) beside text; "
         "for DeepSeek-V4.1 text,engram (the default), text or engram, and dspark (its drafter, from "
         "--source dspark=DRAFTER.gguf or an STQ pack directory) and vision (its tower, from "
         "--source vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors) beside text",
@@ -212,7 +215,8 @@ def main(argv=None):
     )
     parser.add_argument(
         "--layers", type=_layers, metavar="A..B",
-        help="Flash-Next qualification slice: source layers A through B-1, rebased to zero; "
+        help="Flash-Next or dense Qwen4 qualification slice: source layers A through B-1, rebased "
+        "to zero; "
         "retains embedding and head, omits the table when the slice has no PLE",
     )
     parser.add_argument(
@@ -251,8 +255,9 @@ def main(argv=None):
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
         architectures = base.config.get("architectures") or [None]
-        if args.ngram_sha256 is not None and architectures[0] not in QWEN4_EXP_ARCHITECTURES:
-            raise ValueError("--ngram-sha256 requires Qwen3.8-Flash-Next")
+        if args.ngram_sha256 is not None and (architectures[0] not in QWEN4_EXP_ARCHITECTURES
+                                              or not qwen4_has_ple(base.config)):
+            raise ValueError("--ngram-sha256 requires Qwen3.8-Flash-Next or dense Qwen4 with PLE")
         if is_dspine(base.config):
             if (paths or overrides or args.layers or args.proposal
                     or (args.components or "dspine") != "dspine"):
@@ -443,7 +448,10 @@ def main(argv=None):
                   f"{report['seconds']:.1f}s", flush=True)
             return
         if args.layers is not None and not flash_next:
-            raise ValueError("--layers is implemented for Qwen3.8-Flash-Next")
+            raise ValueError("--layers is implemented for Qwen3.8-Flash-Next and dense Qwen4")
+        if flash_next and qwen4_is_dense(base.config) and ({"gguf", "pack"} & set(paths)):
+            raise ValueError("dense Qwen4 converts from its safetensors checkpoint: no GGUF "
+                             "layout of it exists")
         # Flash-Next's MTP GGUF is read block by block, as its model shard is.
         block_sources = frozenset(("ternary", "gguf", "ngram") + (("mtp",) if flash_next else ()))
         opened = {}
@@ -458,7 +466,8 @@ def main(argv=None):
             base.config = with_latent_moe(base.config, pack)
         sources = SourceInputs(base, paths, stack, block_sources, opened)
         if args.components is None:
-            components = ("text", "ngram") if flash_next else ("text",)
+            components = (("text", "ngram") if flash_next and qwen4_has_ple(base.config)
+                          else ("text",))
         else:
             components = tuple(args.components.split(","))
         if len(components) != len(set(components)):

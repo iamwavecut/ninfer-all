@@ -27,6 +27,13 @@ without requantization, expert residency on the device, in pinned host memory or
 files, up to eight concurrent requests, the context cache with host and disk images, structured
 output, token log probabilities, Vision, and MTP from Unsloth's shared GGUF block.
 
+Dense Qwen4 ([section 1.7b](#17b-dense-qwen4s-mlp-qwen4forcausallm-text-model_type-qwen4_text))
+runs the same text path, PLE table, MTP block, Vision tower, context cache, pipeline stages and
+tensor parallelism with a SwiGLU MLP and device weights only. No checkpoint is public, so its
+qualification is on a synthetic checkpoint of the 27B geometry: the FP64 reference over a 4-block
+slice, and the generation, Engine, perplexity and serving checks over the 64-layer model
+([checks](../qwen4-dense.md#checks-on-a-synthetic-checkpoint)).
+
 The qualification contract: every Op against an independent FP64 oracle; exact repetition with the
 execution configuration fixed; exact restore of a context image for the same computation history
 and execution profile. Verification width, prefill partition and batch composition change
@@ -394,6 +401,33 @@ the loader reads each layer's labels before it binds and cuts the groups where t
 the cut come nearest each rank's share of the split (`latent_group_ends`; Edge0's groups hold 8
 to 200 experts). Each rank runs its part into the fixed-point sum (`moe_latent_gguf_part`), so
 the combined routed output equals one device's for any cut.
+
+### 1.7b Dense Qwen4's MLP (`Qwen4ForCausalLM`, text `model_type` `qwen4_text`)
+
+Dense Qwen4 replaces each layer's MoE, and the MTP layer's, by one SwiGLU MLP on the same input
+`m` (the MLP hyper-connection's read):
+```
+y = down( silu(gate @ m) * (up @ m) )        gate, up: (I, H); down: (H, I); I = intermediate_size
+```
+`mlp.gate_proj`, `mlp.up_proj` and `mlp.down_proj` are the checkpoint's names in the text layers and
+`mtp.layers.0.mlp.*` in the MTP block, whose width is `mtp.intermediate_size` or, without it, the
+text model's. Everything else is section 1 unchanged, at the geometry the config declares: hidden
+2560 with hyper-connection rank 320, or 5120 with rank 640; 24 query heads over 2 or 4 KV heads
+(groups of 12 or 6); PLE on one Gated DeltaNet layer or none. No dense checkpoint is public: the
+names of the MLP and the MTP layout are the transformers Qwen3.5 dense layer's, and the 27B
+geometry (H 5120, LR 640, KV 4, I 14,336) comes from third-party code ([the product
+guide](../qwen4-dense.md)). The FP64 reference (`tools/reference/qwen4_exp.py`, `dense_mlp`) runs
+the same expression.
+
+The Ops take the geometry as template parameters: the hyper-connection kernels
+`Geometry<2560, 320>` and `Geometry<5120, 640>` (BF16 and HC8 matrices), sparse attention groups of
+12 and 6 query heads, and the PLE injection into 2560 or 5120 streams; the n-gram embedding stays
+2560 wide (16 heads of 160) at either hidden size. The MLP runs the Linear Op's runtime-shape
+routes: one `linear_swiglu` call for gate and up (joined GGUF blocks as one weight, otherwise the
+two-parent form, which the dense recipe's Q4 matrices take), then down into the stack's FP32 mixer
+output. Tensor parallelism divides the MLP's
+rows by the devices' split weights at whole stored runs and sums the down projections' FP32
+partials in the exchange's fixed order; the GDN key heads and KV heads divide as in Flash-Next.
 
 ### 1.8 Final mixer and head
 

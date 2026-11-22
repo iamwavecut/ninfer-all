@@ -1,4 +1,5 @@
-"""Qwen3.8-Flash-Next (Qwen4ExpForConditionalGeneration) adapter: the mathematical text config.
+"""Qwen3.8-Flash-Next (Qwen4ExpForConditionalGeneration) and dense Qwen4 (Qwen4ForCausalLM)
+adapter: the mathematical text config.
 
 The architecture: 48 blocks of Gated DeltaNet and Qwen Sparse Attention (QSA) mixers, each half
 read from and written into a four-stream hyper-connection residual, a 512-expert top-10 MoE in
@@ -6,6 +7,11 @@ every block, and a hashed n-gram embedding (PLE) injected into the residual befo
 MTP block of one more QSA layer drafts for speculative decoding. The converter normalises the
 checkpoint's config into the text and MTP components' configs, which
 src/models/qwen4_exp/config.cpp parses strictly.
+
+Dense Qwen4 has the same blocks with a SwiGLU MLP (`mlp.{gate,up,down}_proj`, `intermediate_size`
+wide) in place of the MoE, in the MTP block too, at hidden 2560 or 5120 (hyper-connection rank
+hidden / 8) with two or four KV heads; its PLE is optional (an empty or absent `ple_layer_ids`
+leaves out the PLE and n-gram fields and the `ngram` component).
 
 A latent MoE (`text_config.latent_moe`, Edge0's models) keeps the router and the shared expert and
 moves the routed experts into a narrower space: each layer has `groups` pairs of projections, an
@@ -17,7 +23,17 @@ from __future__ import annotations
 
 from .config_fields import _f32, _fixed, _positive, _rope_source
 
-_ARCHITECTURES = ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
+_EXP_ARCHITECTURES = ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
+_DENSE_ARCHITECTURES = ("Qwen4ForConditionalGeneration", "Qwen4ForCausalLM")
+# Every architecture this adapter converts; the converter routes them all here.
+_ARCHITECTURES = _EXP_ARCHITECTURES + _DENSE_ARCHITECTURES
+
+# The MoE fields a dense config must not carry (null or absent).
+_MOE_FIELDS = ("num_experts", "num_experts_per_tok", "moe_intermediate_size",
+               "shared_expert_intermediate_size", "decoder_sparse_step", "mlp_only_layers",
+               "latent_moe", "expert_output_scales")
+_PLE_FIELDS = ("ple_embed_dim", "ngram_size", "heads_per_ngram", "ngram_vocab_size_base",
+               "make_ngram_vocab_size_divisible_by", "ple_conv_kernel_size")
 
 # The reference's class default for the n-gram multipliers (absent from config.json).
 _NGRAM_SEED = 1234
@@ -52,6 +68,19 @@ def latent_moe_config(raw: dict) -> dict | None:
             "column_scale": latent["column_scale"]}
 
 
+def is_dense(source: dict) -> bool:
+    """Whether a checkpoint config is dense Qwen4's (rather than Qwen3.8-Flash-Next's)."""
+    architectures = source.get("architectures")
+    return (isinstance(architectures, list) and len(architectures) == 1
+            and architectures[0] in _DENSE_ARCHITECTURES)
+
+
+def has_ple(source: dict) -> bool:
+    """Whether the checkpoint's text model injects the hashed n-gram embedding into any block
+    (always for Qwen3.8-Flash-Next)."""
+    return bool(source.get("text_config", source).get("ple_layer_ids"))
+
+
 def text_config(source: dict) -> dict:
     architectures = source.get("architectures")
     if (
@@ -59,15 +88,35 @@ def text_config(source: dict) -> dict:
         or len(architectures) != 1
         or architectures[0] not in _ARCHITECTURES
     ):
-        raise ValueError(f"unsupported Qwen4Exp architecture {architectures!r}")
+        raise ValueError(f"unsupported Qwen4 architecture {architectures!r}")
+    dense = is_dense(source)
     raw = source.get("text_config", source)
-    _fixed(raw, "model_type", "qwen4_exp_text", "text")
+    _fixed(raw, "model_type", "qwen4_text" if dense else "qwen4_exp_text", "text")
     _fixed(raw, "hidden_act", "silu", "text")
     _fixed(raw, "attention_bias", False, "text")
     _fixed(raw, "mamba_ssm_dtype", "float32", "text")
     _fixed(raw, "output_gate_type", "sigmoid", "text")
     _fixed(raw, "indexer_kv_heads", 1, "text")
-    result = {"architectures": ["Qwen4ExpForCausalLM"], "model_type": "qwen4_exp_text"}
+    if dense:
+        # Another reading of an absent output_gate_type is SiLU; the engine gates with a sigmoid.
+        if raw.get("output_gate_type") != "sigmoid":
+            raise ValueError("text.output_gate_type: dense Qwen4 must declare 'sigmoid'")
+        _fixed(raw, "attn_output_gate", True, "text")
+        for key in _MOE_FIELDS:
+            if raw.get(key) is not None:
+                raise ValueError(f"text.{key}: dense Qwen4 has no MoE")
+        kinds = raw.get("mlp_layer_types")
+        if kinds is not None and (not isinstance(kinds, list)
+                                  or any(kind != "dense" for kind in kinds)):
+            raise ValueError("text.mlp_layer_types: dense Qwen4 has dense MLPs only")
+    ple = has_ple(source)
+    if dense:
+        result = {"architectures": ["Qwen4ForCausalLM"], "model_type": "qwen4_text"}
+        keys = ("intermediate_size",) + (_PLE_FIELDS if ple else ())
+    else:
+        result = {"architectures": ["Qwen4ExpForCausalLM"], "model_type": "qwen4_exp_text"}
+        keys = ("num_experts", "num_experts_per_tok", "moe_intermediate_size",
+                "shared_expert_intermediate_size") + _PLE_FIELDS
     for key in (
         "hidden_size",
         "vocab_size",
@@ -81,31 +130,21 @@ def text_config(source: dict) -> dict:
         "linear_num_value_heads",
         "linear_value_head_dim",
         "linear_conv_kernel_dim",
-        "num_experts",
-        "num_experts_per_tok",
-        "moe_intermediate_size",
-        "shared_expert_intermediate_size",
         "hc_count",
         "hc_lowrank",
         "indexer_n_heads",
         "indexer_head_dim",
         "indexer_compress_ratio",
         "indexer_budget",
-        "ple_embed_dim",
-        "ngram_size",
-        "heads_per_ngram",
-        "ngram_vocab_size_base",
-        "make_ngram_vocab_size_divisible_by",
-        "ple_conv_kernel_size",
-    ):
+    ) + keys:
         result[key] = _positive(raw.get(key), "text." + key)
     tied = raw.get("tie_word_embeddings", source.get("tie_word_embeddings", False))
     if type(tied) is not bool:
         raise ValueError("text.tie_word_embeddings must be boolean")
     result["tie_word_embeddings"] = tied
-    for key, default in (("fp32_direct", False), ("norm_unit_offset", True),
-                         ("hc_prefill_inject", False), ("gdn_a_is_log", True),
-                         ("expert_output_scales", False)):
+    flags = (("fp32_direct", False), ("norm_unit_offset", True), ("hc_prefill_inject", False),
+             ("gdn_a_is_log", True)) + ((("expert_output_scales", False),) if not dense else ())
+    for key, default in flags:
         if key in raw:
             if type(raw[key]) is not bool:
                 raise ValueError(f"text.{key} must be boolean")
@@ -114,7 +153,8 @@ def text_config(source: dict) -> dict:
     result["eos_token_id"] = _nonnegative(raw.get("eos_token_id"), "text.eos_token_id")
     if result["eos_token_id"] >= result["vocab_size"]:
         raise ValueError("text.eos_token_id exceeds the vocabulary")
-    result["ngram_seed"] = _nonnegative(raw.get("seed", _NGRAM_SEED), "text.seed")
+    if ple:
+        result["ngram_seed"] = _nonnegative(raw.get("seed", _NGRAM_SEED), "text.seed")
 
     layers = raw.get("layer_types")
     if (
@@ -130,6 +170,13 @@ def text_config(source: dict) -> dict:
     factor = _f32(rope.get("partial_rotary_factor", raw.get("partial_rotary_factor")),
                   "partial_rotary_factor")
     sections = rope.get("mrope_section")
+    if dense and sections is None:
+        # A text-only config rotates one position axis: every pair on the first section, which
+        # the interleaved MRoPE of text positions (equal on all three axes) computes the same way.
+        pairs = result["head_dim"] * factor / 2
+        if pairs != int(pairs):
+            raise ValueError("partial_rotary_factor must rotate whole pairs of the head")
+        sections = [int(pairs), 0, 0]
     if (
         not isinstance(sections, list)
         or len(sections) != 3
@@ -143,12 +190,16 @@ def text_config(source: dict) -> dict:
     }
 
     # ple_layer_ids is one-indexed in the checkpoint ([2] is the second block); the artifact
-    # stores zero-based block indices.
-    ple = raw.get("ple_layer_ids")
-    if not isinstance(ple, list) or not ple:
+    # stores zero-based block indices. Dense Qwen4 may name none.
+    ple_ids = raw.get("ple_layer_ids", [] if dense else None)
+    if not isinstance(ple_ids, list) or (not ple_ids and not dense):
         raise ValueError("text.ple_layer_ids must name at least one block")
+    if not ple_ids:
+        for key in _PLE_FIELDS + ("seed",):
+            if raw.get(key) is not None:
+                raise ValueError(f"text.{key}: a model without PLE blocks has no PLE fields")
     blocks = []
-    for value in ple:
+    for value in ple_ids:
         index = _positive(value, "text.ple_layer_ids") - 1
         if index >= result["num_hidden_layers"] or layers[index] != "linear_attention":
             raise ValueError("text.ple_layer_ids must name Gated DeltaNet blocks")
@@ -157,12 +208,14 @@ def text_config(source: dict) -> dict:
         raise ValueError("text.ple_layer_ids must be increasing")
     result["ple_layers"] = blocks
 
-    if result["num_experts_per_tok"] > result["num_experts"]:
-        raise ValueError("selected experts exceed expert count")
     if result["indexer_budget"] % result["indexer_compress_ratio"]:
         raise ValueError("text.indexer_budget must be a whole number of compressed blocks")
-    if result["ple_embed_dim"] % ((result["ngram_size"] - 1) * result["heads_per_ngram"]):
+    if ple and result["ple_embed_dim"] % ((result["ngram_size"] - 1) * result["heads_per_ngram"]):
         raise ValueError("text.ple_embed_dim must divide among the n-gram heads")
+    if dense:
+        return result
+    if result["num_experts_per_tok"] > result["num_experts"]:
+        raise ValueError("selected experts exceed expert count")
     latent = latent_moe_config(raw)
     if latent is not None:
         if result.get("expert_output_scales", False):
@@ -178,7 +231,8 @@ def mtp_config(source: dict) -> dict:
     model's geometry, its own MoE and final mixer, sharing the token embedding and the head. Its
     expert count is the text model's unless the block keeps more (an expert-pruned model with the
     full model's MTP block): `text_config.mtp.num_experts`, which with_mtp_expert_count sets from an
-    MTP GGUF."""
+    MTP GGUF. Dense Qwen4's block has a SwiGLU MLP, `text_config.mtp.intermediate_size` wide or
+    as wide as the text model's."""
 
     raw = source.get("text_config", source)
     _fixed(raw, "mtp_num_hidden_layers", 1, "text")
@@ -189,6 +243,16 @@ def mtp_config(source: dict) -> dict:
     _fixed(mtp, "num_hidden_layers", 1, "text.mtp")
     _fixed(mtp, "hybrid", True, "text.mtp")
     _fixed(mtp, "layer_types", ["full_attention"], "text.mtp")
+    if is_dense(source):
+        if mtp.get("num_experts") is not None:
+            raise ValueError("text.mtp.num_experts: dense Qwen4's MTP block has no MoE")
+        middle = _positive(mtp.get("intermediate_size", raw.get("intermediate_size")),
+                           "text.mtp.intermediate_size")
+        return {
+            "architectures": ["Qwen4MTP"],
+            "rope_theta": _f32(mtp.get("rope_theta"), "text.mtp.rope_theta"),
+            "intermediate_size": middle,
+        }
     experts = _positive(mtp.get("num_experts", raw.get("num_experts")), "text.mtp.num_experts")
     if experts < _positive(raw.get("num_experts_per_tok"), "text.num_experts_per_tok"):
         raise ValueError("text.mtp.num_experts is below the experts each token selects")
@@ -362,8 +426,8 @@ def ngram_hash_constants(text: dict, ple_layer_index: int = 0) -> tuple[list[int
 
 def build_model(base, *, components=("text", "ngram"), companions=None, resource_overrides=None,
                 layers=None):
-    """A Qwen3.8-Flash-Next checkpoint's text component, optionally its Vision tower and its MTP
-    block, and its n-gram table.
+    """A Qwen3.8-Flash-Next or dense Qwen4 checkpoint's text component, optionally its Vision
+    tower and its MTP block, and its n-gram table (absent from a dense model without PLE).
 
     The model always describes the table it reads in its `ngram` component; selecting `ngram` also
     stores the table's rows. `text,ngram` is the self-contained model, `text` the model alone (its
@@ -393,10 +457,13 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
         or ("text" in selected and selected <= {"text", "ngram", "vision", "mtp"})
     ):
         raise ValueError(
-            "Qwen3.8-Flash-Next converts --components text,ngram (the model with its n-gram "
-            "table), text (the model alone) or ngram (the table alone), with vision and mtp "
-            "optional beside text"
+            "Qwen3.8-Flash-Next and dense Qwen4 convert --components text,ngram (the model with "
+            "its n-gram table), text (the model alone) or ngram (the table alone), with vision "
+            "and mtp optional beside text"
         )
+    if "ngram" in selected and not has_ple(base.config):
+        raise ValueError("a model without PLE blocks has no n-gram table: convert --components "
+                         "text")
     if "text" not in selected:
         if layers is not None:
             raise ValueError("--layers requires the text component")
@@ -422,6 +489,10 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
     if config["ple_layers"]:
         records["ngram"] = {"config": ngram_config(base.config)}
     if "vision" in selected:
+        if is_dense(base.config) and "mrope_section" not in _rope_source(
+                base.config.get("text_config", base.config), "text"):
+            raise ValueError("a Vision tower needs the checkpoint's mrope_section: the text "
+                             "config rotates image positions on three axes")
         records["vision"] = {"config": vision_config(base.config, config), "target": "text"}
     if "mtp" in selected:
         from .sources.safetensors import SafetensorsSource
@@ -433,10 +504,12 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
         mtp_description = mtp_store.config or base.config
         if mtp_store is not base:
             actual = text_config(mtp_description)
-            for key in ("hidden_size", "hc_count", "hc_lowrank", "num_attention_heads",
-                        "num_key_value_heads", "head_dim", "indexer_n_heads", "indexer_head_dim",
-                        "moe_intermediate_size", "shared_expert_intermediate_size"):
-                if actual[key] != config[key]:
+            keys = ("hidden_size", "hc_count", "hc_lowrank", "num_attention_heads",
+                    "num_key_value_heads", "head_dim", "indexer_n_heads", "indexer_head_dim")
+            keys += (() if is_dense(base.config)
+                     else ("moe_intermediate_size", "shared_expert_intermediate_size"))
+            for key in keys:
+                if actual.get(key) != config.get(key):
                     raise ValueError(f"MTP companion {key} differs from the target model")
         records["mtp"] = {"config": mtp_config(mtp_description), "target": "text"}
     refs, resources, count, special = load_resources(
@@ -472,7 +545,9 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
                 from dataclasses import replace
                 parameter = model.parameters.pop(p + "gdn/a_log")
                 model.add(replace(parameter, name=p + "gdn/decay"))
-        if "latent_moe" in config:
+        if config["model_type"] == "qwen4_text":
+            builder.dense(p, sp, base, h, config["intermediate_size"])
+        elif "latent_moe" in config:
             _latent_moe(builder, p, sp, base, config)
         else:
             builder.moe(p, sp, base, config)
@@ -489,7 +564,7 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
     if "vision" in selected:
         builder.vision(base, records["vision"]["config"], h)
     if "mtp" in selected:
-        _mtp(builder, mtp_store, config, records["mtp"]["config"]["num_experts"])
+        _mtp(builder, mtp_store, config, records["mtp"]["config"])
     if "ngram" in selected and "ngram" in records:
         _ngram_table(model)
     if config.get("fp32_direct", False):
@@ -502,11 +577,12 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
     return model
 
 
-def _mtp(builder, store, config, experts):
+def _mtp(builder, store, config, mtp):
     """The MTP block (vLLM Qwen4ExpMultiTokenPredictor): the token's embedding and the target's
     pre-mixer stack, each normalised and projected (the stack one stream at a time, by one shared
     matrix), start a stack that one sparse-attention layer advances; its own final mixer feeds the
-    shared head. `pre_fc_norm_hidden` normalises all 10240 values of a position at once."""
+    shared head. `pre_fc_norm_hidden` normalises all four streams of a position at once. Dense
+    Qwen4's layer has a SwiGLU MLP (`mtp.layers.0.mlp.*`) in place of the MoE."""
 
     h, width = config["hidden_size"], config["hc_count"] * config["hidden_size"]
     p, sp = "mtp/", "mtp."
@@ -523,7 +599,10 @@ def _mtp(builder, store, config, experts):
                       config, inject=True)
     builder.attention(layer, source, store, config)
     _indexer(builder, layer, source, store, config)
-    builder.moe(layer, source, store, {**config, "num_experts": experts})
+    if "intermediate_size" in mtp:
+        builder.dense(layer, source, store, h, mtp["intermediate_size"])
+    else:
+        builder.moe(layer, source, store, {**config, "num_experts": mtp["num_experts"]})
     _hyper_connection(builder, p + "final_mixer/", sp + "hyper_connection_mixer.", store, config,
                       inject=False)
 

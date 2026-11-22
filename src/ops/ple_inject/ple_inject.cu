@@ -1,7 +1,7 @@
-// ninfer::ops - the PLE block of Qwen3.8-Flash-Next after its projections (contract in
-// include/ninfer/ops/ple_inject.h). Three launches: per-token statistics, gate and normalised
-// convolution input; the convolution and stack update; the history advance, which the record form
-// leaves to ple_history_advance.
+// ninfer::ops - the PLE block of Qwen3.8-Flash-Next and dense Qwen4 after its projections (contract
+// in include/ninfer/ops/ple_inject.h), at hidden 2560 or 5120. Three launches: per-token
+// statistics, gate and normalised convolution input; the convolution and stack update; the history
+// advance, which the record form leaves to ple_history_advance.
 #include "ninfer/ops/ple_inject.h"
 #include "ops/common/direct_weight.cuh"
 
@@ -20,8 +20,6 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kStreams  = 4;
-constexpr std::int32_t kHidden   = 2560;
-constexpr std::int32_t kWidth    = kStreams * kHidden;
 constexpr std::int32_t kTaps     = 4;
 constexpr std::int32_t kDilation = 3;
 constexpr std::int32_t kHistory  = (kTaps - 1) * kDilation;
@@ -56,11 +54,13 @@ __device__ void block_sum(float (&values)[Count], float* shared) {
 
 // One block per token: the gate per stream (`gate`, [tokens][streams]) and the normalised
 // convolution input N ([tokens][streams * hidden]).
+template <int kHidden>
 __global__ void __launch_bounds__(kThreads)
     ple_gate_kernel(const float* __restrict__ stack, const __nv_bfloat16* __restrict__ key,
                     const __nv_bfloat16* __restrict__ value, DirectWeight norm_key,
                     DirectWeight norm_query, DirectWeight norm_conv, float eps, bool unit_offset,
                     float* __restrict__ gate, float* __restrict__ normalized) {
+    constexpr int kWidth = kStreams * kHidden;
     __shared__ float shared[16 * (kThreads / 32) + 16];
     const int t                 = blockIdx.x;
     const float* xs             = stack + static_cast<std::int64_t>(t) * kWidth;
@@ -126,11 +126,13 @@ __global__ void __launch_bounds__(kThreads)
 
 // One thread per (token, channel): the dilated causal convolution over N, reading the positions
 // before the call from `history`, and the stack update.
+template <int kHidden>
 __global__ void __launch_bounds__(256)
     ple_conv_kernel(float* __restrict__ stack, const __nv_bfloat16* __restrict__ value,
                     DirectWeight conv, const float* __restrict__ history,
                     const float* __restrict__ gate, const float* __restrict__ normalized,
                     int tokens) {
+    constexpr int kWidth = kStreams * kHidden;
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= static_cast<std::int64_t>(tokens) * kWidth) return;
     const int t       = static_cast<int>(i / kWidth);
@@ -155,7 +157,8 @@ __global__ void __launch_bounds__(256)
 // ascending order so a position is read before any thread overwrites it.
 __global__ void __launch_bounds__(256)
     ple_history_kernel(float* __restrict__ history, const float* __restrict__ normalized,
-                       int tokens) {
+                       int width, int tokens) {
+    const int kWidth  = width;
     const int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= kWidth) return;
     for (int j = 0; j < kHistory; ++j) {
@@ -179,95 +182,118 @@ void require_tensor(const Tensor* tensor, DType dtype, std::int32_t n0, std::int
             message);
 }
 
+// The implemented hidden widths.
+bool admitted_hidden(std::int32_t hidden) { return hidden == 2560 || hidden == 5120; }
+
 // The gate and the stack update of `tokens` positions, N into `normalized`; the history is read.
+template <int kHidden>
 void inject(Tensor& stack, const Tensor& key, const Tensor& value, const PleInjectWeights& weights,
             float eps, const Tensor& history, Tensor& gate, Tensor& normalized,
             cudaStream_t stream) {
-    const std::int32_t tokens = stack.ne[2];
-    const auto bf16           = [](const Tensor* tensor) {
+    constexpr std::int32_t kWidth = kStreams * kHidden;
+    const std::int32_t tokens     = stack.ne[2];
+    const auto bf16               = [](const Tensor* tensor) {
         return static_cast<const __nv_bfloat16*>(tensor->data);
     };
-    ple_gate_kernel<<<tokens, kThreads, 0, stream>>>(
+    ple_gate_kernel<kHidden><<<tokens, kThreads, 0, stream>>>(
         static_cast<const float*>(stack.data), bf16(&key), bf16(&value),
         direct_weight(*weights.norm_key), direct_weight(*weights.norm_query),
         direct_weight(*weights.norm_conv), eps, weights.unit_offset, static_cast<float*>(gate.data),
         static_cast<float*>(normalized.data));
     CUDA_CHECK(cudaGetLastError());
     const std::int64_t elements = static_cast<std::int64_t>(tokens) * kWidth;
-    ple_conv_kernel<<<static_cast<unsigned>(div_up(elements, std::int64_t{256})), 256, 0, stream>>>(
+    ple_conv_kernel<kHidden>
+        <<<static_cast<unsigned>(div_up(elements, std::int64_t{256})), 256, 0, stream>>>(
         static_cast<float*>(stack.data), bf16(&value), direct_weight(*weights.conv),
         static_cast<const float*>(history.data), static_cast<const float*>(gate.data),
         static_cast<const float*>(normalized.data), tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void require_inputs(const Tensor& stack, const Tensor& key, const Tensor& value,
-                    const PleInjectWeights& weights, float eps, const Tensor& history) {
+void dispatch_inject(Tensor& stack, const Tensor& key, const Tensor& value,
+                     const PleInjectWeights& weights, float eps, const Tensor& history,
+                     Tensor& gate, Tensor& normalized, cudaStream_t stream) {
+    (stack.ne[0] == 2560 ? inject<2560> : inject<5120>)(stack, key, value, weights, eps, history,
+                                                        gate, normalized, stream);
+}
+
+// The stack's hidden width, after every input is checked against it.
+std::int32_t require_inputs(const Tensor& stack, const Tensor& key, const Tensor& value,
+                            const PleInjectWeights& weights, float eps, const Tensor& history) {
     require(stack.dtype == DType::FP32 && stack.is_contiguous() && stack.data != nullptr &&
-                stack.ne[0] == kHidden && stack.ne[1] == kStreams && stack.ne[3] == 1,
-            "stack must be contiguous FP32 [2560, 4, tokens]");
+                admitted_hidden(stack.ne[0]) && stack.ne[1] == kStreams && stack.ne[3] == 1,
+            "stack must be contiguous FP32 [2560 or 5120, 4, tokens]");
+    const std::int32_t hidden = stack.ne[0];
+    const std::int32_t width  = kStreams * hidden;
     const std::int32_t tokens = stack.ne[2];
     require(tokens > 0, "tokens must be positive");
     require(eps > 0.0f, "eps must be positive");
-    require_tensor(&key, DType::BF16, kWidth, tokens, "key must be BF16 [10240, tokens]");
-    require_tensor(&value, DType::BF16, kHidden, tokens, "value must be BF16 [2560, tokens]");
+    require_tensor(&key, DType::BF16, width, tokens, "key must be BF16 [4 * hidden, tokens]");
+    require_tensor(&value, DType::BF16, hidden, tokens, "value must be BF16 [hidden, tokens]");
     const auto direct = [](const Tensor* tensor, int n0, int n1, const char* label) {
         require(tensor != nullptr && (tensor->dtype == DType::BF16 || tensor->dtype == DType::FP32),
                 label);
         require_tensor(tensor, tensor->dtype, n0, n1, label);
     };
-    direct(weights.norm_key, kWidth, 1, "norm_key must be BF16 or FP32 [10240]");
-    direct(weights.norm_query, kWidth, 1, "norm_query must be BF16 or FP32 [10240]");
-    direct(weights.norm_conv, kWidth, 1, "norm_conv must be BF16 or FP32 [10240]");
-    direct(weights.conv, kTaps, kWidth, "conv must be BF16 or FP32 [4, 10240]");
-    require_tensor(&history, DType::FP32, kWidth, kHistory, "history must be FP32 [10240, 9]");
+    direct(weights.norm_key, width, 1, "norm_key must be BF16 or FP32 [4 * hidden]");
+    direct(weights.norm_query, width, 1, "norm_query must be BF16 or FP32 [4 * hidden]");
+    direct(weights.norm_conv, width, 1, "norm_conv must be BF16 or FP32 [4 * hidden]");
+    direct(weights.conv, kTaps, width, "conv must be BF16 or FP32 [4, 4 * hidden]");
+    require_tensor(&history, DType::FP32, width, kHistory, "history must be FP32 [4 * hidden, 9]");
+    return hidden;
 }
 
 void advance(Tensor& history, const Tensor& normalized, std::int32_t tokens, cudaStream_t stream) {
-    ple_history_kernel<<<div_up(kWidth, 256), 256, 0, stream>>>(
-        static_cast<float*>(history.data), static_cast<const float*>(normalized.data), tokens);
+    const std::int32_t width = history.ne[0];
+    ple_history_kernel<<<div_up(width, 256), 256, 0, stream>>>(
+        static_cast<float*>(history.data), static_cast<const float*>(normalized.data), width,
+        tokens);
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
-std::size_t ple_inject_workspace_bytes(std::int32_t tokens) {
+std::size_t ple_inject_workspace_bytes(std::int32_t hidden, std::int32_t tokens) {
+    require(admitted_hidden(hidden), "hidden must be 2560 or 5120");
     require(tokens > 0, "tokens must be positive");
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::FP32, {kStreams, tokens});
-    (void)layout.alloc(DType::FP32, {kWidth, tokens});
+    (void)layout.alloc(DType::FP32, {kStreams * hidden, tokens});
     return layout.peak_bytes(1);
 }
 
 void ple_inject(Tensor& stack, const Tensor& key, const Tensor& value,
                 const PleInjectWeights& weights, float eps, Tensor& history,
                 WorkspaceArena& workspace, cudaStream_t stream) {
-    require_inputs(stack, key, value, weights, eps, history);
+    const std::int32_t hidden = require_inputs(stack, key, value, weights, eps, history);
     const std::int32_t tokens = stack.ne[2];
     auto scope                = workspace.scope();
     Tensor gate               = workspace.alloc(DType::FP32, {kStreams, tokens});
-    Tensor normalized         = workspace.alloc(DType::FP32, {kWidth, tokens});
-    inject(stack, key, value, weights, eps, history, gate, normalized, stream);
+    Tensor normalized         = workspace.alloc(DType::FP32, {kStreams * hidden, tokens});
+    dispatch_inject(stack, key, value, weights, eps, history, gate, normalized, stream);
     advance(history, normalized, tokens, stream);
 }
 
 void ple_inject_record(Tensor& stack, const Tensor& key, const Tensor& value,
                        const PleInjectWeights& weights, float eps, const Tensor& history,
                        Tensor& normalized, WorkspaceArena& workspace, cudaStream_t stream) {
-    require_inputs(stack, key, value, weights, eps, history);
+    const std::int32_t hidden = require_inputs(stack, key, value, weights, eps, history);
     const std::int32_t tokens = stack.ne[2];
-    require_tensor(&normalized, DType::FP32, kWidth, tokens,
-                   "normalized must be FP32 [10240, tokens]");
+    require_tensor(&normalized, DType::FP32, kStreams * hidden, tokens,
+                   "normalized must be FP32 [4 * hidden, tokens]");
     auto scope  = workspace.scope();
     Tensor gate = workspace.alloc(DType::FP32, {kStreams, tokens});
-    inject(stack, key, value, weights, eps, history, gate, normalized, stream);
+    dispatch_inject(stack, key, value, weights, eps, history, gate, normalized, stream);
 }
 
 void ple_history_advance(Tensor& history, const Tensor& normalized, cudaStream_t stream) {
-    require_tensor(&history, DType::FP32, kWidth, kHistory, "history must be FP32 [10240, 9]");
+    const std::int32_t width = history.ne[0];
+    require(width == kStreams * 2560 || width == kStreams * 5120,
+            "history must be FP32 [4 * hidden, 9] with hidden 2560 or 5120");
+    require_tensor(&history, DType::FP32, width, kHistory, "history must be FP32 [4 * hidden, 9]");
     require(normalized.ne[1] > 0, "normalized needs at least one position");
-    require_tensor(&normalized, DType::FP32, kWidth, normalized.ne[1],
-                   "normalized must be FP32 [10240, tokens]");
+    require_tensor(&normalized, DType::FP32, width, normalized.ne[1],
+                   "normalized must be FP32 [4 * hidden, tokens]");
     advance(history, normalized, normalized.ne[1], stream);
 }
 

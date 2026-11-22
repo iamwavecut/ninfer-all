@@ -1,5 +1,6 @@
-// hyper_connection_read/write against an FP64 oracle of the Qwen3.8-Flash-Next gated residual, at
-// the model's shapes (4 streams, hidden 2560, lowrank 320) and decode, verify and prefill widths,
+// hyper_connection_read/write against an FP64 oracle of the Qwen3.8-Flash-Next and dense Qwen4
+// gated residual, at both implemented shapes (4 streams with hidden 2560 and lowrank 320, or hidden
+// 5120 and lowrank 640) and decode, verify and prefill widths,
 // with and without the inject rows (the final mixer has none), with BF16 and with Q8_0 matrices
 // (the oracle reads the values the blocks represent) and with Q8_0 matrices beside a BF16 inject,
 // eagerly and under graph replay; and
@@ -26,10 +27,17 @@ using namespace ninfer::test;
 namespace {
 
 constexpr int kStreams = 4;
-constexpr int kHidden  = 2560;
-constexpr int kLowrank = 320;
-constexpr int kWidth   = kStreams * kHidden;
 constexpr float kEps   = 1e-6f;
+// The geometry under test (main runs each implemented one).
+int kHidden  = 2560;
+int kLowrank = 320;
+int kWidth   = kStreams * kHidden;
+
+void use_geometry(int hidden, int lowrank) {
+    kHidden  = hidden;
+    kLowrank = lowrank;
+    kWidth   = kStreams * hidden;
+}
 
 std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
@@ -113,7 +121,8 @@ Oracle oracle(const std::vector<float>& stack, const std::vector<float>& norm,
 int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed, bool fused = false,
              bool fp32_y = false, bool q8 = false, bool fp32_norm = false,
              bool bf16_inject = false) {
-    const std::string label = "hyper_connection T=" + std::to_string(tokens) +
+    const std::string label = "hyper_connection H=" + std::to_string(kHidden) +
+                              " T=" + std::to_string(tokens) +
                               (with_inject ? "" : " mixer") + (graph ? " graph" : "") +
                               (fused ? (fp32_y ? " write_read FP32" : " write_read BF16") : "") +
                               (q8 ? " Q8_0" : "") + (fp32_norm ? " FP32 gamma" : "") +
@@ -375,8 +384,8 @@ int run_expand(int tokens, bool with_streams, std::uint32_t seed) {
                 want[i]             = double(x[static_cast<std::size_t>(t) * kHidden + d]) +
                                       (with_streams ? double(streams[i]) : 0.0);
             }
-    const std::string label =
-        std::string(with_streams ? "expand+streams" : "expand") + " T=" + std::to_string(tokens);
+    const std::string label = std::string(with_streams ? "expand+streams" : "expand") +
+                              " H=" + std::to_string(kHidden) + " T=" + std::to_string(tokens);
     int failures = 0;
     if (with_streams) {
         // One FP32 rounding of an exact sum of two widened BF16 values.
@@ -406,6 +415,7 @@ int main() {
         return 77;
     }
     int failures = 0;
+    use_geometry(2560, 320);
     // Every narrow width has its own kernels (1..8), then the wide path.
     for (const int tokens : {1, 2, 3, 6, 7, 8, 9, 16, 37}) {
         failures += run_case(tokens, true, false, 4100u + tokens);
@@ -446,10 +456,32 @@ int main() {
     failures += run_expand(7, false, 4401u);
     failures += run_expand(1, true, 4402u);
     failures += run_expand(9, true, 4403u);
+    // Hidden 5120 with lowrank 640 (dense Qwen4): every narrow width, the GEMM seam, a prefill
+    // interior, the fused write/read with both block-output dtypes, the final mixer, Q8_0 matrices
+    // beside BF16 and Q8_0 injects, graph replays and the expansions.
+    use_geometry(5120, 640);
+    for (const int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 37}) {
+        failures += run_case(tokens, true, false, 5100u + tokens);
+        failures += run_case(tokens, true, false, 5200u + tokens, true, tokens % 2 == 1);
+    }
+    failures += run_case(1, false, false, 5300u);
+    failures += run_case(4, true, true, 5301u);
+    failures += run_case(9, true, true, 5302u, true, true);
+    failures += run_case(3, false, false, 5303u, true, false);
+    for (const int tokens : {1, 3, 8, 9, 37, 96}) {
+        failures += run_case(tokens, true, false, 5400u + tokens, false, false, true);
+        failures += run_case(tokens, true, false, 5500u + tokens, false, false, true, false, true);
+    }
+    failures += run_case(1, false, false, 5600u, false, false, true);
+    failures += run_case(2, true, false, 5601u, true, false, true);
+    failures += run_case(9, true, true, 5602u, true, true, true, true);
+    failures += run_case(5, true, true, 5603u, true, false, true, true, true);
+    failures += run_expand(1, false, 5700u);
+    failures += run_expand(9, true, 5701u);
     // Refusals: an unsupported geometry and an inject output without inject rows.
     bool refused = false;
     try {
-        (void)ops::hyper_connection_read_workspace_bytes(4, 2048, 320, 1);
+        (void)ops::hyper_connection_read_workspace_bytes(4, 5120, 320, 1);
     } catch (const std::invalid_argument&) { refused = true; }
     failures += refused ? 0 : 1;
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " hyper_connection\n";

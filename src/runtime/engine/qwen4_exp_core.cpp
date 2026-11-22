@@ -168,20 +168,41 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
+    StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
+    const artifact::Reader reader(options.artifact_path);
+    const auto text =
+        models::qwen4_exp::parse_text_config(reader.directory().component("text").config);
+    // Qwen3.8-Flash-Next or dense Qwen4, in messages.
+    const std::string family = models::qwen4_exp::family_name(text);
     if (options.prefill_stall_budget_ms != 0) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next sizes its own prefill steps; --prefill-stall-budget-ms "
-                                    "applies to Qwen3.5-family models");
+        throw std::invalid_argument(family + " sizes its own prefill steps; "
+                                    "--prefill-stall-budget-ms applies to Qwen3.5-family models");
     }
     if (options.enable_vision && options.vision_residency != VisionResidency::Resident) {
-        throw std::invalid_argument(
-            "Qwen3.8-Flash-Next runs its Vision tower resident on the device only");
+        throw std::invalid_argument(family + " runs its Vision tower resident on the device only");
+    }
+    if (text.dense() && options.expert_residency != ExpertResidency::Device) {
+        throw std::invalid_argument("dense Qwen4 has no routed experts: --expert-residency "
+                                    "host and disk apply to MoE models");
+    }
+    if (text.dense() && (options.expert_cache_bytes ||
+                         options.hybrid_experts.dma_share ||
+                         options.hybrid_experts.host_bytes ||
+                         options.hybrid_experts.cpu_threads != 0 ||
+                         options.hybrid_experts.mapped_misses ||
+                         options.hybrid_experts.tail_skip_rank != 0 ||
+                         options.hybrid_experts.prefill_buffers != 0 ||
+                         options.hybrid_experts.adaptive_cache ||
+                         !options.hybrid_experts.routing_profile.empty() ||
+                         !options.hybrid_experts.record_profile.empty())) {
+        throw std::invalid_argument("dense Qwen4 has no routed experts: the expert cache, CPU "
+                                    "share, miss and profile options apply to MoE models");
     }
     const SpeculativeOptions& speculative = options.speculative;
     if (speculative.backend == SpeculativeBackend::DFlash ||
         speculative.backend == SpeculativeBackend::DSpark) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next drafts with its MTP block (--spec mtp), "
-                                    "its DFlash2 drafter (--spec dflash2) or a DSpine drafter "
-                                    "(--spec dspine)");
+        throw std::invalid_argument(family + " drafts with its MTP block (--spec mtp), its DFlash2 "
+                                    "drafter (--spec dflash2) or a DSpine drafter (--spec dspine)");
     }
     const bool mtp     = speculative.backend == SpeculativeBackend::Mtp;
     const bool dflash2 = speculative.backend == SpeculativeBackend::DFlash2;
@@ -204,13 +225,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                     "predicts blocks of 8 positions");
     }
     if (!drafts && speculative.ngram_draft_tokens != 0) {
-        throw std::invalid_argument("n-gram copy proposals are not available for "
-                                    "Qwen3.8-Flash-Next");
+        throw std::invalid_argument("n-gram copy proposals are not available for " + family);
     }
     if (speculative.mtp_attention_window != 0 ||
         speculative.proposal_head == ProposalHead::Optimized || speculative.ngram_archive_bytes != 0) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next's MTP drafting has no "
-                                    "--mtp-attention-window, --lm-head-draft or n-gram archive");
+        throw std::invalid_argument(family + "'s MTP drafting has no --mtp-attention-window, "
+                                    "--lm-head-draft or n-gram archive");
     }
     if (speculative.lookup_ngram != 0 && !drafts) {
         throw std::invalid_argument("--lookup-ngram requires --spec mtp, dflash2 or dspine");
@@ -219,8 +239,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
     }
     if (options.context_cache.disk_kv_directstorage) {
-        throw std::invalid_argument(
-            "Qwen3.8-Flash-Next's context cache reads its disk tier without DirectStorage");
+        throw std::invalid_argument(family +
+                                    "'s context cache reads its disk tier without DirectStorage");
     }
     const NgramTableOptions& table = options.ngram_table;
     const NgramTableOptions defaults;
@@ -243,16 +263,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (table.io_depth == 0 || table.io_depth > 1024) {
         throw std::invalid_argument("--ngram-io-depth takes 1..1024 reads");
     }
-    StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
-    const artifact::Reader reader(options.artifact_path);
-    const auto text =
-        models::qwen4_exp::parse_text_config(reader.directory().component("text").config);
     const bool has_ple = !text.ple_layers.empty();
     if (!has_ple &&
         (!table.path.empty() || table.residency != defaults.residency || table.io != defaults.io ||
          table.ram_budget_bytes || !table.hot_profile.empty() || table.lock ||
          table.io_depth != defaults.io_depth)) {
-        throw std::invalid_argument("n-gram table options do not apply to a slice without PLE layers");
+        throw std::invalid_argument(
+            "n-gram table options do not apply to a model or slice without PLE layers");
     }
     // The n-gram table, and the hot-row profile of a ram-hot table, are located before anything
     // else starts, so a model without them fails at once.
@@ -273,10 +290,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             ngram->table_format != ngram->model_format) {
             publish_diagnostic(
                 options.diagnostic_observer, DiagnosticLevel::Warning,
-                "Qwen3.8-Flash-Next: n-gram table %s, sha256 %.16s..., in place of the %s table "
-                "the model names, sha256 %.16s...; its hash constants and geometry match the "
-                "model's, its values are not checked",
-                ngram->table_format.c_str(), ngram->table_digest.c_str(),
+                "%s: n-gram table %s, sha256 %.16s..., in place of the %s table the model "
+                "names, sha256 %.16s...; its hash constants and geometry match the model's, its "
+                "values are not checked",
+                family.c_str(), ngram->table_format.c_str(), ngram->table_digest.c_str(),
                 ngram->model_format.c_str(), ngram->model_digest.c_str());
         }
         if (table.residency == NgramResidency::RamHot) {
@@ -307,8 +324,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.mtp          = mtp;
     load.dflash2      = dflash2;
     if (dspine) { load.dspine = speculative.draft_model; }
-    // Tensor parallelism: every layer's mixer heads, routed experts and shared expert divided over
-    // the devices, and the head's rows; the MTP block, the DFlash2 drafter and Vision on the first.
+    // Tensor parallelism: every layer's mixer heads, routed experts and shared expert (dense Qwen4:
+    // MLP rows) divided over the devices, and the head's rows; the MTP block, the DFlash2 drafter
+    // and Vision on the first.
     // Without --tensor-split each device takes a share of its speed that fits beside what it holds.
     if (options.tensor_parallel) {
         load.tensor_split = options.tensor_split;
@@ -334,7 +352,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         .model    = nullptr,
         .frontend = models::qwen3_5::make_frontend(
             model->resources(), {.chat_template_path      = options.chat_template_path,
-                                 .architecture            = models::Architecture::Qwen4Exp,
+                                 .architecture            = text.dense()
+                                                                ? models::Architecture::Qwen4
+                                                                : models::Architecture::Qwen4Exp,
                                  .vision_enabled          = options.enable_vision,
                                  .max_context             = options.max_context,
                                  .media_cache_bytes       = options.media_cache_bytes,
@@ -451,18 +471,19 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        std::to_string(stored.files_bytes >> 20) + " MiB)" +
                        pinned_block_end_note(stored) + ", read as disk experts";
     }
+    const std::string mlp_place = text.dense() ? "dense MLP" : "experts in " + expert_place;
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "Qwen3.8-Flash-Next: %zu stage(s), prompt chunks of %u tokens, experts in "
-                       "%s, n-gram table %s, state %.0f MiB, workspace %.0f MiB, expert "
-                       "cache %.0f MiB, CUDA Graphs %.0f MiB",
-                       model->stages().stages(), executor.prefill_chunk, expert_place.c_str(),
+                       "%s: %zu stage(s), prompt chunks of %u tokens, %s, n-gram table %s, state "
+                       "%.0f MiB, workspace %.0f MiB, expert cache %.0f MiB, CUDA Graphs %.0f MiB",
+                       family.c_str(), model->stages().stages(), executor.prefill_chunk,
+                       mlp_place.c_str(),
                        table_place.c_str(),
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0,
                        double(instance->executor->graph_bytes()) / 1048576.0);
     if (model->tensor_parallel()) {
-        std::string keys, kv, experts, shared, head;
+        std::string keys, kv, experts, shared, rows, head;
         const auto range = [](std::string& out, std::size_t rank, std::uint64_t begin,
                               std::uint64_t end) {
             out += (rank == 0 ? "" : ", ") +
@@ -476,24 +497,32 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             range(kv, rank, share.kv_head_begin, share.kv_head_end);
             range(experts, rank, share.expert_begin, share.expert_end);
             range(shared, rank, share.shared_begin, share.shared_end);
+            range(rows, rank, share.ffn_begin, share.ffn_end);
             range(head, rank, head_rows.at(rank), head_rows.at(rank + 1));
         }
-        publish_diagnostic(
-            options.diagnostic_observer, DiagnosticLevel::Info,
-            "Qwen3.8-Flash-Next: tensor parallelism, by device Gated DeltaNet key "
-            "heads %s, sparse-attention KV heads %s, %s %s, shared-expert "
-            "middle %s, head rows %s",
-            keys.c_str(), kv.c_str(),
-            model->config().latent_moe
-                ? "latent groups cut in each layer nearest the routed experts' shares"
-                : "routed experts",
-            experts.c_str(), shared.c_str(), head.c_str());
+        if (text.dense()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "dense Qwen4: tensor parallelism, by device Gated DeltaNet key "
+                               "heads %s, sparse-attention KV heads %s, MLP rows %s, head rows %s",
+                               keys.c_str(), kv.c_str(), rows.c_str(), head.c_str());
+        } else {
+            publish_diagnostic(
+                options.diagnostic_observer, DiagnosticLevel::Info,
+                "Qwen3.8-Flash-Next: tensor parallelism, by device Gated DeltaNet key "
+                "heads %s, sparse-attention KV heads %s, %s %s, shared-expert "
+                "middle %s, head rows %s",
+                keys.c_str(), kv.c_str(),
+                model->config().latent_moe
+                    ? "latent groups cut in each layer nearest the routed experts' shares"
+                    : "routed experts",
+                experts.c_str(), shared.c_str(), head.c_str());
+        }
     }
     if (const auto memory = instance->executor->memory(); memory.streamed_kv) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "Qwen3.8-Flash-Next: sparse-attention KV in pinned host memory "
-                           "(%.0f MiB), %.0f MiB of its blocks on the device",
-                           double(memory.host_kv_bytes) / 1048576.0,
+                           "%s: sparse-attention KV in pinned host memory (%.0f MiB), %.0f MiB "
+                           "of its blocks on the device",
+                           family.c_str(), double(memory.host_kv_bytes) / 1048576.0,
                            double(memory.kv_bytes) / 1048576.0);
     }
     if (const std::string cpu = instance->executor->expert_cpu_description(); !cpu.empty()) {
@@ -507,33 +536,37 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     if (drafts) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "Qwen3.8-Flash-Next: %s speculative decoding, %u drafts a round",
+                           "%s: %s speculative decoding, %u drafts a round", family.c_str(),
                            dflash2 ? "DFlash2" : (dspine ? "DSpine" : "MTP"),
                            speculative.draft_tokens);
         if (speculative.ngram_draft_tokens != 0) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                               "Qwen3.8-Flash-Next drafts with its %s only; n-gram copy "
-                               "proposals (--ngram-draft-tokens) are not available for it",
-                               dflash2 ? "DFlash2 drafter"
+                               "%s drafts with its %s only; n-gram copy proposals "
+                               "(--ngram-draft-tokens) are not available for it",
+                               family.c_str(), dflash2 ? "DFlash2 drafter"
                                        : (dspine ? "DSpine drafter" : "MTP block"));
         }
     }
     if (executor.rope_yarn.active()) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "Qwen3.8-Flash-Next: YaRN at factor %.4g past the native %u positions",
-                           double(executor.rope_yarn.factor), executor.rope_yarn.native_context);
+                           "%s: YaRN at factor %.4g past the native %u positions",
+                           family.c_str(), double(executor.rope_yarn.factor),
+                           executor.rope_yarn.native_context);
     }
     if (table.disabled && has_ple) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
-                           "Qwen3.8-Flash-Next runs WITHOUT its n-gram table (--no-ngram-table): "
-                           "a non-standard experimental mode. The model was trained with the "
-                           "table and degrades badly without it (WikiText-2 perplexity 2.66 -> "
-                           "5.01 on GSQ-RCO Q2_0); use it only for experiments");
+                           "%s runs WITHOUT its n-gram table (--no-ngram-table): a non-standard "
+                           "experimental mode. The model was trained with the table and "
+                           "degrades badly without it (Qwen3.8-Flash-Next's WikiText-2 "
+                           "perplexity 2.66 -> 5.01 on GSQ-RCO Q2_0); use it only for "
+                           "experiments",
+                           family.c_str());
     }
 
     ConstructedQwen4Exp out;
     const auto& stats     = model->storage_stats();
-    out.load.architecture = std::string(models::architecture_name(models::Architecture::Qwen4Exp));
+    out.load.architecture = std::string(models::architecture_name(
+        text.dense() ? models::Architecture::Qwen4 : models::Architecture::Qwen4Exp));
     out.load.model_name   = model->info().name;
     out.load.prefill_signature = "qwen4_exp";
     std::set<std::string> formats;
@@ -934,7 +967,7 @@ struct Qwen4ExpCore::Impl {
             stats.host_kv_occupied_bytes = store.host_used();
         }
         worker = std::thread([this] {
-            const DeviceWaitWatch watched(device, "Qwen3.8-Flash-Next worker");
+            const DeviceWaitWatch watched(device, "Qwen4-family worker");
             device.bind_to_current_thread();
             loop();
         });
@@ -2563,7 +2596,7 @@ struct Qwen4ExpCore::Impl {
         r.hold_wanted = false;
         if (slot.fed.size() > back_to) {
             if (r.words_wanted || slot.hold_tokens != back_to) {
-                throw std::logic_error("Qwen3.8-Flash-Next kept no state at a banned word's hold");
+                throw std::logic_error("Qwen4-family core kept no state at a banned word's hold");
             }
             executor.restore(r.slot, slot.hold);
             r.position -= static_cast<std::uint32_t>(slot.fed.size() - back_to);
@@ -3231,7 +3264,8 @@ struct Qwen4ExpCore::Impl {
             const std::int32_t drafts_n   = host[b * w + b + j];
             const std::int32_t* run       = host + j * w;
             if (licensed_n < 1 || licensed_n > columns) {
-                throw std::runtime_error("Qwen3.8-Flash-Next verification returned an invalid licensed run");
+                throw std::runtime_error(
+                    "Qwen4-family verification returned an invalid licensed run");
             }
             // Non-finite logits (the sampler's marker) or an id outside the vocabulary in the run:
             // this request ends, the round's other rows commit.
@@ -3751,7 +3785,7 @@ std::vector<float> Qwen4ExpCore::score(models::qwen3_5::PreparedPrompt prompt,
             throw RequestError(RequestErrorKind::Unavailable, "inference engine is unavailable");
         }
         if (impl_->outstanding != 0) {
-            throw std::logic_error("score requires an idle Qwen3.8-Flash-Next Engine");
+            throw std::logic_error("score requires an idle Qwen4-family Engine");
         }
         ++impl_->outstanding;
     }
@@ -3765,7 +3799,7 @@ std::vector<float> Qwen4ExpCore::score(models::qwen3_5::PreparedPrompt prompt,
         }
     } release{*impl_};
 
-    const DeviceWaitWatch watched(impl_->device, "Qwen3.8-Flash-Next scoring caller");
+    const DeviceWaitWatch watched(impl_->device, "Qwen4-family scoring caller");
     impl_->device.bind_to_current_thread();
     return impl_->score(tokens, first_target);
 }

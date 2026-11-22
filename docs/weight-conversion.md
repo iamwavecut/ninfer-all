@@ -78,6 +78,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL or Q8_0 rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
 | `qwen3_8_flash_next_gguf_preserve` | [Native-source preservation](flash-next-native-dflash2.md): encoded expert grids, FP32 norm gamma and decay, Basalt HC8 rounding and BF16 prefill injection; explicit `--compat-bf16` for the source recipe's compatibility casts | `gguf`, `ngram` (GGUF or NVIDIA FP8 PLE safetensors), optional `vision` and `mtp` |
 | `edge0_pack`, `edge0_pack_q8`, `edge0_pack_q4` | Edge0-145B and Edge0-120B from an Edge0 release folder: the Flash-Next skeleton GGUF as `qwen3_8_flash_next_gguf` reads it, every latent expert row (NVFP4, Q3_K, IQ4_NL) and encoder and decoder row (Q8_0 or Q4_0: the release's choice, or the one the recipe names) byte for byte, the labels, the NVFP4 experts' FP32 multipliers or the reciprocals of the Q3_K builds' column scales; the FP8 n-gram table's codes in the artifact or in a table artifact of their own; the release's MTP block | `pack` (the release folder); `gguf`, `ngram`, `mtp` override its files |
+| `qwen4_dense` | [Dense Qwen4](qwen4-dense.md) from its safetensors checkpoint: Q4 MLP gate and up and mixer query and key, Q5 MLP down and the other mixer projections, HC8 (`gguf_q8_0`) hyper-connection matrices, Q8 embedding and MTP block, Q6 head; a model with PLE adds its n-gram table as FP8 rows or IQ4_NL rows | `ngram` (the checkpoint's BF16 table shards or an IQ4_NL table GGUF) |
 | `gemma4_gguf` | Gemma 4 26B-A4B or the dense 31B from Google's QAT GGUF (or a mixed-format GGUF of it): every matrix in its block format (Q4_0, the tied token table Q6_K), byte for byte, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] MLP projections always, the vectors and expert scales as FP32; with `--components text,mtp` the assistant from its own GGUF the same way, with `vision` the tower from the release's mmproj | `gguf`, `mtp`, `vision` (mmproj GGUF) |
 | `flint_gguf` | Flint from a llama.cpp GGUF (Unsloth's UD-Q4_K_XL or another quantization): every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, a block's Q, K and V grouped into one parent when they share a format and the [gate; up] rows of the dense MLP and the shared expert always, the router (BF16 in the GGUF), norms and sinks as FP32 | `gguf` |
 | `deepseek_v41_gguf` | DeepSeek-V4.1-Flash from ISTA-DASLab's split GSQ-RCO GGUF, in llama.cpp's layout or the earlier one: every matrix in its block format, byte for byte, the routed experts' gate and up banks interleaved per expert by whole rows, the BF16 and F32 tensors (router, compressors, indexers, hyper-connection matrices, norms, sinks) as FP32, the Engram gate as the FP32 product of its BF16 factors; the Engram GGUF's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the first shard), `engram` (the Engram GGUF), `dspark`, `vision`, `bias_vl` (the earlier layout's image routing bias) |
@@ -356,6 +357,15 @@ its expert, encoder and decoder rows byte for byte. The text configuration gains
 latent width, the 8 groups and which scales the artifact stores). The FP8 n-gram table becomes
 `fp8_e4m3fn_row_fp16` rows with the release's one scale in each row, and `--components` places it as
 for Flash-Next. Commands, runtime options and the mathematics: [Edge0](edge0.md).
+
+### Dense Qwen4 checkpoints
+
+`qwen4_dense` reads a dense Qwen4 (`Qwen4ForCausalLM`) safetensors checkpoint through the
+Flash-Next converter ([`qwen4_exp.py`](../tools/convert/qwen4_exp.py)): the same hyper-connection,
+Gated DeltaNet, sparse-attention and PLE tensors, a SwiGLU MLP in every layer and in the MTP block.
+No GGUF layout of dense Qwen4 exists, so `--source gguf` and `--source pack` are refused for it.
+`--components` places a PLE model's n-gram table as for Flash-Next; a model without PLE has none.
+Commands, the accepted geometry and the checks: [Dense Qwen4](qwen4-dense.md).
 
 ### Gemma 4 GGUF releases
 

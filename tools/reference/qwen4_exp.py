@@ -1,12 +1,20 @@
-"""FP64 reference forward of Qwen3.8-Flash-Next (Qwen4ExpForConditionalGeneration), text path.
+"""FP64 reference forward of Qwen3.8-Flash-Next (Qwen4ExpForConditionalGeneration) and dense
+Qwen4 (Qwen4ForCausalLM), text path.
 
 An independent transcription of transformers' modular_qwen4_exp.py (as summarised in
 docs/maintainer/qwen4-exp-model.md, section 1) for producing golden tensors: the PLE
 hash and block, hyper-connection read/write, Gated DeltaNet, QSA (indexer and sparse attention),
-the 512-expert MoE, the final mixer and the head. Tensors load lazily by name from the checkpoint's
-safetensors shards, so a layer slice needs only that slice's tensors on disk.
+the 512-expert MoE or dense Qwen4's SwiGLU MLP, the final mixer and the head. Tensors load lazily
+by name from the checkpoint's safetensors shards, so a layer slice needs only that slice's tensors
+on disk.
 
     python -m tools.reference.qwen4_exp --checkpoint DIR --tokens 1,2,3 --layers 4 --out dump.pt
+
+With --compare REPORT (a logits report of tests/models/qwen4_exp/test_generate_real.cpp,
+NINFER_QWEN4_EXP_LOGITS_REPORT), it runs every prefix of the report through blocks 0 .. N-1
+(--layers N, by default all the checkpoint's; the block count of a `--layers 0..N` slice artifact)
+and the head and prints, per record, the engine's logits against these FP64 ones: relative L2, KL
+divergence and top-1 agreement.
 
 RoPE angles follow the reference's FP32 arithmetic (fl32(position) * fl32 frequency); everything
 else is FP64. Single sequence, text only, no MTP.
@@ -29,7 +37,10 @@ PREFIX = "model.language_model."
 class Checkpoint:
     def __init__(self, root: Path):
         self.root = Path(root)
-        self.config = json.loads((self.root / "config.json").read_text())["text_config"]
+        source = json.loads((self.root / "config.json").read_text())
+        self.config = source.get("text_config", source)
+        self.dense = source["architectures"][0] in ("Qwen4ForConditionalGeneration",
+                                                    "Qwen4ForCausalLM")
         index = json.loads((self.root / "model.safetensors.index.json").read_text())
         self.files = index["weight_map"]
         self._open = {}
@@ -39,7 +50,11 @@ class Checkpoint:
         if file not in self._open:
             self._open[file] = safe_open(str(self.root / file), framework="pt")
         value = self._open[file].get_tensor(name)
-        return value if value.dtype == torch.int64 else value.to(dtype)
+        return value if value.dtype == torch.int64 or dtype is None else value.to(dtype)
+
+    def head(self) -> str:
+        tied = self.config.get("tie_word_embeddings", False)
+        return PREFIX + "embed_tokens.weight" if tied else "lm_head.weight"
 
     def layer(self, index: int, name: str, dtype=F64) -> torch.Tensor:
         return self.tensor(f"{PREFIX}layers.{index}.{name}", dtype)
@@ -102,6 +117,7 @@ class NgramTable:
     def __init__(self, ckpt: Checkpoint, layer: int):
         self.ckpt, self.layer = ckpt, layer
         self.rows_per_shard = None
+        self.handles = {}
         sparse = ckpt.root / "ngram_rows.npz"
         self.sparse = None
         if sparse.exists():
@@ -118,8 +134,10 @@ class NgramTable:
             self.rows_per_shard = handle.get_slice(first).get_shape()[0]
         shard, local = divmod(row, self.rows_per_shard)
         name = f"{PREFIX}layers.{self.layer}.ple.ple_embedding.ngram_embedding.shard_{shard}.weight"
-        handle = safe_open(str(self.ckpt.root / self.ckpt.files[name]), framework="pt")
-        return handle.get_slice(name)[local : local + 1].to(F64)[0]
+        if name not in self.handles:
+            self.handles[name] = safe_open(str(self.ckpt.root / self.ckpt.files[name]),
+                                           framework="pt")
+        return self.handles[name].get_slice(name)[local : local + 1].to(F64)[0]
 
 
 def ple(ckpt, layer, R, tokens, eos, table, eps, state):
@@ -250,6 +268,13 @@ def qsa(ckpt, layer, a, first_position, eps, state):
     return torch.stack(out) @ w("o_proj.weight").T
 
 
+def dense_mlp(ckpt, layer, m):
+    """Dense Qwen4's SwiGLU MLP: down(silu(gate m) * up m)."""
+    w = lambda n: ckpt.layer(layer, "mlp." + n)
+    product = torch.nn.functional.silu(m @ w("gate_proj.weight").T) * (m @ w("up_proj.weight").T)
+    return product @ w("down_proj.weight").T
+
+
 def moe(ckpt, layer, m):
     cfg = ckpt.config
     top, width = int(cfg["num_experts_per_tok"]), int(cfg["moe_intermediate_size"])
@@ -275,15 +300,17 @@ def moe(ckpt, layer, m):
 
 # --- the stack ------------------------------------------------------------------------------------
 
-def forward(ckpt: Checkpoint, tokens: list[int], layers: range, with_head: bool):
-    """Blocks `layers` (a prefix 0 .. N-1) over one sequence from position 0."""
+def forward(ckpt: Checkpoint, tokens: list[int], layers: range, with_head: bool,
+            positions=None):
+    """Blocks `layers` (a prefix 0 .. N-1) over one sequence from position 0; with `positions`,
+    the head's logits at those positions only."""
     cfg = ckpt.config
     eps = float(cfg["rms_norm_eps"])
     hc, h = int(cfg["hc_count"]), int(cfg["hidden_size"])
     eos = int(cfg["eos_token_id"])
-    embed = ckpt.tensor(PREFIX + "embed_tokens.weight")[tokens]
+    embed = ckpt.tensor(PREFIX + "embed_tokens.weight", None)[tokens].to(F64)
     R = embed[:, None, :].repeat(1, hc, 1)
-    ple_blocks = [i - 1 for i in cfg["ple_layer_ids"]]
+    ple_blocks = [i - 1 for i in cfg.get("ple_layer_ids") or []]
     dumps = {"embed": embed, "R": []}
     for layer in layers:
         state = {}
@@ -303,24 +330,75 @@ def forward(ckpt: Checkpoint, tokens: list[int], layers: range, with_head: bool)
             y = qsa(ckpt, layer, a, 0, eps, state)
         R = hc_write(R, y, w1)
         m, w2 = hc_read(ckpt, f"{PREFIX}layers.{layer}.mlp_hyper_connection.", R, eps)
-        R = hc_write(R, moe(ckpt, layer, m), w2)
+        R = hc_write(R, (dense_mlp if ckpt.dense else moe)(ckpt, layer, m), w2)
         dumps["R"].append(R.clone())
     if with_head:
-        final, _ = hc_read(ckpt, PREFIX + "hyper_connection_mixer.", R, eps)
-        dumps["logits"] = final @ ckpt.tensor("lm_head.weight").T
+        rows = R if positions is None else R[list(positions)]
+        final, _ = hc_read(ckpt, PREFIX + "hyper_connection_mixer.", rows, eps)
+        head = ckpt.tensor(ckpt.head(), None)
+        # The head in FP64 a slice of rows at a time: the whole matrix would take 8 bytes a weight.
+        dumps["logits"] = torch.cat([final @ head[at:at + 16384].to(F64).T
+                                     for at in range(0, head.shape[0], 16384)], dim=1)
     return dumps
+
+
+def compare(ckpt: Checkpoint, report_path: Path, layers: int | None = None) -> int:
+    """The engine's teacher-forced logits (a NINFER_QWEN4_EXP_LOGITS_REPORT) against this forward
+    over blocks 0 .. layers-1 (all by default); returns the number of records whose top-1 token
+    differs."""
+    import numpy as np
+
+    report = json.loads(report_path.read_text())
+    if report["dtype"] != "bf16-le":
+        raise ValueError("expected a BF16 logits report")
+    vocab, domain = report["vocab"], report["domain"]
+    words = np.fromfile(report_path.parent / report["payload"], dtype="<u2").astype("<u4") << 16
+    engine = words.view("<f4").reshape(-1, vocab)[:, :domain].astype(np.float64)
+    layers = range(int(ckpt.config["num_hidden_layers"]) if layers is None else layers)
+    differences = 0
+    for prefix in report["prefixes"]:
+        records = [(i, r) for i, r in enumerate(report["records"]) if r["prefix"] == prefix["prefix"]]
+        # Step 0 reads the logits after the prefix, step k after its k-th further token.
+        positions = [prefix["prefix"] - 1 + r["step"] for _, r in records]
+        tokens = prefix["tokens"][: max(positions) + 1]
+        logits = forward(ckpt, tokens, layers, True, positions)["logits"][:, :domain].numpy()
+        for (index, record), want in zip(records, logits):
+            got = engine[index]
+            p = want - want.max()
+            p -= np.log(np.exp(p).sum())
+            q = got - got.max()
+            q -= np.log(np.exp(q).sum())
+            best, chosen = int(np.argmax(want)), int(np.argmax(got))
+            same = best == chosen
+            differences += 0 if same else 1
+            # A differing top-1: the FP64 logit margin of the reference's token over the engine's.
+            margin = "" if same else f", FP64 margin {want[best] - want[chosen]:.3e}"
+            print(f"prefix {record['prefix']} step {record['step']}: relative L2 "
+                  f"{np.linalg.norm(got - want) / np.linalg.norm(want):.3e}, KL "
+                  f"{float(np.sum(np.exp(p) * (p - q))):.3e}, top-1 "
+                  f"{'equal' if same else 'DIFFERENT'} ({best} / {chosen}){margin}", flush=True)
+    print(f"top-1 differs at {differences} of {len(report['records'])} records")
+    return differences
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--checkpoint", required=True, type=Path)
-    parser.add_argument("--tokens", required=True, help="comma-separated token ids")
-    parser.add_argument("--layers", type=int, default=48, help="run blocks 0 .. N-1")
+    parser.add_argument("--tokens", help="comma-separated token ids")
+    parser.add_argument("--compare", type=Path, metavar="REPORT",
+                        help="compare an engine logits report against the whole forward and exit")
+    parser.add_argument("--layers", type=int,
+                        help="run blocks 0 .. N-1 (default: all the checkpoint's blocks)")
     parser.add_argument("--head", action="store_true", help="also apply the final mixer and lm_head")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--list-ngram-rows", action="store_true",
                         help="print the n-gram table rows the tokens address and exit")
     args = parser.parse_args()
+    if args.compare is not None:
+        raise SystemExit(1 if compare(Checkpoint(args.checkpoint), args.compare, args.layers)
+                         else 0)
+    if args.tokens is None:
+        parser.error("--tokens is required")
     if args.list_ngram_rows:
         ckpt = Checkpoint(args.checkpoint)
         tokens = [int(t) for t in args.tokens.split(",")]
@@ -333,7 +411,8 @@ def main() -> None:
         parser.error("--out is required")
     ckpt = Checkpoint(args.checkpoint)
     tokens = [int(t) for t in args.tokens.split(",")]
-    dumps = forward(ckpt, tokens, range(args.layers), args.head)
+    count = int(ckpt.config["num_hidden_layers"]) if args.layers is None else args.layers
+    dumps = forward(ckpt, tokens, range(count), args.head)
     torch.save(dumps, args.out)
     # Raw little-endian FP32 copies for C++ readers: golden.json names them.
     root = args.out.parent

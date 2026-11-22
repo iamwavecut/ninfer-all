@@ -11,9 +11,9 @@
 namespace ninfer::ops {
 
 /**
- * The PLE block of Qwen3.8-Flash-Next (transformers Qwen4ExpTextPLELayer) after its two
- * projections: it gates the hashed n-gram embedding's value by its key's agreement with each
- * residual stream, adds that and a dilated causal convolution of its normalised form to the
+ * The PLE block of Qwen3.8-Flash-Next and dense Qwen4 (transformers Qwen4ExpTextPLELayer) after
+ * its two projections: it gates the hashed n-gram embedding's value by its key's agreement with
+ * each residual stream, adds that and a dilated causal convolution of its normalised form to the
  * stack, and advances the convolution history.
  *
  * For one sequence of `tokens` consecutive positions: `stack` FP32 [hidden, streams, tokens],
@@ -34,7 +34,7 @@ namespace ninfer::ops {
  * and `history` becomes the last (taps - 1) * dilation positions of N. The oracle evaluates this
  * in FP64 from the represented inputs; the stack and history are compared as FP32. Splitting a
  * sequence into consecutive calls gives the same result as one call up to FP32 rounding. The
- * implemented geometry is streams 4, hidden 2560, taps 4, dilation 3.
+ * implemented geometry is streams 4, hidden 2560 or 5120 (the stack's), taps 4, dilation 3.
  */
 struct PleInjectWeights {
     const Tensor* norm_key   = nullptr;
@@ -44,7 +44,7 @@ struct PleInjectWeights {
     bool unit_offset         = true;
 };
 
-[[nodiscard]] std::size_t ple_inject_workspace_bytes(std::int32_t tokens);
+[[nodiscard]] std::size_t ple_inject_workspace_bytes(std::int32_t hidden, std::int32_t tokens);
 
 void ple_inject(Tensor& stack, const Tensor& key, const Tensor& value,
                 const PleInjectWeights& weights, float eps, Tensor& history,

@@ -1,12 +1,13 @@
 #pragma once
 
-// Qwen3.8-Flash-Next (Qwen4ExpForCausalLM): the immutable model a v3 artifact describes. The text
-// tower's parameters are bound as the artifact stores them (GGUF blocks, BF16 or NInfer's own
-// formats); the frontend resources are the Qwen3.5 tokenizer and chat template, which this family
-// shares. Expert banks live on the device of their layer's pipeline stage, or in the pinned Host
-// block where the GPU reads them across the bus. Under tensor parallelism every device holds a run
-// of every layer: Gated DeltaNet heads, sparse-attention KV heads and routed experts, beside
-// replicas of what each device computes for itself (LoadOptions::tensor_split).
+// Qwen3.8-Flash-Next (Qwen4ExpForCausalLM) and dense Qwen4 (Qwen4ForCausalLM): the immutable model
+// a v3 artifact describes. The text tower's parameters are bound as the artifact stores them (GGUF
+// blocks, BF16 or NInfer's own formats); the frontend resources are the Qwen3.5 tokenizer and chat
+// template, which this family shares. Expert banks live on the device of their layer's pipeline
+// stage, or in the pinned Host block where the GPU reads them across the bus. Under tensor
+// parallelism every device holds a run of every layer: Gated DeltaNet heads, sparse-attention KV
+// heads and routed experts or dense MLP rows, beside replicas of what each device computes for
+// itself (LoadOptions::tensor_split).
 
 #include "artifact/materializer.h"
 #include "core/device.h"
@@ -89,11 +90,20 @@ struct PleWeights {
     WeightId key, value, norm_key, norm_query, norm_conv, convolution;
 };
 
+// Dense Qwen4's SwiGLU MLP: gate and up [intermediate, hidden], down [hidden, intermediate]; under
+// tensor parallelism a rank's run of the middle rows (TensorShare::ffn_begin): those rows of gate
+// and up and those inputs of down.
+struct DenseWeights {
+    WeightId gate, up, down;
+};
+
 struct LayerWeights {
     HyperConnectionWeights attn_hc, mlp_hc;
     // std::monostate: a sparse-attention layer of a tensor-parallel rank that holds no KV head.
     std::variant<GdnWeights, SparseAttentionWeights, std::monostate> mixer;
+    // Qwen3.8-Flash-Next's MoE; empty where `dense` is set (TextConfig::dense()).
     MoeWeights moe;
+    std::optional<DenseWeights> dense;
     std::optional<PleWeights> ple;
 };
 
@@ -117,9 +127,10 @@ struct TextWeights {
 };
 
 // Tensor parallelism: the runs of every layer one rank holds. A rank holds the value heads of its
-// Gated DeltaNet key heads and the 12 query heads of each of its sparse-attention KV heads; the
+// Gated DeltaNet key heads and the query heads of each of its sparse-attention KV heads; the
 // ranks holding KV heads are a prefix of the ranks. Each rank also holds a run of the shared
-// expert's 640-wide middle: those rows of its gate and up and those values of its down rows.
+// expert's 640-wide middle: those rows of its gate and up and those values of its down rows; or,
+// in dense Qwen4, a run [ffn_begin, ffn_end) of the MLP's middle rows.
 struct TensorShare {
     std::uint32_t key_head_begin = 0, key_head_end = 0;
     std::uint32_t kv_head_begin = 0, kv_head_end = 0;
@@ -128,11 +139,12 @@ struct TensorShare {
     // the experts, which only the shared expert's runs follow.
     std::uint32_t expert_begin = 0, expert_end = 0;
     std::uint32_t shared_begin = 0, shared_end = 0;
+    std::uint32_t ffn_begin = 0, ffn_end = 0;
 };
 
 // The MTP block (vLLM Qwen4ExpMultiTokenPredictor): the two input norms and projections, one
-// sparse-attention layer with its own MoE, and its final mixer. The token embedding and the head
-// are the text model's.
+// sparse-attention layer with its own MoE (dense Qwen4: its own SwiGLU MLP), and its final mixer.
+// The token embedding and the head are the text model's.
 struct MtpWeights {
     WeightId embedding_norm, hidden_norm, fc_embedding, fc_hidden;
     LayerWeights layer;
@@ -183,8 +195,9 @@ struct LoadOptions {
     // positive weight per rank; empty for none. Each rank holds a run of every Gated DeltaNet
     // layer's heads, of the sparse-attention layers' KV heads (as far as the two allow) and of the
     // routed experts, and replicas of the token embedding, the hyper-connections, the routers and
-    // the PLE layer, a run of each shared expert and of the head's rows; rank 0 also the MTP block
-    // and the Vision tower. One stage; the experts must be device resident.
+    // the PLE layer, a run of each shared expert (dense Qwen4: of each MLP's rows) and of the
+    // head's rows; rank 0 also the MTP block and the Vision tower. One stage; the experts must be
+    // device resident.
     std::vector<double> tensor_split;
 };
 
@@ -299,8 +312,11 @@ private:
     std::vector<TensorShare> shares_; // by rank under tensor parallelism
 };
 
-// Whether the artifact's text component is this family.
+// Whether the artifact's text component is this family: Qwen3.8-Flash-Next or dense Qwen4.
 [[nodiscard]] bool is_qwen4_exp(const artifact::Reader& reader);
+
+// The family member's name in messages: "dense Qwen4" or "Qwen3.8-Flash-Next".
+[[nodiscard]] const char* family_name(const TextConfig& config) noexcept;
 
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader,
                                                 const LoadOptions& options, DeviceContext& device,
