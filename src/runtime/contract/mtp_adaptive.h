@@ -2,7 +2,8 @@
 
 // Adaptive MTP verification width (--adaptive-mtp), shared by the Qwen3.5 Programs and the
 // Qwen3.8-Flash-Next core, the width of a masked drafter's round in the Qwen3.5 Programs
-// (MaskedWidthController), and the per-row extents of a packed verification (MtpPackedPlanner).
+// (MaskedWidthController), the per-row extents of a packed verification (MtpPackedPlanner), and
+// whether a lone request's rounds commit tokens faster than plain decode steps (SpeculationGate).
 // Each request keeps an estimate of how far its drafts survive; a batch
 // controller picks the verification width that maximizes expected committed tokens per unit of
 // round cost, moving between widths only after a candidate has won several rounds and a width has
@@ -718,6 +719,86 @@ private:
 
     std::array<float, kMaximumRows> seconds_{};
     std::array<std::uint16_t, kMaximumRows> samples_{};
+};
+
+// Whether a lone request's speculative rounds commit tokens faster than plain decode steps. Both
+// commit the same tokens, so the choice changes only speed. The mode that runs is timed step by
+// step (tokens committed, seconds, with the first steps after a switch left out) in moving sums;
+// every kRunSteps steps the other mode runs a probe (kPlainProbe plain steps or kRoundProbe rounds,
+// the first of them not counted), and the probe's mode runs next when its rate beats the running
+// mode's by kMargin. A plain step only slows down as the context grows, so rounds that still lead
+// the plain rate last measured by kLead skip the plain probe. A new request starts speculating.
+class SpeculationGate final {
+public:
+    void reset() noexcept { *this = SpeculationGate{}; }
+
+    // Whether the next step runs a round (else a plain decode step).
+    [[nodiscard]] bool speculates() const noexcept { return speculating_ != probing_; }
+
+    // A finished step of the mode speculates() named: the tokens it committed and its seconds.
+    void observe(std::uint32_t tokens, double seconds) noexcept {
+        if (!(seconds > 0.0)) { return; }
+        if (!probing_) {
+            if (steps_ >= kWarmSteps) {
+                run_tokens_  = run_tokens_ * (1.0 - kAlpha) + tokens;
+                run_seconds_ = run_seconds_ * (1.0 - kAlpha) + seconds;
+            }
+            if (++steps_ >= kRunSteps && run_seconds_ > 0.0) {
+                if (speculating_ && plain_seconds_ > 0.0 &&
+                    run_tokens_ / run_seconds_ >
+                        plain_tokens_ / plain_seconds_ * (1.0 + kLead)) {
+                    steps_ = kWarmSteps;
+                    return;
+                }
+                probing_       = true;
+                steps_         = 0;
+                probe_tokens_  = 0.0;
+                probe_seconds_ = 0.0;
+            }
+            return;
+        }
+        if (steps_ >= kWarmSteps) {
+            probe_tokens_ += tokens;
+            probe_seconds_ += seconds;
+        }
+        const std::uint32_t probe = speculating_ ? kPlainProbe : kRoundProbe;
+        if (++steps_ < kWarmSteps + probe) { return; }
+        probing_ = false;
+        steps_   = 0;
+        // The plain rate: the probe's while speculating, else the plain run's.
+        plain_tokens_  = speculating_ ? probe_tokens_ : run_tokens_;
+        plain_seconds_ = speculating_ ? probe_seconds_ : run_seconds_;
+        if (probe_tokens_ / probe_seconds_ > run_tokens_ / run_seconds_ * (1.0 + kMargin)) {
+            speculating_ = !speculating_;
+            ++switches_;
+            // The probe measured the mode that now runs, so its first steps count.
+            run_tokens_  = probe_tokens_;
+            run_seconds_ = probe_seconds_;
+            steps_       = kWarmSteps;
+        }
+    }
+
+    [[nodiscard]] std::uint32_t switches() const noexcept { return switches_; }
+
+private:
+    static constexpr std::uint32_t kWarmSteps  = 1;
+    static constexpr std::uint32_t kRunSteps   = 64;
+    static constexpr std::uint32_t kPlainProbe = 4;
+    static constexpr std::uint32_t kRoundProbe = 8;
+    static constexpr double kAlpha             = 1.0 / 16.0;
+    static constexpr double kMargin            = 0.03;
+    static constexpr double kLead              = 0.10;
+
+    bool speculating_      = true;
+    bool probing_          = false;
+    std::uint32_t steps_   = 0;
+    std::uint32_t switches_ = 0;
+    double run_tokens_     = 0.0;
+    double run_seconds_    = 0.0;
+    double probe_tokens_   = 0.0;
+    double probe_seconds_  = 0.0;
+    double plain_tokens_   = 0.0;
+    double plain_seconds_  = 0.0;
 };
 
 } // namespace ninfer::runtime

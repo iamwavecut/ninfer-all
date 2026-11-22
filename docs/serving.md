@@ -151,6 +151,16 @@ batch drafts until each of its requests has reached the floor or the round's wid
 ran nearly every step for all of them and were slower than plain steps
 ([MTP with several requests](qwen3-8-flash-next.md#mtp-with-several-requests)).
 
+The Inkling 2 Engine also times a lone DSpark request's rounds against plain decoding, since at a
+long context a round can cost more than the tokens it keeps save. It keeps decayed sums of the
+tokens committed and the seconds spent in the running mode; every 64 steps it runs the other mode
+for a few (4 plain steps, or 8 rounds while the request decodes plainly, after one warm-up step
+each) and switches when that mode committed tokens more than 3% faster. A plain step only slows
+down as the context grows, so while rounds lead the plain rate last measured by more than 10% the
+plain probe is skipped. Plain steps still write the drafter's caches, so a round can follow any
+plain step, and both modes commit the target's own tokens, so the text does not change. A new
+request starts with drafts.
+
 ### MTP attention window
 
 Each MTP draft step attends over the whole history of its cache, so at a long context the draft
@@ -2537,7 +2547,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--draft-confidence C` | DSpark only: verify a round's drafts up to the first its confidence head scores below `C` (`0..1`); `0` verifies every draft | `0.5` |
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
-| `--adaptive-mtp` | MTP: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens` for a lone request, drafting only those, and up to three in a round of several), the width favored by the drafts' measured survival and the measured round cost; DFlash, DFlash2 and DSpine on Qwen3.5-core models: each round without a copy drafts and verifies `--draft-tokens` or half of them, chosen the same way; Inkling 2's DSpark: a lone request's round drafts 1..`--draft-tokens`; see [Adaptive MTP](#adaptive-mtp) | off |
+| `--adaptive-mtp` | MTP: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens` for a lone request, drafting only those, and up to three in a round of several), the width favored by the drafts' measured survival and the measured round cost; DFlash, DFlash2 and DSpine on Qwen3.5-core models: each round without a copy drafts and verifies `--draft-tokens` or half of them, chosen the same way; Inkling 2's DSpark: a lone request's round drafts 1..`--draft-tokens`, and the request decodes plainly while its measured rounds commit tokens slower; see [Adaptive MTP](#adaptive-mtp) | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Qwen3.8-Flash-Next: `--spec mtp` or `dflash2`; Flint, which has no drafter, and Inkling 2 without it): the last `N` tokens are matched against the sequence so far and what followed is proposed, from the occurrence the sequence was already copying while it still matches, else from the newest; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`; with DFlash, DFlash2 or DSpine at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |

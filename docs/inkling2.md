@@ -91,7 +91,9 @@ tokenization, the chat template, output parsing and the serving protocols.
   drafter drafts with it while the Engine serves one request at a time: 3 drafts a round, the
   round's width adapting from 1 to 3 by how far the drafts survive and how long the rounds take
   (`--adaptive-mtp`), each proposal ending after its first draft at or below probability 0.5
-  (`--draft-min-p`). The target keeps a draft only while it equals the token it draws itself, so
+  (`--draft-min-p`); the request decodes plainly while its timed rounds commit tokens slower than
+  plain steps do, trying the other mode every 64 steps ([Adaptive MTP](serving.md#adaptive-mtp)).
+  The target keeps a draft only while it equals the token it draws itself, so
   the output is plain decoding's. Context lookup (`--lookup-ngram`, 1 to 7 drafts, 3 by default)
   also drafts, and so does a [DSpine](maintainer/dspine.md) drafter trained for this model
   (`--spec dspine --draft-model PATH`; none is published), which taps the visits' states; with a
@@ -335,6 +337,21 @@ tokens, so plain decoding at 14.9 ms a token stays faster there; after 32,008 to
 bytes of WikiText `00.txt` (49,478 tokens, 16,384-token windows at an 8,192-token stride) is
 1.739363 against 1.739591 before (-0.013%), and `ninfer-perplexity` scored them in 102 s against
 125 s.
+
+The DSpark columns above decode without the speculation gate. With it ([Adaptive
+MTP](serving.md#adaptive-mtp)), on another RTX 3090 (390 W, PCIe 4.0 x16, CUDA 13.4.3, the same
+build targets) the same three requests decode, in tok/s:
+
+| Prompt tokens | `--spec none` | DSpark without the gate (mean of 3 runs) | DSpark with the gate |
+|---:|---:|---:|---:|
+| 7,968 | 102.6 | 115.0 | 114.5 |
+| 32,008 | 92.5 | 121.8 | 120.4 |
+| 120,103 | 69.6 | 59.8 | 70.4 |
+
+After 120,103 tokens the request decodes plainly most of the time: 70.4 against 59.8 tok/s
+(1.18x), 1.2% above `--spec none`. After 7,968 and 32,008 tokens it keeps drafting, and its probes
+of plain decoding cost 0.5% and 1.1%; the ungated runs spread by 0.5, 1.0 and 0.7 tok/s at the
+three lengths. The text equals `--spec none`'s in every run.
 
 ### APEX-I MiniPlus
 

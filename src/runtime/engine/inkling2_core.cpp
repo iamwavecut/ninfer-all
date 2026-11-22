@@ -597,6 +597,10 @@ struct Inkling2Core::Impl {
     // running (0 when it is not the controller's).
     std::optional<runtime::MtpAdaptiveBatchController> spark_controller;
     std::uint32_t spark_round_width = 0;
+    // With the controller: whether a lone request's rounds beat plain decode steps, timed as they
+    // run, and the request it times.
+    std::optional<runtime::SpeculationGate> spark_gate;
+    std::uint64_t spark_gate_cohort = 0;
     const DiagnosticObserver diagnostics;
 
     mutable std::mutex queue_mutex;
@@ -683,6 +687,7 @@ struct Inkling2Core::Impl {
         if (spark_drafts != 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
             spark_controller.emplace();
             spark_controller->reset(spark_drafts, 1);
+            spark_gate.emplace();
         }
         if (reuse_prefixes) {
             // The host tier's budget, sized here once the weights are loaded when it is
@@ -2211,6 +2216,14 @@ struct Inkling2Core::Impl {
                !(r.options.execution.post_thinking_sampling && !r.post_thinking);
     }
 
+    // A key of the request that restarts the width controller's and the gate's choices.
+    [[nodiscard]] static std::uint64_t spark_cohort(const Request& r) noexcept {
+        return (1469598103934665603ULL ^
+                (static_cast<std::uint64_t>(r.slot) << 32U |
+                 static_cast<std::uint32_t>(r.admitted.time_since_epoch().count()))) *
+               1099511628211ULL;
+    }
+
     // The drafts a round takes while `decoding` requests decode at once. Each verified row routes to
     // its own experts, so the rows a round adds cost more as requests join; Gemma 4's measurement of
     // this on an RTX 3090 (two requests gain with one draft each and lose with three, four lose with
@@ -2279,6 +2292,9 @@ struct Inkling2Core::Impl {
         }
         const std::uint32_t steps = round_drafts(decoding);
         std::vector<std::shared_ptr<Request>> deferred;
+        // The lone request the speculation gate times this step, and its tokens before it.
+        std::shared_ptr<Request> gated;
+        std::size_t gated_tokens = 0;
         for (const Slot& slot : slots) {
             // A copy: finishing or failing the request clears its slot.
             const std::shared_ptr<Request> request = slot.request;
@@ -2308,6 +2324,19 @@ struct Inkling2Core::Impl {
                     continue;
                 }
                 if (dspine || (spark_drafts != 0 && request->position + spark_block <= max_context)) {
+                    if (spark_gate && decoding == 1 && !dspine) {
+                        const std::uint64_t cohort = spark_cohort(*request);
+                        if (cohort != spark_gate_cohort) {
+                            spark_gate->reset();
+                            spark_gate_cohort = cohort;
+                        }
+                        gated        = request;
+                        gated_tokens = request->generated.size();
+                        if (!spark_gate->speculates()) {
+                            batch.push_back(request);
+                            continue;
+                        }
+                    }
                     drafting.push_back(request);
                     continue;
                 }
@@ -2333,11 +2362,7 @@ struct Inkling2Core::Impl {
                     {static_cast<std::uint64_t>(budget),
                      static_cast<std::uint64_t>(max_context - r.position), 1U << 20}));
                 const std::uint32_t available = std::min(steps, room > 0 ? room - 1U : 0U);
-                const std::uint64_t cohort =
-                    (1469598103934665603ULL ^
-                     (static_cast<std::uint64_t>(r.slot) << 32U |
-                      static_cast<std::uint32_t>(r.admitted.time_since_epoch().count()))) *
-                    1099511628211ULL;
+                const std::uint64_t cohort               = spark_cohort(r);
                 const runtime::MtpAdaptiveSignal* signal = &r.spark_signal;
                 width = std::clamp<std::uint32_t>(
                     spark_controller->select({&signal, 1}, {&available, 1}, {&room, 1}, cohort), 1,
@@ -2385,6 +2410,14 @@ struct Inkling2Core::Impl {
             spark_controller->observe_execution(1, spark_round_width, seconds(start, Clock::now()));
         }
         spark_round_width = 0;
+        // A step of the gated request alone: a round, a plain step it chose, or the plain step
+        // after a drafter that proposed nothing, all at the cost of its mode.
+        if (gated && deferred.empty() && alone.empty() && batch.size() + speculative.size() == 1) {
+            const std::size_t now_tokens = gated->generated.size();
+            spark_gate->observe(
+                static_cast<std::uint32_t>(now_tokens > gated_tokens ? now_tokens - gated_tokens : 0),
+                seconds(start, Clock::now()));
+        }
         std::lock_guard lock(stats_mutex);
         stats.decode_rounds += 1;
         stats.decode_row_rounds += alone.size() + batch.size() + speculative.size();
