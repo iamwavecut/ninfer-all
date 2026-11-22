@@ -280,10 +280,12 @@ repetitions, the first having spread ±22%.
   score alike: 15.270 against llama.cpp's 15.195 (+0.49%); per window the mean NLL differs by
   -0.012 to +0.022 nats. On 40 KB, device, host and disk experts give the same perplexity,
   19.560887.
-- **Branched reads.** `ninfer_flint_branches_real_test` (with `NINFER_FLINT_ARTIFACT`) checks
-  that a branch alone reads bit for bit as a plain chunk of its tokens; that beside another
-  branch, first or second, it reads the same whatever that branch holds; and that a read joining
-  the prompt's last chunk leaves nothing of its branches in the sequence.
+- **Branched reads and sequences.** `ninfer_flint_branches_real_test` (with
+  `NINFER_FLINT_ARTIFACT`; `NINFER_FLINT_EXPERTS=host` or `disk` on a 24 GB card) checks that a
+  branch alone reads bit for bit as a plain chunk of its tokens; that beside another branch, first
+  or second, it reads the same whatever that branch holds; that a read joining the prompt's last
+  chunk leaves nothing of its branches in the sequence; and that a prompt on the second sequence
+  reads bit for bit as on the first, one decode step of both giving both the same row.
 
 ### Rounding with the pass
 

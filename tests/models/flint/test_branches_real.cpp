@@ -1,11 +1,14 @@
-// Flint's branched passes on a real artifact (skipped without one):
+// Flint's branched passes and its second sequence on a real artifact (skipped without one):
 //   NINFER_FLINT_ARTIFACT  a Flint .ninfer
+//   NINFER_FLINT_EXPERTS   host or disk places the routed experts (device by default)
 // The prompt route's rounding depends on a pass's width (its rows, and how its tokens spread over
 // the experts), so a branch is compared with a pass of the same shape, bit for bit: alone, it reads
 // as a plain chunk of its tokens; beside another branch, it reads the same whatever that branch's
 // tokens are (it sees none of them), in either place; after a prompt's last chunk in one pass, the
 // sequence keeps the chunk's rows and nothing of the branches. It also prints how far the same
 // logits move with the pass around them (the scale a read's labels move by against a chat's).
+// A prompt on the second sequence reads bit for bit as on the first, and a decode step of both in
+// one pass gives both the same row.
 
 #include "artifact/reader.h"
 #include "core/device.h"
@@ -21,6 +24,7 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -92,12 +96,18 @@ int main() {
     DeviceContext device(0);
     device.bind_to_current_thread();
     const artifact::Reader reader(artifact_path);
-    auto model = flint::load_model(reader, {.artifact = artifact_path}, device);
+    flint::LoadOptions load{.artifact = artifact_path};
+    if (const char* experts = std::getenv("NINFER_FLINT_EXPERTS")) {
+        const std::string_view place(experts);
+        if (place == "host") { load.experts = ExpertResidency::Host; }
+        if (place == "disk") { load.experts = ExpertResidency::Disk; }
+    }
+    auto model = flint::load_model(reader, load, device);
     const auto domain = std::int32_t(model->resources().public_token_count);
     flint::ExecutorOptions options;
     options.max_context   = 4096;
     options.prefill_chunk = 2048;
-    options.sequences     = 1;
+    options.sequences     = 2;
     flint::Executor executor(*model, device, options);
     executor.warm_up();
 
@@ -176,6 +186,26 @@ int main() {
               << ", the sequence after it " << one_pass_next << '\n';
     expect(one_pass_first == 0, "a one-pass branch reads the same whatever the other holds");
     expect(one_pass_next == 0, "a one-pass read leaves nothing of its branches in the sequence");
+
+    // The second sequence: the same prompt reads as on the first, and one decode step of both
+    // gives both the same row.
+    executor.reset(0);
+    executor.forward(0, prefix, 1);
+    executor.forward(0, a, 1);
+    const std::vector<float> first_sequence = host_logits(executor, 1);
+    executor.reset(1);
+    executor.forward(1, prefix, 1);
+    executor.forward(1, a, 1);
+    const double second_sequence = largest_difference(host_logits(executor, 1), first_sequence, domain);
+    const std::vector<std::uint32_t> both{0, 1};
+    const std::vector<std::int32_t> step{b.front(), b.front()};
+    executor.decode(both, step);
+    const std::vector<float> rows = host_logits(executor, 2);
+    const double decoded = largest_difference(column(rows, 2, 0), column(rows, 2, 1), domain);
+    std::cout << "the second sequence against the first: prompt " << second_sequence
+              << ", one decode step of both " << decoded << '\n';
+    expect(second_sequence == 0, "a prompt on the second sequence reads as on the first");
+    expect(decoded == 0, "a decode step of both sequences gives both the same row");
 
     std::cout << (failures == 0 ? "PASS" : "FAILED") << " Flint branches\n";
     return failures == 0 ? 0 : 1;
