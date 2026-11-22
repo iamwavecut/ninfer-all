@@ -262,14 +262,15 @@ void launch_yarn(const Tensor& positions, int rotary_dim, float theta, const Rop
                            launch_yarn_heads<4, 0>(positions, q, nullptr, table, stream) ||
                            launch_yarn_heads<16, 0>(positions, q, nullptr, table, stream) ||
                            launch_yarn_heads<2, 0>(positions, q, nullptr, table, stream);
-    if (!launched && k == nullptr) {
-        // A tensor-parallel Flash-Next share has 12 query heads or one key head.
+    if (!launched) {
+        // A tensor-parallel share rotates its own head counts: Flash-Next's 12 query heads or one
+        // key head, a Qwen3.5 share's 18 and 3, 12 and 2 or 6 and 1, in the same arithmetic.
         rope_generic_kernel<__nv_bfloat16, true><<<positions.ne[0], kSmallBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(positions.data), positions.ne[1],
-            static_cast<__nv_bfloat16*>(q->data), nullptr, q->ne[0], rotary_dim, theta, q->ne[1], 0,
-            q->ne[2], token_stride(q), 0, table);
-    } else if (!launched) {
-        throw std::invalid_argument("rope: YaRN covers the 24/4 and 16/2 Text head geometries");
+            static_cast<__nv_bfloat16*>(q->data),
+            k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), q->ne[0], rotary_dim,
+            theta, q->ne[1], k == nullptr ? 0 : k->ne[1], q->ne[2], token_stride(q),
+            token_stride(k), table);
     }
 }
 

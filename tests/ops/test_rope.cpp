@@ -14,6 +14,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -702,6 +703,26 @@ int main() {
                                 24, 2048);
     failures += run_single_case({"flash k mrope yarn", 256, 64, 3, 7, kTextTheta, 2.25F, 262'144},
                                 2, 2048);
+    // Tensor-parallel shares under YaRN rotate run-time head counts: Qwen3.8-27B's 24/4 heads
+    // split 3:1 (18/3 and 6/1) and evenly (12/2), Qwen3.6-35B's 16/2 split evenly (8/1), in the
+    // pair form and the single-tensor form, 1-D and MRoPE, decode and prompt widths.
+    for (int axes : {1, 3}) {
+        for (const auto& [q_heads, k_heads] :
+             {std::pair{18, 3}, std::pair{12, 2}, std::pair{6, 1}, std::pair{8, 1}}) {
+            const std::string label = "tp share yarn " + std::to_string(q_heads) + "/" +
+                                      std::to_string(k_heads);
+            failures += run_pair_case(
+                {label.c_str(), 256, 64, axes, 1, kTextTheta, 4.0F, 262'144}, q_heads, k_heads, 31);
+            failures += run_pair_case(
+                {label.c_str(), 256, 64, axes, 128, kTextTheta, 4.0F, 262'144}, q_heads, k_heads,
+                4096, 16, 8);
+        }
+        for (int heads : {18, 12, 8, 6, 1}) {
+            const std::string label = "tp share yarn single " + std::to_string(heads);
+            failures += run_single_case(
+                {label.c_str(), 256, 64, axes, 9, kTextTheta, 4.0F, 262'144}, heads, 8192, 8);
+        }
+    }
 
     // Linear position interpolation past a threshold the positions cross, 1-D, MRoPE and the
     // single-tensor form: positions up to the threshold keep their angles.
