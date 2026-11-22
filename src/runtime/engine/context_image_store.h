@@ -555,8 +555,9 @@ public:
     }
 
     // Reads the prefix cache file's images into host pages while they fit, the most recently
-    // used first; a file another build wrote, a missing one, or a record of another profile ends
-    // the read. Returns how many it kept.
+    // used first, also those the disk tier's scan found only on disk; a file another build
+    // wrote, a missing one, or a record of another profile ends the read. Returns how many it
+    // kept.
     std::uint32_t load_file(const std::filesystem::path& file, std::string_view identity) {
         std::ifstream in(file, std::ios::binary);
         ContextImageFileHeader head;
@@ -574,19 +575,22 @@ public:
             Image image;
             if (!read_record_head(in, image)) { break; }
             const std::uint64_t rounded = page_rounded(image.bytes);
-            if (index(image.tokens, image.media) ||
+            const auto known            = index(image.tokens, image.media);
+            if ((known && !images_[*known].pages.empty()) ||
                 host_used_ + rounded > host_budget_) {
                 in.seekg(std::streamoff(image.bytes), std::ios::cur);
                 continue;
             }
-            image.pages = take_pages(image.bytes);
-            if (image.pages.empty()) { break; }
-            if (!read_bytes(in, image)) {
-                give_back(image);
+            // An image the scan found on disk keeps its file and gets its bytes from this one.
+            Image& into = known ? images_[*known] : image;
+            into.pages  = take_pages(into.bytes);
+            if (into.pages.empty()) { break; }
+            if (!read_bytes(in, into)) {
+                give_back(into);
                 break;
             }
-            image.last_used = head.images - n; // the file's order of use
-            images_.push_back(std::move(image));
+            into.last_used = head.images - n; // the file's order of use
+            if (!known) { images_.push_back(std::move(image)); }
             ++kept;
         }
         clock_ = std::max<std::uint64_t>(clock_, head.images);

@@ -1195,16 +1195,36 @@ int main() {
                                                {"--device-snapshot-slots", "2"},
                                                {"--cache-taps-per-request", "2"},
                                                {"--cache-tap-ladder", "2048"},
-                                               {"--cache-tap-min-gap", "64"}}) {
+                                               {"--cache-tap-min-gap", "64"},
+                                               {"--prefix-cache-file", "file.cache",
+                                                "--cache-tap-ladder", "2048"},
+                                               {"--cache-tap-ladder", "2048",
+                                                "--prefix-cache-file", "file.cache"}}) {
         std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
         arguments.insert(arguments.end(), hybrid_flag.begin(), hybrid_flag.end());
         failures += check(parse(arguments).context_cache.mode == ninfer::ContextCacheMode::Hybrid,
                           "a hybrid prefix-cache flag did not keep the default hybrid cache");
+        // The cache file alone also serves the families with an Engine core of their own, whose
+        // caches the catalog's options configure: it parses beside them, the flags recorded for
+        // the server's refusal in the other families.
+        const bool file_alone = hybrid_flag.size() == 2 && hybrid_flag[0] == "--prefix-cache-file";
         for (const std::vector<std::string>& catalog_selector :
              std::vector<std::vector<std::string>>{{"--use-original-prefix-caching"},
-                                                   {"--host-kv-mib", "64"}}) {
+                                                   {"--host-kv-mib", "64"},
+                                                   {"--disk-kv-path", "kv"}}) {
             std::vector<std::string> mixed = arguments;
             mixed.insert(mixed.end(), catalog_selector.begin(), catalog_selector.end());
+            if (file_alone) {
+                const ServeOptions options = parse(std::move(mixed));
+                failures += check(
+                    options.context_cache.mode == ninfer::ContextCacheMode::Legacy &&
+                        options.hybrid_cache_flag == "--prefix-cache-file" &&
+                        options.catalog_cache_flag == catalog_selector[0] &&
+                        options.context_cache.hybrid.persistent_file ==
+                            (std::filesystem::current_path() / "file.cache").lexically_normal(),
+                    "--prefix-cache-file beside a catalog option was not kept for the server");
+                continue;
+            }
             bool rejected = false;
             try {
                 (void)parse(std::move(mixed));

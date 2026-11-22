@@ -281,6 +281,29 @@ void check_cache_file(const std::filesystem::path& root) {
         configure(again, 8, {}, false);
         check(again.load_file(file, "build-1") == 2, "an abandoned save keeps the previous file");
     }
+    {
+        // With a restoring disk tier the scan finds the images first, on disk only; the file
+        // brings them into host pages, and they keep their files.
+        const auto dir = root / "disk-and-file";
+        {
+            Store store;
+            configure(store, 8, dir, false);
+            (void)store.put(a, {}, PrefixReusePath::PrivateEndpoint, 100, save(100, 1));
+            (void)store.put(b, {}, PrefixReusePath::PrivateEndpoint, 200, save(200, 2));
+            PrefixCacheSaveControl control;
+            (void)store.save_file(file, "build-1", control);
+            (void)store.spill_to_disk();
+        }
+        Store store;
+        configure(store, 8, dir, true);
+        check(store.images().size() == 2 && store.host_used() == 0, "the scan finds both files");
+        check(store.load_file(file, "build-1") == 2 && store.images().size() == 2 &&
+                  store.host_used() == 8 * kPage,
+              "the file brings the scanned images into host pages");
+        check(!store.images()[0].file.empty() && !store.images()[1].file.empty(),
+              "the scanned images keep their files");
+        check(loads(store, a, 100, 1) && loads(store, b, 200, 2), "both images read back");
+    }
 }
 
 std::vector<TapHint> boundaries(std::initializer_list<std::uint32_t> at) {
