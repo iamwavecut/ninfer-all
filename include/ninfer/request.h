@@ -97,7 +97,7 @@ struct StopPolicy {
 };
 
 // What the reasoning-loop guard does when the open thinking keeps repeating itself (every 512
-// thinking tokens: the last 2,048 characters repeat a period of at most 64 characters, or the share
+// thinking tokens: the last 1,024 characters repeat a period of at most 64 characters, or the share
 // of the last 2,000 words inside a 12-word passage seen three times reaches 25 %).
 enum class ReasoningLoopAction : std::uint8_t {
     Off,      // no check

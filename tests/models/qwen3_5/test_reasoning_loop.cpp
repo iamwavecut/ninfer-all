@@ -218,26 +218,18 @@ int main() {
         expect(periodic_tail(tail), "bounded tail is periodic");
         expect(tail.size() <= 8U * kLoopTailChars, "tail stays bounded");
     }
-    // Early short-window coverage catches tight loops before 2000 words while staying quiet on
-    // varied work and a two-time recap; periodic_tail catches 1024-char exact repeats while
-    // counting_tail still requires the full 2048-char window.
+    // A period is read in the last 1,024 characters, a counter in the last 2,048.
     {
-        std::string early_loop = varied(30);
-        for (int i = 0; i < 16; ++i) { early_loop += pass; }
-        const LoopCoverage early = repeated_passage_coverage_detail(words_of(early_loop));
-        expect(early.long_window == 0.0 && early.short_window >= kLoopShortCoverage,
-               "early short window detects tight loop before 2000 words");
-        const LoopCoverage varied_cov = repeated_passage_coverage_detail(words_of(varied(100)));
-        expect(varied_cov.short_window < 0.05, "early short window stays quiet on varied text");
-        std::string short_digits;
-        while (short_digits.size() < kLoopShortTailChars + 64) { short_digits += "58747693387"; }
-        expect(periodic_tail(short_digits), "periodic_tail catches 1024-char exact repeat");
-        std::string short_counter;
-        for (int i = 1; short_counter.size() < kLoopShortTailChars + 64; ++i) {
-            short_counter += "'time" + std::to_string(i) + "',";
+        std::string digits;
+        while (digits.size() < kLoopPeriodChars + 64) { digits += "58747693387"; }
+        expect(periodic_tail(digits), "a period in the last 1,024 characters");
+        expect(!periodic_tail(digits.substr(0, kLoopPeriodChars - 1)), "fewer than 1,024 characters hold no period");
+        std::string counter;
+        for (int i = 1; counter.size() < kLoopPeriodChars + 64; ++i) {
+            counter += "'time" + std::to_string(i) + "',";
         }
-        expect(short_counter.size() < kLoopTailChars && !counting_tail(short_counter),
-               "counting_tail requires full 2048-char window");
+        expect(counter.size() < kLoopTailChars && !counting_tail(counter),
+               "a counter below 2,048 characters");
     }
     if (failures != 0) { return 1; }
     std::cout << "OK reasoning loop (varied " << novel << ", looping " << loop << ", recap "

@@ -22,25 +22,16 @@
 
 namespace ninfer::models::qwen3_5 {
 
-inline constexpr std::uint32_t kLoopCheckTokens  = 256; // reasoning tokens between two checks
-inline constexpr std::size_t kLoopPassageWords   = 12;  // words in one passage (shared across windows)
-inline constexpr std::uint32_t kLoopRepeats      = 3;   // occurrences that make a passage repeated
-inline constexpr std::size_t kLoopWindowWords    = 2000; // long window words whose coverage is measured
-inline constexpr std::size_t kLoopShortWindow    = 512;  // early tight-loop window words
-inline constexpr std::uint32_t kLoopShortMaxTok  = 2048; // early-phase token ceiling for short window
-inline constexpr std::uint32_t kLoopShortConfirm = 2;    // consecutive short-window hits required
-inline constexpr std::size_t kLoopHistoryWords   = 30000; // how far back passages are counted
-inline constexpr double kLoopCoverage            = 0.25;  // coverage at which the long window fires
-inline constexpr double kLoopShortCoverage       = 0.35;  // tighter threshold for confirmed early check
-inline constexpr std::size_t kLoopTailChars      = 2048;  // reasoning characters read for counting/periodic tail
-inline constexpr std::size_t kLoopShortTailChars = 1024;  // early exact periodic tail length (no counter)
-inline constexpr std::size_t kLoopTailPeriod     = 64;    // a period at most this long repeats
-inline constexpr std::size_t kLoopCounterSteps   = 8;     // periods a counter moves through at least
-
-struct LoopCoverage {
-    double long_window  = 0.0;
-    double short_window = 0.0;
-};
+inline constexpr std::uint32_t kLoopCheckTokens = 512; // reasoning tokens between two checks
+inline constexpr std::size_t kLoopPassageWords  = 12;  // words in one passage
+inline constexpr std::uint32_t kLoopRepeats     = 3;   // occurrences that make a passage repeated
+inline constexpr std::size_t kLoopWindowWords = 2000; // the recent words whose coverage is measured
+inline constexpr std::size_t kLoopHistoryWords = 30000; // how far back passages are counted
+inline constexpr double kLoopCoverage          = 0.25;  // coverage at which the guard fires
+inline constexpr std::size_t kLoopTailChars    = 2048;  // reasoning characters a counter is read in
+inline constexpr std::size_t kLoopPeriodChars  = 1024;  // reasoning characters a period is read in
+inline constexpr std::size_t kLoopTailPeriod   = 64;    // a period at most this long repeats
+inline constexpr std::size_t kLoopCounterSteps = 8;     // periods a counter moves through at least
 
 // Appends the words of UTF-8 `bytes` to `words` as 64-bit hashes. A word is a run of letters,
 // digits and '_' (ASCII letters lower-cased); every other non-space character is a word of its own,
@@ -53,16 +44,15 @@ void append_words(std::string_view bytes, std::string& partial, std::vector<std:
 // occur at least kLoopRepeats times in `words` (the caller passes the last kLoopHistoryWords at
 // most). Zero while fewer than kLoopWindowWords words exist.
 [[nodiscard]] double repeated_passage_coverage(std::span<const std::uint64_t> words);
-[[nodiscard]] LoopCoverage repeated_passage_coverage_detail(std::span<const std::uint64_t> words);
 
 // Appends `bytes` to the bounded tail of the reasoning that periodic_tail reads. It holds at least
 // kLoopTailChars characters whenever that many have been emitted.
 void append_tail(std::string_view bytes, std::string& tail);
 
-// True when the last kLoopTailChars characters of `text` are one period of at most kLoopTailPeriod
-// characters repeated (Strata's #1753). The comparison is byte-exact where Strata folds case, which
-// no loop this catches depends on. False while fewer than kLoopTailChars characters have been
-// emitted.
+// True when the last kLoopPeriodChars characters of `text` are one period of at most
+// kLoopTailPeriod characters repeated (Strata's #1753 reads 2,048 characters). The comparison is
+// byte-exact where Strata folds case, which no loop this catches depends on. False while fewer
+// than kLoopPeriodChars characters have been emitted.
 [[nodiscard]] bool periodic_tail(std::string_view text);
 
 // True when the last kLoopTailChars characters of `text`, with every run of ASCII digits read as

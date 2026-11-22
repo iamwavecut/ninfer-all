@@ -239,7 +239,6 @@ struct SemanticThinkingState {
     std::string loop_tail;
     std::vector<std::uint64_t> loop_round;
     std::uint32_t loop_next_check      = kLoopCheckTokens;
-    std::uint32_t loop_short_hits      = 0;
     bool loop_detected                 = false;
     std::uint32_t loop_thinking_tokens = 0;
     float loop_coverage                = 0.0F;
@@ -630,14 +629,14 @@ public:
     [[nodiscard]] bool model_opens_reasoning() const noexcept { return gemma || flint || inkling; }
 
     // The repeated-passage coverage of the committed thinking plus the previewed round's words.
-    [[nodiscard]] LoopCoverage loop_coverage_detail(const std::vector<std::uint64_t>& round) const {
+    [[nodiscard]] double loop_coverage(const std::vector<std::uint64_t>& round) const {
         const std::size_t keep =
             kLoopHistoryWords > round.size() ? kLoopHistoryWords - round.size() : 0;
         std::vector<std::uint64_t> words(
             loop_words.end() - static_cast<std::ptrdiff_t>(std::min(keep, loop_words.size())),
             loop_words.end());
         words.insert(words.end(), round.begin(), round.end());
-        return repeated_passage_coverage_detail(words);
+        return repeated_passage_coverage(words);
     }
 
     // Whether the loop guard reads this point of the output: Qwen's thinking, opened by the prompt
@@ -1082,31 +1081,12 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         thinking_tokens >= semantic.loop_next_check) {
         semantic.loop_next_check = (thinking_tokens / kLoopCheckTokens + 1U) * kLoopCheckTokens;
         // Strata reads a periodic tail as full coverage before its word measure; a tail that is
-        // periodic around a counter (at >= 2048 chars) reads the same. The early 512-word window
-        // only triggers within the first kLoopShortMaxTok thinking tokens AND after kLoopShortConfirm
-        // consecutive hits to prevent false positives on code re-drafting.
-        double coverage = 0.0;
-        bool triggered  = false;
-        if (periodic_tail(semantic.loop_tail) || counting_tail(semantic.loop_tail)) {
-            coverage  = 1.0;
-            triggered = true;
-        } else {
-            const LoopCoverage detail = impl_->loop_coverage_detail(semantic.loop_round);
-            if (detail.long_window >= kLoopCoverage) {
-                coverage  = detail.long_window;
-                triggered = true;
-            } else if (thinking_tokens <= kLoopShortMaxTok &&
-                       detail.short_window >= kLoopShortCoverage) {
-                ++semantic.loop_short_hits;
-                if (semantic.loop_short_hits >= kLoopShortConfirm) {
-                    coverage  = detail.short_window;
-                    triggered = true;
-                }
-            } else {
-                semantic.loop_short_hits = 0;
-            }
-        }
-        if (triggered) {
+        // periodic around a counter reads the same.
+        const double coverage =
+            periodic_tail(semantic.loop_tail) || counting_tail(semantic.loop_tail)
+                ? 1.0
+                : impl_->loop_coverage(semantic.loop_round);
+        if (coverage >= kLoopCoverage) {
             semantic.loop_detected        = true;
             semantic.loop_thinking_tokens = thinking_tokens;
             semantic.loop_coverage        = static_cast<float>(coverage);
