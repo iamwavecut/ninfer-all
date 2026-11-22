@@ -517,8 +517,8 @@ position of `--config` on the command line. A later layer overrides an earlier o
   Qwen3.8-Flash-Next).
 
 Every switch of every program also takes a `--no-` form, so the command line can turn off a switch
-that a file turns on. `ninfer-serve` records the merged options, with the API key redacted, as
-`arguments` in the request log's `server_start` record. In router mode the router's files and
+that a file turns on. `ninfer-serve` records the merged options, with the API key and admin
+token redacted, as `arguments` in the request log's `server_start` record. In router mode the router's files and
 command line are layers above each model's preset sections.
 
 The container image keeps the files in `/opt/ninfer/configs`. Its working directory is `/models`;

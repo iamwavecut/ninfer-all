@@ -663,6 +663,10 @@ std::string serve_usage_text(const char* argv0) {
            "                                on port N with a worker of their own (default off)\n"
            "  --api-key KEY                 require this bearer or x-api-key value (default:\n"
            "                                none)\n"
+           "  --admin-token KEY             the admin credential; enables the admin routes, of\n"
+           "                                which POST /shutdown, the HTTP form of the Ctrl+Break\n"
+           "                                graceful stop, is the first; the request must carry it\n"
+           "                                as a bearer or x-api-key (default: off)\n"
            "  --cors                        send permissive CORS headers for browser clients\n"
            "  --no-webui                    do not serve a WebUI built in with\n"
            "                                NINFER_WEBUI_DIR on GET /\n"
@@ -804,6 +808,13 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
+            continue;
+        }
+        if (arg == "--admin-token") {
+            options.admin_token = require_value("--admin-token");
+            if (options.admin_token.empty()) {
+                throw std::invalid_argument("--admin-token must not be empty");
+            }
             continue;
         }
         if (arg == "--model-id") {
@@ -2107,7 +2118,8 @@ ServeOptions parse_serve_options(const product::CommandLine& command_line) {
         },
         &effective);
     if (artifact_given) { options.artifact_path = *command_line.artifact; }
-    options.effective_arguments = product::redact_arguments(std::move(effective), {"--api-key"});
+    options.effective_arguments =
+        product::redact_arguments(std::move(effective), {"--api-key", "--admin-token"});
     options.startup_argv        = {command_line.program};
     if (artifact_given) { options.startup_argv.push_back(*command_line.artifact); }
     options.startup_argv.insert(options.startup_argv.end(), options.effective_arguments.begin(),
@@ -2134,7 +2146,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         product::read_command_line(argc, argv, product::PositionalArtifact::Taken));
     std::vector<std::string> startup;
     for (int i = 0; i < argc; ++i) { startup.emplace_back(argv[i] == nullptr ? "" : argv[i]); }
-    options.startup_argv = product::redact_arguments(std::move(startup), {"--api-key"});
+    options.startup_argv =
+        product::redact_arguments(std::move(startup), {"--api-key", "--admin-token"});
     return options;
 }
 

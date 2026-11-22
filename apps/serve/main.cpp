@@ -296,6 +296,10 @@ int main(int argc, char** argv) {
 
     try {
         ninfer::serve::HttpServer server(options, logger, logging.terminal_panel());
+        // POST /shutdown (opt-in via --admin-token) takes the exact Ctrl+Break path: the
+        // Terminate dispatch is non-blocking, so the HTTP 202 is acknowledged first and the stop
+        // (listener close, requests cancelled, prefix-cache save, exit) outlives the response.
+        server.on_shutdown([] { (void)StopEvents::dispatch(StopEvent::Terminate); });
         if (!server.bind()) {
             operational_log.bind_failure(options.host, options.port);
             return 1;

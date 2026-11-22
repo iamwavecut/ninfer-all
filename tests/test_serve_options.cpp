@@ -56,6 +56,7 @@ int launch_configuration_tests() {
                                                "host = 0.0.0.0\n"
                                                "port = 9000\n"
                                                "api-key = do-not-log\n"
+                                               "admin-token = stop-secret\n"
                                                "max-context = 32768\n"
                                                "spec = mtp\n"
                                                "draft-tokens = 4\n"
@@ -66,7 +67,9 @@ int launch_configuration_tests() {
         parse({"ninfer-serve", "--config", base, "--port", "9100", "--spec", "none"});
     failures += check(layered.artifact_path == "from-file.ninfer" && layered.host == "0.0.0.0" &&
                           layered.port == 9100 && layered.max_context == 32768 &&
-                          layered.api_key == "do-not-log" && layered.device_profile == "off",
+                          layered.api_key == "do-not-log" &&
+                          layered.admin_token == "stop-secret" &&
+                          layered.device_profile == "off",
                       "a configuration file's options and artifact did not reach the server");
     failures += check(layered.speculative.backend == ninfer::SpeculativeBackend::None &&
                           layered.speculative.draft_tokens == 0 &&
@@ -75,11 +78,11 @@ int launch_configuration_tests() {
     bool secret_logged = false;
     bool redacted      = false;
     for (const std::string& argument : layered.effective_arguments) {
-        secret_logged = secret_logged || argument == "do-not-log";
+        secret_logged = secret_logged || argument == "do-not-log" || argument == "stop-secret";
         redacted      = redacted || argument == "<redacted>";
     }
     failures += check(!secret_logged && redacted,
-                      "the merged arguments must carry the API key redacted");
+                      "the merged arguments must carry the API key and admin token redacted");
     failures += check(layered.model_layers.size() == 2 &&
                           layered.model_layers[0].source == base &&
                           layered.model_layers[1].source == "command line",
@@ -1494,6 +1497,7 @@ int main() {
     // Every option the parser accepts is described in the grouped help.
     const std::string serve_help = serve_usage_text("ninfer-serve");
     for (const std::string_view flag : {"--adaptive-mtp",
+                                        "--admin-token",
                                         "--api-key",
                                         "--assistant-prefill",
                                         "--auto-long-anchors",
@@ -1702,9 +1706,17 @@ int main() {
                       "--kv-capacity auto did not select automatic sizing");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
-                                       "requests.jsonl", "--api-key", "do-not-log"});
+                                       "requests.jsonl", "--api-key", "do-not-log",
+                                       "--admin-token", "stop-secret"});
     failures += check(logged.request_log_jsonl == "requests.jsonl",
                       "--request-log-jsonl did not preserve its path");
+    failures += check(logged.admin_token == "stop-secret",
+                      "--admin-token did not reach the serving options");
+    bool admin_token_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--admin-token", ""});
+    } catch (const std::invalid_argument&) { admin_token_rejected = true; }
+    failures += check(admin_token_rejected, "--admin-token was accepted empty");
     failures += check(logged.request_log_max_mib == 0 && logged.request_log_keep == 4,
                       "request log rotation was not off by default");
     const ServeOptions rotated =
@@ -1724,11 +1736,11 @@ int main() {
     bool secret_present    = false;
     bool redaction_present = false;
     for (const std::string& argument : logged.startup_argv) {
-        secret_present    = secret_present || argument == "do-not-log";
+        secret_present    = secret_present || argument == "do-not-log" || argument == "stop-secret";
         redaction_present = redaction_present || argument == "<redacted>";
     }
-    failures += check(!secret_present, "startup argv retained the API key");
-    failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
+    failures += check(!secret_present, "startup argv retained the API key or admin token");
+    failures += check(redaction_present, "startup argv omitted the redaction marker");
 
     failures += check(!defaults.fast_prefill_kernel, "the fast prefill kernel must default off");
     failures += check(defaults.speculative.mtp_policy == ninfer::MtpDraftPolicy::Fixed &&
