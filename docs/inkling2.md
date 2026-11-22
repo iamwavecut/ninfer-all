@@ -595,8 +595,12 @@ and 117.8 with DSpark, against 109.7 and 125.3 on the device; disk experts, the 
 page cache, 99.9 and 114.3 with DSpark. Without the profile the cache fills as the first requests
 route: host 86.2 and 87.7 tok/s (95.1% hits), disk 45.6 (93.5%). The profile adds 0.6 to 0.9 s to
 a host start and 1.6 s to a disk start. With a cache of part of the experts the profile also raises
-the hits, but the first tokens decode slower: with `--expert-cache-mib 8192` (1,879 slots), 1,536
-tokens decode 1.05 times as fast (85.2 and 87.8 tok/s against 81.1 and 83.1, 98.2% hits against
-97.3%) and 384 tokens 0.89 to 0.99 times as fast in three pairs (73.6-77.9 against 79.0-83.0); with
-4,096 MiB, 384 tokens decode 0.98 times as fast on the essay (three pairs) and 0.89 times on the
-Python task (one pair). Every run's text equals the device's.
+the hits: with `--expert-cache-mib 8192` (1,879 slots) a build of November 21 decoded 1,536 tokens
+1.05 times as fast (85.2 and 87.8 tok/s against 81.1 and 83.1, 98.2% hits against 97.3%), and its
+first 384 tokens 0.89 to 0.99 times as fast in three pairs (73.6-77.9 against 79.0-83.0; with
+4,096 MiB 0.98 times on the essay and 0.89 times on the Python task), each run's text equal to the
+device's. The build of November 22 no longer decodes the first tokens slower: three essays after
+a start decode at 87.1, 90.0 and 89.9 tok/s with the built-in profile and at 87.3, 90.1 and 90.0
+with an all-zero one (8,192 MiB, the same text). With 4,096 MiB the CPU share, 18 pinned threads
+by measured speeds, decodes the three essays at 61.6-61.9 tok/s against 58.8-59.5 with
+`--expert-dma-share 1`, which copies every miss, with the same text.
