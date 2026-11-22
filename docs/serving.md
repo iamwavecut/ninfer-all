@@ -958,6 +958,16 @@ they advance during a long request rather than at its completion, and their rati
 | `ninfer:context_transfer_seconds_total` | counter | time admissions waited for context-cache transfers |
 | `ninfer:context_historical_fork_hits_total` | counter | admissions that forked a historical checkpoint instead of the latest endpoint |
 | `ninfer:context_occupancy{pool}` | gauge | `device_state_slots`, `host_state_slots`, `device_main_kv_pages`, `device_backend_kv_pages`, `host_kv_bytes` in use |
+| `ninfer:gpu_utilization_percent{device}` | gauge | share of NVML's last sample period in which a kernel ran, 0-100 |
+| `ninfer:gpu_memory_utilization_percent{device}` | gauge | share of that period in which device memory was read or written, 0-100 |
+| `ninfer:gpu_memory_used_bytes{device}`, `ninfer:gpu_memory_total_bytes{device}` | gauge | device memory in use by all processes, and the device's total |
+| `ninfer:gpu_temperature_celsius{device}` | gauge | GPU die temperature |
+| `ninfer:gpu_power_watts{device}`, `ninfer:gpu_power_limit_watts{device}` | gauge | board power draw and the enforced power limit |
+| `ninfer:gpu_sm_clock_mhz{device}`, `ninfer:gpu_memory_clock_mhz{device}` | gauge | SM and memory clocks |
+
+The `ninfer:gpu_` series are read from NVML at each request to `/metrics`, for every CUDA device the
+process sees (`device` is its CUDA ordinal, matched to NVML by PCI bus id). A value NVML does not
+report gives no sample; a host without NVML gives none of these series.
 
 ### WebUI
 

@@ -7,11 +7,13 @@
 // RuntimeStats, so rates advance during a long request instead of jumping at its completion. The
 // ninfer:-prefixed series report what llama.cpp has no name for.
 
+#include "core/gpu_telemetry.h"
 #include "serve/generation_service.h"
 #include "serve/load_report.h"
 
 #include <cstdint>
 #include <mutex>
+#include <span>
 #include <string>
 
 namespace ninfer::serve {
@@ -27,7 +29,10 @@ public:
     // overload, an invalid or oversized prompt or media.
     void record_rejection();
 
-    [[nodiscard]] std::string render(const LoadCapacity& capacity, const LoadSample& sample) const;
+    // `gpus` are the NVML readings of the process's devices (ninfer::read_gpu_telemetry()); a
+    // field NVML did not read gives no sample.
+    [[nodiscard]] std::string render(const LoadCapacity& capacity, const LoadSample& sample,
+                                     std::span<const ninfer::GpuReading> gpus = {}) const;
 
 private:
     mutable std::mutex mutex_;
