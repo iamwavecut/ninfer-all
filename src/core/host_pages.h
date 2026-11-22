@@ -4,6 +4,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <span>
+#include <vector>
 
 namespace ninfer {
 
@@ -27,6 +29,14 @@ public:
     // HostMemoryRegistration).
     void pin(bool device_mapped = false);
 
+    // Pins the block from its start in parts that end at `ends` (ascending, past each other, the
+    // last at most size()), one registration each, until a part would end past `limit` or the host
+    // refuses one (Windows charges page-locked memory to a GPU's shared segment, about half the
+    // RAM). Returns the bytes pinned: the end of the last pinned part, or 0. The pages past them
+    // go back to the system and size() becomes that end; their bytes are lost. Faults in the pages
+    // nobody wrote first, as pin().
+    std::size_t pin_prefix(std::span<const std::size_t> ends, std::size_t limit);
+
     [[nodiscard]] std::byte* data() const noexcept { return data_; }
 
     [[nodiscard]] std::size_t size() const noexcept { return bytes_; }
@@ -34,7 +44,8 @@ public:
 private:
     std::byte* data_   = nullptr;
     std::size_t bytes_ = 0;
-    std::unique_ptr<HostMemoryRegistration> registration_;
+    std::size_t mapping_bytes_ = 0; // the reservation, which size() may end before
+    std::vector<std::unique_ptr<HostMemoryRegistration>> registrations_;
 };
 
 } // namespace ninfer

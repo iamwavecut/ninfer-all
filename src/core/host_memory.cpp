@@ -11,6 +11,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dxgi1_4.h>
+
+#include <cstring>
 #endif
 
 namespace ninfer {
@@ -162,6 +165,66 @@ std::optional<std::uint64_t> available_host_memory_bytes() noexcept {
         return std::nullopt;
 #endif
     } catch (...) { return std::nullopt; }
+}
+
+std::optional<std::uint64_t> pinnable_host_memory_bytes(const void* luid) noexcept {
+#if defined(_WIN32)
+    try {
+        // dxgi.dll is loaded when asked, not linked.
+        if (HMODULE dxgi = LoadLibraryA("dxgi.dll"); dxgi != nullptr) {
+            using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+            const auto create = reinterpret_cast<CreateFactory>(
+                reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+            IDXGIFactory1* factory = nullptr;
+            std::optional<std::uint64_t> remaining;
+            if (create != nullptr && luid != nullptr &&
+                SUCCEEDED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) &&
+                factory != nullptr) {
+                IDXGIAdapter1* adapter = nullptr;
+                for (UINT i = 0; !remaining && factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND;
+                     ++i) {
+                    DXGI_ADAPTER_DESC1 desc{};
+                    IDXGIAdapter3* adapter3 = nullptr;
+                    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                    if (adapter != nullptr && SUCCEEDED(adapter->GetDesc1(&desc)) &&
+                        std::memcmp(&desc.AdapterLuid, luid, sizeof(desc.AdapterLuid)) == 0 &&
+                        SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3),
+                                                          reinterpret_cast<void**>(&adapter3))) &&
+                        adapter3 != nullptr &&
+                        SUCCEEDED(adapter3->QueryVideoMemoryInfo(
+                            0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info)) &&
+                        info.Budget > 0) {
+                        remaining = info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
+                    }
+                    if (adapter3 != nullptr) { adapter3->Release(); }
+                    if (adapter != nullptr) { adapter->Release(); }
+                    adapter = nullptr;
+                }
+                factory->Release();
+            }
+            FreeLibrary(dxgi);
+            if (remaining) { return remaining; }
+        }
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (!GlobalMemoryStatusEx(&status)) { return std::nullopt; }
+        const std::uint64_t half = status.ullTotalPhys / 2;
+        return half > (8ULL << 30) ? half - (8ULL << 30) : 0;
+    } catch (...) { return std::nullopt; }
+#elif defined(__linux__)
+    (void)luid;
+    // WSL2 (/dev/dxg) charges a GPU's page-locked memory to the same WDDM segment; the Linux side
+    // has no DXGI to ask.
+    std::error_code missing;
+    if (!std::filesystem::exists("/dev/dxg", missing)) { return std::nullopt; }
+    const auto total = total_host_memory_bytes();
+    if (!total) { return std::nullopt; }
+    const std::uint64_t half = *total / 2;
+    return half > (8ULL << 30) ? half - (8ULL << 30) : 0;
+#else
+    (void)luid;
+    return std::nullopt;
+#endif
 }
 
 std::optional<std::uint64_t> total_host_memory_bytes() noexcept {

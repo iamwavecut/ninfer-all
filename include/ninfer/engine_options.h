@@ -455,6 +455,11 @@ struct HybridExpertOptions {
     std::filesystem::path mirror;
     // Disk experts: NVMe reads straight into device memory (ExpertDirect).
     ExpertDirect direct = ExpertDirect::Auto;
+    // Host experts: at most this many bytes pinned in host memory, in the artifact's order; the
+    // rest are read from the artifact's files as disk experts are. Unset (default): as many as fit
+    // the host's available memory and, on Windows, what the GPU's shared memory segment can still
+    // lock (about half the RAM) less 4 GiB.
+    std::optional<std::uint64_t> host_bytes;
 };
 
 // The n-gram table of Qwen3.8-Flash-Next's per-layer embedding or DeepSeek-V4.1-Flash's Engram: the

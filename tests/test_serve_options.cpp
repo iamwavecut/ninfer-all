@@ -294,6 +294,17 @@ int main() {
                              "--expert-dma-share", "auto", "--expert-dma-share", "0.5",
                              "--expert-dma-share", "auto"}).hybrid_experts.dma_share.has_value() == false,
                       "server did not preserve an automatic hybrid DMA share");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host",
+                             "--expert-host-mib", "24576"}).hybrid_experts.host_bytes ==
+                          (24576ULL << 20) &&
+                          !parse({"ninfer-serve", "model.ninfer"}).hybrid_experts.host_bytes,
+                      "server did not preserve --expert-host-mib");
+    {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--expert-host-mib", "1.5"}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted a fractional --expert-host-mib");
+    }
     const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});

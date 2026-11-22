@@ -648,6 +648,13 @@ struct ExpertMisses::Impl {
         if (!failure) { failure = std::current_exception(); }
     }
 
+    // A disk expert's projection in the pinned block (host experts it holds,
+    // ExpertLocation::pinned), which needs no read; else null.
+    static const std::byte* held(const MissLayer::Projection& projection, std::int32_t expert) {
+        return projection.located.empty() ? nullptr
+                                          : projection.located[std::size_t(expert)].pinned;
+    }
+
     // Reads one projection of a disk expert into `host_out`; with a drive mirror, a run in an
     // odd stripe from the mirror's copy.
     void fetch(const MissLayer::Projection& projection, std::int32_t expert, std::byte* host_out) {
@@ -1107,11 +1114,14 @@ struct ExpertMisses::Impl {
         for (int k = 0; k < 3; ++k) {
             const auto& p  = layer.projections[std::size_t(k)];
             std::byte* at  = target + offset;
-            if (disk && rank.window) {
+            const std::byte* pinned = held(p, e);
+            if (disk && rank.window && pinned == nullptr) {
                 fetch_direct(rank, kernel, p, e, at);
             } else {
                 const void* source;
-                if (disk) {
+                if (pinned != nullptr) {
+                    source = pinned;
+                } else if (disk) {
                     if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
                         throw std::runtime_error("expert misses: file staging exhausted");
                     }
@@ -1210,7 +1220,9 @@ struct ExpertMisses::Impl {
                     for (int k = 0; k < 3; ++k) {
                         const auto& p = layer.projections[std::size_t(k)];
                         const void* where;
-                        if (disk) {
+                        if (const std::byte* pinned = held(p, e)) {
+                            where = pinned;
+                        } else if (disk) {
                             if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
                                 throw std::runtime_error("expert misses: file staging exhausted");
                             }
@@ -1269,7 +1281,9 @@ struct ExpertMisses::Impl {
                 cpu_work_done += ExpertSplit::cpu_work(expert_megabytes(layer), int(job.pairs.size()));
                 for (int k = 0; k < 3; ++k) {
                     const auto& proj = layer.projections[std::size_t(k)];
-                    if (disk) {
+                    if (const std::byte* pinned = held(proj, job.expert)) {
+                        job.bytes[std::size_t(k)] = reinterpret_cast<const std::uint8_t*>(pinned);
+                    } else if (disk) {
                         if (file_used + std::uint64_t(proj.expert_bytes) > file_half_bytes) {
                             throw std::runtime_error("expert misses: file staging exhausted");
                         }

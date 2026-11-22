@@ -247,6 +247,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         reader,
         {.artifact = options.artifact_path,
          .experts  = options.expert_residency,
+         .expert_host_bytes = options.hybrid_experts.host_bytes,
          .dspark   = dspark,
          .draft_experts = speculative.draft_experts,
          .vision   = vision,
@@ -479,13 +480,16 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         const auto experts = memory.experts;
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "DeepSeek-V4.1: experts in %s, cache %.0f MiB (%u slots), %u layer bank(s) %.0f MiB, "
-            "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB",
-            options.expert_residency == ExpertResidency::Host
-                ? "pinned host memory"
-                : "the artifact's files, read into bounded buffers through the page cache",
+            "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB, "
+            "expert sources in the files %.0f MiB",
+            options.expert_residency == ExpertResidency::Disk
+                ? "the artifact's files, read into bounded buffers through the page cache"
+            : model->expert_file_bytes() > 0 ? "pinned host memory and the artifact's files"
+                                             : "pinned host memory",
             double(experts.cache_bytes) / 1048576, experts.cache_slots, experts.banks,
             double(experts.bank_bytes) / 1048576, double(experts.metadata_bytes) / 1048576,
-            double(experts.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576);
+            double(experts.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576,
+            double(model->expert_file_bytes()) / 1048576);
         const auto cpu = instance->executor->expert_cpu_description();
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "DeepSeek-V4.1: missing experts %s; cache seeded %s",

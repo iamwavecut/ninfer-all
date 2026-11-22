@@ -779,8 +779,9 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         auto model = models::qwen3_5::materialize_model(
             std::move(plan), device, &options.startup_observer,
             artifact::MaterializeOptions{
-                .suspendable     = options.suspend.enabled,
-                .retained_reader = options.suspend.enabled ? retained_reader : nullptr});
+                .suspendable       = options.suspend.enabled,
+                .retained_reader   = options.suspend.enabled ? retained_reader : nullptr,
+                .files_after_bytes = options.hybrid_experts.host_bytes});
         device.synchronize();
         // An automatic Host budget is sized now that the weights are in place, from what the host
         // still has; the media caches grow after startup, so they are reserved too.
@@ -1049,6 +1050,12 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     program.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
     const auto& stats = instance->model->storage_stats();
+    if (stats.files_bytes > 0) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "host experts: %.0f MiB pinned, %.0f MiB read from the artifact's files "
+                           "(the host could not pin more, or --expert-host-mib)",
+                           double(stats.pinned_bytes) / 1048576, double(stats.files_bytes) / 1048576);
+    }
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);
     summary.model_name   = instance->model->info().name;

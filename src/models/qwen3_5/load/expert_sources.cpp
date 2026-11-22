@@ -77,7 +77,12 @@ ExpertBlob blob(const artifact::Reader& reader, const artifact::MaterializedArti
                  std::span<const Span> spans, ExpertResidency residency) {
     ExpertBlob out;
     for (const auto& span : spans) { out.bytes = expert_add(out.bytes, span.bytes); }
-    if (residency == ExpertResidency::Host) {
+    // A host expert the pinned block could not hold is read from the files, as on disk.
+    const bool pinned =
+        residency == ExpertResidency::Host &&
+        std::all_of(spans.begin(), spans.end(),
+                    [&](const Span& span) { return backing.pinned(span.object); });
+    if (pinned) {
         if (spans.size() != 1) {
             throw artifact::ArtifactError(
                 "native host expert plane must be contiguous; disk residency accepts fragments");
@@ -144,7 +149,8 @@ NativeExpertSources expert_sources(const artifact::Reader& reader,
                                     const std::filesystem::path& artifact_path) {
     NativeExpertSources out;
     if (options.expert_residency == ExpertResidency::Device) { return out; }
-    if (options.expert_residency == ExpertResidency::Disk) {
+    // Host experts the pinned block could not hold are read from the files too.
+    if (options.expert_residency == ExpertResidency::Disk || backing.stats().files_bytes > 0) {
         if (artifact_path.empty()) {
             throw std::invalid_argument("disk expert residency requires the artifact entry path");
         }

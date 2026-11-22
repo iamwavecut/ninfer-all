@@ -86,7 +86,9 @@ std::vector<ExpertBlob> expert_blobs(const artifact::Reader& reader,
         blob.bytes = rows * row_bytes;
         blob.zero_tail = kRowTail;
         const auto offset = start + e * blob.bytes;
-        if (reference.residency == artifact::Residency::Pinned) {
+        // A host expert the pinned block could not hold is read from the files, as on disk.
+        if (reference.residency == artifact::Residency::PinnedOrFiles &&
+            backing.pinned(part.object)) {
             const auto* parent = backing.pinned_parent(part.object).data;
             blob.pinned = parent + offset;
             blob.pinned_region = reinterpret_cast<std::uintptr_t>(parent);
@@ -261,7 +263,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             moe.expert_scale  = b.direct(m + "expert_scale", {e}, QType::FP32);
             if (offload) {
                 const auto residency = options.experts == ExpertResidency::Host
-                                           ? artifact::Residency::Pinned : artifact::Residency::Values;
+                                           ? artifact::Residency::PinnedOrFiles
+                                           : artifact::Residency::Values;
                 expert_references.push_back({
                     binder.parameter(m + "gate_up", {e * 2 * w, h}, residency),
                     binder.parameter(m + "down", {e * h, w}, residency)});
@@ -393,7 +396,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     info.artifact_id     = reader.artifact_id();
     auto pending         = std::move(b.weights);
     auto materialization = std::move(binder).finish();
-    auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
+    auto backing = artifact::materialize(reader, std::move(materialization), device, observer,
+                                         nullptr, {.files_after_bytes = options.expert_host_bytes});
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
     std::vector<ExpertBanks> expert_banks;
     for (const auto& reference : expert_references) {
@@ -419,7 +423,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     model->expert_residency_ = options.experts;
     model->expert_split_     = options.expert_split;
     model->expert_banks_ = std::move(expert_banks);
-    if (options.experts == ExpertResidency::Disk) {
+    if (options.experts == ExpertResidency::Disk || model->expert_file_bytes() > 0) {
         for (const auto& file : reader.directory().files) {
             model->expert_files_.push_back(file.path ? options.artifact.parent_path() / *file.path
                                                      : options.artifact);

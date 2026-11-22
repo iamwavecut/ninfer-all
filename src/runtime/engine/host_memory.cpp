@@ -1,5 +1,7 @@
 #include "runtime/engine/host_memory.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -47,12 +49,25 @@ ContextCacheOptions resolve_auto_host_cache(const ContextCacheOptions& requested
 ContextCacheOptions resolve_auto_host_cache_now(const ContextCacheOptions& requested,
                                                 std::uint64_t extra_reserve_bytes) {
     if (!requested.host_cache_auto) { return requested; }
-    const std::optional<std::uint64_t> available = available_host_memory_bytes();
+    std::optional<std::uint64_t> available = available_host_memory_bytes();
     if (!available) {
         throw std::runtime_error(
             "--host-cache-mib auto needs the host's available memory, which this platform does "
             "not report; give the budget in MiB");
     }
+#if defined(_WIN32)
+    // The tier is pinned, which Windows charges to the GPU's shared memory segment.
+    int device = 0;
+    cudaDeviceProp props{};
+    if (cudaGetDevice(&device) == cudaSuccess &&
+        cudaGetDeviceProperties(&props, device) == cudaSuccess) {
+        if (const auto pinnable = pinnable_host_memory_bytes(props.luid)) {
+            available = std::min(*available, *pinnable);
+        }
+    } else {
+        (void)cudaGetLastError();
+    }
+#endif
     return resolve_auto_host_cache(requested, *available, total_host_memory_bytes(),
                                    extra_reserve_bytes);
 }

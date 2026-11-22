@@ -670,7 +670,7 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
             const bool blocks = std::all_of(parts.begin(), parts.end(), [&](const auto& part) {
                 return is_gguf(reader.geometry(part.object).format);
             });
-            if (blocks) { return artifact::Residency::Pinned; }
+            if (blocks) { return artifact::Residency::PinnedOrFiles; }
             // Native banks are registered independently, so each layer's objects stay within
             // one registration. Windows keeps pageable banks and uses bounded copy staging.
 #if defined(__linux__)
@@ -682,6 +682,13 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
         out.gate.push_back(b.parameter(x + "gate", {w, k}, {expert_input}, {}, storage("gate")));
         out.up.push_back(b.parameter(x + "up", {w, k}, {expert_input}, {}, storage("up")));
         out.down.push_back(b.parameter(x + "down", {k, w}, {x + "product"}, {}, storage("down")));
+        // Host GGUF experts the pinned block may not hold are read where they lie in the files.
+        if (storage("gate") == artifact::Residency::PinnedOrFiles) {
+            const auto& reader = b.binder.reader();
+            out.located_gate.push_back(locate(reader, x + "gate", w, k));
+            out.located_up.push_back(locate(reader, x + "up", w, k));
+            out.located_down.push_back(locate(reader, x + "down", k, w));
+        }
     }
     // Under expert parallelism each rank binds its run of the shared expert (bind_shared_run).
     std::vector<WeightId> downs;
@@ -1009,6 +1016,56 @@ bool is_qwen4_exp(const artifact::Reader& reader) {
            config.at("architectures")[0] == "Qwen4ExpForCausalLM";
 }
 
+// Host GGUF experts (Residency::PinnedOrFiles): when the pinned block holds every one, they stay
+// host experts and their file places go. Otherwise every MoE block serves its experts as disk
+// experts do, through the device expert cache, each copied from its pinned bytes where the block
+// holds it (ExpertLocation::pinned) and read from the files where it does not; the residency
+// becomes Disk.
+void settle_host_experts(TextWeights& weights, std::optional<MtpWeights>& mtp,
+                         const std::vector<BoundWeight>& bound, LoadOptions& options) {
+    std::vector<MoeWeights*> blocks;
+    for (auto& layer : weights.layers) { blocks.push_back(&layer.moe); }
+    if (mtp) { blocks.push_back(&mtp->layer.moe); }
+    bool held = true;
+    std::size_t located = 0;
+    // A block with file places and bound experts is one of host GGUF experts; disk experts have
+    // no bound ones.
+    const auto settles = [](const MoeWeights& moe) {
+        return !moe.located_gate.empty() && !moe.gate.empty();
+    };
+    for (const MoeWeights* moe : blocks) {
+        if (!settles(*moe)) { continue; }
+        ++located;
+        for (const auto* ids : {&moe->gate, &moe->up, &moe->down}) {
+            for (const WeightId id : *ids) { held = held && !bound.at(id.index).view.parts.empty(); }
+        }
+    }
+    if (located == 0) { return; }
+    for (MoeWeights* moe : blocks) {
+        if (!settles(*moe)) { continue; }
+        if (!held) {
+            const std::pair<std::vector<WeightId>*, std::vector<ExpertLocation>*> projections[] = {
+                {&moe->gate, &moe->located_gate},
+                {&moe->up, &moe->located_up},
+                {&moe->down, &moe->located_down}};
+            for (const auto& [ids, places] : projections) {
+                for (std::size_t e = 0; e < ids->size(); ++e) {
+                    const auto& view = bound.at((*ids)[e].index).view;
+                    if (!view.parts.empty()) {
+                        (*places)[e].pinned = static_cast<const std::byte*>(native_weight(view).qdata);
+                    }
+                }
+                ids->clear();
+            }
+            continue;
+        }
+        moe->located_gate.clear();
+        moe->located_up.clear();
+        moe->located_down.clear();
+    }
+    if (!held) { options.experts = ExpertResidency::Disk; }
+}
+
 std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOptions& options,
                                   DeviceContext& device, const StartupObserver* observer) {
     if (!is_qwen4_exp(reader)) {
@@ -1242,10 +1299,13 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     }
     auto pending         = std::move(b.weights);
     auto materialization = std::move(binder).finish();
-    auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
+    auto backing = artifact::materialize(reader, std::move(materialization), device, observer,
+                                         nullptr, {.files_after_bytes = options.expert_host_bytes});
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
+    LoadOptions settled = options;
+    settle_host_experts(weights, mtp_weights, bound, settled);
     auto model           = std::unique_ptr<Model>(
-        new Model(std::move(config), options, std::move(weights), std::move(stages),
+        new Model(std::move(config), std::move(settled), std::move(weights), std::move(stages),
                   std::move(bound), std::move(resources), std::move(info), std::move(backing)));
     model->files_          = std::move(files);
     model->replicas_       = qwen3_5::AuxiliaryReplicas(model->bound_, device);

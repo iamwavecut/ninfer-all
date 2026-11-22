@@ -281,6 +281,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.ranks        = device.size();
     load.stage_layers = options.stage_layers;
     load.experts      = options.expert_residency;
+    load.expert_host_bytes = options.hybrid_experts.host_bytes;
     load.vision       = options.enable_vision;
     load.mtp          = mtp;
     load.dflash2      = dflash2;
@@ -416,14 +417,22 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                           ? "hot rows in RAM (" + resident + "), the rest read from " + file + io
                           : "read from " + file + io + ", row cache capacity " + resident;
     }
+    // Host experts the pinned block could not all hold run as disk experts, each copied from its
+    // pinned bytes where the block holds it.
+    std::string expert_place = options.expert_residency == ExpertResidency::Host ? "host memory"
+                             : options.expert_residency == ExpertResidency::Disk
+                                 ? "the artifact's files"
+                                 : "device memory";
+    if (const auto& stored = model->storage_stats(); stored.files_bytes > 0) {
+        expert_place = "pinned host memory (" + std::to_string(stored.pinned_bytes >> 20) +
+                       " MiB) and the artifact's files (" +
+                       std::to_string(stored.files_bytes >> 20) + " MiB), read as disk experts";
+    }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "Qwen3.8-Flash-Next: %zu stage(s), prompt chunks of %u tokens, experts in "
                        "%s, n-gram table %s, state %.0f MiB, workspace %.0f MiB, expert "
                        "cache %.0f MiB, CUDA Graphs %.0f MiB",
-                       model->stages().stages(), executor.prefill_chunk,
-                       options.expert_residency == ExpertResidency::Host   ? "host memory"
-                       : options.expert_residency == ExpertResidency::Disk ? "the artifact's files"
-                                                                           : "device memory",
+                       model->stages().stages(), executor.prefill_chunk, expert_place.c_str(),
                        table_place.c_str(),
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,

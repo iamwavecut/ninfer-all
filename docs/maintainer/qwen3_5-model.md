@@ -235,7 +235,9 @@ each expert plane. Both offload modes use the common `core/expert_delivery` byte
 reads may stripe over a drive mirror or land in device memory directly
 ([disk expert reads](../expert-disk-reads.md)).
 Shared experts and router weights remain resident and keep the same gated SwiGLU mathematics.
-Dense Qwen models reject host/disk expert residency.
+Dense Qwen models reject host/disk expert residency. Host planes the pinned block cannot hold
+(`Residency::PinnedOrFiles`: `--expert-host-mib`, the available memory, or on Windows and WSL2 the
+GPU's shared memory segment) keep file extents, as disk planes do.
 
 A Qwen slot has aliases for gate/up codes, high bits, scales and NVFP4 divisors, followed by the
 same down planes. RowSplit Q4/Q5/Q6 use group-64 FP16 scales; Q8 uses group-32 scales. Q5/Q6 high

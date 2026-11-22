@@ -538,7 +538,11 @@ struct ExpertStream::Impl {
             for (int k = 0; k < 3; ++k) {
                 const ExpertLocation& location = layer.spec.experts[k][expert];
                 std::byte* target              = base + pool.offset[k];
-                if (!windows.empty()) {
+                if (location.pinned != nullptr) {
+                    // A host expert in the pinned block crosses the bus from there.
+                    batch_copies.push_back(
+                        {target, location.pinned, static_cast<std::size_t>(location.bytes)});
+                } else if (!windows.empty()) {
                     // Each run's cover in the rank's window, and its copy out of it.
                     const DirectExpertWindow& window = *windows.at(layer.spec.rank);
                     std::uint64_t at                 = 0;

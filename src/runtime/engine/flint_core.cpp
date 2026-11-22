@@ -146,8 +146,9 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
     inspect.complete();
     install_device_route_profile_for(options, device);
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
-    models::flint::LoadOptions load{.artifact = options.artifact_path,
-                                    .experts  = options.expert_residency};
+    models::flint::LoadOptions load{.artifact          = options.artifact_path,
+                                    .experts           = options.expert_residency,
+                                    .expert_host_bytes = options.hybrid_experts.host_bytes};
     if (dspine) { load.dspine = speculative.draft_model; }
     // Expert parallelism: the routed experts divided over the devices, everything else on the
     // first. Without --tensor-split each device takes a share of its speed that fits beside what
@@ -264,11 +265,15 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
         const auto memory = instance->executor->memory().experts;
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "Flint: experts in %s, cache %.0f MiB (%u slots), %u layer bank(s) %.0f MiB, "
-            "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB",
-            options.expert_residency == ExpertResidency::Host ? "pinned host memory" : "artifact files",
+            "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB, "
+            "expert sources in the files %.0f MiB",
+            options.expert_residency == ExpertResidency::Disk ? "artifact files"
+            : model->expert_file_bytes() > 0                 ? "pinned host memory and artifact files"
+                                                             : "pinned host memory",
             double(memory.cache_bytes) / 1048576, memory.cache_slots, memory.banks,
             double(memory.bank_bytes) / 1048576, double(memory.metadata_bytes) / 1048576,
-            double(memory.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576);
+            double(memory.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576,
+            double(model->expert_file_bytes()) / 1048576);
         const auto cpu = instance->executor->expert_cpu_description();
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "Flint: missing experts %s; cache seeded %s",

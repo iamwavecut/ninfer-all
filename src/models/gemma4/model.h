@@ -110,6 +110,9 @@ struct LoadOptions {
     // Binds the artifact's `vision` component, which must then exist, in this placement.
     VisionPlacement vision = VisionPlacement::None;
     ExpertResidency experts = ExpertResidency::Device;
+    // Host experts: at most this many bytes pinned, the rest read from the artifact's files
+    // (--expert-host-mib); unset, as many as the host can pin.
+    std::optional<std::uint64_t> expert_host_bytes;
     // Expert parallelism (`--tensor-parallel`): each device rank's relative share of every MoE
     // block's routed experts; empty for one device. Everything else stays on rank 0, and the
     // experts must be device resident.
@@ -140,6 +143,17 @@ public:
         for (const auto& bank : expert_banks_) {
             for (const auto& expert : bank.delivery.experts) {
                 for (const auto& blob : expert) { if (blob.pinned) { bytes += blob.bytes; } }
+            }
+        }
+        return bytes;
+    }
+
+    // Bytes of host experts the pinned block could not hold, read from the artifact's files.
+    [[nodiscard]] std::uint64_t expert_file_bytes() const noexcept {
+        std::uint64_t bytes = 0;
+        for (const auto& bank : expert_banks_) {
+            for (const auto& expert : bank.delivery.experts) {
+                for (const auto& blob : expert) { if (!blob.pinned) { bytes += blob.bytes; } }
             }
         }
         return bytes;

@@ -124,7 +124,7 @@ std::string usage_text() {
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
            "       [--expert-dma-share F] [--expert-cpu-threads N] [--expert-cache-adaptive]\n"
            "       [--expert-misses staged|mapped] [--expert-tail-skip N]\n"
-           "       [--expert-prefill-buffers 1|2]\n"
+           "       [--expert-prefill-buffers 1|2] [--expert-host-mib N]\n"
            "       [--ngram-table PATH] [--ngram-residency disk|ram|ram-hot] [--ngram-lock]\n"
            "       [--ngram-io buffered|direct|mmap] [--ngram-io-depth N] [--ngram-ram-mib N]\n"
            "       [--ngram-hot-profile PATH] [--no-ngram-table] [--ngram-dedupe on|off]\n"
