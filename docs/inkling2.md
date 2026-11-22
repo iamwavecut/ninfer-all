@@ -68,10 +68,10 @@ tokenization, the chat template, output parsing and the serving protocols.
   0.1, 0.2, 0.7, 0.9, 0.99; `high` without one). `enable_thinking: false` sets `none`, the
   model's own lowest level, which the release notes do not fully disable reasoning. A thinking
   budget (`--thinking-budget`, `--default-thinking-budget`, a request's) counts the tokens of the
-  thinking blocks the model opens; once reached, the engine closes the open block with Qwen's
-  early-close guidance and `<|end_message|>`, masks `<|content_thinking|>` for the rest of the
-  response and decodes it without drafts. `--reasoning-loop conclude` closes it the same way
-  ([Serving](serving.md#openai-chat-completions)).
+  thinking blocks the model opens, at `none` too (which a forced tool call also sets); once
+  reached, the engine closes the open block with Qwen's early-close guidance and `<|end_message|>`,
+  masks `<|content_thinking|>` for the rest of the response and decodes it without drafts.
+  `--reasoning-loop conclude` closes it the same way ([Serving](serving.md#openai-chat-completions)).
 - **Sampling defaults.** The release's: temperature 1.0.
 - **Speculative decoding.** The release's DSpark drafter (the artifact's `dspark` component,
   `--spec dspark`) proposes a block of up to 7 drafts from the target's tapped hidden states: three

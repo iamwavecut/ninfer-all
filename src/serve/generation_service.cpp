@@ -781,6 +781,15 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             !request.raw_prompt &&
             engine_->load_summary().architecture == "Inkling2ForCausalLM";
         prepared.enable_thinking = prompt.summary().starts_in_reasoning || model_opens_thinking;
+        if (model_opens_thinking && semantics.enable_thinking == false) {
+            // `enable_thinking: false` or a forced call set the lowest effort, at which Inkling may
+            // still open a thinking block: the budget and the loop guard hold for it as well.
+            request_options.execution.thinking.budget = request.thinking_budget
+                                                            ? request.thinking_budget
+                                                            : options_.default_thinking_budget;
+            request_options.execution.thinking.loop = options_.reasoning_loop;
+            prepared.thinking_budget                = request_options.execution.thinking.budget;
+        }
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
