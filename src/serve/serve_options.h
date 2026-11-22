@@ -42,6 +42,11 @@ struct ServeOptions {
     // worker of their own (0 = off).
     int stats_port = 0;
     std::string api_key;                          // empty => no auth
+    // --admin-token: the credential of the admin routes, of which POST /shutdown -- the HTTP form
+    // of the Ctrl+Break graceful stop (listener close, requests cancelled, prefix cache saved,
+    // exit) -- is the first. A request must carry the token as a bearer or x-api-key.
+    // Empty => no admin route is registered.
+    std::string admin_token;
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
     // --request-log-max-mib: rotate the request log at this size (0 keeps one unbounded file),

@@ -59,6 +59,16 @@ int main() {
                           oversized_response.has_header("x-request-id"),
                       "a doubled OpenAI path must keep the OpenAI error envelope");
 
+    // POST /shutdown is an API route: the engine key applies to it when configured, on top of
+    // its own --admin-token.
+    httplib::Request shutdown_request;
+    shutdown_request.method = "POST";
+    shutdown_request.path   = "/shutdown";
+    failures += check(ninfer::serve::requires_api_key("secret", false, shutdown_request) &&
+                          ninfer::serve::requires_api_key("secret", true, shutdown_request),
+                      "POST /shutdown must retain API-key checks with and without WebUI");
+    failures += check(!ninfer::serve::requires_api_key("", false, shutdown_request),
+                      "without a configured key nothing requires one");
     // Route patterns reach the handler under either prefix and keep the endpoint's own captures.
     httplib::Server server;
     server.Post(api_route_pattern("/messages"),

@@ -512,6 +512,26 @@ previous file is kept. Ctrl+C with console text selected only copies the text. W
 process about 5 seconds after its console window is closed, so stop with Ctrl+C when a large Host
 tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 
+With `--admin-token TOKEN` the same stop is reachable over HTTP as `POST /shutdown`, a route
+that exists only while the token is set -- without it the port answers 404. The request carries
+`TOKEN` as a bearer or `x-api-key` header, and with `--api-key` set it carries that key too, since
+the route is an API route: the engine key as the bearer, the token as `x-api-key`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/shutdown \
+  -H 'Authorization: Bearer local-secret' \
+  -H 'x-api-key: stop-token'
+```
+
+A wrong or missing token is a 401. A correct one is acknowledged with 202 and
+`{"status":"stopping",...}`; the stop itself runs moments later, off the request's own thread,
+because stopping closes the listener that would flush the response. From then on it is the stop
+above: new connections are refused, every running and queued request ends with a 503, the prefix
+cache saves when `--prefix-cache-file` is set, and the process exits after the save. A repeated
+request finds the route already gone, and one more Ctrl+C during the stop exits at once without
+saving, as with the console stop. The route is not on `--stats-port`, and like every route it
+answers 503 `model_loading` while the model is still loading.
+
 An Engine-wide failure (an error the Engine's worker cannot attribute to one request) fails every
 queued request and refuses every new one, and the Engine never recovers from it. A single-model
 server then stops on its own and exits with status 2, distinct from startup failures (1), so a
@@ -551,6 +571,7 @@ off.
 | `GET /stats` | the `/v1/load` snapshot plus the ingress peak and every Engine counter since startup (see [Stats](#stats)) |
 | `GET /slots` | per-cell occupancy of the private context cache (see [Slots](#slots)) |
 | `POST /slots/{id}?action=save\|restore\|erase` | save a retained session to a file, restore one, or evict one (see [Slots](#slots)) |
+| `POST /shutdown` | the graceful stop with the Ctrl+Break semantics; registered only when `--admin-token` is set, on the main listener (see [Stop the server](#stop-the-server)) |
 | `GET /props` | llama.cpp-shaped server properties: default sampling, context, lanes, modalities (see [Props](#props)) |
 | `GET /lora-adapters` | the loaded LoRA adapters with their ids and startup scales (see [LoRA adapters and control vectors](#lora-adapters-and-control-vectors)) |
 | `GET /v1` | endpoint index for the announced API base: the model alias and this table |
@@ -2410,7 +2431,9 @@ control vector on one layer 0.1%.
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
 `x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated; `GET /v1/load`,
-`GET /stats` and `GET /metrics` require the key, on `--stats-port` too.
+`GET /stats` and `GET /metrics` require the key, on `--stats-port` too. Registered, `POST /shutdown`
+requires the key like every API route, and its own `--admin-token` on top of it (see
+[Stop the server](#stop-the-server)).
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
@@ -2435,6 +2458,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--port N` | listen port | `8080` |
 | `--stats-port N` | also serve `GET /health`, `/stats`, `/v1/load` and `/metrics` on port `N` of the same address, with one worker of their own, so a dashboard or watchdog is never queued behind the connections the request pool serves; the readiness and API-key rules are the main listener's | off |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
+| `--admin-token KEY` | the admin credential; register the admin routes, of which `POST /shutdown`, the HTTP form of the Ctrl+Break graceful stop, is the first; the request carries `KEY` as a bearer or `x-api-key` (with `--api-key` set, that key as the other header) (see [Stop the server](#stop-the-server)) | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--rope-yarn` | past the model's native window, YaRN at factor `--max-context` / native instead of plain RoPE, for every family: the Qwen3.5 text and MTP layers, Qwen3.8-Flash-Next's sparse attention with its indexer and MTP block, Gemma 4's full-attention blocks (its sliding-window blocks never leave their window); Flint, whose full-attention blocks carry no rotation, and Inkling 2, whose attention carries none, refuse it. Qwen documents the extension for its models; for Gemma 4 it is the same mathematics without a published or measured quality ([Gemma 4](gemma4.md#running)). The `server_start` record's `engine.rope` names the rotation the Engine resolved | off |

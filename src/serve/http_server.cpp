@@ -196,6 +196,7 @@ const char* endpoint_name(std::string_view request_path) noexcept {
     if (path == "/v1/load") { return "load"; }
     if (path == "/stats") { return "stats"; }
     if (path == "/slots" || path.starts_with("/slots/")) { return "slots"; }
+    if (path == "/shutdown") { return "shutdown"; }
     if (path == "/models" || path.starts_with("/models/")) { return "models"; }
     return "http_route";
 }
@@ -623,6 +624,14 @@ void HttpServer::register_routes() {
     register_post(R"(/slots/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_slot_action(req, res);
     });
+    // The supervisor's graceful stop: POST /shutdown runs the Ctrl+Break path, gated by its own
+    // --admin-token (not the API key). Registered only when a token is set, so the route is
+    // absent -- and the port answers 404 -- otherwise.
+    if (!options_.admin_token.empty()) {
+        register_post("/shutdown", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_shutdown(req, res);
+        });
+    }
     server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
         handle_props(req, res);
     });
@@ -1013,6 +1022,40 @@ void HttpServer::handle_health(httplib::Response& res) const {
                                    {"version", options_.build_version}}
                         .dump(),
                     "application/json");
+}
+
+void HttpServer::handle_shutdown(const httplib::Request& req, httplib::Response& res) {
+    // The route exists only when --admin-token is set. When an engine API key is configured,
+    // pre_route has already required it on this request, so a caller then carries two keys: the
+    // engine key as the bearer and this token as x-api-key. Accept the token in either header;
+    // without an engine key the caller simply presents the token as the bearer.
+    const bool bearer_ok =
+        matches_bearer_credential(req.get_header_value("Authorization"), options_.admin_token);
+    const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.admin_token;
+    if (!bearer_ok && !x_api_key_ok) {
+        ApiError error;
+        error.status  = 401;
+        error.type    = "invalid_request_error";
+        error.code    = "invalid_api_key";
+        error.message = "missing or invalid admin token";
+        write_openai_error(res, error);
+        return;
+    }
+    // Acknowledge, then stop off this thread: the stop closes the listener and tears the server
+    // down, and main() can then exit the process before this connection's response is flushed. A
+    // detached thread that fires the stop shortly after we return guarantees the 202 reaches the
+    // caller; the stop itself (cancel requests, save the prefix cache) outlives it either way.
+    res.status         = 202;
+    res.set_content(R"({"status":"stopping","message":"graceful stop requested; the server "
+                         "exits after cancelling requests and saving its prefix cache"})",
+                    "application/json");
+    std::function<void()> handler = shutdown_handler_;
+    if (handler) {
+        std::thread([handler = std::move(handler)] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            handler();
+        }).detach();
+    }
 }
 
 void HttpServer::handle_metrics(const httplib::Request& req, httplib::Response& res) const {
