@@ -15,6 +15,7 @@
 #include "models/divided_head.h"
 #include "models/dspine/runtime.h"
 #include "models/flint/kernels.h"
+#include "ops/kv_cache/row128_rotate.h"
 #include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
@@ -130,8 +131,12 @@ struct LayerPlan {
     // Expert parallelism: rank r's tables (r > 0) in its device memory, entries of the experts it
     // holds (`tables` holds rank 0's); the other entries are null.
     std::vector<DeviceBuffer> peer_tables;
-    // The F16 K and V caches: [sequences][kv heads][slots][D].
+    // The F16 K and V caches: [sequences][kv heads][slots][D]. A quantized run's full block
+    // (kv_format.h) stores its rows' codes and scales instead, K then V, each [sequences][kv
+    // heads][slots][bytes of a row], seen by the kernels through k_plane and v_plane.
     KvArea k, v;
+    KvArea k_codes, k_scales, v_codes, v_scales;
+    KvPlaneView k_plane, v_plane;
     int slots = 0, ring = 0;
     std::int64_t seq_stride = 0, head_stride = 0; // elements of a cache (and of its staging)
     // A sliding block's checkpoint of every sequence's rings (snapshot()), allocated with the
@@ -162,6 +167,13 @@ struct Executor::Impl {
     int prefill_ring = 0;
     DeviceBuffer staging_k, staging_v;
     KvArea mask_full; // a prompt chunk's full-attention mask, [rows][full_slots]
+    // The full blocks' KV storage. A quantized one's prompt chunk attends over F16 rows: one
+    // sequence's full-attention keys and values, [kv heads][global_slots][D], decoded from a
+    // block's planes up to the chunk's end (the chunk's own rows after they are stored), the
+    // staging that a block after it decodes into again. Decode rows go through the workspace.
+    KvFormat kv;
+    KvArea full_stage_k, full_stage_v;
+    DeviceBuffer d_identity; // 0, 1, ...: a decode call's row r takes staging slot r
     // Beside an elastic expert cache, the full blocks' caches (a row per sequence and KV head) and
     // the prompt chunk's mask grow as far as the sequences reach: the expert cache gives memory
     // back when they need it and takes it again when a sequence is reset.
@@ -232,6 +244,7 @@ struct Executor::Impl {
             throw std::invalid_argument("flint executor: at most 7 drafts a round");
         }
         stream = device.stream;
+        kv     = kv_format(options.kv_cache);
         // Beside an automatic cache of host or disk experts, the full-attention caches grow with
         // their sequences and the cache is elastic (ExpertDeliveryOptions::elastic).
         const int device_id = device.rank(0).device;
@@ -282,14 +295,16 @@ struct Executor::Impl {
             // context or the sequences; the reserve covers the rest of the workspace, the CUDA
             // graphs (some captured while serving) and a margin.
             std::size_t needed = 0;
+            const std::size_t f16_row = 2 * row_f16, full_row = full_row_bytes();
             for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
-                const std::size_t kv = 2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
+                const std::size_t heads = std::size_t(kv_heads) * std::size_t(sequences);
                 needed += config.full_attention[i]
-                              ? std::size_t(global_slots) * kv
-                              : (options.checkpoints ? 2 : 1) * std::size_t(ring) * kv;
+                              ? std::size_t(global_slots) * full_row * heads
+                              : (options.checkpoints ? 2 : 1) * std::size_t(ring) * f16_row * heads;
             }
             needed += std::size_t(prefill_ring) * 2 * kv_heads * row_f16 +
                       std::size_t(options.prefill_chunk) * global_slots * 2;
+            if (kv.quantized()) { needed += std::size_t(global_slots) * kv_heads * f16_row; }
             if (options.dspine) {
                 needed += dspine::Runtime::planned_bytes(*model.dspine(), DType::FP32,
                                                          spine_options());
@@ -415,11 +430,38 @@ struct Executor::Impl {
             p.head_stride = std::int64_t(p.slots) * head_dim;
             p.seq_stride  = p.head_stride * kv_heads;
             const bool grows = growing && p.full;
-            for (KvArea* area : {&p.k, &p.v}) {
-                *area = KvArea(std::size_t(sequences), kv_heads,
-                               std::size_t(p.head_stride) * sizeof(__half), row_f16, grows,
-                               device_id);
-                kv_bytes += area->bytes;
+            if (p.full && kv.quantized()) {
+                // A row per (sequence, KV head) in each of the four areas, as the F16 caches.
+                const auto plane = [&](KvArea& codes, KvArea& scales, KvCoding coding,
+                                       bool rotated) {
+                    const std::size_t code = kv_code_bytes(coding), scale = kv_scale_bytes(coding);
+                    codes  = KvArea(std::size_t(sequences), kv_heads, std::size_t(p.slots) * code,
+                                    code, grows, device_id);
+                    scales = KvArea(std::size_t(sequences), kv_heads, std::size_t(p.slots) * scale,
+                                    scale, grows, device_id);
+                    kv_bytes += codes.bytes + scales.bytes;
+                    KvPlaneView view;
+                    view.codes      = static_cast<std::uint8_t*>(codes.p);
+                    view.scales     = static_cast<std::uint8_t*>(scales.p);
+                    view.code_row   = std::int64_t(code);
+                    view.scale_row  = std::int64_t(scale);
+                    view.code_head  = std::int64_t(codes.row_bytes);
+                    view.scale_head = std::int64_t(scales.row_bytes);
+                    view.code_seq   = view.code_head * kv_heads;
+                    view.scale_seq  = view.scale_head * kv_heads;
+                    view.coding     = coding;
+                    view.rotated    = rotated;
+                    return view;
+                };
+                p.k_plane = plane(p.k_codes, p.k_scales, kv.key, kv.rotated_keys);
+                p.v_plane = plane(p.v_codes, p.v_scales, kv.value, false);
+            } else {
+                for (KvArea* area : {&p.k, &p.v}) {
+                    *area = KvArea(std::size_t(sequences), kv_heads,
+                                   std::size_t(p.head_stride) * sizeof(__half), row_f16, grows,
+                                   device_id);
+                    kv_bytes += area->bytes;
+                }
             }
             if (!p.full && options.checkpoints) {
                 // Sized up front with the cache, so a configuration that cannot hold them is refused
@@ -440,6 +482,16 @@ struct Executor::Impl {
             kv_bytes += 2 * staging;
             mask_full = KvArea(1, 1, std::size_t(options.prefill_chunk) * global_slots * 2,
                                std::size_t(options.prefill_chunk) * 2, growing, device_id);
+            if (kv.quantized()) {
+                for (KvArea* area : {&full_stage_k, &full_stage_v}) {
+                    *area = KvArea(1, kv_heads, std::size_t(global_slots) * row_f16, row_f16,
+                                   growing, device_id);
+                }
+            }
+            std::vector<std::int32_t> identity(gguf::kMaxVectorColumns);
+            std::iota(identity.begin(), identity.end(), 0);
+            d_identity = DeviceBuffer(identity.size() * 4);
+            d_identity.copy_from_host(identity.data(), identity.size() * 4);
         }
         const int sms = device.multiprocessor_count();
         // Upper bounds: a step uses as many as its keys fill (a tile of 16 each), so the sliding
@@ -459,11 +511,13 @@ struct Executor::Impl {
         staged      = std::make_unique<CudaCompletionEvent>(device);
         logits_bf16 = DeviceBuffer(std::size_t(vocab) * kMaxLogitRows * 2);
         for (LayerPlan& p : layers) {
-            if (!p.full) { continue; }
-            sequence_areas.push_back(&p.k);
-            sequence_areas.push_back(&p.v);
+            for (KvArea* area : full_areas(p)) { sequence_areas.push_back(area); }
         }
         chunk_areas.push_back(&mask_full);
+        if (kv.quantized()) {
+            chunk_areas.push_back(&full_stage_k);
+            chunk_areas.push_back(&full_stage_v);
+        }
         kv_fixed = kv_bytes;
         if (growing) {
             for (KvArea* area : sequence_areas) { kv_fixed -= area->bytes; }
@@ -635,6 +689,50 @@ struct Executor::Impl {
     static constexpr std::uint32_t kFullChunk  = 2048;
     static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
     static constexpr std::size_t kKvHeadroom   = std::size_t(256) << 20;
+
+    // ---- KV storage ----------------------------------------------------------------------------
+
+    // Bytes of one (sequence, KV head)'s position in a full block: K and V.
+    [[nodiscard]] std::size_t full_row_bytes() const {
+        if (!kv.quantized()) { return 2 * std::size_t(head_dim) * sizeof(__half); }
+        return std::size_t(kv_code_bytes(kv.key) + kv_scale_bytes(kv.key) +
+                           kv_code_bytes(kv.value) + kv_scale_bytes(kv.value));
+    }
+
+    // A full block's areas, by position: the F16 caches or the quantized planes; none for a
+    // sliding block.
+    [[nodiscard]] std::vector<KvArea*> full_areas(LayerPlan& p) const {
+        if (!p.full) { return {}; }
+        if (!kv.quantized()) { return {&p.k, &p.v}; }
+        return {&p.k_codes, &p.k_scales, &p.v_codes, &p.v_scales};
+    }
+    [[nodiscard]] std::vector<const KvArea*> full_areas(const LayerPlan& p) const {
+        std::vector<const KvArea*> out;
+        for (KvArea* area : full_areas(const_cast<LayerPlan&>(p))) { out.push_back(area); }
+        return out;
+    }
+
+    // Stores F16 rows [src_first, src_first + rows) of a block's staging (head stride
+    // src_head_stride) into its planes: slot dst_first + r of `sequence`, or with `slots` and
+    // `sequences` (a decode call) row r's.
+    void store_rows(const LayerPlan& p, const __half* k, const __half* v,
+                    std::int64_t src_head_stride, int src_first, int rows, int dst_first,
+                    int sequence, const std::int32_t* slots, const std::int32_t* sequences) {
+        for (const auto& [src, plane] : {std::pair{k, p.k_plane}, std::pair{v, p.v_plane}}) {
+            kernels::KvStoreArgs store;
+            store.src             = src;
+            store.src_head_stride = src_head_stride;
+            store.src_first       = src_first;
+            store.dst_slots       = slots;
+            store.dst_first       = dst_first;
+            store.sequences       = sequences;
+            store.sequence        = sequence;
+            store.rows            = rows;
+            store.heads           = kv_heads;
+            store.dst             = plane;
+            kernels::kv_store(store, stream);
+        }
+    }
 
     // ---- Growing caches -------------------------------------------------------------------------
 
@@ -838,6 +936,9 @@ struct Executor::Impl {
                     round_up(gguf::moe_routing_bytes(int(config.num_experts), int(pairs)), kAlign) +
                     round_up(t * h * 8, kAlign);
             }
+        }
+        if (kv.quantized()) { // a decode call's F16 rows of a quantized full block
+            add(std::size_t(decode_rows()) * 2 * kv_heads * head_dim * sizeof(__half));
         }
         const std::size_t decode = kernels::decode_attention_workspace_floats(
             decode_rows(), query_heads, head_dim, std::max(decode_splits_full, decode_splits_sliding)) * 4;
@@ -1497,8 +1598,14 @@ struct Executor::Impl {
             qa.slots       = branching ? static_cast<const std::int32_t*>(d_slots.p) : nullptr;
             // A sliding block attends over the staging ring: the window before the chunk first
             // comes over from the sequence's ring, the chunk's keys land there, and the window that
-            // ends the chunk goes back. A full block's keys and values land in the sequence's cache.
-            const std::int64_t seq_offset = std::int64_t(sequence) * p.seq_stride;
+            // ends the chunk goes back. A full block's keys and values land in the sequence's
+            // cache, or a quantized one's in the F16 staging, from which they go into its planes.
+            const bool quantized = p.full && kv.quantized();
+            const std::int64_t seq_offset = quantized ? 0 : std::int64_t(sequence) * p.seq_stride;
+            const __half* full_k = quantized ? static_cast<const __half*>(full_stage_k.p)
+                                             : static_cast<const __half*>(p.k.p) + seq_offset;
+            const __half* full_v = quantized ? static_cast<const __half*>(full_stage_v.p)
+                                             : static_cast<const __half*>(p.v.p) + seq_offset;
             kernels::RingCopyArgs keep;
             keep.kv_heads = kv_heads;
             keep.head_dim = head_dim;
@@ -1519,14 +1626,37 @@ struct Executor::Impl {
                 qa.head_stride = stage_stride;
                 qa.ring        = prefill_ring;
             } else {
-                qa.k_cache     = static_cast<__half*>(p.k.p);
-                qa.v_cache     = static_cast<__half*>(p.v.p);
-                qa.seq_stride  = p.seq_stride;
+                qa.k_cache     = const_cast<__half*>(full_k);
+                qa.v_cache     = const_cast<__half*>(full_v);
+                qa.seq_stride  = quantized ? 0 : p.seq_stride;
                 qa.head_stride = p.head_stride;
                 qa.sequence    = int(sequence);
             }
             kernels::qkv_post(qa, stream);
-            if (kv_only && p.full && li + 1 == layers.size() && !last_tap) { break; }
+            const bool attends = !(kv_only && p.full && li + 1 == layers.size() && !last_tap);
+            if (quantized) {
+                // The chunk's rows into the planes (slot = position, a branch pass's too), then
+                // every row up to the chunk's end back into the staging as the planes hold them.
+                store_rows(p, full_k, full_v, p.head_stride, int(first), t, int(first),
+                           int(sequence), nullptr, nullptr);
+                for (const auto& [plane, dst] :
+                     {std::pair{p.k_plane, full_k}, std::pair{p.v_plane, full_v}}) {
+                    if (!attends) { break; }
+                    kernels::KvLoadArgs load;
+                    load.src             = plane;
+                    load.sequence        = int(sequence);
+                    load.begin           = 0;
+                    load.end             = int(first) + t;
+                    load.heads           = kv_heads;
+                    load.dst             = const_cast<__half*>(dst);
+                    load.dst_head_stride = p.head_stride;
+                    kernels::kv_load(load, stream);
+                }
+            }
+            if (!attends) { break; }
+            if (quantized && p.k_plane.rotated) {
+                ops::kv128::rotate_queries(q, std::int64_t(t) * query_heads, stream);
+            }
             auto* attn = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
             const std::size_t fa_bytes =
                 gguf::flash_attention_workspace_bytes(head_dim, query_heads, kv_heads, t);
@@ -1538,10 +1668,8 @@ struct Executor::Impl {
             fa.tokens         = t;
             fa.q              = q;
             fa.q_token_stride = q_floats;
-            fa.k = p.full ? static_cast<const __half*>(p.k.p) + seq_offset
-                          : static_cast<const __half*>(staging_k.p);
-            fa.v = p.full ? static_cast<const __half*>(p.v.p) + seq_offset
-                          : static_cast<const __half*>(staging_v.p);
+            fa.k = p.full ? full_k : static_cast<const __half*>(staging_k.p);
+            fa.v = p.full ? full_v : static_cast<const __half*>(staging_v.p);
             fa.row_bytes       = std::int64_t(head_dim) * 2;
             fa.head_bytes      = (p.full ? p.head_stride : stage_stride) * 2;
             fa.slots           = p.full ? full_slots : prefill_ring;
@@ -1650,12 +1778,34 @@ struct Executor::Impl {
             qa.inv_freq    = p.rope ? static_cast<const float*>(inv_freq.p) : nullptr;
             qa.q_out       = q;
             qa.sequences   = static_cast<const std::int32_t*>(d_sequences.p);
-            qa.k_cache     = static_cast<__half*>(p.k.p);
-            qa.v_cache     = static_cast<__half*>(p.v.p);
-            qa.seq_stride  = p.seq_stride;
-            qa.head_stride = p.head_stride;
-            qa.ring        = p.ring;
+            const bool quantized = p.full && kv.quantized();
+            if (quantized) {
+                // Row r's K and V at slot r of a workspace staging, then into the planes at its
+                // sequence and position.
+                auto* stage    = static_cast<__half*>(workspace->alloc_bytes(
+                    std::size_t(b) * 2 * kv_heads * head_dim * sizeof(__half)).data);
+                qa.k_cache     = stage;
+                qa.v_cache     = stage + std::int64_t(b) * kv_heads * head_dim;
+                qa.seq_stride  = 0;
+                qa.head_stride = std::int64_t(b) * head_dim;
+                qa.ring        = 0;
+                qa.slots       = static_cast<const std::int32_t*>(d_identity.p);
+            } else {
+                qa.k_cache     = static_cast<__half*>(p.k.p);
+                qa.v_cache     = static_cast<__half*>(p.v.p);
+                qa.seq_stride  = p.seq_stride;
+                qa.head_stride = p.head_stride;
+                qa.ring        = p.ring;
+            }
             kernels::qkv_post(qa, stream);
+            if (quantized) {
+                store_rows(p, qa.k_cache, qa.v_cache, qa.head_stride, 0, b, 0, 0,
+                           static_cast<const std::int32_t*>(d_positions.p),
+                           static_cast<const std::int32_t*>(d_sequences.p));
+                if (p.k_plane.rotated) {
+                    ops::kv128::rotate_queries(q, std::int64_t(b) * query_heads, stream);
+                }
+            }
             const int splits = p.full ? decode_splits_full : decode_splits_sliding;
             auto* partial    = static_cast<float*>(
                 workspace->alloc_bytes(kernels::decode_attention_workspace_floats(
@@ -1665,6 +1815,8 @@ struct Executor::Impl {
             da.q           = q;
             da.k_cache     = static_cast<const __half*>(p.k.p);
             da.v_cache     = static_cast<const __half*>(p.v.p);
+            da.k_plane     = p.k_plane;
+            da.v_plane     = p.v_plane;
             da.sinks       = p.sinks;
             da.seq_stride  = p.seq_stride;
             da.head_stride = p.head_stride;
@@ -1901,7 +2053,7 @@ struct Executor::Impl {
         std::uint64_t bytes = 0;
         for (const LayerPlan& p : layers) {
             if (p.full) {
-                bytes += 2 * std::uint64_t(kv_heads) * position * head_dim * sizeof(__half);
+                bytes += std::uint64_t(kv_heads) * position * full_row_bytes();
             } else {
                 for (const auto& ring : ring_buffers(p, 0)) { bytes += ring.second; }
             }
@@ -1931,13 +2083,16 @@ struct Executor::Impl {
                 at += in_page;
             }
         };
-        const std::size_t head_bytes = std::size_t(global_slots) * head_dim * sizeof(__half);
         for (const LayerPlan& p : layers) {
             if (p.full) {
-                for (const KvArea* area : {&p.k, &p.v}) {
-                    auto* base = static_cast<std::uint8_t*>(area->p) + sequence * head_bytes * kv_heads;
+                // Each head's positions below `position`, area by area (F16 K and V, or the
+                // planes' codes and scales).
+                for (const KvArea* area : full_areas(p)) {
+                    auto* base = static_cast<std::uint8_t*>(area->p) +
+                                 std::size_t(sequence) * kv_heads * area->row_bytes;
                     for (int h = 0; h < kv_heads; ++h) {
-                        copy(base + h * head_bytes, std::size_t(position) * head_dim * sizeof(__half));
+                        copy(base + h * area->row_bytes,
+                             std::size_t(position) * area->position_bytes);
                     }
                 }
                 continue;
@@ -2007,7 +2162,8 @@ ExecutorMemory Executor::memory() const noexcept {
     return ExecutorMemory{.kv_bytes        = impl_->kv_bytes,
                           .kv_backed_bytes = impl_->kv_backed.load(std::memory_order_relaxed),
                           .kv_grows        = impl_->growing,
-                          .workspace_bytes = impl_->workspace_bytes + impl_->mask_full.bytes,
+                          .workspace_bytes = impl_->workspace_bytes + impl_->mask_full.bytes +
+                                             impl_->full_stage_k.bytes + impl_->full_stage_v.bytes,
                           .drafter_bytes   = impl_->spine ? impl_->spine->device_bytes() : 0,
                           .experts = impl_->delivery ? impl_->delivery->memory() : ExpertDeliveryMemory{}};
 }

@@ -10,6 +10,8 @@
 #include "core/startup.h"
 #include "core/tensor_parallel.h"
 #include "models/expert_profile.h"
+#include "models/inkling2/kv_format.h"
+#include "models/kv_storage_name.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/processor.h"
 #include "ninfer/ops/argmax.h"
@@ -142,15 +144,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                     "--adaptive-mtp only with --spec dspark and --draft-min-p only "
                                     "with --spec dspine or dspark");
     }
-    if (options.kv_cache != KvCacheStorage::Mxfp8 && options.kv_cache != KvCacheStorage::BFloat16 &&
-        options.kv_cache != KvCacheStorage::Float16 &&
-        options.kv_cache != KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 &&
-        options.kv_cache != KvCacheStorage::RotatedLloyd4KeyInt4Value) {
-        throw std::invalid_argument(
-            "Inkling 2 keeps its KV cache in MXFP8 (--kv-dtype mxfp8, the default) or F16 "
-            "(--kv-dtype bf16 or fp16), or quantizes the eight full-attention visits' planes "
-            "(--kv-dtype rk8v4 or rk4v4; the sliding-window visits' rings stay F16)");
-    }
+    (void)models::inkling2::kv_format(options.kv_cache); // refuses, by name, one it does not store
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
         hybrid.adaptive_cache) {
@@ -308,11 +302,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     }
     instance->free_after_weights = free_after_weights;
     instance->free_after_startup = free_bytes();
-    const char* kv_name = executor.kv_cache == KvCacheStorage::Mxfp8                     ? "mxfp8"
-                          : executor.kv_cache == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ? "rk8v4"
-                          : executor.kv_cache == KvCacheStorage::RotatedLloyd4KeyInt4Value ? "rk4v4"
-                          : executor.kv_cache == KvCacheStorage::Float16                   ? "fp16"
-                                                                                           : "bf16";
+    const char* kv_name = models::kv_storage_name(executor.kv_cache);
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "Inkling 2: %u sequence(s), prompt chunks of %u tokens, %s KV %.0f MiB%s, "
                        "workspace %.0f MiB",

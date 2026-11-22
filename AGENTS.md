@@ -77,9 +77,10 @@ Flint (`FlintForCausalLM`; `src/models/flint`, `runtime/engine/flint_core`) is a
 family converted from a llama.cpp GGUF of Recursive's release (Unsloth's UD-Q4_K_XL) with its ggml
 blocks kept as stored. It shares the Qwen3.5 frontend in a Flint dialect (its pre-tokenizer, the
 role-marker chat template, reasoning the model opens itself, GLM-4.7 tool calls), runs one to eight
-sequences in prompt chunks of 2048 tokens with an F16 KV cache, drafts by context lookup only
-(`--lookup-ngram`; Recursive publishes no draft model), and has no vision, rotation scaling or
-pipeline stages; several GPUs divide its routed experts (`--tensor-parallel`).
+sequences in prompt chunks of 2048 tokens with an F16 KV cache (or its full-attention blocks in
+`int8`, `rk8v4` or `rk4v4` planes), drafts by context lookup only (`--lookup-ngram`; Recursive
+publishes no draft model), and has no vision, rotation scaling or pipeline stages; several GPUs
+divide its routed experts (`--tensor-parallel`).
 DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`; `src/models/deepseek_v41`,
 `runtime/engine/deepseek_v41_core`) is a fifth explicit family converted from ISTA-DASLab's
 GSQ-RCO GGUF (IQ1_M) and its Engram table GGUF with the ggml blocks kept as stored. It shares the
@@ -103,7 +104,8 @@ Thinking Machines' release (Unsloth's UD-IQ4_XS) with its ggml blocks kept as st
 layers run as 48 visits, the core layers three times with the same weights, each visit with its own
 keys, values and convolution histories. It shares the Qwen3.5 frontend in an Inkling dialect (the
 release's message blocks, reasoning and JSON tool-call blocks that the model opens itself), runs
-one to eight sequences in prompt chunks of 2048 tokens with an F16 KV cache, drafts with the
+one to eight sequences in prompt chunks of 2048 tokens with its full-attention visits' KV in MXFP8
+(the default), `int8`, `rk8v4` or `rk4v4` planes or F16, the windowed rings F16, drafts with the
 release's DSpark drafter (the `dspark` component; without `--spec` while one request runs) or by
 context lookup, encodes images with the release's vision tower (the `vision` component; resident or
 streamed from pinned memory), and has no rotation scaling, video or pipeline stages; several GPUs

@@ -640,8 +640,8 @@ struct EngineOptions {
     // Program and DeepSeek-V4.1 refuse it. BF16 stays the default.
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     // The storage was left to the Engine (no --kv-dtype): Inkling 2 then stores MXFP8 (Mxfp8),
-    // the KV format its release trained with, Flint and DeepSeek-V4.1 their only caches (BFloat16
-    // names them); the other families keep kv_cache. options() report the storage.
+    // the KV format its release trained with, Flint its F16 cache and DeepSeek-V4.1 its only one
+    // (BFloat16 names both); the other families keep kv_cache. options() report the storage.
     bool kv_cache_automatic = false;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

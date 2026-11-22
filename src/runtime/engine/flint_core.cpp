@@ -10,6 +10,8 @@
 #include "core/startup.h"
 #include "core/tensor_parallel.h"
 #include "models/expert_profile.h"
+#include "models/flint/kv_format.h"
+#include "models/kv_storage_name.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/frontend/processor.h"
 #include "ninfer/ops/argmax.h"
@@ -120,11 +122,7 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
                                     "archive, --mtp-attention-window or proposal head, and "
                                     "--draft-min-p only with --spec dspine");
     }
-    if (options.kv_cache != KvCacheStorage::BFloat16 &&
-        options.kv_cache != KvCacheStorage::Float16) {
-        throw std::invalid_argument(
-            "Flint keeps its KV cache in F16 (--kv-dtype fp16, or bf16, the default)");
-    }
+    const models::flint::KvFormat flint_kv = models::flint::kv_format(options.kv_cache);
     const auto& hybrid = options.hybrid_experts;
     if (hybrid.mapped_misses || hybrid.tail_skip_rank != 0 || hybrid.prefill_buffers != 0 ||
         hybrid.adaptive_cache) {
@@ -192,6 +190,7 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
     executor.expert_disk        = {hybrid.mirror, hybrid.direct};
+    executor.kv_cache           = options.kv_cache;
     // The full-attention blocks carry no rotation and the sliding ones never rotate a distance past
     // their window, so no position takes scaling.
     if (options.rope_yarn || options.rope_yarn_factor > 1.0F || options.rope_scaling_factor > 1.0F) {
@@ -242,9 +241,11 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
     instance->free_after_weights = free_after_weights;
     instance->free_after_startup = free_bytes();
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "Flint: %u sequence(s), prompt chunks of %u tokens, F16 KV %.0f MiB%s, "
+                       "Flint: %u sequence(s), prompt chunks of %u tokens, %s KV %.0f MiB%s, "
                        "workspace %.0f MiB",
                        executor.sequences, executor.prefill_chunk,
+                       flint_kv.quantized() ? models::kv_storage_name(options.kv_cache)
+                                             : "F16",
                        double(instance->executor->memory().kv_bytes) / 1048576.0,
                        instance->executor->memory().kv_grows
                            ? " at most, growing with the sequences beside an elastic expert cache"
@@ -455,7 +456,7 @@ struct FlintCore::Impl {
     FlintInstance& instance;
     DeviceContext& device;
     const std::uint32_t max_context;
-    const KvCacheStorage kv_cache; // the requested name of the F16 cache (bf16 or fp16)
+    const KvCacheStorage kv_cache; // --kv-dtype: bf16 or fp16 name the F16 cache
     const std::size_t max_outstanding;
     const std::chrono::milliseconds pending_timeout;
     const std::uint32_t domain;
@@ -2701,7 +2702,7 @@ MemorySummary FlintCore::memory_summary() const {
     out.device      = impl_->device.rank(0).device;
     out.max_context = impl_->max_context;
     out.kv_capacity = impl_->max_context;
-    out.kv_cache    = impl_->kv_cache; // F16 rows either way
+    out.kv_cache    = impl_->kv_cache;
     out.host_kv_capacity_bytes = impl_->host_budget;
     {
         std::lock_guard lock(impl_->stats_mutex);
