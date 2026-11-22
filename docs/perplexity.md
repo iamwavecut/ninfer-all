@@ -27,7 +27,8 @@ KV representations are the server's ten: `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`
 `rk2v4-e8`, `nvfp4`, `k8v4`, and `bf16p`, which scores as `bf16` does. Inkling 2 scores its MXFP8
 default without `--kv-dtype` (`mxfp8`) and quantizes the same eight full-attention visits under
 `rk8v4` or `rk4v4`; the windowed rings stay F16 ([Inkling 2](inkling2.md#kv-cache)). Flint keeps
-its caches in F16 and DeepSeek-V4.1 in BF16, and both are scored with `--kv-dtype bf16`. DeepSeek-V4.1 reads every window from `<｜begin▁of▁sentence｜>`, which
+its caches in F16 and DeepSeek-V4.1 in BF16, and both score them without `--kv-dtype` or with
+`--kv-dtype bf16`. DeepSeek-V4.1 reads every window from `<｜begin▁of▁sentence｜>`, which
 it puts in front of a window that lacks it; the scored tokens stay the window's own.
 
 Seven of them were measured on this corpus with Qwen3.8-27B on an RTX 3090; the results, alongside
