@@ -12,11 +12,18 @@
 #include <bit>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <string>
 #include <thread>
+
+#if defined(__linux__)
+#    include <unistd.h>
+#endif
 
 namespace {
 
@@ -207,6 +214,46 @@ void concurrent_direct_reads() {
     if (failure) { std::rethrow_exception(failure); }
 }
 
+// A file system without O_DIRECT (tmpfs, which holds /dev/shm on Linux) reads through the page
+// cache: the same bytes, the last read up to EOF.
+void direct_reads_without_o_direct() {
+#if defined(__linux__)
+    const std::filesystem::path directory = "/dev/shm";
+    if (!std::filesystem::is_directory(directory)) { return; }
+    const auto path = directory / ("ninfer-reader-test-" + std::to_string(::getpid()) + ".bin");
+    constexpr std::size_t kPieceBytes = 16 * 1024;
+    std::vector<std::byte> bytes(2 * kPieceBytes + 700);
+    for (std::size_t i = 0; i < bytes.size(); ++i) { bytes[i] = std::byte((i * 29 + 7) & 255); }
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+        require(out.good(), "tmpfs fixture was not written");
+    }
+    try {
+        const InputFile file(path);
+        const auto release = [](std::byte* data) {
+            ::operator delete(data, std::align_val_t{kPayloadAlignment});
+        };
+        const std::unique_ptr<std::byte, decltype(release)> staging(
+            static_cast<std::byte*>(
+                ::operator new(kPieceBytes, std::align_val_t{kPayloadAlignment})),
+            release);
+        for (std::size_t begin = 0; begin < bytes.size(); begin += kPieceBytes) {
+            const auto expected = std::min(kPieceBytes, bytes.size() - begin);
+            const auto received = file.read_direct(begin, {staging.get(), kPieceBytes});
+            require(received == expected &&
+                        std::memcmp(staging.get(), bytes.data() + begin, expected) == 0,
+                    "a direct read on tmpfs returned other bytes");
+        }
+    } catch (...) {
+        std::filesystem::remove(path);
+        throw;
+    }
+    std::filesystem::remove(path);
+#endif
+}
+
 void invalid_directories() {
     Fixture fixture;
     const auto bad = [&](auto mutate) {
@@ -279,6 +326,7 @@ int main(int argc, char** argv) {
         file_set_and_bindings();
         geometry_and_views();
         concurrent_direct_reads();
+        direct_reads_without_o_direct();
         invalid_directories();
         // Optional production-writer fixture or explicitly selected real artifact.
         if (argc == 2) {
