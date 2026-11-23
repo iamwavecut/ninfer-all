@@ -1,6 +1,7 @@
 #include "models/flint/kernels.h"
 
 #include "core/device_launch.h"
+#include "core/pdl_arch.cuh"
 #include "ops/common/route_order.cuh"
 #include "ops/kv_cache/row128_codec.cuh"
 #include "ops/common/silu.h"
@@ -138,6 +139,7 @@ int row_threads(int hidden) {
 __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                 int hidden, float eps, __nv_bfloat16* __restrict__ out, Q8Rows q8,
                                 float* __restrict__ f32) {
+    ninfer::pdl::arch_enter_glue();
     const int q      = hidden >> 2, i = threadIdx.x;
     const std::int64_t row = std::int64_t(blockIdx.x) * hidden;
     const float4 v   = i < q ? ld4(x + row, i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -156,6 +158,7 @@ __global__ void rms_norm_kernel(const float* __restrict__ x, const float* __rest
 // Block (t, head): Hq query heads then Hkv key/value heads; D/2 threads, thread i the pair
 // (i, i + D/2).
 __global__ void qkv_post_kernel(QkvArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int t      = blockIdx.x;
     const int head   = blockIdx.y;
     const int d      = a.head_dim;
@@ -195,6 +198,7 @@ __global__ void qkv_post_kernel(QkvArgs a) {
 
 __global__ void build_mask_kernel(__half* mask, int tokens, int slots, int first, int ring,
                                   int window, const std::int32_t* __restrict__ starts, int shared) {
+    ninfer::pdl::arch_enter_glue();
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (s >= slots) { return; }
@@ -227,6 +231,7 @@ __global__ void build_mask_kernel(__half* mask, int tokens, int slots, int first
 
 // Block (position, head): the position's K and V rows, 16-byte words.
 __global__ void ring_copy_kernel(RingCopyArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int p = a.begin + blockIdx.x, h = blockIdx.y;
     const std::int64_t src = h * a.src_head_stride + std::int64_t(p % a.src_ring) * a.head_dim;
     const std::int64_t dst = h * a.dst_head_stride + std::int64_t(p % a.dst_ring) * a.head_dim;
@@ -237,6 +242,7 @@ __global__ void ring_copy_kernel(RingCopyArgs a) {
 }
 
 __global__ void f32_to_bf16_kernel(const float* in, __nv_bfloat16* out, std::int64_t n) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) { out[i] = __float2bfloat16(in[i]); }
 }
@@ -288,6 +294,7 @@ __device__ __forceinline__ const std::uint8_t* row_scales(const KvPlaneView& p, 
 // KC, VC: the key and value codings, F16 for the F16 caches.
 template <KvCoding KC, KvCoding VC>
 __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(DecodeAttentionArgs a) {
+    ninfer::pdl::arch_enter();
     const int b        = blockIdx.x; // rows fastest: a verification's rows read the same keys
     const int kv_head  = blockIdx.y;
     const int split    = blockIdx.z;
@@ -419,6 +426,7 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
 constexpr int kCombineThreads = kD; // at least the largest split count
 
 __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int head = blockIdx.x, b = blockIdx.y;
     const int d    = threadIdx.x;
     const std::int64_t rows  = std::int64_t(a.batch) * a.query_heads * a.splits;
@@ -481,6 +489,7 @@ constexpr int kStoreWarps = 4; // warps per block, one (row, head) each
 
 template <KvCoding C>
 __launch_bounds__(kStoreWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int unit = blockIdx.x * kStoreWarps + warp;
     if (unit >= a.rows * a.heads) { return; }
@@ -505,6 +514,7 @@ __launch_bounds__(kStoreWarps * 32) __global__ void kv_store_kernel(KvStoreArgs 
 // Thread (slot, head, chunk): one 16-byte word of eight decoded values.
 template <KvCoding C>
 __global__ void kv_load_kernel(KvLoadArgs a) {
+    ninfer::pdl::arch_enter();
     constexpr int kChunks = kD / 8;
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t n = std::int64_t(a.end - a.begin) * a.heads * kChunks;
@@ -528,6 +538,7 @@ constexpr int kRouteTokens = 8; // decode: the small kernel below covers up to t
 __global__ void route_logits_kernel(const float* __restrict__ x, int hidden, int tokens,
                                     const float* __restrict__ router, int experts,
                                     float* __restrict__ logits) {
+    ninfer::pdl::arch_enter_glue();
     __shared__ float xs[kRouteTileT][kRouteTileK + 1];
     __shared__ float rs[kRouteTileE][kRouteTileK + 1];
     const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5; // 8 warps
@@ -613,6 +624,7 @@ __device__ __forceinline__ void router_row(const float* __restrict__ x, int hidd
 __global__ void route_logits_small_kernel(const float* __restrict__ x, int hidden, int tokens,
                                           const float* __restrict__ router, int experts,
                                           float* __restrict__ logits) {
+    ninfer::pdl::arch_enter_glue();
     router_row(x, hidden, tokens, router, experts, blockIdx.x, logits);
 }
 
@@ -624,6 +636,7 @@ __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-
 // lower id on ties) selects the top_k; their sigmoid scores renormalized over the top_k.
 __global__ void route_topk_kernel(const float* __restrict__ logits, int experts, int top_k,
                                   std::int32_t* __restrict__ ids, float* __restrict__ weights) {
+    ninfer::pdl::arch_enter_glue();
     __shared__ float v[kTopkMaxExperts];
     __shared__ float chosen[8];
     __shared__ int chosen_id[8];
@@ -757,6 +770,7 @@ __global__ void route_decode_kernel(const float* __restrict__ x, int hidden, int
                                     std::int32_t* __restrict__ active,
                                     std::int32_t* __restrict__ active_count,
                                     unsigned* __restrict__ done) {
+    ninfer::pdl::arch_enter_glue();
     __shared__ bool last;
     router_row(x, hidden, tokens, router, experts, blockIdx.x, logits);
     __threadfence();
@@ -775,6 +789,7 @@ constexpr int kGuardThreads = 128;
 // One block per pair. A warp's step covers 32 aligned values, the span of one F16 sum.
 __global__ void swiglu_rows_kernel(const float* __restrict__ x, int width,
                                    __nv_bfloat16* __restrict__ out, float* __restrict__ weights) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t p = blockIdx.x;
     const float* row     = x + p * 2 * width;
     __nv_bfloat16* o     = out + p * width;
@@ -797,6 +812,7 @@ __global__ void swiglu_rows_kernel(const float* __restrict__ x, int width,
 // One block per column.
 __global__ void scale_columns_kernel(__nv_bfloat16* __restrict__ x, int rows,
                                      float* __restrict__ h, int h_rows, float* __restrict__ scale) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t c   = blockIdx.x;
     __nv_bfloat16* column  = x + c * rows;
     float largest          = 0.0f;
@@ -817,6 +833,7 @@ __global__ void scale_columns_kernel(__nv_bfloat16* __restrict__ x, int rows,
 // One block of `width` threads per pair: each warp's 32 values are one F16 sum's.
 __global__ void quantize_pairs_kernel(__nv_bfloat16* __restrict__ middle, int width,
                                       float* __restrict__ weights, Q8Rows out) {
+    ninfer::pdl::arch_enter_glue();
     __shared__ float largest[32];
     __shared__ int exponent;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -849,6 +866,7 @@ __global__ void quantize_pairs_kernel(__nv_bfloat16* __restrict__ middle, int wi
 
 __global__ void unscale_columns_kernel(float* __restrict__ h, int h_rows,
                                        const float* __restrict__ scale) {
+    ninfer::pdl::arch_enter_glue();
     const float s = scale[blockIdx.x];
     if (s == 1.0f) { return; }
     float* hc = h + std::int64_t(blockIdx.x) * h_rows;
@@ -857,12 +875,14 @@ __global__ void unscale_columns_kernel(float* __restrict__ h, int h_rows,
 
 __global__ void add_fixed_kernel(unsigned long long* sums, const unsigned long long* products,
                                  const std::int32_t* flag, std::int64_t n) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n || *flag == 0) { return; }
     sums[i] += products[i];
 }
 
 __global__ void ffn_combine_kernel(FfnCombineArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int q = a.hidden >> 2, i = threadIdx.x;
     const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
     const float4 zero      = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -892,35 +912,37 @@ __global__ void ffn_combine_kernel(FfnCombineArgs a) {
 void rms_norm(const float* x, const float* w, int hidden, int tokens, float eps,
               __nv_bfloat16* out, cudaStream_t stream, Q8Rows q, float* f32) {
     if (tokens <= 0) { return; }
-    rms_norm_kernel<<<tokens, row_threads(hidden), 0, stream>>>(x, w, hidden, eps, out, q, f32);
+    ninfer::pdl::launch_arch(tokens, row_threads(hidden), 0, stream, rms_norm_kernel, x, w, hidden,
+                             eps, out, q, f32);
     check_launch("rms_norm");
 }
 
 void qkv_post(const QkvArgs& args, cudaStream_t stream) {
     if (args.head_dim != kD) { throw std::invalid_argument("flint qkv_post: head width must be 128"); }
     const dim3 grid(args.tokens, args.query_heads + args.kv_heads, 1);
-    qkv_post_kernel<<<grid, args.head_dim / 2, 0, stream>>>(args);
+    ninfer::pdl::launch_arch(grid, args.head_dim / 2, 0, stream, qkv_post_kernel, args);
     check_launch("qkv_post");
 }
 
 void build_mask(__half* mask, int tokens, int slots, int first, int ring, int window,
                 cudaStream_t stream, const std::int32_t* starts, int shared) {
     const dim3 grid(blocks_for(slots, 256), tokens, 1);
-    build_mask_kernel<<<grid, 256, 0, stream>>>(mask, tokens, slots, first, ring, window, starts,
-                                                shared);
+    ninfer::pdl::launch_arch(grid, 256, 0, stream, build_mask_kernel, mask, tokens, slots, first,
+                             ring, window, starts, shared);
     check_launch("build_mask");
 }
 
 void ring_copy(const RingCopyArgs& a, cudaStream_t stream) {
     if (a.end <= a.begin) { return; }
     if (a.head_dim % 8 != 0) { throw std::invalid_argument("flint ring_copy: head width"); }
-    ring_copy_kernel<<<dim3(a.end - a.begin, a.kv_heads, 1), 64, 0, stream>>>(a);
+    ninfer::pdl::launch_arch(dim3(a.end - a.begin, a.kv_heads, 1), 64, 0, stream, ring_copy_kernel,
+                             a);
     check_launch("ring_copy");
 }
 
 void f32_to_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, cudaStream_t stream) {
     if (n <= 0) { return; }
-    f32_to_bf16_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(in, out, n);
+    ninfer::pdl::launch_arch(blocks_for(n, 256), 256, 0, stream, f32_to_bf16_kernel, in, out, n);
     check_launch("f32_to_bf16");
 }
 
@@ -939,25 +961,28 @@ void decode_attention(const DecodeAttentionArgs& args, cudaStream_t stream) {
     const dim3 grid(args.batch, args.kv_heads, args.splits);
     const KvCoding kc = args.k_plane.coding, vc = args.v_plane.coding;
     if (kc == KvCoding::F16 && vc == KvCoding::F16) {
-        decode_attention_kernel<KvCoding::F16, KvCoding::F16><<<grid, kDecodeThreads, 0, stream>>>(
-            args);
+        ninfer::pdl::launch_arch(grid, kDecodeThreads, 0, stream,
+                                 decode_attention_kernel<KvCoding::F16, KvCoding::F16>, args);
     } else if (args.ring != 0) {
         throw std::invalid_argument("flint decode attention: quantized planes are linear caches");
     } else if (kc == KvCoding::Int8G64 && vc == KvCoding::Int8G64) {
-        decode_attention_kernel<KvCoding::Int8G64, KvCoding::Int8G64>
-            <<<grid, kDecodeThreads, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(grid, kDecodeThreads, 0, stream,
+                                 decode_attention_kernel<KvCoding::Int8G64, KvCoding::Int8G64>,
+                                 args);
     } else if (kc == KvCoding::Int8G64 && vc == KvCoding::Int4G32) {
-        decode_attention_kernel<KvCoding::Int8G64, KvCoding::Int4G32>
-            <<<grid, kDecodeThreads, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(grid, kDecodeThreads, 0, stream,
+                                 decode_attention_kernel<KvCoding::Int8G64, KvCoding::Int4G32>,
+                                 args);
     } else if (kc == KvCoding::Lloyd4 && vc == KvCoding::Int4G32) {
-        decode_attention_kernel<KvCoding::Lloyd4, KvCoding::Int4G32>
-            <<<grid, kDecodeThreads, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(grid, kDecodeThreads, 0, stream,
+                                 decode_attention_kernel<KvCoding::Lloyd4, KvCoding::Int4G32>,
+                                 args);
     } else {
         throw std::invalid_argument("flint decode attention: no kernel for these KV codings");
     }
     check_launch("decode_attention");
-    decode_combine_kernel<<<dim3(args.query_heads, args.batch, 1), kCombineThreads, 0, stream>>>(
-        args);
+    ninfer::pdl::launch_arch(dim3(args.query_heads, args.batch, 1), kCombineThreads, 0, stream,
+                             decode_combine_kernel, args);
     check_launch("decode_combine");
 }
 
@@ -967,13 +992,13 @@ void kv_store(const KvStoreArgs& args, cudaStream_t stream) {
     const dim3 grid((units + kStoreWarps - 1) / kStoreWarps), block(kStoreWarps * 32);
     switch (args.dst.coding) {
     case KvCoding::Int8G64:
-        kv_store_kernel<KvCoding::Int8G64><<<grid, block, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(grid, block, 0, stream, kv_store_kernel<KvCoding::Int8G64>, args);
         break;
     case KvCoding::Int4G32:
-        kv_store_kernel<KvCoding::Int4G32><<<grid, block, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(grid, block, 0, stream, kv_store_kernel<KvCoding::Int4G32>, args);
         break;
     case KvCoding::Lloyd4:
-        kv_store_kernel<KvCoding::Lloyd4><<<grid, block, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(grid, block, 0, stream, kv_store_kernel<KvCoding::Lloyd4>, args);
         break;
     default: throw std::invalid_argument("flint kv_store: not a Flint plane coding");
     }
@@ -986,13 +1011,13 @@ void kv_load(const KvLoadArgs& args, cudaStream_t stream) {
     const unsigned grid = blocks_for(n, 256);
     switch (args.src.coding) {
     case KvCoding::Int8G64:
-        kv_load_kernel<KvCoding::Int8G64><<<grid, 256, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(grid, 256, 0, stream, kv_load_kernel<KvCoding::Int8G64>, args);
         break;
     case KvCoding::Int4G32:
-        kv_load_kernel<KvCoding::Int4G32><<<grid, 256, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(grid, 256, 0, stream, kv_load_kernel<KvCoding::Int4G32>, args);
         break;
     case KvCoding::Lloyd4:
-        kv_load_kernel<KvCoding::Lloyd4><<<grid, 256, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(grid, 256, 0, stream, kv_load_kernel<KvCoding::Lloyd4>, args);
         break;
     default: throw std::invalid_argument("flint kv_load: not a Flint plane coding");
     }
@@ -1005,15 +1030,16 @@ void route(const float* x, int hidden, int tokens, const float* router, int expe
         throw std::invalid_argument("flint route: at most 8 of 256 experts over whole float4s");
     }
     if (tokens <= kRouteTokens) {
-        route_logits_small_kernel<<<experts, kRouteSmallThreads, 0, stream>>>(x, hidden, tokens,
-                                                                             router, experts, logits);
+        ninfer::pdl::launch_arch(experts, kRouteSmallThreads, 0, stream, route_logits_small_kernel,
+                                 x, hidden, tokens, router, experts, logits);
     } else {
         const dim3 grid(blocks_for(experts, kRouteTileE), blocks_for(tokens, kRouteTileT), 1);
-        route_logits_kernel<<<grid, 256, 0, stream>>>(x, hidden, tokens, router, experts, logits);
+        ninfer::pdl::launch_arch(grid, 256, 0, stream, route_logits_kernel, x, hidden, tokens,
+                                 router, experts, logits);
     }
     check_launch("route logits");
-    route_topk_kernel<<<tokens, (experts + 31) / 32 * 32, 0, stream>>>(logits, experts, top_k, ids,
-                                                                       weights);
+    ninfer::pdl::launch_arch(tokens, (experts + 31) / 32 * 32, 0, stream, route_topk_kernel, logits,
+                             experts, top_k, ids, weights);
     check_launch("route top-k");
 }
 
@@ -1025,9 +1051,9 @@ void route_select(const float* x, int hidden, int tokens, const float* router, i
         hidden % 4 != 0) {
         throw std::invalid_argument("flint route_select: at most 8 tokens, 8 of 256 experts");
     }
-    route_decode_kernel<<<experts, kTopkMaxExperts, 0, stream>>>(
-        x, hidden, tokens, router, experts, top_k, logits, ids, weights, bounds, sorted, active,
-        active_count, done);
+    ninfer::pdl::launch_arch(experts, kTopkMaxExperts, 0, stream, route_decode_kernel, x, hidden,
+                             tokens, router, experts, top_k, logits, ids, weights, bounds, sorted,
+                             active, active_count, done);
     check_launch("route_select");
 }
 
@@ -1035,7 +1061,8 @@ void swiglu_rows(const float* x, int pairs, int width, __nv_bfloat16* out, float
                  cudaStream_t stream) {
     if (width % 32 != 0) { throw std::invalid_argument("flint swiglu_rows: width % 32 != 0"); }
     if (pairs <= 0 || width <= 0) { return; }
-    swiglu_rows_kernel<<<pairs, kGuardThreads, 0, stream>>>(x, width, out, weights);
+    ninfer::pdl::launch_arch(pairs, kGuardThreads, 0, stream, swiglu_rows_kernel, x, width, out,
+                             weights);
     check_launch("swiglu_rows");
 }
 
@@ -1043,7 +1070,8 @@ void scale_columns(__nv_bfloat16* x, int rows, int columns, float* h, int h_rows
                    cudaStream_t stream) {
     if (rows % 32 != 0) { throw std::invalid_argument("flint scale_columns: rows % 32 != 0"); }
     if (columns <= 0) { return; }
-    scale_columns_kernel<<<columns, kGuardThreads, 0, stream>>>(x, rows, h, h_rows, scale);
+    ninfer::pdl::launch_arch(columns, kGuardThreads, 0, stream, scale_columns_kernel, x, rows, h,
+                             h_rows, scale);
     check_launch("scale_columns");
 }
 
@@ -1053,27 +1081,30 @@ void quantize_pairs(__nv_bfloat16* middle, int pairs, int width, float* weights,
         throw std::invalid_argument("flint quantize_pairs: whole 32-value groups, at most 1024");
     }
     if (pairs <= 0) { return; }
-    quantize_pairs_kernel<<<pairs, width, 0, stream>>>(middle, width, weights, out);
+    ninfer::pdl::launch_arch(pairs, width, 0, stream, quantize_pairs_kernel, middle, width, weights,
+                             out);
     check_launch("quantize_pairs");
 }
 
 void unscale_columns(float* h, int h_rows, int columns, const float* scale, cudaStream_t stream) {
     if (columns <= 0) { return; }
-    unscale_columns_kernel<<<columns, kGuardThreads, 0, stream>>>(h, h_rows, scale);
+    ninfer::pdl::launch_arch(columns, kGuardThreads, 0, stream, unscale_columns_kernel, h, h_rows,
+                             scale);
     check_launch("unscale_columns");
 }
 
 void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,
                std::int64_t n, cudaStream_t stream) {
     if (n <= 0) { return; }
-    add_fixed_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
-        sums, static_cast<const unsigned long long*>(products), flag, n);
+    ninfer::pdl::launch_arch(blocks_for(n, 256), 256, 0, stream, add_fixed_kernel, sums,
+                             static_cast<const unsigned long long*>(products), flag, n);
     check_launch("add_fixed");
 }
 
 void ffn_combine(const FfnCombineArgs& args, cudaStream_t stream) {
     if (args.next_norm == nullptr) { throw std::invalid_argument("flint ffn_combine: next norm"); }
-    ffn_combine_kernel<<<args.tokens, row_threads(args.hidden), 0, stream>>>(args);
+    ninfer::pdl::launch_arch(args.tokens, row_threads(args.hidden), 0, stream, ffn_combine_kernel,
+                             args);
     check_launch("ffn_combine");
 }
 

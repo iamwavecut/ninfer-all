@@ -52,6 +52,9 @@ struct VecArgs {
     const std::int8_t* qs; // [columns][k]
     const half2* ds;       // [columns][k / 32]
     VecStore out;
+    // Set by the launch: the launch is a programmatic dependent (core/pdl_arch.cuh), whose blocks
+    // read their first rows' weight into L2 before they wait.
+    bool prefetch = false;
 };
 
 // The vector kernel's MoE form (ggml_bridge_vec.cuh moe_kernel).

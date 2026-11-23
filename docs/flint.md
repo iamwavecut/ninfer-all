@@ -38,6 +38,10 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   (`<tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>...</tool_call>`) returned as
   OpenAI tool calls, each value read by its declared parameter type. A forced `tool_choice` ends
   the generation prompt with `<tool_call>NAME`, so the model continues with the arguments.
+- **Dependent launches.** On sm_90 and newer cards the decode graph launches each kernel as a
+  programmatic dependent of the one before it
+  ([programmatic dependent launch](maintainer/op-development.md#programmatic-dependent-launch)).
+  Greedy decode on an RTX 5090 went from 334.9 to 358.0 tok/s with the same tokens.
 - **Prompt chunks without logits.** A chunk before the prompt's last, or before a scoring call's
   first scored position, runs its last block only up to the key/value store: that block's attention
   output and experts feed only the head. The stored rows are those of the whole block, so caches and

@@ -17,6 +17,7 @@ set(ninfer_op_tests
   moe_experts_gguf
   moe_latent_gguf
   moe_experts_native
+  moe_expert_prefetch
   rmsnorm
   rmsnorm_pack_tail
   gated_rmsnorm

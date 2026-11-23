@@ -1,6 +1,7 @@
 #include "models/inkling2/kernels.h"
 
 #include "core/device_launch.h"
+#include "core/pdl_arch.cuh"
 #include "models/inkling2/config.h"
 #include "models/inkling2/kv_codec.cuh"
 #include "models/inkling2/situ.h"
@@ -216,6 +217,7 @@ __device__ __forceinline__ float* history_slot(const History& h, int sequence, i
 __global__ void __launch_bounds__(kRowBlock)
     rms_norm_kernel(const float* __restrict__ x, const float* __restrict__ w, int hidden, float eps,
                     __nv_bfloat16* __restrict__ out, Q8Rows q8, float* f32) {
+    ninfer::pdl::arch_enter_glue();
     const int q = hidden >> 2, i = threadIdx.x;
     const std::int64_t row = std::int64_t(blockIdx.x) * hidden;
     const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -373,6 +375,7 @@ __device__ void mix_row(const MixArgs& a, int t, bool has_current, float4 curren
 }
 
 __global__ void __launch_bounds__(kRowBlock) mix_kernel(MixArgs a) {
+    ninfer::pdl::arch_enter_glue();
     mix_row(a, blockIdx.x, false, make_float4(0.0f, 0.0f, 0.0f, 0.0f));
 }
 
@@ -432,6 +435,7 @@ __device__ __forceinline__ float* split_mixed(const MixArgs& a, int q, int t) {
 }
 
 __global__ void __launch_bounds__(32) mix_split_terms_kernel(MixArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int w = int(blockIdx.x), t = int(blockIdx.y), i = 32 * w + int(threadIdx.x);
     const bool valid = i < (a.hidden >> 2);
     float4 s[kMaxStates], qv[kMaxQueries];
@@ -446,6 +450,7 @@ __global__ void __launch_bounds__(32) mix_split_terms_kernel(MixArgs a) {
 // raw mixes and, for normed outputs, the mixed rows and the warps' sums of their squares; the
 // second the normed outputs.
 __global__ void __launch_bounds__(32) mix_split_rows_kernel(MixArgs a, bool normed) {
+    ninfer::pdl::arch_enter_glue();
     const int w = int(blockIdx.x), t = int(blockIdx.y), i = 32 * w + int(threadIdx.x);
     const bool valid = i < (a.hidden >> 2);
     const int warps  = row_warps(a.hidden);
@@ -538,8 +543,19 @@ __device__ __forceinline__ void gemv_row(const float* __restrict__ w, const floa
 // Block m: output row m.
 template <int N>
 __global__ void gemv_kernel(const float* __restrict__ w, const float* __restrict__ x, int m, int k,
-                            std::int64_t x_stride, float* __restrict__ out,
-                            std::int64_t out_stride) {
+                            std::int64_t x_stride, float* __restrict__ out, std::int64_t out_stride,
+                            bool prefetch) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // A programmatic dependent reads its weight row into L2 before it waits.
+    if (prefetch) {
+        const char* row = reinterpret_cast<const char*>(w + std::int64_t(blockIdx.x) * k);
+        for (std::int64_t o = std::int64_t(threadIdx.x) * 128; o < std::int64_t(k) * 4;
+             o += std::int64_t(blockDim.x) * 128) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(row + o));
+        }
+    }
+#endif
+    ninfer::pdl::arch_enter();
     gemv_row<N>(w, x, int(blockIdx.x), k, x_stride, out, out_stride);
 }
 
@@ -547,6 +563,7 @@ __global__ void gemv_kernel(const float* __restrict__ w, const float* __restrict
 template <int N>
 __global__ void gemv_batch_kernel(GemvBatch b, int k, std::int64_t x_stride,
                                   std::int64_t out_stride) {
+    ninfer::pdl::arch_enter();
     const int e = int(blockIdx.y);
     gemv_row<N>(b.w[e], b.x[e], int(blockIdx.x), k, x_stride, b.out[e], out_stride);
 }
@@ -559,6 +576,7 @@ constexpr int kShortRows = kGemvThreads / 32; // output rows per block of the sh
 template <int N>
 __global__ void __launch_bounds__(kGemvThreads)
     gemv_short_kernel(GemvBatch b, int m, int k, std::int64_t x_stride, std::int64_t out_stride) {
+    ninfer::pdl::arch_enter();
     const int e = int(blockIdx.y), lane = threadIdx.x & 31;
     const int row = int(blockIdx.x) * kShortRows + int(threadIdx.x >> 5);
     if (row >= m) { return; }
@@ -583,6 +601,7 @@ __global__ void __launch_bounds__(kGemvThreads)
 
 // Block (t, input): [rms(x); rms(message)] into concat.
 __global__ void __launch_bounds__(kRowBlock) control_inputs_kernel(ControlInputs a) {
+    ninfer::pdl::arch_enter_glue();
     const int t = blockIdx.x, c = blockIdx.y, i = threadIdx.x, quads = a.hidden >> 2;
     const std::int64_t row = std::int64_t(t) * a.hidden;
     const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -598,6 +617,7 @@ __global__ void __launch_bounds__(kRowBlock) control_inputs_kernel(ControlInputs
 
 // Block (t, input).
 __global__ void __launch_bounds__(kRowBlock) control_apply_kernel(ControlApply a) {
+    ninfer::pdl::arch_enter_glue();
     const int t = blockIdx.x, c = blockIdx.y, i = threadIdx.x, quads = a.hidden >> 2;
     const bool valid = i < quads;
     const std::int64_t row = std::int64_t(t) * a.hidden;
@@ -718,6 +738,7 @@ __device__ __forceinline__ void kv_post_block(const KvArgs& a, int t, int kh) {
 
 // Block (t, y) of 128 threads: Q head y of row t, or K and V head y - heads after the Q heads.
 __global__ void attention_inputs_kernel(QueryArgs q, KvArgs kv, int heads) {
+    ninfer::pdl::arch_enter_glue();
     const int t = blockIdx.x, y = blockIdx.y;
     if (y < heads) {
         query_post_block(q, t, y);
@@ -865,6 +886,7 @@ __device__ __forceinline__ bool split_keys(const AttentionArgs& a, int t0, int t
 template <int kRows, bool kFar = false>
 __global__ void __launch_bounds__(kRows == 1 ? 128 * kMaxRowGroup : 256)
     attention_kernel(AttentionArgs a) {
+    ninfer::pdl::arch_enter();
     constexpr int kWarps = kRows == 1 ? 4 * kMaxRowGroup : 8;
 #if defined(__CUDA_ARCH__)
     if constexpr (kRows == 1 && !kVoltaImage) { return; } // Volta's route only
@@ -1085,6 +1107,7 @@ constexpr int kCombineThreads = kD;
 constexpr int kMaxSplits      = 4 * kCombineThreads;
 
 __global__ void attention_combine_kernel(AttentionArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int head = blockIdx.x, t = blockIdx.y;
     const int d    = threadIdx.x;
     const std::int64_t rows  = std::int64_t(a.rows.tokens) * a.query_heads * a.splits;
@@ -1180,6 +1203,7 @@ constexpr int kFarBlocks = 2;
 
 template <int Group>
 __global__ void __launch_bounds__(64 * Group, kFarBlocks) far_attention_kernel(AttentionArgs a) {
+    ninfer::pdl::arch_enter();
     constexpr int kThreads = 64 * Group;
     constexpr int kWords   = 2 * kFarKeys * (kD / 8); // uint4 words of a K and V tile
     constexpr int kPer     = (kWords + kThreads - 1) / kThreads;
@@ -1426,6 +1450,7 @@ __device__ __forceinline__ void near_range(const AttentionArgs& a, int g, int fr
 
 template <int Group, bool kFar>
 __global__ void __launch_bounds__(64 * Group) near_attention_kernel(AttentionArgs a) {
+    ninfer::pdl::arch_enter();
     if constexpr (kVoltaImage) { return; } // Volta runs attention_kernel<8>
     constexpr int kThreads = 64 * Group;
     constexpr int kWords   = 2 * kFarKeys * (kD / 8);
@@ -1933,6 +1958,7 @@ struct Codings {
 template <KvCoding KC, KvCoding VC, int kRows>
 __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGroup / kRows))
     decode_attention_kernel(AttentionArgs a) {
+    ninfer::pdl::arch_enter();
     if constexpr (kVoltaImage) { return; } // Volta runs attention_kernel<1>
     using KR = RowChunk<KC>;
     using VR = RowChunk<VC>;
@@ -2336,6 +2362,7 @@ __device__ __forceinline__ float4 residual_quad(const ResidualArgs& a, int t, in
 }
 
 __global__ void __launch_bounds__(kRowBlock) residual_kernel(ResidualArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int t = blockIdx.x;
     const float4 cur = residual_quad(a, t, int(threadIdx.x));
     if (a.mix.query_count > 0) { mix_row(a.mix, t, true, cur); }
@@ -2344,6 +2371,7 @@ __global__ void __launch_bounds__(kRowBlock) residual_kernel(ResidualArgs a) {
 // Block (w, t) of a split call: the update of warp w's quads of row t and their sums of its mix,
 // whose other states and queries load before the update.
 __global__ void __launch_bounds__(32) residual_split_kernel(ResidualArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int w = int(blockIdx.x), t = int(blockIdx.y), i = 32 * w + int(threadIdx.x);
     const MixArgs& m = a.mix;
     const bool valid = i < (a.hidden >> 2);
@@ -2367,6 +2395,7 @@ __global__ void __launch_bounds__(32) residual_split_kernel(ResidualArgs a) {
 __global__ void keep_history_kernel(const float* __restrict__ x, std::int64_t stride, int channels,
                                     const std::int32_t* __restrict__ positions, int begin,
                                     History h, int sequence) {
+    ninfer::pdl::arch_enter_glue();
     const int t = begin + blockIdx.x;
     float* slot = history_slot(h, sequence, positions[t]);
     for (int c = threadIdx.x; c < channels; c += blockDim.x) {
@@ -2376,6 +2405,7 @@ __global__ void keep_history_kernel(const float* __restrict__ x, std::int64_t st
 
 // Block per row of [begin, end): its product into its history slot.
 __global__ void __launch_bounds__(kRowBlock) keep_products_kernel(ResidualArgs a, int begin) {
+    ninfer::pdl::arch_enter_glue();
     const int t = begin + blockIdx.x, i = threadIdx.x;
     if (i >= a.hidden / 4) { return; }
     reinterpret_cast<float4*>(
@@ -2398,6 +2428,7 @@ __device__ __forceinline__ void zero_sums(const RouteArgs& a) {
 }
 
 __global__ void route_kernel(RouteArgs a) {
+    ninfer::pdl::arch_enter_glue();
     zero_sums(a);
     const int t = blockIdx.x, e = threadIdx.x;
     __shared__ float selections[kRouteThreads];
@@ -2440,6 +2471,7 @@ __global__ void route_kernel(RouteArgs a) {
 constexpr int kRouteTileWidths = 4;
 __global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
     route_sorted_kernel(RouteArgs a) {
+    ninfer::pdl::arch_enter_glue();
     zero_sums(a);
     constexpr int E = kSortedRouteExperts;
     const int t = int(threadIdx.x) / E, e = int(threadIdx.x) % E;
@@ -2533,6 +2565,7 @@ constexpr int kSituThreads = 128;
 __global__ void situ_rows_kernel(const float* __restrict__ gu, std::int64_t stride, int width,
                                  const float* __restrict__ pair_scale, float gate_cap, float up_cap,
                                  __nv_bfloat16* __restrict__ out) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t p = blockIdx.x;
     const int r          = int(blockIdx.y) * kSituThreads + int(threadIdx.x);
     if (r >= width) { return; }
@@ -2547,6 +2580,7 @@ __global__ void situ_rows_kernel(const float* __restrict__ gu, std::int64_t stri
 __global__ void situ_q8_kernel(const float* __restrict__ gu, std::int64_t stride, int width,
                                const float* __restrict__ pair_scale, float gate_cap, float up_cap,
                                std::int8_t* __restrict__ qs, half2* __restrict__ ds) {
+    ninfer::pdl::arch_enter_glue();
     const int p = blockIdx.x;
     const int r = int(blockIdx.y) * kSituThreads + int(threadIdx.x);
     if (r >= width) { return; } // whole warps: width % 32 == 0
@@ -2585,6 +2619,7 @@ __global__ void __launch_bounds__(kBfWarps * 32)
                             const std::int32_t* __restrict__ active_count,
                             const __nv_bfloat16* __restrict__ x, int x_div,
                             float* __restrict__ out) {
+    ninfer::pdl::arch_enter();
     if (int(blockIdx.y) >= *active_count) { return; }
     const int e     = active[blockIdx.y];
     const int begin = bounds[e], end = bounds[e + 1];
@@ -2648,6 +2683,7 @@ __global__ void __launch_bounds__(kBfWarps * 32)
 __global__ void bf16_rows_f32_kernel(const __nv_bfloat16* __restrict__ table, int k,
                                      const std::int32_t* __restrict__ ids, float* __restrict__ out,
                                      std::int64_t out_stride) {
+    ninfer::pdl::arch_enter_glue();
     const int i = int(blockIdx.y) * blockDim.x + int(threadIdx.x);
     if (i >= k) { return; }
     const std::int64_t r = blockIdx.x;
@@ -2655,6 +2691,7 @@ __global__ void bf16_rows_f32_kernel(const __nv_bfloat16* __restrict__ table, in
 }
 
 __global__ void softcap_kernel(const float* in, __nv_bfloat16* out, std::int64_t n, float cap) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) { out[i] = __float2bfloat16(cap * tanhf(in[i] / cap)); }
 }
@@ -2662,6 +2699,7 @@ __global__ void softcap_kernel(const float* in, __nv_bfloat16* out, std::int64_t
 // Block (part, row): every 256th logit of the row from the part's first.
 __global__ void softcap_rows_kernel(const float* in, std::int64_t in_stride, __nv_bfloat16* out,
                                     std::int64_t out_stride, int width, float cap) {
+    ninfer::pdl::arch_enter_glue();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= width) { return; }
     const std::int64_t r = blockIdx.y;
@@ -2669,18 +2707,21 @@ __global__ void softcap_rows_kernel(const float* in, std::int64_t in_stride, __n
 }
 
 __global__ void f32_to_bf16_kernel(const float* in, __nv_bfloat16* out, std::int64_t n) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) { out[i] = __float2bfloat16(in[i]); }
 }
 
 __global__ void place_rows_kernel(const __nv_bfloat16* __restrict__ rows, std::int64_t n,
                                   float* __restrict__ h) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t k = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (k < n) { h[k] = __bfloat162float(rows[k]); }
 }
 
 // Block (position, head): the position's K and V rows, 16-byte words.
 __global__ void ring_copy_kernel(RingCopyArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int p = a.begin + blockIdx.x, h = blockIdx.y;
     const std::int64_t src = h * a.src_head_stride + std::int64_t(p % a.src_ring) * kD;
     const std::int64_t dst = h * a.dst_head_stride + std::int64_t(p % a.dst_ring) * kD;
@@ -2692,6 +2733,7 @@ __global__ void ring_copy_kernel(RingCopyArgs a) {
 
 __global__ void add_fixed_kernel(unsigned long long* sums, const unsigned long long* products,
                                  const std::int32_t* flag, std::int64_t n) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n || *flag == 0) { return; }
     sums[i] += products[i];
@@ -2701,6 +2743,7 @@ __global__ void add_fixed_kernel(unsigned long long* sums, const unsigned long l
 
 // Block (row): every mix of the row, thread i its values 4i..4i+3.
 __global__ void __launch_bounds__(kRowBlock) spark_mix_kernel(SparkMixArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int t = a.begin + int(blockIdx.x);
     const int q = a.hidden >> 2, i = threadIdx.x;
     const bool valid = i < q;
@@ -2737,6 +2780,7 @@ __global__ void __launch_bounds__(kRowBlock) spark_mix_kernel(SparkMixArgs a) {
 
 // Block (row, head) of 128 threads, thread d the head's value d.
 __global__ void spark_rotate_kernel(SparkRotateArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int t = a.begin + int(blockIdx.x), h = blockIdx.y, d = threadIdx.x;
     float* row = a.x + std::int64_t(t) * a.stride + a.column;
     const float v   = row[h * kD + d];
@@ -2768,6 +2812,7 @@ __global__ void spark_rotate_kernel(SparkRotateArgs a) {
 
 __global__ void add_rows_kernel(float* h, const float* y, std::int64_t y_stride, int hidden,
                                 std::int64_t n) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t at = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at >= n) { return; }
     const std::int64_t t = at / hidden, c = at % hidden;
@@ -2775,6 +2820,7 @@ __global__ void add_rows_kernel(float* h, const float* y, std::int64_t y_stride,
 }
 
 __global__ void silu_mul_kernel(const float* gu, int width, std::int64_t n, __nv_bfloat16* out) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t at = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at >= n) { return; }
     const std::int64_t t = at / width, c = at % width;
@@ -2786,6 +2832,7 @@ constexpr int kSparkRank     = 256;
 constexpr int kSparkPartials = 256;
 
 __global__ void spark_table_kernel(const float* p, std::int64_t n, __nv_bfloat16* m, float* c) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t at = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at >= n * (kSparkRank + 1)) { return; }
     const std::int64_t v = at / (kSparkRank + 1), r = at % (kSparkRank + 1);
@@ -2798,6 +2845,7 @@ __global__ void spark_table_kernel(const float* p, std::int64_t n, __nv_bfloat16
 
 __global__ void spark_head_inputs_kernel(const float* hidden_out, const float* bias, int hidden,
                                          int rank, float* out) {
+    ninfer::pdl::arch_enter_glue();
     const std::int64_t at = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (at >= std::int64_t(rank + 1) * hidden) { return; }
     const std::int64_t r = at / hidden, k = at % hidden;
@@ -2807,6 +2855,7 @@ __global__ void spark_head_inputs_kernel(const float* hidden_out, const float* b
 // Block of eight warps, warp w output 8 blockIdx.x + w of the joint projection; the block's input
 // vector in shared memory.
 __global__ void __launch_bounds__(256) spark_joint_kernel(SparkStepArgs a) {
+    ninfer::pdl::arch_enter_glue();
     extern __shared__ float x[];
     const int k = 2 * kSparkRank + 2 * a.hidden_size;
     const int prev = *a.prev;
@@ -2842,6 +2891,7 @@ __global__ void __launch_bounds__(256) spark_joint_kernel(SparkStepArgs a) {
 
 // Block of eight warps, warp w vocabulary row 8 blockIdx.x + w: its soft-capped logit.
 __global__ void __launch_bounds__(256) spark_logits_kernel(SparkStepArgs a) {
+    ninfer::pdl::arch_enter_glue();
     __shared__ float latent[kSparkRank];
     for (int r = threadIdx.x; r < kSparkRank; r += blockDim.x) {
         latent[r] = tanhf(a.joint[2 * kSparkRank + r]);
@@ -2912,6 +2962,7 @@ __device__ Pick block_pick(Pick p) {
 }
 
 __global__ void __launch_bounds__(256) spark_pick_partials_kernel(SparkStepArgs a) {
+    ninfer::pdl::arch_enter_glue();
     const int per = (a.vocab + kSparkPartials - 1) / kSparkPartials;
     const int lo = blockIdx.x * per, hi = min(a.vocab, lo + per);
     Pick p;
@@ -2934,6 +2985,7 @@ __global__ void __launch_bounds__(256) spark_pick_partials_kernel(SparkStepArgs 
 }
 
 __global__ void __launch_bounds__(kSparkPartials) spark_pick_final_kernel(SparkStepArgs a) {
+    ninfer::pdl::arch_enter_glue();
     Pick p;
     const int b = threadIdx.x;
     p.top   = a.partials[3 * b];
@@ -2963,7 +3015,8 @@ void check_mix(const MixArgs& a) {
 void rms_norm(const float* x, const float* w, int hidden, int tokens, float eps,
               __nv_bfloat16* out, cudaStream_t stream, Q8Rows q, float* f32) {
     if (tokens <= 0) { return; }
-    rms_norm_kernel<<<tokens, row_threads(hidden), 0, stream>>>(x, w, hidden, eps, out, q, f32);
+    ninfer::pdl::launch_arch(tokens, row_threads(hidden), 0, stream, rms_norm_kernel, x, w, hidden,
+                             eps, out, q, f32);
     check_launch("rms_norm");
 }
 
@@ -2981,11 +3034,11 @@ void mix_split_rows(const MixArgs& a, cudaStream_t stream) {
     const dim3 grid(unsigned(row_warps(a.hidden)), unsigned(a.tokens));
     const bool normed = a.out != nullptr || a.out_q.qs != nullptr || a.f32 != nullptr;
     if (a.raw != nullptr || normed) {
-        mix_split_rows_kernel<<<grid, 32, 0, stream>>>(a, false);
+        ninfer::pdl::launch_arch(grid, 32, 0, stream, mix_split_rows_kernel, a, false);
         check_launch("mix_split_rows");
     }
     if (normed) {
-        mix_split_rows_kernel<<<grid, 32, 0, stream>>>(a, true);
+        ninfer::pdl::launch_arch(grid, 32, 0, stream, mix_split_rows_kernel, a, true);
         check_launch("mix_split_rows");
     }
 }
@@ -2997,13 +3050,13 @@ void mix(const MixArgs& args, cudaStream_t stream) {
     row_threads(args.hidden);
     if (args.tokens <= 0 || args.query_count == 0) { return; }
     if (split_mix(args)) {
-        mix_split_terms_kernel<<<dim3(unsigned(row_warps(args.hidden)), unsigned(args.tokens)), 32,
-                                 0, stream>>>(args);
+        ninfer::pdl::launch_arch(dim3(unsigned(row_warps(args.hidden)), unsigned(args.tokens)), 32,
+                                 0, stream, mix_split_terms_kernel, args);
         check_launch("mix_split_terms");
         mix_split_rows(args, stream);
         return;
     }
-    mix_kernel<<<args.tokens, row_threads(args.hidden), 0, stream>>>(args);
+    ninfer::pdl::launch_arch(args.tokens, row_threads(args.hidden), 0, stream, mix_kernel, args);
     check_launch("mix");
 }
 
@@ -3014,8 +3067,9 @@ void gemm_f32(int m, int n, int k, const float* w, const float* x, float* out, c
     if (out_stride == 0) { out_stride = m; }
     if (n <= kGemvRows) {
         const auto gemv = [&](auto tokens) {
-            gemv_kernel<decltype(tokens)::value>
-                <<<m, kGemvThreads, 0, stream>>>(w, x, m, k, x_stride, out, out_stride);
+            ninfer::pdl::launch_arch(m, kGemvThreads, 0, stream,
+                                     gemv_kernel<decltype(tokens)::value>, w, x, m, k, x_stride,
+                                     out, out_stride, ninfer::pdl::arch_dependent(stream));
         };
         switch (n) {
         case 1: gemv(std::integral_constant<int, 1>{}); break;
@@ -3056,11 +3110,12 @@ void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t st
     const auto launch = [&](auto tokens) {
         constexpr int N = decltype(tokens)::value;
         if (short_k) {
-            gemv_short_kernel<N><<<dim3(blocks_for(m, kShortRows), unsigned(batch.count)),
-                                   kGemvThreads, 0, stream>>>(batch, m, k, x_stride, out_stride);
+            ninfer::pdl::launch_arch(dim3(blocks_for(m, kShortRows), unsigned(batch.count)),
+                                     kGemvThreads, 0, stream, gemv_short_kernel<N>, batch, m, k,
+                                     x_stride, out_stride);
         } else {
-            gemv_batch_kernel<N><<<dim3(unsigned(m), unsigned(batch.count)), kGemvThreads, 0,
-                                   stream>>>(batch, k, x_stride, out_stride);
+            ninfer::pdl::launch_arch(dim3(unsigned(m), unsigned(batch.count)), kGemvThreads, 0,
+                                     stream, gemv_batch_kernel<N>, batch, k, x_stride, out_stride);
         }
     };
     switch (n) {
@@ -3078,13 +3133,15 @@ void gemm_f32_batch(int m, int n, int k, const GemvBatch& batch, cudaStream_t st
 
 void control_inputs(const ControlInputs& args, cudaStream_t stream) {
     if (args.count <= 0 || args.tokens <= 0) { return; }
-    control_inputs_kernel<<<dim3(args.tokens, args.count), row_threads(args.hidden), 0, stream>>>(args);
+    ninfer::pdl::launch_arch(dim3(args.tokens, args.count), row_threads(args.hidden), 0, stream,
+                             control_inputs_kernel, args);
     check_launch("control_inputs");
 }
 
 void control_apply(const ControlApply& args, cudaStream_t stream) {
     if (args.count <= 0 || args.tokens <= 0) { return; }
-    control_apply_kernel<<<dim3(args.tokens, args.count), row_threads(args.hidden), 0, stream>>>(args);
+    ninfer::pdl::launch_arch(dim3(args.tokens, args.count), row_threads(args.hidden), 0, stream,
+                             control_apply_kernel, args);
     check_launch("control_apply");
 }
 
@@ -3096,7 +3153,8 @@ void attention_inputs(const QueryArgs& q, const KvArgs& kv, cudaStream_t stream)
     }
     const int tokens = heads > 0 ? q.tokens : kv.rows.tokens;
     if (heads + kv_heads == 0) { return; }
-    attention_inputs_kernel<<<dim3(tokens, heads + kv_heads), kD, 0, stream>>>(q, kv, heads);
+    ninfer::pdl::launch_arch(dim3(tokens, heads + kv_heads), kD, 0, stream, attention_inputs_kernel,
+                             q, kv, heads);
     check_launch("attention_inputs");
 }
 
@@ -3120,10 +3178,12 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
         if (args.rows.chunk || t > 8 || (args.splits > 1 && args.partial == nullptr)) {
             throw std::invalid_argument("inkling2 attention: a uniform block of 1..8 decode rows");
         }
-        attention_kernel<8><<<dim3(1, args.kv_heads, args.splits), 256, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(dim3(1, args.kv_heads, args.splits), 256, 0, stream,
+                                 attention_kernel<8>, args);
         check_launch("attention");
         if (args.splits > 1) {
-            attention_combine_kernel<<<dim3(args.query_heads, t, 1), kCombineThreads, 0, stream>>>(args);
+            ninfer::pdl::launch_arch(dim3(args.query_heads, t, 1), kCombineThreads, 0, stream,
+                                     attention_combine_kernel, args);
             check_launch("attention_combine");
         }
         return;
@@ -3136,10 +3196,18 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
             }
             const dim3 grid(blocks_for(t, kFarRows), unsigned(args.kv_heads));
             switch (group) {
-            case 1: far_attention_kernel<1><<<grid, 64, 0, stream>>>(args); break;
-            case 2: far_attention_kernel<2><<<grid, 128, 0, stream>>>(args); break;
-            case 3: far_attention_kernel<3><<<grid, 192, 0, stream>>>(args); break;
-            default: far_attention_kernel<4><<<grid, 256, 0, stream>>>(args); break;
+            case 1:
+                ninfer::pdl::launch_arch(grid, 64, 0, stream, far_attention_kernel<1>, args);
+                break;
+            case 2:
+                ninfer::pdl::launch_arch(grid, 128, 0, stream, far_attention_kernel<2>, args);
+                break;
+            case 3:
+                ninfer::pdl::launch_arch(grid, 192, 0, stream, far_attention_kernel<3>, args);
+                break;
+            default:
+                ninfer::pdl::launch_arch(grid, 256, 0, stream, far_attention_kernel<4>, args);
+                break;
             }
             check_launch("far_attention");
         }
@@ -3152,18 +3220,21 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
         if (tensor) {
             const dim3 grid(blocks_for(t, kFarRows), unsigned(args.kv_heads));
             if (args.far != nullptr) {
-                near_attention_kernel<3, true><<<grid, 192, 0, stream>>>(args);
+                ninfer::pdl::launch_arch(grid, 192, 0, stream, near_attention_kernel<3, true>,
+                                         args);
             } else {
-                near_attention_kernel<3, false><<<grid, 192, 0, stream>>>(args);
+                ninfer::pdl::launch_arch(grid, 192, 0, stream, near_attention_kernel<3, false>,
+                                         args);
             }
             check_launch("near_attention");
             return;
         }
         if (args.far != nullptr) {
-            attention_kernel<8, true><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(
-                args);
+            ninfer::pdl::launch_arch(dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream,
+                                     attention_kernel<8, true>, args);
         } else {
-            attention_kernel<8><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(args);
+            ninfer::pdl::launch_arch(dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream,
+                                     attention_kernel<8>, args);
         }
         check_launch("attention");
         return;
@@ -3175,12 +3246,12 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
     const int groups = args.row_group == 1 || args.row_groups == 0 ? t : std::min(t, args.row_groups);
 #if defined(NINFER_TIER_VOLTA)
     if (ops::current_device_volta()) {
-        attention_kernel<1><<<dim3(groups, args.kv_heads, args.splits), 128 * args.row_group, 0,
-                              stream>>>(args);
+        ninfer::pdl::launch_arch(dim3(groups, args.kv_heads, args.splits), 128 * args.row_group, 0,
+                                 stream, attention_kernel<1>, args);
         check_launch("attention");
         if (args.splits > 1) {
-            attention_combine_kernel<<<dim3(args.query_heads, t, 1), kCombineThreads, 0, stream>>>(
-                args);
+            ninfer::pdl::launch_arch(dim3(args.query_heads, t, 1), kCombineThreads, 0, stream,
+                                     attention_combine_kernel, args);
             check_launch("attention_combine");
         }
         return;
@@ -3197,9 +3268,11 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
     const auto launch = [&](auto codings) {
         constexpr KvCoding K = decltype(codings)::first, V = decltype(codings)::second;
         if (rows_per_octet == 1) {
-            decode_attention_kernel<K, V, 1><<<grid, threads, fold_bytes, stream>>>(args);
+            ninfer::pdl::launch_arch(grid, threads, fold_bytes, stream,
+                                     decode_attention_kernel<K, V, 1>, args);
         } else {
-            decode_attention_kernel<K, V, 2><<<grid, threads, fold_bytes, stream>>>(args);
+            ninfer::pdl::launch_arch(grid, threads, fold_bytes, stream,
+                                     decode_attention_kernel<K, V, 2>, args);
         }
     };
     if (kc == KvCoding::F16 && vc == KvCoding::F16) {
@@ -3217,7 +3290,8 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
     }
     check_launch("attention");
     if (args.splits > 1) {
-        attention_combine_kernel<<<dim3(args.query_heads, t, 1), kCombineThreads, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(dim3(args.query_heads, t, 1), kCombineThreads, 0, stream,
+                                 attention_combine_kernel, args);
         check_launch("attention_combine");
     }
 }
@@ -3234,27 +3308,28 @@ void residual(const ResidualArgs& args, cudaStream_t stream) {
     // A short call given the split scratch spreads its rows over one-warp blocks.
     if (args.mix.split != nullptr && args.rows.tokens <= kSplitRows &&
         (args.mix.query_count == 0 || args.mix.tokens == args.rows.tokens)) {
-        residual_split_kernel<<<dim3(unsigned(row_warps(args.hidden)), unsigned(args.rows.tokens)),
-                                32, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(dim3(unsigned(row_warps(args.hidden)), unsigned(args.rows.tokens)),
+                                 32, 0, stream, residual_split_kernel, args);
         check_launch("residual_split");
         if (args.mix.query_count > 0) { mix_split_rows(args.mix, stream); }
         return;
     }
-    residual_kernel<<<args.rows.tokens, threads, 0, stream>>>(args);
+    ninfer::pdl::launch_arch(args.rows.tokens, threads, 0, stream, residual_kernel, args);
     check_launch("residual");
 }
 
 void keep_products(const ResidualArgs& args, int begin, int end, cudaStream_t stream) {
     if (end <= begin) { return; }
-    keep_products_kernel<<<end - begin, row_threads(args.hidden), 0, stream>>>(args, begin);
+    ninfer::pdl::launch_arch(end - begin, row_threads(args.hidden), 0, stream, keep_products_kernel,
+                             args, begin);
     check_launch("keep_products");
 }
 
 void keep_history(const float* x, std::int64_t stride, int channels, const std::int32_t* positions,
                   int begin, int end, const History& history, int sequence, cudaStream_t stream) {
     if (end <= begin) { return; }
-    keep_history_kernel<<<end - begin, 256, 0, stream>>>(x, stride, channels, positions, begin,
-                                                         history, sequence);
+    ninfer::pdl::launch_arch(end - begin, 256, 0, stream, keep_history_kernel, x, stride, channels,
+                             positions, begin, history, sequence);
     check_launch("keep_history");
 }
 
@@ -3267,11 +3342,12 @@ void route(const RouteArgs& args, cudaStream_t stream) {
         if (args.tokens > kSortedRouteRows || args.experts > kSortedRouteExperts) {
             throw std::invalid_argument("inkling2 route: sorted pairs of at most 8 rows of 128 experts");
         }
-        route_sorted_kernel<<<1, args.tokens * kSortedRouteExperts, 0, stream>>>(args);
+        ninfer::pdl::launch_arch(1, args.tokens * kSortedRouteExperts, 0, stream,
+                                 route_sorted_kernel, args);
         check_launch("route_sorted");
         return;
     }
-    route_kernel<<<args.tokens, kRouteThreads, 0, stream>>>(args);
+    ninfer::pdl::launch_arch(args.tokens, kRouteThreads, 0, stream, route_kernel, args);
     check_launch("route");
 }
 
@@ -3279,8 +3355,9 @@ void situ_rows(const float* gu, std::int64_t stride, int pairs, int width, const
                float gate_cap, float up_cap, __nv_bfloat16* out, cudaStream_t stream) {
     if (width % 32 != 0) { throw std::invalid_argument("inkling2 situ_rows: whole 32-value groups"); }
     if (pairs <= 0) { return; }
-    situ_rows_kernel<<<dim3(pairs, blocks_for(width, kSituThreads)), kSituThreads, 0, stream>>>(
-        gu, stride, width, pair_scale, gate_cap, up_cap, out);
+    ninfer::pdl::launch_arch(dim3(pairs, blocks_for(width, kSituThreads)), kSituThreads, 0, stream,
+                             situ_rows_kernel, gu, stride, width, pair_scale, gate_cap, up_cap,
+                             out);
     check_launch("situ_rows");
 }
 
@@ -3288,8 +3365,9 @@ void situ_q8(const float* gu, std::int64_t stride, int pairs, int width, const f
              float gate_cap, float up_cap, std::int8_t* qs, half2* ds, cudaStream_t stream) {
     if (width % 32 != 0) { throw std::invalid_argument("inkling2 situ_q8: whole 32-value groups"); }
     if (pairs <= 0) { return; }
-    situ_q8_kernel<<<dim3(pairs, blocks_for(width, kSituThreads)), kSituThreads, 0, stream>>>(
-        gu, stride, width, pair_scale, gate_cap, up_cap, qs, ds);
+    ninfer::pdl::launch_arch(dim3(pairs, blocks_for(width, kSituThreads)), kSituThreads, 0, stream,
+                             situ_q8_kernel, gu, stride, width, pair_scale, gate_cap, up_cap, qs,
+                             ds);
     check_launch("situ_q8");
 }
 
@@ -3301,51 +3379,52 @@ void bf16_expert_rows(const void* const* table, int rows, int k, const std::int3
         throw std::invalid_argument("inkling2 bf16_expert_rows: rows, k a multiple of 8, x_div");
     }
     if (max_active <= 0) { return; }
-    bf16_expert_rows_kernel<<<dim3(blocks_for(rows, kBfRows), unsigned(max_active)), kBfWarps * 32,
-                              0, stream>>>(table, rows, k, bounds, sorted, active, active_count, x,
-                                           x_div, out);
+    ninfer::pdl::launch_arch(dim3(blocks_for(rows, kBfRows), unsigned(max_active)), kBfWarps * 32,
+                             0, stream, bf16_expert_rows_kernel, table, rows, k, bounds, sorted,
+                             active, active_count, x, x_div, out);
     check_launch("bf16_expert_rows");
 }
 
 void bf16_rows_f32(const __nv_bfloat16* table, int k, const std::int32_t* ids, int rows,
                    float* out, std::int64_t out_stride, cudaStream_t stream) {
     if (rows <= 0) { return; }
-    bf16_rows_f32_kernel<<<dim3(unsigned(rows), blocks_for(k, 256)), 256, 0, stream>>>(
-        table, k, ids, out, out_stride);
+    ninfer::pdl::launch_arch(dim3(unsigned(rows), blocks_for(k, 256)), 256, 0, stream,
+                             bf16_rows_f32_kernel, table, k, ids, out, out_stride);
     check_launch("bf16_rows_f32");
 }
 
 void softcap_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, float cap,
                   cudaStream_t stream) {
     if (n <= 0) { return; }
-    softcap_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(in, out, n, cap);
+    ninfer::pdl::launch_arch(blocks_for(n, 256), 256, 0, stream, softcap_kernel, in, out, n, cap);
     check_launch("softcap");
 }
 
 void softcap_bf16(const float* in, std::int64_t in_stride, __nv_bfloat16* out,
                   std::int64_t out_stride, int width, int rows, float cap, cudaStream_t stream) {
     if (width <= 0 || rows <= 0) { return; }
-    softcap_rows_kernel<<<dim3(blocks_for(width, 256), rows), 256, 0, stream>>>(
-        in, in_stride, out, out_stride, width, cap);
+    ninfer::pdl::launch_arch(dim3(blocks_for(width, 256), rows), 256, 0, stream,
+                             softcap_rows_kernel, in, in_stride, out, out_stride, width, cap);
     check_launch("softcap rows");
 }
 
 void f32_to_bf16(const float* in, __nv_bfloat16* out, std::int64_t n, cudaStream_t stream) {
     if (n <= 0) { return; }
-    f32_to_bf16_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(in, out, n);
+    ninfer::pdl::launch_arch(blocks_for(n, 256), 256, 0, stream, f32_to_bf16_kernel, in, out, n);
     check_launch("f32_to_bf16");
 }
 
 void place_rows(const __nv_bfloat16* rows, int count, int hidden, float* h, cudaStream_t stream) {
     const std::int64_t n = std::int64_t(count) * hidden;
     if (n <= 0) { return; }
-    place_rows_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(rows, n, h);
+    ninfer::pdl::launch_arch(blocks_for(n, 256), 256, 0, stream, place_rows_kernel, rows, n, h);
     check_launch("place_rows");
 }
 
 void ring_copy(const RingCopyArgs& a, cudaStream_t stream) {
     if (a.end <= a.begin) { return; }
-    ring_copy_kernel<<<dim3(a.end - a.begin, a.kv_heads, 1), 64, 0, stream>>>(a);
+    ninfer::pdl::launch_arch(dim3(a.end - a.begin, a.kv_heads, 1), 64, 0, stream, ring_copy_kernel,
+                             a);
     check_launch("ring_copy");
 }
 
@@ -3355,13 +3434,15 @@ void spark_mix(const SparkMixArgs& args, cudaStream_t stream) {
         args.context_count + 1 > kMaxSparkMixes || args.slots <= 0) {
         throw std::invalid_argument("inkling2 spark_mix: 1..8 taps and mixes");
     }
-    spark_mix_kernel<<<args.end - args.begin, row_threads(args.hidden), 0, stream>>>(args);
+    ninfer::pdl::launch_arch(args.end - args.begin, row_threads(args.hidden), 0, stream,
+                             spark_mix_kernel, args);
     check_launch("spark_mix");
 }
 
 void spark_rotate(const SparkRotateArgs& args, cudaStream_t stream) {
     if (args.end <= args.begin || args.heads <= 0) { return; }
-    spark_rotate_kernel<<<dim3(args.end - args.begin, args.heads), kD, 0, stream>>>(args);
+    ninfer::pdl::launch_arch(dim3(args.end - args.begin, args.heads), kD, 0, stream,
+                             spark_rotate_kernel, args);
     check_launch("spark_rotate");
 }
 
@@ -3369,21 +3450,24 @@ void add_rows(float* h, const float* y, std::int64_t y_stride, int hidden, int r
               cudaStream_t stream) {
     const std::int64_t n = std::int64_t(rows) * hidden;
     if (n <= 0) { return; }
-    add_rows_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(h, y, y_stride, hidden, n);
+    ninfer::pdl::launch_arch(blocks_for(n, 256), 256, 0, stream, add_rows_kernel, h, y, y_stride,
+                             hidden, n);
     check_launch("add_rows");
 }
 
 void silu_mul(const float* gu, int width, int rows, __nv_bfloat16* out, cudaStream_t stream) {
     const std::int64_t n = std::int64_t(rows) * width;
     if (n <= 0) { return; }
-    silu_mul_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(gu, width, n, out);
+    ninfer::pdl::launch_arch(blocks_for(n, 256), 256, 0, stream, silu_mul_kernel, gu, width, n,
+                             out);
     check_launch("silu_mul");
 }
 
 void spark_table(const float* p, int n, __nv_bfloat16* m, float* c, cudaStream_t stream) {
     const std::int64_t total = std::int64_t(n) * (kSparkRank + 1);
     if (total <= 0) { return; }
-    spark_table_kernel<<<blocks_for(total, 256), 256, 0, stream>>>(p, n, m, c);
+    ninfer::pdl::launch_arch(blocks_for(total, 256), 256, 0, stream, spark_table_kernel, p, n, m,
+                             c);
     check_launch("spark_table");
 }
 
@@ -3391,8 +3475,8 @@ void spark_head_inputs(const float* hidden_out, const float* bias, int hidden, i
                        cudaStream_t stream) {
     if (rank != kSparkRank) { throw std::invalid_argument("inkling2 spark: a Markov rank of 256"); }
     const std::int64_t total = std::int64_t(rank + 1) * hidden;
-    spark_head_inputs_kernel<<<blocks_for(total, 256), 256, 0, stream>>>(hidden_out, bias, hidden,
-                                                                         rank, out);
+    ninfer::pdl::launch_arch(blocks_for(total, 256), 256, 0, stream, spark_head_inputs_kernel,
+                             hidden_out, bias, hidden, rank, out);
     check_launch("spark_head_inputs");
 }
 
@@ -3405,21 +3489,22 @@ void spark_step(const SparkStepArgs& a, cudaStream_t stream) {
         throw std::invalid_argument("inkling2 spark_step: invalid step");
     }
     const int k = 2 * kSparkRank + 2 * a.hidden_size;
-    spark_joint_kernel<<<3 * kSparkRank / 8, 256, std::size_t(k) * 4, stream>>>(a);
+    ninfer::pdl::launch_arch(3 * kSparkRank / 8, 256, std::size_t(k) * 4, stream,
+                             spark_joint_kernel, a);
     check_launch("spark_joint");
-    spark_logits_kernel<<<blocks_for(a.vocab, 8), 256, 0, stream>>>(a);
+    ninfer::pdl::launch_arch(blocks_for(a.vocab, 8), 256, 0, stream, spark_logits_kernel, a);
     check_launch("spark_logits");
-    spark_pick_partials_kernel<<<kSparkPartials, 256, 0, stream>>>(a);
+    ninfer::pdl::launch_arch(kSparkPartials, 256, 0, stream, spark_pick_partials_kernel, a);
     check_launch("spark_pick");
-    spark_pick_final_kernel<<<1, kSparkPartials, 0, stream>>>(a);
+    ninfer::pdl::launch_arch(1, kSparkPartials, 0, stream, spark_pick_final_kernel, a);
     check_launch("spark_pick_final");
 }
 
 void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,
                std::int64_t n, cudaStream_t stream) {
     if (n <= 0) { return; }
-    add_fixed_kernel<<<blocks_for(n, 256), 256, 0, stream>>>(
-        sums, static_cast<const unsigned long long*>(products), flag, n);
+    ninfer::pdl::launch_arch(blocks_for(n, 256), 256, 0, stream, add_fixed_kernel, sums,
+                             static_cast<const unsigned long long*>(products), flag, n);
     check_launch("add_fixed");
 }
 

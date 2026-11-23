@@ -6,6 +6,7 @@
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/mapped_host_copy.h"
+#include "core/pdl_scope.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -2328,7 +2329,12 @@ struct Executor::Impl {
             return;
         }
         if (!entry.executable.ready()) {
-            entry.definition.capture(stream, [&] { body(); });
+            // Its kernels release their dependents early (pdl::arch_enter_glue), so the captured
+            // launches become programmatic dependents on an sm_90+ device.
+            entry.definition.capture(stream, [&] {
+                const pdl::ArchScope dependents;
+                body();
+            });
             entry.executable.instantiate(entry.definition);
         }
         entry.executable.launch(stream);
