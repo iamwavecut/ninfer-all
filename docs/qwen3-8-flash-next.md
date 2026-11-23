@@ -267,7 +267,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | Option | Meaning |
 |---|---|
 | `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
-| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) starts at half of what each device has free after loading less a margin, and once the warm-up has captured the CUDA Graphs and loaded the kernels requests run, and every sequence's snapshot is in place, adds what is still free beyond 384 MiB (the startup line reports the cache and the graphs); with host experts it also takes the prefill buffers and a prompt span's stack between prompts ([the expert cache](#the-expert-cache)); `N` is the cache's size, which the warm-up leaves alone; `0` disables the host-mode cache (disk mode needs one) |
+| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) starts at half of what each device has free after loading less a margin, and once the warm-up has captured the CUDA Graphs and loaded the kernels requests run, and every sequence's snapshot is in place, adds what is still free beyond 384 MiB (the startup line reports the cache and the graphs); with host experts it also takes the prefill buffers, a prompt span's stack and the workspace of the span's expert calls between prompts ([the expert cache](#the-expert-cache)); `N` is the cache's size, which the warm-up leaves alone; `0` disables the host-mode cache (disk mode needs one) |
 | `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks into device memory by the copy engine while the cached ones run, into a cache slot when one is free or when the expert's routes beat the coldest cached expert the call does not route ([the expert cache](#the-expert-cache)), else into staging (`staged`, the default); or its expert kernels read the missing experts across the bus (`mapped`) |
 | `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1`; the CPU computes the rest from RAM while the GPU runs the cached ones. `auto` (the default) gives each call of GGUF experts the split whose copies and CPU products end soonest by the times measured on earlier calls, and copies every miss of native experts. Calls of up to eight tokens (decode steps, one request's verification) give the CPU any missing expert, calls of 9 to 64 tokens (several requests' verifications, short prompt chunks) those with at most eight pairs; wider calls run every expert on the GPU. GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
@@ -327,8 +327,9 @@ drafts, DFlash2, perplexity) takes the text layers' counts of a profile recorded
 (MIT) measured this tier and its constants on Qwen3.8-Flash-Next.
 
 With the automatic cache and host experts, the device buffers that prompt chunks copy a layer's
-uncached experts into (`--expert-prefill-buffers`) and the stack of a prompt span (40 KiB a span
-token: 0.63 GiB for sixteen 1,024-token chunks) are cache slots between prompts: every layer
+uncached experts into (`--expert-prefill-buffers`), the stack of a prompt span (40 KiB a span
+token: 0.63 GiB for sixteen 1,024-token chunks) and the workspace that only the span's expert calls
+reach (1.6 GiB of the 2.3 GiB a 16,384-token call takes) are cache slots between prompts: every layer
 gets the same share of them, free until misses and rounds fill them. A prompt pass takes them
 back: the most routed of the experts they hold move into the slots of colder ones in the cache's
 own memory, the rest leave, and the copies into the buffers wait for the moves. The next decode
@@ -995,17 +996,23 @@ not.
   phase that precedes them, and a span's short last chunk runs from the same pool (a 5,669-token
   prompt prefilled at 1,334 instead of 678 tokens/s on an RTX 3090 when spans came; the bank-shaped
   pool and the two phases then took a 9,297-token Q2_0 prompt from 1.12-1.18k to 1.35k tokens/s from
-  a cold expert cache). The expert phase runs up to 6,144 tokens of consecutive chunks in one call,
-  each chunk routed on its own, so the matrix kernel takes 128-column tiles rather than the 32 of a
-  1,024-token chunk; a last chunk of up to 64 tokens (eight with `--expert-tail-skip`) runs alone,
+  a cold expert cache). The expert phase runs a whole span's chunks in one call (16,384 tokens of
+  sixteen 1,024-token chunks under `--max-concurrency 1`) while that call's workspace takes at most a
+  quarter of the memory free when the engine starts, else eight chunks, else 6,144 tokens; each chunk
+  is routed on its own, so the matrix kernel takes 128-column tiles rather than the 32 of a
+  1,024-token chunk. A last chunk of up to 64 tokens (eight with `--expert-tail-skip`) runs alone,
   after the layer's wider calls, since it may copy experts into cache slots those calls read (with
-  IQ3_S, a 31,860-token prompt's expert matrix products took 4.47 instead of 6.52 s on an RTX 3090
-  at 4,096 tokens a call). Calls of 6,144 instead of 4,096 tokens prefilled a 31,867-token prompt
-  in BF16 KV at 2,586-2,593 instead of 2,504-2,514 tokens/s on an RTX 3090, 3,484-3,506 instead of
-  3,359-3,384 on an RTX PRO 4500 Blackwell and 5,107-5,129 instead of 4,832-4,945 on an RTX 4090;
-  their larger workspace leaves the expert cache about 310 MiB less, and decode with the same
-  tokens ran 69.1-73.4 against 71.4-73.3 tok/s (RTX PRO 4500) and 48.8-50.6 against 45.8-52.0
-  tok/s (RTX 4090, 81.6% instead of 82.0-82.1% cache hits).
+  IQ3_S, a 31,860-token prompt's expert matrix products took 4.47 instead of 6.52 s on an RTX 3090 at
+  4,096 tokens a call). Between prompts the workspace these calls take beyond the others' is cache
+  slots ([the expert cache](#the-expert-cache)), and a group never takes more than the span's
+  tokens (8,192 under `--max-context 8192`). With IQ3_S, a 31,865-token prompt in BF16 KV prefilled
+  at 2.94-2.95k tokens/s with whole-span calls against 2.74-2.75k at 6,144 tokens a call on an RTX
+  3090 (the expert cache 240 MiB larger, decode with the same tokens at 56.8-57.5 against 57.2-57.6
+  tok/s) and at 7.48-7.60k against 6.99-7.14k on an RTX 5090 (decode 85.7-85.9 against 84.2-86.1
+  tok/s); calls of 8,192 and 12,288 tokens took the RTX 3090 to 2.83k and 2.84k, and whole spans
+  whose workspace stayed out of the cache to 2.93k with 1.5 GiB less expert cache. Latent experts
+  ([Edge0](edge0.md)) run a group's call in slices of 2,048 tokens and keep 6,144-token groups:
+  whole spans prefilled Edge0-120B at 2.42-2.43k against 2.45k tokens/s.
   With two prefill buffers (the default with the automatic expert cache, `--expert-prefill-buffers`)
   the pool has two buffers that consecutive layers alternate between: each layer's copies start as
   soon as the layer two back is done with its buffer, while the layer before it runs. A thread of

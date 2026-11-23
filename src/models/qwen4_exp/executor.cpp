@@ -1188,11 +1188,17 @@ struct Executor::Impl {
     // Each chunk's MoE input and hyper-connection injection between a layer's two phases.
     DeviceBuffer span_mixed, span_inject;
     std::size_t span_row_bytes = 0; // n-gram rows of one token
-    // A span's expert phase runs up to kGroupTokens of consecutive chunks in one wide call, whose
-    // matrix products then take wider column tiles: the group's routes and output. span_group is
-    // the chunks a group takes, 1 when groups are off.
+    // A span's expert phase runs consecutive chunks in one wide call, whose matrix products then
+    // take wider column tiles: the group's routes and output. A group is the whole span while its
+    // call's workspace takes at most 1 / kGroupShare of the memory free when the executor starts,
+    // else kSpanChunks, else kGroupTokens' worth (planned_group_chunks). span_group is the chunks a
+    // group takes, 1 when groups are off. The workspace that only these calls reach (rank 0's from
+    // group_workspace_from on) is a cache slot between prompts, as the span's stack is.
     static constexpr std::uint32_t kGroupTokens = 6144;
+    static constexpr std::size_t kGroupShare    = 4;
     std::uint32_t span_group = 1;
+    std::size_t start_free_bytes                = 0;
+    std::size_t group_workspace_from            = 0;
     DeviceBuffer span_ids, span_weights, span_shared, span_y;
     // A span's expert call that a wider call of the same layer follows: the pool keeps that
     // layer's experts.
@@ -1816,8 +1822,10 @@ struct Executor::Impl {
         segments = std::move(pieces);
     }
 
-    [[nodiscard]] std::size_t workspace_bytes(std::size_t rank) const {
+    // The workspace of `rank`'s calls; without `group`, of all but a span's wide expert calls.
+    [[nodiscard]] std::size_t workspace_bytes(std::size_t rank, bool group = true) const {
         const std::int32_t t = static_cast<std::int32_t>(options.prefill_chunk);
+        const std::uint32_t chunks = group && rank == 0 ? planned_group_chunks() : 1;
         std::size_t bytes    = ops::hyper_connection_read_workspace_bytes(
             static_cast<std::int32_t>(config.hc_count),
             static_cast<std::int32_t>(config.hidden_size),
@@ -1831,11 +1839,7 @@ struct Executor::Impl {
                 bytes, ops::moe_experts_gguf_part_workspace_bytes(t, config.expert_output_scales) +
                            round_up(std::uint64_t(config.hidden_size) * t * 8));
         }
-        if (const std::uint32_t group = planned_group_chunks(); group > 1 && rank == 0) {
-            bytes = std::max(
-                bytes, ops::moe_experts_gguf_workspace_bytes(static_cast<std::int32_t>(group) * t,
-                                                             config.expert_output_scales));
-        }
+        if (chunks > 1) { bytes = std::max(bytes, group_workspace(group_tokens(chunks))); }
         std::vector<const LayerPlan*> planned;
         for (const auto& plan : layers) {
             if (plan.rank == rank) { planned.push_back(&plan); }
@@ -1872,9 +1876,8 @@ struct Executor::Impl {
             if (plan.moe.latent) {
                 // The staged misses take a whole chunk; a single call, a span group's included,
                 // a slice of at most kGgufLatentSliceTokens.
-                const std::int32_t group =
-                    rank == 0 ? static_cast<std::int32_t>(planned_group_chunks()) * t : t;
-                const std::int32_t call  = std::min(group, ops::kGgufLatentSliceTokens);
+                const std::int32_t call =
+                    std::min(static_cast<std::int32_t>(chunks) * t, ops::kGgufLatentSliceTokens);
                 const auto& latent       = *plan.moe.latent;
                 bytes = std::max({bytes,
                                   ops::moe_latent_gguf_workspace_bytes(t, latent.width, latent.groups),
@@ -2053,6 +2056,9 @@ struct Executor::Impl {
                 rank.mixer_out = nullptr;
             }
             rank.workspace = std::make_unique<DeviceArena>(workspace_bytes(r));
+            if (r == 0 && planned_group_chunks() > 1) {
+                group_workspace_from = round_up(workspace_bytes(r, false));
+            }
             std::vector<std::int32_t> identity(std::max<std::uint32_t>(pages, options.sequences));
             std::iota(identity.begin(), identity.end(), 0);
             rank.block_table = DeviceBuffer(std::size_t(pages) * 4);
@@ -5357,9 +5363,15 @@ struct Executor::Impl {
         return tokens > options.prefill_chunk ? tokens : 0;
     }
 
-    // The chunks a span takes (span_chunks), before anything is sized by it.
+    // The chunks a span takes (span_chunks), before anything is sized by it, and the memory the
+    // device has free then.
     void plan_span_chunks() {
         span_chunks = kSpanChunks;
+        {
+            RankBinding bind(device, 0);
+            std::size_t total = 0;
+            CUDA_CHECK(cudaMemGetInfo(&start_free_bytes, &total));
+        }
         const std::uint64_t further =
             std::uint64_t(kLoneSpanChunks - kSpanChunks) * options.prefill_chunk;
         if (options.sequences != 1 ||
@@ -5370,19 +5382,47 @@ struct Executor::Impl {
         const std::uint64_t token_bytes =
             std::uint64_t(config.hc_count) * config.hidden_size * 4 + config.hidden_size * 2 +
             config.hc_count * 4;
-        RankBinding bind(device, 0);
-        std::size_t free_bytes = 0, total = 0;
-        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
-        if (further * token_bytes <= free_bytes / kLoneSpanShare) { span_chunks = kLoneSpanChunks; }
+        if (further * token_bytes <= start_free_bytes / kLoneSpanShare) {
+            span_chunks = kLoneSpanChunks;
+        }
     }
 
-    // The chunks one expert call of a span's expert phase takes: as many as kGroupTokens holds,
-    // with host experts, whose groups run from the pool.
+    // The chunks one expert call of a span's expert phase takes, with host experts, whose groups
+    // run from the pool (see kGroupShare). Latent experts run a group's call in slices, so their
+    // groups stay at kGroupTokens' worth: whole spans prefilled Edge0-120B 1% slower.
     [[nodiscard]] std::uint32_t planned_group_chunks() const {
         if (planned_span_tokens() == 0 || model.options().experts != ExpertResidency::Host) {
             return 1;
         }
-        return std::clamp<std::uint32_t>(kGroupTokens / options.prefill_chunk, 1, kSpanChunks);
+        const std::uint32_t c     = options.prefill_chunk;
+        const std::uint32_t least = std::clamp<std::uint32_t>(kGroupTokens / c, 1, span_chunks);
+        if (!gguf_experts()) { return least; }
+        for (const std::uint32_t g : {span_chunks, kSpanChunks}) {
+            if (g > least && group_workspace(group_tokens(g)) <= start_free_bytes / kGroupShare) {
+                return g;
+            }
+        }
+        return least;
+    }
+
+    // The most tokens a group of `chunks` chunks holds: a span holds no more than its planes do.
+    [[nodiscard]] std::uint32_t group_tokens(std::uint32_t chunks) const {
+        return std::min(chunks * options.prefill_chunk, planned_span_tokens());
+    }
+
+    // Whether a text layer's routed experts are GGUF experts (not latent or native).
+    [[nodiscard]] bool gguf_experts() const {
+        return std::any_of(layers.begin(), layers.end(), [](const LayerPlan& plan) {
+            return !plan.moe.latent && !plan.moe.native;
+        });
+    }
+
+    // The workspace of a group's wide expert call of `tokens` tokens: none past the other calls'
+    // for latent experts, whose calls run in slices.
+    [[nodiscard]] std::size_t group_workspace(std::uint32_t tokens) const {
+        return gguf_experts() ? ops::moe_experts_gguf_workspace_bytes(
+                                    static_cast<std::int32_t>(tokens), config.expert_output_scales)
+                              : 0;
     }
 
     void allocate_span() {
@@ -5411,7 +5451,7 @@ struct Executor::Impl {
         }
         span_group = planned_group_chunks();
         if (span_group > 1) {
-            const std::size_t group = std::size_t(span_group) * options.prefill_chunk;
+            const std::size_t group = group_tokens(span_group);
             const std::size_t pairs = group * config.num_experts_per_tok;
             span_ids     = DeviceBuffer(pairs * 4);
             span_weights = DeviceBuffer(pairs * 4);
@@ -6336,6 +6376,12 @@ struct Executor::Impl {
             }
             if (span_stack.p != nullptr) {
                 loans.push_back({.rank = 0, .base = span_stack.p, .bytes = span_stack.bytes});
+            }
+            if (group_workspace_from > 0 && ranks[0].workspace->capacity() > group_workspace_from) {
+                loans.push_back({.rank  = 0,
+                                 .base  = static_cast<std::byte*>(ranks[0].workspace->base()) +
+                                          group_workspace_from,
+                                 .bytes = ranks[0].workspace->capacity() - group_workspace_from});
             }
             if (!loans.empty()) {
                 lent_ranks.assign(device.size(), 0);

@@ -168,19 +168,21 @@ __global__ void combine_fixed_kernel(PartSet parts, float* __restrict__ y, std::
 }
 
 // fixed[pair's token][r] += weights[pair] * values[i][r] for the listed pairs, rounded per pair
-// as the vector products round theirs. One block row per listed pair.
+// as the vector products round theirs. Block row y takes listed pairs y, y + gridDim.y, ...
 __global__ void add_products_kernel(const float* __restrict__ values,
                                     const std::int32_t* __restrict__ pairs,
                                     const std::int32_t* __restrict__ count, int per_token,
                                     const float* __restrict__ weights,
                                     unsigned long long* __restrict__ fixed) {
-    const int i = blockIdx.y;
-    if (i >= *count) { return; }
-    const int pair = pairs[i];
-    for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < kHidden; r += gridDim.x * blockDim.x) {
-        atomicAdd(fixed + std::int64_t(pair / per_token) * kHidden + r,
-                  static_cast<unsigned long long>(
-                      fixed_product(values[std::int64_t(i) * kHidden + r], weights[pair])));
+    const int n = *count;
+    for (int i = blockIdx.y; i < n; i += gridDim.y) {
+        const int pair = pairs[i];
+        for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < kHidden;
+             r += gridDim.x * blockDim.x) {
+            atomicAdd(fixed + std::int64_t(pair / per_token) * kHidden + r,
+                      static_cast<unsigned long long>(
+                          fixed_product(values[std::int64_t(i) * kHidden + r], weights[pair])));
+        }
     }
 }
 
@@ -487,7 +489,6 @@ void require_shared_width(const GgufMoeWeights& banks) {
 void check_stage_inputs(const Tensor& m, const Tensor& ids, const Tensor& weights) {
     const std::int32_t tokens = m.ne[1];
     require(tokens > 0 && shaped(m, DType::BF16, kHidden, tokens), "m must be BF16 [2560, tokens]");
-    require(tokens * kTopK <= 65535, "at most 6553 tokens per call");
     require(shaped(ids, DType::I32, kTopK, tokens), "ids must be I32 [10, tokens]");
     require(shaped(weights, DType::FP32, kTopK, tokens), "weights must be FP32 [10, tokens]");
 }
@@ -545,8 +546,9 @@ void moe_experts_gguf_add_products(const GgufMoeStage& stage, const float* value
     require(stage.fixed != nullptr && max_count >= 0 && max_count <= stage.tokens * kTopK,
             "invalid product count");
     if (max_count == 0) { return; }
-    add_products_kernel<<<dim3(5, static_cast<unsigned>(max_count)), 512, 0, stream>>>(
-        values, pairs, count, kTopK, static_cast<const float*>(weights.data), stage.fixed);
+    add_products_kernel<<<dim3(5, static_cast<unsigned>(std::min(max_count, 65535))), 512, 0,
+                          stream>>>(values, pairs, count, kTopK,
+                                    static_cast<const float*>(weights.data), stage.fixed);
     CUDA_CHECK(cudaGetLastError());
 }
 
