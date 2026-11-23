@@ -37,7 +37,8 @@ tokenization, the chat template, output parsing and the serving protocols.
   output projections in 4 layers, Q8_0 gates), the token table Q4_K and the head Q6_K. The router,
   convolutions, distance tables, mixing queries, controllers, norms and expert scales are FP32;
   MiniPlus stores its sink and dynamic-tap projections in Q8_0, which the converter decodes to FP32
-  exactly.
+  exactly; it decodes such a vector from any other ggml block format as well (some GGUFs store
+  Q4_K).
   Vector kernels multiply up to eight tokens, integer matrix kernels the prompt chunks, the expert
   products the routed experts only; a layer's query, gate, relative, key and value products of one
   format share vector launches ([GGUF products](gguf.md#products)). The NVFP4 experts' matrix
@@ -181,8 +182,9 @@ python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
 ```
 
 The conversion writes one 16,494,910,976-byte (15.4 GiB) `.ninfer` file of 1,185 objects: the text
-model, the vision tower (Q8_0 matrices) and the DSpark drafter (Q8_0). With Unsloth's
-`mmproj-BF16.gguf` as the `vision` source the tower keeps BF16 matrices and the file has
+model, the vision tower (Q8_0 matrices) and the DSpark drafter (Q8_0, its Markov embedding BF16 as
+the GGUF stores it; a drafter GGUF with embedding values that BF16 does not hold is refused). With
+Unsloth's `mmproj-BF16.gguf` as the `vision` source the tower keeps BF16 matrices and the file has
 16,790,806,016 bytes (15.6 GiB). Unsloth's repository holds each quantization in two layouts, the
 root file's `inkling2` (48 unrolled blocks in its metadata) and llama.cpp's `inkling2_loop` (24
 blocks, `Mainline_Support/*.gguf_file`). Both convert to the same artifact: from UD-IQ4_XS the two
