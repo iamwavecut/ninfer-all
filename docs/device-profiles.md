@@ -18,18 +18,23 @@ Up to three layers answer, per route key:
 1. **Your profile file.** `$NINFER_DEVICE_PROFILES`, else `$XDG_CACHE_HOME/ninfer/device-profiles.json`,
    else `~/.cache/ninfer/device-profiles.json` (`%LOCALAPPDATA%\ninfer\device-profiles.json` on
    Windows). `--device-profile-path` names another file.
-2. **The built-in table.** Profiles measured on 60 GPU models ship inside the binary
+2. **The built-in table.** Profiles measured on 66 GPU models ship inside the binary
    (`src/runtime/engine/device_profiles.json`); the Profile column of the
    [card tables](gpus.md#cards) shows which. Each desktop, workstation and data-center entry was
-   measured at the card's default power limit by the build that serves it: the image's `75`, `86`
-   and `120a` builds (an Ada card runs the `86` build), CUDA 12.8 `80` and `70` builds for the A100
-   and V100, a CUDA 12.8 `86` build for the A10, whose host driver (570) predates the image's
-   CUDA 13, and a CUDA 13.1 `120a` build for the RTX 5070 Ti, with the image's route catalog. The
-   RTX 4080 Laptop GPU entry comes from a CUDA 12.8 build on one laptop with the same route catalog;
-   that laptop's power limit is not recorded. Variants that report different names have their own
-   entries, such as the PRO 6000's Workstation (600 W), Max-Q (300 W) and Server
-   editions. The Turing entries come from a `75` build, the only build that runs on them; its route
-   catalog lacks the keys a Turing build never selects.
+   measured at the card's default power limit. 48 entries were measured on November 23, 2026 by the
+   release image of master 5342f9f, whose one executable serves every card (`cuda13.4` with
+   `75;80;86;89;120a`; `cuda12.9` with `70` for the Tesla V100-SXM2-32GB), with that build's route
+   catalog. The other 18 keep the measurements of earlier builds, because Vast.ai and RunPod had
+   none of these cards at its default power limit that day, or the rented host did not start: the
+   RTX 5090 D v2, RTX PRO 4500 Blackwell Server Edition, RTX 4070, 4070 Ti, 4070 Ti Super and 4080,
+   RTX 3090 Ti and 3050, RTX A2000 12GB and A4500, RTX 2060, 2070 and 2070 Super, TITAN RTX, Tesla
+   T4, Tesla V100-SXM2-16GB and V100-PCIE-32GB, and the RTX 4080 Laptop GPU, whose entry comes from
+   a CUDA 12.8 build on one laptop whose power limit is not recorded. A measured entry keeps the
+   built-in bands of the keys calibration does not measure (below), and the RTX 3090 entry also
+   keeps its `gguf_vector/*` bands, which whole-model decode chose. Variants that report different
+   names have their own entries, such as the PRO 6000's Workstation (600 W), Max-Q (300 W) and
+   Server editions. The Turing entries come from the `75` code, the only code that runs on them;
+   its route catalog lacks the keys a Turing build never selects.
 3. **The compiled route** of each operation, for a key neither names.
 
 For a key both the file and the built-in table name, the file's bands answer up to their last width
@@ -39,9 +44,9 @@ an RTX 3090, 4090 or 5090 replaces the keys calibration measures and keeps every
 the compiled route best is stored with an empty schedule, which overrides a built-in choice for it.
 
 A GPU with neither a file entry nor a built-in one is calibrated once when the engine starts, before
-the weights are loaded. For the built-in table this took 35 to 75 seconds on most Ampere, Ada and
-Blackwell cards with 46 or more SMs, 75 to 132 seconds on smaller ones and 94 to 204 seconds on
-Turing cards (the six GGUF load keys add about 2 seconds on an RTX 3090), and the result is written
+the weights are loaded. For the built-in table this took 88 to 288 seconds on Ampere, Ada and
+Blackwell cards with 46 or more SMs, 223 to 375 seconds on smaller ones, 171 to 336 seconds on
+Turing cards and 12 seconds on the Tesla V100, and the result is written
 to the profile file for later starts. A `70` build runs its own native projection and attention
 routes, which no profile key steers, so it calibrates the two-stage GDN switch and the GGUF vector
 and MoE load schedules alone.
@@ -114,8 +119,8 @@ survives a second interleaved measurement, and its output matches the compiled r
 | `attn_parallel_tiles` | single-row chunked small-T attention over an INT8-family cache as parallel query tiles (one batched append, one split-KV launch over every tile, one reduce) instead of serial fused chunks; widths without an exact 2-8 column tile divisor stay serial; `NINFER_ATTN_PARALLEL_TILES=0\|1` overrides | 16 and 32 verify columns at 32K and 131K |
 | `q4_linear_add/5120x<k>` | the small-T Q4 residual projections (`small_t_c8`, `small_t_c16`, `small_t_c32`) for the attention or GDN output (k = 6144) and the MLP down (k = 17408) of a Q4-output artifact | widths 1 to 32 |
 | `gguf_vector/q4_k`, `gguf_vector/q6_k` | scalar or cooperative vector loads in the public GGUF Linear Op and SwiGLU, measured on both 17,408x5,120 and 5,120x17,408 plain projections and the 34,816x5,120 gate/up projection | widths 1 to 8; calibration requires both plain and fused sweeps to win. The RTX 3090 profile takes cooperative Q6_K at widths 1 to 8, and Q4_K at width 1, where the fused form alone does not win but whole-model decode does |
-| `gguf_matrix/<format>` for `q4_0`, `q5_0`, `q8_0`, `iq4_nl`, `q4_k`, `q5_k`, `q2_0`, `iq4_xs`, `nvfp4` | `async`: the format's integer matrix kernel staging both tiles through `cp.async` at each column tile (16, 32, 64 and 128 columns) (three barriers an iteration instead of four) against the compiled loop, over the 17,408x5,120 and 5,120x17,408 projections in BF16. The formats whose 256-value step is a whole number of 16-byte words copy 16 bytes at a time, Q2_0 and IQ4_XS 8 bytes; rows whose bytes or start are multiples of 4 bytes only (the 704- and 2,112-wide rows of the 32-value formats) copy 4 bytes. Listed on sm_80, 86, 89 and 120a builds; taken only where the row count is a whole number of 128-row tiles, the row bytes and the weight pointer are multiples of 4 bytes and the shared memory fits (Q4_K takes 92.5 KiB at 128 columns; Q8_0 fits an RTX 3090's 99 KiB only at 64 columns and narrower). The values are those of the compiled loop | widths 9 to 4,096 (9, 16, 17, 32, 33, 64, 65, 128, 129, 256, 512, 768, 1,024, 1,280, 1,536, 2,048, 3,072, 4,096); calibration keeps `async` on a 3% win that holds at 1.5% on a recheck. Past the last band the compiled route runs. Of the 43 built-in sm_80 and newer classes, all take `async` at some width for Q4_0, Q5_0, Q4_K, Q5_K, IQ4_NL and Q2_0, 25 for Q8_0 and 18 for IQ4_XS. NVFP4 is measured on the RTX 3090, RTX 4090 and RTX PRO 4500 Blackwell classes only, which take it at every width (RTX 3090), past 16 (RTX PRO 4500 Blackwell) or at 9 to 32 and past 64 (RTX 4090) |
-| `gguf_moe_matrix/<format>` for the same formats and `iq1_m` | the same staging in the routed MoE matrix kernel, over 64 experts of 640x2,560 rows at 8 to 1,024 pairs per expert (8, 16, 17, 32, 33, 48, 64, 65, 128, 256, 512, 1,024; the pairs divided by the expert count set the tile, the narrowest of 16, 32, 64 and 128 columns that holds them); IQ1_M, which has no dense matrix kernel, copies 8 bytes at a time. Taken only for banks whose expert pointers are 16-byte aligned (`MoeTable::aligned16`, which Gemma 4, Flint, Qwen3.8-Flash-Next and Edge0 set for their device banks and for the banks, slots and slot pools that bring host or disk experts to the device, and DeepSeek-V4.1 for the banks and slots that bring its host or disk experts); the row stride sets the copy as in the dense kernel | pairs per expert, 8 to 1,024. All 43 built-in sm_80 and newer classes take `async` at some pair count for every listed format but NVFP4, which the RTX 3090, RTX 4090 and RTX PRO 4500 Blackwell classes take at every pair count |
+| `gguf_matrix/<format>` for `q4_0`, `q5_0`, `q8_0`, `iq4_nl`, `q4_k`, `q5_k`, `q2_0`, `iq4_xs`, `nvfp4` | `async`: the format's integer matrix kernel staging both tiles through `cp.async` at each column tile (16, 32, 64 and 128 columns) (three barriers an iteration instead of four) against the compiled loop, over the 17,408x5,120 and 5,120x17,408 projections in BF16. The formats whose 256-value step is a whole number of 16-byte words copy 16 bytes at a time, Q2_0 and IQ4_XS 8 bytes; rows whose bytes or start are multiples of 4 bytes only (the 704- and 2,112-wide rows of the 32-value formats) copy 4 bytes. Listed on sm_80, 86, 89 and 120a builds; taken only where the row count is a whole number of 128-row tiles, the row bytes and the weight pointer are multiples of 4 bytes and the shared memory fits (Q4_K takes 92.5 KiB at 128 columns; Q8_0 fits an RTX 3090's 99 KiB only at 64 columns and narrower). The values are those of the compiled loop | widths 9 to 4,096 (9, 16, 17, 32, 33, 64, 65, 128, 129, 256, 512, 768, 1,024, 1,280, 1,536, 2,048, 3,072, 4,096); calibration keeps `async` on a 3% win that holds at 1.5% on a recheck. Past the last band the compiled route runs. Of the 53 built-in sm_80 and newer classes, the 50 whose entries measured these keys all take `async` at some width for Q4_0, Q5_0, Q4_K, Q5_K, IQ4_NL and Q2_0, 21 for Q8_0 and 20 for IQ4_XS; the RTX 5090 D v2, RTX 4070 Ti and RTX PRO 4500 Blackwell Server Edition entries predate them. NVFP4 is measured on 42 classes, which all take it at some width and 17 at every width |
+| `gguf_moe_matrix/<format>` for the same formats and `iq1_m` | the same staging in the routed MoE matrix kernel, over 64 experts of 640x2,560 rows at 8 to 1,024 pairs per expert (8, 16, 17, 32, 33, 48, 64, 65, 128, 256, 512, 1,024; the pairs divided by the expert count set the tile, the narrowest of 16, 32, 64 and 128 columns that holds them); IQ1_M, which has no dense matrix kernel, copies 8 bytes at a time. Taken only for banks whose expert pointers are 16-byte aligned (`MoeTable::aligned16`, which Gemma 4, Flint, Qwen3.8-Flash-Next and Edge0 set for their device banks and for the banks, slots and slot pools that bring host or disk experts to the device, and DeepSeek-V4.1 for the banks and slots that bring its host or disk experts); the row stride sets the copy as in the dense kernel | pairs per expert, 8 to 1,024. The 50 sm_80 and newer classes whose entries measured these keys take `async` at some pair count for every listed format, at every pair count for Q4_0, Q5_0, Q4_K, Q5_K, IQ4_NL, Q2_0 and IQ4_XS (48 for IQ1_M, 5 for Q8_0); NVFP4 is measured on 42 of them, which all take it and 37 at every pair count |
 | `gguf_moe_vector/q4_k`, `gguf_moe_vector/q6_k`, `gguf_moe_up/q4_k`, `gguf_moe_up/q6_k` | scalar or cooperative GGUF MoE vector loads, measured with three experts and reordered slots; generic products test separate plain and fused SwiGLU forms on 640x2,560 rows at chunks 1, 2, 4, 8, and decode-up uses 640x2,560 rows at chunks 1, 2, 4 | per-type, per-chunk calibration; the RTX 3090 profile takes cooperative Q6_K products at chunks 1 to 4 and Q6_K decode-up at chunk 4 |
 | `q6_head/248320x5120` | the Q6 vocabulary head's per-row GEMV (`gemv`, widths 1 and 2) or small-T MMA (`small_t`, widths up to 32) | widths 1 to 32 |
 | `q8_ksplit/<rows>x<k>` | the four-K-warp form (`kw4`: at most 128 registers a thread, four CTAs an SM) of the 8-column tile of the Q8 G32 K-split contraction, which MTP heads, DFlash2 drafters and Q8 heads run, instead of the route's own schedule | the eleven contraction shapes of those layers, widths 1 to 8 |

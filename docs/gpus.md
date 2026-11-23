@@ -95,20 +95,20 @@ means the card calibrates once at its first start.
 | ✅ | RTX 4080 | 16 GB | GeForce | ✓ | IQ3_S ([field report](performance/field-reports.md#rtx-4080-and-rtx-4090-windows-11)) |
 | ⬜ | RTX 4070 Ti Super | 16 GB | GeForce | ✓ | |
 | ⬜ | RTX 4070 Ti | 12 GB | GeForce | ✓ | |
-| ⬜ | RTX 4070 Super | 12 GB | GeForce | | |
+| ⬜ | RTX 4070 Super | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 4070 | 12 GB | GeForce | ✓ | |
 | ✅ | RTX 4060 Ti | 16 / 8 GB | GeForce | ✓ | Inkling 2 Mini on the 16 GB card (experts in host memory) |
 | ⬜ | RTX 4060 | 8 GB | GeForce | ✓ | |
 | ⬜ | RTX 4080 Laptop GPU | 12 GB | GeForce laptop | ✓ | |
 | ✅ | RTX 6000 Ada | 48 GB | Workstation | ✓ | Inkling 2 Mini |
-| ⬜ | RTX 5880 Ada | 48 GB | Workstation | | |
+| ⬜ | RTX 5880 Ada | 48 GB | Workstation | ✓ | |
 | ⬜ | RTX 5000 Ada | 32 GB | Workstation | ✓ | |
-| ⬜ | RTX 4500 Ada | 24 GB | Workstation | | |
+| ⬜ | RTX 4500 Ada | 24 GB | Workstation | ✓ | |
 | ✅ | RTX 4000 Ada | 20 GB | Workstation | ✓ | Inkling 2 Mini |
 | ⬜ | RTX 4000 SFF Ada | 20 GB | Workstation | | |
 | ⬜ | RTX 2000 Ada | 16 GB | Workstation | | |
 | ✅ | L40S | 48 GB | Data center | ✓ | Flash-Next, Inkling 2 Mini |
-| ⬜ | L40 | 48 GB | Data center | | |
+| ⬜ | L40 | 48 GB | Data center | ✓ | |
 | ⬜ | L20 | 48 GB | Data center | | |
 | ⬜ | L4 | 24 GB | Data center | ✓ | |
 
@@ -146,6 +146,7 @@ means the card calibrates once at its first start.
 | ✅ | A100 (PCIe, SXM4) | 80 / 40 GB | Data center | ✓ | Inkling 2 Mini |
 | ⬜ | A800 | 80 / 40 GB | Data center | | |
 | ⬜ | A30 | 24 GB | Data center | | |
+| ⬜ | CMP 170HX | 8 GB | CMP | ✓ | |
 
 ### Turing (7.5, build `75`)
 
@@ -160,9 +161,9 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 2060 | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 2060 Super | 8 GB | GeForce | ✓ | |
 | ✅ | Quadro RTX 8000 | 48 GB | Workstation | ✓ | Bonsai 2, Gemma 4, Flash-Next |
-| ⬜ | Quadro RTX 6000 | 24 GB | Workstation | ✓ | |
+| ✅ | Quadro RTX 6000 | 24 GB | Workstation | ✓ | Inkling 2 Mini |
 | ⬜ | Quadro RTX 5000 | 16 GB | Workstation | | |
-| ⬜ | Quadro RTX 4000 | 8 GB | Workstation | | |
+| ⬜ | Quadro RTX 4000 | 8 GB | Workstation | ✓ | |
 | ⬜ | T1000 | 8 GB | Workstation | | no tensor cores; whether the `75` build runs on it is unknown |
 | ⬜ | Tesla T4 | 16 GB | Data center | ✓ | |
 
