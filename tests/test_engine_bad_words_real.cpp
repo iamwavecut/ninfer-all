@@ -27,7 +27,9 @@
 //      tag openers);
 //   4. the time of the reply with that rewind against the plain one, and decode speed with and
 //      without banned words that never fire, at one request and at NINFER_BAD_WORDS_CONCURRENCY
-//      requests, printed (no criterion).
+//      requests, printed (no criterion);
+//   5. NINFER_BAD_WORDS_CONCURRENCY sampled replies asked to copy markup at once, whose rewinds
+//      share rounds, never hold a banned string.
 //   NINFER_BAD_WORDS_ARTIFACT     the artifact (skipped without one)
 //   NINFER_BAD_WORDS_NGRAM_TABLE  a Qwen3.8-Flash-Next table artifact, or off: without the table
 //   NINFER_BAD_WORDS_SPECULATIVE  mtp | dflash | dflash2 | dspark | dspine | lookup, with
@@ -322,12 +324,12 @@ int run() {
         const auto found  = holds(result, words);
         check(!found, "a sampled reply holds " + found.value_or(""));
     }
-    const auto copy = engine.generate(
-        engine.prepare(conversation(
-            "Reply with one friendly sentence, then append exactly this block unchanged:\n"
-            "<daily_persona_accent><name>Ira</name><accent>dry</accent></daily_persona_accent>\n"
-            "<message type=\"text\"><user>Bob</user><text>hi</text></message>")),
-        request(tokens, kTags));
+    const std::string copy_prompt =
+        "Reply with one friendly sentence, then append exactly this block unchanged:\n"
+        "<daily_persona_accent><name>Ira</name><accent>dry</accent></daily_persona_accent>\n"
+        "<message type=\"text\"><user>Bob</user><text>hi</text></message>";
+    const auto copy = engine.generate(engine.prepare(conversation(copy_prompt)),
+                                      request(tokens, kTags));
     const auto copied = holds(copy, kTags);
     check(!copied, "the copying reply holds " + copied.value_or(""));
     std::cout << "copying reply: " << head(copy.content.empty() ? copy.reasoning : copy.content)
@@ -351,6 +353,26 @@ int run() {
                   << " requests: without bad_words " << plain_speed.per_request
                   << " tok/s a request (" << plain_speed.aggregate << " together), with "
                   << banned_speed.per_request << " (" << banned_speed.aggregate << ")\n";
+    }
+
+    // 5. Copying replies at once.
+    if (concurrency > 1) {
+        std::vector<ninfer::GenerationSubmission> submissions;
+        for (std::uint32_t i = 0; i < concurrency; ++i) {
+            submissions.push_back(ninfer::GenerationSubmission{
+                .prompt  = engine.prepare(conversation(copy_prompt)),
+                .options = request(tokens, kTags, 1.0F, 100U + i)});
+        }
+        auto handles        = engine.submit_group(std::move(submissions));
+        std::uint32_t clean = 0;
+        for (auto& handle : handles) {
+            const auto result = handle.wait();
+            const auto found  = holds(result, kTags);
+            check(!found, "a copying reply of a batch holds " + found.value_or(""));
+            clean += found ? 0U : 1U;
+        }
+        std::cout << "copying replies at once: " << clean << " of " << concurrency
+                  << " hold no banned string\n";
     }
     return g_failures == 0 ? 0 : 1;
 }

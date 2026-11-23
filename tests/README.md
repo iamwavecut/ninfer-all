@@ -355,21 +355,22 @@ NINFER_STOP_ARTIFACT=$PWD/out/qwen3_8_27b.ninfer NINFER_STOP_CONTEXT_CACHE=hybri
   --output-on-failure
 ```
 
-`ninfer_engine_bad_words_real_test` checks vLLM's `bad_words` on a real model of any family: a
-greedy reply that is asked again with a string of it banned agrees with the first reply's tokens up
-to the token that holds the string's first byte, draws another token there and never holds the
-string; a fresh request whose prompt carries the banned reply's tokens through the redrawn one
-continues as the banned reply did (the test prints the agreeing tokens, with no criterion: prefill
-and decode round differently); sampled replies and a reply asked to copy prompt markup never hold a
-chat bot's 43 tag openers (the test prints what the model writes instead). It prints both replies'
-times, and decode tok/s with and without the openers at one request and at
-`NINFER_BAD_WORDS_CONCURRENCY` (8) requests, interleaved, with no criterion. `NINFER_BAD_WORDS_ARTIFACT`
-names the artifact, and the test is skipped without it; `NINFER_BAD_WORDS_SPECULATIVE` (with
-`NINFER_BAD_WORDS_DRAFTS`, 2), `NINFER_BAD_WORDS_DRAFT_MODEL`, `NINFER_BAD_WORDS_NGRAM_TABLE`,
-`NINFER_BAD_WORDS_EXPERTS`, `NINFER_BAD_WORDS_DEVICES` and `NINFER_BAD_WORDS_THINKING=on` work as
-the stop-string test's variables do (`NINFER_BAD_WORDS_NGRAM_TABLE=off` included),
-`NINFER_BAD_WORDS_KV=int8` or `rk8v4` selects the KV format
-and `NINFER_BAD_WORDS_TOKENS` each reply's limit (256):
+`ninfer_engine_bad_words_real_test` checks vLLM's `bad_words` on a real model of any family: of two
+equal greedy replies, the second (which resumes the prompt from the same cached state as the next
+request) is asked again with a string of it banned; the banned reply agrees with it up to the token
+that holds the string's first byte, draws another token there and never holds the string; a fresh
+request whose prompt carries the banned reply's tokens through the redrawn one continues as the
+banned reply did (the test prints the agreeing tokens, with no criterion: prefill and decode round
+differently); sampled replies and a reply asked to copy prompt markup never hold a chat bot's 43 tag
+openers (the test prints what the model writes instead), nor do `NINFER_BAD_WORDS_CONCURRENCY` (8)
+sampled copying replies at once. It prints both replies' times, and decode tok/s with and without
+the openers at one request and at `NINFER_BAD_WORDS_CONCURRENCY` requests, interleaved, with no
+criterion. `NINFER_BAD_WORDS_ARTIFACT` names the artifact, and the test is skipped without it;
+`NINFER_BAD_WORDS_SPECULATIVE` (with `NINFER_BAD_WORDS_DRAFTS`, 2), `NINFER_BAD_WORDS_DRAFT_MODEL`,
+`NINFER_BAD_WORDS_NGRAM_TABLE`, `NINFER_BAD_WORDS_EXPERTS`, `NINFER_BAD_WORDS_DEVICES` and
+`NINFER_BAD_WORDS_THINKING=on` work as the stop-string test's variables do
+(`NINFER_BAD_WORDS_NGRAM_TABLE=off` included), `NINFER_BAD_WORDS_KV=int8` or `rk8v4` selects the KV
+format and `NINFER_BAD_WORDS_TOKENS` each reply's limit (256):
 
 ```bash
 NINFER_BAD_WORDS_ARTIFACT=$PWD/out/gemma4_26b.ninfer NINFER_BAD_WORDS_SPECULATIVE=mtp \
