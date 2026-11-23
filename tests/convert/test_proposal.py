@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 
 import numpy as np
@@ -7,7 +8,13 @@ import torch
 
 from tools.convert.methods import AuxiliaryValue, import_encoded
 from tools.convert.model import Model, Parameter
-from tools.convert.proposal import add_official_proposal, add_proposal
+from tools.convert.proposal import (
+    DEFAULT_INCLUDE,
+    DEFAULT_RANKING,
+    add_official_proposal,
+    add_proposal,
+    load_include,
+)
 from tools.convert.recipe import Recipe
 from tools.convert.resources import token_domain
 from tools.convert.sources.logical import EncodedRows, LogicalSource, array_source
@@ -115,3 +122,41 @@ def test_proposal_of_an_imported_head_keeps_its_exact_rows_and_encoding(tmp_path
     ids = model.parameters["proposal/token_ids"].source.values().tolist()
     gathered = model.parameters["proposal/head"].source.read_encoded(0, 3)
     assert torch.equal(gathered.codes, codes[ids]) and torch.equal(gathered.scales, scales[ids])
+
+
+def _toy_model(vocab: int, hidden: int = 4) -> Model:
+    model = Model(
+        {
+            "text": {"config": {"vocab_size": vocab}},
+            "mtp": {"config": {}, "target": "text"},
+        },
+        token_count=vocab,
+    )
+    head = torch.zeros(vocab, hidden, dtype=torch.bfloat16)
+    model.add(Parameter("text/output_head", (vocab, hidden), array_source(head, "head")))
+    return model
+
+
+def test_proposal_keeps_an_include_files_tokens_in_place_of_the_least_frequent(tmp_path):
+    ranking = tmp_path / "ranking.i64"
+    np.array([[9, 8, 7, 6, 5, 4, 3, 0]], dtype="<i8").tofile(ranking)
+    include = tmp_path / "include.json"
+    include.write_text(json.dumps({"artifact_type": "proposal_include", "ids": [7, 99]}))
+    model = _toy_model(8)
+    add_proposal(Recipe(model), ranking=ranking, rows=4, include=include)
+    # 99 lies outside the vocabulary and is ignored; 7 takes the place of 3.
+    assert model.parameters["proposal/token_ids"].source.values().tolist() == [0, 1, 2, 7]
+    model = _toy_model(8)
+    add_proposal(Recipe(model), ranking=ranking, rows=4)
+    assert model.parameters["proposal/token_ids"].source.values().tolist() == [0, 1, 2, 3]
+
+
+def test_the_repositorys_ranking_keeps_the_russian_tokens_and_another_does_not(tmp_path):
+    russian = load_include(DEFAULT_INCLUDE, DEFAULT_RANKING)
+    assert len(russian) == 1024 and len(set(russian)) == 1024
+    assert load_include("auto", tmp_path / "ranking.condensed.i64") == ()
+    vocab = 248320
+    model = _toy_model(vocab, hidden=1)
+    add_official_proposal(Recipe(model))
+    ids = set(model.parameters["proposal/token_ids"].source.values().tolist())
+    assert len(ids) == 131072 and set(russian) <= ids

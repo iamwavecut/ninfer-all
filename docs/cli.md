@@ -190,7 +190,11 @@ Speculative decoding is disabled by default. Select MTP, the 35B-A3B DFlash or t
 DFlash2 backend with one to fifteen draft positions. Only one backend can be enabled per Engine.
 Drafts go through the artifact's optimized proposal head when it stores one: a vocabulary shortlist
 (131,072 rows of the 27B's 248,320) that is cheaper to project at every draft step, for the memory
-of that matrix (0.3 GiB with the 27B GSQ-RCO IQ3_S artifact). `--lm-head-draft` requires the
+of that matrix (0.3 GiB with the 27B GSQ-RCO IQ3_S artifact). The converter takes the most frequent
+tokens of its ranking and 1,024 Russian ones that ranking holds too few of
+(`tools/freq_corpus/fixtures/ranking/proposal.include.ru.json`): the shortlist then holds 99.61% of
+the tokens of held-out Russian answers (98.42% without them) and 99.70% of English chat (99.72%).
+Artifacts converted before this change keep the shortlist without them. `--lm-head-draft` requires the
 proposal head and `--full-draft-head` keeps the full output head; both need a selected backend.
 Both masked-draft backends may be combined with `--vision`:
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,33 @@ DEFAULT_RANKING = (
     Path(__file__).resolve().parents[1]
     / "freq_corpus/fixtures/ranking/ranking.train.counts.i64"
 )
+# Russian tokens the ranking's corpus holds too few of: the 1,024 most frequent in Russian answers
+# that its top 131,072 lacks (proposal.include.ru.json says how they were chosen). With them a
+# 131,072-row shortlist covers 99.61% of held-out Russian answer tokens instead of 98.42%, and
+# loses 0.02 points of English chat (99.72% -> 99.70%).
+DEFAULT_INCLUDE = (
+    Path(__file__).resolve().parents[1]
+    / "freq_corpus/fixtures/ranking/proposal.include.ru.json"
+)
+
+
+def include_path(path: str | Path | None, ranking: str | Path) -> Path | None:
+    """The include file a shortlist takes: "auto" is the Russian ids with the repository's ranking
+    and none with another (a condensed vocabulary numbers its tokens anew)."""
+    if path == "auto":
+        return DEFAULT_INCLUDE if Path(ranking).resolve() == DEFAULT_RANKING.resolve() else None
+    return None if path is None else Path(path)
+
+
+def load_include(path: str | Path | None, ranking: str | Path) -> tuple[int, ...]:
+    """The token ids of include_path(path, ranking); none for no file."""
+    path = include_path(path, ranking)
+    if path is None:
+        return ()
+    data = json.loads(Path(path).read_text())
+    if data.get("artifact_type") != "proposal_include":
+        raise ValueError(f"{path}: not a proposal include file")
+    return tuple(int(i) for i in data["ids"])
 
 
 def select_shortlist(total: np.ndarray, n: int, force_include=()) -> np.ndarray:
@@ -50,6 +78,7 @@ def add_proposal(
     rows: int = 131072,
     source=None,
     format="q4_g64_fp16",
+    include: str | Path | None = "auto",
 ) -> None:
     model = recipe.model
     if "proposal/head" in model.parameters:
@@ -60,7 +89,9 @@ def add_proposal(
         raise ValueError("ranking must contain complete int64 vocabulary rows")
     total = np.fromfile(ranking, dtype="<i8", count=vocab)
     selected = select_shortlist(
-        total[: model.token_count], rows, model.special_token_ids
+        total[: model.token_count],
+        rows,
+        (*model.special_token_ids, *load_include(include, ranking)),
     )
     ids = torch.from_numpy(selected).to(torch.int32)
     derived = source is None
@@ -92,7 +123,12 @@ def add_proposal(
         Parameter(
             "proposal/token_ids",
             (rows,),
-            array_source(ids, f"shortlist({ranking})"),
+            array_source(
+                ids,
+                f"shortlist({ranking})"
+                if include_path(include, ranking) is None
+                else f"shortlist({ranking}, {include_path(include, ranking)})",
+            ),
             direct_format="int32",
             residency="proposal",
         )
@@ -121,13 +157,13 @@ def add_proposal(
 
 
 def add_official_proposal(
-    recipe: Recipe, *, ranking=DEFAULT_RANKING, rows=131072
+    recipe: Recipe, *, ranking=DEFAULT_RANKING, rows=131072, include="auto"
 ) -> None:
     # The rows the output head is converted from: the recipe's own source when it selected one (a
     # ternary checkpoint's head), the base checkpoint's head otherwise.
     base = recipe.model.parameters["text/output_head"].source
     selections = recipe.selections["text/output_head"]
     if len(selections) == 1 and selections[0].source is not base:
-        add_proposal(recipe, ranking=ranking, rows=rows)
+        add_proposal(recipe, ranking=ranking, rows=rows, include=include)
         return
-    add_proposal(recipe, ranking=ranking, rows=rows, source=base)
+    add_proposal(recipe, ranking=ranking, rows=rows, source=base, include=include)
