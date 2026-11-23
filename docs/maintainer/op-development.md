@@ -311,6 +311,22 @@ that reads no memory: a routed launch's work list, token map and expert rows are
 so such a kernel waits before it reads them. Attention over the KV cache
 stays an ordinary launch; it has no weights to stage and measured no faster as a dependent.
 
+The Gemma 4, Flint and Inkling 2 kernels and the GGUF vector products are compiled for every
+architecture of a build, so they use the form in `src/core/pdl_arch.cuh`: the grid dependency
+instructions exist only in the sm_90+ images, and `pdl::launch_arch()` adds the programmatic
+attribute only on an sm_90+ device, while the stream captures a CUDA Graph, inside a
+`pdl::ArchScope` (`src/core/pdl_scope.h`). Those three executors open the scope around their
+decode-graph capture; Qwen3.5-core, Flash-Next, Edge0 and DeepSeek-V4.1 open none, and their
+launches stay ordinary. Short kernels call `pdl::arch_enter_glue()`, the release rule of `enter()`;
+kernels that stream weights or the KV cache call `pdl::arch_enter()`, which only waits: the release
+instruction compiled into a GGUF expert product slowed it by about 15 % on an RTX 5090, also where
+its branch was not taken. A vector product launched as a dependent reads the first weight lines of
+each warp's rows into L2 before it waits. On an RTX 5090 the scoped launches took greedy decode from
+199.4 to 216.0 tok/s on Inkling 2 without drafts, from 371.1 to 382.7 on Gemma 4 26B-A4B with MTP
+and from 334.9 to 358.0 on Flint, with the same tokens. Behind kernels that release it only at their
+exit, the vector product's early start measured slower: Qwen3.8-27B decoded at 104.9 instead of
+105.7 tok/s.
+
 #### TMA pipeline stages
 
 The consumer warps of a TMA-pipelined kernel return each stage to its producer through

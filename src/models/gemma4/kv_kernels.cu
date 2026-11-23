@@ -2,6 +2,7 @@
 // queries for rotated planes (kernels.h, kv_codec.cuh).
 
 #include "models/gemma4/kernels.h"
+#include "core/pdl_arch.cuh"
 #include "models/gemma4/kv_codec.cuh"
 
 #include <cuda_fp16.h>
@@ -32,6 +33,7 @@ __device__ __forceinline__ std::uint8_t* row_scales(const KvPlaneView& v, int se
 
 template <KvCoding C>
 __launch_bounds__(kWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
+    ninfer::pdl::arch_enter_glue();
     constexpr int kCode = kv_code_bytes(C), kScale = kv_scale_bytes(C);
     __shared__ float scratch[kWarps][kKvBlockDims];
     __shared__ __align__(16) std::uint8_t codes_s[kWarps][kCode];
@@ -74,6 +76,7 @@ __launch_bounds__(kWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
 
 template <KvCoding C>
 __launch_bounds__(kWarps * 32) __global__ void kv_load_kernel(KvLoadArgs a) {
+    ninfer::pdl::arch_enter();
     constexpr int kCode = kv_code_bytes(C), kScale = kv_scale_bytes(C);
     __shared__ float scratch[kWarps][kKvBlockDims];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -97,6 +100,7 @@ __launch_bounds__(kWarps * 32) __global__ void kv_load_kernel(KvLoadArgs a) {
 }
 
 __launch_bounds__(kWarps * 32) __global__ void rotate_rows_kernel(float* x, int rows) {
+    ninfer::pdl::arch_enter_glue();
     const int row  = blockIdx.x * kWarps + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (row >= rows) { return; }
@@ -126,6 +130,7 @@ __device__ __forceinline__ void store_row_block(const __half* src, const KvPlane
 // Units: the K blocks (KC not F16), then the V blocks, then the query rows to turn.
 template <KvCoding KC, KvCoding VC>
 __launch_bounds__(kWarps * 32) __global__ void kv_store_rows_kernel(KvRowsArgs a) {
+    ninfer::pdl::arch_enter_glue();
     __shared__ float scratch[kWarps][kKvBlockDims];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int unit = blockIdx.x * kWarps + warp;
@@ -188,13 +193,15 @@ void dispatch(KvCoding coding, Args&&... args) {
 template <KvCoding C>
 struct StoreLaunch {
     static void run(const KvStoreArgs& a, int units, cudaStream_t stream) {
-        kv_store_kernel<C><<<(units + kWarps - 1) / kWarps, kWarps * 32, 0, stream>>>(a);
+        ninfer::pdl::launch_arch((units + kWarps - 1) / kWarps, kWarps * 32, 0, stream,
+                                 kv_store_kernel<C>, a);
     }
 };
 template <KvCoding C>
 struct LoadLaunch {
     static void run(const KvLoadArgs& a, int units, cudaStream_t stream) {
-        kv_load_kernel<C><<<(units + kWarps - 1) / kWarps, kWarps * 32, 0, stream>>>(a);
+        ninfer::pdl::launch_arch((units + kWarps - 1) / kWarps, kWarps * 32, 0, stream,
+                                 kv_load_kernel<C>, a);
     }
 };
 
@@ -226,7 +233,8 @@ void kv_store_rows(const KvRowsArgs& a, cudaStream_t stream) {
     const C k = keys ? a.k_plane.coding : C::F16, v = a.v_plane.coding;
 #define GEMMA4_KV_ROWS(KC, VC)                                                                     \
     if (k == C::KC && v == C::VC) {                                                                \
-        kv_store_rows_kernel<C::KC, C::VC><<<grid, block, 0, stream>>>(args);                      \
+        ninfer::pdl::launch_arch(grid, block, 0, stream, kv_store_rows_kernel<C::KC, C::VC>,       \
+                                 args);                                                            \
         check_launch("kv_store_rows");                                                             \
         return;                                                                                    \
     }
@@ -249,7 +257,8 @@ void kv_store_rows(const KvRowsArgs& a, cudaStream_t stream) {
 
 void rotate_rows(float* x, int rows, cudaStream_t stream) {
     if (rows <= 0) { return; }
-    rotate_rows_kernel<<<(rows + kWarps - 1) / kWarps, kWarps * 32, 0, stream>>>(x, rows);
+    ninfer::pdl::launch_arch((rows + kWarps - 1) / kWarps, kWarps * 32, 0, stream,
+                             rotate_rows_kernel, x, rows);
     check_launch("rotate_rows");
 }
 
