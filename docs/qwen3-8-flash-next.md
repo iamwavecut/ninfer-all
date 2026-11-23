@@ -353,17 +353,18 @@ cache forgets what it held, the Engine counts an `engine_recoveries` and serves 
 
 The page-locked block of GGUF host experts holds them in the artifact's order while they fit the
 host's available memory and, on Windows and WSL2, what the GPU's shared memory segment can still
-lock, less 4 GiB for what startup pins after them: WDDM charges page-locked memory there, about
-half the RAM, so 48 GB of experts on a 64 GB Windows machine do not pin whole
-([#358](https://github.com/iamwavecut/ninfer-all/issues/358)). `--expert-host-mib N` pins at most
-`N` MiB. The block registers in parts of about 1 GiB, and a part the host refuses ends it. When it
-holds every expert, the run is the host run above. Otherwise the experts run as disk experts do,
-through the device expert cache: each is copied from its pinned bytes where the block holds it and
-read from the artifact's files where it does not, and the startup line names both amounts. The
-results equal the host and disk runs; host-only options (`--expert-misses mapped`,
-`--expert-tail-skip`, `--expert-prefill-buffers`, `--expert-profile`, `--expert-profile-out`)
-are refused then. Native
-(non-GGUF) host banks register per layer and are not divided this way.
+lock, less 4 GiB for what startup pins after them: WDDM charges page-locked memory there, about half
+of Windows' memory however much WSL2 is given, so 48 GB of experts on a 64 GB Windows machine do not
+pin whole ([#358](https://github.com/iamwavecut/ninfer-all/issues/358)). `--expert-host-mib N` pins
+at most `N` MiB and replaces the segment estimate; the available memory and the host's first refusal
+still end the block. The block registers in parts of about 1 GiB, and a part the host refuses ends
+it. When it holds every expert, the run is the host run above. Otherwise the experts run as disk
+experts do, through the device expert cache: each is copied from its pinned bytes where the block
+holds it and read from the artifact's files where it does not, and the startup line names both
+amounts and what ended the block. The results equal the host and disk runs; host-only options
+(`--expert-misses mapped`, `--expert-tail-skip`, `--expert-prefill-buffers`, `--expert-profile`,
+`--expert-profile-out`) are refused then. Native (non-GGUF) host banks register per layer and are
+not divided this way.
 
 Native host banks copy every miss to the GPU by default (`--expert-dma-share 1`). Values below one
 let the CPU compute a share of the missing experts; this mode is experimental: on one RTX 3090 with

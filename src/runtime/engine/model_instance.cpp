@@ -22,6 +22,7 @@
 #include "models/qwen3_5/expert_admission.h"
 #include "models/qwen3_5/measurement.h"
 #include "runtime/engine/host_memory.h"
+#include "runtime/engine/pinned_block.h"
 #include "runtime/contract/rope_scaling.h"
 
 #include <algorithm>
@@ -1052,9 +1053,9 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     const auto& stats = instance->model->storage_stats();
     if (stats.files_bytes > 0) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "host experts: %.0f MiB pinned, %.0f MiB read from the artifact's files "
-                           "(the host could not pin more, or --expert-host-mib)",
-                           double(stats.pinned_bytes) / 1048576, double(stats.files_bytes) / 1048576);
+                           "host experts: %.0f MiB pinned, %.0f MiB read from the artifact's files%s",
+                           double(stats.pinned_bytes) / 1048576, double(stats.files_bytes) / 1048576,
+                           pinned_block_end_note(stats).c_str());
     }
     LoadSummary summary;
     summary.architecture = models::architecture_name(instance->model->config().text.architecture);

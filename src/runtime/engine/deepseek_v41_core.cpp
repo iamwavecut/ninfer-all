@@ -29,6 +29,7 @@
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/host_memory.h"
+#include "runtime/engine/pinned_block.h"
 #include "runtime/engine/model_instance.h"
 #include "text/structured_output.h"
 
@@ -479,10 +480,11 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     }
     if (options.expert_residency != ExpertResidency::Device) {
         const auto experts = memory.experts;
+        const std::string pinned_end = pinned_block_end_note(model->storage_stats());
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "DeepSeek-V4.1: experts in %s, cache %.0f MiB (%u slots), %u layer bank(s) %.0f MiB, "
             "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB, "
-            "expert sources in the files %.0f MiB",
+            "expert sources in the files %.0f MiB%s",
             options.expert_residency == ExpertResidency::Disk
                 ? "the artifact's files, read into bounded buffers through the page cache"
             : model->expert_file_bytes() > 0 ? "pinned host memory and the artifact's files"
@@ -490,7 +492,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
             double(experts.cache_bytes) / 1048576, experts.cache_slots, experts.banks,
             double(experts.bank_bytes) / 1048576, double(experts.metadata_bytes) / 1048576,
             double(experts.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576,
-            double(model->expert_file_bytes()) / 1048576);
+            double(model->expert_file_bytes()) / 1048576, pinned_end.c_str());
         const auto cpu = instance->executor->expert_cpu_description();
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "DeepSeek-V4.1: missing experts %s; cache seeded %s",

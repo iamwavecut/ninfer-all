@@ -684,20 +684,22 @@ UploadTotals upload_device_objects(const Reader& reader,
 }
 
 // Where the pinned block holds each placement it keeps: every placement that must be pinned at its
-// plan offset, then the Residency::PinnedOrFiles ones in order while they fit within
-// MaterializeOptions::files_after_bytes, the memory the host has available and, on Windows, what
-// it can still pin for the device less kPinHeadroom for what later startup pins. The latter lie
-// in parts of at least kPinPartBytes, each starting on a page of its own, so each registers apart
-// and the first part the host refuses ends the block without splitting an object.
+// plan offset, then the Residency::PinnedOrFiles ones in order while they fit the memory the host
+// has available and MaterializeOptions::files_after_bytes, or without that cap, on Windows and
+// WSL2, what the host can still pin for the device less kPinnedHeadroomBytes for what later
+// startup pins: an explicit cap replaces that estimate. The latter lie in parts of at least
+// kPinPartBytes, each starting on a page of its own, so each registers apart and the first part
+// the host refuses ends the block without splitting an object.
 struct PinnedLayout {
     std::vector<std::uint64_t> offsets;  // the kept placements', the plan's leading ones
     std::vector<std::size_t> part_ends;  // every part's end, the required prefix's first
     std::uint64_t required_end = 0, end = 0;
     bool fallback = false; // some placement may stay in the files
+    PinnedBlockEnd ended_by  = PinnedBlockEnd::Complete;
+    std::uint64_t limit_bytes = 0; // the memory figure that ended it
 };
 
 constexpr std::uint64_t kPinPartBytes = 1ULL << 30;
-constexpr std::uint64_t kPinHeadroom  = 4ULL << 30;
 constexpr std::uint64_t kPinPage      = 64ULL << 10; // a multiple of every host page size
 
 PinnedLayout lay_out_pinned(const Reader& reader, const MaterializationPlan& plan,
@@ -732,11 +734,17 @@ PinnedLayout lay_out_pinned(const Reader& reader, const MaterializationPlan& pla
     out.end = out.required_end;
     if (first_fallback == plan.pinned_objects.size()) { return out; }
     out.fallback = true;
-    std::uint64_t limit = std::numeric_limits<std::uint64_t>::max();
-    if (const auto available = available_host_memory_bytes()) { limit = *available; }
-    if (const auto pinnable = pinnable_host_memory_bytes(device.props.luid)) {
-        limit = std::min(limit, *pinnable > kPinHeadroom ? *pinnable - kPinHeadroom : 0);
-    }
+    constexpr std::uint64_t kNone = std::numeric_limits<std::uint64_t>::max();
+    const auto available          = available_host_memory_bytes();
+    const auto pinnable           = options.files_after_bytes
+                                        ? std::nullopt
+                                        : pinnable_host_memory_bytes(device.props.luid);
+    const std::uint64_t pinnable_limit =
+        !pinnable                          ? kNone
+        : *pinnable > kPinnedHeadroomBytes ? *pinnable - kPinnedHeadroomBytes
+                                           : 0;
+    const bool pinnable_ends  = pinnable_limit < available.value_or(kNone);
+    const std::uint64_t limit = std::min(available.value_or(kNone), pinnable_limit);
     const std::uint64_t budget =
         options.files_after_bytes.value_or(std::numeric_limits<std::uint64_t>::max());
     // Each part closes where the next one starts, so its registration covers the padding.
@@ -748,7 +756,15 @@ PinnedLayout lay_out_pinned(const Reader& reader, const MaterializationPlan& pla
             align_up(new_part ? align_up(cursor, kPinPage, "pinned Host offset") : cursor,
                      placement.alignment, "pinned Host offset");
         const std::uint64_t end = checked_add(at, placement.bytes, "pinned Host capacity");
-        if (end > limit || placement.bytes > budget - taken) { break; }
+        if (end > limit) {
+            out.ended_by    = pinnable_ends ? PinnedBlockEnd::Pinnable : PinnedBlockEnd::Available;
+            out.limit_bytes = pinnable_ends ? *pinnable : *available;
+            break;
+        }
+        if (placement.bytes > budget - taken) {
+            out.ended_by = PinnedBlockEnd::Cap;
+            break;
+        }
         if (new_part) {
             if (cursor > 0) { out.part_ends.push_back(at); }
             part_start = at;
@@ -987,6 +1003,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                                 " MiB of host memory: the host refused it");
         }
     }
+    out.stats_.pinned_block_end         = pinned < pinned_layout.end ? PinnedBlockEnd::Refused
+                                                                     : pinned_layout.ended_by;
+    out.stats_.pinned_block_limit_bytes = pinned < pinned_layout.end ? 0 : pinned_layout.limit_bytes;
     for (std::size_t i = 0; i < plan.pinned_objects.size(); ++i) {
         const auto& placement = plan.pinned_objects[i];
         if (i >= pinned_layout.offsets.size() ||
