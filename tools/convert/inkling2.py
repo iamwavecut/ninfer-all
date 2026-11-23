@@ -16,27 +16,29 @@ matrix (UD-Q8_K_XL's attention projections, token table, head and last four laye
 its words and multiplies BF16 inputs. Other BF16 and F32 tensors (sink and dynamic-tap projections,
 router, convolutions, clips, the distance tables, mixing queries, norms, controllers, expert
 scales) become FP32, exactly, as do Q8_0 ones, whose values d * q FP32 holds (IsValorum's APEX
-GGUFs store the sink and dynamic-tap projections in Q8_0).
+GGUFs store the sink and dynamic-tap projections in Q8_0); other block formats (Q4_K in some GGUFs)
+become the FP32 values of their blocks.
 
 The GGUFs come in two layouts that convert to the same artifact: llama.cpp's (`inkling2_loop`, 24
 blocks, a block's four message queries in `blk.N.loop_msg_query` and its controllers
-`loop_{q,k,v,ffn}_ctrl_*`) and the earlier one of Unsloth's root files (`inkling2`, 48 unrolled
-blocks in its metadata, the queries in the global `loop_res_query` and `loop_kv_res_query` and the
-controllers `loop_{attn,k,v,mlp}_*`).
+`loop_{q,k,v,ffn}_ctrl_*`) and the earlier one of Unsloth's root files, now in its `Old_Support/`
+(`inkling2`, 48 unrolled blocks in its metadata, the queries in the global `loop_res_query` and
+`loop_kv_res_query` and the controllers `loop_{attn,k,v,mlp}_*`).
 
 The release's vision tower forms the `vision` component beside `text` (`--components text,vision`,
 `--source vision=mmproj-BF16.gguf`, projector `inkling2v`): a ViT with a class row, learned
 position rows resized to each image and 2D-rotated heads, then 2x2 patch merging and a two-layer
 projector, its vectors FP32 and its matrices BF16 or, from a quantized mmproj such as ggml-org's
 `mmproj-Inkling-2-Mini-Q8_0.gguf`, the GGUF's block rows as stored. The release's DSpark drafter
-(`--components text,dspark`, `--source dspark=dspark-Inkling-2-Mini-Q8_0.gguf`, llama.cpp
-architecture `dflash`) forms the `dspark` component: three blocks over the target's tapped hidden
-states, each with its own context projections, and a recurrent Markov head that corrects the
-target's head.
+(`--components text,dspark`, `--source dspark=dspark-Inkling-2-Mini-Q8_0_Old.gguf`, llama.cpp
+architecture `dflash`; the mainline drafter of Unsloth's root `dspark-Inkling-2-Mini-Q8_0.gguf`
+stores other tensors and is not read) forms the `dspark` component: three blocks over the target's
+tapped hidden states, each with its own context projections, and a recurrent Markov head that
+corrects the target's head.
 
     python -m tools.convert --model HF_DIR --recipe inkling2_gguf \\
         --source gguf=Inkling-2-Mini-UD-IQ4_XS.gguf \\
-        --source vision=mmproj-BF16.gguf --source dspark=dspark-Inkling-2-Mini-Q8_0.gguf \\
+        --source vision=mmproj-BF16.gguf --source dspark=dspark-Inkling-2-Mini-Q8_0_Old.gguf \\
         --components text,vision,dspark --out inkling-2-mini-UD-IQ4_XS.ninfer
 
 `HF_DIR` holds the release's `config.json`, `tokenizer.json`, `tokenizer_config.json`,
