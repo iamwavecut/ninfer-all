@@ -472,6 +472,23 @@ codes times their power-of-two scale, exact against the FP32 path for every pair
 exponent, moved the far field from 19.9 to 19.2 s on the RTX 3090 and the RTX PRO 4500's prefill
 from 4.18k, 4.16k to 4.16k, 4.14k and from 3.34k to 3.29k, so the decode keeps its FP32 products.
 
+Turing and Volta, November 23, 2026: the release image of master 5342f9f (`cuda13.4`, and
+`cuda12.9` on the V100) on Vast.ai cards at their default power limits, experts on the GPU, MXFP8
+KV; the CLI's prefill of the 32,070-token prompt as above and `ninfer-perplexity` over the same
+49,478 WikiText tokens:
+
+| Card | Prefill, 32,070 tokens (tok/s) | Mean NLL |
+|---|---:|---:|
+| RTX 3090 (420 W, PCIe 3.0 x16) | 3.24k | 1.739533 |
+| Quadro RTX 6000 (250 W, PCIe 3.0 x16) | 1.51k | 1.739427 |
+| Tesla V100-SXM2-32GB (300 W) | 1.02k | 1.739296 |
+
+The Quadro RTX 6000 runs both fields on tensor cores (the far field at one block a
+multiprocessor); the V100 keeps the SIMT kernels for the near field. The RTX 3090's NLL equals its
+value above. A 600-token greedy reply (`--max-context 4096`) decoded at 75.2 tok/s with DSpark and
+68.7 without drafts on the Quadro RTX 6000, 85.2 and 67.3 on the V100, and 144.4 and 120.5 on the
+RTX 3090.
+
 ### APEX-I MiniPlus
 
 IsValorum's APEX-I MiniPlus V2.1 (12.8 GiB with its Q8_0 tower and the DSpark drafter) on a rented
