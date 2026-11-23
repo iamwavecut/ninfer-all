@@ -71,6 +71,7 @@ enum class OutputChannel : std::uint8_t;
 struct StopString;
 struct StopPolicy;
 enum class ReasoningLoopAction : std::uint8_t;
+class AnswerNowSignal;
 struct ThinkingControlOptions;
 enum class StructuredOutputKind : std::uint8_t;
 struct StructuredOutputOptions;
