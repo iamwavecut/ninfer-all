@@ -41,6 +41,7 @@ BadWordsFilter::BadWordsFilter(std::shared_ptr<const Tokens> tokens, std::vector
     // The trie of the words, its children unordered while it grows.
     std::vector<std::vector<Edge>> children(1);
     std::vector<bool> terminal(1, false);
+    std::vector<std::uint32_t> depths(1, 0);
     // Per word, the trie node after each of its first k bytes (index k - 1).
     std::vector<std::vector<State>> prefixes(words_.size());
     for (std::size_t w = 0; w < words_.size(); ++w) {
@@ -57,6 +58,7 @@ BadWordsFilter::BadWordsFilter(std::shared_ptr<const Tokens> tokens, std::vector
                 edges.push_back(Edge{.byte = b, .next = next});
                 children.emplace_back();
                 terminal.push_back(false);
+                depths.push_back(depths[node] + 1);
                 node = next;
             }
             prefixes[w].push_back(node);
@@ -68,6 +70,7 @@ BadWordsFilter::BadWordsFilter(std::shared_ptr<const Tokens> tokens, std::vector
         auto& edges = children[n];
         std::sort(edges.begin(), edges.end(),
                   [](const Edge& a, const Edge& b) { return a.byte < b.byte; });
+        nodes_[n].depth      = depths[n];
         nodes_[n].first_edge = static_cast<std::uint32_t>(edges_.size());
         nodes_[n].edges      = static_cast<std::uint32_t>(edges.size());
         edges_.insert(edges_.end(), edges.begin(), edges.end());
@@ -175,6 +178,11 @@ void BadWordsFilter::clear_banned(State state, std::span<std::uint32_t> mask) co
             }
         }
     }
+}
+
+std::size_t BadWordsFilter::token_bytes(TokenId token) const noexcept {
+    if (token < 0 || static_cast<std::size_t>(token) >= tokens_->text.size()) { return 0; }
+    return tokens_->text[static_cast<std::size_t>(token)].size();
 }
 
 std::size_t BadWordsFilter::vocab_size() const noexcept { return tokens_->text.size(); }

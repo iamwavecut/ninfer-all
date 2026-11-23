@@ -232,6 +232,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     quote->grammar                     = plan.grammar;
     quote->logprobs                    = plan.logprobs;
     quote->readout_tokens              = plan.readout_tokens;
+    quote->penalized_prompt_tokens     = plan.penalized_prompt_tokens;
     quote->branches                    = plan.branches;
     quote->drafting                    = plan.drafting;
     quote->text_kv_page_entitlement    = plan.text_kv_page_entitlement;
@@ -953,7 +954,9 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         request.logprobs = quote.logprobs;
         request.readout_tokens = quote.readout_tokens;
         request.branches       = quote.branches;
-        install_sampling(sequence, request, quote.sampling);
+        install_sampling(
+            sequence, request, quote.sampling,
+            std::span<const TokenId>(prompt.token_ids).last(quote.penalized_prompt_tokens));
         sequence.mtp_draft_count    = 0;
         sequence.mtp_drafts_pending = false;
         sequence.rope_delta = prompt.rope_delta;

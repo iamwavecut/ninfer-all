@@ -745,7 +745,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         request.logprobs = request_plan.logprobs;
         request.readout_tokens = request_plan.readout_tokens;
         request.branches       = request_plan.branches;
-        install_sampling(sequence, request, request_plan.sampling);
+        install_sampling(sequence, request, request_plan.sampling,
+                         std::span<const TokenId>(staged.prompt.token_ids)
+                             .last(request_plan.penalized_prompt_tokens));
         write_lane_scales(sequence, staged.prompt);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);

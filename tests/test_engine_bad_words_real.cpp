@@ -15,12 +15,18 @@
 #include <vector>
 
 // Banned words (bad_words) on a real model through the public Engine, for any model family:
-//   1. a greedy reply banned a string it wrote is the same reply up to the space before that
-//      string, and never holds it;
-//   2. sampled replies and a reply asked to copy markup never hold a banned string (a chat bot's
+//   1. a greedy reply banned a string it wrote goes back to where the string began: its tokens
+//      are the plain reply's up to the token that holds the string's first byte, it draws another
+//      token there, and it never holds the string;
+//   2. the state it went back to: a fresh request whose prompt is the prompt and the banned
+//      reply's tokens through the redrawn one continues as the banned reply did; printed as the
+//      agreeing tokens (no criterion: prefill and decode round differently, and a near tie may
+//      part them);
+//   3. sampled replies and a reply asked to copy markup never hold a banned string (a chat bot's
 //      tag openers);
-//   3. decode speed with and without banned words that never fire, at one request and at
-//      NINFER_BAD_WORDS_CONCURRENCY requests, printed (no criterion).
+//   4. the time of the reply with that rewind against the plain one, and decode speed with and
+//      without banned words that never fire, at one request and at NINFER_BAD_WORDS_CONCURRENCY
+//      requests, printed (no criterion).
 //   NINFER_BAD_WORDS_ARTIFACT     the artifact (skipped without one)
 //   NINFER_BAD_WORDS_NGRAM_TABLE  a Qwen3.8-Flash-Next table artifact
 //   NINFER_BAD_WORDS_SPECULATIVE  mtp | dflash | dflash2 | dspark | dspine | lookup, with
@@ -148,8 +154,24 @@ std::string head(std::string_view text, std::size_t bytes = 240) {
     return out;
 }
 
-// A string the reply wrote a third of the way in: it starts a word and spans several tokens.
-std::optional<std::string> pick_word(const std::string& text) {
+// The bytes of a reply's tokens in order, and where each token's bytes begin.
+struct RawText {
+    std::string bytes;
+    std::vector<std::size_t> starts;
+};
+
+RawText raw_text(const ninfer::Engine& engine, const std::vector<ninfer::TokenId>& tokens) {
+    RawText raw;
+    for (const ninfer::TokenId token : tokens) {
+        raw.starts.push_back(raw.bytes.size());
+        raw.bytes += engine.token_bytes(token);
+    }
+    return raw;
+}
+
+// A string the reply wrote a third of the way in, and its first byte: it starts a word after a
+// space and spans several tokens.
+std::optional<std::pair<std::string, std::size_t>> pick_word(const std::string& text) {
     constexpr std::size_t kBytes = 11;
     for (std::size_t at = text.size() / 3; at + kBytes + 1 <= text.size(); ++at) {
         if (text[at] != ' ' || std::isalpha(static_cast<unsigned char>(text[at + 1])) == 0) {
@@ -159,9 +181,18 @@ std::optional<std::string> pick_word(const std::string& text) {
         const bool ascii       = std::all_of(word.begin(), word.end(), [](char byte) {
             return static_cast<unsigned char>(byte) >= 0x20U && static_cast<unsigned char>(byte) < 0x80U;
         });
-        if (ascii && text.find(word) == at + 1) { return word; }
+        if (ascii && text.find(word) == at + 1) { return std::pair(word, at + 1); }
     }
     return std::nullopt;
+}
+
+std::size_t common_prefix(const std::vector<ninfer::TokenId>& a,
+                          const std::vector<ninfer::TokenId>& b, std::size_t b_offset = 0) {
+    std::size_t same = 0;
+    while (same < a.size() && b_offset + same < b.size() && a[same] == b[b_offset + same]) {
+        ++same;
+    }
+    return same;
 }
 
 struct Speed {
@@ -215,33 +246,59 @@ int run() {
                                            "repairs clocks. Use many short sentences."));
     };
     const ninfer::GenerationResult plain = engine.generate(story(), request(tokens, {}));
-    const std::string& text = plain.content.empty() ? plain.reasoning : plain.content;
-    const auto word         = pick_word(text);
-    check(word.has_value(), "the reply holds a usable string to ban");
-    if (!word) { return 1; }
-    const ninfer::GenerationResult banned = engine.generate(story(), request(tokens, {*word}));
-    const std::string& banned_text = plain.content.empty() ? banned.reasoning : banned.content;
-    // The string starts after a space, and the token that holds that space may also hold the
-    // string's first bytes: the replies agree up to the space.
-    const std::size_t before        = text.find(*word);
-    check(!holds(banned, {*word}), "the banned reply holds its banned string");
-    check(banned_text.compare(0, before - 1, text, 0, before - 1) == 0,
-          "the banned reply differs before the banned string");
-    std::size_t same = 0;
-    while (same < text.size() && same < banned_text.size() && text[same] == banned_text[same]) {
-        ++same;
-    }
-    std::cout << "banned \"" << *word << "\" at byte " << before << " of " << text.size()
-              << "; the replies part at byte " << same << ": \"..."
-              << head(std::string_view(banned_text).substr(same > 20 ? same - 20 : 0), 80)
+    const RawText text                   = raw_text(engine, plain.generated_token_ids);
+    const auto picked                    = pick_word(text.bytes);
+    check(picked.has_value(), "the reply holds a usable string to ban");
+    if (!picked) { return 1; }
+    const std::string& word = picked->first;
+    // The token that holds the string's first byte, where the hold of a reply banned it begins.
+    const std::size_t first =
+        static_cast<std::size_t>(std::upper_bound(text.starts.begin(), text.starts.end(),
+                                                  picked->second) -
+                                 text.starts.begin()) -
+        1U;
+    const ninfer::GenerationResult banned = engine.generate(story(), request(tokens, {word}));
+    const RawText banned_text             = raw_text(engine, banned.generated_token_ids);
+    check(!holds(banned, {word}) && banned_text.bytes.find(word) == std::string::npos,
+          "the banned reply holds its banned string");
+    const std::size_t agree = common_prefix(plain.generated_token_ids, banned.generated_token_ids);
+    check(agree == first, "the banned reply goes back to the token where the string began");
+    check(agree < banned.generated_token_ids.size(),
+          "the banned reply draws a token where the string began");
+    const std::size_t parted = agree < banned_text.starts.size() ? banned_text.starts[agree] : 0;
+    std::cout << "banned \"" << word << "\" from token " << first << " of "
+              << plain.generated_token_ids.size() << "; the replies part at token " << agree
+              << ": \"..."
+              << head(std::string_view(banned_text.bytes).substr(parted > 20 ? parted - 20 : 0), 80)
               << "\"\n";
     std::cout << "speculative rounds " << banned.speculative.rounds << ", drafted "
               << banned.speculative.drafted_tokens << ", accepted "
               << banned.speculative.accepted_tokens << '\n';
 
-    // 2. Sampled replies, and a reply asked to copy the markup it may not write.
+    // 2. The state the banned reply went back to: the prompt and its tokens through the redrawn
+    // one, prefilled afresh, continue as it did.
+    if (agree < banned.generated_token_ids.size() && agree + 1U < tokens) {
+        const ninfer::PreparedPrompt prompt = story();
+        std::vector<ninfer::TokenId> history(prompt.token_ids().begin(), prompt.token_ids().end());
+        history.insert(history.end(), banned.generated_token_ids.begin(),
+                       banned.generated_token_ids.begin() + static_cast<std::ptrdiff_t>(agree + 1));
+        const auto rest = engine.generate(
+            engine.prepare_tokens(std::move(history), false),
+            request(tokens - static_cast<std::uint32_t>(agree + 1), {word}));
+        const std::size_t after = banned.generated_token_ids.size() - agree - 1U;
+        std::cout << "state oracle: the continuation after the redrawn token agrees for "
+                  << common_prefix(rest.generated_token_ids, banned.generated_token_ids,
+                                   agree + 1U)
+                  << " of " << after << " tokens\n";
+    }
+    std::cout << std::fixed << std::setprecision(2) << "one rewind: plain reply "
+              << plain.generated_token_ids.size() << " tokens in " << plain.timings.total_seconds
+              << " s, banned reply " << banned.generated_token_ids.size() << " tokens in "
+              << banned.timings.total_seconds << " s\n";
+
+    // 3. Sampled replies, and a reply asked to copy the markup it may not write.
     std::vector<std::string> words = kTags;
-    words.push_back(*word);
+    words.push_back(word);
     for (std::uint64_t seed = 1; seed <= 4; ++seed) {
         const auto result = engine.generate(story(), request(tokens, words, 1.0F, seed));
         const auto found  = holds(result, words);
@@ -258,7 +315,7 @@ int run() {
     std::cout << "copying reply: " << head(copy.content.empty() ? copy.reasoning : copy.content)
               << '\n';
 
-    // 3. Decode speed with the tag list (which a story never completes) and without it.
+    // 4. Decode speed with the tag list (which a story never completes) and without it.
     std::uint64_t nonce = 0;
     for (const std::uint32_t count : {1U, concurrency}) {
         if (count == concurrency && concurrency == 1) { break; }

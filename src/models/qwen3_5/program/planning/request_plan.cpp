@@ -358,6 +358,10 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     base->grammar                        = options.grammar;
     base->logprobs                       = options.logprobs;
     base->readout_tokens                 = options.readout_tokens;
+    if (options.penalized_prompt_tokens > base->summary.prompt_tokens) {
+        throw std::invalid_argument("penalized prompt tokens exceed the prompt");
+    }
+    base->penalized_prompt_tokens = options.penalized_prompt_tokens;
     for (const TokenId id : base->readout_tokens) {
         if (id < 0 || id >= execution::dimension(parameters.model.resources().public_token_count)) {
             throw std::invalid_argument("readout token is outside the public token domain");
@@ -641,6 +645,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     plan->grammar                     = base.grammar;
     plan->logprobs                    = base.logprobs;
     plan->readout_tokens              = base.readout_tokens;
+    plan->penalized_prompt_tokens     = base.penalized_prompt_tokens;
     plan->branches                    = base.branches;
     plan->drafting                    = base.drafting;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;

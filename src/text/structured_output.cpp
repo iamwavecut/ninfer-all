@@ -310,6 +310,12 @@ struct GrammarState::Impl {
     // The request's banned words, and the filter's state after the text accepted so far.
     std::shared_ptr<const BadWordsFilter> banned;
     BadWordsFilter::State banned_at = BadWordsFilter::kStart;
+    std::uint64_t accepted          = 0;
+    bool ban_completions            = true;
+    // The bans of one generated position (ban_at).
+    std::uint64_t ban_position     = ~std::uint64_t{0};
+    std::vector<TokenId> ban_tokens;
+    bool ban_position_completions = false;
 
     Impl(std::optional<xgrammar::GrammarMatcher> matcher, int vocab_size,
          std::shared_ptr<const std::vector<std::string>> vocabulary,
@@ -333,8 +339,13 @@ std::unique_ptr<GrammarState> GrammarState::fork() const {
     if (impl_->matcher) { matcher = impl_->matcher->Fork(); }
     auto impl = std::make_unique<Impl>(std::move(matcher), impl_->vocab_size, impl_->vocabulary,
                                        impl_->stops, std::move(strings));
-    impl->banned    = impl_->banned;
-    impl->banned_at = impl_->banned_at;
+    impl->banned                   = impl_->banned;
+    impl->banned_at                = impl_->banned_at;
+    impl->accepted                 = impl_->accepted;
+    impl->ban_completions          = impl_->ban_completions;
+    impl->ban_position             = impl_->ban_position;
+    impl->ban_tokens               = impl_->ban_tokens;
+    impl->ban_position_completions = impl_->ban_position_completions;
     return std::unique_ptr<GrammarState>(new GrammarState(std::move(impl)));
 }
 
@@ -355,6 +366,29 @@ GrammarState::with_bad_words(std::shared_ptr<GrammarState> grammar,
 
 bool GrammarState::has_grammar() const noexcept { return impl_->matcher.has_value(); }
 
+std::uint64_t GrammarState::accepted_tokens() const noexcept { return impl_->accepted; }
+
+void GrammarState::ban_completions(bool banned) noexcept { impl_->ban_completions = banned; }
+
+void GrammarState::ban_at(std::uint64_t position, std::span<const TokenId> tokens,
+                          bool completions) {
+    if (position != impl_->ban_position) {
+        impl_->ban_position = position;
+        impl_->ban_tokens.clear();
+        impl_->ban_position_completions = false;
+    }
+    for (const TokenId token : tokens) {
+        if (token < 0 || token >= impl_->vocab_size) {
+            throw std::invalid_argument("banned token is outside the vocabulary");
+        }
+        if (std::find(impl_->ban_tokens.begin(), impl_->ban_tokens.end(), token) ==
+            impl_->ban_tokens.end()) {
+            impl_->ban_tokens.push_back(token);
+        }
+    }
+    impl_->ban_position_completions = impl_->ban_position_completions || completions;
+}
+
 void GrammarState::accept(std::span<const TokenId> tokens) {
     for (TokenId token : tokens) {
         if (token < 0 || token >= impl_->vocab_size ||
@@ -374,6 +408,7 @@ void GrammarState::accept(std::span<const TokenId> tokens) {
                                        " completes a banned word (bad_words)");
             impl_->banned_at = *next;
         }
+        ++impl_->accepted;
     }
 }
 
@@ -428,7 +463,15 @@ void GrammarState::fill_masks(std::span<std::uint32_t> masks,
         if (impl_->vocab_size % 32)
             masks[(col + 1) * words - 1] &= (1U << (impl_->vocab_size % 32)) - 1;
         auto row = masks.subspan(col * words, words);
-        if (impl_->banned) impl_->banned->clear_banned(column.banned_at, row);
+        const bool ban_position = impl_->accepted + col == impl_->ban_position;
+        if (impl_->banned &&
+            (impl_->ban_completions || (ban_position && impl_->ban_position_completions)))
+            impl_->banned->clear_banned(column.banned_at, row);
+        if (ban_position) {
+            for (const TokenId token : impl_->ban_tokens)
+                row[static_cast<std::size_t>(token) / 32] &=
+                    ~(1U << (static_cast<unsigned>(token) % 32));
+        }
         // Semantic work is absent for ordinary schemas.
         const auto& constraint = column.strings;
         if (constraint) {

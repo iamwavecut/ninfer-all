@@ -21,6 +21,7 @@
 #include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/lookup_draft.h"
 #include "runtime/contract/rope_scaling.h"
+#include "runtime/engine/bad_words_rewind.h"
 #include "runtime/engine/context_image_store.h"
 #include "runtime/engine/session_slots.h"
 #include "runtime/engine/diagnostics.h"
@@ -357,8 +358,9 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
             executor.expert_profile = models::builtin_expert_profile("deepseek-v4.1", widths);
         }
     }
-    // Causal scoring keeps no context between requests.
-    executor.checkpoints = options.context_cache.enabled &&
+    // Causal scoring keeps no context between requests. A banned word's hold (structured output)
+    // keeps its state as a stop string's does.
+    executor.checkpoints = (options.context_cache.enabled || options.structured_output) &&
                            options.purpose == EnginePurpose::Generation;
     // Prompt chunks of 2048 tokens unless --prefill-chunk asks for another count, at most 4096:
     // the routed experts' matrix kernel fills its widest tile only at wide chunks, and the staging
@@ -715,6 +717,17 @@ struct DeepSeekV41Core::Request {
     bool hold_wanted = false;
     bool stop_rewind = false;
     std::optional<std::uint32_t> hold_after;
+    // Banned words (bad_words) with rewinds: the tokens its sequence had read before the generated
+    // token where a banned word's hold begins, and the purpose of the draw that took that token,
+    // whose logits the slot's hold_logits keep. The hold takes the slot's held state before a
+    // stop string's (words_wanted: the next step keeps it first, as hold_wanted does; a round
+    // keeps it with hold_after). words_rewind: a rewind to that generated token which a
+    // speculative round completes once it commits; redrawing: the deferred draw is the rewind's.
+    std::optional<std::size_t> words_fed;
+    std::int32_t words_purpose = 0;
+    bool words_wanted          = false;
+    std::optional<std::uint32_t> words_rewind;
+    bool redrawing = false;
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
@@ -765,6 +778,7 @@ struct DeepSeekV41Core::Impl {
     const std::uint32_t domain;
     const bool structured_output;
     const bool reuse_prefixes;
+    const bool holds_ready; // every slot's hold (Executor::hold) has its buffers
     const std::uint32_t drafts;       // a round's drafts at most; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
     const std::uint32_t dspark_block; // --spec dspark: the drafter's block; 0 is off
@@ -819,6 +833,8 @@ struct DeepSeekV41Core::Impl {
     // A row's logits kept while its grammar mask is late (one per sequence), and those of the rows
     // sampled together afterwards, side by side.
     DeviceBuffer saved_logits, deferred_logits;
+    // The logits that drew the token where a banned word's hold begins, one row per sequence.
+    DeviceBuffer hold_logits;
     std::size_t vocab_rows = 0; // logits per row
     DeviceBuffer token_mask;
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
@@ -842,7 +858,8 @@ struct DeepSeekV41Core::Impl {
           pending_timeout(options.pending_timeout_ms),
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
-          reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
+          reuse_prefixes(i.executor->options().checkpoints && options.context_cache.enabled),
+          holds_ready(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
           lookup_ngram(options.speculative.lookup_ngram), dspark_block(i.executor->dspark_block()),
           dspark_floor(options.speculative.draft_confidence.value_or(kDSparkConfidenceFloor)),
           dspine(options.speculative.backend == SpeculativeBackend::DSpine),
@@ -890,6 +907,7 @@ struct DeepSeekV41Core::Impl {
             vocab_rows      = static_cast<std::size_t>(instance.executor->logits(1).ne[0]);
             saved_logits    = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
             deferred_logits = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
+            hold_logits     = DeviceBuffer(rows * vocab_rows * sizeof(__nv_bfloat16));
         }
         sample_config   = DeviceBuffer(rows * sizeof(ops::SamplingConfig));
         sample_position = DeviceBuffer(rows * sizeof(std::int32_t));
@@ -1031,14 +1049,30 @@ struct DeepSeekV41Core::Impl {
     // Starts the mask of a structured-output request's next token, from its grammar's state now.
     void schedule_mask(Request& r) {
         const auto grammar = r.output.grammar_state();
+        if (grammar) { allow_rewinds(r); }
         r.mask = grammar ? runtime::GrammarMaskJob::start(*grammar, mask_words()) : nullptr;
+    }
+
+    // Banned words: whether the request may take its output back to where a banned word began
+    // (OutputSession::allow_bad_words_rewind): its sequence still stands there, or the slot's held
+    // state is that one; a hold that begins takes the held state.
+    void allow_rewinds(Request& r) {
+        bool can = holds_ready && !r.branches;
+        if (can && r.decoding && r.words_fed) {
+            const Slot& slot = slots[r.slot];
+            can = r.words_wanted || slot.fed.size() == *r.words_fed ||
+                  slot.hold_tokens == *r.words_fed;
+        }
+        r.output.allow_bad_words_rewind(can);
     }
 
     // After a structured request's accepted tokens: one that decodes plainly starts its next mask
     // now, a step ahead; one that speculates fills its round's columns during the verification.
+    // A request whose token waits for a rewind's draw needs that token's mask.
     void next_mask(const std::shared_ptr<Request>& request) {
         Request& r = *request;
-        if (r.constrained && active(request) && !(drafts > 0 && r.mask_cost.speculates())) {
+        if (r.constrained && active(request) &&
+            (r.awaiting_sample || !(drafts > 0 && r.mask_cost.speculates()))) {
             schedule_mask(r);
         } else {
             r.mask.reset();
@@ -2231,7 +2265,7 @@ struct DeepSeekV41Core::Impl {
         // The first token's mask began with the request; when it is not done yet, the prompt's
         // last logits wait for it instead of the engine thread.
         if (r.branches) {
-            accept(request, r.branch_token, &r.branch_record);
+            accept(request, r.branch_token, &r.branch_record, Draws{});
             return;
         }
         if (!mask_ready(r)) {
@@ -2244,7 +2278,9 @@ struct DeepSeekV41Core::Impl {
         runtime::RawTokenLogprob logprob;
         sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
                std::span(&logprob, 1));
-        accept(request, token, row.logprobs ? &logprob : nullptr);
+        const Tensor logits = executor.logits(1);
+        accept(request, token, row.logprobs ? &logprob : nullptr,
+               Draws{.logits = &logits, .purpose = ops::kSamplePurposePrefill});
         next_mask(request);
     }
 
@@ -2252,16 +2288,96 @@ struct DeepSeekV41Core::Impl {
         return slots.at(request->slot).request == request;
     }
 
+    // Where the logits that drew a round's tokens are: token i's in column `column + i` of
+    // `logits`, drawn for `purpose`. A banned word's hold keeps its token's.
+    struct Draws {
+        const Tensor* logits = nullptr;
+        std::size_t column   = 0;
+        std::int32_t purpose = ops::kSamplePurposeDecode;
+    };
+
     // Applies the output policy to a sampled token: publishes what it accepts, then either
     // finishes the request or queues what its next decode step feeds.
     void accept(const std::shared_ptr<Request>& request, TokenId token,
-                const runtime::RawTokenLogprob* logprob) {
+                const runtime::RawTokenLogprob* logprob, const Draws& draws) {
         if (token < 0) { throw_numerical_failure(*request); }
         (void)accept(request, std::span<const TokenId>(&token, 1),
                      logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
                                         : std::span<const runtime::RawTokenLogprob>{},
-                     true);
+                     true, draws);
         check_capacity(request);
+    }
+
+    // Banned words: the round's token `index` begins a hold. The request keeps the logits that
+    // drew it and how many tokens its sequence had read before it; the step after the round, or
+    // a speculative round's commit (hold_after), keeps the sequence's state there.
+    void begin_words_hold(Request& r, std::uint32_t index, bool committed, const Draws& draws) {
+        if (draws.logits == nullptr) {
+            throw std::logic_error("a banned word's hold began without the logits of its token");
+        }
+        const std::size_t bytes  = vocab_rows * sizeof(__nv_bfloat16);
+        const std::size_t stride = static_cast<std::size_t>(draws.logits->ne[0]) *
+                                   sizeof(__nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::uint8_t*>(hold_logits.p) + std::size_t(r.slot) * bytes,
+            static_cast<const std::uint8_t*>(draws.logits->data) + (draws.column + index) * stride,
+            bytes, cudaMemcpyDeviceToDevice, instance.executor->head_stream()));
+        r.words_fed     = slots[r.slot].fed.size() + (committed ? 0 : 1) + index;
+        r.words_purpose = draws.purpose;
+        r.words_wanted  = committed && holds_ready;
+        if (!committed && holds_ready) { r.hold_after = index + 1; }
+    }
+
+    // Keeps the sequence's state where a banned word's hold began, in the slot's held state.
+    void keep_words_hold(Request& r) {
+        r.words_wanted = false;
+        Slot& slot     = slots[r.slot];
+        if (!r.decoding || !r.words_fed || slot.fed.size() != *r.words_fed) { return; }
+        slot.hold_tokens = instance.executor->hold(r.slot, slot.hold)
+                               ? static_cast<std::uint32_t>(slot.fed.size())
+                               : 0;
+    }
+
+    // Banned words: takes the request back to the state before generated token `words_rewind`,
+    // the hold's, and draws that position again from the hold's logits once the grammar's mask,
+    // which bans the dropped token there, is ready (next_mask). A speculative round calls it once
+    // it has committed the tokens before the hold.
+    void complete_words_rewind(Request& r) {
+        const std::uint32_t to = *r.words_rewind;
+        r.words_rewind.reset();
+        auto& executor = *instance.executor;
+        Slot& slot     = slots[r.slot];
+        if (!r.words_fed || to > r.generated.size() || slot.fed.size() < *r.words_fed) {
+            throw std::logic_error("banned-word rewind without the hold it returns to");
+        }
+        const std::size_t back_to = *r.words_fed;
+        const std::span<const TokenId> dropped(r.generated.data() + to, r.generated.size() - to);
+        if (r.penalties) {
+            runtime::uncount_tokens(static_cast<std::int32_t*>(token_counts.p) +
+                                        std::size_t(r.slot) * domain,
+                                    dropped, executor.head_stream());
+        }
+        r.budget->release(static_cast<std::uint32_t>(dropped.size()));
+        r.generated.resize(to);
+        r.hold_wanted = false;
+        if (slot.fed.size() > back_to) {
+            if (r.words_wanted || slot.hold_tokens != back_to) {
+                throw std::logic_error("DeepSeek-V4.1 kept no state at a banned word's hold");
+            }
+            executor.restore_hold(r.slot, slot.hold);
+            r.position -= static_cast<std::uint32_t>(slot.fed.size() - back_to);
+            slot.fed.resize(back_to);
+        }
+        r.feed.clear();
+        const std::size_t bytes = vocab_rows * sizeof(__nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(
+            static_cast<std::uint8_t*>(saved_logits.p) + std::size_t(r.slot) * bytes,
+            static_cast<const std::uint8_t*>(hold_logits.p) + std::size_t(r.slot) * bytes, bytes,
+            cudaMemcpyDeviceToDevice, executor.head_stream()));
+        r.awaiting_sample  = true;
+        r.awaiting_purpose = r.words_purpose;
+        r.redrawing        = true;
+        r.mask.reset();
     }
 
     // Keeps the state of a request whose next step feeds the token that begins a stop string's
@@ -2302,7 +2418,8 @@ struct DeepSeekV41Core::Impl {
     // `committed`: the sequence already holds the state the tokens leave; a speculative round
     // commits after the policy has decided.
     std::uint32_t accept(const std::shared_ptr<Request>& request, std::span<const TokenId> tokens,
-                         std::span<const runtime::RawTokenLogprob> logprobs, bool committed) {
+                         std::span<const runtime::RawTokenLogprob> logprobs, bool committed,
+                         const Draws& draws) {
         Request& r                    = *request;
         const OutputDecision decision = r.output.preview_model(tokens, r.budget->remaining(),
                                                                r.budget->limit_reason(), logprobs);
@@ -2338,7 +2455,31 @@ struct DeepSeekV41Core::Impl {
             accepted > 0 && decision.stop_hold_after && *decision.stop_hold_after < accepted
                 ? decision.stop_hold_after
                 : std::nullopt;
-        if (hold && !committed) { r.hold_after = *hold + 1; }
+        // A banned word's hold, which takes the held state first.
+        if (!decision.bad_words_hold_alive) {
+            r.words_fed.reset();
+            r.words_wanted = false;
+        }
+        const bool words_alive = r.words_fed.has_value();
+        if (hold && !committed && reuse_prefixes && !words_alive) { r.hold_after = *hold + 1; }
+        if (decision.bad_words_hold_after) {
+            begin_words_hold(r, *decision.bad_words_hold_after, committed, draws);
+        }
+        if (decision.bad_words_rewind) {
+            // A banned word was completed: the output stands at its hold again.
+            r.words_rewind = *decision.bad_words_rewind;
+            if (committed) {
+                // The draw counted the round's token, which the output did not take.
+                if (r.penalties) {
+                    runtime::uncount_tokens(static_cast<std::int32_t*>(token_counts.p) +
+                                                std::size_t(r.slot) * domain,
+                                            tokens.subspan(accepted),
+                                            instance.executor->head_stream());
+                }
+                complete_words_rewind(r);
+            }
+            return accepted;
+        }
         if (decision.finished()) {
             // A sampled token that begins and ends the match is not read: the live state is the
             // one the text continues. Any other cut returns to the kept state.
@@ -2352,7 +2493,7 @@ struct DeepSeekV41Core::Impl {
             finish(request, decision.finish_reason);
             return accepted;
         }
-        r.hold_wanted = committed && hold.has_value();
+        r.hold_wanted = committed && hold.has_value() && !r.words_fed;
         r.feed.assign(1, tokens[accepted > 0 ? accepted - 1 : 0]);
         if (decision.continuation == ContinuationAction::ApplyTargetControl) {
             // A reached thinking budget, or the loop guard's conclusion, closes the reasoning: the
@@ -2467,6 +2608,7 @@ struct DeepSeekV41Core::Impl {
         }
         const std::uint32_t steps = round_drafts(decoding);
         for (const Slot& slot : slots) {
+            if (slot.request && slot.request->words_wanted) { keep_words_hold(*slot.request); }
             if (slot.request && slot.request->hold_wanted) { keep_hold(*slot.request); }
         }
         std::vector<std::shared_ptr<Request>> deferred;
@@ -2538,7 +2680,8 @@ struct DeepSeekV41Core::Impl {
                    std::span(&logprob, 1));
             try {
                 if (!mask_usable(request)) { continue; }
-                accept(request, token, row.logprobs ? &logprob : nullptr);
+                const Tensor logits = instance.executor->logits(1);
+                accept(request, token, row.logprobs ? &logprob : nullptr, Draws{.logits = &logits});
                 next_mask(request);
             } catch (...) { fail(request, std::current_exception()); }
         }
@@ -2584,11 +2727,13 @@ struct DeepSeekV41Core::Impl {
             sample(rows, purpose, sampled, logprobs, &source);
             for (std::size_t j = 0; j < group.size(); ++j) {
                 group[j]->awaiting_sample = false;
-                if (purpose == ops::kSamplePurposeDecode && drafts > 0) {
+                if (purpose == ops::kSamplePurposeDecode && drafts > 0 && !group[j]->redrawing) {
                     ++group[j]->speculative.fallback_steps;
                 }
+                group[j]->redrawing = false;
                 try {
-                    accept(group[j], sampled[j], rows[j].logprobs ? &logprobs[j] : nullptr);
+                    accept(group[j], sampled[j], rows[j].logprobs ? &logprobs[j] : nullptr,
+                           Draws{.logits = &source, .column = j, .purpose = purpose});
                     next_mask(group[j]);
                 } catch (...) { fail(group[j], std::current_exception()); }
             }
@@ -2644,7 +2789,9 @@ struct DeepSeekV41Core::Impl {
             if (drafts > 0) { ++now[b]->speculative.fallback_steps; }
             try {
                 if (!mask_usable(now[b])) { continue; }
-                accept(now[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
+                accept(now[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr,
+                       Draws{.logits = source ? &*source : &logits,
+                             .column = source ? b : columns[b]});
                 next_mask(now[b]);
             } catch (...) { fail(now[b], std::current_exception()); }
         }
@@ -2714,6 +2861,7 @@ struct DeepSeekV41Core::Impl {
         for (std::size_t j = 0; j < b; ++j) {
             if (!batch[j]->constrained) { continue; }
             const std::size_t own = std::min<std::size_t>(draft_extents[j], k);
+            allow_rewinds(*batch[j]);
             column_masks[j] = runtime::GrammarMaskJob::start(
                 *batch[j]->output.grammar_state(), mask_words(),
                 std::vector<TokenId>(proposed.begin() + std::ptrdiff_t(j * k),
@@ -2903,27 +3051,33 @@ struct DeepSeekV41Core::Impl {
                 failed[j] = 1;
             } else {
                 try {
-                    taken = accept(request, run_tokens, records, false);
+                    taken = accept(request, run_tokens, records, false,
+                                   Draws{.logits = &logits, .column = std::size_t(starts[j])});
                 } catch (...) {
                     fail(request, std::current_exception());
                     failed[j] = 1;
                 }
             }
-            // The tokens counted as sampled: those taken, or the first when none was.
-            kept[j] = std::max<std::uint32_t>(taken, 1);
-            if (kept[j] < std::uint32_t(licensed_n) && active(request) && rows[j].counts) {
+            // The tokens counted as sampled: those taken, or the first when none was. A rewind to
+            // a banned word's hold feeds the tokens taken before it and counts only those.
+            const bool rewound = r.words_rewind.has_value();
+            kept[j] = rewound ? taken + 1 : std::max<std::uint32_t>(taken, 1);
+            const std::uint32_t counted = rewound ? taken : kept[j];
+            if (counted < std::uint32_t(licensed_n) && active(request) && rows[j].counts) {
                 // The acceptance counted the whole run; the request keeps only its prefix.
                 const std::size_t at = std::size_t(r.slot) * domain * sizeof(std::int32_t);
                 CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(token_counts.p) + at,
                                            static_cast<const std::byte*>(counts_backup.p) + at,
                                            std::size_t(domain) * sizeof(std::int32_t),
                                            cudaMemcpyDeviceToDevice, stream));
-                const Tensor ids(static_cast<std::int32_t*>(spec_licensed.p) + j * w, DType::I32,
-                                 {static_cast<std::int32_t>(kept[j])});
-                Tensor row_counts(static_cast<std::int32_t*>(token_counts.p) +
-                                      std::size_t(r.slot) * domain,
-                                  DType::I32, {static_cast<std::int32_t>(domain)});
-                ops::increment_token_counts(ids, row_counts, stream);
+                if (counted > 0) {
+                    const Tensor ids(static_cast<std::int32_t*>(spec_licensed.p) + j * w,
+                                     DType::I32, {static_cast<std::int32_t>(counted)});
+                    Tensor row_counts(static_cast<std::int32_t*>(token_counts.p) +
+                                          std::size_t(r.slot) * domain,
+                                      DType::I32, {static_cast<std::int32_t>(domain)});
+                    ops::increment_token_counts(ids, row_counts, stream);
+                }
             }
         }
         // A row whose stop string's match began inside its run also keeps the state after the
@@ -2932,7 +3086,7 @@ struct DeepSeekV41Core::Impl {
         std::vector<models::deepseek_v41::SequenceSnapshot*> holds(b, nullptr);
         for (std::size_t j = 0; j < b; ++j) {
             const auto after = std::exchange(batch[j]->hold_after, std::nullopt);
-            if (!after || failed[j] || !reuse_prefixes) { continue; }
+            if (!after || failed[j] || !holds_ready) { continue; }
             hold_after[j] = std::min(*after, kept[j]);
             holds[j]      = &slots[batch[j]->slot].hold;
         }
@@ -2953,8 +3107,12 @@ struct DeepSeekV41Core::Impl {
             r.position += kept[j];
             if (r.stop_rewind) { rewind_to_hold(r); }
             try {
+                if (r.words_rewind) { complete_words_rewind(r); }
                 check_capacity(batch[j]);
-            } catch (...) { fail(batch[j], std::current_exception()); }
+            } catch (...) {
+                fail(batch[j], std::current_exception());
+                continue;
+            }
             if (r.constrained) { next_mask(batch[j]); }
         }
     }

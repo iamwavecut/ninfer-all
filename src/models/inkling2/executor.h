@@ -186,6 +186,9 @@ public:
     // image, and within the slots its rings keep past the window, the convolutions' taps and a
     // round's drafts).
     bool rewind(std::uint32_t sequence, std::uint32_t tokens);
+    // How many positions past `position` (one the sequence has read, not before its last prompt,
+    // checkpoint or image) it may read and still rewind() to it.
+    [[nodiscard]] std::uint32_t rewind_reach(std::uint32_t sequence, std::uint32_t position) const;
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
     SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
                              std::span<std::byte* const> pages, std::size_t page_bytes);

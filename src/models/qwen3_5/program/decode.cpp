@@ -192,7 +192,8 @@ void ProgramImpl::upload_sampling(std::uint32_t lane, RequestControl& request) {
 }
 
 void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& request,
-                                   const ops::SamplingConfig& config) {
+                                   const ops::SamplingConfig& config,
+                                   std::span<const TokenId> penalized) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
                         .view({dimension(parameters.model.resources().public_token_count)});
     request.sampling_host     = config;
@@ -216,7 +217,21 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     if (masked_controller) { request.masked_signal = masked_controller->pooled(); }
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
-    if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream)); }
+    if (penalties && penalized.empty()) {
+        CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
+    } else if (penalties) {
+        // The tokens a requeued request generated before its banned-word rewind, now the end of
+        // its prompt, stay counted. A copy from pageable memory returns once it is staged.
+        std::vector<std::int32_t> host(static_cast<std::size_t>(counts.numel()), 0);
+        for (const TokenId token : penalized) {
+            if (token < 0 || static_cast<std::size_t>(token) >= host.size()) {
+                throw std::invalid_argument("penalized token is outside the public token domain");
+            }
+            ++host[static_cast<std::size_t>(token)];
+        }
+        CUDA_CHECK(cudaMemcpyAsync(counts.data, host.data(), counts.bytes(),
+                                   cudaMemcpyHostToDevice, device.stream));
+    }
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
     upload_sampling(sequence.lane, request);

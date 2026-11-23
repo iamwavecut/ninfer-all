@@ -518,11 +518,9 @@ this adds a CPU synchronization point and mask transfers per round. No speedup c
 
 The text is the bytes of the generated tokens in order, reasoning and tool-call text included. A
 token that the tokenizer marks special (a turn, channel or tool-call marker) has no text and
-separates the text around it, so a string cannot span it. Each round masks every token that would
-complete a listed string: a token that holds a string whole, and a token that completes one begun
-by the text before it. This bans every spelling of a string, whatever tokens would write it, and
-so every token sequence that vLLM bans for it (its own tokenization and the one after a space);
-it also bans the string inside a longer word (`<text` inside `<textarea`). Matching is
+separates the text around it, so a string cannot span it. A string is banned whatever tokens would
+write it, and so in every token sequence that vLLM bans for it (its own tokenization and the one
+after a space), and also inside a longer word (`<text` inside `<textarea`). Matching is
 case-sensitive. Bans apply from the first generated token; the prompt does not count.
 
 The field is an array of at most 128 distinct non-empty strings of at most 256 bytes; each string
@@ -532,15 +530,39 @@ so they need `--structured-output`; without it a request with `bad_words` fails 
 `bad_words_not_supported`. They combine with a response format or strict tools in one mask per
 position; a position where nothing is left fails the request.
 
-Bans hold at every speculative position: each column of a verification round masks the tokens
-that would complete a string after the drafts before it, so a draft that would complete one is
-rejected and the correction or bonus token completes none. Drafts are proposed without the bans.
-A request with only banned words keeps its drafts (MTP, DFlash, DFlash2, DSpark, a context
-lookup): its masks take microseconds and fill on the engine thread with no mask thread. The first
-request with a new list builds the list's filter (an Aho-Corasick automaton of the strings and
-the vocabulary's tokens by their bytes); the last eight lists are kept. A ban removes only the
-token that would complete a string, so the model can write most of a string before the ban
-stops it, and then continues with another token.
+A reply does not write the start of a banned string and then turn away from it. From the token
+where text that can still become a banned string begins (the hold), the request holds its output
+back and keeps what it needs to return there: the sequence's state before that token and the
+logits that drew it. When the text can no longer become a string, the held output is published.
+When a token completes a string, the request goes back: it drops the hold's token and every token
+after it, returns the sequence to its state before them, and draws the hold's position again from
+the kept logits with the dropped token banned there. The output never holds the dropped tokens; a
+stream receives held text when its hold ends, so a string's first tokens delay the stream. Logprobs
+follow the published tokens. The masks of every round ban the tokens that hold a whole string and
+the tokens a rewind banned at that position.
+
+A request rewinds at most 32 times and bans at most 8 tokens at one position. Past either limit,
+and where a family cannot reach back to the hold (below), each round's masks keep out every token
+that would complete a string instead: the model may then write most of a string before the ban
+stops it, and it continues with another token. How each family goes back:
+
+| Family | Going back | Reach and cost |
+|---|---|---|
+| Qwen3.5, 3.6 and 3.8 (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) | The request's sequence ends and the request queues again at the head of the queue: its prompt is the submitted one followed by the generated tokens it keeps, and its first draw is the rewound position. | Any distance. The context cache resumes the new prompt from the deepest state it holds: one token short of its end when the hold began in the round that completed the string, after that round's first token (a speculative round); otherwise a state at or before the submitted prompt's end, so the generated tokens up to the hold run again as prompt tokens (each requeue asks the cache for a resume point at its own prompt's end, for a later rewind). Without the context cache, or for a prompt that may not be reused, the whole prompt runs again. The result's timings add up every sequence's prefill and decode. |
+| Qwen3.8-Flash-Next and Edge0 | The recurrent state is copied when the hold begins, into the snapshot a stop string's hold uses, and restored; attention rows are kept by position. | Any distance. The snapshot takes 74 MiB a sequence, which `--structured-output` allocates also without the context cache. A hold that begins inside a speculative round ends that round's commit at the hold's token, and the tokens after it run in the next step. While a hold is alive a stop string keeps no state of its own, so a turn it cuts there leaves no resume point at the cut. |
+| Gemma 4 | The windowed blocks' rings keep rows past the window; full-attention rows are kept by position. No state is copied. | With drafts (`--spec mtp` or `dspine`; rings of 1280 rows for a window of 1024), 256 positions less a round's drafts; without drafts, the 32 decode steps after the hold begins, whose overwritten rows a hold keeps. |
+| Flint | The rings keep 768 positions for a window of 513; full-attention rows are kept by position. No state is copied. | 255 positions less a round's drafts. |
+| DeepSeek-V4.1 | The window rings and compressor tails are copied when the hold begins and restored; compressed rows are kept by position. | Any distance. With `--structured-output` and the context cache off, the copies take two more copies of each sequence's window rings (5.3 MiB each), as the context cache's checkpoints do. A hold that begins inside a speculative round is copied as the round commits, with no extra pass. |
+| Inkling 2 | The rings and the convolution and recurrent-head histories keep the last 32 positions. No state is copied. | 29 positions less a round's drafts. |
+
+The kept logits take one BF16 row of the vocabulary a sequence (0.5 MiB for Gemma 4). Bans hold at
+every speculative position: each column of a verification round masks after the drafts before it,
+so a draft with a banned token is rejected, and a draft that completes a string is accepted and
+then taken back with the rest of the hold. Drafts are proposed without the bans. A request with
+only banned words keeps its drafts (MTP, DFlash, DFlash2, DSpark, a context lookup): its masks
+take microseconds and fill on the engine thread with no mask thread. The first request with a new
+list builds the list's filter (an Aho-Corasick automaton of the strings and the vocabulary's tokens
+by their bytes); the last eight lists are kept.
 
 ## Stop the server
 

@@ -132,6 +132,13 @@ public:
                    const std::optional<std::vector<LoraScale>>& lora = std::nullopt) const;
     [[nodiscard]] PreparedPrompt append_read_tokens(PreparedPrompt prompt,
                                                     std::span<const TokenId> tokens) const;
+    // A copy of `prompt` followed by `generated`, the tokens a request generated after it, for the
+    // request to run again from there (a banned-word rewind). It keeps the prompt's media, cache
+    // hints and drafting sources, takes the n-gram archive view of `archive` (the request's
+    // binding, or null), and adds a resume point at its own end.
+    [[nodiscard]] PreparedPrompt continue_prompt(const PreparedPrompt& prompt,
+                                                 std::span<const TokenId> generated,
+                                                 const NgramArchive::Request* archive) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text,
                                                      bool parse_special = true) const;
     [[nodiscard]] std::string token_bytes(TokenId token) const;

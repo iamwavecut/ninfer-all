@@ -355,10 +355,13 @@ NINFER_STOP_ARTIFACT=$PWD/out/qwen3_8_27b.ninfer NINFER_STOP_CONTEXT_CACHE=hybri
 ```
 
 `ninfer_engine_bad_words_real_test` checks vLLM's `bad_words` on a real model of any family: a
-greedy reply that is asked again with a string of it banned agrees with the first reply up to the
-space before that string and never holds it, sampled replies and a reply asked to copy prompt markup
-never hold a chat bot's 43 tag openers (the test prints what the model writes instead), and it
-prints decode tok/s with and without the openers at one request and at
+greedy reply that is asked again with a string of it banned agrees with the first reply's tokens up
+to the token that holds the string's first byte, draws another token there and never holds the
+string; a fresh request whose prompt carries the banned reply's tokens through the redrawn one
+continues as the banned reply did (the test prints the agreeing tokens, with no criterion: prefill
+and decode round differently); sampled replies and a reply asked to copy prompt markup never hold a
+chat bot's 43 tag openers (the test prints what the model writes instead). It prints both replies'
+times, and decode tok/s with and without the openers at one request and at
 `NINFER_BAD_WORDS_CONCURRENCY` (8) requests, interleaved, with no criterion. `NINFER_BAD_WORDS_ARTIFACT`
 names the artifact, and the test is skipped without it; `NINFER_BAD_WORDS_SPECULATIVE` (with
 `NINFER_BAD_WORDS_DRAFTS`, 2), `NINFER_BAD_WORDS_DRAFT_MODEL`, `NINFER_BAD_WORDS_NGRAM_TABLE`,

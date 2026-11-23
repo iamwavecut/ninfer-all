@@ -49,6 +49,10 @@ public:
     // Clears the bit of every token banned after `state` in a mask of the vocabulary (bit t % 32 of
     // word t / 32), at least vocab_size() bits.
     void clear_banned(State state, std::span<std::uint32_t> mask) const noexcept;
+    // The bytes of the text's longest suffix that begins a word: the text a word may still need.
+    [[nodiscard]] std::uint32_t depth(State state) const noexcept { return nodes_[state].depth; }
+    // The bytes of `token`'s text: zero for a token without text.
+    [[nodiscard]] std::size_t token_bytes(TokenId token) const noexcept;
     [[nodiscard]] std::size_t vocab_size() const noexcept;
     [[nodiscard]] const std::vector<std::string>& words() const noexcept { return words_; }
 
@@ -60,6 +64,7 @@ private:
         std::uint32_t fail        = 0;
         std::uint32_t first_edge  = 0, edges = 0;  // edges_, ascending by byte
         std::uint32_t first_range = 0, ranges = 0; // ranges_: the tokens this suffix completes
+        std::uint32_t depth       = 0;             // bytes of this node's string
         bool ends                 = false;         // a word ends here or on the failure chain
     };
     struct Edge {
