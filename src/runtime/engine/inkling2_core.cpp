@@ -32,6 +32,7 @@
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/host_memory.h"
+#include "runtime/engine/pinned_block.h"
 #include "runtime/engine/model_instance.h"
 #include "text/structured_output.h"
 
@@ -326,17 +327,18 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     }
     if (options.expert_residency != ExpertResidency::Device) {
         const auto memory = instance->executor->memory().experts;
+        const std::string pinned_end = pinned_block_end_note(model->storage_stats());
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "Inkling 2: experts in %s, cache %.0f MiB (%u slots), %u layer bank(s) %.0f MiB, "
             "metadata %.1f MiB, pinned delivery %.1f MiB, pinned expert sources %.0f MiB, "
-            "expert sources in the files %.0f MiB",
+            "expert sources in the files %.0f MiB%s",
             options.expert_residency == ExpertResidency::Disk ? "artifact files"
             : model->expert_file_bytes() > 0                 ? "pinned host memory and artifact files"
                                                              : "pinned host memory",
             double(memory.cache_bytes) / 1048576, memory.cache_slots, memory.banks,
             double(memory.bank_bytes) / 1048576, double(memory.metadata_bytes) / 1048576,
             double(memory.pinned_bytes) / 1048576, double(model->expert_pinned_bytes()) / 1048576,
-            double(model->expert_file_bytes()) / 1048576);
+            double(model->expert_file_bytes()) / 1048576, pinned_end.c_str());
         const auto cpu = instance->executor->expert_cpu_description();
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
             "Inkling 2: missing experts %s; cache seeded %s",

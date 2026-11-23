@@ -34,6 +34,7 @@
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/host_memory.h"
+#include "runtime/engine/pinned_block.h"
 #include "runtime/engine/model_instance.h"
 #include "text/structured_output.h"
 
@@ -445,7 +446,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (const auto& stored = model->storage_stats(); stored.files_bytes > 0) {
         expert_place = "pinned host memory (" + std::to_string(stored.pinned_bytes >> 20) +
                        " MiB) and the artifact's files (" +
-                       std::to_string(stored.files_bytes >> 20) + " MiB), read as disk experts";
+                       std::to_string(stored.files_bytes >> 20) + " MiB)" +
+                       pinned_block_end_note(stored) + ", read as disk experts";
     }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "Qwen3.8-Flash-Next: %zu stage(s), prompt chunks of %u tokens, experts in "

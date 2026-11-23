@@ -456,6 +456,10 @@ HostMemoryRegistration::HostMemoryRegistration(void* data, std::size_t bytes, bo
     const unsigned flags = cudaHostRegisterPortable | (mapped ? cudaHostRegisterMapped : 0U);
     const cudaError_t error = cudaHostRegister(data, bytes, flags);
     if (error != cudaSuccess) {
+        // The exception carries the refusal; left as the thread's last error, it would fail the
+        // next unrelated cudaGetLastError check, such as a kernel launch's, after a caller that
+        // stops pinning at the first refused part (HostPages::pin_prefix) has moved on.
+        (void)cudaGetLastError();
         throw std::runtime_error(cuda_error_message("cudaHostRegister failed", error));
     }
     data_ = data;

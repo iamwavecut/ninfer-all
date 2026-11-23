@@ -109,7 +109,8 @@ void pinned_or_files(DeviceContext& device) {
                                    {.files_after_bytes = 0});
         require(backing.pinned(reader.find("q5")) && !backing.pinned(divisors) &&
                     backing.stats().files_bytes == 8 && backing.stats().files_object_count == 1 &&
-                    backing.stats().pinned_bytes == 528,
+                    backing.stats().pinned_bytes == 528 &&
+                    backing.stats().pinned_block_end == PinnedBlockEnd::Cap,
                 "a zero budget pinned an object that may stay in the files");
         const auto view = bind_view(row, backing);
         require(page_locked(view.parts.front().parent->data) &&
@@ -127,7 +128,8 @@ void pinned_or_files(DeviceContext& device) {
         auto held = materialize(reader, MaterializationPlan(plan), device, nullptr, nullptr,
                                 {.files_after_bytes = 528});
         require(held.pinned(reader.find("q5")) && !held.pinned(divisors) &&
-                    held.stats().files_bytes == 8 && held.stats().pinned_object_count == 1,
+                    held.stats().files_bytes == 8 && held.stats().pinned_object_count == 1 &&
+                    held.stats().pinned_block_end == PinnedBlockEnd::Cap,
                 "the budget did not end the block after the objects it holds");
         const auto view = bind_view(row, held);
         require(!view.parts.empty() && page_locked(view.parts.front().parent->data) &&
@@ -143,7 +145,8 @@ void pinned_or_files(DeviceContext& device) {
                 "an object left in the files kept a pinned parent or a view");
         auto all = materialize(reader, MaterializationPlan(plan), device);
         require(all.pinned(reader.find("q5")) && all.pinned(divisors) &&
-                    all.stats().files_bytes == 0 && all.stats().files_object_count == 0,
+                    all.stats().files_bytes == 0 && all.stats().files_object_count == 0 &&
+                    all.stats().pinned_block_end == PinnedBlockEnd::Complete,
                 "without a budget the host left objects it could pin in the files");
     }
     {
@@ -156,6 +159,20 @@ void pinned_or_files(DeviceContext& device) {
         require(page_locked(pages.data()) && page_locked(pages.data() + kPart + 8) &&
                     pages.data()[kPart] == std::byte(kPart >> 12),
                 "pin_prefix lost a part's pages or bytes");
+    }
+    {
+        // A part the host refuses (here: already registered) ends the block, and the refusal is
+        // not left as the thread's last CUDA error for the next launch check to fail on.
+        constexpr std::size_t kPart = 64 << 10;
+        HostPages pages(3 * kPart);
+        CUDA_CHECK(cudaHostRegister(pages.data() + kPart, kPart, cudaHostRegisterDefault));
+        const std::array<std::size_t, 3> ends{kPart, 2 * kPart, 3 * kPart};
+        const std::size_t pinned  = pages.pin_prefix(ends, 3 * kPart);
+        const cudaError_t pending = cudaGetLastError();
+        CUDA_CHECK(cudaHostUnregister(pages.data() + kPart));
+        require(pinned == kPart && pages.size() == kPart && page_locked(pages.data()),
+                "a refused part did not end the pinned block after the parts before it");
+        require(pending == cudaSuccess, "a refused part left its error pending");
     }
 }
 

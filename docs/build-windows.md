@@ -94,7 +94,10 @@ prebuilt FFmpeg tree may have no PNG decoder), they pass the NVFP4 TMA descripto
 memory, since MSVC cannot pass them by value, and WDDM charges pinned host memory against the
 card's memory. Host experts pin only what the GPU's shared memory segment can still lock (DXGI's
 budget, about half the RAM) less 4 GiB, and the automatic host tier of the context cache only what
-is left of it; experts past that are read from the artifact's files (`--expert-host-mib`). Every Windows build offers `--wddm-evictable-budget`, which sizes the KV cache against
+is left of it; experts past that are read from the artifact's files. `--expert-host-mib N` replaces
+that budget: the block pins up to `N` MiB until the host refuses a part, and a later startup pin
+may then fail. Under WSL2 host experts read the same budget through `/dev/dxg`; it does not depend
+on the memory WSL2 is given, and without it they pin until the host refuses a part. Every Windows build offers `--wddm-evictable-budget`, which sizes the KV cache against
 the card's memory less the weights and a 512 MiB desktop floor instead of what is free at startup,
 and commits the device arenas at startup. Another process that later takes memory makes WDDM page
 some of this process's memory out, which slows generation until it comes back. WDDM may queue a
