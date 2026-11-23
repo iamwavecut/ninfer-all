@@ -2,7 +2,7 @@
 // incomplete block, through a fragmented paged cache: a full 512-block selection at long context,
 // short contexts where every block is selected, and every tail length 0..3, both for up to eight
 // queries (positions split over CTAs, partial softmaxes merged) and for wider calls (on tensor
-// cores where the device's tier and the storage select them).
+// cores where the device's tier, the storage and the query heads per KV head select them).
 //
 // A BF16 cache is written directly. Every quantized storage is written by kv_cache_append and its
 // planes are decoded back on the host, independently of the kernel, to the represented keys and
@@ -427,9 +427,12 @@ int main() {
         // A tensor-parallel share of one KV head: an unsplit and a split call.
         failures += run(storage, 2047, 9, 9106u, 1);
         failures += run(storage, 6001, 8, 9107u, 1);
-        // Dense Qwen4's four KV heads of six query heads each: the layer, unsplit and split.
-        failures += run(storage, 2047, 9, 9108u, 4, 6);
-        failures += run(storage, 6001, 8, 9109u, 4, 6);
+        // Dense Qwen4's four KV heads of six query heads each: the layer, unsplit and split, and
+        // the two wide calls above.
+        failures += run(storage, 2047, 9, 9130u, 4, 6);
+        failures += run(storage, 6001, 8, 9131u, 4, 6);
+        failures += run(storage, 0, 12, 9132u, 4, 6);
+        failures += run(storage, 6001, 24, 9133u, 4, 6);
     }
     // Tensor-parallel shares of dense Qwen4's KV heads: three, two and one of them, so the merge
     // runs at 18, 12 and 6 query heads.

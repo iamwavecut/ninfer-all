@@ -101,15 +101,17 @@ for its text path applies: one to eight concurrent requests in prompt chunks, th
 with host and disk images, a checkpoint inside a long last message, the prefix cache file and
 session slots ([Serving](serving.md#context-cache-of-the-other-families)), every Flash-Next
 `--kv-dtype`, the n-gram table's residencies (`--ngram-residency`, `--ngram-table`,
-`--no-ngram-table`), structured output, [banned words](serving.md#banned-words), log probabilities,
-thinking budgets and MTP drafts for several requests. A prompt call's sparse attention runs on
-tensor cores ([Flash-Next](qwen3-8-flash-next.md#prompt-attention-on-tensor-cores)) in a model with
-two KV heads; a model with four keeps the SIMT kernel, since the tensor-core kernel takes only
-groups of twelve query heads. Tensor parallelism divides the Gated DeltaNet key heads, the
-sparse-attention KV heads with their cache and the MLP rows in shares sized to each card
-(`--tensor-split`); the head, the MTP block and the n-gram rows stay on the first device. The
-devices' MLP partial sums are exchanged as FP32 and added in a fixed order, so the result depends on
-the split (Flash-Next's expert sums are exact fixed-point sums).
+`--no-ngram-table`), structured output, [banned words](serving.md#banned-words), log
+probabilities, thinking budgets and MTP drafts for several requests. A prompt call of more than
+eight tokens attends on tensor cores where they measured faster than the SIMT kernel: with
+two KV heads as in [Flash-Next](qwen3-8-flash-next.md#prompt-attention-on-tensor-cores), with four
+only for a BF16 or FP16 cache, and `bf16p` on Ampere and Ada
+([measurements](#prompt-attention-on-tensor-cores)).
+Tensor parallelism divides the Gated DeltaNet key heads, the sparse-attention KV heads with their
+cache and the MLP rows in shares sized to each card (`--tensor-split`); the head, the MTP block and
+the n-gram rows stay on the first device. The devices' MLP partial sums are exchanged as FP32 and
+added in a fixed order, so the result depends on the split (Flash-Next's expert sums are exact
+fixed-point sums).
 
 Dense Qwen4 has no routed experts. The engine refuses `--expert-residency host|disk`,
 `--expert-cache-mib`, `--expert-host-mib`, `--expert-dma-share`, the other hybrid-expert options
@@ -159,3 +161,32 @@ which the Engine test's EOS check needs. Near-tied tokens are common: plain and 
 differ at a token whose top two log probabilities are 0.125 apart, and the Engine test's stop-token
 case, which stops at the plain decode's sixth token, then runs to its output limit. The model's
 quality, MTP acceptance and speed with real weights are unmeasured until a checkpoint is released.
+
+## Prompt attention on tensor cores
+
+With four KV heads, each KV head has six query heads, and the tensor-core kernel puts them in its
+16-row tile, so each staged K and V tile serves six rows instead of twelve. The sparse attention Op
+at 1,024 queries over 2,051 positions (the first query at position 16,384), four KV heads, the SIMT
+kernel's time over the tensor-core kernel's, 2026-11-23 (CUDA 13.4, the release build's
+architectures):
+
+| KV format | RTX 3090 | RTX 5080 |
+|---|---:|---:|
+| `bf16` | 2.54 | 2.83 |
+| `fp16` | 1.51 | 1.46 |
+| `bf16p` | 1.09 | 0.98 |
+| `int8` | 0.79 | 0.66 |
+| `rk8v4` | 0.80 | 0.66 |
+| `fp8` | 0.84 | 0.72 |
+| `k8v4` | 0.84 | 0.72 |
+| `nvfp4` | 0.86 | 0.71 |
+| `rk4v4` | 0.84 | 0.67 |
+| `rk4v4-e8` | 0.83 | 0.66 |
+| `rk2v4-e8` | 0.80 | 0.68 |
+
+The engine runs the tensor-core kernel where the column is above 1: `bf16`, `fp16` and `bf16p` on
+Ampere and Ada (Ada follows the RTX 3090; no Ada card was measured), `bf16` and `fp16` on
+Blackwell. Turing and Volta keep the SIMT kernel. `ninfer_sparse_attention_test` passes on both
+cards with each kernel forced for every call and with this choice, and `compute-sanitizer
+racecheck` on the RTX 3090 reports no hazards in the tensor-core kernel's calls of six query heads.
+The end-to-end prefill speed of a model with four KV heads was not measured.
