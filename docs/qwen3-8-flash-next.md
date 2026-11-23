@@ -992,11 +992,17 @@ not.
   phase that precedes them, and a span's short last chunk runs from the same pool (a 5,669-token
   prompt prefilled at 1,334 instead of 678 tokens/s on an RTX 3090 when spans came; the bank-shaped
   pool and the two phases then took a 9,297-token Q2_0 prompt from 1.12-1.18k to 1.35k tokens/s from
-  a cold expert cache). The expert phase runs up to 4,096 tokens of consecutive chunks in one call,
+  a cold expert cache). The expert phase runs up to 6,144 tokens of consecutive chunks in one call,
   each chunk routed on its own, so the matrix kernel takes 128-column tiles rather than the 32 of a
   1,024-token chunk; a last chunk of up to 64 tokens (eight with `--expert-tail-skip`) runs alone,
   after the layer's wider calls, since it may copy experts into cache slots those calls read (with
-  IQ3_S, a 31,860-token prompt's expert matrix products took 4.47 instead of 6.52 s on an RTX 3090).
+  IQ3_S, a 31,860-token prompt's expert matrix products took 4.47 instead of 6.52 s on an RTX 3090
+  at 4,096 tokens a call). Calls of 6,144 instead of 4,096 tokens prefilled a 31,867-token prompt
+  in BF16 KV at 2,586-2,593 instead of 2,504-2,514 tokens/s on an RTX 3090, 3,484-3,506 instead of
+  3,359-3,384 on an RTX PRO 4500 Blackwell and 5,107-5,129 instead of 4,832-4,945 on an RTX 4090;
+  their larger workspace leaves the expert cache about 310 MiB less, and decode with the same
+  tokens ran 69.1-73.4 against 71.4-73.3 tok/s (RTX PRO 4500) and 48.8-50.6 against 45.8-52.0
+  tok/s (RTX 4090, 81.6% instead of 82.0-82.1% cache hits).
   With two prefill buffers (the default with the automatic expert cache, `--expert-prefill-buffers`)
   the pool has two buffers that consecutive layers alternate between: each layer's copies start as
   soon as the layer two back is done with its buffer, while the layer before it runs. A thread of
