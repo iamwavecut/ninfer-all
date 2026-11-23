@@ -223,7 +223,10 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
     {
         const std::lock_guard lock(direct_open_);
         if (direct_fd_ < 0) {
-            const int fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+            int fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+            // A filesystem without O_DIRECT (tmpfs, a RAM disk) reads the same bytes through the
+            // page cache.
+            if (fd < 0 && errno == EINVAL) { fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC); }
             if (fd < 0) { fail(path_, "open direct"); }
             direct_fd_ = fd;
         }
