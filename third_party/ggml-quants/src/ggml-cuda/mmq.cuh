@@ -923,6 +923,7 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_async_row_bytes(const ggm
         case GGML_TYPE_IQ4_NL: return 8 * 18;
         case GGML_TYPE_Q4_K:   return 144;
         case GGML_TYPE_Q5_K:   return 176;
+        case GGML_TYPE_NVFP4:  return 4 * 36;
         default:               return 0;
     }
 }

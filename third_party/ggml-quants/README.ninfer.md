@@ -33,7 +33,7 @@ The tile loop has an asynchronous form at each column tile the bridge launches (
 are staged through `cp.async` while the current one is multiplied, the weights unpack from shared
 memory, and the loop takes three barriers an iteration instead of four. The values are unchanged. It
 covers the formats whose 256-value step is a whole number of 8-byte words
-(`ggml_cuda_mmq_async_row_bytes`): Q4_0, Q5_0, Q8_0, IQ4_NL, Q4_K and Q5_K copy 16 bytes at a time,
+(`ggml_cuda_mmq_async_row_bytes`): Q4_0, Q5_0, Q8_0, IQ4_NL, Q4_K, Q5_K and NVFP4 copy 16 bytes at a time,
 Q2_0, IQ4_XS and IQ1_M 8 bytes at a time (`cp_async_ca_8`, added to `cp-async.cuh` with a `#pragma
 once` so the kernel header can include it). Rows that start on 4 bytes only, whose value count is
 not a whole number of 256-value steps (Gemma 4's 704- and 2112-wide rows in the 32-value formats),

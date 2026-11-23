@@ -21,9 +21,9 @@ reads, in two expert builds:
 
 Prompt chunks stage the matrix kernel's tiles through `cp.async` (`gguf_moe_matrix/<format>`,
 [device profiles](device-profiles.md#what-is-calibrated)) at every column tile, 16 to 128 columns,
-for the Q4_0 and Q8_0 group encoders and decoders and the q3k builds' IQ4_NL down experts, where
-the card's profile takes them; Q3_K and NVFP4 experts keep their own loops. The values are those of
-the synchronous loop.
+for the Q4_0 and Q8_0 group encoders and decoders, the NVFP4 builds' experts and the q3k builds'
+IQ4_NL down experts, where the card's profile takes them; Q3_K experts keep their own loop. The
+values are those of the synchronous loop.
 
 Every folder also holds the skeleton as a llama.cpp GGUF (6.0 GB), the n-gram table in FP8
 (`ple-fp8.gguf`, 51.2 GB, the same in all four), the MTP block and the publisher's tokenizer. The
