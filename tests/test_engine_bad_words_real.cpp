@@ -335,8 +335,9 @@ int run() {
 
     // 4. Decode speed with the tag list (which a story never completes) and without it.
     std::uint64_t nonce = 0;
-    for (const std::uint32_t count : {1U, concurrency}) {
-        if (count == concurrency && concurrency == 1) { break; }
+    std::vector<std::uint32_t> counts{1U};
+    if (concurrency > 1) { counts.push_back(concurrency); }
+    for (const std::uint32_t count : counts) {
         Speed plain_speed, banned_speed;
         for (int repeat = 0; repeat < 2; ++repeat) {
             const Speed a = measure(engine, count, tokens, {}, nonce);
