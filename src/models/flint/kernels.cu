@@ -320,7 +320,9 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
 
     const std::int64_t base = std::int64_t(sequence) * a.seq_stride +
                               std::int64_t(kv_head) * a.head_stride;
-    // One 16-byte word of K and one of V per thread and tile: row w / 16, words w % 16.
+    // One 16-byte word of K and one of V per thread and tile: row w / 16, words w % 16. A plane's
+    // next tile stays in registers as its stored bits while the warps read the current one, and is
+    // decoded as it enters shared memory.
     constexpr int kWords = kD / 8;
     static_assert(kTile * kWords == kDecodeThreads, "one word per thread and matrix");
     const int r = threadIdx.x / kWords, c = threadIdx.x % kWords;
@@ -335,10 +337,10 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
                 k_next = *reinterpret_cast<const uint4*>(a.k_cache + at);
                 v_next = *reinterpret_cast<const uint4*>(a.v_cache + at);
             } else {
-                k_next = ops::kv128::chunk_word<KC>(row_codes(a.k_plane, sequence, kv_head, slot),
+                k_next = ops::kv128::chunk_bits<KC>(row_codes(a.k_plane, sequence, kv_head, slot),
                                                     row_scales(a.k_plane, sequence, kv_head, slot),
                                                     c);
-                v_next = ops::kv128::chunk_word<VC>(row_codes(a.v_plane, sequence, kv_head, slot),
+                v_next = ops::kv128::chunk_bits<VC>(row_codes(a.v_plane, sequence, kv_head, slot),
                                                     row_scales(a.v_plane, sequence, kv_head, slot),
                                                     c);
             }
@@ -350,8 +352,16 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
     if (lo < hi) { fetch(lo, min(kTile, hi - lo)); }
     for (int tile = lo; tile < hi; tile += kTile) {
         const int count = min(kTile, hi - tile);
-        *reinterpret_cast<uint4*>(&k_s[r][c * 8]) = k_next;
-        *reinterpret_cast<uint4*>(&v_s[r][c * 8]) = v_next;
+        if constexpr (KC == KvCoding::F16) {
+            *reinterpret_cast<uint4*>(&k_s[r][c * 8]) = k_next;
+        } else {
+            *reinterpret_cast<uint4*>(&k_s[r][c * 8]) = ops::kv128::chunk_decode<KC>(k_next);
+        }
+        if constexpr (VC == KvCoding::F16) {
+            *reinterpret_cast<uint4*>(&v_s[r][c * 8]) = v_next;
+        } else {
+            *reinterpret_cast<uint4*>(&v_s[r][c * 8]) = ops::kv128::chunk_decode<VC>(v_next);
+        }
         __syncthreads();
         if (tile + kTile < hi) { fetch(tile + kTile, min(kTile, hi - tile - kTile)); }
         float part[kTile];

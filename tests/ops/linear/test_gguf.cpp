@@ -31,6 +31,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -405,6 +406,64 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
     return failures;
 }
 
+// One launch over several products (vector_products): three weights of `first`, 71 and 25 rows (no
+// whole number of a warp's rows) times two activations, against the same products launched one by
+// one, bit for bit. 9,000 rows ask for more blocks than the device holds at once, which the
+// products then share; K = 5120 is a static K of the 27B text matrices for some types.
+int run_jobs(const TypeCase& c, std::uint32_t seed, std::int32_t kK, std::int32_t first) {
+    if (kK % gguf_block_shape(c.qtype).elements != 0) { return 0; }
+    const std::int32_t rows[] = {first, 71, 25};
+    const std::int32_t total  = rows[0] + rows[1] + rows[2];
+    std::mt19937 rng(seed);
+    const auto host_blocks = random_blocks(c, total, kK, rng);
+    DeviceBuffer blocks(host_blocks.size());
+    blocks.copy_from_host(host_blocks.data(), host_blocks.size());
+    const auto block             = gguf_block_shape(c.qtype);
+    const std::int64_t row_bytes = std::int64_t(kK / block.elements) * block.bytes;
+    const auto type              = ops::detail::gguf_type(c.qtype);
+    constexpr std::int32_t kMaxT = 8;
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<__nv_bfloat16> x_host(std::size_t(kK) * kMaxT * 2);
+    for (auto& v : x_host) { v = __float2bfloat16(normal(rng)); }
+    DeviceBuffer x_device(x_host.size() * sizeof(__nv_bfloat16));
+    x_device.copy_from_host(x_host.data(), x_host.size() * sizeof(__nv_bfloat16));
+    int failures = 0;
+    for (const std::int32_t t : {1, 2, 3, 5, 8}) {
+        const std::size_t bytes = ops::gguf::vector_activation_bytes(kK, t);
+        DeviceBuffer acts(2 * bytes);
+        for (int a = 0; a < 2; ++a) {
+            ops::gguf::quantize_vector_activation(
+                static_cast<const __nv_bfloat16*>(x_device.p) + std::size_t(a) * kK * kMaxT, kK, t,
+                nullptr, static_cast<std::uint8_t*>(acts.p) + a * bytes, nullptr);
+        }
+        DeviceBuffer one(std::size_t(total) * t * sizeof(float)), all(one.bytes);
+        std::vector<ops::gguf::VectorJob> jobs;
+        for (int j = 0, row = 0; j < 3; row += rows[j], ++j) {
+            ops::gguf::VectorJob job;
+            job.weight            = static_cast<const std::uint8_t*>(blocks.p) + row * row_bytes;
+            job.rows              = rows[j];
+            job.activation        = static_cast<const std::uint8_t*>(acts.p) + (j == 1) * bytes;
+            job.out.f32           = static_cast<float*>(one.p) + std::size_t(row) * t;
+            job.out.column_stride = rows[j];
+            ops::gguf::vector_product(type, job.weight, row_bytes, job.rows, kK, job.activation, t,
+                                      job.out, nullptr);
+            job.out.f32 = static_cast<float*>(all.p) + std::size_t(row) * t;
+            jobs.push_back(job);
+        }
+        ops::gguf::vector_products(type, row_bytes, kK, jobs, t, nullptr);
+        check(cudaDeviceSynchronize(), "vector products");
+        std::vector<float> want(std::size_t(total) * t), got(want.size());
+        one.copy_to_host(want.data(), want.size() * sizeof(float));
+        all.copy_to_host(got.data(), got.size() * sizeof(float));
+        if (std::memcmp(want.data(), got.data(), want.size() * sizeof(float)) != 0) {
+            std::cerr << "FAIL " << c.name << " vector_products K=" << kK << " rows " << first
+                      << " T=" << t << " differs from one launch per product\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 // The token-table gather reading its table in place from page-locked host memory mapped into the
 // device (`--embedding-residency host`), at the Qwen3.8-27B width: the rows must be bit for bit the
 // ones the same gather reads from a device copy, which are the exact weights rounded to BF16, in a
@@ -544,6 +603,16 @@ int main() {
                               << (schedule.empty() ? "" : " ") << schedule << '\n';
                     failures += f;
                 }
+            }
+        }
+        for (const auto& c : cases()) {
+            for (const auto [k, first] : {std::pair{2304, 201}, std::pair{2304, 9000},
+                                          std::pair{5120, 201}}) {
+                if (k % gguf_block_shape(c.qtype).elements != 0) { continue; }
+                const int f = run_jobs(c, seed++, k, first);
+                std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " vector_products K="
+                          << k << " rows " << first << "\n";
+                failures += f;
             }
         }
         // The latent widths of Edge0's routed experts: gate and up K = 1792 (145B) or 1280 (120B) in

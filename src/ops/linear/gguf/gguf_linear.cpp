@@ -272,6 +272,31 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
     return widest;
 }
 
+void gguf_vector_project(std::span<const GgufVectorProduct> products, std::int32_t t,
+                         cudaStream_t stream) {
+    std::vector<gguf::VectorJob> jobs;
+    const Weight* group = nullptr;
+    const auto flush    = [&] {
+        if (jobs.empty()) { return; }
+        gguf::vector_products(gguf_type(group->qtype), row_bytes(*group), group->k, jobs, t, stream);
+        jobs.clear();
+    };
+    for (const auto& p : products) {
+        const Weight& w = *p.weight;
+        require_gguf(w, "gguf vector product");
+        if (!jobs.empty() &&
+            (p.out.epilogue != gguf::Epilogue::Store ||
+             jobs.back().out.epilogue != gguf::Epilogue::Store || group->qtype != w.qtype ||
+             group->k != w.k || row_bytes(*group) != row_bytes(w) ||
+             jobs.size() == std::size_t(gguf::kMaxVectorJobs))) {
+            flush();
+        }
+        group = &w;
+        jobs.push_back({w.qdata, w.n, p.activation, p.out});
+    }
+    flush();
+}
+
 void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
                   WorkspaceArena& workspace, cudaStream_t stream, const void* quantized_x) {
     require_activation(x, "gguf product");
@@ -294,6 +319,8 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
         };
         std::vector<Activation> activations;
         if (quantized_x != nullptr) { activations.push_back({nullptr, quantized_x}); }
+        std::vector<GgufVectorProduct> queued;
+        queued.reserve(products.size());
         for (const auto& p : products) {
             const Weight& w = *p.weight;
             auto found      = std::find_if(activations.begin(), activations.end(),
@@ -304,9 +331,9 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
                 activations.push_back({w.input_columns, data});
                 found = activations.end() - 1;
             }
-            gguf::vector_product(gguf_type(w.qtype), w.qdata, row_bytes(w), w.n, k, found->data,
-                                 t, output(p, 0), stream);
+            queued.push_back({&w, found->data, output(p, 0)});
         }
+        gguf_vector_project(queued, t, stream);
         return;
     }
 

@@ -42,6 +42,7 @@ constexpr const char* async_matrix_key() {
     case GGML_TYPE_IQ4_NL: return "gguf_matrix/iq4_nl";
     case GGML_TYPE_Q4_K: return "gguf_matrix/q4_k";
     case GGML_TYPE_Q5_K: return "gguf_matrix/q5_k";
+    case GGML_TYPE_NVFP4: return "gguf_matrix/nvfp4";
     default: return nullptr;
     }
 }
@@ -58,6 +59,7 @@ constexpr const char* async_moe_matrix_key() {
     case GGML_TYPE_IQ4_NL: return "gguf_moe_matrix/iq4_nl";
     case GGML_TYPE_Q4_K: return "gguf_moe_matrix/q4_k";
     case GGML_TYPE_Q5_K: return "gguf_moe_matrix/q5_k";
+    case GGML_TYPE_NVFP4: return "gguf_moe_matrix/nvfp4";
     default: return nullptr;
     }
 }

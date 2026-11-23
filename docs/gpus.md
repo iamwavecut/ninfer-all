@@ -55,7 +55,8 @@ weights alone are larger.
 
 ## Cards
 
-Desktop, workstation and data-center cards with 8 GB or more; laptop GPUs are not listed.
+Desktop, workstation and data-center cards with 8 GB or more; a laptop GPU is listed only when the
+binary carries its device profile.
 ✅ ran the models listed: measured by the project, or reported by a user in a
 [field report](performance/field-reports.md) · ⬜ no result yet. **Profile:** ✓ the binary carries a
 [device profile](device-profiles.md) measured on this card (or on the variant named); an empty cell
@@ -98,6 +99,7 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 4070 | 12 GB | GeForce | ✓ | |
 | ✅ | RTX 4060 Ti | 16 / 8 GB | GeForce | ✓ | Inkling 2 Mini on the 16 GB card (experts in host memory) |
 | ⬜ | RTX 4060 | 8 GB | GeForce | ✓ | |
+| ⬜ | RTX 4080 Laptop GPU | 12 GB | GeForce laptop | ✓ | |
 | ✅ | RTX 6000 Ada | 48 GB | Workstation | ✓ | Inkling 2 Mini |
 | ⬜ | RTX 5880 Ada | 48 GB | Workstation | | |
 | ⬜ | RTX 5000 Ada | 32 GB | Workstation | ✓ | |

@@ -353,17 +353,18 @@ cache forgets what it held, the Engine counts an `engine_recoveries` and serves 
 
 The page-locked block of GGUF host experts holds them in the artifact's order while they fit the
 host's available memory and, on Windows and WSL2, what the GPU's shared memory segment can still
-lock, less 4 GiB for what startup pins after them: WDDM charges page-locked memory there, about
-half the RAM, so 48 GB of experts on a 64 GB Windows machine do not pin whole
-([#358](https://github.com/iamwavecut/ninfer-all/issues/358)). `--expert-host-mib N` pins at most
-`N` MiB. The block registers in parts of about 1 GiB, and a part the host refuses ends it. When it
-holds every expert, the run is the host run above. Otherwise the experts run as disk experts do,
-through the device expert cache: each is copied from its pinned bytes where the block holds it and
-read from the artifact's files where it does not, and the startup line names both amounts. The
-results equal the host and disk runs; host-only options (`--expert-misses mapped`,
-`--expert-tail-skip`, `--expert-prefill-buffers`, `--expert-profile`, `--expert-profile-out`)
-are refused then. Native
-(non-GGUF) host banks register per layer and are not divided this way.
+lock, less 4 GiB for what startup pins after them: WDDM charges page-locked memory there, about half
+of Windows' memory however much WSL2 is given, so 48 GB of experts on a 64 GB Windows machine do not
+pin whole ([#358](https://github.com/iamwavecut/ninfer-all/issues/358)). `--expert-host-mib N` pins
+at most `N` MiB and replaces the segment estimate; the available memory and the host's first refusal
+still end the block. The block registers in parts of about 1 GiB, and a part the host refuses ends
+it. When it holds every expert, the run is the host run above. Otherwise the experts run as disk
+experts do, through the device expert cache: each is copied from its pinned bytes where the block
+holds it and read from the artifact's files where it does not, and the startup line names both
+amounts and what ended the block. The results equal the host and disk runs; host-only options
+(`--expert-misses mapped`, `--expert-tail-skip`, `--expert-prefill-buffers`, `--expert-profile`,
+`--expert-profile-out`) are refused then. Native (non-GGUF) host banks register per layer and are
+not divided this way.
 
 Native host banks copy every miss to the GPU by default (`--expert-dma-share 1`). Values below one
 let the CPU compute a share of the missing experts; this mode is experimental: on one RTX 3090 with
@@ -946,7 +947,17 @@ not.
 - The residual is a four-stream hyper-connection stack kept in FP32 between layers.
 - The 36 Gated DeltaNet layers run the Qwen3.5 GDN kernels with a sigmoid output gate; the 12 sparse
   attention layers run the block indexer and attend only to the blocks it selects (plain dense
-  attention below 2,051 positions).
+  attention below 2,051 positions). A call of more than eight tokens attends on tensor cores where
+  they measured faster than the SIMT kernel (1,024 queries over 2,051 positions): on Blackwell in
+  every KV format, on Ampere and Ada in all but the 8-bit-key formats (`int8`, `rk8v4`, `fp8`,
+  `k8v4`), on Turing in all but `bf16` and `bf16p`, whose BF16 tiles it emulates. Volta keeps the
+  SIMT kernel. One CTA per token and KV head takes the head's twelve query heads as one 16-row
+  tile against 32-position tiles of the selected keys and values.
+  A BF16 cache scores exact BF16 products in FP32 and takes the probabilities in three BF16 parts,
+  all 24 bits of each; FP16 tiles (an FP16 or a decoded cache) take the query and the probabilities
+  in two FP16 parts, about 22 bits of each; the softmax and the sums stay FP32. The outputs are not
+  the SIMT kernel's bits, so a later layer's indexer can select other blocks
+  ([measurements](#prompt-attention-on-tensor-cores)).
 - The PLE layer reads its 16 n-gram rows per token from the table's file (IQ4_NL rows decoded on
   the GPU).
 - A layer's projections of one input run together: the GGUF ones quantize the input to q8_1 once,
@@ -982,11 +993,17 @@ not.
   phase that precedes them, and a span's short last chunk runs from the same pool (a 5,669-token
   prompt prefilled at 1,334 instead of 678 tokens/s on an RTX 3090 when spans came; the bank-shaped
   pool and the two phases then took a 9,297-token Q2_0 prompt from 1.12-1.18k to 1.35k tokens/s from
-  a cold expert cache). The expert phase runs up to 4,096 tokens of consecutive chunks in one call,
+  a cold expert cache). The expert phase runs up to 6,144 tokens of consecutive chunks in one call,
   each chunk routed on its own, so the matrix kernel takes 128-column tiles rather than the 32 of a
   1,024-token chunk; a last chunk of up to 64 tokens (eight with `--expert-tail-skip`) runs alone,
   after the layer's wider calls, since it may copy experts into cache slots those calls read (with
-  IQ3_S, a 31,860-token prompt's expert matrix products took 4.47 instead of 6.52 s on an RTX 3090).
+  IQ3_S, a 31,860-token prompt's expert matrix products took 4.47 instead of 6.52 s on an RTX 3090
+  at 4,096 tokens a call). Calls of 6,144 instead of 4,096 tokens prefilled a 31,867-token prompt
+  in BF16 KV at 2,586-2,593 instead of 2,504-2,514 tokens/s on an RTX 3090, 3,484-3,506 instead of
+  3,359-3,384 on an RTX PRO 4500 Blackwell and 5,107-5,129 instead of 4,832-4,945 on an RTX 4090;
+  their larger workspace leaves the expert cache about 310 MiB less, and decode with the same
+  tokens ran 69.1-73.4 against 71.4-73.3 tok/s (RTX PRO 4500) and 48.8-50.6 against 45.8-52.0
+  tok/s (RTX 4090, 81.6% instead of 82.0-82.1% cache hits).
   With two prefill buffers (the default with the automatic expert cache, `--expert-prefill-buffers`)
   the pool has two buffers that consecutive layers alternate between: each layer's copies start as
   soon as the layer two back is done with its buffer, while the layer before it runs. A thread of
@@ -1475,6 +1492,52 @@ for these reads. Perplexity with host experts (4,096-token windows advancing by 
 |---|---:|---:|---:|
 | `perplexity-1m` | 3.93783 | 3.93842 | +0.015% |
 | `perplexity-heldout-2026-09` | 4.69573 | 4.69673 | +0.021% |
+
+### Prompt attention on tensor cores
+
+The sparse attention Op at 1,024 queries over 2,051 positions (the first query at position 16,384),
+the SIMT kernel's time over the tensor-core kernel's, 2026-11-23:
+
+| KV format | RTX PRO 4500 Blackwell | RTX 3090 | RTX 2080 Ti |
+|---|---:|---:|---:|
+| `bf16` | 3.15 | 2.76 | 0.32 |
+| `fp16` | 2.01 | 1.67 | 1.21 |
+| `bf16p` | 1.46 | 1.18 | 0.20 |
+| `int8` | 1.19 | 0.94 | 1.73 |
+| `rk8v4` | 1.18 | 0.95 | 1.40 |
+| `fp8` | 1.36 | 0.99 | 1.56 |
+| `k8v4` | 1.34 | 0.99 | 1.53 |
+| `nvfp4` | 1.30 | 1.07 | 1.57 |
+| `rk4v4` | 1.17 | 1.04 | 1.48 |
+| `rk4v4-e8` | 1.17 | 1.04 | 1.50 |
+| `rk2v4-e8` | 1.07 | 1.07 | 1.53 |
+
+The engine runs the tensor-core kernel where the column is above 1: Blackwell in every format,
+Ampere and Ada in all but the four 8-bit-key formats, Turing in all but `bf16` and `bf16p`. The
+Turing column is an Op result only: no Flash-Next prompt was timed on a Turing card.
+
+The IQ3_S release with host experts (`ninfer-serve --expert-residency host --max-context 65536
+--spec none`), one request with a 31,867-token and one with a 5,468-token prompt, prefill in
+tokens/s, one to five runs each:
+
+| GPU | KV | 31,867 tokens, SIMT | tensor cores | 5,468 tokens, SIMT | tensor cores |
+|---|---|---:|---:|---:|---:|
+| RTX 3090 (Xeon W-2170B) | `bf16` | 2,128-2,156 | 2,504-2,514 | 1,464-1,589 | 1,455-1,573 |
+| RTX PRO 4500 Blackwell | `bf16` | 2,708-2,867 | 3,339-3,384 | 2,159-2,314 | 2,339-2,889 |
+| RTX PRO 4500 Blackwell | `int8` | 2,771 | 2,855 | 2,578 | 2,647 |
+| RTX 4090 (EPYC 7B13) | `bf16` | 3,899-4,276 | 4,832-4,945 | 2,407-2,922 | 2,372-2,868 |
+| RTX 4090 (EPYC 7B13) | `rk4v4` | 4,190 | 4,284 | 2,904 | 2,903 |
+
+A 5,468-token prompt spends little of its time in attention, so its spread is the host's. The
+32K answers have the same tokens; some 4K answers differ in later tokens.
+
+The tensor-core outputs are not the SIMT kernel's bits, so a later layer's indexer can select other
+blocks. Perplexity of the first 40 KB of WikiText (9,234 tokens, host experts) on the RTX 3090,
+mean NLL: `bf16` 0.683973 with the SIMT kernel, 0.689371 (+0.79%) with the tensor-core kernel;
+an earlier form that took the probabilities in two BF16 parts gave 0.678268 (-0.83%). The next
+120 KB of the same file (28,977 tokens) on the RTX 4090: 1.292431 with the SIMT kernel, 1.296269
+(+0.30%) with the tensor-core kernel. A run that computed the tensor-core outputs and then
+overwrote them with the SIMT kernel's gave 0.683973, so the kernel changes nothing but its outputs.
 
 ### Against llama.cpp
 

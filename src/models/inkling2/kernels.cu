@@ -6,6 +6,7 @@
 #include "models/inkling2/situ.h"
 #include "ops/common/device_tier.h"
 #include "ops/common/mma.cuh"
+#include "ops/linear/gguf/q8_1_value.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -619,9 +620,9 @@ __global__ void __launch_bounds__(kRowBlock) control_apply_kernel(ControlApply a
 
 // ---- Attention inputs ---------------------------------------------------------------------------
 
-// Block (t, head) of 128 threads: Q's value d, and the relative feature's in the first 16.
-__global__ void query_post_kernel(QueryArgs a) {
-    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+// Q head h of row t, 128 threads: Q's value d, and the relative feature's in the first 16.
+__device__ __forceinline__ void query_post_block(const QueryArgs& a, int t, int h) {
+    const int d = threadIdx.x;
     const float* row = a.qgr + std::int64_t(t) * a.stride;
     float tau = 1.0f;
     if (a.log_scale) {
@@ -667,9 +668,9 @@ __device__ __forceinline__ float convolve(const Rows& rows, int t, const float* 
     return in[0] + out;
 }
 
-// Block (t, kv head) of 128 threads, channel d of the head.
-__global__ void kv_post_kernel(KvArgs a) {
-    const int t = blockIdx.x, kh = blockIdx.y, d = threadIdx.x;
+// K and V head kh of row t, 128 threads: channel d of the head.
+__device__ __forceinline__ void kv_post_block(const KvArgs& a, int t, int kh) {
+    const int d = threadIdx.x;
     const int c = kh * kD + d, v_column = a.kv_heads * kD + c;
     const bool dynamic = a.k_taps != nullptr;
     const float* k_taps = dynamic ? a.k_taps + std::int64_t(t) * a.taps_stride + kh * kTaps : nullptr;
@@ -712,6 +713,16 @@ __global__ void kv_post_kernel(KvArgs a) {
         const int p = a.rows.positions[t];
         history_slot(a.k_history, sequence, p)[c] = a.kv[std::int64_t(t) * a.kv_stride + c];
         history_slot(a.v_history, sequence, p)[c] = a.kv[std::int64_t(t) * a.kv_stride + v_column];
+    }
+}
+
+// Block (t, y) of 128 threads: Q head y of row t, or K and V head y - heads after the Q heads.
+__global__ void attention_inputs_kernel(QueryArgs q, KvArgs kv, int heads) {
+    const int t = blockIdx.x, y = blockIdx.y;
+    if (y < heads) {
+        query_post_block(q, t, y);
+    } else {
+        kv_post_block(kv, t, y - heads);
     }
 }
 
@@ -1148,8 +1159,10 @@ __global__ void attention_combine_kernel(AttentionArgs a) {
 // The far field's softmax states (far_end): block (group of kFarRows rows, KV head) of two warps
 // per query head of the KV head, warp w head w / 2 over rows 16 (w % 2) .. + 16 of the group. Q
 // (scaled) and the probabilities enter the MMAs as F16, K and V as the attention reads them (F16,
-// or a plane's chunks decoded to F16); scores, softmax and sums stay FP32. Writes (acc, m, l) of
-// each row and head to a.far in attention_workspace_floats(T, query_heads, 1)'s layout.
+// or a plane's chunks decoded to F16); scores, softmax and sums stay FP32. A plane's next tile
+// stays in registers as its stored bits while the block computes the current one, and is decoded
+// as it enters shared memory. Writes (acc, m, l) of each row and head to a.far in
+// attention_workspace_floats(T, query_heads, 1)'s layout.
 constexpr int kFarPad = kD + 8; // halves per shared row: 272 bytes keep the ldmatrix rows apart
 
 __device__ __forceinline__ unsigned half2_bits(float x, float y) {
@@ -1157,8 +1170,16 @@ __device__ __forceinline__ unsigned half2_bits(float x, float y) {
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
+// Two blocks a multiprocessor, three warps to each scheduler, where its shared memory holds them;
+// Turing's 64 KiB holds one.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+constexpr int kFarBlocks = 1;
+#else
+constexpr int kFarBlocks = 2;
+#endif
+
 template <int Group>
-__global__ void __launch_bounds__(64 * Group) far_attention_kernel(AttentionArgs a) {
+__global__ void __launch_bounds__(64 * Group, kFarBlocks) far_attention_kernel(AttentionArgs a) {
     constexpr int kThreads = 64 * Group;
     constexpr int kWords   = 2 * kFarKeys * (kD / 8); // uint4 words of a K and V tile
     constexpr int kPer     = (kWords + kThreads - 1) / kThreads;
@@ -1197,7 +1218,7 @@ __global__ void __launch_bounds__(64 * Group) far_attention_kernel(AttentionArgs
                 const std::int64_t scales_row = std::int64_t(sequence) * plane.scale_seq +
                                                 std::int64_t(kv_head) * plane.scale_head +
                                                 std::int64_t(slot) * plane.scale_row;
-                words[i] = chunk_word(plane, plane.codes + codes_row, plane.scales + scales_row, c);
+                words[i] = chunk_bits(plane, plane.codes + codes_row, plane.scales + scales_row, c);
             } else {
                 const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
                 words[i] = *reinterpret_cast<const uint4*>(cache + base +
@@ -1213,8 +1234,10 @@ __global__ void __launch_bounds__(64 * Group) far_attention_kernel(AttentionArgs
             const int matrix = w / (kFarKeys * (kD / 8));
             const int rest   = w % (kFarKeys * (kD / 8));
             const int r = rest / (kD / 8), c = rest % (kD / 8);
+            const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
             __half* to = matrix == 0 ? &k_s[buffer][r][c * 8] : &v_s[buffer][r][c * 8];
-            *reinterpret_cast<uint4*>(to) = words[i];
+            *reinterpret_cast<uint4*>(to) =
+                plane.coding != KvCoding::F16 ? chunk_decode(plane, words[i]) : words[i];
         }
     };
 
@@ -1343,6 +1366,464 @@ __global__ void __launch_bounds__(64 * Group) far_attention_kernel(AttentionArgs
     }
 }
 
+// ---- A prompt chunk's near field on tensor cores -----------------------------------------------
+// Block (group of kFarRows rows, KV head) of two warps per query head of the KV head, warp w
+// head w / 2 over rows 16 (w % 2) .. + 16 of the group, as far_attention_kernel. The keys some row
+// of the group sees (from its window's start, or from the far field's end with kFar, through the
+// group's last row) pass through shared memory in tiles of 32, decoded as the other kernels decode
+// them.
+// A score sums Q (scaled) against K on tensor cores in two parts, Q rounded to F16 and its
+// remainder times 2^12 rounded again (about 22 bits of Q), plus the relative bias r . table[d]:
+// where the group's rows and the tile's keys lie at consecutive positions, the 63 distances the
+// tile spans come from MMAs over R and the table slice, each split the same way, through a band in
+// shared memory (a warp's 16 rows against 47 distances); otherwise each biased score sums its 16
+// products in FP32. Masks, the online softmax and the sums stay FP32; the probabilities enter P V
+// as F16. With kFar the rows start from the far field's states. Volta keeps attention_kernel<8>.
+constexpr float kRemainder = 4096.0f, kRemainderInverse = 1.0f / 4096.0f;
+// A warp's distances in a tile: i - j + 31 for its rows i < 16 and the keys j < 32.
+constexpr int kNearBand = 47;
+// The group's distances in a tile (63 used).
+constexpr int kNearSlice = kFarRows + kFarKeys;
+// Halves per slice row: 48 bytes keep a fragment's rows apart.
+constexpr int kNearRel = kRel + 8;
+// Floats per band column: the band's MMA stores and the score reads fall in 32 distinct banks.
+constexpr int kNearBandRows = 20;
+
+template <int Group>
+struct NearShared {
+    __half k[kFarKeys][kFarPad];
+    __half v[kFarKeys][kFarPad];
+    __half slice_hi[kNearSlice][kNearRel];
+    __half slice_lo[kNearSlice][kNearRel];
+    float band[2 * Group][kNearBand][kNearBandRows];
+    int key_logical[kFarKeys]; // INT_MAX: no key
+    int key_row[kFarKeys];     // the key's chunk row, -1 for a cached key
+    int key_start[kFarKeys];   // the branch start of a chunk key past `shared`, else -1
+    int band_ok;               // the tile's keys consecutive (and the group's rows)
+};
+
+// The first and the last key the rows [g, g + kFarRows) read, from `from` on, and whether their
+// logical positions are consecutive; by every lane of the warp.
+__device__ __forceinline__ void near_range(const AttentionArgs& a, int g, int from, int& lo,
+                                           int& hi,
+                                           bool& consecutive) {
+    const int lane = threadIdx.x & 31;
+    const int t    = g + lane;
+    const bool in  = t < a.rows.tokens;
+    const int p0   = a.rows.positions[g];
+    const int p    = in ? a.rows.positions[t] : p0 + lane;
+    int l = in ? (a.window != 0 ? max(0, p - a.window + 1) : 0) : INT_MAX;
+    int h = in ? physical(a.rows, t) : 0;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        l = min(l, __shfl_xor_sync(0xFFFFFFFFu, l, o));
+        h = max(h, __shfl_xor_sync(0xFFFFFFFFu, h, o));
+    }
+    lo          = max(l, from);
+    hi          = h;
+    consecutive = __all_sync(0xFFFFFFFFu, p == p0 + lane);
+}
+
+template <int Group, bool kFar>
+__global__ void __launch_bounds__(64 * Group) near_attention_kernel(AttentionArgs a) {
+    if constexpr (kVoltaImage) { return; } // Volta runs attention_kernel<8>
+    constexpr int kThreads = 64 * Group;
+    constexpr int kWords   = 2 * kFarKeys * (kD / 8);
+    constexpr int kPer     = (kWords + kThreads - 1) / kThreads;
+    __shared__ __align__(16) NearShared<Group> sm;
+    static_assert(sizeof(NearShared<Group>) <= 48 * 1024, "static shared memory");
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tid4 = lane & 3;
+    const int kv_head = blockIdx.y;
+    const int g       = blockIdx.x * kFarRows;
+    const int head    = kv_head * Group + warp / 2;
+    const int r0      = g + 16 * (warp & 1);
+    const int sequence = row_sequence(a.rows, g);
+    const std::int64_t base = std::int64_t(sequence) * a.seq_stride +
+                              std::int64_t(kv_head) * a.head_stride;
+    int far = 0;
+    if constexpr (kFar) { far = far_end(a, g); }
+    int lo = 0, hi = 0;
+    bool rows_consecutive = false;
+    near_range(a, g, far, lo, hi, rows_consecutive);
+    const int p_g = a.rows.positions[g];
+
+    // The tile's K and V words (a plane's stored bits), staged in registers while the block
+    // computes the tile before.
+    uint4 words[kPer];
+    const auto fetch = [&](int k0) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int w = int(threadIdx.x) + i * kThreads;
+            words[i]    = make_uint4(0, 0, 0, 0);
+            if (kWords % kThreads != 0 && w >= kWords) { continue; }
+            const int matrix = w / (kFarKeys * (kD / 8));
+            const int rest   = w % (kFarKeys * (kD / 8));
+            const int r = rest / (kD / 8), c = rest % (kD / 8);
+            const int p = k0 + r;
+            if (p > hi) { continue; } // past the group's keys: zeros, never unwritten slots
+            const int slot = a.ring != 0 ? p % a.ring : p;
+            const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
+            if (plane.coding != KvCoding::F16) {
+                const std::int64_t codes_row = std::int64_t(sequence) * plane.code_seq +
+                                               std::int64_t(kv_head) * plane.code_head +
+                                               std::int64_t(slot) * plane.code_row;
+                const std::int64_t scales_row = std::int64_t(sequence) * plane.scale_seq +
+                                                std::int64_t(kv_head) * plane.scale_head +
+                                                std::int64_t(slot) * plane.scale_row;
+                words[i] = chunk_bits(plane, plane.codes + codes_row, plane.scales + scales_row, c);
+            } else {
+                const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
+                words[i] = *reinterpret_cast<const uint4*>(cache + base +
+                                                            std::int64_t(slot) * kD + c * 8);
+            }
+        }
+    };
+    // The staged words into shared memory (a plane's decoded), with the tile's keys and, where they
+    // are consecutive, its slice of the table: distances p_g - logical(k0) - 31 + c for c < 63.
+    const auto put = [&](int k0) {
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int w = int(threadIdx.x) + i * kThreads;
+            if (kWords % kThreads != 0 && w >= kWords) { continue; }
+            const int matrix = w / (kFarKeys * (kD / 8));
+            const int rest   = w % (kFarKeys * (kD / 8));
+            const int r = rest / (kD / 8), c = rest % (kD / 8);
+            const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
+            __half* to = matrix == 0 ? &sm.k[r][c * 8] : &sm.v[r][c * 8];
+            *reinterpret_cast<uint4*>(to) =
+                plane.coding != KvCoding::F16 ? chunk_decode(plane, words[i]) : words[i];
+        }
+        const Rows& rows = a.rows;
+        const int l0 = k0 >= rows.first ? rows.positions[k0 - rows.first] : k0;
+        if (warp == 0) {
+            const int k = k0 + lane;
+            int logical = INT_MAX, row = -1, start = -1;
+            if (k <= hi) {
+                if (k >= rows.first) {
+                    row     = k - rows.first;
+                    logical = rows.positions[row];
+                    if (rows.starts != nullptr && row >= rows.shared) { start = rows.starts[row]; }
+                } else {
+                    logical = k;
+                }
+            }
+            sm.key_logical[lane] = logical;
+            sm.key_row[lane]     = row;
+            sm.key_start[lane]   = start;
+            const bool ok = rows_consecutive && (k > hi || logical == l0 + lane);
+            const bool all = __all_sync(0xFFFFFFFFu, ok);
+            if (lane == 0) { sm.band_ok = all ? 1 : 0; }
+        }
+        if (a.extent > 0) {
+            const int d0 = p_g - l0 - (kFarKeys - 1);
+            for (int e = int(threadIdx.x); e < (kNearSlice - 1) * kRel; e += kThreads) {
+                const int c = e / kRel, i = e % kRel;
+                const int d = d0 + c;
+                const float x = d >= 0 && d < a.extent ? a.table[std::int64_t(d) * kRel + i] : 0.0f;
+                const __half h = __float2half_rn(x);
+                sm.slice_hi[c][i] = h;
+                sm.slice_lo[c][i] = __float2half_rn((x - __half2float(h)) * kRemainder);
+            }
+        }
+    };
+
+    // Q's A fragments, rounded and remainder: rows r0 + gid (+ 8), dimensions 16 ks + 2 tid4 (+ 8).
+    unsigned qh[kD / 16][4], ql[kD / 16][4];
+#pragma unroll
+    for (int ks = 0; ks < kD / 16; ++ks) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = r0 + gid + (i & 1) * 8;
+            const int dim = 16 * ks + 2 * tid4 + (i >> 1) * 8;
+            float2 q      = make_float2(0.0f, 0.0f);
+            if (row < a.rows.tokens) {
+                q = *reinterpret_cast<const float2*>(
+                    a.q + (std::int64_t(row) * a.query_heads + head) * kD + dim);
+            }
+            const float x = q.x * a.scale, y = q.y * a.scale;
+            const __half hx = __float2half_rn(x), hy = __float2half_rn(y);
+            qh[ks][i] = half2_bits(__half2float(hx), __half2float(hy));
+            ql[ks][i] = half2_bits((x - __half2float(hx)) * kRemainder,
+                                   (y - __half2float(hy)) * kRemainder);
+        }
+    }
+    // R's A fragments (rows as Q's, the 16 relative features), rounded and remainder.
+    unsigned rh[4] = {0, 0, 0, 0}, rl[4] = {0, 0, 0, 0};
+    if (a.extent > 0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = r0 + gid + (i & 1) * 8;
+            const int dim = 2 * tid4 + (i >> 1) * 8;
+            float2 r      = make_float2(0.0f, 0.0f);
+            if (row < a.rows.tokens) {
+                r = *reinterpret_cast<const float2*>(
+                    a.r + (std::int64_t(row) * a.query_heads + head) * kRel + dim);
+            }
+            const __half hx = __float2half_rn(r.x), hy = __float2half_rn(r.y);
+            rh[i] = half2_bits(__half2float(hx), __half2float(hy));
+            rl[i] = half2_bits((r.x - __half2float(hx)) * kRemainder,
+                               (r.y - __half2float(hy)) * kRemainder);
+        }
+    }
+    // This thread's rows: t (the chunk row), its logical position and branch start.
+    int row_t[2], pos_t[2], start_t[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        row_t[i]   = r0 + gid + 8 * i;
+        const bool in = row_t[i] < a.rows.tokens;
+        pos_t[i]   = in ? a.rows.positions[row_t[i]] : INT_MIN;
+        start_t[i] = in && a.rows.starts != nullptr ? a.rows.starts[row_t[i]] : -1;
+    }
+
+    float o[kD / 8][4];
+    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int n = 0; n < kD / 8; ++n) { o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f; }
+    if (kFar && far > 0) {
+        const std::int64_t n_all = std::int64_t(a.rows.tokens) * a.query_heads;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            if (row_t[i] >= a.rows.tokens) { continue; }
+            const std::int64_t at = std::int64_t(row_t[i]) * a.query_heads + head;
+#pragma unroll
+            for (int n = 0; n < kD / 8; ++n) {
+                const float2 f =
+                    *reinterpret_cast<const float2*>(a.far + at * kD + 8 * n + 2 * tid4);
+                o[n][2 * i]     = f.x;
+                o[n][2 * i + 1] = f.y;
+            }
+            m[i] = a.far[n_all * kD + 2 * at];
+            l[i] = tid4 == 0 ? a.far[n_all * kD + 2 * at + 1] : 0.0f; // the quad sums l at the end
+        }
+    }
+
+    const int first_key = lo / kFarKeys * kFarKeys; // far is a whole number of tiles
+    fetch(first_key);
+    put(first_key);
+    __syncthreads();
+    for (int k0 = first_key; k0 <= hi; k0 += kFarKeys) {
+        const bool more = k0 + kFarKeys <= hi;
+        if (more) { fetch(k0 + kFarKeys); }
+        // S = Q K^T, the rounded and the remainder parts: n-tile j holds keys 8 j .. 8 j + 7.
+        float sc[kFarKeys / 8][4], sl[kFarKeys / 8][4];
+#pragma unroll
+        for (int j = 0; j < kFarKeys / 8; ++j) {
+            sc[j][0] = sc[j][1] = sc[j][2] = sc[j][3] = 0.0f;
+            sl[j][0] = sl[j][1] = sl[j][2] = sl[j][3] = 0.0f;
+        }
+#pragma unroll
+        for (int ks = 0; ks < kD / 16; ++ks) {
+#pragma unroll
+            for (int jp = 0; jp < kFarKeys / 16; ++jp) {
+                const int key = 8 * (2 * jp + (lane >> 4)) + (lane & 7);
+                const int dim = 16 * ks + ((lane >> 3) & 1) * 8;
+                unsigned b0, b1, b2, b3;
+                ops::ldmatrix_x4(b0, b1, b2, b3, ops::smem_addr(&sm.k[key][dim]));
+                ops::mma_f16(sl[2 * jp][0], sl[2 * jp][1], sl[2 * jp][2], sl[2 * jp][3], ql[ks][0],
+                             ql[ks][1], ql[ks][2], ql[ks][3], b0, b1);
+                ops::mma_f16(sl[2 * jp + 1][0], sl[2 * jp + 1][1], sl[2 * jp + 1][2],
+                             sl[2 * jp + 1][3], ql[ks][0], ql[ks][1], ql[ks][2], ql[ks][3], b2, b3);
+                ops::mma_f16(sc[2 * jp][0], sc[2 * jp][1], sc[2 * jp][2], sc[2 * jp][3], qh[ks][0],
+                             qh[ks][1], qh[ks][2], qh[ks][3], b0, b1);
+                ops::mma_f16(sc[2 * jp + 1][0], sc[2 * jp + 1][1], sc[2 * jp + 1][2],
+                             sc[2 * jp + 1][3], qh[ks][0], qh[ks][1], qh[ks][2], qh[ks][3], b2, b3);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kFarKeys / 8; ++j) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) { sc[j][e] = fmaf(sl[j][e], kRemainderInverse, sc[j][e]); }
+        }
+        // The relative bias band: B[i][c] = R[i] . table[d_w - 31 + c], d_w = p(r0) - logical(k0).
+        const bool band = sm.band_ok != 0;
+        if (band && a.extent > 0) {
+#pragma unroll
+            for (int nt = 0; nt < (kNearBand + 7) / 8; ++nt) {
+                const int c = 16 * (warp & 1) + 8 * nt + gid;
+                const __half* hi_row = &sm.slice_hi[c][2 * tid4];
+                const __half* lo_row = &sm.slice_lo[c][2 * tid4];
+                const unsigned th0   = *reinterpret_cast<const unsigned*>(hi_row);
+                const unsigned th1   = *reinterpret_cast<const unsigned*>(hi_row + 8);
+                const unsigned tl0   = *reinterpret_cast<const unsigned*>(lo_row);
+                const unsigned tl1   = *reinterpret_cast<const unsigned*>(lo_row + 8);
+                float b[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                ops::mma_f16(b[0], b[1], b[2], b[3], rh[0], rh[1], rh[2], rh[3], tl0, tl1);
+                ops::mma_f16(b[0], b[1], b[2], b[3], rl[0], rl[1], rl[2], rl[3], th0, th1);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) { b[e] *= kRemainderInverse; }
+                ops::mma_f16(b[0], b[1], b[2], b[3], rh[0], rh[1], rh[2], rh[3], th0, th1);
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int col = 8 * nt + 2 * tid4 + (e & 1);
+                    if (col < kNearBand) { sm.band[warp][col][gid + 8 * (e >> 1)] = b[e]; }
+                }
+            }
+            __syncwarp();
+        }
+        // Masks and biases, then the online softmax of rows gid (elements 0, 1) and gid + 8 (2, 3).
+        float top[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+        for (int j = 0; j < kFarKeys / 8; ++j) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int i   = e >> 1;
+                const int key = 8 * j + 2 * tid4 + (e & 1);
+                const int kr  = sm.key_row[key];
+                const int lg  = sm.key_logical[key];
+                bool visible  = pos_t[i] != INT_MIN && lg != INT_MAX;
+                if (visible && kr >= 0) {
+                    visible = kr <= row_t[i] &&
+                              (a.rows.starts == nullptr || kr < a.rows.shared ||
+                               sm.key_start[key] == start_t[i]);
+                }
+                const int distance = pos_t[i] - lg;
+                visible = visible && distance >= 0 && (a.window == 0 || distance < a.window);
+                float s = -INFINITY;
+                if (visible) {
+                    s = sc[j][e];
+                    if (distance < a.extent) {
+                        if (band) {
+                            s += sm.band[warp][gid + 8 * i - key + kFarKeys - 1][gid + 8 * i];
+                        } else {
+                            const float* rr =
+                                a.r + (std::int64_t(row_t[i]) * a.query_heads + head) * kRel;
+                            const float* tr = a.table + std::int64_t(distance) * kRel;
+                            float bias = 0.0f;
+#pragma unroll
+                            for (int c = 0; c < kRel; ++c) { bias = fmaf(rr[c], tr[c], bias); }
+                            s += bias;
+                        }
+                    }
+                }
+                sc[j][e] = s;
+                top[i]   = fmaxf(top[i], s);
+            }
+        }
+        float corr[2], sum[2] = {0.0f, 0.0f}, mt[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            top[i] = fmaxf(top[i], __shfl_xor_sync(0xFFFFFFFFu, top[i], 1));
+            top[i] = fmaxf(top[i], __shfl_xor_sync(0xFFFFFFFFu, top[i], 2));
+            const float m_new = fmaxf(m[i], top[i]);
+            corr[i] = m_new == -INFINITY ? 1.0f : expf(m[i] - m_new);
+            m[i]    = m_new;
+            mt[i]   = m_new == -INFINITY ? 0.0f : m_new;
+        }
+#pragma unroll
+        for (int j = 0; j < kFarKeys / 8; ++j) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                sc[j][e] = expf(sc[j][e] - mt[e >> 1]); // exp(-inf) = 0 for a masked key
+                sum[e >> 1] += sc[j][e];
+            }
+        }
+        l[0] = l[0] * corr[0] + sum[0];
+        l[1] = l[1] * corr[1] + sum[1];
+#pragma unroll
+        for (int n = 0; n < kD / 8; ++n) {
+            o[n][0] *= corr[0];
+            o[n][1] *= corr[0];
+            o[n][2] *= corr[1];
+            o[n][3] *= corr[1];
+        }
+        // O += P V: k16 step s over keys 16 s .. 16 s + 15 (n-tiles 2 s and 2 s + 1 of S).
+#pragma unroll
+        for (int s16 = 0; s16 < kFarKeys / 16; ++s16) {
+            const unsigned p0 = half2_bits(sc[2 * s16][0], sc[2 * s16][1]);
+            const unsigned p1 = half2_bits(sc[2 * s16][2], sc[2 * s16][3]);
+            const unsigned p2 = half2_bits(sc[2 * s16 + 1][0], sc[2 * s16 + 1][1]);
+            const unsigned p3 = half2_bits(sc[2 * s16 + 1][2], sc[2 * s16 + 1][3]);
+#pragma unroll
+            for (int n2 = 0; n2 < kD / 16; ++n2) {
+                const int key = 16 * s16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+                const int dim = 8 * (2 * n2 + (lane >> 4));
+                unsigned v0, v1, v2, v3;
+                ops::ldmatrix_x4_t(v0, v1, v2, v3, ops::smem_addr(&sm.v[key][dim]));
+                ops::mma_f16(o[2 * n2][0], o[2 * n2][1], o[2 * n2][2], o[2 * n2][3], p0, p1, p2, p3,
+                             v0, v1);
+                ops::mma_f16(o[2 * n2 + 1][0], o[2 * n2 + 1][1], o[2 * n2 + 1][2],
+                             o[2 * n2 + 1][3], p0, p1, p2, p3, v2, v3);
+            }
+        }
+        __syncthreads();
+        if (more) {
+            put(k0 + kFarKeys);
+            __syncthreads();
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xFFFFFFFFu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xFFFFFFFFu, l[i], 2);
+    }
+    // The rows' outputs, as attention_kernel writes them: the sink, the gate, BF16 or q8_1.
+    const int width = a.query_heads * kD;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int t     = row_t[i];
+        const bool live = t < a.rows.tokens;
+        const float sink = live && a.sinks != nullptr
+                               ? a.sinks[std::int64_t(t) * a.sink_stride + head]
+                               : -INFINITY;
+        const float top = fmaxf(m[i], sink);
+        const float w   = expf(m[i] - top);
+        const float inv = 1.0f / (l[i] * w + expf(sink - top));
+        float y[kD / 8][2];
+#pragma unroll
+        for (int n = 0; n < kD / 8; ++n) {
+            float2 gx = make_float2(1.0f, 1.0f);
+            if (live && a.gate != nullptr) {
+                const float2 x = *reinterpret_cast<const float2*>(
+                    a.gate + std::int64_t(t) * a.gate_stride + head * kD + 8 * n + 2 * tid4);
+                gx = make_float2(sigmoidf(x.x), sigmoidf(x.y));
+            }
+            y[n][0] = o[n][2 * i] * w * inv * gx.x;
+            y[n][1] = o[n][2 * i + 1] * w * inv * gx.y;
+        }
+        if (a.out_q.qs != nullptr) {
+            // q8_1 block b (32 values) is n-tiles 4 b .. 4 b + 3, eight values a lane of the quad.
+#pragma unroll
+            for (int b = 0; b < kD / 32; ++b) {
+                float amax = 0.0f, sum = 0.0f;
+#pragma unroll
+                for (int n = 4 * b; n < 4 * b + 4; ++n) {
+                    amax = fmaxf(amax, fmaxf(fabsf(y[n][0]), fabsf(y[n][1])));
+                    sum += y[n][0] + y[n][1];
+                }
+#pragma unroll
+                for (int off = 1; off < 4; off <<= 1) {
+                    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+                    sum += __shfl_xor_sync(0xFFFFFFFFu, sum, off);
+                }
+                if (!live) { continue; }
+                const float d = amax / 127.0f;
+#pragma unroll
+                for (int n = 4 * b; n < 4 * b + 4; ++n) {
+                    char2 c = make_char2(0, 0);
+                    if (amax != 0.0f) {
+                        c = make_char2(static_cast<signed char>(roundf(y[n][0] / d)),
+                                       static_cast<signed char>(roundf(y[n][1] / d)));
+                    }
+                    *reinterpret_cast<char2*>(a.out_q.qs + std::int64_t(t) * width + head * kD +
+                                              8 * n + 2 * tid4) = c;
+                }
+                if (tid4 == 0) {
+                    a.out_q.ds[std::int64_t(t) * (width / 32) + (head * kD) / 32 + b] =
+                        make_half2(__float2half(d), __float2half(sum));
+                }
+            }
+        } else if (live) {
+#pragma unroll
+            for (int n = 0; n < kD / 8; ++n) {
+                *reinterpret_cast<__nv_bfloat162*>(a.out + std::int64_t(t) * width + head * kD +
+                                                   8 * n + 2 * tid4) =
+                    __floats2bfloat162_rn(y[n][0], y[n][1]);
+            }
+        }
+    }
+}
+
 // ---- Decode and verification attention on tensor cores ------------------------------------------
 // Block (row group, KV head, split) of four warps a row octet: octet o holds kRows (1 or 2) of the
 // group's rows, t0 + kRows o + r. For each row the MMAs compute S^T = K Q^T and O^T = V^T P^T with
@@ -1360,7 +1841,6 @@ __global__ void __launch_bounds__(64 * Group) far_attention_kernel(AttentionArgs
 // block folds its warps' softmax states in warp order. A row's keys, subtiles, MMAs and fold do
 // not depend on the other rows of its group, so its output has the bits of a row alone.
 constexpr int kOctetWarps = 4;
-constexpr float kRemainder = 4096.0f, kRemainderInverse = 1.0f / 4096.0f;
 
 // Chunks [c0, c0 + N) (eight values each) of a key's row of coding C: their raw words in the
 // widest loads the span allows, the scale they share, and each chunk's eight halves: a plane's
@@ -1908,7 +2388,17 @@ constexpr int kRouteThreads = 256; // at least the experts
 
 // Block per row: thread e the expert. The top_k by p + bias, lower id first: expert e is chosen
 // k-th when k experts precede it in that order.
+// The call's fixed-point expert sums from zero, over every thread of the route launch.
+__device__ __forceinline__ void zero_sums(const RouteArgs& a) {
+    const std::int64_t step = std::int64_t(gridDim.x) * blockDim.x;
+    for (std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < a.zero_count;
+         i += step) {
+        a.zero[i] = 0;
+    }
+}
+
 __global__ void route_kernel(RouteArgs a) {
+    zero_sums(a);
     const int t = blockIdx.x, e = threadIdx.x;
     __shared__ float selections[kRouteThreads];
     __shared__ int chosen[8];
@@ -1950,6 +2440,7 @@ __global__ void route_kernel(RouteArgs a) {
 constexpr int kRouteTileWidths = 4;
 __global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
     route_sorted_kernel(RouteArgs a) {
+    zero_sums(a);
     constexpr int E = kSortedRouteExperts;
     const int t = int(threadIdx.x) / E, e = int(threadIdx.x) % E;
     __shared__ float selections[kSortedRouteRows][E];
@@ -2050,6 +2541,21 @@ __global__ void situ_rows_kernel(const float* __restrict__ gu, std::int64_t stri
     const float g    = ops::silu_detail::mul(row[r], s);
     const float u    = ops::silu_detail::mul(row[width + r], s);
     out[p * width + r] = __float2bfloat16(situ(g, u, gate_cap, up_cap));
+}
+
+// situ_rows_kernel's middle, then its q8_1 numbers: a warp holds one block of 32 values.
+__global__ void situ_q8_kernel(const float* __restrict__ gu, std::int64_t stride, int width,
+                               const float* __restrict__ pair_scale, float gate_cap, float up_cap,
+                               std::int8_t* __restrict__ qs, half2* __restrict__ ds) {
+    const int p = blockIdx.x;
+    const int r = int(blockIdx.y) * kSituThreads + int(threadIdx.x);
+    if (r >= width) { return; } // whole warps: width % 32 == 0
+    const float s    = pair_scale[p];
+    const float* row = gu + std::int64_t(p) * stride;
+    const float g    = ops::silu_detail::mul(row[r], s);
+    const float u    = ops::silu_detail::mul(row[width + r], s);
+    const float m    = __bfloat162float(__float2bfloat16(situ(g, u, gate_cap, up_cap)));
+    ops::gguf::quantize_q8_1_value(m, r, p, qs, ds, width);
 }
 
 // ---- BF16 experts --------------------------------------------------------------------------------
@@ -2582,16 +3088,16 @@ void control_apply(const ControlApply& args, cudaStream_t stream) {
     check_launch("control_apply");
 }
 
-void query_post(const QueryArgs& args, cudaStream_t stream) {
-    if (args.tokens <= 0) { return; }
-    query_post_kernel<<<dim3(args.tokens, args.heads), kD, 0, stream>>>(args);
-    check_launch("query_post");
-}
-
-void kv_post(const KvArgs& args, cudaStream_t stream) {
-    if (args.rows.tokens <= 0) { return; }
-    kv_post_kernel<<<dim3(args.rows.tokens, args.kv_heads), kD, 0, stream>>>(args);
-    check_launch("kv_post");
+void attention_inputs(const QueryArgs& q, const KvArgs& kv, cudaStream_t stream) {
+    const int heads    = q.tokens > 0 ? q.heads : 0;
+    const int kv_heads = kv.rows.tokens > 0 ? kv.kv_heads : 0;
+    if (heads > 0 && kv_heads > 0 && q.tokens != kv.rows.tokens) {
+        throw std::invalid_argument("inkling2 attention_inputs: Q and K/V of different rows");
+    }
+    const int tokens = heads > 0 ? q.tokens : kv.rows.tokens;
+    if (heads + kv_heads == 0) { return; }
+    attention_inputs_kernel<<<dim3(tokens, heads + kv_heads), kD, 0, stream>>>(q, kv, heads);
+    check_launch("attention_inputs");
 }
 
 std::size_t attention_workspace_floats(int rows, int query_heads, int splits) {
@@ -2636,6 +3142,22 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
             default: far_attention_kernel<4><<<grid, 256, 0, stream>>>(args); break;
             }
             check_launch("far_attention");
+        }
+        // The near field on tensor cores for the release's three query heads per KV head; Volta,
+        // and other groups, on the SIMT kernel.
+        bool tensor = group == 3;
+#if defined(NINFER_TIER_VOLTA)
+        tensor = tensor && !ops::current_device_volta();
+#endif
+        if (tensor) {
+            const dim3 grid(blocks_for(t, kFarRows), unsigned(args.kv_heads));
+            if (args.far != nullptr) {
+                near_attention_kernel<3, true><<<grid, 192, 0, stream>>>(args);
+            } else {
+                near_attention_kernel<3, false><<<grid, 192, 0, stream>>>(args);
+            }
+            check_launch("near_attention");
+            return;
         }
         if (args.far != nullptr) {
             attention_kernel<8, true><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(
@@ -2760,6 +3282,15 @@ void situ_rows(const float* gu, std::int64_t stride, int pairs, int width, const
     situ_rows_kernel<<<dim3(pairs, blocks_for(width, kSituThreads)), kSituThreads, 0, stream>>>(
         gu, stride, width, pair_scale, gate_cap, up_cap, out);
     check_launch("situ_rows");
+}
+
+void situ_q8(const float* gu, std::int64_t stride, int pairs, int width, const float* pair_scale,
+             float gate_cap, float up_cap, std::int8_t* qs, half2* ds, cudaStream_t stream) {
+    if (width % 32 != 0) { throw std::invalid_argument("inkling2 situ_q8: whole 32-value groups"); }
+    if (pairs <= 0) { return; }
+    situ_q8_kernel<<<dim3(pairs, blocks_for(width, kSituThreads)), kSituThreads, 0, stream>>>(
+        gu, stride, width, pair_scale, gate_cap, up_cap, qs, ds);
+    check_launch("situ_q8");
 }
 
 void bf16_expert_rows(const void* const* table, int rows, int k, const std::int32_t* bounds,

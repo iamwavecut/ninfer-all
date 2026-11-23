@@ -457,8 +457,9 @@ struct HybridExpertOptions {
     ExpertDirect direct = ExpertDirect::Auto;
     // Host experts: at most this many bytes pinned in host memory, in the artifact's order; the
     // rest are read from the artifact's files as disk experts are. Unset (default): as many as fit
-    // the host's available memory and, on Windows, what the GPU's shared memory segment can still
-    // lock (about half the RAM) less 4 GiB.
+    // the host's available memory and, on Windows and WSL2, what the GPU's shared memory segment
+    // can still lock (about half of Windows' memory) less 4 GiB. A value replaces that segment
+    // estimate; the available memory and the first part the host refuses still end the block.
     std::optional<std::uint64_t> host_bytes;
 };
 
