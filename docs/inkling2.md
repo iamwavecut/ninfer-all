@@ -54,8 +54,13 @@ tokenization, the chat template, output parsing and the serving protocols.
 - **Long contexts.** A prompt chunk of a full-attention visit first computes, on tensor cores, its
   rows' attention over the keys at least 1,024 positions (the relative table's extent) before every
   row of a group of 32: F16 queries and probabilities, keys and values as stored (a plane format's
-  chunks decoded to F16), FP32 scores, softmax and sums. The SIMT kernel starts each row from that
-  state and reads the nearer keys with their relative bias. A full visit's decode and verification
+  chunks decoded to F16), FP32 scores, softmax and sums. Every visit's prompt chunk then reads the
+  nearer keys on tensor cores too (a full visit's rows starting from that state, a sliding-window
+  visit's over its window), 32 rows to a block: each query enters the products as an F16 value and
+  its remainder times 2^12, and the relative bias comes from products of the rows' relative
+  features and the table rows of the distances a 32-key tile spans, split the same way (a sum of
+  FP32 products for each score where a chunk's positions are not consecutive, as with branches),
+  with FP32 masks, softmax and sums and F16 probabilities. A full visit's decode and verification
   rows also run on tensor cores: four warps read a split's 16-key tiles in turn, keys and values
   decoded from their stored format straight into the products' operands, and each query and
   probability enters them as an F16 value and its remainder times 2^12 (about 22 significant
@@ -65,9 +70,10 @@ tokenization, the chat template, output parsing and the serving protocols.
   warps, which read each key tile once for them, and each row reads the tiles of its own split.
   Every product and sum the kernel rounds is an explicit operation, so the compiler cannot fuse a
   block's second row differently from a decode row: a verification row computes the bits a decode
-  step computes. Volta, whose tensor-core products are emulated, keeps the SIMT kernel and about 32
-  blocks a multiprocessor. On an RTX 3090 a 120,103-token prompt prefills at 1.52k tok/s instead of
-  501, and after 114,754 tokens decode runs at 86.1 tok/s instead of 68.6 with the SIMT decode
+  step computes. Volta, whose tensor-core products are emulated, keeps the SIMT kernels for decode
+  rows (about 32 blocks a multiprocessor) and for the near field of prompt chunks. On an RTX 3090 a
+  114,754-token prompt prefills at 1.83k tok/s instead of 1.44k with the near field on the SIMT
+  kernel, and after 114,754 tokens decode runs at 86.1 tok/s instead of 68.6 with the SIMT decode
   kernel ([measurements](#long-contexts)).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens, prefix reuse across turns and requests with host-memory images
@@ -400,6 +406,25 @@ and 10.2 µs on the RTX 5090. Against an FP64 oracle both kernels' outputs have 
 MXFP8 after 114,754 keys, mostly the BF16 output's rounding). On a Tesla V100, whose tensor-core
 products are emulated, the tensor-core kernel took 1,914 µs against the SIMT kernel's 1,235
 (MXFP8) and 1,624 against 841 (F16), so Volta keeps the SIMT kernel.
+
+The near field of prompt chunks on tensor cores, November 23, 2026: the CLI (`--greedy
+--max-context 131072 --max-new 4 --spec none`, MXFP8 KV, experts on the GPU, CUDA 13.4, build
+`75;80;86;89;120a`) after two fixed prompts, master db39615 against the same tree with the kernel,
+the two builds alternating. The CLI's prefill rate, in tok/s:
+
+| Card | Prompt tokens | Prefill, before | Prefill |
+|---|---:|---:|---:|
+| RTX 3090 (350 W, PCIe 4.0 x16) | 32,070 | 1.98k, 1.96k | 2.76k, 2.75k |
+| | 114,754 | 1.44k | 1.83k |
+| RTX PRO 4500 Blackwell (200 W, PCIe 4.0 x16) | 32,070 | 3.17k, 3.16k | 3.97k, 3.95k |
+| | 114,754 | 2.43k | 2.88k |
+
+Both builds give the same first tokens after both prompts on both cards. On the RTX 3090 the
+114,754-token prefill spends 62.8 s in GPU kernels: the far field 29.2 s (46.5%), the near field
+6.0 s (9.6%). The mean NLL over the first 200,000 bytes of WikiText `00.txt` (49,478 tokens,
+16,384-token windows at an 8,192-token stride) is 1.739533 against 1.739363 on the RTX 3090
+(+0.010%) and 1.739307 against 1.739413 on the RTX PRO 4500 (-0.006%); `ninfer-perplexity` scored
+them in 68.1 s against 84.5 s and in 46.8 s against 54.3 s.
 
 ### APEX-I MiniPlus
 

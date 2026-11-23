@@ -215,7 +215,8 @@ void kv_post(const KvArgs& args, cudaStream_t stream);
 // of the gate (FP32 rows `gate_stride` apart, [heads][128]; null: no gate), goes out as BF16 rows
 // [T][heads * 128] or their q8_1 form (r may be null when extent is 0).
 // A decode or verification call (rows.chunk false) splits each row's keys over `splits` ranges
-// merged after; a prompt chunk runs its rows eight to a block, every key in one pass.
+// merged after; a prompt chunk runs its rows 32 to a block on tensor cores (eight to a block of the
+// SIMT kernel on Volta), every key in one pass.
 // `uniform` (a DSpark block, rows.chunk false, at most eight rows of one sequence whose keys are
 // already in the cache): every row sees the keys the last row sees, its position and the `window`
 // before it (0: every earlier one), the block's own later rows included; eight rows to a block,
