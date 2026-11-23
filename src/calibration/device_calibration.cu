@@ -446,7 +446,8 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
                        qtype == QType::GGUF_Q5_K || qtype == QType::GGUF_Q4_0 ||
                        qtype == QType::GGUF_Q5_0 || qtype == QType::GGUF_Q8_0 ||
                        qtype == QType::GGUF_IQ4_NL || qtype == QType::GGUF_IQ4_XS ||
-                       qtype == QType::GGUF_Q2_0 || qtype == QType::GGUF_IQ1_M;
+                       qtype == QType::GGUF_Q2_0 || qtype == QType::GGUF_IQ1_M ||
+                       qtype == QType::GGUF_NVFP4;
     if (!known || block.elements == 0 || k % block.elements != 0) {
         throw std::invalid_argument("calibration: unsupported GGUF vector weight format");
     }
@@ -468,6 +469,11 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
                 std::uint8_t& high = host[base + 48 + 2 * i + 1];
                 high = static_cast<std::uint8_t>((high & 0x0f) | (((d >> (4 * i)) & 0xf) << 4));
             }
+            continue;
+        }
+        if (qtype == QType::GGUF_NVFP4) {
+            // Four UE4M3 scales of 1.0, one per 16 values.
+            std::memset(host.data() + base, 0x38, 4);
             continue;
         }
         std::memcpy(host.data() + base + (qtype == QType::GGUF_Q6_K ? 208 : 0), &d, sizeof(d));
@@ -590,6 +596,7 @@ constexpr AsyncMatrixFormat kAsyncMatrixFormats[] = {
     {QType::GGUF_IQ4_NL, "iq4_nl", ops::gguf::GgmlType::IQ4_NL},
     {QType::GGUF_Q2_0, "q2_0", ops::gguf::GgmlType::Q2_0},
     {QType::GGUF_IQ4_XS, "iq4_xs", ops::gguf::GgmlType::IQ4_XS},
+    {QType::GGUF_NVFP4, "nvfp4", ops::gguf::GgmlType::NVFP4},
     {QType::GGUF_IQ1_M, "iq1_m", ops::gguf::GgmlType::IQ1_M, false},
 };
 

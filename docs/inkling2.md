@@ -40,7 +40,12 @@ tokenization, the chat template, output parsing and the serving protocols.
   exactly.
   Vector kernels multiply up to eight tokens, integer matrix kernels the prompt chunks, the expert
   products the routed experts only; a layer's query, gate, relative, key and value products of one
-  format share vector launches ([GGUF products](gguf.md#products)). A GGUF's BF16 matrices keep their words: UD-Q8_K_XL stores
+  format share vector launches ([GGUF products](gguf.md#products)). The NVFP4 experts' matrix
+  kernel stages its tiles through `cp.async` where the card's
+  [device profile](device-profiles.md#what-is-calibrated) takes it: a 20,430-token prompt
+  prefilled at 3.07-3.08k instead of 2.96-2.97k tokens/s on an RTX 3090, 4.61-4.62k instead of
+  4.31-4.33k on an RTX PRO 4500 Blackwell and 6.81-6.82k instead of 6.43k on an RTX 4090. A GGUF's
+  BF16 matrices keep their words: UD-Q8_K_XL stores
   attention, the token table, the head and layers 20-23's expert banks in BF16. A model with any
   BF16 matrix runs every call on BF16 rows: Linear's A16 route multiplies the BF16 matrices into
   FP32, a SIMT kernel the BF16 experts (FP32 sums of each expert's pairs, 32 at a time), and the
