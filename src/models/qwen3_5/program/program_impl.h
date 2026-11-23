@@ -237,6 +237,8 @@ struct RequestBasePlanImpl {
     bool logprobs = false;
     // With logprobs: the token ids read out exactly on the first generated token.
     std::vector<TokenId> readout_tokens;
+    // The prompt's last tokens the penalties count (runtime::ResolvedExecutionOptions).
+    std::uint32_t penalized_prompt_tokens = 0;
     // A branched read's branches (runtime::ResolvedExecutionOptions::branches), or null.
     std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
     // The speculative drafter serves this request (ExecutionOptions::speculative_drafting, or a
@@ -310,6 +312,7 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::shared_ptr<text::GrammarState> grammar;
     bool logprobs                             = false;
     std::vector<TokenId> readout_tokens;
+    std::uint32_t penalized_prompt_tokens     = 0;
     std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
     bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
@@ -335,6 +338,7 @@ struct HybridQuoteImpl {
     std::shared_ptr<text::GrammarState> grammar;
     bool logprobs                             = false;
     std::vector<TokenId> readout_tokens;
+    std::uint32_t penalized_prompt_tokens     = 0;
     std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
     bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
@@ -1861,8 +1865,10 @@ private:
     void prepare_graphs();
     // Writes the request's sampler and its MTP proposal sampler to the lane's device records.
     void upload_sampling(std::uint32_t lane, RequestControl& request);
+    // `penalized` are the prompt's tokens the penalties count as generated ones.
     void install_sampling(SequenceState& sequence, RequestControl& request,
-                          const ops::SamplingConfig& config);
+                          const ops::SamplingConfig& config,
+                          std::span<const TokenId> penalized = {});
     void set_device_i32(Tensor& tensor, std::int32_t value);
     // Writes the adapter scales `prompt` runs under to the lane scales of the sequence's KV table
     // row on every rank, ahead of its passes; a no-op without adapters.

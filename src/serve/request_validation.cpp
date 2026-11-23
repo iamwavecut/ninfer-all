@@ -1,10 +1,13 @@
 #include "serve/request_validation.h"
 
+#include "text/bad_words.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 
 namespace ninfer::serve {
@@ -99,6 +102,27 @@ std::optional<std::vector<ninfer::LoraScale>> parse_lora_field(const RequestJson
                                         .scale = static_cast<float>(scale.get<double>())});
     }
     return out;
+}
+
+std::vector<std::string> parse_bad_words_field(const RequestJson& body) {
+    if (!body.contains("bad_words") || body.at("bad_words").is_null()) { return {}; }
+    const RequestJson& field = body.at("bad_words");
+    if (!field.is_array()) {
+        bad_request("bad_words must be an array of strings", "bad_words", "invalid_bad_words");
+    }
+    std::vector<std::string> words;
+    words.reserve(field.size());
+    for (const RequestJson& value : field) {
+        if (!value.is_string()) {
+            bad_request("bad_words entries must be strings", "bad_words", "invalid_bad_words");
+        }
+        words.push_back(value.get<std::string>());
+    }
+    try {
+        return text::normalize_bad_words(words);
+    } catch (const std::invalid_argument& e) {
+        bad_request(e.what(), "bad_words", "invalid_bad_words");
+    }
 }
 
 std::optional<std::uint32_t> parse_thinking_budget_field(const RequestJson& body) {

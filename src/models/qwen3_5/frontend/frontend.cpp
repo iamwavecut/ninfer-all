@@ -17,6 +17,7 @@
 #include "models/qwen3_5/frontend/ngram_sources.h"
 #include "models/qwen3_5/program/prefix/block_keys.h"
 #include "text/unicode.h"
+#include "text/bad_words.h"
 #include "text/structured_output.h"
 #include <mutex>
 
@@ -1257,6 +1258,8 @@ public:
 
     mutable std::mutex grammar_mutex;
     mutable std::unique_ptr<text::StructuredCompiler> grammar_compiler;
+    // The tokens as text for banned words (bad_words), made with the first request that bans any.
+    mutable std::unique_ptr<text::BadWordsVocabulary> bad_words_vocabulary;
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
@@ -1844,6 +1847,77 @@ PreparedPrompt Frontend::append_read_tokens(PreparedPrompt prompt,
     return prompt;
 }
 
+PreparedPrompt Frontend::continue_prompt(const PreparedPrompt& prompt,
+                                         std::span<const TokenId> generated,
+                                         const NgramArchive::Request* archive) const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    const PreparedPromptData& source = *prompt.data_;
+    const std::size_t previous       = source.token_ids.size();
+    if (previous > impl_->max_context || generated.size() > impl_->max_context - previous) {
+        throw_context_length_exceeded(impl_->max_context);
+    }
+    for (const TokenId token : generated) {
+        if (!impl_->tokenizer->is_valid_token(token)) {
+            throw std::out_of_range("generated token is outside the checkpoint vocabulary");
+        }
+    }
+    auto prepared                 = std::make_unique<PreparedPromptData>();
+    PreparedPromptData& data      = *prepared;
+    const std::size_t count       = previous + generated.size();
+    data.ngram_sources            = source.ngram_sources;
+    data.ngram_boundaries         = source.ngram_boundaries;
+    data.ngram_snapshot           = archive != nullptr ? archive->snapshot() : nullptr;
+    data.token_ids.reserve(count);
+    data.token_ids.assign(source.token_ids.begin(), source.token_ids.end());
+    data.token_ids.insert(data.token_ids.end(), generated.begin(), generated.end());
+    data.token_types = source.token_types;
+    data.token_types.resize(count, 0);
+    // Generated text continues at the media-adjusted cursor on every mRoPE axis.
+    data.positions.resize(count * 3);
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        std::copy_n(source.positions.begin() + static_cast<std::ptrdiff_t>(axis * previous),
+                    previous, data.positions.begin() + static_cast<std::ptrdiff_t>(axis * count));
+        for (std::size_t index = previous; index < count; ++index) {
+            const auto position = static_cast<std::int64_t>(index) + source.rope_delta;
+            if (position < 0 || position > std::numeric_limits<std::int32_t>::max()) {
+                throw std::invalid_argument("generated position exceeds int32 range");
+            }
+            data.positions[axis * count + index] = static_cast<std::int32_t>(position);
+        }
+    }
+    data.rope_delta          = source.rope_delta;
+    data.media_payloads      = source.media_payloads;
+    data.vision_items        = source.vision_items;
+    data.identity            = source.identity;
+    data.context_cache       = source.context_cache;
+    data.tap_hints           = source.tap_hints;
+    data.tool_call_output    = source.tool_call_output;
+    data.starts_in_reasoning = source.starts_in_reasoning;
+    data.graft_name          = source.graft_name;
+    data.graft_frontier      = source.graft_frontier;
+    data.lora_scales         = source.lora_scales;
+    data.lora_key            = source.lora_key;
+    // A later rewind at or after this one resumes from the end of this prompt.
+    if (!generated.empty() && data.identity.reusable) {
+        const auto frontier = static_cast<std::uint32_t>(count - 1U);
+        data.context_cache.opportunities.push_back(
+            PreparedCacheOpportunity{.kind     = PromptCacheMarkerKind::PrivateLongAnchor,
+                                     .evidence = SharedCandidateEvidence::EngineStructural,
+                                     .frontier = frontier});
+        data.tap_hints.hints.push_back(runtime::prefix_cache::TapHint{
+            .position = frontier, .kind = runtime::prefix_cache::TapHintKind::GenerationOpener});
+    }
+    // A copy without generated tokens shares the source's index build.
+    if (source.ngram_index && generated.empty()) {
+        data.ngram_index = source.ngram_index;
+    } else if (source.ngram_index) {
+        build_ngram_index(data);
+    }
+    detail::prompt_block_keys(data, data.block_hashes, data.block_extras);
+    return PreparedPrompt(std::move(prepared));
+}
+
 std::vector<TokenId> Frontend::tokenize_text(std::string_view text, bool parse_special) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     return impl_->tokenizer->encode(text, {.parse_added_tokens = parse_special});
@@ -1877,7 +1951,8 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
                                             const ThinkingControlOptions& thinking,
-                                            const StructuredOutputOptions& structured) const {
+                                            const StructuredOutputOptions& structured,
+                                            std::span<const std::string> bad_words) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     std::shared_ptr<text::GrammarState> grammar;
@@ -1956,12 +2031,35 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                                          : fi::tool_call_text_format(*tools),
                                          envelope);
     }
+    std::shared_ptr<const text::BadWordsFilter> filter;
+    if (!bad_words.empty()) {
+        const std::vector<std::string> words = text::normalize_bad_words(bad_words);
+        const text::BadWordsVocabulary* vocabulary = nullptr;
+        {
+            std::lock_guard lock(impl_->grammar_mutex);
+            if (!impl_->bad_words_vocabulary) {
+                // A special token has no text: it separates the text around it.
+                std::vector<std::string> text(impl_->tokenizer->vocab_size());
+                for (std::size_t id = 0; id < text.size(); ++id) {
+                    if (impl_->tokenizer->is_valid_token(static_cast<int>(id)) &&
+                        !impl_->tokenizer->is_special_token(static_cast<int>(id))) {
+                        text[id] = impl_->tokenizer->decode_token_bytes(static_cast<int>(id), false);
+                    }
+                }
+                impl_->bad_words_vocabulary =
+                    std::make_unique<text::BadWordsVocabulary>(std::move(text));
+            }
+            vocabulary = impl_->bad_words_vocabulary.get();
+        }
+        filter  = vocabulary->filter(words);
+        grammar = text::GrammarState::with_bad_words(std::move(grammar), filter);
+    }
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(impl_->tokenizer, std::move(policy), output,
                          prompt.data_->starts_in_reasoning, thinking,
                          impl_->thinking_control_tokens, prompt.data_->tool_call_output,
                          std::move(grammar), impl_->gemma, impl_->flint, impl_->deepseek,
-                         impl_->inkling);
+                         impl_->inkling, std::move(filter));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

@@ -2145,6 +2145,12 @@ struct Executor::Impl {
     // A position's window lies in the rings while the sequence has written fewer positions past
     // it than the rings hold beyond the window and a round's drafts, and the rings held the
     // window before it when they last came whole. The full-attention rows are kept by position.
+    std::uint32_t rewind_reach(std::uint32_t sequence, std::uint32_t position) const {
+        if (position < ring_floor.at(sequence) || position > positions.at(sequence)) { return 0; }
+        const std::int64_t slack = std::int64_t(ring) - window - std::int64_t(options.draft_tokens);
+        return slack > 0 ? std::uint32_t(slack) : 0;
+    }
+
     bool rewind(std::uint32_t sequence, std::uint32_t tokens) {
         const std::uint32_t at = positions.at(sequence);
         const std::int64_t slack = std::int64_t(ring) - window - std::int64_t(options.draft_tokens);
@@ -2276,6 +2282,10 @@ void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
     impl_->restore(sequence, from);
+}
+
+std::uint32_t Executor::rewind_reach(std::uint32_t sequence, std::uint32_t position) const {
+    return impl_->rewind_reach(sequence, position);
 }
 
 bool Executor::rewind(std::uint32_t sequence, std::uint32_t tokens) {

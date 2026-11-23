@@ -173,6 +173,10 @@ ninfer_add_test(ninfer_structured_output_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_structured_output.cpp"
   LIBRARIES ninfer_text ninfer::json)
 
+ninfer_add_test(ninfer_bad_words_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_bad_words.cpp"
+  LIBRARIES ninfer_text)
+
 ninfer_add_test(ninfer_unicode_scalar_output_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_unicode_scalar_output.cpp"
   LIBRARIES ninfer_text ninfer::json)

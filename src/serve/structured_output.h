@@ -18,8 +18,9 @@ void parse_constrained_decoding_extensions(const RequestJson& body, GenerationRe
 
 // A server started without --structured-output reserves no grammar masks. There, a request's
 // response format and strict tools are refused, unless --unconstrained-response-format lets them go
-// unenforced; a Chat Completions strict flag is advisory and always does. Returns the request with
-// the dropped constraints, or nothing when the request runs as given.
+// unenforced; a Chat Completions strict flag is advisory and always does. Banned words (bad_words)
+// are refused there in any case. Returns the request with the dropped constraints, or nothing when
+// the request runs as given.
 std::optional<GenerationRequest> drop_unavailable_constraints(const GenerationRequest& request,
                                                               bool structured_output,
                                                               bool unconstrained_response_format);

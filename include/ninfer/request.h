@@ -188,6 +188,12 @@ struct StructuredOutputOptions {
 
 struct ExecutionOptions {
     StructuredOutputOptions structured_output;
+    // vLLM's bad_words: strings the generated text never contains, whatever tokens would spell
+    // them. Each loses its leading ASCII whitespace; at most 128 distinct non-empty strings of at
+    // most 256 bytes. The text is the bytes of the generated tokens, separated at each special
+    // token. Sampling masks every token that would complete a string, in every speculative
+    // column. Requires an Engine started with structured_output, whose masks carry the bans.
+    std::vector<std::string> bad_words;
     SamplingOverrides sampling;
     // Present on a thinking request: from the token after the model closes its reasoning block,
     // sampling switches to these values, omitted ones taken from the post-thinking preset and an

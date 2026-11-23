@@ -510,6 +510,13 @@ int test_tools() {
     const auto unenforced = drop_unavailable_constraints(strict, false, true);
     failures += check(unenforced && !unenforced->tools.at(0).strict,
                       "--unconstrained-response-format did not drop the strict flag");
+    {
+        Json banned_body         = body;
+        banned_body["bad_words"] = Json::array({"<daily_persona"});
+        failures += check(parse(banned_body).generation.bad_words ==
+                              std::vector<std::string>{"<daily_persona"},
+                          "Anthropic Messages bad_words were not parsed");
+    }
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
     body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});

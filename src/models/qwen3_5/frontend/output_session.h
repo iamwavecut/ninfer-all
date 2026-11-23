@@ -13,6 +13,10 @@
 #include <string>
 #include <vector>
 
+namespace ninfer::text {
+class BadWordsFilter;
+} // namespace ninfer::text
+
 namespace ninfer::models::qwen3_5 {
 namespace frontend {
 class Tokenizer;
@@ -24,10 +28,11 @@ struct InklingMarkers;
 } // namespace frontend
 class Frontend;
 
+// The channel deltas a commit publishes, in order: one per channel transition.
 class PublishedOutput {
 public:
-    using iterator       = std::array<OutputDelta, 2>::iterator;
-    using const_iterator = std::array<OutputDelta, 2>::const_iterator;
+    using iterator       = std::vector<OutputDelta>::iterator;
+    using const_iterator = std::vector<OutputDelta>::const_iterator;
 
     PublishedOutput()                                  = default;
     PublishedOutput(const PublishedOutput&)            = default;
@@ -35,28 +40,29 @@ public:
     PublishedOutput(PublishedOutput&& other) noexcept;
     PublishedOutput& operator=(PublishedOutput&& other) noexcept;
 
-    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] bool empty() const noexcept { return values_.empty(); }
 
-    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] std::size_t size() const noexcept { return values_.size(); }
 
     [[nodiscard]] iterator begin() noexcept { return values_.begin(); }
 
     [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
 
-    [[nodiscard]] iterator end() noexcept { return values_.begin() + size_; }
+    [[nodiscard]] iterator end() noexcept { return values_.end(); }
 
-    [[nodiscard]] const_iterator end() const noexcept { return values_.begin() + size_; }
+    [[nodiscard]] const_iterator end() const noexcept { return values_.end(); }
 
-    [[nodiscard]] OutputDelta& back() noexcept { return values_[size_ - 1]; }
+    [[nodiscard]] OutputDelta& back() noexcept { return values_.back(); }
 
-    [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
+    [[nodiscard]] const OutputDelta& back() const noexcept { return values_.back(); }
 
     void clear() noexcept;
     void push_back(OutputDelta value);
+    // Appends `other`'s deltas, joining a delta to the last one when their channels match.
+    void append(PublishedOutput other);
 
 private:
-    std::array<OutputDelta, 2> values_{};
-    std::size_t size_ = 0;
+    std::vector<OutputDelta> values_;
 };
 
 class OutputSession {
@@ -98,9 +104,23 @@ public:
     // write again after an early close.
     [[nodiscard]] std::optional<TokenId> banned_token() const noexcept;
     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
+    // Banned words (bad_words): whether the request's core can take the output back to where a
+    // banned word began (OutputDecision::bad_words_rewind) in the rounds from here on. Until a
+    // core allows it, the masks keep out every token that would complete a word, and nothing is
+    // held back. Call it between rounds, before the next round's masks are filled.
+    void allow_bad_words_rewind(bool allowed);
 
 private:
     class Impl;
+    struct BadWords;
+    // The round without banned words: what preview_model and commit_preview do for a request
+    // that bans none.
+    [[nodiscard]] runtime::OutputDecision
+    preview_tokens(std::span<const TokenId> tokens, std::uint32_t total_budget_remaining,
+                   FinishReason limit_reason, std::span<const runtime::RawTokenLogprob> logprobs);
+    [[nodiscard]] PublishedOutput commit_tokens();
+    // A preview of no tokens, which commit_preview commits without a change.
+    void preview_nothing();
     OutputSession(std::shared_ptr<const frontend::Tokenizer> tokenizer, StopPolicy policy,
                   OutputOptions output, bool starts_in_reasoning, ThinkingControlOptions thinking,
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
@@ -109,8 +129,10 @@ private:
                   std::shared_ptr<const frontend::GemmaMarkers> gemma       = {},
                   std::shared_ptr<const frontend::FlintMarkers> flint       = {},
                   std::shared_ptr<const frontend::DeepSeekMarkers> deepseek = {},
-                  std::shared_ptr<const frontend::InklingMarkers> inkling   = {});
+                  std::shared_ptr<const frontend::InklingMarkers> inkling   = {},
+                  std::shared_ptr<const text::BadWordsFilter> bad_words     = {});
     std::unique_ptr<Impl> impl_;
+    std::unique_ptr<BadWords> bad_words_;
 
     friend class Frontend;
 };

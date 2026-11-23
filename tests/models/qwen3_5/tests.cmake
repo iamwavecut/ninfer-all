@@ -52,6 +52,12 @@ ninfer_add_test(ninfer_gemma4_output_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma_output.cpp"
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
+# NINFER_BAD_WORDS_TOKENIZER: a release's tokenizer directory; skipped without one.
+ninfer_add_test(ninfer_bad_words_tokenizer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bad_words_tokenizer.cpp"
+  LIBRARIES ninfer_engine ninfer_core ninfer_text ninfer::json)
+set_tests_properties(ninfer_bad_words_tokenizer_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_flint_frontend_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_flint_frontend.cpp"
   NEEDS_SOURCE_DIR

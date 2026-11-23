@@ -426,6 +426,7 @@ TextCompletionRequest parse_text_completion_request(const Json& body, const Requ
     parse_sampling(body, output.generation);
     require_neutral_controls(body);
     parse_stop(body, output.generation);
+    output.generation.bad_words = parse_bad_words_field(body);
     parse_output_limit(body, limits, dialect, output);
     parse_structured_output_fields(body, dialect, output.generation);
     output.generation.lora            = parse_lora_field(body);

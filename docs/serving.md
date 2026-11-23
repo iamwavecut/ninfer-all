@@ -503,6 +503,71 @@ state advances only with Engine output commit, and is never restored from a prom
 DFlash/DFlash2 CUDA Graphs contain a host matcher node between draft generation and verification;
 this adds a CPU synchronization point and mask transfers per round. No speedup claim is implied.
 
+### Banned words
+
+`bad_words` (vLLM's field) lists strings that the generated text never contains. Chat Completions,
+`/v1/completions`, `/completion`, `/v1/responses` and `/v1/messages` accept it:
+
+```json
+{
+  "model": "your-model-id",
+  "messages": [{"role": "user", "content": "Answer the last message."}],
+  "bad_words": ["<message", "<daily_persona", "<think"]
+}
+```
+
+The text is the bytes of the generated tokens in order, reasoning and tool-call text included. A
+token that the tokenizer marks special (a turn, channel or tool-call marker) has no text and
+separates the text around it, so a string cannot span it. A string is banned whatever tokens would
+write it, and so in every token sequence that vLLM bans for it (its own tokenization and the one
+after a space), and also inside a longer word (`<text` inside `<textarea`). Matching is
+case-sensitive. Bans apply from the first generated token; the prompt does not count.
+
+The field is an array of at most 128 distinct non-empty strings of at most 256 bytes; each string
+loses its leading spaces, tabs and line breaks, as in vLLM, and duplicates count once. A malformed
+field fails with HTTP 400 `invalid_bad_words`. The bans use the structured-output token masks,
+so they need `--structured-output`; without it a request with `bad_words` fails with HTTP 400
+`bad_words_not_supported`. They combine with a response format or strict tools in one mask per
+position; a position where nothing is left fails the request.
+
+A reply does not write the start of a banned string and then turn away from it. From the token where
+text that can still become a banned string begins (the hold), the request holds its output back and
+keeps what it needs to return there: the sequence's state before that token and the logits that drew
+it. When the text can no longer become a string, the held output is published. When that text dies
+and later text that can become a string begins in the same round (one token, or the several a
+speculative round verifies), the hold moves there and the output before it is published. When a
+token completes a string, the request goes back: it drops the hold's token and every token after it,
+returns the sequence to its state before them, and draws the hold's position again from the kept
+logits with the dropped token banned there. A string that begins and completes in one round goes
+back to its own first token there. A string whose start overlaps a longer start that began in an
+earlier round (`<<x` written as `<<<x`, one byte a round) goes back to that earlier start. The
+output never holds the dropped tokens; a stream receives held text when its hold ends, so a string's
+first tokens delay the stream. Logprobs follow the published tokens. The masks of every round ban
+the tokens that hold a whole string and the tokens a rewind banned at that position.
+
+A request rewinds at most 32 times and bans at most 8 tokens at one position. Past either limit,
+and where a family cannot reach back to the hold (below), each round's masks keep out every token
+that would complete a string instead: the model may then write most of a string before the ban
+stops it, and it continues with another token. How each family goes back:
+
+| Family | Going back | Reach and cost |
+|---|---|---|
+| Qwen3.5, 3.6 and 3.8 (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) | The request's sequence ends and the request queues again at the head of the queue: its prompt is the submitted one followed by the generated tokens it keeps, and its first draw is the rewound position. | Any distance. The context cache resumes the new prompt from the deepest state it holds: one token short of its end when the hold began in the round that completed the string, after that round's first token (a speculative round); otherwise a state at or before the submitted prompt's end, so the generated tokens up to the hold run again as prompt tokens (each requeue asks the cache for a resume point at its own prompt's end, for a later rewind). Without the context cache, or for a prompt that may not be reused, the whole prompt runs again. The result's timings add up every sequence's prefill and decode. |
+| Qwen3.8-Flash-Next and Edge0 | The recurrent state is copied when the hold begins, into the snapshot a stop string's hold uses, and restored; attention rows are kept by position. | Any distance. The snapshot takes 74 MiB a sequence, which `--structured-output` allocates also without the context cache. A hold that begins inside a speculative round ends that round's commit at the hold's token, and the tokens after it run in the next step. While a hold is alive a stop string keeps no state of its own, so a turn it cuts there leaves no resume point at the cut. |
+| Gemma 4 | The windowed blocks' rings keep rows past the window; full-attention rows are kept by position. No state is copied. | With drafts (`--spec mtp` or `dspine`; rings of 1280 rows for a window of 1024), 256 positions less a round's drafts; without drafts, the 32 decode steps after the hold begins, whose overwritten rows a hold keeps. |
+| Flint | The rings keep 768 positions for a window of 513; full-attention rows are kept by position. No state is copied. | 255 positions less a round's drafts. |
+| DeepSeek-V4.1 | The window rings and compressor tails are copied when the hold begins and restored; compressed rows are kept by position. | Any distance. With `--structured-output` and the context cache off, the copies take two more copies of each sequence's window rings (5.3 MiB each), as the context cache's checkpoints do. A hold that begins inside a speculative round is copied as the round commits, with no extra pass. |
+| Inkling 2 | The rings and the convolution and recurrent-head histories keep the last 32 positions. No state is copied. | 29 positions less a round's drafts. |
+
+The kept logits take one BF16 row of the vocabulary a sequence (0.5 MiB for Gemma 4). Bans hold at
+every speculative position: each column of a verification round masks after the drafts before it,
+so a draft with a banned token is rejected, and a draft that completes a string is accepted and
+then taken back with the rest of the hold. Drafts are proposed without the bans. A request with
+only banned words keeps its drafts (MTP, DFlash, DFlash2, DSpark, a context lookup): its masks
+take microseconds and fill on the engine thread with no mask thread. The first request with a new
+list builds the list's filter (an Aho-Corasick automaton of the strings and the vocabulary's tokens
+by their bytes); the last eight lists are kept.
+
 ## Stop the server
 
 Press Ctrl+C twice to stop the server. The first press only shows a prompt on the console's bottom
@@ -1072,6 +1137,8 @@ The endpoint supports:
   it first. Caller stop strings still apply; any other value type is rejected with 400. Output past
   the model's natural end is not meaningful text. `/v1/responses` and `/v1/messages` do not
   honor it;
+- vLLM's `bad_words`, strings that the reply never contains, with `--structured-output` (see
+  [Banned words](#banned-words));
 - `n:1` and text-only `modalities`;
 - `response_format` of type `text`, `json_object`, or `json_schema` (`name`, optional
   `description`, `schema` and `strict`), and the vLLM and llama.cpp constraint fields
@@ -1593,7 +1660,8 @@ curl http://127.0.0.1:8080/v1/completions -d '{"prompt": "The capital of France 
 
 Both accept `temperature` (below zero samples greedily), `top_k` (zero or below is the widest
 candidate set, 20), `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `seed` (negative for
-a random one), `stop` (a string or up to 32 strings), `ignore_eos`, `stream`, `timings_per_token`,
+a random one), `stop` (a string or up to 32 strings), [`bad_words`](#banned-words), `ignore_eos`,
+`stream`, `timings_per_token`,
 `response_format`, the vLLM and llama.cpp constraint fields of [Structured
 output](#structured-output) (`grammar` among them), and llama.cpp's `cache_prompt` (`false` keeps
 the request out of the context cache). The output limit is llama.cpp's `n_predict`, then
@@ -1958,6 +2026,7 @@ wire response contains typed `output` Items.
 | `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts), or `null`; also accepted by input token count |
 | `lora` | llama.cpp's [LoRA adapter scales](#lora-adapters-and-control-vectors), or `null`; also accepted by input token count |
 | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
+| `bad_words` | vLLM's [banned words](#banned-words), or `null`; needs `--structured-output`; rejected by input token count |
 | `text.format` | `text`, `json_object`, or flat `json_schema`; see [structured output](#structured-output) |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
 | `tool_choice` | `auto`, `none`, a named function, `required` over a single callable tool, or function-only `allowed_tools` in either mode; a namespaced selection carries both `namespace` and `name` |
@@ -2261,7 +2330,8 @@ explicitly.
 [default output limit](#default-output-limit); a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k` (clamped to 20
-like the OpenAI endpoints), and `stop_sequences` enter Engine execution. A matched custom stop is returned as
+like the OpenAI endpoints), `stop_sequences` and vLLM's [`bad_words`](#banned-words) enter Engine
+execution. A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 

@@ -712,8 +712,10 @@ snapshot.
 A turn that a stop string ends resumes where its visible text ends. The sequence keeps only the
 tokens before the one that begins the stop string's match: a round that holds such a token commits
 the tokens before it, and the next step reads the rest. A match that stays open keeps a second
-snapshot of the sequence there (another 74 MiB a sequence, with the context cache), which the turn
-goes back to when the stop string ends it in a later step, so the next prompt continues that state.
+snapshot of the sequence there (another 74 MiB a sequence, with the context cache or
+`--structured-output`, whose [banned words](serving.md#banned-words) go back to the same snapshot),
+which the turn goes back to when the stop string ends it in a later step, so the next prompt
+continues that state.
 Either way only the new tokens are prefilled; the response's prompt summary reports how many were
 reused. A request goes to the free sequence that holds the longest such prefix of its prompt.
 A prefix with images or video is the same only with the same media at the same places (each
