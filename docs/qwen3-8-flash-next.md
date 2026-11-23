@@ -950,8 +950,9 @@ not.
   attention below 2,051 positions). A call of more than eight tokens attends on tensor cores where
   they measured faster than the SIMT kernel (1,024 queries over 2,051 positions): on Blackwell in
   every KV format, on Ampere and Ada in all but the 8-bit-key formats (`int8`, `rk8v4`, `fp8`,
-  `k8v4`). Volta and Turing keep the SIMT kernel. One CTA per token and KV head takes the head's
-  twelve query heads as one 16-row tile against 32-position tiles of the selected keys and values.
+  `k8v4`), on Turing in all but `bf16` and `bf16p`, whose BF16 tiles it emulates. Volta keeps the
+  SIMT kernel. One CTA per token and KV head takes the head's twelve query heads as one 16-row
+  tile against 32-position tiles of the selected keys and values.
   A BF16 cache scores exact BF16 products in FP32 and takes the probabilities in three BF16 parts,
   all 24 bits of each; FP16 tiles (an FP16 or a decoded cache) take the query and the probabilities
   in two FP16 parts, about 22 bits of each; the softmax and the sums stay FP32. The outputs are not
@@ -1512,8 +1513,8 @@ the SIMT kernel's time over the tensor-core kernel's, 2026-11-23:
 | `rk2v4-e8` | 1.07 | 1.07 | 1.53 |
 
 The engine runs the tensor-core kernel where the column is above 1: Blackwell in every format,
-Ampere and Ada in all but the four 8-bit-key formats. The RTX 2080 Ti's FP16 tiles would win, but
-the Op's test has not run on a Turing card, so Turing keeps the SIMT kernel.
+Ampere and Ada in all but the four 8-bit-key formats, Turing in all but `bf16` and `bf16p`. The
+Turing column is an Op result only: no Flash-Next prompt was timed on a Turing card.
 
 The IQ3_S release with host experts (`ninfer-serve --expert-residency host --max-context 65536
 --spec none`), one request with a 31,867-token and one with a 5,468-token prompt, prefill in
