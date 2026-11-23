@@ -246,8 +246,8 @@ endif()
 if(NINFER_PTXAS_VERBOSE)
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
 endif()
-# Source-line tables change no machine code, but the driver expands every module of a compressed
-# fatbin into host memory, line tables included, when CUDA starts.
+# Source-line tables change no machine code, but they make the kernel images about 3.5 times as
+# large, and each module takes longer to load (docs/maintainer/build-system.md).
 option(NINFER_CUDA_LINEINFO
        "Record each kernel's source lines (-lineinfo) for compute-sanitizer reports and the Nsight Compute source view" OFF)
 if(NINFER_CUDA_LINEINFO)
