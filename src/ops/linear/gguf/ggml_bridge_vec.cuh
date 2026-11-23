@@ -770,20 +770,15 @@ struct Decoder<GGML_TYPE_IQ1_M> {
     }
 };
 
-// KS: the static K the slice loop unrolls over, or 0 for the runtime K. Fused: the weight is one
-// [gate; up] parent and each output row is silu(gate row) * up row.
-template <ggml_type type, int T, bool Fused, int KS, bool Cooperative = false>
-__launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
+// The rows of one product that block `block` of `blocks` takes: each warp kRows of them (one
+// fused pair) at a time. KS: the static K the slice loop unrolls over, or 0 for the runtime K.
+// Fused: the weight is one [gate; up] parent and each output row is silu(gate row) * up row.
+template <ggml_type type, int T, bool Fused, int KS, bool Cooperative>
+__device__ __forceinline__ void vec_rows(const VecArgs& p, int block, int blocks,
+                                         const std::uint32_t* table) {
     using D                 = Decoder<type>;
-    constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
     constexpr int kPerBlock = D::kBlockElems / 32;
     constexpr int kRows     = 2;
-    __shared__ __align__(16) std::uint32_t table[kTable];
-    if constexpr (D::kTableWords > 0) {
-        const std::uint32_t* src = D::table();
-        for (int i = threadIdx.x; i < D::kTableWords; i += kVecWarps * 32) { table[i] = src[i]; }
-        __syncthreads();
-    }
     const int warp   = threadIdx.x >> 5;
     const int lane   = threadIdx.x & 31;
     const int k      = KS != 0 ? KS : p.k;
@@ -792,8 +787,8 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
     const std::int64_t lane_offset = std::int64_t(lane / kPerBlock) * D::kBlockBytes;
     const int sub                  = lane % kPerBlock;
 
-    for (int row0 = (blockIdx.x * kVecWarps + warp) * step; row0 < p.rows;
-         row0 += gridDim.x * kVecWarps * step) {
+    for (int row0 = (block * kVecWarps + warp) * step; row0 < p.rows;
+         row0 += blocks * kVecWarps * step) {
         const std::uint8_t* rowp[kRows];
         if constexpr (Fused) {
             rowp[0] = p.weight + std::int64_t(row0) * p.row_bytes + lane_offset;
@@ -868,6 +863,50 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
 }
 
 template <ggml_type type, int T, bool Fused, int KS, bool Cooperative = false>
+__launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
+    using D              = Decoder<type>;
+    constexpr int kTable = D::kTableWords > 0 ? D::kTableWords : 4;
+    __shared__ __align__(16) std::uint32_t table[kTable];
+    if constexpr (D::kTableWords > 0) {
+        const std::uint32_t* src = D::table();
+        for (int i = threadIdx.x; i < D::kTableWords; i += kVecWarps * 32) { table[i] = src[i]; }
+        __syncthreads();
+    }
+    vec_rows<type, T, Fused, KS, Cooperative>(p, blockIdx.x, gridDim.x, table);
+}
+
+// Up to kMaxVecJobs products of one runtime K in one launch: blocks [p.first[j], p.first[j + 1])
+// take product j's rows as kernel() takes a product's.
+template <ggml_type type, int T, bool Cooperative>
+__launch_bounds__(kVecWarps * 32) __global__ void jobs_kernel(VecJobs p) {
+    using D              = Decoder<type>;
+    constexpr int kTable = D::kTableWords > 0 ? D::kTableWords : 4;
+    __shared__ __align__(16) std::uint32_t table[kTable];
+    if constexpr (D::kTableWords > 0) {
+        const std::uint32_t* src = D::table();
+        for (int i = threadIdx.x; i < D::kTableWords; i += kVecWarps * 32) { table[i] = src[i]; }
+        __syncthreads();
+    }
+    const int b = blockIdx.x;
+    int j       = 0;
+#pragma unroll
+    for (int i = 1; i < kMaxVecJobs; ++i) {
+        if (i < p.count && b >= p.first[i]) { j = i; }
+    }
+    VecArgs job = p.job[0];
+    int first = p.first[0], last = p.first[1];
+#pragma unroll
+    for (int i = 1; i < kMaxVecJobs; ++i) {
+        if (i == j) {
+            job   = p.job[i];
+            first = p.first[i];
+            last  = p.first[i + 1];
+        }
+    }
+    vec_rows<type, T, false, 0, Cooperative>(job, b - first, last - first, table);
+}
+
+template <ggml_type type, int T, bool Fused, int KS, bool Cooperative = false>
 void launch(const VecArgs& args, cudaStream_t stream) {
     static const int resident = [] {
         int blocks = 0;
@@ -912,6 +951,105 @@ void launch_columns(const VecArgs& args, int columns, cudaStream_t stream) {
     }
     throw std::invalid_argument("gguf vector product: columns must be 1..8");
 }
+
+// Blocks per SM that one launch of several products may hold. More of them at once stream slower:
+// replayed in a graph at one column, Inkling's query, gate, relative and key rows (944 blocks, 11.5
+// per SM) took 32.17 us in one launch on an RTX 3090 against 30.26 us apart, and 28.62 us in
+// launches within 10 per SM (an RTX PRO 4500 Blackwell: 24.36, 31.84 and 26.86 us). Within 10 per
+// SM, the layer shapes measured (Inkling's, Gemma 4 26B's, a Q4_K q/k/v) at 1-8 columns ran 5-32%
+// faster than apart on both cards.
+inline constexpr int kVecJobsBlocksPerSm = 10;
+
+// One launch of products [begin, end) of `args`: past the resident blocks each keeps its share of
+// them, at least one block.
+template <ggml_type type, int T, bool Cooperative>
+void jobs_launch_range(const VecJobs& args, int begin, int end, cudaStream_t stream) {
+    static const int resident = [] {
+        int blocks = 0;
+        check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, jobs_kernel<type, T, Cooperative>,
+                                                            kVecWarps * 32, 0),
+              "vector occupancy");
+        return std::max(blocks, 1);
+    }();
+    constexpr int per_block = kVecWarps * 2;
+    const int cap           = resident * device_facts().sm_count;
+    VecJobs part{};
+    part.count = end - begin;
+    int want[kMaxVecJobs] = {}, total = 0;
+    for (int i = 0; i < part.count; ++i) {
+        part.job[i] = args.job[begin + i];
+        want[i]     = (part.job[i].rows + per_block - 1) / per_block;
+        total += want[i];
+    }
+    part.first[0] = 0;
+    for (int i = 0; i < part.count; ++i) {
+        const int blocks = total <= cap ? want[i]
+                                        : std::max(1, int(std::int64_t(want[i]) * cap / total));
+        part.first[i + 1] = part.first[i] + blocks;
+    }
+    jobs_kernel<type, T, Cooperative><<<part.first[part.count], kVecWarps * 32, 0, stream>>>(part);
+    check(cudaGetLastError(), "vector products launch");
+}
+
+// Consecutive products share a launch while their blocks fit kVecJobsBlocksPerSm per SM; a
+// product left alone takes the one-product kernel.
+template <ggml_type type, int T, bool Cooperative>
+void jobs_launch(const VecJobs& args, cudaStream_t stream) {
+    constexpr int per_block = kVecWarps * 2;
+    const int budget        = kVecJobsBlocksPerSm * device_facts().sm_count;
+    for (int begin = 0; begin < args.count;) {
+        int end    = begin + 1;
+        int blocks = (args.job[begin].rows + per_block - 1) / per_block;
+        while (end < args.count) {
+            const int more = (args.job[end].rows + per_block - 1) / per_block;
+            if (blocks + more > budget) { break; }
+            blocks += more;
+            ++end;
+        }
+        if (end - begin == 1) {
+            launch<type, T, false, 0, Cooperative>(args.job[begin], stream);
+        } else {
+            jobs_launch_range<type, T, Cooperative>(args, begin, end, stream);
+        }
+        begin = end;
+    }
+}
+
+// A static K (the 27B text matrices') keeps the unrolled kernel, one launch per product.
+template <ggml_type type, int T, bool Cooperative>
+void jobs_k(const VecJobs& args, cudaStream_t stream) {
+    if constexpr (kVecStaticK<type>) {
+        switch (args.job[0].k) {
+        case 5120:
+        case 6144:
+        case 10240:
+        case 17408:
+            for (int i = 0; i < args.count; ++i) {
+                launch_k<type, T, false, Cooperative>(args.job[i], stream);
+            }
+            return;
+        default: break;
+        }
+    }
+    jobs_launch<type, T, Cooperative>(args, stream);
+}
+
+template <ggml_type type, bool Cooperative>
+void jobs_columns(const VecJobs& args, int columns, cudaStream_t stream) {
+    switch (columns) {
+    case 1: return jobs_k<type, 1, Cooperative>(args, stream);
+    case 2: return jobs_k<type, 2, Cooperative>(args, stream);
+    case 3: return jobs_k<type, 3, Cooperative>(args, stream);
+    case 4: return jobs_k<type, 4, Cooperative>(args, stream);
+    case 5: return jobs_k<type, 5, Cooperative>(args, stream);
+    case 6: return jobs_k<type, 6, Cooperative>(args, stream);
+    case 7: return jobs_k<type, 7, Cooperative>(args, stream);
+    case 8: return jobs_k<type, 8, Cooperative>(args, stream);
+    default: break;
+    }
+    throw std::invalid_argument("gguf vector product: columns must be 1..8");
+}
+
 
 // The MoE form: block (x, y) takes rows of the y-th active expert for every pair routed to it, up
 // to T of them per pass over the rows; a pass over fewer skips the missing columns, and every
@@ -1847,17 +1985,26 @@ void moe_launch(const MoeVecArgs& args, int max_active, int chunk, bool fused,
 }
 
 template <ggml_type type>
-void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t stream) {
+void vec_launch(const VecJobs& args, int columns, bool fused, cudaStream_t stream) {
     using D = vec::Decoder<type>;
-    if (args.k % D::kBlockElems != 0 || args.row_bytes % D::kBlockBytes != 0 ||
-        args.row_bytes < std::int64_t(args.k / D::kBlockElems) * D::kBlockBytes || args.rows <= 0) {
-        throw std::invalid_argument("gguf vector product: unsupported geometry");
+    if (args.count < 1 || args.count > kMaxVecJobs || (fused && args.count != 1)) {
+        throw std::invalid_argument("gguf vector product: 1..4 products, one when fused");
+    }
+    for (int i = 0; i < args.count; ++i) {
+        const VecArgs& job = args.job[i];
+        if (job.k % D::kBlockElems != 0 || job.row_bytes % D::kBlockBytes != 0 ||
+            job.row_bytes < std::int64_t(job.k / D::kBlockElems) * D::kBlockBytes ||
+            job.rows <= 0 || job.k != args.job[0].k || job.row_bytes != args.job[0].row_bytes) {
+            throw std::invalid_argument("gguf vector product: unsupported geometry");
+        }
     }
     const auto launch = [&]<bool Cooperative>() {
-        if (fused) {
-            vec::launch_columns<type, true, Cooperative>(args, columns, stream);
+        if (args.count > 1) {
+            vec::jobs_columns<type, Cooperative>(args, columns, stream);
+        } else if (fused) {
+            vec::launch_columns<type, true, Cooperative>(args.job[0], columns, stream);
         } else {
-            vec::launch_columns<type, false, Cooperative>(args, columns, stream);
+            vec::launch_columns<type, false, Cooperative>(args.job[0], columns, stream);
         }
     };
     if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) {
@@ -1986,7 +2133,7 @@ void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const s
 
 #define NINFER_GGUF_VECTOR_INSTANCE(TYPE)                                                          \
     template void ninfer::ops::gguf::detail::vec_launch<TYPE>(                                     \
-        const ninfer::ops::gguf::detail::VecArgs&, int, bool, cudaStream_t);                       \
+        const ninfer::ops::gguf::detail::VecJobs&, int, bool, cudaStream_t);                       \
     template void ninfer::ops::gguf::detail::moe_launch<TYPE>(                                     \
         const ninfer::ops::gguf::detail::MoeVecArgs&, int, int, bool, cudaStream_t);               \
     template void ninfer::ops::gguf::detail::moe_decode_up_launch<TYPE>(                           \

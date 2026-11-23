@@ -107,7 +107,7 @@ __launch_bounds__(kQuantizeThreads) __global__
     quantize_vector_value(xi, i, column, qs, ds, k);
 }
 
-using VectorLaunch = void (*)(const VecArgs&, int, bool, cudaStream_t);
+using VectorLaunch = void (*)(const VecJobs&, int, bool, cudaStream_t);
 using MoeLaunch    = void (*)(const MoeVecArgs&, int, int, bool, cudaStream_t);
 
 MoeLaunch moe_launcher(GgmlType type) {
@@ -735,19 +735,41 @@ void quantize_vector_activation_f32(const float* x, int k, int columns, const st
     detail::check(cudaGetLastError(), "vector activation launch");
 }
 
-void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
-                    const void* activation, int columns, const VectorOutput& out,
-                    cudaStream_t stream) {
+namespace {
+
+detail::VecStore vector_store(const VectorOutput& out) {
     if ((out.bf16 == nullptr) == (out.f32 == nullptr) ||
         (out.epilogue == Epilogue::GateProduct && out.gate == nullptr)) {
         throw std::invalid_argument("gguf vector product: invalid output");
     }
-    const detail::VecStore store{out.bf16,     out.f32,  out.column_stride,
-                                 out.epilogue, out.gate, out.gate_column_stride,
-                                 static_cast<int>(out.activation)};
-    detail::vector_launch(type)(
-        detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
-        false, stream);
+    return detail::VecStore{out.bf16,     out.f32,  out.column_stride,
+                            out.epilogue, out.gate, out.gate_column_stride,
+                            static_cast<int>(out.activation)};
+}
+
+} // namespace
+
+void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
+                    const void* activation, int columns, const VectorOutput& out,
+                    cudaStream_t stream) {
+    detail::VecJobs jobs{};
+    jobs.job[0] =
+        detail::vector_args(weight, row_bytes, rows, k, activation, columns, vector_store(out));
+    jobs.count = 1;
+    detail::vector_launch(type)(jobs, columns, false, stream);
+}
+
+void vector_products(GgmlType type, std::int64_t row_bytes, int k,
+                     std::span<const VectorJob> products, int columns, cudaStream_t stream) {
+    if (products.empty() || products.size() > std::size_t(kMaxVectorJobs)) {
+        throw std::invalid_argument("gguf vector products: 1..4 products");
+    }
+    detail::VecJobs jobs{};
+    for (const VectorJob& p : products) {
+        jobs.job[jobs.count++] = detail::vector_args(p.weight, row_bytes, p.rows, k, p.activation,
+                                                     columns, vector_store(p.out));
+    }
+    detail::vector_launch(type)(jobs, columns, false, stream);
 }
 
 void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
@@ -757,9 +779,10 @@ void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, in
     const detail::VecStore store{out,     nullptr, out_column_stride,
                                  Epilogue::Store, nullptr, 0,
                                  static_cast<int>(gate_activation)};
-    detail::vector_launch(type)(
-        detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
-        true, stream);
+    detail::VecJobs jobs{};
+    jobs.job[0] = detail::vector_args(weight, row_bytes, rows, k, activation, columns, store);
+    jobs.count  = 1;
+    detail::vector_launch(type)(jobs, columns, true, stream);
 }
 
 std::size_t moe_routing_bytes(int experts, int pairs) {

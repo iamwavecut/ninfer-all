@@ -1203,14 +1203,18 @@ struct Executor::Impl {
         kernels::unscale_columns(h, hidden, t, scale, stream);
     }
 
-    // A block's Q, K and V rows into FP32 [T][qkv_rows], part by part when they are not one parent.
+    // A block's Q, K and V rows into FP32 [T][qkv_rows], part by part when they are not one parent
+    // (the q8_1 parts of one block type and row size in one launch).
     void project_qkv(const Tensor* x, const Q8Act* xq, const LayerPlan& p, int t, float* out) {
         if (xq != nullptr) {
-            int row = 0;
-            for (const Weight& part : p.qkv) {
-                vector_f32(*xq, part, t, out, p.qkv_rows, row);
-                row += part.n;
+            std::vector<ops::detail::GgufVectorProduct> parts(p.qkv.size());
+            for (std::size_t i = 0, row = 0; i < parts.size(); row += p.qkv[i].n, ++i) {
+                parts[i].weight            = &p.qkv[i];
+                parts[i].activation        = xq->base;
+                parts[i].out.f32           = out + row;
+                parts[i].out.column_stride = p.qkv_rows;
             }
+            ops::detail::gguf_vector_project(parts, t, stream);
             return;
         }
         std::vector<ops::detail::GgufProduct> parts(p.qkv.size());
