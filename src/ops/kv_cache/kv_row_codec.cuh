@@ -361,4 +361,50 @@ __device__ __forceinline__ uint4 chunk_word(const std::uint8_t* codes, const std
     return pack8(f);
 }
 
+// Chunk `c`'s stored bits in one register word, the codes in x (and y) and the scale's bits in z,
+// and chunk_word<C>'s word from them: a tile loader issues a tile's loads into such words and
+// decodes them when it stores the tile, so the loads need not complete before its other work.
+template <KvCoding C>
+__device__ __forceinline__ uint4 chunk_bits(const std::uint8_t* codes, const std::uint8_t* scales,
+                                            int c) {
+    using K = Chunk<C>;
+    static_assert(sizeof(typename K::Raw) <= 8 && sizeof(typename K::Scale) <= 2,
+                  "codes and scale in three registers");
+    const typename K::Raw r   = K::load(codes, c);
+    const typename K::Scale s = K::scale(scales, c);
+    uint4 w                   = make_uint4(0, 0, 0, 0);
+    if constexpr (sizeof(typename K::Raw) == 8) {
+        w.x = r.x;
+        w.y = r.y;
+    } else {
+        w.x = r;
+    }
+    if constexpr (sizeof(typename K::Scale) == 2) {
+        w.z = __half_as_ushort(s);
+    } else {
+        w.z = s;
+    }
+    return w;
+}
+
+template <KvCoding C>
+__device__ __forceinline__ uint4 chunk_decode(uint4 w) {
+    using K = Chunk<C>;
+    typename K::Raw r;
+    typename K::Scale s;
+    if constexpr (sizeof(typename K::Raw) == 8) {
+        r = make_uint2(w.x, w.y);
+    } else {
+        r = w.x;
+    }
+    if constexpr (sizeof(typename K::Scale) == 2) {
+        s = __ushort_as_half(static_cast<unsigned short>(w.z));
+    } else {
+        s = static_cast<typename K::Scale>(w.z);
+    }
+    float f[8];
+    K::decode(r, s, f);
+    return pack8(f);
+}
+
 } // namespace ninfer::ops::kv_row

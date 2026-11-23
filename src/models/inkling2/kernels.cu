@@ -1148,8 +1148,10 @@ __global__ void attention_combine_kernel(AttentionArgs a) {
 // The far field's softmax states (far_end): block (group of kFarRows rows, KV head) of two warps
 // per query head of the KV head, warp w head w / 2 over rows 16 (w % 2) .. + 16 of the group. Q
 // (scaled) and the probabilities enter the MMAs as F16, K and V as the attention reads them (F16,
-// or a plane's chunks decoded to F16); scores, softmax and sums stay FP32. Writes (acc, m, l) of
-// each row and head to a.far in attention_workspace_floats(T, query_heads, 1)'s layout.
+// or a plane's chunks decoded to F16); scores, softmax and sums stay FP32. A plane's next tile
+// stays in registers as its stored bits while the block computes the current one, and is decoded
+// as it enters shared memory. Writes (acc, m, l) of each row and head to a.far in
+// attention_workspace_floats(T, query_heads, 1)'s layout.
 constexpr int kFarPad = kD + 8; // halves per shared row: 272 bytes keep the ldmatrix rows apart
 
 __device__ __forceinline__ unsigned half2_bits(float x, float y) {
@@ -1157,8 +1159,16 @@ __device__ __forceinline__ unsigned half2_bits(float x, float y) {
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
+// Two blocks a multiprocessor, three warps to each scheduler, where its shared memory holds them;
+// Turing's 64 KiB holds one.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+constexpr int kFarBlocks = 1;
+#else
+constexpr int kFarBlocks = 2;
+#endif
+
 template <int Group>
-__global__ void __launch_bounds__(64 * Group) far_attention_kernel(AttentionArgs a) {
+__global__ void __launch_bounds__(64 * Group, kFarBlocks) far_attention_kernel(AttentionArgs a) {
     constexpr int kThreads = 64 * Group;
     constexpr int kWords   = 2 * kFarKeys * (kD / 8); // uint4 words of a K and V tile
     constexpr int kPer     = (kWords + kThreads - 1) / kThreads;
@@ -1197,7 +1207,7 @@ __global__ void __launch_bounds__(64 * Group) far_attention_kernel(AttentionArgs
                 const std::int64_t scales_row = std::int64_t(sequence) * plane.scale_seq +
                                                 std::int64_t(kv_head) * plane.scale_head +
                                                 std::int64_t(slot) * plane.scale_row;
-                words[i] = chunk_word(plane, plane.codes + codes_row, plane.scales + scales_row, c);
+                words[i] = chunk_bits(plane, plane.codes + codes_row, plane.scales + scales_row, c);
             } else {
                 const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
                 words[i] = *reinterpret_cast<const uint4*>(cache + base +
@@ -1213,8 +1223,10 @@ __global__ void __launch_bounds__(64 * Group) far_attention_kernel(AttentionArgs
             const int matrix = w / (kFarKeys * (kD / 8));
             const int rest   = w % (kFarKeys * (kD / 8));
             const int r = rest / (kD / 8), c = rest % (kD / 8);
+            const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
             __half* to = matrix == 0 ? &k_s[buffer][r][c * 8] : &v_s[buffer][r][c * 8];
-            *reinterpret_cast<uint4*>(to) = words[i];
+            *reinterpret_cast<uint4*>(to) =
+                plane.coding != KvCoding::F16 ? chunk_decode(plane, words[i]) : words[i];
         }
     };
 
@@ -1425,7 +1437,8 @@ __global__ void __launch_bounds__(64 * Group) near_attention_kernel(AttentionArg
     near_range(a, g, far, lo, hi, rows_consecutive);
     const int p_g = a.rows.positions[g];
 
-    // The tile's K and V words, staged in registers while the block computes the tile before.
+    // The tile's K and V words (a plane's stored bits), staged in registers while the block
+    // computes the tile before.
     uint4 words[kPer];
     const auto fetch = [&](int k0) {
 #pragma unroll
@@ -1447,7 +1460,7 @@ __global__ void __launch_bounds__(64 * Group) near_attention_kernel(AttentionArg
                 const std::int64_t scales_row = std::int64_t(sequence) * plane.scale_seq +
                                                 std::int64_t(kv_head) * plane.scale_head +
                                                 std::int64_t(slot) * plane.scale_row;
-                words[i] = chunk_word(plane, plane.codes + codes_row, plane.scales + scales_row, c);
+                words[i] = chunk_bits(plane, plane.codes + codes_row, plane.scales + scales_row, c);
             } else {
                 const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
                 words[i] = *reinterpret_cast<const uint4*>(cache + base +
@@ -1455,8 +1468,8 @@ __global__ void __launch_bounds__(64 * Group) near_attention_kernel(AttentionArg
             }
         }
     };
-    // The staged words into shared memory, with the tile's keys and, where they are consecutive,
-    // its slice of the table: distances p_g - logical(k0) - 31 + c for c < 63.
+    // The staged words into shared memory (a plane's decoded), with the tile's keys and, where they
+    // are consecutive, its slice of the table: distances p_g - logical(k0) - 31 + c for c < 63.
     const auto put = [&](int k0) {
 #pragma unroll
         for (int i = 0; i < kPer; ++i) {
@@ -1465,8 +1478,10 @@ __global__ void __launch_bounds__(64 * Group) near_attention_kernel(AttentionArg
             const int matrix = w / (kFarKeys * (kD / 8));
             const int rest   = w % (kFarKeys * (kD / 8));
             const int r = rest / (kD / 8), c = rest % (kD / 8);
+            const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
             __half* to = matrix == 0 ? &sm.k[r][c * 8] : &sm.v[r][c * 8];
-            *reinterpret_cast<uint4*>(to) = words[i];
+            *reinterpret_cast<uint4*>(to) =
+                plane.coding != KvCoding::F16 ? chunk_decode(plane, words[i]) : words[i];
         }
         const Rows& rows = a.rows;
         const int l0 = k0 >= rows.first ? rows.positions[k0 - rows.first] : k0;

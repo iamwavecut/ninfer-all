@@ -10,6 +10,8 @@
 namespace ninfer::models::inkling2 {
 
 namespace kv = ::ninfer::ops::kv128;
+using ::ninfer::ops::kv128::chunk_bits;
+using ::ninfer::ops::kv128::chunk_decode;
 using ::ninfer::ops::kv128::chunk_word;
 
 } // namespace ninfer::models::inkling2
