@@ -1,10 +1,11 @@
 // A wide call's routed experts, by default at DeepSeek-V4.1-Flash's shapes (a [gate; up] parent of
 // 2 x 2304 rows over 5120 inputs and a down projection of 5120 rows over 2304, six experts a token;
 // Qwen3.8-Flash-Next's are --hidden 2560 --width 640 --top-k 10 --experts 512), on the two routes a
-// call wider than eight tokens can take: the integer matrix kernel (quantize_moe_matrix_activation,
-// moe_matrix_product) and the vector kernel in groups of eight columns (quantize_vector_activation,
-// moe_vector_product). Each projection is timed alone, its activation's quantization included, over
-// random routes of each --tokens count to distinct experts (the routes' sort is outside the timing).
+// call can take: the integer matrix kernel (quantize_moe_matrix_activation, moe_matrix_product)
+// and the vector kernel in the models' column groups, one to eight columns a pass
+// (quantize_vector_activation, moe_vector_product). Each projection is timed alone, its
+// activation's quantization included, over random routes of each --tokens count to distinct
+// experts (the routes' sort is outside the timing).
 // The bytes are the active experts' weights, each read once. The products themselves are checked by
 // test_gguf_moe_iq1m (IQ1_M) and the models' tests.
 //
@@ -172,11 +173,13 @@ void run(const Format& format, const Shape& shape_of, int experts, int tokens, s
             bytes, 3, 20, 300);
         gguf::MoeOutput rows;
         rows.f32           = static_cast<float*>(out.p);
+        // The models' chunk: as many columns a pass as the call has tokens, up to eight.
+        const int chunk   = tokens <= 1 ? 1 : tokens <= 2 ? 2 : tokens <= 4 ? 4 : 8;
         const auto vector = bench::bench_loop(
             [&](cudaStream_t stream) {
                 gguf::quantize_vector_activation(xb, proj.k, columns, nullptr, vector_act.p, stream);
                 gguf::moe_vector_product(format.type, moe, routing, max_active, proj.column_group,
-                                         top_k, vector_act.p, columns, rows, 8, stream);
+                                         top_k, vector_act.p, columns, rows, chunk, stream);
             },
             bytes, 3, 20, 300);
         check(cudaDeviceSynchronize(), "products");
