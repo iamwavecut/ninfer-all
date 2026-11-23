@@ -54,8 +54,7 @@ import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
-from .gguf_blocks import (GGML_MXFP4, GGML_Q8_0, bf16_source, block_source, dequantize_blocks,
-                          dequantize_q8_0,
+from .gguf_blocks import (GGML_MXFP4, bf16_source, block_source, dequantize_blocks,
                           mxfp4_as_q8_0)
 from .methods import cast_direct, import_encoded
 from .resources import _dump_json, token_domain
@@ -278,19 +277,15 @@ def _load_resources(root: Path, vocab: int, overrides: dict):
 
 
 def _direct(gguf: GGUFFile, tensor: str, shape: tuple[int, ...]) -> LogicalSource:
-    """F32 as stored, BF16 and F16 widened exactly, Q8_0 blocks decoded exactly."""
+    """FP32 values: F32 as stored, BF16 and F16 widened exactly, and the ggml blocks of any stored
+    format decoded by `dequantize_blocks` (MiniPlus stores its sink and dynamic-tap projections in
+    Q8_0, other quantizers in Q4_K)."""
 
     info = gguf.info(tensor)
-    if info.type_id == GGML_Q8_0:
-        values = dequantize_q8_0(gguf.read_blocks(tensor))
-    elif info.type_name in ("F32", "BF16", "F16"):
+    if info.type_name in ("F32", "BF16", "F16"):
         values = gguf.read_direct(tensor).astype(np.float32)
     else:
-        # Vector-role params are usually F32/BF16/F16/Q8_0, but third-party quantizers
-        # may store them in other block formats (e.g. Q4_K for attn_sink_proj).
-        # Decode via the shared dequantizer so any GGUF block type is accepted.
-        values = np.asarray(dequantize_blocks(info.type_id, gguf.read_blocks(tensor)),
-                            dtype=np.float32)
+        values = dequantize_blocks(info.type_id, gguf.read_blocks(tensor)).numpy()
     if values.size != int(np.prod(shape)):
         raise ValueError(f"{tensor}: stored {info.shape}, expected {shape}")
     return array_source(torch.from_numpy(np.ascontiguousarray(values.reshape(shape))), tensor)
@@ -640,7 +635,8 @@ def _vision(model, vision: GGUFFile, vc: dict, config: dict) -> None:
 
 def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict) -> None:
     """The drafter's matrices as stored (Q8_0 in the release's GGUF), its vectors FP32, the Markov
-    embedding BF16 as stored and the fusion weights of its feature mixtures FP32."""
+    embedding BF16 as stored (a source BF16 does not hold is refused) and the fusion weights of its
+    feature mixtures FP32."""
 
     from .model import Parameter
 
@@ -654,7 +650,8 @@ def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict) -> None:
         model.add(Parameter(name, shape, _matrix(dspark, tensor, shape), inputs=tuple(inputs)))
 
     def vector(name, tensor, shape, stored="fp32"):
-        model.add(Parameter(name, shape, _direct(dspark, tensor, shape), direct_format=stored))
+        read = _exact_bf16 if stored == "bf16" else _direct
+        model.add(Parameter(name, shape, read(dspark, tensor, shape), direct_format=stored))
 
     vector("dspark/fuse", "dspark_fuse.weight", (layers + 1, taps))
     vector("dspark/context_norm", "dspark_norm.weight", (h,))
