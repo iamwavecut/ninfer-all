@@ -4,6 +4,7 @@
 #include "models/inkling2/config.h"
 #include "models/inkling2/kv_codec.cuh"
 #include "models/inkling2/situ.h"
+#include "ops/common/device_tier.h"
 #include "ops/common/mma.cuh"
 
 #include <cublas_v2.h>
@@ -715,14 +716,26 @@ __global__ void kv_post_kernel(KvArgs a) {
 }
 
 // ---- Attention ----------------------------------------------------------------------------------
-// Heads of 128 values with up to four query heads per key and value head.
-//   Prompt chunks and uniform (DSpark) blocks: attention_kernel, block (eight rows, kv head[,
-//   split]) of eight warps, warp r row r, every head. A tile's 16 keys and values pass through
-//   shared memory once for the block; lane l holds dimensions [4 l, 4 l + 4) of the query.
-//   Decode and verification: decode_attention_kernel on tensor cores (below), block (row group,
-//   kv head, split). A group is one row or, with a.row_group, up to that many consecutive rows of
-//   one sequence (row_group_bounds); each row reads the keys of its own split as a group of one
-//   row does.
+// Whether the image being compiled is Volta's. Volta runs decode and verification rows on the SIMT
+// kernel (attention_kernel<1>): with its m16n8 MMAs emulated (sm70_emulation.cuh) the tensor-core
+// kernel was 1.3 to 1.9 times slower on a Tesla V100. Each image carries code for its own route.
+#if defined(NINFER_SM70_DEVICE)
+constexpr bool kVoltaImage = true;
+#else
+constexpr bool kVoltaImage = false;
+#endif
+
+// Heads of 128 values with up to four query heads per key and value head. A tile's 16 keys and
+// values pass through shared memory once for the block; lane l holds dimensions [4 l, 4 l + 4) of
+// the query, and a warp keeps the online softmax of its (row, head) pairs.
+//   Prompt chunks and uniform (DSpark) blocks (kRows 8): block (eight rows, kv head[, split]) of
+//   eight warps, warp r row r, every head.
+//   Decode and verification rows on Volta (kRows 1): block (row group, kv head, split) of four
+//   warps a row, warp 4 i + h row i's head h. A group is one row or, with a.row_group, up to that
+//   many consecutive rows of one sequence (row_group_bounds), for which the tiles pass through
+//   shared memory once; each row reads the tiles of its own split as a group of one row does. The
+//   other tiers run these rows on tensor cores (decode_attention_kernel, below), and their images
+//   carry no code for kRows 1.
 constexpr int kTile = 16;
 constexpr int kSplitTiles = 4; // the fewest tiles a split reads
 
@@ -838,31 +851,62 @@ __device__ __forceinline__ bool split_keys(const AttentionArgs& a, int t0, int t
 // kFar: a prompt chunk whose far field far_attention_kernel computed (a.far): its rows start from
 // those states and read the keys after the far field. A separate instantiation keeps the other
 // calls' kernels free of that code.
-template <bool kFar = false>
-__global__ void __launch_bounds__(256) attention_kernel(AttentionArgs a) {
-    constexpr int kRows = 8, kWarps = 8;
+template <int kRows, bool kFar = false>
+__global__ void __launch_bounds__(kRows == 1 ? 128 * kMaxRowGroup : 256)
+    attention_kernel(AttentionArgs a) {
+    constexpr int kWarps = kRows == 1 ? 4 * kMaxRowGroup : 8;
+#if defined(__CUDA_ARCH__)
+    if constexpr (kRows == 1 && !kVoltaImage) { return; } // Volta's route only
+#endif
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int group   = a.query_heads / a.kv_heads;
     const int kv_head = blockIdx.y;
-    const int t0 = blockIdx.x * kRows;
-    const int t1 = min(a.rows.tokens, t0 + kRows);
-    const int t       = t0 + warp;
-    const bool row_ok = t < t1;
-    const int heads   = group;
-    const int head0   = kv_head * group;
+    int t0 = 0, t1 = 0;
+    if constexpr (kRows == 1) {
+        if (!row_group_bounds(a.rows, a.row_group, int(blockIdx.x), t0, t1)) { return; }
+    } else {
+        t0 = blockIdx.x * kRows;
+        t1 = min(a.rows.tokens, t0 + kRows);
+    }
+    const int t       = kRows == 1 ? t0 + warp / 4 : t0 + warp;
+    const int head_w  = kRows == 1 ? warp % 4 : 0;
+    const bool in_row = t < t1;
+    const bool row_ok = in_row && (kRows != 1 || head_w < group);
+    const int heads   = kRows == 1 ? 1 : group;
+    const int head0   = kv_head * group + head_w;
     // A prompt chunk of a full visit with its far field done: the keys after it.
     int far = 0;
     if constexpr (kFar) { far = far_end(a, t0 / kFarRows * kFarRows); }
     const int split = int(blockIdx.z);
-    // The rows' keys [begin, end) of the split: the tiles the block loads.
-    int begin = 0, end = 0;
-    const bool active = split_keys(a, t0, t1, far, a.uniform, split, begin, end);
-    if (!active) { return; }
-    const int first = begin, last = end;
+    // The row's keys [begin, end) of its split (every row's, kRows 8), and the tiles [first, last)
+    // the block loads for its rows.
+    int begin = 0, end = 0, first = INT_MAX, last = 0;
+    bool active = false;
+    if constexpr (kRows == 1) {
+        active = in_row && split_keys(a, t, t + 1, far, true, split, begin, end);
+        bool any = false;
+        for (int r = t0; r < t1; ++r) {
+            int b = 0, e = 0;
+            if (split_keys(a, r, r + 1, far, true, split, b, e)) {
+                any = true;
+                if (b < e) {
+                    first = min(first, b);
+                    last  = max(last, e);
+                }
+            }
+        }
+        if (!any) { return; }
+    } else {
+        active = split_keys(a, t0, t1, far, a.uniform, split, begin, end);
+        if (!active) { return; }
+        first = begin;
+        last  = end;
+    }
 
     __shared__ __align__(16) __half k_s[kTile][kD];
     __shared__ __align__(16) __half v_s[kTile][kD];
-    constexpr int kRelHeads = kMaxGroup;
+    // A decode warp holds one head's relative features; a prompt warp every head's.
+    constexpr int kRelHeads = kRows == 1 ? 1 : kMaxGroup;
     __shared__ float r_s[kWarps][kRelHeads][kRel];
 
     float q_r[kMaxGroup][4], acc[kMaxGroup][4], m[kMaxGroup], l[kMaxGroup];
@@ -1409,6 +1453,7 @@ struct Codings {
 template <KvCoding KC, KvCoding VC, int kRows>
 __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGroup / kRows))
     decode_attention_kernel(AttentionArgs a) {
+    if constexpr (kVoltaImage) { return; } // Volta runs attention_kernel<1>
     using KR = RowChunk<KC>;
     using VR = RowChunk<VC>;
     // A lane's K chunks 4t..4t+3 share a scale, and so do its V chunks 2g, 2g + 1.
@@ -2563,7 +2608,7 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
         if (args.rows.chunk || t > 8 || (args.splits > 1 && args.partial == nullptr)) {
             throw std::invalid_argument("inkling2 attention: a uniform block of 1..8 decode rows");
         }
-        attention_kernel<><<<dim3(1, args.kv_heads, args.splits), 256, 0, stream>>>(args);
+        attention_kernel<8><<<dim3(1, args.kv_heads, args.splits), 256, 0, stream>>>(args);
         check_launch("attention");
         if (args.splits > 1) {
             attention_combine_kernel<<<dim3(args.query_heads, t, 1), kCombineThreads, 0, stream>>>(args);
@@ -2587,10 +2632,10 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
             check_launch("far_attention");
         }
         if (args.far != nullptr) {
-            attention_kernel<true><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(
+            attention_kernel<8, true><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(
                 args);
         } else {
-            attention_kernel<><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(args);
+            attention_kernel<8><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(args);
         }
         check_launch("attention");
         return;
@@ -2600,6 +2645,19 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
         throw std::invalid_argument("inkling2 attention: row groups of 1..4 rows, a full visit's");
     }
     const int groups = args.row_group == 1 || args.row_groups == 0 ? t : std::min(t, args.row_groups);
+#if defined(NINFER_TIER_VOLTA)
+    if (ops::current_device_volta()) {
+        attention_kernel<1><<<dim3(groups, args.kv_heads, args.splits), 128 * args.row_group, 0,
+                              stream>>>(args);
+        check_launch("attention");
+        if (args.splits > 1) {
+            attention_combine_kernel<<<dim3(args.query_heads, t, 1), kCombineThreads, 0, stream>>>(
+                args);
+            check_launch("attention_combine");
+        }
+        return;
+    }
+#endif
     // Single rows (decode) take one row an octet; verification groups two.
     const int rows_per_octet = args.row_group == 1 ? 1 : 2;
     const int octets = (args.row_group + rows_per_octet - 1) / rows_per_octet;
