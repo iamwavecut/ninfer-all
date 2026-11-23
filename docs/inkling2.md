@@ -55,12 +55,19 @@ tokenization, the chat template, output parsing and the serving protocols.
   row of a group of 32: F16 queries and probabilities, keys and values as stored (a plane format's
   chunks decoded to F16), FP32 scores, softmax and sums. The SIMT kernel starts each row from that
   state and reads the nearer keys with their relative bias. A full visit's decode and verification
-  rows split their keys into about 32 blocks a multiprocessor (at most 512, each at least 64 keys),
-  the same split for every row of every call; a verification call's rows of one sequence go up to
-  four to a block, which reads each key tile once for them, and each row reads the tiles of its own
-  split, so a verification row computes what a decode step computes. On an RTX 3090 a
-  120,103-token prompt prefills at 1.52k tok/s instead of 501 and then decodes at 67.1 tok/s
-  instead of 46.8 ([measurements](#long-contexts)).
+  rows also run on tensor cores: four warps read a split's 16-key tiles in turn, keys and values
+  decoded from their stored format straight into the products' operands, and each query and
+  probability enters them as an F16 value and its remainder times 2^12 (about 22 significant
+  bits), with FP32 scores, softmax and sums. A row's keys split into about two blocks a
+  multiprocessor (at most 512, each at least 64 keys), the same split for every row of every call;
+  a verification call's rows of one sequence go up to four to a block, two to each set of four
+  warps, which read each key tile once for them, and each row reads the tiles of its own split.
+  Every product and sum the kernel rounds is an explicit operation, so the compiler cannot fuse a
+  block's second row differently from a decode row: a verification row computes the bits a decode
+  step computes. Volta, whose tensor-core products are emulated, keeps the SIMT kernel and about 32
+  blocks a multiprocessor. On an RTX 3090 a 120,103-token prompt prefills at 1.52k tok/s instead of
+  501, and after 114,754 tokens decode runs at 86.1 tok/s instead of 68.6 with the SIMT decode
+  kernel ([measurements](#long-contexts)).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens, prefix reuse across turns and requests with host-memory images
   ([below](#prefix-reuse)), branched reads for [typed decisions](serving.md#typed-decisions) and
@@ -353,6 +360,46 @@ After 120,103 tokens the request decodes plainly most of the time: 70.4 against 
 of plain decoding cost 0.5% and 1.1%; the ungated runs spread by 0.5, 1.0 and 0.7 tok/s at the
 three lengths. The text equals `--spec none`'s in every run.
 
+The decode and verification attention on tensor cores, November 23, 2026: `ninfer-serve
+--max-context 131072`, MXFP8 KV, one greedy request of 256 tokens after each of three fixed
+prompts, one run each, with DSpark gated as above; the build before it (release 2026-11-22.6 on
+the RTX 3090, master 3f82067 built alike on the RTX 5090) against the build with it. The server's
+own decode rates, in tok/s:
+
+| Card | Prompt tokens | `--spec none`, before | `--spec none` | DSpark, before | DSpark |
+|---|---:|---:|---:|---:|---:|
+| RTX 3090 (370 W, PCIe 4.0 x16) | 35 | 105.9 | 110.8 | 105.5 | 109.5 |
+| | 32,070 | 90.8 | 99.9 | 100.6 | 121.7 |
+| | 114,754 | 68.6 | 86.1 | 71.3 | 97.7 |
+| RTX 5090 (600 W, PCIe 3.0 x16) | 35 | 168.1 | 179.7 | 186.4 | 192.9 |
+| | 32,070 | 152.9 | 164.1 | 205.1 | 243.1 |
+| | 114,754 | 129.7 | 144.3 | 165.6 | 190.4 |
+
+Prompt chunks keep their kernels, and prefill stayed within 1% (after 114,754 tokens 1.31k against
+1.32k tok/s on the RTX 3090, whose host also ran other tenants' jobs at a load average of about
+50). DSpark's text equals `--spec none`'s in both builds after every prompt on both cards, and so
+does the CLI's after 32,070 tokens with each KV format (`mxfp8`, `bf16`, `int8`, `rk8v4`, `rk4v4`)
+on the RTX 5090; the text itself changed with the kernel's rounding. With `--spec none` after
+32,070 tokens the CLI on the RTX 3090 decoded at 99.7 tok/s against 90.6 with `int8`, 101.6
+against 90.7 with `rk8v4`, 101.5 against 90.5 with `rk4v4` and 95.6 against 90.1 with `bf16`.
+
+The kernel alone, in µs, against the SIMT kernel at the split each uses: random caches at the
+model's 8 KV heads and 24 query heads, 114,754 keys (the F16 window ring: 1,024 keys, 16 splits):
+
+| GPU | Splits | MXFP8 decode | MXFP8, four verification rows | F16 decode | F16 window ring |
+|---|---|---:|---:|---:|---:|
+| Quadro RTX 6000 | 288 → 18 | 1,083.5 → 572.6 | 3,054 → 1,326 | 1,003 → 916 | 25.1 → 20.3 |
+| RTX 3090 | 328 → 20 | 625 → 294 | 1,861 → 689 | 605 → 545 | 21.9 → 12.0 |
+| RTX 4090 | 512 → 32 | 324.8 → 271.0 | 873 → 332 | 556.5 → 507.7 | 15.5 → 9.4 |
+| RTX 5090 | 512 → 42 | 207.0 → 158.1 | 458 → 236 | 329.7 → 290.5 | 14.4 → 10.3 |
+
+These are the kernel's first form, whose products and sums the compiler could fuse; with every
+rounding explicit it took 293.4, 689.4, 544.9 and 12.6 µs on the RTX 3090 and 158.5, 240.0, 289.8
+and 10.2 µs on the RTX 5090. Against an FP64 oracle both kernels' outputs have the same error (relative RMS 1.705e-3 with
+MXFP8 after 114,754 keys, mostly the BF16 output's rounding). On a Tesla V100, whose tensor-core
+products are emulated, the tensor-core kernel took 1,914 µs against the SIMT kernel's 1,235
+(MXFP8) and 1,624 against 841 (F16), so Volta keeps the SIMT kernel.
+
 ### APEX-I MiniPlus
 
 IsValorum's APEX-I MiniPlus V2.1 (12.8 GiB with its Q8_0 tower and the DSpark drafter) on a rented
@@ -556,9 +603,11 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
   oracles at Inkling 2 Mini's shapes: the depth mixes, the controllers, the attention's clips,
   convolutions, relative bias and sinks, the residual updates, routing and SiTU; the split rows,
   the batched controller products and the sorted route against their one-block forms bit for bit;
-  the CPU's expert products against the GPU's. `ninfer_inkling2_dspark_kernels_test` qualifies the
-  drafter's kernels (its uniform-block attention over window rings and full caches, its mixes,
-  rotations, the recurrent head's steps, ties to the lower id).
+  verification rows of two to four positions against decode rows bit for bit (FP32 partials of
+  every split and the outputs) at every position of two spans, 200 positions with 16 splits and 48
+  with one; the CPU's expert products against the GPU's. `ninfer_inkling2_dspark_kernels_test`
+  qualifies the drafter's kernels (its uniform-block attention over window rings and full caches,
+  its mixes, rotations, the recurrent head's steps, ties to the lower id).
   `ninfer_inkling2_vision_kernels_test` qualifies the tower's kernels.
 - **Against an FP64 forward.** `tools/reference/inkling2.py` runs the model in FP64 over the GGUF's
   exactly decoded blocks. On 1,150 WikiText tokens (past the 1,024-position window) NInfer-all

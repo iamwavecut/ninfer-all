@@ -20,6 +20,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/weight_input.h"
+#include "ops/common/device_tier.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
 
@@ -474,15 +475,20 @@ struct Executor::Impl {
             kv_bytes += 2 * staging;
         }
         // A full visit's decode or verification row splits its keys so that one row's blocks
-        // number about 32 per multiprocessor, at most 512 (the combine's capacity); the kernel
-        // uses fewer while the keys are short (active_splits). Every row of every call splits
-        // alike, so a verification row computes what a decode step at its position computes. On
-        // an RTX 3090 after 120K tokens 32 (328 splits) decoded at 67.1 tok/s, 16 at 66.7, 64
-        // (512) at 67.0 but 1.2% slower after 32K, and 128 splits at 65.5; 2 a multiprocessor
-        // decoded 4-40% slower.
-        const int sms         = device.multiprocessor_count();
+        // number about two per multiprocessor on tensor cores, at most 512 (the combine's
+        // capacity); the kernel uses fewer while the keys are short (active_splits). Every row of
+        // every call splits alike, so a verification row computes what a decode step at its
+        // position computes. On an RTX 3090 (82 multiprocessors, 8 KV heads) the tensor-core
+        // kernel read 114,754 MXFP8 keys in 294 us with 20 splits, 297 with 30, 328 with 21 (some
+        // multiprocessors three blocks), 349 with 41 and 434 with 10; four verification rows took
+        // 689 us with 20, 688 with 10 and 694 with 30; after 32,070 keys 20 splits took 94 us and
+        // 41 took 110. Volta's SIMT kernel keeps about 32 blocks a multiprocessor.
+        const int sms = device.multiprocessor_count();
+        const int kv_divisor = std::max(1, kv_heads);
         decode_splits_full =
-            std::clamp((32 * sms + kv_heads - 1) / std::max(1, kv_heads), 1, 512);
+            ops::kBuildVolta && ops::device_tier(device.rank(0).device) == ops::DeviceTier::Volta
+                ? std::clamp((32 * sms + kv_divisor - 1) / kv_divisor, 1, 512)
+                : std::clamp(2 * sms / kv_divisor, 1, 512);
         decode_splits_sliding = 16;
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
         d_tokens    = DeviceBuffer(rows * 4);
