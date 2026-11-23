@@ -2190,7 +2190,10 @@ private:
                 const std::uint32_t accepted = output_tokens[row];
                 if (!cancelled[row]) {
                     request->budget->commit(accepted);
-                    if (decode_round) { Scheduling::consume_service_work(*request, accepted); }
+                    // A banned-word rewind to this round's first token keeps none of its tokens.
+                    if (decode_round && accepted != 0) {
+                        Scheduling::consume_service_work(*request, accepted);
+                    }
                 }
                 auto published = commit_output(*request);
                 auto timing    = record_committed_output(request, accepted);
