@@ -948,6 +948,314 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 : 256) attention_kernel(Atten
     }
 }
 
+// ---- Tensor-core prompt attention ---------------------------------------------------------------
+// One block is 64 prompt rows of one KV head (three query heads, four warps each): QK and PV run on
+// mma.sync m16n8k16, K/V stream through shared memory in 32-key tiles, and the online softmax stays
+// in registers. This is the prompt route for a single-sequence chunk; branched or batched chunks
+// keep the scalar kernel above.
+constexpr int kPromptRows = 64, kPromptWarps = 12, kPromptThreads = kPromptWarps * 32;
+constexpr int kPromptKeys = 32, kPromptLd = kD + 8;
+constexpr float kPromptLog2e = 1.4426950408889634f;
+
+struct PromptTile {
+    __half k[kPromptKeys][kPromptLd];
+    __half v[kPromptKeys][kPromptLd];
+};
+
+__device__ __forceinline__ unsigned prompt_smem_u32(const void* p) {
+    return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+__device__ __forceinline__ void prompt_ldsm_x4(unsigned& r0, unsigned& r1, unsigned& r2,
+                                               unsigned& r3, const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(prompt_smem_u32(p)));
+}
+__device__ __forceinline__ void prompt_ldsm_x4_t(unsigned& r0, unsigned& r1, unsigned& r2,
+                                                 unsigned& r3, const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(prompt_smem_u32(p)));
+}
+__device__ __forceinline__ void prompt_mma16816(float (&c)[4], unsigned a0, unsigned a1,
+                                                unsigned a2, unsigned a3, unsigned b0,
+                                                unsigned b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ unsigned prompt_pack_h2(float lo, float hi) {
+    const __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const unsigned*>(&h);
+}
+__device__ __forceinline__ float prompt_quad_max(float v) {
+    v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFFu, v, 1));
+    return fmaxf(v, __shfl_xor_sync(0xFFFFFFFFu, v, 2));
+}
+__device__ __forceinline__ float prompt_quad_sum(float v) {
+    v += __shfl_xor_sync(0xFFFFFFFFu, v, 1);
+    return v + __shfl_xor_sync(0xFFFFFFFFu, v, 2);
+}
+__device__ __forceinline__ void prompt_store_bf16x2(__nv_bfloat16* p, float2 v) {
+    const __nv_bfloat162 h = __floats2bfloat162_rn(v.x, v.y);
+    *reinterpret_cast<unsigned*>(p) = *reinterpret_cast<const unsigned*>(&h);
+}
+
+__device__ __forceinline__ void prompt_load_tile(const AttentionArgs& a, PromptTile& tile,
+                                                 int kvh, int k0, int lo, int hi, int tid) {
+    const int sequence = a.rows.sequence;
+    const std::int64_t base = std::int64_t(sequence) * a.seq_stride +
+                              std::int64_t(kvh) * a.head_stride;
+    constexpr int kChunks = kPromptKeys * (kD / 8);
+    for (int c = tid; c < 2 * kChunks; c += kPromptThreads) {
+        const bool isv = c >= kChunks;
+        const int rem = isv ? c - kChunks : c;
+        const int j = rem / (kD / 8), col = (rem % (kD / 8)) * 8;
+        const int p = k0 + j;
+        uint4 word = make_uint4(0, 0, 0, 0);
+        if (p >= lo && p <= hi) {
+            const int slot = a.ring != 0 ? p % a.ring : p;
+            const KvPlaneView& plane = isv ? a.v_plane : a.k_plane;
+            if (plane.coding != KvCoding::F16) {
+                const std::int64_t codes_row = std::int64_t(sequence) * plane.code_seq +
+                                               std::int64_t(kvh) * plane.code_head +
+                                               std::int64_t(slot) * plane.code_row;
+                const std::int64_t scales_row = std::int64_t(sequence) * plane.scale_seq +
+                                                std::int64_t(kvh) * plane.scale_head +
+                                                std::int64_t(slot) * plane.scale_row;
+                word = chunk_word(plane, plane.codes + codes_row, plane.scales + scales_row,
+                                  col / 8);
+            } else {
+                const __half* cache = isv ? a.v_cache : a.k_cache;
+                word = *reinterpret_cast<const uint4*>(cache + base +
+                                                       std::int64_t(slot) * kD + col);
+            }
+        }
+        *reinterpret_cast<uint4*>(isv ? &tile.v[j][col] : &tile.k[j][col]) = word;
+    }
+}
+
+__global__ void __launch_bounds__(kPromptThreads, 1)
+attention_prompt_kernel(AttentionArgs a, int rows) {
+    __shared__ PromptTile tile;
+    __shared__ float r_s[kPromptWarps][16][kRel];
+
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int g = lane >> 2, tq = lane & 3;
+    const int kvh = blockIdx.y;
+    const int nh = a.query_heads;
+    const int i0 = (int) (gridDim.x - 1 - blockIdx.x) * kPromptRows;
+    const int head = kvh * 3 + w / 4;
+    const int jw = (w % 4) * 16;
+    const int ia = i0 + jw + g, ib = ia + 8;
+    const bool va = ia < rows, vb = ib < rows;
+    const int q0 = i0 + jw;
+    const int t0 = min(q0, rows - 1);
+    const int t1 = min(q0 + 16, rows) - 1;
+    const int pos_first = a.rows.positions[t0];
+    const int pos_last = t1 >= t0 ? a.rows.positions[t1] : pos_first;
+    const int block_last = min(rows, i0 + kPromptRows) - 1;
+    const int hi = physical(a.rows, block_last);
+    const int lo = a.window > 0 ? max(0, a.rows.positions[i0] - a.window + 1) : 0;
+
+    for (int idx = tid; idx < kPromptWarps * 16 * kRel; idx += kPromptThreads) {
+        const int ww = idx / (16 * kRel), rr = (idx / kRel) % 16, ii = idx % kRel;
+        const int t = i0 + (ww % 4) * 16 + rr;
+        const int h = kvh * 3 + ww / 4;
+        r_s[ww][rr][ii] =
+            (t < rows && a.r != nullptr) ? a.r[(std::int64_t(t) * nh + h) * kRel + ii] : 0.0f;
+    }
+
+    uint32_t qf[kD / 16][4];
+    {
+        const float* qa = a.q + ((std::size_t) (va ? ia : 0) * nh + head) * kD + 2 * tq;
+        const float* qb = a.q + ((std::size_t) (vb ? ib : 0) * nh + head) * kD + 2 * tq;
+#pragma unroll
+        for (int kk = 0; kk < kD / 16; ++kk) {
+            const float2 x0 = *reinterpret_cast<const float2*>(qa + 16 * kk);
+            const float2 x1 = *reinterpret_cast<const float2*>(qb + 16 * kk);
+            const float2 x2 = *reinterpret_cast<const float2*>(qa + 16 * kk + 8);
+            const float2 x3 = *reinterpret_cast<const float2*>(qb + 16 * kk + 8);
+            qf[kk][0] = prompt_pack_h2(x0.x, x0.y);
+            qf[kk][1] = prompt_pack_h2(x1.x, x1.y);
+            qf[kk][2] = prompt_pack_h2(x2.x, x2.y);
+            qf[kk][3] = prompt_pack_h2(x3.x, x3.y);
+        }
+    }
+
+    float o[kD / 8][4];
+#pragma unroll
+    for (int n = 0; n < kD / 8; ++n) {
+        o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    }
+    float m_a = -INFINITY, m_b = -INFINITY, l_a = 0.0f, l_b = 0.0f;
+    const float scale2 = a.scale * kPromptLog2e;
+
+    for (int k0 = lo / kPromptKeys * kPromptKeys; k0 <= hi; k0 += kPromptKeys) {
+        __syncthreads();
+        prompt_load_tile(a, tile, kvh, k0, lo, hi, tid);
+        __syncthreads();
+
+        const bool whole = (k0 + kPromptKeys - 1 <= pos_first) &&
+                           (a.window <= 0 || k0 > pos_last - a.window);
+        const bool skip = (k0 > pos_last) ||
+                          (a.window > 0 && k0 + kPromptKeys - 1 <= pos_first - a.window);
+        if (skip) { continue; }
+
+        float s[kPromptKeys / 8][4];
+#pragma unroll
+        for (int n = 0; n < kPromptKeys / 8; ++n) {
+            s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+        }
+#pragma unroll
+        for (int kk = 0; kk < kD / 16; ++kk) {
+#pragma unroll
+            for (int n = 0; n < kPromptKeys / 8; n += 2) {
+                unsigned b0, b1, b2, b3;
+                prompt_ldsm_x4(b0, b1, b2, b3,
+                               &tile.k[n * 8 + (lane & 7) + ((lane >> 4) << 3)]
+                                     [kk * 16 + ((lane >> 3) & 1) * 8]);
+                prompt_mma16816(s[n], qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], b0, b1);
+                prompt_mma16816(s[n + 1], qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], b2, b3);
+            }
+        }
+
+        const bool far = pos_first - (k0 + kPromptKeys - 1) >= a.extent;
+#pragma unroll
+        for (int n = 0; n < kPromptKeys / 8; ++n) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int row = g + (e >> 1) * 8;
+                const int t = q0 + row;
+                const int col = n * 8 + 2 * tq + (e & 1);
+                const int p = k0 + col;
+                int dist = 0;
+                bool vis = false;
+                if (t < rows && p >= lo && p <= hi) {
+                    if (whole) {
+                        vis = true;
+                        dist = a.rows.positions[t] - p;
+                    } else {
+                        vis = sees(a, t, p, dist);
+                    }
+                }
+                float sc = -INFINITY;
+                if (vis) {
+                    sc = s[n][e] * scale2;
+                    if (!far && a.table != nullptr && dist < a.extent) {
+                        const float* brow = a.table + std::size_t(dist) * kRel;
+                        float b = 0.0f;
+#pragma unroll
+                        for (int i = 0; i < kRel; ++i) { b += r_s[w][row][i] * brow[i]; }
+                        sc += b * kPromptLog2e;
+                    }
+                }
+                s[n][e] = sc;
+            }
+        }
+
+        float mx_a = m_a, mx_b = m_b;
+#pragma unroll
+        for (int n = 0; n < kPromptKeys / 8; ++n) {
+            mx_a = fmaxf(mx_a, fmaxf(s[n][0], s[n][1]));
+            mx_b = fmaxf(mx_b, fmaxf(s[n][2], s[n][3]));
+        }
+        mx_a = prompt_quad_max(mx_a);
+        mx_b = prompt_quad_max(mx_b);
+        const float ca = mx_a == -INFINITY ? 1.0f : exp2f(m_a - mx_a);
+        const float cb = mx_b == -INFINITY ? 1.0f : exp2f(m_b - mx_b);
+        m_a = mx_a;
+        m_b = mx_b;
+        float ps_a = 0.0f, ps_b = 0.0f;
+#pragma unroll
+        for (int n = 0; n < kPromptKeys / 8; ++n) {
+            s[n][0] = s[n][0] == -INFINITY ? 0.0f : exp2f(s[n][0] - m_a);
+            s[n][1] = s[n][1] == -INFINITY ? 0.0f : exp2f(s[n][1] - m_a);
+            s[n][2] = s[n][2] == -INFINITY ? 0.0f : exp2f(s[n][2] - m_b);
+            s[n][3] = s[n][3] == -INFINITY ? 0.0f : exp2f(s[n][3] - m_b);
+            ps_a += s[n][0] + s[n][1];
+            ps_b += s[n][2] + s[n][3];
+        }
+        l_a = l_a * ca + ps_a;
+        l_b = l_b * cb + ps_b;
+#pragma unroll
+        for (int n = 0; n < kD / 8; ++n) {
+            o[n][0] *= ca;
+            o[n][1] *= ca;
+            o[n][2] *= cb;
+            o[n][3] *= cb;
+        }
+
+        unsigned pf[kPromptKeys / 16][4];
+#pragma unroll
+        for (int j = 0; j < kPromptKeys / 16; ++j) {
+            pf[j][0] = prompt_pack_h2(s[2 * j][0], s[2 * j][1]);
+            pf[j][1] = prompt_pack_h2(s[2 * j][2], s[2 * j][3]);
+            pf[j][2] = prompt_pack_h2(s[2 * j + 1][0], s[2 * j + 1][1]);
+            pf[j][3] = prompt_pack_h2(s[2 * j + 1][2], s[2 * j + 1][3]);
+        }
+#pragma unroll
+        for (int n = 0; n < kD / 8; n += 2) {
+#pragma unroll
+            for (int j = 0; j < kPromptKeys / 16; ++j) {
+                unsigned b0, b1, b2, b3;
+                prompt_ldsm_x4_t(b0, b1, b2, b3,
+                                 &tile.v[j * 16 + (lane & 15)][n * 8 + (lane >> 4) * 8]);
+                prompt_mma16816(o[n], pf[j][0], pf[j][1], pf[j][2], pf[j][3], b0, b1);
+                prompt_mma16816(o[n + 1], pf[j][0], pf[j][1], pf[j][2], pf[j][3], b2, b3);
+            }
+        }
+    }
+
+    l_a = prompt_quad_sum(l_a);
+    l_b = prompt_quad_sum(l_b);
+    const float sink_a = (va && a.sinks != nullptr)
+                             ? a.sinks[std::int64_t(ia) * a.sink_stride + head] * kPromptLog2e
+                             : -INFINITY;
+    const float sink_b = (vb && a.sinks != nullptr)
+                             ? a.sinks[std::int64_t(ib) * a.sink_stride + head] * kPromptLog2e
+                             : -INFINITY;
+    const float ma = fmaxf(m_a, sink_a), mb = fmaxf(m_b, sink_b);
+    const float fa = m_a == -INFINITY ? 0.0f : exp2f(m_a - ma);
+    const float fb = m_b == -INFINITY ? 0.0f : exp2f(m_b - mb);
+    const float inv_a = ma == -INFINITY ? 0.0f : fa / (l_a * fa + exp2f(sink_a - ma));
+    const float inv_b = mb == -INFINITY ? 0.0f : fb / (l_b * fb + exp2f(sink_b - mb));
+
+    const int width = nh * kD;
+#pragma unroll
+    for (int n = 0; n < kD / 8; ++n) {
+        const int col = n * 8 + 2 * tq;
+        if (va) {
+            float2 y = make_float2(o[n][0] * inv_a, o[n][1] * inv_a);
+            if (a.gate != nullptr) {
+                const float2 gx = *reinterpret_cast<const float2*>(
+                    a.gate + std::int64_t(ia) * a.gate_stride + head * kD + col);
+                y.x *= sigmoidf(gx.x);
+                y.y *= sigmoidf(gx.y);
+            }
+            prompt_store_bf16x2(a.out + std::int64_t(ia) * width + head * kD + col, y);
+        }
+        if (vb) {
+            float2 y = make_float2(o[n][2] * inv_b, o[n][3] * inv_b);
+            if (a.gate != nullptr) {
+                const float2 gx = *reinterpret_cast<const float2*>(
+                    a.gate + std::int64_t(ib) * a.gate_stride + head * kD + col);
+                y.x *= sigmoidf(gx.x);
+                y.y *= sigmoidf(gx.y);
+            }
+            prompt_store_bf16x2(a.out + std::int64_t(ib) * width + head * kD + col, y);
+        }
+    }
+}
+
+void attention_prompt(const AttentionArgs& a, cudaStream_t stream) {
+    const int rows = a.rows.tokens;
+    const dim3 grid(static_cast<unsigned>((rows + kPromptRows - 1) / kPromptRows),
+                    static_cast<unsigned>(a.kv_heads), 1);
+    attention_prompt_kernel<<<grid, kPromptThreads, 0, stream>>>(a, rows);
+    check_launch("attention_prompt");
+}
+
 // Block (head, row): merges the splits of one query head and its sink, thread d the output's
 // dimension d. Every split counts with weight exp(m_s - M), the sink as a key without a value:
 // M = max(max_s m_s, sink), l = sum_s l_s exp(m_s - M) + exp(sink - M).
@@ -1832,6 +2140,14 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
     }
     if (args.rows.chunk) {
         if (args.splits != 1) { throw std::invalid_argument("inkling2 attention: chunk splits"); }
+        // A single-sequence chunk with three query heads per KV head takes the tensor-core prompt
+        // route; branched and batched chunks keep the scalar kernel.
+        if (args.out != nullptr && args.out_q.qs == nullptr &&
+            args.query_heads == 3 * args.kv_heads && args.rows.starts == nullptr &&
+            args.rows.sequences == nullptr) {
+            attention_prompt(args, stream);
+            return;
+        }
         attention_kernel<8><<<dim3(blocks_for(t, 8), args.kv_heads, 1), 256, 0, stream>>>(args);
         check_launch("attention");
         return;
