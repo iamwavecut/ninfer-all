@@ -54,16 +54,18 @@ tokenization, the chat template, output parsing and the serving protocols.
 - **Long contexts.** A prompt chunk of a full-attention visit first computes, on tensor cores, its
   rows' attention over the keys at least 1,024 positions (the relative table's extent) before every
   row of a group of 32: F16 queries and probabilities, keys and values as stored (a plane format's
-  chunks decoded to F16), FP32 scores, softmax and sums. Every visit's prompt chunk then reads the
-  nearer keys on tensor cores too (a full visit's rows starting from that state, a sliding-window
-  visit's over its window), 32 rows to a block: each query enters the products as an F16 value and
-  its remainder times 2^12, and the relative bias comes from products of the rows' relative
-  features and the table rows of the distances a 32-key tile spans, split the same way (a sum of
-  FP32 products for each score where a chunk's positions are not consecutive, as with branches),
-  with FP32 masks, softmax and sums and F16 probabilities. A full visit's decode and verification
-  rows also run on tensor cores: four warps read a split's 16-key tiles in turn, keys and values
-  decoded from their stored format straight into the products' operands, and each query and
-  probability enters them as an F16 value and its remainder times 2^12 (about 22 significant
+  chunks decoded to F16), FP32 scores, softmax and sums, two blocks a multiprocessor (one on
+  Turing). A plane's next tile waits in registers as its stored bits and is decoded as it enters
+  shared memory, so its loads overlap the current tile's products. Every visit's prompt chunk then
+  reads the nearer keys on tensor cores too (a full visit's rows starting from that state, a
+  sliding-window visit's over its window), 32 rows to a block: each query enters the products as an
+  F16 value and its remainder times 2^12, and the relative bias comes from products of the rows'
+  relative features and the table rows of the distances a 32-key tile spans, split the same way (a
+  sum of FP32 products for each score where a chunk's positions are not consecutive, as with
+  branches), with FP32 masks, softmax and sums and F16 probabilities. A full visit's decode and
+  verification rows also run on tensor cores: four warps read a split's 16-key tiles in turn, keys
+  and values decoded from their stored format straight into the products' operands, and each query
+  and probability enters them as an F16 value and its remainder times 2^12 (about 22 significant
   bits), with FP32 scores, softmax and sums. A row's keys split into about two blocks a
   multiprocessor (at most 512, each at least 64 keys), the same split for every row of every call;
   a verification call's rows of one sequence go up to four to a block, two to each set of four
@@ -72,9 +74,9 @@ tokenization, the chat template, output parsing and the serving protocols.
   block's second row differently from a decode row: a verification row computes the bits a decode
   step computes. Volta, whose tensor-core products are emulated, keeps the SIMT kernels for decode
   rows (about 32 blocks a multiprocessor) and for the near field of prompt chunks. On an RTX 3090 a
-  114,754-token prompt prefills at 1.83k tok/s instead of 1.44k with the near field on the SIMT
-  kernel, and after 114,754 tokens decode runs at 86.1 tok/s instead of 68.6 with the SIMT decode
-  kernel ([measurements](#long-contexts)).
+  114,754-token prompt prefills at 2.13k tok/s instead of 1.44k with the near field on the SIMT
+  kernel and the far field one block a multiprocessor, and after 114,754 tokens decode runs at 86.1
+  tok/s instead of 68.6 with the SIMT decode kernel ([measurements](#long-contexts)).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens, prefix reuse across turns and requests with host-memory images
   ([below](#prefix-reuse)), branched reads for [typed decisions](serving.md#typed-decisions) and
@@ -425,6 +427,27 @@ Both builds give the same first tokens after both prompts on both cards. On the 
 16,384-token windows at an 8,192-token stride) is 1.739533 against 1.739363 on the RTX 3090
 (+0.010%) and 1.739307 against 1.739413 on the RTX PRO 4500 (-0.006%); `ninfer-perplexity` scored
 them in 68.1 s against 84.5 s and in 46.8 s against 54.3 s.
+
+The far field at two blocks a multiprocessor with a plane's next tile held as its stored bits,
+November 23, 2026: the same CLI runs, master 4e1561d against the same tree with both changes, the
+two builds alternating. The CLI's prefill rate, in tok/s:
+
+| Card | Prompt tokens | Prefill, before | Prefill |
+|---|---:|---:|---:|
+| RTX 3090 (350 W, PCIe 4.0 x16) | 32,070 | 2.73k, 2.73k | 2.87k, 2.87k |
+| | 114,754 | 1.83k | 2.13k |
+| RTX PRO 4500 Blackwell (200 W, PCIe 4.0 x16) | 32,070 | 3.98k, 3.95k | 4.15k, 4.14k |
+| | 114,754 | 2.88k | 3.31k |
+
+Both builds give the same first tokens, and the mean NLL above is 1.739533 with both on the RTX
+3090: the changes move no bits. On the RTX 3090 the far field of the 114,754-token prefill took
+29.2 s of GPU time before, 24.9 s with the staged bits alone and 19.9 s with both (36.9% of 53.8
+s); with F16 keys and values (`--kv-dtype bf16`) it takes 16.7 s at one block a multiprocessor and
+15.1 s at two. With the staged bits alone the CLI prefilled at 2.78k tok/s (32,070 tokens) and
+1.95k (114,754) on the RTX 3090, 4.06k and 3.06k on the RTX PRO 4500. F16 products for MXFP8's
+codes times their power-of-two scale, exact against the FP32 path for every pair of codes and every
+exponent, moved the far field from 19.9 to 19.2 s on the RTX 3090 and the RTX PRO 4500's prefill
+from 4.18k, 4.16k to 4.16k, 4.14k and from 3.34k to 3.29k, so the decode keeps its FP32 products.
 
 ### APEX-I MiniPlus
 
