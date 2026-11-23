@@ -880,18 +880,22 @@ bool launch_tensor_cores(const __nv_bfloat16* q, const int* first, const int* se
     // SIMT kernel: an RTX PRO 4500 Blackwell ran every storage faster here (1.07-3.15 times). An
     // RTX 3090 ran BF16 2.76 times, FP16 1.67, bf16p 1.18 and the 4-bit keys (nvfp4, rk4v4,
     // rk4v4-e8, rk2v4-e8) 1.04-1.07 times, but the 8-bit keys (int8, rk8v4, fp8, k8v4) at
-    // 0.94-0.99, whose decode the four warps here hide worse than the SIMT kernel's twelve. Turing
-    // keeps the SIMT kernel: an RTX 2080 Ti ran BF16 and bf16p at 0.32 and 0.20 times on its
-    // emulated BF16 MMAs, and its FP16 tiles (1.21-1.73 times) have not run the Op's test on a
-    // Turing card. Volta emulates every MMA.
-    constexpr bool kByteKeys = Storage == KvCacheStorage::Int8Group64 ||
+    // 0.94-0.99, whose decode the four warps here hide worse than the SIMT kernel's twelve. An
+    // RTX 2080 Ti ran the FP16 tiles (FP16 and every decoded storage) 1.21-1.73 times, but BF16
+    // and bf16p at 0.32 and 0.20 on its emulated BF16 MMAs. Volta emulates every MMA.
+    constexpr bool kBf16Tiles = std::is_same_v<TileElement<Storage>, __nv_bfloat16>;
+    constexpr bool kByteKeys  = Storage == KvCacheStorage::Int8Group64 ||
                                Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                                Storage == KvCacheStorage::Fp8E4M3Row256 ||
                                Storage == KvCacheStorage::Fp8KeyNvfp4Value;
-    const DeviceTier tier = current_device_tier();
-    if (tier != DeviceTier::Blackwell && (tier != DeviceTier::Ampere || kByteKeys)) {
-        return false;
+    bool faster = false;
+    switch (current_device_tier()) {
+    case DeviceTier::Blackwell: faster = true; break;
+    case DeviceTier::Ampere: faster = !kByteKeys; break;
+    case DeviceTier::Turing: faster = !kBf16Tiles; break;
+    case DeviceTier::Volta: faster = false; break;
     }
+    if (!faster) { return false; }
     constexpr int kBytes = TcLayout<!std::is_same_v<TileElement<Storage>, __nv_bfloat16>>::kBytes;
     constexpr int kDevices = 64;
     static std::array<std::once_flag, kDevices> opted;
