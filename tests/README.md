@@ -333,7 +333,8 @@ begins at a space after a word where the reply has one, so the next prompt token
 text before it as the turn did. The test measures how far the next prompt repeats the turn's tokens:
 where a template renders the reply anew (Flint and Gemma 4 with thinking off), no state of the
 reply continues it and the test only reports the reuse. `NINFER_STOP_ARTIFACT` names
-the artifact, and the test is skipped without it; `NINFER_STOP_NGRAM_TABLE` names a table artifact,
+the artifact, and the test is skipped without it; `NINFER_STOP_NGRAM_TABLE` names a table artifact
+(`off` runs the model without its table, as `--no-ngram-table`),
 `NINFER_STOP_SPECULATIVE=mtp`, `dflash`, `dflash2`, `dspark`, `dspine` or `lookup` decodes the
 reply in speculative rounds (`NINFER_STOP_DRAFTS` tokens; `NINFER_STOP_DRAFT_MODEL` names the
 DSpine drafter), `NINFER_STOP_EXPERTS=host` or `disk` places the
@@ -366,7 +367,8 @@ times, and decode tok/s with and without the openers at one request and at
 names the artifact, and the test is skipped without it; `NINFER_BAD_WORDS_SPECULATIVE` (with
 `NINFER_BAD_WORDS_DRAFTS`, 2), `NINFER_BAD_WORDS_DRAFT_MODEL`, `NINFER_BAD_WORDS_NGRAM_TABLE`,
 `NINFER_BAD_WORDS_EXPERTS`, `NINFER_BAD_WORDS_DEVICES` and `NINFER_BAD_WORDS_THINKING=on` work as
-the stop-string test's variables do, `NINFER_BAD_WORDS_KV=int8` or `rk8v4` selects the KV format
+the stop-string test's variables do (`NINFER_BAD_WORDS_NGRAM_TABLE=off` included),
+`NINFER_BAD_WORDS_KV=int8` or `rk8v4` selects the KV format
 and `NINFER_BAD_WORDS_TOKENS` each reply's limit (256):
 
 ```bash

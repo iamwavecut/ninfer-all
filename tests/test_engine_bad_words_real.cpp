@@ -28,7 +28,7 @@
 //      without banned words that never fire, at one request and at NINFER_BAD_WORDS_CONCURRENCY
 //      requests, printed (no criterion).
 //   NINFER_BAD_WORDS_ARTIFACT     the artifact (skipped without one)
-//   NINFER_BAD_WORDS_NGRAM_TABLE  a Qwen3.8-Flash-Next table artifact
+//   NINFER_BAD_WORDS_NGRAM_TABLE  a Qwen3.8-Flash-Next table artifact, or off: without the table
 //   NINFER_BAD_WORDS_SPECULATIVE  mtp | dflash | dflash2 | dspark | dspine | lookup, with
 //                                 NINFER_BAD_WORDS_DRAFTS tokens a round (2 by default)
 //   NINFER_BAD_WORDS_DRAFT_MODEL  the DSpine drafter artifact (with dspine)
@@ -89,7 +89,9 @@ ninfer::EngineOptions engine_options(const char* artifact, std::uint32_t concurr
             begin = end + 1;
         }
     }
-    if (const auto table = variable("NINFER_BAD_WORDS_NGRAM_TABLE"); !table.empty()) {
+    if (const auto table = variable("NINFER_BAD_WORDS_NGRAM_TABLE"); table == "off") {
+        options.ngram_table.disabled = true;
+    } else if (!table.empty()) {
         options.ngram_table.path = std::string(table);
     }
     if (const auto kv = variable("NINFER_BAD_WORDS_KV"); kv == "int8") {

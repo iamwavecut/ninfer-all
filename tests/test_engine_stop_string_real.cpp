@@ -17,7 +17,7 @@
 // not from the end of the prompt before it, and answers as it does after a turn that an output
 // limit ended at that position.
 //   NINFER_STOP_ARTIFACT       the artifact (skipped without one)
-//   NINFER_STOP_NGRAM_TABLE    a Qwen3.8-Flash-Next table artifact
+//   NINFER_STOP_NGRAM_TABLE    a Qwen3.8-Flash-Next table artifact, or off: without the table
 //   NINFER_STOP_SPECULATIVE    mtp | dflash | dflash2 | dspark | dspine | lookup: the reply decodes
 //                              in speculative rounds (NINFER_STOP_DRAFTS tokens, 4 by default)
 //   NINFER_STOP_DRAFT_MODEL    the DSpine drafter artifact (with dspine)
@@ -76,7 +76,9 @@ ninfer::EngineOptions engine_options(const char* artifact) {
         }
     }
     if (variable("NINFER_STOP_TENSOR_PARALLEL") == "1") { options.tensor_parallel = true; }
-    if (const auto table = variable("NINFER_STOP_NGRAM_TABLE"); !table.empty()) {
+    if (const auto table = variable("NINFER_STOP_NGRAM_TABLE"); table == "off") {
+        options.ngram_table.disabled = true;
+    } else if (!table.empty()) {
         options.ngram_table.path = std::string(table);
     }
     if (variable("NINFER_STOP_CONTEXT_CACHE") == "hybrid") {
