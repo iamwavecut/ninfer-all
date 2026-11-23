@@ -17,7 +17,8 @@
 // Banned words (bad_words) on a real model through the public Engine, for any model family:
 //   1. a greedy reply banned a string it wrote goes back to where the string began: its tokens
 //      are the plain reply's up to the token that holds the string's first byte, it draws another
-//      token there, and it never holds the string;
+//      token there, and it never holds the string. The plain reply is the second of two equal
+//      requests, so that it and the banned reply resume the prompt from the same cached state;
 //   2. the state it went back to: a fresh request whose prompt is the prompt and the banned
 //      reply's tokens through the redrawn one continues as the banned reply did; printed as the
 //      agreeing tokens (no criterion: prefill and decode round differently, and a near tie may
@@ -208,10 +209,11 @@ Speed measure(ninfer::Engine& engine, std::uint32_t count, std::uint32_t tokens,
     for (std::uint32_t i = 0; i < count; ++i) {
         // One nonce a prompt: no prompt reuses another's prefix past the template's head.
         submissions.push_back(ninfer::GenerationSubmission{
-            .prompt  = engine.prepare(conversation(
+            .prompt      = engine.prepare(conversation(
                 std::to_string(++nonce) + ". Write a long, detailed travel story about a city by "
                                           "the sea, with many short paragraphs.")),
-            .options = request(tokens, bad_words)});
+            .options     = request(tokens, bad_words),
+            .observation = {.phase_timings = true}});
     }
     auto handles = engine.submit_group(std::move(submissions));
     Speed speed;
@@ -247,7 +249,11 @@ int run() {
         return engine.prepare(conversation("Tell a long story about a lighthouse keeper who "
                                            "repairs clocks. Use many short sentences."));
     };
+    const ninfer::GenerationResult cold  = engine.generate(story(), request(tokens, {}));
     const ninfer::GenerationResult plain = engine.generate(story(), request(tokens, {}));
+    std::cout << "two plain replies agree for "
+              << common_prefix(cold.generated_token_ids, plain.generated_token_ids) << " of "
+              << plain.generated_token_ids.size() << " tokens\n";
     const RawText text                   = raw_text(engine, plain.generated_token_ids);
     const auto picked                    = pick_word(text.bytes);
     check(picked.has_value(), "the reply holds a usable string to ban");
@@ -273,6 +279,16 @@ int run() {
               << ": \"..."
               << head(std::string_view(banned_text.bytes).substr(parted > 20 ? parted - 20 : 0), 80)
               << "\"\n";
+    const auto pieces = [&](const std::vector<ninfer::TokenId>& ids) {
+        std::string out;
+        const std::size_t from = std::min(agree, first) > 3 ? std::min(agree, first) - 3 : 0;
+        for (std::size_t i = from; i < ids.size() && i <= std::max(agree, first) + 3; ++i) {
+            out += (i == agree ? "|[" : "[") + head(engine.token_bytes(ids[i]), 40) + "]";
+        }
+        return out;
+    };
+    std::cout << "plain tokens:  " << pieces(plain.generated_token_ids) << "\nbanned tokens: "
+              << pieces(banned.generated_token_ids) << '\n';
     std::cout << "speculative rounds " << banned.speculative.rounds << ", drafted "
               << banned.speculative.drafted_tokens << ", accepted "
               << banned.speculative.accepted_tokens << '\n';
