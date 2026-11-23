@@ -105,8 +105,8 @@ session slots ([Serving](serving.md#context-cache-of-the-other-families)), every
 probabilities, thinking budgets and MTP drafts for several requests. A prompt call of more than
 eight tokens attends on tensor cores where they measured faster than the SIMT kernel: with
 two KV heads as in [Flash-Next](qwen3-8-flash-next.md#prompt-attention-on-tensor-cores), with four
-only for a BF16 or FP16 cache, and `bf16p` on Ampere and Ada
-([measurements](#prompt-attention-on-tensor-cores)).
+for a BF16 or FP16 cache, `bf16p` too on Ampere and Ada, and on Turing every format but `bf16`
+and `bf16p` ([measurements](#prompt-attention-on-tensor-cores)).
 Tensor parallelism divides the Gated DeltaNet key heads, the sparse-attention KV heads with their
 cache and the MLP rows in shares sized to each card (`--tensor-split`); the head, the MTP block and
 the n-gram rows stay on the first device. The devices' MLP partial sums are exchanged as FP32 and
@@ -170,23 +170,24 @@ at 1,024 queries over 2,051 positions (the first query at position 16,384), four
 kernel's time over the tensor-core kernel's, 2026-11-23 (CUDA 13.4, the release build's
 architectures):
 
-| KV format | RTX 3090 | RTX 5080 |
-|---|---:|---:|
-| `bf16` | 2.54 | 2.83 |
-| `fp16` | 1.51 | 1.46 |
-| `bf16p` | 1.09 | 0.98 |
-| `int8` | 0.79 | 0.66 |
-| `rk8v4` | 0.80 | 0.66 |
-| `fp8` | 0.84 | 0.72 |
-| `k8v4` | 0.84 | 0.72 |
-| `nvfp4` | 0.86 | 0.71 |
-| `rk4v4` | 0.84 | 0.67 |
-| `rk4v4-e8` | 0.83 | 0.66 |
-| `rk2v4-e8` | 0.80 | 0.68 |
+| KV format | RTX 3090 | RTX 5080 | TITAN RTX |
+|---|---:|---:|---:|
+| `bf16` | 2.54 | 2.83 | 0.29 |
+| `fp16` | 1.51 | 1.46 | 1.53 |
+| `bf16p` | 1.09 | 0.98 | 0.22 |
+| `int8` | 0.79 | 0.66 | 1.16 |
+| `rk8v4` | 0.80 | 0.66 | 1.16 |
+| `fp8` | 0.84 | 0.72 | 1.21 |
+| `k8v4` | 0.84 | 0.72 | 1.24 |
+| `nvfp4` | 0.86 | 0.71 | 1.21 |
+| `rk4v4` | 0.84 | 0.67 | 1.21 |
+| `rk4v4-e8` | 0.83 | 0.66 | 1.20 |
+| `rk2v4-e8` | 0.80 | 0.68 | 1.13 |
 
 The engine runs the tensor-core kernel where the column is above 1: `bf16`, `fp16` and `bf16p` on
 Ampere and Ada (Ada follows the RTX 3090; no Ada card was measured), `bf16` and `fp16` on
-Blackwell. Turing and Volta keep the SIMT kernel. `ninfer_sparse_attention_test` passes on both
-cards with each kernel forced for every call and with this choice, and `compute-sanitizer
-racecheck` on the RTX 3090 reports no hazards in the tensor-core kernel's calls of six query heads.
-The end-to-end prefill speed of a model with four KV heads was not measured.
+Blackwell, every format but `bf16` and `bf16p` on Turing, whose BF16 tiles it emulates. Volta keeps
+the SIMT kernel. `ninfer_sparse_attention_test` passes on the three cards with each kernel forced
+for every call and with this choice, and `compute-sanitizer racecheck` on the RTX 3090 and the
+TITAN RTX reports no hazards in the tensor-core kernel's calls of six query heads. The end-to-end
+prefill speed of a model with four KV heads was not measured.

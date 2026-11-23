@@ -881,6 +881,7 @@ void require_plane(const Tensor& plane, DType dtype, std::int32_t leading,
 // positions.
 template <int Group, KvCacheStorage Storage>
 bool tensor_cores_faster(DeviceTier tier) {
+    constexpr bool kBf16Tiles = std::is_same_v<TileElement<Storage>, __nv_bfloat16>;
     if constexpr (Group == kWideGroup) {
         // Twelve query heads (Qwen3.8-Flash-Next, dense Qwen4 with two KV heads): an RTX PRO 4500
         // Blackwell ran every storage faster here (1.07-3.15 times). An RTX 3090 ran BF16 2.76
@@ -889,7 +890,6 @@ bool tensor_cores_faster(DeviceTier tier) {
         // the four warps here hide worse than the SIMT kernel's twelve. An RTX 2080 Ti ran the
         // FP16 tiles (FP16 and every decoded storage) 1.21-1.73 times, but BF16 and bf16p at 0.32
         // and 0.20 on its emulated BF16 MMAs. Volta emulates every MMA.
-        constexpr bool kBf16Tiles = std::is_same_v<TileElement<Storage>, __nv_bfloat16>;
         constexpr bool kByteKeys  = Storage == KvCacheStorage::Int8Group64 ||
                                    Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                                    Storage == KvCacheStorage::Fp8E4M3Row256 ||
@@ -906,13 +906,14 @@ bool tensor_cores_faster(DeviceTier tier) {
         // each staged K and V tile serves half as many rows, while the SIMT kernel's work follows
         // the query heads. An RTX 3090 ran BF16 2.54 times, FP16 1.51 and bf16p 1.09 here, every
         // other storage 0.79-0.86; an RTX 5080 ran BF16 2.83 and FP16 1.46, bf16p 0.98 and the
-        // others 0.66-0.72. Turing (not measured for six) and Volta keep the SIMT kernel.
+        // others 0.66-0.72. A TITAN RTX ran the FP16 tiles 1.13-1.53 times (FP16 1.53, every
+        // decoded storage 1.13-1.24), BF16 and bf16p at 0.29 and 0.22. Volta emulates every MMA.
         constexpr bool kHalfTiles =
             Storage == KvCacheStorage::BFloat16 || Storage == KvCacheStorage::Float16;
         switch (tier) {
         case DeviceTier::Blackwell: return kHalfTiles;
         case DeviceTier::Ampere: return kHalfTiles || Storage == KvCacheStorage::Bf16Packed;
-        case DeviceTier::Turing:
+        case DeviceTier::Turing: return !kBf16Tiles;
         case DeviceTier::Volta: return false;
         }
         return false;
