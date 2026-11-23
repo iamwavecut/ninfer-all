@@ -6,6 +6,7 @@
 #include "models/inkling2/situ.h"
 #include "ops/common/device_tier.h"
 #include "ops/common/mma.cuh"
+#include "ops/linear/gguf/q8_1_value.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -619,9 +620,9 @@ __global__ void __launch_bounds__(kRowBlock) control_apply_kernel(ControlApply a
 
 // ---- Attention inputs ---------------------------------------------------------------------------
 
-// Block (t, head) of 128 threads: Q's value d, and the relative feature's in the first 16.
-__global__ void query_post_kernel(QueryArgs a) {
-    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+// Q head h of row t, 128 threads: Q's value d, and the relative feature's in the first 16.
+__device__ __forceinline__ void query_post_block(const QueryArgs& a, int t, int h) {
+    const int d = threadIdx.x;
     const float* row = a.qgr + std::int64_t(t) * a.stride;
     float tau = 1.0f;
     if (a.log_scale) {
@@ -667,9 +668,9 @@ __device__ __forceinline__ float convolve(const Rows& rows, int t, const float* 
     return in[0] + out;
 }
 
-// Block (t, kv head) of 128 threads, channel d of the head.
-__global__ void kv_post_kernel(KvArgs a) {
-    const int t = blockIdx.x, kh = blockIdx.y, d = threadIdx.x;
+// K and V head kh of row t, 128 threads: channel d of the head.
+__device__ __forceinline__ void kv_post_block(const KvArgs& a, int t, int kh) {
+    const int d = threadIdx.x;
     const int c = kh * kD + d, v_column = a.kv_heads * kD + c;
     const bool dynamic = a.k_taps != nullptr;
     const float* k_taps = dynamic ? a.k_taps + std::int64_t(t) * a.taps_stride + kh * kTaps : nullptr;
@@ -712,6 +713,16 @@ __global__ void kv_post_kernel(KvArgs a) {
         const int p = a.rows.positions[t];
         history_slot(a.k_history, sequence, p)[c] = a.kv[std::int64_t(t) * a.kv_stride + c];
         history_slot(a.v_history, sequence, p)[c] = a.kv[std::int64_t(t) * a.kv_stride + v_column];
+    }
+}
+
+// Block (t, y) of 128 threads: Q head y of row t, or K and V head y - heads after the Q heads.
+__global__ void attention_inputs_kernel(QueryArgs q, KvArgs kv, int heads) {
+    const int t = blockIdx.x, y = blockIdx.y;
+    if (y < heads) {
+        query_post_block(q, t, y);
+    } else {
+        kv_post_block(kv, t, y - heads);
     }
 }
 
@@ -2377,7 +2388,17 @@ constexpr int kRouteThreads = 256; // at least the experts
 
 // Block per row: thread e the expert. The top_k by p + bias, lower id first: expert e is chosen
 // k-th when k experts precede it in that order.
+// The call's fixed-point expert sums from zero, over every thread of the route launch.
+__device__ __forceinline__ void zero_sums(const RouteArgs& a) {
+    const std::int64_t step = std::int64_t(gridDim.x) * blockDim.x;
+    for (std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < a.zero_count;
+         i += step) {
+        a.zero[i] = 0;
+    }
+}
+
 __global__ void route_kernel(RouteArgs a) {
+    zero_sums(a);
     const int t = blockIdx.x, e = threadIdx.x;
     __shared__ float selections[kRouteThreads];
     __shared__ int chosen[8];
@@ -2419,6 +2440,7 @@ __global__ void route_kernel(RouteArgs a) {
 constexpr int kRouteTileWidths = 4;
 __global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
     route_sorted_kernel(RouteArgs a) {
+    zero_sums(a);
     constexpr int E = kSortedRouteExperts;
     const int t = int(threadIdx.x) / E, e = int(threadIdx.x) % E;
     __shared__ float selections[kSortedRouteRows][E];
@@ -2519,6 +2541,21 @@ __global__ void situ_rows_kernel(const float* __restrict__ gu, std::int64_t stri
     const float g    = ops::silu_detail::mul(row[r], s);
     const float u    = ops::silu_detail::mul(row[width + r], s);
     out[p * width + r] = __float2bfloat16(situ(g, u, gate_cap, up_cap));
+}
+
+// situ_rows_kernel's middle, then its q8_1 numbers: a warp holds one block of 32 values.
+__global__ void situ_q8_kernel(const float* __restrict__ gu, std::int64_t stride, int width,
+                               const float* __restrict__ pair_scale, float gate_cap, float up_cap,
+                               std::int8_t* __restrict__ qs, half2* __restrict__ ds) {
+    const int p = blockIdx.x;
+    const int r = int(blockIdx.y) * kSituThreads + int(threadIdx.x);
+    if (r >= width) { return; } // whole warps: width % 32 == 0
+    const float s    = pair_scale[p];
+    const float* row = gu + std::int64_t(p) * stride;
+    const float g    = ops::silu_detail::mul(row[r], s);
+    const float u    = ops::silu_detail::mul(row[width + r], s);
+    const float m    = __bfloat162float(__float2bfloat16(situ(g, u, gate_cap, up_cap)));
+    ops::gguf::quantize_q8_1_value(m, r, p, qs, ds, width);
 }
 
 // ---- BF16 experts --------------------------------------------------------------------------------
@@ -3051,16 +3088,16 @@ void control_apply(const ControlApply& args, cudaStream_t stream) {
     check_launch("control_apply");
 }
 
-void query_post(const QueryArgs& args, cudaStream_t stream) {
-    if (args.tokens <= 0) { return; }
-    query_post_kernel<<<dim3(args.tokens, args.heads), kD, 0, stream>>>(args);
-    check_launch("query_post");
-}
-
-void kv_post(const KvArgs& args, cudaStream_t stream) {
-    if (args.rows.tokens <= 0) { return; }
-    kv_post_kernel<<<dim3(args.rows.tokens, args.kv_heads), kD, 0, stream>>>(args);
-    check_launch("kv_post");
+void attention_inputs(const QueryArgs& q, const KvArgs& kv, cudaStream_t stream) {
+    const int heads    = q.tokens > 0 ? q.heads : 0;
+    const int kv_heads = kv.rows.tokens > 0 ? kv.kv_heads : 0;
+    if (heads > 0 && kv_heads > 0 && q.tokens != kv.rows.tokens) {
+        throw std::invalid_argument("inkling2 attention_inputs: Q and K/V of different rows");
+    }
+    const int tokens = heads > 0 ? q.tokens : kv.rows.tokens;
+    if (heads + kv_heads == 0) { return; }
+    attention_inputs_kernel<<<dim3(tokens, heads + kv_heads), kD, 0, stream>>>(q, kv, heads);
+    check_launch("attention_inputs");
 }
 
 std::size_t attention_workspace_floats(int rows, int query_heads, int splits) {
@@ -3245,6 +3282,15 @@ void situ_rows(const float* gu, std::int64_t stride, int pairs, int width, const
     situ_rows_kernel<<<dim3(pairs, blocks_for(width, kSituThreads)), kSituThreads, 0, stream>>>(
         gu, stride, width, pair_scale, gate_cap, up_cap, out);
     check_launch("situ_rows");
+}
+
+void situ_q8(const float* gu, std::int64_t stride, int pairs, int width, const float* pair_scale,
+             float gate_cap, float up_cap, std::int8_t* qs, half2* ds, cudaStream_t stream) {
+    if (width % 32 != 0) { throw std::invalid_argument("inkling2 situ_q8: whole 32-value groups"); }
+    if (pairs <= 0) { return; }
+    situ_q8_kernel<<<dim3(pairs, blocks_for(width, kSituThreads)), kSituThreads, 0, stream>>>(
+        gu, stride, width, pair_scale, gate_cap, up_cap, qs, ds);
+    check_launch("situ_q8");
 }
 
 void bf16_expert_rows(const void* const* table, int rows, int k, const std::int32_t* bounds,

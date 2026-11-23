@@ -49,8 +49,13 @@ tokenization, the chat template, output parsing and the serving protocols.
   and residual update over one-warp blocks of 128 channels instead of one block per row. Each warp
   keeps its sums, and every reader adds them in the order the one-block kernel adds its warps', so
   the values are the same bits. A controller's nine products run in two launches, and the route
-  kernel also groups the pairs by expert for the expert kernels. These kernels took decode on an
-  RTX 3090 from 88.9 to 111.4 tok/s with the same tokens ([measurements](#measurements)).
+  kernel also groups the pairs by expert for the expert kernels and zeroes the sums the vector
+  expert products add into. A layer's query and key/value epilogues share one launch, and SiTU
+  writes the down products' q8_1 input itself, the bytes the quantizer would write. These kernels
+  took decode on an RTX 3090 from 88.9 to 111.4 tok/s with the same tokens
+  ([measurements](#measurements)); the shared launches then added 1.9% without drafts on an RTX
+  PRO 4500 Blackwell (126.6 to 129.0 tok/s) and 2.2% on an RTX 4090 (139.4-139.9 to 142.8-142.9
+  tok/s), and 1.1-1.4% with DSpark, again with the same tokens.
 - **Long contexts.** A prompt chunk of a full-attention visit first computes, on tensor cores, its
   rows' attention over the keys at least 1,024 positions (the relative table's extent) before every
   row of a group of 32: F16 queries and probabilities, keys and values as stored (a plane format's

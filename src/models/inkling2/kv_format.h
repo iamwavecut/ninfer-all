@@ -38,8 +38,8 @@ struct KvFormat {
     [[nodiscard]] bool quantized() const noexcept {
         return storage != KvCacheStorage::BFloat16 && storage != KvCacheStorage::Float16;
     }
-    // MXFP8: kv_post encodes the full visits' planes itself; the other quantized formats stage
-    // F16 rows for kv_store.
+    // MXFP8: attention_inputs encodes the full visits' planes itself; the other quantized formats
+    // stage F16 rows for kv_store.
     [[nodiscard]] bool mxfp8() const noexcept { return storage == KvCacheStorage::Mxfp8; }
     [[nodiscard]] bool staged() const noexcept { return quantized() && !mxfp8(); }
 };

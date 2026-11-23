@@ -4,6 +4,7 @@
 #include "ggml_bridge.h"
 #include "ggml_bridge_mmq_launch.cuh"
 #include "ggml_bridge_vec_launch.cuh"
+#include "q8_1_value.cuh"
 
 #include "../../common/device_tier.h"
 #include "../../common/fixed_point.cuh"
@@ -65,17 +66,6 @@ namespace {
 // 32 values, element i of column c read from x[c][input_columns[i]] when a gather is given.
 constexpr int kQuantizeThreads = 256;
 
-// Value i of column `column` into the planar q8_1 activation; every lane of the warp takes part.
-__device__ __forceinline__ void quantize_vector_value(float xi, int i, int column,
-                                                      std::int8_t* __restrict__ qs,
-                                                      half2* __restrict__ ds, int k) {
-    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
-    const float sum  = warp_reduce_sum<QK8_1>(xi);
-    const float d    = amax / 127.0f;
-    qs[std::int64_t(column) * k + i] = amax == 0.0f ? 0 : static_cast<std::int8_t>(roundf(xi / d));
-    if (i % QK8_1 == 0) { ds[std::int64_t(column) * (k / QK8_1) + i / QK8_1] = make_half2(d, sum); }
-}
-
 __launch_bounds__(kQuantizeThreads) __global__
     void quantize_vector_kernel(const __nv_bfloat16* __restrict__ x,
                                 const std::int32_t* __restrict__ input_columns,
@@ -84,8 +74,8 @@ __launch_bounds__(kQuantizeThreads) __global__
     const int column = blockIdx.y;
     if (i >= k) { return; }
     const int source = input_columns != nullptr ? input_columns[i] : i;
-    quantize_vector_value(__bfloat162float(x[std::int64_t(column) * k + source]), i, column, qs, ds,
-                          k);
+    quantize_q8_1_value(__bfloat162float(x[std::int64_t(column) * k + source]), i, column, qs, ds,
+                        k);
 }
 
 // FP32 columns: output column c reads x column source[c] (zeros for a negative entry), each value
@@ -104,7 +94,7 @@ __launch_bounds__(kQuantizeThreads) __global__
         xi = x[std::int64_t(from) * k + i];
         if (scale != nullptr) { xi = __fmul_rn(xi, scale[i]); }
     }
-    quantize_vector_value(xi, i, column, qs, ds, k);
+    quantize_q8_1_value(xi, i, column, qs, ds, k);
 }
 
 using VectorLaunch = void (*)(const VecJobs&, int, bool, cudaStream_t);

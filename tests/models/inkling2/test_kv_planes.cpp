@@ -209,7 +209,7 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
     const int key_scale_bytes   = mi::kv_scale_bytes(key);
     const int value_code_bytes  = mi::kv_code_bytes(value);
     const int value_scale_bytes = mi::kv_scale_bytes(value);
-    // The rows kv_post would stage, in kv_post's row-slots layout: [heads][rows][128] halves
+    // The rows attention_inputs would stage, in its row-slots layout: [heads][rows][128] halves
     // (a quantized visit stages head h's row r at stage + h * rows + r * 128), Gaussian.
     std::vector<__half> ks(std::size_t(kKv) * t * kD), vs(std::size_t(kKv) * t * kD);
     {
