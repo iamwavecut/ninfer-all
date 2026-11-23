@@ -644,6 +644,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --unconstrained-response-format\n"
            "                                without --structured-output, generate such a\n"
            "                                request unconstrained instead of refusing it\n"
+           "  --no-structured-output-instruction\n"
+           "                                keep a constrained request's messages as sent,\n"
+           "                                without the format instruction; the grammar\n"
+           "                                alone enforces the format\n"
            "  --assistant-prefill           continue a Chat Completions request's trailing\n"
            "                                assistant message in place, as /v1/messages\n"
            "                                does; needs thinking disabled\n"
@@ -1745,6 +1749,9 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             continue;
         }
         if (product::switch_option(arg, "unconstrained-response-format", [&](bool on) { options.unconstrained_response_format = on; })) {
+            continue;
+        }
+        if (product::switch_option(arg, "structured-output-instruction", [&](bool on) { options.structured_output_instruction = on; })) {
             continue;
         }
         if (product::switch_option(arg, "assistant-prefill", [&](bool on) { options.assistant_prefill = on; })) {

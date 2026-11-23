@@ -232,6 +232,34 @@ int test_structured_output() {
                           json_prompt.messages.front().parts.back().text.find("raw JSON") !=
                               std::string::npos,
                       "JSON response contract is visible to the model");
+    {
+        // --no-structured-output-instruction keeps the caller's messages, with or without a
+        // leading system message, while the grammar still reaches the Engine.
+        ServeOptions server;
+        server.structured_output_instruction = false;
+        const auto as_sent = [&](const GenerationRequest& request) {
+            return to_prompt_input(request, resolve_prompt_semantics(request, server), {});
+        };
+        const auto user_only = as_sent(generation);
+        failures += check(user_only.messages.size() == 1 &&
+                              user_only.messages.front().role == ninfer::ChatRole::User &&
+                              user_only.messages.front().parts.size() == 1 &&
+                              user_only.messages.front().parts.front().text == "hello",
+                          "--no-structured-output-instruction added a message");
+        auto with_system        = body;
+        with_system["messages"] = Json::array({Json{{"role", "system"}, {"content", "Be brief."}},
+                                               Json{{"role", "user"}, {"content", "hello"}}});
+        const auto system_prompt = as_sent(parse(with_system).generation);
+        failures += check(system_prompt.messages.size() == 2 &&
+                              system_prompt.messages.front().parts.size() == 1 &&
+                              system_prompt.messages.front().parts.front().text == "Be brief.",
+                          "--no-structured-output-instruction changed the system message");
+        failures += check(to_request_options(generation, server,
+                                             resolve_prompt_semantics(generation, server), true)
+                                  .execution.structured_output.kind ==
+                              ninfer::StructuredOutputKind::JsonObject,
+                          "--no-structured-output-instruction dropped the constraint");
+    }
     body["response_format"] = Json{
         {"type", "json_schema"},
         {"json_schema", Json{{"name", "answer"},

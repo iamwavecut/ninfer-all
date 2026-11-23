@@ -754,6 +754,7 @@ std::string format_server_start_json(
         {"api_key_configured", !options.api_key.empty()},
         {"cors_enabled", options.enable_cors},
         {"unconstrained_response_format", options.unconstrained_response_format},
+        {"structured_output_instruction", options.structured_output_instruction},
         {"assistant_prefill", options.assistant_prefill},
         {"derive_session_keys", options.derive_session_keys},
         {"lenient_assistant_history", options.lenient_assistant_history},

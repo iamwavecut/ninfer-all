@@ -1586,6 +1586,7 @@ int main() {
                                         "--no-prefill-a8",
                                         "--no-prefill-cublas-projections",
                                         "--no-prefix-reuse",
+                                        "--no-structured-output-instruction",
                                         "--no-thinking",
                                         "--no-webui",
                                         "--pending-timeout-ms",
@@ -2089,6 +2090,12 @@ int main() {
         } catch (const std::invalid_argument&) { unconstrained_with_structured_rejected = true; }
         failures += check(unconstrained_with_structured_rejected,
                           "--unconstrained-response-format was accepted with --structured-output");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--structured-output"})
+                                  .structured_output_instruction &&
+                              !parse({"ninfer-serve", "model.ninfer", "--structured-output",
+                                      "--no-structured-output-instruction"})
+                                   .structured_output_instruction,
+                          "--no-structured-output-instruction was not an on-by-default switch");
         const ServeOptions headroom = parse({"ninfer-serve", "model.ninfer", "--kv-capacity",
                                              "auto", "--vram-headroom-mib", "512"});
         failures += check(headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&

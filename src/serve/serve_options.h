@@ -221,6 +221,9 @@ struct ServeOptions {
     // --unconstrained-response-format: without structured_output, generate a JSON or JSON Schema
     // request unconstrained instead of refusing it, for clients that always send a format.
     bool unconstrained_response_format = false;
+    // --no-structured-output-instruction: a request with a response format keeps its messages as
+    // sent, without the leading format instruction; the token grammar alone enforces the format.
+    bool structured_output_instruction = true;
     // --assistant-prefill: a Chat Completions request whose last message is the assistant's
     // continues that message in place, as /v1/messages always does.
     bool assistant_prefill = false;

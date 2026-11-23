@@ -459,6 +459,10 @@ This helps the model choose the intended final-answer branch when tools remain e
 token grammar enforces validity independently. Tool selection and termination remain model
 decisions under `tool_choice:"auto"`; use `tool_choice:"none"` when no further tools are needed.
 Requests without an explicit response format receive no format instruction or grammar.
+Start the server with `--no-structured-output-instruction` to keep a constrained request's messages
+as the caller sent them, for example when the caller's prompt already describes the format, or when
+a request must reach the model as it would on another engine. The token grammar still enforces the
+format.
 
 The native tool envelope restricts calls to declared names and emits each declared parameter at most
 once, in the declaration order shown in the prompt. A non-strict tool's parameter values are free
@@ -2677,6 +2681,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--ui-config-file PATH` | a JSON object of WebUI settings, reported as `/props` `ui_settings` ([WebUI](#webui)) | none |
 | `--structured-output` | enforce response formats (JSON, JSON Schema, regex, choice, GBNF) and strict tool arguments (see [Structured output](#structured-output)) | off |
 | `--unconstrained-response-format` | without `--structured-output`, generate a constrained request or strict tools unconstrained instead of refusing them | off |
+| `--no-structured-output-instruction` | keep a constrained request's messages as sent, without the format instruction; the grammar alone enforces the format (see [Structured output](#structured-output)) | instruction added |
 | `--assistant-prefill` | continue a Chat Completions request's trailing assistant message in place, as `/v1/messages` does | off |
 | `--lenient-assistant-history` | accept Responses input whose assistant message content or reasoning follows `function_call` Items in one run: it joins that run's assistant turn, as Messages flattens content blocks, and the template renders it before the calls. Without it such input fails with `invalid_assistant_history` rather than being silently reordered | off |
 | `--lenient-image-detail` | read an OpenAI image `detail` other than `auto`, `low` or `high` as `auto` instead of failing with `image_detail_not_supported`, for clients that send values NInfer does not know (see [image detail](#image-detail)) | off |

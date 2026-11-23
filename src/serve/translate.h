@@ -31,6 +31,9 @@ struct ResolvedPromptSemantics {
     std::string graft;
     // The request's `lora`, each id a loaded adapter's.
     std::optional<std::vector<ninfer::LoraScale>> lora;
+    // Off under --no-structured-output-instruction: a response format adds no instruction to the
+    // prompt.
+    bool structured_output_instruction = true;
 };
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
