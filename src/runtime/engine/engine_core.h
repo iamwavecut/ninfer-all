@@ -318,6 +318,10 @@ public:
                 throw std::invalid_argument(
                     "structured output requires an Engine started with structured_output");
             }
+            if (!member.options.execution.bad_words.empty() && !structured_output_) {
+                throw std::invalid_argument(
+                    "bad_words require an Engine started with structured_output");
+            }
             if (member.pending_deadline == Clock::time_point{}) {
                 member.pending_deadline = submitted + pending_timeout_;
             }
@@ -378,18 +382,31 @@ public:
                     instance_.frontend.thinking_control_token_count());
                 auto output = instance_.frontend.make_output_session(
                     member.prompt, options.stop, options.output, options.execution.thinking,
-                    options.execution.structured_output);
+                    options.execution.structured_output, options.execution.bad_words);
                 // Strict tool arguments bring a grammar without a structured final format.
                 if (output.grammar_state() && !structured_output_) {
                     throw std::invalid_argument(
                         "strict tool arguments require an Engine started with structured_output");
                 }
                 options.execution.grammar = output.grammar_state();
+                // Banned words go back to where a word began by queueing the request again
+                // (requeue_bad_words_rewind), from a copy of its prompt. A branched read keeps
+                // every completing token out with its masks instead.
+                std::optional<typename Request::BadWordsRequeue> bad_words;
+                if (!options.execution.bad_words.empty() && !options.execution.branches) {
+                    bad_words.emplace(typename Request::BadWordsRequeue{
+                        .prompt = instance_.frontend.continue_prompt(member.prompt, {}, nullptr),
+                        .requested_output_tokens = options.execution.requested_output_tokens,
+                        .sampling                = options.execution.sampling,
+                    });
+                    output.allow_bad_words_rewind(true);
+                }
                 requests.push_back(std::make_shared<Request>(
                     first_request_id + k, first_publication_order + k, std::move(member.prompt),
                     std::move(output), member.prompt_summary, member.prepare_seconds,
                     std::move(options), member.consumer_mode, member.observation,
                     member.pending_deadline, submitted));
+                requests.back()->bad_words = std::move(bad_words);
                 effective_budgets.push_back(
                     requests.back()->output.thinking_stats().effective_budget);
             }
@@ -1264,10 +1281,18 @@ private:
         instance_.program->update_sampling(*request.sequence,
                                            *request.options.execution.post_thinking_sampling);
         request.post_thinking_applied = true;
+        if (request.bad_words) {
+            request.bad_words->post_thinking_at =
+                static_cast<std::uint32_t>(request.generated.size());
+        }
     }
 
     void publish_prompt_progress(const std::shared_ptr<Request>& request) {
-        if (!request->observation.prompt_progress) { return; }
+        // A request queued again after a banned-word rewind has reported its prompt already.
+        if (!request->observation.prompt_progress ||
+            (request->bad_words && request->bad_words->requeues != 0)) {
+            return;
+        }
         if (!request->admitted_begin || !request->admitted_at) {
             throw std::logic_error("prompt progress has no admitted request boundary");
         }
@@ -1295,6 +1320,8 @@ private:
             throw std::logic_error("request admission published generation start twice");
         }
         request->admitted_begin = begin;
+        // A request queued again after a banned-word rewind keeps its first admission's start.
+        if (request->bad_words && request->bad_words->requeues != 0) { return; }
         if (request->observation.phase_timings || request->observation.live_timings ||
             request->observation.prompt_progress) {
             request->admitted_at = Clock::now();
@@ -1363,6 +1390,7 @@ private:
         request->lane.reset();
         request->budget.reset();
         request->terminal_reason.reset();
+        request->bad_words.reset();
         {
             std::lock_guard lock(request->mutex);
             if (request->response_done) { return; }
@@ -1390,6 +1418,7 @@ private:
         try { request->lane.reset(); } catch (...) {}
         try { request->budget.reset(); } catch (...) {}
         try { request->terminal_reason.reset(); } catch (...) {}
+        try { request->bad_words.reset(); } catch (...) {}
         bool release_capacity = false;
         try {
             std::lock_guard lock(request->mutex);
@@ -1454,9 +1483,20 @@ private:
         result.finish_reason           = reason;
         result.matched_stop_string     = request->output.matched_stop_string();
         result.timings.prepare_seconds = request->prepare_seconds;
-        if (request->begin) {
-            result.reused_prompt_tokens = request->begin->reused_prompt_tokens;
-            result.prefix_reuse_path    = request->begin->prefix_reuse_path;
+        const std::optional<BeginSummary>& begin =
+            request->bad_words && request->bad_words->begin ? request->bad_words->begin
+                                                            : request->begin;
+        if (begin) {
+            result.reused_prompt_tokens = begin->reused_prompt_tokens;
+            result.prefix_reuse_path    = begin->prefix_reuse_path;
+        }
+        if (request->bad_words && request->bad_words->requeues != 0) {
+            // What the sequences that banned-word rewinds ended measured, with this one.
+            auto& words = *request->bad_words;
+            accumulate_measurements(words.timings, request->generation_timings);
+            accumulate_measurements(words.speculative, std::move(request->speculative_stats));
+            request->generation_timings = words.timings;
+            request->speculative_stats  = std::move(words.speculative);
         }
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
@@ -1500,6 +1540,7 @@ private:
         request->lane.reset();
         request->budget.reset();
         request->terminal_reason.reset();
+        request->bad_words.reset();
         finish_engine_phase(completion, EngineHostPhase::CommitOutput);
         result.engine_timing = request->host_timing.public_snapshot();
         {
@@ -1510,6 +1551,73 @@ private:
         }
         if (mark_completed(request)) { release_reserved_capacity(); }
         request->cv.notify_one();
+    }
+
+    // A banned-word rewind on the Program, which cannot take a sequence back to an earlier state.
+    // The request's sequence has ended (settle_terminal_requests) and the request queues again at
+    // the head of the FIFO, its prompt the submitted one followed by the generated tokens the
+    // rewind keeps. The cache resumes it from the deepest state it holds, and its first draw is
+    // the rewound position, where the output session's masks now ban the dropped token. What was
+    // published stays published; the output session already stands at that position.
+    void requeue_bad_words_rewind(const std::shared_ptr<Request>& request) {
+        auto& words                = *request->bad_words;
+        const std::uint32_t target = *words.target;
+        if (target != request->generated.size() || target >= words.requested_output_tokens) {
+            throw std::logic_error("banned-word rewind lost its generated prefix");
+        }
+        words.target.reset();
+        accumulate_measurements(words.timings, request->generation_timings);
+        accumulate_measurements(words.speculative, std::move(request->speculative_stats));
+        request->generation_timings = {};
+        request->speculative_stats  = {};
+        if (words.requeues == 0) { words.begin = request->begin; }
+        ++words.requeues;
+
+        ResolvedExecutionOptions& execution = request->options.execution;
+        execution.requested_output_tokens   = words.requested_output_tokens - target;
+        // The first generated token's readout belongs to the request's first draw.
+        if (target != 0) { execution.readout_tokens.clear(); }
+        // The lane starts with the sampling the output stands at, and its penalties count what
+        // they counted before: every kept token, or those since the post-thinking switch when
+        // only that sampling has penalties.
+        const bool post_thinking =
+            execution.post_thinking_sampling && request->output.reasoning_closed();
+        execution.sampling = post_thinking ? *execution.post_thinking_sampling : words.sampling;
+        const bool first_penalties =
+            words.sampling.presence_penalty != 0.0F || words.sampling.frequency_penalty != 0.0F;
+        execution.penalized_prompt_tokens =
+            post_thinking && !first_penalties
+                ? target - std::min(target, words.post_thinking_at.value_or(target))
+                : target;
+        request->post_thinking_applied = post_thinking;
+        if (!post_thinking) { words.post_thinking_at.reset(); }
+
+        request->prompt = instance_.frontend.continue_prompt(words.prompt, request->generated,
+                                                             request->ngram_archive.get());
+        release_planning_state(request);
+        request->sequence.reset();
+        request->lane.reset();
+        request->budget.reset();
+        request->terminal_reason.reset();
+        request->admitted_begin.reset();
+        request->begin.reset();
+        request->model_state              = EngineRequestState::Waiting;
+        request->capture_pending          = false;
+        request->post_capture_state       = EngineRequestState::Prefill;
+        request->lease_shortfall_reported = false;
+        request->remaining_service_work   = 0;
+        request->backfill_epoch           = 0;
+        request->backfill_class           = BackfillClass::None;
+        request->computed_prompt_tokens   = 0;
+        request->paced_prefill_tokens     = 0;
+        request->retained_slot            = -1;
+        request->retained_session_digest.clear();
+        request->deadline = Clock::now() + pending_timeout_;
+        {
+            std::lock_guard lock(queue_mutex_);
+            pending_.push_front(request);
+        }
+        request_admission_check();
     }
 
     void complete_cancelled(const std::shared_ptr<Request>& request) {
@@ -1614,8 +1722,13 @@ private:
             // Free the slot and publish the post-release snapshot before waking the caller so
             // runtime_stats() read after generate() returns reflects the released lane.
             remove_completed_slot(lane);
-            publish_runtime_stats();
-            complete_success(request, reason);
+            if (request->bad_words && request->bad_words->target) {
+                requeue_bad_words_rewind(request);
+                publish_runtime_stats();
+            } else {
+                publish_runtime_stats();
+                complete_success(request, reason);
+            }
             boundary = begin_host_phase();
             changed  = true;
         }
@@ -1804,6 +1917,8 @@ private:
         std::array<bool, kMaximumConcurrency> cancelled{};
         // A row whose tokens its request's grammar rejects ends with this error instead.
         std::array<std::exception_ptr, kMaximumConcurrency> row_errors{};
+        // The generated tokens a row's banned-word rewind keeps (requeue_bad_words_rewind).
+        std::array<std::optional<std::uint32_t>, kMaximumConcurrency> rewinds{};
         bool generated_staged = false;
         std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
         std::array<std::uint32_t, kMaximumConcurrency> terminal_lanes{};
@@ -1913,6 +2028,33 @@ private:
                         .cancelled       = true,
                     };
                     finish_reasons[row] = FinishReason::Cancelled;
+                    continue;
+                }
+                if (decision.bad_words_rewind) {
+                    // A banned word was completed. The request's sequence ends after this round's
+                    // tokens before the rewound position, and the request queues again from there
+                    // (requeue_bad_words_rewind). When the round keeps a token, the sequence ends
+                    // one token short of the requeued prompt, which the cache resumes from;
+                    // otherwise its end is behind the prompt's and is not kept.
+                    const std::uint32_t target   = *decision.bad_words_rewind;
+                    const std::uint32_t accepted = decision.accepted_tokens;
+                    const std::size_t generated  = request->generated.size();
+                    if (!request->bad_words || decision.finished() || accepted >= count ||
+                        target > generated + accepted ||
+                        (accepted != 0 && target != generated + accepted)) {
+                        throw std::logic_error(
+                            "output policy returned an invalid banned-word rewind");
+                    }
+                    output_tokens[row]  = accepted;
+                    decisions[row]      = CommitDecision{
+                             .accepted_tokens = std::max<std::uint32_t>(accepted, 1U),
+                             .terminal        = true,
+                             .cancelled       = false,
+                             .stop_cut        = accepted == 0,
+                    };
+                    finish_reasons[row] = FinishReason::None;
+                    continuations[row]  = ContinuationAction::Decode;
+                    rewinds[row]        = target;
                     continue;
                 }
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
@@ -2048,7 +2190,10 @@ private:
                 const std::uint32_t accepted = output_tokens[row];
                 if (!cancelled[row]) {
                     request->budget->commit(accepted);
-                    if (decode_round) { Scheduling::consume_service_work(*request, accepted); }
+                    // A banned-word rewind to this round's first token keeps none of its tokens.
+                    if (decode_round && accepted != 0) {
+                        Scheduling::consume_service_work(*request, accepted);
+                    }
                 }
                 auto published = commit_output(*request);
                 auto timing    = record_committed_output(request, accepted);
@@ -2063,6 +2208,10 @@ private:
                     } else {
                         request->model_state     = EngineRequestState::ModelFinished;
                         request->terminal_reason = finish_reasons[row];
+                        if (rewinds[row]) {
+                            request->generated.resize(*rewinds[row]);
+                            request->bad_words->target = *rewinds[row];
+                        }
                     }
                 } else if (committed.captures[row]) {
                     if (!request->is_prefilling()) {
@@ -2670,9 +2819,11 @@ private:
                     request->backfill_class              = control.backfill_class;
                     request->materialization_diagnostics = terminal.diagnostics;
                     request->model_state                 = EngineRequestState::Prefill;
-                    request->host_timing.queue_wait_ns =
-                        elapsed_ns(request->submitted, Clock::now());
-                    request->queue_wait_recorded = true;
+                    if (!request->queue_wait_recorded) {
+                        request->host_timing.queue_wait_ns =
+                            elapsed_ns(request->submitted, Clock::now());
+                        request->queue_wait_recorded = true;
+                    }
                     slots_[lane]                 = request;
                     record_prefix_selection(control.summary);
                     materializing_.reset();
@@ -2735,7 +2886,8 @@ private:
         GenerationBudget prepared_budget(summary.effective_output_tokens,
                                          summary.effective_limit_reason);
         try {
-            request->generated.reserve(summary.effective_output_tokens);
+            request->generated.reserve(request->generated.size() +
+                                       summary.effective_output_tokens);
         } catch (...) {
             const AdmissionProgress progress =
                 remove_pending_error(request, std::current_exception());

@@ -916,6 +916,10 @@ int run_tests() {
             (void)parse({"ninfer", "model.ninfer", "--prompt", "x", "--json", "--raw-output"});
         }),
         "raw JSON output should be rejected");
+    const auto banned = parse({"ninfer", "model.ninfer", "--prompt", "x", "--bad-word", "<message",
+                               "--bad-word", " <think"});
+    failures += check(banned.bad_words == std::vector<std::string>{"<message", " <think"},
+                      "CLI --bad-word collects its words in order");
     failures += launch_configuration_tests();
     return failures == 0 ? 0 : 1;
 }

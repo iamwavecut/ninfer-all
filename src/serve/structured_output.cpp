@@ -205,6 +205,12 @@ std::optional<GenerationRequest> drop_unavailable_constraints(const GenerationRe
                                                               bool structured_output,
                                                               bool unconstrained_response_format) {
     if (structured_output) { return std::nullopt; }
+    if (!request.bad_words.empty()) {
+        throw ApiException(ApiError{
+            .message = "bad_words require the server to start with --structured-output",
+            .param   = "bad_words",
+            .code    = "bad_words_not_supported"});
+    }
     std::optional<GenerationRequest> dropped;
     if (request.structured_output.kind != StructuredOutputKind::None) {
         if (!unconstrained_response_format) {

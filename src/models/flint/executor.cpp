@@ -6,6 +6,7 @@
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/mapped_host_copy.h"
+#include "core/pdl_scope.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -1869,7 +1870,12 @@ struct Executor::Impl {
             return;
         }
         if (!entry.executable.ready()) {
-            entry.definition.capture(stream, [&] { body(); });
+            // Its kernels release their dependents early (pdl::arch_enter_glue), so the captured
+            // launches become programmatic dependents on an sm_90+ device.
+            entry.definition.capture(stream, [&] {
+                const pdl::ArchScope dependents;
+                body();
+            });
             entry.executable.instantiate(entry.definition);
         }
         entry.executable.launch(stream);
@@ -2145,6 +2151,12 @@ struct Executor::Impl {
     // A position's window lies in the rings while the sequence has written fewer positions past
     // it than the rings hold beyond the window and a round's drafts, and the rings held the
     // window before it when they last came whole. The full-attention rows are kept by position.
+    std::uint32_t rewind_reach(std::uint32_t sequence, std::uint32_t position) const {
+        if (position < ring_floor.at(sequence) || position > positions.at(sequence)) { return 0; }
+        const std::int64_t slack = std::int64_t(ring) - window - std::int64_t(options.draft_tokens);
+        return slack > 0 ? std::uint32_t(slack) : 0;
+    }
+
     bool rewind(std::uint32_t sequence, std::uint32_t tokens) {
         const std::uint32_t at = positions.at(sequence);
         const std::int64_t slack = std::int64_t(ring) - window - std::int64_t(options.draft_tokens);
@@ -2276,6 +2288,10 @@ void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {
 
 void Executor::restore(std::uint32_t sequence, const SequenceSnapshot& from) {
     impl_->restore(sequence, from);
+}
+
+std::uint32_t Executor::rewind_reach(std::uint32_t sequence, std::uint32_t position) const {
+    return impl_->rewind_reach(sequence, position);
 }
 
 bool Executor::rewind(std::uint32_t sequence, std::uint32_t tokens) {

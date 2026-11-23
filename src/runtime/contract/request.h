@@ -8,6 +8,7 @@
 #include <optional>
 
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace ninfer::text {
@@ -27,6 +28,8 @@ struct ReadBranch {
 // and validated these values before constructing the runtime request.
 struct ResolvedExecutionOptions {
     StructuredOutputOptions structured_output;
+    // ExecutionOptions::bad_words as text::normalize_bad_words() returns them.
+    std::vector<std::string> bad_words;
     std::shared_ptr<text::GrammarState> grammar;
     ResolvedSamplingParameters sampling;
     // Applied once the model closes its reasoning block.
@@ -41,6 +44,9 @@ struct ResolvedExecutionOptions {
     std::vector<TokenId> readout_tokens;
     // ExecutionOptions::speculative_drafting.
     bool speculative_drafting = true;
+    // The prompt's last tokens that the presence and frequency penalties count as generated: the
+    // generated tokens that a request requeued after a banned-word rewind carries in its prompt.
+    std::uint32_t penalized_prompt_tokens = 0;
     // Engine::submit_branches: after the prompt, each branch runs as a block over it and its first
     // generated token is read; null for an ordinary request. Such a request is greedy, reads one
     // token and drafts nothing; its own readout_tokens are empty.
@@ -80,6 +86,19 @@ struct OutputDecision {
     // Bytes that a stop string may still cut are held at the round's end: the hold of this round
     // or of an earlier one is alive.
     bool stop_hold_alive = false;
+    // Banned words (bad_words). Text that may still begin a banned word is held back from the
+    // output; its hold begins at a generated token. When that token is in this round: the number
+    // of the accepted tokens before it. The request keeps what it needs to return there: the
+    // sequence's state before that token and the logits that drew it.
+    std::optional<std::uint32_t> bad_words_hold_after;
+    // A hold, of this round or an earlier one, is alive at the round's end.
+    bool bad_words_hold_alive = false;
+    // A banned word was completed: the request returns to the state before the generated token
+    // with this index (the hold's token, in this round or an earlier one), drops that token and
+    // every later one, and draws that position again from the kept logits under the masks, which
+    // now ban the dropped token there. The output session already stands at that position;
+    // accepted_tokens counts this round's tokens before it.
+    std::optional<std::uint32_t> bad_words_rewind;
 
     [[nodiscard]] bool finished() const noexcept { return finish_reason != FinishReason::None; }
 };

@@ -380,6 +380,7 @@ int main(int argc, char** argv) {
         request.execution.sampling                = cli.sampling;
         request.execution.post_thinking_sampling  = cli.post_thinking_sampling;
         request.execution.structured_output       = cli.structured_output;
+        request.execution.bad_words               = cli.bad_words;
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;
         request.execution.thinking.loop           = cli.reasoning_loop;
@@ -429,8 +430,10 @@ int main(int argc, char** argv) {
         engine_options.rope_yarn_factor         = cli.rope_yarn_factor;
         engine_options.rope_scaling_factor           = cli.rope_scaling_factor;
         engine_options.rope_scaling_original_context = cli.rope_scaling_original_context;
+        // Banned words ride on the structured-output masks.
         engine_options.structured_output =
-            cli.structured_output.kind != ninfer::StructuredOutputKind::None;
+            cli.structured_output.kind != ninfer::StructuredOutputKind::None ||
+            !cli.bad_words.empty();
         engine_options.wddm_evictable_budget    = cli.wddm_evictable_budget;
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
         engine_options.prefill_a8               = cli.prefill_a8;

@@ -1572,6 +1572,26 @@ int test_input_tokens_uses_shared_state_path() {
     return failures;
 }
 
+// vLLM's bad_words on Responses: parsed like Chat Completions, never an unknown parameter, and
+// refused by input token counting, which does not generate.
+int test_bad_words_extension() {
+    Json body    = {{"model", "m"}, {"input", "hello"}, {"bad_words", Json::array({" <message"})}};
+    int failures = check(parse_openai_responses_create_request(body, limits())
+                                 .prompt.generation.bad_words == std::vector<std::string>{"<message"},
+                         "Responses bad_words were not parsed");
+    body["bad_words"] = Json::array({""});
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(body, limits());
+                      }).param == "bad_words",
+                      "an empty Responses bad_words entry was accepted");
+    Json counting = {{"model", "m"}, {"input", "hello"}, {"bad_words", Json::array({"<a"})}};
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_input_tokens_request(counting, limits());
+                      }).param == "bad_words",
+                      "input token count accepted bad_words");
+    return failures;
+}
+
 int test_thinking_budget_extension() {
     Json body    = {{"model", "m"}, {"input", "hello"}};
     int failures = check(!parse_openai_responses_create_request(body, limits())
@@ -1645,6 +1665,7 @@ int main() {
     failures += test_graft_extension();
     failures += test_lora_extension();
     failures += test_thinking_budget_extension();
+    failures += test_bad_words_extension();
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();
     failures += test_reasoning_encrypted_content_request();

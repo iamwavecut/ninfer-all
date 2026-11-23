@@ -54,7 +54,8 @@ import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
-from .gguf_blocks import (GGML_MXFP4, GGML_Q8_0, bf16_source, block_source, dequantize_q8_0,
+from .gguf_blocks import (GGML_MXFP4, GGML_Q8_0, bf16_source, block_source, dequantize_blocks,
+                          dequantize_q8_0,
                           mxfp4_as_q8_0)
 from .methods import cast_direct, import_encoded
 from .resources import _dump_json, token_domain
@@ -285,8 +286,11 @@ def _direct(gguf: GGUFFile, tensor: str, shape: tuple[int, ...]) -> LogicalSourc
     elif info.type_name in ("F32", "BF16", "F16"):
         values = gguf.read_direct(tensor).astype(np.float32)
     else:
-        raise ValueError(f"{tensor}: expected a float or Q8_0 vector or matrix, found "
-                         f"{info.type_name}")
+        # Vector-role params are usually F32/BF16/F16/Q8_0, but third-party quantizers
+        # may store them in other block formats (e.g. Q4_K for attn_sink_proj).
+        # Decode via the shared dequantizer so any GGUF block type is accepted.
+        values = np.asarray(dequantize_blocks(info.type_id, gguf.read_blocks(tensor)),
+                            dtype=np.float32)
     if values.size != int(np.prod(shape)):
         raise ValueError(f"{tensor}: stored {info.shape}, expected {shape}")
     return array_source(torch.from_numpy(np.ascontiguousarray(values.reshape(shape))), tensor)

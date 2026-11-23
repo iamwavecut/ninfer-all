@@ -150,6 +150,10 @@ void controls() {
                !stops.generation.cache_prompt,
            "llama.cpp stop lists, ignore_eos and cache_prompt");
 
+    const auto banned = parse(R"({"prompt": "x", "bad_words": ["<message", "\n<think"]})");
+    expect(banned.generation.bad_words == std::vector<std::string>{"<message", "<think"},
+           "bad_words on a raw-prompt completion");
+
     const auto schema = parse(R"({"prompt": "x", "json_schema": {"type": "object"}})");
     expect(schema.generation.structured_output.kind == ninfer::StructuredOutputKind::JsonSchema,
            "json_schema constrains the output");

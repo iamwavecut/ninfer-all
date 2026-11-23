@@ -9,6 +9,7 @@
 #include "product/rope_yarn_options.h"
 #include "product/tensor_split_options.h"
 #include "product/speculative_options.h"
+#include "text/bad_words.h"
 
 #include <cerrno>
 #include <cmath>
@@ -383,6 +384,8 @@ std::string usage_text(const char* argv0) {
            "OUTPUT\n"
            "  --json                        constrain the answer to a JSON object\n"
            "  --json-schema FILE            enforce a supported JSON schema\n"
+           "  --bad-word TEXT               never write this text anywhere in the reply\n"
+           "                                (vLLM's bad_words); repeatable\n"
            "  --raw-output                  print the raw generated text without framing\n"
            "  --print-token-ids             also print the generated token ids\n"
            "\n"
@@ -677,6 +680,8 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                 throw std::invalid_argument("--stop-token-id exceeds the token domain");
             }
             options.stop_token_ids.push_back(static_cast<TokenId>(token));
+        } else if (arg == "--bad-word") {
+            options.bad_words.push_back(value(arg));
         } else if (arg == "--stop" || arg == "--reasoning-stop") {
             std::string text = value(arg);
             if (text.empty()) {
@@ -788,6 +793,13 @@ Options parse_arguments(const std::vector<std::string>& arguments,
     // pixels) keeps one to a few seconds.
     if (options.vision_residency == VisionResidency::Cpu && !vision_max_merged_explicit) {
         options.vision_max_merged_tokens = 256;
+    }
+    if (!options.bad_words.empty()) {
+        try {
+            (void)text::normalize_bad_words(options.bad_words);
+        } catch (const std::invalid_argument& e) {
+            throw std::invalid_argument(std::string("--bad-word: ") + e.what());
+        }
     }
     if (options.structured_output.kind != StructuredOutputKind::None) {
         if (options.raw_output || !options.stop_strings.empty() ||

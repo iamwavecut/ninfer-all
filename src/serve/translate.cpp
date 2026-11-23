@@ -488,6 +488,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
             options.execution.post_thinking_sampling->presence_penalty = 0.0F;
         }
     }
+    options.execution.bad_words      = request.bad_words;
     options.execution.logprobs       = request.logprobs;
     options.execution.readout_tokens = request.readout_tokens;
     options.execution.speculative_drafting = request.speculative_drafting;

@@ -1246,6 +1246,7 @@ void reject_unsupported_platform_fields(const Json& body) {
 void validate_common_top_level(const Json& body, bool create) {
     static const std::unordered_set<std::string> create_fields = {"access_programs",
                                                                   "background",
+                                                                  "bad_words",
                                                                   "chat_template_kwargs",
                                                                   "client_metadata",
                                                                   "context_management",
@@ -1338,6 +1339,7 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     out.store                   = optional_bool(body, "store", true);
     out.stream                  = optional_bool(body, "stream", false);
     out.prompt.generation.thinking_budget = parse_thinking_budget_field(body);
+    out.prompt.generation.bad_words       = parse_bad_words_field(body);
     validate_metadata(body, out.metadata);
 
     // Codex attaches per-request tracing information here. It is an opaque client hint and has no

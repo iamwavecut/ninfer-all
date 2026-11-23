@@ -94,6 +94,8 @@ struct Options {
 
     std::vector<TokenId> stop_token_ids;
     std::vector<StopString> stop_strings;
+    // --bad-word: text the reply never contains (ExecutionOptions::bad_words).
+    std::vector<std::string> bad_words;
 
     // Omitted fields are resolved from the loaded model and rendered prompt mode by Engine.
     SamplingOverrides sampling;

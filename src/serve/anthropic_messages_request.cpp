@@ -952,6 +952,7 @@ void parse_generation_fields(const Json& body, GenerationRequest& request) {
             request.stop_strings.push_back(value.get<std::string>());
         }
     }
+    request.bad_words = parse_bad_words_field(body);
 
     request.sampling.temperature = optional_number(body, "temperature");
     request.sampling.top_p       = optional_number(body, "top_p");

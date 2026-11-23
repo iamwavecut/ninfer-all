@@ -96,6 +96,47 @@ struct RequestHostTiming {
     }
 };
 
+// Adds what one of a request's sequences measured to the sums of its earlier ones (a request
+// queued again after a banned-word rewind runs several).
+inline void accumulate_measurements(GenerationTimings& into, const GenerationTimings& from) {
+    into.vision_seconds += from.vision_seconds;
+    into.prefill_seconds += from.prefill_seconds;
+    into.overlay_windows += from.overlay_windows;
+    into.overlay_window_seconds += from.overlay_window_seconds;
+    into.overlay_evict_seconds += from.overlay_evict_seconds;
+    into.overlay_restore_seconds += from.overlay_restore_seconds;
+    into.overlay_evicted_bytes += from.overlay_evicted_bytes;
+    into.overlay_staged_bytes += from.overlay_staged_bytes;
+    into.overlay_exclusive_windows += from.overlay_exclusive_windows;
+    into.decode_seconds += from.decode_seconds;
+}
+
+inline void accumulate_measurements(SpeculativeStats& into, SpeculativeStats&& from) {
+    const auto add = [](std::vector<std::uint64_t>& sum, const std::vector<std::uint64_t>& part) {
+        if (sum.size() < part.size()) { sum.resize(part.size(), 0); }
+        for (std::size_t index = 0; index < part.size(); ++index) { sum[index] += part[index]; }
+    };
+    if (!into.enabled && into.rounds == 0) {
+        into.backend      = from.backend;
+        into.enabled      = from.enabled;
+        into.draft_window = from.draft_window;
+        into.adaptive     = from.adaptive;
+    }
+    into.rounds += from.rounds;
+    into.drafted_tokens += from.drafted_tokens;
+    into.accepted_tokens += from.accepted_tokens;
+    into.fallback_steps += from.fallback_steps;
+    add(into.accepted_per_position, from.accepted_per_position);
+    into.window_transitions += from.window_transitions;
+    add(into.rounds_per_window, from.rounds_per_window);
+    into.ngram_rounds += from.ngram_rounds;
+    into.ngram_drafted_tokens += from.ngram_drafted_tokens;
+    into.ngram_accepted_tokens += from.ngram_accepted_tokens;
+    into.ngram_archive_rounds += from.ngram_archive_rounds;
+    into.ngram_archive_drafted_tokens += from.ngram_archive_drafted_tokens;
+    into.ngram_archive_accepted_tokens += from.ngram_archive_accepted_tokens;
+}
+
 enum class EngineRequestState : std::uint8_t {
     Waiting,
     Materializing,
@@ -209,6 +250,30 @@ struct RequestRecord {
     // The catalog cell and session digest the finished session was retained under, if any.
     std::int32_t retained_slot = -1;
     std::string retained_session_digest;
+
+    // Banned words (bad_words). The Program cannot take a sequence back to an earlier state, so a
+    // rewind ends the request's sequence and queues the request again: its prompt is then the
+    // submitted one followed by the generated tokens the rewind keeps, and its first draw is the
+    // rewound position (EngineCore::requeue_bad_words_rewind).
+    struct BadWordsRequeue {
+        // The prompt as submitted, which every requeue continues.
+        PreparedPrompt prompt;
+        // The submitted output limit and sampling, which a requeue resolves again.
+        std::uint32_t requested_output_tokens = 0;
+        ResolvedSamplingParameters sampling;
+        // The generated tokens the pending rewind keeps; set from its commit until the request
+        // settles and queues again.
+        std::optional<std::uint32_t> target;
+        std::uint32_t requeues = 0;
+        // The generated tokens before the switch to post-thinking sampling, once it is applied.
+        std::optional<std::uint32_t> post_thinking_at;
+        // The first admission's Begin, which the result reports, and what the ended sequences
+        // measured.
+        std::optional<BeginSummary> begin;
+        GenerationTimings timings;
+        SpeculativeStats speculative;
+    };
+    std::optional<BadWordsRequeue> bad_words;
 
     std::mutex mutex;
     std::condition_variable cv;

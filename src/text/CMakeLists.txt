@@ -1,5 +1,6 @@
 add_library(ninfer_text STATIC
   unicode.cpp
+  bad_words.cpp
   structured_output.cpp
   schema_normalization.cpp
   string_constraints.cpp
