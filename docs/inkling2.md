@@ -61,6 +61,19 @@ tokenization, the chat template, output parsing and the serving protocols.
   ([measurements](#measurements)); the shared launches then added 1.9% without drafts on an RTX
   PRO 4500 Blackwell (126.6 to 129.0 tok/s) and 2.2% on an RTX 4090 (139.4-139.9 to 142.8-142.9
   tok/s), and 1.1-1.4% with DSpark, again with the same tokens.
+- **Expert read-ahead.** With the experts on the GPU, a decode call of one row guesses each
+  visit's experts one visit early: on a side stream, the next visit's router scores the current
+  visit's MoE input, and the next visit reads its likeliest experts' rows into L2 while its
+  attention runs. A card reads as many experts as a quarter of its L2 holds (at most 16, none
+  below two): four on an RTX 4090, five on an RTX 5090; an RTX 3090's 6 MiB holds none. The reads
+  change no value. Greedy decode without drafts went from 144.6 to 147.3-147.6 tok/s on an RTX 4090
+  and from 207.5 to 217.5 on an RTX 5090, with the same tokens. Calls of several rows (DSpark's
+  verifications, concurrent requests) read none: two guesses a row or fewer slowed DSpark decode on
+  the RTX 4090 from 175.6-178.4 to 171.4-171.9 tok/s.
+- **Dependent launches.** On sm_90 and newer cards the decode graph launches each kernel as a
+  programmatic dependent of the one before it, and the short kernels release it once they are
+  resident ([programmatic dependent launch](maintainer/op-development.md#programmatic-dependent-launch)).
+  Greedy decode without drafts went from 199.4 to 216.0 tok/s on an RTX 5090 with the same tokens.
 - **Long contexts.** A prompt chunk of a full-attention visit first computes, on tensor cores, its
   rows' attention over the keys at least 1,024 positions (the relative table's extent) before every
   row of a group of 32: F16 queries and probabilities, keys and values as stored (a plane format's
