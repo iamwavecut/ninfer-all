@@ -90,6 +90,11 @@ ninfer_add_op_test(ninfer_linear_gguf_moe_iq1m_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_moe_iq1m.cpp"
   LIBRARIES ninfer_ops)
 
+# The vector kernels' dense and MoE forms against the CPU's expert rows, bit for bit.
+ninfer_add_op_test(ninfer_linear_gguf_vector_rows_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_vector_rows.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_gguf_mmq_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_mmq_store.cu"
   LIBRARIES ninfer_ops)

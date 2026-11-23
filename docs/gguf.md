@@ -36,11 +36,16 @@ sums](flint.md#f16-activation-sums)).
 
 - **Up to eight columns** (decode, speculative verification, small batches), the vector kernel
   (`src/ops/linear/gguf/ggml_bridge_vec.cuh`) decodes each 32-value slice of a row once into int8
-  words and dots it with every column. A warp owns two rows; a `[gate; up]` pair of one type is one
-  launch that writes `silu(gate) * up`. A layer's separate products of one input format (Inkling's
-  query, gate, relative, key and value rows; Gemma 4's and Flint's query, key and value parts of
-  one block type) share launches of up to four products and 10 blocks per SM, each product's rows
-  computed as alone, so the outputs are the same bits.
+  words and dots it with every column. A warp owns two rows (four in a single column's routed
+  expert products): lane `l` adds slices `l`, `l + 32`, ... and the warp then sums its lanes. When
+  a row's slices are not a whole number of 32, the rows' last slices spread over all lanes and
+  each product returns to the lane that adds it, so the sums keep their bits while no lane waits
+  idle (every format but `Q2_K` and `IQ2_XS`, whose slice products the compiler forms differently
+  in another position). A `[gate; up]` pair of one type is one launch that writes
+  `silu(gate) * up`. A layer's separate products of one input format (Inkling's query, gate,
+  relative, key and value rows; Gemma 4's and Flint's query, key and value parts of one block
+  type) share launches of up to four products and 10 blocks per SM, each product's rows computed
+  as alone, so the outputs are the same bits.
 - **More columns** (prompts) take llama.cpp's integer tensor-core kernel (`mul_mat_q`, vendored
   in `third_party/ggml-quants` under its MIT license with the changes its `README.ninfer.md`
   lists) with its Ampere tile table. `IQ1_M` has no such kernel for dense matrices, whose wide
