@@ -389,17 +389,25 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         const std::uint64_t dkv = std::uint64_t(dc.num_key_value_heads) * dc.head_dim;
         const std::uint64_t rank = dc.markov_rank;
         const std::uint64_t width = dc.intermediate_size;
+        const std::uint64_t vocab = config.unpadded_vocab_size;
+        if (!binder.contains("dspark/markov_out")) {
+            throw artifact::ArtifactError(
+                "the artifact's DSpark drafter has the earlier form, converted from a drafter GGUF "
+                "whose Markov output is not folded with the head; convert it again from Unsloth's "
+                "current dspark-Inkling-2-Mini-Q8_0.gguf or download the current artifact "
+                "(--spec none runs without the drafter)");
+        }
         DSparkWeights& dw   = dspark.emplace();
-        dw.fuse            = vector("dspark/fuse", {dc.num_hidden_layers + 1u,
-                                                    std::uint64_t(dc.target_visits.size())});
+        dw.mix             = vector("dspark/mix", {dc.num_hidden_layers + 1u,
+                                                   std::uint64_t(dc.target_visits.size())});
         dw.context_norm    = vector("dspark/context_norm", {h});
         dw.final_norm      = vector("dspark/final_norm", {h});
         dw.mask_embedding  = vector("dspark/mask_embedding", {h});
-        dw.markov_embed    = b.direct("dspark/markov_embed", {config.vocab_size, rank}, QType::BF16);
+        dw.markov_embed    = b.direct("dspark/markov_embed", {vocab, rank}, QType::BF16);
         dw.joint           = vector("dspark/joint", {3 * rank, 2 * rank + 2 * h});
         dw.joint_bias      = vector("dspark/joint_bias", {3 * rank});
-        dw.hidden_out      = vector("dspark/hidden_out", {h, rank});
-        dw.hidden_out_bias = vector("dspark/hidden_out_bias", {h});
+        dw.markov_out      = b.direct("dspark/markov_out", {vocab, rank}, QType::BF16);
+        dw.markov_out_bias = vector("dspark/markov_out_bias", {vocab});
         for (std::uint32_t i = 0; i < dc.num_hidden_layers; ++i) {
             const std::string p = "dspark/layers/" + std::to_string(i) + "/";
             const std::string a = p + "attention/";

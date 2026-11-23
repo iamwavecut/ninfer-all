@@ -4,14 +4,14 @@
 //  - attention over a uniform block: every row sees the anchor's window (or every position) and
 //    the whole block, no sinks, gate or relative bias; window rings and full caches, one and many
 //    splits, a block of 8 and of 3 rows; BF16 and q8_1 outputs.
-//  - spark_mix: the softmax-weighted mixes of four taps RMS-normed per mix, BF16 and q8_1 rows,
+//  - spark_mix: the weighted mixes of four taps (softmax rows) RMS-normed per mix, BF16 and q8_1 rows,
 //    the last mix FP32 into the context ring from its first row on, rows past `end` untouched.
 //  - spark_rotate: per-head RMS norm and NeoX rotation of queries in place and of keys into F16
 //    caches with the values beside them (window ring and full cache), at positions up to 2^20 - 1
 //    (the angle formed in FP64).
 //  - spark_step: the recurrent head's joint projection, the soft-capped logits over the head's
 //    table, the first maximum (an exact tie included), its probability and the state update, three
-//    steps chained; spark_table and spark_head_inputs exactly; silu_mul and add_rows.
+//    steps chained; silu_mul and add_rows.
 // BF16 and F16 outputs are compared by RMS error relative to the oracle's.
 
 #include "core/device_buffer.h"
@@ -25,7 +25,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -202,7 +201,15 @@ void mix_case(const std::string& name, int tokens, bool q8, int end, int ring_be
     constexpr int kTapCount = 4, kContexts = 3;
     std::vector<std::vector<float>> taps;
     for (int j = 0; j < kTapCount; ++j) { taps.push_back(normal(std::size_t(tokens) * kHidden, 1.0f + j, rng)); }
-    const auto fuse = normal((kContexts + 1) * kTapCount, 1.5f, rng);
+    // Softmax rows, as llama.cpp's converter stores the release's fusion weights.
+    auto mix = normal((kContexts + 1) * kTapCount, 1.5f, rng);
+    for (int m = 0; m <= kContexts; ++m) {
+        double total = 0;
+        for (int j = 0; j < kTapCount; ++j) { total += std::exp(double(mix[m * kTapCount + j])); }
+        for (int j = 0; j < kTapCount; ++j) {
+            mix[m * kTapCount + j] = float(std::exp(double(mix[m * kTapCount + j])) / total);
+        }
+    }
     std::vector<std::vector<float>> norms;
     for (int m = 0; m <= kContexts; ++m) {
         auto w = normal(kHidden, 0.3f, rng);
@@ -218,7 +225,7 @@ void mix_case(const std::string& name, int tokens, bool q8, int end, int ring_be
     std::vector<DeviceBuffer> d_taps, d_norms;
     for (const auto& t : taps) { d_taps.push_back(upload(t)); }
     for (const auto& n : norms) { d_norms.push_back(upload(n)); }
-    DeviceBuffer df = upload(fuse), dp = upload(positions), ds = upload(seqs);
+    DeviceBuffer df = upload(mix), dp = upload(positions), ds = upload(seqs);
     const std::size_t q8_bytes = std::size_t(tokens) * kHidden + std::size_t(tokens) * (kHidden / 32) * 4;
     const std::size_t q8_stride = (q8_bytes + 255) / 256 * 256;
     DeviceBuffer out(std::size_t(kContexts) * tokens * kHidden * 2), outq(kContexts * q8_stride);
@@ -234,7 +241,7 @@ void mix_case(const std::string& name, int tokens, bool q8, int end, int ring_be
     a.rows.first     = chunk ? 500 : 0;
     for (int j = 0; j < kTapCount; ++j) { a.taps[j] = as<float>(d_taps[j]); }
     a.tap_count = kTapCount;
-    a.fuse      = as<float>(df);
+    a.mix       = as<float>(df);
     for (int m = 0; m <= kContexts; ++m) { a.norm[m] = as<float>(d_norms[m]); }
     a.context_count = kContexts;
     a.hidden        = kHidden;
@@ -268,12 +275,9 @@ void mix_case(const std::string& name, int tokens, bool q8, int end, int ring_be
     std::vector<bool> written(ring_init.size(), false);
     for (int t = 0; t < end; ++t) {
         for (int m = 0; m <= kContexts; ++m) {
-            double top = -INFINITY, total = 0;
-            for (int j = 0; j < kTapCount; ++j) { top = std::max(top, double(fuse[m * kTapCount + j])); }
-            for (int j = 0; j < kTapCount; ++j) { total += std::exp(fuse[m * kTapCount + j] - top); }
             std::vector<double> x(kHidden, 0.0);
             for (int j = 0; j < kTapCount; ++j) {
-                const double w = std::exp(fuse[m * kTapCount + j] - top) / total;
+                const double w = mix[m * kTapCount + j];
                 for (int c = 0; c < kHidden; ++c) { x[c] += w * taps[j][std::size_t(t) * kHidden + c]; }
             }
             double ss = 0;
@@ -548,36 +552,6 @@ void step_case(const std::string& name, int vocab, bool tie, std::mt19937& rng) 
                (tie ? (tie_ok ? ", ties to the lower id" : ", tie broken wrongly") : ""));
 }
 
-void table_case(std::mt19937& rng) {
-    const int n = 777;
-    const auto p = normal(std::size_t(n) * (kRank + 1), 2.0f, rng);
-    DeviceBuffer dp = upload(p), m(std::size_t(n) * kRank * 2), c(std::size_t(n) * 4);
-    k::spark_table(as<float>(dp), n, as<bf16>(m), as<float>(c), nullptr);
-    const auto hidden_out = normal(std::size_t(kHidden) * kRank, 1.0f, rng);
-    const auto bias       = normal(kHidden, 1.0f, rng);
-    DeviceBuffer dho = upload(hidden_out), dbias = upload(bias), inputs(std::size_t(kRank + 1) * kHidden * 4);
-    k::spark_head_inputs(as<float>(dho), as<float>(dbias), kHidden, kRank, as<float>(inputs), nullptr);
-    sync("spark_table");
-    const auto gm = download<bf16>(m, std::size_t(n) * kRank);
-    const auto gc = download<float>(c, n);
-    const auto gi = download<float>(inputs, std::size_t(kRank + 1) * kHidden);
-    std::size_t wrong = 0;
-    for (int v = 0; v < n; ++v) {
-        for (int r = 0; r < kRank; ++r) {
-            const bf16 want = __float2bfloat16(p[std::size_t(v) * (kRank + 1) + r]);
-            wrong += std::memcmp(&gm[std::size_t(v) * kRank + r], &want, 2) != 0;
-        }
-        wrong += gc[v] != p[std::size_t(v) * (kRank + 1) + kRank];
-    }
-    for (int r = 0; r <= kRank; ++r) {
-        for (int i = 0; i < kHidden; ++i) {
-            const float want = r < kRank ? hidden_out[std::size_t(i) * kRank + r] : bias[i];
-            wrong += gi[std::size_t(r) * kHidden + i] != want;
-        }
-    }
-    report(wrong == 0, "spark_table and spark_head_inputs: " + std::to_string(wrong) + " values differ");
-}
-
 void elementwise_case(std::mt19937& rng) {
     const int rows = 5, width = 9216;
     const auto gu = normal(std::size_t(rows) * 2 * width, 2.5f, rng);
@@ -628,7 +602,6 @@ int main() {
         rotate_case(rng);
         step_case("vocabulary of 5000", 5000, false, rng);
         step_case("an exact tie", 1000, true, rng);
-        table_case(rng);
         elementwise_case(rng);
     } catch (const std::exception& e) {
         std::cout << "FAIL " << e.what() << '\n';

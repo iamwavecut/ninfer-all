@@ -116,10 +116,10 @@ enum class VisionPlacement : std::uint8_t {
     Pinned,
 };
 
-// The DSpark drafter: the fusion weights of its feature mixes [layers + 1][taps], the norms, the
-// mask rows' embedding, the Markov embedding [vocab][rank] (BF16), the recurrent head's joint
-// projection [3 rank][2 rank + 2 hidden] and bias, its output [hidden][rank] and bias (FP32), and
-// three blocks.
+// The DSpark drafter: the weights of its feature mixes [layers + 1][taps], the norms, the mask
+// rows' embedding, the recurrent head's Markov embedding [vocab][rank] (BF16), joint projection
+// [3 rank][2 rank + 2 hidden] and bias, and output [vocab][rank] (BF16) with its bias [vocab]
+// (FP32), the release's head folded in, over the unpadded vocabulary; and three blocks.
 struct DSparkLayerWeights {
     WeightId context_norm, attention_norm, ffn_norm;
     WeightId query, key, value, output, context_key, context_value;
@@ -128,8 +128,8 @@ struct DSparkLayerWeights {
 };
 
 struct DSparkWeights {
-    WeightId fuse, context_norm, final_norm, mask_embedding, markov_embed, joint, joint_bias,
-        hidden_out, hidden_out_bias;
+    WeightId mix, context_norm, final_norm, mask_embedding, markov_embed, joint, joint_bias,
+        markov_out, markov_out_bias;
     std::vector<DSparkLayerWeights> layers;
 };
 

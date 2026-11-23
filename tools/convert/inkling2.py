@@ -30,15 +30,16 @@ The release's vision tower forms the `vision` component beside `text` (`--compon
 position rows resized to each image and 2D-rotated heads, then 2x2 patch merging and a two-layer
 projector, its vectors FP32 and its matrices BF16 or, from a quantized mmproj such as ggml-org's
 `mmproj-Inkling-2-Mini-Q8_0.gguf`, the GGUF's block rows as stored. The release's DSpark drafter
-(`--components text,dspark`, `--source dspark=dspark-Inkling-2-Mini-Q8_0_Old.gguf`, llama.cpp
-architecture `dflash`; the mainline drafter of Unsloth's root `dspark-Inkling-2-Mini-Q8_0.gguf`
-stores other tensors and is not read) forms the `dspark` component: three blocks over the target's
-tapped hidden states, each with its own context projections, and a recurrent Markov head that
-corrects the target's head.
+in llama.cpp's layout (`--components text,dspark`, `--source dspark=dspark-Inkling-2-Mini-Q8_0.gguf`,
+architecture `dflash`) forms the `dspark` component: three blocks over the target's tapped hidden
+states, each with its own context projections, and a recurrent Markov head that corrects the
+target's head, its output folded with the release's head by llama.cpp's converter. The earlier
+layout of Unsloth's `dspark-Inkling-2-Mini-Q8_0_Old.gguf`, which stores the unfolded output, is
+refused.
 
     python -m tools.convert --model HF_DIR --recipe inkling2_gguf \\
         --source gguf=Inkling-2-Mini-UD-IQ4_XS.gguf \\
-        --source vision=mmproj-BF16.gguf --source dspark=dspark-Inkling-2-Mini-Q8_0_Old.gguf \\
+        --source vision=mmproj-BF16.gguf --source dspark=dspark-Inkling-2-Mini-Q8_0.gguf \\
         --components text,vision,dspark --out inkling-2-mini-UD-IQ4_XS.ninfer
 
 `HF_DIR` holds the release's `config.json`, `tokenizer.json`, `tokenizer_config.json`,
@@ -408,6 +409,14 @@ def dspark_config(source: dict, config: dict, dspark: GGUFFile) -> dict:
     """The `dspark` component's config from the release's mtp_config, checked against the drafter
     GGUF's metadata."""
 
+    kv, f = dspark.kv, "dflash."
+    if kv.get("general.architecture") != "dflash":
+        raise ValueError(f"{dspark.path}: expected the release's DSpark drafter (dflash) GGUF")
+    if "dspark_fuse.weight" in dspark.tensors:
+        raise ValueError(f"{dspark.path}: the earlier DSpark drafter layout (Unsloth's "
+                         "dspark-Inkling-2-Mini-Q8_0_Old.gguf), which stores the Markov head's "
+                         "output unfolded; convert from llama.cpp's layout, Unsloth's "
+                         "dspark-Inkling-2-Mini-Q8_0.gguf")
     raw = source.get("mtp_config")
     if not isinstance(raw, dict) or raw.get("markov_head_type") != "rnn_hidden":
         raise ValueError("config.json has no mtp_config with a recurrent Markov head")
@@ -435,9 +444,7 @@ def dspark_config(source: dict, config: dict, dspark: GGUFFile) -> dict:
     out["target_layer_ids"] = list(targets)
     if out["num_attention_heads"] % out["num_key_value_heads"]:
         raise ValueError("drafter query heads must be a multiple of its key/value heads")
-    kv, f = dspark.kv, "dflash."
-    if kv.get("general.architecture") != "dflash":
-        raise ValueError(f"{dspark.path}: expected the release's DSpark drafter (dflash) GGUF")
+    # llama.cpp's sliding window counts the anchor's own position too.
     expected = {
         "block_count": out["num_hidden_layers"], "embedding_length": config["hidden_size"],
         "feed_forward_length": out["intermediate_size"],
@@ -445,10 +452,8 @@ def dspark_config(source: dict, config: dict, dspark: GGUFFile) -> dict:
         "attention.head_count_kv": out["num_key_value_heads"],
         "attention.key_length": out["head_dim"], "attention.value_length": out["head_dim"],
         "rope.dimension_count": out["head_dim"], "block_size": out["block_size"],
-        "dspark.markov_rank": out["markov_rank"], "sample_from_anchor": False,
-        "has_confidence_head": False, "attention.causal": False,
-        "attention.sliding_window": out["sliding_window_size"],
-        "vocab_size": config["vocab_size"], "vocab_size_unpadded": config["unpadded_vocab_size"],
+        "sample_from_anchor": False, "has_confidence_head": False, "has_markov_context": True,
+        "attention.sliding_window": out["sliding_window_size"] + 1,
     }
     for key, value in expected.items():
         if kv.get(f + key) != value:
@@ -576,7 +581,7 @@ def build_model(base, gguf: GGUFFile, *, vision: GGUFFile | None = None,
     if vision is not None:
         _vision(model, vision, records["vision"]["config"], config)
     if dspark is not None:
-        _dspark(model, dspark, records["dspark"]["config"], config)
+        _dspark(model, dspark, records["dspark"]["config"], config, gguf)
     return model
 
 
@@ -635,14 +640,18 @@ def _vision(model, vision: GGUFFile, vc: dict, config: dict) -> None:
           ("vision/projector_hidden",))
 
 
-def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict) -> None:
-    """The drafter's matrices as stored (Q8_0 in the release's GGUF), its vectors FP32, the Markov
-    embedding BF16 as stored (a source BF16 does not hold is refused) and the fusion weights of its
-    feature mixtures FP32."""
+def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict, gguf: GGUFFile) -> None:
+    """llama.cpp's drafter GGUF: the matrices as stored (Q8_0 in Unsloth's), the vectors FP32, the
+    weights of the feature mixes FP32 (llama.cpp's softmax of the release's fusion weights, a row
+    per mix), and the recurrent head's Markov embedding and output BF16 as stored (a source BF16
+    does not hold is refused) with the output's bias FP32. llama.cpp folds the release's head into
+    that output (markov_w2 = unembed hidden_out, its bias unembed hidden_out_bias) over the unpadded
+    vocabulary, the Markov embedding's rows too. The file repeats the one mask row per block slot
+    and the target's embedding norm; both repeats are checked."""
 
     from .model import Parameter
 
-    h, vocab = config["hidden_size"], config["vocab_size"]
+    h, vocab = config["hidden_size"], config["unpadded_vocab_size"]
     heads, kv_heads, d = (drafter["num_attention_heads"], drafter["num_key_value_heads"],
                           drafter["head_dim"])
     width, rank = drafter["intermediate_size"], drafter["markov_rank"]
@@ -655,19 +664,37 @@ def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict) -> None:
         read = _exact_bf16 if stored == "bf16" else _direct
         model.add(Parameter(name, shape, read(dspark, tensor, shape), direct_format=stored))
 
-    vector("dspark/fuse", "dspark_fuse.weight", (layers + 1, taps))
-    vector("dspark/context_norm", "dspark_norm.weight", (h,))
+    def values(tensor, shape):
+        return _direct(dspark, tensor, shape).values(0, int(np.prod(shape))).reshape(shape)
+
+    mixes = [values(f"blk.{b}.ctx_mix.weight", (taps,)) for b in range(layers)]
+    mixes = torch.stack(mixes + [values("markov_ctx_mix.weight", (taps,))])
+    if bool((mixes < 0).any()) or not torch.allclose(mixes.double().sum(1),
+                                                     torch.ones(layers + 1, dtype=torch.float64),
+                                                     rtol=0.0, atol=1e-5):
+        raise ValueError(f"{dspark.path}: the feature mixes' weights are not softmax rows")
+    model.add(Parameter("dspark/mix", (layers + 1, taps), array_source(mixes, "dspark/mix"),
+                        direct_format="fp32"))
+    masks = values("mask_embd.weight", (drafter["block_size"] - 1, h))
+    if not torch.equal(masks, masks[:1].expand_as(masks)):
+        raise ValueError(f"{dspark.path}: the mask rows differ; the release has one")
+    model.add(Parameter("dspark/mask_embedding", (h,), array_source(masks[0].clone(),
+                                                                     "mask_embd.weight"),
+                        direct_format="fp32"))
+    target_norm = _direct(gguf, "token_embd_norm.weight", (h,)).values(0, h)
+    if not torch.equal(values("token_embd_norm.weight", (h,)), target_norm):
+        raise ValueError(f"{dspark.path}: the drafter's embedding norm is not the model's")
+    vector("dspark/context_norm", "markov_ctx_norm.weight", (h,))
     vector("dspark/final_norm", "output_norm.weight", (h,))
-    vector("dspark/mask_embedding", "mask_embd.weight", (h,))
     vector("dspark/markov_embed", "markov_w1.weight", (vocab, rank), stored="bf16")
     vector("dspark/joint", "joint_proj.weight", (3 * rank, 2 * rank + 2 * h))
     vector("dspark/joint_bias", "joint_proj.bias", (3 * rank,))
-    vector("dspark/hidden_out", "dspark_hidden_out.weight", (h, rank))
-    vector("dspark/hidden_out_bias", "dspark_hidden_out.bias", (h,))
+    vector("dspark/markov_out", "markov_w2.weight", (vocab, rank), stored="bf16")
+    vector("dspark/markov_out_bias", "markov_w2.bias", (vocab,))
     for b in range(layers):
         g, p = f"blk.{b}.", f"dspark/layers/{b}/"
         a = p + "attention/"
-        vector(p + "context_norm", g + "dflare_norm.weight", (h,))
+        vector(p + "context_norm", g + "ctx_norm.weight", (h,))
         vector(p + "attention_norm", g + "attn_norm.weight", (h,))
         vector(p + "ffn_norm", g + "ffn_norm.weight", (h,))
         matrix(a + "query", g + "attn_q.weight", (heads * d, h), (p + "attention_input",))
@@ -688,8 +715,8 @@ def _dspark(model, dspark: GGUFFile, drafter: dict, config: dict) -> None:
 
 def inkling2_gguf(model, recipe, sources):
     """Every matrix keeps its GGUF blocks, the vision tower's its BF16 values or, from a
-    quantized mmproj, its blocks; vectors are FP32 (the drafter's Markov embedding BF16, as
-    stored). A layer's query, gate and relative projections, which read one input, share one
+    quantized mmproj, its blocks; vectors are FP32 (the drafter's Markov embedding and output
+    BF16, as stored). A layer's query, gate and relative projections, which read one input, share one
     parent when the GGUF stores them in one format, as do the drafter's Q, K and V, its context
     K and V, and its MLP's gate and up rows."""
 

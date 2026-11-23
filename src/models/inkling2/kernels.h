@@ -396,7 +396,7 @@ void ring_copy(const RingCopyArgs& args, cudaStream_t stream);
 // ---- The DSpark drafter (executor.h) -------------------------------------------------------------
 
 // The drafter's feature mixes of rows [begin, end) of a call: mix m of row t is
-//   x = sum_j softmax_j(fuse[m]) taps[j][t]   (taps FP32 [T][hidden] each, j < tap_count)
+//   x = sum_j mix[m][j] taps[j][t]   (taps FP32 [T][hidden] each, j < tap_count)
 // RMS-normed with norm[m] (eps). Mixes below `context_count` go out as BF16 rows (out, mix m at
 // m * T * hidden) or q8_1 rows (out_q, mix m q8_stride bytes on); mix `context_count` (the
 // recurrent head's context) goes out FP32 into the row's slot (its position % slots) of its
@@ -407,7 +407,7 @@ struct SparkMixArgs {
     Rows rows;
     const float* taps[kMaxSparkTaps] = {};
     int tap_count = 0;
-    const float* fuse = nullptr; // [context_count + 1][tap_count]
+    const float* mix = nullptr; // [context_count + 1][tap_count], each row a softmax
     const float* norm[kMaxSparkMixes] = {};
     int context_count = 0, hidden = 0, begin = 0, end = 0, ring_begin = 0;
     float eps = 1e-6f;
@@ -446,13 +446,6 @@ void add_rows(float* h, const float* y, std::int64_t y_stride, int hidden, int r
 // out[t][c] = bf16(silu(gu[t][c]) * gu[t][width + c]) for FP32 [gate; up] rows (2 width each).
 void silu_mul(const float* gu, int width, int rows, __nv_bfloat16* out, cudaStream_t stream);
 
-// The recurrent head's head products (prepared once): W [rows][k] FP32 rows into M BF16 [rows][256]
-// and c FP32 [rows]: m[v][r] = bf16(p[v][r]) and c[v] = p[v][256] for products p FP32 [n][257].
-void spark_table(const float* p, int n, __nv_bfloat16* m, float* c, cudaStream_t stream);
-// out[r][k] = hidden_out[k][r] for r < rank, out[rank][k] = bias[k]: the head's inputs.
-void spark_head_inputs(const float* hidden_out, const float* bias, int hidden, int rank, float* out,
-                       cudaStream_t stream);
-
 // One step of the recurrent head (rank 256) over draft row `row` of a block:
 //   joint  = W [state; embed[prev]; hidden[row]; context] + bias     (W FP32 [768][512 + 2 hidden])
 //   logits = cap tanh((base[row] + c + M tanh(joint[512:768])) / cap)    over `vocab`
@@ -472,8 +465,8 @@ struct SparkStepArgs {
     const std::int32_t* sequences = nullptr;
     const float* base = nullptr; // [block][vocab_stride] FP32 head products of `hidden`
     std::int64_t vocab_stride = 0;
-    const __nv_bfloat16* m = nullptr;
-    const float* c = nullptr;
+    const __nv_bfloat16* m = nullptr; // [vocab][256], the head's output with the head folded in
+    const float* c = nullptr;         // [vocab], its bias
     int vocab = 0, hidden_size = 0, row = 0;
     float cap = 30.0f;
     float* state = nullptr;          // [256]

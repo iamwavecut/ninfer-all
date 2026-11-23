@@ -189,23 +189,22 @@ struct SparkLayer {
 
 // The DSpark drafter (Model::dspark()): its layers, the taps it reads, every sequence's ring of
 // recurrent-head contexts ([sequences][kR][hidden] FP32, position p in slot p % kR) and its
-// checkpoint, the head's table of the recurrent correction (M BF16 [vocab][256], c FP32 [vocab],
-// prepared once), and a round's device state.
+// checkpoint, the recurrent head's weights (its output M BF16 [vocab][256] and bias c FP32 [vocab]
+// fold the release's head in), and a round's device state.
 struct Spark {
     const DSparkConfig* config = nullptr;
     std::vector<SparkLayer> layers;
-    const float *fuse = nullptr, *context_norm = nullptr, *final_norm = nullptr,
+    const float *mix = nullptr, *context_norm = nullptr, *final_norm = nullptr,
                 *mask_embedding = nullptr, *joint = nullptr, *joint_bias = nullptr,
-                *hidden_out = nullptr, *hidden_out_bias = nullptr;
-    const __nv_bfloat16* markov_embed = nullptr;
+                *markov_out_bias = nullptr;
+    const __nv_bfloat16 *markov_embed = nullptr, *markov_out = nullptr;
     // tap_after[v]: the stored tap (0..taps - 2) visit v's output is, or -1; the last tap is the
     // final hidden.
     std::vector<int> tap_after;
     int taps = 0, block = 0, window = 0;
-    DeviceBuffer contexts, contexts_kept, table_m, table_c, state, prev, drafts, confidence;
+    DeviceBuffer contexts, contexts_kept, state, prev, drafts, confidence;
     std::unique_ptr<PinnedHostBuffer> host;
     std::unique_ptr<CudaCompletionEvent> copied;
-    bool prepared = false;
     std::uint64_t bytes = 0; // beside the caches (in kv_bytes)
 };
 
@@ -866,7 +865,6 @@ struct Executor::Impl {
         }
         bytes += (options.checkpoints ? 2 : 1) * std::size_t(options.sequences) * kR *
                  config.hidden_size * 4;
-        bytes += std::size_t(config.unpadded_vocab_size) * (dc.markov_rank * 2 + 4);
         return bytes;
     }
 
@@ -895,23 +893,25 @@ struct Executor::Impl {
             }
             d->tap_after[v - 1] = j;
         }
-        d->fuse            = fp32(model, dw.fuse, int(dc.num_hidden_layers + 1) * d->taps);
+        d->mix             = fp32(model, dw.mix, int(dc.num_hidden_layers + 1) * d->taps);
         d->context_norm    = fp32(model, dw.context_norm, hidden);
         d->final_norm      = fp32(model, dw.final_norm, hidden);
         d->mask_embedding  = fp32(model, dw.mask_embedding, hidden);
         const int rank     = int(dc.markov_rank);
         d->joint           = fp32(model, dw.joint, 3 * rank * (2 * rank + 2 * hidden));
         d->joint_bias      = fp32(model, dw.joint_bias, 3 * rank);
-        d->hidden_out      = fp32(model, dw.hidden_out, hidden * rank);
-        d->hidden_out_bias = fp32(model, dw.hidden_out_bias, hidden);
-        {
-            const Tensor t = weight_tensor(model.weight(dw.markov_embed).view,
-                                           {std::int32_t(rank), std::int32_t(config.vocab_size)});
+        d->markov_out_bias = fp32(model, dw.markov_out_bias, vocab);
+        const auto bf16_rows = [&](WeightId id, const char* what) {
+            const Tensor t = weight_tensor(model.weight(id).view,
+                                           {std::int32_t(rank), std::int32_t(vocab)});
             if (t.dtype != DType::BF16) {
-                throw std::invalid_argument("inkling2 DSpark: the Markov embedding must be BF16");
+                throw std::invalid_argument(std::string("inkling2 DSpark: the Markov ") + what +
+                                            " must be BF16");
             }
-            d->markov_embed = static_cast<const __nv_bfloat16*>(t.data);
-        }
+            return static_cast<const __nv_bfloat16*>(t.data);
+        };
+        d->markov_embed = bf16_rows(dw.markov_embed, "embedding");
+        d->markov_out   = bf16_rows(dw.markov_out, "output");
         const int q = query_heads * kD, w = int(dc.intermediate_size);
         const std::size_t row_f16 = std::size_t(kD) * sizeof(__half);
         for (std::uint32_t i = 0; i < dc.num_hidden_layers; ++i) {
@@ -963,49 +963,13 @@ struct Executor::Impl {
             d->contexts_kept = DeviceBuffer(contexts);
             d->bytes += contexts;
         }
-        d->table_m = DeviceBuffer(std::size_t(vocab) * rank * 2);
-        d->table_c = DeviceBuffer(std::size_t(vocab) * 4);
         d->state   = DeviceBuffer(std::size_t(rank) * 4);
         d->prev    = DeviceBuffer(4);
         d->drafts  = DeviceBuffer(std::size_t(d->block) * 4);
         d->confidence = DeviceBuffer(std::size_t(d->block) * 4);
-        d->bytes += d->table_m.bytes + d->table_c.bytes;
         d->host   = std::make_unique<PinnedHostBuffer>(std::size_t(d->block) * 8);
         d->copied = std::make_unique<CudaCompletionEvent>(device);
         spark = std::move(d);
-    }
-
-    // The head's products of the recurrent correction (M = head hidden_out, c = head bias), from
-    // the head's decoded rows in FP32, once.
-    void prepare_spark() {
-        Spark& d = *spark;
-        if (d.prepared) { return; }
-        const int rank = int(d.config->markov_rank), cols = rank + 1;
-        workspace->reset();
-        auto scope   = workspace->scope();
-        auto* inputs = static_cast<float*>(workspace->alloc_bytes(std::size_t(cols) * hidden * 4).data);
-        kernels::spark_head_inputs(d.hidden_out, d.hidden_out_bias, hidden, rank, inputs, stream);
-        const std::size_t free = workspace->capacity() - workspace->used() - (2u << 20);
-        int chunk = int(std::min<std::size_t>(8192, free / (std::size_t(hidden + cols) * 4 + 4)));
-        chunk     = chunk / 256 * 256;
-        if (chunk < 256) { throw std::runtime_error("inkling2 DSpark: no workspace for the table"); }
-        auto* ids  = static_cast<std::int32_t*>(workspace->alloc_bytes(std::size_t(chunk) * 4).data);
-        auto* rows = static_cast<float*>(workspace->alloc_bytes(std::size_t(chunk) * hidden * 4).data);
-        auto* out  = static_cast<float*>(workspace->alloc_bytes(std::size_t(chunk) * cols * 4).data);
-        std::vector<std::int32_t> host(chunk);
-        for (int first = 0; first < vocab; first += chunk) {
-            const int n = std::min(chunk, vocab - first);
-            for (int i = 0; i < n; ++i) { host[i] = first + i; }
-            CUDA_CHECK(cudaMemcpyAsync(ids, host.data(), std::size_t(n) * 4, cudaMemcpyHostToDevice,
-                                       stream));
-            table_rows(head, ids, n, rows, hidden, stream);
-            kernels::gemm_f32(cols, n, hidden, inputs, rows, out, stream);
-            kernels::spark_table(out, n,
-                                 static_cast<__nv_bfloat16*>(d.table_m.p) + std::int64_t(first) * rank,
-                                 static_cast<float*>(d.table_c.p) + first, stream);
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-        }
-        d.prepared = true;
     }
 
     // The drafter's caches of rows [0, c.spark_rows) of a call, from its taps: each layer's
@@ -1023,7 +987,7 @@ struct Executor::Impl {
         for (int j = 0; j + 1 < d.taps; ++j) { ma.taps[j] = c.spark_taps + std::int64_t(j) * c.plane; }
         ma.taps[d.taps - 1] = c.ffn_f32;
         ma.tap_count        = d.taps;
-        ma.fuse             = d.fuse;
+        ma.mix              = d.mix;
         for (int l = 0; l < contexts; ++l) { ma.norm[l] = d.layers[l].context_norm; }
         ma.norm[contexts] = d.context_norm;
         ma.context_count  = contexts;
@@ -1195,8 +1159,8 @@ struct Executor::Impl {
         sa.sequences    = rows.sequences;
         sa.base         = base;
         sa.vocab_stride = vocab;
-        sa.m            = static_cast<const __nv_bfloat16*>(d.table_m.p);
-        sa.c            = static_cast<const float*>(d.table_c.p);
+        sa.m            = d.markov_out;
+        sa.c            = d.markov_out_bias;
         sa.vocab        = vocab;
         sa.hidden_size  = hidden;
         sa.cap          = config.logit_softcap;
@@ -1232,7 +1196,6 @@ struct Executor::Impl {
             throw std::invalid_argument("inkling2 draft: a block needs a committed token before it "
                                         "and room in the context");
         }
-        prepare_spark();
         back(sequence, first + std::uint32_t(b));
         std::vector<std::int32_t> tokens(b, 0), pos(b), seq(b, std::int32_t(sequence));
         tokens[0] = anchor;
@@ -3078,7 +3041,6 @@ struct Executor::Impl {
 
     void warm_up() {
         if (spine) { spine->prepare(stream); }
-        if (spark) { prepare_spark(); }
         const std::vector<std::int32_t> prompt(std::min<std::uint32_t>(options.prefill_chunk, 16), 2);
         forward(0, prompt, 1);
         if (spine) {

@@ -127,7 +127,8 @@ tokenization, the chat template, output parsing and the serving protocols.
 - **Speculative decoding.** The release's DSpark drafter (the artifact's `dspark` component,
   `--spec dspark`) proposes a block of up to 7 drafts from the target's tapped hidden states: three
   non-causal blocks over the anchor and mask rows, then a recurrent Markov head of rank 256 that
-  corrects the target head's logits draft by draft. Without `--spec`, an artifact that carries the
+  corrects the target head's logits draft by draft through an output table that llama.cpp's
+  converter folded with the release's BF16 head. Without `--spec`, an artifact that carries the
   drafter drafts with it while the Engine serves one request at a time: 3 drafts a round, the
   round's width adapting from 1 to 3 by how far the drafts survive and how long the rounds take
   (`--adaptive-mtp`), each proposal ending after its first draft at or below probability 0.5
@@ -170,30 +171,31 @@ for f in config.json tokenizer.json tokenizer_config.json chat_template.jinja ge
   curl -fsSL -o models/inkling2/hf/$f https://huggingface.co/thinkingmachines/Inkling-2-Mini/resolve/main/$f
 done
 hf download unsloth/Inkling-2-Mini-GGUF Inkling-2-Mini-UD-IQ4_XS.gguf \
-  dspark-Inkling-2-Mini-Q8_0_Old.gguf --local-dir models/inkling2
+  dspark-Inkling-2-Mini-Q8_0.gguf --local-dir models/inkling2
 hf download ggml-org/Inkling-2-Mini-GGUF mmproj-Inkling-2-Mini-Q8_0.gguf --local-dir models/inkling2
 
 python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
   --source gguf=models/inkling2/Inkling-2-Mini-UD-IQ4_XS.gguf \
   --source vision=models/inkling2/mmproj-Inkling-2-Mini-Q8_0.gguf \
-  --source dspark=models/inkling2/dspark-Inkling-2-Mini-Q8_0_Old.gguf \
+  --source dspark=models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf \
   --components text,vision,dspark --name Inkling-2-Mini-UD-IQ4_XS \
   --out models/Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --device cpu
 ```
 
 The conversion writes one 16,494,910,976-byte (15.4 GiB) `.ninfer` file of 1,185 objects: the text
 model, the vision tower (Q8_0 matrices) and the DSpark drafter (Q8_0, its Markov embedding BF16 as
-the GGUF stores it; a drafter GGUF with embedding values that BF16 does not hold is refused). With
-Unsloth's `mmproj-BF16.gguf` as the `vision` source the tower keeps BF16 matrices and the file has
-16,790,806,016 bytes (15.6 GiB). Unsloth's repository holds each quantization in two layouts:
-llama.cpp's `inkling2_loop` (24 blocks), the root files since 2026-11-23, and the earlier `inkling2`
-(48 unrolled blocks in its metadata), now `Old_Support/*.gguf_file`. Both convert to the same
-artifact: from UD-IQ4_XS the two payloads are equal byte for byte, and the headers differ only in
-the recorded source path and the random artifact id. The drafter the converter reads is the one the
-repository published first, `dspark-Inkling-2-Mini-Q8_0_Old.gguf` (also
-`Old_Support/dspark-Inkling-2-Mini-Q8_0.gguf_file`). The root `dspark-Inkling-2-Mini-Q8_0.gguf` is
-now llama.cpp's mainline drafter, with other tensors (no `dspark_fuse`, per-block `ctx_norm` and
-`ctx_mix`, a Markov context mixture), which the converter does not read.
+the GGUF stores it, and its Markov output table BF16; a drafter GGUF with table values that BF16
+does not hold is refused). With Unsloth's `mmproj-BF16.gguf` as the `vision` source the tower keeps
+BF16 matrices and the file has 16,790,806,016 bytes (15.6 GiB). Unsloth's repository holds each
+quantization in two layouts: llama.cpp's `inkling2_loop` (24 blocks), the root files since
+2026-11-23, and the earlier `inkling2` (48 unrolled blocks in its metadata), now
+`Old_Support/*.gguf_file`. Both convert to the same artifact: from UD-IQ4_XS the two payloads are
+equal byte for byte, and the headers differ only in the recorded source path and the random artifact
+id. The drafter is llama.cpp's mainline layout, Unsloth's root `dspark-Inkling-2-Mini-Q8_0.gguf`:
+per-block feature mixtures, context norms and the Markov output folded with the head. The earlier
+drafter layout (`dspark-Inkling-2-Mini-Q8_0_Old.gguf`, with `dspark_fuse` and the unfolded output)
+is refused, and the Engine refuses an artifact converted from it; convert again or download the
+current artifact (`--spec none` runs such an artifact without the drafter).
 
 IsValorum's APEX-I MiniPlus V2.1 converts the same way with its own Q8_0 mmproj and Unsloth's
 drafter, which its repository does not carry:
@@ -206,7 +208,7 @@ hf download IsValorum/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-GGUF \
 python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
   --source gguf=models/inkling2/apex/Inkling-2-Mini-APEX-I-MiniPlus-V2.1.gguf \
   --source vision=models/inkling2/apex/mmproj-Inkling-2-Mini-Q8_0.gguf \
-  --source dspark=models/inkling2/dspark-Inkling-2-Mini-Q8_0_Old.gguf \
+  --source dspark=models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf \
   --components text,vision,dspark --name Inkling-2-Mini-APEX-I-MiniPlus-V2.1 \
   --out models/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-ninfer-v3.ninfer --device cpu
 ```

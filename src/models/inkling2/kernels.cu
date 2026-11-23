@@ -2754,15 +2754,11 @@ __global__ void __launch_bounds__(kRowBlock) spark_mix_kernel(SparkMixArgs a) {
         tap[j] = valid && j < a.tap_count ? ld4(a.taps[j] + std::int64_t(t) * a.hidden, i) : zero;
     }
     for (int m = 0; m <= a.context_count; ++m) {
-        const float* f = a.fuse + std::int64_t(m) * a.tap_count;
-        float top = -INFINITY;
-        for (int j = 0; j < a.tap_count; ++j) { top = fmaxf(top, f[j]); }
-        float total = 0.0f;
-        for (int j = 0; j < a.tap_count; ++j) { total += expf(f[j] - top); }
+        const float* w = a.mix + std::int64_t(m) * a.tap_count;
         float4 x = zero;
 #pragma unroll
         for (int j = 0; j < kMaxSparkTaps; ++j) {
-            if (j < a.tap_count) { x = add4(x, scale4(tap[j], expf(f[j] - top) / total)); }
+            if (j < a.tap_count) { x = add4(x, scale4(tap[j], w[j])); }
         }
         const float inv = rsqrtf(block_sum(dot4(x, x)) / float(a.hidden) + a.eps);
         const float4 y  = valid ? mul4(scale4(x, inv), ld4(a.norm[m], i)) : zero;
@@ -2830,27 +2826,6 @@ __global__ void silu_mul_kernel(const float* gu, int width, std::int64_t n, __nv
 
 constexpr int kSparkRank     = 256;
 constexpr int kSparkPartials = 256;
-
-__global__ void spark_table_kernel(const float* p, std::int64_t n, __nv_bfloat16* m, float* c) {
-    ninfer::pdl::arch_enter_glue();
-    const std::int64_t at = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (at >= n * (kSparkRank + 1)) { return; }
-    const std::int64_t v = at / (kSparkRank + 1), r = at % (kSparkRank + 1);
-    if (r < kSparkRank) {
-        m[v * kSparkRank + r] = __float2bfloat16(p[at]);
-    } else {
-        c[v] = p[at];
-    }
-}
-
-__global__ void spark_head_inputs_kernel(const float* hidden_out, const float* bias, int hidden,
-                                         int rank, float* out) {
-    ninfer::pdl::arch_enter_glue();
-    const std::int64_t at = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (at >= std::int64_t(rank + 1) * hidden) { return; }
-    const std::int64_t r = at / hidden, k = at % hidden;
-    out[at] = r < rank ? hidden_out[k * rank + r] : bias[k];
-}
 
 // Block of eight warps, warp w output 8 blockIdx.x + w of the joint projection; the block's input
 // vector in shared memory.
@@ -3461,23 +3436,6 @@ void silu_mul(const float* gu, int width, int rows, __nv_bfloat16* out, cudaStre
     ninfer::pdl::launch_arch(blocks_for(n, 256), 256, 0, stream, silu_mul_kernel, gu, width, n,
                              out);
     check_launch("silu_mul");
-}
-
-void spark_table(const float* p, int n, __nv_bfloat16* m, float* c, cudaStream_t stream) {
-    const std::int64_t total = std::int64_t(n) * (kSparkRank + 1);
-    if (total <= 0) { return; }
-    ninfer::pdl::launch_arch(blocks_for(total, 256), 256, 0, stream, spark_table_kernel, p, n, m,
-                             c);
-    check_launch("spark_table");
-}
-
-void spark_head_inputs(const float* hidden_out, const float* bias, int hidden, int rank, float* out,
-                       cudaStream_t stream) {
-    if (rank != kSparkRank) { throw std::invalid_argument("inkling2 spark: a Markov rank of 256"); }
-    const std::int64_t total = std::int64_t(rank + 1) * hidden;
-    ninfer::pdl::launch_arch(blocks_for(total, 256), 256, 0, stream, spark_head_inputs_kernel,
-                             hidden_out, bias, hidden, rank, out);
-    check_launch("spark_head_inputs");
 }
 
 std::size_t spark_step_floats(int vocab) {

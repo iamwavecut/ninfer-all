@@ -414,9 +414,8 @@ payload byte for byte. It checks the GGUF's metadata against the config (the sto
 layers, the sliding-window pattern, the attention and expert geometry, the softcap) and imports
 every row as stored. `--components text,vision,dspark` adds the vision tower from `--source vision=`
 (the release's mmproj, projector `inkling2v`) and the DSpark drafter from `--source dspark=`
-(llama.cpp architecture `dflash`, the layout of Unsloth's `dspark-Inkling-2-Mini-Q8_0_Old.gguf`; the
-mainline drafter in its root `dspark-Inkling-2-Mini-Q8_0.gguf` stores other tensors and is not
-read). Commands, runtime defaults and measurements: [Inkling 2 Mini](inkling2.md).
+(llama.cpp's mainline architecture `dflash`, Unsloth's root `dspark-Inkling-2-Mini-Q8_0.gguf`, its
+Markov output folded with the head; the earlier `dspark-Inkling-2-Mini-Q8_0_Old.gguf` is refused). Commands, runtime defaults and measurements: [Inkling 2 Mini](inkling2.md).
 
 ## Change part of a recipe
 
