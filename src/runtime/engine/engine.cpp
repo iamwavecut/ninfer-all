@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "text/bad_words.h"
 #include "text/structured_output.h"
 
 #include "artifact/reader.h"
@@ -336,6 +337,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
     resolved.execution.structured_output       = std::move(options.execution.structured_output);
+    resolved.execution.bad_words = text::normalize_bad_words(options.execution.bad_words);
     resolved.execution.logprobs                = options.execution.logprobs;
     resolved.execution.readout_tokens          = std::move(options.execution.readout_tokens);
     resolved.execution.speculative_drafting    = options.execution.speculative_drafting;

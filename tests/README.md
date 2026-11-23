@@ -354,6 +354,24 @@ NINFER_STOP_ARTIFACT=$PWD/out/qwen3_8_27b.ninfer NINFER_STOP_CONTEXT_CACHE=hybri
   --output-on-failure
 ```
 
+`ninfer_engine_bad_words_real_test` checks vLLM's `bad_words` on a real model of any family: a
+greedy reply that is asked again with a string of it banned agrees with the first reply up to the
+space before that string and never holds it, sampled replies and a reply asked to copy prompt markup
+never hold a chat bot's 43 tag openers (the test prints what the model writes instead), and it
+prints decode tok/s with and without the openers at one request and at
+`NINFER_BAD_WORDS_CONCURRENCY` (8) requests, interleaved, with no criterion. `NINFER_BAD_WORDS_ARTIFACT`
+names the artifact, and the test is skipped without it; `NINFER_BAD_WORDS_SPECULATIVE` (with
+`NINFER_BAD_WORDS_DRAFTS`, 2), `NINFER_BAD_WORDS_DRAFT_MODEL`, `NINFER_BAD_WORDS_NGRAM_TABLE`,
+`NINFER_BAD_WORDS_EXPERTS`, `NINFER_BAD_WORDS_DEVICES` and `NINFER_BAD_WORDS_THINKING=on` work as
+the stop-string test's variables do, `NINFER_BAD_WORDS_KV=int8` or `rk8v4` selects the KV format
+and `NINFER_BAD_WORDS_TOKENS` each reply's limit (256):
+
+```bash
+NINFER_BAD_WORDS_ARTIFACT=$PWD/out/gemma4_26b.ninfer NINFER_BAD_WORDS_SPECULATIVE=mtp \
+  NINFER_BAD_WORDS_KV=rk8v4 ctest --test-dir build -R ninfer_engine_bad_words_real_test \
+  --output-on-failure
+```
+
 Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration
 tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
 `pressure-resume` or `concurrent`; the default is `all`. These integration checks
@@ -519,6 +537,21 @@ ctest --test-dir build -R '^ninfer_(structured_output|unicode_scalar_output)_tes
 python3 tests/text/native_schema_oracle.py --emit-corpus corpus.jsonl --report oracle.json
 build/tests/ninfer_native_schema_probe < corpus.jsonl > native.jsonl
 python3 tests/text/native_schema_oracle.py --native-results native.jsonl --report comparison.json
+```
+
+`ninfer_bad_words_test` checks banned words (`bad_words`) on a synthetic vocabulary against a
+substring oracle: random token walks with and without drafts, words that overlap or hold one
+another, special tokens, the combination with a grammar, and the error when the bans leave no
+token. `ninfer_bad_words_tokenizer_test` checks the same bans over a release's vocabulary (Gemma
+4's, for one): it prints how the tokenizer splits a chat bot's tag openers and compares the whole
+mask with the oracle after texts that end in most of a word. `NINFER_BAD_WORDS_TOKENIZER` names a
+directory with the release's `tokenizer.json`, `tokenizer_config.json` and
+`generation_config.json`, and the test is skipped without it:
+
+```bash
+ctest --test-dir build -R '^ninfer_bad_words_test$' --output-on-failure
+NINFER_BAD_WORDS_TOKENIZER=$HOME/models/gemma-4-26b-a4b-it ctest --test-dir build \
+  -R ninfer_bad_words_tokenizer_test --output-on-failure
 ```
 
 These host tests establish supported grammar semantics. Actual tokenizer,

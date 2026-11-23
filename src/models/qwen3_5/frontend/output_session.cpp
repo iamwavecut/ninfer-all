@@ -796,12 +796,14 @@ OutputSession::OutputSession(
                                    std::move(thinking_control_tokens), std::move(tool_call_output),
                                    std::move(gemma), std::move(flint), std::move(deepseek),
                                    std::move(inkling))) {
-    impl_->grammar              = std::move(grammar);
-    impl_->state.exact_close    = impl_->grammar != nullptr;
-    impl_->semantic.exact_close = impl_->grammar != nullptr;
+    impl_->grammar = std::move(grammar);
+    // Banned words alone leave the output's structure as it is without them.
+    const bool grammar_constrains = impl_->grammar && impl_->grammar->has_grammar();
+    impl_->state.exact_close      = grammar_constrains;
+    impl_->semantic.exact_close   = grammar_constrains;
     // A grammar admits the stop token only after the thinking closes, so a constrained turn
     // cannot end inside it.
-    if (impl_->grammar) { impl_->collect_open_reasoning = false; }
+    if (grammar_constrains) { impl_->collect_open_reasoning = false; }
 }
 
 std::shared_ptr<text::GrammarState> OutputSession::grammar_state() const {

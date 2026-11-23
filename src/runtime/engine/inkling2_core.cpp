@@ -3046,6 +3046,9 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
         throw std::invalid_argument(
             "structured output requires an Engine started with structured_output");
     }
+    if (!options.execution.bad_words.empty() && !impl_->structured_output) {
+        throw std::invalid_argument("bad_words require an Engine started with structured_output");
+    }
     if (pending_deadline == Clock::time_point{}) {
         pending_deadline = submitted + impl_->pending_timeout;
     }
@@ -3142,7 +3145,7 @@ Inkling2Core::make_request(GroupMember& member, std::optional<std::uint32_t>& bu
         impl_->instance.frontend.thinking_control_token_count());
     request->output = impl_->instance.frontend.make_output_session(
         prompt, options.stop, options.output, options.execution.thinking,
-        options.execution.structured_output);
+        options.execution.structured_output, options.execution.bad_words);
     // Strict tool arguments bring a grammar without a structured final format.
     if (request->output.grammar_state() && !impl_->structured_output) {
         throw std::invalid_argument(

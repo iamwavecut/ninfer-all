@@ -15,6 +15,7 @@
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/registry.h"
+#include "text/structured_output.h"
 
 #include <nlohmann/json.hpp>
 
@@ -181,6 +182,62 @@ void test_thinking_control() {
                reasoning.find("Considering the limited time") != std::string::npos &&
                content == "OK",
            "reasoning '" + reasoning + "', content '" + content + "'");
+}
+
+// Banned words beside thinking: the reasoning and content publish as without them, the session's
+// constraint holds no grammar, its masks ban the token that would complete a word (inside the
+// reasoning too, but not across the channel's markers), and a banned token fails the preview.
+void test_bad_words() {
+    const auto frontend = gemma_frontend();
+    ninfer::PromptInput input;
+    input.messages.push_back(
+        {.role  = ninfer::ChatRole::User,
+         .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "Hi"}}});
+    input.options.continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
+    const auto prompt = frontend.prepare(std::move(input));
+    const std::vector<std::string> words = {"  <accent", "<name"};
+    const auto run = [&](std::span<const std::string> banned, std::string& reasoning,
+                         std::string& content) {
+        auto session = frontend.make_output_session(prompt, {}, ninfer::OutputOptions{}, {}, {},
+                                                    banned);
+        const auto take = [&](const auto& deltas) {
+            for (const ninfer::OutputDelta& delta : deltas) {
+                (delta.channel == ninfer::OutputChannel::Reasoning ? reasoning : content) +=
+                    delta.text;
+            }
+        };
+        auto tokens = tokens_of({kChannelOpenId}, "thought\n<acc");
+        tokens.push_back(kChannelCloseId);
+        for (const char byte : std::string("ent <acce")) { tokens.push_back(static_cast<unsigned char>(byte)); }
+        (void)session.preview_model(tokens, 256, ninfer::FinishReason::OutputLimit);
+        take(session.commit_preview());
+        return session;
+    };
+    std::string plain_reasoning, plain_content, reasoning, content;
+    (void)run({}, plain_reasoning, plain_content);
+    auto session = run(words, reasoning, content);
+    expect(reasoning == plain_reasoning && content == plain_content,
+           "banned words leave the channels as they are: '" + reasoning + "' / '" + content + "'");
+    const auto grammar = session.grammar_state();
+    expect(grammar != nullptr && !grammar->has_grammar(), "banned words alone hold no grammar");
+    if (!grammar) { return; }
+    // 256 byte tokens and the 8 markers.
+    constexpr std::size_t words_per_mask = (264 + 31) / 32;
+    std::vector<std::uint32_t> masks(words_per_mask * 2);
+    const ninfer::TokenId n = 'n';
+    grammar->fill_masks(masks, std::span(&n, 1));
+    const auto allowed = [&](std::size_t column, ninfer::TokenId token) {
+        return ((masks[column * words_per_mask + token / 32] >> (token % 32)) & 1U) != 0;
+    };
+    expect(allowed(0, 'n') && allowed(0, 't') && allowed(1, 'e') && !allowed(1, 't'),
+           "the masks ban the byte that completes <accent after its draft");
+    expect(allowed(1, kEosId), "the end of the turn stays allowed");
+    const std::vector<ninfer::TokenId> completing = {'n', 't'};
+    bool refused = false;
+    try {
+        (void)session.preview_model(completing, 128, ninfer::FinishReason::OutputLimit);
+    } catch (const std::logic_error&) { refused = true; }
+    expect(refused, "a token that completes a banned word fails the preview");
 }
 
 } // namespace
@@ -365,6 +422,7 @@ int main() {
     }
     try {
         test_thinking_control();
+        test_bad_words();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         ++failures;

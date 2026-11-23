@@ -450,7 +450,9 @@ for a request that offers tools ([HTTP serving](serving.md#server-options)).
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
-generated token IDs in diagnostics.
+generated token IDs in diagnostics. Repeat `--bad-word TEXT` to ban text from the reply, reasoning
+included, as vLLM's `bad_words` does; the CLI then starts the Engine with structured-output masks
+([banned words](serving.md#banned-words)).
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 

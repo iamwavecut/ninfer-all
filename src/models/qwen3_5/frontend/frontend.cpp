@@ -17,6 +17,7 @@
 #include "models/qwen3_5/frontend/ngram_sources.h"
 #include "models/qwen3_5/program/prefix/block_keys.h"
 #include "text/unicode.h"
+#include "text/bad_words.h"
 #include "text/structured_output.h"
 #include <mutex>
 
@@ -1257,6 +1258,8 @@ public:
 
     mutable std::mutex grammar_mutex;
     mutable std::unique_ptr<text::StructuredCompiler> grammar_compiler;
+    // The tokens as text for banned words (bad_words), made with the first request that bans any.
+    mutable std::unique_ptr<text::BadWordsVocabulary> bad_words_vocabulary;
     fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
@@ -1877,7 +1880,8 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
                                             const ThinkingControlOptions& thinking,
-                                            const StructuredOutputOptions& structured) const {
+                                            const StructuredOutputOptions& structured,
+                                            std::span<const std::string> bad_words) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     std::shared_ptr<text::GrammarState> grammar;
@@ -1955,6 +1959,27 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                          impl_->deepseek ? fi::deepseek_tool_call_text_format(*tools)
                                                          : fi::tool_call_text_format(*tools),
                                          envelope);
+    }
+    if (!bad_words.empty()) {
+        const std::vector<std::string> words = text::normalize_bad_words(bad_words);
+        const text::BadWordsVocabulary* vocabulary = nullptr;
+        {
+            std::lock_guard lock(impl_->grammar_mutex);
+            if (!impl_->bad_words_vocabulary) {
+                // A special token has no text: it separates the text around it.
+                std::vector<std::string> text(impl_->tokenizer->vocab_size());
+                for (std::size_t id = 0; id < text.size(); ++id) {
+                    if (impl_->tokenizer->is_valid_token(static_cast<int>(id)) &&
+                        !impl_->tokenizer->is_special_token(static_cast<int>(id))) {
+                        text[id] = impl_->tokenizer->decode_token_bytes(static_cast<int>(id), false);
+                    }
+                }
+                impl_->bad_words_vocabulary =
+                    std::make_unique<text::BadWordsVocabulary>(std::move(text));
+            }
+            vocabulary = impl_->bad_words_vocabulary.get();
+        }
+        grammar = text::GrammarState::with_bad_words(std::move(grammar), vocabulary->filter(words));
     }
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(impl_->tokenizer, std::move(policy), output,

@@ -998,6 +998,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, limits.assistant_prefill, output.generation);
     settle_image_details(output.generation.messages, limits, "messages", "image_url.detail");
     parse_stop(body, output.generation);
+    output.generation.bad_words = parse_bad_words_field(body);
     parse_sampling(body, output.generation);
     if (body.contains("logprobs") && body.at("logprobs").is_boolean()) {
         output.generation.logprobs = body.at("logprobs").get<bool>();

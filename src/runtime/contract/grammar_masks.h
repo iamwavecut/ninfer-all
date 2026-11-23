@@ -9,7 +9,9 @@
 // their own (a GrammarMaskJob, from a fork of the grammar) while the GPU runs, instead of holding
 // every request's round for it. A speculative round needs one mask per draft and the bonus; their
 // columns fill in parallel (GrammarState::fill_masks) while the verification runs, which hides a few
-// milliseconds per column. A request whose masks cost more decodes without drafts.
+// milliseconds per column. A request whose masks cost more decodes without drafts. A request that
+// only bans words (bad_words) has masks of the same shape, which take microseconds and fill where
+// the job starts.
 
 #include "ninfer/base.h"
 #include "text/structured_output.h"
@@ -65,6 +67,17 @@ public:
         auto job = std::make_shared<GrammarMaskJob>();
         job->columns_ = drafts.size() + 1;
         job->words_.resize(words * job->columns_);
+        if (!grammar.has_grammar()) {
+            // Banned words alone fill their masks in microseconds, less than a thread's start.
+            const auto begin = std::chrono::steady_clock::now();
+            try {
+                grammar.fill_masks(job->words_, drafts);
+            } catch (...) { job->error_ = std::current_exception(); }
+            job->seconds_ =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+            job->done_.store(true, std::memory_order_release);
+            return job;
+        }
         std::thread([job, state = std::shared_ptr<text::GrammarState>(grammar.fork()),
                      drafts = std::move(drafts)] {
             const auto begin = std::chrono::steady_clock::now();

@@ -31,12 +31,24 @@ struct StructuredOutputEnvelope {
     std::string response_alternative_format;
 };
 
+class BadWordsFilter;
+
+// A request's token constraint: a grammar (structured output, strict tool arguments), banned words
+// (bad_words), or both. Its masks admit the tokens that the grammar admits and that complete no
+// banned word; accept() throws GrammarViolation for any other token.
 class GrammarState {
 public:
     ~GrammarState();
     GrammarState(GrammarState&&) noexcept;
     GrammarState& operator=(GrammarState&&) noexcept;
+    // `grammar` (a state nobody else holds yet, or null for none) banning `filter`'s words too.
+    // A null filter returns `grammar` unchanged.
+    [[nodiscard]] static std::shared_ptr<GrammarState>
+    with_bad_words(std::shared_ptr<GrammarState> grammar,
+                   std::shared_ptr<const BadWordsFilter> filter);
     [[nodiscard]] std::unique_ptr<GrammarState> fork() const;
+    // False for a state that only bans words: the output is otherwise free.
+    [[nodiscard]] bool has_grammar() const noexcept;
     void accept(std::span<const TokenId> tokens);
     // Column i is conditioned on drafts[0..i). Unreachable suffix columns are unrestricted.
     void fill_masks(std::span<std::uint32_t> masks, std::span<const TokenId> drafts) const;

@@ -8,6 +8,7 @@
 #include <optional>
 
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace ninfer::text {
@@ -27,6 +28,8 @@ struct ReadBranch {
 // and validated these values before constructing the runtime request.
 struct ResolvedExecutionOptions {
     StructuredOutputOptions structured_output;
+    // ExecutionOptions::bad_words as text::normalize_bad_words() returns them.
+    std::vector<std::string> bad_words;
     std::shared_ptr<text::GrammarState> grammar;
     ResolvedSamplingParameters sampling;
     // Applied once the model closes its reasoning block.

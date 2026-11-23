@@ -503,6 +503,45 @@ state advances only with Engine output commit, and is never restored from a prom
 DFlash/DFlash2 CUDA Graphs contain a host matcher node between draft generation and verification;
 this adds a CPU synchronization point and mask transfers per round. No speedup claim is implied.
 
+### Banned words
+
+`bad_words` (vLLM's field) lists strings that the generated text never contains. Chat Completions,
+`/v1/completions`, `/completion`, `/v1/responses` and `/v1/messages` accept it:
+
+```json
+{
+  "model": "your-model-id",
+  "messages": [{"role": "user", "content": "Answer the last message."}],
+  "bad_words": ["<message", "<daily_persona", "<think"]
+}
+```
+
+The text is the bytes of the generated tokens in order, reasoning and tool-call text included. A
+token that the tokenizer marks special (a turn, channel or tool-call marker) has no text and
+separates the text around it, so a string cannot span it. Each round masks every token that would
+complete a listed string: a token that holds a string whole, and a token that completes one begun
+by the text before it. This bans every spelling of a string, whatever tokens would write it, and
+so every token sequence that vLLM bans for it (its own tokenization and the one after a space);
+it also bans the string inside a longer word (`<text` inside `<textarea`). Matching is
+case-sensitive. Bans apply from the first generated token; the prompt does not count.
+
+The field is an array of at most 128 distinct non-empty strings of at most 256 bytes; each string
+loses its leading spaces, tabs and line breaks, as in vLLM, and duplicates count once. A malformed
+field fails with HTTP 400 `invalid_bad_words`. The bans use the structured-output token masks,
+so they need `--structured-output`; without it a request with `bad_words` fails with HTTP 400
+`bad_words_not_supported`. They combine with a response format or strict tools in one mask per
+position; a position where nothing is left fails the request.
+
+Bans hold at every speculative position: each column of a verification round masks the tokens
+that would complete a string after the drafts before it, so a draft that would complete one is
+rejected and the correction or bonus token completes none. Drafts are proposed without the bans.
+A request with only banned words keeps its drafts (MTP, DFlash, DFlash2, DSpark, a context
+lookup): its masks take microseconds and fill on the engine thread with no mask thread. The first
+request with a new list builds the list's filter (an Aho-Corasick automaton of the strings and
+the vocabulary's tokens by their bytes); the last eight lists are kept. A ban removes only the
+token that would complete a string, so the model can write most of a string before the ban
+stops it, and then continues with another token.
+
 ## Stop the server
 
 Press Ctrl+C twice to stop the server. The first press only shows a prompt on the console's bottom
@@ -1072,6 +1111,8 @@ The endpoint supports:
   it first. Caller stop strings still apply; any other value type is rejected with 400. Output past
   the model's natural end is not meaningful text. `/v1/responses` and `/v1/messages` do not
   honor it;
+- vLLM's `bad_words`, strings that the reply never contains, with `--structured-output` (see
+  [Banned words](#banned-words));
 - `n:1` and text-only `modalities`;
 - `response_format` of type `text`, `json_object`, or `json_schema` (`name`, optional
   `description`, `schema` and `strict`), and the vLLM and llama.cpp constraint fields
@@ -1593,7 +1634,8 @@ curl http://127.0.0.1:8080/v1/completions -d '{"prompt": "The capital of France 
 
 Both accept `temperature` (below zero samples greedily), `top_k` (zero or below is the widest
 candidate set, 20), `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `seed` (negative for
-a random one), `stop` (a string or up to 32 strings), `ignore_eos`, `stream`, `timings_per_token`,
+a random one), `stop` (a string or up to 32 strings), [`bad_words`](#banned-words), `ignore_eos`,
+`stream`, `timings_per_token`,
 `response_format`, the vLLM and llama.cpp constraint fields of [Structured
 output](#structured-output) (`grammar` among them), and llama.cpp's `cache_prompt` (`false` keeps
 the request out of the context cache). The output limit is llama.cpp's `n_predict`, then
@@ -1958,6 +2000,7 @@ wire response contains typed `output` Items.
 | `graft` | NInfer extension: name of a [prompt graft](#prompt-grafts), or `null`; also accepted by input token count |
 | `lora` | llama.cpp's [LoRA adapter scales](#lora-adapters-and-control-vectors), or `null`; also accepted by input token count |
 | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
+| `bad_words` | vLLM's [banned words](#banned-words), or `null`; needs `--structured-output`; rejected by input token count |
 | `text.format` | `text`, `json_object`, or flat `json_schema`; see [structured output](#structured-output) |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
 | `tool_choice` | `auto`, `none`, a named function, `required` over a single callable tool, or function-only `allowed_tools` in either mode; a namespaced selection carries both `namespace` and `name` |
@@ -2261,7 +2304,8 @@ explicitly.
 [default output limit](#default-output-limit); a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k` (clamped to 20
-like the OpenAI endpoints), and `stop_sequences` enter Engine execution. A matched custom stop is returned as
+like the OpenAI endpoints), `stop_sequences` and vLLM's [`bad_words`](#banned-words) enter Engine
+execution. A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 

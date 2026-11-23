@@ -318,6 +318,10 @@ public:
                 throw std::invalid_argument(
                     "structured output requires an Engine started with structured_output");
             }
+            if (!member.options.execution.bad_words.empty() && !structured_output_) {
+                throw std::invalid_argument(
+                    "bad_words require an Engine started with structured_output");
+            }
             if (member.pending_deadline == Clock::time_point{}) {
                 member.pending_deadline = submitted + pending_timeout_;
             }
@@ -378,7 +382,7 @@ public:
                     instance_.frontend.thinking_control_token_count());
                 auto output = instance_.frontend.make_output_session(
                     member.prompt, options.stop, options.output, options.execution.thinking,
-                    options.execution.structured_output);
+                    options.execution.structured_output, options.execution.bad_words);
                 // Strict tool arguments bring a grammar without a structured final format.
                 if (output.grammar_state() && !structured_output_) {
                     throw std::invalid_argument(

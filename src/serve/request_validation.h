@@ -34,6 +34,11 @@ std::optional<std::string> parse_graft_field(const RequestJson& body);
 // Whether each id is loaded is checked during translation.
 std::optional<std::vector<ninfer::LoraScale>> parse_lora_field(const RequestJson& body);
 
+// vLLM's `bad_words`: an array of strings the generated text never contains (absent, null or empty
+// is none). Each is checked and normalized by text::normalize_bad_words(); a malformed field fails
+// with invalid_bad_words.
+std::vector<std::string> parse_bad_words_field(const RequestJson& body);
+
 // The NInfer `thinking_budget` extension field: a positive cap on model-origin thinking tokens for
 // this request, or absent/null (nullopt) to take the server default. Ignored when the request does
 // not think. Anthropic Messages carries the same cap as `thinking.budget_tokens`.

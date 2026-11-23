@@ -1,5 +1,6 @@
 #include "text/structured_output.h"
 #include "ninfer/request.h"
+#include "text/bad_words.h"
 #include "text/schema_normalization.h"
 #include "text/string_constraints.h"
 #include <bit>
@@ -300,13 +301,17 @@ void validate_structured_output(const StructuredOutputOptions& options) {
 }
 
 struct GrammarState::Impl {
-    xgrammar::GrammarMatcher matcher;
+    // None for a state that only bans words.
+    std::optional<xgrammar::GrammarMatcher> matcher;
     int vocab_size;
     std::shared_ptr<const std::vector<std::string>> vocabulary;
     std::shared_ptr<const std::vector<std::uint8_t>> stops;
     std::unique_ptr<StringConstraintState> strings;
+    // The request's banned words, and the filter's state after the text accepted so far.
+    std::shared_ptr<const BadWordsFilter> banned;
+    BadWordsFilter::State banned_at = BadWordsFilter::kStart;
 
-    Impl(xgrammar::GrammarMatcher matcher, int vocab_size,
+    Impl(std::optional<xgrammar::GrammarMatcher> matcher, int vocab_size,
          std::shared_ptr<const std::vector<std::string>> vocabulary,
          std::shared_ptr<const std::vector<std::uint8_t>> stops,
          std::unique_ptr<StringConstraintState> strings)
@@ -324,20 +329,51 @@ GrammarState& GrammarState::operator=(GrammarState&&) noexcept = default;
 
 std::unique_ptr<GrammarState> GrammarState::fork() const {
     auto strings = impl_->strings ? std::make_unique<StringConstraintState>(*impl_->strings) : nullptr;
-    return std::unique_ptr<GrammarState>(new GrammarState(
-        std::make_unique<Impl>(impl_->matcher.Fork(), impl_->vocab_size, impl_->vocabulary,
-                               impl_->stops, std::move(strings))));
+    std::optional<xgrammar::GrammarMatcher> matcher;
+    if (impl_->matcher) { matcher = impl_->matcher->Fork(); }
+    auto impl = std::make_unique<Impl>(std::move(matcher), impl_->vocab_size, impl_->vocabulary,
+                                       impl_->stops, std::move(strings));
+    impl->banned    = impl_->banned;
+    impl->banned_at = impl_->banned_at;
+    return std::unique_ptr<GrammarState>(new GrammarState(std::move(impl)));
 }
+
+std::shared_ptr<GrammarState>
+GrammarState::with_bad_words(std::shared_ptr<GrammarState> grammar,
+                             std::shared_ptr<const BadWordsFilter> filter) {
+    if (!filter) { return grammar; }
+    if (!grammar) {
+        grammar = std::shared_ptr<GrammarState>(new GrammarState(std::make_unique<Impl>(
+            std::nullopt, static_cast<int>(filter->vocab_size()), nullptr, nullptr, nullptr)));
+    } else if (filter->vocab_size() != static_cast<std::size_t>(grammar->impl_->vocab_size)) {
+        throw std::logic_error("bad_words filter and grammar have different vocabularies");
+    }
+    grammar->impl_->banned    = std::move(filter);
+    grammar->impl_->banned_at = BadWordsFilter::kStart;
+    return grammar;
+}
+
+bool GrammarState::has_grammar() const noexcept { return impl_->matcher.has_value(); }
 
 void GrammarState::accept(std::span<const TokenId> tokens) {
     for (TokenId token : tokens) {
-        if (token < 0 || token >= impl_->vocab_size || impl_->matcher.IsTerminated())
+        if (token < 0 || token >= impl_->vocab_size ||
+            (impl_->matcher && impl_->matcher->IsTerminated()))
             throw GrammarViolation("generated token violates the structured output grammar");
-        auto next = impl_->strings ? std::make_unique<StringConstraintState>(*impl_->strings) : nullptr;
-        if ((next && !next->accept(impl_->semantic_bytes(token))) || !impl_->matcher.AcceptToken(token))
-            throw GrammarViolation("generated token " + std::to_string(token) +
-                                   " violates the structured output grammar");
-        if (next) impl_->strings = std::move(next);
+        if (impl_->matcher) {
+            auto next = impl_->strings ? std::make_unique<StringConstraintState>(*impl_->strings) : nullptr;
+            if ((next && !next->accept(impl_->semantic_bytes(token))) || !impl_->matcher->AcceptToken(token))
+                throw GrammarViolation("generated token " + std::to_string(token) +
+                                       " violates the structured output grammar");
+            if (next) impl_->strings = std::move(next);
+        }
+        if (impl_->banned) {
+            const auto next = impl_->banned->advance(impl_->banned_at, token);
+            if (!next)
+                throw GrammarViolation("generated token " + std::to_string(token) +
+                                       " completes a banned word (bad_words)");
+            impl_->banned_at = *next;
+        }
     }
 }
 
@@ -349,34 +385,50 @@ void GrammarState::fill_masks(std::span<std::uint32_t> masks,
     std::fill(masks.begin(), masks.end(), ~std::uint32_t{0});
     // The grammar after each prefix of the drafts the grammar admits, made in order (accepting a
     // token is cheap); the masks, the costly part, then fill one column per thread. A draft the
-    // grammar rejects leaves the columns after it unrestricted.
+    // grammar rejects, or one that completes a banned word, leaves the columns after it
+    // unrestricted.
     struct Column {
-        xgrammar::GrammarMatcher matcher;
+        std::optional<xgrammar::GrammarMatcher> matcher;
         std::unique_ptr<StringConstraintState> strings;
+        BadWordsFilter::State banned_at = BadWordsFilter::kStart;
     };
     std::vector<Column> columns;
     columns.reserve(drafts.size() + 1);
-    auto matcher = impl_->matcher.Fork();
+    std::optional<xgrammar::GrammarMatcher> matcher;
+    if (impl_->matcher) { matcher = impl_->matcher->Fork(); }
     auto strings = impl_->strings ? std::make_unique<StringConstraintState>(*impl_->strings) : nullptr;
+    BadWordsFilter::State banned_at = impl_->banned_at;
     for (std::size_t col = 0; col <= drafts.size(); ++col) {
-        if (matcher.IsTerminated()) break;
-        columns.push_back({matcher.Fork(), strings ? std::make_unique<StringConstraintState>(*strings) : nullptr});
+        if (matcher && matcher->IsTerminated()) break;
+        std::optional<xgrammar::GrammarMatcher> column;
+        if (matcher) { column = matcher->Fork(); }
+        columns.push_back({std::move(column),
+                           strings ? std::make_unique<StringConstraintState>(*strings) : nullptr,
+                           banned_at});
         if (col == drafts.size()) break;
         const TokenId token = drafts[col];
-        if (token < 0 || token >= impl_->vocab_size || !matcher.AcceptToken(token)) break;
+        if (token < 0 || token >= impl_->vocab_size || (matcher && !matcher->AcceptToken(token))) break;
         if (strings && !strings->accept(impl_->semantic_bytes(token))) break;
+        if (impl_->banned) {
+            const auto next = impl_->banned->advance(banned_at, token);
+            if (!next) break;
+            banned_at = *next;
+        }
     }
     const auto fill = [&](std::size_t col) {
         Column& column        = columns[col];
-        std::int64_t shape[2] = {1, words};
-        DLTensor tensor{};
-        tensor.data = masks.data() + col * words;
-        tensor.device = {kDLCPU, 0}; tensor.ndim = 2;
-        tensor.dtype = {kDLInt, 32, 1}; tensor.shape = shape;
-        column.matcher.FillNextTokenBitmask(&tensor);
+        if (column.matcher) {
+            std::int64_t shape[2] = {1, words};
+            DLTensor tensor{};
+            tensor.data = masks.data() + col * words;
+            tensor.device = {kDLCPU, 0}; tensor.ndim = 2;
+            tensor.dtype = {kDLInt, 32, 1}; tensor.shape = shape;
+            column.matcher->FillNextTokenBitmask(&tensor);
+        }
         if (impl_->vocab_size % 32)
             masks[(col + 1) * words - 1] &= (1U << (impl_->vocab_size % 32)) - 1;
         auto row = masks.subspan(col * words, words);
+        if (impl_->banned) impl_->banned->clear_banned(column.banned_at, row);
         // Semantic work is absent for ordinary schemas.
         const auto& constraint = column.strings;
         if (constraint) {
@@ -393,17 +445,21 @@ void GrammarState::fill_masks(std::span<std::uint32_t> masks,
             }
         }
         if (std::none_of(row.begin(), row.end(), [](auto word) { return word != 0; }))
-            throw std::runtime_error("structured output grammar has no admissible next token");
+            throw std::runtime_error(impl_->matcher
+                                         ? "structured output grammar has no admissible next token"
+                                         : "bad_words leave no admissible next token");
     };
     std::vector<std::exception_ptr> errors(columns.size());
     std::vector<std::thread> threads;
-    for (std::size_t col = 1; col < columns.size(); ++col) {
+    // Banned words alone cost microseconds a column: without a grammar the columns fill here.
+    const std::size_t here = impl_->matcher ? std::min<std::size_t>(1, columns.size()) : columns.size();
+    for (std::size_t col = here; col < columns.size(); ++col) {
         threads.emplace_back([&, col] {
             try { fill(col); } catch (...) { errors[col] = std::current_exception(); }
         });
     }
-    if (!columns.empty()) {
-        try { fill(0); } catch (...) { errors[0] = std::current_exception(); }
+    for (std::size_t col = 0; col < here; ++col) {
+        try { fill(col); } catch (...) { errors[col] = std::current_exception(); }
     }
     for (auto& thread : threads) thread.join();
     for (const auto& error : errors) {

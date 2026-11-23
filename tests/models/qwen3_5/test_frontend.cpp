@@ -2922,9 +2922,11 @@ ninfer::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& frontend
     return frontend.prepare(std::move(input));
 }
 
-int test_reasoning_close_requires_boundary(const Frontend& frontend) {
+// With banned words (bad_words) the closes are the same: they constrain no grammar.
+int test_reasoning_close_requires_boundary(const Frontend& frontend,
+                                           std::span<const std::string> bad_words = {}) {
     auto prompt  = thinking_prompt(frontend);
-    auto session = frontend.make_output_session(prompt, {});
+    auto session = frontend.make_output_session(prompt, {}, {}, {}, {}, bad_words);
 
     std::vector<ninfer::TokenId> quoted = fixture_tokens("discussing ");
     quoted.push_back(kFixtureThinkCloseToken);
@@ -4853,6 +4855,8 @@ int main() {
     failures += test_tool_definitions_in_prompt();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);
+    failures += test_reasoning_close_requires_boundary(
+        frontend, std::vector<std::string>{"<message", "<daily_persona"});
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_tokens_without_budget(frontend);
     failures += test_thinking_budget_control(frontend);
