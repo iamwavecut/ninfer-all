@@ -1191,7 +1191,7 @@ struct Executor::Impl {
     // A span's expert phase runs up to kGroupTokens of consecutive chunks in one wide call, whose
     // matrix products then take wider column tiles: the group's routes and output. span_group is
     // the chunks a group takes, 1 when groups are off.
-    static constexpr std::uint32_t kGroupTokens = 4096;
+    static constexpr std::uint32_t kGroupTokens = 6144;
     std::uint32_t span_group = 1;
     DeviceBuffer span_ids, span_weights, span_shared, span_y;
     // A span's expert call that a wider call of the same layer follows: the pool keeps that
