@@ -407,14 +407,16 @@ digest stay the same. Commands, runtime defaults and measurements: [DeepSeek-V4.
 `inkling2_gguf` ([`inkling2.py`](../tools/convert/inkling2.py)) imports Inkling 2 Mini from a
 llama.cpp GGUF of `thinkingmachines/Inkling-2-Mini` with `--model` holding the release's
 `config.json`, tokenizer, `chat_template.jinja` and `generation_config.json` and `--source gguf=`
-the GGUF. It reads both layouts of Unsloth's repository: llama.cpp's `inkling2_loop` (24 blocks,
-the loop's message queries and controllers per block) and the earlier `inkling2` of its root files
-(48 unrolled blocks in the metadata, the queries global). Both convert to the same payload byte for
-byte. It checks the GGUF's metadata against the config (the stored and visited layers, the
-sliding-window pattern, the attention and expert geometry, the softcap) and imports every row as
-stored. `--components text,vision,dspark` adds the vision tower from `--source vision=` (the
-release's mmproj, projector `inkling2v`) and the DSpark drafter from `--source dspark=` (llama.cpp
-architecture `dflash`). Commands, runtime defaults and measurements: [Inkling 2 Mini](inkling2.md).
+the GGUF. It reads both layouts of Unsloth's repository: llama.cpp's `inkling2_loop` of its root
+files (24 blocks, the loop's message queries and controllers per block) and the earlier `inkling2`
+in `Old_Support/` (48 unrolled blocks in the metadata, the queries global). Both convert to the same
+payload byte for byte. It checks the GGUF's metadata against the config (the stored and visited
+layers, the sliding-window pattern, the attention and expert geometry, the softcap) and imports
+every row as stored. `--components text,vision,dspark` adds the vision tower from `--source vision=`
+(the release's mmproj, projector `inkling2v`) and the DSpark drafter from `--source dspark=`
+(llama.cpp architecture `dflash`, the layout of Unsloth's `dspark-Inkling-2-Mini-Q8_0_Old.gguf`; the
+mainline drafter in its root `dspark-Inkling-2-Mini-Q8_0.gguf` stores other tensors and is not
+read). Commands, runtime defaults and measurements: [Inkling 2 Mini](inkling2.md).
 
 ## Change part of a recipe
 
