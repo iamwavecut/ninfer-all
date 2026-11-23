@@ -14,9 +14,10 @@
 //    the host from their codes and exponent bytes, within MXFP8's error of the oracle.
 //  - attention: relative bias inside its extent only, per-query sinks far below, near and above the
 //    scores, the sigmoid gate; sliding-window rings and full caches, one and many splits, prompt
-//    chunks after cached positions and branch rows, with and without the far field on tensor
-//    cores, decode and verification rows on tensor cores (the SIMT kernel on Volta), verification
-//    rows in groups with the bits of single rows; BF16 and q8_1 outputs.
+//    chunks after cached positions and branch rows (their near field on tensor cores, in groups of
+//    32 rows with a short last group), with and without the far field on tensor cores, decode and
+//    verification rows on tensor cores (the SIMT kernels on Volta), verification rows in groups
+//    with the bits of single rows; BF16 and q8_1 outputs.
 //  - residual over plain products, 2^-32 fixed-point sums and weighted pair rows, starting a block
 //    or adding to it, keeping the history, with the next depth mix fused; keep_products and
 //    keep_history.
@@ -1703,6 +1704,10 @@ int main() {
         attention_case({"full cache, decode", {{700, 1300}, {0, 1}}, 0, 0, 7, -30.0f}, rng);
         attention_case({"full cache, decode", {{700, 1300}, {0, 1}}, 0, 0, 7, 12.0f}, rng);
         attention_case({"window ring, chunk after 1100", {iota(1100, 37), {}, true, 1100}, ring, kWindow, 1}, rng);
+        // Prompt chunks of several 32-row groups (the tensor-core near field), the last one short.
+        attention_case({"window ring, chunk after 2000", {iota(2000, 60), {}, true, 2000}, ring, kWindow, 1}, rng);
+        attention_case({"window ring, chunk at 0", {iota(0, 50), {}, true, 0}, ring, kWindow, 1}, rng);
+        attention_case({"full cache, chunk after 900", {iota(900, 100), {}, true, 900}, 0, 0, 1}, rng);
         attention_case({"full cache, chunk after 600", {iota(600, 21), {}, true, 600}, 0, 0, 1}, rng);
         attention_case({"full cache, chunk at 0", {iota(0, 64), {}, true, 0}, 0, 0, 1}, rng);
         attention_case({"full cache, branches", branches, 0, 0, 1}, rng);
@@ -1711,6 +1716,7 @@ int main() {
         attention_case({"full cache, chunk after 1100", {iota(1100, 37), {}, true, 1100}, 0, 0, 1, 0.0f, true}, rng);
         attention_case({"full cache, chunk after 3000", {iota(3000, 70), {}, true, 3000}, 0, 0, 1, 0.0f, true}, rng);
         attention_case({"full cache, chunk after 3000", {iota(3000, 70), {}, true, 3000}, 0, 0, 1, -30.0f, true}, rng);
+        attention_case({"full cache, chunk after 4000", {iota(4000, 130), {}, true, 4000}, 0, 0, 1, 0.0f, true}, rng);
         {
             RowsCase far_branches{{}, {}, true, 1600, 4, {}};
             far_branches.positions = {1600, 1601, 1602, 1603, 1604, 1605, 1606, 1604, 1605};
