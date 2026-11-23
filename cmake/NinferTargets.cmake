@@ -100,7 +100,7 @@ function(ninfer_cuda_archive target)
   if(WIN32)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
-  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+  target_compile_options(${target} PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>")
   ninfer_prune_cuda_ptx(${target})
 endfunction()
@@ -112,7 +112,7 @@ function(ninfer_cuda_non_rdc_archive target)
   if(WIN32)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
-  target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+  target_compile_options(${target} PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>")
   ninfer_prune_cuda_ptx(${target})
 endfunction()

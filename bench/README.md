@@ -408,7 +408,8 @@ measured with the configured warmup and repetitions; the benchmark never issues 
 `T=1` launches as a substitute workload.
 
 For NCU, `--profile` performs setup, warmup, and the L2 flush before enabling the profiler, then
-captures exactly one public Linear call. Profiling a whole model under NCU can stretch one device
+captures exactly one public Linear call. Nsight Compute shows the source beside the SASS only for a
+build with `-DNINFER_CUDA_LINEINFO=ON`. Profiling a whole model under NCU can stretch one device
 wait past 120 s; `NINFER_DEVICE_STALL_SECONDS=0` ([Device stall
 watch](../docs/cli.md#device-stall-watch)) keeps the process alive and keeps the stall probe's
 kernel out of the profile. That call may emit one or more production-selected kernel

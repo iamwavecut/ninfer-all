@@ -26,7 +26,7 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 add_library(cache_check OBJECT host.cpp kernel.cu)
 target_include_directories(cache_check PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 target_compile_options(cache_check PRIVATE
-  "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;-Xfatbin=-compress-all;-compress-mode=size>")
+  "$<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all;-compress-mode=size>")
 """)
 # Restored shards can contain every probe variant from this same workflow run.
 # Give each invocation fresh source content so invalidation must cause a miss.

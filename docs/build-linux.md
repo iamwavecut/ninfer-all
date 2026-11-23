@@ -317,6 +317,7 @@ CMake configure command as `-DNAME=VALUE`.
 | `NINFER_BF16_RESIDUAL_ADD=ON` | BF16 linear projections are added onto the residual in bf16 instead of fp32 |
 | `NINFER_NVCC_SPLIT_COMPILE=N` | nvcc optimizes one translation unit on N threads (`--split-compile`); `0` is every core, which a parallel ninja multiplies by its job count |
 | `NINFER_PTXAS_VERBOSE=ON` | ptxas reports each kernel's registers and local-memory spills |
+| `NINFER_CUDA_LINEINFO=ON` | nvcc records each kernel's source lines (`-lineinfo`), so `compute-sanitizer` reports name the file and line and Nsight Compute shows the source beside the SASS; the machine code stays the same, and the kernel images grow about 3.5 times, so the packages grow and their modules load more slowly |
 | `NINFER_WEBUI_DIR=PATH` | compiles the WebUI in that directory (an `index.html` or `index.html.gz` at its root) into the server |
 | `NINFER_SM120_NATIVE=ON` | on a `120a` build, compiles upstream's native routes instead of the `mma.sync` path (every `120a` build compiles the FP8 A8 and NVFP4 W4A4 units) |
 | `NINFER_PDL=ON` | on a `120a` build of the `mma.sync` path, launches decode-graph kernels as programmatic dependents, so a kernel stages its weights while the one before it finishes (the native routes always do) |

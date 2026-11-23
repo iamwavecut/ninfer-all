@@ -359,8 +359,13 @@ read carries no device code.
 `ninfer_nvfp4_non_rdc` explicitly disables separable compilation and device-symbol resolution. It
 contains the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend
 on `setmaxnreg` register transfer, which RDC would discard. Their owning family manifests register
-these sources into that target; host launchers connect them to the normal Ops. All four CUDA
-archive targets retain `-lineinfo`.
+these sources into that target; host launchers connect them to the normal Ops. No CUDA target
+records source lines unless `NINFER_CUDA_LINEINFO=ON` ([build options](../build-linux.md#build-options)).
+The tables change no machine code: the CUDA 13.4 Linux package of November 22, 2026 had the same
+109,406 kernel code sections with and without them. With them its runtime library took 2,566 MiB
+instead of 939 MiB, the sm_86 images 5,858 MiB expanded instead of 1,615 MiB, and on an RTX 3090
+Inkling 2's CUDA graphs became ready after 1.0 and 0.78 s instead of 0.41 and 0.30 s (two runs
+each; peak host memory 1,016 to 1,023 MiB in both builds).
 
 Whole-program compilation is not a speed lever on every card. On the RTX 3090 (sm_86, CUDA 12.8, 27B
 DFlash2 bundle, rk4v4 KV, three interleaved rounds) the base line measured the switch at
