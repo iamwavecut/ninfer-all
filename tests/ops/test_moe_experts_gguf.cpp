@@ -784,6 +784,73 @@ int run_case(const Case& c, std::uint32_t seed) {
     return failures;
 }
 
+// A call of more than 6,553 tokens (more pairs than a grid has rows) equals the same tokens in two
+// calls bit for bit: Flash-Next's IQ3_XXS gate and up with IQ4_NL down on the matrix kernel, and
+// MXFP4, which only the vector kernel takes, its down products' input quantized over every pair.
+int wide_call(const char* name, QType gate_up, QType down_format, std::uint32_t seed) {
+    constexpr int kTokens = 6600, kHalf = kTokens / 2;
+    std::mt19937 rng(seed);
+    using Q = QType;
+    const Bank gate(gate_up, kWidth, kHidden, 4, kExperts, rng);
+    const Bank up(gate_up, kWidth, kHidden, 4, kExperts, rng);
+    const Bank down(down_format, kHidden, kWidth, 4, kExperts, rng);
+    const Bank sgate(Q::GGUF_Q6_K, kWidth, kHidden, 1, 1, rng);
+    const Bank sup(Q::GGUF_Q6_K, kWidth, kHidden, 1, 1, rng);
+    const Bank sdown(Q::GGUF_IQ4_NL, kHidden, kWidth, 1, 1, rng);
+    const ops::GgufMoeWeights banks{gate.view(), up.view(),    down.view(), sgate.view(),
+                                    sup.view(),  sdown.view(), kExperts,    true,
+                                    kWidth,      true,         nullptr};
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::uniform_real_distribution<float> unit(0.05f, 1.0f);
+    std::vector<__nv_bfloat16> m(std::size_t(kHidden) * kTokens);
+    for (auto& v : m) { v = __float2bfloat16(normal(rng)); }
+    std::vector<std::int32_t> ids(std::size_t(kTopK) * kTokens);
+    std::vector<float> weights(ids.size()), shared(kTokens);
+    std::vector<int> pool(kExperts);
+    std::iota(pool.begin(), pool.end(), 0);
+    for (int t = 0; t < kTokens; ++t) {
+        std::shuffle(pool.begin(), pool.end(), rng);
+        for (int j = 0; j < kTopK; ++j) {
+            ids[t * kTopK + j]     = pool[j];
+            weights[t * kTopK + j] = unit(rng);
+        }
+        shared[t] = unit(rng);
+    }
+    DeviceBuffer d_m(m.size() * 2), d_ids(ids.size() * 4), d_w(weights.size() * 4),
+        d_s(shared.size() * 4), d_y(std::size_t(kHidden) * kTokens * 4),
+        d_halves(std::size_t(kHidden) * kTokens * 4);
+    d_m.copy_from_host(m.data(), m.size() * 2);
+    d_ids.copy_from_host(ids.data(), ids.size() * 4);
+    d_w.copy_from_host(weights.data(), weights.size() * 4);
+    d_s.copy_from_host(shared.data(), shared.size() * 4);
+    WorkspaceArena workspace(ops::moe_experts_gguf_workspace_bytes(kTokens, false));
+    const auto run = [&](int first, int tokens, void* y) {
+        const auto at = [&](const DeviceBuffer& b, std::size_t per_token, std::size_t bytes) {
+            return static_cast<std::uint8_t*>(b.p) + std::size_t(first) * per_token * bytes;
+        };
+        Tensor t_m(at(d_m, kHidden, 2), DType::BF16, {kHidden, tokens}),
+            t_ids(at(d_ids, kTopK, 4), DType::I32, {kTopK, tokens}),
+            t_w(at(d_w, kTopK, 4), DType::FP32, {kTopK, tokens}),
+            t_s(at(d_s, 1, 4), DType::FP32, {tokens}),
+            t_y(static_cast<std::uint8_t*>(y) + std::size_t(first) * kHidden * 4, DType::FP32,
+                {kHidden, tokens});
+        ops::moe_experts_gguf(t_m, t_ids, t_w, t_s, banks, workspace, t_y, nullptr);
+        check(cudaDeviceSynchronize(), "moe_experts_gguf wide");
+    };
+    run(0, kTokens, d_y.p);
+    run(0, kHalf, d_halves.p);
+    run(kHalf, kTokens - kHalf, d_halves.p);
+    std::vector<float> whole(std::size_t(kHidden) * kTokens), halves(whole.size());
+    d_y.copy_to_host(whole.data(), whole.size() * 4);
+    d_halves.copy_to_host(halves.data(), halves.size() * 4);
+    bool finite = true;
+    for (const float v : whole) { finite = finite && std::isfinite(v); }
+    const bool same = finite && std::memcmp(whole.data(), halves.data(), whole.size() * 4) == 0;
+    std::cout << (same ? "OK   " : "FAIL ") << name << " wide call T=" << kTokens
+              << ": equals two calls of " << kHalf << '\n';
+    return same ? 0 : 1;
+}
+
 } // namespace
 
 int main() {
@@ -953,6 +1020,8 @@ int main() {
         int failures       = 0;
         std::uint32_t seed = 4242;
         for (const auto& c : cases) { failures += run_case(c, seed++); }
+        failures += wide_call("iq3_xxs/iq4_nl", QType::GGUF_IQ3_XXS, QType::GGUF_IQ4_NL, seed++);
+        failures += wide_call("mxfp4", QType::GGUF_MXFP4, QType::GGUF_MXFP4, seed++);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " MoE experts GGUF\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -36,7 +36,8 @@ struct ExpertCache::Layer {
         std::byte* base     = nullptr;
         std::uint32_t count = 0;
     };
-    std::array<Block, 3> lent{};
+
+    std::array<Block, 4> lent{};
     std::vector<std::int32_t> slot_of;   // a held or pending expert's slot, else -1
     std::vector<std::int32_t> expert_of; // a slot's held or pending expert, else -1
     std::vector<std::int32_t> free_slots;
@@ -576,8 +577,8 @@ ExpertCache::Ranges ExpertCache::storage(std::size_t index) const {
         const auto begin = reinterpret_cast<std::uintptr_t>(lent.base);
         return std::pair<std::uintptr_t, std::uintptr_t>{begin, begin + std::uint64_t(lent.count) * layer.slot_bytes};
     };
-    return {range(layer.storage), range(layer.extra), block(layer.lent[0]), block(layer.lent[1]),
-            block(layer.lent[2])};
+    return {range(layer.storage), range(layer.extra),   block(layer.lent[0]),
+            block(layer.lent[1]), block(layer.lent[2]), block(layer.lent[3])};
 }
 
 std::vector<std::uint64_t> ExpertCache::grow(std::span<const std::uint64_t> bytes_by_rank) {
@@ -646,7 +647,7 @@ std::vector<std::uint64_t> ExpertCache::lend(std::span<const Loan> loans) {
         }
         const std::size_t k = lent_by_rank[loan.rank]++;
         if (k >= std::tuple_size_v<decltype(Layer::lent)>) {
-            throw std::invalid_argument("expert cache: at most three lent buffers a rank");
+            throw std::invalid_argument("expert cache: at most four lent buffers a rank");
         }
         const auto it = on_rank.find(loan.rank);
         if (it == on_rank.end()) { continue; }
