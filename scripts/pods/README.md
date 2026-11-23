@@ -191,8 +191,10 @@ Keep model deletion separate from upload; a failed backup does not authorize del
 Large artifact work that needs no GPU runs on a CPU Pod: `runpod_cpu.py create` provisions a 4-vCPU
 Pod with a temporary volume (select `.local/pods/runpod-cpu/pod.json` with `NINFER_POD_STATE`), the
 same harness deploys and runs on it, and `runpod_cpu.py destroy` deletes only that Pod and volume
-once a local `cleanup-approved.json` receipt authorizes it. Model weights stay on the remote Linux
-host; the release scripts refuse macOS and paths outside `/workspace`, hash-check every source,
+once a local `cleanup-approved.json` receipt authorizes it. The script uses REST v2 through
+`~/runpod/pod-lib.sh`; its local guard stops the Pod two hours after creation, and `stop`,
+`destroy` and the guard itself remove its launchd job on macOS. Model weights stay on the remote
+Linux host; the release scripts refuse macOS and paths outside `/workspace`, hash-check every source,
 read back every output object before uploading it, and record the local SHA-256, the remote hash
 and the size before deleting temporary copies. A successful upload does not establish GPU
 qualification.
