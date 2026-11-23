@@ -169,7 +169,6 @@ struct QueryArgs {
     float* q_out = nullptr;
     float* r_out = nullptr;
 };
-void query_post(const QueryArgs& args, cudaStream_t stream);
 
 // K and V of each row: their short convolutions over the raw projections (FP32 rows `kv_stride`
 // apart, K at column 0, V at kv_heads * 128), with the dynamic per-head taps of a full-attention
@@ -203,7 +202,10 @@ struct KvArgs {
     // at slot `position`, and k_cache / v_cache are unused.
     KvPlaneView k_plane, v_plane;
 };
-void kv_post(const KvArgs& args, cudaStream_t stream);
+// A layer's attention inputs in one launch: block (t, y) of 128 threads runs Q head y of row t for
+// y < q.heads and K and V head y - q.heads after them. Either part may be absent (q.tokens or
+// kv.rows.tokens 0); when both are given they cover the same rows.
+void attention_inputs(const QueryArgs& q, const KvArgs& kv, cudaStream_t stream);
 
 // The attention of each row's heads (128 values, `query_heads / kv_heads` query heads per key and
 // value head) over the keys it sees: its sequence's earlier positions (and, in a prompt chunk, the
@@ -330,6 +332,10 @@ struct RouteArgs {
     // call's pairs also grouped by expert there as gguf::moe_sort_routes writes them (its fields of
     // gguf::moe_sorted_routes's view of the same workspace), in the same launch.
     RouteSort sorted;
+    // The call's fixed-point expert sums (zero_count values), zeroed by the same launch; null:
+    // none.
+    unsigned long long* zero = nullptr;
+    std::int64_t zero_count  = 0;
 };
 inline constexpr int kSortedRouteRows    = 8;
 inline constexpr int kSortedRouteExperts = 128;
@@ -340,6 +346,11 @@ void route(const RouteArgs& args, cudaStream_t stream);
 // values the CPU's expert products compute (cpu_experts.h).
 void situ_rows(const float* gu, std::int64_t stride, int pairs, int width, const float* pair_scale,
                float gate_cap, float up_cap, __nv_bfloat16* out, cudaStream_t stream);
+// The same middles as the down product's vector activation, the bytes
+// gguf::quantize_vector_activation writes from situ_rows's output: int8 values qs [pairs][width]
+// and half2 scales ds [pairs][width / 32] (the activation's two planes).
+void situ_q8(const float* gu, std::int64_t stride, int pairs, int width, const float* pair_scale,
+             float gate_cap, float up_cap, std::int8_t* qs, half2* ds, cudaStream_t stream);
 
 // BF16 expert products: out[p][r] = sum_j W_e[r][j] x[p / x_div][j] in FP32 for every pair p of
 // an active expert e (the routing's grouping: pairs sorted[bounds[e], bounds[e + 1]), experts
@@ -413,7 +424,7 @@ void spark_mix(const SparkMixArgs& args, cudaStream_t stream);
 // logical position (NeoX halves, theta^(-2i/128) for pair (i, i + 64)). Queries (`heads` of them,
 // FP32 rows `stride` apart from `column`) are rotated in place; keys (`heads` KV heads at `column`)
 // and the values after them (at column + heads * 128, not normed) go as F16 into cache slot
-// `position % ring` (ring 0: position) of the row's sequence, laid out as kv_post's caches.
+// `position % ring` (ring 0: position) of the row's sequence, laid out as attention_inputs' caches.
 struct SparkRotateArgs {
     Rows rows;
     float* x = nullptr;
