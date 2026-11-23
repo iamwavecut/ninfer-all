@@ -15,7 +15,8 @@
 //  - attention: relative bias inside its extent only, per-query sinks far below, near and above the
 //    scores, the sigmoid gate; sliding-window rings and full caches, one and many splits, prompt
 //    chunks after cached positions and branch rows, with and without the far field on tensor
-//    cores, verification rows in groups with the bits of single rows; BF16 and q8_1 outputs.
+//    cores, decode and verification rows on tensor cores (the SIMT kernel on Volta), verification
+//    rows in groups with the bits of single rows; BF16 and q8_1 outputs.
 //  - residual over plain products, 2^-32 fixed-point sums and weighted pair rows, starting a block
 //    or adding to it, keeping the history, with the next depth mix fused; keep_products and
 //    keep_history.
@@ -847,6 +848,139 @@ void attention_case(const AttentionCase& c, std::mt19937& rng) {
                " unbiased scores): bf16 " + num(eb.rel()) + ", q8_1 " + num(eq.rel()));
 }
 
+// Verification rows of one sequence (two to four consecutive positions, grouped as the executor
+// groups a full visit's rows) against each row alone, as a decode step at its position computes
+// it, at every position of [first, first + count): the same bits, FP32 partials of every active
+// split and BF16 output (splits > 1) or BF16 and q8_1 outputs (one split), so that speculative
+// decoding keeps the text of plain decoding. On an RTX 5090 every grouped row's partials differed
+// while the compiler was free to contract the grouped kernel's products and sums in another order.
+void attention_rows_case(int first, int count, int splits, std::mt19937& rng) {
+    constexpr int kMax = 4;
+    const int slots = first + count + kMax, width = kHeads * kD;
+    const std::int64_t head_stride = std::int64_t(slots) * kD;
+    std::vector<__half> kc(std::size_t(kKv) * head_stride), vc(kc.size());
+    {
+        std::normal_distribution<float> n(0.0f, 1.0f);
+        for (auto& v : kc) { v = __float2half(1.5f * n(rng)); }
+        for (auto& v : vc) { v = __float2half(n(rng)); }
+    }
+    const auto q     = normal(std::size_t(kMax) * width, 0.6f, rng);
+    const auto r     = normal(std::size_t(kMax) * kHeads * kRel, 1.0f, rng);
+    const auto table = normal(std::size_t(kExtent) * kRel, 1.0f, rng);
+    const auto gate  = normal(std::size_t(kMax) * width, 1.0f, rng);
+    const auto sinks = normal(std::size_t(kMax) * kHeads, 2.0f, rng);
+    const std::size_t partial_floats = k::attention_workspace_floats(kMax, kHeads, splits);
+    const std::size_t q8_bytes = std::size_t(kMax) * width + std::size_t(kMax) * (width / 32) * 4;
+    DeviceBuffer dk = upload(kc), dv = upload(vc), dq = upload(q), dr = upload(r),
+                 dt = upload(table), dg = upload(gate), ds = upload(sinks), positions(kMax * 4),
+                 partial(partial_floats * 4), out(std::size_t(kMax) * width * 2), q8(q8_bytes);
+    k::AttentionArgs a;
+    a.rows.positions = as<std::int32_t>(positions);
+    a.q              = as<float>(dq);
+    a.r              = as<float>(dr);
+    a.sinks          = as<float>(ds);
+    a.sink_stride    = kHeads;
+    a.table          = as<float>(dt);
+    a.extent         = kExtent;
+    a.k_cache        = as<__half>(dk);
+    a.v_cache        = as<__half>(dv);
+    a.seq_stride     = std::int64_t(kKv) * head_stride;
+    a.head_stride    = head_stride;
+    a.query_heads    = kHeads;
+    a.kv_heads       = kKv;
+    a.scale          = 1.0f / std::sqrt(float(kD));
+    a.splits         = splits;
+    a.partial        = as<float>(partial);
+    a.gate           = as<float>(dg);
+    a.gate_stride    = width;
+    // A call's values for its rows: the active splits' partials (O, then m and l) and the BF16
+    // output, or the BF16 and q8_1 outputs.
+    struct Got {
+        std::vector<float> o, ml;
+        std::vector<bf16> y;
+        std::vector<std::int8_t> qs;
+        std::vector<half2> qd;
+    };
+    const auto call = [&](k::AttentionArgs b, int row_first) {
+        Got g;
+        const int t = b.rows.tokens;
+        b.rows.positions += row_first;
+        b.q += std::int64_t(row_first) * width;
+        b.r += std::int64_t(row_first) * kHeads * kRel;
+        b.sinks += std::int64_t(row_first) * kHeads;
+        b.gate += std::int64_t(row_first) * width;
+        b.out = as<bf16>(out);
+        k::attention(b, nullptr);
+        sync("attention rows");
+        g.y = download<bf16>(out, std::size_t(t) * width);
+        if (splits > 1) {
+            const auto all = download<float>(partial, partial_floats);
+            const std::size_t n = std::size_t(t) * kHeads * splits;
+            g.o.assign(all.begin(), all.begin() + std::ptrdiff_t(n * kD));
+            g.ml.assign(all.begin() + std::ptrdiff_t(n * kD),
+                        all.begin() + std::ptrdiff_t(n * kD + 2 * n));
+        } else {
+            b.out      = nullptr;
+            b.out_q.qs = as<std::int8_t>(q8);
+            b.out_q.ds = reinterpret_cast<half2*>(as<std::uint8_t>(q8) + std::size_t(t) * width);
+            k::attention(b, nullptr);
+            sync("attention rows q8");
+            g.qs.resize(std::size_t(t) * width);
+            g.qd.resize(std::size_t(t) * (width / 32));
+            check(cudaMemcpy(g.qs.data(), b.out_q.qs, g.qs.size(), cudaMemcpyDeviceToHost),
+                  "q8 qs");
+            check(cudaMemcpy(g.qd.data(), b.out_q.ds, g.qd.size() * 4, cudaMemcpyDeviceToHost),
+                  "q8 ds");
+        }
+        return g;
+    };
+    // Row t of `many` against row 0 of `one`.
+    const auto equal = [&](const Got& many, int t, const Got& one, int keys) {
+        const int active = std::min(splits, std::max(1, (keys + 63) / 64));
+        for (int h = 0; h < kHeads; ++h) {
+            for (int s = 0; s < (splits > 1 ? active : 0); ++s) {
+                const std::size_t i = (std::size_t(t) * kHeads + h) * splits + s;
+                const std::size_t j = std::size_t(h) * splits + s;
+                if (std::memcmp(&many.o[i * kD], &one.o[j * kD], kD * 4) != 0 ||
+                    std::memcmp(&many.ml[2 * i], &one.ml[2 * j], 8) != 0) {
+                    return false;
+                }
+            }
+        }
+        const std::size_t row = std::size_t(t) * width;
+        if (std::memcmp(&many.y[row], one.y.data(), width * sizeof(bf16)) != 0) { return false; }
+        return splits > 1 || (std::memcmp(&many.qs[row], one.qs.data(), width) == 0 &&
+                              std::memcmp(&many.qd[row / 32], one.qd.data(), width / 32 * 4) == 0);
+    };
+    int rows = 0, differ = 0;
+    for (int p = first; p < first + count; ++p) {
+        std::vector<std::int32_t> pos(kMax);
+        for (int t = 0; t < kMax; ++t) { pos[t] = p + t; }
+        positions.copy_from_host(pos.data(), pos.size() * 4);
+        std::vector<Got> alone;
+        for (int t = 0; t < kMax; ++t) {
+            k::AttentionArgs b = a;
+            b.rows.tokens      = 1;
+            alone.push_back(call(b, t));
+        }
+        for (int n = 2; n <= kMax; ++n) {
+            k::AttentionArgs b = a;
+            b.rows.tokens      = n;
+            b.row_group        = n;
+            b.row_groups       = 1;
+            const Got grouped  = call(b, 0);
+            for (int t = 0; t < n; ++t) {
+                ++rows;
+                differ += equal(grouped, t, alone[t], p + t + 1) ? 0 : 1;
+            }
+        }
+    }
+    report(differ == 0, "attention, verification rows of 2-4 positions at " +
+                            std::to_string(first) + ".." + std::to_string(first + count - 1) +
+                            ", splits " + std::to_string(splits) + ": " + std::to_string(differ) +
+                            " of " + std::to_string(rows) + " rows differ from a decode row");
+}
+
 // ---- Residual updates ---------------------------------------------------------------------------
 
 enum class Product { Plain, Fixed, Pairs };
@@ -1563,6 +1697,9 @@ int main() {
         attention_case({"full cache, decode", {{20000}, {0}}, 0, 0, 300}, rng);
         attention_case({"full cache, verification", {{40000, 40001, 40002}, {0, 0, 0}}, 0, 0, 512, 0.0f, false, 3}, rng);
         attention_case({"window ring, verification", {{2000, 2001, 2002}, {0, 0, 0}}, ring, kWindow, 4}, rng);
+        // Every position of a span: 16 splits (partials) and one (the outputs).
+        attention_rows_case(2000, 200, 16, rng);
+        attention_rows_case(1200, 48, 1, rng);
         attention_case({"full cache, decode", {{700, 1300}, {0, 1}}, 0, 0, 7, -30.0f}, rng);
         attention_case({"full cache, decode", {{700, 1300}, {0, 1}}, 0, 0, 7, 12.0f}, rng);
         attention_case({"window ring, chunk after 1100", {iota(1100, 37), {}, true, 1100}, ring, kWindow, 1}, rng);

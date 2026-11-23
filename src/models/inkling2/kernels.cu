@@ -1524,6 +1524,10 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
     const std::int64_t vs0 = std::int64_t(sequence) * a.v_plane.scale_seq +
                              std::int64_t(kv_head) * a.v_plane.scale_head;
 
+    // Every product and sum below that rounds is an explicit operation (__fmaf_rn, __fmul_rn,
+    // __fadd_rn, __fdiv_rn). Left to the compiler, a block's second row could be contracted in
+    // another order than a decode row (an sm_120a build fused it so), and a verification row would
+    // no longer give the bits a decode step gives.
     // O^T of row r, m-tile mt: dimension 16 gid + 2 mt (elements 0, 1: head tid4's F16 and
     // remainder columns) and 16 gid + 2 mt + 1 (elements 2, 3).
     float o[kRows][kD / 16][4];
@@ -1626,14 +1630,14 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
                 int distance  = 0;
                 vis[j] = active[r] && head_ok && key >= begin[r] && key < end[r] &&
                          sees(a, t[r], key, distance);
-                float score = sc[r][2 * j] + sc[r][2 * j + 1] * kRemainderInverse;
+                float score = __fmaf_rn(sc[r][2 * j + 1], kRemainderInverse, sc[r][2 * j]);
                 if (vis[j] && distance < a.extent) {
                     const float* rr  = a.r + (std::int64_t(t[r]) * a.query_heads + head) * kRel;
                     const float* row = a.table + std::int64_t(distance) * kRel;
                     float bias = 0.0f;
 #pragma unroll
-                    for (int c = 0; c < kRel; ++c) { bias += rr[c] * row[c]; }
-                    score += bias;
+                    for (int c = 0; c < kRel; ++c) { bias = __fmaf_rn(rr[c], row[c], bias); }
+                    score = __fadd_rn(score, bias);
                 }
                 sv[j] = vis[j] ? score : -INFINITY;
             }
@@ -1645,13 +1649,13 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
             const float corr  = m_new == -INFINITY ? 1.0f : expf(m[r] - m_new);
             const float p0v   = vis[0] ? expf(sv[0] - m_new) : 0.0f;
             const float p1v   = vis[1] ? expf(sv[1] - m_new) : 0.0f;
-            l[r] = l[r] * corr + (p0v + p1v);
+            l[r] = __fmaf_rn(l[r], corr, __fadd_rn(p0v, p1v));
             m[r] = m_new;
             if (__any_sync(0xFFFFFFFFu, corr != 1.0f)) {
 #pragma unroll
                 for (int mt = 0; mt < kD / 16; ++mt) {
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) { o[r][mt][j] *= corr; }
+                    for (int j = 0; j < 4; ++j) { o[r][mt][j] = __fmul_rn(o[r][mt][j], corr); }
                 }
             }
             // P^T's B fragment: column gid (head gid / 2, part gid % 2), keys 2 tid4, 2 tid4 + 1
@@ -1683,8 +1687,8 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
         l[r] += __shfl_xor_sync(0xFFFFFFFFu, l[r], 16);
 #pragma unroll
         for (int mt = 0; mt < kD / 16; ++mt) {
-            out[r][2 * mt]     = o[r][mt][0] + o[r][mt][1] * kRemainderInverse;
-            out[r][2 * mt + 1] = o[r][mt][2] + o[r][mt][3] * kRemainderInverse;
+            out[r][2 * mt]     = __fmaf_rn(o[r][mt][1], kRemainderInverse, o[r][mt][0]);
+            out[r][2 * mt + 1] = __fmaf_rn(o[r][mt][3], kRemainderInverse, o[r][mt][2]);
         }
     }
     // Warps 1..3 of the octet hand their states to warp 0, which folds them in order.
@@ -1716,9 +1720,11 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
             const float mn = fmaxf(m[r], mw);
             if (mn == -INFINITY) { continue; }
             const float a0 = expf(m[r] - mn), a1 = expf(mw - mn);
-            l[r] = l[r] * a0 + lw * a1;
+            l[r] = __fmaf_rn(l[r], a0, __fmul_rn(lw, a1));
 #pragma unroll
-            for (int j = 0; j < 16; ++j) { out[r][j] = out[r][j] * a0 + theirs[16 * gid + j] * a1; }
+            for (int j = 0; j < 16; ++j) {
+                out[r][j] = __fmaf_rn(out[r][j], a0, __fmul_rn(theirs[16 * gid + j], a1));
+            }
             m[r] = mn;
         }
         if (!active[r]) { continue; }
@@ -1745,14 +1751,14 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
                                                   : -INFINITY;
             const float top = fmaxf(m[r], sink);
             const float wt  = expf(m[r] - top);
-            const float inv = 1.0f / (l[r] * wt + expf(sink - top));
+            const float inv = __fdiv_rn(1.0f, __fmaf_rn(l[r], wt, expf(sink - top)));
 #pragma unroll
             for (int j = 0; j < 16; ++j) {
                 const float g = a.gate != nullptr
                                     ? sigmoidf(a.gate[std::int64_t(tr) * a.gate_stride + head * kD +
                                                       16 * gid + j])
                                     : 1.0f;
-                y[j] = out[r][j] * wt * inv * g;
+                y[j] = __fmul_rn(__fmul_rn(__fmul_rn(out[r][j], wt), inv), g);
             }
         } else {
 #pragma unroll
