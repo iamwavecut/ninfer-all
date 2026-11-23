@@ -857,7 +857,10 @@ struct OutputSession::BadWords {
         FinishReason round_limit   = FinishReason::OutputLimit;
         bool drop_snapshot         = false;
         // This round's output is held back; otherwise the held output is published with it.
-        bool withhold = false;
+        // `release_withheld`: the hold moved into this round, so the output held back before it
+        // is published now and this round's is held back.
+        bool withhold         = false;
+        bool release_withheld = false;
         // A rewind to `ban_position`, which bans `ban_token` there (and every completing token
         // with `ban_completions`); a replay published `replay` first.
         bool rewound = false;
@@ -1362,11 +1365,16 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
                                          " completes a banned word (bad_words)");
         }
         const bool rewinds            = words.rewinds_left();
+        // The completed word began in this round, after the hold or with none: the output goes
+        // back to where it began, within the round.
+        const bool in_round = rewinds && live_before && *live_before >= first &&
+                              *live_before >= words.floor &&
+                              (!words.hold || *live_before > *words.hold);
         // Back to the hold of an earlier round: the session returns to its copy from before the
         // round in which the hold began and replays that round's tokens before the hold. A replay
         // that would end the turn or apply a control span falls back to banning the completing
         // token where it stands.
-        if (rewinds && words.hold && *words.hold < first && words.snapshot) {
+        if (!in_round && rewinds && words.hold && *words.hold < first && words.snapshot) {
             const std::uint32_t hold = *words.hold;
             const std::size_t replay = hold - words.snapshot_text.generated;
             std::unique_ptr<Impl> scratch = words.snapshot->clone();
@@ -1423,12 +1431,11 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         // token banned there (no rewind possible, or the replay fell back).
         std::uint32_t target    = completes;
         bool ban_completions    = true;
-        if (rewinds && words.hold && *words.hold >= first) {
-            target          = *words.hold;
-            ban_completions = false;
-        } else if (rewinds && !words.hold && live_before && *live_before >= first &&
-                   *live_before >= words.floor) {
+        if (in_round) {
             target          = *live_before;
+            ban_completions = false;
+        } else if (rewinds && words.hold && *words.hold >= first) {
+            target          = *words.hold;
             ban_completions = false;
         }
         const std::size_t kept = target - first;
@@ -1464,10 +1471,22 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
     }
 
     // No word completed. A hold that the core can return to begins at the live suffix when none
-    // is kept yet; the session before this round is then its snapshot.
+    // is kept yet, and moves to it when the suffix now begins in this round, after the kept hold
+    // (the suffix that began there died); the session before this round is then its snapshot.
     const bool new_snapshot_possible = words.rewinds_left();
+    const auto moves_to = [&](const std::optional<std::uint32_t>& live) {
+        return words.hold && live && *live >= first && *live > *words.hold && *live >= words.floor;
+    };
+    bool may_move = false;
+    if (new_snapshot_possible && words.hold && words.snapshot) {
+        BadWords::Text probe = words.text;
+        words.advance(probe, tokens);
+        may_move = moves_to(words.live_start(probe));
+    }
     std::unique_ptr<Impl> before;
-    if (new_snapshot_possible && (!words.hold || !words.snapshot)) { before = impl_->clone(); }
+    if (new_snapshot_possible && (!words.hold || !words.snapshot || may_move)) {
+        before = impl_->clone();
+    }
     runtime::OutputDecision decision =
         preview_tokens(tokens, total_budget_remaining, limit_reason, logprobs);
     const std::size_t accepted = decision.accepted_tokens;
@@ -1481,12 +1500,19 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         pending.drop_snapshot = true;
         return decision;
     }
-    if (words.hold) {
-        // A kept hold stays, also when the suffix now begins after it: a rewind goes back to
+    const bool moved = moves_to(live) && before != nullptr;
+    if (words.hold && !moved) {
+        // A kept hold stays when the suffix began in an earlier round: a rewind goes back to
         // where the core kept its state.
         pending.hold       = words.hold;
         pending.hold_token = words.hold_token;
         if (*words.hold >= first) { pending.hold_token = tokens[*words.hold - first]; }
+    } else if (moved) {
+        // The output withheld since the kept hold is final: it is published with this round.
+        pending.hold                  = *live;
+        pending.hold_token            = tokens[*live - first];
+        pending.release_withheld      = true;
+        decision.bad_words_hold_after = *live - first;
     } else if (*live >= first && *live >= words.floor) {
         pending.hold                  = *live;
         pending.hold_token            = tokens[*live - first];
@@ -1497,7 +1523,7 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         pending.drop_snapshot = true;
         return decision;
     }
-    if (!words.snapshot) {
+    if (!words.snapshot || moved) {
         pending.snapshot       = std::move(before);
         pending.snapshot_text  = words.text;
         pending.round_tokens.assign(tokens.begin(), tokens.begin() + accepted);
@@ -1729,11 +1755,16 @@ PublishedOutput OutputSession::commit_preview() {
         words.round_limit    = pending.round_limit;
     }
     if (pending.withhold && words.hold && !impl_->state.terminal) {
+        PublishedOutput released;
+        if (pending.release_withheld) {
+            released                  = std::exchange(words.withheld, {});
+            impl_->committed_logprobs = std::exchange(words.withheld_logprobs, {});
+        }
         words.withheld.append(std::move(output));
         words.withheld_logprobs.insert(words.withheld_logprobs.end(),
                                        std::make_move_iterator(records.begin()),
                                        std::make_move_iterator(records.end()));
-        output = {};
+        output = std::move(released);
     } else {
         PublishedOutput all = std::exchange(words.withheld, {});
         all.append(std::move(output));

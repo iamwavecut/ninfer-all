@@ -530,16 +530,20 @@ so they need `--structured-output`; without it a request with `bad_words` fails 
 `bad_words_not_supported`. They combine with a response format or strict tools in one mask per
 position; a position where nothing is left fails the request.
 
-A reply does not write the start of a banned string and then turn away from it. From the token
-where text that can still become a banned string begins (the hold), the request holds its output
-back and keeps what it needs to return there: the sequence's state before that token and the
-logits that drew it. When the text can no longer become a string, the held output is published.
-When a token completes a string, the request goes back: it drops the hold's token and every token
-after it, returns the sequence to its state before them, and draws the hold's position again from
-the kept logits with the dropped token banned there. The output never holds the dropped tokens; a
-stream receives held text when its hold ends, so a string's first tokens delay the stream. Logprobs
-follow the published tokens. The masks of every round ban the tokens that hold a whole string and
-the tokens a rewind banned at that position.
+A reply does not write the start of a banned string and then turn away from it. From the token where
+text that can still become a banned string begins (the hold), the request holds its output back and
+keeps what it needs to return there: the sequence's state before that token and the logits that drew
+it. When the text can no longer become a string, the held output is published. When that text dies
+and later text that can become a string begins in the same round (one token, or the several a
+speculative round verifies), the hold moves there and the output before it is published. When a
+token completes a string, the request goes back: it drops the hold's token and every token after it,
+returns the sequence to its state before them, and draws the hold's position again from the kept
+logits with the dropped token banned there. A string that begins and completes in one round goes
+back to its own first token there. A string whose start overlaps a longer start that began in an
+earlier round (`<<x` written as `<<<x`, one byte a round) goes back to that earlier start. The
+output never holds the dropped tokens; a stream receives held text when its hold ends, so a string's
+first tokens delay the stream. Logprobs follow the published tokens. The masks of every round ban
+the tokens that hold a whole string and the tokens a rewind banned at that position.
 
 A request rewinds at most 32 times and bans at most 8 tokens at one position. Past either limit,
 and where a family cannot reach back to the hold (below), each round's masks keep out every token

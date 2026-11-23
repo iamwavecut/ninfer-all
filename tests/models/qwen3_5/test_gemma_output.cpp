@@ -358,6 +358,15 @@ void test_bad_words_rewind() {
         expect(one.clean && one.holds && one.rewinds == 1 &&
                    text_of(one.generated) == "ab -a_a cd" && one.published == "ab -a_a cd",
                label + "a word within one round: '" + one.published + "'");
+        // A suffix that dies ("t" of "beat") before the word's own begins: the hold moves to
+        // where the word began, and the rewind goes there.
+        for (const auto& round_sizes : {sizes, std::vector<std::size_t>{6}}) {
+            const RewindRun moved = run_rewinds({"the w"}, "a beat the wave", round_sizes, '-');
+            expect(moved.clean && moved.holds && moved.counted && moved.rewinds == 1 &&
+                       text_of(moved.generated) == "a beat -he wave" &&
+                       moved.published == "a beat -he wave",
+                   label + "a suffix that died before the word: '" + moved.published + "'");
+        }
         // A model that writes the tag whatever comes before it: after the request's rewinds the
         // masks keep the completing byte out, and no banned word is ever published.
         std::string stubborn;
