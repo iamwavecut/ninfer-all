@@ -1,7 +1,8 @@
 // sparse_softmax_attention against an FP64 oracle over the selected blocks and the query's own
 // incomplete block, through a fragmented paged cache: a full 512-block selection at long context,
 // short contexts where every block is selected, and every tail length 0..3, both for up to eight
-// queries (positions split over CTAs, partial softmaxes merged) and for wider calls.
+// queries (positions split over CTAs, partial softmaxes merged) and for wider calls (on tensor
+// cores where the device's tier and the storage select them).
 //
 // A BF16 cache is written directly. Every quantized storage is written by kv_cache_append and its
 // planes are decoded back on the host, independently of the kernel, to the represented keys and
@@ -419,6 +420,8 @@ int main() {
         failures += run(storage, 4096, 3, 9103u); // a full selection
         failures += run(storage, 9000, 1, 9104u);
         failures += run(storage, 6001, 8, 9105u); // the widest split call, every split busy
+        failures += run(storage, 0, 12, 9108u);   // a wide call within one partial tile
+        failures += run(storage, 6001, 24, 9109u); // a wide call over full selections
         // A tensor-parallel share of one KV head: an unsplit and a split call.
         failures += run(storage, 2047, 9, 9106u, 1);
         failures += run(storage, 6001, 8, 9107u, 1);
