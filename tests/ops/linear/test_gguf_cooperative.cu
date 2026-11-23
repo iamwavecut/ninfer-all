@@ -124,7 +124,10 @@ void product_case(int k) {
             const ninfer::ops::DeviceRouteForce force(key, schedule);
             checked(cudaMemcpy(out, initial.data(), initial.size() * sizeof(float),
                                cudaMemcpyHostToDevice));
-            vec_launch<Type>(args, T, Fused, nullptr);
+            VecJobs one{};
+            one.job[0] = args;
+            one.count  = 1;
+            vec_launch<Type>(one, T, Fused, nullptr);
             checked(cudaMemcpy(cooperative.data(), out, cooperative.size() * sizeof(float),
                                cudaMemcpyDeviceToHost));
             if (std::memcmp(scalar.data(), cooperative.data(), scalar.size() * sizeof(float)) != 0) {

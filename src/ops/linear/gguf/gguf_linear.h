@@ -65,6 +65,22 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
                   WorkspaceArena& workspace, cudaStream_t stream,
                   const void* quantized_x = nullptr);
 
+// One product of gguf_vector_project: `weight` times a planar vector activation
+// (gguf::quantize_vector_activation) into `out`.
+struct GgufVectorProduct {
+    const Weight* weight   = nullptr;
+    const void* activation = nullptr;
+    gguf::VectorOutput out;
+};
+
+// gguf::vector_product for each product in order, t <= gguf::kMaxVectorColumns columns: consecutive
+// stored products of one block type and row size share a launch (up to gguf::kMaxVectorJobs); a
+// product whose epilogue reads an output (Accumulate, or a GateProduct's gate plane, which an
+// earlier product may write) runs after the ones before it. No product reads another's output as
+// its activation.
+void gguf_vector_project(std::span<const GgufVectorProduct> products, std::int32_t t,
+                         cudaStream_t stream);
+
 void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                  cudaStream_t stream);
 void gguf_linear_add(const Tensor& x, const Weight& w, Tensor& residual,

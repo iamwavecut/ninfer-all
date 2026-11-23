@@ -39,7 +39,8 @@ tokenization, the chat template, output parsing and the serving protocols.
   MiniPlus stores its sink and dynamic-tap projections in Q8_0, which the converter decodes to FP32
   exactly.
   Vector kernels multiply up to eight tokens, integer matrix kernels the prompt chunks, the expert
-  products the routed experts only. A GGUF's BF16 matrices keep their words: UD-Q8_K_XL stores
+  products the routed experts only; a layer's query, gate, relative, key and value products of one
+  format share vector launches ([GGUF products](gguf.md#products)). A GGUF's BF16 matrices keep their words: UD-Q8_K_XL stores
   attention, the token table, the head and layers 20-23's expert banks in BF16. A model with any
   BF16 matrix runs every call on BF16 rows: Linear's A16 route multiplies the BF16 matrices into
   FP32, a SIMT kernel the BF16 experts (FP32 sums of each expert's pairs, 32 at a time), and the

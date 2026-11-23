@@ -1819,6 +1819,33 @@ struct Executor::Impl {
                     column_stride, row);
     }
 
+    // product() for a layer's projections of one call: with q8_1 inputs those of one block type
+    // and row size share a launch (ops::detail::gguf_vector_project).
+    struct Projection {
+        const Weight* w;
+        const void* xq;
+        const __nv_bfloat16* x;
+        float* out;
+        int column_stride;
+        int row;
+    };
+    void products(std::span<const Projection> list, int t) {
+        if (std::any_of(list.begin(), list.end(), [](const Projection& p) { return p.xq == nullptr; })) {
+            for (const Projection& p : list) {
+                product(*p.w, p.xq, p.x, t, p.out, p.column_stride, p.row);
+            }
+            return;
+        }
+        std::vector<ops::detail::GgufVectorProduct> queued(list.size());
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            queued[i].weight            = list[i].w;
+            queued[i].activation        = list[i].xq;
+            queued[i].out.f32           = list[i].out + list[i].row;
+            queued[i].out.column_stride = list[i].column_stride;
+        }
+        ops::detail::gguf_vector_project(queued, t, stream);
+    }
+
     static constexpr std::size_t kStagingRegions = 4;
 
     // Tokens, positions, and when given sequences and branch starts, to the device.
@@ -2185,11 +2212,13 @@ struct Executor::Impl {
         auto* qgr = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * lp.query_rows * 4).data);
         auto* kv  = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 4).data);
         auto* sinks = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * 4).data);
+        std::vector<Projection> qkv;
         for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
-            product(lp.query[i], input_q(c, 0), bf16_in(0), t, qgr, lp.query_rows, int(row));
+            qkv.push_back({&lp.query[i], input_q(c, 0), bf16_in(0), qgr, lp.query_rows, int(row)});
         }
-        product(lp.key, input_q(c, ki), bf16_in(ki), t, kv, 2 * kvd, 0);
-        product(lp.value, input_q(c, vi), bf16_in(vi), t, kv, 2 * kvd, kvd);
+        qkv.push_back({&lp.key, input_q(c, ki), bf16_in(ki), kv, 2 * kvd, 0});
+        qkv.push_back({&lp.value, input_q(c, vi), bf16_in(vi), kv, 2 * kvd, kvd});
+        products(qkv, t);
         kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream);
         float* taps = nullptr;
         const int tap_columns = 2 * kv_heads * kTaps;

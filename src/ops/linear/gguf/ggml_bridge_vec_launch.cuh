@@ -101,8 +101,19 @@ void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const s
     return (std::size_t(k) * columns + 15) / 16 * 16;
 }
 
+// Products of one block type, K, row size and column count that one launch of the vector kernel
+// takes, each with its own weight rows, activation and store (a layer's products of one input).
+// The launch sets `first`: product j's blocks are [first[j], first[j + 1]).
+inline constexpr int kMaxVecJobs = 4;
+struct VecJobs {
+    VecArgs job[kMaxVecJobs];
+    int count;
+    int first[kMaxVecJobs + 1];
+};
+
+// jobs.count products, or with `fused` one fused [gate; up] product.
 template <ggml_type type>
-void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t stream);
+void vec_launch(const VecJobs& jobs, int columns, bool fused, cudaStream_t stream);
 
 // SiLU and the tanh-approximated GELU from correctly rounded operations (ops/common/silu.h): the
 // CPU's GGUF expert products compute the same bits.
