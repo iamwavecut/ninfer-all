@@ -87,6 +87,10 @@ struct ExpertCpuOptions {
 
 struct ExpertDeliveryOptions {
     std::uint32_t pair_capacity = 0;
+    // The experts a token routes through a layer: a decode pass's routes, the scale of a routing
+    // profile's and a prompt's counts in the tier (ExpertTier::steady). 0: a profile and a prompt
+    // place experts only into free slots and leave the counts to the decode.
+    std::uint32_t top_k = 0;
     // Persistent cache only; the layer banks are separate. Both explicit and automatic cache keep
     // keep_free_bytes free after physical allocation rounding.
     std::optional<std::uint64_t> cache_bytes;
@@ -196,9 +200,11 @@ struct ExpertDeliveryMemory {
 // bank, laid out like a resident bank (expert e of blob b at a fixed stride) with one copy per run
 // of consecutive experts (repeated wide calls to one layer, a prompt span's chunks, fill only what
 // its bank lacks), starts the bank of the other layer whose wide call followed its last wide call
-// (narrow calls between prompts do not change that order), and promotes its
-// most routed experts from the bank into free cache slots by device copies, up to the layer's
-// share; it evicts nothing and counts nothing, so a prompt does not push out the decode working set.
+// (narrow calls between prompts do not change that order), and promotes its most routed experts
+// from the bank by device copies: into free cache slots up to the layer's share, then, with top_k,
+// into the slots of colder experts under the tier's rule, its routes joining the tier's counts
+// scaled down to the decode's steady sum (ExpertTier::prompt). A prompt so places the cache its
+// reply starts with, and a long one never outweighs the reply's own routes.
 // While only narrow calls run, the banks are lent to the cache (ExpertDeliveryOptions::lend_banks):
 // a narrow call's miss that no cache slot takes enters a free slot of a lent bank, else the slot of
 // its least routed expert the call does not route, and stays there for later calls. A round
@@ -257,7 +263,8 @@ public:
     [[nodiscard]] ExpertDeliveryMemory memory() const noexcept;
     // Once warm-up is done, before the first request: empties the cache, forgets the routes the
     // tier and the totals learned, and fills the slots with the most routed (layer, expert) pairs
-    // of `profile` ([layer][expert], a routing profile of these layers) over every layer.
+    // of `profile` ([layer][expert], a routing profile of these layers) over every layer; with
+    // top_k, the profile also seeds the tier's counts (ExpertTier::seed).
     void prime(const std::vector<std::vector<std::uint64_t>>* profile);
     // Every route the narrow calls took through each layer's experts since prime().
     [[nodiscard]] std::vector<std::vector<std::uint64_t>> totals() const;

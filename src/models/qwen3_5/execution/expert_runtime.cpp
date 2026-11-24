@@ -44,6 +44,7 @@ NativeExpertRuntime::NativeExpertRuntime(const Model& model, DeviceContext& devi
         if (layers[rank].empty()) { continue; }
         ExpertDeliveryOptions options;
         options.pair_capacity = ops::detail::kSparseMoeStreamPairs;
+        options.top_k = std::get<MoeConfig>(model.config().text.ffn).num_experts_per_tok;
         options.suspendable = model.weights_suspendable();
         if (cache_bytes) { options.cache_bytes = *cache_bytes / device.size(); }
         options.keep_free_bytes = expert_add(keep_free_by_rank[rank], 512ULL << 20);

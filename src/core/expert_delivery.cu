@@ -413,6 +413,8 @@ struct ExpertDelivery::Impl {
     // experts are replaced only while a request is served, never one it routes.
     std::int64_t previous_layer = -1;
     bool previous_wide          = false;
+    // A prompt's routes joined the tier (top_k): the next narrow call settles the cache.
+    bool settle_pending         = false;
     std::size_t call_layer      = 0;
     int call_bank               = 0;
     bool call_wide              = false;
@@ -1345,7 +1347,12 @@ struct ExpertDelivery::Impl {
     // routes); candidates hold their slots pending until post work has copied them in.
     void round(ExpertDeliveryStats& delta) {
         set_free();
-        for (const auto& swap : tier->end_pass()) {
+        apply_swaps(tier->end_pass(), delta);
+    }
+
+    // The swaps of a round or a settle: each candidate's copy is queued for issue_rounds.
+    void apply_swaps(const std::vector<ExpertTier::Swap>& swaps, ExpertDeliveryStats& delta) {
+        for (const auto& swap : swaps) {
             auto& layer = layers[swap.layer];
             if (layer.slot_of[std::size_t(swap.in)] >= 0) { continue; }
             std::int32_t s = -1;
@@ -1763,6 +1770,12 @@ struct ExpertDelivery::Impl {
         // after it, carry the round's evictions before any later layer runs.
         const auto learn = [&] {
             if (wide) { return; }
+            if (settle_pending) {
+                // The first narrow call after a prompt: every swap its routes call for.
+                settle_pending = false;
+                set_free();
+                apply_swaps(tier->settle(), delta);
+            }
             if (new_pass) { round(delta); }
             last_narrow = std::int64_t(li);
             std::lock_guard lock(mutex);
@@ -1813,10 +1826,11 @@ struct ExpertDelivery::Impl {
         add(delta);
     }
 
-    // After the call's experts are ready: a wide call promotes its most routed bank experts into
-    // free cache slots by device copies, up to the layer's share of the cache, so a first prompt
-    // fills the cache across every layer and evicts nothing. It also starts the bank of the layer
-    // that followed it last time.
+    // After the call's experts are ready: a wide call joins its routes to the tier's counts (with
+    // top_k; the next narrow call settles the cache by them), promotes its most routed bank experts
+    // into free cache slots by device copies, up to the layer's share of the cache, so a first
+    // prompt fills the cache across every layer and evicts nothing, and starts the bank of the
+    // layer that followed it last time.
     void post() {
         const auto started = std::chrono::steady_clock::now();
         ExpertDeliveryStats delta;
@@ -1830,6 +1844,12 @@ struct ExpertDelivery::Impl {
         }
         const std::size_t li = call_layer;
         auto& layer = layers[li];
+        if (options.top_k != 0 && pool_of(li).count != 0) {
+            std::lock_guard lock(mutex);
+            tier->prompt(li, std::span(call_count.data(), layer.source.experts.size()),
+                         float(options.top_k));
+            settle_pending = true;
+        }
         if (pool_of(li).count != 0 && call_bank >= 0) {
             const auto& bank = bank_state[std::size_t(call_bank)];
             std::vector<std::int32_t> candidates;
@@ -2290,6 +2310,11 @@ void ExpertDelivery::prime(const std::vector<std::vector<std::uint64_t>>* profil
     p.upload_tables();
     CUDA_CHECK(ninfer::wait_for_stream(p.copies));
     p.set_free();
+    if (p.options.top_k != 0) {
+        for (std::size_t li = 0; li < p.layers.size(); ++li) {
+            p.tier->seed(li, counts[li], float(p.options.top_k));
+        }
+    }
     p.counters = p.counters + delta;
 }
 

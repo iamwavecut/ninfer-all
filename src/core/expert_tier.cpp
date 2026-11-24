@@ -12,7 +12,8 @@ ExpertTier::ExpertTier(std::vector<std::uint32_t> experts, std::vector<std::uint
     if (experts_.empty() || pools_.size() != experts_.size() ||
         !std::isfinite(options_.decay) || options_.decay < 0 || options_.decay > 1 ||
         !std::isfinite(options_.min_gain) || options_.min_gain < 0 ||
-        !std::isfinite(options_.min_count) || options_.min_count < 0) {
+        !std::isfinite(options_.min_count) || options_.min_count < 0 ||
+        !std::isfinite(options_.gain_ratio) || options_.gain_ratio < 1) {
         throw std::invalid_argument("expert tier: invalid layers, pools or options");
     }
     std::uint32_t pool_count = 0;
@@ -72,6 +73,43 @@ void ExpertTier::reset() {
     passes_ = 0;
 }
 
+float ExpertTier::steady(float per_pass) const noexcept {
+    if (options_.every == 0 || options_.decay >= 1 || !(per_pass > 0)) { return 0; }
+    return per_pass * float(options_.every) / (1.0F - options_.decay);
+}
+
+void ExpertTier::seed(std::size_t layer, std::span<const std::uint64_t> counts, float per_pass) {
+    if (layer >= experts_.size() || counts.size() != experts_[layer]) {
+        throw std::invalid_argument("expert tier: the seed describes another layer");
+    }
+    double total = 0;
+    for (const std::uint64_t c : counts) { total += double(c); }
+    const float sum = steady(per_pass);
+    const double scale = sum > 0 && total > 0 ? double(sum) / total : 1.0;
+    for (std::size_t e = 0; e < counts.size(); ++e) {
+        entries_[offset_[layer] + e].count = float(double(counts[e]) * scale);
+    }
+    refresh_cold();
+}
+
+void ExpertTier::prompt(std::size_t layer, std::span<const std::uint32_t> counts, float per_pass) {
+    if (layer >= experts_.size() || counts.size() != experts_[layer]) {
+        throw std::invalid_argument("expert tier: the prompt describes another layer");
+    }
+    double total = 0;
+    for (std::size_t e = 0; e < counts.size(); ++e) {
+        Entry& entry = entries_[offset_[layer] + e];
+        entry.count += float(counts[e]);
+        total += double(entry.count);
+    }
+    const float sum = steady(per_pass);
+    if (sum > 0 && total > double(sum)) {
+        const auto scale = float(double(sum) / total);
+        for (std::size_t e = 0; e < counts.size(); ++e) { entries_[offset_[layer] + e].count *= scale; }
+    }
+    refresh_cold();
+}
+
 // Orders the leading `count` pairs of `list` ((key, entry), ascending; entries are unique, so
 // this is a stable sort's order by key) and leaves the rest after them in some order.
 template <class Pair>
@@ -128,59 +166,72 @@ ExpertTier::Victim ExpertTier::admission_victim(std::size_t layer, std::int32_t 
         if (victim.state != State::Held) { continue; }
         ++held;
         if (l == layer && std::size_t(e) < busy.size() && busy[std::size_t(e)] != 0) { continue; }
-        if (candidate >= victim.count + options_.min_gain) { return {l, e}; }
+        if (candidate >= options_.gain_ratio * victim.count + options_.min_gain) { return {l, e}; }
     }
     return {};
 }
 
-std::vector<ExpertTier::Swap> ExpertTier::end_pass() {
+std::vector<ExpertTier::Swap> ExpertTier::round_swaps(std::size_t cap) const {
     std::vector<Swap> swaps;
+    // Candidates hottest first, victims coldest first, each (key, entry) with the lower entry
+    // first among equal counts. A pool's swaps come out best gain first and the round keeps at
+    // most `cap`, so only its first free + cap candidates and cap victims need an order.
+    std::vector<std::vector<std::pair<float, std::size_t>>> candidates(cold_.size()),
+        victims(cold_.size());
+    for (std::size_t i = 0; i < entries_.size(); ++i) {
+        const std::uint32_t pool = pools_[layer_of_[i]];
+        if (entries_[i].state == State::Held) {
+            victims[pool].emplace_back(entries_[i].count, i);
+        } else if (entries_[i].state == State::Out && entries_[i].count >= options_.min_count) {
+            candidates[pool].emplace_back(-entries_[i].count, i);
+        }
+    }
+    const auto split = [&](std::size_t i) {
+        const std::uint32_t l = layer_of_[i];
+        return std::pair{l, std::int32_t(i - offset_[l])};
+    };
+    for (std::size_t pool = 0; pool < cold_.size(); ++pool) {
+        auto& in  = candidates[pool];
+        auto& out = victims[pool];
+        const std::size_t used = std::min(in.size(), std::size_t(free_[pool]) + cap);
+        order_prefix(in, used);
+        order_prefix(out, std::min(out.size(), cap));
+        std::size_t next = 0;
+        for (std::size_t c = 0; c < used; ++c) {
+            const auto [layer, expert] = split(in[c].second);
+            if (c < free_[pool]) {
+                swaps.push_back({layer, expert, 0, -1, entries_[in[c].second].count});
+                continue;
+            }
+            if (next == std::min(out.size(), cap)) { break; }
+            const float gain = entries_[in[c].second].count -
+                               options_.gain_ratio * entries_[out[next].second].count;
+            if (gain < options_.min_gain) { break; }
+            const auto [victim_layer, victim] = split(out[next++].second);
+            swaps.push_back({layer, expert, victim_layer, victim, gain});
+        }
+    }
+    std::stable_sort(swaps.begin(), swaps.end(),
+                     [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+    if (swaps.size() > cap) { swaps.resize(cap); }
+    return swaps;
+}
+
+std::vector<ExpertTier::Swap> ExpertTier::end_pass() {
+    std::vector<Swap> result;
     if (options_.every != 0 && ++passes_ >= options_.every) {
         passes_ = 0;
-        // Candidates hottest first, victims coldest first, each (key, entry) with the lower entry
-        // first among equal counts. A pool's swaps come out best gain first and the round keeps at
-        // most `swaps`, so only its first free + swaps candidates and swaps victims need an order.
-        std::vector<std::vector<std::pair<float, std::size_t>>> candidates(cold_.size()),
-            victims(cold_.size());
-        for (std::size_t i = 0; i < entries_.size(); ++i) {
-            const std::uint32_t pool = pools_[layer_of_[i]];
-            if (entries_[i].state == State::Held) {
-                victims[pool].emplace_back(entries_[i].count, i);
-            } else if (entries_[i].state == State::Out && entries_[i].count >= options_.min_count) {
-                candidates[pool].emplace_back(-entries_[i].count, i);
-            }
-        }
-        const auto split = [&](std::size_t i) {
-            const std::uint32_t l = layer_of_[i];
-            return std::pair{l, std::int32_t(i - offset_[l])};
-        };
-        for (std::size_t pool = 0; pool < cold_.size(); ++pool) {
-            auto& in  = candidates[pool];
-            auto& out = victims[pool];
-            const std::size_t used = std::size_t(free_[pool]) + options_.swaps;
-            order_prefix(in, used);
-            order_prefix(out, options_.swaps);
-            std::size_t next = 0;
-            for (std::size_t c = 0; c < std::min(in.size(), used); ++c) {
-                const auto [layer, expert] = split(in[c].second);
-                if (c < free_[pool]) {
-                    swaps.push_back({layer, expert, 0, -1, entries_[in[c].second].count});
-                    continue;
-                }
-                if (next == std::min(out.size(), std::size_t(options_.swaps))) { break; }
-                const float gain = entries_[in[c].second].count - entries_[out[next].second].count;
-                if (gain < options_.min_gain) { break; }
-                const auto [victim_layer, victim] = split(out[next++].second);
-                swaps.push_back({layer, expert, victim_layer, victim, gain});
-            }
-        }
-        std::stable_sort(swaps.begin(), swaps.end(),
-                         [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
-        if (swaps.size() > options_.swaps) { swaps.resize(options_.swaps); }
+        result = round_swaps(options_.swaps);
         for (auto& entry : entries_) { entry.count *= options_.decay; }
     }
     refresh_cold();
-    return swaps;
+    return result;
+}
+
+std::vector<ExpertTier::Swap> ExpertTier::settle() {
+    auto result = round_swaps(entries_.size());
+    refresh_cold();
+    return result;
 }
 
 } // namespace ninfer

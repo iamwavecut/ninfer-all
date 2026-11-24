@@ -282,9 +282,11 @@ copies arrive
 products end soonest by earlier calls' times): each product row is the streamed d3/d4 kernels' warp
 arithmetic reproduced lane by lane (fused multiply-adds in lane order, the shfl_down tree,
 `ops::portable_silu`), so it is the GPU's bit for bit, and a placement kernel puts the rows into
-their pairs' slots before the merge. A wide call evicts nothing; it promotes its
+their pairs' slots before the merge. A wide call evicts nothing itself: it promotes its
 most routed experts from the bank into free slots by device copies, up to each layer's share of the
-cache, so a prompt does not flush the decode working set. `--expert-cache-mib 0` keeps the banks
+cache, and its routes join the tier's counts scaled down to the sum a decode settles to
+(`ExpertTier::prompt`), so the first narrow call after it swaps in the experts the prompt calls for
+(`ExpertTier::settle`) and a long prompt does not flush the decode working set. `--expert-cache-mib 0` keeps the banks
 only. Between prompts the layer banks serve as cache slots (`core/expert_delivery`): once two
 passes have run without a wide call, a narrow call's miss that the tier does not admit enters a free
 slot of a lent bank, else the slot of its least routed expert the call does not route, and stays
