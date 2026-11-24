@@ -550,6 +550,11 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             model_metadata      = std::move(constructed.model_metadata);
             sampling_defaults   = gemma->frontend.sampling_defaults();
+            // options() reports whether decode runs in CUDA Graphs, here and for the families
+            // below as for the Qwen3.5 path: an executor turns them off where a replayed graph
+            // could wait on expert copies queued behind it (host or disk experts on Windows and
+            // WSL2).
+            options.use_cuda_graph = gemma->executor->options().cuda_graphs;
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<Gemma4Core>(*gemma, device, options);
@@ -563,6 +568,7 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             model_metadata      = std::move(constructed.model_metadata);
             sampling_defaults   = flint->frontend.sampling_defaults();
+            options.use_cuda_graph = flint->executor->options().cuda_graphs;
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<FlintCore>(*flint, device, options);
@@ -576,6 +582,7 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             model_metadata      = std::move(constructed.model_metadata);
             sampling_defaults   = inkling->frontend.sampling_defaults();
+            options.use_cuda_graph = inkling->executor->options().cuda_graphs;
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<Inkling2Core>(*inkling, device, options);
@@ -589,6 +596,7 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             model_metadata      = std::move(constructed.model_metadata);
             sampling_defaults   = deepseek->frontend.sampling_defaults();
+            options.use_cuda_graph = deepseek->executor->options().cuda_graphs;
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<DeepSeekV41Core>(*deepseek, device, options);
@@ -602,6 +610,7 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             model_metadata      = std::move(constructed.model_metadata);
             sampling_defaults   = flash->frontend.sampling_defaults();
+            options.use_cuda_graph = flash->executor->options().cuda_graphs;
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<Qwen4ExpCore>(*flash, device, options);

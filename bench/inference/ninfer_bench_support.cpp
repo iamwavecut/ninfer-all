@@ -618,6 +618,14 @@ std::string decode_path_name(bool use_cuda_graph, const SpeculativeOptions& spec
                      execution;
 }
 
+void record_decode_route(BenchEnvironment& env, const EngineOptions& engine,
+                         const std::vector<BenchTest>& tests) {
+    env.use_cuda_graph = engine.use_cuda_graph;
+    const bool decodes = std::ranges::any_of(tests, &BenchTest::has_decode);
+    env.decode_graph_prime_output_tokens =
+        env.use_cuda_graph && decodes ? decode_graph_prime_output_tokens(env.speculative) : 0;
+}
+
 std::uint32_t decode_graph_prime_output_tokens(const SpeculativeOptions& speculative) {
     product::validate_speculative_cli_options(speculative);
     const auto widest = std::max(speculative.draft_tokens, speculative.ngram_draft_tokens);
