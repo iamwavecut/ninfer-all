@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -329,6 +330,26 @@ int run() {
               << banned.bad_words.rewind_seconds << " s added; the banned reply took "
               << banned.timings.total_seconds - plain.timings.total_seconds
               << " s longer than the plain one\n";
+    // Where each reply's time went: the rest of that difference lies outside the rewind (the text
+    // after the redrawn token is another reply, with its own number of speculative rounds).
+    const auto phases = [](const ninfer::GenerationResult& result) {
+        const auto& t = result.timings;
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(3) << "queue " << result.engine_timing.queue_wait_seconds
+            << " prepare " << t.prepare_seconds << " prefill " << t.prefill_seconds << " first token "
+            << t.first_token_seconds << " decode " << t.decode_seconds << " in "
+            << result.speculative.rounds + result.speculative.fallback_steps << " rounds, total "
+            << t.total_seconds;
+        return out.str();
+    };
+    std::cout << "plain reply:  " << phases(plain) << "\nbanned reply: " << phases(banned) << '\n';
+    // The same banned request again, once the engine holds the vocabulary's token text and this
+    // word list's filter: the first banned-words request of an engine builds both.
+    const ninfer::GenerationResult again = engine.generate(story(), request(tokens, {word}));
+    std::cout << "banned again: " << phases(again) << "; "
+              << common_prefix(banned.generated_token_ids, again.generated_token_ids) << " of "
+              << banned.generated_token_ids.size() << " tokens as before, "
+              << again.bad_words.rewind_seconds << " s of rewinds\n";
 
     // 3. Sampled replies, and a reply asked to copy the markup it may not write.
     std::vector<std::string> words = kTags;

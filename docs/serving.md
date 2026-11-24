@@ -570,14 +570,17 @@ then taken back with the rest of the hold. Drafts are proposed without the bans.
 only banned words keeps its drafts (MTP, DFlash, DFlash2, DSpark, a context lookup): its masks
 take microseconds and fill on the engine thread with no mask thread. The first request with a new
 list builds the list's filter (an Aho-Corasick automaton of the strings and the vocabulary's tokens
-by their bytes); the last eight lists are kept.
+by their bytes); the last eight lists are kept. The engine's first request with banned words also
+reads the bytes of every token of the vocabulary, which delays its first token once (on an RTX
+A5000: 0.17 s for Gemma 4, 0.12 s for Inkling 2, 0.10 s for DeepSeek-V4.1).
 
 The request log's `request_done.result` records a request's rewinds (`bad_words_rewinds`), the
 generated tokens they dropped (`bad_words_dropped_tokens`: those the rounds had generated at or
 after each rewind's position), and the delay they added to the reply (`bad_words_rewind_seconds`):
 for each rewind, the wall time from the round that generated its first dropped token to the round
 that committed the token drawn again there, including the requeue and prefill of a Qwen3.5-core
-rewind. The console's done line adds
+rewind. The text after the token drawn again is another reply, with its own number of decode
+rounds, which this delay does not count. The console's done line adds
 `bad_words N rewinds, D dropped, T` when a request rewound, and [Metrics](#metrics) sum the three
 over completed requests.
 
