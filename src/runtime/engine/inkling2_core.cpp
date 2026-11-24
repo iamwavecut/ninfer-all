@@ -384,8 +384,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         const auto& dc = *model->dspark_config();
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Inkling 2: DSpark drafter, %u layers over a block of %u, up to %u "
-                           "drafts a round for one decoding request%s; its head table and "
-                           "contexts %.0f MiB",
+                           "drafts a round for one decoding request%s; its contexts %.1f MiB",
                            dc.num_hidden_layers, dc.block_size,
                            speculative.draft_tokens != 0 ? speculative.draft_tokens
                                                          : dc.block_size - 1,
