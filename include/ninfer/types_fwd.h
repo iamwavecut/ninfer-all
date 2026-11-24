@@ -126,6 +126,7 @@ struct GenerationTimings;
 struct GenerationEngineTiming;
 struct SpeculativeStats;
 struct ThinkingBudgetStats;
+struct BadWordsStats;
 enum class PrefixReusePath : std::uint8_t;
 enum class MaterializationStopReason : std::uint8_t;
 enum class MaterializationSearchPhase : std::uint8_t;
