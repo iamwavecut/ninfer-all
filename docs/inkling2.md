@@ -80,15 +80,16 @@ tokenization, the chat template, output parsing and the serving protocols.
   row of a group of 32: F16 queries and probabilities, keys and values as stored (a plane format's
   chunks decoded to F16), FP32 scores, softmax and sums. A block holds two groups, one block a
   multiprocessor: the groups share each tile's loads and decoding, and each computes only the keys
-  of its own far field, so a row's bits do not depend on the other group. A plane's next tile
-  waits in registers as its stored bits and is decoded as it enters shared memory, so its loads
-  overlap the current tile's products. Every visit's prompt chunk then
-  reads the nearer keys on tensor cores too (a full visit's rows starting from that state, a
-  sliding-window visit's over its window), 32 rows to a block: each query enters the products as an
-  F16 value and its remainder times 2^12, and the relative bias comes from products of the rows'
-  relative features and the table rows of the distances a 32-key tile spans, split the same way (a
-  sum of FP32 products for each score where a chunk's positions are not consecutive, as with
-  branches), with FP32 masks, softmax and sums and F16 probabilities. A full visit's decode and
+  of its own far field, so a row's bits do not depend on the other group; on Volta a call with
+  fewer such blocks than multiprocessors (a 256-row scoring call) runs one group a block, two
+  blocks a multiprocessor. A plane's next tile waits in registers as its stored bits and is decoded
+  as it enters shared memory, so its loads overlap the current tile's products. Every visit's
+  prompt chunk then reads the nearer keys on tensor cores too (a full visit's rows starting from
+  that state, a sliding-window visit's over its window), 32 rows to a block: each query enters the
+  products as an F16 value and its remainder times 2^12, and the relative bias comes from products
+  of the rows' relative features and the table rows of the distances a 32-key tile spans, split the
+  same way (a sum of FP32 products for each score where a chunk's positions are not consecutive, as
+  with branches), with FP32 masks, softmax and sums and F16 probabilities. A full visit's decode and
   verification rows also run on tensor cores: four warps read a split's 16-key tiles in turn, keys
   and values decoded from their stored format straight into the products' operands, and each query
   and probability enters them as an F16 value and its remainder times 2^12 (about 22 significant
