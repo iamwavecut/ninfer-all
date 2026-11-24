@@ -177,6 +177,7 @@ means the card calibrates once at its first start.
 | ✅ | Tesla V100-SXM2 | 16 GB | Data center | ✓ | Bonsai 2, IQ3_S, Qwen3.8-27B (Q4 embedding and head), Flash-Next (experts in host memory, on disk), Gemma 4 |
 | ✅ | Tesla V100-SXM2 | 32 GB | Data center | ✓ | DeepSeek-V4.1-Flash (experts in host memory, on disk; 16 GB of the card), Edge0 (three-layer slices), Inkling 2 Mini |
 | ⬜ | Tesla V100 PCIe | 32 GB | Data center | ✓ | |
+| ⬜ | Tesla V100-FHHL | 16 GB | Data center | ✓ | |
 | ⬜ | Tesla V100 PCIe | 16 GB | Data center | | |
 | ⬜ | Tesla V100S PCIe | 32 GB | Data center | | |
 

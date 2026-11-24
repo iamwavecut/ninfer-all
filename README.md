@@ -173,7 +173,7 @@ Every card by name, with what has run on it:
 <summary><b>Device profiles and limits</b> — how a card gets its kernel routes</summary>
 
 - **Device profiles.** A profile picks the kernel route of every operation and width. The binary
-  carries profiles measured on 66 GPU models, from the Tesla V100 and RTX 2060 Super to the RTX PRO
+  carries profiles measured on 67 GPU models, from the Tesla V100 and RTX 2060 Super to the RTX PRO
   6000 (the Profile column of [supported GPUs](docs/gpus.md#cards)); a built-in profile applies to
   the same GPU name, compute capability and SM count. Any other card is calibrated once at first
   start, which takes from 12 seconds on a Tesla V100 to about six minutes on the smallest cards,
