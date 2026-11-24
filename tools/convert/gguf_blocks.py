@@ -40,7 +40,7 @@ from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
 from .methods import cast_direct, grouped_absmax, import_encoded
 from .official_recipes import Q4, Q5, Q6, Q8
-from .sources.gguf import TYPE_BF16, GGUFFile
+from .sources.gguf import TYPE_BF16, TYPE_PTQ1_0, GGUFFile, decode_ptq1_0
 from .sources.logical import EncodedRows, LogicalSource, array_source
 from .ternary import (
     ATTENTION_HEAD_DIM,
@@ -249,6 +249,10 @@ def has_mtp(gguf: GGUFFile) -> bool:
 def validate(gguf: GGUFFile) -> None:
     """Refuse any GGUF that is not a dense Qwen3.5/3.8-27B text tower of stored block types."""
 
+    if any(key.startswith("prism.hadamard.") for key in gguf.kv):
+        raise ValueError(
+            f"{gguf.path}: a Hadamard-rotated PrismML GGUF converts with bonsai2_27b_ternary"
+        )
     for key, expected in EXPECTED_HEADER.items():
         if gguf.kv.get(key) != expected:
             raise ValueError(
@@ -412,18 +416,28 @@ def mxfp4_as_q8_0(blocks: np.ndarray) -> np.ndarray:
     return out
 
 
+def dequantize_ptq1_0(blocks: np.ndarray) -> np.ndarray:
+    """PrismML PTQ1_0 rows (``uint8 [rows, row bytes]``, 28-byte blocks of 128 ternary values):
+    each value times its block's binary16 d."""
+
+    rows = blocks.shape[0]
+    ternary = decode_ptq1_0(np.ascontiguousarray(blocks).reshape(rows, -1, 28))
+    values = ternary.values.astype(np.float32) * ternary.scales.astype(np.float32)[..., None]
+    return values.reshape(rows, -1)
+
+
 GGML_Q4_0 = 2
 GGML_MXFP4 = 39
 GGML_NVFP4 = 40
 _LOCAL_DECODERS = {GGML_Q2_0: dequantize_q2_0, GGML_Q4_0: dequantize_q4_0,
                    GGML_Q8_0: dequantize_q8_0, GGML_MXFP4: dequantize_mxfp4,
-                   GGML_NVFP4: dequantize_nvfp4}
+                   GGML_NVFP4: dequantize_nvfp4, TYPE_PTQ1_0: dequantize_ptq1_0}
 
 
 def dequantize_blocks(type_id: int, blocks: np.ndarray) -> torch.Tensor:
     """FP32 values ``[rows, columns]`` of encoded ggml rows ``blocks`` (``uint8 [rows, row
-    bytes]``) of block type `type_id`: local decoders for Q2_0, Q4_0, Q8_0, MXFP4 and NVFP4,
-    gguf-py's for the others."""
+    bytes]``) of block type `type_id`: local decoders for Q2_0, Q4_0, Q8_0, MXFP4, NVFP4 and
+    PTQ1_0, gguf-py's for the others."""
 
     rows = blocks.shape[0]
     local = _LOCAL_DECODERS.get(type_id)
@@ -807,25 +821,30 @@ def _vision_source(model, sources):
     )
 
 
+def assign_vision(model, recipe, sources) -> None:
+    """Every Vision parameter from `--source vision` (the release's mmproj GGUF, or a checkpoint):
+    projections in the official Vision formats, the rest in their direct formats."""
+
+    vision = _vision_source(model, sources)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("vision/"):
+            continue
+        source = model.source(name, vision)
+        if parameter.projection:
+            recipe.assign(name, format=_vision_format(name), method=grouped_absmax, source=source)
+        else:
+            recipe.assign(
+                name, format=parameter.direct_format, method=cast_direct, source=source
+            )
+
+
 def _companions(model, recipe, sources) -> None:
     """Vision from the mmproj GGUF in the official formats; DFlash2 as the official recipe."""
 
-    vision = _vision_source(model, sources) if "vision" in model.components else None
+    if "vision" in model.components:
+        assign_vision(model, recipe, sources)
     for name, parameter in model.parameters.items():
-        if name.startswith("vision/"):
-            source = model.source(name, vision)
-            if parameter.projection:
-                recipe.assign(
-                    name, format=_vision_format(name), method=grouped_absmax, source=source
-                )
-            else:
-                recipe.assign(
-                    name,
-                    format=parameter.direct_format,
-                    method=cast_direct,
-                    source=source,
-                )
-        elif name.startswith(("dflash/", "dflash2/")) and parameter.projection:
+        if name.startswith(("dflash/", "dflash2/")) and parameter.projection:
             if name.endswith(
                 (
                     "/attention_conv/kernel_projection",
@@ -907,6 +926,7 @@ RECIPES = {"qwen3_8_27b_gguf": qwen3_8_27b_gguf}
 __all__ = [
     "EXPECTED_HEADER",
     "RECIPES",
+    "assign_vision",
     "block_format",
     "bf16_source",
     "block_source",
