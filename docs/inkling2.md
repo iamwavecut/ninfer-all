@@ -17,7 +17,8 @@ tokenization, the chat template, output parsing and the serving protocols.
 
 - **The model.** 24 stored layers of width 2304 run as 48 visits: the prelude (layers 0-5), the
   core (layers 6-17) three times with the same weights, then the coda (layers 18-23). Every visit
-  has its own keys, values and convolution history. Attention has no rotation: 24 query heads over
+  has its own keys, values and convolution history (`--loop-kv` shares the core's keys and values
+  between its passes, [shared loop KV](#shared-loop-kv)). Attention has no rotation: 24 query heads over
   8 key/value heads of width 128, a 16-wide relative feature per query head that scores a learned
   table of 1,024 distances, a sink logit per query and head, Q and K clipped to an L2 norm, V
   RMS-normed, causal 4-tap convolutions over K, V and both residual updates (dynamic per-head taps
@@ -311,6 +312,78 @@ so each format is compared with the F16 run of the same build. Speed: one server
 tok/s in all five. On this text `rk8v4` raised the NLL less than MXFP8 in a smaller cache, and
 `int8` no more than MXFP8 in the same 16.5 KiB; MXFP8 stays the default because the release
 trained with it.
+
+### Shared loop KV
+
+`--loop-kv` chooses which keys and values the three passes of the looped core keep. `per-pass`, the
+default, keeps every visit's own, the model's arithmetic. `last-full` keeps only the last pass's for
+the core's two full-attention layers, 11 and 17: in a call (a prompt chunk, a decode step, a
+verification) the first two passes write their rows at the call's positions into the last pass's
+cache and attend over it, so they read the last pass's keys and values for every position before
+the call and their own for the call's, and the last pass then writes its rows over theirs. Four of
+the eight full-attention visits keep a cache, so a token takes half the bytes in every
+`--kv-dtype` (8.25 KiB in MXFP8). `last-all` shares the core's ten sliding-window layers' rings the
+same way; this is transformers' `recurrent_kv_cache_mode="last_loop"`
+([PR 51161](https://github.com/huggingface/transformers/pull/51161)). The rings do not grow with the
+context, so `last-all` saves a fixed 165 MiB a sequence more. The convolution histories stay every
+visit's own in both modes. A sequence's image (the context cache's host and disk tiers, the prefix
+cache file, slot files) holds the caches the mode keeps, and an image saved in one mode does not load
+in another.
+
+Both modes change the model, and it is the transformers mode that changes it most. The first two
+passes read keys and values only the last pass computes, and what they read depends on how the
+tokens are split into calls: a decoded token reads the last pass's rows of every position before
+it, a token in a prompt chunk its own pass's rows of the chunk's earlier tokens. So the perplexity
+depends on the scoring calls (`ninfer-perplexity` scores in calls of 256 tokens; for the one-token
+column a change to the scorer, not part of the build, scored each token in its own call after a
+context prefilled in prompt chunks, as decoding reads), and a reply differs between `--spec none` and DSpark, whose verifications are calls of
+several tokens.
+
+| `--loop-kv` | KV of one sequence of 131,072 tokens | Sequences of 131,072 tokens that start | Mean NLL, 9,718 tokens | The same, one token a call | Mean NLL, 67,977 tokens | Mean NLL, 49,478 tokens, 16,384-token windows |
+|---|---:|---:|---:|---:|---:|---:|
+| `per-pass` (default) | 3,066 MiB | 2 | 1.858381 | 1.860160 | 1.784949 | 1.739055 |
+| `last-full` | 2,008 MiB | 5 | 1.874149 (+0.85%) | 1.880513 (+1.09%) | 1.797734 (+0.72%) | 1.754859 (+0.91%) |
+| `last-all` | 1,843 MiB | 5 | 1.899762 (+2.23%) | 1.997081 (+7.36%) | 1.824870 (+2.24%) | 1.785669 (+2.68%) |
+
+UD-IQ4_XS on an RTX 4090 (450 W, PCIe 4.0 x16), MXFP8 KV, experts on the GPU, a CUDA 13.4.3 build
+for `75;80;86;89;120a`, November 24, 2026. The KV column is the startup's KV line (the
+full-attention caches, the rings, the histories and the checkpoints); the sequences column is the
+most `ninfer-serve --max-context 131072 --max-concurrency N` starts with on that card (DSpark's
+drafter loaded, its default). The NLL columns score the first 40,000 bytes, all 277,332 bytes and
+the first 200,000 bytes of WikiText `00.txt`, the first two in 4,096-token windows at a 2,048-token
+stride; `per-pass` equals the build before the option bit for bit. With `last-full` the other
+formats rise alike on the 40,000 bytes: F16 1.860018 to 1.872789 (+0.69%), `int8` 1.859395 to
+1.872493 (+0.70%), `rk8v4` 1.859445 to 1.876169 (+0.90%), `rk4v4` 1.859137 to 1.873246 (+0.76%).
+
+For memory alone a smaller format costs less: `rk4v4` keeps 8.75 KiB a token, about what
+`last-full` keeps in MXFP8, for +0.04% against +0.85%; 4 sequences of 131,072 tokens start with it
+on the RTX 4090. `last-full` over `rk4v4` halves that again, 4.4 KiB a token: 7 sequences start
+(1,511 MiB of KV for one), at +0.76%. Two sequences of the model's whole 262,144-token context start
+with either shared mode in MXFP8 and not with `per-pass`.
+
+Speed stays: the modes run the same kernels over fewer caches. One server per mode
+(`--max-context 131072`), greedy replies of 256 tokens after prompts of 42, 7,703, 24,828 and
+86,848 tokens, two rounds of one run each: with `--spec none` the shared modes prefilled within
+-0.2% to +2.1% of `per-pass` (7.04k, 6.55k and 5.05k tok/s at the three long prompts) and decoded
+within -3.1% to +1.0% (`per-pass` 127.6 tok/s after 24,828 tokens, `last-all` 123.6 there, the
+largest change, -2.4% in the other round). The replies depart from `per-pass`'s after 40 to 114
+characters with `last-full` and 9 to 125 with `last-all` (of 690 to 1,139 characters of reasoning
+and answer), and with DSpark from their own `--spec none` replies after 60 to 718 and 39 to 306;
+they stay on topic, and `per-pass` gives the same reply with DSpark and without. Recall: with the
+four codes of `tools/longctx_recall_probe.py`'s prompt (thinking off, greedy), every mode names all
+four at 32,409, 64,523 and 126,185 tokens, and gives the same answer again from the context cache
+after another request has taken the sequence.
+
+Two other shares were measured by copying rows between the per-pass caches before each call (on
+the 40,000 bytes unless named), and not built. The earlier passes reading the middle pass's rows instead
+of the last pass's raised the NLL more, to 1.876032 (1.800353 and 1.757383 on the longer texts),
+and the first pass's to 1.897353. The first two passes keeping their own rows of the 1,024
+positions before a call, beside the last pass's older ones, brought `last-full` to 1.864526
+(+0.33%; 1.873125 and 1.871936 with 64 and 256 positions), 1.864576 one token a call (+0.24%),
+1.789919 on the 67,977 tokens (+0.28%) and 1.750070 in the 16,384-token windows (+0.63%): the
+longer the context, the less the near rows recover, and each earlier visit would need a second
+ring in every image, checkpoint and rewind, for a cost on the 40,000 bytes still six to eight
+times `rk4v4`'s.
 
 ## Measurements
 
@@ -814,6 +887,15 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
   from one card's after about 150 tokens; 64/64 and 32/96 experts give the same text, with and
   without DSpark, and the same perplexity. On the first 40 KiB of WikiText (`--kv-dtype bf16`)
   the split scores a mean NLL of 1.866484 against one card's 1.866193 (+0.016%).
+- **Shared loop KV.** `ninfer_inkling2_loop_kv_real_test` (`NINFER_INKLING_ARTIFACT`; with
+  `NINFER_INKLING_EXPERTS=host` or `disk` its experts there) runs `last-full` in every KV format
+  and `last-all` in MXFP8 against the per-pass executor, whose state goes out as an image before
+  each call and comes back with the earlier passes' caches of the shared layers replaced by the last
+  pass's, so the call reads what the shared mode reads through the same kernels. A first prompt
+  chunk, a second chunk far enough in for the far field, a decode step, a verification of four
+  rows kept up to its second and a decode step after it give the same logits bit for bit; an image
+  holds four of the eight full-attention visits' rows a position (`last-all` also 20 of the 40
+  rings), and a sequence loaded from one decodes as the sequence it came from.
 - **The vision tower.** `ninfer_inkling2_vision_real_test` (`NINFER_INKLING_VISION_ARTIFACT`,
   `NINFER_INKLING_VISION_IMAGE` and `NINFER_INKLING_VISION_DIR`, with the rows of
   `tools/reference/inkling2_vision.py` there) runs examples/cli/media/natural_scene.png, a

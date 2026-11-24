@@ -66,6 +66,16 @@ double seconds(Clock::time_point from, Clock::time_point to) {
     return std::chrono::duration<double>(to - from).count();
 }
 
+// --loop-kv's spelling.
+const char* loop_kv_name(LoopKvCache mode) {
+    switch (mode) {
+    case LoopKvCache::PerPass: return "per-pass";
+    case LoopKvCache::LastFull: return "last-full";
+    case LoopKvCache::LastAll: return "last-all";
+    }
+    return "per-pass";
+}
+
 bool request_error(const std::exception_ptr& error) {
     try {
         std::rethrow_exception(error);
@@ -233,6 +243,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.kv_cache      = options.kv_cache;
+    executor.loop_kv       = options.loop_kv;
     executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
     executor.dspine        = dspine;
     executor.dspark        = dspark;
@@ -315,6 +326,17 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                            ? " at most, growing with the sequences beside an elastic expert cache"
                            : "",
                        double(instance->executor->memory().workspace_bytes) / 1048576.0);
+    if (executor.loop_kv != LoopKvCache::PerPass) {
+        publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Warning,
+            "Inkling 2: --loop-kv %s: the core's earlier passes read the last pass's keys and "
+            "values of %s, which only the last pass keeps (lossy: the output differs from the "
+            "model's and with how the tokens are split into calls)",
+            loop_kv_name(executor.loop_kv),
+            executor.loop_kv == LoopKvCache::LastFull
+                ? "its full-attention layers"
+                : "its full-attention layers and the rings of its windowed layers");
+    }
     if (model->expert_parallel()) {
         std::string ranges;
         for (std::size_t rank = 0; rank < device.size(); ++rank) {
@@ -711,10 +733,14 @@ struct Inkling2Core::Impl {
                 sized.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
             auto* executor            = i.executor.get();
             const auto* spine_model   = i.model->dspine();
+            // An image holds the caches the --loop-kv mode keeps, so the mode names its profile.
             const std::string profile = context_image_profile(
                 "inkling2", i.model->info().artifact_id, kv_cache, executor->image_bytes(0),
                 executor->image_bytes(1),
-                spine_model != nullptr ? "-dspine" + spine_model->artifact_hex() : std::string());
+                (spine_model != nullptr ? "-dspine" + spine_model->artifact_hex() : std::string()) +
+                    (options.loop_kv != LoopKvCache::PerPass
+                         ? std::string("-loop-") + loop_kv_name(options.loop_kv)
+                         : std::string()));
             store.configure(
                 context_image_store_options(cache, budget, budget, profile), profile,
                 [executor](std::uint32_t position) { return executor->image_bytes(position); },

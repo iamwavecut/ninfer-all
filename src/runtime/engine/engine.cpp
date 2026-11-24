@@ -140,6 +140,11 @@ EngineOptions with_family_attention(EngineOptions options) {
     if (options.kv_cache == KvCacheStorage::Mxfp8 && !inkling2) {
         throw std::invalid_argument("--kv-dtype mxfp8 applies to Inkling2ForCausalLM artifacts");
     }
+    // Only Inkling 2 runs layers more than once a token.
+    if (options.loop_kv != LoopKvCache::PerPass && !inkling2) {
+        throw std::invalid_argument("--loop-kv applies to Inkling2ForCausalLM artifacts, the one "
+                                    "family with a looped core");
+    }
     if ((options.tensor_attention != TensorAttention::Heads || options.invariant_attention) &&
         own_family_artifact(options.artifact_path)) {
         throw std::invalid_argument(

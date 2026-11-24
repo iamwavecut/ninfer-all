@@ -8,6 +8,7 @@
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 #include "product/kv_resident_options.h"
+#include "product/loop_kv_options.h"
 #include "product/launch_config/launch_config.h"
 #include "product/option_layers.h"
 #include "product/tensor_split_options.h"
@@ -76,6 +77,7 @@ struct Options {
     ninfer::HybridExpertOptions hybrid_experts;
     ninfer::NgramTableOptions ngram_table;
     std::optional<std::uint32_t> kv_resident;
+    ninfer::LoopKvCache loop_kv = ninfer::LoopKvCache::PerPass; // Inkling 2: --loop-kv
 #if defined(NINFER_SM8X_COMPAT)
     // FP8 E4M3 KV attention has no SM86 implementation, so the upstream default would fail at
     // engine construction on this fork. INT8 group-64 is the qualified quantized profile here.
@@ -130,6 +132,7 @@ std::string usage_text() {
            "       [--ngram-hot-profile PATH] [--no-ngram-table] [--ngram-dedupe on|off]\n"
            "       [--iq1m-experts matrix|vector]\n"
            "       [--kv-resident N|all|auto]   (Qwen3.8-Flash-Next)\n"
+           "       [--loop-kv per-pass|last-full|last-all]   (Inkling 2; lossy past per-pass)\n"
            "       [--kv-dtype bf16|fp16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|bf16p|mxfp8] "
            "[--output "
            "<directory>]\n"
@@ -320,6 +323,8 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                        option, out.prompt_routes, [&] { return value(option.data()); }, false)) {
         } else if (ninfer::product::parse_kv_resident_option(
                        option, out.kv_resident, [&] { return value(option.data()); })) {
+        } else if (ninfer::product::parse_loop_kv_option(
+                       option, out.loop_kv, [&] { return value(option.data()); })) {
         } else if (ninfer::product::switch_option(option, "rope-yarn",
                                                    [&](bool on) { out.rope_yarn = on; })) {
         } else if (option == "--rope-yarn-factor") {
@@ -505,6 +510,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
     engine_options.kv_cache_automatic = !options.kv_explicit;
+    engine_options.loop_kv          = options.loop_kv;
     engine_options.lm_head_q4       = options.lm_head_q4;
     engine_options.lm_head_q6       = options.lm_head_q6;
     engine_options.embedding_q4     = options.embedding_q4;
@@ -710,7 +716,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"windows", options.disjoint ? "disjoint" : "sliding"},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
-          {"kv_dtype", kv_name(kv)}}},
+          {"kv_dtype", kv_name(kv)},
+          {"loop_kv", ninfer::product::loop_kv_name(options.loop_kv)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
           {"read_and_tokenize_seconds", preflight_seconds},

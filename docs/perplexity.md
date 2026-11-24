@@ -26,7 +26,9 @@ The default evaluation uses a 4,096-token context and a 2,048-token stride. Use 
 KV representations are the server's ten: `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`,
 `rk2v4-e8`, `nvfp4`, `k8v4`, and `bf16p`, which scores as `bf16` does. Inkling 2 scores its MXFP8
 default without `--kv-dtype` (`mxfp8`) and quantizes the same eight full-attention visits under
-`int8`, `rk8v4` or `rk4v4`; the windowed rings stay F16 ([Inkling 2](inkling2.md#kv-cache)). Flint
+`int8`, `rk8v4` or `rk4v4`; the windowed rings stay F16 ([Inkling 2](inkling2.md#kv-cache)). Its
+`--loop-kv last-full` or `last-all` scores the [shared loop KV](inkling2.md#shared-loop-kv) in calls of
+up to 256 tokens; `report.json` records the mode as `loop_kv`. Flint
 scores its F16 cache without `--kv-dtype` (or with `bf16`) and quantizes its 14 full-attention
 blocks under `int8`, `rk8v4` or `rk4v4` ([Flint](flint.md#kv-cache)); DeepSeek-V4.1 keeps BF16 and
 scores it without `--kv-dtype` or with `--kv-dtype bf16`. DeepSeek-V4.1 reads every window from
