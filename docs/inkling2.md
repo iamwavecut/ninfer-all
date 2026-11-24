@@ -549,10 +549,14 @@ scored them at these rates, in tok/s:
 | RTX 5090 | 2,079.7 | 2,087.9 | 2,553.6 | 2,612.7 |
 | A100-SXM4-40GB | 779.0 | 789.1 | 1,095.9 | 1,177.8 |
 | Quadro RTX 6000 | 447.8 | 448.9 | 737.4 | 744.9 |
-| Tesla V100-SXM2-32GB | 348.6 | 346.0 | V100LONGM | V100LONGF |
+| Tesla V100-SXM2-32GB | 348.6 | 349.6 | 275.3 | 277.6 |
 
-Other tenants' jobs loaded the RTX 3090's host (load average 58 at the start) and the V100's (3 to
-70). The RTX 4090's prompts ran with each KV format the family stores.
+Other tenants' jobs loaded the RTX 3090's host (load average 58 at the start) and the V100's (2 to
+78). The RTX 4090's prompts ran with each KV format the family stores. On the V100 two groups in
+every block scored at 346.0 tok/s (three runs, against 348.6 three times) and 269.0 and 268.0
+(against 275.3 and 275.4): a 256-row call has 32 such blocks for 80 multiprocessors. Its scoring
+rates above are the build that runs one group a block there, which wrote the same NLL, prefilled the
+two prompts at 536 and 1.11k tok/s and wrote the same texts.
 
 ### The mainline drafter
 
