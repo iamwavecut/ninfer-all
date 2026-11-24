@@ -147,7 +147,14 @@ tokenization, the chat template, output parsing and the serving protocols.
   drafts, 3 by default) also drafts, and so does a [DSpine](maintainer/dspine.md) drafter trained
   for this model (`--spec dspine --draft-model PATH`; none is published), which taps the visits'
   states; with a random drafter of this geometry the text equals plain decoding's, greedy and
-  sampled.
+  sampled. incoai's [DFlash2 drafter](maintainer/dflash.md#inkling-2) (an artifact's optional
+  `dflash2` component, `--spec dflash2`, 7 drafts unless `--draft-tokens` sets 1 to 6) drafts
+  the same way for one request, with `--adaptive-mtp` and `--draft-min-p` too: five
+  sliding-window layers over the anchor and 7 masks, from the same taps, then the target's head
+  and a conditional selector over each row's 16 best tokens. It sees the last 2,048 positions
+  only. Its drafts survive further than DSpark's in greedy answers that draw on those, and it
+  loses to DSpark at temperature 1 and on answers that copy older text, so the default stays
+  DSpark and the published artifacts do not carry it ([measurements](#dflash2)).
 - **Images.** The release's vision tower (the artifact's `vision` component, `--vision`): a ViT
   with a class row, learned position rows resized to each image and 2D-rotated heads, then 2 x 2
   patch merging and a two-layer projector, up to 4,096 positions an image (fewer with
@@ -232,6 +239,27 @@ do not take: the converter writes the same values as Q8_0 blocks, each code's do
 the int8 code and 2^(e - 128) as the F16 scale, checking every block against the MXFP4 decode.
 UD-Q8_K_XL converts the same way to 23,785,597,440 bytes in 27 seconds on the same host;
 its BF16 matrices, expert banks included, are copied word for word.
+
+incoai's DFlash2 drafter converts beside the others from the release's folder
+(`config.json` and `model.safetensors`, BF16):
+
+```bash
+hf download incoai/Inkling-2-Mini-DFlash2 config.json model.safetensors \
+  --local-dir models/inkling2/dflash2
+
+python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
+  --source gguf=models/inkling2/Inkling-2-Mini-UD-IQ4_XS.gguf \
+  --source vision=models/inkling2/mmproj-Inkling-2-Mini-Q8_0.gguf \
+  --source dspark=models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf \
+  --source dflash2=models/inkling2/dflash2 \
+  --components text,vision,dspark,dflash2 --name Inkling-2-Mini-UD-IQ4_XS \
+  --out models/Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --device cpu
+```
+
+It writes 17,230,821,888 bytes of 1,266 objects, 635,544,064 bytes and 81 objects more than
+without the drafter, in 185 seconds on a rented RTX 3090 host (its projections are quantized to
+Q8_G32 rows on the CPU). The converter checks the release's geometry, taps and selector
+settings and refuses a tensor stored other than BF16.
 
 ## Running
 
@@ -658,6 +686,45 @@ mainline one 138 of 797 (75.8 tok/s). The GPU keeps 15.1 GiB of weights with the
 of 15.0 and plans 16.9 GiB for a 12,288-token sequence in both builds: the folded table is now a
 weight rather than workspace the Engine filled at startup. DSpark figures in this section dated
 before November 24 come from the earlier drafter.
+
+### DFlash2
+
+incoai's DFlash2 drafter in the UD-IQ4_XS artifact ([converting](#converting)) against DSpark on one
+RTX 3090 (350 W, PCIe 4.0 x16, an EPYC 7R32 host), a CUDA 13.4.3 build, `ninfer-serve
+--max-context 40960`, experts on the GPU, MXFP8 KV, 384 tokens a request (the GSM8K question stops
+at 94), reasoning first, one run each, in tok/s:
+
+| Request | `--spec none` | DSpark (default) | DFlash2, 3, floor 0.5 | DFlash2, 7, floor 0.5 | DFlash2, 7 adapting, floor 0.5 |
+|---|---:|---:|---:|---:|---:|
+| essay, greedy | 115.1 | 129.9 | 143.0 | 138.2 | 131.9 |
+| Python task, greedy | 114.6 | 159.3 | 150.9 | 165.1 | 165.7 |
+| GSM8K question, greedy | 118.4 | 176.1 | 199.1 | 196.3 | 200.2 |
+| summary of a 5,753-token document, greedy | 108.8 | 158.8 | 98.7 | 84.3 | 107.9 |
+| summary of a 27,145-token document, greedy | 104.2 | 132.2 | 118.4 | 118.8 | 115.4 |
+| essay, seed 1 | 113.0 | 117.5 | 101.2 | 101.9 | 107.3 |
+| essay, seed 2 | 114.1 | 119.3 | 104.7 | 109.3 | 104.7 |
+| Python task, seed 2 | 116.7 | 137.7 | 138.0 | 120.5 | 133.6 |
+
+Every run's text equals `--spec none`'s. DFlash2 is faster than DSpark on the short greedy
+requests: by 1.5-10.1% on the essay, -5.3 to +4.0% on the Python task and 11.5-13.7% on the GSM8K
+question. It is slower on both documents (0.53-0.68 times DSpark on the 5,753-token one, 0.87-0.90
+on the 27,145-token one) and at temperature 1 (0.86-0.92 times on the essays; 0.88-1.00 on the
+Python task). Its window is the reason for the documents: with 7 drafts and no floor the CLI's
+rounds accepted 4.12 tokens on a 1,593-token slice of the document (DSpark 3.32) and 2.06 on the
+whole document (DSpark 3.14), where the summary draws on text more than 2,048 positions back, which
+DSpark's full-attention layers see. Essays after 3,111 and 6,045 tokens of unrelated text kept 2.50
+and 2.51 (DSpark 1.97 and 2.03), so the ring's wrap costs nothing by itself. At temperature 1 the
+target keeps a draft only while it equals its own draw, so acceptance follows the target's
+probability of the draft, and DFlash2's 7-draft rounds (about 31 ms against 9 for a plain step)
+lose more than they gain. 7 drafts without a floor decoded the greedy essay at 106.6 tok/s and the
+5,753-token document at 60.3.
+
+The first pass of the same matrix, beside a one-core compile on the host, gave the same order; the
+adapting settings moved by up to 17% between passes (DSpark on the 27,145-token document 112.6
+then 132.2, from 165 then 216 accepted drafts), as the controller and the timing gate react to
+round times; the fixed settings moved by 7% at most. The drafter adds 0.6 GiB of weights (15.2 GiB
+against DSpark's 15.1) and plans 147 MiB for its ring of 2,048 positions and workspace; the server
+started with 5.19 GiB free against 5.22 with DSpark.
 
 ### APEX-I MiniPlus
 
