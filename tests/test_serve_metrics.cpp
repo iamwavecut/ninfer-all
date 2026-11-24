@@ -69,6 +69,7 @@ int main() {
     outcome.metrics.prefix_cache_hit_tokens     = 300;
     outcome.metrics.speculative_draft_tokens    = 30;
     outcome.metrics.speculative_accepted_tokens = 21;
+    outcome.bad_words = ninfer::BadWordsStats{.rewinds = 2, .dropped_tokens = 5, .rewind_seconds = 0.25};
     metrics.record_done(outcome);
     metrics.record_done(outcome);
     metrics.record_failure();
@@ -109,6 +110,10 @@ int main() {
                           values.at("ninfer:reused_prompt_tokens_total") == 700.0 &&
                           values.at("ninfer:engine_recoveries_total") == 1.0,
                       "ninfer series accumulate reuse, speculation and recoveries");
+    failures += check(values.at("ninfer:bad_words_rewinds_total") == 4.0 &&
+                          values.at("ninfer:bad_words_dropped_tokens_total") == 10.0 &&
+                          values.at("ninfer:bad_words_rewind_seconds_total") == 0.5,
+                      "banned-word rewinds, dropped tokens and their delay accumulate");
     const auto at = [&](const char* series) { return values.at(series); };
     failures += check(at("ninfer:context_selections_total{source=\"root\"}") == 3.0 &&
                           at("ninfer:context_selections_total"

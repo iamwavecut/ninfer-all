@@ -453,7 +453,8 @@ Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions
 generated token IDs in diagnostics. Repeat `--bad-word TEXT` to ban text from the reply, reasoning
 included, as vLLM's `bad_words` does: a reply that completes a banned string goes back to where the
 string began and writes something else there. The CLI then starts the Engine with structured-output
-masks ([banned words](serving.md#banned-words)).
+masks ([banned words](serving.md#banned-words)), and its report adds the rewinds, the tokens they
+dropped and the delay they added when the reply rewound.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
 

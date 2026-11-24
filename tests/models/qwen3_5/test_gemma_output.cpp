@@ -20,6 +20,8 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -28,6 +30,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -245,7 +248,11 @@ void test_bad_words() {
 // and that writes another byte where the masks ban the script's. Each round's token i is drawn
 // under mask column i, conditioned on the round's tokens before it. The published text never
 // holds a banned word nor the start of one that a rewind took back; it ends as the generated
-// text; every rewind returns to the hold the core was told to keep.
+// text; every rewind returns to the hold the core was told to keep. The run also keeps what the
+// session's BadWordsStats should report: the tokens each rewind drops (those its round and the
+// rounds before had generated at or after its position) and the delay, from the round that
+// generated a rewind's first dropped token to the next round, which draws that position again.
+// `pause` sleeps before every round to make rounds take time.
 struct RewindRun {
     std::string published;
     std::vector<ninfer::TokenId> generated;
@@ -253,10 +260,14 @@ struct RewindRun {
     bool clean   = true; // no published prefix ever held a banned word
     bool holds   = true; // every rewind went to a kept hold
     bool counted = true; // the grammar counted exactly the generated tokens
+    std::uint64_t dropped   = 0;
+    double rewind_seconds   = 0.0;
+    ninfer::BadWordsStats stats;
 };
 
 RewindRun run_rewinds(const std::vector<std::string>& words, const std::string& script,
-                      const std::vector<std::size_t>& round_sizes, char fallback) {
+                      const std::vector<std::size_t>& round_sizes, char fallback,
+                      std::chrono::milliseconds pause = std::chrono::milliseconds(0)) {
     const auto frontend = gemma_frontend();
     ninfer::PromptInput input;
     input.messages.push_back(
@@ -271,8 +282,14 @@ RewindRun run_rewinds(const std::vector<std::string>& words, const std::string& 
     // The script position the model reached before each generated token.
     std::vector<std::size_t> cursor_at{0};
     std::optional<std::size_t> kept;
+    // When the round that generated each kept token began, and the pending rewind's delay.
+    using Clock      = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    std::vector<double> made_at;
+    std::optional<double> redraw_since;
     for (std::size_t round = 0; round < 400; ++round) {
         session.allow_bad_words_rewind(true);
+        if (pause.count() > 0) { std::this_thread::sleep_for(pause); }
         const std::size_t size = round_sizes[round % round_sizes.size()];
         std::vector<ninfer::TokenId> tokens;
         std::size_t cursor = cursor_at[run.generated.size()];
@@ -294,9 +311,15 @@ RewindRun run_rewinds(const std::vector<std::string>& words, const std::string& 
             if (token == kEosId) { break; }
         }
         const std::size_t first = run.generated.size();
+        const double now = std::chrono::duration<double>(Clock::now() - start).count();
         const auto decision =
             session.preview_model(tokens, 4096, ninfer::FinishReason::OutputLimit);
+        if (redraw_since) {
+            run.rewind_seconds += now - *redraw_since;
+            redraw_since.reset();
+        }
         for (std::size_t i = 0; i < decision.accepted_tokens; ++i) {
+            made_at.push_back(now);
             run.generated.push_back(tokens[i]);
             std::size_t next = cursor_at[first + i];
             if (tokens[i] != kEosId) { ++next; }
@@ -305,9 +328,13 @@ RewindRun run_rewinds(const std::vector<std::string>& words, const std::string& 
         }
         if (decision.bad_words_hold_after) { kept = first + *decision.bad_words_hold_after; }
         if (decision.bad_words_rewind) {
+            const std::size_t target = *decision.bad_words_rewind;
             ++run.rewinds;
-            run.holds = run.holds && kept == *decision.bad_words_rewind;
-            run.generated.resize(*decision.bad_words_rewind);
+            run.holds = run.holds && kept == target;
+            run.dropped += first + tokens.size() - target;
+            redraw_since = target < first ? made_at[target] : now;
+            run.generated.resize(target);
+            made_at.resize(target);
             cursor_at.resize(run.generated.size() + 1);
         }
         for (const ninfer::OutputDelta& delta : session.commit_preview()) {
@@ -320,7 +347,16 @@ RewindRun run_rewinds(const std::vector<std::string>& words, const std::string& 
         run.counted = run.counted && grammar->accepted_tokens() == run.generated.size();
         if (decision.finished()) { break; }
     }
+    run.stats = session.bad_words_stats();
     return run;
+}
+
+// The session's BadWordsStats agree with the run's own record: rewinds, dropped tokens, and the
+// delay to within the microseconds between the run's clock and the session's in each round.
+bool stats_agree(const RewindRun& run) {
+    return run.stats.rewinds == static_cast<std::uint32_t>(run.rewinds) &&
+           run.stats.dropped_tokens == run.dropped &&
+           std::abs(run.stats.rewind_seconds - run.rewind_seconds) <= 0.0005 * (run.rewinds + 1);
 }
 
 std::string text_of(const std::vector<ninfer::TokenId>& tokens) {
@@ -348,6 +384,18 @@ void test_bad_words_rewind() {
                                             copy.published + "' / '" + text + "'");
         expect(copy.rewinds == 2 && text == "Ok .daily_perso.a_accent> and <acc! done",
                label + "rewinds take back the words' first bytes: '" + text + "'");
+        expect(stats_agree(copy) && copy.dropped >= 14 + 4,
+               label + "the copy's rewind statistics: " + std::to_string(copy.stats.rewinds) +
+                   " rewinds, " + std::to_string(copy.stats.dropped_tokens) + " dropped");
+        // Rounds that take time: each rewind's delay runs from the round that generated its first
+        // dropped token ('<' 14 bytes before "<daily_persona" completes in rounds of one) to the
+        // round after it.
+        const RewindRun timed = run_rewinds(words, "Ok <daily_persona_accent> and <acc! done",
+                                            sizes, '.', std::chrono::milliseconds(2));
+        expect(stats_agree(timed) && timed.stats.rewinds == 2 &&
+                   timed.stats.rewind_seconds >= 0.002 * 2,
+               label + "the rewinds' delay: " + std::to_string(timed.stats.rewind_seconds) +
+                   " s, expected " + std::to_string(timed.rewind_seconds) + " s");
         // A word that begins inside the text another hold covers ("na_a" inside "persona_a").
         const RewindRun inner = run_rewinds(words, "x persona_accent y", sizes, '-');
         expect(inner.clean && inner.holds && inner.counted &&
@@ -358,6 +406,9 @@ void test_bad_words_rewind() {
         expect(one.clean && one.holds && one.rewinds == 1 &&
                    text_of(one.generated) == "ab -a_a cd" && one.published == "ab -a_a cd",
                label + "a word within one round: '" + one.published + "'");
+        expect(stats_agree(one) && one.stats.dropped_tokens == 5,
+               label + "a word within one round drops the round's tokens from its start: " +
+                   std::to_string(one.stats.dropped_tokens));
         // A suffix that dies ("t" of "beat") before the word's own begins: the hold moves to
         // where the word began, and the rewind goes there.
         for (const auto& round_sizes : {sizes, std::vector<std::size_t>{6}}) {
@@ -372,7 +423,7 @@ void test_bad_words_rewind() {
         std::string stubborn;
         for (int i = 0; i < 40; ++i) { stubborn += "<accent"; }
         const RewindRun insist = run_rewinds(words, stubborn, sizes, '<');
-        expect(insist.clean && insist.holds && insist.counted &&
+        expect(insist.clean && insist.holds && insist.counted && stats_agree(insist) &&
                    insist.published == text_of(insist.generated) && insist.rewinds <= 32,
                label + "a stubborn model: " + std::to_string(insist.rewinds) + " rewinds, '" +
                    insist.published.substr(0, 60) + "'");

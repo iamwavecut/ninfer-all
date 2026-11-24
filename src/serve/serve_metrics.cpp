@@ -164,6 +164,9 @@ void ServeMetrics::record_done(const GenerationOutcome& outcome) {
     prefix_cache_hit_tokens_total_ += metrics.prefix_cache_hit_tokens;
     draft_tokens_total_ += metrics.speculative_draft_tokens;
     draft_accepted_tokens_total_ += metrics.speculative_accepted_tokens;
+    bad_words_rewinds_total_ += outcome.bad_words.rewinds;
+    bad_words_dropped_tokens_total_ += outcome.bad_words.dropped_tokens;
+    bad_words_rewind_seconds_total_ += outcome.bad_words.rewind_seconds;
 }
 
 void ServeMetrics::record_failure() {
@@ -248,6 +251,15 @@ std::string ServeMetrics::render(const LoadCapacity& capacity, const LoadSample&
     append(out, "ninfer:draft_accepted_tokens_total", "counter",
            "Speculative draft tokens accepted for completed requests.",
            static_cast<double>(draft_accepted_tokens_total_));
+    append(out, "ninfer:bad_words_rewinds_total", "counter",
+           "Banned-word rewinds of completed requests.",
+           static_cast<double>(bad_words_rewinds_total_));
+    append(out, "ninfer:bad_words_dropped_tokens_total", "counter",
+           "Generated tokens that banned-word rewinds of completed requests dropped.",
+           static_cast<double>(bad_words_dropped_tokens_total_));
+    append(out, "ninfer:bad_words_rewind_seconds_total", "counter",
+           "Delay that banned-word rewinds added to completed requests, in seconds.",
+           bad_words_rewind_seconds_total_);
     append(out, "ninfer:context_cache_exhausted_requests_total", "counter",
            "Requests failed because the context cache had no placement for them.",
            static_cast<double>(stats.context_cache_exhausted_requests));

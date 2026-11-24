@@ -315,6 +315,20 @@ int run() {
               << plain.generated_token_ids.size() << " tokens in " << plain.timings.total_seconds
               << " s, banned reply " << banned.generated_token_ids.size() << " tokens in "
               << banned.timings.total_seconds << " s\n";
+    // The result's rewind statistics: one rewind, the tokens it dropped from the string's first
+    // token, and the delay it added; the plain reply made none.
+    check(plain.bad_words.rewinds == 0 && plain.bad_words.dropped_tokens == 0 &&
+              plain.bad_words.rewind_seconds == 0.0,
+          "the plain reply reports banned-word rewinds");
+    check(banned.bad_words.rewinds == 1 && banned.bad_words.dropped_tokens >= 1 &&
+              banned.bad_words.rewind_seconds > 0.0 &&
+              banned.bad_words.rewind_seconds < banned.timings.total_seconds,
+          "the banned reply's rewind statistics");
+    std::cout << std::setprecision(3) << "rewind statistics: " << banned.bad_words.rewinds
+              << " rewind, " << banned.bad_words.dropped_tokens << " tokens dropped, "
+              << banned.bad_words.rewind_seconds << " s added; the banned reply took "
+              << banned.timings.total_seconds - plain.timings.total_seconds
+              << " s longer than the plain one\n";
 
     // 3. Sampled replies, and a reply asked to copy the markup it may not write.
     std::vector<std::string> words = kTags;
@@ -334,6 +348,10 @@ int run() {
     check(!copied, "the copying reply holds " + copied.value_or(""));
     std::cout << "copying reply: " << head(copy.content.empty() ? copy.reasoning : copy.content)
               << '\n';
+    std::cout << std::setprecision(3) << "copying reply's rewinds: " << copy.bad_words.rewinds
+              << ", " << copy.bad_words.dropped_tokens << " tokens dropped, "
+              << copy.bad_words.rewind_seconds << " s added of " << copy.timings.total_seconds
+              << " s\n";
 
     // 4. Decode speed with the tag list (which a story never completes) and without it.
     std::uint64_t nonce = 0;

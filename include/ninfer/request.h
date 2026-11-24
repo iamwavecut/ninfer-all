@@ -733,6 +733,7 @@ struct GenerationResult {
     SpeculativeStats speculative;
     NgramArchiveStats ngram_archive;
     ThinkingBudgetStats thinking;
+    BadWordsStats bad_words;
     // Engine::submit_branches: one record per branch, in order; empty for every other request.
     std::vector<BranchResult> branches;
 };

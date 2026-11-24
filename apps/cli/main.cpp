@@ -226,6 +226,12 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                 std::to_string(static_cast<int>(result.thinking.loop_coverage * 100.0F + 0.5F)) +
                 "% repeated), " + (result.thinking.applied ? "concluded" : "stopped"));
     }
+    if (result.bad_words.rewinds != 0) {
+        print_metric("bad_words rewinds",
+                     std::to_string(result.bad_words.rewinds) + " (" +
+                         std::to_string(result.bad_words.dropped_tokens) + " tokens dropped, " +
+                         format_seconds(result.bad_words.rewind_seconds) + ")");
+    }
     print_metric("model elapsed", format_seconds(model_seconds));
     print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),
                                               result.timings.prefill_seconds));

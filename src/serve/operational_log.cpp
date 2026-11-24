@@ -355,6 +355,12 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << product::format_pretty_count(outcome.thinking.answer_now_thinking_tokens)
             << " thinking tokens";
     }
+    if (outcome.bad_words.rewinds != 0) {
+        out << " | bad_words " << product::format_pretty_count(outcome.bad_words.rewinds)
+            << (outcome.bad_words.rewinds == 1 ? " rewind, " : " rewinds, ")
+            << product::format_pretty_count(outcome.bad_words.dropped_tokens) << " dropped, "
+            << product::format_pretty_duration(outcome.bad_words.rewind_seconds);
+    }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
 

@@ -1502,6 +1502,7 @@ private:
         result.timings.prepare_seconds = request->prepare_seconds;
         result.speculative             = std::move(request->speculative_stats);
         result.thinking                = request->output.thinking_stats();
+        result.bad_words               = request->output.bad_words_stats();
         result.thinking.post_thinking_sampling = request->post_thinking_applied;
         if (request->ngram_archive) {
             result.ngram_archive.bound = true;
