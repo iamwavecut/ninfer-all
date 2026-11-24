@@ -5,6 +5,7 @@
 #include "models/inkling2/config.h"
 #include "models/inkling2/kv_codec.cuh"
 #include "models/inkling2/situ.h"
+#include "ops/common/device_multiprocessors.h"
 #include "ops/common/device_tier.h"
 #include "ops/common/mma.cuh"
 #include "ops/linear/gguf/q8_1_value.cuh"
@@ -1179,43 +1180,45 @@ __global__ void attention_combine_kernel(AttentionArgs a) {
     }
 }
 
-// The far field's softmax states (far_end): block (two groups of kFarRows rows, KV head) of four
-// warps per query head of the KV head, warp w head w / 4 over rows 16 (w % 4) .. + 16 of the
-// block's 64. Each group keeps its own far_end: the block streams the tiles of the larger end, and
-// a warp computes only the tiles of its group's, so every row reads the keys and rounds the
-// products it would in a block of its group alone; the two groups share each tile's loads and
-// decoding. Q (scaled) and the probabilities enter the MMAs as F16, K and V as the attention reads
-// them (F16, or a plane's chunks decoded to F16); scores, softmax and sums stay FP32. A plane's
-// next tile stays in registers as its stored bits while the block computes the current one, and is
-// decoded as it enters shared memory. Writes (acc, m, l) of each row and head to a.far in
-// attention_workspace_floats(T, query_heads, 1)'s layout.
-constexpr int kFarPad    = kD + 8; // halves per shared row: 272 bytes keep the ldmatrix rows apart
-constexpr int kFarGroups = 2;      // groups of kFarRows rows a block
+// The far field's softmax states (far_end): block (Groups groups of kFarRows rows, KV head) of
+// 2 Groups warps per query head of the KV head, warp w head w / (2 Groups) over rows
+// 16 (w % (2 Groups)) .. + 16 of the block's 32 Groups. Each group keeps its own far_end: the block
+// streams the tiles of the largest end, and a warp computes only the tiles of its group's, so every
+// row reads the keys and rounds the products it would in a block of its group alone; the groups
+// share each tile's loads and decoding. Q (scaled) and the probabilities enter the MMAs as F16, K
+// and V as the attention reads them (F16, or a plane's chunks decoded to F16); scores, softmax and
+// sums stay FP32. A plane's next tile stays in registers as its stored bits while the block
+// computes the current one, and is decoded as it enters shared memory. Writes (acc, m, l) of each
+// row and head to a.far in attention_workspace_floats(T, query_heads, 1)'s layout.
+constexpr int kFarPad = kD + 8; // halves per shared row: 272 bytes keep the ldmatrix rows apart
 
 __device__ __forceinline__ unsigned half2_bits(float x, float y) {
     const __half2 h = __floats2half2_rn(x, y);
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
-// One block a multiprocessor, three warps to each scheduler; its 34 KiB of shared memory fits
-// Turing's 64 KiB too.
-template <int Group>
-__global__ void __launch_bounds__(128 * Group, 1) far_attention_kernel(AttentionArgs a) {
+// Two groups: one block a multiprocessor, three warps to each scheduler; its 34 KiB of shared
+// memory fits Turing's 64 KiB too. One group (Volta's small calls, far_attention): two blocks a
+// multiprocessor.
+template <int Group, int Groups>
+__global__ void __launch_bounds__(64 * Group * Groups, 2 / Groups)
+    far_attention_kernel(AttentionArgs a) {
+    static_assert(Groups == 1 || Groups == 2);
     ninfer::pdl::arch_enter();
-    constexpr int kThreads = 128 * Group;
+    constexpr int kThreads = 64 * Group * Groups;
     constexpr int kWords   = 2 * kFarKeys * (kD / 8); // uint4 words of a K and V tile
     constexpr int kPer     = (kWords + kThreads - 1) / kThreads;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int gid = lane >> 2, tid4 = lane & 3;
     const int kv_head = blockIdx.y;
-    const int g       = blockIdx.x * (kFarGroups * kFarRows);
+    const int g       = blockIdx.x * (Groups * kFarRows);
     const int end0    = far_end(a, g);
-    const int end1    = g + kFarRows < a.rows.tokens ? far_end(a, g + kFarRows) : 0;
+    const int end1    = Groups == 2 && g + kFarRows < a.rows.tokens ? far_end(a, g + kFarRows) : 0;
     const int end     = max(end0, end1);
     if (end == 0) { return; }
-    const int quarter   = warp & 3;
+    const int quarter   = warp % (2 * Groups);
     const int own_tiles = (quarter < 2 ? end0 : end1) / kFarKeys; // this warp's group's tiles
-    const int head      = kv_head * Group + warp / 4;
+    const int head      = kv_head * Group + warp / (2 * Groups);
     const int r0        = g + 16 * quarter;
     const int sequence  = row_sequence(a.rows, g);
     const std::int64_t base =
@@ -3347,21 +3350,35 @@ void attention(const AttentionArgs& args, cudaStream_t stream) {
             if (args.window != 0 || args.ring != 0) {
                 throw std::invalid_argument("inkling2 attention: a far field is a full visit's");
             }
-            const dim3 grid(blocks_for(t, kFarGroups * kFarRows), unsigned(args.kv_heads));
-            switch (group) {
-            case 1:
-                ninfer::pdl::launch_arch(grid, 128, 0, stream, far_attention_kernel<1>, args);
-                break;
-            case 2:
-                ninfer::pdl::launch_arch(grid, 256, 0, stream, far_attention_kernel<2>, args);
-                break;
-            case 3:
-                ninfer::pdl::launch_arch(grid, 384, 0, stream, far_attention_kernel<3>, args);
-                break;
-            default:
-                ninfer::pdl::launch_arch(grid, 512, 0, stream, far_attention_kernel<4>, args);
-                break;
+            // Two groups of 32 rows a block; on Volta, whose products are emulated, one group a
+            // block where two-group blocks would leave multiprocessors idle (a 256-row scoring
+            // call).
+            int groups = 2;
+#if defined(NINFER_TIER_VOLTA)
+            if (ops::current_device_volta() &&
+                std::int64_t(blocks_for(t, 2 * kFarRows)) * args.kv_heads <
+                    ops::detail::current_device_multiprocessors(80)) {
+                groups = 1;
             }
+#endif
+            const dim3 grid(blocks_for(t, groups * kFarRows), unsigned(args.kv_heads));
+            const unsigned threads = unsigned(64 * group * groups);
+            const auto launch = [&]<int Groups>() {
+                void (*kernel)(AttentionArgs) = group == 1   ? far_attention_kernel<1, Groups>
+                                                : group == 2 ? far_attention_kernel<2, Groups>
+                                                : group == 3 ? far_attention_kernel<3, Groups>
+                                                             : far_attention_kernel<4, Groups>;
+                ninfer::pdl::launch_arch(grid, threads, 0, stream, kernel, args);
+            };
+#if defined(NINFER_TIER_VOLTA)
+            if (groups == 1) {
+                launch.template operator()<1>();
+            } else {
+                launch.template operator()<2>();
+            }
+#else
+            launch.template operator()<2>();
+#endif
             check_launch("far_attention");
         }
         // The near field on tensor cores for the release's three query heads per KV head; Volta,
