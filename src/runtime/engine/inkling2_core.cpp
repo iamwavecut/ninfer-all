@@ -127,15 +127,19 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         }
     }
     // A speculative round verifies what a context lookup, the release's DSpark drafter (--spec
-    // dspark, the artifact's `dspark` component) or a standalone DSpine drafter (--spec dspine
-    // --draft-model) proposes.
+    // dspark, the artifact's `dspark` component), incoai's DFlash2 drafter (--spec dflash2, the
+    // artifact's `dflash2` component) or a standalone DSpine drafter (--spec dspine
+    // --draft-model) proposes. DSpark and DFlash2 are block drafters: a block of drafts a round
+    // for one decoding request.
     const SpeculativeOptions& speculative = options.speculative;
-    const bool dspine = speculative.backend == SpeculativeBackend::DSpine;
-    const bool dspark = speculative.backend == SpeculativeBackend::DSpark;
-    if (speculative.backend != SpeculativeBackend::None && !dspine && !dspark) {
-        throw std::invalid_argument("Inkling 2 drafts with its DSpark drafter (--spec dspark), a "
-                                    "DSpine drafter (--spec dspine --draft-model) or by context "
-                                    "lookup (--lookup-ngram)");
+    const bool dspine  = speculative.backend == SpeculativeBackend::DSpine;
+    const bool dspark  = speculative.backend == SpeculativeBackend::DSpark;
+    const bool dflash2 = speculative.backend == SpeculativeBackend::DFlash2;
+    const bool block   = dspark || dflash2;
+    if (speculative.backend != SpeculativeBackend::None && !dspine && !block) {
+        throw std::invalid_argument("Inkling 2 drafts with its DSpark drafter (--spec dspark), its "
+                                    "DFlash2 drafter (--spec dflash2), a DSpine drafter (--spec "
+                                    "dspine --draft-model) or by context lookup (--lookup-ngram)");
     }
     const std::uint32_t lookup_drafts =
         speculative.lookup_ngram == 0 ? 0
@@ -145,17 +149,17 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                          speculative.draft_tokens > 7))) {
         throw std::invalid_argument("Inkling 2 verifies 1 to 7 drafts a round (--draft-tokens)");
     }
-    if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine && !dspark) ||
+    if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine && !block) ||
         speculative.draft_confidence.has_value() ||
-        speculative.mtp_attention_window != 0 || speculative.ngram_draft_tokens != 0 ||
-        speculative.ngram_archive_bytes != 0 ||
+        speculative.mtp_attention_window != 0 ||
+        (speculative.ngram_draft_tokens != 0 && !dflash2) || speculative.ngram_archive_bytes != 0 ||
         speculative.proposal_head == ProposalHead::Optimized ||
         (speculative.proposal_head != ProposalHead::Auto && !dspine) ||
-        (speculative.mtp_policy == MtpDraftPolicy::Adaptive && !dspark)) {
+        (speculative.mtp_policy == MtpDraftPolicy::Adaptive && !block)) {
         throw std::invalid_argument("Inkling 2 has no --draft-confidence, n-gram copy proposals or "
                                     "archive, --mtp-attention-window or proposal head, "
-                                    "--adaptive-mtp only with --spec dspark and --draft-min-p only "
-                                    "with --spec dspine or dspark");
+                                    "--adaptive-mtp only with --spec dspark or dflash2 and "
+                                    "--draft-min-p only with --spec dspine, dspark or dflash2");
     }
     (void)models::inkling2::kv_format(options.kv_cache); // refuses, by name, one it does not store
     const auto& hybrid = options.hybrid_experts;
@@ -184,6 +188,10 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         throw std::invalid_argument("--spec dspark: the artifact holds no Inkling 2 DSpark drafter "
                                     "(convert with --components text,dspark)");
     }
+    if (dflash2 && !models::inkling2::has_dflash2(reader)) {
+        throw std::invalid_argument("--spec dflash2: the artifact holds no Inkling 2 DFlash2 "
+                                    "drafter (convert with --components text,dflash2)");
+    }
     inspect.complete();
     install_device_route_profile_for(options, device);
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
@@ -191,7 +199,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                     .experts           = options.expert_residency,
                                     .expert_host_bytes = options.hybrid_experts.host_bytes,
                                     .vision            = vision,
-                                    .dspark   = dspark};
+                                    .dspark   = dspark,
+                                    .dflash2  = dflash2};
     if (dspine) { load.dspine = speculative.draft_model; }
     // Expert parallelism: the routed experts divided over the devices, everything else on the
     // first. Without --tensor-split each device takes a share of its speed that fits beside what
@@ -247,15 +256,18 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.draft_tokens  = dspine ? speculative.draft_tokens : lookup_drafts;
     executor.dspine        = dspine;
     executor.dspark        = dspark;
-    if (dspark) {
+    executor.dflash2       = dflash2;
+    if (block) {
         // The drafter's block less its anchor a round, or fewer with --draft-tokens; a round of a
         // context lookup's may verify as many as the lookup proposes.
-        const std::uint32_t block  = model->dspark_config()->block_size;
+        const std::uint32_t size   = dspark ? model->dspark_config()->block_size
+                                            : model->dflash2_config()->block_size;
         const std::uint32_t drafts = speculative.draft_tokens != 0 ? speculative.draft_tokens
-                                                                   : block - 1;
-        if (drafts > block - 1) {
-            throw std::invalid_argument("Inkling 2: --spec dspark verifies 1 to " +
-                                        std::to_string(block - 1) +
+                                                                   : size - 1;
+        if (drafts > size - 1) {
+            throw std::invalid_argument(std::string("Inkling 2: --spec ") +
+                                        (dspark ? "dspark" : "dflash2") + " verifies 1 to " +
+                                        std::to_string(size - 1) +
                                         " drafts a round (--draft-tokens), its block less the "
                                         "anchor");
         }
@@ -400,6 +412,26 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                            lookup_drafts != 0 ? " where no context lookup matches" : "",
                            models::dspine::ring_capacity(drafter.config(), options.max_context),
                            double(drafter.device_bytes()) / 1048576.0,
+                           double(instance->executor->memory().drafter_bytes) / 1048576.0);
+    }
+    if (dflash2 && speculative.ngram_draft_tokens != 0) {
+        // --spec dflash2 turns n-gram copy proposals on by default (the Qwen3.5-core models');
+        // Inkling 2 drafts with the drafter and context lookup only, as Gemma 4 does.
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Inkling 2 drafts with its drafter and context lookup (--lookup-ngram); "
+                           "n-gram copy proposals (--ngram-draft-tokens) are not available for it");
+    }
+    if (dflash2) {
+        const auto& dc = *model->dflash2_config();
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Inkling 2: DFlash2 drafter, %u layers over a block of %u, up to %u "
+                           "drafts a round for one decoding request%s; ring of %u positions, "
+                           "ring and workspace %.1f MiB",
+                           dc.num_hidden_layers, dc.block_size,
+                           speculative.draft_tokens != 0 ? speculative.draft_tokens
+                                                         : dc.block_size - 1,
+                           lookup_drafts != 0 ? " where no context lookup matches" : "",
+                           dc.sliding_window,
                            double(instance->executor->memory().drafter_bytes) / 1048576.0);
     }
     if (dspark) {
@@ -573,8 +605,8 @@ struct Inkling2Core::Request {
     std::uint32_t prefill_counted = 0;
     Clock::time_point prefill_counted_at;
     SpeculativeStats speculative; // an Engine with --lookup-ngram only
-    // With --adaptive-mtp: how far its DSpark drafts survive, position by position.
-    runtime::MtpAdaptiveSignal spark_signal;
+    // With --adaptive-mtp: how far its block drafter's drafts survive, position by position.
+    runtime::MtpAdaptiveSignal block_signal;
 };
 
 struct Inkling2Core::Impl {
@@ -619,21 +651,22 @@ struct Inkling2Core::Impl {
     const std::uint32_t drafts;       // drafts a round; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
     const bool dspine;                // --spec dspine: the drafter proposes where no lookup does
-    // --spec dspark: the drafts the DSpark drafter proposes a round where no lookup does (0 is
-    // off), and its block's positions.
-    const std::uint32_t spark_drafts, spark_block;
+    const SpeculativeBackend backend; // --spec
+    // --spec dspark or dflash2: the drafts the block drafter proposes a round where no lookup does
+    // (0 is off), and its block's positions.
+    const std::uint32_t block_drafts, block_width;
     // --draft-min-p: a drafter's round verifies through its first draft at or below this
     // probability.
     const float draft_floor;
-    // --adaptive-mtp with --spec dspark: the drafts of a lone request's round, from how far its
+    // --adaptive-mtp with a block drafter: the drafts of a lone request's round, from how far its
     // drafts survive and the round times measured at each width; and the width of the round
     // running (0 when it is not the controller's).
-    std::optional<runtime::MtpAdaptiveBatchController> spark_controller;
-    std::uint32_t spark_round_width = 0;
+    std::optional<runtime::MtpAdaptiveBatchController> block_controller;
+    std::uint32_t block_round_width = 0;
     // With the controller: whether a lone request's rounds beat plain decode steps, timed as they
     // run, and the request it times.
-    std::optional<runtime::SpeculationGate> spark_gate;
-    std::uint64_t spark_gate_cohort = 0;
+    std::optional<runtime::SpeculationGate> block_gate;
+    std::uint64_t block_gate_cohort = 0;
     const DiagnosticObserver diagnostics;
 
     mutable std::mutex queue_mutex;
@@ -708,10 +741,11 @@ struct Inkling2Core::Impl {
           reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
           lookup_ngram(options.speculative.lookup_ngram),
           dspine(options.speculative.backend == SpeculativeBackend::DSpine),
-          spark_drafts(i.executor->dspark_block() == 0      ? 0U
+          backend(options.speculative.backend),
+          block_drafts(i.executor->block_drafts() == 0      ? 0U
                        : options.speculative.draft_tokens != 0 ? options.speculative.draft_tokens
-                                                               : i.executor->dspark_block()),
-          spark_block(i.executor->dspark_block() + 1),
+                                                               : i.executor->block_drafts()),
+          block_width(i.executor->block_drafts() + 1),
           draft_floor(options.speculative.draft_min_p.value_or(0.0F)),
           diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
@@ -719,10 +753,10 @@ struct Inkling2Core::Impl {
               options.decode_rounds_per_prefill != 0
                   ? options.decode_rounds_per_prefill
                   : std::max<std::uint32_t>(1, i.executor->options().prefill_chunk / 64)) {
-        if (spark_drafts != 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
-            spark_controller.emplace();
-            spark_controller->reset(spark_drafts, 1);
-            spark_gate.emplace();
+        if (block_drafts != 0 && options.speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
+            block_controller.emplace();
+            block_controller->reset(block_drafts, 1);
+            block_gate.emplace();
         }
         if (reuse_prefixes) {
             // The host tier's budget, sized here once the weights are loaded when it is
@@ -1466,15 +1500,14 @@ struct Inkling2Core::Impl {
         if (reused > 0) { place_checkpoint(r, reused); }
         if (drafts > 0) {
             r.speculative.enabled      = true;
-            r.speculative.backend      = dspine         ? SpeculativeBackend::DSpine
-                                         : spark_drafts != 0 ? SpeculativeBackend::DSpark
-                                                             : SpeculativeBackend::None;
+            r.speculative.backend      = dspine || block_drafts != 0 ? backend
+                                                                     : SpeculativeBackend::None;
             r.speculative.draft_window = drafts;
             r.speculative.accepted_per_position.assign(drafts, 0);
-            if (spark_controller) {
+            if (block_controller) {
                 r.speculative.adaptive = true;
                 r.speculative.rounds_per_window.assign(drafts, 0);
-                r.spark_signal.reset();
+                r.block_signal.reset();
             }
         }
         r.prefill_start        = Clock::now();
@@ -2368,7 +2401,7 @@ struct Inkling2Core::Impl {
     }
 
     // A key of the request that restarts the width controller's and the gate's choices.
-    [[nodiscard]] static std::uint64_t spark_cohort(const Request& r) noexcept {
+    [[nodiscard]] static std::uint64_t block_cohort(const Request& r) noexcept {
         return (1469598103934665603ULL ^
                 (static_cast<std::uint64_t>(r.slot) << 32U |
                  static_cast<std::uint32_t>(r.admitted.time_since_epoch().count()))) *
@@ -2379,9 +2412,9 @@ struct Inkling2Core::Impl {
     // its own experts, so the rows a round adds cost more as requests join; Gemma 4's measurement of
     // this on an RTX 3090 (two requests gain with one draft each and lose with three, four lose with
     // one) sets the same bounds here.
-    // The DSpark drafter drafts for one request at a time.
+    // A block drafter drafts for one request at a time.
     [[nodiscard]] std::uint32_t round_drafts(std::size_t decoding) const noexcept {
-        if (spark_drafts != 0) { return decoding == 1 ? drafts : 0U; }
+        if (block_drafts != 0) { return decoding == 1 ? drafts : 0U; }
         return decoding == 1 ? drafts : decoding <= 3 ? 1U : 0U;
     }
 
@@ -2396,12 +2429,12 @@ struct Inkling2Core::Impl {
         return found;
     }
 
-    // The drafter's proposals of `steps` drafts for each request of `rows` (DSpine's at once,
-    // DSpark's a block each, at most its drafts), each cut after its first draft at or below the
-    // floor.
+    // The drafter's proposals of `steps` drafts for each request of `rows` (DSpine's and DFlash2's
+    // at once, DSpark's a block each, a block drafter's at most its drafts), each cut after its
+    // first draft at or below the floor.
     std::vector<std::vector<TokenId>> drafter_proposals(
         const std::vector<std::shared_ptr<Request>>& rows, std::uint32_t steps) {
-        if (spark_drafts != 0) { steps = std::min(steps, spark_drafts); }
+        if (block_drafts != 0) { steps = std::min(steps, block_drafts); }
         std::vector<std::uint32_t> sequences;
         std::vector<std::int32_t> anchors;
         for (const auto& request : rows) {
@@ -2474,16 +2507,16 @@ struct Inkling2Core::Impl {
                     looked_up.push_back(1);
                     continue;
                 }
-                if (dspine || (spark_drafts != 0 && request->position + spark_block <= max_context)) {
-                    if (spark_gate && decoding == 1 && !dspine) {
-                        const std::uint64_t cohort = spark_cohort(*request);
-                        if (cohort != spark_gate_cohort) {
-                            spark_gate->reset();
-                            spark_gate_cohort = cohort;
+                if (dspine || (block_drafts != 0 && request->position + block_width <= max_context)) {
+                    if (block_gate && decoding == 1 && !dspine) {
+                        const std::uint64_t cohort = block_cohort(*request);
+                        if (cohort != block_gate_cohort) {
+                            block_gate->reset();
+                            block_gate_cohort = cohort;
                         }
                         gated        = request;
                         gated_tokens = request->generated.size();
-                        if (!spark_gate->speculates()) {
+                        if (!block_gate->speculates()) {
                             batch.push_back(request);
                             continue;
                         }
@@ -2503,22 +2536,22 @@ struct Inkling2Core::Impl {
         // they survive and the round times it has measured at each width; a new request restarts
         // its probe. It measures the rounds that verify all the drafts it picked.
         bool measured = false;
-        spark_round_width = 0;
+        block_round_width = 0;
         if (!drafting.empty()) {
             std::uint32_t width = steps;
-            if (spark_controller && drafting.size() == 1 && batch.empty() && speculative.empty()) {
+            if (block_controller && drafting.size() == 1 && batch.empty() && speculative.empty()) {
                 const Request& r     = *drafting.front();
                 const auto budget    = r.output.model_token_budget_remaining(r.budget->remaining());
                 const std::uint32_t room = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                     {static_cast<std::uint64_t>(budget),
                      static_cast<std::uint64_t>(max_context - r.position), 1U << 20}));
                 const std::uint32_t available = std::min(steps, room > 0 ? room - 1U : 0U);
-                const std::uint64_t cohort               = spark_cohort(r);
-                const runtime::MtpAdaptiveSignal* signal = &r.spark_signal;
+                const std::uint64_t cohort               = block_cohort(r);
+                const runtime::MtpAdaptiveSignal* signal = &r.block_signal;
                 width = std::clamp<std::uint32_t>(
-                    spark_controller->select({&signal, 1}, {&available, 1}, {&room, 1}, cohort), 1,
+                    block_controller->select({&signal, 1}, {&available, 1}, {&room, 1}, cohort), 1,
                     steps);
-                spark_round_width = width;
+                block_round_width = width;
             }
             auto drafted = drafter_proposals(drafting, width);
             for (std::size_t j = 0; j < drafting.size(); ++j) {
@@ -2526,7 +2559,7 @@ struct Inkling2Core::Impl {
                     batch.push_back(drafting[j]);
                     continue;
                 }
-                measured = spark_round_width != 0 && drafted[j].size() == width;
+                measured = block_round_width != 0 && drafted[j].size() == width;
                 proposals.push_back(std::move(drafted[j]));
                 speculative.push_back(drafting[j]);
                 looked_up.push_back(0);
@@ -2559,14 +2592,14 @@ struct Inkling2Core::Impl {
         if (!batch.empty()) { plain_step(batch); }
         if (!speculative.empty()) { speculative_round(speculative, proposals, looked_up); }
         if (measured && batch.empty() && deferred.empty() && alone.empty()) {
-            spark_controller->observe_execution(1, spark_round_width, seconds(start, Clock::now()));
+            block_controller->observe_execution(1, block_round_width, seconds(start, Clock::now()));
         }
-        spark_round_width = 0;
+        block_round_width = 0;
         // A step of the gated request alone: a round, a plain step it chose, or the plain step
         // after a drafter that proposed nothing, all at the cost of its mode.
         if (gated && deferred.empty() && alone.empty() && batch.size() + speculative.size() == 1) {
             const std::size_t now_tokens = gated->generated.size();
-            spark_gate->observe(
+            block_gate->observe(
                 static_cast<std::uint32_t>(now_tokens > gated_tokens ? now_tokens - gated_tokens : 0),
                 seconds(start, Clock::now()));
         }
@@ -2926,10 +2959,10 @@ struct Inkling2Core::Impl {
                 ++r.speculative.ngram_rounds;
                 r.speculative.ngram_drafted_tokens += draft_extents[j];
                 r.speculative.ngram_accepted_tokens += std::uint32_t(drafts_n);
-            } else if (spark_round_width != 0) {
-                r.spark_signal.observe(draft_extents[j], std::uint32_t(drafts_n));
-                ++r.speculative.rounds_per_window[spark_round_width - 1];
-                if (spark_controller->transitioned()) { ++r.speculative.window_transitions; }
+            } else if (block_round_width != 0) {
+                r.block_signal.observe(draft_extents[j], std::uint32_t(drafts_n));
+                ++r.speculative.rounds_per_window[block_round_width - 1];
+                if (block_controller->transitioned()) { ++r.speculative.window_transitions; }
             }
             for (std::int32_t i = 0; i < drafts_n; ++i) {
                 ++r.speculative.accepted_per_position[i];

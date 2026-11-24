@@ -4,7 +4,8 @@ DFlash backends propose several tokens with one masked-block forward, conditione
 target hidden features. The target verifies the proposal causally and remains the output authority.
 NInfer implements DFlash and DFlash2 as optional components of the
 [Qwen3.5 model](qwen3_5-model.md), and DFlash2 as one of
-[Qwen3.8-Flash-Next](qwen4-exp-model.md) ([below](#qwen38-flash-next)). Their private config and
+[Qwen3.8-Flash-Next](qwen4-exp-model.md) ([below](#qwen38-flash-next)) and of
+[Inkling 2](../inkling2.md) ([below](#inkling-2)). Their private config and
 bindings select the stored weights; startup chooses one backend, draft width and proposal head.
 
 This reference owns model mathematics, proposal distributions and backend state. Scheduling,
@@ -363,6 +364,45 @@ operands and the two calls:
   call the graph of its run length; the warm-up captures both, so a request takes no device memory
   for them. A round of several sequences runs both calls eagerly.
 - Pipeline stages are refused. With tensor parallelism the drafter runs on the head's device.
+
+## Inkling 2
+
+Inkling 2 carries incoai's [Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)
+as an optional `dflash2` component beside the text model (`--source dflash2=DIR --components
+...,dflash2`), which `--spec dflash2` loads and drafts with:
+
+| Quantity | Inkling 2 DFlash2 |
+|---|---:|
+| Hidden width H | 2304 (the target's) |
+| Draft layers | 5, all local |
+| Intermediate width | 6912 |
+| Q heads / KV heads / head dimension | 32 / 8 / 128 |
+| Target block IDs | `[5,23,41,48]` |
+| Trained block | 8 (the anchor and 7 masks) |
+| Sliding-window scalar S | 2048 |
+| Norm epsilon / RoPE theta | `1e-6` / `1e4` |
+| Dynamic convolution | Two taps, group width 16 |
+| Candidate selector | Top-16 conditional path, rank 256, edges soft-capped at 30 after the correction |
+
+The ids count the 48 visits of the looped stack: id v below 48 is visit v's input (visit v - 1's
+output), and 48 is the final norm's rows, the capture the release's SGLang patch and the DSpark
+drafter share. The anchor and the mask token (200056) take the target's normed token rows, and the
+target's head scores the mask columns over its 201,024 stored rows without its soft cap; the
+selector's unary scores are those logits, its edges take the release's `final_logit_softcapping`
+of 30 after the correction (`selector_softcap_mode` `after_correction`). The converter keeps the
+release's BF16 convolution and selector projections, norms, bases and codebooks and stores the
+other projections as Q8_G32 rows, as the Qwen3.5 recipe does.
+
+[`models/dflash2`](../../src/models/dflash2/drafter.h) composes the drafter from the runtime-shape
+Ops, and [`dspine::Runtime`](../../src/models/dspine/runtime.h) runs it as it runs a DSpine
+drafter ([DSpine](dspine.md#state)): a ring lane of 2048 positions per sequence (5
+layers * (2-byte K + 2-byte V) * 8 heads * 128 * 2048 = 40 MiB), the taps of every pass, commits,
+snapshots and context-cache images. In the Engine it is a block drafter as DSpark is: a round drafts
+for one decoding request, up to 7 drafts, with the adaptive width (`--adaptive-mtp`), the timing
+gate and `--draft-min-p` over the selector's confidence. The target keeps a draft only while it
+equals its own keyed draw, so the output is plain decoding's at any temperature; q is not read.
+The window bounds what the drafter sees: an answer that copies text from more than 2048 positions
+back is drafted from the last 2048 only ([measurements](../inkling2.md#measurements)).
 
 ## Execution flow
 

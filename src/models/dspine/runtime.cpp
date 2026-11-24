@@ -57,71 +57,142 @@ std::size_t staging_bytes(std::uint32_t k, std::uint32_t rows) {
     return 4 * kMaxRows * 4 + 2 * std::size_t(k) * rows * 4;
 }
 
-// The device allocations of a runtime with these options.
-struct Sizes {
-    std::uint32_t window = 0, lanes = 0;
-    std::size_t ring = 0, table = 0, features = 0, operands = 0, workspace = 0;
+// The commit widths and proposal shape these options reach.
+struct Shapes {
+    std::uint32_t piece = 0;
+    std::int32_t width = 0, rows = 0;
 };
 
-Sizes sizes(const Model& model, DType logits, const RuntimeOptions& o) {
-    const Config& c = model.config();
-    require(o.sequences >= 1 && o.draft_tokens >= 1 && o.draft_tokens + 1 <= c.block_size &&
+void require_options(const RuntimeOptions& o, std::uint32_t block_size) {
+    require(o.sequences >= 1 && o.draft_tokens >= 1 && o.draft_tokens + 1 <= block_size &&
                 o.max_context >= 1 && o.feature_columns >= 1 && o.draft_rows >= 1 &&
                 o.draft_rows <= kMaxRows && o.commit_rows >= 1 && o.commit_rows <= kMaxRows &&
                 o.commit_rows <= o.feature_columns && o.piece_columns >= 1,
             "one sequence, 1..block_size - 1 drafts, a context, 1..8 rows a proposal and a "
             "commit, and a feature column a committed row and a column a piece at least");
+}
+
+// A store or a commit goes in pieces of at most piece_columns columns, a commit within the window.
+Shapes shapes(const RuntimeOptions& o, std::uint32_t window) {
+    return {std::min({o.piece_columns, o.feature_columns, window}),
+            static_cast<std::int32_t>(o.draft_tokens + 1),
+            static_cast<std::int32_t>(o.draft_rows)};
+}
+
+Runtime::Plan dspine_plan(const Model& model, DType logits, const RuntimeOptions& o) {
+    const Config& c = model.config();
+    require_options(o, c.block_size);
+    Runtime::Plan plan;
+    plan.geometry = {.hidden            = c.hidden_size,
+                     .vocab             = c.vocab_size,
+                     .layers            = c.num_hidden_layers,
+                     .block_size        = c.block_size,
+                     .num_target_layers = c.num_target_layers,
+                     .kv_heads          = static_cast<std::int32_t>(c.num_key_value_heads),
+                     .head_dim          = static_cast<std::int32_t>(c.head_dim),
+                     .target_layer_ids  = c.target_layer_ids};
+    plan.window         = ring_capacity(c, o.max_context);
+    const Shapes shape  = shapes(o, plan.window);
+    plan.table          = aligned(head_write_bytes(c));
+    plan.context_piece  = Drafter::context_workspace_bytes(model, plan.window,
+                                                          static_cast<std::int32_t>(shape.piece), 1);
+    plan.context_rows   = Drafter::context_workspace_bytes(
+        model, plan.window, 1, static_cast<std::int32_t>(o.commit_rows));
+    plan.proposal = Drafter::proposal_workspace_bytes(model, logits, plan.window, o.max_context,
+                                                      shape.width, shape.rows, o.head_bytes);
+    plan.prepare =
+        Drafter::prepare_workspace_bytes(model, logits, shape.rows, shape.width, o.head_bytes);
+    return plan;
+}
+
+Runtime::Plan dflash2_plan(const dflash2::Config& c, const dflash2::Operands& p, DType logits,
+                           const RuntimeOptions& o) {
+    require_options(o, c.block_size);
+    Runtime::Plan plan;
+    plan.geometry = {.hidden            = c.hidden_size,
+                     .vocab             = c.vocab_size,
+                     .layers            = c.num_hidden_layers,
+                     .block_size        = c.block_size,
+                     .num_target_layers = c.num_target_layers,
+                     .kv_heads          = static_cast<std::int32_t>(c.num_key_value_heads),
+                     .head_dim          = static_cast<std::int32_t>(c.head_dim),
+                     .target_layer_ids  = c.target_layer_ids};
+    plan.window        = c.sliding_window;
+    const Shapes shape = shapes(o, plan.window);
+    plan.context_piece =
+        dflash2::Drafter::context_workspace_bytes(c, p, static_cast<std::int32_t>(shape.piece), 1);
+    plan.context_rows = dflash2::Drafter::context_workspace_bytes(
+        c, p, 1, static_cast<std::int32_t>(o.commit_rows));
+    plan.proposal = dflash2::Drafter::proposal_workspace_bytes(c, p, logits, o.max_context,
+                                                               shape.width, shape.rows,
+                                                               o.head_bytes);
+    return plan;
+}
+
+// The device allocations of a runtime with these options.
+struct Sizes {
+    std::uint32_t lanes = 0;
+    std::size_t ring = 0, features = 0, operands = 0, workspace = 0;
+};
+
+Sizes sizes(const Runtime::Plan& plan, const RuntimeOptions& o) {
+    const Runtime::Geometry& g = plan.geometry;
     Sizes s;
-    s.window = ring_capacity(c, o.max_context);
-    s.lanes  = o.sequences * (1 + o.kept_states);
+    s.lanes = o.sequences * (1 + o.kept_states);
     LayoutBuilder builder;
-    (void)plan_cyclic_kv_cache(builder, c.num_hidden_layers, s.window,
-                               static_cast<std::int32_t>(c.num_key_value_heads),
-                               static_cast<std::int32_t>(c.head_dim),
+    (void)plan_cyclic_kv_cache(builder, g.layers, plan.window, g.kv_heads, g.head_dim,
                                static_cast<std::int32_t>(s.lanes));
-    s.ring     = builder.finish(kAlign, "DSpine context ring");
-    s.table    = aligned(head_write_bytes(c));
-    s.features = aligned(std::size_t(c.taps()) * c.hidden_size * o.feature_columns * 2);
+    s.ring     = builder.finish(kAlign, "drafter context ring");
+    s.features = aligned(g.target_layer_ids.size() * std::size_t(g.hidden) * o.feature_columns * 2);
     s.operands = operand_layout(o.draft_tokens, o.draft_rows).bytes;
-    // A store or a commit goes in pieces of at most piece_columns columns, a commit within the
-    // window.
-    const std::uint32_t piece = std::min({o.piece_columns, o.feature_columns, s.window});
-    const auto width   = static_cast<std::int32_t>(o.draft_tokens + 1);
-    const auto rows    = static_cast<std::int32_t>(o.draft_rows);
+    const std::uint32_t piece = shapes(o, plan.window).piece;
     const std::size_t store =
-        aligned(std::size_t(c.hidden_size) * std::min(o.piece_columns, o.feature_columns) * 2);
+        aligned(std::size_t(g.hidden) * std::min(o.piece_columns, o.feature_columns) * 2);
     const std::size_t commit =
-        std::max(aligned(std::size_t(piece) * 4) +
-                     Drafter::context_workspace_bytes(model, s.window,
-                                                      static_cast<std::int32_t>(piece), 1),
-                 Drafter::context_workspace_bytes(model, s.window, 1,
-                                                  static_cast<std::int32_t>(o.commit_rows)));
-    s.workspace = std::max({store, commit,
-                            Drafter::proposal_workspace_bytes(model, logits, s.window,
-                                                              o.max_context, width, rows,
-                                                              o.head_bytes),
-                            Drafter::prepare_workspace_bytes(model, logits, rows, width,
-                                                             o.head_bytes)}) +
-                  (1U << 20);
+        std::max(aligned(std::size_t(piece) * 4) + plan.context_piece, plan.context_rows);
+    s.workspace = std::max({store, commit, plan.proposal, plan.prepare}) + (1U << 20);
     return s;
 }
 
 } // namespace
 
-Runtime::Runtime(const Model& model, Target target, RuntimeOptions options)
-    : model_(model), options_(options) {
-    const Config& c = model_.config();
-    const Sizes s   = sizes(model_, target.logits, options_);
-    window_         = s.window;
-    tap_of_.assign(c.num_target_layers, -1);
-    for (std::size_t t = 0; t < c.target_layer_ids.size(); ++t) {
-        tap_of_.at(c.target_layer_ids[t]) = static_cast<int>(t);
+Runtime::Runtime(const Model& model, Target target, RuntimeOptions options) : options_(options) {
+    const Plan plan = dspine_plan(model, target.logits, options_);
+    allocate(plan);
+    drafter_ = std::make_unique<Drafter>(
+        model, std::move(target),
+        Tensor(table_.p, DType::BF16,
+               {static_cast<std::int32_t>(model.config().rank),
+                static_cast<std::int32_t>(model.config().vocab_size)}),
+        window_, options_.max_context, static_cast<std::int32_t>(options_.draft_rows),
+        static_cast<std::int32_t>(options_.draft_tokens + 1));
+}
+
+Runtime::Runtime(const dflash2::Config& config, dflash2::Operands operands, Target target,
+                 RuntimeOptions options)
+    : options_(options) {
+    const Plan plan = dflash2_plan(config, operands, target.logits, options_);
+    allocate(plan);
+    dflash2_ = std::make_unique<dflash2::Drafter>(
+        config, std::move(operands), std::move(target), options_.max_context,
+        static_cast<std::int32_t>(options_.draft_rows),
+        static_cast<std::int32_t>(options_.draft_tokens + 1));
+}
+
+void Runtime::allocate(const Plan& plan) {
+    const Sizes s = sizes(plan, options_);
+    geometry_     = plan.geometry;
+    window_       = plan.window;
+    const Geometry& g = geometry_;
+    tap_of_.assign(g.num_target_layers, -1);
+    for (std::size_t t = 0; t < g.target_layer_ids.size(); ++t) {
+        tap_of_.at(g.target_layer_ids[t]) = static_cast<int>(t);
     }
     LayoutBuilder builder;
-    const CyclicKVCacheLayout layout = plan_cyclic_kv_cache(
-        builder, c.num_hidden_layers, window_, static_cast<std::int32_t>(c.num_key_value_heads),
-        static_cast<std::int32_t>(c.head_dim), static_cast<std::int32_t>(s.lanes));
-    ring_backing_ = DeviceBuffer(builder.finish(kAlign, "DSpine context ring"));
+    const CyclicKVCacheLayout layout =
+        plan_cyclic_kv_cache(builder, g.layers, window_, g.kv_heads, g.head_dim,
+                             static_cast<std::int32_t>(s.lanes));
+    ring_backing_ = DeviceBuffer(builder.finish(kAlign, "drafter context ring"));
     // Finite values in every slot before a lane's positions reach it.
     ring_backing_.fill(0);
     ring_ = std::make_unique<CyclicKVCache>(DeviceSpan{ring_backing_.p, ring_backing_.bytes},
@@ -129,7 +200,7 @@ Runtime::Runtime(const Model& model, Target target, RuntimeOptions options)
     for (std::uint32_t l = 0; l < ring_->layer_count(); ++l) {
         views_.push_back(ring_->layer_view(l));
     }
-    table_    = DeviceBuffer(s.table);
+    if (plan.table != 0) { table_ = DeviceBuffer(plan.table); }
     features_ = DeviceBuffer(s.features);
     operands_ = DeviceBuffer(s.operands);
     operands_.fill(0);
@@ -145,12 +216,6 @@ Runtime::Runtime(const Model& model, Target target, RuntimeOptions options)
         DeviceSpan{workspace_backing_.p, workspace_backing_.bytes});
     staging_ = std::make_unique<PinnedHostBuffer>(
         staging_bytes(options_.draft_tokens, options_.draft_rows));
-    drafter_ = std::make_unique<Drafter>(
-        model_, std::move(target),
-        Tensor(table_.p, DType::BF16,
-               {static_cast<std::int32_t>(c.rank), static_cast<std::int32_t>(c.vocab_size)}),
-        window_, options_.max_context, static_cast<std::int32_t>(options_.draft_rows),
-        static_cast<std::int32_t>(options_.draft_tokens + 1));
 }
 
 Runtime::~Runtime() = default;
@@ -173,11 +238,21 @@ std::uint64_t Runtime::device_bytes() const noexcept {
 
 std::uint64_t Runtime::planned_bytes(const Model& model, DType logits,
                                      const RuntimeOptions& options) {
-    const Sizes s = sizes(model, logits, options);
-    return s.ring + s.table + s.features + s.operands + s.workspace;
+    const Plan plan = dspine_plan(model, logits, options);
+    const Sizes s   = sizes(plan, options);
+    return s.ring + plan.table + s.features + s.operands + s.workspace;
+}
+
+std::uint64_t Runtime::planned_bytes(const dflash2::Config& config,
+                                     const dflash2::Operands& operands, DType logits,
+                                     const RuntimeOptions& options) {
+    const Plan plan = dflash2_plan(config, operands, logits, options);
+    const Sizes s   = sizes(plan, options);
+    return s.ring + s.features + s.operands + s.workspace;
 }
 
 void Runtime::prepare(cudaStream_t stream) {
+    if (!drafter_) { return; }
     work_->reset();
     drafter_->prepare(*work_, stream);
     work_->reset();
@@ -185,15 +260,14 @@ void Runtime::prepare(cudaStream_t stream) {
 
 void Runtime::store_tap(std::uint32_t tap, const Tensor& rows, std::uint32_t column,
                         cudaStream_t stream) {
-    const Config& c       = config();
-    const std::int32_t h  = static_cast<std::int32_t>(c.hidden_size);
+    const std::int32_t h  = static_cast<std::int32_t>(geometry_.hidden);
     const std::int32_t n  = rows.ne[1];
-    require(tap < c.taps() && rows.ne[0] == h && n >= 1 && rows.ne[2] == 1 && rows.ne[3] == 1 &&
+    require(tap < taps() && rows.ne[0] == h && n >= 1 && rows.ne[2] == 1 && rows.ne[3] == 1 &&
                 (rows.dtype == DType::FP32 || rows.dtype == DType::BF16) &&
                 std::uint64_t(column) + std::uint64_t(n) <= options_.feature_columns,
             "a tap is FP32 or BF16 [hidden, n] within the feature columns");
     const std::size_t row          = std::size_t(h) * 2;
-    const std::size_t column_bytes = row * c.taps();
+    const std::size_t column_bytes = row * taps();
     const auto piece = static_cast<std::int32_t>(options_.piece_columns);
     for (std::int32_t done = 0; done < n; done += piece) {
         const std::int32_t m = std::min(piece, n - done);
@@ -215,13 +289,12 @@ void Runtime::store_tap(std::uint32_t tap, const Tensor& rows, std::uint32_t col
 void Runtime::commit(std::uint32_t lane, std::uint32_t position, std::uint32_t column,
                      std::uint32_t count, cudaStream_t stream) {
     if (count == 0) { return; }
-    const Config& c = config();
     require(lane < std::uint32_t(ring_->lane_capacity()) &&
                 std::uint64_t(column) + count <= options_.feature_columns &&
                 std::uint64_t(position) + count <= options_.max_context,
             "a commit names a lane, feature columns and positions in range");
     const OperandLayout o = operand_layout(options_.draft_tokens, options_.draft_rows);
-    const auto rows       = static_cast<std::int32_t>(std::size_t(c.taps()) * c.hidden_size);
+    const auto rows       = static_cast<std::int32_t>(std::size_t(taps()) * geometry_.hidden);
     if (count > window_) {
         // No later block sees a position before the last window.
         column += count - window_;
@@ -243,40 +316,47 @@ void Runtime::commit(std::uint32_t lane, std::uint32_t position, std::uint32_t c
         const Tensor features(static_cast<std::uint8_t*>(features_.p) +
                                   (std::size_t(column) + done) * std::size_t(rows) * 2,
                               DType::BF16, {rows, n, 1});
-        drafter_->materialize({.features  = features,
-                               .positions = positions.view({n, 1}),
-                               .counts    = counts,
-                               .lanes     = lanes,
-                               .min_count = m,
-                               .max_count = m},
-                              views_, *work_, stream);
+        materialize({.features  = features,
+                     .positions = positions.view({n, 1}),
+                     .counts    = counts,
+                     .lanes     = lanes,
+                     .min_count = m,
+                     .max_count = m},
+                    stream);
     }
     work_->reset();
 }
 
 void Runtime::commit_rows(const Tensor& lanes, const Tensor& positions, std::uint32_t column,
                           cudaStream_t stream) {
-    const Config& c = config();
     const std::int32_t n = lanes.ne[0];
     require(lanes.dtype == DType::I32 && positions.dtype == DType::I32 && n >= 1 &&
                 std::uint32_t(n) <= options_.commit_rows && positions.ne[0] == n &&
                 std::uint64_t(column) + std::uint64_t(n) <= options_.feature_columns,
             "a row commit names up to commit_rows lanes and positions within the features");
     const OperandLayout o = operand_layout(options_.draft_tokens, options_.draft_rows);
-    const auto rows       = static_cast<std::int32_t>(std::size_t(c.taps()) * c.hidden_size);
+    const auto rows       = static_cast<std::int32_t>(std::size_t(taps()) * geometry_.hidden);
     const Tensor features(static_cast<std::uint8_t*>(features_.p) +
                               std::size_t(column) * std::size_t(rows) * 2,
                           DType::BF16, {rows, 1, n});
     const Tensor counts(static_cast<std::uint8_t*>(operands_.p) + o.ones, DType::I32, {n});
     work_->reset();
-    drafter_->materialize({.features  = features,
-                           .positions = Tensor(positions.data, DType::I32, {1, n}),
-                           .counts    = counts,
-                           .lanes     = Tensor(lanes.data, DType::I32, {n}),
-                           .min_count = 1,
-                           .max_count = 1},
-                          views_, *work_, stream);
+    materialize({.features  = features,
+                 .positions = Tensor(positions.data, DType::I32, {1, n}),
+                 .counts    = counts,
+                 .lanes     = Tensor(lanes.data, DType::I32, {n}),
+                 .min_count = 1,
+                 .max_count = 1},
+                stream);
     work_->reset();
+}
+
+void Runtime::materialize(const ContextCall& call, cudaStream_t stream) {
+    if (dflash2_) {
+        dflash2_->materialize(call, views_, *work_, stream);
+    } else {
+        drafter_->materialize(call, views_, *work_, stream);
+    }
 }
 
 void Runtime::draft(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> anchors,
@@ -290,7 +370,7 @@ void Runtime::draft(std::span<const std::uint32_t> lanes, std::span<const std::i
             "a draft names 1..draft_rows rows of 1..draft_tokens drafts");
     for (std::size_t j = 0; j < b; ++j) {
         require(lanes[j] < std::uint32_t(ring_->lane_capacity()) && anchors[j] >= 0 &&
-                    anchors[j] < std::int32_t(config().vocab_size) &&
+                    anchors[j] < std::int32_t(geometry_.vocab) &&
                     std::uint64_t(positions[j]) + k <= options_.max_context,
                 "a row names a lane, an anchor and a position in range");
     }
@@ -317,7 +397,7 @@ void Runtime::draft(std::span<const std::uint32_t> lanes, std::span<const std::i
     Tensor q(operands + o.q, DType::FP32, {16, steps, rows});
     Tensor out_confidence(operands + o.confidence, DType::FP32, {steps, rows});
     work_->reset();
-    drafter_->propose({.anchors       = anchor_ids,
+    const ProposalCall call{.anchors       = anchor_ids,
                        .frontiers     = frontiers,
                        .valid_columns = valid,
                        .lanes         = lane_ids,
@@ -327,8 +407,12 @@ void Runtime::draft(std::span<const std::uint32_t> lanes, std::span<const std::i
                        .drafts     = out_drafts,
                        .candidates = candidates,
                        .proposal_q = q,
-                       .confidence = out_confidence},
-                      views_, *work_, stream);
+                       .confidence = out_confidence};
+    if (dflash2_) {
+        dflash2_->propose(call, views_, *work_, stream);
+    } else {
+        drafter_->propose(call, views_, *work_, stream);
+    }
     work_->reset();
     auto* back = host + 4 * kMaxRows;
     CUDA_CHECK(cudaMemcpyAsync(back, out_drafts.data, b * k * 4, cudaMemcpyDeviceToHost, stream));

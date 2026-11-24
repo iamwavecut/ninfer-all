@@ -302,6 +302,10 @@ struct Executor::Impl {
     std::map<std::uint32_t, GraphEntry> graphs;
     std::vector<std::uint32_t> verify_widths;
     std::unique_ptr<dspine::Runtime> spine;
+    // The spine drafter's tap of each visit's output state (-1: none), and of the final norm's
+    // rows (DFlash2's last tap; -1 for DSpine).
+    std::vector<int> spine_tap_after;
+    int spine_final_tap = -1;
     std::unique_ptr<Spark> spark;
     // The vision tower and its buffers: an image's patches, a span's rows.
     std::unique_ptr<VisionTower> tower;
@@ -322,9 +326,15 @@ struct Executor::Impl {
             throw std::invalid_argument("inkling2 executor: at most 7 drafts a round");
         }
         if (options.dspark &&
-            (!model.dspark() || options.dspine || options.draft_tokens == 0 ||
+            (!model.dspark() || options.dspine || options.dflash2 || options.draft_tokens == 0 ||
              options.draft_tokens + 1 > model.dspark_config()->block_size)) {
             throw std::invalid_argument("inkling2 executor: DSpark drafting needs the model's "
+                                        "drafter and 1 to its block less one drafts a round");
+        }
+        if (options.dflash2 &&
+            (!model.dflash2() || options.dspine || options.draft_tokens == 0 ||
+             options.draft_tokens + 1 > model.dflash2_config()->block_size)) {
+            throw std::invalid_argument("inkling2 executor: DFlash2 drafting needs the model's "
                                         "drafter and 1 to its block less one drafts a round");
         }
         stream = device.stream;
@@ -406,6 +416,10 @@ struct Executor::Impl {
             if (options.dspine) {
                 needed += dspine::Runtime::planned_bytes(*model.dspine(), DType::FP32,
                                                          spine_options());
+            }
+            if (options.dflash2) {
+                needed += dspine::Runtime::planned_bytes(*model.dflash2_config(), *model.dflash2(),
+                                                         DType::FP32, spine_options());
             }
             if (options.dspark) { needed += spark_planned_bytes(); }
             std::size_t free_bytes = 0, total_bytes = 0;
@@ -562,7 +576,7 @@ struct Executor::Impl {
             }
         }
         workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
-        if (options.dspine) { make_spine(); }
+        if (options.dspine || options.dflash2) { make_spine(); }
         allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
         plan_guess();
@@ -738,8 +752,9 @@ struct Executor::Impl {
     // ---- Drafters --------------------------------------------------------------------------------
 
     [[nodiscard]] dspine::RuntimeOptions spine_options() const {
-        const dspine::Config& c    = model.dspine()->config();
-        const std::uint32_t window = dspine::ring_capacity(c, options.max_context);
+        const std::uint32_t window =
+            options.dflash2 ? model.dflash2_config()->sliding_window
+                            : dspine::ring_capacity(model.dspine()->config(), options.max_context);
         dspine::RuntimeOptions o;
         o.sequences       = options.sequences;
         o.kept_states     = options.checkpoints ? 1 : 0;
@@ -764,7 +779,9 @@ struct Executor::Impl {
     // its head as FP32 logits before the soft cap, as Gemma 4's does, on rank 0. Its vocabulary
     // is the head's stored rows (config.vocab_size): the scored rows come from the head, the
     // padding rows past them are zero. No token of a sequence reaches those, since the
-    // tokenizer's domain lies within the scored rows.
+    // tokenizer's domain lies within the scored rows. A DSpine drafter's target layer v is visit
+    // v's output; DFlash2's (as the release captures them) is visit v's input, the output of the
+    // visit before it, and the last one, visit_count(), the final norm's rows.
     void make_spine() {
         dspine::Target target;
         target.hidden = std::uint32_t(hidden);
@@ -813,16 +830,35 @@ struct Executor::Impl {
                                              std::size_t(rows - vocab) * 4, std::size_t(n), on));
             }
         };
+        spine_tap_after.assign(visits.size(), -1);
+        if (options.dflash2) {
+            spine = std::make_unique<dspine::Runtime>(*model.dflash2_config(), *model.dflash2(),
+                                                      std::move(target), spine_options());
+            for (std::size_t v = 1; v < visits.size(); ++v) {
+                const int tap = spine->tap_of(std::uint32_t(v));
+                if (tap < 0) { continue; }
+                // A visit's input is the state the visit before it leaves, unless the visit
+                // restarts the core from the prelude's output.
+                if (visits[v].restart) {
+                    throw std::invalid_argument("inkling2 DFlash2: a tap outside the implemented "
+                                                "visits");
+                }
+                spine_tap_after[v - 1] = tap;
+            }
+            spine_final_tap = spine->tap_of(std::uint32_t(visits.size()));
+            return;
+        }
         spine = std::make_unique<dspine::Runtime>(*model.dspine(), std::move(target),
                                                   spine_options());
+        for (std::size_t v = 0; v < visits.size(); ++v) {
+            spine_tap_after[v] = spine->tap_of(std::uint32_t(v));
+        }
     }
 
-    // Tap `v` of the DSpine drafter, when it reads that visit's output: rows [first, first + n)
-    // of the state h [T][H] into feature columns [0, n).
-    void store_tap(std::size_t v, const float* h, int first, int n) {
-        if (!spine || n <= 0) { return; }
-        const int tap = spine->tap_of(std::uint32_t(v));
-        if (tap < 0) { return; }
+    // The drafter's tap `tap` (none when negative): rows [first, first + n) of the state h [T][H]
+    // into feature columns [0, n).
+    void store_tap(int tap, const float* h, int first, int n) {
+        if (!spine || n <= 0 || tap < 0) { return; }
         spine->store_tap(std::uint32_t(tap),
                          Tensor(const_cast<float*>(h) + std::int64_t(first) * hidden, DType::FP32,
                                 {hidden, n}),
@@ -2057,14 +2093,15 @@ struct Executor::Impl {
     }
 
     // The output's mix: the final norm into the MoE input's BF16 or q8_1 rows.
-    // With the DSpark drafter its FP32 rows too (the drafter's last tap), in the MoE input's.
+    // With the DSpark or DFlash2 drafter its FP32 rows too (the drafter's last tap), in the MoE
+    // input's.
     kernels::MixArgs output_mix_args(Call& c) {
         kernels::MixArgs m = mix_args(c, output_mix, 1);
         m.norm[0]          = final_norm;
         std::int64_t unused = 0;
         float* none         = nullptr;
         set_outputs(c, m.out, m.out_q, none, unused, c.ffn_bf16, c.ffn_q, 0,
-                    spark ? c.ffn_f32 : nullptr);
+                    spark || spine_final_tap >= 0 ? c.ffn_f32 : nullptr);
         return m;
     }
 
@@ -2902,7 +2939,9 @@ struct Executor::Impl {
         c.guess = guess_budget > 0 && t == 1 && !c.chunk && c.q8;
         for (std::size_t v = 0; v < visits.size(); ++v) {
             visit(c, v);
-            store_tap(v, c.states.buffers[c.states.cur], tap_first, tap_rows);
+            if (spine) {
+                store_tap(spine_tap_after[v], c.states.buffers[c.states.cur], tap_first, tap_rows);
+            }
             if (spark && spark->tap_after[v] >= 0) {
                 CUDA_CHECK(cudaMemcpyAsync(c.spark_taps + std::int64_t(spark->tap_after[v]) * c.plane,
                                            c.states.buffers[c.states.cur],
@@ -2916,6 +2955,7 @@ struct Executor::Impl {
             CUDA_CHECK(cudaStreamWaitEvent(stream, guess_done, 0));
         }
         if (spark) { spark_inject(c); }
+        if (spine) { store_tap(spine_final_tap, c.ffn_f32, tap_first, tap_rows); }
     }
 
     // ---- Decode ----------------------------------------------------------------------------------
@@ -3454,13 +3494,9 @@ void Executor::draft(std::span<const std::uint32_t> sequences,
     impl_->draft(sequences, anchors, k, drafts, confidence);
 }
 
-std::uint32_t Executor::dspark_block() const noexcept {
-    return impl_->spark ? std::uint32_t(impl_->spark->block - 1) : 0;
-}
-
-void Executor::draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
-                     std::span<float> confidence) {
-    impl_->spark_draft(sequence, anchor, drafts, confidence);
+std::uint32_t Executor::block_drafts() const noexcept {
+    if (impl_->spark) { return std::uint32_t(impl_->spark->block - 1); }
+    return impl_->spine && impl_->spine->dflash2() ? impl_->spine->block_size() - 1 : 0;
 }
 
 void Executor::snapshot(std::uint32_t sequence, SequenceSnapshot& out) {

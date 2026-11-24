@@ -20,17 +20,22 @@ namespace ninfer::ops {
  *
  * For K in [1,15] and B in [1,8], the inputs are contiguous candidate_ids I32 [16,K,B],
  * unary_scores FP32 [16,K,B], projected_hidden BF16 [256,K,B], anchors I32 [B],
- * predecessor_codebook and successor_codebook BF16 [256,248320], base_positions I32 [B], and a
- * device-resident SamplingConfig[B]. Candidate rank is the fastest axis. The 16 candidate ids in
- * each row are distinct, and all candidate and anchor token ids lie in [0,248077); the registered
- * vocabulary, artifact binding, and linear_topk producer establish that trusted value contract.
+ * predecessor_codebook and successor_codebook BF16 [256,V] (V rows, one a token: the drafter's
+ * vocabulary), base_positions I32 [B], and a device-resident SamplingConfig[B]. Candidate rank is
+ * the fastest axis. The 16 candidate ids in each row are distinct, and all candidate and anchor
+ * token ids lie in [0,V); the registered vocabulary, artifact binding, and the candidates'
+ * producer (linear_topk, candidate_topk over the public vocabulary) establish that trusted value
+ * contract.
  *
  * Starting with predecessor=anchors[b], each position i in [0,K) computes:
  *
  *   edge[c] = unary_scores[c,i,b]
  *           + sum_r predecessor_codebook[r,predecessor]
  *                   * projected_hidden[r,i,b]
- *                   * successor_codebook[r,candidate_ids[c,i,b]].
+ *                   * successor_codebook[r,candidate_ids[c,i,b]],
+ *
+ * and with edge_softcap s > 0 (a drafter whose soft cap follows the correction) the edge is then
+ * s * tanh(edge / s); every use below reads that value.
  *
  * A row with configs[b].temperature<=0 selects the lowest candidate rank attaining max(edge) and
  * writes its exact one-hot distribution. A positive-temperature row writes the FP32 softmax of
@@ -39,7 +44,9 @@ namespace ninfer::ops {
  * written to drafts[i,b] and becomes the next predecessor. The Op ignores all other
  * SamplingConfig fields and never updates token_counts.
  *
- * drafts is contiguous I32 [K,B] and proposal_q is contiguous FP32 [16,K,B]. Both outputs are
+ * drafts is contiguous I32 [K,B] and proposal_q is contiguous FP32 [16,K,B]. With `confidence`,
+ * contiguous FP32 [K,B], the Op also stores at [i,b] the selected candidate's probability under
+ * the FP32 softmax of edge at temperature 1, whatever the row's temperature. Every output is
  * completely overwritten. Inputs, outputs, codebooks, and the config array must be pairwise
  * non-overlapping. The Op has no persistent state or internal allocation. Caller workspace is
  * transient and must not overlap any input or output.
@@ -49,23 +56,23 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                             cudaStream_t stream);
+                             cudaStream_t stream, Tensor* confidence = nullptr,
+                             float edge_softcap = 0.0F);
 
 /**
  * The same Op over codebooks stored as ggml Q4_0 rows (a GGUF drafter's, kept as stored): each
- * Weight is GGUF_Q4_0 with n=248320 rows of k=256 values, a row 8 blocks of 18 bytes (a binary16
- * scale d and 16 bytes of codes; value j of a block is d * (q_j - 8), q_j the low nibble of byte j
- * for j<16 and the high nibble of byte j-16). Every codebook value enters the formula above as that
- * exact FP32 product; the rest of the contract is unchanged. With `confidence`, contiguous FP32
- * [K,B], the Op also stores at [i,b] the selected candidate's probability under the FP32 softmax of
- * edge at temperature 1, whatever the row's temperature.
+ * Weight is GGUF_Q4_0 with n=V rows of k=256 values, a row 8 blocks of 18 bytes (a binary16 scale
+ * d and 16 bytes of codes; value j of a block is d * (q_j - 8), q_j the low nibble of byte j for
+ * j<16 and the high nibble of byte j-16). Every codebook value enters the formula above as that
+ * exact FP32 product; the rest of the contract is unchanged.
  */
 void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
                              const Tensor& projected_hidden, const Tensor& anchors,
                              const Weight& predecessor_codebook, const Weight& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                             cudaStream_t stream, Tensor* confidence = nullptr);
+                             cudaStream_t stream, Tensor* confidence = nullptr,
+                             float edge_softcap = 0.0F);
 
 // Transient bytes candidate_topk() needs for U columns.
 [[nodiscard]] std::size_t candidate_topk_workspace_capacity_bytes(std::int32_t columns);

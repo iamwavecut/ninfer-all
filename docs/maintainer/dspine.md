@@ -27,7 +27,7 @@ defines the conditioning, verification and publication that DSpine shares, and
 | [`tools/convert/dspine.py`](../../tools/convert/dspine.py) | the checkpoint's validation and the `dspine` component |
 | [`models/dspine/config.h`](../../src/models/dspine/config.h), [`model.h`](../../src/models/dspine/model.h) | the config and the materialized drafter |
 | [`models/dspine/drafter.h`](../../src/models/dspine/drafter.h) | the context projection, the drafted block and the head-write table |
-| [`models/dspine/runtime.h`](../../src/models/dspine/runtime.h) | lanes, features and staging for Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 |
+| [`models/dspine/runtime.h`](../../src/models/dspine/runtime.h) | lanes, features and staging for Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2, and for Inkling 2's [DFlash2 drafter](dflash.md#inkling-2) |
 | [`ops/dspine.h`](../../include/ninfer/ops/dspine.h) | the bridge and refinement Ops |
 
 ## The artifact
@@ -239,7 +239,8 @@ tensor parallelism; pipeline stages are refused. The context cache's store name 
 drafter's artifact digest and ring capacity.
 
 **Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2** keep their own sequences, so
-[`dspine::Runtime`](../../src/models/dspine/runtime.h) holds the drafter's state beside them: a ring
+[`dspine::Runtime`](../../src/models/dspine/runtime.h) holds the drafter's state beside them (and
+Inkling 2's [DFlash2 drafter's](dflash.md#inkling-2), with a ring of its trained window): a ring
 lane per sequence and one more per sequence with checkpoints, the head-write table, the features of
 a pass, and pinned staging. A pass stores the taps of the rows it computes. A prompt chunk commits
 its last window of rows into the sequence's lane; a decode step commits its rows with

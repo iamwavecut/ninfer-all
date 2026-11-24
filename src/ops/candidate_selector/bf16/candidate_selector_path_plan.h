@@ -38,5 +38,6 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
                                       const SelectorCodebooks& codebooks,
                                       const Tensor& base_positions, const SamplingConfig* configs,
                                       Tensor& drafts, Tensor& proposal_q, float* confidence,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
+                                      float edge_softcap, WorkspaceArena& workspace,
+                                      cudaStream_t stream);
 } // namespace ninfer::ops::detail

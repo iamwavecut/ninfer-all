@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import struct
+
 import numpy as np
 import pytest
 import torch
@@ -213,3 +216,166 @@ def test_the_earlier_drafter_layout_is_refused(tmp_path):
                [("dspark_fuse.weight", (2, 2), TYPE_F32, _f32(np.zeros((2, 2))))])
     with GGUFFile(path) as gguf, pytest.raises(ValueError, match="Q8_0_Old.gguf"):
         inkling2.dspark_config({}, CONFIG, gguf)
+
+
+# incoai's DFlash2 drafter: the release's config.json and a small safetensors directory.
+RELEASE_DFLASH2 = {
+    "architectures": ["DFlash2DraftModel"], "model_type": "qwen3", "hidden_act": "silu",
+    "attention_bias": False, "is_causal": False, "hidden_size": 2304, "intermediate_size": 6912,
+    "num_hidden_layers": 5, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+    "vocab_size": 201024, "num_target_layers": 48, "sliding_window": 2048, "rms_norm_eps": 1e-6,
+    "layer_types": ["sliding_attention"] * 5,
+    "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+    "dflash_config": {"block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2,
+                      "final_logit_softcapping": 30.0, "mask_token_id": 200056,
+                      "selector_rank": 256, "selector_softcap_mode": "after_correction",
+                      "selector_top_k": 16, "target_layer_ids": [5, 23, 41, 48]},
+}
+LOOPED = {"hidden_size": 2304, "vocab_size": 201024, "unpadded_vocab_size": 200058,
+          "num_hidden_layers": 24,
+          "loop": {"core_start": 6, "core_end": 18, "num_passes": 3, "gate_rank": 64}}
+
+
+def _release(**changes) -> dict:
+    config = json.loads(json.dumps(RELEASE_DFLASH2))
+    for key, value in changes.items():
+        if key in config["dflash_config"]:
+            config["dflash_config"][key] = value
+        else:
+            config[key] = value
+    return config
+
+
+def test_the_dflash2_config_is_the_releases_with_the_final_norm_tap_counted():
+    out = inkling2.dflash2_config(_release(), LOOPED)
+    assert out["architectures"] == ["Inkling2DFlash2"]
+    assert out["model_type"] == "inkling2_dflash2"
+    assert out["target_layer_ids"] == [5, 23, 41, 48]
+    # 48 visits' inputs and the final norm's rows.
+    assert out["num_target_layers"] == 49
+    assert out["selector_softcap"] == 30.0
+    assert (out["block_size"], out["sliding_window"], out["rope_theta"]) == (8, 2048, 10000.0)
+    assert (out["conv_kernel_size"], out["conv_group_size"]) == (2, 16)
+    assert (out["selector_rank"], out["selector_top_k"], out["mask_token_id"]) == (256, 16, 200056)
+
+
+@pytest.mark.parametrize("changes, message", [
+    ({"selector_softcap_mode": "before_correction"}, "after_correction"),
+    ({"target_layer_ids": [5, 23, 41]}, "final hidden"),
+    ({"target_layer_ids": [0, 23, 48]}, "after the first"),
+    ({"num_target_layers": 24}, "48 layer visits"),
+    ({"vocab_size": 200064}, "vocab_size"),
+    ({"mask_token_id": 200100}, "scored vocabulary"),
+    ({"layer_types": ["full_attention"] + ["sliding_attention"] * 4}, "every layer must slide"),
+])
+def test_a_dflash2_drafter_the_release_does_not_describe_is_refused(changes, message):
+    with pytest.raises(ValueError, match=message):
+        inkling2.dflash2_config(_release(**changes), LOOPED)
+
+
+def _write_safetensors(root, tensors: dict) -> None:
+    """BF16 words [shape] by name, in one model.safetensors."""
+
+    header, data, offset = {}, b"", 0
+    for name, words in tensors.items():
+        raw = words.astype("<u2").tobytes()
+        header[name] = {"dtype": "BF16", "shape": list(words.shape),
+                        "data_offsets": [offset, offset + len(raw)]}
+        data += raw
+        offset += len(raw)
+    encoded = json.dumps(header).encode()
+    (root / "model.safetensors").write_bytes(struct.pack("<Q", len(encoded)) + encoded + data)
+
+
+SMALL_DFLASH2 = {"hidden_size": 32, "head_dim": 8, "num_attention_heads": 4,
+                 "num_key_value_heads": 2, "intermediate_size": 48, "selector_rank": 16,
+                 "vocab_size": 8, "conv_kernel_size": 2, "conv_group_size": 16,
+                 "num_hidden_layers": 1, "target_layer_ids": [1, 2, 3]}
+
+
+def _small_dflash2_tensors(rng) -> dict:
+    h, d, q = 32, 8, 32
+    kv, inner, rank, vocab, coefficients = 16, 48, 16, 8, 2 * 2 * (32 // 16)
+    shapes = {
+        "fc.weight": (h, 3 * h), "hidden_norm.weight": (h,), "norm.weight": (h,),
+        "candidate_selector.hidden_projection.weight": (rank, h),
+        "candidate_selector.predecessor_codebook": (vocab, rank),
+        "candidate_selector.successor_codebook": (vocab, rank),
+        "layers.0.input_layernorm.weight": (h,),
+        "layers.0.post_attention_layernorm.weight": (h,),
+        "layers.0.self_attn.q_norm.weight": (d,), "layers.0.self_attn.k_norm.weight": (d,),
+        "layers.0.self_attn.q_proj.weight": (q, h), "layers.0.self_attn.k_proj.weight": (kv, h),
+        "layers.0.self_attn.v_proj.weight": (kv, h), "layers.0.self_attn.o_proj.weight": (h, q),
+        "layers.0.mlp.gate_proj.weight": (inner, h), "layers.0.mlp.up_proj.weight": (inner, h),
+        "layers.0.mlp.down_proj.weight": (h, inner),
+        "layers.0.attention_conv.base_kernel": (2, 2, h),
+        "layers.0.attention_conv.kernel_projection.weight": (coefficients, h),
+        "layers.0.mlp_conv.base_kernel": (2, 2, h),
+        "layers.0.mlp_conv.kernel_projection.weight": (coefficients, h),
+    }
+    return {name: _bf16_words(rng, shape) for name, shape in shapes.items()}
+
+
+class _Recipe:
+    def __init__(self):
+        self.assigned = {}
+
+    def assign(self, name, **spec):
+        self.assigned[name] = spec
+
+    def group(self, names):
+        raise AssertionError(f"unexpected group {names}")
+
+
+def test_the_dflash2_drafter_is_read_as_stored_and_its_projections_become_q8_rows(tmp_path):
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    tensors = _small_dflash2_tensors(np.random.default_rng(9))
+    _write_safetensors(tmp_path, tensors)
+    model = Model(components={"text": {"config": {
+        "architectures": [inkling2.TEXT_ARCHITECTURE], "num_hidden_layers": 0}}})
+    with SafetensorsSource(tmp_path) as store:
+        inkling2._dflash2(model, store, SMALL_DFLASH2)
+        params = model.parameters
+        for name, tensor in (("dflash2/feature_projection", "fc.weight"),
+                             ("dflash2/candidate_selector/successor_codebook",
+                              "candidate_selector.successor_codebook"),
+                             ("dflash2/layers/0/mlp_conv/base_kernel",
+                              "layers.0.mlp_conv.base_kernel"),
+                             ("dflash2/layers/0/attention/key", "layers.0.self_attn.k_proj.weight")):
+            assert np.array_equal(_words(params[name], tensors[tensor].shape), tensors[tensor])
+        assert params["dflash2/feature_projection"].inputs == ("dflash2/target_features",)
+        assert params["dflash2/layers/0/attention/output"].inputs == (
+            "dflash2/layers/0/attention/output_input",)
+        assert params["dflash2/layers/0/mlp_conv/kernel_projection"].inputs == (
+            "dflash2/layers/0/mlp_norm",)
+        assert params["dflash2/candidate_selector/hidden_projection"].inputs == (
+            "dflash2/final_hidden",)
+        recipe = _Recipe()
+        inkling2.inkling2_gguf(model, recipe, {})
+    formats = {name: spec["format"] for name, spec in recipe.assigned.items()}
+    assert set(formats) == set(params)
+    q8 = {name for name, f in formats.items() if f == "q8_g32_fp16"}
+    assert q8 == {"dflash2/feature_projection"} | {
+        "dflash2/layers/0/" + role for role in (
+            "attention/query", "attention/key", "attention/value", "attention/output",
+            "mlp/gate", "mlp/up", "mlp/down")}
+    assert all(formats[name] == "bf16" for name in set(params) - q8)
+    assert recipe.assigned["dflash2/candidate_selector/hidden_projection"][
+        "activation_policy"] == "A16Only"
+
+
+def test_a_dflash2_tensor_stored_wider_than_bf16_is_refused(tmp_path):
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    tensors = _small_dflash2_tensors(np.random.default_rng(10))
+    _write_safetensors(tmp_path, tensors)
+    path = tmp_path / "model.safetensors"
+    raw = path.read_bytes()
+    length = struct.unpack("<Q", raw[:8])[0]
+    header = json.loads(raw[8:8 + length])
+    header["norm.weight"]["dtype"] = "F16"
+    encoded = json.dumps(header).encode().ljust(length)
+    path.write_bytes(raw[:8] + encoded + raw[8 + length:])
+    with SafetensorsSource(tmp_path) as store, pytest.raises(ValueError, match="expected BF16"):
+        inkling2._dflash2(Model(components={}), store, SMALL_DFLASH2)
