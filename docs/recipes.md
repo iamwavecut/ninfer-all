@@ -276,8 +276,9 @@ ninfer-serve --config configs/deepseek-v4.1-flash-coder-host.ini
 
 ## Inkling 2 Mini
 
-Unsloth's UD-IQ4_XS GGUF with the release's vision tower and DSpark drafter as one artifact
-([Inkling 2 Mini](inkling2.md)); 15.0 GiB of weights with the drafter.
+Unsloth's UD-IQ4_XS GGUF with the release's vision tower, its DSpark drafter and incoai's DFlash2
+drafter as one artifact ([Inkling 2 Mini](inkling2.md)); 15.0 GiB of weights with DSpark, which
+these configs draft with.
 
 ```bash
 hf download WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3 Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer \

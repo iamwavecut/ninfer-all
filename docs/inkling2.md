@@ -154,7 +154,7 @@ tokenization, the chat template, output parsing and the serving protocols.
   and a conditional selector over each row's 16 best tokens. It sees the last 2,048 positions
   only. Its drafts survive further than DSpark's in greedy answers that draw on those, and it
   loses to DSpark at temperature 1 and on answers that copy older text, so the default stays
-  DSpark and the published artifacts do not carry it ([measurements](#dflash2)).
+  DSpark; the published artifacts carry it ([measurements](#dflash2)).
 - **Images.** The release's vision tower (the artifact's `vision` component, `--vision`): a ViT
   with a class row, learned position rows resized to each image and 2D-rotated heads, then 2 x 2
   patch merging and a two-layer projector, up to 4,096 positions an image (fewer with
@@ -257,9 +257,14 @@ python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
 ```
 
 It writes 17,230,821,888 bytes of 1,266 objects, 635,544,064 bytes and 81 objects more than
-without the drafter, in 185 seconds on a rented RTX 3090 host (its projections are quantized to
-Q8_G32 rows on the CPU). The converter checks the release's geometry, taps and selector
-settings and refuses a tensor stored other than BF16.
+without the drafter (its projections are quantized to Q8_G32 rows on the CPU), in 25 seconds on a
+rented RTX 3090 host with a Threadripper 3960X and 185 on one with an EPYC 7R32 share. Every other
+object keeps its bytes: the six published artifacts, converted this way with the drafter on
+November 24 in 18 to 29 seconds each, equal the files without it object for object apart from the
+81 new ones (45 BF16, 36 Q8_G32). They are 9,521,507,584 bytes (UD-IQ1_M), 10,816,268,032
+(UD-Q2_K_XL), 14,476,376,832 (APEX-I MiniPlus V2.1), 15,128,844,544 (UD-Q3_K_XL), 17,230,821,888
+(UD-IQ4_XS) and 24,421,141,504 (UD-Q8_K_XL). The converter checks the release's geometry, taps and
+selector settings and refuses a tensor stored other than BF16.
 
 ## Running
 
@@ -725,6 +730,26 @@ then 132.2, from 165 then 216 accepted drafts), as the controller and the timing
 round times; the fixed settings moved by 7% at most. The drafter adds 0.6 GiB of weights (15.2 GiB
 against DSpark's 15.1) and plans 147 MiB for its ring of 2,048 positions and workspace; the server
 started with 5.19 GiB free against 5.22 with DSpark.
+
+The six published artifacts carry the drafter. Release `2026-11-24.7` on another RTX 3090 (350 W,
+PCIe 4.0 x16, a Threadripper 3960X host), the CLI's 384-token greedy essay at `--max-context
+12288`, November 24, one run each, in tok/s (tokens a round in parentheses):
+
+| Artifact | `--spec none` | DSpark (default) | DFlash2, 7, floor 0.5 |
+|---|---:|---:|---:|
+| UD-IQ1_M | 135.2 | 136.5 (1.87) | 148.2 (2.55) |
+| UD-Q2_K_XL | 131.2 | 147.3 (1.98) | 158.8 (2.80) |
+| APEX-I MiniPlus V2.1 | 132.6 | 135.8 (1.62) | 141.5 (2.39) |
+| UD-Q3_K_XL | 123.7 | 140.6 (1.89) | 134.5 (2.90) |
+| UD-IQ4_XS | 119.0 | 130.7 (1.99) | 134.8 (2.82) |
+| UD-Q8_K_XL, host experts | 71.3 | 87.4 (2.08) | 95.4 (3.01) |
+
+Every run's text, reasoning included, equals `--spec none`'s. On UD-Q3_K_XL DFlash2 is 4.3% slower
+than DSpark despite its longer rounds. UD-IQ4_XS's Python task gave 120.2, 176.6 (2.80) and 178.0
+(4.26); its essay at temperature 1.0 (seed 1) 118.8 plain and 116.7 (2.17) with DFlash2; DFlash2
+with host and disk experts 127.9 and 126.1 with the device run's text. At this context the ring and
+workspace take 107 MiB. Release `2026-11-24.6` runs the new UD-IQ4_XS file with DSpark (129.9 tok/s)
+and with `--spec none` (119.7), with the same text.
 
 ### APEX-I MiniPlus
 
