@@ -212,4 +212,27 @@ DSparkConfig parse_dspark_config(const Json& value, const TextConfig& text) {
     return out;
 }
 
+dflash2::Config parse_dflash2_config(const Json& value, const TextConfig& text) {
+    architecture(value, "Inkling2DFlash2", "inkling2_dflash2");
+    dflash2::Config out = dflash2::parse_config(value);
+    // Tap position v < visit_count() is visit v's input, position visit_count() the final hidden
+    // after the final norm: the release's capture of the visits' states and the head's input.
+    dflash2::check_target(out, text.hidden_size, text.vocab_size, text.visit_count() + 1,
+                          "Inkling 2");
+    if (out.target_layer_ids.back() != text.visit_count() || out.target_layer_ids.front() == 0) {
+        throw ArtifactError("Inkling 2 DFlash2 config: the taps must end at the final hidden and "
+                            "tap visits' inputs after the first");
+    }
+    for (std::size_t i = 1; i < out.target_layer_ids.size(); ++i) {
+        if (out.target_layer_ids[i] <= out.target_layer_ids[i - 1]) {
+            throw ArtifactError("Inkling 2 DFlash2 config: target_layer_ids must ascend");
+        }
+    }
+    if (out.mask_token_id >= text.unpadded_vocab_size) {
+        throw ArtifactError("Inkling 2 DFlash2 config: the mask token lies outside the scored "
+                            "vocabulary");
+    }
+    return out;
+}
+
 } // namespace ninfer::models::inkling2

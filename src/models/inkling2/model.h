@@ -7,12 +7,14 @@
 // pinned host memory or in the artifact's files (ExpertResidency). The frontend resources are
 // Inkling's tokenizer and chat template, which the shared frontend serves in its Inkling dialect.
 // With LoadOptions::vision the vision tower binds, with LoadOptions::dspark the DSpark drafter,
-// with LoadOptions::dspine a standalone DSpine drafter artifact loads beside it.
+// with LoadOptions::dflash2 the DFlash2 drafter, with LoadOptions::dspine a standalone DSpine
+// drafter artifact loads beside it.
 
 #include "artifact/materializer.h"
 #include "core/device.h"
 #include "core/expert_delivery.h"
 #include "core/startup.h"
+#include "models/dflash2/drafter.h"
 #include "models/dspine/model.h"
 #include "models/inkling2/config.h"
 #include "models/qwen3_5/frontend/resources.h"
@@ -146,8 +148,9 @@ struct LoadOptions {
     // Binds the artifact's `vision` component, which must then exist, in this placement.
     VisionPlacement vision = VisionPlacement::None;
     bool dspark            = false; // bind the artifact's DSpark drafter
+    bool dflash2           = false; // bind the artifact's DFlash2 drafter on rank 0
     // Loads the standalone DSpine drafter artifact at this path (--spec dspine --draft-model) on
-    // rank 0; empty for none. It excludes the DSpark drafter.
+    // rank 0; empty for none. One drafter at most.
     std::filesystem::path dspine;
 };
 
@@ -198,6 +201,13 @@ public:
         return dspark_config_;
     }
     [[nodiscard]] const std::optional<DSparkWeights>& dspark() const noexcept { return dspark_; }
+    // The DFlash2 drafter's config and device operands (LoadOptions::dflash2).
+    [[nodiscard]] const std::optional<dflash2::Config>& dflash2_config() const noexcept {
+        return dflash2_config_;
+    }
+    [[nodiscard]] const std::optional<dflash2::Operands>& dflash2() const noexcept {
+        return dflash2_;
+    }
     [[nodiscard]] const dspine::Model* dspine() const noexcept { return dspine_.get(); }
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
@@ -229,14 +239,17 @@ private:
     VisionPlacement vision_placement_ = VisionPlacement::None;
     std::optional<DSparkConfig> dspark_config_;
     std::optional<DSparkWeights> dspark_;
+    std::optional<dflash2::Config> dflash2_config_;
+    std::optional<dflash2::Operands> dflash2_;
     std::unique_ptr<dspine::Model> dspine_;
 };
 
-// Whether the artifact's text component is Inkling 2, and whether it carries the vision tower and
-// the DSpark drafter.
+// Whether the artifact's text component is Inkling 2, and whether it carries the vision tower, the
+// DSpark drafter and the DFlash2 drafter.
 [[nodiscard]] bool is_inkling2(const artifact::Reader& reader);
 [[nodiscard]] bool has_vision(const artifact::Reader& reader);
 [[nodiscard]] bool has_dspark(const artifact::Reader& reader);
+[[nodiscard]] bool has_dflash2(const artifact::Reader& reader);
 
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader,
                                                 const LoadOptions& options, DeviceContext& device,

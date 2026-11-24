@@ -199,7 +199,9 @@ def main(argv=None):
         "artifact), and vision or mtp (from --source mtp=MTP.gguf or an HF safetensors subset) beside text; "
         "for DeepSeek-V4.1 text,engram (the default), text or engram, and dspark (its drafter, from "
         "--source dspark=DRAFTER.gguf or an STQ pack directory) and vision (its tower, from "
-        "--source vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors) beside text",
+        "--source vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors) beside text; "
+        "for Inkling 2 vision, dspark and dflash2 (incoai's drafter, from --source dflash2=DIR) "
+        "beside text",
     )
     parser.add_argument(
         "--resource",
@@ -341,28 +343,32 @@ def main(argv=None):
         if architectures[0] in INKLING2_ARCHITECTURES:
             wanted = (args.components or "text").split(",")
             if ("gguf" not in paths or args.layers or wanted[0] != "text"
-                    or not set(wanted) <= {"text", "vision", "dspark"}
+                    or not set(wanted) <= {"text", "vision", "dspark", "dflash2"}
                     or len(set(wanted)) != len(wanted)
-                    or ("vision" in wanted) != ("vision" in paths)
-                    or ("dspark" in wanted) != ("dspark" in paths)):
+                    or any((name in wanted) != (name in paths)
+                           for name in ("vision", "dspark", "dflash2"))):
                 raise ValueError("Inkling 2 converts its text component from --source gguf=FILE; "
                                  "--components text,vision adds its vision tower from --source "
-                                 "vision=MMPROJ.gguf and text,dspark its drafter from --source "
-                                 "dspark=DRAFTER.gguf")
+                                 "vision=MMPROJ.gguf, text,dspark its DSpark drafter from --source "
+                                 "dspark=DRAFTER.gguf and text,dflash2 its DFlash2 drafter from "
+                                 "--source dflash2=DIR")
             gguf = stack.enter_context(GGUFFile(paths["gguf"]))
             vision = stack.enter_context(GGUFFile(paths["vision"])) if "vision" in paths else None
             dspark = stack.enter_context(GGUFFile(paths["dspark"])) if "dspark" in paths else None
-            model = build_inkling2(base, gguf, vision=vision, dspark=dspark,
+            dflash2 = (stack.enter_context(SafetensorsSource(paths["dflash2"]))
+                       if "dflash2" in paths else None)
+            model = build_inkling2(base, gguf, vision=vision, dspark=dspark, dflash2=dflash2,
                                    resource_overrides=overrides)
             recipe = Recipe(model)
             inkling_sources = ({"base": base, "gguf": gguf} | ({"vision": vision} if vision else {})
-                               | ({"dspark": dspark} if dspark else {}))
+                               | ({"dspark": dspark} if dspark else {})
+                               | ({"dflash2": dflash2} if dflash2 else {}))
             _function(args.recipe)(model, recipe, inkling_sources)
             if args.override:
                 _function(args.override)(model, recipe, inkling_sources)
             source_paths = {"base": {"path": str(args.model)},
                             "gguf": {"path": str(paths["gguf"])}}
-            for name in ("vision", "dspark"):
+            for name in ("vision", "dspark", "dflash2"):
                 if name in paths:
                     source_paths[name] = {"path": str(paths[name])}
             report = convert(
