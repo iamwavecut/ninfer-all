@@ -367,7 +367,9 @@ the batched controllers and the sorted route ([what runs](#what-runs)) NInfer-al
   (`--max-concurrency 4`, no drafts) decode 238.5 tok/s together on the split against 209.4 on
   one card (1.14x), each request's text equal to its text alone. With one request and an
   8,192-token context the server's devices use about 11,100 and 7,600 MiB against one card's
-  18,300 MiB. Prompt rates over the split were not measured beyond a 33-token prompt.
+  18,300 MiB. Prompt rates over the split were not measured beyond a 33-token prompt. A
+  [field report](performance/field-reports.md#tesla-t10-two-cards) runs two Tesla T10s without peer
+  access the same way, with prompts up to 261,760 tokens.
 
 ### Long contexts
 

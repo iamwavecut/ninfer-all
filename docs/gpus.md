@@ -166,6 +166,7 @@ means the card calibrates once at its first start.
 | ⬜ | Quadro RTX 4000 | 8 GB | Workstation | ✓ | |
 | ⬜ | T1000 | 8 GB | Workstation | | no tensor cores; whether the `75` build runs on it is unknown |
 | ⬜ | Tesla T4 | 16 GB | Data center | ✓ | |
+| ✅ | Tesla T10 | 16 GB | Data center | | Inkling 2 Mini over two cards without peer access ([field report](performance/field-reports.md#tesla-t10-two-cards)) |
 
 ### Volta (7.0, build `70` with CUDA 12.8 or 12.9, built from source)
 
