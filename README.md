@@ -265,12 +265,12 @@ their Notes link it, and [N-gram tables](#n-gram-tables) lists them all.
 
 | Model | Size, GiB | Weights | Vision | Drafting | Notes |
 |---|---:|---|:-:|---|---|
-| [Inkling 2 Mini UD-IQ1_M](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ1_M-NInfer-v3) | 8.18 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 down banks | ✓ | DSpark | Unsloth's UD-IQ1_M GGUF byte for byte; otherwise as UD-IQ4_XS |
-| [Inkling 2 Mini UD-Q2_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q2_K_XL-NInfer-v3) | 9.39 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 and NVFP4 down banks | ✓ | DSpark | Unsloth's UD-Q2_K_XL GGUF byte for byte, its one MXFP4 bank as the same values in Q8_0; otherwise as UD-IQ4_XS |
-| [Inkling 2 Mini APEX-I MiniPlus V2.1](https://huggingface.co/WaveCut/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-NInfer-v3) | 12.80 | GGUF blocks, IQ3_XXS and IQ3_S experts | ✓ | DSpark | IsValorum's APEX-I MiniPlus GGUF byte for byte with its Q8_0 vision tower; Unsloth's DSpark drafter; otherwise as UD-IQ4_XS |
-| [Inkling 2 Mini UD-Q3_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q3_K_XL-NInfer-v3) | 13.40 | GGUF blocks, NVFP4 and IQ3 experts | ✓ | DSpark | Unsloth's UD-Q3_K_XL GGUF byte for byte; otherwise as UD-IQ4_XS |
-| [Inkling 2 Mini UD-IQ4_XS](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3) | 15.36 | GGUF blocks, NVFP4 experts in 20 of 24 layers | ✓ | DSpark | Unsloth's UD-IQ4_XS GGUF byte for byte; Q8_0 vision tower (images); DSpark drafter, by default for one request at a time, or context lookup |
-| [Inkling 2 Mini UD-Q8_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q8_K_XL-NInfer-v3) | 22.06 | BF16 attention, head, token table and layers 20-23's experts; NVFP4 experts in 20 layers | ✓ | DSpark | Unsloth's UD-Q8_K_XL GGUF byte for byte; a card of 32 GB or more, or host experts; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini UD-IQ1_M](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ1_M-NInfer-v3) | 8.28 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 down banks | ✓ | DSpark | Unsloth's UD-IQ1_M GGUF byte for byte; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini UD-Q2_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q2_K_XL-NInfer-v3) | 9.48 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 and NVFP4 down banks | ✓ | DSpark | Unsloth's UD-Q2_K_XL GGUF byte for byte, its one MXFP4 bank as the same values in Q8_0; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini APEX-I MiniPlus V2.1](https://huggingface.co/WaveCut/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-NInfer-v3) | 12.89 | GGUF blocks, IQ3_XXS and IQ3_S experts | ✓ | DSpark | IsValorum's APEX-I MiniPlus GGUF byte for byte with its Q8_0 vision tower; Unsloth's DSpark drafter; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini UD-Q3_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q3_K_XL-NInfer-v3) | 13.50 | GGUF blocks, NVFP4 and IQ3 experts | ✓ | DSpark | Unsloth's UD-Q3_K_XL GGUF byte for byte; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini UD-IQ4_XS](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3) | 15.46 | GGUF blocks, NVFP4 experts in 20 of 24 layers | ✓ | DSpark | Unsloth's UD-IQ4_XS GGUF byte for byte; Q8_0 vision tower (images); DSpark drafter, by default for one request at a time, or context lookup |
+| [Inkling 2 Mini UD-Q8_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q8_K_XL-NInfer-v3) | 22.15 | BF16 attention, head, token table and layers 20-23's experts; NVFP4 experts in 20 layers | ✓ | DSpark | Unsloth's UD-Q8_K_XL GGUF byte for byte; a card of 32 GB or more, or host experts; otherwise as UD-IQ4_XS |
 
 Tencent's [DSpine drafter for Qwen3.8-27B](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3)
 (2.27 GiB, Q8 layers and a BF16 code bridge) is an artifact of its own, which

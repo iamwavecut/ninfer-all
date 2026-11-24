@@ -182,11 +182,11 @@ python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
   --out models/Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --device cpu
 ```
 
-The conversion writes one 16,494,910,976-byte (15.4 GiB) `.ninfer` file of 1,185 objects: the text
+The conversion writes one 16,595,277,824-byte (15.5 GiB) `.ninfer` file of 1,185 objects: the text
 model, the vision tower (Q8_0 matrices) and the DSpark drafter (Q8_0, its Markov embedding BF16 as
 the GGUF stores it, and its Markov output table BF16; a drafter GGUF with table values that BF16
 does not hold is refused). With Unsloth's `mmproj-BF16.gguf` as the `vision` source the tower keeps
-BF16 matrices and the file has 16,790,806,016 bytes (15.6 GiB). Unsloth's repository holds each
+BF16 matrices and the file is 295,895,040 bytes larger. Unsloth's repository holds each
 quantization in two layouts: llama.cpp's `inkling2_loop` (24 blocks), the root files since
 2026-11-23, and the earlier `inkling2` (48 unrolled blocks in its metadata), now
 `Old_Support/*.gguf_file`. Both convert to the same artifact: from UD-IQ4_XS the two payloads are
@@ -213,15 +213,15 @@ python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
   --out models/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-ninfer-v3.ninfer --device cpu
 ```
 
-It writes 13,740,465,920 bytes (12.8 GiB) of 1,173 objects. Each conversion took about two minutes
-on a rented A40's container.
+It writes 13,840,832,768 bytes (12.9 GiB) of 1,173 objects. Each conversion took 21 or 22 seconds
+on a rented RTX 3090 host's container.
 
 Unsloth's UD-IQ1_M, UD-Q2_K_XL and UD-Q3_K_XL convert like UD-IQ4_XS (`--source gguf=` names the
-file) to 8,785,600,768, 10,080,361,216 and 14,392,937,728 bytes, in about 30 seconds each on a
+file) to 8,885,967,616, 10,180,728,064 and 14,493,304,576 bytes, in 17 to 21 seconds each on a
 rented RTX 3090 host. UD-Q2_K_XL stores layer 20's down bank in MXFP4, which the expert products
 do not take: the converter writes the same values as Q8_0 blocks, each code's doubled value as
 the int8 code and 2^(e - 128) as the F16 scale, checking every block against the MXFP4 decode.
-UD-Q8_K_XL converts the same way to 23,685,230,592 bytes in 55 seconds on a rented RTX A6000 host;
+UD-Q8_K_XL converts the same way to 23,785,597,440 bytes in 27 seconds on the same host;
 its BF16 matrices, expert banks included, are copied word for word.
 
 ## Running
@@ -243,11 +243,11 @@ ninfer-serve models/Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --model-id inkling
   --max-context 32768 --expert-residency host
 ```
 
-With its experts on the GPU the model keeps 14.6 GiB of weights (15.0 GiB with the DSpark drafter)
-and 1.2 GiB of workspace, and a sequence's F16 keys and values take 32 KiB per token of context
-(its 8 full-attention visits) beside 224 MiB of sliding-window rings and convolution histories. One
-sequence of 12,288 tokens plans 16.5 GiB of the GPU, 17.0 GiB with the drafter. With
-`--expert-residency host` the GPU keeps 1.6 GiB of weights (1.95 GiB with the drafter), two
+With its experts on the GPU the model keeps 14.6 GiB of weights (15.1 GiB with the DSpark drafter)
+and 1.2 GiB of workspace, and a sequence of 12,288 tokens takes 418 MiB of MXFP8 keys and values
+(16.5 KiB a token in its 8 full-attention visits), sliding-window rings and convolution histories.
+One such sequence plans 16.3 GiB of the GPU, 16.9 GiB with the drafter. With
+`--expert-residency host` the GPU keeps 1.57 GiB of weights (2.04 GiB with the drafter), two
 whole-layer banks of 1,337 MiB and a cache of as many experts as fit, and the host pins 13.1 GiB
 for the routed experts; `disk` reads them from the artifact through the OS page cache.
 
@@ -497,22 +497,50 @@ value above. A 600-token greedy reply (`--max-context 4096`) decoded at 75.2 tok
 68.7 without drafts on the Quadro RTX 6000, 85.2 and 67.3 on the V100, and 144.4 and 120.5 on the
 RTX 3090.
 
+### The mainline drafter
+
+Since November 24 the published artifacts carry the drafter in llama.cpp's mainline layout,
+Unsloth's root `dspark-Inkling-2-Mini-Q8_0.gguf`: its feature mixtures stored as softmax rows and
+its Markov output folded with the release's BF16 head, where the earlier file left that fold to the
+Engine, which used the target's quantized head (Q6_K in UD-IQ4_XS). Every other object of the six
+artifacts keeps its bytes. Against release 2026-11-23.11 with the earlier UD-IQ4_XS artifact on one
+RTX 3090 (350 W, PCIe 4.0 x16, a CUDA 13.4.3 build), the CLI's 384 tokens a request, DSpark by
+default, the two builds alternating, one run each, in tok/s:
+
+| Request | `--spec none` | Earlier drafter | Mainline drafter | Drafts accepted, earlier / mainline |
+|---|---:|---:|---:|---:|
+| essay, greedy | 119.1 | 128.8 | 127.9 | 155 of 354 / 155 of 350 |
+| Python task, greedy | 119.9 | 172.5 | 175.3 | 245 of 358 / 245 of 358 |
+| question about a 5,542-token document, greedy | 114.2 | 141.5 | 143.8 | 224 of 392 / 224 of 390 |
+| essay, seed 1 | 118.1 | 122.3 | 124.2 | 120 of 265 / 117 of 248 |
+| essay, seed 2 | 119.1 | 125.8 | 123.6 | 144 of 311 / 136 of 288 |
+| Python task, seed 2 | 118.0 | 159.4 | 160.3 | 229 of 385 / 230 of 381 |
+
+Every DSpark run's text equals its `--spec none` twin's in both builds. With 7 drafts a round over
+256 greedy essay tokens the earlier drafter had 137 of 804 drafts accepted (74.8 tok/s), the
+mainline one 138 of 797 (75.8 tok/s). The GPU keeps 15.1 GiB of weights with the drafter instead
+of 15.0 and plans 16.9 GiB for a 12,288-token sequence in both builds: the folded table is now a
+weight rather than workspace the Engine filled at startup. DSpark figures in this section dated
+before November 24 come from the earlier drafter.
+
 ### APEX-I MiniPlus
 
-IsValorum's APEX-I MiniPlus V2.1 (12.8 GiB with its Q8_0 tower and the DSpark drafter) on a rented
+IsValorum's APEX-I MiniPlus V2.1 (12.9 GiB with its Q8_0 tower and the DSpark drafter) on a rented
 A40 (300 W, PCIe 4.0 x16, CUDA 12.8, build `86`), November 21, 2026:
 
 - **Speed.** `ninfer_bench`, three repetitions: prefill of 2,048 tokens 2,776 tok/s, of 10,000
-  tokens 2,128; decode of 128 tokens 104.3 tok/s, 90.2 after 10,000. The CLI's 384-token greedy
-  essay, one run each: 103.1 tok/s with `--spec none`, 115.6 with DSpark (1.69 tokens a round),
-  with the same text. UD-IQ4_XS on another A40 host ([below](#across-cards)) gave 2,432, 1,897,
-  85.3 and 75.5, and 84.4 and 97.3 on the essay; this was not an A/B on one host.
+  tokens 2,128; decode of 128 tokens 104.3 tok/s, 90.2 after 10,000. UD-IQ4_XS on another A40
+  host ([below](#across-cards)) gave 2,432, 1,897, 85.3 and 75.5; this was not an A/B on one host.
+  The CLI's 384-token greedy essay on a third A40 (300 W, PCIe 4.0 x16, a CUDA 13.4.3 build,
+  November 24, the mainline drafter), one run each: 103.0 tok/s with `--spec none`, 110.2 with
+  DSpark (1.66 tokens a round), 94.1 with host experts and 93.9 with disk experts, all with the
+  same text; UD-IQ4_XS there 89.7 and 107.0 (2.06).
 - **Quality.** Perplexity on the first 40,000 bytes of WikiText (`--kv-dtype bf16`, 9,718 scored
   tokens): a mean NLL of 1.870942 (perplexity 6.494411) against UD-IQ4_XS's 1.859871 (6.422907),
   +0.60%.
-- **Memory.** With every expert on the GPU: 12.1 GiB of weights, 12.8 GiB with the tower and the
-  drafter. One sequence plans 13.8 GiB of the GPU at 8,192 tokens and 14.5 GiB at 32,768 without
-  the drafter, 14.7 and 15.5 GiB with the tower and the drafter; no 16 GB card has run it.
+- **Memory.** With every expert on the GPU: 12.1 GiB of weights, 12.5 GiB with the drafter. One
+  sequence plans 13.8 GiB of the GPU at 8,192 tokens and 14.5 GiB at 32,768 without the drafter,
+  14.7 and 15.5 GiB with the tower and the drafter; no 16 GB card has run it.
   `--expert-residency host` pins 10.9 GiB of host memory for the routed experts and keeps 1.16 GiB
   of weights and two 1,002 MiB layer banks on the GPU; `host` and `disk` (the A40's cache held
   every expert) gave the device run's 384 greedy tokens byte for byte.
@@ -521,35 +549,38 @@ A40 (300 W, PCIe 4.0 x16, CUDA 12.8, build `86`), November 21, 2026:
 
 ### Smaller quantizations
 
-Unsloth's UD-IQ1_M (8.2 GiB), UD-Q2_K_XL (9.4 GiB) and UD-Q3_K_XL (13.4 GiB), each with the Q8_0
+Unsloth's UD-IQ1_M (8.3 GiB), UD-Q2_K_XL (9.5 GiB) and UD-Q3_K_XL (13.5 GiB), each with the Q8_0
 tower and the DSpark drafter, on a rented RTX 3090 (350 W, PCIe 4.0 x16, CUDA 12.8), November 21,
-2026, one run each:
+2026, one run each; the essay columns on another RTX 3090 (350 W, PCIe 4.0 x16, a CUDA 13.4.3
+build) on November 24 with the mainline drafter:
 
 | Quantization | Unsloth's KLD to UD-Q8_K_XL | Mean NLL, 40 KB WikiText | Essay, `--spec none` | Essay, DSpark | GPU plan: 8K, `--spec none` / 32K, tower and DSpark |
 |---|---:|---:|---:|---:|---:|
-| UD-IQ1_M | 0.0867 | 1.929600 (+3.75%) | 124.3 tok/s | 128.9 (1.67 a round) | 9.2 / 10.9 GiB |
-| UD-Q2_K_XL | 0.0595 | 1.901978 (+2.26%) | 121.3 | 130.3 (1.92) | 10.4 / 12.1 GiB |
-| UD-Q3_K_XL | 0.0174 | 1.861615 (+0.09%) | 113.5 | 126.1 (2.03) | 14.4 / 16.1 GiB |
+| UD-IQ1_M | 0.0867 | 1.929600 (+3.75%) | 135.4 tok/s | 139.2 (1.84 a round) | 9.2 / 10.9 GiB |
+| UD-Q2_K_XL | 0.0595 | 1.901978 (+2.26%) | 131.3 | 144.5 (1.98) | 10.4 / 12.1 GiB |
+| UD-Q3_K_XL | 0.0174 | 1.861615 (+0.09%) | 122.9 | 140.8 (1.95) | 14.4 / 16.1 GiB |
 
 The NLL differences are against UD-IQ4_XS's 1.859871 (`--kv-dtype bf16`, 9,718 scored tokens).
 With `--expert-residency host` (6.3, 7.5 and 11.4 GiB pinned) or `disk` each gave the device
-run's 384 greedy tokens, reasoning included, byte for byte, as did DSpark; the 3090's cache held
-every expert. Each names the mailbox's 24 and the sun on the right in the image prompt of
-examples/cli/messages/image_natural.json. No card under 24 GB has run them.
+run's 384 greedy tokens, reasoning included, byte for byte, as did DSpark, on both dates; the
+3090's cache held every expert. Each names the mailbox's 24 and the sun on the right in the image
+prompt of examples/cli/messages/image_natural.json. No card under 24 GB has run them.
 
 ### UD-Q8_K_XL
 
-Unsloth's UD-Q8_K_XL (22.1 GiB), the reference of Unsloth's KL measurements, keeps BF16 attention,
+Unsloth's UD-Q8_K_XL (22.2 GiB), the reference of Unsloth's KL measurements, keeps BF16 attention,
 token table, head and layers 20-23's experts, and NVFP4 experts in layers 0-19. On a rented RTX
 A6000 (300 W, PCIe 4.0 x16, CUDA 12.8), November 21, 2026, one run each:
 
-- **Memory.** 21.3 GiB of weights, 22.0 GiB with the tower and the drafter; one sequence plans
+- **Memory.** 21.3 GiB of weights, 22.1 GiB with the tower and the drafter; one sequence plans
   22.9 GiB of the GPU at 8,192 tokens with `--spec none` and 24.7 GiB at 32,768 with the tower and
   the drafter. `--expert-residency host` pins 18.3 GiB of host memory and keeps 3.07 GiB of weights
   and two 1,944 MiB layer banks on the GPU.
-- **Speed.** The 384-token greedy essay decodes at 67.3 tok/s with `--spec none`, 72.9 with DSpark
-  (1.76 tokens a round), 63.8 with host experts and 63.5 with disk experts (the A6000's cache held
-  every expert). A 9,742-token prompt prefills at 1,710 tok/s, then decodes at 61.6 tok/s.
+- **Speed.** A 9,742-token prompt prefills at 1,710 tok/s, then decodes at 61.6 tok/s. On another
+  RTX A6000 (300 W, PCIe 4.0 x16, a CUDA 13.4.3 build, November 24, the mainline drafter) the
+  384-token greedy essay decodes at 71.3 tok/s with `--spec none`, 90.2 with DSpark and the tower
+  (2.08 tokens a round), 68.2 with host experts and 67.8 with disk experts (the A6000's cache held
+  every expert), all with the same text; UD-IQ4_XS there 105.8 and 124.7 (2.06).
 - **Quality.** A mean NLL of 1.857855 on the 40 KB WikiText slice (`--kv-dtype bf16`, 9,718
   scored tokens), against UD-IQ4_XS's 1.859871 (-0.11%). Host, disk and DSpark runs give the
   device run's 384 greedy tokens byte for byte; the image prompt gives the mailbox's 24 and the sun
@@ -632,7 +663,7 @@ under 0.9% on the 3090, and the tables hold the second runs. llama.cpp on the 30
 
 #### Experts in host memory
 
-The model's 15.0 GiB of weights do not fit on the cards of 8, 12 and 16 GB. On these NInfer-all kept
+The model's 15.1 GiB of weights do not fit on the cards of 8, 12 and 16 GB. On these NInfer-all kept
 the routed experts in pinned host memory (`--expert-residency host`) beside the device cache it
 sizes itself, and llama-bench ran with `--fit-target 1024 --fit-ctx 10240`: llama.cpp fits the model
 to the card itself, with llama-server's default margin of 1024 MiB, and keeps on the CPU what does
@@ -734,7 +765,9 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
   (greedy) both towers name the mailbox's 24 and the sun on the right; the Q8_0 tower's text
   departs from the BF16 tower's 324 characters into the reasoning.
 - **DSpark.** With 7 drafts a round over 256 greedy tokens of the essay prompt, NInfer-all's drafter
-  had 133 drafts accepted of 832, llama.cpp's implementation 133 of 850.
+  had 138 drafts accepted of 797 on November 24 ([the mainline drafter](#the-mainline-drafter)); on
+  November 21, with the earlier drafter file, NInfer-all's had 133 of 832 and llama.cpp's
+  implementation 133 of 850.
 
 ## Expert residency
 
