@@ -636,6 +636,7 @@ struct Executor::Impl {
         }
         ExpertDeliveryOptions transport;
         transport.pair_capacity = options.prefill_chunk * config.top_k_experts;
+        transport.top_k         = config.top_k_experts;
         transport.cache_bytes   = options.expert_cache_bytes;
         // A growing cache's next positions come from the headroom before the expert cache has to
         // give memory back.

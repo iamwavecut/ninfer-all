@@ -1,8 +1,9 @@
 // The host side of every MoE family's host and disk experts: the expert tier must fill free slots
-// first, swap a candidate in only when its count beats the victim's by the gain, pair the hottest
-// candidates with the coldest victims of their own pool, order a round by gain over every pool,
-// cap it, decay the counts, and admit a candidate over a held expert its count beats, never one
-// its call routes. The split must give the CPU more of the misses when copies turn out slow and
+// first, swap a candidate in only when its count beats the victim's, times the gain ratio, by the
+// gain, pair the hottest candidates with the coldest victims of their own pool, order a round by
+// gain over every pool, cap it, decay the counts, admit a candidate over a held expert its count
+// beats, never one its call routes, and seed a profile's and add a prompt's counts at the steady
+// sum the decay settles to. The split must give the CPU more of the misses when copies turn out slow and
 // fewer when its products do, and probe a side it left unused. The pinned pool must run every index
 // of a job exactly once, run after run, rethrow a job's failure, run a side once on the calling
 // thread, finish every job before a failing side's error and stamp its last job's end before it
@@ -32,10 +33,17 @@ void require(bool condition, const std::string& message) {
 
 bool near(float a, float b) { return std::fabs(a - b) < 1e-4F; }
 
+// The rule's arithmetic with plain constants (decay 0.7, gain 1.5, no ratio): the defaults are a
+// measured policy, which these checks do not restate.
+ExpertTierOptions plain(std::uint32_t every, std::uint32_t swaps = 96) {
+    return {.every = every, .swaps = swaps, .decay = 0.7F, .min_gain = 1.5F, .min_count = 2.0F,
+            .gain_ratio = 1.0F};
+}
+
 void tier_rounds() {
     using State = ExpertTier::State;
     // Two layers of eight experts, each with its own pool; a round every second pass.
-    ExpertTier tier({8, 8}, {0, 1}, {.every = 2});
+    ExpertTier tier({8, 8}, {0, 1}, plain(2));
     tier.set_free(0, 2);
     for (std::int32_t e = 0; e < 4; ++e) { tier.set(1, e, State::Held); }
     tier.route(0, std::vector<std::int32_t>{1, 1, 1, 2, 2, 3, -1, 8});
@@ -55,11 +63,11 @@ void tier_rounds() {
     require(near(tier.count(1, 5), 4 * 0.7F), "a round decays every count");
 
     // A gain below min_gain swaps nothing; the cap keeps the best.
-    ExpertTier close({4}, {0}, {.every = 1});
+    ExpertTier close({4}, {0}, plain(1));
     close.set(0, 0, State::Held);
     close.route(0, std::vector<std::int32_t>{0, 0, 1, 1, 1});
     require(close.end_pass().empty(), "a candidate one route ahead does not swap");
-    ExpertTier capped({4, 4}, {0, 1}, {.every = 1, .swaps = 1});
+    ExpertTier capped({4, 4}, {0, 1}, plain(1, 1));
     capped.set(0, 0, State::Held);
     capped.set(1, 0, State::Held);
     capped.route(0, std::vector<std::int32_t>{1, 1, 1});
@@ -67,7 +75,7 @@ void tier_rounds() {
     const auto best = capped.end_pass();
     require(best.size() == 1 && best[0].layer == 1 && best[0].in == 1, "the cap keeps the best swap");
     // Pending experts are neither candidates nor victims.
-    ExpertTier pending({4}, {0}, {.every = 1});
+    ExpertTier pending({4}, {0}, plain(1));
     pending.set(0, 0, State::Pending);
     pending.set(0, 1, State::Held);
     pending.route(0, std::vector<std::int32_t>{0, 0, 0, 0, 0});
@@ -76,7 +84,7 @@ void tier_rounds() {
 
 void tier_admission() {
     using State = ExpertTier::State;
-    ExpertTier tier({8}, {0}, {.every = 0});
+    ExpertTier tier({8}, {0}, plain(0));
     for (std::int32_t e = 0; e < 4; ++e) { tier.set(0, e, State::Held); }
     tier.route(0, std::vector<std::int32_t>{0, 0, 0, 1, 2, 2});
     require(tier.end_pass().empty(), "every = 0 runs no rounds");
@@ -99,13 +107,71 @@ void tier_admission() {
     require(tier.admission_victim(0, 7, 5, busy).expert == 0, "the scan passes the warmed expert");
 
     // One pool for two layers: the victim may be another layer's.
-    ExpertTier shared({4, 4}, {0, 0}, {.every = 0});
+    ExpertTier shared({4, 4}, {0, 0}, plain(0));
     shared.set(1, 2, State::Held);
     shared.set(0, 1, State::Held);
     shared.route(0, std::vector<std::int32_t>{1, 1, 1});
     require(shared.end_pass().empty(), "a pass ends");
     const auto other = shared.admission_victim(0, 3, 2, std::vector<unsigned char>(4, 0));
     require(other.layer == 1 && other.expert == 2, "a shared pool's coldest expert may be another layer's");
+}
+
+// A layer's counts settle near every * routes / (1 - decay): a routing profile seeds them at that sum
+// in its shares, a prompt's routes join them and scale down to it, and the coldest seeded expert is
+// the one an admission takes first.
+void tier_settle() {
+    using State = ExpertTier::State;
+    const auto close = [](float a, double b) { return std::fabs(double(a) - b) <= 1e-5 * (1 + std::fabs(b)); };
+    ExpertTier tier({4}, {0}, {.every = 4, .decay = 0.75F, .min_gain = 1.5F, .gain_ratio = 1.5F});
+    require(close(tier.steady(8), 128), "the steady sum is 4 passes of 8 routes over 1 - 0.75");
+    ExpertTier none({4}, {0}, plain(0));
+    require(none.steady(8) == 0, "without rounds no sum is steady");
+    none.seed(0, std::vector<std::uint64_t>{5, 0, 0, 0}, 8);
+    require(close(none.count(0, 0), 5), "without a steady sum a seed keeps its counts");
+
+    tier.set(0, 0, State::Held);
+    tier.set(0, 1, State::Held);
+    tier.seed(0, std::vector<std::uint64_t>{300, 100, 0, 0}, 8);
+    require(close(tier.count(0, 0), 96) && close(tier.count(0, 1), 32) && close(tier.count(0, 2), 0),
+            "a seed takes the profile's shares of the steady sum");
+    const std::vector<unsigned char> busy(4, 0);
+    // 1.5 * 32 + 1.5 = 49.5: 49 pairs do not take expert 1's slot, 50 do; expert 0 stays.
+    require(tier.admission_victim(0, 3, 49, busy).expert < 0, "a candidate below the ratio waits");
+    require(tier.admission_victim(0, 3, 50, busy).expert == 1, "the coldest seeded expert leaves first");
+
+    // A short prompt joins as is; a long one scales the layer down to the steady sum.
+    tier.prompt(0, std::vector<std::uint32_t>{0, 0, 0, 0}, 8);
+    require(close(tier.count(0, 0), 96), "an empty prompt changes nothing");
+    tier.prompt(0, std::vector<std::uint32_t>{0, 0, 1000, 0}, 8);
+    const double scale = 128.0 / 1128.0;
+    require(close(tier.count(0, 0), 96 * scale) && close(tier.count(0, 1), 32 * scale) &&
+                close(tier.count(0, 2), 1000 * scale),
+            "a long prompt scales the layer down to the steady sum");
+    require(tier.admission_victim(0, 3, 50, busy).expert == 1, "a prompt keeps the cold order current");
+
+    // A settle swaps every candidate its rule admits, past the round's cap, and decays nothing.
+    ExpertTier wide({8}, {0}, plain(4, 1));
+    for (std::int32_t e = 0; e < 4; ++e) { wide.set(0, e, State::Held); }
+    wide.prompt(0, std::vector<std::uint32_t>{0, 0, 0, 0, 9, 9, 9, 9}, 8);
+    const auto settled = wide.settle();
+    require(settled.size() == 4 && settled[0].in == 4 && settled[0].out == 0,
+            "a settle takes every swap, hottest candidate for the coldest victim first");
+    require(close(wide.count(0, 4), 9), "a settle decays nothing");
+
+    bool refused = false;
+    try {
+        tier.prompt(0, std::vector<std::uint32_t>{1, 2, 3}, 8);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "a prompt of another layer's size is refused");
+    refused = false;
+    try {
+        ExpertTier bad({4}, {0}, {.gain_ratio = 0.5F});
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "a gain ratio below 1 is refused");
 }
 
 // The tier as a plain whole sort states it: held experts coldest first as the pass ended (lower
@@ -144,7 +210,9 @@ struct WholeSortTier {
             if (states[i] != ExpertTier::State::Held) { continue; }
             ++held;
             if (busy[i] != 0) { continue; }
-            if (candidate >= counts[i] + options.min_gain) { return std::int64_t(i); }
+            if (candidate >= options.gain_ratio * counts[i] + options.min_gain) {
+                return std::int64_t(i);
+            }
         }
         return -1;
     }
@@ -177,7 +245,7 @@ struct WholeSortTier {
                         continue;
                     }
                     if (n == out.size()) { break; }
-                    const float gain = counts[in[c]] - counts[out[n]];
+                    const float gain = counts[in[c]] - options.gain_ratio * counts[out[n]];
                     if (gain < options.min_gain) { break; }
                     swaps.emplace_back(in[c], std::int64_t(out[n++]), gain);
                 }
@@ -195,12 +263,13 @@ struct WholeSortTier {
 
 // Thousands of held experts: a pass orders only the coldest few hundred, the scans of a pass may
 // pass all of them, and a round pairs a few hundred candidates with victims. Every victim and
-// every round must be those of the whole sort, many passes in a row, with counts that tie.
-void tier_matches_whole_sort() {
+// every round must be those of the whole sort, many passes in a row, with counts that tie, with
+// and without a gain ratio.
+void tier_matches_whole_sort(float gain_ratio) {
     using State                     = ExpertTier::State;
     constexpr std::uint32_t kLayers = 3, kExperts = 700;
     // Layers 0 and 1 share pool 0 (1,400 entries), layer 2 owns pool 1.
-    const ExpertTierOptions options{.every = 2, .swaps = 96};
+    const ExpertTierOptions options{.every = 2, .swaps = 96, .decay = 0.7F, .min_gain = 1.5F, .gain_ratio = gain_ratio};
     ExpertTier tier(std::vector<std::uint32_t>(kLayers, kExperts), {0, 0, 1}, options);
     WholeSortTier whole;
     whole.options = options;
@@ -451,7 +520,9 @@ int main() {
     try {
         tier_rounds();
         tier_admission();
-        tier_matches_whole_sort();
+        tier_matches_whole_sort(1.0F);
+        tier_matches_whole_sort(1.5F);
+        tier_settle();
         split();
         pool();
         rows();

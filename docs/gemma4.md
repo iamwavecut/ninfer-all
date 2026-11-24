@@ -615,11 +615,13 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   as any other, so a model of mixed formats spends no slot bytes on room its experts lack. A miss
   the GPU copies takes a free slot of its pool, or the slot of the coldest expert of that pool the
   call does not route when its routes beat that expert's, and every four decode passes a round
-  swaps the most routed missing experts in, copied behind the calls. A prompt chunk evicts nothing;
-  it promotes its most routed experts from the bank into free slots by device copies, up to each
-  layer's share of its pool, so a long prompt does not flush decode's working set. A routing profile
-  (`--expert-profile`, else the built-in one of the model family where the build has one) fills the
-  slots at startup. `0` keeps the banks only.
+  swaps the most routed missing experts in, copied behind the calls. A prompt chunk evicts nothing
+  itself: it promotes its most routed experts from the bank into free slots by device copies, up to
+  each layer's share of its pool, and its routes join the tier's counts scaled down to the sum a
+  decode settles to, so the first decode call after it swaps in the experts the prompt calls for
+  and a long prompt does not flush decode's working set. A routing profile (`--expert-profile`,
+  else the built-in one of the model family where the build has one) fills the slots at startup
+  and seeds the counts. `0` keeps the banks only.
 - **CPU share.** Of a decode or verification call's misses that neither the cache nor the layer's
   bank holds, CPU threads compute a share from the stored blocks while the GPU copies and runs the
   rest (`--expert-dma-share`, `auto` by default: the split whose copies and CPU products end

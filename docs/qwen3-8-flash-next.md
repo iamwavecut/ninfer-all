@@ -310,10 +310,10 @@ cache and bounded transfer buffers.
 With host experts the device cache's slots follow the expert tier that every MoE family with host or
 disk experts shares (`core/expert_tier.h`), one pool of slots per layer. Each decode or verification
 call adds one to the count of every (token, expert) pair it routes; every four decode passes a round
-swaps up to 96 of the most routed experts the cache lacks into the slots of the least routed ones it
-holds, best gain first, each only when its count reaches the victim's plus 1.5 (and at least 2),
-then multiplies every count by 0.7. Each pass until the next round starts up to 24 of those swaps (a
-quarter of the limit), best gain first: their victims leave the tables at once, and their
+swaps up to 64 of the most routed experts the cache lacks into the slots of the least routed ones it
+holds, best gain first, each only when its count reaches 1.5 times the victim's plus 2 (and at least
+2), then multiplies every count by 0.95. Each pass until the next round starts up to 16 of those
+swaps (a quarter of the limit), best gain first: their victims leave the tables at once, and their
 candidates' copies run on a side stream beside the draft, ahead of the next verification, whose
 missing experts would otherwise queue on the bus behind a whole round. The candidates' table entries
 move to their slots once the copies have landed. A miss the GPU copies anyway takes a slot at once
@@ -323,8 +323,19 @@ CPU computes moves no expert bytes and enters only through a round. Prompt chunk
 statistics only. A routing profile (`--expert-profile`, else the built-in one of the model family)
 fills the slots at startup and, ranking its counts over every layer, gives each text layer the slots
 its most routed experts take; the MTP block keeps an even share. A run without the MTP block (no
-drafts, DFlash2, perplexity) takes the text layers' counts of a profile recorded with it. Strata
-(MIT) measured this tier and its constants on Qwen3.8-Flash-Next.
+drafts, DFlash2, perplexity) takes the text layers' counts of a profile recorded with it. The slow
+decay and the ratio keep the cache from trading experts whose counts differ by a few routes: against
+the earlier constants (Strata's: up to 96 swaps, decay 0.7, the victim's count plus 1.5), 512-token
+replies after a 2K prompt with host experts decoded 0.9% faster here on an RTX 3060, Flint 4.5%,
+Inkling 2 1.8% and Gemma 4 26B-A4B 0.4% faster on the same card, and Qwen3.6-35B-A3B 14.9% faster
+on an RTX 5090 with a 6 GiB cache, the same texts (November 24, 2026).
+
+The other families' caches (`core/expert_delivery`) also take a prompt's routes: a prompt chunk's
+counts join the tier's, scaled down to the sum the decode's counts settle to (four passes of a
+token's routes over 1 - 0.95), so a long prompt weighs no more than a stretch of decode; the first
+decode call after it swaps in every expert those counts call for, past a round's limit. A routing
+profile seeds the counts at that sum, so the experts it placed keep their slots until the
+conversation's own routes beat them.
 
 With the automatic cache and host experts, the device buffers that prompt chunks copy a layer's
 uncached experts into (`--expert-prefill-buffers`), the stack of a prompt span (40 KiB a span

@@ -1150,6 +1150,7 @@ struct Executor::Impl {
         }
         ExpertDeliveryOptions transport;
         transport.pair_capacity   = options.prefill_chunk * config.top_k_experts;
+        transport.top_k           = config.top_k_experts;
         transport.cache_bytes     = options.expert_cache_bytes;
         transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
@@ -1204,6 +1205,7 @@ struct Executor::Impl {
             }
             ExpertDeliveryOptions peer;
             peer.pair_capacity   = transport.pair_capacity;
+            peer.top_k           = transport.top_k;
             peer.cache_bytes     = options.expert_cache_bytes;
             peer.keep_free_bytes = kGraphReserve;
             peer.disk            = options.expert_disk;
