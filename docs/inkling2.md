@@ -78,9 +78,11 @@ tokenization, the chat template, output parsing and the serving protocols.
 - **Long contexts.** A prompt chunk of a full-attention visit first computes, on tensor cores, its
   rows' attention over the keys at least 1,024 positions (the relative table's extent) before every
   row of a group of 32: F16 queries and probabilities, keys and values as stored (a plane format's
-  chunks decoded to F16), FP32 scores, softmax and sums, two blocks a multiprocessor (one on
-  Turing). A plane's next tile waits in registers as its stored bits and is decoded as it enters
-  shared memory, so its loads overlap the current tile's products. Every visit's prompt chunk then
+  chunks decoded to F16), FP32 scores, softmax and sums. A block holds two groups, one block a
+  multiprocessor: the groups share each tile's loads and decoding, and each computes only the keys
+  of its own far field, so a row's bits do not depend on the other group. A plane's next tile
+  waits in registers as its stored bits and is decoded as it enters shared memory, so its loads
+  overlap the current tile's products. Every visit's prompt chunk then
   reads the nearer keys on tensor cores too (a full visit's rows starting from that state, a
   sliding-window visit's over its window), 32 rows to a block: each query enters the products as an
   F16 value and its remainder times 2^12, and the relative bias comes from products of the rows'
@@ -99,8 +101,9 @@ tokenization, the chat template, output parsing and the serving protocols.
   step computes. Volta, whose tensor-core products are emulated, keeps the SIMT kernels for decode
   rows (about 32 blocks a multiprocessor) and for the near field of prompt chunks. On an RTX 3090 a
   114,754-token prompt prefills at 2.13k tok/s instead of 1.44k with the near field on the SIMT
-  kernel and the far field one block a multiprocessor, and after 114,754 tokens decode runs at 86.1
-  tok/s instead of 68.6 with the SIMT decode kernel ([measurements](#long-contexts)).
+  kernel and the far field one block a multiprocessor, and at 2.30k instead of 2.20k on another RTX
+  3090 with two groups to a far-field block; after 114,754 tokens decode runs at 86.1 tok/s instead
+  of 68.6 with the SIMT decode kernel ([measurements](#long-contexts)).
 - **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens, prefix reuse across turns and requests with host-memory images
   ([below](#prefix-reuse)), branched reads for [typed decisions](serving.md#typed-decisions) and
@@ -500,6 +503,55 @@ multiprocessor); the V100 keeps the SIMT kernels for the near field. The RTX 309
 value above. A 600-token greedy reply (`--max-context 4096`) decoded at 75.2 tok/s with DSpark and
 68.7 without drafts on the Quadro RTX 6000, 85.2 and 67.3 on the V100, and 144.4 and 120.5 on the
 RTX 3090.
+
+The far field at two groups of 32 rows a block, November 24, 2026: release 2026-11-24.2 (master
+6e1937e) against the Native release build of master 03ac425f26 with the change, on rented cards at
+their default power limits, experts on the GPU, the two builds alternating, one run each. The CLI
+(`--greedy --max-new 32`, DSpark) after the 114,754- and 32,070-token prompts above, and on the RTX
+4090 after a 195,073-token prompt; the RTX 4090 ran Unsloth's UD-Q4_K_XL converted by master's
+converter, the other cards the published UD-IQ4_XS artifact. The CLI's prefill rate, in tok/s:
+
+| Card | KV | Prompt tokens | Prefill, before | Prefill |
+|---|---|---:|---:|---:|
+| RTX 4090 (450 W, CUDA 13.4) | `rk8v4` | 195,073 | 4.17k, 4.12k | 4.54k, 4.53k |
+| | `mxfp8` | 195,073 | 4.05k | 4.51k |
+| | `rk4v4` | 195,073 | 4.09k | 4.49k |
+| | `int8` | 114,754 | 5.01k | 5.37k |
+| | `bf16` | 114,754 | 5.04k | 5.23k |
+| | `mxfp8` | 32,070 | 6.52k | 6.68k |
+| | `rk8v4` | 32,070 | 6.56k | 6.70k |
+| RTX 3090 (350 W, CUDA 13.4) | `mxfp8` | 114,754 | 2.20k | 2.30k |
+| | `rk8v4` | 114,754 | 2.21k | 2.30k |
+| | `mxfp8` | 32,070 | 2.97k | 3.03k |
+| RTX 5090 (575 W, CUDA 13.4) | `mxfp8` | 114,754 | 6.86k | 7.13k |
+| | `rk8v4` | 114,754 | 6.89k | 7.11k |
+| | `mxfp8` | 32,070 | 8.86k | 9.00k |
+| A100-SXM4-40GB (400 W, CUDA 13.4) | `mxfp8` | 114,754 | 2.27k | 2.45k |
+| | `rk8v4` | 114,754 | 2.28k | 2.45k |
+| | `mxfp8` | 32,070 | 2.82k | 2.89k |
+| Quadro RTX 6000 (250 W, CUDA 13.4) | `mxfp8` | 114,754 | 1.19k | 1.40k |
+| | `rk8v4` | 114,754 | 1.18k | 1.39k |
+| | `mxfp8` | 32,070 | 1.50k | 1.58k |
+| Tesla V100-SXM2-32GB (300 W, CUDA 12.9) | `mxfp8` | 114,754 | 453 | 533 |
+| | `rk8v4` | 114,754 | 467 | 532 |
+| | `mxfp8` | 32,070 | 1.02k | 1.11k |
+
+Both builds wrote the same text after every prompt, and each card's mean NLL over the first 200,000
+bytes of WikiText `00.txt` (49,478 tokens, 16,384-token windows at an 8,192-token stride) and over
+one 110,592-token window of the 114,754-token prompt's text is the same with both. `ninfer-perplexity`
+scored them at these rates, in tok/s:
+
+| Card | 16,384-token windows, before | 16,384-token windows | 110,592-token window, before | 110,592-token window |
+|---|---:|---:|---:|---:|
+| RTX 4090 (UD-Q4_K_XL) | 1,608.7 | 1,615.6 | 2,049.0 | 2,079.0 |
+| RTX 3090 | 791.5 | 793.8 | 1,124.6 | 1,137.8 |
+| RTX 5090 | 2,079.7 | 2,087.9 | 2,553.6 | 2,612.7 |
+| A100-SXM4-40GB | 779.0 | 789.1 | 1,095.9 | 1,177.8 |
+| Quadro RTX 6000 | 447.8 | 448.9 | 737.4 | 744.9 |
+| Tesla V100-SXM2-32GB | 348.6 | 346.0 | V100LONGM | V100LONGF |
+
+Other tenants' jobs loaded the RTX 3090's host (load average 58 at the start) and the V100's (3 to
+70). The RTX 4090's prompts ran with each KV format the family stores.
 
 ### The mainline drafter
 
