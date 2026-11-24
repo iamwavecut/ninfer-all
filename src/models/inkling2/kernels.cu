@@ -2824,8 +2824,8 @@ __global__ void silu_mul_kernel(const float* gu, int width, std::int64_t n, __nv
     out[at]       = __float2bfloat16(g / (1.0f + expf(-g)) * u);
 }
 
-constexpr int kSparkRank     = 256;
-constexpr int kSparkPartials = 256;
+constexpr int kSparkRank        = 256;
+constexpr int kSparkPickThreads = 256;
 
 // Block of eight warps, warp w output 8 blockIdx.x + w of the joint projection; the block's input
 // vector in shared memory.
@@ -2864,7 +2864,7 @@ __global__ void __launch_bounds__(256) spark_joint_kernel(SparkStepArgs a) {
     if (lane == 0) { a.joint[o] = sum + a.bias[o]; }
 }
 
-// Block of eight warps, warp w vocabulary row 8 blockIdx.x + w: its soft-capped logit.
+// Block of eight warps, warp w candidate 8 blockIdx.x + w of the step's row: its soft-capped logit.
 __global__ void __launch_bounds__(256) spark_logits_kernel(SparkStepArgs a) {
     ninfer::pdl::arch_enter_glue();
     __shared__ float latent[kSparkRank];
@@ -2873,8 +2873,9 @@ __global__ void __launch_bounds__(256) spark_logits_kernel(SparkStepArgs a) {
     }
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const std::int64_t v = std::int64_t(blockIdx.x) * 8 + warp;
-    if (v >= a.vocab) { return; }
+    const int o            = int(blockIdx.x) * 8 + warp;
+    const std::int64_t at  = std::int64_t(a.row - 1) * kSparkCandidates + o;
+    const std::int64_t v   = a.candidate_ids[at];
     const uint4 word = reinterpret_cast<const uint4*>(a.m + v * kSparkRank)[lane];
     const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&word);
     float dot = 0.0f;
@@ -2885,8 +2886,8 @@ __global__ void __launch_bounds__(256) spark_logits_kernel(SparkStepArgs a) {
     }
     dot = warp_sum(dot);
     if (lane == 0) {
-        const float logit = a.base[std::int64_t(a.row) * a.vocab_stride + v] + a.c[v] + dot;
-        a.logits[v]       = a.cap * tanhf(logit * (1.0f / a.cap));
+        const float logit = a.candidate_values[at] + a.c[v] + dot;
+        a.logits[o]       = a.cap * tanhf(logit * (1.0f / a.cap));
     }
 }
 
@@ -2936,46 +2937,216 @@ __device__ Pick block_pick(Pick p) {
     return all;
 }
 
-__global__ void __launch_bounds__(256) spark_pick_partials_kernel(SparkStepArgs a) {
+// One block: the first maximum of the step's candidate logits (the lowest id among equal ones),
+// its probability over the candidates, then the state update.
+__global__ void __launch_bounds__(kSparkPickThreads) spark_pick_kernel(SparkStepArgs a) {
     ninfer::pdl::arch_enter_glue();
-    const int per = (a.vocab + kSparkPartials - 1) / kSparkPartials;
-    const int lo = blockIdx.x * per, hi = min(a.vocab, lo + per);
+    const std::int32_t* ids = a.candidate_ids + std::int64_t(a.row - 1) * kSparkCandidates;
     Pick p;
-    for (int v = lo + threadIdx.x; v < hi; v += blockDim.x) {
-        const float x = a.logits[v];
-        if (x > p.top) {
-            p.sum   = p.sum * expf(p.top - x) + 1.0f;
-            p.top   = x;
-            p.index = v;
-        } else {
-            p.sum += expf(x - p.top);
-        }
+    for (int o = threadIdx.x; o < kSparkCandidates; o += blockDim.x) {
+        Pick one;
+        one.top   = a.logits[o];
+        one.index = ids[o];
+        one.sum   = 1.0f;
+        p         = merge_pick(p, one);
     }
     p = block_pick(p);
     if (threadIdx.x == 0) {
-        a.partials[3 * blockIdx.x]     = p.top;
-        a.partials[3 * blockIdx.x + 1] = __int_as_float(p.index);
-        a.partials[3 * blockIdx.x + 2] = p.sum;
-    }
-}
-
-__global__ void __launch_bounds__(kSparkPartials) spark_pick_final_kernel(SparkStepArgs a) {
-    ninfer::pdl::arch_enter_glue();
-    Pick p;
-    const int b = threadIdx.x;
-    p.top   = a.partials[3 * b];
-    p.index = __float_as_int(a.partials[3 * b + 1]);
-    p.sum   = a.partials[3 * b + 2];
-    p       = block_pick(p);
-    if (threadIdx.x == 0) {
-        *a.prev                   = p.index;
-        a.drafts[a.row - 1]       = p.index;
-        a.confidence[a.row - 1]   = 1.0f / p.sum;
+        *a.prev                 = p.index;
+        a.drafts[a.row - 1]     = p.index;
+        a.confidence[a.row - 1] = 1.0f / p.sum;
     }
     for (int r = threadIdx.x; r < kSparkRank; r += blockDim.x) {
         const float gate      = sigmoidf(a.joint[r]);
         const float candidate = tanhf(a.joint[kSparkRank + r]);
         a.state[r]            = candidate + gate * (a.state[r] - candidate);
+    }
+}
+
+// spark_candidates: a two-level 8-bit radix select over the top 16 bits of each value's order key
+// (its BF16 truncation), each row split into kCandidateSlices slices of one block each.
+constexpr int kCandidateSlices  = 32;
+constexpr int kCandidateThreads = 256;
+
+struct CandidateRow {
+    unsigned high[256];          // elements by the key's high byte
+    unsigned low[256];           // elements of the selected high byte by the key's low byte
+    int above[kCandidateSlices]; // per slice: elements whose key exceeds the need-th largest key
+    int ties[kCandidateSlices];  // per slice: elements whose key equals it
+};
+
+__device__ __forceinline__ unsigned candidate_key(float v) {
+    const unsigned u = __float_as_uint(v);
+    return (u ^ ((u & 0x80000000u) != 0 ? 0xFFFFFFFFu : 0x80000000u)) >> 16;
+}
+
+__device__ __forceinline__ void slice_bounds(int vocab, int& lo, int& hi) {
+    const int per = (vocab + kCandidateSlices - 1) / kCandidateSlices;
+    lo = min(vocab, int(blockIdx.x) * per);
+    hi = min(vocab, lo + per);
+}
+
+// Of `bins` (256 counts), the bin holding the need-th largest element counting from the top bin, and
+// the elements in the bins above it. Every thread of the block (kCandidateThreads) gets both.
+__device__ void select_bin(const unsigned* bins, int need, int& bin, int& above) {
+    __shared__ unsigned warp_total[kCandidateThreads / 32];
+    __shared__ int chosen[2];
+    const int t = int(threadIdx.x), lane = t & 31, warp = t >> 5;
+    const unsigned count = bins[255 - t];
+    unsigned x = count;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const unsigned y = __shfl_up_sync(0xFFFFFFFFu, x, o);
+        if (lane >= o) { x += y; }
+    }
+    if (lane == 31) { warp_total[warp] = x; }
+    __syncthreads();
+    unsigned before = 0;
+    for (int w = 0; w < warp; ++w) { before += warp_total[w]; }
+    const unsigned inclusive = before + x, exclusive = inclusive - count;
+    if (exclusive < unsigned(need) && unsigned(need) <= inclusive) {
+        chosen[0] = 255 - t;
+        chosen[1] = int(exclusive);
+    }
+    __syncthreads();
+    bin   = chosen[0];
+    above = chosen[1];
+    __syncthreads();
+}
+
+// The 16-bit key of a row's need-th largest element and how many elements equal to it the
+// candidates take, from both levels' counts.
+__device__ void candidate_threshold(const CandidateRow& w, int need, unsigned& key, int& ties) {
+    int high = 0, above_high = 0, low = 0, above_low = 0;
+    select_bin(w.high, need, high, above_high);
+    select_bin(w.low, need - above_high, low, above_low);
+    key  = (unsigned(high) << 8) | unsigned(low);
+    ties = need - above_high - above_low;
+}
+
+__global__ void __launch_bounds__(kCandidateThreads)
+    candidates_high_kernel(const float* base, std::int64_t stride, int vocab, CandidateRow* rows) {
+    ninfer::pdl::arch_enter_glue();
+    __shared__ unsigned bins[256];
+    bins[threadIdx.x] = 0;
+    __syncthreads();
+    const float* x = base + std::int64_t(blockIdx.y) * stride;
+    int lo = 0, hi = 0;
+    slice_bounds(vocab, lo, hi);
+    for (int v = lo + int(threadIdx.x); v < hi; v += kCandidateThreads) {
+        atomicAdd(&bins[candidate_key(x[v]) >> 8], 1u);
+    }
+    __syncthreads();
+    if (bins[threadIdx.x] != 0) { atomicAdd(&rows[blockIdx.y].high[threadIdx.x], bins[threadIdx.x]); }
+}
+
+__global__ void __launch_bounds__(kCandidateThreads)
+    candidates_low_kernel(const float* base, std::int64_t stride, int vocab, int need, CandidateRow* rows) {
+    ninfer::pdl::arch_enter_glue();
+    __shared__ unsigned bins[256];
+    bins[threadIdx.x] = 0;
+    CandidateRow& w = rows[blockIdx.y];
+    int high = 0, above = 0;
+    select_bin(w.high, need, high, above);
+    const float* x = base + std::int64_t(blockIdx.y) * stride;
+    int lo = 0, hi = 0;
+    slice_bounds(vocab, lo, hi);
+    for (int v = lo + int(threadIdx.x); v < hi; v += kCandidateThreads) {
+        const unsigned key = candidate_key(x[v]);
+        if (int(key >> 8) == high) { atomicAdd(&bins[key & 255u], 1u); }
+    }
+    __syncthreads();
+    if (bins[threadIdx.x] != 0) { atomicAdd(&w.low[threadIdx.x], bins[threadIdx.x]); }
+}
+
+__global__ void __launch_bounds__(kCandidateThreads)
+    candidates_count_kernel(const float* base, std::int64_t stride, int vocab, int need, CandidateRow* rows) {
+    ninfer::pdl::arch_enter_glue();
+    __shared__ int totals[2];
+    CandidateRow& w = rows[blockIdx.y];
+    unsigned threshold = 0;
+    int ties = 0;
+    candidate_threshold(w, need, threshold, ties);
+    if (threadIdx.x < 2) { totals[threadIdx.x] = 0; }
+    __syncthreads();
+    const float* x = base + std::int64_t(blockIdx.y) * stride;
+    int lo = 0, hi = 0;
+    slice_bounds(vocab, lo, hi);
+    int up = 0, equal = 0;
+    for (int v = lo + int(threadIdx.x); v < hi; v += kCandidateThreads) {
+        const unsigned key = candidate_key(x[v]);
+        up += key > threshold ? 1 : 0;
+        equal += key == threshold ? 1 : 0;
+    }
+    atomicAdd(&totals[0], up);
+    atomicAdd(&totals[1], equal);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        w.above[blockIdx.x] = totals[0];
+        w.ties[blockIdx.x]  = totals[1];
+    }
+}
+
+// Each slice writes its elements above the threshold, then its share of the ties (the lowest ids
+// first), in id order, after the slices before it.
+__global__ void __launch_bounds__(kCandidateThreads)
+    candidates_write_kernel(const float* base, std::int64_t stride, int vocab, int need,
+                            CandidateRow* rows, std::int32_t* ids, float* values) {
+    ninfer::pdl::arch_enter_glue();
+    __shared__ int warp_counts[2][kCandidateThreads / 32];
+    CandidateRow& w = rows[blockIdx.y];
+    unsigned threshold = 0;
+    int allowed = 0;
+    candidate_threshold(w, need, threshold, allowed);
+    int above_before = 0, ties_before = 0, above_all = 0;
+    for (int s = 0; s < kCandidateSlices; ++s) {
+        above_all += w.above[s];
+        if (s < int(blockIdx.x)) {
+            above_before += w.above[s];
+            ties_before += w.ties[s];
+        }
+    }
+    const float* x      = base + std::int64_t(blockIdx.y) * stride;
+    std::int32_t* out_i = ids + std::int64_t(blockIdx.y) * need;
+    float* out_v        = values + std::int64_t(blockIdx.y) * need;
+    const int lane = int(threadIdx.x) & 31, warp = int(threadIdx.x) >> 5;
+    int lo = 0, hi = 0;
+    slice_bounds(vocab, lo, hi);
+    for (int start = lo; start < hi; start += kCandidateThreads) {
+        const int v        = start + int(threadIdx.x);
+        const float value  = v < hi ? x[v] : 0.0f;
+        const unsigned key = v < hi ? candidate_key(value) : 0u;
+        const bool up  = v < hi && key > threshold;
+        const bool tie = v < hi && key == threshold;
+        const unsigned up_mask  = __ballot_sync(0xFFFFFFFFu, up);
+        const unsigned tie_mask = __ballot_sync(0xFFFFFFFFu, tie);
+        if (lane == 0) {
+            warp_counts[0][warp] = __popc(up_mask);
+            warp_counts[1][warp] = __popc(tie_mask);
+        }
+        __syncthreads();
+        int up_at = above_before, tie_at = ties_before, up_tile = 0, tie_tile = 0;
+        for (int i = 0; i < kCandidateThreads / 32; ++i) {
+            if (i < warp) {
+                up_at += warp_counts[0][i];
+                tie_at += warp_counts[1][i];
+            }
+            up_tile += warp_counts[0][i];
+            tie_tile += warp_counts[1][i];
+        }
+        const unsigned below = (1u << lane) - 1u;
+        up_at += __popc(up_mask & below);
+        tie_at += __popc(tie_mask & below);
+        if (up) {
+            out_i[up_at] = v;
+            out_v[up_at] = value;
+        } else if (tie && tie_at < allowed) {
+            out_i[above_all + tie_at] = v;
+            out_v[above_all + tie_at] = value;
+        }
+        above_before += up_tile;
+        ties_before += tie_tile;
+        __syncthreads();
     }
 }
 
@@ -3438,24 +3609,48 @@ void silu_mul(const float* gu, int width, int rows, __nv_bfloat16* out, cudaStre
     check_launch("silu_mul");
 }
 
-std::size_t spark_step_floats(int vocab) {
-    return std::size_t(3 * kSparkRank) + std::size_t(vocab) + 3 * kSparkPartials;
+std::size_t spark_step_floats() { return std::size_t(3 * kSparkRank) + kSparkCandidates; }
+
+std::size_t spark_candidates_bytes(int rows) {
+    return std::size_t(std::max(rows, 0)) * sizeof(CandidateRow);
+}
+
+void spark_candidates(const float* base, std::int64_t stride, int vocab, int rows,
+                      std::int32_t* ids, float* values, void* workspace, cudaStream_t stream) {
+    constexpr int count = kSparkCandidates;
+    if (rows < 1 || vocab < count || stride < vocab || workspace == nullptr) {
+        throw std::invalid_argument("inkling2 spark_candidates: invalid rows, vocabulary or workspace");
+    }
+    auto* w = static_cast<CandidateRow*>(workspace);
+    CUDA_CHECK(cudaMemsetAsync(w, 0, spark_candidates_bytes(rows), stream));
+    const dim3 grid(kCandidateSlices, unsigned(rows));
+    ninfer::pdl::launch_arch(grid, kCandidateThreads, 0, stream, candidates_high_kernel, base, stride,
+                             vocab, w);
+    check_launch("spark_candidates high");
+    ninfer::pdl::launch_arch(grid, kCandidateThreads, 0, stream, candidates_low_kernel, base, stride,
+                             vocab, count, w);
+    check_launch("spark_candidates low");
+    ninfer::pdl::launch_arch(grid, kCandidateThreads, 0, stream, candidates_count_kernel, base,
+                             stride, vocab, count, w);
+    check_launch("spark_candidates count");
+    ninfer::pdl::launch_arch(grid, kCandidateThreads, 0, stream, candidates_write_kernel, base,
+                             stride, vocab, count, w, ids, values);
+    check_launch("spark_candidates write");
 }
 
 void spark_step(const SparkStepArgs& a, cudaStream_t stream) {
-    if (a.row < 1 || a.vocab <= 0 || a.hidden_size % 4 != 0 || a.cap <= 0.0f) {
+    if (a.row < 1 || a.hidden_size % 4 != 0 || a.cap <= 0.0f || a.candidate_ids == nullptr ||
+        a.candidate_values == nullptr) {
         throw std::invalid_argument("inkling2 spark_step: invalid step");
     }
     const int k = 2 * kSparkRank + 2 * a.hidden_size;
     ninfer::pdl::launch_arch(3 * kSparkRank / 8, 256, std::size_t(k) * 4, stream,
                              spark_joint_kernel, a);
     check_launch("spark_joint");
-    ninfer::pdl::launch_arch(blocks_for(a.vocab, 8), 256, 0, stream, spark_logits_kernel, a);
+    ninfer::pdl::launch_arch(kSparkCandidates / 8, 256, 0, stream, spark_logits_kernel, a);
     check_launch("spark_logits");
-    ninfer::pdl::launch_arch(kSparkPartials, 256, 0, stream, spark_pick_partials_kernel, a);
+    ninfer::pdl::launch_arch(1, kSparkPickThreads, 0, stream, spark_pick_kernel, a);
     check_launch("spark_pick");
-    ninfer::pdl::launch_arch(1, kSparkPartials, 0, stream, spark_pick_final_kernel, a);
-    check_launch("spark_pick_final");
 }
 
 void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,

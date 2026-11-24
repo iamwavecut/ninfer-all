@@ -9,9 +9,12 @@
 //  - spark_rotate: per-head RMS norm and NeoX rotation of queries in place and of keys into F16
 //    caches with the values beside them (window ring and full cache), at positions up to 2^20 - 1
 //    (the angle formed in FP64).
+//  - spark_candidates exactly: each row's 16,384 largest head products by their BF16 truncation,
+//    the lowest ids of those equal to the 16,384th, over uneven slices and with ties across the
+//    boundary.
 //  - spark_step: the recurrent head's joint projection, the soft-capped logits over the head's
-//    table, the first maximum (an exact tie included), its probability and the state update, three
-//    steps chained; silu_mul and add_rows.
+//    table for the row's candidates, the first maximum (an exact tie included), its probability
+//    over the candidates and the state update, three steps chained; silu_mul and add_rows.
 // BF16 and F16 outputs are compared by RMS error relative to the oracle's.
 
 #include "core/device_buffer.h"
@@ -25,6 +28,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <functional>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -425,6 +430,69 @@ void rotate_case(std::mt19937& rng) {
 
 // ---- The recurrent head -------------------------------------------------------------------------
 
+std::uint32_t candidate_key(float v) {
+    std::uint32_t u = 0;
+    std::memcpy(&u, &v, 4);
+    return (u ^ ((u & 0x80000000u) != 0 ? 0xFFFFFFFFu : 0x80000000u)) >> 16;
+}
+
+// A row's candidates as spark_candidates orders them: the ids whose key exceeds the
+// kSparkCandidates-th largest key ascending, then the lowest ids of those equal to it ascending.
+std::vector<std::int32_t> candidates_of(const float* row, int vocab) {
+    std::vector<std::uint32_t> keys(vocab);
+    for (int v = 0; v < vocab; ++v) { keys[v] = candidate_key(row[v]); }
+    std::vector<std::uint32_t> sorted = keys;
+    std::nth_element(sorted.begin(), sorted.begin() + (k::kSparkCandidates - 1), sorted.end(),
+                     std::greater<>());
+    const std::uint32_t threshold = sorted[k::kSparkCandidates - 1];
+    std::vector<std::int32_t> out, ties;
+    for (int v = 0; v < vocab; ++v) {
+        if (keys[v] > threshold) { out.push_back(v); }
+        if (keys[v] == threshold) { ties.push_back(v); }
+    }
+    for (std::size_t i = 0; out.size() < std::size_t(k::kSparkCandidates); ++i) { out.push_back(ties[i]); }
+    return out;
+}
+
+void candidates_case(const std::string& name, int vocab, int rows, bool boundary_ties, std::mt19937& rng) {
+    const std::int64_t stride = vocab + 13;
+    auto base = normal(std::size_t(rows) * stride, 3.0f, rng);
+    if (boundary_ties) {
+        // kSparkCandidates - 124 ids above every other value, then 300 equal by their BF16
+        // truncation (half 8.0, half 8.0 plus less than its BF16 step) for the remaining 124 places.
+        std::vector<int> ids(vocab);
+        for (int v = 0; v < vocab; ++v) { ids[v] = v; }
+        for (int r = 0; r < rows; ++r) {
+            std::shuffle(ids.begin(), ids.end(), rng);
+            float* row = base.data() + std::size_t(r) * stride;
+            for (int v = 0; v < vocab; ++v) { row[v] = std::min(row[v], 6.0f); }
+            const int above = k::kSparkCandidates - 124;
+            for (int i = 0; i < above; ++i) { row[ids[i]] = 10.0f + 0.0001f * float(i % 1000); }
+            for (int i = above; i < above + 300; ++i) { row[ids[i]] = i % 2 == 0 ? 8.0f : 8.00001f; }
+        }
+    }
+    DeviceBuffer dbase = upload(base), ids(std::size_t(rows) * k::kSparkCandidates * 4),
+                 values(std::size_t(rows) * k::kSparkCandidates * 4),
+                 work(k::spark_candidates_bytes(rows));
+    k::spark_candidates(as<float>(dbase), stride, vocab, rows, as<std::int32_t>(ids), as<float>(values),
+                        work.p, nullptr);
+    sync("spark_candidates");
+    const auto gi = download<std::int32_t>(ids, std::size_t(rows) * k::kSparkCandidates);
+    const auto gv = download<float>(values, std::size_t(rows) * k::kSparkCandidates);
+    std::size_t wrong = 0;
+    for (int r = 0; r < rows; ++r) {
+        const float* row = base.data() + std::size_t(r) * stride;
+        const auto want  = candidates_of(row, vocab);
+        for (int o = 0; o < k::kSparkCandidates; ++o) {
+            const std::size_t at = std::size_t(r) * k::kSparkCandidates + o;
+            wrong += gi[at] != want[o] || gv[at] != row[want[o]];
+        }
+    }
+    report(wrong == 0, "spark_candidates " + name + ": " + std::to_string(wrong) + " of " +
+                           std::to_string(rows * k::kSparkCandidates) + " candidates differ");
+}
+
+
 void step_case(const std::string& name, int vocab, bool tie, std::mt19937& rng) {
     const int k_ = 2 * kRank + 2 * kHidden, steps = 3;
     const auto weight = normal(std::size_t(3 * kRank) * k_, 0.02f, rng);
@@ -453,8 +521,13 @@ void step_case(const std::string& name, int vocab, bool tie, std::mt19937& rng) 
                  dc = upload(c), dbase = upload(base), dh = upload(hidden), dr = upload(ring),
                  dp = upload(positions), ds = upload(seqs),
                  state(kRank * 4), prev = upload(std::vector<std::int32_t>{anchor}),
-                 drafts(kBlock * 4), conf(kBlock * 4), scratch(k::spark_step_floats(vocab) * 4);
+                 drafts(kBlock * 4), conf(kBlock * 4), scratch(k::spark_step_floats() * 4),
+                 cand_ids(std::size_t(steps) * k::kSparkCandidates * 4),
+                 cand_values(std::size_t(steps) * k::kSparkCandidates * 4),
+                 cand_work(k::spark_candidates_bytes(steps));
     state.fill(0);
+    k::spark_candidates(as<float>(dbase) + vocab, vocab, vocab, steps, as<std::int32_t>(cand_ids),
+                        as<float>(cand_values), cand_work.p, nullptr);
     k::SparkStepArgs a;
     a.weight       = as<float>(dw);
     a.bias         = as<float>(db);
@@ -465,11 +538,10 @@ void step_case(const std::string& name, int vocab, bool tie, std::mt19937& rng) 
     a.slots        = kSlots;
     a.positions    = as<std::int32_t>(dp);
     a.sequences    = as<std::int32_t>(ds);
-    a.base         = as<float>(dbase);
-    a.vocab_stride = vocab;
+    a.candidate_ids    = as<std::int32_t>(cand_ids);
+    a.candidate_values = as<float>(cand_values);
     a.m            = as<bf16>(dt);
     a.c            = as<float>(dc);
-    a.vocab        = vocab;
     a.hidden_size  = kHidden;
     a.cap          = kCap;
     a.state        = as<float>(state);
@@ -478,7 +550,6 @@ void step_case(const std::string& name, int vocab, bool tie, std::mt19937& rng) 
     a.confidence   = as<float>(conf);
     a.joint        = as<float>(scratch);
     a.logits       = a.joint + 3 * kRank;
-    a.partials     = a.logits + vocab;
     for (int row = 1; row <= steps; ++row) {
         a.row = row;
         k::spark_step(a, nullptr);
@@ -508,22 +579,19 @@ void step_case(const std::string& name, int vocab, bool tie, std::mt19937& rng) 
             for (int i = 0; i < k_; ++i) { sum += double(weight[std::size_t(o) * k_ + i]) * x[i]; }
             j[o] = sum;
         }
-        std::vector<double> logits(vocab);
-        double top = -INFINITY, second = -INFINITY;
+        std::vector<double> logits(vocab, -INFINITY);
+        double top = -INFINITY;
         int best = 0;
-        for (int v = 0; v < vocab; ++v) {
+        for (const std::int32_t v : candidates_of(base.data() + std::size_t(row) * vocab, vocab)) {
             double d = 0;
             for (int r = 0; r < kRank; ++r) {
                 d += double(__bfloat162float(table[std::size_t(v) * kRank + r])) * std::tanh(j[2 * kRank + r]);
             }
             const double l = kCap * std::tanh((base[std::size_t(row) * vocab + v] + c[v] + d) / kCap);
             logits[v] = l;
-            if (l > top) {
-                second = top;
-                top    = l;
-                best   = v;
-            } else if (l > second) {
-                second = l;
+            if (l > top || (l == top && v < best)) {
+                top  = l;
+                best = v;
             }
         }
         double sum = 0;
@@ -600,8 +668,11 @@ int main() {
         mix_case("decode rows, q8_1", 5, true, 5, 0, false, rng);
         mix_case("prompt rows, bf16", 40, false, 37, 9, true, rng);
         rotate_case(rng);
-        step_case("vocabulary of 5000", 5000, false, rng);
-        step_case("an exact tie", 1000, true, rng);
+        candidates_case("vocabulary of 201,088, 7 rows", 201088, 7, false, rng);
+        candidates_case("ties across the last candidate, 3 rows", 50001, 3, true, rng);
+        candidates_case("every product a candidate", k::kSparkCandidates, 1, false, rng);
+        step_case("vocabulary of 20,000", 20000, false, rng);
+        step_case("an exact tie", 17000, true, rng);
         elementwise_case(rng);
     } catch (const std::exception& e) {
         std::cout << "FAIL " << e.what() << '\n';

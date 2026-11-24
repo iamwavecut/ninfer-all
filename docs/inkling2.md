@@ -128,17 +128,21 @@ tokenization, the chat template, output parsing and the serving protocols.
   `--spec dspark`) proposes a block of up to 7 drafts from the target's tapped hidden states: three
   non-causal blocks over the anchor and mask rows, then a recurrent Markov head of rank 256 that
   corrects the target head's logits draft by draft through an output table that llama.cpp's
-  converter folded with the release's BF16 head. Without `--spec`, an artifact that carries the
-  drafter drafts with it while the Engine serves one request at a time: 3 drafts a round, the
-  round's width adapting from 1 to 3 by how far the drafts survive and how long the rounds take
-  (`--adaptive-mtp`), each proposal ending after its first draft at or below probability 0.5
-  (`--draft-min-p`); the request decodes plainly while its timed rounds commit tokens slower than
-  plain steps do, trying the other mode every 64 steps ([Adaptive MTP](serving.md#adaptive-mtp)).
-  The target keeps a draft only while it equals the token it draws itself, so
-  the output is plain decoding's. Context lookup (`--lookup-ngram`, 1 to 7 drafts, 3 by default)
-  also drafts, and so does a [DSpine](maintainer/dspine.md) drafter trained for this model
-  (`--spec dspine --draft-model PATH`; none is published), which taps the visits' states; with a
-  random drafter of this geometry the text equals plain decoding's, greedy and sampled.
+  converter folded with the release's BF16 head. The head scores only each row's 16,384 candidates,
+  its largest head logits by their BF16 truncation (the lowest ids among those equal to the
+  16,384th), as vLLM's top-k Markov sampling does when a drafter's config asks for it; a draft is
+  the best candidate and its probability is taken over the candidates. Without `--spec`, an artifact
+  that carries the drafter drafts with it while the Engine serves one request at a time: 3 drafts a
+  round, the round's width adapting from 1 to 3 by how far the drafts survive and how long the
+  rounds take (`--adaptive-mtp`), each proposal ending after its first draft at or below probability
+  0.5 (`--draft-min-p`); the request decodes plainly while its timed rounds commit tokens slower
+  than plain steps do, trying the other mode every 64 steps
+  ([Adaptive MTP](serving.md#adaptive-mtp)). The target keeps a draft only while it equals the token
+  it draws itself, so the output is plain decoding's. Context lookup (`--lookup-ngram`, 1 to 7
+  drafts, 3 by default) also drafts, and so does a [DSpine](maintainer/dspine.md) drafter trained
+  for this model (`--spec dspine --draft-model PATH`; none is published), which taps the visits'
+  states; with a random drafter of this geometry the text equals plain decoding's, greedy and
+  sampled.
 - **Images.** The release's vision tower (the artifact's `vision` component, `--vision`): a ViT
   with a class row, learned position rows resized to each image and 2D-rotated heads, then 2 x 2
   patch merging and a two-layer projector, up to 4,096 positions an image (fewer with

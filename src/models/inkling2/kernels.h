@@ -446,13 +446,25 @@ void add_rows(float* h, const float* y, std::int64_t y_stride, int hidden, int r
 // out[t][c] = bf16(silu(gu[t][c]) * gu[t][width + c]) for FP32 [gate; up] rows (2 width each).
 void silu_mul(const float* gu, int width, int rows, __nv_bfloat16* out, cudaStream_t stream);
 
+// The candidates a draft row's recurrent head scores: the 16,384 largest of each row's head products
+// by their BF16 truncation (the top 16 bits of the FP32 order), of the products equal to the 16,384th
+// the lowest ids; spark_step picks drafts only among them. Rows `stride` floats apart from `base`,
+// `vocab` products each; ids and values [rows][16,384], the ids above the 16,384th product in id order,
+// then the taken ties in id order. `workspace` holds spark_candidates_bytes(rows).
+inline constexpr int kSparkCandidates = 16384;
+[[nodiscard]] std::size_t spark_candidates_bytes(int rows);
+void spark_candidates(const float* base, std::int64_t stride, int vocab, int rows,
+                      std::int32_t* ids, float* values, void* workspace, cudaStream_t stream);
+
 // One step of the recurrent head (rank 256) over draft row `row` of a block:
 //   joint  = W [state; embed[prev]; hidden[row]; context] + bias     (W FP32 [768][512 + 2 hidden])
-//   logits = cap tanh((base[row] + c + M tanh(joint[512:768])) / cap)    over `vocab`
-//   prev   = the first maximum; confidence[row - 1] = its probability; drafts[row - 1] = prev
+//   logits = cap tanh((base[row][v] + c[v] + M[v] tanh(joint[512:768])) / cap)
+//            over the row's candidates v (spark_candidates of the block's rows 1..)
+//   prev   = the first maximum (the lowest id among equal logits); confidence[row - 1] = its
+//            probability over the candidates; drafts[row - 1] = prev
 //   state  = tanh(joint[256:512]) + sigmoid(joint[0:256]) (state - tanh(joint[256:512]))
 // The context is the ring row of the position before the block's first (rows.positions[0] - 1) of
-// rows.sequences[0]. `joint`, `logits` and `partials` are scratch (spark_step_floats).
+// rows.sequences[0]. `joint` and `logits` are scratch (spark_step_floats).
 struct SparkStepArgs {
     const float* weight = nullptr;
     const float* bias   = nullptr;
@@ -463,11 +475,12 @@ struct SparkStepArgs {
     int slots = 0;
     const std::int32_t* positions = nullptr;
     const std::int32_t* sequences = nullptr;
-    const float* base = nullptr; // [block][vocab_stride] FP32 head products of `hidden`
-    std::int64_t vocab_stride = 0;
+    // [rows - 1][kSparkCandidates]: spark_candidates of the block's rows 1.. (row r at r - 1)
+    const std::int32_t* candidate_ids = nullptr;
+    const float* candidate_values     = nullptr;
     const __nv_bfloat16* m = nullptr; // [vocab][256], the head's output with the head folded in
     const float* c = nullptr;         // [vocab], its bias
-    int vocab = 0, hidden_size = 0, row = 0;
+    int hidden_size = 0, row = 0;
     float cap = 30.0f;
     float* state = nullptr;          // [256]
     std::int32_t* prev = nullptr;    // [1]
@@ -475,9 +488,8 @@ struct SparkStepArgs {
     float* confidence = nullptr;     // [block - 1]
     float* joint = nullptr;
     float* logits = nullptr;
-    float* partials = nullptr;
 };
-[[nodiscard]] std::size_t spark_step_floats(int vocab);
+[[nodiscard]] std::size_t spark_step_floats();
 void spark_step(const SparkStepArgs& args, cudaStream_t stream);
 
 // sums[i] += products[i] for i < n when *flag is nonzero: the 2^-32 fixed-point sums of the
