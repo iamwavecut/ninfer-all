@@ -1143,8 +1143,17 @@ struct Executor::Impl {
                               head_in.rows);
             vector_f32(head_in.base, head, k, base + vocab, vocab);
         }
+        // Each step's candidates: the kSparkCandidates largest head products of its row.
+        constexpr int count = kernels::kSparkCandidates;
+        auto* candidate_ids = static_cast<std::int32_t*>(
+            workspace->alloc_bytes(std::size_t(k) * count * 4).data);
+        auto* candidate_values = static_cast<float*>(
+            workspace->alloc_bytes(std::size_t(k) * count * 4).data);
+        kernels::spark_candidates(base + vocab, vocab, vocab, k, candidate_ids, candidate_values,
+                                  workspace->alloc_bytes(kernels::spark_candidates_bytes(k)).data,
+                                  stream);
         auto* scratch = static_cast<float*>(
-            workspace->alloc_bytes(kernels::spark_step_floats(vocab) * 4).data);
+            workspace->alloc_bytes(kernels::spark_step_floats() * 4).data);
         CUDA_CHECK(cudaMemsetAsync(d.state.p, 0, d.state.bytes, stream));
         CUDA_CHECK(cudaMemcpyAsync(d.prev.p, d_tokens.p, 4, cudaMemcpyDeviceToDevice, stream));
         kernels::SparkStepArgs sa;
@@ -1157,11 +1166,10 @@ struct Executor::Impl {
         sa.slots        = kR;
         sa.positions    = rows.positions;
         sa.sequences    = rows.sequences;
-        sa.base         = base;
-        sa.vocab_stride = vocab;
+        sa.candidate_ids    = candidate_ids;
+        sa.candidate_values = candidate_values;
         sa.m            = d.markov_out;
         sa.c            = d.markov_out_bias;
-        sa.vocab        = vocab;
         sa.hidden_size  = hidden;
         sa.cap          = config.logit_softcap;
         sa.state        = static_cast<float*>(d.state.p);
@@ -1170,7 +1178,6 @@ struct Executor::Impl {
         sa.confidence   = static_cast<float*>(d.confidence.p);
         sa.joint        = scratch;
         sa.logits       = scratch + 3 * dc.markov_rank;
-        sa.partials     = sa.logits + vocab;
         for (int i = 1; i <= k; ++i) {
             sa.row = i;
             kernels::spark_step(sa, stream);
