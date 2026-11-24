@@ -22,7 +22,8 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
                                       const SelectorCodebooks& codebooks,
                                       const Tensor& base_positions, const SamplingConfig* configs,
                                       Tensor& drafts, Tensor& proposal_q, float* confidence,
-                                      WorkspaceArena& workspace, cudaStream_t stream) {
+                                      float edge_softcap, WorkspaceArena& workspace,
+                                      cudaStream_t stream) {
     const auto route = candidate_selector_path_route(candidate_ids.ne[1], candidate_ids.ne[2]);
     auto scope       = workspace.scope();
     const auto scratch =
@@ -49,6 +50,6 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
     }
     candidate_selector_path_launch(route, candidate_ids, unary_scores, projected_hidden, anchors,
                                    codebooks, base_positions, configs, drafts, proposal_q,
-                                   confidence, scratch, stream);
+                                   confidence, edge_softcap, scratch, stream);
 }
 } // namespace ninfer::ops::detail

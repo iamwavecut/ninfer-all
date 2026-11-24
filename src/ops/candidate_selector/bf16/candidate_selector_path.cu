@@ -29,6 +29,7 @@ struct DeviceArgs {
     float* q;
     float* confidence; // FP32 [K,B] or null: the selected candidate's softmax(edge) probability
     int steps;
+    float softcap; // > 0: each edge becomes softcap * tanh(edge / softcap)
 };
 
 constexpr int kQ4BlockBytes = 18, kQ4RowBytes = kRank / 32 * kQ4BlockBytes;
@@ -140,7 +141,10 @@ __device__ void score_row(const DeviceArgs& a, int column, SelectorShared& share
                             : __bfloat162float(shared.successors[c * kRank + r]),
                        sum);
         sum = warp_reduce_sum(sum);
-        if (lane == 0) shared.edge[c] = a.unary[column * kCandidates + c] + sum;
+        if (lane == 0) {
+            const float edge = a.unary[column * kCandidates + c] + sum;
+            shared.edge[c]   = a.softcap > 0.0F ? a.softcap * tanhf(edge / a.softcap) : edge;
+        }
     }
     __syncthreads();
 }
@@ -218,7 +222,7 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                                     const Tensor& anchors, const SelectorCodebooks& codebooks,
                                     const Tensor& base_positions,
                                     const SamplingConfig* configs, Tensor& drafts,
-                                    Tensor& proposal_q, float* confidence,
+                                    Tensor& proposal_q, float* confidence, float edge_softcap,
                                     const SelectorWorkspace& workspace, cudaStream_t stream) {
     const DeviceArgs args{static_cast<const std::int32_t*>(candidate_ids.data),
                           static_cast<const float*>(unary_scores.data),
@@ -232,7 +236,8 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                           static_cast<std::int32_t*>(drafts.data),
                           static_cast<float*>(proposal_q.data),
                           confidence,
-                          candidate_ids.ne[1]};
+                          candidate_ids.ne[1],
+                          edge_softcap};
     if (route == SelectorRoute::Direct) {
         CUDA_CHECK(pdl::launch_consumer({dim3(candidate_ids.ne[2]), dim3(512), 0, stream},
                                         selector_walk_kernel, args));

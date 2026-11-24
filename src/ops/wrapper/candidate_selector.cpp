@@ -4,6 +4,7 @@
 #include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -13,9 +14,8 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kCandidates   = 16;
-constexpr std::int32_t kRank         = 256;
-constexpr std::int32_t kCodebookRows = 248320;
+constexpr std::int32_t kCandidates = 16;
+constexpr std::int32_t kRank       = 256;
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
     return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
@@ -97,7 +97,12 @@ void select_path(const Tensor& candidate_ids, const Tensor& unary_scores,
                  const Tensor& projected_hidden, const Tensor& anchors,
                  const detail::SelectorCodebooks& codebooks, const Tensor& base_positions,
                  const SamplingConfig* configs, Tensor& drafts, Tensor& proposal_q,
-                 Tensor* confidence, WorkspaceArena& workspace, cudaStream_t stream) {
+                 Tensor* confidence, float edge_softcap, WorkspaceArena& workspace,
+                 cudaStream_t stream) {
+    if (!(edge_softcap >= 0.0F) || !std::isfinite(edge_softcap)) {
+        throw std::invalid_argument("candidate_selector_path: edge_softcap must be finite and "
+                                    "nonnegative");
+    }
     const std::int32_t batch_size = candidate_ids.ne[2];
     const std::int32_t kSteps     = candidate_ids.ne[1];
     if (kSteps < 1 || kSteps > 15)
@@ -132,13 +137,13 @@ void select_path(const Tensor& candidate_ids, const Tensor& unary_scores,
     detail::candidate_selector_path_dispatch(
         candidate_ids, unary_scores, projected_hidden, anchors, codebooks, base_positions, configs,
         drafts, proposal_q, confidence != nullptr ? static_cast<float*>(confidence->data) : nullptr,
-        workspace, stream);
+        edge_softcap, workspace, stream);
 }
 
 void require_q4_codebook(const Weight& codebook, const char* label) {
     constexpr std::uint64_t kRowBytes = kRank / 32 * 18;
-    if (codebook.qtype != QType::GGUF_Q4_0 || codebook.n != kCodebookRows || codebook.k != kRank ||
-        codebook.qdata == nullptr || codebook.payload_bytes < kRowBytes * kCodebookRows ||
+    if (codebook.qtype != QType::GGUF_Q4_0 || codebook.n < kCandidates || codebook.k != kRank ||
+        codebook.qdata == nullptr || codebook.payload_bytes < kRowBytes * codebook.n ||
         codebook.input_columns != nullptr || !aligned_to(codebook.qdata, 2)) {
         throw std::invalid_argument(std::string("candidate_selector_path: invalid ") + label);
     }
@@ -151,18 +156,18 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                             cudaStream_t stream) {
-    require_tensor(predecessor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
-                   "predecessor_codebook");
-    require_tensor(successor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
-                   "successor_codebook");
-    if (predecessor_codebook.bytes() != successor_codebook.bytes()) {
-        throw std::invalid_argument("candidate_selector_path: codebooks differ in size");
+                             cudaStream_t stream, Tensor* confidence, float edge_softcap) {
+    const std::int32_t rows = predecessor_codebook.ne[1];
+    if (rows < kCandidates) {
+        throw std::invalid_argument("candidate_selector_path: a codebook holds fewer rows than "
+                                    "the candidates");
     }
+    require_tensor(predecessor_codebook, DType::BF16, kRank, rows, 1, 1, "predecessor_codebook");
+    require_tensor(successor_codebook, DType::BF16, kRank, rows, 1, 1, "successor_codebook");
     const detail::SelectorCodebooks codebooks{predecessor_codebook.data, successor_codebook.data,
                                               predecessor_codebook.bytes(), false};
     select_path(candidate_ids, unary_scores, projected_hidden, anchors, codebooks, base_positions,
-                configs, drafts, proposal_q, nullptr, workspace, stream);
+                configs, drafts, proposal_q, confidence, edge_softcap, workspace, stream);
 }
 
 void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,
@@ -170,14 +175,18 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Weight& predecessor_codebook, const Weight& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
-                             cudaStream_t stream, Tensor* confidence) {
+                             cudaStream_t stream, Tensor* confidence, float edge_softcap) {
     require_q4_codebook(predecessor_codebook, "predecessor_codebook");
     require_q4_codebook(successor_codebook, "successor_codebook");
+    if (predecessor_codebook.n != successor_codebook.n) {
+        throw std::invalid_argument("candidate_selector_path: codebooks differ in rows");
+    }
     const detail::SelectorCodebooks codebooks{predecessor_codebook.qdata,
                                               successor_codebook.qdata,
-                                              std::size_t(kRank / 32 * 18) * kCodebookRows, true};
+                                              std::size_t(kRank / 32 * 18) * predecessor_codebook.n,
+                                              true};
     select_path(candidate_ids, unary_scores, projected_hidden, anchors, codebooks, base_positions,
-                configs, drafts, proposal_q, confidence, workspace, stream);
+                configs, drafts, proposal_q, confidence, edge_softcap, workspace, stream);
 }
 
 } // namespace ninfer::ops

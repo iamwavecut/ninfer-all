@@ -7,6 +7,6 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                                     const Tensor& anchors, const SelectorCodebooks& codebooks,
                                     const Tensor& base_positions,
                                     const SamplingConfig* configs, Tensor& drafts,
-                                    Tensor& proposal_q, float* confidence,
+                                    Tensor& proposal_q, float* confidence, float edge_softcap,
                                     const SelectorWorkspace& workspace, cudaStream_t stream);
 }
