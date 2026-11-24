@@ -28,6 +28,7 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,8 @@ using namespace ninfer;
 namespace ink = ninfer::models::inkling2;
 
 int failures = 0;
+// Host or disk experts: each executor's device cache, small enough for three executors at once.
+std::optional<std::uint64_t> expert_cache;
 
 void expect(bool ok, const std::string& what) {
     std::cout << (ok ? "ok   " : "FAIL ") << what << '\n';
@@ -153,6 +156,7 @@ ink::ExecutorOptions executor_options(KvCacheStorage storage, LoopKvCache mode) 
     o.kv_cache     = storage;
     o.draft_tokens = 3;
     o.loop_kv      = mode;
+    o.expert_cache_bytes = expert_cache;
     return o;
 }
 
@@ -250,6 +254,7 @@ int main() {
         const std::string_view place(experts);
         if (place == "host") { load.experts = ExpertResidency::Host; }
         if (place == "disk") { load.experts = ExpertResidency::Disk; }
+        if (place == "host" || place == "disk") { expert_cache = std::uint64_t{512} << 20; }
     }
     auto model = ink::load_model(reader, load, device);
     const ink::TextConfig& c = model->config();
