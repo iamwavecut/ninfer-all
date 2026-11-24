@@ -98,6 +98,9 @@ public:
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
+    // The banned-word rewinds the session made and the delay they added (BadWordsStats); zero for
+    // a request without bad_words.
+    [[nodiscard]] BadWordsStats bad_words_stats() const noexcept;
     // True once a session that began inside a reasoning block has committed its close.
     [[nodiscard]] bool reasoning_closed() const noexcept;
     // The reasoning opener a model that opens its own reasoning (Inkling, Flint, Gemma) cannot

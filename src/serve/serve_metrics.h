@@ -42,6 +42,9 @@ private:
     std::uint64_t prefix_cache_hit_tokens_total_ = 0;
     std::uint64_t draft_tokens_total_            = 0;
     std::uint64_t draft_accepted_tokens_total_   = 0;
+    std::uint64_t bad_words_rewinds_total_        = 0;
+    std::uint64_t bad_words_dropped_tokens_total_ = 0;
+    double bad_words_rewind_seconds_total_        = 0.0;
 };
 
 } // namespace ninfer::serve

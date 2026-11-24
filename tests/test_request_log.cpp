@@ -314,6 +314,7 @@ int main() {
     // A derived budget: the parse-time context bound is replaced by what was actually submitted.
     request.max_tokens           = 65536;
     request.derive_output_budget = true;
+    request.bad_words            = {"<message", "<daily_persona"};
     request.messages.resize(2);
     request.messages.front().content.push_back(ContentPart{.kind = ContentKind::Image});
 
@@ -371,6 +372,8 @@ int main() {
                       "request output budget missing");
     failures += check(started.at("request").at("enable_thinking") == true,
                       "resolved thinking mode missing");
+    failures += check(started.at("request").at("bad_word_count") == 2,
+                      "the request's banned-word count is missing");
     failures += check(started.at("request").at("thinking_budget") == 256,
                       "resolved thinking budget missing");
     failures += check(started.at("request").at("effective_thinking_budget") == 256,
@@ -548,6 +551,27 @@ int main() {
                           done.at("result").at("thinking_control_tokens") == 19 &&
                           done.at("result").at("thinking_control_applied") == true,
                       "thinking-control result accounting missing");
+    failures += check(done.at("result").at("bad_words_rewinds") == 0 &&
+                          done.at("result").at("bad_words_dropped_tokens") == 0 &&
+                          done.at("result").at("bad_words_rewind_seconds") == 0.0 &&
+                          render_request_done(context, outcome).message.find("bad_words") ==
+                              std::string::npos,
+                      "a request without rewinds reported banned-word rewinds");
+    {
+        auto rewound      = outcome;
+        rewound.bad_words = ninfer::BadWordsStats{
+            .rewinds = 3, .dropped_tokens = 7, .rewind_seconds = 0.0425};
+        const Json rewound_done =
+            Json::parse(format_request_done_json("serve-test", 3001, context, rewound));
+        failures += check(rewound_done.at("result").at("bad_words_rewinds") == 3 &&
+                              rewound_done.at("result").at("bad_words_dropped_tokens") == 7 &&
+                              rewound_done.at("result").at("bad_words_rewind_seconds") == 0.0425,
+                          "done JSON log did not record the banned-word rewinds");
+        failures += check(render_request_done(context, rewound)
+                                  .message.find("| bad_words 3 rewinds, 7 dropped, 42.5 ms") !=
+                              std::string::npos,
+                          "operational done log did not show the banned-word rewinds");
+    }
     failures += check(done.at("result").at("reasoning_loop_detected") == false &&
                           done.at("result").at("reasoning_loop_thinking_tokens") == 0 &&
                           render_request_done(context, outcome).message.find("reasoning loop") ==

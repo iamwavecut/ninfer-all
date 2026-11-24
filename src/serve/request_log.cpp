@@ -262,6 +262,7 @@ Json request_json(const RequestLogContext& context) {
                 {"tool_count", context.tool_count},
                 {"tool_choice", tool_choice_name(context.tool_choice)},
                 {"has_tool_history", context.has_tool_history},
+                {"bad_word_count", context.bad_word_count},
                 {"enable_thinking", context.enable_thinking},
                 {"thinking_budget", std::move(thinking_budget)},
                 {"effective_thinking_budget", std::move(effective_thinking_budget)},
@@ -994,6 +995,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"reasoning_loop_coverage", outcome.thinking.loop_coverage},
              {"answer_now", outcome.thinking.answer_now},
              {"answer_now_thinking_tokens", outcome.thinking.answer_now_thinking_tokens},
+             {"bad_words_rewinds", outcome.bad_words.rewinds},
+             {"bad_words_dropped_tokens", outcome.bad_words.dropped_tokens},
+             {"bad_words_rewind_seconds", outcome.bad_words.rewind_seconds},
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] = Json{

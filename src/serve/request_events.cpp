@@ -36,6 +36,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.tool_count                         = request.tools.size();
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
+    context.bad_word_count                     = request.bad_words.size();
     context.enable_thinking                    = prepared.enable_thinking;
     context.thinking_budget                    = prepared.thinking_budget;
     context.effective_thinking_budget          = prepared.effective_thinking_budget;

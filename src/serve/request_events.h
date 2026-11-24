@@ -22,6 +22,8 @@ struct RequestLogContext {
     std::size_t tool_count                  = 0;
     ToolChoice tool_choice;
     bool has_tool_history = false;
+    // The distinct banned words (bad_words) the request carries.
+    std::size_t bad_word_count = 0;
     bool enable_thinking  = true;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<std::uint32_t> effective_thinking_budget;

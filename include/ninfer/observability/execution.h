@@ -101,6 +101,19 @@ struct ThinkingBudgetStats {
     std::uint32_t answer_now_thinking_tokens = 0;
 };
 
+// Banned words (ExecutionOptions::bad_words): the rewinds a request made and what they cost it.
+// A rewind drops the generated tokens from the position where a banned string began, and that
+// position is drawn again. `dropped_tokens` counts the tokens the rounds had generated at or after
+// each rewind's position. `rewind_seconds` is the delay the rewinds added to the reply: for each
+// rewind, the wall time from the round that generated the first dropped token to the round that
+// committed the token drawn again at its position (with the requeue and prefill a Qwen3.5-core
+// rewind runs).
+struct BadWordsStats {
+    std::uint32_t rewinds        = 0;
+    std::uint64_t dropped_tokens = 0;
+    double rewind_seconds        = 0.0;
+};
+
 enum class PrefixReusePath : std::uint8_t {
     Root,
     PrivateEndpoint,

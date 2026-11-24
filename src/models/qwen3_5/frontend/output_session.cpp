@@ -12,6 +12,7 @@
 #include "text/unicode.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -802,6 +803,7 @@ void PublishedOutput::append(PublishedOutput other) {
 struct OutputSession::BadWords {
     using Filter = text::BadWordsFilter;
     using State  = Filter::State;
+    using Clock  = std::chrono::steady_clock;
 
     // Rewinds a request may make, and tokens banned at one position, before the masks keep out
     // every completing token instead.
@@ -842,9 +844,21 @@ struct OutputSession::BadWords {
     std::uint32_t floor   = 0;
     std::optional<std::uint32_t> ban_position;
     std::uint32_t bans = 0;
+    // What the rewinds cost (BadWordsStats). A round's time is when its preview began, the moment
+    // its tokens left the model. `hold_at`: the round that generated the hold's token, which is
+    // never before the round that drew the last rewind's position again (a rewind leaves the hold
+    // at its position), so the delays of successive rewinds do not overlap. `redraw_since`: a
+    // rewind's position waits to be drawn again since then.
+    std::uint64_t dropped_tokens = 0;
+    double rewind_seconds        = 0.0;
+    std::optional<Clock::time_point> hold_at;
+    std::optional<Clock::time_point> redraw_since;
 
     // What commit_preview applies.
     struct Pending {
+        // The round's time and its first generated token.
+        Clock::time_point at;
+        std::uint32_t first = 0;
         Text text;
         std::optional<std::uint32_t> hold;
         TokenId hold_token = -1;
@@ -867,6 +881,9 @@ struct OutputSession::BadWords {
         std::uint32_t ban_position = 0;
         TokenId ban_token          = -1;
         bool ban_completions       = false;
+        // The tokens the rewind drops, and when the first of them was generated.
+        std::uint32_t dropped = 0;
+        Clock::time_point dropped_since;
         bool replayed              = false;
         PublishedOutput replay;
         std::vector<TokenLogprob> replay_logprobs;
@@ -1339,6 +1356,8 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
     words.pending_ready          = true;
     BadWords::Pending& pending   = words.pending;
     const std::uint32_t first    = words.text.generated;
+    pending.at                   = BadWords::Clock::now();
+    pending.first                = first;
     const auto prefix_logprobs   = [&](std::size_t count) {
         return logprobs.empty() ? logprobs : logprobs.first(count);
     };
@@ -1418,6 +1437,8 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
                 pending.rewound         = true;
                 pending.ban_position    = hold;
                 pending.ban_token       = words.hold_token;
+                pending.dropped         = first + static_cast<std::uint32_t>(tokens.size()) - hold;
+                pending.dropped_since   = words.hold_at.value_or(pending.at);
                 pending.replayed        = true;
                 pending.replay          = std::move(output);
                 pending.replay_logprobs = std::move(records);
@@ -1464,6 +1485,8 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
         pending.ban_position    = target;
         pending.ban_token       = tokens[kept];
         pending.ban_completions = ban_completions;
+        pending.dropped         = static_cast<std::uint32_t>(tokens.size() - kept);
+        pending.dropped_since   = pending.at;
         decision.bad_words_hold_after = static_cast<std::uint32_t>(kept);
         decision.bad_words_hold_alive = true;
         decision.bad_words_rewind     = target;
@@ -1604,6 +1627,8 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
         words.pending.text.recent_bytes = 0;
         words.pending.text.generated += static_cast<std::uint32_t>(tokens.size());
         words.pending.drop_snapshot  = true;
+        words.pending.at             = BadWords::Clock::now();
+        words.pending.first          = words.text.generated;
     }
 
     impl_->preview_state            = impl_->state;
@@ -1695,6 +1720,8 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
         bad_words_->pending_ready         = true;
         bad_words_->pending.text          = bad_words_->text;
         bad_words_->pending.drop_snapshot = true;
+        bad_words_->pending.at            = BadWords::Clock::now();
+        bad_words_->pending.first         = bad_words_->text.generated;
     }
     impl_->preview_state            = impl_->state;
     impl_->preview_semantic         = impl_->semantic;
@@ -1731,8 +1758,16 @@ PublishedOutput OutputSession::commit_preview() {
         records.insert(records.begin(), std::make_move_iterator(pending.replay_logprobs.begin()),
                        std::make_move_iterator(pending.replay_logprobs.end()));
     }
+    if (words.redraw_since) {
+        // The round after a rewind draws its position again: the delay ends here.
+        words.rewind_seconds +=
+            std::chrono::duration<double>(pending.at - *words.redraw_since).count();
+        words.redraw_since.reset();
+    }
     if (pending.rewound) {
         ++words.rewinds;
+        words.dropped_tokens += pending.dropped;
+        words.redraw_since = pending.dropped_since;
         if (words.ban_position != pending.ban_position) {
             words.ban_position = pending.ban_position;
             words.bans         = 0;
@@ -1745,6 +1780,13 @@ PublishedOutput OutputSession::commit_preview() {
     words.text       = std::move(pending.text);
     words.hold       = pending.hold;
     words.hold_token = pending.hold_token;
+    // The hold's token is generated in this round when the hold begins or moves here, or when a
+    // rewind's position is drawn again; a rewind's own round has not drawn it yet.
+    if (!words.hold) {
+        words.hold_at.reset();
+    } else if (!pending.rewound && *words.hold >= pending.first) {
+        words.hold_at = pending.at;
+    }
     if (pending.drop_snapshot || !words.hold) { words.snapshot.reset(); }
     if (pending.snapshot && words.hold) {
         words.snapshot       = std::move(pending.snapshot);
@@ -1928,6 +1970,13 @@ ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
         .answer_now            = impl_->semantic.answer_now,
         .answer_now_thinking_tokens = impl_->semantic.answer_now_thinking_tokens,
     };
+}
+
+BadWordsStats OutputSession::bad_words_stats() const noexcept {
+    if (!bad_words_) { return {}; }
+    return BadWordsStats{.rewinds        = bad_words_->rewinds,
+                         .dropped_tokens = bad_words_->dropped_tokens,
+                         .rewind_seconds = bad_words_->rewind_seconds};
 }
 
 std::optional<std::string> OutputSession::matched_stop_string() const {

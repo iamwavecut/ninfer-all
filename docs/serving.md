@@ -570,7 +570,19 @@ then taken back with the rest of the hold. Drafts are proposed without the bans.
 only banned words keeps its drafts (MTP, DFlash, DFlash2, DSpark, a context lookup): its masks
 take microseconds and fill on the engine thread with no mask thread. The first request with a new
 list builds the list's filter (an Aho-Corasick automaton of the strings and the vocabulary's tokens
-by their bytes); the last eight lists are kept.
+by their bytes); the last eight lists are kept. The engine's first request with banned words also
+reads the bytes of every token of the vocabulary, which delays its first token once (on an RTX
+A5000: 0.17 s for Gemma 4, 0.12 s for Inkling 2, 0.10 s for DeepSeek-V4.1).
+
+The request log's `request_done.result` records a request's rewinds (`bad_words_rewinds`), the
+generated tokens they dropped (`bad_words_dropped_tokens`: those the rounds had generated at or
+after each rewind's position), and the delay they added to the reply (`bad_words_rewind_seconds`):
+for each rewind, the wall time from the round that generated its first dropped token to the round
+that committed the token drawn again there, including the requeue and prefill of a Qwen3.5-core
+rewind. The text after the token drawn again is another reply, with its own number of decode
+rounds, which this delay does not count. The console's done line adds
+`bad_words N rewinds, D dropped, T` when a request rewound, and [Metrics](#metrics) sum the three
+over completed requests.
 
 ## Stop the server
 
@@ -1010,6 +1022,9 @@ they advance during a long request rather than at its completion, and their rati
 | `ninfer:reused_prompt_tokens_total` | counter | prompt tokens restored from the context cache instead of prefilled |
 | `ninfer:draft_tokens_total` | counter | speculative draft tokens proposed for completed requests |
 | `ninfer:draft_accepted_tokens_total` | counter | speculative draft tokens accepted for completed requests |
+| `ninfer:bad_words_rewinds_total` | counter | [banned-word](#banned-words) rewinds of completed requests |
+| `ninfer:bad_words_dropped_tokens_total` | counter | generated tokens those rewinds dropped |
+| `ninfer:bad_words_rewind_seconds_total` | counter | delay those rewinds added to their replies, in seconds |
 | `ninfer:context_cache_exhausted_requests_total` | counter | requests failed because the context cache had no placement for them |
 | `ninfer:engine_recoveries_total` | counter | host-side worker failures the Engine survived instead of latching unavailable |
 | `ninfer:uptime_seconds` | gauge | seconds since the Engine became ready |
@@ -2860,7 +2875,7 @@ is also rejected if it resolves to the model artifact.
 Add `--request-log-jsonl profiles/bench/run/server.requests.jsonl` to the startup command to write
 the log at that path.
 
-Every line is one `ninfer_serve_request_log` schema-v28 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v30 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -2869,9 +2884,9 @@ they do not infer request behavior from process-global counter deltas.
 | Event | Contents |
 |---|---|
 | `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, the rotation past the native window the Engine resolved (`engine.rope`: type `none` or `yarn`, factor, native window; Qwen3.8-Flash-Next reports it, the other families `null`), n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, redacted argv, and `arguments`: the redacted options the server runs with, its `--config` files merged under the command line ([launch configuration files](cli.md#launch-configuration-files)) |
-| `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
+| `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape, the number of distinct banned words (`bad_word_count`) |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, reasoning-loop guard firing, answer-now closes, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, reasoning-loop guard firing, answer-now closes, banned-word rewinds (`bad_words_rewinds`, `bad_words_dropped_tokens`, `bad_words_rewind_seconds`), unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 

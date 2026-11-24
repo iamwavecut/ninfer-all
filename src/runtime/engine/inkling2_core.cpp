@@ -1766,6 +1766,7 @@ struct Inkling2Core::Impl {
         result.finish_reason                   = reason;
         result.matched_stop_string             = r.output.matched_stop_string();
         result.thinking                        = r.output.thinking_stats();
+        result.bad_words                       = r.output.bad_words_stats();
         result.thinking.post_thinking_sampling = r.post_thinking;
         result.reused_prompt_tokens            = r.reused;
         result.prefix_reuse_path               = r.reuse_path;
