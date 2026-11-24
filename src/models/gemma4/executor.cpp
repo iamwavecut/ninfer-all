@@ -312,6 +312,12 @@ struct Executor::Impl {
         // Beside an automatic cache of host or disk experts, the full-attention caches grow with
         // their sequences and the cache is elastic (ExpertDeliveryOptions::elastic).
         const int device_id = device.rank(0).device;
+        // Where a device's copies queue behind one another whatever their streams
+        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for a missing host
+        // or disk expert can hold back the copies that end it, so those placements run eager. Experts on
+        // the device capture their graphs as everywhere else.
+        if (!model.expert_banks().empty() && serialized_copy_queue()) { options.cuda_graphs = false; }
+
         growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
                   vmm::granularity(device_id) != 0;
         hidden      = int(config.hidden_size);
@@ -708,13 +714,13 @@ struct Executor::Impl {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
             if (options.prefill_chunk < kFullChunk &&
-                workspace_bytes + kGraphReserve + unbacked() > free_bytes) {
+                workspace_bytes + graph_reserve() + unbacked() > free_bytes) {
                 // The destructor does not run for a constructor that throws.
                 if (media_begin != nullptr) { cudaEventDestroy(media_begin); }
                 if (media_end != nullptr) { cudaEventDestroy(media_end); }
                 throw InsufficientMemory(
                     "Gemma 4: the workspace of " + std::to_string(workspace_bytes >> 20) +
-                    " MiB and " + std::to_string(kGraphReserve >> 20) +
+                    " MiB and " + std::to_string(graph_reserve() >> 20) +
                     " MiB for the CUDA graphs need more than the " +
                     std::to_string(free_bytes >> 20) +
                     " MiB free after the caches; lower --max-concurrency or --max-context");
@@ -747,7 +753,7 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemGetInfo(&free, &total));
             const auto cache = options.expert_cache_bytes.value_or(0);
             // The caches that grow later need their memory too: the elastic cache gives it back.
-            if (bank + metadata + cache + unbacked() + kGraphReserve > free) {
+            if (bank + metadata + cache + unbacked() + graph_reserve() > free) {
                 throw InsufficientMemory("Gemma 4: expert delivery needs " +
                     std::to_string((bank + metadata + cache) >> 20) + " MiB beside " +
                     std::to_string(unbacked() >> 20) +
@@ -759,7 +765,7 @@ struct Executor::Impl {
             transport.cache_bytes = options.expert_cache_bytes;
             // A growing cache's next positions come from the headroom before the expert cache
             // has to give memory back.
-            transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
+            transport.keep_free_bytes = graph_reserve() + (growing ? kKvHeadroom : 0);
             transport.elastic = growing;
             transport.disk            = options.expert_disk;
             const float dma_share = options.expert_dma_share.value_or(0.0F);
@@ -787,11 +793,6 @@ struct Executor::Impl {
             }
             delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                         std::move(sources), transport);
-            // Where a device's copies queue behind one another whatever their streams
-            // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for the
-            // misses can hold the copies the graph queued after it ahead of the delivery's own,
-            // which end that wait. Eager passes wait on the host and queue nothing behind the wait.
-            if (serialized_copy_queue()) { options.cuda_graphs = false; }
             // Aliases 0 to 2 (gate, up, gate_up) point into the gate/up blob, 3 into the down blob.
             for (auto& p : layers) {
                 if (p.delivery_layer < 0) { continue; }
@@ -811,6 +812,12 @@ struct Executor::Impl {
     // planned workspace with kGraphReserve beside it.
     static constexpr std::uint32_t kFullChunk  = 2048;
     static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
+
+    // Whether this run captures CUDA graphs: false where a host or disk expert's miss would hang a
+    // replayed graph, unless the run asked for no graphs at all.
+    [[nodiscard]] std::size_t graph_reserve() const {
+        return options.cuda_graphs ? kGraphReserve : 0;
+    }
     static constexpr std::size_t kKvHeadroom   = std::size_t(256) << 20;
 
     // ---- Growing caches -------------------------------------------------------------------------
@@ -909,7 +916,7 @@ struct Executor::Impl {
         }
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        if (free < need + kGraphReserve) { delivery->shrink_cache(need + kGraphReserve - free); }
+        if (free < need + graph_reserve()) { delivery->shrink_cache(need + graph_reserve() - free); }
         while (!apply()) {
             if (delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
                 count_backed();

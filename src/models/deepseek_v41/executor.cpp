@@ -473,6 +473,12 @@ struct Executor::Impl {
         stream              = device.stream;
         sms                 = device.multiprocessor_count();
         const int device_id = device.rank(0).device;
+        // Where a device's copies queue behind one another whatever their streams
+        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for a missing host
+        // or disk expert can hold back the copies that end it, so those placements run eager. Experts on
+        // the device capture their graphs as everywhere else.
+        if (!model.expert_banks().empty() && serialized_copy_queue()) { options.cuda_graphs = false; }
+
         growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
                   vmm::granularity(device_id) != 0;
         hidden      = int(config.hidden_size);
@@ -712,10 +718,10 @@ struct Executor::Impl {
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-            if (workspace_bytes + kGraphReserve + unbacked() > free_bytes) {
+            if (workspace_bytes + graph_reserve() + unbacked() > free_bytes) {
                 throw InsufficientMemory(
                     "DeepSeek-V4.1: the workspace of " + std::to_string(workspace_bytes >> 20) +
-                    " MiB and " + std::to_string(kGraphReserve >> 20) +
+                    " MiB and " + std::to_string(graph_reserve() >> 20) +
                     " MiB for the CUDA graphs need more than the " + std::to_string(free_bytes >> 20) +
                     " MiB free after the caches; lower --prefill-chunk, --max-concurrency or "
                     "--max-context");
@@ -1142,7 +1148,7 @@ struct Executor::Impl {
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         const auto cache = options.expert_cache_bytes.value_or(0);
-        if (bank + metadata + cache + unbacked() + kGraphReserve > free) {
+        if (bank + metadata + cache + unbacked() + graph_reserve() > free) {
             throw InsufficientMemory("DeepSeek-V4.1: expert delivery needs " +
                 std::to_string((bank + metadata + cache) >> 20) + " MiB beside " +
                 std::to_string(unbacked() >> 20) +
@@ -1152,7 +1158,7 @@ struct Executor::Impl {
         transport.pair_capacity   = options.prefill_chunk * config.top_k_experts;
         transport.top_k           = config.top_k_experts;
         transport.cache_bytes     = options.expert_cache_bytes;
-        transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
+        transport.keep_free_bytes = graph_reserve() + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
         transport.disk            = options.expert_disk;
         const float dma_share     = options.expert_dma_share.value_or(0.0F);
@@ -1186,17 +1192,12 @@ struct Executor::Impl {
         }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
-        // Where a device's copies queue behind one another whatever their streams
-        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for the
-        // misses can hold the copies the graph queued after it ahead of the delivery's own, which
-        // end that wait. Eager passes wait on the host and queue nothing behind the wait.
-        if (serialized_copy_queue()) { options.cuda_graphs = false; }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             const auto [begin, end] = expert_ranges[r];
             RankBinding bind(device, r);
             std::size_t free_r = 0, total_r = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_r, &total_r));
-            if (bank_bytes(end - begin) + metadata + cache + kGraphReserve > free_r) {
+            if (bank_bytes(end - begin) + metadata + cache + graph_reserve() > free_r) {
                 throw InsufficientMemory(
                     "DeepSeek-V4.1: expert delivery of device rank " + std::to_string(r) +
                     " needs " + std::to_string((bank_bytes(end - begin) + metadata + cache) >> 20) +
@@ -1207,7 +1208,7 @@ struct Executor::Impl {
             peer.pair_capacity   = transport.pair_capacity;
             peer.top_k           = transport.top_k;
             peer.cache_bytes     = options.expert_cache_bytes;
-            peer.keep_free_bytes = kGraphReserve;
+            peer.keep_free_bytes = graph_reserve();
             peer.disk            = options.expert_disk;
             // The delivery serves the calls on the rank's expert-parallel stream.
             RankContext rank         = device.rank(r);
@@ -1250,7 +1251,7 @@ struct Executor::Impl {
         std::vector<double> room(device.size());
         for (std::size_t r = 0; r < device.size(); ++r) {
             const std::uint64_t keep =
-                kGraphReserve + metadata + (r == 0 && growing ? kKvHeadroom : 0);
+                graph_reserve() + metadata + (r == 0 && growing ? kKvHeadroom : 0);
             room[r] = options.expert_cache_bytes ? double(*options.expert_cache_bytes)
                       : free_bytes[r] > keep      ? double(free_bytes[r] - keep)
                                                   : 0.0;
@@ -1346,6 +1347,12 @@ struct Executor::Impl {
     }
 
     static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
+
+    // Whether this run captures CUDA graphs: false where a host or disk expert's miss would hang a
+    // replayed graph, unless the run asked for no graphs at all.
+    [[nodiscard]] std::size_t graph_reserve() const {
+        return options.cuda_graphs ? kGraphReserve : 0;
+    }
     static constexpr std::size_t kKvHeadroom   = std::size_t(256) << 20;
 
     std::size_t start_reserve() const {
@@ -1367,7 +1374,7 @@ struct Executor::Impl {
         const std::uint64_t chunk = plan_workspace(0), bank = bank_bytes();
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        const std::uint64_t fixed = chunk + kGraphReserve + unbacked() + (growing ? kKvHeadroom : 0) +
+        const std::uint64_t fixed = chunk + graph_reserve() + unbacked() + (growing ? kKvHeadroom : 0) +
                                     delivery_metadata() + options.expert_cache_bytes.value_or(0);
         if (free <= fixed + 2 * bank) { return 0; }
         const std::uint64_t room = free - fixed - 2 * bank;
@@ -1573,7 +1580,7 @@ struct Executor::Impl {
         }
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        if (free < need + kGraphReserve) { delivery->shrink_cache(need + kGraphReserve - free); }
+        if (free < need + graph_reserve()) { delivery->shrink_cache(need + graph_reserve() - free); }
         while (!apply()) {
             if (delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
                 count_backed();
@@ -1588,7 +1595,7 @@ struct Executor::Impl {
     // giving memory back when the device keeps less than them and the CUDA Graph reserve. Empty
     // when the cache has no more to give. Outside capture.
     DeviceBuffer borrow_span(std::uint32_t n) {
-        const std::size_t bytes = span_buffers(n), need = bytes + kGraphReserve;
+        const std::size_t bytes = span_buffers(n), need = bytes + graph_reserve();
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         while (free < need) {
