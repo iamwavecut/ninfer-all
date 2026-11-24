@@ -24,11 +24,7 @@ void check_launch(const char* what) {
 }
 
 template <KvCoding C>
-__launch_bounds__(kWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
-    constexpr int kCode = kv_code_bytes(C), kScale = kv_scale_bytes(C);
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int unit = blockIdx.x * kWarps + warp;
-    if (unit >= a.rows_count * a.heads) { return; }
+__device__ __forceinline__ void kv_store_row(const KvStoreArgs& a, int unit, int warp, int lane) {
     const int head = unit % a.heads;
     const int r    = unit / a.heads;
     const int slot = physical(a.rows, r);
@@ -42,6 +38,50 @@ __launch_bounds__(kWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
     std::uint8_t* scales = a.dst.scales + sequence * a.dst.scale_seq + head * a.dst.scale_head +
                            std::int64_t(slot) * a.dst.scale_row;
     kv::encode_row<C>(x, codes, scales, lane);
+}
+
+template <KvCoding C>
+__launch_bounds__(kWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int unit = blockIdx.x * kWarps + warp;
+    if (unit >= a.rows_count * a.heads) { return; }
+    kv_store_row<C>(a, unit, warp, lane);
+}
+
+// The key and value stores of one visit in one launch: plane 0 encodes with CK, plane 1 with CV
+// (the format's key and value codings differ). Every unit's row reads and encodes exactly as
+// kv_store_kernel's does, so the planes' bytes are its bit for bit.
+template <KvCoding CK, KvCoding CV>
+__launch_bounds__(kWarps * 32) __global__ void kv_store_pair_kernel(KvStoreArgs ak, KvStoreArgs av) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const bool value = int(blockIdx.y) != 0;
+    const KvStoreArgs& a = value ? av : ak;
+    const int unit = blockIdx.x * kWarps + warp;
+    if (unit >= a.rows_count * a.heads) { return; }
+    if (value) {
+        kv_store_row<CV>(a, unit, warp, lane);
+    } else {
+        kv_store_row<CK>(a, unit, warp, lane);
+    }
+}
+
+// One warp per (position, head): lanes 0-15 decode the K row's sixteen chunks, 16-31 the V row's.
+__global__ __launch_bounds__(32) void ring_load_kernel(RingLoadArgs a) {
+    const int p    = a.begin + blockIdx.x, h = blockIdx.y;
+    const int lane = threadIdx.x;
+    const bool key = lane < 16;
+    const KvPlaneView& plane = key ? a.src_k : a.src_v;
+    const int src = p % a.src_ring, dst = p % a.dst_ring, chunk = lane & 15;
+    const std::int64_t codes_row = std::int64_t(a.sequence) * plane.code_seq +
+                                   std::int64_t(h) * plane.code_head +
+                                   std::int64_t(src) * plane.code_row;
+    const std::int64_t scales_row = std::int64_t(a.sequence) * plane.scale_seq +
+                                    std::int64_t(h) * plane.scale_head +
+                                    std::int64_t(src) * plane.scale_row;
+    const uint4 word = chunk_word(plane, plane.codes + codes_row, plane.scales + scales_row, chunk);
+    __half* out = key ? a.dst_k : a.dst_v;
+    reinterpret_cast<uint4*>(out + std::int64_t(h) * a.dst_head_stride +
+                             std::int64_t(dst) * kKvRowDims)[chunk] = word;
 }
 
 } // namespace
@@ -58,6 +98,66 @@ void kv_store(const KvStoreArgs& args, cudaStream_t stream) {
     default: throw std::invalid_argument("inkling2 kv_store: not an Inkling 2 plane coding");
     }
     check_launch("kv_store");
+}
+
+void kv_store_pair(const KvStoreArgs& key, const KvStoreArgs& value, cudaStream_t stream) {
+    const int units_k = key.rows_count * key.heads, units_v = value.rows_count * value.heads;
+    if (units_k <= 0 && units_v <= 0) { return; }
+    if (units_k != units_v || units_k <= 0 || key.dst.coding == KvCoding::F16 ||
+        value.dst.coding == KvCoding::F16) {
+        kv_store(key, stream);
+        kv_store(value, stream);
+        return;
+    }
+    const dim3 grid((units_k + kWarps - 1) / kWarps, 2, 1), block(kWarps * 32);
+    const auto launch = [&](auto ck, auto cv) {
+        kv_store_pair_kernel<decltype(ck)::value, decltype(cv)::value><<<grid, block, 0, stream>>>(
+            key, value);
+    };
+    switch (key.dst.coding) {
+    case KvCoding::Int8G64:
+        switch (value.dst.coding) {
+        case KvCoding::Int8G64: launch(std::integral_constant<KvCoding, KvCoding::Int8G64>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int8G64>{}); break;
+        case KvCoding::Int4G32: launch(std::integral_constant<KvCoding, KvCoding::Int8G64>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int4G32>{}); break;
+        case KvCoding::Lloyd4: launch(std::integral_constant<KvCoding, KvCoding::Int8G64>{},
+                                      std::integral_constant<KvCoding, KvCoding::Lloyd4>{}); break;
+        default: break;
+        }
+        break;
+    case KvCoding::Int4G32:
+        switch (value.dst.coding) {
+        case KvCoding::Int8G64: launch(std::integral_constant<KvCoding, KvCoding::Int4G32>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int8G64>{}); break;
+        case KvCoding::Int4G32: launch(std::integral_constant<KvCoding, KvCoding::Int4G32>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int4G32>{}); break;
+        case KvCoding::Lloyd4: launch(std::integral_constant<KvCoding, KvCoding::Int4G32>{},
+                                      std::integral_constant<KvCoding, KvCoding::Lloyd4>{}); break;
+        default: break;
+        }
+        break;
+    case KvCoding::Lloyd4:
+        switch (value.dst.coding) {
+        case KvCoding::Int8G64: launch(std::integral_constant<KvCoding, KvCoding::Lloyd4>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int8G64>{}); break;
+        case KvCoding::Int4G32: launch(std::integral_constant<KvCoding, KvCoding::Lloyd4>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int4G32>{}); break;
+        case KvCoding::Lloyd4: launch(std::integral_constant<KvCoding, KvCoding::Lloyd4>{},
+                                      std::integral_constant<KvCoding, KvCoding::Lloyd4>{}); break;
+        default: break;
+        }
+        break;
+    default: throw std::invalid_argument("inkling2 kv_store: F16 needs no plane");
+    }
+    check_launch("kv_store_pair");
+}
+
+void ring_load(const RingLoadArgs& args, cudaStream_t stream) {
+    if (args.end <= args.begin) { return; }
+    const dim3 grid(args.end - args.begin, args.kv_heads, 1);
+    ring_load_kernel<<<grid, 32, 0, stream>>>(args);
+    check_launch("ring_load");
 }
 
 } // namespace ninfer::models::inkling2::kernels
