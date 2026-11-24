@@ -10,6 +10,13 @@ IQ1_M, which llama.cpp multiplies on its vector kernels only, has a matrix tile 
 (`mmq-load-tiles.cuh`) and Ampere-config entries copied from IQ2_S's: each row of eight grid
 values g with its ±1/8 shift becomes the int8 values 8g ± 1, each 16 values' scale d(2s + 1)/8,
 as in NInfer's own vector kernel. NInfer runs it for routed experts only.
+PrismML's PTQ1_0 (GGML type 143: 128 ternary values in 28 bytes, five base-3 digits a byte and one
+binary16 scale; [ggml-org/llama.cpp#29672](https://github.com/ggml-org/llama.cpp/pull/29672) and
+[#29676](https://github.com/ggml-org/llama.cpp/pull/29676), both open) has its block struct in
+`ggml-common.h`, a matrix tile loader (`mmq-load-tiles.cuh`) that expands the digits to int8 values
+-1, 0 and 1 with the block's scale as Q2_0's loader does, and Ampere-config entries copied from
+Q2_0's. NInfer runs it for dense products only. Products of up to eight tokens use NInfer's own
+PTQ1_0 kernel (`src/ops/linear/gguf/ggml_bridge_ptq1.cuh`).
 
 NInfer compiles ggml's integer tensor-core matrix multiplication (`ggml-cuda/mmq.cuh`) and its
 dequantizers through the bridge in `src/ops/linear/gguf/`, as a separate archive, and keeps only the
@@ -34,7 +41,7 @@ are staged through `cp.async` while the current one is multiplied, the weights u
 memory, and the loop takes three barriers an iteration instead of four. The values are unchanged. It
 covers the formats whose 256-value step is a whole number of 8-byte words
 (`ggml_cuda_mmq_async_row_bytes`): Q4_0, Q5_0, Q8_0, IQ4_NL, Q4_K, Q5_K and NVFP4 copy 16 bytes at a time,
-Q2_0, IQ4_XS and IQ1_M 8 bytes at a time (`cp_async_ca_8`, added to `cp-async.cuh` with a `#pragma
+Q2_0, PTQ1_0, IQ4_XS and IQ1_M 8 bytes at a time (`cp_async_ca_8`, added to `cp-async.cuh` with a `#pragma
 once` so the kernel header can include it). Rows that start on 4 bytes only, whose value count is
 not a whole number of 256-value steps (Gemma 4's 704- and 2112-wide rows in the 32-value formats),
 copy 4 bytes at a time (`cp_async_ca_4`); the copy width is the kernel's `async_tiles` argument, 0

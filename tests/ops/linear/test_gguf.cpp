@@ -57,6 +57,7 @@ std::vector<TypeCase> cases() {
         {QType::GGUF_IQ4_XS, "iq4_xs", {0}},   {QType::GGUF_Q4_0, "q4_0", {0}},
         {QType::GGUF_Q5_0, "q5_0", {0}},       {QType::GGUF_Q2_0, "q2_0", {0}},
         {QType::GGUF_MXFP4, "mxfp4", {}},      {QType::GGUF_NVFP4, "nvfp4", {}},
+        {QType::GGUF_PTQ1_0, "ptq1_0", {26}},
     };
 }
 
@@ -71,13 +72,16 @@ float half_value(const std::uint8_t* p) {
 // and Q2_0 (two bits per value, low bits first); and MXFP4, the E2M1 value of each nibble (sign,
 // two exponent bits, one mantissa bit; low nibbles first) times 2^(e - 127); and NVFP4, the E2M1
 // value of each nibble (value j of sub-block s the low nibble of code byte 8 s + j, j < 8, else the
-// high nibble of code byte 8 s + j - 8) times its sub-block's UE4M3 scale. Empty for every other
-// type.
+// high nibble of code byte 8 s + j - 8) times its sub-block's UE4M3 scale; and PTQ1_0, d (bytes 26
+// and 27) times (digit - 1), value 16 t + i digit t of byte i (i < 16), 80 + 8 t + i digit t of byte
+// 16 + i, 120 + 2 t + h digit t of byte 24 + h, the digits of byte q in base 3 most significant
+// first as q / 256 approximates their fraction of 243: digit t = floor(3^(t+1) q / 256) mod 3.
+// Empty for every other type.
 std::vector<float> host_decode(QType qtype, const std::vector<std::uint8_t>& bytes) {
     std::vector<float> out;
     const auto block = gguf_block_shape(qtype);
     if (qtype != QType::GGUF_Q4_0 && qtype != QType::GGUF_Q5_0 && qtype != QType::GGUF_Q2_0 &&
-        qtype != QType::GGUF_MXFP4 && qtype != QType::GGUF_NVFP4) {
+        qtype != QType::GGUF_MXFP4 && qtype != QType::GGUF_NVFP4 && qtype != QType::GGUF_PTQ1_0) {
         return out;
     }
     const auto e2m1 = [](int code) {
@@ -106,6 +110,17 @@ std::vector<float> host_decode(QType qtype, const std::vector<std::uint8_t>& byt
                                                    : std::ldexp(1.0 + mantissa / 8.0, exponent - 7);
                 const int byte = b[4 + 8 * s + v % 8];
                 out.push_back(float(e2m1(v < 8 ? byte & 0xF : byte >> 4) * scale));
+            }
+            continue;
+        }
+        if (qtype == QType::GGUF_PTQ1_0) {
+            const float d = half_value(b + 26);
+            for (int j = 0; j < block.elements; ++j) {
+                const int byte = j < 80 ? b[j % 16] : j < 120 ? b[16 + (j - 80) % 8] : b[24 + (j - 120) % 2];
+                const int t    = j < 80 ? j / 16 : j < 120 ? (j - 80) / 8 : (j - 120) / 2;
+                int power      = 3;
+                for (int i = 0; i < t; ++i) { power *= 3; }
+                out.push_back(d * float(byte * power / 256 % 3 - 1));
             }
             continue;
         }
@@ -637,6 +652,22 @@ int main() {
             for (const auto& c : cases()) {
                 if (c.qtype != QType::GGUF_Q4_K) { continue; }
                 for (const std::int32_t k : {2560, 5120}) {
+                    const int f = run_type(c, seed++, k);
+                    std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
+                              << " matrix " << (schedule.empty() ? "compiled" : schedule) << '\n';
+                    failures += f;
+                }
+            }
+        }
+        // PTQ1_0 at Ternary Bonsai 2.5's widths and at 32 blocks a row: the vector kernel's lanes a
+        // row set are 8, 16 and 32 there (ggml_bridge_ptq1.cuh), and the matrix kernel's compiled and
+        // asynchronous tile loops.
+        for (const std::string_view schedule : {"", "async"}) {
+            ops::DeviceRouteForce force("gguf_matrix/ptq1_0", std::string(schedule));
+            for (const auto& c : cases()) {
+                if (c.qtype != QType::GGUF_PTQ1_0) { continue; }
+                for (const std::int32_t k : {5120, 6144, 4096}) {
+                    if (!schedule.empty() && k != 5120) { continue; }
                     const int f = run_type(c, seed++, k);
                     std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
                               << " matrix " << (schedule.empty() ? "compiled" : schedule) << '\n';

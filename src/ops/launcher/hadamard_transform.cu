@@ -123,6 +123,25 @@ void embedding_rotated_t2_launch(const Tensor& ids, const Weight& table, const T
     CUDA_CHECK(cudaGetLastError());
 }
 
+void embedding_rotated_ptq1_launch(const Tensor& ids, const Weight& table, const Tensor& signs,
+                                   Tensor& out, cudaStream_t stream) {
+    const std::int32_t width = out.ne[0];
+    const std::int64_t items =
+        static_cast<std::int64_t>(ids.ne[0]) * (width / kHadamardTransformBlock);
+    const std::int64_t ctas = (items + kWarpsPerCta - 1) / kWarpsPerCta;
+    if (ctas > std::numeric_limits<unsigned>::max()) {
+        throw std::overflow_error("embedding_rotated: grid exceeds the CUDA launch limit");
+    }
+    const std::int64_t row_bytes = static_cast<std::int64_t>(width / 128) * 28;
+    embed_gather_ptq1_hadamard_kernel<kWarpsPerCta>
+        <<<static_cast<unsigned>(ctas), kWarpsPerCta * kWarpSize, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data),
+            static_cast<const std::uint8_t*>(table.qdata), row_bytes,
+            static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data),
+            items, width);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void hadamard_transform_launch(const Tensor& x, const Tensor& signs, bool inverse, Tensor& out,
                                cudaStream_t stream) {
     const std::int32_t k                 = x.ne[0];

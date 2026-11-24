@@ -39,6 +39,7 @@ enum class GgmlType : int {
     MXFP4   = 39,
     NVFP4   = 40,
     Q2_0    = 42,
+    PTQ1_0  = 143, // PrismML's ternary blocks (dense products only)
 };
 
 struct BlockShape {

@@ -54,6 +54,7 @@ const TypeCase kCases[] = {
     {QType::GGUF_Q4_0, gguf::GgmlType::Q4_0, "q4_0", {0}},
     {QType::GGUF_Q5_0, gguf::GgmlType::Q5_0, "q5_0", {0}},
     {QType::GGUF_Q2_0, gguf::GgmlType::Q2_0, "q2_0", {0}},
+    {QType::GGUF_PTQ1_0, gguf::GgmlType::PTQ1_0, "ptq1_0", {26}},
 };
 
 // IQ1_M has the routed-expert matrix kernel only, so it is not among the dense cases above.
@@ -382,6 +383,9 @@ const AsyncCase kAsyncCases[] = {
      moe_async_offered<GGML_TYPE_IQ1_M>},
     {gguf::GgmlType::NVFP4, "gguf_matrix/nvfp4", "gguf_moe_matrix/nvfp4",
      dense_async_offered<GGML_TYPE_NVFP4>, moe_async_offered<GGML_TYPE_NVFP4>},
+    // Dense products only: two 28-byte blocks a step, staged in 8-byte copies.
+    {gguf::GgmlType::PTQ1_0, "gguf_matrix/ptq1_0", nullptr, dense_async_offered<GGML_TYPE_PTQ1_0>,
+     nullptr},
 };
 
 std::int64_t row_bytes_of(const TypeCase& c, int k) {
@@ -539,6 +543,7 @@ std::map<int, int> offered_tiles(const TypeCase& c, const char* key, Offer offer
 
 // Eight experts with 8 to 1,024 pairs each, every column tile at a full and a partial width.
 void compare_moe_widths(const TypeCase& c, const AsyncCase& a) {
+    if (a.moe_key == nullptr) { return; }
     const auto offered =
         offered_tiles(c, a.moe_key, [&](int columns) { return a.moe(640, 2560, columns, 0); });
     for (const int pairs : {64, 128, 192, 256, 384, 512, 1024, 4096, 8192}) {

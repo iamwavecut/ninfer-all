@@ -89,9 +89,9 @@ void moe_decode_down_launch(const MoeDecodeDownArgs& args, int chunk, cudaStream
 template <ggml_type type>
 void moe_decode_prep_launch(const MoeDecodePrepArgs& args, cudaStream_t stream);
 
-// Whether slice_dequantize serves the type (every type but IQ1_M).
+// Whether slice_dequantize serves the type (every type but IQ1_M and PTQ1_0).
 template <ggml_type type>
-inline constexpr bool kSliceDequantize = type != GGML_TYPE_IQ1_M;
+inline constexpr bool kSliceDequantize = type != GGML_TYPE_IQ1_M && type != GGML_TYPE_PTQ1_0;
 
 // Rows of a GGUF matrix to dst_t through the vector kernels' slice decoders: one thread a 32-value
 // slice, written as 16-byte stores (ggml_bridge_vec.cuh).
@@ -117,6 +117,9 @@ struct VecJobs {
 // jobs.count products, or with `fused` one fused [gate; up] product.
 template <ggml_type type>
 void vec_launch(const VecJobs& jobs, int columns, bool fused, cudaStream_t stream);
+// PTQ1_0's products take their own kernel, a lane a whole block (ggml_bridge_ptq1.cuh).
+template <>
+void vec_launch<GGML_TYPE_PTQ1_0>(const VecJobs& jobs, int columns, bool fused, cudaStream_t stream);
 
 // SiLU and the tanh-approximated GELU from correctly rounded operations (ops/common/silu.h): the
 // CPU's GGUF expert products compute the same bits.

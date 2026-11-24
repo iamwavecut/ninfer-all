@@ -99,6 +99,10 @@ typedef sycl::half2 ggml_half2;
 #define QI2_0 (QK2_0 / 32)
 #define QR2_0 1
 
+// NInfer: PTQ1_0 (ggml-org/llama.cpp#29672).
+#define QI_PTQ1_0 (QK_PTQ1_0 / 32)
+#define QR_PTQ1_0 1
+
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -286,6 +290,18 @@ typedef struct {
     ggml_half d;
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
+
+// NInfer: PrismML's PTQ1_0 (ggml-org/llama.cpp#29672): TQ1_0's trit packing with one scale per
+// 128 weights. qs[0..15] hold elements e = 16 t + i (byte i, base-3 digit t = 0..4), qs[16..23]
+// elements 80 + 8 t + (i - 16), qh[h] elements 120 + 2 t + h (t = 0..3). A byte holds its digits
+// as ceil(v * 256 / 243) for v = sum d_t 3^(4 - t); digit t is ((byte * 3^t) mod 256) * 3 >> 8.
+#define QK_PTQ1_0 128
+typedef struct {
+    uint8_t qs[(QK_PTQ1_0 - 4 * QK_PTQ1_0 / 64) / 5]; // 5 elements per byte (3^5 = 243 < 256)
+    uint8_t qh[QK_PTQ1_0 / 64];                       // 4 elements per byte
+    ggml_half d;
+} block_ptq1_0;
+static_assert(sizeof(block_ptq1_0) == sizeof(ggml_half) + QK_PTQ1_0 / 64 + (QK_PTQ1_0 - 4 * QK_PTQ1_0 / 64) / 5, "wrong ptq1_0 block size/padding");
 
 //
 // Super-block quantization structures
