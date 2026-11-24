@@ -51,9 +51,9 @@ The matrix contains three independently measured test kinds:
   rates from the same generation call.
 
 All benchmark requests use raw output, disable model-default stops, and disable prefix reuse. This
-keeps the requested token count exact without adding another generation path. When CUDA Graph is
-enabled and the matrix contains decode work, one ordinary public generation request primes the
-decode graph before warmups and measured repetitions.
+keeps the requested token count exact without adding another generation path. When the Engine
+decodes in CUDA Graphs and the matrix contains decode work, one ordinary public generation request
+primes the decode graph before warmups and measured repetitions.
 
 ## CLI
 
@@ -90,7 +90,10 @@ Example:
 
 Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (K=1..15 for every backend).
 Drafts use the optimized proposal head when the artifact stores one; `--lm-head-draft` requires it
-and `--full-draft-head` keeps the full output head. CUDA Graph decode is enabled by default.
+and `--full-draft-head` keeps the full output head. CUDA Graph decode is enabled by default. The
+reports' `decode_path` (`cuda_graph` or `eager`, after the speculative backend) and `use_cuda_graph`
+name the route the Engine ran, from `Engine::options()`: host or disk experts on Windows and WSL2
+decode eagerly even without `--no-cuda-graph`.
 
 `--expert-residency host|disk` keeps a MoE model's routed experts in pinned host memory or in the
 artifact's files, as the CLI does; `--expert-cache-mib` sizes the device expert cache, and
