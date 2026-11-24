@@ -23,3 +23,8 @@ ninfer_add_test(ninfer_inkling2_dspark_kernels_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dspark_kernels.cpp"
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_inkling2_dspark_kernels_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_inkling2_loop_kv_real_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loop_kv_real.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_inkling2_loop_kv_real_test PROPERTIES SKIP_RETURN_CODE 77)

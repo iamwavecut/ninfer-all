@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/kv_resident_options.h"
+#include "product/loop_kv_options.h"
 #include "product/option_layers.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
@@ -361,7 +362,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
            "                                fp16: Flash-Next, Gemma 4 and Flint; mxfp8:\n"
            "                                Inkling 2 (its default)\n" +
-           std::string(product::kKvResidentHelp) +
+           std::string(product::kKvResidentHelp) + std::string(product::kLoopKvHelp) +
            "\n"
            "CONTEXT CACHE\n"
            "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
@@ -1318,6 +1319,10 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (product::parse_kv_resident_option(arg, options.kv_resident_positions,
                                               [&] { return require_value(arg.c_str()); })) {
+            continue;
+        }
+        if (product::parse_loop_kv_option(arg, options.loop_kv,
+                                          [&] { return require_value(arg.c_str()); })) {
             continue;
         }
         if (arg == "--stage-layers") {

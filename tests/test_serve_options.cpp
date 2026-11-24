@@ -283,6 +283,24 @@ int main() {
         catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted an invalid --kv-resident");
     }
+    // --loop-kv: per-pass (lossless) by default, each lossy mode reaching the Engine.
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer"})).loop_kv ==
+                              ninfer::LoopKvCache::PerPass &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer", "--loop-kv",
+                                                     "last-full"}))
+                                  .loop_kv == ninfer::LoopKvCache::LastFull &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer", "--loop-kv",
+                                                     "last-all"}))
+                                  .loop_kv == ninfer::LoopKvCache::LastAll,
+                      "server did not carry --loop-kv to the Engine options");
+    for (const auto* value : {"last_loop", "", "Last-full"}) {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--loop-kv", value}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid --loop-kv");
+    }
+    failures += check(serve_usage_text("ninfer-serve").find("--loop-kv") != std::string::npos,
+                      "serve help omits --loop-kv");
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "none"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"})

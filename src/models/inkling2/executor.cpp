@@ -162,6 +162,9 @@ struct VisitPlan {
     bool restart      = false; // the core's first visit of a later pass
     bool control      = false; // a later pass's core visit
     bool start        = false; // the layer starts a residual block
+    // The visit whose caches this one reads and writes (--loop-kv: a core layer's last pass), or
+    // -1: its own. A visit that uses another's owns no caches or checkpoint.
+    int store = -1;
     // The F16 K and V caches: [sequences][kv heads][slots][D]. A quantized full visit has none;
     // its rows live in its code and scale planes.
     KvArea k, v;
@@ -375,6 +378,7 @@ struct Executor::Impl {
         }
         const auto schedule  = config.visits();
         const int sequences  = int(options.sequences);
+        const std::vector<int> stores = loop_stores(schedule);
         const std::size_t row_f16 = std::size_t(kD) * sizeof(__half);
         // Bytes of one full visit's K and V rows of one slot: F16 halves, or a quantized row's
         // codes and scales.
@@ -388,7 +392,9 @@ struct Executor::Impl {
                 : 2 * std::size_t(kv_heads) * row_f16 * std::size_t(sequences);
         {
             std::size_t needed = 0;
-            for (const auto& [layer, pass] : schedule) {
+            for (std::size_t v = 0; v < schedule.size(); ++v) {
+                const std::uint32_t layer = schedule[v].first;
+                if (stores[v] >= 0) { continue; }
                 needed += config.full_attention[layer]
                               ? std::size_t(global_slots) * full_slot_bytes
                               : (options.checkpoints ? 2 : 1) * std::size_t(ring) *
@@ -429,11 +435,16 @@ struct Executor::Impl {
             p.restart      = config.core(layer) && layer == config.core_start && pass > 0;
             p.control      = config.core(layer) && pass > 0;
             p.start        = layer % config.block_size == 0;
+            p.store        = stores[v];
             p.slots        = p.full ? global_slots : ring;
             p.ring         = p.full ? 0 : ring;
             p.head_stride  = std::int64_t(p.slots) * kD;
             p.seq_stride   = p.head_stride * kv_heads;
             const bool grows = growing && p.full;
+            if (p.store >= 0) {
+                visits.push_back(std::move(p));
+                continue;
+            }
             if (p.full && kvfmt.quantized()) {
                 // One code and one scale area per plane; a row is one head's whole block of
                 // slots (the F16 caches' row shape), position_bytes one slot's codes or scales.
@@ -512,7 +523,7 @@ struct Executor::Impl {
         logits_bf16 = DeviceBuffer(std::size_t(vocab) * kMaxLogitRows * 2);
         if (options.dspark) { plan_spark(device_id, sequences); }
         for (VisitPlan& p : visits) {
-            if (!p.full) { continue; }
+            if (!p.full || p.store >= 0) { continue; }
             if (p.k_codes.p != nullptr) {
                 for (KvArea* area : {&p.k_codes, &p.k_scales, &p.v_codes, &p.v_scales}) {
                     sequence_areas.push_back(area);
@@ -1413,6 +1424,33 @@ struct Executor::Impl {
                                                    : std::size_t(512) << 20;
     }
 
+    // The visit whose caches each visit of `schedule` uses (VisitPlan::store): -1, its own, or
+    // with --loop-kv the core layer's last pass for an earlier pass of a full-attention core layer
+    // (LastFull) or of any core layer (LastAll).
+    [[nodiscard]] std::vector<int>
+    loop_stores(const std::vector<std::pair<std::uint32_t, std::uint32_t>>& schedule) const {
+        std::vector<int> out(schedule.size(), -1);
+        if (options.loop_kv == LoopKvCache::PerPass) { return out; }
+        if (config.num_passes < 2) {
+            throw std::invalid_argument("Inkling 2: --loop-kv needs a looped core; this model runs "
+                                        "its layers once");
+        }
+        std::map<std::uint32_t, int> last; // a core layer's last-pass visit
+        for (std::size_t v = 0; v < schedule.size(); ++v) {
+            const auto [layer, pass] = schedule[v];
+            if (config.core(layer) && pass + 1 == config.num_passes) { last[layer] = int(v); }
+        }
+        for (std::size_t v = 0; v < schedule.size(); ++v) {
+            const auto [layer, pass] = schedule[v];
+            const bool shared =
+                config.full_attention[layer] || options.loop_kv == LoopKvCache::LastAll;
+            if (config.core(layer) && pass + 1 < config.num_passes && shared) {
+                out[v] = last.at(layer);
+            }
+        }
+        return out;
+    }
+
     ~Impl() {
         if (delivery || growing) { ninfer::wait_for_stream(stream); }
         if (guess_stream != nullptr) {
@@ -2286,8 +2324,10 @@ struct Executor::Impl {
         // sequence's ring, the chunk's keys land there, and the window that ends the chunk's kept
         // rows goes back). A full visit of an mxfp8 run encodes its rows into its planes there;
         // one of rk8v4 or rk4v4 stages them as F16 (one slot per row) for kv_store to encode.
+        // The caches are the visit's own, or (--loop-kv) the core's last pass's (`kvp`).
+        const VisitPlan& kvp = vp.store >= 0 ? visits[std::size_t(vp.store)] : vp;
         const std::int64_t stage_stride = std::int64_t(prefill_ring) * kD;
-        const std::int64_t seq_offset   = std::int64_t(c.sequence) * vp.seq_stride;
+        const std::int64_t seq_offset   = std::int64_t(c.sequence) * kvp.seq_stride;
         const bool staging   = c.chunk && !vp.full;
         const bool quantized = vp.full && kvfmt.quantized();
         KvPlaneView k_view, v_view; // a quantized full visit's planes, else null codings
@@ -2298,15 +2338,15 @@ struct Executor::Impl {
                 plane.scales  = static_cast<std::uint8_t*>(scales.p);
                 plane.code_row  = kv_code_bytes(coding);
                 plane.scale_row = kv_scale_bytes(coding);
-                plane.code_head  = std::int64_t(vp.slots) * plane.code_row;
-                plane.scale_head = std::int64_t(vp.slots) * plane.scale_row;
+                plane.code_head  = std::int64_t(kvp.slots) * plane.code_row;
+                plane.scale_head = std::int64_t(kvp.slots) * plane.scale_row;
                 plane.code_seq  = plane.code_head * kv_heads;
                 plane.scale_seq = plane.scale_head * kv_heads;
                 plane.coding    = coding;
                 return plane;
             };
-            k_view = view(vp.k_codes, vp.k_scales, kvfmt.key.coding);
-            v_view = view(vp.v_codes, vp.v_scales, kvfmt.value.coding);
+            k_view = view(kvp.k_codes, kvp.k_scales, kvfmt.key.coding);
+            v_view = view(kvp.v_codes, kvp.v_scales, kvfmt.value.coding);
         }
         kernels::RingCopyArgs keep;
         keep.kv_heads = kv_heads;
@@ -2337,13 +2377,13 @@ struct Executor::Impl {
             ka.ring        = 0;
             ka.row_slots   = true;
         } else if (staging) {
-            keep.src_k           = static_cast<const __half*>(vp.k.p) + seq_offset;
-            keep.src_v           = static_cast<const __half*>(vp.v.p) + seq_offset;
+            keep.src_k           = static_cast<const __half*>(kvp.k.p) + seq_offset;
+            keep.src_v           = static_cast<const __half*>(kvp.v.p) + seq_offset;
             keep.dst_k           = static_cast<__half*>(staging_k.p);
             keep.dst_v           = static_cast<__half*>(staging_v.p);
-            keep.src_head_stride = vp.head_stride;
+            keep.src_head_stride = kvp.head_stride;
             keep.dst_head_stride = stage_stride;
-            keep.src_ring        = vp.ring;
+            keep.src_ring        = kvp.ring;
             keep.dst_ring        = prefill_ring;
             keep.begin           = std::max(0, c.first - window);
             keep.end             = c.first;
@@ -2354,11 +2394,11 @@ struct Executor::Impl {
             ka.head_stride = stage_stride;
             ka.ring        = prefill_ring;
         } else {
-            ka.k_cache     = static_cast<__half*>(vp.k.p);
-            ka.v_cache     = static_cast<__half*>(vp.v.p);
-            ka.seq_stride  = vp.seq_stride;
-            ka.head_stride = vp.head_stride;
-            ka.ring        = vp.ring;
+            ka.k_cache     = static_cast<__half*>(kvp.k.p);
+            ka.v_cache     = static_cast<__half*>(kvp.v.p);
+            ka.seq_stride  = kvp.seq_stride;
+            ka.head_stride = kvp.head_stride;
+            ka.ring        = kvp.ring;
         }
         kernels::attention_inputs(qa, ka, stream);
         if (quantized && kvfmt.staged()) {
@@ -2430,14 +2470,17 @@ struct Executor::Impl {
             aa.out_q       = attn_q.rows;
             kernels::attention(aa, stream);
         }
-        if (staging && c.kept > 0) {
+        // A ring another pass shares takes back only the last pass's window: an earlier pass's
+        // rows past position `first + kept - ring` would land in the slots of the window before
+        // the chunk, which the next pass still copies in.
+        if (staging && c.kept > 0 && vp.store < 0) {
             kernels::RingCopyArgs back = keep;
             std::swap(back.src_head_stride, back.dst_head_stride);
             std::swap(back.src_ring, back.dst_ring);
             back.src_k = static_cast<const __half*>(staging_k.p);
             back.src_v = static_cast<const __half*>(staging_v.p);
-            back.dst_k = static_cast<__half*>(vp.k.p) + seq_offset;
-            back.dst_v = static_cast<__half*>(vp.v.p) + seq_offset;
+            back.dst_k = static_cast<__half*>(kvp.k.p) + seq_offset;
+            back.dst_v = static_cast<__half*>(kvp.v.p) + seq_offset;
             back.begin = std::max(0, c.first + c.kept - window);
             back.end   = c.first + c.kept;
             kernels::ring_copy(back, stream);
@@ -3110,10 +3153,13 @@ struct Executor::Impl {
         return visits.size() * kR * std::size_t(slot_floats) * 4;
     }
 
-    // Every cache a sequence's state holds: the visits', then the DSpark drafter's layers'.
+    // Every cache a sequence's state holds: the visits' own (not those another visit's stand
+    // for), then the DSpark drafter's layers'.
     [[nodiscard]] std::vector<const VisitPlan*> cache_plans() const {
         std::vector<const VisitPlan*> out;
-        for (const VisitPlan& p : visits) { out.push_back(&p); }
+        for (const VisitPlan& p : visits) {
+            if (p.store < 0) { out.push_back(&p); }
+        }
         if (spark) {
             for (const SparkLayer& l : spark->layers) { out.push_back(&l.cache); }
         }
