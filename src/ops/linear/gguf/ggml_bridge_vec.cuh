@@ -15,6 +15,7 @@
 #include "../../common/device_route_lookup.h"
 
 #include <algorithm>
+#include <string_view>
 #include <type_traits>
 
 namespace ninfer::ops::gguf::detail {
@@ -52,6 +53,40 @@ bool cooperative_loads(int width) {
     }
     return false;
 }
+
+// The route key of `type`'s MoE vector products' columns a pass (moe_launch), for rows whose K
+// leaves a remainder of 32-value slices past whole warps (`spread`, kSpreadForm) or not: a device
+// profile that names "one" at a requested chunk runs that chunk one column a pass, which computes
+// the same bits.
+#define NINFER_MOE_COLUMNS_KEY(TYPE, NAME)                                                           \
+    case TYPE: return spread ? "gguf_moe_columns/" NAME "/spread" : "gguf_moe_columns/" NAME "/whole"
+template <ggml_type type>
+constexpr std::string_view moe_columns_key(bool spread) {
+    switch (type) {
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_Q8_0, "q8_0");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_Q4_0, "q4_0");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_Q5_0, "q5_0");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_Q2_0, "q2_0");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_Q2_K, "q2_k");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_Q3_K, "q3_k");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_Q4_K, "q4_k");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_Q5_K, "q5_k");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_Q6_K, "q6_k");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_IQ2_XXS, "iq2_xxs");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_IQ2_XS, "iq2_xs");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_IQ2_S, "iq2_s");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_IQ3_XXS, "iq3_xxs");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_IQ3_S, "iq3_s");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_IQ1_S, "iq1_s");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_IQ1_M, "iq1_m");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_IQ4_NL, "iq4_nl");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_IQ4_XS, "iq4_xs");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_MXFP4, "mxfp4");
+        NINFER_MOE_COLUMNS_KEY(GGML_TYPE_NVFP4, "nvfp4");
+    default: return {};
+    }
+}
+#undef NINFER_MOE_COLUMNS_KEY
 
 struct Slice {
     int w[8];
@@ -2395,6 +2430,11 @@ void moe_launch(const MoeVecArgs& args, int max_active, int chunk, bool fused,
         args.row_bytes < std::int64_t(args.k / D::kBlockElems) * D::kBlockBytes || args.rows <= 0 ||
         max_active <= 0 || max_active > 65535) {
         throw std::invalid_argument("gguf moe product: unsupported geometry");
+    }
+    // One column a pass where the device's profile measured it faster at this chunk.
+    if (chunk > 1) {
+        const bool spread = vec::kSpreadForm<type> && (args.k / 32) % 32 != 0;
+        if (device_route_schedule(vec::moe_columns_key<type>(spread), chunk) == "one") { chunk = 1; }
     }
     const auto launch = [&]<bool Cooperative>() {
         if (fused) {

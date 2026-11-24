@@ -15,6 +15,11 @@
 namespace ninfer::calibration {
 namespace {
 
+// Every block type of the MoE vector products (ggml_bridge.cu's moe_launcher).
+constexpr std::array<std::string_view, 20> kMoeColumnsFormats = {
+    "q8_0",    "q4_0",   "q5_0",  "q2_0",    "q2_k",  "q3_k",  "q4_k",   "q5_k",   "q6_k",  "iq2_xxs",
+    "iq2_xs",  "iq2_s",  "iq3_xxs", "iq3_s", "iq1_s", "iq1_m", "iq4_nl", "iq4_xs", "mxfp4", "nvfp4"};
+
 std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
     std::vector<RouteCatalogEntry> catalog;
     const bool volta         = tier == ops::DeviceTier::Volta;
@@ -29,6 +34,13 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
     add("gguf_moe_vector/q6_k", {"scalar", "cooperative"});
     add("gguf_moe_up/q4_k", {"scalar", "cooperative"});
     add("gguf_moe_up/q6_k", {"scalar", "cooperative"});
+    // The MoE vector products' columns a pass per block type and row form: one against the
+    // requested chunk. Q2_K and IQ2_XS rows have no spread form.
+    for (const std::string_view format : kMoeColumnsFormats) {
+        const std::string base = "gguf_moe_columns/" + std::string(format);
+        if (format != "q2_k" && format != "iq2_xs") { add(base + "/spread", {"one"}); }
+        add(base + "/whole", {"one"});
+    }
     if (!volta && !turing_shapes) {
         // The asynchronous MMQ tile loop per format (ggml_cuda_mmq_async_row_bytes); IQ1_M has
         // the routed-expert matrix kernel only.

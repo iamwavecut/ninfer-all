@@ -44,7 +44,7 @@ struct Format {
     const char* name;
     gguf::GgmlType type;
 };
-// Every block type with both expert routes (MXFP4 has no matrix kernel).
+// Every block type with a vector expert route; MXFP4 and NVFP4 have no matrix kernel.
 constexpr Format kFormats[] = {
     {"Q4_0", gguf::GgmlType::Q4_0},       {"Q5_0", gguf::GgmlType::Q5_0},
     {"Q8_0", gguf::GgmlType::Q8_0},       {"Q2_0", gguf::GgmlType::Q2_0},
@@ -55,6 +55,7 @@ constexpr Format kFormats[] = {
     {"IQ2_XS", gguf::GgmlType::IQ2_XS},   {"IQ2_S", gguf::GgmlType::IQ2_S},
     {"IQ3_XXS", gguf::GgmlType::IQ3_XXS}, {"IQ3_S", gguf::GgmlType::IQ3_S},
     {"IQ4_NL", gguf::GgmlType::IQ4_NL},   {"IQ4_XS", gguf::GgmlType::IQ4_XS},
+    {"MXFP4", gguf::GgmlType::MXFP4},     {"NVFP4", gguf::GgmlType::NVFP4},
 };
 
 std::vector<std::string> split(const std::string& text) {
@@ -79,8 +80,9 @@ std::uint16_t half_bits(float value) {
     return bits;
 }
 
-// Every expert's rows of random codes, each block's binary16 multiplier finite (IQ1_M's spread over
-// the top nibbles of its four scale words, the others' the block's first two bytes), then zeros.
+// Every expert's rows of random codes, each block's multipliers finite (MXFP4's E8M0 byte and
+// NVFP4's four UE4M3 bytes near one, IQ1_M's binary16 spread over the top nibbles of its four scale
+// words, the others' binary16 in the block's first two bytes), then zeros.
 DeviceBuffer random_bank(gguf::GgmlType type, int experts, int rows, int k, std::mt19937& rng) {
     const auto shape = gguf::block_shape(type);
     const std::size_t row_bytes = std::size_t(k / shape.elements) * shape.bytes;
@@ -94,6 +96,16 @@ DeviceBuffer random_bank(gguf::GgmlType type, int experts, int rows, int k, std:
             std::memcpy(host.data() + i, &word, 4);
         }
         for (std::size_t at = 0; at < host.size(); at += std::size_t(shape.bytes)) {
+            if (type == gguf::GgmlType::MXFP4) {
+                host[at] = static_cast<std::uint8_t>(120 + rng() % 8);
+                continue;
+            }
+            if (type == gguf::GgmlType::NVFP4) {
+                for (int j = 0; j < 4; ++j) {
+                    host[at + std::size_t(j)] = static_cast<std::uint8_t>(0x30 + rng() % 9);
+                }
+                continue;
+            }
             const std::uint16_t d = half_bits(scale(rng));
             if (type != gguf::GgmlType::IQ1_M) {
                 std::memcpy(&host[at], &d, 2);
@@ -139,11 +151,7 @@ void run(const Format& format, const Shape& shape_of, int experts, int tokens, s
     for (const Projection& proj :
          {Projection{"gate_up", 2 * shape_of.width, shape_of.hidden, top_k},
           Projection{"down", shape_of.hidden, shape_of.width, 1}}) {
-        if (!gguf::moe_matrix_supported(format.type, proj.rows, proj.k, true)) {
-            std::printf("%-8s %-7s T=%-5d no matrix route on this device\n", format.name, proj.name,
-                        tokens);
-            continue;
-        }
+        const bool matrix_route = gguf::moe_matrix_supported(format.type, proj.rows, proj.k, true);
         const auto shape = gguf::block_shape(format.type);
         const std::int64_t row_bytes = std::int64_t(proj.k / shape.elements) * shape.bytes;
         DeviceBuffer bank = random_bank(format.type, experts, proj.rows, proj.k, rng);
@@ -163,14 +171,17 @@ void run(const Format& format, const Shape& shape_of, int experts, int tokens, s
             out(std::size_t(pairs) * proj.rows * 4);
         const auto* xb = static_cast<const __nv_bfloat16*>(x.p);
         const double bytes = double(active_experts) * double(proj.rows) * double(row_bytes);
-        const auto matrix  = bench::bench_loop(
-            [&](cudaStream_t stream) {
-                gguf::quantize_moe_matrix_activation(format.type, xb, proj.k, routing, pairs,
-                                                     proj.column_group, matrix_act.p, stream);
-                gguf::moe_matrix_product(format.type, moe, routing, max_active, pairs, true,
-                                         matrix_act.p, static_cast<float*>(out.p), stream);
-            },
-            bytes, 3, 20, 300);
+        bench::Result matrix{};
+        if (matrix_route) {
+            matrix = bench::bench_loop(
+                [&](cudaStream_t stream) {
+                    gguf::quantize_moe_matrix_activation(format.type, xb, proj.k, routing, pairs,
+                                                         proj.column_group, matrix_act.p, stream);
+                    gguf::moe_matrix_product(format.type, moe, routing, max_active, pairs, true,
+                                             matrix_act.p, static_cast<float*>(out.p), stream);
+                },
+                bytes, 3, 20, 300);
+        }
         gguf::MoeOutput rows;
         rows.f32           = static_cast<float*>(out.p);
         // The models' chunk: as many columns a pass as the call has tokens, up to eight.
@@ -183,6 +194,13 @@ void run(const Format& format, const Shape& shape_of, int experts, int tokens, s
             },
             bytes, 3, 20, 300);
         check(cudaDeviceSynchronize(), "products");
+        if (!matrix_route) {
+            std::printf("%-8s %-7s T=%-5d experts %3d: no matrix route, vector %9.1f us "
+                        "(%6.1f GB/s)\n",
+                        format.name, proj.name, tokens, active_experts, vector.median_us,
+                        vector.gbs);
+            continue;
+        }
         std::printf("%-8s %-7s T=%-5d experts %3d: matrix %9.1f us (%6.1f GB/s), vector %9.1f us "
                     "(%6.1f GB/s), vector/matrix %.2fx\n",
                     format.name, proj.name, tokens, active_experts, matrix.median_us, matrix.gbs,

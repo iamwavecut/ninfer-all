@@ -410,9 +410,10 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
     return bands;
 }
 
-std::vector<ops::DeviceRouteBand> common_cooperative_bands(
+// The bands where both sweeps chose `schedule`, compiled elsewhere.
+std::vector<ops::DeviceRouteBand> common_bands(
     const std::vector<std::int32_t>& widths, const std::vector<ops::DeviceRouteBand>& first,
-    const std::vector<ops::DeviceRouteBand>& second) {
+    const std::vector<ops::DeviceRouteBand>& second, std::string_view chosen = "cooperative") {
     const auto schedule_at = [](const std::vector<ops::DeviceRouteBand>& bands,
                                 std::int32_t width) -> std::string_view {
         for (const auto& band : bands) {
@@ -423,8 +424,8 @@ std::vector<ops::DeviceRouteBand> common_cooperative_bands(
     std::vector<ops::DeviceRouteBand> result;
     for (const std::int32_t width : widths) {
         const std::string schedule =
-            schedule_at(first, width) == "cooperative" && schedule_at(second, width) == "cooperative"
-                ? "cooperative"
+            schedule_at(first, width) == chosen && schedule_at(second, width) == chosen
+                ? std::string(chosen)
                 : "";
         if (!result.empty() && result.back().schedule == schedule) {
             result.back().last = width;
@@ -447,7 +448,11 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
                        qtype == QType::GGUF_Q5_0 || qtype == QType::GGUF_Q8_0 ||
                        qtype == QType::GGUF_IQ4_NL || qtype == QType::GGUF_IQ4_XS ||
                        qtype == QType::GGUF_Q2_0 || qtype == QType::GGUF_IQ1_M ||
-                       qtype == QType::GGUF_NVFP4;
+                       qtype == QType::GGUF_NVFP4 || qtype == QType::GGUF_Q2_K ||
+                       qtype == QType::GGUF_Q3_K || qtype == QType::GGUF_IQ2_XXS ||
+                       qtype == QType::GGUF_IQ2_XS || qtype == QType::GGUF_IQ2_S ||
+                       qtype == QType::GGUF_IQ3_XXS || qtype == QType::GGUF_IQ3_S ||
+                       qtype == QType::GGUF_IQ1_S || qtype == QType::GGUF_MXFP4;
     if (!known || block.elements == 0 || k % block.elements != 0) {
         throw std::invalid_argument("calibration: unsupported GGUF vector weight format");
     }
@@ -476,7 +481,21 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
             std::memset(host.data() + base, 0x38, 4);
             continue;
         }
-        std::memcpy(host.data() + base + (qtype == QType::GGUF_Q6_K ? 208 : 0), &d, sizeof(d));
+        if (qtype == QType::GGUF_MXFP4) {
+            host[base] = 0x7f; // an E8M0 scale of 2^0
+            continue;
+        }
+        // The FP16 d: after Q6_K's quants and scales, Q2_K's scales and quants, Q3_K's high bits,
+        // quants and scales; first elsewhere.
+        const std::size_t at = qtype == QType::GGUF_Q6_K   ? 208
+                               : qtype == QType::GGUF_Q2_K ? 80
+                               : qtype == QType::GGUF_Q3_K ? 108
+                                                           : 0;
+        std::memcpy(host.data() + base + at, &d, sizeof(d));
+        if (qtype == QType::GGUF_Q2_K) {
+            const std::uint16_t dmin = 0x3800;
+            std::memcpy(host.data() + base + 82, &dmin, sizeof(dmin));
+        }
         if (qtype == QType::GGUF_Q4_K || qtype == QType::GGUF_Q5_K) {
             const std::uint16_t dmin = 0x3800;
             std::memcpy(host.data() + base + 2, &dmin, sizeof(dmin));
@@ -570,7 +589,7 @@ void calibrate_gguf_vector(ops::DeviceRouteProfile& profile, Timer& timer,
                     fused_output.p, static_cast<std::size_t>(17408) * tokens};
             },
             {}};
-        auto bands = common_cooperative_bands(widths, sweep(family, timer, options),
+        auto bands = common_bands(widths, sweep(family, timer, options),
                                               sweep(fused_family, timer, options));
         if (!bands.empty()) {
             profile.routes[family.key] = std::move(bands);
@@ -830,7 +849,7 @@ void calibrate_gguf_moe_vector(ops::DeviceRouteProfile& profile, Timer& timer,
                                                           static_cast<std::size_t>(rows) * pairs};
             },
             {}};
-        auto bands = common_cooperative_bands(chunks, sweep(family, timer, options),
+        auto bands = common_bands(chunks, sweep(family, timer, options),
                                               sweep(fused_family, timer, options));
         if (!bands.empty()) {
             profile.routes[family.key] = std::move(bands);
@@ -907,6 +926,153 @@ void calibrate_gguf_moe_up(ops::DeviceRouteProfile& profile, Timer& timer,
             profile.routes[family.key] = std::move(bands);
             ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
         }
+    }
+}
+
+// Every block type of the MoE vector products (route_catalog.cpp's gguf_moe_columns keys).
+struct MoeColumnsFormat {
+    QType qtype;
+    const char* name;
+    ops::gguf::GgmlType ggml;
+};
+constexpr MoeColumnsFormat kMoeColumnsFormats[] = {
+    {QType::GGUF_Q8_0, "q8_0", ops::gguf::GgmlType::Q8_0},
+    {QType::GGUF_Q4_0, "q4_0", ops::gguf::GgmlType::Q4_0},
+    {QType::GGUF_Q5_0, "q5_0", ops::gguf::GgmlType::Q5_0},
+    {QType::GGUF_Q2_0, "q2_0", ops::gguf::GgmlType::Q2_0},
+    {QType::GGUF_Q2_K, "q2_k", ops::gguf::GgmlType::Q2_K},
+    {QType::GGUF_Q3_K, "q3_k", ops::gguf::GgmlType::Q3_K},
+    {QType::GGUF_Q4_K, "q4_k", ops::gguf::GgmlType::Q4_K},
+    {QType::GGUF_Q5_K, "q5_k", ops::gguf::GgmlType::Q5_K},
+    {QType::GGUF_Q6_K, "q6_k", ops::gguf::GgmlType::Q6_K},
+    {QType::GGUF_IQ2_XXS, "iq2_xxs", ops::gguf::GgmlType::IQ2_XXS},
+    {QType::GGUF_IQ2_XS, "iq2_xs", ops::gguf::GgmlType::IQ2_XS},
+    {QType::GGUF_IQ2_S, "iq2_s", ops::gguf::GgmlType::IQ2_S},
+    {QType::GGUF_IQ3_XXS, "iq3_xxs", ops::gguf::GgmlType::IQ3_XXS},
+    {QType::GGUF_IQ3_S, "iq3_s", ops::gguf::GgmlType::IQ3_S},
+    {QType::GGUF_IQ1_S, "iq1_s", ops::gguf::GgmlType::IQ1_S},
+    {QType::GGUF_IQ1_M, "iq1_m", ops::gguf::GgmlType::IQ1_M},
+    {QType::GGUF_IQ4_NL, "iq4_nl", ops::gguf::GgmlType::IQ4_NL},
+    {QType::GGUF_IQ4_XS, "iq4_xs", ops::gguf::GgmlType::IQ4_XS},
+    {QType::GGUF_MXFP4, "mxfp4", ops::gguf::GgmlType::MXFP4},
+    {QType::GGUF_NVFP4, "nvfp4", ops::gguf::GgmlType::NVFP4},
+};
+
+// One column a pass against the requested chunk of the MoE vector products, which compute the same
+// bits either way, at a decode or verification call of 2, 4 or 8 tokens, for each row form: Inkling
+// 2's widths (2304 hidden; 1280 per expert, whole K-quant blocks) leave a remainder of 32-value
+// slices past whole warps (`spread`), 2048 and 1024 do not (`whole`). 48 experts, each token routing
+// eight of them and six tokens' sets distinct, so a call of eight tokens routes 32 experts once and
+// 16 twice, as a decode round about does; the timer's L2 flush streams the weights from DRAM. A
+// [gate; up] product with the down product (Inkling 2, Edge0) and a fused gate and up product with
+// the down product (Gemma 4, Flint, DeepSeek) must both run faster.
+void calibrate_gguf_moe_columns(ops::DeviceRouteProfile& profile, Timer& timer,
+                                const CalibrationOptions& options, const MoeColumnsFormat& format,
+                                const char* form, std::int32_t hidden, std::int32_t width) {
+    constexpr int experts = 48;
+    constexpr int per_token = 8;
+    const std::vector<std::int32_t> chunks = {2, 4, 8};
+    const std::string key = std::string("gguf_moe_columns/") + format.name + "/" + form;
+    if (!options.only.empty() && key.rfind(options.only, 0) != 0) { return; }
+    const GgufBlockShape block = gguf_block_shape(format.qtype);
+    const std::int64_t up_row_bytes = static_cast<std::int64_t>(hidden / block.elements) * block.bytes;
+    const std::int64_t down_row_bytes = static_cast<std::int64_t>(width / block.elements) * block.bytes;
+    std::vector<SyntheticWeight> weights;
+    weights.reserve(2 * experts);
+    std::vector<const void*> gate_up(experts), up(experts), down(experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        weights.push_back(gguf_vector_weight(format.qtype, 2 * width, hidden,
+                                             0x6a09e667U + static_cast<std::uint32_t>(expert)));
+        gate_up[expert] = weights.back().storage.p;
+        up[expert] = static_cast<const std::uint8_t*>(gate_up[expert]) + width * up_row_bytes;
+        weights.push_back(gguf_vector_weight(format.qtype, hidden, width,
+                                             0xbb67ae85U + static_cast<std::uint32_t>(expert)));
+        down[expert] = weights.back().storage.p;
+    }
+    DeviceBuffer gate_up_storage(experts * sizeof(const void*));
+    DeviceBuffer up_storage(experts * sizeof(const void*));
+    DeviceBuffer down_storage(experts * sizeof(const void*));
+    gate_up_storage.copy_from_host(gate_up.data(), gate_up_storage.bytes);
+    up_storage.copy_from_host(up.data(), up_storage.bytes);
+    down_storage.copy_from_host(down.data(), down_storage.bytes);
+    const auto table = [](const DeviceBuffer& storage, std::int64_t row_bytes, int rows, int k) {
+        return ops::gguf::MoeTable{reinterpret_cast<const void* const*>(storage.p), row_bytes, rows, k};
+    };
+    const ops::gguf::MoeTable gate_up_table = table(gate_up_storage, up_row_bytes, 2 * width, hidden);
+    const ops::gguf::MoeTable gate_table = table(gate_up_storage, up_row_bytes, width, hidden);
+    const ops::gguf::MoeTable up_table = table(up_storage, up_row_bytes, width, hidden);
+    const ops::gguf::MoeTable down_table = table(down_storage, down_row_bytes, hidden, width);
+    // Token t of a call routes experts 6 j + 5 t (mod 48), j < 8: tokens six apart route the same
+    // set. Each width's quantized inputs (their scales follow all of a width's values).
+    struct Call {
+        DeviceBuffer workspace;
+        ops::gguf::MoeRouting routing;
+        DeviceBuffer x;
+        DeviceBuffer middle;
+    };
+    std::map<std::int32_t, Call> calls;
+    const int max_pairs = chunks.back() * per_token;
+    DeviceBuffer ids_device(static_cast<std::size_t>(max_pairs) * sizeof(std::int32_t));
+    DeviceBuffer x = bf16_buffer(static_cast<std::size_t>(hidden) * chunks.back());
+    DeviceBuffer middle = bf16_buffer(static_cast<std::size_t>(width) * max_pairs);
+    for (const std::int32_t tokens : chunks) {
+        const int pairs = tokens * per_token;
+        std::vector<std::int32_t> ids(pairs);
+        for (int t = 0; t < tokens; ++t) {
+            for (int j = 0; j < per_token; ++j) { ids[t * per_token + j] = (6 * j + 5 * t) % experts; }
+        }
+        ids_device.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+        Call call{DeviceBuffer(ops::gguf::moe_routing_bytes(experts, pairs)), {},
+                  DeviceBuffer(ops::gguf::vector_activation_bytes(hidden, tokens)),
+                  DeviceBuffer(ops::gguf::vector_activation_bytes(width, pairs))};
+        call.routing = ops::gguf::moe_sort_routes(static_cast<const std::int32_t*>(ids_device.p),
+                                                  pairs, experts, call.workspace.p, nullptr);
+        ops::gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(x.p), hidden, tokens,
+                                             nullptr, call.x.p, nullptr);
+        ops::gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(middle.p), width,
+                                             pairs, nullptr, call.middle.p, nullptr);
+        CUDA_CHECK(ninfer::wait_for_device());
+        calls.emplace(tokens, std::move(call));
+    }
+    // Each output: the first product's rows, then the down product's.
+    const std::size_t down_rows = static_cast<std::size_t>(hidden) * max_pairs;
+    DeviceBuffer output = bf16_buffer(static_cast<std::size_t>(2 * width) * max_pairs + down_rows);
+    DeviceBuffer fused_output = bf16_buffer(static_cast<std::size_t>(width) * max_pairs + down_rows);
+    const auto run = [&](std::int32_t chunk, bool fused, cudaStream_t stream) {
+        const int pairs = chunk * per_token;
+        const Call& call = calls.at(chunk);
+        auto* first = static_cast<__nv_bfloat16*>(fused ? fused_output.p : output.p);
+        if (fused) {
+            ops::gguf::moe_vector_swiglu(format.ggml, gate_table, up_table, call.routing, pairs,
+                                         per_token, call.x.p, chunk, first, chunk, stream);
+        } else {
+            ops::gguf::MoeOutput rows{};
+            rows.bf16 = first;
+            ops::gguf::moe_vector_product(format.ggml, gate_up_table, call.routing, pairs, per_token,
+                                          per_token, call.x.p, chunk, rows, chunk, stream);
+        }
+        ops::gguf::MoeOutput rows{};
+        rows.bf16 = first + static_cast<std::size_t>(fused ? width : 2 * width) * max_pairs;
+        ops::gguf::moe_vector_product(format.ggml, down_table, call.routing, pairs, 1, per_token,
+                                      call.middle.p, pairs, rows, chunk, stream);
+    };
+    const auto family = [&](bool fused) {
+        return Family{
+            key,
+            chunks,
+            [&run, fused](std::int32_t chunk, cudaStream_t stream) { run(chunk, fused, stream); },
+            [&, fused](std::int32_t) {
+                return std::pair<const void*, std::size_t>{
+                    fused ? fused_output.p : output.p,
+                    static_cast<std::size_t>(fused ? width : 2 * width) * max_pairs + down_rows};
+            },
+            {}};
+    };
+    auto bands = common_bands(chunks, sweep(family(false), timer, options),
+                              sweep(family(true), timer, options), "one");
+    if (!bands.empty()) {
+        profile.routes[key] = std::move(bands);
+        ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
     }
 }
 
@@ -1948,6 +2114,12 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
         calibrate_gguf_vector(profile, timer, options);
         calibrate_gguf_moe_vector(profile, timer, options);
         calibrate_gguf_moe_up(profile, timer, options);
+        for (const MoeColumnsFormat& format : kMoeColumnsFormats) {
+            if (format.qtype != QType::GGUF_Q2_K && format.qtype != QType::GGUF_IQ2_XS) {
+                calibrate_gguf_moe_columns(profile, timer, options, format, "spread", 2304, 1280);
+            }
+            calibrate_gguf_moe_columns(profile, timer, options, format, "whole", 2048, 1024);
+        }
         if (projections && !ops::turing_shapes_here()) {
             for (const AsyncMatrixFormat& format : kAsyncMatrixFormats) {
                 calibrate_gguf_matrix(profile, timer, options, format);
