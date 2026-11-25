@@ -451,3 +451,33 @@ def test_grouped_quantization_refuses_mxfp8():
 
     with pytest.raises(ValueError, match="mxfp8 stores exact BF16 expert banks"):
         quantize_matrix(torch.ones(4, 128), "mxfp8")
+
+
+def test_mxfp8_banks_convert_into_an_artifact_that_reads_back_their_values(tmp_path):
+    from tools.artifact.codecs.row_split import dequantize_row_split
+    from tools.artifact.reader import Artifact
+    from tools.convert.methods import import_encoded
+    from tools.convert.model import Parameter
+    from tools.convert.pipeline import convert
+    from tools.convert.recipe import Recipe
+
+    rng = np.random.default_rng(10)
+    gate_up, down = _mxfp8_values(rng, 512, 128), _mxfp8_values(rng, 256, 128)
+    _banks(tmp_path / "banks.gguf", gate_up, down)
+    output = tmp_path / "banks.ninfer"
+    with GGUFFile(tmp_path / "banks.gguf") as gguf:
+        sources = inkling2._expert_banks(gguf, "blk.0.ffn_gate_up_exps.weight", (512, 128),
+                                         "blk.0.ffn_down_exps.weight", (256, 128))
+        model = Model({"text": {"config": {}}})
+        model.add(Parameter("gate_up", (512, 128), sources[0], inputs=("input",)))
+        model.add(Parameter("down", (256, 128), sources[1], inputs=("product",)))
+        recipe = Recipe(model)
+        for name in ("gate_up", "down"):
+            recipe.assign(name, format="mxfp8", method=import_encoded, activation_policy="A16Only")
+        convert(model, recipe, output, device="cpu", rows_per_chunk=100)
+    with Artifact(output) as artifact:
+        for name, values in (("gate_up", gate_up), ("down", down)):
+            obj = artifact.directory.bindings[name]["object"]
+            decoded = dequantize_row_split(artifact.read_object(obj), "mxfp8", tuple(values.shape),
+                                           dtype=torch.float32)
+            assert torch.equal(decoded, values.float())
