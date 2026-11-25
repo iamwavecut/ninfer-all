@@ -544,6 +544,11 @@ std::map<int, int> offered_tiles(const TypeCase& c, const char* key, Offer offer
 // Eight experts with 8 to 1,024 pairs each, every column tile at a full and a partial width.
 void compare_moe_widths(const TypeCase& c, const AsyncCase& a) {
     if (a.moe_key == nullptr) { return; }
+    // sm_70's routed matrix kernel covers only the formats with a dense one (not IQ1_M).
+    if (!gguf::moe_matrix_supported(c.type, 640, 2560, false)) {
+        std::cout << "NOTE: " << c.name << " has no routed matrix kernel on this device\n";
+        return;
+    }
     const auto offered =
         offered_tiles(c, a.moe_key, [&](int columns) { return a.moe(640, 2560, columns, 0); });
     for (const int pairs : {64, 128, 192, 256, 384, 512, 1024, 4096, 8192}) {
