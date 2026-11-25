@@ -42,7 +42,7 @@ Measured, one request; context in tokens is the largest `--max-context` the serv
 
 | GPU memory | Runs | Measured on |
 |---|---|---|
-| 8 GB | Ternary Bonsai 2 27B (24,576 tokens with `rk4v4`, no MTP); Qwen3.8-Flash-Next and Inkling 2 Mini with their experts in host memory or on disk | RTX 3060 Ti; for Inkling 2 Mini the RTX 5060 |
+| 8 GB | Ternary Bonsai 2 27B (24,576 tokens with `rk4v4`, no MTP); Qwen3.8-Flash-Next and Inkling 2 Mini with their experts in host memory or on disk | RTX 3060 Ti; for Inkling 2 Mini the RTX 5060 and the RTX 3070 Ti ([field report](performance/field-reports.md#rtx-3070-ti-windows-11)) |
 | 11 GB | Ternary Bonsai 2 27B (196,608 tokens with `rk4v4`; 139,264 with MTP) | RTX 2080 Ti |
 | 12 GB | Ternary Bonsai 2 27B (266,240 tokens); Qwen3.8-27B GSQ-RCO IQ3_S (8,192 tokens, no MTP); Inkling 2 Mini with its experts in host memory | RTX 3060; for Inkling 2 Mini also the RTX 5070 |
 | 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens; 122,880 with `rk4v4-e8` and 98,304 with MTP on a card that also drives a desktop); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4`; DeepSeek-V4.1-Flash with its experts in host memory or on disk ([16 GB](deepseek-v41.md#16-gb)); Inkling 2 Mini with its experts in host memory | Tesla V100-SXM2-16GB, RTX 5070 Ti ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)), RTX 5080 ([field report](performance/field-reports.md#rtx-5080-wsl2)); for DeepSeek-V4.1-Flash an RTX 4090 and a Tesla V100-SXM2-32GB held to 16 GB free; for Inkling 2 Mini the RTX 5080, RTX 5060 Ti, RTX 4080 Super, RTX 4060 Ti and RTX A4000 |
@@ -120,7 +120,7 @@ means the card calibrates once at its first start.
 | ✅ | RTX 3090 | 24 GB | GeForce | ✓ | Bonsai 2 and 2.5, Qwen3.8-27B, IQ3_S, 35B-A3B, Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk; the reference card), Inkling 2 Mini (experts on the GPU, in host memory, on disk) |
 | ⬜ | RTX 3080 Ti | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 3080 | 12 / 10 GB | GeForce | 10 GB (68 SMs) | |
-| ⬜ | RTX 3070 Ti | 8 GB | GeForce | ✓ | |
+| ✅ | RTX 3070 Ti | 8 GB | GeForce | ✓ | Inkling 2 Mini under Windows 11 (experts in host memory; [field report](performance/field-reports.md#rtx-3070-ti-windows-11)) |
 | ⬜ | RTX 3070 | 8 GB | GeForce | ✓ | |
 | ✅ | RTX 3060 Ti | 8 GB | GeForce | ✓ | Bonsai 2, Flash-Next (experts in host memory, on disk) |
 | ✅ | RTX 3060 | 12 GB | GeForce | ✓ | Bonsai 2, IQ3_S, Flash-Next (experts in host memory, on disk), Inkling 2 Mini (experts in host memory) |

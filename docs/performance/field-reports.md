@@ -14,6 +14,7 @@ or against each other as a benchmark. [Send a report](#send-a-report) to add a c
 | RTX 4080 and RTX 4090 | Windows 11 | Qwen3.8-27B GSQ-RCO IQ3_S | Hermes Desktop | [RTX 4080 and 4090](#rtx-4080-and-rtx-4090-windows-11) |
 | RTX 5060 Ti, 16 GB, two and four | Linux | Qwen3.8-27B NVFP4 | `--tensor-parallel` prompts to 28.8K tokens, KV capacity | [RTX 5060 Ti](#rtx-5060-ti-two-and-four-cards) |
 | Tesla T10, 16 GB, two | Linux | Inkling 2 Mini UD-IQ4_XS | `--tensor-parallel` without peer access, retrieval prompts to 261,760 tokens, against llama.cpp | [Tesla T10](#tesla-t10-two-cards) |
+| RTX 3070 Ti, 8 GB | Windows 11 | Inkling 2 Mini UD-IQ4_XS | experts in host memory, the largest context with `rk4v4`, a 168K-token retrieval prompt | [RTX 3070 Ti](#rtx-3070-ti-windows-11) |
 
 ## RTX 5070 Ti, Windows 11
 
@@ -390,6 +391,38 @@ layers and an F16 KV cache reached first content in 98.21 s (prefill 334 tok/s),
 tensor-parallel llama.cpp configuration with IQ4_NL and an F16 KV cache in 111.87 s (293 tok/s).
 Their weights and KV formats differ from NInfer's. Visible-text throughput, latency percentiles and
 DSpark at 131K and 261K tokens were not measured.
+
+## RTX 3070 Ti, Windows 11
+
+Reported by @cedrik-fuoco in
+[iamwavecut/ninfer-all#451](https://github.com/iamwavecut/ninfer-all/issues/451) and
+[#467](https://github.com/iamwavecut/ninfer-all/pull/467), 24 November 2026.
+
+- RTX 3070 Ti 8 GB (`sm_86`), Windows 11 with the WDDM driver.
+- The change of #467 (`83e37de`), an `86` build with CUDA 12.9 and Visual Studio 2022 Build Tools
+  17.14 (MSVC 14.44.35207): `cmake -G Ninja -DCMAKE_CUDA_ARCHITECTURES=86` in vcpkg manifest mode.
+- `Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer`.
+
+```bat
+ninfer-serve Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --model-id inkling-2-mini ^
+  --host 127.0.0.1 --port 8094 --max-context 243200 --kv-dtype rk4v4 --expert-residency host
+```
+
+Under WDDM Inkling 2 runs its passes with host experts eagerly, without CUDA Graphs
+([Windows build](../build-windows.md#build)). The build measured here kept no memory free beside
+them; the merged change keeps 64 MiB free for kernels CUDA loads at their first launch, about 7,500
+tokens of `rk4v4` context (8.75 KiB a token) below the ceiling measured here.
+
+- **Largest context.** On the 128-token grid the largest `--max-context` that started was 243,200
+  tokens; 243,712 was refused. At 243,200 the server took 6.99 GiB and left 81 MiB of the card free.
+- **Decode.** 52.4 tok/s on a 512-token answer.
+- **Long prompt.** A 168,201-token prompt with a needle at half its depth: the answer named the
+  needle; prefill ran at 409 tok/s and decode at 20 to 33 tok/s.
+- **Same text.** A fixed prompt at temperature 0 (seed 1234, 512 tokens) gave the same text at
+  212,992 and 243,200 tokens of context, and the same text as a build without #467.
+
+The CPU, host memory, driver version and power limit are not in the report. Prefill and decode at
+other prompt lengths and the other KV formats were not measured.
 
 ## Send a report
 
