@@ -3238,7 +3238,9 @@ network serialization run outside the GPU executor and do not delay formation of
 
 `--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
-and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. The
+and leaves 1 GiB of sizing headroom; omitting the option makes it follow `--max-context`. An
+explicit capacity leaves 64 MiB of each device free: CUDA loads a kernel on its first launch, and a
+request can reach kernels that startup did not launch, such as the last chunk of a long prompt. The
 CUDA Graph driver-state allowance reserved against that budget is computed from the enabled
 graph profiles and concurrency unless `--cuda-graph-allowance-mib` supplies an explicit total; a
 too-small value risks CUDA out-of-memory at graph capture and a too-large one shrinks the KV pool.

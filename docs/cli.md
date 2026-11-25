@@ -641,12 +641,13 @@ as long per call as with BF16 tiles. On an RTX 4090 the same Bonsai runs decoded
 must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
-the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
-memory, and directly chooses the largest legal page capacity for the complete enabled runtime
-layout. This includes the selected speculative backend, fixed sequence state, unified workspace,
-and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
-unallocated. It does not probe allocations or resize the pool at request time. The single-request
-CLI normally leaves the option omitted so it follows
+the 64-token page size; an explicit capacity, given or following `--max-context`, leaves 64 MiB of
+each device free for the kernels CUDA loads on their first launch. `--kv-capacity auto` loads the
+selected weights, measures the remaining GPU memory, and directly chooses the largest legal page
+capacity for the complete enabled runtime layout. This includes the selected speculative backend,
+fixed sequence state, unified workspace, and CUDA Graph allowance, while leaving the default 1 GiB
+automatic headroom unallocated. It does not probe allocations or resize the pool at request time.
+The single-request CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
