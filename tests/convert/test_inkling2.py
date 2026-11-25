@@ -379,3 +379,75 @@ def test_a_dflash2_tensor_stored_wider_than_bf16_is_refused(tmp_path):
     path.write_bytes(raw[:8] + encoded + raw[8 + length:])
     with SafetensorsSource(tmp_path) as store, pytest.raises(ValueError, match="expected BF16"):
         inkling2._dflash2(Model(components={}), store, SMALL_DFLASH2)
+
+
+def _mxfp8_values(rng: np.random.Generator, rows: int, k: int) -> torch.Tensor:
+    """MXFP8 values as BF16 (which holds each exactly): finite E4M3 codes, subnormals included,
+    times a power of two per 32 columns."""
+
+    codes = rng.integers(0, 256, size=(rows, k), dtype=np.uint8)
+    codes[(codes & 0x7F) == 0x7F] = 0x38  # no NaN code
+    exponents = rng.integers(-12, 4, size=(rows, k // 32))
+    values = torch.ldexp(torch.from_numpy(codes).view(torch.float8_e4m3fn).float(),
+                         torch.from_numpy(np.repeat(exponents, 32, axis=1)))
+    return values.to(torch.bfloat16)
+
+
+def _banks(path, gate_up: torch.Tensor, down: torch.Tensor) -> None:
+    tensors = {}
+    for name, values in (("blk.0.ffn_gate_up_exps.weight", gate_up),
+                         ("blk.0.ffn_down_exps.weight", down)):
+        words = values.view(torch.int16).numpy().view(np.uint16)
+        tensors[name] = (tuple(words.shape), TYPE_BF16, words.tobytes())
+    _write(path, tensors)
+
+
+def test_exact_bf16_expert_banks_are_stored_as_mxfp8_rows(tmp_path):
+    rng = np.random.default_rng(7)
+    gate_up, down = _mxfp8_values(rng, 512, 128), _mxfp8_values(rng, 256, 128)
+    _banks(tmp_path / "banks.gguf", gate_up, down)
+    with GGUFFile(tmp_path / "banks.gguf") as gguf:
+        sources = inkling2._expert_banks(gguf, "blk.0.ffn_gate_up_exps.weight", (512, 128),
+                                         "blk.0.ffn_down_exps.weight", (256, 128))
+        for source, values in zip(sources, (gate_up, down)):
+            rows = source.read_encoded(0, values.shape[0])
+            assert rows.format == "mxfp8" and rows.packed
+            assert rows.codes.dtype == torch.uint8 and rows.scales.dtype == torch.uint8
+            decoded = torch.ldexp(rows.codes.view(torch.float8_e4m3fn).float(),
+                                  rows.scales.repeat_interleave(32, dim=1).int() - 127)
+            assert torch.equal(decoded, values.float())
+            assert torch.equal(source.values().reshape(values.shape), values)
+
+
+def test_a_layer_keeps_both_banks_bf16_when_one_is_not_exact_mxfp8(tmp_path):
+    rng = np.random.default_rng(8)
+    gate_up, down = _mxfp8_values(rng, 512, 128), _mxfp8_values(rng, 256, 128)
+    down[3, 5] = 1.0078125  # eight significant bits: no E4M3 code holds it
+    _banks(tmp_path / "banks.gguf", gate_up, down)
+    with GGUFFile(tmp_path / "banks.gguf") as gguf:
+        sources = inkling2._expert_banks(gguf, "blk.0.ffn_gate_up_exps.weight", (512, 128),
+                                         "blk.0.ffn_down_exps.weight", (256, 128))
+        assert all(source.read_encoded is None for source in sources)
+
+
+def test_mxfp8_row_split_payloads_decode_to_their_values():
+    from tools.artifact.codecs.row_split import dequantize_row_split
+    from tools.artifact.formats import MXFP8
+    from tools.artifact.layouts import row_split_geometry
+
+    rng = np.random.default_rng(9)
+    values = _mxfp8_values(rng, 6, 256)
+    codes, scales = inkling2.encode_mxfp8_exact(values)
+    g = row_split_geometry(MXFP8, (6, 256))
+    payload = bytearray(g.payload_bytes)
+    payload[g.base_offset:g.base_offset + codes.numel()] = codes.numpy().tobytes()
+    payload[g.scale_offset:g.scale_offset + scales.numel()] = scales.numpy().tobytes()
+    decoded = dequantize_row_split(bytes(payload), MXFP8, (6, 256), dtype=torch.float32)
+    assert torch.equal(decoded, values.float())
+
+
+def test_grouped_quantization_refuses_mxfp8():
+    from tools.convert.quantization.groupwise import quantize_matrix
+
+    with pytest.raises(ValueError, match="mxfp8 stores exact BF16 expert banks"):
+        quantize_matrix(torch.ones(4, 128), "mxfp8")

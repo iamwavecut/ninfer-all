@@ -354,21 +354,20 @@ def encode_mxfp8_exact(bf16_rows: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return codes_u8.contiguous(), scales_u8.contiguous()
 
 
-def _expert_matrix(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
-    """Expert bank matrix: lossless MXFP8 (`mxfp8`) when stored as BF16 with `k % 32 == 0` and
-    every value is exactly MXFP8-representable; otherwise `_matrix(...)` unchanged."""
+def _mxfp8_bank(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource | None:
+    """A BF16 expert bank as MXFP8 rows (`mxfp8`) when every value round-trips exactly and K is a
+    multiple of 128 (the expert products step through unpadded rows); otherwise None."""
 
+    if gguf.info(tensor).type_id != TYPE_BF16 or shape[1] % 128 != 0:
+        return None
     source = _matrix(gguf, tensor, shape)
-    info = gguf.info(tensor)
-    if info.type_id != TYPE_BF16 or shape[1] % 32 != 0:
-        return source
     rows_total, k = shape
-    chunk_rows = max(1, min(rows_total, (16 * 1024 * 1024) // max(1, k)))
+    chunk_rows = max(1, min(rows_total, (16 * 1024 * 1024) // k))
     for begin in range(0, rows_total, chunk_rows):
         end = min(rows_total, begin + chunk_rows)
         vals = source.values(begin * k, end * k).reshape(end - begin, k).to(torch.bfloat16)
         if encode_mxfp8_exact(vals) is None:
-            return source
+            return None
 
     def encoded(begin: int, end: int) -> EncodedRows:
         vals = source.values(begin * k, end * k).reshape(end - begin, k).to(torch.bfloat16)
@@ -380,6 +379,16 @@ def _expert_matrix(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> Logic
 
     return replace(source, label=f"{tensor}[bf16 as exact mxfp8]{list(shape)}",
                    read_encoded=encoded)
+
+
+def _expert_banks(gguf: GGUFFile, gate_up: str, gate_up_shape: tuple[int, int], down: str,
+                  down_shape: tuple[int, int]) -> tuple[LogicalSource, LogicalSource]:
+    """A layer's two expert banks: both MXFP8 when both are exact BF16 banks, else as stored."""
+
+    exact = (_mxfp8_bank(gguf, gate_up, gate_up_shape), _mxfp8_bank(gguf, down, down_shape))
+    if exact[0] is not None and exact[1] is not None:
+        return exact
+    return _matrix(gguf, gate_up, gate_up_shape), _matrix(gguf, down, down_shape)
 
 
 def _matrix(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
@@ -754,12 +763,10 @@ def build_model(base, gguf: GGUFFile, *, vision: GGUFFile | None = None,
         vector(p + "ffn_norm", g + "ffn_norm.weight", (h,))
         vector(m + "router", g + "ffn_gate_inp.weight", (e, h))
         vector(m + "router_bias", g + "exp_probs_b.bias", (e,))
-        model.add(Parameter(m + "gate_up", (e * 2 * w, h),
-                            _expert_matrix(gguf, g + "ffn_gate_up_exps.weight", (e * 2 * w, h)),
-                            inputs=(m + "input",)))
-        model.add(Parameter(m + "down", (e * h, w),
-                            _expert_matrix(gguf, g + "ffn_down_exps.weight", (e * h, w)),
-                            inputs=(m + "product",)))
+        gate_up, down = _expert_banks(gguf, g + "ffn_gate_up_exps.weight", (e * 2 * w, h),
+                                      g + "ffn_down_exps.weight", (e * h, w))
+        model.add(Parameter(m + "gate_up", (e * 2 * w, h), gate_up, inputs=(m + "input",)))
+        model.add(Parameter(m + "down", (e * h, w), down, inputs=(m + "product",)))
         for tensor, name in (("ffn_gate_up_exps.scale", "gate_up_scale"),
                              ("ffn_down_exps.scale", "down_scale")):
             if g + tensor in gguf.tensors:

@@ -363,15 +363,9 @@ void bf16_expert_rows(const void* const* table, int rows, int k, const std::int3
                       const std::int32_t* active_count, int max_active, const __nv_bfloat16* x,
                       int x_div, float* out, cudaStream_t stream);
 
-// MXFP8 re-encoding of BF16 expert rows: `rows * k` BF16 values (`k % 32 == 0`) encoded into
-// `(rows * k)` E4M3 codes (`uint8_t`) and `(rows * (k / 32))` E8M0 scales (`uint8_t`),
-// incrementing `*inexact` if any element does not round-trip bit-exactly to its BF16 value.
-void mxfp8_encode_bf16_rows(const __nv_bfloat16* src, int rows, int k, std::uint8_t* codes,
-                            std::uint8_t* scales, unsigned int* inexact, cudaStream_t stream);
-
-// MXFP8 expert products: same routing, tiling, and accumulation order as `bf16_expert_rows`,
-// reading `rows * k` E4M3 codes from `codes_table[e]` and `rows * (k / 32)` E8M0 scales from
-// `scales_table[e]` (`k % 32 == 0`, 16-byte aligned).
+// MXFP8 expert products: bf16_expert_rows's sums over W_e decoded from `rows` rows of k E4M3 codes
+// at codes_table[e] (8-byte aligned) and of k / 32 E8M0 scales at scales_table[e], k % 32 == 0.
+// Weights equal to a BF16 bank's give that bank's bits.
 void mxfp8_expert_rows(const void* const* codes_table, const void* const* scales_table, int rows,
                        int k, const std::int32_t* bounds, const std::int32_t* sorted,
                        const std::int32_t* active, const std::int32_t* active_count,

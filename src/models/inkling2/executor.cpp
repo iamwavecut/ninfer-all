@@ -692,6 +692,11 @@ struct Executor::Impl {
                     p.down_type         = down_type;
                     p.gate_up_row_bytes = mxfp8 ? gate_up.padded_shape[1] : row_bytes(gate_up);
                     p.down_row_bytes    = mxfp8 ? down.padded_shape[1] : row_bytes(down);
+                    // The MXFP8 products step through rows of K codes and K/32 scales.
+                    if (mxfp8 && (p.gate_up_row_bytes != hidden || p.down_row_bytes != width)) {
+                        throw std::invalid_argument("Inkling 2: MXFP8 experts need K a multiple "
+                                                    "of 128");
+                    }
                 } else if (bf16 != p.bf16 || mxfp8 != p.mxfp8 || gate_up_type != p.gate_up_type ||
                            down_type != p.down_type) {
                     throw std::invalid_argument("Inkling 2: one layer's experts in different "
@@ -749,8 +754,9 @@ struct Executor::Impl {
         } else {
             p.delivery_layer    = int(i);
             const auto& bank    = model.expert_banks()[i];
-            p.bf16 = bank.gate_up_type == QType::BF16 && bank.down_type == QType::BF16;
-            if (!p.bf16) {
+            p.bf16  = bank.gate_up_type == QType::BF16 && bank.down_type == QType::BF16;
+            p.mxfp8 = bank.gate_up_type == QType::MXFP8 && bank.down_type == QType::MXFP8;
+            if (!p.bf16 && !p.mxfp8) {
                 p.gate_up_type = ops::detail::gguf_type(bank.gate_up_type);
                 p.down_type    = ops::detail::gguf_type(bank.down_type);
             }
