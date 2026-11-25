@@ -16,7 +16,7 @@ The storage registry contains exactly these identities:
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `row_interleaved_v1` | tensor layout | `fp8_e4m3fn_row_fp16` | rank 2 `[N,K]` | 256 bytes |
-| `gguf_blocks_v1` | tensor layout | the eighteen `gguf_*` formats | rank 2 `[N,K]`, `K % block_values == 0` | 256 bytes |
+| `gguf_blocks_v1` | tensor layout | the nineteen `gguf_*` formats | rank 2 `[N,K]`, `K % block_values == 0` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are

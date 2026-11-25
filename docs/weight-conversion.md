@@ -73,7 +73,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `qwen3_8_27b_nvfp4_nvidia` | nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant): imported NVFP4 MLP projections and per-row FP8 attention and GDN projections; FP8 embedding, and the NVFP4 output head re-quantized to FP8 | `quantized` |
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter/Qwen3.8-27B-Uncensored-NVFP4 (GPTQ compressed-tensors): imported NVFP4 MLP projections in layers 0-55, per-row FP8 everywhere else; FP8 embedding and output head from BF16 | `quantized` |
-| `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
+| `bonsai2_27b_ternary` | Ternary Bonsai 2 or 2.5: the Hadamard-rotated ternary text tower, token table and output head kept as stored (PQ2_0 as `t2_g128_fp16`, PTQ1_0 as `gguf_ptq1_0`) with the signs on their Uses; an `-mtp` GGUF's MTP head in its Q4_0 blocks | `ternary` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte; an untied BF16 output head as BF16 words | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL or Q8_0 rows in the same artifact or in a table artifact of their own; every hyper-connection matrix as ggml Q8_0 rows (the release's BF16 ones re-quantised); the MTP block from an MTP GGUF, its matrices in their blocks | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
 | `qwen3_8_flash_next_gguf_preserve` | [Native-source preservation](flash-next-native-dflash2.md): encoded expert grids, FP32 norm gamma and decay, Basalt HC8 rounding and BF16 prefill injection; explicit `--compat-bf16` for the source recipe's compatibility casts | `gguf`, `ngram` (GGUF or NVIDIA FP8 PLE safetensors), optional `vision` and `mtp` |
@@ -168,19 +168,24 @@ text,vision,mtp,dflash2`). An artifact may contain several optional
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
 
-### Ternary Bonsai 2 27B
+### Ternary Bonsai 2 and 2.5 27B
 
 `bonsai2_27b_ternary` ([`ternary.py`](../tools/convert/ternary.py)) builds a Qwen3.8-27B artifact
-whose text tower comes from PrismML's `Ternary-Bonsai-2-27B-PQ2_0.gguf`. Every text projection
-except the GDN A/B controls, the output head and the token-embedding table are stored as
-`t2_g128_fp16`: the ternary codes and their per-128 scales are imported without rounding. Those
+whose text tower comes from PrismML's `Ternary-Bonsai-2-27B-PQ2_0.gguf`, or from a Bonsai 2.5
+release in either of its two ternary forms. Every text projection except the GDN A/B controls, the
+output head and the token-embedding table are stored without rounding: PQ2_0 rows as
+`t2_g128_fp16` (the ternary codes and their per-128 scales), PTQ1_0 rows as `gguf_ptq1_0`, their
+28-byte blocks byte for byte ([GGUF block formats](gguf.md#formats)). Those
 matrices are Hadamard-rotated in the checkpoint, so each projection's Uses carry the
 `hadamard_signs` auxiliary of its input width (three shared vectors in total), and the runtime
 rotates the matching activations. The token table has no Use of its own: the runtime restores each
 gathered row to the primal basis with the hidden-width signs that the output head carries. The
 recipe also undoes llama.cpp's exporter conventions: GDN value heads return from the tiled to the
-grouped order, norms from `1 + w` to `w`, and `ssm_a` to `A_log`. Vision and the frontend
-resources come from the Qwen3.8-27B checkpoint, which shares the geometry. The published artifact
+grouped order, norms from `1 + w` to `w`, and `ssm_a` to `A_log`; Bonsai 2.5 stores its GDN
+controls as F32 words, which the recipe takes only when BF16 holds every one exactly. Vision and the
+frontend resources come from the Qwen3.8-27B checkpoint, which shares the geometry, or Vision from
+the release's `mmproj` GGUF with `--source vision=` (in the official Vision formats). The published
+Bonsai 2 artifact
 takes its MTP head and DFlash2 adapter from ProCreations' heads trained on Bonsai 2 itself
 ([MTP](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-MTP),
 [DFlash2](https://huggingface.co/ProCreations/Ternary-Bonsai-2-27B-DFlash2)), which accept more drafts
@@ -204,10 +209,33 @@ python3 -m tools.convert \
 
 Without `--source mtp` the MTP head comes from the checkpoint, and `--source
 dflash2=/path/to/Qwen3.8-27B-DFlash2` selects z-lab's adapter. `--proposal` takes the proposal
-head's rows from the ternary output head itself: PrismML's T2 rows of the 131,072 most frequent
-tokens, in their own encoding and with the head's rotation, so a draft through `--lm-head-draft`
-scores those tokens exactly as the full head does. It adds 170 MiB to the file and is loaded only
-with `--lm-head-draft`.
+head's rows from the ternary output head itself: PrismML's rows of the 131,072 most frequent
+tokens, in their own encoding (T2 or PTQ1_0 blocks) and with the head's rotation, so a draft through
+the proposal head scores those tokens exactly as the full head does. It adds 170 MiB to the Bonsai 2
+file; a drafter loads it unless `--full-draft-head` keeps the drafts on the full head.
+
+Bonsai 2.5's `-mtp` GGUFs carry PrismML's MTP head as block 64: one layer in Q4_0 blocks, which
+PrismML fine-tuned from Bonsai 2's head (itself started from Qwen3.8-27B's). With `--components
+...,mtp` and no `--source mtp`, the recipe stores its blocks byte for byte as `gguf_q4_0`; the head
+reads the Engine's ordinary, unrotated activations. Bonsai 2.5 has no DFlash2 adapter. The two
+published artifacts:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B \
+  --recipe bonsai2_27b_ternary \
+  --source ternary=/path/to/Ternary-Bonsai-2.5-27B-PTQ1_0-mtp.gguf \
+  --source vision=/path/to/Ternary-Bonsai-2.5-27B-mmproj-BF16.gguf \
+  --components text,vision,mtp \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --proposal \
+  --name bonsai2.5-27b \
+  --out models/Ternary-Bonsai-2.5-27B-PTQ1_0-ninfer-v3.ninfer
+```
+
+`--source ternary=.../Ternary-Bonsai-2.5-27B-PQ2_0-mtp.gguf` gives the PQ2_0 artifact. `--model`
+needs only the checkpoint's configuration and tokenizer files here. PQ2_0 and PTQ1_0 hold the same
+ternary values and scales; PTQ1_0 packs them in 1.75 bits per weight instead of 2.125.
 
 A named source whose path ends in `.gguf` opens as a GGUF file; the recipe validates its header,
 tensor set and Hadamard metadata before reading anything.

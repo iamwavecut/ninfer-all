@@ -76,25 +76,48 @@ ninfer-serve --config configs/bonsai2-27b-disk-tier.ini
 - **Images.** `--vision --vision-residency overlay --vision-max-merged 12288` adds them. The encode
   borrows the drafter's memory, so the whole window still fits a 24 GB card.
 - **Past 958,464 tokens.** The RTX 5090 and the PRO 6000 hold the 1,048,576-token maximum with
-  `rk4v4`, DFlash2 or MTP included; the RTX 5090 holds 978,944 with `rk8v4`. Filled to 1,048,576
+  `rk4v4`, DFlash2 or MTP included; the RTX 5090 holds 974,848 with `rk8v4`. Filled to 1,048,576
   tokens, the model misses the code at 90% (about 943K); up to about 880K it found every code on
   every card.
+
+## Ternary Bonsai 2.5 27B
+
+PQ2_0 with MTP, and the largest context a 24 GB card holds with PTQ1_0.
+
+```bash
+# The fastest single stream: PQ2_0 with MTP and three drafts over 262,144 tokens of rk8v4.
+ninfer-serve --config configs/bonsai2.5-27b-mtp.ini
+
+# The largest context a 24 GB card holds: PTQ1_0, 1,019,904 tokens of rk4v4 with --rope-yarn.
+ninfer-serve --config configs/bonsai2.5-27b-max-context.ini
+```
+
+- **Which artifact.** PTQ1_0 decodes one request faster without a drafter on every measured card
+  and holds the longest windows; PQ2_0 is faster with MTP, with several requests and on prompts
+  ([measurements](performance/bonsai-2-5-2026-11.md)).
+- **Past 1,019,904 tokens.** 1,019,904 is the RTX 4090's window; the RTX 3090 holds 1,032,192, and
+  the RTX 5090 and the PRO 6000 the 1,048,576-token maximum with `rk4v4` and either artifact, MTP
+  included.
 
 ## Qwen3.8-27B
 
 The official `groupwise-int` artifact and the GSQ-RCO IQ3_S release.
 
 ```bash
-# The official artifact on a 24 GB card: DFlash2 with five drafts over 245,760 tokens of rk4v4.
+# The official artifact on a 24 GB card: DFlash2 with five drafts over 192,512 tokens of rk4v4.
 ninfer-serve --config configs/qwen3.8-27b-dflash2.ini
 
 # GSQ-RCO IQ3_S: MTP over 176,128 tokens of rk8v4.
 ninfer-serve --config configs/qwen3.8-27b-iq3s-mtp.ini
 ```
 
-- **The official artifact with `rk8v4`.** The same speculation fits 167,936 tokens on an RTX 4090
-  and 176,128 on an RTX 3090. An RTX 5090 takes the full 262,144 with either KV format.
-- **IQ3_S.** It drafts with `--spec dflash2 --draft-tokens 5` as well, and `--vision` adds images.
+- **The official artifact with `rk8v4`.** The same speculation fits 131,072 tokens on an RTX 4090.
+  An RTX 5090 takes the full 262,144 with either KV format.
+- **More context with a drafter.** `--full-draft-head --ngram-draft-tokens 0` drafts through the full
+  output head without copy drafting and gives back about 0.8 GiB with DFlash2: 167,936 tokens of
+  `rk8v4` on an RTX 4090 ([largest context](performance.md#largest-context)).
+- **IQ3_S.** It holds 413,696 tokens of `rk8v4` with MTP 3 on an RTX 4090, drafts with
+  `--spec dflash2 --draft-tokens 5` as well, and `--vision` adds images.
 
 ## Qwen3.8-27B fine-tunes
 
@@ -329,16 +352,17 @@ build (the image has one); `sm_86` and `sm_89` builds refuse the file. On an RTX
 
 ## Cards of 8 to 12 GB
 
-The windows the [small cards](performance/small-cards-2026-10.md) page measured: the server started
-with `--max-concurrency 1` and answered a request. These three cards carry built-in device profiles;
-another card of this size calibrates once at its first start, in one to three minutes.
+The windows the [small cards](performance/small-cards-2026-10.md) page measured, checked again in
+November 2026: the server started with `--max-concurrency 1` and answered a request. These three
+cards carry built-in device profiles; another card of this size calibrates once at its first start,
+in one to three minutes.
 
 ```bash
 # 8 GB (RTX 3060 Ti): Ternary Bonsai 2 with 24,576 tokens of rk4v4 and no drafter. MTP does not fit.
 ninfer-serve --config configs/bonsai2-27b-8gb.ini
 
-# 11 GB (RTX 2080 Ti): 143,360 tokens of rk4v4 with MTP. Without drafting the card holds 200,704:
-# --spec none --max-context 200704 --kv-capacity 200704.
+# 11 GB (RTX 2080 Ti): 139,264 tokens of rk4v4 with MTP. Without drafting the card holds 196,608:
+# --spec none --max-context 196608 --kv-capacity 196608.
 ninfer-serve --config configs/bonsai2-27b-11gb.ini
 
 # 12 GB (RTX 3060): 266,240 tokens of rk4v4.
