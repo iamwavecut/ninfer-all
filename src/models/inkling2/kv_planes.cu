@@ -65,25 +65,6 @@ __launch_bounds__(kWarps * 32) __global__ void kv_store_pair_kernel(KvStoreArgs 
     }
 }
 
-// One warp per (position, head): lanes 0-15 decode the K row's sixteen chunks, 16-31 the V row's.
-__global__ __launch_bounds__(32) void ring_load_kernel(RingLoadArgs a) {
-    const int p    = a.begin + blockIdx.x, h = blockIdx.y;
-    const int lane = threadIdx.x;
-    const bool key = lane < 16;
-    const KvPlaneView& plane = key ? a.src_k : a.src_v;
-    const int src = p % a.src_ring, dst = p % a.dst_ring, chunk = lane & 15;
-    const std::int64_t codes_row = std::int64_t(a.sequence) * plane.code_seq +
-                                   std::int64_t(h) * plane.code_head +
-                                   std::int64_t(src) * plane.code_row;
-    const std::int64_t scales_row = std::int64_t(a.sequence) * plane.scale_seq +
-                                    std::int64_t(h) * plane.scale_head +
-                                    std::int64_t(src) * plane.scale_row;
-    const uint4 word = chunk_word(plane, plane.codes + codes_row, plane.scales + scales_row, chunk);
-    __half* out = key ? a.dst_k : a.dst_v;
-    reinterpret_cast<uint4*>(out + std::int64_t(h) * a.dst_head_stride +
-                             std::int64_t(dst) * kKvRowDims)[chunk] = word;
-}
-
 } // namespace
 
 void kv_store(const KvStoreArgs& args, cudaStream_t stream) {
@@ -151,13 +132,6 @@ void kv_store_pair(const KvStoreArgs& key, const KvStoreArgs& value, cudaStream_
     default: throw std::invalid_argument("inkling2 kv_store: F16 needs no plane");
     }
     check_launch("kv_store_pair");
-}
-
-void ring_load(const RingLoadArgs& args, cudaStream_t stream) {
-    if (args.end <= args.begin) { return; }
-    const dim3 grid(args.end - args.begin, args.kv_heads, 1);
-    ring_load_kernel<<<grid, 32, 0, stream>>>(args);
-    check_launch("ring_load");
 }
 
 } // namespace ninfer::models::inkling2::kernels

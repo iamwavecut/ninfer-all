@@ -2459,9 +2459,6 @@ struct Executor::Impl {
             }
             kernels::kv_store_pair(stores[0], stores[1], stream);
         }
-            }
-            kernels::kv_store_pair(stores[0], stores[1], stream);
-        }
         if (c.chunk) {
             const auto [begin, end] = kept_history(c);
             kernels::keep_history(kv, 2 * kvd, 2 * kvd, c.rows.positions, begin, end, site(v, 0),
