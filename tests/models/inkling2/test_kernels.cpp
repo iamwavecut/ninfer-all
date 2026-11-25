@@ -1448,6 +1448,100 @@ void bf16_experts_case(int tokens, int rows, int k_, int x_div, int experts, std
                            std::to_string(k_) + ": " + std::to_string(wrong) + " values differ");
 }
 
+// An MXFP8 value: an E4M3 code's (no NaN codes reach here) times 2^(scale - 127).
+double mxfp8_value(std::uint8_t code, std::uint8_t scale) {
+    return e4m3_value(code) * std::ldexp(1.0, int(scale) - 127);
+}
+
+// MXFP8 banks as the converter stores them: random finite codes over every exponent and the
+// subnormals, a scale per 32 columns. The products equal an FP64 sum over the codes' values and
+// bf16_expert_rows's bits over the same values stored as BF16 (which holds every one exactly).
+void mxfp8_experts_case(int tokens, int rows, int k_, int x_div, int experts, std::mt19937& rng) {
+    const int pairs = tokens * kTopK, inputs = x_div == 1 ? pairs : tokens;
+    std::vector<std::int32_t> ids(pairs);
+    std::vector<int> order(experts);
+    std::iota(order.begin(), order.end(), 0);
+    for (int t = 0; t < tokens; ++t) {
+        std::shuffle(order.begin(), order.end(), rng);
+        for (int j = 0; j < kTopK; ++j) { ids[t * kTopK + j] = order[j]; }
+    }
+    for (int p = 5; p < pairs; p += 11) { ids[p] = -1; }
+    const std::size_t values = std::size_t(experts) * rows * k_;
+    std::vector<std::uint8_t> codes(values), scales(values / 32);
+    std::vector<bf16> w(values), x(std::size_t(inputs) * k_);
+    std::uniform_int_distribution<int> code_dist(0, 255), scale_dist(127 - 18, 127 - 6);
+    for (auto& c : codes) {
+        do { c = std::uint8_t(code_dist(rng)); } while ((c & 0x7F) == 0x7F);
+    }
+    for (auto& g : scales) { g = std::uint8_t(scale_dist(rng)); }
+    for (std::size_t i = 0; i < values; ++i) {
+        const double v = mxfp8_value(codes[i], scales[i / 32]);
+        w[i]           = __float2bfloat16(float(v));
+        if (double(__bfloat162float(w[i])) != v) {
+            throw std::logic_error("BF16 misses an MXFP8 value");
+        }
+    }
+    {
+        const auto xf = normal(x.size(), 1.0f, rng);
+        for (std::size_t i = 0; i < x.size(); ++i) { x[i] = __float2bfloat16(xf[i]); }
+    }
+    DeviceBuffer d_w = upload(w), d_x = upload(x), d_ids = upload(ids);
+    DeviceBuffer d_codes = upload(codes), d_scales = upload(scales);
+    std::vector<const void*> bf16_table(experts), codes_table(experts), scales_table(experts);
+    for (int e = 0; e < experts; ++e) {
+        bf16_table[e]   = as<bf16>(d_w) + std::int64_t(e) * rows * k_;
+        codes_table[e]  = as<std::uint8_t>(d_codes) + std::int64_t(e) * rows * k_;
+        scales_table[e] = as<std::uint8_t>(d_scales) + std::int64_t(e) * rows * (k_ / 32);
+    }
+    DeviceBuffer d_bf16_table = upload(bf16_table), d_codes_table = upload(codes_table),
+                 d_scales_table = upload(scales_table);
+    DeviceBuffer space(gguf::moe_routing_bytes(experts, pairs));
+    const gguf::MoeRouting routing =
+        gguf::moe_sort_routes(as<std::int32_t>(d_ids), pairs, experts, space.p, nullptr);
+    const float sentinel = 12345.0f;
+    const std::vector<float> fill(std::size_t(pairs) * rows, sentinel);
+    DeviceBuffer out_bf16 = upload(fill), out_mxfp8 = upload(fill);
+    k::bf16_expert_rows(static_cast<const void* const*>(d_bf16_table.p), rows, k_, routing.bounds,
+                        routing.sorted, routing.active, routing.active_count,
+                        std::min(pairs, experts), as<bf16>(d_x), x_div, as<float>(out_bf16),
+                        nullptr);
+    k::mxfp8_expert_rows(static_cast<const void* const*>(d_codes_table.p),
+                         static_cast<const void* const*>(d_scales_table.p), rows, k_,
+                         routing.bounds, routing.sorted, routing.active, routing.active_count,
+                         std::min(pairs, experts), as<bf16>(d_x), x_div, as<float>(out_mxfp8),
+                         nullptr);
+    sync("mxfp8_expert_rows");
+    const auto got_bf16  = download<float>(out_bf16, std::size_t(pairs) * rows);
+    const auto got       = download<float>(out_mxfp8, std::size_t(pairs) * rows);
+    const int step       = pairs > 64 ? 13 : 1;
+    Error e;
+    std::size_t kept_wrong = 0;
+    for (int p = 0; p < pairs; ++p) {
+        if (ids[p] < 0) {
+            for (int r = 0; r < rows; ++r) {
+                kept_wrong += got[std::size_t(p) * rows + r] != sentinel;
+            }
+            continue;
+        }
+        const bf16* xp = x.data() + std::size_t(x_div == 1 ? p : p / kTopK) * k_;
+        const std::size_t base = std::size_t(ids[p]) * rows * k_;
+        for (int r = 0; r < rows; r += step) {
+            double sum = 0;
+            for (int j = 0; j < k_; ++j) {
+                const std::size_t i = base + std::size_t(r) * k_ + j;
+                sum += mxfp8_value(codes[i], scales[i / 32]) * double(__bfloat162float(xp[j]));
+            }
+            e.add(got[std::size_t(p) * rows + r], sum);
+        }
+    }
+    report(e.rel() < 2e-6 && kept_wrong == 0 && same_bits(got, got_bf16),
+           "mxfp8_expert_rows " + std::to_string(rows) + "x" + std::to_string(k_) + ", " +
+               std::to_string(pairs) + " pairs over " + std::to_string(experts) +
+               " experts (x per " + (x_div == 1 ? "pair" : "token") + "): rel " + num(e.rel()) +
+               ", " + std::to_string(kept_wrong) + " foreign rows changed, BF16 bits " +
+               (same_bits(got, got_bf16) ? "equal" : "differ"));
+}
+
 void elementwise_case(std::mt19937& rng) {
     constexpr std::int64_t n = 200058;
     auto x = normal(n, 20.0f, rng);
@@ -1811,6 +1905,8 @@ int main() {
         for (const int tokens : {1, 8, 300}) {
             bf16_experts_case(tokens, 2 * kWidth, kHidden, kTopK, 16, rng);
             bf16_experts_case(tokens, kHidden, kWidth, 1, 16, rng);
+            mxfp8_experts_case(tokens, 2 * kWidth, kHidden, kTopK, 16, rng);
+            mxfp8_experts_case(tokens, kHidden, kWidth, 1, 16, rng);
         }
 
         cpu_experts_case("NVFP4/NVFP4", QType::GGUF_NVFP4, QType::GGUF_NVFP4, true, 1, rng);

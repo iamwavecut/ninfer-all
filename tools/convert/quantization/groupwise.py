@@ -85,6 +85,8 @@ def quantize_matrix(
         raise ValueError("grouped quantization requires a quantized numeric format")
     if spec.name == "q2_g64_fp16":
         raise ValueError("q2_g64_fp16 requires encoded GSQ Q2_0 input, not grouped quantization")
+    if spec.name == "mxfp8":
+        raise ValueError("mxfp8 stores exact BF16 expert banks, not grouped quantization")
     if weight.dim() != 2:
         raise ValueError(
             f"grouped quantization requires rank 2, got {tuple(weight.shape)}"

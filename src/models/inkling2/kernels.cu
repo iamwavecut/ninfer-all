@@ -2617,23 +2617,54 @@ __device__ __forceinline__ void bf16x8(const uint4& v, float (&f)[8]) {
     }
 }
 
+// An expert's stored rows as expert_rows_kernel reads them: eight FP32 values of row `row` from
+// column c, each the stored value exactly.
+struct Bf16Rows {
+    const void* const* table;
+    struct Expert {
+        const __nv_bfloat16* w;
+        __device__ void load(int row, int k, int c, float (&f)[8]) const {
+            bf16x8(*reinterpret_cast<const uint4*>(w + std::int64_t(row) * k + c), f);
+        }
+    };
+    __device__ Expert expert(int e) const { return {static_cast<const __nv_bfloat16*>(table[e])}; }
+};
+
+// MXFP8 rows: K E4M3 codes and K/32 E8M0 scales a row, decoded as the MXFP8 KV planes are.
+struct Mxfp8Rows {
+    const void* const* codes;
+    const void* const* scales;
+    struct Expert {
+        const std::uint8_t *codes, *scales;
+        __device__ void load(int row, int k, int c, float (&f)[8]) const {
+            ops::kv_row::Chunk<KvCoding::Mxfp8>::decode(
+                *reinterpret_cast<const uint2*>(codes + std::int64_t(row) * k + c),
+                scales[std::int64_t(row) * (k / 32) + c / 32], f);
+        }
+    };
+    __device__ Expert expert(int e) const {
+        return {static_cast<const std::uint8_t*>(codes[e]),
+                static_cast<const std::uint8_t*>(scales[e])};
+    }
+};
+
 // Block (row tile, active slot a): expert e = active[a]'s rows [8 tile, 8 tile + 8), each warp
 // two of them, against the expert's pairs 32 at a time. The pairs' inputs pass through shared
 // memory 256 columns at a time; lane l multiplies columns [8 l, 8 l + 8) of each, in order, into
-// one FP32 sum per (row, pair), and the warp adds its lanes' sums.
+// one FP32 sum per (row, pair), and the warp adds its lanes' sums. The weights' storage changes
+// only how a lane reads its eight values, so equal values give equal bits.
+template <class Rows>
 __global__ void __launch_bounds__(kBfWarps * 32)
-    bf16_expert_rows_kernel(const void* const* __restrict__ table, int rows, int k,
-                            const std::int32_t* __restrict__ bounds,
-                            const std::int32_t* __restrict__ sorted,
-                            const std::int32_t* __restrict__ active,
-                            const std::int32_t* __restrict__ active_count,
-                            const __nv_bfloat16* __restrict__ x, int x_div,
-                            float* __restrict__ out) {
+    expert_rows_kernel(Rows stored, int rows, int k, const std::int32_t* __restrict__ bounds,
+                       const std::int32_t* __restrict__ sorted,
+                       const std::int32_t* __restrict__ active,
+                       const std::int32_t* __restrict__ active_count,
+                       const __nv_bfloat16* __restrict__ x, int x_div, float* __restrict__ out) {
     ninfer::pdl::arch_enter();
     if (int(blockIdx.y) >= *active_count) { return; }
     const int e     = active[blockIdx.y];
     const int begin = bounds[e], end = bounds[e + 1];
-    const auto* w   = static_cast<const __nv_bfloat16*>(table[e]);
+    const auto w    = stored.expert(e);
     const int warp = int(threadIdx.x) >> 5, lane = int(threadIdx.x) & 31;
     const int row0 = int(blockIdx.x) * kBfRows + warp * kBfRowsPerWarp;
     __shared__ __align__(16) __nv_bfloat16 xs[kBfPairs][kBfChunk];
@@ -2659,8 +2690,7 @@ __global__ void __launch_bounds__(kBfWarps * 32)
 #pragma unroll
             for (int r = 0; r < kBfRowsPerWarp; ++r) {
                 const int row = min(row0 + r, rows - 1); // a row past the end is never written
-                bf16x8(*reinterpret_cast<const uint4*>(w + std::int64_t(row) * k + c + 8 * lane),
-                       wf[r]);
+                w.load(row, k, c + 8 * lane, wf[r]);
             }
 #pragma unroll
             for (int p = 0; p < kBfPairs; ++p) {
@@ -3550,9 +3580,25 @@ void bf16_expert_rows(const void* const* table, int rows, int k, const std::int3
     }
     if (max_active <= 0) { return; }
     ninfer::pdl::launch_arch(dim3(blocks_for(rows, kBfRows), unsigned(max_active)), kBfWarps * 32,
-                             0, stream, bf16_expert_rows_kernel, table, rows, k, bounds, sorted,
-                             active, active_count, x, x_div, out);
+                             0, stream, expert_rows_kernel<Bf16Rows>, Bf16Rows{table}, rows, k,
+                             bounds, sorted, active, active_count, x, x_div, out);
     check_launch("bf16_expert_rows");
+}
+
+void mxfp8_expert_rows(const void* const* codes_table, const void* const* scales_table, int rows,
+                       int k, const std::int32_t* bounds, const std::int32_t* sorted,
+                       const std::int32_t* active, const std::int32_t* active_count,
+                       int max_active, const __nv_bfloat16* x, int x_div, float* out,
+                       cudaStream_t stream) {
+    if (rows <= 0 || k <= 0 || k % 32 != 0 || x_div <= 0) {
+        throw std::invalid_argument("inkling2 mxfp8_expert_rows: rows, k a multiple of 32, x_div");
+    }
+    if (max_active <= 0) { return; }
+    ninfer::pdl::launch_arch(dim3(blocks_for(rows, kBfRows), unsigned(max_active)), kBfWarps * 32,
+                             0, stream, expert_rows_kernel<Mxfp8Rows>,
+                             Mxfp8Rows{codes_table, scales_table}, rows, k, bounds, sorted, active,
+                             active_count, x, x_div, out);
+    check_launch("mxfp8_expert_rows");
 }
 
 void bf16_rows_f32(const __nv_bfloat16* table, int k, const std::int32_t* ids, int rows,

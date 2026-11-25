@@ -363,6 +363,15 @@ void bf16_expert_rows(const void* const* table, int rows, int k, const std::int3
                       const std::int32_t* active_count, int max_active, const __nv_bfloat16* x,
                       int x_div, float* out, cudaStream_t stream);
 
+// MXFP8 expert products: bf16_expert_rows's sums over W_e decoded from `rows` rows of k E4M3 codes
+// at codes_table[e] (8-byte aligned) and of k / 32 E8M0 scales at scales_table[e], k % 32 == 0.
+// Weights equal to a BF16 bank's give that bank's bits.
+void mxfp8_expert_rows(const void* const* codes_table, const void* const* scales_table, int rows,
+                       int k, const std::int32_t* bounds, const std::int32_t* sorted,
+                       const std::int32_t* active, const std::int32_t* active_count,
+                       int max_active, const __nv_bfloat16* x, int x_div, float* out,
+                       cudaStream_t stream);
+
 // Rows ids[0, rows) of a BF16 table [*][k] as FP32 rows `out_stride` apart, exactly.
 void bf16_rows_f32(const __nv_bfloat16* table, int k, const std::int32_t* ids, int rows,
                    float* out, std::int64_t out_stride, cudaStream_t stream);

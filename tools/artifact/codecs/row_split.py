@@ -122,6 +122,8 @@ def encode_row_split(
     spec = _format(format)
     if not isinstance(spec, QuantFormat):
         raise ValueError("row-split encoding requires a grouped quantized format")
+    if spec.name == "mxfp8":
+        raise ValueError("mxfp8 rows are E4M3 codes with E8M0 scales: write them packed")
     geometry = row_split_geometry(spec, shape)
     expected_codes = (geometry.n, geometry.groups_per_row, spec.group_size)
     expected_scales = (geometry.n, geometry.groups_per_row)
@@ -459,6 +461,8 @@ def decode_row_split_codes(
     spec = _format(format)
     if not isinstance(spec, QuantFormat):
         raise ValueError("row-split decoding requires a grouped quantized format")
+    if spec.name == "mxfp8":
+        raise ValueError("mxfp8 rows hold E4M3 codes, not signed integer codes")
     geometry = row_split_geometry(spec, shape)
     planes = _planes_on_device(source, geometry, torch.device(device))
     return _unpack_codes(planes, spec, geometry)
@@ -557,6 +561,13 @@ def dequantize_row_split(
     geometry = row_split_geometry(spec, shape)
     target = torch.device(device)
     planes = _planes_on_device(source, geometry, target)
+    if spec.name == "mxfp8":
+        assert isinstance(planes.base, torch.Tensor)
+        assert isinstance(planes.scale, torch.Tensor)
+        codes = planes.base.view(torch.float8_e4m3fn).reshape(geometry.n, -1, spec.group_size)
+        exponents = planes.scale.view(torch.uint8).reshape(geometry.n, -1, 1).to(torch.int32)
+        physical = torch.ldexp(codes.float(), exponents - 127).reshape(geometry.n, geometry.k_pad)
+        return physical[:, : geometry.k].to(dtype)
     if dtype == torch.bfloat16:
         byte_indices, shifts = _high_indices(
             target.type, target.index, spec.bits, spec.group_size

@@ -92,12 +92,26 @@ class TensorOutput:
         rows, k = codes.shape[0], obj.shape[1]
         if rows <= 0 or row_begin + rows > obj.shape[0]:
             raise ValueError(f"{obj.id}: encoded rows exceed parent")
-        if packed and self.format.name not in ("q2_g64_fp16", "q8_g32_fp16"):
-            raise ValueError("packed code planes require native Q2 or Q8")
+        if packed and self.format.name not in ("q2_g64_fp16", "q8_g32_fp16", "mxfp8"):
+            raise ValueError("packed code planes require native Q2, Q8, or MXFP8")
         self._padding()
         if isinstance(self.format, QuantFormat):
             g = row_split_geometry(self.format, obj.shape)
             if packed:
+                if self.format.name == "mxfp8":
+                    if (codes.dtype != torch.uint8 or tuple(codes.shape) != (rows, g.base_row_bytes)
+                            or scales.dtype != torch.uint8 or
+                            tuple(scales.shape) != (rows, g.groups_per_row)):
+                        raise ValueError("packed MXFP8 rows have incompatible code/scale geometry")
+                    code_words = codes.detach().cpu().contiguous().numpy()
+                    scale_words = scales.detach().cpu().contiguous().numpy()
+                    if (scale_words > 246).any() or ((code_words & 0x7F) == 0x7F).any():
+                        raise ValueError("packed MXFP8 rows violate the native code/scale contract")
+                    self.write_bytes(g.base_offset + row_begin * g.base_row_bytes,
+                                     code_words.tobytes())
+                    self.write_bytes(g.scale_offset + row_begin * g.scale_row_bytes,
+                                     scale_words.tobytes())
+                    return
                 if (codes.dtype != torch.uint8 or tuple(codes.shape) != (rows, g.base_row_bytes)
                         or scales.dtype != torch.float16 or
                         tuple(scales.shape) != (rows, g.groups_per_row)):

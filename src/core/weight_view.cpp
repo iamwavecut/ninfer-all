@@ -106,8 +106,9 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     const auto k       = shape[1];
     out.padded_columns = k;
     if (is_row_split(layout)) {
-        std::uint64_t code_per_group = 32;
-        std::uint64_t high_per_group = 0;
+        std::uint64_t code_per_group  = 32;
+        std::uint64_t high_per_group  = 0;
+        std::uint64_t scale_per_group = 2;
         switch (format) {
         case QType::Q2_G64_FP16:
             out.group_size = 64;
@@ -127,6 +128,10 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         case QType::Q8_G32_FP16:
             out.group_size = 32;
             break;
+        case QType::MXFP8:
+            out.group_size  = 32;
+            scale_per_group = 1;
+            break;
         case QType::T2_G128_FP16:
             out.group_size = 128;
             break;
@@ -137,7 +142,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         const auto groups       = out.padded_columns / out.group_size;
         out.code_bytes_per_row  = mul(groups, code_per_group);
         out.high_bytes_per_row  = mul(groups, high_per_group);
-        out.scale_bytes_per_row = mul(groups, 2);
+        out.scale_bytes_per_row = mul(groups, scale_per_group);
         out.code_bytes          = mul(n, out.code_bytes_per_row);
         out.high_offset         = aligned(out.code_bytes, 256);
         out.high_bytes          = mul(n, out.high_bytes_per_row);
@@ -246,7 +251,8 @@ std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t 
     }
     const auto stride = geometry.row_stride_bytes ? geometry.row_stride_bytes
                                                   : geometry.scale_bytes_per_row;
-    return geometry.scale_offset + row * stride + group * 2;
+    const std::uint64_t scale_bytes = geometry.format == QType::MXFP8 ? 1 : 2;
+    return geometry.scale_offset + row * stride + group * scale_bytes;
 }
 
 WeightRowPlanes weight_row_planes(const WeightRegion& region) {
@@ -337,11 +343,12 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     out.weight_scale_divisor = region.parent->weight_scale_divisor;
     out.input_scale_divisor  = input_divisor;
     if (is_row_split(g.layout)) {
-        out.scale_dtype = DType::FP16;
-        out.scale_ne[0] = dimension(g.padded_columns / g.group_size);
-        out.scale_ne[1] = out.n;
-        out.scale_nb[0] = 2;
-        out.scale_nb[1] = static_cast<std::int64_t>(g.scale_bytes_per_row);
+        const std::int64_t scale_bytes = g.format == QType::MXFP8 ? 1 : 2;
+        out.scale_dtype                = g.format == QType::MXFP8 ? DType::U8 : DType::FP16;
+        out.scale_ne[0]                = dimension(g.padded_columns / g.group_size);
+        out.scale_ne[1]                = out.n;
+        out.scale_nb[0]                = scale_bytes;
+        out.scale_nb[1]                = static_cast<std::int64_t>(g.scale_bytes_per_row);
         out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[1] * out.n;
     } else if (g.layout == QuantLayout::RowScale) {
         out.scale_dtype = DType::BF16;
