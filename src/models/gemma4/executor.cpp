@@ -714,14 +714,14 @@ struct Executor::Impl {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
             if (options.prefill_chunk < kFullChunk &&
-                workspace_bytes + graph_reserve() + unbacked() > free_bytes) {
+                workspace_bytes + launch_reserve() + unbacked() > free_bytes) {
                 // The destructor does not run for a constructor that throws.
                 if (media_begin != nullptr) { cudaEventDestroy(media_begin); }
                 if (media_end != nullptr) { cudaEventDestroy(media_end); }
                 throw InsufficientMemory(
                     "Gemma 4: the workspace of " + std::to_string(workspace_bytes >> 20) +
-                    " MiB and " + std::to_string(graph_reserve() >> 20) +
-                    " MiB for the CUDA graphs need more than the " +
+                    " MiB and " + std::to_string(launch_reserve() >> 20) +
+                    " MiB kept free for CUDA graphs and kernel loading need more than the " +
                     std::to_string(free_bytes >> 20) +
                     " MiB free after the caches; lower --max-concurrency or --max-context");
             }
@@ -753,11 +753,12 @@ struct Executor::Impl {
             CUDA_CHECK(cudaMemGetInfo(&free, &total));
             const auto cache = options.expert_cache_bytes.value_or(0);
             // The caches that grow later need their memory too: the elastic cache gives it back.
-            if (bank + metadata + cache + unbacked() + graph_reserve() > free) {
+            if (bank + metadata + cache + unbacked() + launch_reserve() > free) {
                 throw InsufficientMemory("Gemma 4: expert delivery needs " +
                     std::to_string((bank + metadata + cache) >> 20) + " MiB beside " +
-                    std::to_string(unbacked() >> 20) +
-                    " MiB for the growing caches and the CUDA Graph reserve after workspace allocation");
+                    std::to_string(unbacked() >> 20) + " MiB for the growing caches and " +
+                    std::to_string(launch_reserve() >> 20) +
+                    " MiB kept free for CUDA graphs and kernel loading after workspace allocation");
             }
             ExpertDeliveryOptions transport;
             transport.pair_capacity = options.prefill_chunk * config.top_k_experts;
@@ -765,7 +766,7 @@ struct Executor::Impl {
             transport.cache_bytes = options.expert_cache_bytes;
             // A growing cache's next positions come from the headroom before the expert cache
             // has to give memory back.
-            transport.keep_free_bytes = graph_reserve() + (growing ? kKvHeadroom : 0);
+            transport.keep_free_bytes = launch_reserve() + (growing ? kKvHeadroom : 0);
             transport.elastic = growing;
             transport.disk            = options.expert_disk;
             const float dma_share = options.expert_dma_share.value_or(0.0F);
@@ -809,14 +810,19 @@ struct Executor::Impl {
     // The startup check's room for the workspace and the CUDA graphs: 1.5 GiB at the full
     // 2048-token chunk (measured to leave 0.35-0.46 GiB for the graphs captured while serving
     // eight sequences); a narrower chunk keeps the least its workspace takes and then checks the
-    // planned workspace with kGraphReserve beside it.
+    // planned workspace with launch_reserve() beside it.
     static constexpr std::uint32_t kFullChunk  = 2048;
     static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
+    // Without graphs the device still keeps room for the kernels CUDA loads at their first
+    // launch (lazy module loading): a prompt or reply reaches kernels that startup never
+    // launched, and with every byte given to the expert cache that load fails ("out of memory").
+    static constexpr std::size_t kKernelReserve = std::size_t(64) << 20;
 
-    // Whether this run captures CUDA graphs: false where a host or disk expert's miss would hang a
-    // replayed graph, unless the run asked for no graphs at all.
-    [[nodiscard]] std::size_t graph_reserve() const {
-        return options.cuda_graphs ? kGraphReserve : 0;
+    // What the device keeps free beside the planned memory: the CUDA graphs' reserve where this run
+    // captures them (graphs are off for --no-cuda-graph, and for host or disk experts where a
+    // device's copies queue behind one another), else the kernels' reserve.
+    [[nodiscard]] std::size_t launch_reserve() const {
+        return options.cuda_graphs ? kGraphReserve : kKernelReserve;
     }
     static constexpr std::size_t kKvHeadroom   = std::size_t(256) << 20;
 
@@ -892,8 +898,8 @@ struct Executor::Impl {
 
     // Before a call that writes or reads `sequence`'s positions below `end`: its full-attention
     // rows (and with `chunk`, the prompt chunk's scratch) are backed up to the 256-slot tile that
-    // holds `end`, the expert cache giving memory back when the device keeps less than the CUDA
-    // Graph reserve beside them. Outside capture.
+    // holds `end`, the expert cache giving memory back when the device keeps less than
+    // launch_reserve() beside them. Outside capture.
     void back(std::uint32_t sequence, std::uint32_t end, bool chunk) {
         if (!growing) { return; }
         const auto positions = std::uint32_t(round_up(end, 256));
@@ -916,7 +922,9 @@ struct Executor::Impl {
         }
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        if (free < need + graph_reserve()) { delivery->shrink_cache(need + graph_reserve() - free); }
+        if (free < need + launch_reserve()) {
+            delivery->shrink_cache(need + launch_reserve() - free);
+        }
         while (!apply()) {
             if (delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
                 count_backed();
