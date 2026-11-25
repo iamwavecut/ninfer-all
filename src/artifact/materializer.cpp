@@ -991,17 +991,27 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             checked_add(out.stats_.pinned_bytes, plan.mapped_capacity_bytes, "mapped Host bytes");
     }
     std::uint64_t pinned = 0;
+    void* pinned_alias = nullptr;
     if (out.pinned_ && !pinned_layout.fallback) {
-        out.pinned_->pin();
+        out.pinned_->pin(/*device_mapped=*/true);
         pinned = pinned_layout.end;
     } else if (out.pinned_) {
         // The required prefix, then each part of objects that may stay in the files while the
         // host pins it; the pages past the last pinned part go back.
-        pinned = out.pinned_->pin_prefix(pinned_layout.part_ends, pinned_layout.end);
+        pinned = out.pinned_->pin_prefix(pinned_layout.part_ends, pinned_layout.end,
+                                         /*device_mapped=*/true);
         if (pinned < pinned_layout.required_end) {
             throw ArtifactError("failed to pin " + std::to_string(pinned_layout.required_end >> 20) +
                                 " MiB of host memory: the host refused it");
         }
+    }
+    if (pinned > 0) {
+        // The address the primary device reads the pinned block at, as for the mapped block.
+        // Under unified addressing it is the host address, but only the runtime may say so; the
+        // latent experts' copy_segments_kernel reads these bytes in place, which WDDM only
+        // permits for a device-mapped registration.
+        check_cuda(cudaHostGetDevicePointer(&pinned_alias, out.pinned_->data(), 0),
+                   "resolve the pinned Host block's device address");
     }
     out.stats_.pinned_block_end         = pinned < pinned_layout.end ? PinnedBlockEnd::Refused
                                                                      : pinned_layout.ended_by;
@@ -1020,7 +1030,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                                                static_cast<std::size_t>(placement.bytes));
         const auto divisor = read_divisor(reader, placement.object, geometry, destination, out.stats_);
         out.objects_.at(placement.object.index).pinned =
-            WeightParent{geometry, destination.data(), divisor};
+            WeightParent{geometry,
+                         static_cast<const std::byte*>(pinned_alias) + pinned_layout.offsets[i],
+                         divisor};
         ++out.stats_.pinned_object_count;
     }
     out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, pinned, "pinned Host bytes");
@@ -1033,8 +1045,11 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         storage.host_data = std::move(placement.data);
         if (placement.registered) {
+            // Device-mapped as for the pinned block: the copy-kernel miss service may read these
+            // rows in place; the fallback bytes' registration is per object, so the host address
+            // serves as its own device alias under unified addressing.
             storage.registration = std::make_unique<HostMemoryRegistration>(
-                storage.host_data.data(), storage.host_data.size());
+                storage.host_data.data(), storage.host_data.size(), /*mapped=*/true);
             out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, storage.host_data.size(),
                                                 "registered Host bytes");
             ++out.stats_.pinned_object_count;

@@ -106,7 +106,8 @@ void HostPages::pin(bool device_mapped) {
     }
 }
 
-std::size_t HostPages::pin_prefix(std::span<const std::size_t> ends, std::size_t limit) {
+std::size_t HostPages::pin_prefix(std::span<const std::size_t> ends, std::size_t limit,
+                                  bool device_mapped) {
     if (!registrations_.empty()) { throw std::logic_error("HostPages: the block is pinned"); }
     // Two registrations may not share a page, so each part but the block's last ends on one.
     const std::size_t page = page_bytes();
@@ -122,7 +123,7 @@ std::size_t HostPages::pin_prefix(std::span<const std::size_t> ends, std::size_t
             touch_pages(data_, registered, through);
             try {
                 registrations_.push_back(std::make_unique<HostMemoryRegistration>(
-                    data_ + registered, through - registered));
+                    data_ + registered, through - registered, device_mapped));
             } catch (const std::exception&) { break; }
             registered = through;
         }

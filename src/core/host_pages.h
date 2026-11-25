@@ -35,7 +35,8 @@ public:
     // RAM). Returns the bytes pinned: the end of the last pinned part, or 0. The pages past them
     // go back to the system and size() becomes that end; their bytes are lost. Faults in the pages
     // nobody wrote first, as pin().
-    std::size_t pin_prefix(std::span<const std::size_t> ends, std::size_t limit);
+    std::size_t pin_prefix(std::span<const std::size_t> ends, std::size_t limit,
+                           bool device_mapped = false);
 
     [[nodiscard]] std::byte* data() const noexcept { return data_; }
 
