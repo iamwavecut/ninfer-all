@@ -5,7 +5,7 @@ ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 # The opt-in cuBLAS prefill route hands its GEMM to cuBLAS; see
 # ops/linear_swiglu/q4cublas/w4_cublas_prefill.h for why that route exists.
-target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
+target_link_libraries(ninfer_ops PRIVATE ${NINFER_CUBLAS_TARGET})
 
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These
@@ -131,6 +131,6 @@ if(NINFER_WINDOWS_KERNEL_DLL)
     CUDA_SEPARABLE_COMPILATION OFF CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
   ninfer_export_archive_instantiations(ninfer_kernels ninfer_small_t_i8 "launch_small_t_i8_[a-z0-9]+"
     ${NINFER_SMALL_T_I8_INSTANTIATIONS})
-  target_link_libraries(ninfer_kernels PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cublas)
+  target_link_libraries(ninfer_kernels PRIVATE ninfer_core ${NINFER_CUDART_TARGET} ${NINFER_CUBLAS_TARGET})
   target_link_libraries(ninfer_ops PRIVATE ninfer_kernels)
 endif()

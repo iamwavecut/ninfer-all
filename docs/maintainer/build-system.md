@@ -206,6 +206,7 @@ The default configuration is Release. Ninja links and archives share the single-
 | `NINFER_BUILD_APPS` | ON | CLI, HTTP server, perplexity evaluator and `ninfer-calibrate` |
 | `BUILD_TESTING` | OFF | C++ tests and registered Python interoperability tests |
 | `NINFER_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
+| `NINFER_STATIC_CUDA_LIBS` | OFF | Statically link CUDA runtime and cuBLAS |
 
 The opt-in kernel, build and platform options (`NINFER_SM120_NATIVE`, `NINFER_PDL`,
 `NINFER_MULTICALL`, the SFU and Windows options, and the rest) are listed in the
