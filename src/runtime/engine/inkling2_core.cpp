@@ -200,7 +200,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                     .expert_host_bytes = options.hybrid_experts.host_bytes,
                                     .vision            = vision,
                                     .dspark   = dspark,
-                                    .dflash2  = dflash2};
+                                    .dflash2  = dflash2,
+                                    .mxfp8_experts = options.experts_mxfp8};
     if (dspine) { load.dspine = speculative.draft_model; }
     // Expert parallelism: the routed experts divided over the devices, everything else on the
     // first. Without --tensor-split each device takes a share of its speed that fits beside what

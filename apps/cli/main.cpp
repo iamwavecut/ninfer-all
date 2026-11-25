@@ -417,6 +417,7 @@ int main(int argc, char** argv) {
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.kv_cache_automatic       = cli.kv_cache_automatic;
         engine_options.loop_kv                  = cli.loop_kv;
+        engine_options.experts_mxfp8            = cli.experts_mxfp8;
         engine_options.speculative              = cli.speculative;
         engine_options.gumbel_sampling          = cli.gumbel_sampling;
         engine_options.enable_vision            = cli.enable_vision;

@@ -144,7 +144,8 @@ struct LayerPlan {
                 *gate_up_scale = nullptr, *down_scale = nullptr;
     int delivery_layer = -1;
     gguf::GgmlType gate_up_type{}, down_type{};
-    bool bf16 = false; // BF16 experts (both banks), multiplied by kernels::bf16_expert_rows
+    bool bf16  = false; // BF16 experts (both banks), multiplied by kernels::bf16_expert_rows
+    bool mxfp8 = false; // MXFP8 experts (both banks), multiplied by kernels::mxfp8_expert_rows
     std::int64_t gate_up_row_bytes = 0, down_row_bytes = 0;
     DeviceBuffer tables; // pointers: [E] gate, [E] up, [E] gate_up, [E] down
     bool gate_up_aligned16 = true, down_aligned16 = true;
@@ -664,6 +665,39 @@ struct Executor::Impl {
         if (mw.gate_up_scale) { p.gate_up_scale = fp32(model, *mw.gate_up_scale, e); }
         if (mw.down_scale) { p.down_scale = fp32(model, *mw.down_scale, e); }
         if (model.expert_residency() == ExpertResidency::Device) {
+            if (model.mxfp8_experts()) {
+                p.mxfp8 = true;
+                const auto mxfp8_tables = [&](std::size_t r) {
+                    const Mxfp8RankBank* bank = model.mxfp8_bank(i, r);
+                    if (!bank) {
+                        throw std::invalid_argument("Inkling 2: missing MXFP8 expert bank");
+                    }
+                    std::vector<const void*> table(4 * std::size_t(e), nullptr);
+                    for (std::uint32_t local = 0; local < bank->expert_count; ++local) {
+                        const std::uint32_t x = bank->expert_begin + local;
+                        table[x] = static_cast<const std::byte*>(bank->gate_up_scales) +
+                                   std::size_t(local) * bank->gate_up_scale_stride;
+                        table[e + x] = static_cast<const std::byte*>(bank->down_scales) +
+                                       std::size_t(local) * bank->down_scale_stride;
+                        table[2 * e + x] = static_cast<const std::byte*>(bank->gate_up_codes) +
+                                           std::size_t(local) * bank->gate_up_code_stride;
+                        table[3 * e + x] = static_cast<const std::byte*>(bank->down_codes) +
+                                           std::size_t(local) * bank->down_code_stride;
+                    }
+                    DeviceBuffer buffer(table.size() * sizeof(void*));
+                    buffer.copy_from_host(table.data(), table.size() * sizeof(void*));
+                    return buffer;
+                };
+                if (!model.expert_parallel()) {
+                    p.tables = mxfp8_tables(0);
+                } else {
+                    p.peer_tables.resize(device.size());
+                    for (std::size_t r = 0; r < device.size(); ++r) {
+                        RankBinding bind(device, r);
+                        (r == 0 ? p.tables : p.peer_tables[r]) = mxfp8_tables(r);
+                    }
+                }
+            } else {
             const auto bank_tables = [&](WeightId gate_up_id, WeightId down_id, std::uint32_t first,
                                          std::uint32_t last) {
                 const Weight gate_up = matrix(model, {gate_up_id});
@@ -719,6 +753,7 @@ struct Executor::Impl {
                         mw.gate_up_shares.at(r), mw.down_shares.at(r), first, last);
                 }
             }
+            }
         } else {
             p.delivery_layer    = int(i);
             const auto& bank    = model.expert_banks()[i];
@@ -730,9 +765,10 @@ struct Executor::Impl {
             p.gate_up_row_bytes = std::int64_t(bank.gate_up_row_bytes);
             p.down_row_bytes    = std::int64_t(bank.down_row_bytes);
         }
-        bf16_rows = bf16_rows || p.bf16;
-        if (!p.bf16 && (!gguf::moe_matrix_supported(p.gate_up_type, 2 * width, hidden, true) ||
-                        !gguf::moe_matrix_supported(p.down_type, hidden, width, true))) {
+        bf16_rows = bf16_rows || p.bf16 || p.mxfp8;
+        if (!p.bf16 && !p.mxfp8 &&
+            (!gguf::moe_matrix_supported(p.gate_up_type, 2 * width, hidden, true) ||
+             !gguf::moe_matrix_supported(p.down_type, hidden, width, true))) {
             throw std::invalid_argument("Inkling 2: no integer expert kernel for these expert "
                                         "formats");
         }
@@ -1709,19 +1745,30 @@ struct Executor::Impl {
                          reinterpret_cast<half2*>(base + scales), on);
     }
 
-    // A BF16 layer's routed experts over the pairs of `routing`: FP32 [gate; up] rows `gu`, their
-    // SiTU middles, then each pair's FP32 product row in `rows` ([pairs][hidden]).
-    void bf16_experts(const void* const* tables, const gguf::MoeRouting& routing, int max_active,
-                      const __nv_bfloat16* x, float* gu, __nv_bfloat16* middle,
-                      const float* pair_scale, int pairs, float* rows, cudaStream_t on) const {
+    // A BF16 or MXFP8 layer's routed experts over the pairs of `routing`: FP32 [gate; up] rows
+    // `gu`, their SiTU middles, then each pair's FP32 product row in `rows` ([pairs][hidden]).
+    void dense_experts(bool mxfp8, const void* const* tables, const gguf::MoeRouting& routing,
+                       int max_active, const __nv_bfloat16* x, float* gu, __nv_bfloat16* middle,
+                       const float* pair_scale, int pairs, float* rows, cudaStream_t on) const {
         const int e = int(config.num_experts), k = int(config.top_k_experts);
         const int width = int(config.moe_intermediate_size);
-        kernels::bf16_expert_rows(tables + 2 * e, 2 * width, hidden, routing.bounds, routing.sorted,
-                                  routing.active, routing.active_count, max_active, x, k, gu, on);
-        situ(gu, pairs, pair_scale, middle, on);
-        kernels::bf16_expert_rows(tables + 3 * e, hidden, width, routing.bounds, routing.sorted,
-                                  routing.active, routing.active_count, max_active, middle, 1, rows,
-                                  on);
+        if (mxfp8) {
+            kernels::mxfp8_expert_rows(tables + 2 * e, tables, 2 * width, hidden, routing.bounds,
+                                       routing.sorted, routing.active, routing.active_count,
+                                       max_active, x, k, gu, on);
+            situ(gu, pairs, pair_scale, middle, on);
+            kernels::mxfp8_expert_rows(tables + 3 * e, tables + e, hidden, width, routing.bounds,
+                                       routing.sorted, routing.active, routing.active_count,
+                                       max_active, middle, 1, rows, on);
+        } else {
+            kernels::bf16_expert_rows(tables + 2 * e, 2 * width, hidden, routing.bounds,
+                                      routing.sorted, routing.active, routing.active_count,
+                                      max_active, x, k, gu, on);
+            situ(gu, pairs, pair_scale, middle, on);
+            kernels::bf16_expert_rows(tables + 3 * e, hidden, width, routing.bounds, routing.sorted,
+                                      routing.active, routing.active_count, max_active, middle, 1,
+                                      rows, on);
+        }
     }
 
     // One rank's part of a MoE call of layer `p`: the call's pairs routed to the experts the rank
@@ -1750,9 +1797,10 @@ struct Executor::Impl {
             static_cast<__nv_bfloat16*>(space.alloc_bytes(std::size_t(pairs) * width * 2).data);
         auto* gu =
             static_cast<float*>(space.alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
-        if (p.bf16) {
+        if (p.bf16 || p.mxfp8) {
             auto* rows = static_cast<float*>(space.alloc_bytes(std::size_t(pairs) * hidden * 4).data);
-            bf16_experts(tables, routing, max_active, x, gu, middle, pair_scale, pairs, rows, on);
+            dense_experts(p.mxfp8, tables, routing, max_active, x, gu, middle, pair_scale, pairs,
+                          rows, on);
             gguf::moe_weighted_rows(rows, mine, weights, t, k, hidden, fixed, on);
             return;
         }
@@ -2735,11 +2783,11 @@ struct Executor::Impl {
         auto* middle = static_cast<__nv_bfloat16*>(
             workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
         if (delivery) { delivery->await(stream); }
-        if (p.bf16) {
+        if (p.bf16 || p.mxfp8) {
             auto* rows = static_cast<float*>(
                 workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
-            bf16_experts(tables, routing, max_active, c.ffn_bf16, gu, middle, pair_scale, pairs,
-                         rows, stream);
+            dense_experts(p.mxfp8, tables, routing, max_active, c.ffn_bf16, gu, middle, pair_scale,
+                          pairs, rows, stream);
             ra.moe_rows    = rows;
             ra.moe_weights = weights;
             ra.top_k       = k;

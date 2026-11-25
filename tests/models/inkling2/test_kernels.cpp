@@ -1448,6 +1448,94 @@ void bf16_experts_case(int tokens, int rows, int k_, int x_div, int experts, std
                            std::to_string(k_) + ": " + std::to_string(wrong) + " values differ");
 }
 
+void mxfp8_experts_case(int tokens, int rows, int k_, int x_div, int experts, std::mt19937& rng) {
+    const int pairs = tokens * kTopK, inputs = x_div == 1 ? pairs : tokens;
+    std::vector<std::int32_t> ids(pairs);
+    std::vector<int> order(experts);
+    std::iota(order.begin(), order.end(), 0);
+    for (int t = 0; t < tokens; ++t) {
+        std::shuffle(order.begin(), order.end(), rng);
+        for (int j = 0; j < kTopK; ++j) { ids[t * kTopK + j] = order[j]; }
+    }
+    for (int p = 5; p < pairs; p += 11) { ids[p] = -1; }
+
+    // Generate exact MXFP8-representable BF16 blocks: shared E8M0 scale per 32 values * 3-bit mantissa.
+    std::vector<bf16> w(std::size_t(experts) * rows * k_), x(std::size_t(inputs) * k_);
+    std::uniform_int_distribution<int> exp_dist(-12, -2);
+    std::uniform_int_distribution<int> mant_dist(-14, 14);
+    for (std::size_t blk = 0; blk < w.size() / 32; ++blk) {
+        const float scale = std::ldexp(1.0f, exp_dist(rng));
+        for (int j = 0; j < 32; ++j) {
+            const float val = float(mant_dist(rng)) * 0.125f * scale;
+            w[blk * 32 + j] = __float2bfloat16(val);
+        }
+    }
+    {
+        const auto xf = normal(x.size(), 1.0f, rng);
+        for (std::size_t i = 0; i < x.size(); ++i) { x[i] = __float2bfloat16(xf[i]); }
+    }
+
+    DeviceBuffer d_w = upload(w), d_x = upload(x), d_ids = upload(ids);
+    const std::size_t codes_per_e  = std::size_t(rows) * k_;
+    const std::size_t scales_per_e = std::size_t(rows) * (k_ / 32);
+    DeviceBuffer d_codes(std::size_t(experts) * codes_per_e);
+    DeviceBuffer d_scales(std::size_t(experts) * scales_per_e);
+    DeviceBuffer d_inexact(sizeof(unsigned int));
+    const unsigned int zero = 0;
+    d_inexact               = upload(std::vector<unsigned int>{zero});
+
+    std::vector<const void*> bf16_table(experts), codes_table(experts), scales_table(experts);
+    for (int e = 0; e < experts; ++e) {
+        bf16_table[e]   = as<bf16>(d_w) + std::int64_t(e) * rows * k_;
+        codes_table[e]  = static_cast<std::uint8_t*>(d_codes.p) + std::size_t(e) * codes_per_e;
+        scales_table[e] = static_cast<std::uint8_t*>(d_scales.p) + std::size_t(e) * scales_per_e;
+        k::mxfp8_encode_bf16_rows(static_cast<const bf16*>(bf16_table[e]), rows, k_,
+                                  static_cast<std::uint8_t*>(const_cast<void*>(codes_table[e])),
+                                  static_cast<std::uint8_t*>(const_cast<void*>(scales_table[e])),
+                                  static_cast<unsigned int*>(d_inexact.p), nullptr);
+    }
+    sync("mxfp8_encode_bf16_rows");
+    const auto inexact_vec = download<unsigned int>(d_inexact, 1);
+
+    DeviceBuffer d_bf16_table = upload(bf16_table), d_codes_table = upload(codes_table),
+                 d_scales_table = upload(scales_table);
+    DeviceBuffer space(gguf::moe_routing_bytes(experts, pairs));
+    const gguf::MoeRouting routing =
+        gguf::moe_sort_routes(as<std::int32_t>(d_ids), pairs, experts, space.p, nullptr);
+    const float sentinel = 12345.0f;
+    const std::vector<float> fill(std::size_t(pairs) * rows, sentinel);
+    DeviceBuffer out_bf16 = upload(fill), out_mxfp8 = upload(fill);
+
+    k::bf16_expert_rows(static_cast<const void* const*>(d_bf16_table.p), rows, k_, routing.bounds,
+                        routing.sorted, routing.active, routing.active_count,
+                        std::min(pairs, experts), as<bf16>(d_x), x_div, as<float>(out_bf16),
+                        nullptr);
+    k::mxfp8_expert_rows(static_cast<const void* const*>(d_codes_table.p),
+                         static_cast<const void* const*>(d_scales_table.p), rows, k_,
+                         routing.bounds, routing.sorted, routing.active, routing.active_count,
+                         std::min(pairs, experts), as<bf16>(d_x), x_div, as<float>(out_mxfp8),
+                         nullptr);
+    sync("mxfp8_expert_rows");
+    const auto got_bf16  = download<float>(out_bf16, std::size_t(pairs) * rows);
+    const auto got_mxfp8 = download<float>(out_mxfp8, std::size_t(pairs) * rows);
+
+    // Also verify inexact detection catches non-MXFP8 BF16 values (e.g. 1.0078125 = 1 + 2^-7).
+    std::vector<bf16> bad(32, __float2bfloat16(1.0078125f));
+    DeviceBuffer d_bad = upload(bad), d_bad_c(32), d_bad_s(1),
+                 d_bad_inexact = upload(std::vector<unsigned int>{0});
+    k::mxfp8_encode_bf16_rows(as<bf16>(d_bad), 1, 32, static_cast<std::uint8_t*>(d_bad_c.p),
+                              static_cast<std::uint8_t*>(d_bad_s.p),
+                              static_cast<unsigned int*>(d_bad_inexact.p), nullptr);
+    sync("mxfp8_encode_inexact");
+    const auto bad_inexact = download<unsigned int>(d_bad_inexact, 1);
+
+    report(inexact_vec[0] == 0 && bad_inexact[0] > 0 && same_bits(got_bf16, got_mxfp8),
+           "mxfp8_expert_rows " + std::to_string(rows) + "x" + std::to_string(k_) + ", " +
+               std::to_string(pairs) + " pairs over " + std::to_string(experts) +
+               " experts (x per " + (x_div == 1 ? "pair" : "token") + "): inexact=" +
+               std::to_string(inexact_vec[0]) + ", bad_inexact=" + std::to_string(bad_inexact[0]));
+}
+
 void elementwise_case(std::mt19937& rng) {
     constexpr std::int64_t n = 200058;
     auto x = normal(n, 20.0f, rng);
@@ -1811,6 +1899,8 @@ int main() {
         for (const int tokens : {1, 8, 300}) {
             bf16_experts_case(tokens, 2 * kWidth, kHidden, kTopK, 16, rng);
             bf16_experts_case(tokens, kHidden, kWidth, 1, 16, rng);
+            mxfp8_experts_case(tokens, 2 * kWidth, kHidden, kTopK, 16, rng);
+            mxfp8_experts_case(tokens, kHidden, kWidth, 1, 16, rng);
         }
 
         cpu_experts_case("NVFP4/NVFP4", QType::GGUF_NVFP4, QType::GGUF_NVFP4, true, 1, rng);

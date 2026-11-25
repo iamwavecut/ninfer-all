@@ -301,6 +301,24 @@ int main() {
     }
     failures += check(serve_usage_text("ninfer-serve").find("--loop-kv") != std::string::npos,
                       "serve help omits --loop-kv");
+    // --mxfp8-experts: auto by default, each mode reaching the Engine.
+    failures += check(make_engine_options(parse({"ninfer-serve", "model.ninfer"})).experts_mxfp8 ==
+                              ninfer::ExpertsMxfp8::Auto &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer",
+                                                     "--mxfp8-experts", "on"}))
+                                  .experts_mxfp8 == ninfer::ExpertsMxfp8::On &&
+                          make_engine_options(parse({"ninfer-serve", "model.ninfer",
+                                                     "--mxfp8-experts", "off"}))
+                                  .experts_mxfp8 == ninfer::ExpertsMxfp8::Off,
+                      "server did not carry --mxfp8-experts to the Engine options");
+    for (const auto* value : {"true", "", "On"}) {
+        bool rejected = false;
+        try { (void)parse({"ninfer-serve", "model.ninfer", "--mxfp8-experts", value}); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid --mxfp8-experts");
+    }
+    failures += check(serve_usage_text("ninfer-serve").find("--mxfp8-experts") != std::string::npos,
+                      "serve help omits --mxfp8-experts");
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "none"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"})

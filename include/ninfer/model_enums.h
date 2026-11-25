@@ -176,4 +176,13 @@ enum class LoopKvCache : std::uint8_t {
     LastAll,
 };
 
+// Inkling 2: how BF16 routed expert banks (e.g. UD-Q8_K_XL layers 20-23) are held on the device
+// (--mxfp8-experts). Their values are exact MXFP8 values, so re-encoding them as E4M3 codes plus
+// one E8M0 scale per 32 values halves their VRAM without changing any output.
+enum class ExpertsMxfp8 : std::uint8_t {
+    Auto, // Re-encode when keeping BF16 leaves under 4 GiB free on a device.
+    On,   // Always re-encode device-resident BF16 expert banks.
+    Off,  // Keep BF16 weights as stored.
+};
+
 } // namespace ninfer

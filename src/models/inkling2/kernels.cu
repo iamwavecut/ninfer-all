@@ -2700,6 +2700,160 @@ __global__ void bf16_rows_f32_kernel(const __nv_bfloat16* __restrict__ table, in
     out[r * out_stride + i] = __bfloat162float(table[std::int64_t(ids[r]) * k + i]);
 }
 
+__device__ __forceinline__ float mx_code(unsigned byte) {
+    return __half2float(__ushort_as_half(
+        static_cast<unsigned short>(((byte & 0x80U) << 8) | ((byte & 0x7FU) << 7))));
+}
+
+__device__ __forceinline__ float mx_scale(unsigned s) {
+    return __uint_as_float((s + 8U) << 23);
+}
+
+__device__ __forceinline__ std::uint8_t e4m3_encode(float x) {
+    if (x == 0.0f) { return 0; }
+    const unsigned sign = x < 0.0f ? 0x80U : 0x00U;
+    const float ax      = fabsf(x);
+    int exp             = 0;
+    const float mant    = frexpf(ax, &exp);
+    const int e_unbiased = exp - 1;
+    int e = 0, m = 0;
+    if (e_unbiased < -6) {
+        m = __float2int_rn(ldexpf(ax, 9));
+        if (m >= 8) {
+            e = 1;
+            m = 0;
+        }
+    } else {
+        e = e_unbiased + 7;
+        m = __float2int_rn((mant * 2.0f - 1.0f) * 8.0f);
+        if (m >= 8) {
+            m = 0;
+            ++e;
+        }
+        if (e > 15 || (e == 15 && m > 6)) {
+            e = 15;
+            m = 6;
+        }
+    }
+    return static_cast<std::uint8_t>(sign | ((static_cast<unsigned>(e) & 0xFU) << 3) |
+                                     (static_cast<unsigned>(m) & 0x7U));
+}
+
+__global__ void mxfp8_encode_kernel(const __nv_bfloat16* __restrict__ src, std::int64_t blocks,
+                                    std::uint8_t* __restrict__ codes,
+                                    std::uint8_t* __restrict__ scales,
+                                    unsigned int* __restrict__ inexact) {
+    ninfer::pdl::arch_enter_glue();
+    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= blocks) { return; }
+    const std::int64_t base = i * 32;
+    float v[32];
+    float amax = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+        v[j] = __bfloat162float(src[base + j]);
+        amax = fmaxf(amax, fabsf(v[j]));
+    }
+    if (amax == 0.0f) {
+        scales[i] = 127;
+        for (int j = 0; j < 32; ++j) { codes[base + j] = 0; }
+        return;
+    }
+    const int e = ilogbf(amax);
+    int k       = e - 8;
+    if (amax > 1.75f * ldexpf(1.0f, e)) { k = e - 7; }
+    if (k < -127) { k = -127; }
+    if (k > 119) { k = 119; }
+    const unsigned s  = static_cast<unsigned>(k + 127);
+    scales[i]         = static_cast<std::uint8_t>(s);
+    const float inv_f = ldexpf(1.0f, -k);
+    const float f     = mx_scale(s);
+    for (int j = 0; j < 32; ++j) {
+        const std::uint8_t code = e4m3_encode(v[j] * inv_f);
+        codes[base + j]         = code;
+        if (mx_code(code) * f != v[j]) { atomicAdd(inexact, 1U); }
+    }
+}
+
+__global__ void __launch_bounds__(kBfWarps * 32)
+    mxfp8_expert_rows_kernel(const void* const* __restrict__ codes_table,
+                             const void* const* __restrict__ scales_table, int rows, int k,
+                             const std::int32_t* __restrict__ bounds,
+                             const std::int32_t* __restrict__ sorted,
+                             const std::int32_t* __restrict__ active,
+                             const std::int32_t* __restrict__ active_count,
+                             const __nv_bfloat16* __restrict__ x, int x_div,
+                             float* __restrict__ out) {
+    ninfer::pdl::arch_enter_glue();
+    if (int(blockIdx.y) >= *active_count) { return; }
+    const int e     = active[blockIdx.y];
+    const int begin = bounds[e], end = bounds[e + 1];
+    if (begin >= end) { return; }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int row0 = int(blockIdx.x) * kBfRows + warp * kBfRowsPerWarp;
+    __shared__ __align__(16) __nv_bfloat16 xs[kBfPairs][kBfChunk];
+    for (int g = begin; g < end; g += kBfPairs) {
+        const int n = min(kBfPairs, end - g);
+        float acc[kBfRowsPerWarp][kBfPairs];
+#pragma unroll
+        for (int r = 0; r < kBfRowsPerWarp; ++r) {
+#pragma unroll
+            for (int p = 0; p < kBfPairs; ++p) { acc[r][p] = 0.0f; }
+        }
+        for (int c = 0; c < k; c += kBfChunk) {
+            const int vectors = min(kBfChunk, k - c) / 8;
+            for (int idx = threadIdx.x; idx < n * vectors; idx += kBfWarps * 32) {
+                const int p = idx / vectors, v = idx - p * vectors;
+                const int pair = sorted[g + p];
+                *reinterpret_cast<uint4*>(&xs[p][8 * v]) = *reinterpret_cast<const uint4*>(
+                    x + std::int64_t(pair / x_div) * k + c + 8 * v);
+            }
+            __syncthreads();
+            if (lane < vectors) {
+                float wf[kBfRowsPerWarp][8];
+#pragma unroll
+                for (int r = 0; r < kBfRowsPerWarp; ++r) {
+                    const int row = min(row0 + r, rows - 1);
+                    const auto* wc = static_cast<const std::uint8_t*>(codes_table[e]) +
+                                     std::int64_t(row) * k + c + 8 * lane;
+                    const auto* ws = static_cast<const std::uint8_t*>(scales_table[e]) +
+                                     std::int64_t(row) * (k / 32) + (c >> 5) + (lane >> 2);
+                    const float s      = mx_scale(*ws);
+                    const uint2 packed = *reinterpret_cast<const uint2*>(wc);
+                    const unsigned lo = packed.x, hi = packed.y;
+                    wf[r][0] = mx_code(lo & 0xFFU) * s;
+                    wf[r][1] = mx_code((lo >> 8) & 0xFFU) * s;
+                    wf[r][2] = mx_code((lo >> 16) & 0xFFU) * s;
+                    wf[r][3] = mx_code((lo >> 24) & 0xFFU) * s;
+                    wf[r][4] = mx_code(hi & 0xFFU) * s;
+                    wf[r][5] = mx_code((hi >> 8) & 0xFFU) * s;
+                    wf[r][6] = mx_code((hi >> 16) & 0xFFU) * s;
+                    wf[r][7] = mx_code((hi >> 24) & 0xFFU) * s;
+                }
+                for (int p = 0; p < n; ++p) {
+                    float xf[8];
+                    bf16x8(*reinterpret_cast<const uint4*>(&xs[p][8 * lane]), xf);
+#pragma unroll
+                    for (int r = 0; r < kBfRowsPerWarp; ++r) {
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) { acc[r][p] += wf[r][j] * xf[j]; }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int r = 0; r < kBfRowsPerWarp; ++r) {
+            const int row = row0 + r;
+            for (int p = 0; p < n; ++p) {
+                const float sum = warp_sum(acc[r][p]);
+                if (lane == 0 && row < rows) {
+                    out[std::int64_t(sorted[g + p]) * rows + row] = sum;
+                }
+            }
+        }
+    }
+}
+
 __global__ void softcap_kernel(const float* in, __nv_bfloat16* out, std::int64_t n, float cap) {
     ninfer::pdl::arch_enter_glue();
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -3553,6 +3707,32 @@ void bf16_expert_rows(const void* const* table, int rows, int k, const std::int3
                              0, stream, bf16_expert_rows_kernel, table, rows, k, bounds, sorted,
                              active, active_count, x, x_div, out);
     check_launch("bf16_expert_rows");
+}
+
+void mxfp8_encode_bf16_rows(const __nv_bfloat16* src, int rows, int k, std::uint8_t* codes,
+                            std::uint8_t* scales, unsigned int* inexact, cudaStream_t stream) {
+    if (rows <= 0 || k <= 0 || k % 32 != 0) {
+        throw std::invalid_argument("inkling2 mxfp8_encode_bf16_rows: rows, k a multiple of 32");
+    }
+    const std::int64_t blocks = std::int64_t(rows) * (k / 32);
+    ninfer::pdl::launch_arch(blocks_for(blocks, 256), 256, 0, stream, mxfp8_encode_kernel, src,
+                             blocks, codes, scales, inexact);
+    check_launch("mxfp8_encode_bf16_rows");
+}
+
+void mxfp8_expert_rows(const void* const* codes_table, const void* const* scales_table, int rows,
+                       int k, const std::int32_t* bounds, const std::int32_t* sorted,
+                       const std::int32_t* active, const std::int32_t* active_count,
+                       int max_active, const __nv_bfloat16* x, int x_div, float* out,
+                       cudaStream_t stream) {
+    if (rows <= 0 || k <= 0 || k % 32 != 0 || x_div <= 0) {
+        throw std::invalid_argument("inkling2 mxfp8_expert_rows: rows, k a multiple of 32, x_div");
+    }
+    if (max_active <= 0) { return; }
+    ninfer::pdl::launch_arch(dim3(blocks_for(rows, kBfRows), unsigned(max_active)), kBfWarps * 32,
+                             0, stream, mxfp8_expert_rows_kernel, codes_table, scales_table, rows,
+                             k, bounds, sorted, active, active_count, x, x_div, out);
+    check_launch("mxfp8_expert_rows");
 }
 
 void bf16_rows_f32(const __nv_bfloat16* table, int k, const std::int32_t* ids, int rows,

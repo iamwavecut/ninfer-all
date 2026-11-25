@@ -1008,7 +1008,7 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
 
 ## Expert residency
 
-`--expert-residency device` keeps the routed GGUF banks on the GPU. `host` keeps them in pinned host
+`--expert-residency device` keeps the routed GGUF banks on the GPU. For models with device-resident BF16 routed experts whose weights are exactly MXFP8-representable (such as `UD-Q8_K_XL`), `--mxfp8-experts auto|on|off` (default `auto`) can stream-encode those BF16 expert banks on the fly into E4M3 codes + per-32 E8M0 scales (~17/32 of the BF16 footprint) while checking bit-for-bit parity against the BF16 weights (`inexact == 0`). `auto` enables MXFP8 when free VRAM is tight (within 4 GiB of holding BF16 experts alongside the rest of the model) and keeps BF16 when VRAM has room; `on` forces MXFP8; `off` keeps BF16. Both single-GPU and `--tensor-parallel` expert-parallel runs are supported. `host` keeps them in pinned host
 memory and `disk` in the artifact's files, read through the OS page cache. Both run the experts
 with the resident kernels on the GPU, except the share of decode and verification misses that CPU
 threads compute, through the transport Gemma 4 and Flint use
