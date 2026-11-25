@@ -84,14 +84,9 @@ void kv_store(const KvStoreArgs& args, cudaStream_t stream) {
 void kv_store_pair(const KvStoreArgs& key, const KvStoreArgs& value, cudaStream_t stream) {
     const int units_k = key.rows_count * key.heads, units_v = value.rows_count * value.heads;
     if (units_k <= 0 && units_v <= 0) { return; }
-    // The pair launch is for the codings where fusing was measured to win (the #473 review:
-    // int8 and rk8v4 gained 1-2% on a 3090, and our re-measurement in a steady thermal state
-    // found the fused and separate stores within noise). Lloyd4-keyed planes keep the two
-    // separate launches: the same review measured fused rk4v4 ~4.5% slower, and our
-    // investigation found no compile-level cause (no register spills in the fused kernel, the
-    // isolated store phase twice as fast) — the separate launches cost nothing measurable, so
-    // the conservative side wins on a contested point. An unknown coding throws: a silent skip
-    // would leave the cache unwritten.
+    // One launch for int8 G64 and int4 G32 planes (int8, rk8v4); Lloyd4 keys (rk4v4), MXFP8
+    // planes and unequal row counts take the two kv_store launches, which decoded rk4v4 faster
+    // on an RTX 3090.
     const auto fuses = [](KvCoding c) {
         return c == KvCoding::Int8G64 || c == KvCoding::Int4G32;
     };

@@ -4,6 +4,7 @@
 //  - kv_store: the stored codes, decoded on the host with their stored scales, stay near the F16
 //    rows stored (a coding's own error bound); MXFP8's codes and scales equal the release's rule
 //    (vLLM's mxfp8_quantize) applied on the host, bit for bit;
+//  - kv_store_pair: both planes' bytes equal kv_store's, untouched slots included;
 //  - attention over the planes: a full-attention visit's decode rows, verification rows, prompt
 //    chunk, branches and a chunk with a far field against an FP64 attention over the host-decoded
 //    rows, the slots being the rows' physical positions.
@@ -248,8 +249,37 @@ void case_run(const char* name, mi::KvCoding key, mi::KvCoding value, const Rows
         args.dst             = plane(codes, scales, cb, sb, coding);
         k::kv_store(args, nullptr);
     };
+    // Zero planes: the attention below reads the slots no row stores as zero rows.
+    for (DeviceBuffer* b : {&dkc, &dks, &dvc, &dvs}) { b->fill(0); }
     store(as<__half>(dk), dkc, dks, key_code_bytes, key_scale_bytes, key);
     store(as<__half>(dv), dvc, dvs, value_code_bytes, value_scale_bytes, value);
+    {
+        // kv_store_pair, the visit's store, writes the planes kv_store writes byte for byte,
+        // untouched slots included.
+        DeviceBuffer pkc(dkc.bytes), pks(dks.bytes), pvc(dvc.bytes), pvs(dvs.bytes);
+        for (DeviceBuffer* b : {&pkc, &pks, &pvc, &pvs}) { b->fill(0); }
+        k::KvStoreArgs ka, va;
+        for (const auto& [args, src, codes, scales, cb, sb, coding] :
+             {std::tuple{&ka, &dk, &pkc, &pks, key_code_bytes, key_scale_bytes, key},
+              std::tuple{&va, &dv, &pvc, &pvs, value_code_bytes, value_scale_bytes, value}}) {
+            args->rows            = rows_dev.rows;
+            args->src             = as<__half>(*src);
+            args->src_head_stride = t * kD;
+            args->rows_count      = t;
+            args->heads           = kKv;
+            args->dst             = plane(*codes, *scales, cb, sb, coding);
+        }
+        k::kv_store_pair(ka, va, nullptr);
+        check(cudaDeviceSynchronize(), "kv_store_pair");
+        bool same = true;
+        for (const auto& [a, b] : {std::pair{&dkc, &pkc}, std::pair{&dks, &pks},
+                                   std::pair{&dvc, &pvc}, std::pair{&dvs, &pvs}}) {
+            same = same &&
+                   download<std::uint8_t>(*a, a->bytes) == download<std::uint8_t>(*b, b->bytes);
+        }
+        report(same, std::string(name) + " kv_store_pair planes equal kv_store's (" +
+                         std::to_string(t) + " rows)");
+    }
     if (far) {
         // The positions before the chunk hold stored rows too, for the far field to read.
         RowsCase before;
