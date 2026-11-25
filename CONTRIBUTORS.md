@@ -26,6 +26,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [CommanderTurtle](https://github.com/CommanderTurtle) | System One `box` questions: normalized bounding boxes read as four coordinate distributions, and images kept through the digits of a long label | [#362](https://github.com/iamwavecut/ninfer-all/pull/362) |
 | [fakezeta](https://github.com/fakezeta) | Qwen3.8-27B GGUFs with a condensed vocabulary: token tables and output heads padded to whole 128-row tiles, and the tokenizer, configuration ids and proposal ranking moved to the condensed ids | [#359](https://github.com/iamwavecut/ninfer-all/pull/359) |
 | [lededev](https://github.com/lededev) | The `sm_89` FP8 fast prompt kernel with a shared split-merge route, and the HTTP graceful stop (`POST /shutdown` behind `--admin-token`) | [#333](https://github.com/iamwavecut/ninfer-all/pull/333), [#414](https://github.com/iamwavecut/ninfer-all/pull/414) |
+| [cedrik-fuoco](https://github.com/cedrik-fuoco) | The CUDA Graph reserve of Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 charged only where the graphs run, and the Inkling 2 Mini field report on an 8 GB RTX 3070 Ti under Windows 11 | [#467](https://github.com/iamwavecut/ninfer-all/pull/467) |
 
 ## Work carried from other forks
 

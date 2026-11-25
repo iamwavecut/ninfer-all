@@ -340,6 +340,12 @@ struct Executor::Impl {
         stream = device.stream;
         const int device_id = device.rank(0).device;
         kvfmt = kv_format(o.kv_cache);
+        // Where a device's copies queue behind one another whatever their streams
+        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for a missing host
+        // or disk expert can hold back the copies that end it, so those placements run eager. Experts on
+        // the device capture their graphs as everywhere else.
+        if (!model.expert_banks().empty() && serialized_copy_queue()) { options.cuda_graphs = false; }
+
         growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
                   vmm::granularity(device_id) != 0;
         hidden      = int(config.hidden_size);
@@ -565,11 +571,11 @@ struct Executor::Impl {
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-            if (workspace_bytes + kGraphReserve + unbacked() > free_bytes) {
+            if (workspace_bytes + launch_reserve() + unbacked() > free_bytes) {
                 throw InsufficientMemory(
                     "Inkling 2: the workspace of " + std::to_string(workspace_bytes >> 20) +
-                    " MiB and " + std::to_string(kGraphReserve >> 20) +
-                    " MiB for the CUDA graphs need more than the " +
+                    " MiB and " + std::to_string(launch_reserve() >> 20) +
+                    " MiB kept free for CUDA graphs and kernel loading need more than the " +
                     std::to_string(free_bytes >> 20) +
                     " MiB free after the caches; lower --max-concurrency, --max-context or the "
                     "prompt chunk");
@@ -1288,17 +1294,18 @@ struct Executor::Impl {
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         const auto cache = options.expert_cache_bytes.value_or(0);
-        if (bank + metadata + cache + unbacked() + kGraphReserve > free) {
+        if (bank + metadata + cache + unbacked() + launch_reserve() > free) {
             throw InsufficientMemory("Inkling 2: expert delivery needs " +
                 std::to_string((bank + metadata + cache) >> 20) + " MiB beside " +
-                std::to_string(unbacked() >> 20) +
-                " MiB for the growing caches and the CUDA Graph reserve after workspace allocation");
+                std::to_string(unbacked() >> 20) + " MiB for the growing caches and " +
+                std::to_string(launch_reserve() >> 20) +
+                " MiB kept free for CUDA graphs and kernel loading after workspace allocation");
         }
         ExpertDeliveryOptions transport;
         transport.pair_capacity   = options.prefill_chunk * config.top_k_experts;
         transport.top_k           = config.top_k_experts;
         transport.cache_bytes     = options.expert_cache_bytes;
-        transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
+        transport.keep_free_bytes = launch_reserve() + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
         transport.disk            = options.expert_disk;
         const float dma_share     = options.expert_dma_share.value_or(0.0F);
@@ -1338,11 +1345,6 @@ struct Executor::Impl {
         }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
-        // Where a device's copies queue behind one another whatever their streams
-        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for the
-        // misses can hold the copies the graph queued after it ahead of the delivery's own, which
-        // end that wait. Eager passes wait on the host and queue nothing behind the wait.
-        if (serialized_copy_queue()) { options.cuda_graphs = false; }
         for (auto& p : layers) {
             if (p.delivery_layer < 0) { continue; }
             const auto l       = std::size_t(p.delivery_layer);
@@ -1356,6 +1358,17 @@ struct Executor::Impl {
 
     static constexpr std::uint32_t kFullChunk  = 2048;
     static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
+    // Without graphs the device still keeps room for the kernels CUDA loads at their first
+    // launch (lazy module loading): a prompt or reply reaches kernels that startup never
+    // launched, and with every byte given to the expert cache that load fails ("out of memory").
+    static constexpr std::size_t kKernelReserve = std::size_t(64) << 20;
+
+    // What the device keeps free beside the planned memory: the CUDA graphs' reserve where this run
+    // captures them (graphs are off for --no-cuda-graph, and for host or disk experts where a
+    // device's copies queue behind one another), else the kernels' reserve.
+    [[nodiscard]] std::size_t launch_reserve() const {
+        return options.cuda_graphs ? kGraphReserve : kKernelReserve;
+    }
     static constexpr std::size_t kKvHeadroom   = std::size_t(256) << 20;
 
     // ---- Growing caches --------------------------------------------------------------------------
@@ -1436,7 +1449,9 @@ struct Executor::Impl {
         }
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        if (free < need + kGraphReserve) { delivery->shrink_cache(need + kGraphReserve - free); }
+        if (free < need + launch_reserve()) {
+            delivery->shrink_cache(need + launch_reserve() - free);
+        }
         while (!apply()) {
             if (delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
                 count_backed();
