@@ -1,11 +1,12 @@
 #include "models/qwen4_exp/read_pool.h"
 
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace ninfer::models::qwen4_exp {
 
-ReadPool::ReadPool(std::size_t threads) {
+ReadPool::ReadPool(std::size_t threads, const char* name) : name_(name) {
     for (std::size_t i = 0; i < threads; ++i) {
         workers_.emplace_back([this] { work(); });
     }
@@ -24,7 +25,9 @@ void ReadPool::start(std::size_t count, std::function<void(std::size_t)> read) {
     {
         std::lock_guard lock(mutex_);
         if (remaining_ != 0 || job_) {
-            throw std::logic_error("ReadPool: the previous batch has not finished");
+            throw std::logic_error(std::string("ReadPool: the previous batch has not finished (") +
+                                   name_ + ", " + std::to_string(remaining_) + " of " +
+                                   std::to_string(count_) + " left)");
         }
         if (count == 0) { return; }
         job_       = std::move(read);
