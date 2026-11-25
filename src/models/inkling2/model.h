@@ -18,7 +18,6 @@
 #include "models/dspine/model.h"
 #include "models/inkling2/config.h"
 #include "models/qwen3_5/frontend/resources.h"
-#include "ninfer/model_enums.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/weights.h"
 #include "ninfer/ops/weight_input.h"
@@ -92,28 +91,6 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
 };
 
-// On-the-fly MXFP8 re-encoding of BF16 routed expert banks for one (layer, rank).
-struct Mxfp8RankBank {
-    int device_ordinal           = 0;
-    std::uint32_t expert_begin   = 0;
-    std::uint32_t expert_count   = 0;
-    void* gate_up_codes          = nullptr;
-    void* gate_up_scales         = nullptr;
-    void* down_codes             = nullptr;
-    void* down_scales            = nullptr;
-    std::size_t gate_up_code_stride  = 0;
-    std::size_t gate_up_scale_stride = 0;
-    std::size_t down_code_stride     = 0;
-    std::size_t down_scale_stride    = 0;
-
-    Mxfp8RankBank() = default;
-    Mxfp8RankBank(Mxfp8RankBank&& o) noexcept;
-    Mxfp8RankBank& operator=(Mxfp8RankBank&& o) noexcept;
-    Mxfp8RankBank(const Mxfp8RankBank&)            = delete;
-    Mxfp8RankBank& operator=(const Mxfp8RankBank&) = delete;
-    ~Mxfp8RankBank();
-};
-
 struct ExpertBanks {
     QType gate_up_type{}, down_type{};
     std::uint64_t gate_up_row_bytes = 0, down_row_bytes = 0;
@@ -172,7 +149,6 @@ struct LoadOptions {
     VisionPlacement vision = VisionPlacement::None;
     bool dspark            = false; // bind the artifact's DSpark drafter
     bool dflash2           = false; // bind the artifact's DFlash2 drafter on rank 0
-    ExpertsMxfp8 mxfp8_experts = ExpertsMxfp8::Auto;
     // Loads the standalone DSpine drafter artifact at this path (--spec dspine --draft-model) on
     // rank 0; empty for none. One drafter at most.
     std::filesystem::path dspine;
@@ -191,9 +167,6 @@ public:
     // [first, second) rank `rank` holds.
     [[nodiscard]] bool expert_parallel() const noexcept { return !expert_split_.empty(); }
     [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> expert_range(std::size_t rank) const;
-    [[nodiscard]] bool mxfp8_experts() const noexcept { return !mxfp8_banks_.empty(); }
-    [[nodiscard]] const Mxfp8RankBank* mxfp8_bank(std::size_t layer,
-                                                  std::size_t rank) const noexcept;
     // Host or disk experts: one bank per stored layer, in layer order.
     [[nodiscard]] std::span<const ExpertBanks> expert_banks() const noexcept { return expert_banks_; }
     [[nodiscard]] std::uint64_t expert_pinned_bytes() const noexcept {
@@ -260,7 +233,6 @@ private:
     ExpertResidency expert_residency_ = ExpertResidency::Device;
     std::vector<double> expert_split_;
     std::vector<ExpertBanks> expert_banks_;
-    std::vector<std::vector<Mxfp8RankBank>> mxfp8_banks_;
     std::vector<std::filesystem::path> expert_files_;
     std::optional<VisionConfig> vision_config_;
     std::optional<VisionWeights> vision_;

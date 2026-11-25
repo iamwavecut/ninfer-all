@@ -647,9 +647,6 @@ struct EngineOptions {
     // Inkling 2 only: which keys and values the three passes of its looped core keep
     // (LoopKvCache). Anything but PerPass is lossy and never the default.
     LoopKvCache loop_kv = LoopKvCache::PerPass;
-    // Inkling 2 only: hold device-resident BF16 routed expert banks as their exact MXFP8
-    // re-encoding (halves their VRAM with identical output).
-    ExpertsMxfp8 experts_mxfp8 = ExpertsMxfp8::Auto;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

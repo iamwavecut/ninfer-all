@@ -103,7 +103,6 @@ struct ServeOptions {
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     bool kv_cache_automatic                = false; // no --kv-dtype (EngineOptions::kv_cache_automatic)
     LoopKvCache loop_kv                    = LoopKvCache::PerPass; // Inkling 2: --loop-kv
-    ExpertsMxfp8 experts_mxfp8             = ExpertsMxfp8::Auto;  // Inkling 2: --mxfp8-experts
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;

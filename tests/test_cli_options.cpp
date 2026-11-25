@@ -341,27 +341,6 @@ int run_tests() {
                               "CLI accepted an invalid --loop-kv");
         }
     }
-    {
-        // --mxfp8-experts: auto by default; on/off when named.
-        const auto mxfp8 = [&](std::vector<std::string> tail) {
-            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
-            args.insert(args.end(), tail.begin(), tail.end());
-            return parse(args).experts_mxfp8;
-        };
-        failures += check(mxfp8({}) == ninfer::ExpertsMxfp8::Auto &&
-                              mxfp8({"--mxfp8-experts", "on"}) == ninfer::ExpertsMxfp8::On &&
-                              mxfp8({"--mxfp8-experts", "off"}) == ninfer::ExpertsMxfp8::Off &&
-                              mxfp8({"--mxfp8-experts", "on", "--mxfp8-experts", "auto"}) ==
-                                  ninfer::ExpertsMxfp8::Auto,
-                          "CLI did not preserve --mxfp8-experts");
-        failures += check(ninfer::cli::usage_text("ninfer-cli").find("--mxfp8-experts") !=
-                              std::string::npos,
-                          "CLI help omits --mxfp8-experts");
-        for (const auto* value : {"true", "", "On"}) {
-            failures += check(rejects([&] { (void)mxfp8({"--mxfp8-experts", value}); }),
-                              "CLI accepted an invalid --mxfp8-experts");
-        }
-    }
     for (const auto* share : {"0", "0.25", "1"}) {
         const auto hybrid = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
             "--expert-residency", "host", "--expert-dma-share", share,

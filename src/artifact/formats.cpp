@@ -44,6 +44,7 @@ constexpr std::array kFormats = {
     std::pair{QType::GGUF_PTQ1_0, std::string_view{"gguf_ptq1_0"}},
     std::pair{QType::FP16, std::string_view{"fp16"}},
     std::pair{QType::UINT16, std::string_view{"uint16"}},
+    std::pair{QType::MXFP8, std::string_view{"mxfp8"}},
 };
 constexpr std::array kLayouts = {
     std::pair{QuantLayout::Contiguous, std::string_view{"contiguous_le_v1"}},

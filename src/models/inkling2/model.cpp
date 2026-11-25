@@ -6,18 +6,11 @@
 #include "core/tensor_split.h"
 #include "core/weight_view.h"
 #include "models/expert_parallel.h"
-#include "models/inkling2/kernels.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/load/bindings.h"
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
-
 #include <algorithm>
 #include <array>
-#include <cstddef>
-#include <cstdint>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -30,192 +23,6 @@ using qwen3_5::loading::Bindings;
 // Zero bytes after a matrix whose rows are not whole 256-value steps: the integer matrix kernel
 // reads past the last row's end (gguf_project, moe_matrix_product).
 constexpr std::uint64_t kRowTail = 512;
-
-constexpr std::size_t kMxfp8AutoRoom = 4ULL << 30;
-
-void mxfp8_cuda_check(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("inkling2 mxfp8 ") + what + ": " +
-                                 cudaGetErrorString(err));
-    }
-}
-
-struct PinnedHostBuffer {
-    void* ptr = nullptr;
-    PinnedHostBuffer() = default;
-    explicit PinnedHostBuffer(std::size_t bytes) {
-        mxfp8_cuda_check(cudaMallocHost(&ptr, bytes), "cudaMallocHost");
-    }
-    ~PinnedHostBuffer() {
-        if (ptr) { cudaFreeHost(ptr); }
-    }
-    PinnedHostBuffer(const PinnedHostBuffer&)            = delete;
-    PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
-};
-
-struct DeviceScratch {
-    void* ptr = nullptr;
-    DeviceScratch() = default;
-    explicit DeviceScratch(std::size_t bytes) {
-        mxfp8_cuda_check(cudaMalloc(&ptr, bytes), "cudaMalloc");
-    }
-    ~DeviceScratch() {
-        if (ptr) { cudaFree(ptr); }
-    }
-    DeviceScratch(const DeviceScratch&)            = delete;
-    DeviceScratch& operator=(const DeviceScratch&) = delete;
-};
-
-struct CudaStreamGuard {
-    cudaStream_t stream = nullptr;
-    CudaStreamGuard() {
-        mxfp8_cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
-                         "cudaStreamCreateWithFlags");
-    }
-    ~CudaStreamGuard() {
-        if (stream) { cudaStreamDestroy(stream); }
-    }
-    CudaStreamGuard(const CudaStreamGuard&)            = delete;
-    CudaStreamGuard& operator=(const CudaStreamGuard&) = delete;
-};
-
-struct CudaEventGuard {
-    cudaEvent_t event = nullptr;
-    CudaEventGuard() {
-        mxfp8_cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
-                         "cudaEventCreateWithFlags");
-    }
-    ~CudaEventGuard() {
-        if (event) { cudaEventDestroy(event); }
-    }
-    CudaEventGuard(const CudaEventGuard&)            = delete;
-    CudaEventGuard& operator=(const CudaEventGuard&) = delete;
-};
-
-struct Mxfp8LayerSpec {
-    std::uint64_t gate_up_offset = 0;
-    std::uint64_t down_offset    = 0;
-};
-
-void free_mxfp8_bank(Mxfp8RankBank& b) noexcept {
-    if (!b.gate_up_codes && !b.gate_up_scales && !b.down_codes && !b.down_scales) { return; }
-    int prev = -1;
-    cudaGetDevice(&prev);
-    if (prev != b.device_ordinal) { cudaSetDevice(b.device_ordinal); }
-    if (b.gate_up_codes) { cudaFree(b.gate_up_codes); }
-    if (b.gate_up_scales) { cudaFree(b.gate_up_scales); }
-    if (b.down_codes) { cudaFree(b.down_codes); }
-    if (b.down_scales) { cudaFree(b.down_scales); }
-    if (prev >= 0 && prev != b.device_ordinal) { cudaSetDevice(prev); }
-    b.gate_up_codes  = nullptr;
-    b.gate_up_scales = nullptr;
-    b.down_codes     = nullptr;
-    b.down_scales    = nullptr;
-}
-
-std::vector<std::vector<Mxfp8RankBank>> build_mxfp8_banks(
-    const artifact::Reader& reader, const DeviceContext& device,
-    const std::vector<std::optional<Mxfp8LayerSpec>>& layers, std::uint64_t e, std::uint64_t w,
-    std::uint64_t h, const std::vector<std::uint64_t>& ends) {
-    const std::size_t rank_count = ends.empty() ? 1 : ends.size() - 1;
-    std::vector<std::vector<Mxfp8RankBank>> banks(layers.size());
-    for (std::size_t li = 0; li < layers.size(); ++li) {
-        if (layers[li].has_value()) { banks[li].resize(rank_count); }
-    }
-
-    const std::size_t gu_rows         = static_cast<std::size_t>(2 * w);
-    const std::size_t gu_k            = static_cast<std::size_t>(h);
-    const std::size_t gu_code_stride  = gu_rows * gu_k;
-    const std::size_t gu_scale_stride = gu_rows * (gu_k / 32);
-    const std::size_t gu_bf16_bytes   = gu_code_stride * sizeof(std::uint16_t);
-
-    const std::size_t dn_rows         = static_cast<std::size_t>(h);
-    const std::size_t dn_k            = static_cast<std::size_t>(w);
-    const std::size_t dn_code_stride  = dn_rows * dn_k;
-    const std::size_t dn_scale_stride = dn_rows * (dn_k / 32);
-    const std::size_t dn_bf16_bytes   = dn_code_stride * sizeof(std::uint16_t);
-
-    const std::size_t stage_bytes = std::max(gu_bf16_bytes, dn_bf16_bytes);
-    PinnedHostBuffer host_stage[2] = {PinnedHostBuffer(stage_bytes), PinnedHostBuffer(stage_bytes)};
-
-    for (std::size_t r = 0; r < rank_count; ++r) {
-        const std::uint32_t begin = ends.empty() ? 0 : static_cast<std::uint32_t>(ends[r]);
-        const std::uint32_t end =
-            ends.empty() ? static_cast<std::uint32_t>(e) : static_cast<std::uint32_t>(ends[r + 1]);
-        const std::uint32_t count = end - begin;
-        const int dev             = device.device_ids()[r];
-        DeviceBinding bind(dev);
-
-        CudaStreamGuard stream;
-        CudaEventGuard copy_done[2];
-        DeviceScratch dev_bf16(stage_bytes);
-        DeviceScratch dev_inexact(sizeof(unsigned int));
-        mxfp8_cuda_check(cudaMemsetAsync(dev_inexact.ptr, 0, sizeof(unsigned int), stream.stream),
-                         "cudaMemsetAsync");
-
-        int slot = 0;
-        for (std::size_t li = 0; li < layers.size(); ++li) {
-            if (!layers[li].has_value()) { continue; }
-            Mxfp8RankBank& bank       = banks[li][r];
-            bank.device_ordinal       = dev;
-            bank.expert_begin         = begin;
-            bank.expert_count         = count;
-            bank.gate_up_code_stride  = gu_code_stride;
-            bank.gate_up_scale_stride = gu_scale_stride;
-            bank.down_code_stride     = dn_code_stride;
-            bank.down_scale_stride    = dn_scale_stride;
-
-            mxfp8_cuda_check(cudaMalloc(&bank.gate_up_codes, count * gu_code_stride), "malloc gu c");
-            mxfp8_cuda_check(cudaMalloc(&bank.gate_up_scales, count * gu_scale_stride),
-                             "malloc gu s");
-            mxfp8_cuda_check(cudaMalloc(&bank.down_codes, count * dn_code_stride), "malloc dn c");
-            mxfp8_cuda_check(cudaMalloc(&bank.down_scales, count * dn_scale_stride), "malloc dn s");
-
-            const auto encode_bank = [&](std::uint64_t base_offset, std::size_t rows,
-                                         std::size_t k, std::size_t bf16_bytes,
-                                         std::size_t code_stride, std::size_t scale_stride,
-                                         void* codes_dst, void* scales_dst) {
-                for (std::uint32_t x = 0; x < count; ++x) {
-                    const std::uint64_t off =
-                        base_offset + std::uint64_t(begin + x) * bf16_bytes;
-                    mxfp8_cuda_check(cudaEventSynchronize(copy_done[slot].event),
-                                     "cudaEventSynchronize");
-                    reader.read_into(
-                        off, std::span<std::byte>(static_cast<std::byte*>(host_stage[slot].ptr),
-                                                  bf16_bytes));
-                    mxfp8_cuda_check(cudaMemcpyAsync(dev_bf16.ptr, host_stage[slot].ptr, bf16_bytes,
-                                                     cudaMemcpyHostToDevice, stream.stream),
-                                     "cudaMemcpyAsync");
-                    mxfp8_cuda_check(cudaEventRecord(copy_done[slot].event, stream.stream),
-                                     "cudaEventRecord");
-                    kernels::mxfp8_encode_bf16_rows(
-                        static_cast<const __nv_bfloat16*>(dev_bf16.ptr), static_cast<int>(rows),
-                        static_cast<int>(k), static_cast<std::uint8_t*>(codes_dst) + x * code_stride,
-                        static_cast<std::uint8_t*>(scales_dst) + x * scale_stride,
-                        static_cast<unsigned int*>(dev_inexact.ptr), stream.stream);
-                    slot ^= 1;
-                }
-            };
-
-            encode_bank(layers[li]->gate_up_offset, gu_rows, gu_k, gu_bf16_bytes, gu_code_stride,
-                        gu_scale_stride, bank.gate_up_codes, bank.gate_up_scales);
-            encode_bank(layers[li]->down_offset, dn_rows, dn_k, dn_bf16_bytes, dn_code_stride,
-                        dn_scale_stride, bank.down_codes, bank.down_scales);
-        }
-
-        unsigned int inexact_count = 0;
-        mxfp8_cuda_check(cudaMemcpyAsync(&inexact_count, dev_inexact.ptr, sizeof(unsigned int),
-                                         cudaMemcpyDeviceToHost, stream.stream),
-                         "cudaMemcpyAsync inexact");
-        mxfp8_cuda_check(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize");
-        if (inexact_count != 0) {
-            throw artifact::ArtifactError(
-                "inkling2: routed expert weights are not exactly MXFP8-representable (" +
-                std::to_string(inexact_count) + " inexact elements)");
-        }
-    }
-    return banks;
-}
 
 FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config, bool vision) {
     const auto resource = [&](std::string_view role, std::string_view component = "text") {
@@ -333,44 +140,6 @@ ops::WeightInput Model::input(WeightId id) const {
     return ops::WeightInput{parameter.view, use.policy, use.activation_input_divisor};
 }
 
-Mxfp8RankBank::Mxfp8RankBank(Mxfp8RankBank&& o) noexcept
-    : device_ordinal(o.device_ordinal),
-      expert_begin(o.expert_begin),
-      expert_count(o.expert_count),
-      gate_up_codes(std::exchange(o.gate_up_codes, nullptr)),
-      gate_up_scales(std::exchange(o.gate_up_scales, nullptr)),
-      down_codes(std::exchange(o.down_codes, nullptr)),
-      down_scales(std::exchange(o.down_scales, nullptr)),
-      gate_up_code_stride(o.gate_up_code_stride),
-      gate_up_scale_stride(o.gate_up_scale_stride),
-      down_code_stride(o.down_code_stride),
-      down_scale_stride(o.down_scale_stride) {}
-
-Mxfp8RankBank& Mxfp8RankBank::operator=(Mxfp8RankBank&& o) noexcept {
-    if (this != &o) {
-        free_mxfp8_bank(*this);
-        device_ordinal       = o.device_ordinal;
-        expert_begin         = o.expert_begin;
-        expert_count         = o.expert_count;
-        gate_up_codes        = std::exchange(o.gate_up_codes, nullptr);
-        gate_up_scales       = std::exchange(o.gate_up_scales, nullptr);
-        down_codes           = std::exchange(o.down_codes, nullptr);
-        down_scales          = std::exchange(o.down_scales, nullptr);
-        gate_up_code_stride  = o.gate_up_code_stride;
-        gate_up_scale_stride = o.gate_up_scale_stride;
-        down_code_stride     = o.down_code_stride;
-        down_scale_stride    = o.down_scale_stride;
-    }
-    return *this;
-}
-
-Mxfp8RankBank::~Mxfp8RankBank() { free_mxfp8_bank(*this); }
-
-const Mxfp8RankBank* Model::mxfp8_bank(std::size_t layer, std::size_t rank) const noexcept {
-    if (layer >= mxfp8_banks_.size() || rank >= mxfp8_banks_[layer].size()) { return nullptr; }
-    return &mxfp8_banks_[layer][rank];
-}
-
 std::pair<std::uint32_t, std::uint32_t> Model::expert_range(std::size_t rank) const {
     if (expert_split_.empty()) { return {0, rank == 0 ? config_.num_experts : 0}; }
     const auto ends =
@@ -467,77 +236,6 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     const std::uint64_t taps = config.conv_taps;
     const std::uint64_t rel  = config.relative_width;
     const std::uint64_t e = config.num_experts, w = config.moe_intermediate_size;
-    if (offload && options.mxfp8_experts == ExpertsMxfp8::On) {
-        throw std::invalid_argument(
-            "inkling2: --mxfp8-experts on requires device-resident experts");
-    }
-    bool want_mxfp8 = false;
-    std::vector<std::optional<Mxfp8LayerSpec>> mxfp8_layers;
-    if (!offload && options.mxfp8_experts != ExpertsMxfp8::Off) {
-        const auto resolve_bf16_bank = [&](const std::string& param_name, std::uint64_t rows,
-                                           std::uint64_t k, std::uint64_t& out_offset) -> bool {
-            const auto found = reader.directory().bindings.find(param_name);
-            if (found == reader.directory().bindings.end()) { return false; }
-            const auto& parts = found->second.parts;
-            if (parts.size() != 1) { return false; }
-            const auto& part     = parts.front();
-            const auto& geometry = reader.geometry(part.object);
-            if (geometry.format != QType::BF16 || geometry.shape.size() != 2 ||
-                geometry.shape[1] != k || part.begin % k != 0 ||
-                part.end - part.begin != e * rows * k) {
-                return false;
-            }
-            reader.validate_object(part.object);
-            out_offset = reader.directory().tensor(part.object).offset +
-                         part.begin * sizeof(std::uint16_t);
-            return true;
-        };
-        const bool dims_ok = (h % 32 == 0) && (w % 32 == 0);
-        std::size_t bf16_layer_count = 0;
-        if (dims_ok) {
-            mxfp8_layers.resize(config.num_hidden_layers);
-            for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
-                const std::string m = "text/layers/" + std::to_string(i) + "/moe/";
-                Mxfp8LayerSpec spec;
-                if (resolve_bf16_bank(m + "gate_up", 2 * w, h, spec.gate_up_offset) &&
-                    resolve_bf16_bank(m + "down", h, w, spec.down_offset)) {
-                    mxfp8_layers[i] = spec;
-                    ++bf16_layer_count;
-                }
-            }
-        }
-        if (options.mxfp8_experts == ExpertsMxfp8::On) {
-            if (bf16_layer_count == 0) {
-                throw artifact::ArtifactError(
-                    "inkling2: --mxfp8-experts on requires at least one layer with BF16 routed "
-                    "experts and dimensions divisible by 32");
-            }
-            want_mxfp8 = true;
-        } else if (bf16_layer_count > 0) {
-            const std::uint64_t total_expert_bf16 =
-                std::uint64_t(bf16_layer_count) * e * (2 * w * h + h * w) * sizeof(std::uint16_t);
-            const std::uint64_t total_bytes  = reader.file_bytes();
-            const std::uint64_t non_expert   = total_bytes > total_expert_bf16
-                                                   ? (total_bytes - total_expert_bf16)
-                                                   : 0;
-            const std::size_t rank_count     = ends.empty() ? 1 : ends.size() - 1;
-            const std::uint64_t per_rank_fix = non_expert / rank_count;
-            for (std::size_t r = 0; r < rank_count; ++r) {
-                const std::uint64_t rank_experts = ends.empty() ? e : (ends[r + 1] - ends[r]);
-                const std::uint64_t rank_bf16 =
-                    std::uint64_t(bf16_layer_count) * rank_experts * (2 * w * h + h * w) *
-                    sizeof(std::uint16_t);
-                DeviceBinding bind(device.device_ids()[r]);
-                std::size_t free_b = 0, total_b = 0;
-                if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess &&
-                    free_b < rank_bf16 + per_rank_fix + kMxfp8AutoRoom) {
-                    want_mxfp8 = true;
-                    break;
-                }
-            }
-        }
-        if (!want_mxfp8) { mxfp8_layers.clear(); }
-    }
     const auto vector = [&](const std::string& name, artifact::Shape shape) {
         return b.direct(name, std::move(shape), QType::FP32);
     };
@@ -591,9 +289,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             moe.gate_up_scale = vector(m + "gate_up_scale", {e});
         }
         if (binder.contains(m + "down_scale")) { moe.down_scale = vector(m + "down_scale", {e}); }
-        if (want_mxfp8 && mxfp8_layers[i].has_value()) {
-            // Experts are already queued in mxfp8_layers and streamed directly after materialize().
-        } else if (offload) {
+        if (offload) {
             const auto residency = options.experts == ExpertResidency::Host
                                        ? artifact::Residency::PinnedOrFiles
                                            : artifact::Residency::Values;
@@ -812,10 +508,6 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     auto backing = artifact::materialize(reader, std::move(materialization), device, observer,
                                          nullptr, {.files_after_bytes = options.expert_host_bytes});
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
-    std::vector<std::vector<Mxfp8RankBank>> mxfp8_banks;
-    if (want_mxfp8) {
-        mxfp8_banks = build_mxfp8_banks(reader, device, mxfp8_layers, e, w, h, ends);
-    }
     std::vector<ExpertBanks> expert_banks;
     for (const auto& reference : expert_references) {
         ExpertBanks bank;
@@ -836,7 +528,6 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     model->expert_residency_ = options.experts;
     model->expert_split_     = options.expert_split;
     model->expert_banks_     = std::move(expert_banks);
-    model->mxfp8_banks_      = std::move(mxfp8_banks);
     model->vision_config_    = std::move(vision_config);
     model->vision_           = std::move(vision_weights);
     model->vision_placement_ = options.vision;

@@ -63,6 +63,9 @@ enum class QType : std::uint16_t {
     // values 16 t + i, byte i >= 16 values 80 + 8 t + i - 16 (digit t = 0..4), qh byte h values
     // 120 + 2 t + h (t = 0..3); digit t of byte q is ((q * 3^t) mod 256) * 3 >> 8, value digit - 1.
     GGUF_PTQ1_0 = 34,
+    // OCP MXFP8 (RowSplit): E4M3FN codes (one byte per element) with one E8M0 exponent scale byte
+    // per 32 columns.
+    MXFP8 = 35,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {

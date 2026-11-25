@@ -200,7 +200,8 @@ void row_split(QType format, std::uint64_t group, std::uint64_t code_bytes, std:
                                          sg * high_bytes + b],
                         "a row-split high-bit byte holds its source");
             }
-            for (std::uint64_t b = 0; b < 2; ++b) {
+            const std::uint64_t scale_bytes = format == QType::MXFP8 ? 1 : 2;
+            for (std::uint64_t b = 0; b < scale_bytes; ++b) {
                 require(bytes.piece[weight_scale_offset(piece, r, g) + b] ==
                             bytes.stored[weight_scale_offset(whole, sr, sg) + b],
                         "a row-split group scale holds its source");
@@ -216,6 +217,8 @@ void row_split_layouts() {
     // Q8 groups of 32, two ranges; T2 groups of 128.
     row_split(QType::Q8_G32_FP16, 32, 32, 0, {3, 512},
               {.rows = {{0, 3}}, .columns = {{0, 128}, {256, 512}}});
+    row_split(QType::MXFP8, 32, 32, 0, {4, 512},
+              {.rows = {{1, 3}}, .columns = {{0, 512}}});
     row_split(QType::T2_G128_FP16, 128, 32, 0, {4, 384},
               {.rows = {{2, 4}}, .columns = {{256, 384}}});
     // Q4 whole rows; a K that is not a multiple of 128 cuts only at its end.

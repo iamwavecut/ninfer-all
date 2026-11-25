@@ -665,70 +665,57 @@ struct Executor::Impl {
         if (mw.gate_up_scale) { p.gate_up_scale = fp32(model, *mw.gate_up_scale, e); }
         if (mw.down_scale) { p.down_scale = fp32(model, *mw.down_scale, e); }
         if (model.expert_residency() == ExpertResidency::Device) {
-            if (model.mxfp8_bank(i, 0) != nullptr) {
-                p.mxfp8 = true;
-                const auto mxfp8_tables = [&](std::size_t r) {
-                    const Mxfp8RankBank* bank = model.mxfp8_bank(i, r);
-                    if (!bank) {
-                        throw std::invalid_argument("Inkling 2: missing MXFP8 expert bank");
-                    }
-                    std::vector<const void*> table(4 * std::size_t(e), nullptr);
-                    for (std::uint32_t local = 0; local < bank->expert_count; ++local) {
-                        const std::uint32_t x = bank->expert_begin + local;
-                        table[x] = static_cast<const std::byte*>(bank->gate_up_scales) +
-                                   std::size_t(local) * bank->gate_up_scale_stride;
-                        table[e + x] = static_cast<const std::byte*>(bank->down_scales) +
-                                       std::size_t(local) * bank->down_scale_stride;
-                        table[2 * e + x] = static_cast<const std::byte*>(bank->gate_up_codes) +
-                                           std::size_t(local) * bank->gate_up_code_stride;
-                        table[3 * e + x] = static_cast<const std::byte*>(bank->down_codes) +
-                                           std::size_t(local) * bank->down_code_stride;
-                    }
-                    DeviceBuffer buffer(table.size() * sizeof(void*));
-                    buffer.copy_from_host(table.data(), table.size() * sizeof(void*));
-                    return buffer;
-                };
-                if (!model.expert_parallel()) {
-                    p.tables = mxfp8_tables(0);
-                } else {
-                    p.peer_tables.resize(device.size());
-                    for (std::size_t r = 0; r < device.size(); ++r) {
-                        RankBinding bind(device, r);
-                        (r == 0 ? p.tables : p.peer_tables[r]) = mxfp8_tables(r);
-                    }
-                }
-            } else {
             const auto bank_tables = [&](WeightId gate_up_id, WeightId down_id, std::uint32_t first,
                                          std::uint32_t last) {
                 const Weight gate_up = matrix(model, {gate_up_id});
                 const Weight down    = matrix(model, {down_id});
                 const bool bf16      = gate_up.qtype == QType::BF16 && down.qtype == QType::BF16;
-                if (!bf16 && (!is_gguf(gate_up.qtype) || !is_gguf(down.qtype))) {
-                    throw std::invalid_argument("Inkling 2 experts must be GGUF block matrices or "
-                                                "BF16 (both banks)");
+                const bool mxfp8     = gate_up.qtype == QType::MXFP8 && down.qtype == QType::MXFP8;
+                if (!bf16 && !mxfp8 && (!is_gguf(gate_up.qtype) || !is_gguf(down.qtype))) {
+                    throw std::invalid_argument("Inkling 2 experts must be GGUF block matrices, "
+                                                "MXFP8, or BF16 (both banks)");
                 }
-                const auto gate_up_type = bf16 ? gguf::GgmlType{} : ops::detail::gguf_type(gate_up.qtype);
-                const auto down_type    = bf16 ? gguf::GgmlType{} : ops::detail::gguf_type(down.qtype);
+                const auto gate_up_type =
+                    (bf16 || mxfp8) ? gguf::GgmlType{} : ops::detail::gguf_type(gate_up.qtype);
+                const auto down_type =
+                    (bf16 || mxfp8) ? gguf::GgmlType{} : ops::detail::gguf_type(down.qtype);
                 if (p.gate_up_row_bytes == 0) {
                     p.bf16              = bf16;
+                    p.mxfp8             = mxfp8;
                     p.gate_up_type      = gate_up_type;
                     p.down_type         = down_type;
-                    p.gate_up_row_bytes = row_bytes(gate_up);
-                    p.down_row_bytes    = row_bytes(down);
-                } else if (bf16 != p.bf16 || gate_up_type != p.gate_up_type ||
+                    p.gate_up_row_bytes = mxfp8 ? gate_up.padded_shape[1] : row_bytes(gate_up);
+                    p.down_row_bytes    = mxfp8 ? down.padded_shape[1] : row_bytes(down);
+                } else if (bf16 != p.bf16 || mxfp8 != p.mxfp8 || gate_up_type != p.gate_up_type ||
                            down_type != p.down_type) {
                     throw std::invalid_argument("Inkling 2: one layer's experts in different "
                                                 "formats");
                 }
                 std::vector<const void*> table(4 * std::size_t(e), nullptr);
-                for (std::uint32_t x = first; x < last; ++x) {
-                    const auto* gu = static_cast<const std::byte*>(gate_up.qdata) +
-                                     std::int64_t(x - first) * 2 * width * p.gate_up_row_bytes;
-                    table[x]         = gu;
-                    table[e + x]     = gu + std::int64_t(width) * p.gate_up_row_bytes;
-                    table[2 * e + x] = gu;
-                    table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
-                                       std::int64_t(x - first) * hidden * p.down_row_bytes;
+                if (mxfp8) {
+                    const std::size_t gu_scale_row = static_cast<std::size_t>(gate_up.scale_nb[1]);
+                    const std::size_t dn_scale_row = static_cast<std::size_t>(down.scale_nb[1]);
+                    for (std::uint32_t x = first; x < last; ++x) {
+                        const std::size_t local = x - first;
+                        table[x] = static_cast<const std::byte*>(gate_up.scales) +
+                                   local * 2 * width * gu_scale_row;
+                        table[e + x] = static_cast<const std::byte*>(down.scales) +
+                                       local * hidden * dn_scale_row;
+                        table[2 * e + x] = static_cast<const std::byte*>(gate_up.qdata) +
+                                           local * 2 * width * p.gate_up_row_bytes;
+                        table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
+                                           local * hidden * p.down_row_bytes;
+                    }
+                } else {
+                    for (std::uint32_t x = first; x < last; ++x) {
+                        const auto* gu = static_cast<const std::byte*>(gate_up.qdata) +
+                                         std::int64_t(x - first) * 2 * width * p.gate_up_row_bytes;
+                        table[x]         = gu;
+                        table[e + x]     = gu + std::int64_t(width) * p.gate_up_row_bytes;
+                        table[2 * e + x] = gu;
+                        table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
+                                           std::int64_t(x - first) * hidden * p.down_row_bytes;
+                    }
                 }
                 bool gate_up_aligned = true, down_aligned = true;
                 for (std::size_t j = 0; j < table.size(); ++j) {
@@ -752,7 +739,6 @@ struct Executor::Impl {
                     (r == 0 ? p.tables : p.peer_tables[r]) = bank_tables(
                         mw.gate_up_shares.at(r), mw.down_shares.at(r), first, last);
                 }
-            }
             }
         } else {
             p.delivery_layer    = int(i);

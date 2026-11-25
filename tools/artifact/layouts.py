@@ -103,7 +103,7 @@ CONTIGUOUS_LE_V1 = Layout(
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
     256,
-    frozenset(("q2_g64_fp16", "q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16", "t2_g128_fp16")),
+    frozenset(("q2_g64_fp16", "q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16", "mxfp8", "t2_g128_fp16")),
 )
 BLOCK_SCALE_K16_M128X4_V1 = Layout(
     "block_scale_k16_m128x4_v1",
@@ -202,7 +202,7 @@ def row_split_geometry(
     )
     base_row_bytes = groups_per_row * base_bytes_per_group
     high_row_bytes = groups_per_row * high_bytes_per_group
-    scale_row_bytes = groups_per_row * 2
+    scale_row_bytes = groups_per_row * spec.scale_bytes
     base_bytes = n * base_row_bytes
     high_bytes = n * high_row_bytes
     scale_bytes = n * scale_row_bytes

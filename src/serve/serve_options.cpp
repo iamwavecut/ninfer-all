@@ -1,7 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/kv_resident_options.h"
 #include "product/loop_kv_options.h"
-#include "product/mxfp8_experts_options.h"
 #include "product/option_layers.h"
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
@@ -364,7 +363,6 @@ std::string serve_usage_text(const char* argv0) {
            "                                fp16: Flash-Next, Gemma 4 and Flint; mxfp8:\n"
            "                                Inkling 2 (its default)\n" +
            std::string(product::kKvResidentHelp) + std::string(product::kLoopKvHelp) +
-           std::string(product::kMxfp8ExpertsHelp) +
            "\n"
            "CONTEXT CACHE\n"
            "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
@@ -1328,10 +1326,6 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (product::parse_loop_kv_option(arg, options.loop_kv,
                                           [&] { return require_value(arg.c_str()); })) {
-            continue;
-        }
-        if (product::parse_mxfp8_experts_option(arg, options.experts_mxfp8,
-                                                   [&] { return require_value(arg.c_str()); })) {
             continue;
         }
         if (arg == "--stage-layers") {

@@ -9,7 +9,6 @@
 #include "product/logging/startup_log.h"
 #include "product/kv_resident_options.h"
 #include "product/loop_kv_options.h"
-#include "product/mxfp8_experts_options.h"
 #include "product/launch_config/launch_config.h"
 #include "product/option_layers.h"
 #include "product/tensor_split_options.h"
@@ -79,7 +78,6 @@ struct Options {
     ninfer::NgramTableOptions ngram_table;
     std::optional<std::uint32_t> kv_resident;
     ninfer::LoopKvCache loop_kv = ninfer::LoopKvCache::PerPass; // Inkling 2: --loop-kv
-    ninfer::ExpertsMxfp8 experts_mxfp8 = ninfer::ExpertsMxfp8::Auto; // Inkling 2: --mxfp8-experts
 #if defined(NINFER_SM8X_COMPAT)
     // FP8 E4M3 KV attention has no SM86 implementation, so the upstream default would fail at
     // engine construction on this fork. INT8 group-64 is the qualified quantized profile here.
@@ -327,8 +325,6 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                        option, out.kv_resident, [&] { return value(option.data()); })) {
         } else if (ninfer::product::parse_loop_kv_option(
                        option, out.loop_kv, [&] { return value(option.data()); })) {
-        } else if (ninfer::product::parse_mxfp8_experts_option(
-                       option, out.experts_mxfp8, [&] { return value(option.data()); })) {
         } else if (ninfer::product::switch_option(option, "rope-yarn",
                                                    [&](bool on) { out.rope_yarn = on; })) {
         } else if (option == "--rope-yarn-factor") {
@@ -515,7 +511,6 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.kv_cache         = options.kv;
     engine_options.kv_cache_automatic = !options.kv_explicit;
     engine_options.loop_kv          = options.loop_kv;
-    engine_options.experts_mxfp8    = options.experts_mxfp8;
     engine_options.lm_head_q4       = options.lm_head_q4;
     engine_options.lm_head_q6       = options.lm_head_q6;
     engine_options.embedding_q4     = options.embedding_q4;

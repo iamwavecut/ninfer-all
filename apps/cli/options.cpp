@@ -1,7 +1,6 @@
 #include "options.h"
 #include "product/kv_resident_options.h"
 #include "product/loop_kv_options.h"
-#include "product/mxfp8_experts_options.h"
 #include "product/launch_config/launch_config.h"
 #include "product/option_layers.h"
 #include "product/ngram_table_options.h"
@@ -249,7 +248,6 @@ std::string usage_text(const char* argv0) {
            "                                fp16: Flash-Next, Gemma 4 and Flint; mxfp8:\n"
            "                                Inkling 2 (its default)\n" +
            std::string(product::kKvResidentHelp) + std::string(product::kLoopKvHelp) +
-           std::string(product::kMxfp8ExpertsHelp) +
            "\n"
            "SPECULATIVE DECODING\n"
            "  --spec none|mtp|dflash|dflash2|dspark|dspine\n"
@@ -533,8 +531,6 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                                                      [&] { return value(arg); })) {
         } else if (product::parse_loop_kv_option(arg, options.loop_kv,
                                                  [&] { return value(arg); })) {
-        } else if (product::parse_mxfp8_experts_option(arg, options.experts_mxfp8,
-                                                          [&] { return value(arg); })) {
         } else if (arg == "--kv-dtype") {
             options.kv_cache   = parse_kv_cache(value(arg));
             kv_dtype_explicit  = true;
