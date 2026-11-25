@@ -250,7 +250,8 @@ The startup check counts everything that grows with the context or the sequences
 checkpoints, the prompt chunk's derived keys, F16 values and full-attention mask) and keeps 1.5 GiB
 for the rest of the workspace and the CUDA graphs. A card without that room (a 16 GB one with the
 assistant or the vision tower) prefills in 1,024- or 512-token chunks instead: the check then keeps
-512 MiB, and the chunk's planned workspace with 320 MiB beside it must fit what the caches leave.
+512 MiB, and the chunk's planned workspace with 320 MiB for the CUDA graphs beside it (64 MiB for
+kernel loading when the graphs are off) must fit what the caches leave.
 
 ### Quality and speed
 
@@ -648,12 +649,12 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   chunk's derived keys, F16 values and mask are backed only as far as their sequences reach (in
   256-position tiles, on devices with CUDA virtual memory management), and the cache takes the rest
   of the device. When the next positions need memory the device lacks beside its 320 MiB graph
-  reserve, the cache gives slots back: it keeps its most routed experts, moved by device copies into
-  the slots that stay, and the others leave. A reset sequence's rows go back to the device, and the
-  cache takes what is free beyond 256 MiB of headroom for the next positions. Startup still checks
-  that every sequence's whole context fits beside the layer banks, so a context never runs out of
-  memory: the cache can shrink to no slots. An explicit `--expert-cache-mib` and device experts keep
-  the whole KV allocated.
+  reserve (64 MiB for kernel loading when the graphs are off), the cache gives slots back: it keeps
+  its most routed experts, moved by device copies into the slots that stay, and the others leave. A
+  reset sequence's rows go back to the device, and the cache takes what is free beyond 256 MiB of
+  headroom for the next positions. Startup still checks that every sequence's whole context fits
+  beside the layer banks, so a context never runs out of memory: the cache can shrink to no slots.
+  An explicit `--expert-cache-mib` and device experts keep the whole KV allocated.
 
 On an RTX 4090 (450 W, PCIe 4.0 x16, CUDA 12.8) with the QAT artifact, host experts, four sequences
 of 131,072 positions and three drafts a round, 2026-10-20: commit `5ed86dff9`, which reserves every
