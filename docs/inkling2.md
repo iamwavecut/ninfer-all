@@ -48,10 +48,12 @@ tokenization, the chat template, output parsing and the serving protocols.
   prefilled at 3.07-3.08k instead of 2.96-2.97k tokens/s on an RTX 3090, 4.61-4.62k instead of
   4.31-4.33k on an RTX PRO 4500 Blackwell and 6.81-6.82k instead of 6.43k on an RTX 4090. A GGUF's
   BF16 matrices keep their words: UD-Q8_K_XL stores
-  attention, the token table, the head and layers 20-23's expert banks in BF16. A model with any
-  BF16 matrix runs every call on BF16 rows: Linear's A16 route multiplies the BF16 matrices into
-  FP32, a SIMT kernel the BF16 experts (FP32 sums of each expert's pairs, 32 at a time), and the
-  integer matrix kernels the GGUF matrices at every width.
+  attention, the token table, the head and layers 20-23's expert banks in BF16. Every value of
+  those banks is an MXFP8 value, so the converter stores them as `mxfp8` rows (E4M3 codes, one
+  E8M0 scale per 32 values), the same values in 33/64 of the bytes. A model with any BF16 matrix
+  runs every call on BF16 rows: Linear's A16 route multiplies the BF16 matrices into FP32, a SIMT
+  kernel the MXFP8 or BF16 experts (FP32 sums of each expert's pairs, 32 at a time, the same bits
+  from either form), and the integer matrix kernels the GGUF matrices at every width.
 - **The looped state.** A decode or verification call of at most 16 rows spreads each depth mix
   and residual update over one-warp blocks of 128 channels instead of one block per row. Each warp
   keeps its sums, and every reader adds them in the order the one-block kernel adds its warps', so
@@ -237,8 +239,11 @@ file) to 8,885,967,616, 10,180,728,064 and 14,493,304,576 bytes, in 17 to 21 sec
 rented RTX 3090 host. UD-Q2_K_XL stores layer 20's down bank in MXFP4, which the expert products
 do not take: the converter writes the same values as Q8_0 blocks, each code's doubled value as
 the int8 code and 2^(e - 128) as the F16 scale, checking every block against the MXFP4 decode.
-UD-Q8_K_XL converts the same way to 23,785,597,440 bytes in 27 seconds on the same host;
-its BF16 matrices, expert banks included, are copied word for word.
+UD-Q8_K_XL converts the same way; its BF16 matrices are copied word for word except layers
+20-23's expert banks. The converter checks that every value of a layer's two banks is an MXFP8
+value and stores both as `mxfp8` rows; a bank with any other value keeps its layer's banks BF16.
+With the DFlash2 drafter (below) it wrote 20,471,680,000 bytes in 139 seconds on a rented RTX
+3090 host, 3,949,461,504 bytes fewer than with BF16 banks (96 seconds there).
 
 incoai's DFlash2 drafter converts beside the others from the release's folder
 (`config.json` and `model.safetensors`, BF16):
@@ -263,7 +268,8 @@ object keeps its bytes: the six published artifacts, converted this way with the
 November 24 in 18 to 29 seconds each, equal the files without it object for object apart from the
 81 new ones (45 BF16, 36 Q8_G32). They are 9,521,507,584 bytes (UD-IQ1_M), 10,816,268,032
 (UD-Q2_K_XL), 14,476,376,832 (APEX-I MiniPlus V2.1), 15,128,844,544 (UD-Q3_K_XL), 17,230,821,888
-(UD-IQ4_XS) and 24,421,141,504 (UD-Q8_K_XL). The converter checks the release's geometry, taps and
+(UD-IQ4_XS) and 24,421,141,504 (UD-Q8_K_XL, since November 25 20,471,680,000 with its
+MXFP8 banks). The converter checks the release's geometry, taps and
 selector settings and refuses a tensor stored other than BF16.
 
 ## Running
@@ -796,23 +802,40 @@ prompt of examples/cli/messages/image_natural.json. No card under 24 GB has run 
 
 ### UD-Q8_K_XL
 
-Unsloth's UD-Q8_K_XL (22.2 GiB), the reference of Unsloth's KL measurements, keeps BF16 attention,
-token table, head and layers 20-23's experts, and NVFP4 experts in layers 0-19. On a rented RTX
-A6000 (300 W, PCIe 4.0 x16, CUDA 12.8), November 21, 2026, one run each:
+Unsloth's UD-Q8_K_XL, the reference of Unsloth's KL measurements, keeps BF16 attention, token
+table, head and layers 20-23's experts, and NVFP4 experts in layers 0-19. Every value of layers
+20-23's experts is an MXFP8 value, and the artifact stores them as `mxfp8` rows: 19.1 GiB with the
+tower and both drafters, against 22.7 GiB with BF16 banks. The CLI's 384-token greedy essay
+(`--spec none`) on a rented RTX 3090 (370 W, PCIe 4.0 x16, a CUDA 13.4.3 build), November 25, 2026,
+one run each, against the artifact with BF16 banks under master's build of that day, in tok/s:
 
-- **Memory.** 21.3 GiB of weights, 22.1 GiB with the tower and the drafter; one sequence plans
-  22.9 GiB of the GPU at 8,192 tokens with `--spec none` and 24.7 GiB at 32,768 with the tower and
-  the drafter. `--expert-residency host` pins 18.3 GiB of host memory and keeps 3.07 GiB of weights
-  and two 1,944 MiB layer banks on the GPU.
-- **Speed.** A 9,742-token prompt prefills at 1,710 tok/s, then decodes at 61.6 tok/s. On another
-  RTX A6000 (300 W, PCIe 4.0 x16, a CUDA 13.4.3 build, November 24, the mainline drafter) the
-  384-token greedy essay decodes at 71.3 tok/s with `--spec none`, 90.2 with DSpark and the tower
-  (2.08 tokens a round), 68.2 with host experts and 67.8 with disk experts (the A6000's cache held
-  every expert), all with the same text; UD-IQ4_XS there 105.8 and 124.7 (2.06).
-- **Quality.** A mean NLL of 1.857855 on the 40 KB WikiText slice (`--kv-dtype bf16`, 9,718
-  scored tokens), against UD-IQ4_XS's 1.859871 (-0.11%). Host, disk and DSpark runs give the
-  device run's 384 greedy tokens byte for byte; the image prompt gives the mailbox's 24 and the sun
-  on the right.
+| Experts | MXFP8 banks | BF16 banks |
+|---|---:|---:|
+| on the GPU | 81.7 | 79.7 |
+| in pinned host memory | 76.5 | 70.8 |
+| read from the file | 76.2 | 62.0 |
+
+All six runs wrote the same text. With host or disk experts the MXFP8 cache held all 3,072
+experts (100% hits) and the BF16 cache 2,341 (99.2%), and the 25-token prompt prefilled at 330 to
+344 tok/s against 52 to 109: a prompt chunk copies whole layer banks, half as large in MXFP8.
+
+- **Memory.** 17.7 GiB of weights (21.3 with BF16 banks), 18.4 GiB with the tower and DSpark; one
+  sequence plans 19.3 GiB of the GPU at 12,288 tokens with `--spec none`, and 20.2, 20.6 and
+  21.2 GiB at 12,288, 32,768 and 65,536 tokens with the tower and DSpark, so
+  `configs/inkling2-mini.ini` fits a 24 GB card (1.69 GiB free after startup on the RTX 3090). At
+  the CLI's 2,048 tokens 3.90 GiB stay free after startup instead of 809 MiB, and prompts run in
+  chunks of 2,048 tokens instead of 1,024. `--expert-residency host` pins 14.6 GiB of host memory
+  (18.3 with BF16 banks) and keeps 3.07 GiB of weights and two layer banks of 2,005 MiB together
+  (3,888) on the GPU.
+- **Drafting, KV formats and two cards.** Another RTX 3090 of the host (420 W, PCIe 3.0 x16) gave
+  the BF16 banks' text with DSpark (81.3 tok/s, 1.56 tokens a round; 79.6 with BF16 banks), DFlash2
+  (76.9; 76.0), each `--kv-dtype` and both cards dividing the experts (`--tensor-parallel`, 64.7;
+  64.1).
+- **Quality.** Measured with BF16 banks, whose products the MXFP8 rows reproduce bit for bit, on a
+  rented RTX A6000 (300 W, PCIe 4.0 x16, CUDA 12.8), November 21: a mean NLL of 1.857855 on the
+  40 KB WikiText slice (`--kv-dtype bf16`, 9,718 scored tokens), against UD-IQ4_XS's 1.859871
+  (-0.11%). Host, disk and DSpark runs gave the device run's 384 greedy tokens byte for byte; the
+  image prompt gives the mailbox's 24 and the sun on the right.
 
 ### Across cards
 
@@ -1008,7 +1031,7 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
 
 ## Expert residency
 
-`--expert-residency device` keeps the routed GGUF or MXFP8 banks on the GPU. When `tools/convert` converts an artifact with BF16 routed experts whose weights round-trip bit-exactly to MXFP8 (`UD-Q8_K_XL`), the `inkling2_gguf` recipe stores those banks natively as `mxfp8` (E4M3 codes with per-32 E8M0 scales, ~17/32 of the BF16 footprint) and keeps non-exact banks in BF16. Both single-GPU and `--tensor-parallel` expert-parallel runs are supported. `host` keeps them in pinned host
+`--expert-residency device` keeps the routed banks on the GPU. `host` keeps them in pinned host
 memory and `disk` in the artifact's files, read through the OS page cache. Both run the experts
 with the resident kernels on the GPU, except the share of decode and verification misses that CPU
 threads compute, through the transport Gemma 4 and Flint use
@@ -1017,7 +1040,7 @@ rounds and the growing KV): a whole-layer bank for a prompt chunk's missing expe
 experts decode routes most (`--expert-cache-mib`), and a CPU share of a decode call's misses
 (`--expert-dma-share`, `--expert-cpu-threads`) computed from the stored blocks into the same 2^-32
 fixed-point sums as the GPU's, so outputs do not depend on the split. A model with BF16 matrices
-(UD-Q8_K_XL) has no CPU share: its calls read BF16 rows, and the GPU copies every miss. At startup the cache takes
+(UD-Q8_K_XL) has no CPU share: its calls read BF16 and MXFP8 rows, and the GPU copies every miss. At startup the cache takes
 the most routed experts of the build's routing profile for this geometry, recorded over four chat
 requests unlike the measured ones (`--expert-profile PATH` reads another); from then on it follows
 the routes.

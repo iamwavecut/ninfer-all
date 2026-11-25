@@ -19,7 +19,7 @@ routed experts of DeepSeek-V4.1's DSpark GGUF drafter; and `NVFP4` (64 values in
 and PrismML's `PTQ1_0` (128 ternary values in 28 bytes, five base-3 digits a byte and one binary16
 scale), the [Ternary Bonsai 2.5](weight-conversion.md#ternary-bonsai-2-and-25-27b) PTQ1_0 release,
 dense products only; stored as the `gguf_*` formats of the `gguf_blocks_v1` layout
-([tensor formats](maintainer/tensor-formats.md#35-gguf-block-formats),
+([tensor formats](maintainer/tensor-formats.md#36-gguf-block-formats),
 [storage layouts](maintainer/storage-layouts.md#6-gguf_blocks_v1)). A projection may mix types:
 the parts of a fused projection that share a type are multiplied together, the others one by one
 against the same activation. A dense release's untied BF16 output head is stored and multiplied as

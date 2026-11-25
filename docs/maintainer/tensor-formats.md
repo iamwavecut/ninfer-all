@@ -44,6 +44,12 @@ The row-scaled floating-point weight formats are:
 | `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
 | `fp8_e4m3fn_row_fp16` | E4M3FN, 8 bits/weight | one multiplier per logical row | IEEE binary16 |
 
+The group-scaled floating-point weight format is OCP MXFP8:
+
+| Canonical name | Code | K group | Group scale | Full-group logical bits/weight |
+|---|---|---:|---|---:|
+| `mxfp8` | E4M3FN, 8 bits/weight | 32 | one E8M0 exponent byte/group | 8.25 |
+
 GGUF block formats keep ggml's quantized blocks byte for byte, so a GGUF tensor imports without
 decoding or requantizing (`gguf_ptq1_0` is PrismML's ternary block: five base-3 digits a byte, one
 binary16 scale per 128 values, [ggml-org/llama.cpp#29672](https://github.com/ggml-org/llama.cpp/pull/29672)):
@@ -86,7 +92,7 @@ The registry keeps the following concerns separate.
 
 A **persistent numeric format** defines the logical words needed to recover a numeric tensor from
 an artifact. The closed registry contains direct scalar formats, grouped signed-integer formats,
-the block-scaled `nvfp4` format, and the row-scaled `fp8_e4m3fn_row_bf16` format. It does not
+the block-scaled `nvfp4` format, the row-scaled FP8 formats and the group-scaled `mxfp8` format. It does not
 identify a tensor's model role, physical byte layout, or supported consumer.
 
 ### 2.2 Direct scalar format
@@ -365,7 +371,23 @@ It rounds the reciprocal of the stored scale to FP32, multiplies each BF16 input
 reciprocal with an FP32 result, clamps to `[-448,448]`, then rounds to E4M3FN with ties to even.
 All-zero rows use positive-zero codes and scale. Each row is independent of chunk boundaries.
 
-### 3.5 GGUF block formats
+### 3.5 `mxfp8`
+
+`mxfp8` is a rank-two weight matrix `[N,K]` whose rows hold one E4M3FN code word per weight and one
+E8M0 scale byte per group of 32 consecutive columns. The code rules are those of Section 3.4: the
+NaN words `0x7f` and `0xff` are invalid. A scale byte `s` means `2^(s - 127)`; the stored bytes are
+at most 246, so the scale times any code is a finite binary32 value, and 255 (NaN) is invalid. For
+code word `c[n,k]` and scale byte `s[n, floor(k / 32)]`:
+
+```text
+w_hat[n,k] = exact_e4m3fn_to_binary32(c[n,k]) * 2^(s[n, floor(k / 32)] - 127)
+```
+
+The product is exact. Converters write `mxfp8` only where a BF16 source's every value is such a
+product (Inkling 2's BF16 expert banks), so the weights equal the source's bit for bit; there is no
+grouped quantization into it. The supported layout is `row_split_k128_v1` with one-byte scales.
+
+### 3.6 GGUF block formats
 
 A `gguf_*` weight is a row-major `[N,K]` matrix whose rows are `K / block_values` consecutive
 ggml blocks of the named type, each block the byte image of the `block_*` struct of
