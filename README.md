@@ -1,8 +1,8 @@
 # NInfer-all
 
 A C++/CUDA inference engine for the Qwen3.5 model family (Qwen3.6 and Qwen3.8 27B, Qwen3.6-35B-A3B,
-their fine-tunes and Ternary Bonsai 2), Qwen3.8-Flash-Next with dense Qwen4 and Edge0's latent-MoE
-models built on it,
+their fine-tunes and Ternary Bonsai 2 and 2.5), Qwen3.8-Flash-Next with dense Qwen4 and Edge0's
+latent-MoE models built on it,
 Gemma 4 26B-A4B and 31B, Recursive's Flint, DeepSeek-V4.1-Flash and Thinking Machines' looped
 Inkling 2 Mini, on NVIDIA GPUs from Volta to consumer Blackwell, from 8 GB of memory. It serves the
 OpenAI, Anthropic and llama.cpp APIs from one GPU, or from up to eight as pipeline stages on Linux. The same chat model
@@ -27,7 +27,8 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Novelties only: a new model, family, artifact, platform, option, endpoint, format or mode, or a measured speedup of a path that worked. No fixes of any kind (crashes, wrong output, failed starts, missed cases, regressions and the speedups that win them back, the options and defaults they bring), no guards, diagnostics, internal, CI, build, test or documentation changes, and no chronicle: a date without a novelty gets no line. One line per date, a few words per item, each linked to the document with its details; no descriptions, mechanisms, measurements or hardware. Full rule: CONTRIBUTING.md, "Documentation describes the current state". -->
 
-- **2026-11-24:** Inkling 2 [drafting with DSpark faster](docs/inkling2.md#what-runs): its Markov head scores each draft row's 16,384 likeliest tokens; every MoE family with host or disk experts [decoding faster](docs/qwen3-8-flash-next.md#the-expert-cache) (Qwen3.6-35B-A3B 15%, Flint 4.5%): the device cache's tier trades an expert only for 1.5 times its routes and places the experts a prompt calls for; Inkling 2 [prefilling long prompts faster](docs/inkling2.md#long-contexts).
+- **2026-11-25:** [Ternary Bonsai 2.5 27B](docs/performance/bonsai-2-5-2026-11.md) in both of PrismML's forms, PTQ1_0 and PQ2_0, with its MTP head and vision tower, [published](#supported-models); PrismML's [PTQ1_0 ternary blocks](docs/gguf.md#formats), multiplied as stored.
+- **2026-11-24:** Inkling 2 [drafting with DSpark faster](docs/inkling2.md#what-runs): its Markov head scores each draft row's 16,384 likeliest tokens; every MoE family with host or disk experts [decoding faster](docs/qwen3-8-flash-next.md#the-expert-cache) (Qwen3.6-35B-A3B 15%, Flint 4.5%): the device cache's tier trades an expert only for 1.5 times its routes and places the experts a prompt calls for; Inkling 2 [prefilling long prompts faster](docs/inkling2.md#long-contexts); Inkling 2's [shared loop KV](docs/inkling2.md#shared-loop-kv) (`--loop-kv`), an opt-in, lossy mode; Inkling 2 [drafting with incoai's DFlash2 drafter](docs/inkling2.md#dflash2) (`--spec dflash2`), in its six [published artifacts](#inkling-2-mini).
 - **2026-11-23:** Inkling 2 [decoding faster](docs/inkling2.md#what-runs), [decoding faster after long prompts](docs/inkling2.md#long-contexts) and [prefilling long prompts faster](docs/inkling2.md#long-contexts); Gemma 4 and Flint decoding faster on Blackwell cards ([Gemma 4](docs/gemma4.md#what-runs), [Flint](docs/flint.md#what-runs)); Flint [decoding faster with `int8`, `rk8v4` and `rk4v4` KV](docs/flint.md#kv-cache); Flash-Next [prefilling long prompts faster](docs/qwen3-8-flash-next.md#execution); faster prompt chunks with [`cp.async` tiles](docs/device-profiles.md#what-is-calibrated) for NVFP4 weights; vLLM's [`bad_words`](docs/serving.md#banned-words), strings a reply never writes, and the CLI's [`--bad-word`](docs/cli.md); [`--no-structured-output-instruction`](docs/serving.md#structured-output), which keeps a constrained request's messages as the caller sent them; [device profiles](docs/gpus.md) for six more GPUs; Inkling 2 Mini [on Turing](docs/inkling2.md#long-contexts).
 - **2026-11-22:** [POST /shutdown](docs/serving.md#stop-the-server), the HTTP form of the graceful stop, registered by [`--admin-token`](docs/serving.md#server-options); [POST /v1/answer_now](docs/serving.md#answer-now), which ends a running reply's thinking; Inkling 2's [MXFP8 KV cache](docs/inkling2.md#kv-cache), its default (`--kv-dtype mxfp8`), and its [`int8`, `rk8v4` and `rk4v4` KV formats](docs/inkling2.md#kv-cache); Flint's [`int8`, `rk8v4` and `rk4v4` KV formats](docs/flint.md#kv-cache); for Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Flash-Next a [disk tier, prefix cache file and session slots](docs/serving.md#context-cache-of-the-other-families) (`--disk-kv-path`, `--prefix-cache-file`, `--slot-save-path`), and a checkpoint inside a long message, so a document followed by another question resumes after the document; [thinking budgets](docs/serving.md#openai-chat-completions) and `--reasoning-loop conclude` for Inkling 2, Flint and Gemma 4; Inkling 2 [prefilling and decoding faster at long contexts](docs/inkling2.md#long-contexts).
 - **2026-11-21:** [Inkling 2 Mini](docs/inkling2.md), the first looped transformer, from Unsloth's UD-IQ4_XS GGUF with the release's vision tower and DSpark drafter, [published](#supported-models); its [Q8_0 vision tower](docs/inkling2.md#converting) from a llama.cpp mmproj, and IsValorum's [APEX-I MiniPlus](docs/inkling2.md#apex-i-miniplus), [published](#supported-models); Unsloth's [UD-IQ1_M, UD-Q2_K_XL and UD-Q3_K_XL](docs/inkling2.md#smaller-quantizations) (8.2 to 13.4 GiB), [published](#supported-models); Unsloth's [UD-Q8_K_XL](docs/inkling2.md#ud-q8_k_xl) with its BF16 attention, head and experts (22.1 GiB), [published](#supported-models).
@@ -161,10 +162,10 @@ Every card by name, with what has run on it:
 | GPU memory | Runs | Measured on |
 |---|---|---|
 | 8 GB | Ternary Bonsai 2 27B (24,576 tokens with `rk4v4`, no MTP); Qwen3.8-Flash-Next and Inkling 2 Mini with their experts in host memory or on disk | RTX 3060 Ti; RTX 5060 for Inkling 2 Mini |
-| 11 GB | Ternary Bonsai 2 27B (200,704 tokens with `rk4v4`; 143,360 with MTP) | RTX 2080 Ti |
+| 11 GB | Ternary Bonsai 2 27B (196,608 tokens with `rk4v4`; 139,264 with MTP) | RTX 2080 Ti |
 | 12 GB | Ternary Bonsai 2 27B (266,240 tokens); Qwen3.8-27B GSQ-RCO IQ3_S (8,192 tokens, no MTP); Inkling 2 Mini with its experts in host memory | RTX 3060; also the RTX 5070 for Inkling 2 Mini |
 | 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4`; Inkling 2 Mini with its experts in host memory | Tesla V100-SXM2-16GB; RTX 5080, 5060 Ti, 4080 Super, 4060 Ti and A4000 for Inkling 2 Mini |
-| 24 GB | Gemma 4 31B Q4_0 (101,376 tokens; 87,040 with MTP); the official Qwen3.8-27B and its MXFP8 tune; Qwen3.6-35B-A3B `groupwise-int` on an RTX 3090; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash with its experts in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
+| 24 GB | Ternary Bonsai 2.5 27B PTQ1_0 (1,032,192 tokens with `rk4v4`); Gemma 4 31B Q4_0 (101,376 tokens; 87,040 with MTP); the official Qwen3.8-27B and its MXFP8 tune; Qwen3.6-35B-A3B `groupwise-int` on an RTX 3090; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash with its experts in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
 | 32 GB | Qwen3.6-35B-A3B NVFP4 (Blackwell only) | RTX 5090 |
 | 48 GB | Flash-Next Q2_0 with every expert on one card | L40S, RTX PRO 6000 |
 
@@ -206,6 +207,13 @@ their Notes link it, and [N-gram tables](#n-gram-tables) lists them all.
 | Model | Size, GiB | Weights | Vision | Drafting | Notes |
 |---|---:|---|:-:|---|---|
 | [Ternary Bonsai 2 27B](https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3) | 8.87 | ternary, 2.125 bits | ✓ | MTP<br>DFlash2<br>Proposal head | Bonsai-trained MTP head and DFlash2 adapter |
+
+### Ternary Bonsai 2.5 27B
+
+| Model | Size, GiB | Weights | Vision | Drafting | Notes |
+|---|---:|---|:-:|---|---|
+| [PTQ1_0](https://huggingface.co/WaveCut/Ternary-Bonsai-2.5-27B-PTQ1_0-NInfer-v3) | 6.17 | ternary PTQ1_0, 1.75 bits | ✓ | MTP<br>Proposal head | PrismML's MTP head; the longest windows |
+| [PQ2_0](https://huggingface.co/WaveCut/Ternary-Bonsai-2.5-27B-PQ2_0-NInfer-v3) | 7.37 | ternary, 2.125 bits | ✓ | MTP<br>Proposal head | PrismML's MTP head; the faster prompts |
 
 ### Qwen3.8-27B
 
@@ -267,12 +275,12 @@ their Notes link it, and [N-gram tables](#n-gram-tables) lists them all.
 
 | Model | Size, GiB | Weights | Vision | Drafting | Notes |
 |---|---:|---|:-:|---|---|
-| [Inkling 2 Mini UD-IQ1_M](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ1_M-NInfer-v3) | 8.28 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 down banks | ✓ | DSpark | Unsloth's UD-IQ1_M GGUF byte for byte; otherwise as UD-IQ4_XS |
-| [Inkling 2 Mini UD-Q2_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q2_K_XL-NInfer-v3) | 9.48 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 and NVFP4 down banks | ✓ | DSpark | Unsloth's UD-Q2_K_XL GGUF byte for byte, its one MXFP4 bank as the same values in Q8_0; otherwise as UD-IQ4_XS |
-| [Inkling 2 Mini APEX-I MiniPlus V2.1](https://huggingface.co/WaveCut/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-NInfer-v3) | 12.89 | GGUF blocks, IQ3_XXS and IQ3_S experts | ✓ | DSpark | IsValorum's APEX-I MiniPlus GGUF byte for byte with its Q8_0 vision tower; Unsloth's DSpark drafter; otherwise as UD-IQ4_XS |
-| [Inkling 2 Mini UD-Q3_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q3_K_XL-NInfer-v3) | 13.50 | GGUF blocks, NVFP4 and IQ3 experts | ✓ | DSpark | Unsloth's UD-Q3_K_XL GGUF byte for byte; otherwise as UD-IQ4_XS |
-| [Inkling 2 Mini UD-IQ4_XS](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3) | 15.46 | GGUF blocks, NVFP4 experts in 20 of 24 layers | ✓ | DSpark | Unsloth's UD-IQ4_XS GGUF byte for byte; Q8_0 vision tower (images); DSpark drafter, by default for one request at a time, or context lookup |
-| [Inkling 2 Mini UD-Q8_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q8_K_XL-NInfer-v3) | 22.15 | BF16 attention, head, token table and layers 20-23's experts; NVFP4 experts in 20 layers | ✓ | DSpark | Unsloth's UD-Q8_K_XL GGUF byte for byte; a card of 32 GB or more, or host experts; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini UD-IQ1_M](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ1_M-NInfer-v3) | 8.87 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 down banks | ✓ | DSpark<br>DFlash2 | Unsloth's UD-IQ1_M GGUF byte for byte; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini UD-Q2_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q2_K_XL-NInfer-v3) | 10.07 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 and NVFP4 down banks | ✓ | DSpark<br>DFlash2 | Unsloth's UD-Q2_K_XL GGUF byte for byte, its one MXFP4 bank as the same values in Q8_0; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini APEX-I MiniPlus V2.1](https://huggingface.co/WaveCut/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-NInfer-v3) | 13.48 | GGUF blocks, IQ3_XXS and IQ3_S experts | ✓ | DSpark<br>DFlash2 | IsValorum's APEX-I MiniPlus GGUF byte for byte with its Q8_0 vision tower; Unsloth's DSpark drafter; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini UD-Q3_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q3_K_XL-NInfer-v3) | 14.09 | GGUF blocks, NVFP4 and IQ3 experts | ✓ | DSpark<br>DFlash2 | Unsloth's UD-Q3_K_XL GGUF byte for byte; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini UD-IQ4_XS](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3) | 16.05 | GGUF blocks, NVFP4 experts in 20 of 24 layers | ✓ | DSpark<br>DFlash2 | Unsloth's UD-IQ4_XS GGUF byte for byte; Q8_0 vision tower (images); DSpark drafter, by default for one request at a time, incoai's DFlash2 drafter (`--spec dflash2`) or context lookup |
+| [Inkling 2 Mini UD-Q8_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q8_K_XL-NInfer-v3) | 22.74 | BF16 attention, head, token table and layers 20-23's experts; NVFP4 experts in 20 layers | ✓ | DSpark<br>DFlash2 | Unsloth's UD-Q8_K_XL GGUF byte for byte; a card of 32 GB or more, or host experts; otherwise as UD-IQ4_XS |
 
 Tencent's [DSpine drafter for Qwen3.8-27B](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3)
 (2.27 GiB, Q8 layers and a BF16 code bridge) is an artifact of its own, which
@@ -301,13 +309,13 @@ DeepSeek-V4.1-Flash models read the Engram table, the release's IQ4_NL rows with
 
 The official NInfer artifacts (Qwen3.6-27B, Qwen3.6-35B-A3B and Qwen3.8-27B, `groupwise-int` and
 `nvfp4`) load too; the [documentation map](docs/README.md#model-artifacts) links them. Weight
-conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b) and
+conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-and-25-27b) and
 [GSQ-RCO](docs/weight-conversion.md#a-mixed-precision-qwen38-27b-gguf) artifacts are built.
 
 ## Highlights
 
-Ternary Bonsai 2 27B decodes 397 tok/s on an RTX 5090 with DFlash2 and holds a 978,944-token context with
-every planted code found. Qwen3.8-Flash-Next decodes 138 tok/s with every expert on one RTX PRO 6000, and
+Ternary Bonsai 2 27B decodes 397 tok/s on an RTX 5090 with DFlash2, and Ternary Bonsai 2.5 fills that
+card's 1,048,576-token window with every planted code found. Qwen3.8-Flash-Next decodes 138 tok/s with every expert on one RTX PRO 6000, and
 96 tok/s with its experts in host memory on one RTX 5090. DeepSeek-V4.1-Flash decodes 52 tok/s on one
 RTX 5090, 48 on one RTX PRO 6000 and 39 on one RTX 4090 with its 106.7 GiB of experts in host memory. Inkling 2 Mini
 decodes 182 tok/s on an RTX 5090, 1.4 to 2.8 times llama.cpp's rate on 25 cards, and runs on an 8 GB card with its
@@ -329,6 +337,26 @@ Measured in September 2026, one card each, greedy, one request unless the column
 
 The RTX PRO 6000 (96 GB) starts at the engine's ceiling of 1,048,576 tokens with every KV format and drafter.
 Filled to it, the model misses the code at 90% (about 943K); up to about 880K it found every code on every card.
+
+</details>
+
+<details>
+<summary><b>Ternary Bonsai 2.5 27B</b> — up to 349 tok/s, every code found at 1,048,576 tokens</summary>
+
+Measured in November 2026, one card each, greedy, `rk8v4` over a 262,144-token window, one request
+unless the column says otherwise; the largest context is filled with `rk4v4`.
+
+| Card | Short chat, PTQ1_0, no drafter (tok/s) | Short chat, PQ2_0, MTP 3 (tok/s) | After a 261K-token document, PQ2_0, MTP 3 (tok/s) | 261K-token prompt, PQ2_0, to the first token | Largest context, all three codes found | Eight requests at once, PQ2_0, MTP 3 (tok/s) |
+|---|---:|---:|---:|---:|---:|---:|
+| RTX 3090 | 94 | 189 | 95 | 199 s | 1,032,192 (PTQ1_0) | 576 |
+| RTX 4090 | 126 | 232 | 110 | 91 s | 1,019,904 (PTQ1_0) | 943 |
+| RTX 5090 | 189 | 345 | 170 | 74 s | 1,048,576 | 1,157 |
+| RTX PRO 6000 | 188 | 349 | 170 | 73 s | 1,048,576 | 1,237 |
+
+PTQ1_0 (6.17 GiB) decodes one request fastest without a drafter and holds the longest windows; PQ2_0
+(7.37 GiB) is the faster one with MTP, with several requests and on prompts. Both decode faster than
+PrismML's own llama.cpp fork on the RTX PRO 6000, 5090 and 4090
+([comparison](docs/performance/bonsai-2-5-2026-11.md#prismmls-runtime)).
 
 </details>
 
@@ -471,7 +499,7 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
 *Click a section to expand it.*
 
 <details>
-<summary><b>Models and weight formats</b> — Qwen3.5 family, GGUF block formats, Ternary Bonsai 2, Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash, Inkling 2 Mini</summary>
+<summary><b>Models and weight formats</b> — Qwen3.5 family, GGUF block formats, Ternary Bonsai 2 and 2.5, Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash, Inkling 2 Mini</summary>
 
 - **Qwen3.5 family.** Dense and MoE (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) with MTP,
   DFlash (35B-A3B) and DFlash2 (Qwen3.8-27B, 35B-A3B) drafters, Vision for images and video, and
@@ -489,6 +517,11 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
   Hadamard rotations fused into the norms and gates and integer activations for its projections.
   The `bonsai2_27b_ternary` recipe adds ProCreations' MTP head and DFlash2 adapter and an exact
   proposal head.
+- **Ternary Bonsai 2.5 27B.** PrismML's [second ternary release](https://huggingface.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF)
+  in both of its forms: PQ2_0 as `t2_g128_fp16`, and PTQ1_0 (1.75 bits per weight) as its own
+  28-byte blocks, multiplied in place by kernels of their own. Both artifacts carry PrismML's MTP
+  head in its Q4_0 blocks, the release's Vision tower and an exact proposal head
+  ([measurements](docs/performance/bonsai-2-5-2026-11.md)).
 - **Qwen3.8-Flash-Next.** The 125B-parameter MoE (512 experts, about 6B active) from the GSQ-RCO
   GGUF releases, with its experts on the GPUs, in pinned host memory with a GPU cache
   (`--expert-residency host`) or in the artifact's files read into a GPU cache
@@ -539,7 +572,8 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
   table and sinks, depth attention over the earlier layers' states, 128 routed experts, up to eight
   concurrent requests with prefix reuse through host memory, the model's own reasoning and tool-call
   blocks, structured output, typed decisions, images through the release's vision tower, the
-  release's DSpark drafter and context-lookup drafting, and experts on the GPU, in pinned host
+  release's DSpark drafter, incoai's DFlash2 drafter (`--spec dflash2`) and context-lookup drafting,
+  and experts on the GPU, in pinned host
   memory or in the artifact's files. On an RTX 3090 it prefills a 10,000-token prompt at 2,031 tok/s
   and decodes at 111.4 tok/s, 95.9 after 10,000 tokens, against llama.cpp's 1,228, 58.6 and 55.9 on
   the same GGUF; DSpark decodes greedy answers 1.14 to 1.41 times as fast
@@ -760,6 +794,6 @@ launcher scripts; [tests](tests/README.md) and [benchmarks](bench/README.md) hav
 
 ## License
 
-Apache-2.0, as upstream. The Bonsai artifact's weights come from PrismML, ProCreations and Qwen,
-all Apache-2.0; its card lists the notices. The Qwen3.8-Flash-Next artifacts carry the Qwen
+Apache-2.0, as upstream. The Bonsai artifacts' weights come from PrismML, ProCreations and Qwen,
+all Apache-2.0; their cards list the notices. The Qwen3.8-Flash-Next artifacts carry the Qwen
 Community License 1.0 of their model.

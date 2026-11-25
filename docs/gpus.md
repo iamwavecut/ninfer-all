@@ -43,10 +43,10 @@ Measured, one request; context in tokens is the largest `--max-context` the serv
 | GPU memory | Runs | Measured on |
 |---|---|---|
 | 8 GB | Ternary Bonsai 2 27B (24,576 tokens with `rk4v4`, no MTP); Qwen3.8-Flash-Next and Inkling 2 Mini with their experts in host memory or on disk | RTX 3060 Ti; for Inkling 2 Mini the RTX 5060 |
-| 11 GB | Ternary Bonsai 2 27B (200,704 tokens with `rk4v4`; 143,360 with MTP) | RTX 2080 Ti |
+| 11 GB | Ternary Bonsai 2 27B (196,608 tokens with `rk4v4`; 139,264 with MTP) | RTX 2080 Ti |
 | 12 GB | Ternary Bonsai 2 27B (266,240 tokens); Qwen3.8-27B GSQ-RCO IQ3_S (8,192 tokens, no MTP); Inkling 2 Mini with its experts in host memory | RTX 3060; for Inkling 2 Mini also the RTX 5070 |
 | 16 GB | Gemma 4 26B-A4B Q4_0 (61,440 tokens); Qwen3.8-27B IQ3_S (241,664 tokens; 122,880 with `rk4v4-e8` and 98,304 with MTP on a card that also drives a desktop); the official Qwen3.8-27B with `--embedding-q4 --lm-head-q4`; DeepSeek-V4.1-Flash with its experts in host memory or on disk ([16 GB](deepseek-v41.md#16-gb)); Inkling 2 Mini with its experts in host memory | Tesla V100-SXM2-16GB, RTX 5070 Ti ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)), RTX 5080 ([field report](performance/field-reports.md#rtx-5080-wsl2)); for DeepSeek-V4.1-Flash an RTX 4090 and a Tesla V100-SXM2-32GB held to 16 GB free; for Inkling 2 Mini the RTX 5080, RTX 5060 Ti, RTX 4080 Super, RTX 4060 Ti and RTX A4000 |
-| 24 GB | Gemma 4 31B Q4_0 (101,376 tokens; 87,040 with MTP); the official Qwen3.8-27B (20 GiB) and its MXFP8 tune (17 GiB); Qwen3.6-35B-A3B `groupwise-int` (19.6 GiB of weights) on an RTX 3090, over two cards on the TITAN RTX; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash (6.0 GiB of dense weights) with its 106.7 GiB of experts (61.5 GiB in the Coder build) in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
+| 24 GB | Ternary Bonsai 2.5 27B PTQ1_0 (1,032,192 tokens with `rk4v4`); Gemma 4 31B Q4_0 (101,376 tokens; 87,040 with MTP); the official Qwen3.8-27B (20 GiB) and its MXFP8 tune (17 GiB); Qwen3.6-35B-A3B `groupwise-int` (19.6 GiB of weights) on an RTX 3090, over two cards on the TITAN RTX; Flash-Next with every expert on the GPU over two cards; DeepSeek-V4.1-Flash (6.0 GiB of dense weights) with its 106.7 GiB of experts (61.5 GiB in the Coder build) in host memory or on disk | RTX 3090, RTX 4090, TITAN RTX |
 | 32 GB | Qwen3.6-35B-A3B NVFP4 (Blackwell only) | RTX 5090 |
 | 48 GB | Flash-Next Q2_0 with every expert on one card | L40S, RTX PRO 6000 |
 
@@ -66,7 +66,7 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk), Edge0 (three-layer slices), Inkling 2 Mini |
+| ✅ | RTX 5090 | 32 GB | GeForce | ✓ | Bonsai 2 and 2.5, Qwen3.8-27B, IQ3_S, Flash-Next, 35B-A3B NVFP4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk), Edge0 (three-layer slices), Inkling 2 Mini |
 | ⬜ | RTX 5090 D | 32 GB | GeForce | | |
 | ⬜ | RTX 5090 D V2 | 24 GB | GeForce | ✓ | |
 | ✅ | RTX 5080 | 16 GB | GeForce | ✓ | IQ3_S under WSL2 ([field report](performance/field-reports.md#rtx-5080-wsl2)), Inkling 2 Mini (experts in host memory) |
@@ -75,7 +75,7 @@ means the card calibrates once at its first start.
 | ✅ | RTX 5060 Ti | 16 / 8 GB | GeForce | ✓ | Qwen3.8-27B NVFP4 with tensor parallelism over two and four cards ([field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards)); Inkling 2 Mini on the 16 GB card (experts in host memory) |
 | ✅ | RTX 5060 | 8 GB | GeForce | ✓ | Inkling 2 Mini (experts in host memory, on disk) |
 | ⬜ | RTX 5050 | 8 GB | GeForce | | |
-| ✅ | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | Workstation | ✓ | Bonsai 2, Qwen3.8-27B, Flash-Next, DeepSeek-V4.1-Flash (experts in host memory, on disk; DSpark drafts), Inkling 2 Mini |
+| ✅ | RTX PRO 6000 Blackwell Workstation Edition | 96 GB | Workstation | ✓ | Bonsai 2 and 2.5, Qwen3.8-27B, Flash-Next, DeepSeek-V4.1-Flash (experts in host memory, on disk; DSpark drafts), Inkling 2 Mini |
 | ⬜ | RTX PRO 6000 Blackwell Max-Q | 96 GB | Workstation | ✓ | |
 | ⬜ | RTX PRO 5000 Blackwell | 72 / 48 GB | Workstation | 48 GB | |
 | ✅ | RTX PRO 4500 Blackwell | 32 GB | Workstation | ✓ | Inkling 2 Mini |
@@ -89,7 +89,7 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, Flash-Next, Flint (experts in host memory), DeepSeek-V4.1-Flash (experts in host memory, on disk), Inkling 2 Mini; Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)) |
+| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2 and 2.5, Qwen3.8-27B, IQ3_S, Flash-Next, Flint (experts in host memory), DeepSeek-V4.1-Flash (experts in host memory, on disk), Inkling 2 Mini; Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)) |
 | ⬜ | RTX 4090 D | 24 GB | GeForce | | |
 | ✅ | RTX 4080 Super | 16 GB | GeForce | ✓ | Inkling 2 Mini (experts in host memory) |
 | ✅ | RTX 4080 | 16 GB | GeForce | ✓ | IQ3_S ([field report](performance/field-reports.md#rtx-4080-and-rtx-4090-windows-11)) |
@@ -117,7 +117,7 @@ means the card calibrates once at its first start.
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
 | ✅ | RTX 3090 Ti | 24 GB | GeForce | ✓ | Flash-Next over two cards |
-| ✅ | RTX 3090 | 24 GB | GeForce | ✓ | Bonsai 2, Qwen3.8-27B, IQ3_S, 35B-A3B, Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk; the reference card), Inkling 2 Mini (experts on the GPU, in host memory, on disk) |
+| ✅ | RTX 3090 | 24 GB | GeForce | ✓ | Bonsai 2 and 2.5, Qwen3.8-27B, IQ3_S, 35B-A3B, Flash-Next, Gemma 4, Flint, DeepSeek-V4.1-Flash (experts in host memory, on disk; the reference card), Inkling 2 Mini (experts on the GPU, in host memory, on disk) |
 | ⬜ | RTX 3080 Ti | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 3080 | 12 / 10 GB | GeForce | 10 GB (68 SMs) | |
 | ⬜ | RTX 3070 Ti | 8 GB | GeForce | ✓ | |
@@ -143,7 +143,7 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | A100 (PCIe, SXM4) | 80 / 40 GB | Data center | ✓ | Inkling 2 Mini |
+| ✅ | A100 (PCIe, SXM4) | 80 / 40 GB | Data center | ✓ | Bonsai 2.5, Inkling 2 Mini |
 | ⬜ | A800 | 80 / 40 GB | Data center | | |
 | ⬜ | A30 | 24 GB | Data center | | |
 | ⬜ | CMP 170HX | 8 GB | CMP | ✓ | |
@@ -161,11 +161,12 @@ means the card calibrates once at its first start.
 | ⬜ | RTX 2060 | 12 GB | GeForce | ✓ | |
 | ⬜ | RTX 2060 Super | 8 GB | GeForce | ✓ | |
 | ✅ | Quadro RTX 8000 | 48 GB | Workstation | ✓ | Bonsai 2, Gemma 4, Flash-Next |
-| ✅ | Quadro RTX 6000 | 24 GB | Workstation | ✓ | Inkling 2 Mini |
+| ✅ | Quadro RTX 6000 | 24 GB | Workstation | ✓ | Bonsai 2.5, Inkling 2 Mini |
 | ⬜ | Quadro RTX 5000 | 16 GB | Workstation | | |
 | ⬜ | Quadro RTX 4000 | 8 GB | Workstation | ✓ | |
 | ⬜ | T1000 | 8 GB | Workstation | | no tensor cores; whether the `75` build runs on it is unknown |
 | ⬜ | Tesla T4 | 16 GB | Data center | ✓ | |
+| ✅ | Tesla T10 | 16 GB | Data center | | Inkling 2 Mini over two cards without peer access ([field report](performance/field-reports.md#tesla-t10-two-cards)) |
 
 ### Volta (7.0, build `70` with CUDA 12.8 or 12.9, built from source)
 
@@ -177,7 +178,7 @@ means the card calibrates once at its first start.
 | ✅ | Tesla V100-SXM2 | 16 GB | Data center | ✓ | Bonsai 2, IQ3_S, Qwen3.8-27B (Q4 embedding and head), Flash-Next (experts in host memory, on disk), Gemma 4 |
 | ✅ | Tesla V100-SXM2 | 32 GB | Data center | ✓ | DeepSeek-V4.1-Flash (experts in host memory, on disk; 16 GB of the card), Edge0 (three-layer slices), Inkling 2 Mini |
 | ⬜ | Tesla V100 PCIe | 32 GB | Data center | ✓ | |
-| ⬜ | Tesla V100-FHHL | 16 GB | Data center | ✓ | |
+| ✅ | Tesla V100-FHHL | 16 GB | Data center | ✓ | Bonsai 2.5 |
 | ⬜ | Tesla V100 PCIe | 16 GB | Data center | | |
 | ⬜ | Tesla V100S PCIe | 32 GB | Data center | | |
 

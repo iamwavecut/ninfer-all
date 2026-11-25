@@ -644,6 +644,9 @@ struct EngineOptions {
     // the KV format its release trained with, Flint its F16 cache and DeepSeek-V4.1 its only one
     // (BFloat16 names both); the other families keep kv_cache. options() report the storage.
     bool kv_cache_automatic = false;
+    // Inkling 2 only: which keys and values the three passes of its looped core keep
+    // (LoopKvCache). Anything but PerPass is lossy and never the default.
+    LoopKvCache loop_kv = LoopKvCache::PerPass;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

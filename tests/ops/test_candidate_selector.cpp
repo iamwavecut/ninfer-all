@@ -22,12 +22,15 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr std::int32_t kCandidates   = 16;
-int kSteps                           = 7;
-constexpr std::int32_t kRank         = 256;
-constexpr std::int32_t kCodebookRows = 248320;
-constexpr std::int32_t kTokenDomain  = 248077;
-constexpr std::int32_t kMaxBatch     = 8;
+constexpr std::int32_t kCandidates  = 16;
+int kSteps                          = 7;
+constexpr std::int32_t kRank        = 256;
+constexpr std::int32_t kTokenDomain = 248077;
+constexpr std::int32_t kMaxBatch    = 8;
+// The codebooks' rows (Qwen's vocabulary, or Inkling 2's 201024) and the soft cap the edges take
+// after the correction (0: none; Inkling 2's DFlash2 drafter: 30).
+std::int32_t kCodebookRows = 248320;
+float kEdgeCap             = 0.0F;
 
 constexpr PointwiseCriterion kProbabilityCriterion{/*absolute=*/2.0e-6,
                                                    /*relative=*/2.0e-5};
@@ -115,7 +118,7 @@ std::vector<std::uint16_t> make_projected_hidden() {
 std::vector<std::int32_t> make_anchors() {
     std::vector<std::int32_t> result(kMaxBatch);
     for (std::int32_t batch = 0; batch < kMaxBatch; ++batch) {
-        result[batch] = 220000 + batch * 101;
+        result[batch] = kCodebookRows - 28320 + batch * 101;
     }
     return result;
 }
@@ -172,6 +175,10 @@ std::vector<double> build_lattice(const std::vector<std::int32_t>& candidate_ids
                             static_cast<double>(bf16_to_f32(projected_hidden[hidden_base + rank])) *
                             static_cast<double>(successor_value(successor, rank));
                     }
+                    if (kEdgeCap > 0.0F) {
+                        edge = static_cast<double>(kEdgeCap) *
+                               std::tanh(edge / static_cast<double>(kEdgeCap));
+                    }
                     lattice[lattice_offset(batch, step, predecessor_rank, candidate)] = edge;
                 }
             }
@@ -199,6 +206,8 @@ float oracle_uniform(std::uint64_t seed, std::int32_t position) {
 struct WalkResult {
     std::vector<std::int32_t> drafts;
     std::vector<double> probabilities;
+    // The drawn candidate's probability under the softmax of the edges at temperature 1.
+    std::vector<double> confidence;
     std::array<double, kMaxBatch> minimum_decision_margin;
 };
 
@@ -209,6 +218,7 @@ WalkResult walk_oracle(const std::vector<std::int32_t>& candidate_ids,
     WalkResult result;
     result.drafts.resize(static_cast<std::size_t>(kMaxBatch) * kSteps);
     result.probabilities.resize(static_cast<std::size_t>(kMaxBatch) * kSteps * kCandidates);
+    result.confidence.resize(static_cast<std::size_t>(kMaxBatch) * kSteps);
     result.minimum_decision_margin.fill(std::numeric_limits<double>::infinity());
     for (std::int32_t batch = 0; batch < kMaxBatch; ++batch) {
         std::int32_t predecessor_rank = 0;
@@ -268,6 +278,18 @@ WalkResult walk_oracle(const std::vector<std::int32_t>& candidate_ids,
             }
             result.drafts[static_cast<std::size_t>(batch) * kSteps + step] =
                 candidate_ids[candidate_offset(batch, step, selected)];
+            {
+                double maximum = lattice[edge_base];
+                for (std::int32_t candidate = 1; candidate < kCandidates; ++candidate) {
+                    maximum = std::max(maximum, lattice[edge_base + candidate]);
+                }
+                double sum = 0.0;
+                for (std::int32_t candidate = 0; candidate < kCandidates; ++candidate) {
+                    sum += std::exp(lattice[edge_base + candidate] - maximum);
+                }
+                result.confidence[static_cast<std::size_t>(batch) * kSteps + step] =
+                    std::exp(lattice[edge_base + selected] - maximum) / sum;
+            }
             predecessor_rank = selected;
         }
     }
@@ -448,8 +470,10 @@ int run(bool ties = false, bool dependent = false) {
         const std::size_t q_count     = draft_count * kCandidates;
         GuardedDeviceBuffer draft_device(draft_count * sizeof(std::int32_t));
         GuardedDeviceBuffer q_device(q_count * sizeof(float));
+        GuardedDeviceBuffer confidence_device(draft_count * sizeof(float));
         draft_device.fill(0xff);
         q_device.fill(0xff);
+        confidence_device.fill(0xff);
         Tensor ids(candidate_device.p, DType::I32, {kCandidates, kSteps, batch_size});
         Tensor unary(unary_device.p, DType::FP32, {kCandidates, kSteps, batch_size});
         Tensor hidden(hidden_device.p, DType::BF16, {kRank, kSteps, batch_size});
@@ -457,6 +481,7 @@ int run(bool ties = false, bool dependent = false) {
         Tensor positions(position_device.p, DType::I32, {batch_size});
         Tensor drafts(draft_device.data(), DType::I32, {kSteps, batch_size});
         Tensor q(q_device.data(), DType::FP32, {kCandidates, kSteps, batch_size});
+        Tensor confidence(confidence_device.data(), DType::FP32, {kSteps, batch_size});
         const auto capacity = ops::candidate_selector_path_workspace_capacity_bytes(
             kSteps, kSteps, batch_size, batch_size);
         GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
@@ -465,7 +490,7 @@ int run(bool ties = false, bool dependent = false) {
             ops::candidate_selector_path(ids, unary, hidden, anchor, predecessor, successor,
                                          positions,
                                          static_cast<const ops::SamplingConfig*>(config_device.p),
-                                         drafts, q, workspace, stream);
+                                         drafts, q, workspace, stream, &confidence, kEdgeCap);
         };
         launch(nullptr);
         cuda_synchronize();
@@ -483,6 +508,15 @@ int run(bool ties = false, bool dependent = false) {
             std::span<const double>(expected.probabilities.data(), q_count), kProbabilityCriterion);
         failures += verify_draws(label, batch_size, candidate_ids, configs, base_positions,
                                  from_device<int>(draft_device.data(), draft_count), actual_q);
+        {
+            const std::vector<float> actual = from_device<float>(confidence_device.data(),
+                                                                 draft_count);
+            failures += verify_pointwise(
+                label + " confidence", std::vector<double>(actual.begin(), actual.end()),
+                std::span<const double>(expected.confidence.data(), draft_count),
+                kProbabilityCriterion);
+        }
+        failures += confidence_device.verify_guards(label + " confidence");
         failures += draft_device.verify_guards(label + " drafts");
         failures += q_device.verify_guards(label + " proposal_q");
         failures += scratch.verify_guards(label + " workspace");
@@ -583,7 +617,7 @@ int run(bool ties = false, bool dependent = false) {
             tq(dq.data(), DType::FP32, {kCandidates, kSteps, 3});
         ops::candidate_selector_path(ti, tu, th, ta, predecessor, successor, tp,
                                      static_cast<const ops::SamplingConfig*>(dc.p), td, tq,
-                                     workspace, nullptr);
+                                     workspace, nullptr, nullptr, kEdgeCap);
         cuda_synchronize();
         const auto actual_d = from_device<int>(dd.data(), 3 * kSteps);
         const auto actual_q = from_device<float>(dq.data(), 3 * kSteps * kCandidates);
@@ -627,6 +661,16 @@ int main() {
             failures += run(false, true);
             kSteps = 15;
             failures += run(false, true);
+        }
+        {
+            // Inkling 2's DFlash2 drafter: codebooks of its 201024 rows and edges soft-capped at
+            // 30 after the correction.
+            kCodebookRows = 201024;
+            kEdgeCap      = 30.0F;
+            for (const int steps : {1, 4, 5, 7, 15}) {
+                kSteps = steps;
+                failures += run();
+            }
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " candidate_selector_path\n";
         return failures == 0 ? 0 : 1;

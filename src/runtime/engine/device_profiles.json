@@ -1,5 +1,5 @@
 {"schema": "ninfer.device-route-profiles", "schema_version": 2, "devices": [
-    {"hardware_class": "nvidia-geforce-rtx-3090-sm86", "multiprocessors": 82, "origin": "built in: RTX 3090 at 390 W, 2026-09-25; unified routes and two-stage GDN at 420 W, 2026-09-27; cuBLAS prefill gate at 350 W, 2026-10-18; GGUF Q4_K/Q6_K vector loads at 350 W, 2026-10-24; GGUF MoE Q6_K loads at 350 W, 2026-10-25; Q6 head and Q4 residual projections at 350 W, 2026-10-30; Q4_K matrix and MoE async tiles at 350 W, 2026-11-04 and 2026-11-05; GGUF and NVFP4 W4A8-int routes at 350 W, 2026-11-19; NVFP4 matrix and MoE async tiles at 370 W, 2026-11-23; calibrated route catalog at 420 W, 2026-11-23; MoE vector columns at 350 W, 2026-11-24; NVFP4, IQ4_XS, Q4_K, Q5_K and IQ4_NL spread MoE vector columns at the requested chunk by Inkling 2 decode at 350 W, 2026-11-24",
+    {"hardware_class": "nvidia-geforce-rtx-3090-sm86", "multiprocessors": 82, "origin": "built in: RTX 3090 at 390 W, 2026-09-25; unified routes and two-stage GDN at 420 W, 2026-09-27; cuBLAS prefill gate at 350 W, 2026-10-18; GGUF Q4_K/Q6_K vector loads at 350 W, 2026-10-24; GGUF MoE Q6_K loads at 350 W, 2026-10-25; Q6 head and Q4 residual projections at 350 W, 2026-10-30; Q4_K matrix and MoE async tiles at 350 W, 2026-11-04 and 2026-11-05; GGUF and NVFP4 W4A8-int routes at 350 W, 2026-11-19; NVFP4 matrix and MoE async tiles at 370 W, 2026-11-23; calibrated route catalog at 420 W, 2026-11-23; MoE vector columns at 350 W, 2026-11-24; NVFP4, IQ4_XS, Q4_K, Q5_K and IQ4_NL spread MoE vector columns at the requested chunk by Inkling 2 decode at 350 W, 2026-11-24; PTQ1_0 matrix async tiles at 420 W, 2026-11-24",
      "routes": {
         "attn_i8_small/h24/int8/w3": [[1048576, "8x2x32q"]],
         "attn_i8_small/h24/int8/w4": [[1048576, "8x2x32q"]],
@@ -78,6 +78,7 @@
         "gguf_matrix/iq4_nl": [[32, "async"], [64, ""], [65, "async"], [128, ""], [4096, "async"]],
         "gguf_matrix/iq4_xs": [[4096, ""]],
         "gguf_matrix/q2_0": [[64, ""], [128, "async"], [129, ""], [4096, "async"]],
+        "gguf_matrix/ptq1_0": [[32, ""], [1536, "async"], [4096, ""]],
         "gguf_matrix/q4_0": [[65, ""], [128, "async"], [129, ""], [4096, "async"]],
         "gguf_matrix/q5_0": [[16, "async"], [64, ""], [129, "async"], [256, ""], [4096, "async"]],
         "gguf_matrix/q5_k": [[64, "async"], [129, ""], [4096, "async"]],
@@ -168,7 +169,7 @@
         "gguf_moe_columns/q8_0/spread": [[8, ""]],
         "gguf_moe_columns/q8_0/whole": [[8, ""]]
      }},
-    {"hardware_class": "nvidia-geforce-rtx-4090-sm89", "multiprocessors": 128, "origin": "built in: RTX 4090 at 450 W, 2026-09-25; unified routes and two-stage GDN at 300 to 450 W, 2026-09-27; Q4_K matrix and MoE async tiles at 450 W, 2026-11-06; GGUF, NVFP4 W4A8-int and cuBLAS prefill routes at 450 W, 2026-11-19; NVFP4 matrix and MoE async tiles at 450 W, 2026-11-23; calibrated route catalog at 450 W, 2026-11-23; MoE vector columns at 450 W, 2026-11-24",
+    {"hardware_class": "nvidia-geforce-rtx-4090-sm89", "multiprocessors": 128, "origin": "built in: RTX 4090 at 450 W, 2026-09-25; unified routes and two-stage GDN at 300 to 450 W, 2026-09-27; Q4_K matrix and MoE async tiles at 450 W, 2026-11-06; GGUF, NVFP4 W4A8-int and cuBLAS prefill routes at 450 W, 2026-11-19; NVFP4 matrix and MoE async tiles at 450 W, 2026-11-23; calibrated route catalog at 450 W, 2026-11-23; MoE vector columns at 450 W, 2026-11-24; PTQ1_0 matrix async tiles at 450 W, 2026-11-24",
      "routes": {
         "attn_i8_small/h24/int8/w2": [[8192, "4x2x32e"], [1048576, ""]],
         "attn_i8_small/h24/int8/w3": [[1048576, "8x2x32q"]],
@@ -240,6 +241,7 @@
         "gguf_matrix/iq4_nl": [[512, ""], [1024, "async"], [1280, ""], [2048, "async"], [4096, ""]],
         "gguf_matrix/iq4_xs": [[4096, ""]],
         "gguf_matrix/q2_0": [[65, ""], [128, "async"], [129, ""], [4096, "async"]],
+        "gguf_matrix/ptq1_0": [[16, ""], [17, "async"], [32, ""], [64, "async"], [65, ""], [128, "async"], [512, ""], [4096, "async"]],
         "gguf_matrix/q4_0": [[1024, ""], [1280, "async"], [1536, ""], [4096, "async"]],
         "gguf_matrix/q5_0": [[16, "async"], [17, ""], [32, "async"], [129, ""], [1024, "async"], [1280, ""], [1536, "async"], [2048, ""], [4096, "async"]],
         "gguf_matrix/q5_k": [[16, "async"], [512, ""], [1024, "async"], [1536, ""], [4096, "async"]],
@@ -338,7 +340,7 @@
         "gguf_moe_columns/q8_0/spread": [[8, ""]],
         "gguf_moe_columns/q8_0/whole": [[8, ""]]
      }},
-    {"hardware_class": "nvidia-geforce-rtx-5090-sm120", "multiprocessors": 170, "origin": "built in: RTX 5090 at 575 W, 2026-09-25; unified routes and two-stage GDN at 450 W, 2026-09-27; Q4/Q5 MoE prefill tile at 450 W, 2026-10-15; GGUF, NVFP4 W4A8-int and cuBLAS prefill routes at 600 W, 2026-11-19; calibrated route catalog at 575 W, 2026-11-23; MoE vector columns at 575 W, 2026-11-24",
+    {"hardware_class": "nvidia-geforce-rtx-5090-sm120", "multiprocessors": 170, "origin": "built in: RTX 5090 at 575 W, 2026-09-25; unified routes and two-stage GDN at 450 W, 2026-09-27; Q4/Q5 MoE prefill tile at 450 W, 2026-10-15; GGUF, NVFP4 W4A8-int and cuBLAS prefill routes at 600 W, 2026-11-19; calibrated route catalog at 575 W, 2026-11-23; MoE vector columns at 575 W, 2026-11-24; PTQ1_0 matrix async tiles at 575 W, 2026-11-24",
      "routes": {
         "sparse_moe/prefill-tiles/q4-q5": [[1023, ""], [1024, "narrow"]],
         "attn_i8_small/h24/int8/w1": [[65536, "16x1x32"], [1048576, ""]],
@@ -405,6 +407,7 @@
         "gguf_matrix/iq4_nl": [[64, ""], [4096, "async"]],
         "gguf_matrix/iq4_xs": [[65, ""], [4096, "async"]],
         "gguf_matrix/q2_0": [[33, ""], [4096, "async"]],
+        "gguf_matrix/ptq1_0": [[32, ""], [4096, "async"]],
         "gguf_matrix/q4_0": [[32, ""], [4096, "async"]],
         "gguf_matrix/q4_k": [[32, ""], [4096, "async"]],
         "gguf_matrix/q5_0": [[32, ""], [4096, "async"]],
@@ -837,7 +840,7 @@
         "gguf_moe_columns/q8_0/spread": [[8, ""]],
         "gguf_moe_columns/q8_0/whole": [[8, ""]]
      }},
-    {"hardware_class": "nvidia-rtx-pro-6000-blackwell-workstation-edition-sm120", "multiprocessors": 188, "origin": "built in: RTX PRO 6000 Blackwell Workstation Edition at 600 W, 2026-11-23; MoE vector columns at 600 W, 2026-11-24",
+    {"hardware_class": "nvidia-rtx-pro-6000-blackwell-workstation-edition-sm120", "multiprocessors": 188, "origin": "built in: RTX PRO 6000 Blackwell Workstation Edition at 600 W, 2026-11-23; MoE vector columns at 600 W, 2026-11-24; PTQ1_0 matrix async tiles at 600 W, 2026-11-24",
      "routes": {
         "attn_i8_small/h24/int8/w1": [[65536, "16x1x32"], [1048576, ""]],
         "attn_i8_small/h24/int8/w3": [[8192, "16x1x32"], [1048576, "8x2x32q"]],
@@ -885,6 +888,7 @@
         "gguf_matrix/iq4_nl": [[33, ""], [64, "async"], [65, ""], [128, "async"], [129, ""], [4096, "async"]],
         "gguf_matrix/iq4_xs": [[129, ""], [4096, "async"]],
         "gguf_matrix/q2_0": [[33, ""], [64, "async"], [65, ""], [4096, "async"]],
+        "gguf_matrix/ptq1_0": [[32, ""], [4096, "async"]],
         "gguf_matrix/q4_0": [[32, ""], [64, "async"], [65, ""], [128, "async"], [129, ""], [4096, "async"]],
         "gguf_matrix/q4_k": [[32, ""], [64, "async"], [65, ""], [128, "async"], [129, ""], [4096, "async"]],
         "gguf_matrix/q5_0": [[16, ""], [128, "async"], [129, ""], [4096, "async"]],

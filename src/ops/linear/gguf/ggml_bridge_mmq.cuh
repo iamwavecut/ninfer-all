@@ -43,6 +43,7 @@ constexpr const char* async_matrix_key() {
     case GGML_TYPE_Q4_K: return "gguf_matrix/q4_k";
     case GGML_TYPE_Q5_K: return "gguf_matrix/q5_k";
     case GGML_TYPE_NVFP4: return "gguf_matrix/nvfp4";
+    case GGML_TYPE_PTQ1_0: return "gguf_matrix/ptq1_0";
     default: return nullptr;
     }
 }
@@ -433,7 +434,8 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
         const void* const*, std::int64_t, int, int, const ninfer::ops::gguf::MoeRouting&, int,     \
         int, bool, bool, const void*, float*, cudaStream_t)
 
-#define NINFER_GGUF_MATRIX_INSTANCE(TYPE)                                                          \
+// The dense products alone (a type without routed experts: PTQ1_0).
+#define NINFER_GGUF_DENSE_MATRIX_INSTANCE(TYPE)                                                    \
     template std::size_t ninfer::ops::gguf::detail::matrix_fixup_bytes_impl<TYPE>(int, int);       \
     template void ninfer::ops::gguf::detail::matrix_product_impl<TYPE>(                            \
         const void*, std::int64_t, int, int, const void*, int, float*, std::int64_t, void*,        \
@@ -443,5 +445,8 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
         cudaStream_t, bool, float*);                                                              \
     template void ninfer::ops::gguf::detail::matrix_product_impl<TYPE, __nv_bfloat16, true>(     \
         const void*, std::int64_t, int, int, const void*, int, __nv_bfloat16*, std::int64_t, void*, \
-        cudaStream_t, bool, float*);                                                              \
+        cudaStream_t, bool, float*)
+
+#define NINFER_GGUF_MATRIX_INSTANCE(TYPE)                                                          \
+    NINFER_GGUF_DENSE_MATRIX_INSTANCE(TYPE);                                                       \
     NINFER_GGUF_MOE_MATRIX_INSTANCE(TYPE)

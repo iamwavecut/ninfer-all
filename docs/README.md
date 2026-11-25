@@ -35,7 +35,7 @@ spelling and defaults.
 
 ## Model artifacts
 
-The artifacts converted for this engine (Ternary Bonsai 2, the GSQ-RCO and Flash-Next conversions,
+The artifacts converted for this engine (Ternary Bonsai 2 and 2.5, the GSQ-RCO and Flash-Next conversions,
 the Qwen3.8-27B fine-tunes, Qwen3.6-35B-A3B NVFP4 and the Qwen3.8-27B DSpine drafter) are in the
 README's [Supported Models](../README.md#supported-models); their cards live on Hugging Face. The official NInfer
 artifacts load as well; their cards on Hugging Face give upstream's requirements and its

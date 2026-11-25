@@ -6,10 +6,15 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "core/device_buffer.h"
+#include "core/qtype.h"
+#include "core/weight.h"
+
+#include <cuda_fp16.h>
 
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -396,6 +401,125 @@ int run_sigmoid_mul_hadamard_case(std::int32_t width, std::int64_t columns, bool
     return failures;
 }
 
+std::uint16_t half_word(float value) {
+    const __half h = __float2half_rn(value);
+    std::uint16_t word;
+    std::memcpy(&word, &h, sizeof(word));
+    return word;
+}
+
+// A ternary table of `vocab` rows and `k` columns: trits {-1, 0, 1} times one FP16 scale per 128
+// columns, stored as a row-split T2 plane (codes and scales) or as PTQ1_0 blocks, and gathered by
+// embedding_rotated at `ids`. The oracle restores the trits times their scales with the FP64
+// butterfly, independently of the stored encoding.
+int run_embedding_rotated_case(QType format, std::int32_t vocab, std::int32_t k,
+                               const std::vector<std::int32_t>& ids, std::uint32_t seed) {
+    const std::size_t values = static_cast<std::size_t>(vocab) * k;
+    const std::int32_t groups = k / 128;
+    std::vector<int> trits(values);
+    std::vector<float> scales(static_cast<std::size_t>(vocab) * groups);
+    std::uint32_t state = seed * 2654435761U + 1U;
+    const auto draw = [&] {
+        state = state * 1664525U + 1013904223U;
+        return state >> 8;
+    };
+    for (auto& trit : trits) trit = static_cast<int>(draw() % 3U) - 1;
+    for (auto& scale : scales) {
+        // Positive and negative binary16 scales over four octaves, every one exact in FP16.
+        const float magnitude = std::ldexp(1.0F + static_cast<float>(draw() % 1024U) / 1024.0F,
+                                           -4 - static_cast<int>(draw() % 4U));
+        scale                 = draw() % 5U == 0 ? -magnitude : magnitude;
+    }
+    std::vector<std::uint8_t> codes;
+    std::vector<std::uint16_t> scale_words;
+    Weight table;
+    table.qtype = format;
+    table.n     = vocab;
+    table.k     = k;
+    if (format == QType::T2_G128_FP16) {
+        codes.assign(values / 4, 0);
+        for (std::size_t i = 0; i < values; ++i) {
+            codes[i / 4] |= static_cast<std::uint8_t>((trits[i] & 3) << (2 * (i % 4)));
+        }
+        for (const float scale : scales) scale_words.push_back(half_word(scale));
+        table.layout      = QuantLayout::RowSplit;
+        table.scale_dtype = DType::FP16;
+    } else {
+        // ggml-common.h block_ptq1_0: value 16 t + i is base-3 digit t of qs[i], 80 + 8 t + i digit
+        // t of qs[16 + i], 120 + 2 t + h digit t of qh[h]; a byte holds ceil(v * 256 / 243) for
+        // its digits read as v = sum (trit + 1) 3^(4 - t), a four-digit byte's fifth digit zero.
+        codes.assign(static_cast<std::size_t>(vocab) * groups * 28, 0);
+        for (std::int32_t row = 0; row < vocab; ++row) {
+            for (std::int32_t g = 0; g < groups; ++g) {
+                const std::size_t first = static_cast<std::size_t>(row) * k + 128 * g;
+                std::uint8_t* block = codes.data() + (static_cast<std::size_t>(row) * groups + g) * 28;
+                const auto pack = [&](const int (&elements)[5], int digits) {
+                    int v = 0;
+                    for (int t = 0; t < 5; ++t) {
+                        v = 3 * v + (t < digits ? trits[first + elements[t]] + 1 : 0);
+                    }
+                    return static_cast<std::uint8_t>((v * 256 + 242) / 243);
+                };
+                for (int i = 0; i < 16; ++i) {
+                    const int elements[5] = {i, 16 + i, 32 + i, 48 + i, 64 + i};
+                    block[i]              = pack(elements, 5);
+                }
+                for (int i = 0; i < 8; ++i) {
+                    const int elements[5] = {80 + i, 88 + i, 96 + i, 104 + i, 112 + i};
+                    block[16 + i]         = pack(elements, 5);
+                }
+                for (int h = 0; h < 2; ++h) {
+                    const int elements[5] = {120 + h, 122 + h, 124 + h, 126 + h, 0};
+                    block[24 + h]         = pack(elements, 4);
+                }
+                const std::uint16_t d = half_word(scales[static_cast<std::size_t>(row) * groups + g]);
+                std::memcpy(block + 26, &d, sizeof(d));
+            }
+        }
+        table.layout = QuantLayout::GgufBlocks;
+    }
+    std::vector<float> signs(static_cast<std::size_t>(k));
+    fill_uniform(signs, seed + 1U, -1.0F, 1.0F);
+    for (auto& sign : signs) sign = sign < 0.0F ? -1.0F : 1.0F;
+    std::vector<std::uint16_t> sign_words(signs.size());
+    for (std::size_t i = 0; i < signs.size(); ++i) sign_words[i] = f32_to_bf16(signs[i]);
+
+    const std::int32_t tokens = static_cast<std::int32_t>(ids.size());
+    std::vector<float> rows(static_cast<std::size_t>(tokens) * k);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t i = 0; i < k; ++i) {
+            const std::size_t at = static_cast<std::size_t>(ids[t]) * k + i;
+            rows[static_cast<std::size_t>(t) * k + i] =
+                static_cast<float>(trits[at]) *
+                scales[static_cast<std::size_t>(ids[t]) * groups + i / 128];
+        }
+    }
+    const auto reference = hadamard_butterfly_oracle(rows, signs, k, tokens, true);
+
+    DeviceBuffer device_codes  = to_device(codes);
+    DeviceBuffer device_scales = scale_words.empty() ? DeviceBuffer(16) : to_device(scale_words);
+    DeviceBuffer device_signs  = to_device(sign_words);
+    DeviceBuffer device_ids    = to_device(ids);
+    const std::size_t count    = static_cast<std::size_t>(tokens) * k;
+    GuardedDeviceBuffer output(count * sizeof(std::uint16_t));
+    output.fill(0xff);
+    table.qdata = device_codes.p;
+    if (format == QType::T2_G128_FP16) table.scales = device_scales.p;
+    Tensor id_tensor(device_ids.p, DType::I32, {tokens});
+    Tensor sign_tensor(device_signs.p, DType::BF16, {k});
+    Tensor out(output.data(), DType::BF16, {k, tokens});
+    DeviceContext device;
+    ops::embedding_rotated(id_tensor, table, sign_tensor, out, device.stream);
+    cuda_synchronize(device.stream);
+    const std::string label = std::string("embedding_rotated ") +
+                              (format == QType::T2_G128_FP16 ? "t2" : "ptq1_0") +
+                              " K=" + std::to_string(k) + " T=" + std::to_string(tokens);
+    int failures = verify_reduction(label, from_device_bf16(output.data(), count), reference,
+                                    hadamard_bf16_criterion());
+    failures += output.verify_guards(label + " output guards");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -439,6 +563,12 @@ int main() {
     for (const std::int64_t t : {1, 4, 8, 9, 64}) {
         failures += run_sigmoid_mul_hadamard_case(6144, t, false, seed++);
         failures += run_sigmoid_mul_hadamard_case(6144, t, true, seed++);
+    }
+
+    for (const QType format : {QType::T2_G128_FP16, QType::GGUF_PTQ1_0}) {
+        failures += run_embedding_rotated_case(format, 37, 5120, {0, 36, 7, 7, 19}, seed++);
+        failures += run_embedding_rotated_case(format, 9, 1024, {8}, seed++);
+        failures += run_embedding_rotated_case(format, 11, 6144, {3, 0, 10, 5, 3, 1, 2, 9}, seed++);
     }
 
     std::cout << (failures ? "FAIL" : "OK") << " hadamard_transform\n";

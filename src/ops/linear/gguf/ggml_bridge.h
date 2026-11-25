@@ -39,6 +39,7 @@ enum class GgmlType : int {
     MXFP4   = 39,
     NVFP4   = 40,
     Q2_0    = 42,
+    PTQ1_0  = 143, // PrismML's ternary blocks (dense products only)
 };
 
 struct BlockShape {
@@ -56,22 +57,37 @@ struct BlockShape {
 // (moe_matrix_supported), off sm_70.
 [[nodiscard]] bool has_matrix_kernel(GgmlType type);
 
-// Columns the vector kernel takes in one launch; wider products take the matrix kernel.
+// Columns every type's vector kernel takes in one launch; wider products take the matrix kernel.
 inline constexpr int kMaxVectorColumns = 8;
+// The most columns any type's vector kernel takes (vector_columns).
+inline constexpr int kMaxTypeVectorColumns = 20;
+// Columns the type's vector kernel takes in one launch on the current device: kMaxVectorColumns, or
+// for PTQ1_0 on sm_80 and newer kMaxTypeVectorColumns (its tensor-core form).
+[[nodiscard]] int vector_columns(GgmlType type);
 
 // Activation for the vector kernel: q8_1 blocks of 32 values, [columns][k / 32].
 [[nodiscard]] std::size_t vector_activation_bytes(int k, int columns);
 // Its layout: int8 values [columns][k] from byte 0, then half2 (d, sum) pairs [columns][k / 32]
 // from this byte offset; d = max|x| / 127 over the 32 values, sum their (unquantized) total.
+// PTQ1_0's lane kernel reads a transposed form of the same bytes (vector_activation_transposed): a
+// column's value e of 128-value block b at byte (e / 16) * (k / 128) * 16 + 16 b + e % 16 of the
+// column, so that the lanes reading neighbouring blocks read neighbouring 16 bytes, and in place
+// of each pair's sum the exact total of its 32 int8 values, an int16 in the half's bits.
 [[nodiscard]] std::size_t vector_activation_scales_offset(int k, int columns);
+// Whether `type`'s vector product of `columns` columns reads the transposed form: PTQ1_0 where its
+// lane kernel takes the columns (one column on sm_80 and newer, up to eight before).
+[[nodiscard]] bool vector_activation_transposed(GgmlType type, int columns);
 // `input_columns` (optional, [k]) makes element c of each column x[input_columns[c]].
+// `transposed` writes the transposed form (k a multiple of 128).
 void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
-                                const std::int32_t* input_columns, void* out, cudaStream_t stream);
+                                const std::int32_t* input_columns, void* out, cudaStream_t stream,
+                                bool transposed = false);
 // The same activation from FP32 columns: output column c holds x column source[c] (zeros for a
 // negative entry; column c without `source`), each value first multiplied by scale[i] when `scale`
 // ([k]) is given, quantized as the BF16 form quantizes its values.
 void quantize_vector_activation_f32(const float* x, int k, int columns, const std::int32_t* source,
-                                    const float* scale, void* out, cudaStream_t stream);
+                                    const float* scale, void* out, cudaStream_t stream,
+                                    bool transposed = false);
 
 struct VectorOutput {
     __nv_bfloat16* bf16 = nullptr; // exactly one of bf16 / f32
@@ -84,7 +100,8 @@ struct VectorOutput {
 };
 
 // out[r, c] <- epilogue(sum_k W[r, k] x[k, c]) for rows [0, rows) and columns [0, columns),
-// columns <= kMaxVectorColumns. `weight` points at row 0; rows are `row_bytes` apart.
+// columns <= vector_columns(type). `weight` points at row 0; rows are `row_bytes` apart. The
+// activation is transposed where vector_activation_transposed(type, columns) says so.
 void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                     const void* activation, int columns, const VectorOutput& out,
                     cudaStream_t stream);

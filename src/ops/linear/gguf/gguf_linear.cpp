@@ -27,6 +27,15 @@ std::int64_t row_bytes(const Weight& w) {
 
 bool matrix_kernel(const Weight& w) { return gguf::has_matrix_kernel(gguf_type(w.qtype)); }
 
+// Columns up to which a call of these products takes the vector kernels: the narrowest type's.
+std::int32_t vector_columns(std::span<const GgufProduct> products) {
+    int columns = gguf::kMaxTypeVectorColumns;
+    for (const auto& p : products) {
+        columns = std::min(columns, gguf::vector_columns(gguf_type(p.weight->qtype)));
+    }
+    return columns;
+}
+
 // A matrix product refused for its geometry (rows not whole 128-row tiles, for instance) names
 // the problem, so a report shows which projection it was.
 [[noreturn]] void refuse_matrix(const std::invalid_argument& e, const Weight& w, std::int32_t t) {
@@ -173,6 +182,12 @@ void sm70_project(const Tensor& x, std::span<const GgufProduct> products, Worksp
     }
 }
 
+// Whether the product's vector kernel at t columns reads the transposed activation (PTQ1_0's lane
+// kernel).
+bool transposed(const Weight& w, std::int32_t t) {
+    return gguf::vector_activation_transposed(gguf_type(w.qtype), t);
+}
+
 } // namespace
 
 gguf::GgmlType gguf_type(QType format) {
@@ -200,6 +215,7 @@ gguf::GgmlType gguf_type(QType format) {
         return gguf::GgmlType::Q2_0;
     case QType::GGUF_MXFP4: return gguf::GgmlType::MXFP4;
     case QType::GGUF_NVFP4: return gguf::GgmlType::NVFP4;
+    case QType::GGUF_PTQ1_0: return gguf::GgmlType::PTQ1_0;
     default: break;
     }
     throw std::invalid_argument("gguf: not a GGUF block format");
@@ -246,15 +262,19 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
     if (detail::sm70::takes(max_tokens)) {
         widest = sm70_project_bytes(activations, static_cast<std::int32_t>(rows), k, max_tokens);
     }
-    if (min_tokens <= gguf::kMaxVectorColumns) {
-        const std::int32_t t = std::min(max_tokens, gguf::kMaxVectorColumns);
+    std::int32_t vector = gguf::kMaxTypeVectorColumns;
+    for (const GgufShape& shape : shapes) {
+        vector = std::min(vector, gguf::vector_columns(gguf_type(shape.qtype)));
+    }
+    if (min_tokens <= vector) {
+        const std::int32_t t = std::min(max_tokens, vector);
         WorkspaceLayoutBuilder layout;
         for (std::size_t i = 0; i < activations; ++i) {
             (void)layout.alloc_bytes(gguf::vector_activation_bytes(k, t));
         }
         widest = std::max(widest, layout.peak_bytes(1));
     }
-    if (max_tokens > gguf::kMaxVectorColumns) {
+    if (max_tokens > vector) {
         const std::int32_t t = max_tokens;
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc_bytes(rows * t * sizeof(float));
@@ -312,23 +332,28 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
         return;
     }
 
-    if (t <= gguf::kMaxVectorColumns) {
+    if (t <= vector_columns(products)) {
         struct Activation {
             const std::int32_t* columns;
+            bool transposed;
             const void* data;
         };
         std::vector<Activation> activations;
-        if (quantized_x != nullptr) { activations.push_back({nullptr, quantized_x}); }
+        if (quantized_x != nullptr) { activations.push_back({nullptr, false, quantized_x}); }
         std::vector<GgufVectorProduct> queued;
         queued.reserve(products.size());
         for (const auto& p : products) {
-            const Weight& w = *p.weight;
-            auto found      = std::find_if(activations.begin(), activations.end(),
-                                           [&](const Activation& a) { return a.columns == w.input_columns; });
+            const Weight& w  = *p.weight;
+            const bool lanes = transposed(w, t);
+            auto found       = std::find_if(activations.begin(), activations.end(),
+                                            [&](const Activation& a) {
+                                                return a.columns == w.input_columns &&
+                                                       a.transposed == lanes;
+                                            });
             if (found == activations.end()) {
                 void* data = workspace.alloc_bytes(gguf::vector_activation_bytes(k, t)).data;
-                gguf::quantize_vector_activation(xb, k, t, w.input_columns, data, stream);
-                activations.push_back({w.input_columns, data});
+                gguf::quantize_vector_activation(xb, k, t, w.input_columns, data, stream, lanes);
+                activations.push_back({w.input_columns, lanes, data});
                 found = activations.end() - 1;
             }
             queued.push_back({&w, found->data, output(p, 0)});
@@ -472,11 +497,12 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& 
     Weight up_rows;
     if (up == nullptr) {
         if (gate.n != 2 * rows) { throw std::invalid_argument("gguf swiglu: parent is not [gate; up]"); }
-        if (t <= gguf::kMaxVectorColumns) {
+        if (t <= gguf::vector_columns(gguf_type(gate.qtype))) {
             void* vector_input =
                 workspace.alloc_bytes(gguf::vector_activation_bytes(gate.k, t)).data;
             gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(x.data), gate.k, t,
-                                             gate.input_columns, vector_input, stream);
+                                             gate.input_columns, vector_input, stream,
+                                             transposed(gate, t));
             gguf::vector_swiglu(gguf_type(gate.qtype), gate.qdata, row_bytes(gate), rows, gate.k,
                                 vector_input, t, static_cast<__nv_bfloat16*>(out.data), rows,
                                 stream, activation);

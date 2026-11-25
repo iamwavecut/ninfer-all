@@ -51,9 +51,9 @@ The matrix contains three independently measured test kinds:
   rates from the same generation call.
 
 All benchmark requests use raw output, disable model-default stops, and disable prefix reuse. This
-keeps the requested token count exact without adding another generation path. When CUDA Graph is
-enabled and the matrix contains decode work, one ordinary public generation request primes the
-decode graph before warmups and measured repetitions.
+keeps the requested token count exact without adding another generation path. When the Engine
+decodes in CUDA Graphs and the matrix contains decode work, one ordinary public generation request
+primes the decode graph before warmups and measured repetitions.
 
 ## CLI
 
@@ -90,7 +90,10 @@ Example:
 
 Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (K=1..15 for every backend).
 Drafts use the optimized proposal head when the artifact stores one; `--lm-head-draft` requires it
-and `--full-draft-head` keeps the full output head. CUDA Graph decode is enabled by default.
+and `--full-draft-head` keeps the full output head. CUDA Graph decode is enabled by default. The
+reports' `decode_path` (`cuda_graph` or `eager`, after the speculative backend) and `use_cuda_graph`
+name the route the Engine ran, from `Engine::options()`: host or disk experts on Windows and WSL2
+decode eagerly even without `--no-cuda-graph`.
 
 `--expert-residency host|disk` keeps a MoE model's routed experts in pinned host memory or in the
 artifact's files, as the CLI does; `--expert-cache-mib` sizes the device expert cache, and
@@ -360,6 +363,20 @@ second, stored bytes a second and nanoseconds a row for each format, token count
 ```bash
 ./build/bench/ninfer_benches ninfer_gguf_cpu_rows_bench --formats IQ3_S,IQ1_M,Q2_0 --tokens 1,2,8 --threads 1,16
 ./build/bench/ninfer_benches ninfer_gguf_cpu_rows_bench --formats IQ4_NL,Q2_0 --k 640 --backend scalar
+```
+
+`ninfer_gguf_linear_bench` times dense GGUF products through the public Linear and LinearSwiGLU Ops
+(the vector kernels up to their width, the integer matrix kernel above), by default PTQ1_0 at the
+Qwen3.8-27B text tower's shapes: the [gate; up] pair of 2 x 17,408 rows, the down product of 5,120
+rows over 17,408, the GDN input rows (10,240 and 6,144 over 5,120) and the 5,120-row output product
+over 6,144. Each point quantizes its activation inside the timing and starts after a 256 MiB read
+that evicts L2, as a decode step reads each layer's weights from DRAM; it reports the median of 30
+samples, the kernel family and the weight bytes a second. `ninfer_linear_gguf_test` checks the
+products. Its resolution is about 1 µs on an RTX 3090 and 2 µs on an RTX 5090, so a change of a few
+percent on one product needs whole-model decode to settle:
+
+```bash
+./build/bench/ninfer_benches ninfer_gguf_linear_bench --format ptq1_0 --tokens 1,2,4,8,20,24,32
 ```
 
 `ninfer_gguf_moe_matrix_bench` times a wide call's routed experts at DeepSeek-V4.1-Flash's shapes

@@ -1,17 +1,20 @@
 #pragma once
 
-// A DSpine drafter beside a family whose engine keeps its own sequences (Gemma 4, Flint,
-// DeepSeek-V4.1; docs/maintainer/dspine.md): the context ring with a lane per sequence and per
-// state the family keeps of it (a checkpoint, a held state), the head-write table, the target
-// features a pass leaves for the ring, a proposal's device operands and a workspace of its own.
-// The family stores its taps after each pass, commits the kept columns into a lane, copies lanes
-// with its own snapshots, and carries a lane in its context-cache images. Every call enqueues on
-// the given stream, on the device that was current at construction (the target's head device).
+// A masked drafter beside a family whose engine keeps its own sequences (Gemma 4, Flint,
+// DeepSeek-V4.1, Inkling 2; docs/maintainer/dspine.md): a standalone DSpine drafter, or a DFlash2
+// drafter the family's artifact carries (models/dflash2/drafter.h). The runtime holds the context
+// ring with a lane per sequence and per state the family keeps of it (a checkpoint, a held state),
+// DSpine's head-write table, the target features a pass leaves for the ring, a proposal's device
+// operands and a workspace of its own. The family stores its taps after each pass, commits the
+// kept columns into a lane, copies lanes with its own snapshots, and carries a lane in its
+// context-cache images. Every call enqueues on the given stream, on the device that was current
+// at construction (the target's head device).
 
 #include "core/arena.h"
 #include "core/device_buffer.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/tensor.h"
+#include "models/dflash2/drafter.h"
 #include "models/dspine/drafter.h"
 
 #include <cuda_runtime.h>
@@ -47,16 +50,25 @@ struct RuntimeOptions {
 
 class Runtime {
 public:
+    // A standalone DSpine drafter.
     Runtime(const Model& model, Target target, RuntimeOptions options);
+    // A DFlash2 drafter of the family's artifact; `config` outlives the runtime.
+    Runtime(const dflash2::Config& config, dflash2::Operands operands, Target target,
+            RuntimeOptions options);
     ~Runtime();
     Runtime(const Runtime&)            = delete;
     Runtime& operator=(const Runtime&) = delete;
 
-    [[nodiscard]] const Config& config() const noexcept { return model_.config(); }
     [[nodiscard]] const RuntimeOptions& options() const noexcept { return options_; }
-    // The ring's capacity and the drafter's attention window (ring_capacity()).
+    // The ring's capacity and the drafter's attention window: ring_capacity() of a DSpine
+    // drafter, a DFlash2 drafter's trained window.
     [[nodiscard]] std::uint32_t window() const noexcept { return window_; }
-    [[nodiscard]] std::uint32_t taps() const noexcept { return config().taps(); }
+    [[nodiscard]] std::uint32_t taps() const noexcept {
+        return static_cast<std::uint32_t>(geometry_.target_layer_ids.size());
+    }
+    // The trained block: the anchor and block_size() - 1 masks.
+    [[nodiscard]] std::uint32_t block_size() const noexcept { return geometry_.block_size; }
+    [[nodiscard]] bool dflash2() const noexcept { return dflash2_ != nullptr; }
     // The tap index of target layer `layer`, or -1 when the drafter does not read it.
     [[nodiscard]] int tap_of(std::uint32_t layer) const noexcept;
     // The lane of `sequence`'s state `state` (0: live; 1..kept_states: the family's kept states).
@@ -67,8 +79,12 @@ public:
     // The bytes the constructor allocates for these options (device_bytes() of the result).
     [[nodiscard]] static std::uint64_t planned_bytes(const Model& model, DType logits,
                                                      const RuntimeOptions& options);
+    [[nodiscard]] static std::uint64_t planned_bytes(const dflash2::Config& config,
+                                                     const dflash2::Operands& operands,
+                                                     DType logits, const RuntimeOptions& options);
 
-    // Derives the head-write table from the head (Drafter::prepare): once, before the first draft.
+    // Derives a DSpine drafter's head-write table from the head (Drafter::prepare): once, before
+    // the first draft. A DFlash2 drafter has none.
     void prepare(cudaStream_t stream);
 
     // Stores tap `tap` of `rows` (FP32 or BF16 [H, n], contiguous) at feature columns
@@ -120,8 +136,26 @@ public:
         }
     }
 
+    // What the runtime needs of its drafter: the features' and ring's geometry, and the
+    // drafter's workspace and table sizes at these options.
+    struct Geometry {
+        std::uint32_t hidden = 0, vocab = 0, layers = 0, block_size = 0, num_target_layers = 0;
+        std::int32_t kv_heads = 0, head_dim = 0;
+        std::vector<std::uint32_t> target_layer_ids;
+    };
+    struct Plan {
+        Geometry geometry;
+        std::uint32_t window = 0;
+        std::size_t table = 0, proposal = 0, prepare = 0;
+        // Workspace of a commit of `width` columns in `batch` rows.
+        std::size_t context_piece = 0, context_rows = 0;
+    };
+
 private:
-    const Model& model_;
+    void allocate(const Plan& plan);
+    void materialize(const ContextCall& call, cudaStream_t stream);
+
+    Geometry geometry_;
     RuntimeOptions options_;
     std::uint32_t window_ = 0;
     std::vector<int> tap_of_;
@@ -131,7 +165,9 @@ private:
     std::unique_ptr<WorkspaceArena> work_;
     // A proposal's inputs on their way to the device, then its drafts and confidences back.
     std::unique_ptr<PinnedHostBuffer> staging_;
+    // The drafter: DSpine's or DFlash2's.
     std::unique_ptr<Drafter> drafter_;
+    std::unique_ptr<dflash2::Drafter> dflash2_;
 };
 
 } // namespace ninfer::models::dspine

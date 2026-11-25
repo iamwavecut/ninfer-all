@@ -995,6 +995,20 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
     static constexpr int bs = sizeof(block_q2_0);
 };
 
+// NInfer: PTQ1_0 (ggml-org/llama.cpp#29676). Four packed trit digits {0, 1, 2} as signed bytes
+// {-1, 0, 1}; the per-byte subtraction cannot borrow across bytes.
+static __device__ __forceinline__ int ptq1_0_trits_to_signed(const uint32_t q) {
+    return __vsub4(q, 0x01010101);
+}
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_PTQ1_0> {
+    static constexpr int qk = QK_PTQ1_0;
+    static constexpr int qr = QR_PTQ1_0;
+    static constexpr int qi = QI_PTQ1_0;
+    static constexpr int bs = sizeof(block_ptq1_0);
+};
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
     static constexpr int qk = QK4_0;

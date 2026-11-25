@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/kv_resident_options.h"
+#include "product/loop_kv_options.h"
 #include "product/launch_config/launch_config.h"
 #include "product/option_layers.h"
 #include "product/ngram_table_options.h"
@@ -246,7 +247,7 @@ std::string usage_text(const char* argv0) {
            "                                rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
            "                                fp16: Flash-Next, Gemma 4 and Flint; mxfp8:\n"
            "                                Inkling 2 (its default)\n" +
-           std::string(product::kKvResidentHelp) +
+           std::string(product::kKvResidentHelp) + std::string(product::kLoopKvHelp) +
            "\n"
            "SPECULATIVE DECODING\n"
            "  --spec none|mtp|dflash|dflash2|dspark|dspine\n"
@@ -261,18 +262,21 @@ std::string usage_text(const char* argv0) {
            "                                request at a time whose artifact has its\n"
            "                                drafter, else none; dspark: the release's\n"
            "                                DSpark drafter\n"
-           "                                (DeepSeek-V4.1, Inkling 2);\n"
+           "                                (DeepSeek-V4.1, Inkling 2); dflash2 on Inkling 2:\n"
+           "                                incoai's DFlash2 drafter;\n"
            "                                dspine: the DSpine drafter --draft-model names)\n"
            "  --draft-model PATH            dspine: the DSpine drafter artifact, trained for\n"
            "                                this model\n"
            "  --draft-tokens N              drafts per round, 1..15 (Flash-Next dflash2: 1..7;\n"
+           "                                Inkling 2 dflash2: 1..7, 7 the default;\n"
            "                                dspark: up to its block of 5, the default, 7 for\n"
            "                                Inkling 2; dspine:\n"
            "                                up to its block less one, 7 for Gemma 4, Flint\n"
            "                                and DeepSeek-V4.1)\n"
            "  --draft-min-p P               confidence floor 0..1 of Flash-Next MTP, DFlash2\n"
            "                                or DSpine, of DSpine on Gemma 4, Flint or\n"
-           "                                DeepSeek-V4.1 and of DSpark on Inkling 2: a round\n"
+           "                                DeepSeek-V4.1 and of DSpark or DFlash2 on\n"
+           "                                Inkling 2: a round\n"
            "                                ends after its first draft at or below P\n"
            "                                (default 0 with --spec, 0.5 when\n"
            "                                the engine chooses MTP or Inkling 2's DSpark,\n"
@@ -525,6 +529,8 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                                                      [&] { return value(arg); })) {
         } else if (product::parse_kv_resident_option(arg, options.kv_resident_positions,
                                                      [&] { return value(arg); })) {
+        } else if (product::parse_loop_kv_option(arg, options.loop_kv,
+                                                 [&] { return value(arg); })) {
         } else if (arg == "--kv-dtype") {
             options.kv_cache   = parse_kv_cache(value(arg));
             kv_dtype_explicit  = true;

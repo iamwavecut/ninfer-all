@@ -105,13 +105,13 @@ void sigmoid_mul_hadamard(const Tensor& gate, const Tensor& x, const Tensor& sig
 /**
  * Op: embedding_rotated
  *
- * Gathers rows of a Hadamard-rotated T2 table and restores them to the primal basis:
+ * Gathers rows of a Hadamard-rotated ternary table and restores them to the primal basis:
  *   out[b*1024+i, t] = 2^-5 * signs[b*1024+i] * sum_j H[i][j] * table[ids[t], b*1024+j]
  * i.e. the inverse hadamard_transform of each dequantised row. `table` is a row-split
- * t2_g128_fp16 [vocab, K] weight, `signs` BF16 [K] of +1 / -1 (K a multiple of 1024), `ids` I32 [T]
- * with every id in [0, vocab), `out` BF16 [K, T]; signs and out are 16-byte aligned. The
- * dequantised values enter the transform unrounded, so out carries one BF16 rounding. No workspace
- * or persistent state.
+ * t2_g128_fp16 or a gguf_ptq1_0 [vocab, K] weight (its qdata 4-byte aligned), `signs` BF16 [K] of
+ * +1 / -1 (K a multiple of 1024), `ids` I32 [T] with every id in [0, vocab), `out` BF16 [K, T];
+ * signs and out are 16-byte aligned. The dequantised values enter the transform unrounded, so out
+ * carries one BF16 rounding. No workspace or persistent state.
  */
 void embedding_rotated(const Tensor& ids, const Weight& table, const Tensor& signs, Tensor& out,
                        cudaStream_t stream);

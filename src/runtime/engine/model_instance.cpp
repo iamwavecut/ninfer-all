@@ -220,12 +220,24 @@ std::size_t current_free_device_bytes() {
     return free_bytes;
 }
 
-// Free memory on each rank's device, in rank order. Ranks that share a physical device (a test mode
-// that exercises the multi-stage path on one card) split what is free between them, since each
-// one's budget is spent from the same memory. Under the WDDM evictable budget the primary device
-// may also count what other processes hold beyond the desktop floor: all of it but the resident
-// weights.
-std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device,
+// What an explicit KV capacity leaves free on every device. CUDA loads a kernel on its first launch
+// (lazy module loading), and a request can reach kernels the startup graphs never launched, such
+// as the prompt tail's widths; with every byte planned that load fails. An RTX 3090 serving
+// Bonsai 2.5 PTQ1_0 at 1,036,288 tokens of rk4v4 started with 1.06 MiB free and stopped at the end
+// of its first prompt (cudaFuncSetAttribute: out of memory). Automatic capacity keeps its larger
+// headroom instead.
+constexpr std::size_t kExplicitKernelReserve = std::size_t(64) << 20;
+
+std::size_t kernel_reserve(const EngineOptions& options) {
+    return options.kv_capacity.mode == KvCapacityMode::Explicit ? kExplicitKernelReserve : 0;
+}
+
+// Free memory on each rank's device, in rank order, less `reserve` on each physical device. Ranks
+// that share a physical device (a test mode that exercises the multi-stage path on one card) split
+// what is free between them, since each one's budget is spent from the same memory. Under the WDDM
+// evictable budget the primary device may also count what other processes hold beyond the desktop
+// floor: all of it but the resident weights.
+std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device, std::size_t reserve,
                                             bool evictable_budget      = false,
                                             std::size_t resident_bytes = 0) {
     std::vector<std::size_t> out;
@@ -245,7 +257,7 @@ std::vector<std::size_t> free_bytes_by_rank(const DeviceContext& device,
                 free_bytes = std::max(free_bytes, total - resident_bytes - kDesktopFloor);
             }
         }
-        out.push_back(free_bytes / sharing);
+        out.push_back((free_bytes - std::min(free_bytes, reserve)) / sharing);
     }
     return out;
 }
@@ -725,7 +737,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     std::vector<double> split_speed;
     models::qwen3_5::StageSizing split_sizing;
     if (automatic_split) {
-        const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
+        const std::vector<std::size_t> free_now =
+            free_bytes_by_rank(device, kernel_reserve(options));
         const std::vector<std::uint64_t> free_bytes(free_now.begin(), free_now.end());
         split_sizing = models::qwen3_5::StageSizing{
             .kv_storage = options.kv_cache,
@@ -741,7 +754,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             reader, models::load_options(options), split_sizing, free_bytes, split_speed);
     }
     if (options.devices.size() > 1 && options.stage_layers.empty() && !options.tensor_parallel) {
-        const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
+        const std::vector<std::size_t> free_now =
+            free_bytes_by_rank(device, kernel_reserve(options));
         const std::vector<std::uint64_t> free_bytes(free_now.begin(), free_now.end());
         const models::qwen3_5::StageSizing sizing{
             .kv_storage = options.kv_cache,
@@ -825,7 +839,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             }
         }
         plan_sequences();
-        free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
+        free_by_rank = free_bytes_by_rank(device, kernel_reserve(options),
+                                          options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
         if (!automatic_split || refits == 2) { break; }
         const auto& curve = planner->capacity_curve();
@@ -986,7 +1001,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                                cpu.c_str(), options.hybrid_experts.dma_share ? "fixed share"
                                                                              : "by measured speeds");
         }
-        free_by_rank = free_bytes_by_rank(device, options.wddm_evictable_budget,
+        free_by_rank = free_bytes_by_rank(device, kernel_reserve(options),
+                                          options.wddm_evictable_budget,
                                           instance->model->storage_stats().device_capacity_bytes);
         resolution = resolve_capacity();
     }

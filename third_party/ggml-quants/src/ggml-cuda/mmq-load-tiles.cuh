@@ -184,6 +184,101 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// NInfer: PTQ1_0 (ggml-org/llama.cpp#29676). Eight lanes take a block: lanes 0-3 a word of qs[0..15]
+// (elements 16 t + 4 g ..), lanes 4-5 a word of qs[16..23] (elements 80 + 8 t + 4 g ..), lane 6 the
+// qh bytes (elements 120..127); each walks its word's five base-3 digits in 16-bit lanes, so a
+// multiply by three cannot carry between bytes, and writes the signed bytes in value order.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+#if defined(TURING_MMA_AVAILABLE)
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q8_0, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(TURING_MMA_AVAILABLE)
+
+    constexpr int blocks_per_iter   = MMQ_ITER_K / QK_PTQ1_0;
+    constexpr int threads_per_block = 8;
+    constexpr int threads_per_row   = blocks_per_iter * threads_per_block;
+    constexpr int nrows             = warp_size / threads_per_row;
+
+    const int txi  = threadIdx.x % threads_per_row;
+    const int kbx  = txi / threads_per_block;
+    const int lane = txi % threads_per_block;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i*stride + kbx;
+#if defined(TURING_MMA_AVAILABLE)
+        int * row = x_qs + i*sram_stride + kbx*(QK_PTQ1_0/4);
+#else
+        int * row = x_qs + i*(2*MMQ_TILE_NE_K + 1) + kbx*(QK_PTQ1_0/4);
+#endif // defined(TURING_MMA_AVAILABLE)
+
+        // Every lane runs the same five-digit walk on its own word; only the stores differ.
+        const uint32_t packed    = get_int_b4(bxi->qs, lane < 7 ? lane : 6);
+        uint32_t       v_lo      = __byte_perm(packed, 0, 0x4140); // bytes 0, 1 in 16-bit lanes
+        uint32_t       v_hi      = __byte_perm(packed, 0, 0x4342); // bytes 2, 3
+        const bool     full_lane = lane < 6;
+        v_hi = full_lane ? v_hi : v_lo;                             // lane 6 walks qh0, qh1 twice
+        const int dst_base   = lane < 4 ? lane : 16 + lane;         // lanes 4, 5 -> words 20, 21
+        const int dst_stride = lane < 4 ? 4 : 2;
+        int q[5];
+#pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const uint32_t w_lo = v_lo * 3;
+            const uint32_t w_hi = v_hi * 3;
+            v_lo = w_lo & 0x00FF00FF;
+            v_hi = w_hi & 0x00FF00FF;
+            q[t] = ptq1_0_trits_to_signed(__byte_perm(w_lo, w_hi, 0x7531));
+            if (full_lane) {
+                row[dst_base + t*dst_stride] = q[t];
+            }
+        }
+        if (lane == 6) {
+            // q[t] = {qh0 digit t, qh1 digit t, the same again}; elements 120 + 2 t + h.
+            row[30] = __byte_perm(q[0], q[1], 0x5410);
+            row[31] = __byte_perm(q[2], q[3], 0x5410);
+        }
+    }
+
+    constexpr int scale_entries_per_block = QK_PTQ1_0 / QK8_1;
+    constexpr int scale_entries_per_row   = blocks_per_iter * scale_entries_per_block;
+    constexpr int rows_per_warp           = warp_size / scale_entries_per_row;
+    const int     ksx                     = threadIdx.x % scale_entries_per_row;
+    const int     scale_block             = ksx / scale_entries_per_block;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
+        int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/scale_entries_per_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i*stride + scale_block;
+
+#if defined(TURING_MMA_AVAILABLE)
+        x_df[i*sram_stride                           + ksx] = bxi->d;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K/QI8_0) + i/(QI8_0/2) + ksx] = bxi->d;
+#endif // defined(TURING_MMA_AVAILABLE)
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();

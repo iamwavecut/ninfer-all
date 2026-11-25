@@ -309,6 +309,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.fast_prefill_kernel      = options.fast_prefill_kernel;
     engine_options.kv_cache                 = options.kv_cache;
     engine_options.kv_cache_automatic       = options.kv_cache_automatic;
+    engine_options.loop_kv                  = options.loop_kv;
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
     options.steering.apply(engine_options);

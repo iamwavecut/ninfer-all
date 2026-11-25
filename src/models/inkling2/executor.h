@@ -1,8 +1,9 @@
 #pragma once
 
 // The forward pass of Inkling 2 over a loaded Model: 48 visits of its 24 stored layers (the
-// prelude, the looped core three times, the coda), each visit with its own keys and values and
-// its own short-convolution history. The caches are F16, or — with kv_cache rk8v4 / rk4v4 — the
+// prelude, the looped core three times, the coda), each visit with its own keys and values (with
+// ExecutorOptions::loop_kv, the core's earlier passes share the last pass's) and its own
+// short-convolution history. The caches are F16, or — with kv_cache rk8v4 / rk4v4 — the
 // eight full-attention visits' planes are quantized (kv_format.h) while every windowed visit
 // keeps its F16 ring. A sliding-window visit keeps a ring of the last window
 // (and a round's drafts) per sequence, a full-attention visit every position. Every visit's
@@ -18,7 +19,11 @@
 // values and its recurrent head's context for each row it computes from the visits the drafter taps
 // (a verification's rejected rows lie past the next anchor, where the next block overwrites them);
 // draft() runs the drafter's block (the anchor and masks, every row seeing the anchor's window and
-// the whole block), then its recurrent head row by row, a draft at a time.
+// the whole block), then its recurrent head row by row, a draft at a time. The model's DFlash2
+// drafter (ExecutorOptions::dflash2) runs in a DSpine drafter's runtime (models/dspine/runtime.h):
+// every pass stores its taps, the inputs of the visits it reads and the final norm's rows, and the
+// rows a sequence keeps go into its context ring; draft() runs its block of masks and candidate
+// selector.
 //
 // With the model's vision tower (vision_max_patches), encode_image() turns an image's patches into
 // its span's rows, and a prompt chunk's image rows take the place of their tokens' embeddings.
@@ -29,6 +34,7 @@
 #include "models/expert_profile.h"
 #include "models/inkling2/kv_format.h"
 #include "models/inkling2/model.h"
+#include "ninfer/model_enums.h"
 
 #include <cuda_runtime.h>
 
@@ -56,6 +62,13 @@ struct ExecutorOptions {
     // full-attention visits of rk8v4 / rk4v4 — the windowed visits' rings stay F16 whatever this
     // says.
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    // Which keys and values the core's passes keep (--loop-kv). LastFull: an earlier pass's
+    // full-attention visit of a core layer owns no store; it writes its rows of a call into the
+    // last pass's store at their positions and attends over that store (the positions before the
+    // call hold the last pass's rows), and the last pass overwrites them. LastAll: the core's
+    // sliding-window visits share the last pass's ring and its checkpoint the same way. The
+    // convolution histories stay every visit's own.
+    LoopKvCache loop_kv = LoopKvCache::PerPass;
     // Proposed tokens a verification may carry per sequence after its anchor (0: no
     // verification); a verification's rows, the anchors and drafts of all its sequences, are at
     // most 8.
@@ -66,6 +79,9 @@ struct ExecutorOptions {
     bool dspine = false;
     // Drafts with the model's DSpark drafter (Model::dspark(); its block of drafts a round).
     bool dspark = false;
+    // Drafts with the model's DFlash2 drafter (Model::dflash2(); draft_tokens of them at most, its
+    // block less one).
+    bool dflash2 = false;
     // Prompt calls may carry images (a model loaded with its vision tower): the most patches an
     // image has, which sizes the tower's scratch. 0: text only.
     std::uint32_t vision_max_patches = 0;
@@ -169,15 +185,12 @@ public:
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept);
     // The drafter's greedy drafts of the `k` positions after each sequence's anchor and each
     // draft's probability under it, sequence-major; returns once they are on the host. DSpark runs
-    // one block per sequence.
+    // one block per sequence. A block needs a committed token before it.
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
                std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence);
-    // DSpark: the drafts its block proposes a round, its block less one (0 without the drafter);
-    // and the drafter's greedy drafts of the drafts.size() positions after the sequence's anchor
-    // (at most that many) with their probabilities. A block needs a committed token before it.
-    [[nodiscard]] std::uint32_t dspark_block() const noexcept;
-    void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
-               std::span<float> confidence);
+    // A block drafter (DSpark, DFlash2): the drafts its block proposes a round, its block less one
+    // (0 without one).
+    [[nodiscard]] std::uint32_t block_drafts() const noexcept;
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);

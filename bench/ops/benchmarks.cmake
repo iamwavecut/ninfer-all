@@ -40,6 +40,7 @@ ninfer_add_op_bench(ninfer_linear_topk_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/
 ninfer_add_op_bench(ninfer_gguf_cpu_rows_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gguf_cpu_rows_bench.cpp")
 ninfer_add_op_bench(ninfer_gguf_moe_matrix_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/gguf_moe_matrix_bench.cu")
+ninfer_add_op_bench(ninfer_gguf_linear_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gguf_linear_bench.cu")
 ninfer_add_op_bench(ninfer_candidate_selector_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/candidate_selector_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_input_proj_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench

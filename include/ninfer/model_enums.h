@@ -162,4 +162,18 @@ enum class PrefillTail : std::uint8_t {
     Rows,
 };
 
+// Inkling 2: which keys and values the three passes of its looped core keep (--loop-kv).
+// transformers' recurrent_kv_cache_mode "last_loop" is LastAll.
+enum class LoopKvCache : std::uint8_t {
+    // Every visit keeps its own keys and values: the model's arithmetic.
+    PerPass,
+    // The core's full-attention layers keep only the last pass's keys and values. An earlier pass
+    // reads the positions before its call from the last pass's rows and the call's positions from
+    // its own, which the last pass then overwrites. Lossy, and the output depends on how the tokens
+    // are split into calls.
+    LastFull,
+    // LastFull, and the core's sliding-window layers share the last pass's ring the same way.
+    LastAll,
+};
+
 } // namespace ninfer

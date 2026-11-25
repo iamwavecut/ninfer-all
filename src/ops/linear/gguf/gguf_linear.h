@@ -3,7 +3,8 @@
 // Products of GGUF block matrices (QType::GGUF_*, QuantLayout::GgufBlocks). Every product quantizes
 // its activation to ggml's q8_1 exactly as llama.cpp does -- that is the format's arithmetic, so it
 // happens whatever the Use's policy says -- and accumulates in FP32: ggml's vector kernel through
-// eight columns, its integer tensor-core kernel above.
+// eight columns (PTQ1_0's own kernels through gguf::vector_columns), its integer tensor-core kernel
+// above.
 
 #include "core/arena.h"
 #include "core/qtype.h"
@@ -59,21 +60,24 @@ struct GgufShape {
 
 // Runs every product against one BF16 activation x [K,T], quantizing x once per activation layout
 // (and once more per distinct input gather). A caller that already holds x's vector activation
-// (gguf::quantize_vector_activation of x without a gather) passes it as `quantized_x`; up to
-// gguf::kMaxVectorColumns columns the products without a gather then read it instead of a new one.
+// (gguf::quantize_vector_activation of x without a gather, not transposed) passes it as
+// `quantized_x`; up to the products' gguf::vector_columns the products without a gather then read
+// it instead of a new one, except those that read a transposed activation
+// (gguf::vector_activation_transposed).
 void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
                   WorkspaceArena& workspace, cudaStream_t stream,
                   const void* quantized_x = nullptr);
 
 // One product of gguf_vector_project: `weight` times a planar vector activation
-// (gguf::quantize_vector_activation) into `out`.
+// (gguf::quantize_vector_activation, transposed where gguf::vector_activation_transposed says so)
+// into `out`.
 struct GgufVectorProduct {
     const Weight* weight   = nullptr;
     const void* activation = nullptr;
     gguf::VectorOutput out;
 };
 
-// gguf::vector_product for each product in order, t <= gguf::kMaxVectorColumns columns: consecutive
+// gguf::vector_product for each product in order, t <= gguf::vector_columns of each: consecutive
 // stored products of one block type and row size share a launch (up to gguf::kMaxVectorJobs); a
 // product whose epilogue reads an output (Accumulate, or a GateProduct's gate plane, which an
 // earlier product may write) runs after the ones before it. No product reads another's output as

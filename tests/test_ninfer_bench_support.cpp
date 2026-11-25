@@ -569,6 +569,50 @@ int test_human_and_csv_reports() {
 }
 
 
+// The reports name the decode route the Engine runs (its resolved options), not --cuda-graph: an
+// Engine that turned graphs off itself (host or disk experts on Windows and WSL2) decodes eagerly.
+int test_engine_decode_route() {
+    int failures = 0;
+    failures += expect_string(qb::decode_path_name(false, {}), "eager", "eager decode route");
+    failures += expect_string(qb::decode_path_name(true, {}), "cuda_graph", "graph decode route");
+    const auto results = sample_results();
+    const std::vector<qb::BenchTest> tests{{qb::TestKind::Prefill, 512, 0, "pp512"},
+                                           {qb::TestKind::Decode, 0, 3, "tg3"}};
+    ninfer::EngineOptions engine;
+    qb::BenchEnvironment env = sample_environment();
+    qb::record_decode_route(env, engine, tests);
+    failures += expect(env.use_cuda_graph, "an Engine running graphs");
+    failures += expect_u32(env.decode_graph_prime_output_tokens, 65, "graph prime outputs");
+    failures += expect(qb::format_table(env, results).find("decode_path=mtp_cuda_graph") !=
+                           std::string::npos,
+                       "table names the graph route");
+    qb::record_decode_route(env, engine, {{qb::TestKind::Prefill, 512, 0, "pp512"}});
+    failures += expect_u32(env.decode_graph_prime_output_tokens, 0, "prefill primes no graph");
+
+    engine.use_cuda_graph = false;
+    env                   = sample_environment();
+    qb::record_decode_route(env, engine, tests);
+    failures += expect(!env.use_cuda_graph && env.decode_graph_prime_output_tokens == 0,
+                       "an Engine without graphs primes none");
+    env.decode_graph_primed = false;
+    const std::string table = qb::format_table(env, results);
+    failures += expect(table.find("decode_path=mtp_eager graph_prime=n/a") != std::string::npos &&
+                           table.find("cuda_graph") == std::string::npos,
+                       "table names the eager route");
+    const Json report =
+        Json::parse(qb::format_json(env, "ninfer_bench --weights model.ninfer", results));
+    failures += expect(report.at("config").at("decode_path") == "mtp_eager" &&
+                           report.at("config").at("use_cuda_graph") == false &&
+                           report.at("config").at("decode_graph_prime").at("primed") == false,
+                       "JSON names the eager route");
+    const std::string csv = qb::format_csv(env, results);
+    failures += expect(csv.find(",mtp_eager,") != std::string::npos &&
+                           csv.find("cuda_graph,") == std::string::npos,
+                       "CSV names the eager route");
+    return failures;
+}
+
+
 // --config: the artifact as `weights`, and short spellings overriding a file's long keys.
 int test_launch_configuration() {
     int failures         = 0;
@@ -602,6 +646,7 @@ int main() {
     failures += test_measurement_contract();
     failures += test_report_contract();
     failures += test_human_and_csv_reports();
+    failures += test_engine_decode_route();
     failures += test_launch_configuration();
     return failures == 0 ? 0 : fail("ninfer_bench support contract failed");
 }

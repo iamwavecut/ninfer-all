@@ -55,6 +55,7 @@ struct Options {
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     bool kv_cache_automatic = false; // no --kv-dtype (EngineOptions::kv_cache_automatic)
+    LoopKvCache loop_kv     = LoopKvCache::PerPass; // Inkling 2: --loop-kv
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     VisionResidency vision_residency       = VisionResidency::Resident;

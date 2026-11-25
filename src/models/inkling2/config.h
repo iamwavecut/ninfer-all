@@ -17,6 +17,7 @@
 // projected, soft-capped and cut to the unpadded vocabulary.
 
 #include "artifact/schema.h"
+#include "models/dflash2/config.h"
 
 #include <cstdint>
 #include <utility>
@@ -124,10 +125,17 @@ struct DSparkConfig {
     std::vector<std::uint32_t> target_visits;
 };
 
+// The DFlash2 drafter trained for this model (the artifact's `dflash2` component, from incoai's
+// Inkling-2-Mini-DFlash2): five sliding-window layers over the anchor and seven masks, tapping
+// the inputs of visits 5, 23 and 41 and the final hidden after the final norm (tap position
+// visit_count(), as the release's capture names it), the target's normed token rows and its head.
+
 // Each throws artifact::ArtifactError naming the field that is missing, malformed or outside the
 // implemented geometry.
 [[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
 [[nodiscard]] VisionConfig parse_vision_config(const artifact::Json& value, const TextConfig& text);
 [[nodiscard]] DSparkConfig parse_dspark_config(const artifact::Json& value, const TextConfig& text);
+[[nodiscard]] dflash2::Config parse_dflash2_config(const artifact::Json& value,
+                                                   const TextConfig& text);
 
 } // namespace ninfer::models::inkling2
