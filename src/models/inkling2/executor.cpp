@@ -665,7 +665,7 @@ struct Executor::Impl {
         if (mw.gate_up_scale) { p.gate_up_scale = fp32(model, *mw.gate_up_scale, e); }
         if (mw.down_scale) { p.down_scale = fp32(model, *mw.down_scale, e); }
         if (model.expert_residency() == ExpertResidency::Device) {
-            if (model.mxfp8_experts()) {
+            if (model.mxfp8_bank(i, 0) != nullptr) {
                 p.mxfp8 = true;
                 const auto mxfp8_tables = [&](std::size_t r) {
                     const Mxfp8RankBank* bank = model.mxfp8_bank(i, r);

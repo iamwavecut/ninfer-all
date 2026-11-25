@@ -17,6 +17,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -92,8 +93,8 @@ struct CudaEventGuard {
 };
 
 struct Mxfp8LayerSpec {
-    std::string gate_up_name;
-    std::string down_name;
+    std::uint64_t gate_up_offset = 0;
+    std::uint64_t down_offset    = 0;
 };
 
 void free_mxfp8_bank(Mxfp8RankBank& b) noexcept {
@@ -114,11 +115,13 @@ void free_mxfp8_bank(Mxfp8RankBank& b) noexcept {
 
 std::vector<std::vector<Mxfp8RankBank>> build_mxfp8_banks(
     const artifact::Reader& reader, const DeviceContext& device,
-    const std::vector<Mxfp8LayerSpec>& layers, std::uint64_t e, std::uint64_t w,
+    const std::vector<std::optional<Mxfp8LayerSpec>>& layers, std::uint64_t e, std::uint64_t w,
     std::uint64_t h, const std::vector<std::uint64_t>& ends) {
     const std::size_t rank_count = ends.empty() ? 1 : ends.size() - 1;
     std::vector<std::vector<Mxfp8RankBank>> banks(layers.size());
-    for (auto& layer_ranks : banks) { layer_ranks.resize(rank_count); }
+    for (std::size_t li = 0; li < layers.size(); ++li) {
+        if (layers[li].has_value()) { banks[li].resize(rank_count); }
+    }
 
     const std::size_t gu_rows         = static_cast<std::size_t>(2 * w);
     const std::size_t gu_k            = static_cast<std::size_t>(h);
@@ -152,6 +155,7 @@ std::vector<std::vector<Mxfp8RankBank>> build_mxfp8_banks(
 
         int slot = 0;
         for (std::size_t li = 0; li < layers.size(); ++li) {
+            if (!layers[li].has_value()) { continue; }
             Mxfp8RankBank& bank       = banks[li][r];
             bank.device_ordinal       = dev;
             bank.expert_begin         = begin;
@@ -167,12 +171,10 @@ std::vector<std::vector<Mxfp8RankBank>> build_mxfp8_banks(
             mxfp8_cuda_check(cudaMalloc(&bank.down_codes, count * dn_code_stride), "malloc dn c");
             mxfp8_cuda_check(cudaMalloc(&bank.down_scales, count * dn_scale_stride), "malloc dn s");
 
-            const auto encode_bank = [&](const std::string& tensor_name, std::size_t rows,
+            const auto encode_bank = [&](std::uint64_t base_offset, std::size_t rows,
                                          std::size_t k, std::size_t bf16_bytes,
                                          std::size_t code_stride, std::size_t scale_stride,
                                          void* codes_dst, void* scales_dst) {
-                const std::uint64_t base_offset =
-                    reader.directory().tensor(reader.find(tensor_name)).offset;
                 for (std::uint32_t x = 0; x < count; ++x) {
                     const std::uint64_t off =
                         base_offset + std::uint64_t(begin + x) * bf16_bytes;
@@ -195,9 +197,9 @@ std::vector<std::vector<Mxfp8RankBank>> build_mxfp8_banks(
                 }
             };
 
-            encode_bank(layers[li].gate_up_name, gu_rows, gu_k, gu_bf16_bytes, gu_code_stride,
+            encode_bank(layers[li]->gate_up_offset, gu_rows, gu_k, gu_bf16_bytes, gu_code_stride,
                         gu_scale_stride, bank.gate_up_codes, bank.gate_up_scales);
-            encode_bank(layers[li].down_name, dn_rows, dn_k, dn_bf16_bytes, dn_code_stride,
+            encode_bank(layers[li]->down_offset, dn_rows, dn_k, dn_bf16_bytes, dn_code_stride,
                         dn_scale_stride, bank.down_codes, bank.down_scales);
         }
 
@@ -470,27 +472,50 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             "inkling2: --mxfp8-experts on requires device-resident experts");
     }
     bool want_mxfp8 = false;
+    std::vector<std::optional<Mxfp8LayerSpec>> mxfp8_layers;
     if (!offload && options.mxfp8_experts != ExpertsMxfp8::Off) {
-        bool all_bf16 = (h % 32 == 0) && (w % 32 == 0);
-        for (std::uint32_t i = 0; i < config.num_hidden_layers && all_bf16; ++i) {
-            const std::string m = "text/layer." + std::to_string(i) + "/moe/";
-            const auto gu_g     = reader.geometry(reader.find(m + "gate_up"));
-            const auto dn_g     = reader.geometry(reader.find(m + "down"));
-            all_bf16            = (gu_g.format == QType::BF16 && dn_g.format == QType::BF16 &&
-                        gu_g.layout == QuantLayout::Contiguous &&
-                        dn_g.layout == QuantLayout::Contiguous);
+        const auto resolve_bf16_bank = [&](const std::string& param_name, std::uint64_t rows,
+                                           std::uint64_t k, std::uint64_t& out_offset) -> bool {
+            const auto found = reader.directory().bindings.find(param_name);
+            if (found == reader.directory().bindings.end()) { return false; }
+            const auto& parts = found->second.parts;
+            if (parts.size() != 1) { return false; }
+            const auto& part     = parts.front();
+            const auto& geometry = reader.geometry(part.object);
+            if (geometry.format != QType::BF16 || geometry.shape.size() != 2 ||
+                geometry.shape[1] != k || part.begin % k != 0 ||
+                part.end - part.begin != e * rows * k) {
+                return false;
+            }
+            reader.validate_object(part.object);
+            out_offset = reader.directory().tensor(part.object).offset +
+                         part.begin * sizeof(std::uint16_t);
+            return true;
+        };
+        const bool dims_ok = (h % 32 == 0) && (w % 32 == 0);
+        std::size_t bf16_layer_count = 0;
+        if (dims_ok) {
+            mxfp8_layers.resize(config.num_hidden_layers);
+            for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
+                const std::string m = "text/layers/" + std::to_string(i) + "/moe/";
+                Mxfp8LayerSpec spec;
+                if (resolve_bf16_bank(m + "gate_up", 2 * w, h, spec.gate_up_offset) &&
+                    resolve_bf16_bank(m + "down", h, w, spec.down_offset)) {
+                    mxfp8_layers[i] = spec;
+                    ++bf16_layer_count;
+                }
+            }
         }
         if (options.mxfp8_experts == ExpertsMxfp8::On) {
-            if (!all_bf16) {
+            if (bf16_layer_count == 0) {
                 throw artifact::ArtifactError(
-                    "inkling2: --mxfp8-experts on requires contiguous BF16 routed experts with "
-                    "dimensions divisible by 32");
+                    "inkling2: --mxfp8-experts on requires at least one layer with BF16 routed "
+                    "experts and dimensions divisible by 32");
             }
             want_mxfp8 = true;
-        } else if (all_bf16) {
+        } else if (bf16_layer_count > 0) {
             const std::uint64_t total_expert_bf16 =
-                std::uint64_t(config.num_hidden_layers) * e * (2 * w * h + h * w) *
-                sizeof(std::uint16_t);
+                std::uint64_t(bf16_layer_count) * e * (2 * w * h + h * w) * sizeof(std::uint16_t);
             const std::uint64_t total_bytes  = reader.file_bytes();
             const std::uint64_t non_expert   = total_bytes > total_expert_bf16
                                                    ? (total_bytes - total_expert_bf16)
@@ -500,7 +525,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             for (std::size_t r = 0; r < rank_count; ++r) {
                 const std::uint64_t rank_experts = ends.empty() ? e : (ends[r + 1] - ends[r]);
                 const std::uint64_t rank_bf16 =
-                    std::uint64_t(config.num_hidden_layers) * rank_experts * (2 * w * h + h * w) *
+                    std::uint64_t(bf16_layer_count) * rank_experts * (2 * w * h + h * w) *
                     sizeof(std::uint16_t);
                 DeviceBinding bind(device.device_ids()[r]);
                 std::size_t free_b = 0, total_b = 0;
@@ -511,8 +536,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                 }
             }
         }
+        if (!want_mxfp8) { mxfp8_layers.clear(); }
     }
-    std::vector<Mxfp8LayerSpec> mxfp8_layers;
     const auto vector = [&](const std::string& name, artifact::Shape shape) {
         return b.direct(name, std::move(shape), QType::FP32);
     };
@@ -566,8 +591,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             moe.gate_up_scale = vector(m + "gate_up_scale", {e});
         }
         if (binder.contains(m + "down_scale")) { moe.down_scale = vector(m + "down_scale", {e}); }
-        if (want_mxfp8) {
-            mxfp8_layers.push_back({m + "gate_up", m + "down"});
+        if (want_mxfp8 && mxfp8_layers[i].has_value()) {
+            // Experts are already queued in mxfp8_layers and streamed directly after materialize().
         } else if (offload) {
             const auto residency = options.experts == ExpertResidency::Host
                                        ? artifact::Residency::PinnedOrFiles
