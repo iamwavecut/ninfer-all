@@ -33,6 +33,7 @@ GGML_BLOCKS = {
     39: (32, 17),
     40: (64, 36),
     42: (64, 18),
+    143: (128, 28),
 }
 
 
@@ -522,3 +523,17 @@ def test_an_mxfp4_scale_outside_binary16_is_refused(exponent):
     blocks[0, 0] = exponent
     with pytest.raises(ValueError, match="leave binary16"):
         gguf_blocks.mxfp4_as_q8_0(blocks)
+
+
+def test_rotated_prismml_gguf_is_refused(tmp_path):
+    # PrismML's ternary GGUFs store Hadamard-rotated rows; only bonsai2_27b_ternary adds the
+    # signs that restore them.
+    path = tmp_path / "prism.gguf"
+    write_gguf(
+        path,
+        {"general.architecture": "qwen35", "prism.hadamard.version": 1},
+        [("w", (1, 32), TYPE_Q8_0, bytes(34))],
+    )
+    with GGUFFile(path) as gguf:
+        with pytest.raises(ValueError, match="bonsai2_27b_ternary"):
+            gguf_blocks.validate(gguf)

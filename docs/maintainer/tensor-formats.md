@@ -45,7 +45,8 @@ The row-scaled floating-point weight formats are:
 | `fp8_e4m3fn_row_fp16` | E4M3FN, 8 bits/weight | one multiplier per logical row | IEEE binary16 |
 
 GGUF block formats keep ggml's quantized blocks byte for byte, so a GGUF tensor imports without
-decoding or requantizing:
+decoding or requantizing (`gguf_ptq1_0` is PrismML's ternary block: five base-3 digits a byte, one
+binary16 scale per 128 values, [ggml-org/llama.cpp#29672](https://github.com/ggml-org/llama.cpp/pull/29672)):
 
 | Canonical name | ggml type | Block values | Block bytes | Bits/weight |
 |---|---:|---:|---:|---:|
@@ -69,6 +70,7 @@ decoding or requantizing:
 | `gguf_iq1_m` | 29 | 256 | 56 | 1.75 |
 | `gguf_mxfp4` | 39 | 32 | 17 | 4.25 |
 | `gguf_nvfp4` | 40 | 64 | 36 | 4.50 |
+| `gguf_ptq1_0` | 143 | 128 | 28 | 1.75 |
 
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and

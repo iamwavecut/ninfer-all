@@ -58,11 +58,17 @@ enum class QType : std::uint16_t {
     // then 32 bytes of E2M1 codes; value j of sub-block s is the low nibble of code byte 8 s + j for
     // j < 8 and the high nibble of code byte 8 s + j - 8 otherwise.
     GGUF_NVFP4 = 33,
+    // PrismML's ternary PTQ1_0 blocks (GgufBlocks) of 128 values {-1, 0, 1} times one binary16 d:
+    // 24 bytes of five base-3 digits each (qs), 2 bytes of four (qh), then d. Byte i < 16 of qs holds
+    // values 16 t + i, byte i >= 16 values 80 + 8 t + i - 16 (digit t = 0..4), qh byte h values
+    // 120 + 2 t + h (t = 0..3); digit t of byte q is ((q * 3^t) mod 256) * 3 >> 8, value digit - 1.
+    GGUF_PTQ1_0 = 34,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
     return (format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0) ||
-           format == QType::GGUF_MXFP4 || format == QType::GGUF_NVFP4;
+           format == QType::GGUF_MXFP4 || format == QType::GGUF_NVFP4 ||
+           format == QType::GGUF_PTQ1_0;
 }
 
 struct GgufBlockShape {
@@ -96,6 +102,7 @@ struct GgufBlockShape {
         return {64, 18};
     case QType::GGUF_MXFP4: return {32, 17};
     case QType::GGUF_NVFP4: return {64, 36};
+    case QType::GGUF_PTQ1_0: return {128, 28};
     default: return {};
     }
 }

@@ -50,6 +50,7 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
             add(std::string("gguf_moe_matrix/") + format, {"async"});
         }
         add("gguf_moe_matrix/iq1_m", {"async"});
+        add("gguf_matrix/ptq1_0", {"async"}); // dense products only
     }
 
     if (!volta) {

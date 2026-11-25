@@ -113,6 +113,11 @@ GGUF_MXFP4 = GgufFormat("gguf_mxfp4", 39, 32, 17)
 # NVFP4): value j of sub-block s is the low nibble of byte 8 s + j for j < 8, the high nibble of
 # byte 8 s + j - 8 otherwise.
 GGUF_NVFP4 = GgufFormat("gguf_nvfp4", 40, 64, 36)
+# PrismML's ternary PTQ1_0 (ggml-org/llama.cpp#29672): 128 values {-1, 0, 1} * d a block, 24 bytes
+# of five base-3 digits, 2 bytes of four, then the binary16 d. Value 16 t + i (i < 16) is digit t of
+# byte i, 80 + 8 t + i digit t of byte 16 + i, 120 + 2 t + h digit t of byte 24 + h; digit t of byte
+# q is ((q * 3^t) mod 256) * 3 >> 8.
+GGUF_PTQ1_0 = GgufFormat("gguf_ptq1_0", 143, 128, 28)
 
 
 DIRECT_FORMATS = MappingProxyType(
@@ -152,6 +157,7 @@ GGUF_FORMATS = MappingProxyType(
             GGUF_Q2_0,
             GGUF_MXFP4,
             GGUF_NVFP4,
+            GGUF_PTQ1_0,
         )
     }
 )

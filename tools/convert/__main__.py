@@ -98,6 +98,10 @@ class SourceInputs(Mapping):
             )
         return self._sources[name]
 
+    def __contains__(self, name):
+        # Whether the source was given, without opening it (Mapping's default reads the item).
+        return name in self._sources or name in self._paths
+
     def __iter__(self):
         return iter(dict.fromkeys((*self._sources, *self._paths)))
 

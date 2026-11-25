@@ -32,5 +32,7 @@ void sigmoid_mul_hadamard_launch(const Tensor& gate, const Tensor& x, const Tens
                                  Tensor& out, cudaStream_t stream);
 void embedding_rotated_t2_launch(const Tensor& ids, const Weight& table, const Tensor& signs,
                                  Tensor& out, cudaStream_t stream);
+void embedding_rotated_ptq1_launch(const Tensor& ids, const Weight& table, const Tensor& signs,
+                                   Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

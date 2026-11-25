@@ -304,4 +304,83 @@ __launch_bounds__(WarpsPerCta* kWarpSize) __global__
     }
 }
 
+// Eight consecutive values from `first` (a multiple of 8) of a PTQ1_0 row (ggml-common.h
+// block_ptq1_0: 28-byte blocks of 128 values, qs[24], qh[2], a binary16 d), each d * (digit - 1)
+// with digit t of byte q ((q * 3^t) mod 256) * 3 >> 8. Value 16 t + i (i < 16) is digit t of qs[i],
+// 80 + 8 t + i digit t of qs[16 + i], 120 + 2 t + h digit t of qh[h]; the row starts on 4 bytes.
+__device__ __forceinline__ void ptq1_decode8(const std::uint8_t* row, int first, float (&v)[8]) {
+    const std::uint8_t* block = row + (first / 128) * 28;
+    const int e               = first % 128;
+    const float d             = __half2float(*reinterpret_cast<const __half*>(block + 26));
+    constexpr unsigned kPow3[5] = {1, 3, 9, 27, 81};
+    unsigned bytes[8];
+    unsigned t[8];
+    if (e < 120) {
+        const int at    = e < 80 ? e % 16 : 16;
+        const unsigned digit = e < 80 ? unsigned(e / 16) : unsigned((e - 80) / 8);
+        const auto* w   = reinterpret_cast<const std::uint32_t*>(block + at);
+        const std::uint32_t lo = w[0], hi = w[1];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            bytes[j] = ((j < 4 ? lo : hi) >> (8 * (j % 4))) & 0xFFU;
+            t[j]     = digit;
+        }
+    } else {
+        const std::uint32_t h = *reinterpret_cast<const std::uint16_t*>(block + 24);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            bytes[j] = (h >> (8 * (j % 2))) & 0xFFU;
+            t[j]     = unsigned(j / 2);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const unsigned digit = (((bytes[j] * kPow3[t[j]]) & 0xFFU) * 3U) >> 8;
+        v[j]                 = d * (float(digit) - 1.0f);
+    }
+}
+
+// Rows of a Hadamard-rotated PTQ1_0 table restored to the primal basis, as
+// embed_gather_t2_hadamard_kernel restores a T2 table's: one warp per (token, 1024-block), the
+// dequantised values entering the butterfly unrounded.
+template <int WarpsPerCta>
+__launch_bounds__(WarpsPerCta* kWarpSize) __global__
+    void embed_gather_ptq1_hadamard_kernel(const std::int32_t* __restrict__ ids,
+                                           const std::uint8_t* __restrict__ table,
+                                           std::int64_t row_bytes,
+                                           const __nv_bfloat16* __restrict__ signs,
+                                           __nv_bfloat16* __restrict__ out, std::int64_t items,
+                                           std::int32_t width) {
+    const int lane          = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp          = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::int64_t item = static_cast<std::int64_t>(blockIdx.x) * WarpsPerCta + warp;
+    if (item >= items) { return; }
+    const std::int32_t blocks_per_row = width / kHadamardTransformBlock;
+    const std::int64_t token          = item / blocks_per_row;
+    const int block                   = static_cast<int>(item - token * blocks_per_row);
+    const std::uint8_t* row           = table + static_cast<std::int64_t>(ids[token]) * row_bytes;
+    const int block_base              = block * kHadamardTransformBlock;
+
+    float v[kHadamardTransformLaneVectors][8];
+#pragma unroll
+    for (int r = 0; r < kHadamardTransformLaneVectors; ++r) {
+        ptq1_decode8(row, block_base + hadamard_lane_offset(lane, r), v[r]);
+    }
+
+    hadamard_1024_butterfly(v, lane);
+
+    const __nv_bfloat16* block_signs = signs + block_base;
+    __nv_bfloat16* out_block         = out + token * width + block_base;
+#pragma unroll
+    for (int r = 0; r < kHadamardTransformLaneVectors; ++r) {
+        float s[8];
+        hadamard_unpack8(load_vec<uint4>(block_signs + hadamard_lane_offset(lane, r)), s);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            v[r][j] = __fmul_rn(v[r][j], kHadamardTransformNormalizer) * s[j];
+        }
+        store_vec(out_block + hadamard_lane_offset(lane, r), hadamard_pack8(v[r]));
+    }
+}
+
 } // namespace ninfer::ops

@@ -24,73 +24,111 @@ drafts with the tokens committed per verify round in brackets.
 
 | Card | Memory | Build | Power limit | Measured on |
 |---|---:|---|---|---|
-| RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [DeepSeek](deepseek-v41.md#measurements) |
+| RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [Bonsai 2.5](performance/bonsai-2-5-2026-11.md) |
 | RTX PRO 6000 Blackwell Server Edition | 96 GB | `120a` | 600 W | [GGUF across cards](performance/gguf-cards-2026-11.md) |
-| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [GGUF across cards](performance/gguf-cards-2026-11.md) |
+| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [GGUF across cards](performance/gguf-cards-2026-11.md), [Bonsai 2.5](performance/bonsai-2-5-2026-11.md) |
 | RTX 5070 Ti | 16 GB | `120a` | 300 W | [field report](performance/field-reports.md#rtx-5070-ti-windows-11) |
 | RTX 5060 Ti, one, two and four | 16 GB each | `120a` | 180 W | [field report](performance/field-reports.md#rtx-5060-ti-two-and-four-cards), [GGUF across cards](performance/gguf-cards-2026-11.md) |
-| RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md), [GGUF across cards](performance/gguf-cards-2026-11.md) |
+| RTX 4090 | 24 GB | `89` | 450 W; 500 W boards for Flint | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements), [Flint](flint.md#measurements), [DeepSeek](deepseek-v41.md#measurements), [field reports](performance/field-reports.md), [GGUF across cards](performance/gguf-cards-2026-11.md), [Bonsai 2.5](performance/bonsai-2-5-2026-11.md) |
 | L40S | 48 GB | `89` | 350 W | [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF across cards](performance/gguf-cards-2026-11.md) |
-| A100-SXM4-80GB, A100-SXM4-40GB | 80 GB, 40 GB | `80` | 400 W | [GGUF across cards](performance/gguf-cards-2026-11.md) |
+| A100-SXM4-80GB, A100-SXM4-40GB | 80 GB, 40 GB | `80` | 400 W | [GGUF across cards](performance/gguf-cards-2026-11.md), [Bonsai 2.5](performance/bonsai-2-5-2026-11.md) |
 | RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
 | A40 | 48 GB | `86` | 300 W | [Flint](flint.md#measurements), [Edge0](edge0.md#measurements) |
 | RTX 3090 | 24 GB | `86` | 300 to 420 W by campaign | every page |
 | RTX 3060 | 12 GB | `86`, the image | 170 W | [small cards](performance/small-cards-2026-10.md) |
 | RTX 3060 Ti | 8 GB | `86`, the image | 200 W | [small cards](performance/small-cards-2026-10.md) |
 | TITAN RTX | 24 GB | `75` | 280 W | [TITAN RTX](performance/titan-rtx-2026-10.md) |
+| Quadro RTX 6000 | 24 GB | `75` | 250 W | [Bonsai 2.5](performance/bonsai-2-5-2026-11.md) |
 | RTX 2080 Ti | 11 GB | `75`, the image | 250 W | [small cards](performance/small-cards-2026-10.md) |
 | Tesla T10, two | 16 GB each | `75` | | [field report](performance/field-reports.md#tesla-t10-two-cards) |
 | Tesla V100-SXM2-16GB | 16 GB | `70` | 300 W | [Tesla V100](performance/tesla-v100-2026-10.md) |
 | Tesla V100-SXM2-32GB | 32 GB | `70` | 300 W | [32 GB follow-up](performance/tesla-v100-2026-10.md#follow-up-on-the-32-gb-and-16-gb-cards-15-16-october) |
+| Tesla V100-FHHL-16GB | 16 GB | `70` | 150 W | [Bonsai 2.5](performance/bonsai-2-5-2026-11.md) |
 
 ## Largest context
 
 The largest `--max-context` (= `--kv-capacity`, one request) the server starts with, bisected in
 4,096-token steps, with `--gdn-state-fp16` and `--rope-yarn` past 262,144; 1,048,576 is the
-engine's ceiling, and the RTX PRO 6000 starts every configuration there with at least 50 GiB free.
-On the 8 to 12 GB cards a step also had to answer one request. Each cell gives the window without
-a drafter / with MTP 3 / with DFlash2 5:
+engine's ceiling, which the RTX PRO 6000 reaches in every configuration. On the 8 to 12 GB cards a
+step also had to answer one request. Each cell gives the window without a drafter / with MTP 3 /
+with DFlash2 5 (Ternary Bonsai 2.5 has no DFlash2 adapter):
 
 | Model | KV | RTX PRO 6000 | RTX 5090 | RTX 4090 | RTX 3090 | Tesla V100 | RTX 3060 | RTX 2080 Ti | RTX 3060 Ti |
 |---|---|---|---|---|---|---|---|---|---|
-| Ternary Bonsai 2 27B | `rk8v4` | 1,048,576 / 1,048,576 / 1,048,576 | 978,944 / 901,120 / 901,120 | 659,456 / 602,112 / 581,632 | 663,552 / 606,208 / 585,728 | | | | |
-| Ternary Bonsai 2 27B | `rk4v4` | 1,048,576 / 1,048,576 / 1,048,576 | 1,048,576 / 1,048,576 / 1,048,576 | 958,464 / 876,544 / 831,488 | 970,752 / 884,736 / 839,680 | 499,712 / 421,888 / 344,064 | 266,240 | 200,704 / 143,360 | 24,576 / does not fit |
-| Ternary Bonsai 2 27B | `rk4v4-e8` | 1,048,576 | 1,048,576 | 958,464 | 970,752 | | | | |
-| Ternary Bonsai 2 27B | `int8` | | | | | | | 106,496 | |
-| Qwen3.8-27B | `rk8v4` | 1,048,576 / 1,048,576 / 1,048,576 | 598,016 / 544,768 / 491,520 | 278,528 / 241,664 / 167,936 | 286,720 / 249,856 / 176,128 | | | | |
-| Qwen3.8-27B | `rk4v4` | 1,048,576 / 1,048,576 / 1,048,576 | 872,448 / 794,624 / 716,800 | 405,504 / 356,352 / 245,760 | 417,792 / 364,544 / 258,048 | | | | |
+| Ternary Bonsai 2 27B | `rk8v4` | 1,048,576 / 1,048,576 / 1,048,576 | 974,848 / 884,736 / 872,448 | 655,360 / 585,728 / 548,864 | 663,552 / 589,824 / 557,056 | | | | |
+| Ternary Bonsai 2 27B | `rk4v4` | 1,048,576 / 1,048,576 / 1,048,576 | 1,048,576 / 1,048,576 / 1,048,576 | 958,464 / 851,968 / 802,816 | 966,656 / 864,256 / 815,104 | 499,712 / 421,888 / 344,064 | 266,240 | 196,608 / 139,264 | 24,576 / does not fit |
+| Ternary Bonsai 2 27B | `rk4v4-e8` | 1,048,576 | 1,048,576 | 958,464 | 966,656 | | | | |
+| Ternary Bonsai 2 27B | `int8` | | | | | | | 102,400 | |
+| Ternary Bonsai 2.5 27B PTQ1_0 | `rk8v4` | 1,048,576 / 1,048,576 | 1,019,904 / 937,984 | 700,416 / 634,880 | 708,608 / 643,072 | | | | |
+| Ternary Bonsai 2.5 27B PTQ1_0 | `rk4v4` | 1,048,576 / 1,048,576 | 1,048,576 / 1,048,576 | 1,019,904 / 925,696 | 1,032,192 / 933,888 | | | | |
+| Ternary Bonsai 2.5 27B PQ2_0 | `rk8v4` | 1,048,576 / 1,048,576 | 970,752 / 892,928 | 655,360 / 593,920 | 663,552 / 598,016 | | | | |
+| Ternary Bonsai 2.5 27B PQ2_0 | `rk4v4` | 1,048,576 / 1,048,576 | 1,048,576 / 1,048,576 | 958,464 / 864,256 | 966,656 / 872,448 | | | | |
+| Qwen3.8-27B | `rk8v4` | 1,048,576 / 1,048,576 / 1,048,576 | 598,016 / 524,288 / 454,656 | 278,528 / 221,184 / 131,072 | 286,720 / 249,856 / 176,128 | | | | |
+| Qwen3.8-27B | `rk4v4` | 1,048,576 / 1,048,576 / 1,048,576 | 872,448 / 761,856 / 663,552 | 405,504 / 323,584 / 192,512 | 417,792 / 364,544 / 258,048 | | | | |
 | Qwen3.8-27B | `rk4v4-e8` | 1,048,576 | 872,448 | 405,504 | 417,792 | | | | |
+| Qwen3.8-27B IQ3_S | `rk8v4` | | | 413,696 (MTP 3) | | | | | |
 | Qwen3.8-27B IQ3_S | `rk4v4` | | | | | 241,664 / 176,128 / 32,768 | 8,192 / does not fit | | |
 | Gemma 4 26B-A4B Q4_0 | `bf16` | | | | | 61,440 / 28,672 (MTP 2) | | | |
 | Gemma 4 31B Q4_0 | `bf16` | | | | 101,376 / 87,040 (MTP 2) | | | | |
+
+The cells are the November 2026 build's except the Tesla V100 column, the RTX 3090's Qwen3.8-27B
+cells, Qwen3.8-27B's RTX PRO 6000 cells, the drafter cells of the RTX 3060 and RTX 3060 Ti and the
+Gemma 4 rows, which earlier builds measured; the rentals for a recheck had ended. Against the
+September measurements of the RTX PRO 6000, 5090, 4090 and 3090 a window is 0 to 4,096 tokens
+smaller without a drafter and 16,384 to 53,248 smaller with one; the cards measured in October
+lose at most 4,096. Three changes since September hold the memory, measured on an RTX 4090 with
+`rk8v4`:
+
+- An explicit `--kv-capacity` leaves 64 MiB of each device free for the kernels CUDA loads at their
+  first launch ([context and memory](cli.md#context-and-memory)).
+- Drafts go through the artifact's proposal head, 0.33 GiB of Qwen3.8-27B's weights and 0.16 GiB of
+  Bonsai 2's; `--full-draft-head` omits it.
+- N-gram copy drafting beside a drafter has graph sets of its own: the CUDA graph allowance is 236
+  MiB instead of 86 with MTP 3 and 960 MiB instead of 480 with DFlash2 5; `--ngram-draft-tokens 0`
+  omits it.
+
+With `--full-draft-head --ngram-draft-tokens 0` Qwen3.8-27B starts on the RTX 4090 at September's
+241,664 tokens with MTP 3 and 167,936 with DFlash2 5; Bonsai 2 falls 48 MiB (MTP 3) and 38 MiB
+(DFlash2 5) short of its September windows, less than the 64 MiB reserve.
 
 The Gemma 4 31B row was bisected in 1,024-token steps ([its section](gemma4.md#gemma-4-31b)).
 Gemma 4's windows at eight sequences on an RTX 3090 are in [its section](#gemma-4-26b-a4b). An RTX
 5070 Ti that also drives a desktop started IQ3_S with `rk4v4-e8` at 122,880 tokens without a
 drafter and 98,304 with MTP 3 ([field report](performance/field-reports.md#rtx-5070-ti-windows-11)).
 
-Filled to that window without a drafter (one request: a document with three codes at 33, 66 and
-90%, asked back in order):
+Filled to the window of the build that ran it, without a drafter (one request: a document with
+three codes at 33, 66 and 90%, asked back in order); Ternary Bonsai 2 and Qwen3.8-27B ran on the
+September build, whose windows were up to 4,096 tokens larger, and the RTX 3090's PQ2_0 row on the
+November build before the 64 MiB reserve:
 
 | Card | Model | KV | Tokens | Codes found | Prompt time | Decode after it, tok/s |
 |---|---|---|---:|---:|---:|---:|
 | RTX PRO 6000 | Ternary Bonsai 2 27B | `rk4v4` | 1,048,576 | 2/3 | 910 s | 55.3 |
+| RTX PRO 6000 | Ternary Bonsai 2.5 27B PTQ1_0 | `rk4v4` | 1,048,576 | 3/3 | 884 s | 53.7 |
+| RTX PRO 6000 | Ternary Bonsai 2.5 27B PQ2_0 | `rk4v4` | 1,048,576 | 3/3 | 844 s | 51.8 |
 | RTX PRO 6000 | Qwen3.8-27B | `rk4v4` | 1,048,576 | 2/3 | 999 s | 42.9 |
 | RTX 5090 | Ternary Bonsai 2 27B | `rk4v4` | 1,048,576 | 2/3 | 937 s | 56.2 |
 | RTX 5090 | Ternary Bonsai 2 27B | `rk8v4` | 978,944 | 3/3 | 772 s | 46.9 |
+| RTX 5090 | Ternary Bonsai 2.5 27B PTQ1_0 | `rk4v4` | 1,048,576 | 3/3 | 876 s | 54.1 |
+| RTX 5090 | Ternary Bonsai 2.5 27B PQ2_0 | `rk4v4` | 1,048,576 | 3/3 | 829 s | 52.2 |
 | RTX 5090 | Qwen3.8-27B | `rk4v4` | 872,448 | 3/3 | 755 s | 47.6 |
 | RTX 5090 | Qwen3.8-27B | `rk8v4` | 598,016 | 3/3 | 378 s | 49.1 |
 | RTX 4090 | Ternary Bonsai 2 27B | `rk4v4` | 958,464 | 3/3 | 991 s | 30.9 |
 | RTX 4090 | Ternary Bonsai 2 27B | `rk8v4` | 659,456 | 3/3 | 484 s | 32.9 |
+| RTX 4090 | Ternary Bonsai 2.5 27B PTQ1_0 | `rk4v4` | 1,019,904 | 3/3 | 1,077 s | 30.1 |
+| RTX 4090 | Ternary Bonsai 2.5 27B PQ2_0 | `rk4v4` | 958,464 | 3/3 | 914 s | 30.5 |
 | RTX 4090 | Qwen3.8-27B | `rk4v4` | 405,504 | 3/3 | 293 s | 35.4 |
 | RTX 4090 | Qwen3.8-27B | `rk8v4` | 278,528 | 3/3 | 166 s | 36.8 |
 | RTX 3090 | Ternary Bonsai 2 27B | `rk4v4` | 970,752 | 3/3 | 2,359 s | 17.7 |
 | RTX 3090 | Ternary Bonsai 2 27B | `rk8v4` | 663,552 | 3/3 | 1,137 s | 24.4 |
+| RTX 3090 | Ternary Bonsai 2.5 27B PTQ1_0 | `rk4v4` | 1,032,192 | 3/3 | 2,435 s | 17.9 |
+| RTX 3090 | Ternary Bonsai 2.5 27B PQ2_0 | `rk4v4` | 970,752 | 3/3 | 2,067 s | 18.5 |
 | RTX 3090 | Qwen3.8-27B | `rk4v4` | 417,792 | 3/3 | 644 s | 23.8 |
 | RTX 3090 | Qwen3.8-27B | `rk8v4` | 286,720 | 3/3 | 353 s | 31.0 |
 
-At 1,048,576 tokens both cards miss the code at 90%, with `--rope-yarn` and with plain RoPE alike.
-Up to the 262,144-token window every card and KV format found all three codes
+At 1,048,576 tokens Ternary Bonsai 2 and Qwen3.8-27B miss the code at 90% on both cards, with
+`--rope-yarn` and with plain RoPE alike; both Bonsai 2.5 artifacts find all three. Up to the
+262,144-token window every card and KV format found all three codes
 ([needles](performance/reference-2026-09.md)).
 
 ## Ternary Bonsai 2 27B
@@ -315,6 +353,161 @@ The same with 256-token answers, `--max-context 8192 --kv-capacity 65536`, one r
 
 Against `rk8v4`'s 5.631 the reference measurement gives 5.650 for `rk4v4-e8` and 5.820 for
 `rk2v4-e8`.
+
+## Ternary Bonsai 2.5 27B
+
+PrismML's second ternary release in its two artifacts, PTQ1_0 (1.75 bits per weight) and PQ2_0
+(2.125), each with PrismML's MTP head. The setup, the analysis and the PTQ1_0 kernels' timings are
+on [Ternary Bonsai 2.5, November 2026](performance/bonsai-2-5-2026-11.md); the windows are in
+[Largest context](#largest-context).
+
+### Decode by depth
+
+Server, one request, `rk8v4`, window 262,144 tokens; decode tok/s after a cold document of that many
+tokens, and VRAM held by the idle server:
+
+| Card | Artifact | Drafter | VRAM | short chat | 1,024 | 8,192 | 32,768 | 65,536 | 131,072 | 196,608 | 261,120 |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| RTX PRO 6000 | PTQ1_0 | none | 13.6 GiB | 187.9 | 186.9 | 179.2 | 159.4 | 146.2 | 125.9 | 111.0 | 99.6 |
+| RTX PRO 6000 | PTQ1_0 | MTP 3 | 14.4 GiB | 320.4 | 306.6 | 254.2 | 256.4 | 274.1 | 192.2 | 188.1 | 173.6 |
+| RTX PRO 6000 | PQ2_0 | none | 14.7 GiB | 167.2 | 166.2 | 160.0 | 143.9 | 133.4 | 116.3 | 103.7 | 93.6 |
+| RTX PRO 6000 | PQ2_0 | MTP 3 | 15.6 GiB | 348.6 | 326.8 | 274.2 | 270.7 | 265.0 | 198.6 | 203.4 | 169.8 |
+| RTX 5090 | PTQ1_0 | none | 13.4 GiB | 188.9 | 187.7 | 181.2 | 167.8 | 146.7 | 127.0 | 112.3 | 100.8 |
+| RTX 5090 | PTQ1_0 | MTP 3 | 14.2 GiB | 324.0 | 304.6 | 255.9 | 261.3 | 266.7 | 188.8 | 201.3 | 168.0 |
+| RTX 5090 | PQ2_0 | none | 14.5 GiB | 166.1 | 165.2 | 160.2 | 150.0 | 132.6 | 116.2 | 104.0 | 94.0 |
+| RTX 5090 | PQ2_0 | MTP 3 | 15.4 GiB | 344.9 | 314.7 | 272.4 | 288.6 | 278.6 | 200.4 | 195.4 | 170.0 |
+| RTX 4090 | PTQ1_0 | none | 13.4 GiB | 125.6 | 124.5 | 120.9 | 111.7 | 101.4 | 85.8 | 74.3 | 62.8 |
+| RTX 4090 | PTQ1_0 | MTP 3 | 14.2 GiB | 202.8 | 188.0 | 157.4 | 170.3 | 161.9 | 120.2 | 120.7 | 99.8 |
+| RTX 4090 | PQ2_0 | none | 14.4 GiB | 109.2 | 108.6 | 106.1 | 98.6 | 90.6 | 77.9 | 68.4 | 58.5 |
+| RTX 4090 | PQ2_0 | MTP 3 | 15.3 GiB | 232.1 | 217.3 | 213.1 | 187.8 | 181.6 | 140.7 | 127.9 | 110.0 |
+| RTX 3090 | PTQ1_0 | none | 13.2 GiB | 94.1 | 93.5 | 90.8 | 84.7 | 77.8 | 67.1 | 58.5 | 52.4 |
+| RTX 3090 | PTQ1_0 | MTP 3 | 14.0 GiB | 149.8 | 139.5 | 125.9 | 132.2 | 123.0 | 89.7 | 91.8 | 76.3 |
+| RTX 3090 | PQ2_0 | none | 14.3 GiB | 92.8 | 92.3 | 89.8 | 83.7 | 77.1 | 66.5 | 58.0 | 52.0 |
+| RTX 3090 | PQ2_0 | MTP 3 | 15.1 GiB | 189.4 | 174.2 | 147.9 | 151.7 | 146.1 | 111.6 | 100.9 | 94.9 |
+
+### Prompt time by depth
+
+Seconds to the first token after the same documents:
+
+| Card | Artifact | Drafter | 1,024 | 8,192 | 32,768 | 65,536 | 131,072 | 196,608 | 261,120 |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| RTX PRO 6000 | PTQ1_0 | none | 0.16 | 1.29 | 5.7 | 12.8 | 31.0 | 54.9 | 83.6 |
+| RTX PRO 6000 | PTQ1_0 | MTP 3 | 0.17 | 1.36 | 6.0 | 13.4 | 32.6 | 57.1 | 87.0 |
+| RTX PRO 6000 | PQ2_0 | none | 0.13 | 1.02 | 4.6 | 10.5 | 26.5 | 47.5 | 73.4 |
+| RTX PRO 6000 | PQ2_0 | MTP 3 | 0.13 | 1.04 | 4.7 | 10.8 | 27.4 | 49.5 | 76.7 |
+| RTX 5090 | PTQ1_0 | none | 0.16 | 1.30 | 5.7 | 12.7 | 30.7 | 54.3 | 82.7 |
+| RTX 5090 | PTQ1_0 | MTP 3 | 0.17 | 1.35 | 5.9 | 13.2 | 32.2 | 56.7 | 86.2 |
+| RTX 5090 | PQ2_0 | none | 0.13 | 1.01 | 4.5 | 10.5 | 26.5 | 47.7 | 73.5 |
+| RTX 5090 | PQ2_0 | MTP 3 | 0.13 | 1.01 | 4.5 | 10.4 | 26.6 | 48.4 | 75.4 |
+| RTX 4090 | PTQ1_0 | none | 0.20 | 1.68 | 7.4 | 16.4 | 39.5 | 69.3 | 104.9 |
+| RTX 4090 | PTQ1_0 | MTP 3 | 0.21 | 1.72 | 7.5 | 16.9 | 40.8 | 71.8 | 109.2 |
+| RTX 4090 | PQ2_0 | none | 0.15 | 1.25 | 5.6 | 13.0 | 32.6 | 58.9 | 91.3 |
+| RTX 4090 | PQ2_0 | MTP 3 | 0.15 | 1.28 | 5.8 | 13.3 | 33.8 | 61.4 | 95.4 |
+| RTX 3090 | PTQ1_0 | none | 0.47 | 3.8 | 16.5 | 36.7 | 88.2 | 154.1 | 233.2 |
+| RTX 3090 | PTQ1_0 | MTP 3 | 0.47 | 3.8 | 16.9 | 37.6 | 90.7 | 158.7 | 240.6 |
+| RTX 3090 | PQ2_0 | none | 0.33 | 2.7 | 12.1 | 28.0 | 70.8 | 128.2 | 198.9 |
+| RTX 3090 | PQ2_0 | MTP 3 | 0.33 | 2.7 | 12.4 | 28.9 | 73.4 | 133.6 | 208.0 |
+
+### Draft acceptance
+
+MTP 3 with the rows above:
+
+| Card | Artifact | short chat | 1,024 | 8,192 | 32,768 | 65,536 | 131,072 | 196,608 | 261,120 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| RTX PRO 6000 | PTQ1_0 | 0.47 (2.42) | 0.47 (2.40) | 0.35 (2.04) | 0.41 (2.22) | 0.55 (2.64) | 0.38 (2.14) | 0.44 (2.33) | 0.45 (2.35) |
+| RTX PRO 6000 | PQ2_0 | 0.49 (2.48) | 0.47 (2.41) | 0.36 (2.06) | 0.40 (2.19) | 0.48 (2.42) | 0.36 (2.07) | 0.47 (2.41) | 0.41 (2.22) |
+| RTX 5090 | PTQ1_0 | 0.50 (2.49) | 0.47 (2.41) | 0.36 (2.07) | 0.43 (2.28) | 0.54 (2.60) | 0.37 (2.10) | 0.49 (2.47) | 0.42 (2.27) |
+| RTX 5090 | PQ2_0 | 0.49 (2.46) | 0.44 (2.31) | 0.36 (2.06) | 0.45 (2.35) | 0.49 (2.46) | 0.37 (2.12) | 0.43 (2.29) | 0.40 (2.21) |
+| RTX 4090 | PTQ1_0 | 0.49 (2.46) | 0.45 (2.37) | 0.34 (2.02) | 0.45 (2.35) | 0.47 (2.40) | 0.35 (2.05) | 0.44 (2.32) | 0.42 (2.25) |
+| RTX 4090 | PQ2_0 | 0.51 (2.52) | 0.49 (2.47) | 0.48 (2.46) | 0.45 (2.35) | 0.50 (2.47) | 0.41 (2.24) | 0.44 (2.32) | 0.45 (2.35) |
+| RTX 3090 | PTQ1_0 | 0.49 (2.46) | 0.45 (2.35) | 0.40 (2.18) | 0.49 (2.45) | 0.49 (2.46) | 0.36 (2.09) | 0.47 (2.40) | 0.41 (2.24) |
+| RTX 3090 | PQ2_0 | 0.50 (2.50) | 0.46 (2.38) | 0.37 (2.09) | 0.44 (2.31) | 0.49 (2.45) | 0.41 (2.23) | 0.44 (2.32) | 0.49 (2.46) |
+
+### Several requests at once
+
+Server, total generated tok/s when N short-chat requests of 512 tokens arrive together, `rk8v4`,
+`--max-concurrency 8 --max-context 16384 --kv-capacity 131072`:
+
+| Card | Artifact | Drafter | 1 | 2 | 4 | 8 |
+|---|---|---|---:|---:|---:|---:|
+| RTX PRO 6000 | PTQ1_0 | none | 186.3 | 304.6 | 567.9 | 986.8 |
+| RTX PRO 6000 | PTQ1_0 | MTP 3 | 277.0 | 500.5 | 809.0 | 1,139.3 |
+| RTX PRO 6000 | PQ2_0 | none | 166.3 | 323.1 | 616.8 | 1,079.8 |
+| RTX PRO 6000 | PQ2_0 | MTP 3 | 306.5 | 578.8 | 975.5 | 1,237.1 |
+| RTX 5090 | PTQ1_0 | none | 187.4 | 300.1 | 553.0 | 917.0 |
+| RTX 5090 | PTQ1_0 | MTP 3 | 279.9 | 503.8 | 704.2 | 1,106.8 |
+| RTX 5090 | PQ2_0 | none | 165.2 | 322.1 | 609.4 | 1,050.8 |
+| RTX 5090 | PQ2_0 | MTP 3 | 295.4 | 566.1 | 915.2 | 1,156.5 |
+| RTX 4090 | PTQ1_0 | none | 124.9 | 185.6 | 349.1 | 588.1 |
+| RTX 4090 | PTQ1_0 | MTP 3 | 177.1 | 322.0 | 530.1 | 850.6 |
+| RTX 4090 | PQ2_0 | none | 108.6 | 211.4 | 394.1 | 670.6 |
+| RTX 4090 | PQ2_0 | MTP 3 | 203.6 | 384.6 | 645.0 | 943.4 |
+| RTX 3090 | PTQ1_0 | none | 93.6 | 141.8 | 258.0 | 411.6 |
+| RTX 3090 | PTQ1_0 | MTP 3 | 131.5 | 221.9 | 359.4 | 461.9 |
+| RTX 3090 | PQ2_0 | none | 92.0 | 176.8 | 326.3 | 551.9 |
+| RTX 3090 | PQ2_0 | MTP 3 | 159.8 | 301.5 | 454.1 | 575.5 |
+
+### Against Bonsai 2 and PrismML's runtime
+
+Short chat on the same host and build, decode tok/s; with MTP, the acceptance and the tokens per
+verify round in brackets. Bonsai 2 runs its own artifact with ProCreations' MTP head:
+
+| Card | Bonsai 2: none | MTP 3 | PQ2_0: none | MTP 3 | PTQ1_0: none | MTP 3 |
+|---|---:|---:|---:|---:|---:|---:|
+| RTX PRO 6000 | 167.1 | 324.8 (0.47, 2.41) | 167.2 | 348.6 (0.49, 2.48) | 187.9 | 320.4 (0.47, 2.42) |
+| RTX 5090 | 166.5 | 329.2 (0.48, 2.45) | 166.1 | 344.9 (0.49, 2.46) | 188.9 | 324.0 (0.50, 2.49) |
+| RTX 4090 | 109.2 | 206.7 (0.45, 2.35) | 109.2 | 232.1 (0.51, 2.52) | 125.6 | 202.8 (0.49, 2.46) |
+| RTX 3090 | 92.8 | 175.5 (0.48, 2.43) | 92.8 | 189.4 (0.50, 2.50) | 94.1 | 149.8 (0.49, 2.46) |
+
+PrismML's llama.cpp fork (`prism-b12178-03ec600`) on the release's `-mtp` GGUFs with the settings of
+PrismML's CUDA preset for each card, F16 KV, a 16,384-token window, against NInfer at that window
+(on the RTX PRO 6000 and RTX 5090) and at the 262,144 of the rows above:
+
+Without a drafter:
+
+| Card | Artifact | PrismML, 16,384 | NInfer, 16,384 | NInfer, 262,144 |
+|---|---|---:|---:|---:|
+| RTX PRO 6000 | PTQ1_0 | 174.3 | 187.9 | 187.9 |
+| RTX PRO 6000 | PQ2_0 | 150.2 | 167.3 | 167.2 |
+| RTX 5090 | PTQ1_0 | 170.7 | 189.3 | 188.9 |
+| RTX 5090 | PQ2_0 | 149.3 | 166.7 | 166.1 |
+| RTX 4090 | PTQ1_0 | 114.0 | — | 125.6 |
+| RTX 4090 | PQ2_0 | 99.0 | — | 109.2 |
+| RTX 3090 | PTQ1_0 | 95.3 | — | 94.1 |
+| RTX 3090 | PQ2_0 | 82.0 | — | 92.8 |
+
+With MTP 3:
+
+| Card | Artifact | PrismML, 16,384 | NInfer, 16,384 | NInfer, 262,144 |
+|---|---|---:|---:|---:|
+| RTX PRO 6000 | PTQ1_0 | 293.4 (0.54, 2.60) | 334.6 (0.51, 2.52) | 320.4 (0.47, 2.42) |
+| RTX PRO 6000 | PQ2_0 | 266.2 (0.55, 2.63) | 355.1 (0.51, 2.54) | 348.6 (0.49, 2.48) |
+| RTX 5090 | PTQ1_0 | 268.5 (0.56, 2.66) | 334.4 (0.52, 2.55) | 324.0 (0.50, 2.49) |
+| RTX 5090 | PQ2_0 | 232.7 (0.54, 2.61) | 350.4 (0.50, 2.49) | 344.9 (0.49, 2.46) |
+| RTX 4090 | PTQ1_0 | 188.2 (0.55, 2.64) | — | 202.8 (0.49, 2.46) |
+| RTX 4090 | PQ2_0 | 183.5 (0.57, 2.70) | — | 232.1 (0.51, 2.52) |
+| RTX 3090 | PTQ1_0 | 157.7 (0.58, 2.71) | — | 149.8 (0.49, 2.46) |
+| RTX 3090 | PQ2_0 | 110.3 (0.56, 2.66) | — | 189.4 (0.50, 2.50) |
+
+### Older cards
+
+Short chat with `rk8v4` over a 32,768-token window, each card on its built-in device profile:
+
+| Card | Build | Power limit | PTQ1_0: none | MTP 3 | PQ2_0: none | MTP 3 | PTQ1_0 perplexity |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Tesla V100-FHHL-16GB | `70`, CUDA 12.9 | 150 W | 64.0 | 62.0 | 25.6 | 41.0 | — |
+| Quadro RTX 6000 | `75`, CUDA 13.4 | 250 W | 68.1 | 84.7 (0.48, 2.43) | 54.9 | 115.5 (0.51, 2.52) | 6.6700 |
+| A100-SXM4-40GB | `80`, CUDA 13.4 | 400 W | 114.1 | 149.6 (0.50, 2.49) | 106.5 | 219.7 (0.51, 2.51) | 6.6658 |
+
+The Tesla V100's acceptance and perplexity were not pulled before its rental stopped, and its PQ2_0
+rate, a third of Bonsai 2's on a Tesla V100-SXM2-16GB, is not diagnosed
+([older cards](performance/bonsai-2-5-2026-11.md#older-cards)).
+
+### Quality
+
+`ninfer-perplexity --quick` on `ninfer-ppl-1m-v1`, `rk8v4`, RTX 5090: 6.6668 for PTQ1_0, 6.6647 for
+PQ2_0, against Bonsai 2's 5.6308 on the same host
+([by corpus](performance/bonsai-2-5-2026-11.md#quality)).
 
 ## Qwen3.8-27B
 
@@ -1128,6 +1321,7 @@ cards.
 | [Tesla V100, October 2026](performance/tesla-v100-2026-10.md) | a `70` build on 16 GB: what fits, engine and server rates of Ternary Bonsai 2, the Qwen3.8-27B releases, Flash-Next and Gemma 4, perplexity against other cards, llama.cpp on the same card | Tesla V100-SXM2-16GB |
 | [TITAN RTX, October 2026](performance/titan-rtx-2026-10.md) | a `75` build on one and two 24 GB cards: every model's prompt and decode rates against an RTX 3090, drafters, KV formats, depth, Flash-Next and the 35B-A3B over two stages, the device profile, where the time goes, perplexity | TITAN RTX, RTX 3090 |
 | [8, 11 and 12 GB cards, October 2026](performance/small-cards-2026-10.md) | the published image on small cards: which models load, CLI rates, the largest context, Flash-Next with host and disk experts | RTX 3060 Ti, RTX 2080 Ti, RTX 3060 |
+| [Ternary Bonsai 2.5, November 2026](performance/bonsai-2-5-2026-11.md) | both artifacts (PTQ1_0 and PQ2_0) with PrismML's MTP head: decode and prompt time by depth, several requests at once, against Bonsai 2 and PrismML's llama.cpp fork, largest context and needles, perplexity, the PTQ1_0 kernels' timings, older cards | RTX PRO 6000, 5090, 4090, 3090, A100 40 GB, Quadro RTX 6000, Tesla V100-FHHL-16GB |
 | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#measurements) | every expert placement of the GSQ-RCO releases, MTP, perplexity against llama.cpp, AIME and GPQA | RTX 3090, 3090 Ti, 4090, 5090, PRO 6000, L40S |
 | [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
 | [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |

@@ -452,7 +452,8 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
                        qtype == QType::GGUF_Q3_K || qtype == QType::GGUF_IQ2_XXS ||
                        qtype == QType::GGUF_IQ2_XS || qtype == QType::GGUF_IQ2_S ||
                        qtype == QType::GGUF_IQ3_XXS || qtype == QType::GGUF_IQ3_S ||
-                       qtype == QType::GGUF_IQ1_S || qtype == QType::GGUF_MXFP4;
+                       qtype == QType::GGUF_IQ1_S || qtype == QType::GGUF_MXFP4 ||
+                       qtype == QType::GGUF_PTQ1_0;
     if (!known || block.elements == 0 || k % block.elements != 0) {
         throw std::invalid_argument("calibration: unsupported GGUF vector weight format");
     }
@@ -486,11 +487,12 @@ SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
             continue;
         }
         // The FP16 d: after Q6_K's quants and scales, Q2_K's scales and quants, Q3_K's high bits,
-        // quants and scales; first elsewhere.
-        const std::size_t at = qtype == QType::GGUF_Q6_K   ? 208
-                               : qtype == QType::GGUF_Q2_K ? 80
-                               : qtype == QType::GGUF_Q3_K ? 108
-                                                           : 0;
+        // quants and scales, PTQ1_0's trits; first elsewhere.
+        const std::size_t at = qtype == QType::GGUF_Q6_K     ? 208
+                               : qtype == QType::GGUF_Q2_K   ? 80
+                               : qtype == QType::GGUF_Q3_K   ? 108
+                               : qtype == QType::GGUF_PTQ1_0 ? 26
+                                                             : 0;
         std::memcpy(host.data() + base + at, &d, sizeof(d));
         if (qtype == QType::GGUF_Q2_K) {
             const std::uint16_t dmin = 0x3800;
@@ -605,6 +607,7 @@ struct AsyncMatrixFormat {
     const char* name;
     ops::gguf::GgmlType ggml;
     bool dense = true; // false: the routed-expert matrix kernel only (IQ1_M)
+    bool moe   = true; // false: the dense products only (PTQ1_0)
 };
 constexpr AsyncMatrixFormat kAsyncMatrixFormats[] = {
     {QType::GGUF_Q4_K, "q4_k", ops::gguf::GgmlType::Q4_K},
@@ -616,6 +619,7 @@ constexpr AsyncMatrixFormat kAsyncMatrixFormats[] = {
     {QType::GGUF_Q2_0, "q2_0", ops::gguf::GgmlType::Q2_0},
     {QType::GGUF_IQ4_XS, "iq4_xs", ops::gguf::GgmlType::IQ4_XS},
     {QType::GGUF_NVFP4, "nvfp4", ops::gguf::GgmlType::NVFP4},
+    {QType::GGUF_PTQ1_0, "ptq1_0", ops::gguf::GgmlType::PTQ1_0, true, false},
     {QType::GGUF_IQ1_M, "iq1_m", ops::gguf::GgmlType::IQ1_M, false},
 };
 
@@ -680,7 +684,7 @@ void calibrate_gguf_moe_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
     constexpr int per_token = 2;
     const std::vector<std::int32_t> widths = {8, 16, 17, 32, 33, 48, 64, 65, 128, 256, 512, 1024};
     const std::string key = std::string("gguf_moe_matrix/") + format.name;
-    if (!options.only.empty() && key.rfind(options.only, 0) != 0) { return; }
+    if (!format.moe || (!options.only.empty() && key.rfind(options.only, 0) != 0)) { return; }
     const GgufBlockShape block = gguf_block_shape(format.qtype);
     std::vector<SyntheticWeight> weights;
     std::vector<const void*> pointers;

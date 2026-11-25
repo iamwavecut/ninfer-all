@@ -430,7 +430,9 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // NInfer: PrismML's ternary PTQ1_0 (ggml-org/llama.cpp#29672), at its GGUF type id.
+        GGML_TYPE_PTQ1_0  = 143, // ternary, group 128
+        GGML_TYPE_COUNT   = 144,
     };
 
     // [TAG_GGML_PREC]
