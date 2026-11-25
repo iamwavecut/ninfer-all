@@ -25,7 +25,8 @@ void kv_store(const KvStoreArgs& args, cudaStream_t stream);
 
 
 // The key and value stores of one visit in one launch (their planes' codings differ; the rows'
-// bytes are kv_store's bit for bit). Falls back to the two launches unless both planes are
-// quantized and hold the same rows.
+// bytes are kv_store's bit for bit). Fuses only the codings whose fused stores were measured to
+// win (Int8G64 and Int4G32 planes: int8, rk8v4); Lloyd4-keyed planes (rk4v4) and every other
+// combination keep the two separate launches, and an unsupported coding throws.
 void kv_store_pair(const KvStoreArgs& key, const KvStoreArgs& value, cudaStream_t stream);
 } // namespace ninfer::models::inkling2::kernels
