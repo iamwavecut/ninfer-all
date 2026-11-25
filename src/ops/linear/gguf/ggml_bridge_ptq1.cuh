@@ -11,11 +11,15 @@
 //
 // A row set is two weight rows (two consecutive rows, or a fused product's gate row and its up row)
 // that share their activation loads; G lanes take a row set, lane q its blocks q, q + G, ..., where
-// G (8, 16 or 32) is the widest that divides the row's blocks, so no lane idles at K = 5120, 6144 or
-// 17408. Each slice's integer dot is exact: {0, 1, 2} digits less one, as signed bytes, or as the
-// digits' dot less the slice's sum of activations (the same integer, cheaper below four columns).
-// The float sums then run slice by slice and block by block, each lane its blocks in order, and the
-// G lanes' sums meet in a butterfly.
+// G is 8, or 16 or 32 when a product's row sets are too few to keep the SMs busy or a lane would walk
+// too many blocks (group_lanes). The
+// activation is transposed (gguf::vector_activation_transposed): the lanes of a row set read
+// neighbouring 16 bytes of one plane, and each slice's (d, sum) pair comes from one load of a block's
+// four (16 bytes) or, on Blackwell, from its own (4 bytes; kSliceScales). Each
+// slice's integer dot is exact: the {0, 1, 2} digits' dot less the slice's exact sum of
+// activations, which the activation carries, equal to the dot of the digits less one. The float
+// sums then run slice by slice and block by block, each lane its blocks in order, and the G lanes'
+// sums meet in a butterfly.
 
 #include "ggml_bridge_vec_launch.cuh"
 #include "../../../core/pdl_arch.cuh"
@@ -32,6 +36,8 @@ inline constexpr int kJobsBlocksPerSm = 10;
 inline constexpr int kBlockValues = 128;
 inline constexpr int kBlockBytes  = 28;
 inline constexpr int kBlockWords  = kBlockBytes / 4;
+// Columns this kernel takes in one launch.
+inline constexpr int kMaxColumns  = 8;
 
 // The digits still to come of four bytes, each byte as ((byte * 3^t) mod 256) in a 16-bit lane:
 // bytes 0 and 1 in `lo`, bytes 2 and 3 in `hi`. A lane times three stays below 2^16.
@@ -54,7 +60,8 @@ __device__ __forceinline__ std::uint32_t next(Walk& w) {
     return __byte_perm(lo, hi, 0x7531);
 }
 
-// Digits {0, 1, 2} as the signed bytes {-1, 0, 1}: no byte carries, since d + 0x7F <= 0x81.
+// Digits {0, 1, 2} as the signed bytes {-1, 0, 1} (the tensor-core kernel's A fragments): no byte
+// carries, since d + 0x7F <= 0x81.
 __device__ __forceinline__ int to_signed(std::uint32_t digits) {
     return int((digits + 0x7F7F7F7Fu) ^ 0x80808080u);
 }
@@ -123,10 +130,6 @@ __device__ __forceinline__ void slice_words(Block& blk, std::uint32_t (&w)[8]) {
     }
 }
 
-// Below this many columns a slice's dot subtracts the activation's sum (one sum a column, shared by
-// the row set's two rows) instead of converting each row's words to signed bytes.
-inline constexpr int kSignedColumns = 4;
-
 __device__ __forceinline__ int dot8(const std::uint32_t (&w)[8], const int (&a)[8]) {
     int acc = 0;
 #pragma unroll
@@ -134,58 +137,80 @@ __device__ __forceinline__ int dot8(const std::uint32_t (&w)[8], const int (&a)[
     return acc;
 }
 
-__device__ __forceinline__ int sum8(const int (&a)[8]) {
-    int acc = 0;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) { acc = __dp4a(0x01010101, a[i], acc); }
-    return acc;
+__device__ __forceinline__ int component(const int4& v, int i) {
+    return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
 }
 
-// Slice S of block `blk_index` for both rows of the set, into part[r][j].
+// Whether each slice loads its own (d, sum) pair rather than taking it from one load of the block's
+// four. Bonsai 2.5 PTQ1_0's short chats with no drafter, a slice's own pairs against a block's: RTX
+// 5090 188.5 against 180.3 tok/s, RTX PRO 6000 187.6 against 186.6, RTX 4090 125.6 either way,
+// RTX 3090 90.1 against 91.6.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+inline constexpr bool kSliceScales = true;
+#else
+inline constexpr bool kSliceScales = false;
+#endif
+
+// Slice S of block `blk_index` for both rows of the set, into part[r][j]. Without kSliceScales,
+// scales[j] holds the block's four (d, exact sum) pairs of column j.
 template <int T, int S>
-__device__ __forceinline__ void slice(const VecArgs& p, int slices, int blk_index, Block (&blk)[2],
-                                      float (&part)[2][T]) {
-    const int s = 4 * blk_index + S;
+__device__ __forceinline__ void slice(const VecArgs& p, int planes, int blk_index, Block (&blk)[2],
+                                      const int4 (&scales)[T], float (&part)[2][T]) {
     int a[T][8];
     float d[T];
+    int sum[T];
 #pragma unroll
     for (int j = 0; j < T; ++j) {
-        d[j]          = __low2float(p.ds[std::int64_t(j) * slices + s]);
-        const auto* q = reinterpret_cast<const int4*>(p.qs + std::int64_t(j) * p.k + 32 * s);
-        const int4 v0 = __ldg(q), v1 = __ldg(q + 1);
+        // The slice's (d, exact sum) pair: d in the low 16 bits, the sum (int16) in the high ones.
+        int pair;
+        if constexpr (kSliceScales) {
+            pair = __ldg(reinterpret_cast<const int*>(p.ds) + std::int64_t(j) * 4 * planes +
+                         4 * blk_index + S);
+        } else {
+            pair = component(scales[j], S);
+        }
+        d[j]   = __half2float(__ushort_as_half(static_cast<unsigned short>(pair & 0xFFFF)));
+        sum[j] = pair >> 16;
+        // Values 32 S .. 32 S + 15 and 32 S + 16 .. 32 S + 31: planes 2 S and 2 S + 1.
+        const auto* q = reinterpret_cast<const int4*>(p.qs + std::int64_t(j) * p.k) + blk_index;
+        const int4 v0 = __ldg(q + (2 * S) * planes), v1 = __ldg(q + (2 * S + 1) * planes);
         a[j][0] = v0.x; a[j][1] = v0.y; a[j][2] = v0.z; a[j][3] = v0.w;
         a[j][4] = v1.x; a[j][5] = v1.y; a[j][6] = v1.z; a[j][7] = v1.w;
     }
-    if constexpr (T < kSignedColumns) {
-        int sum[T];
 #pragma unroll
-        for (int j = 0; j < T; ++j) { sum[j] = sum8(a[j]); }
+    for (int r = 0; r < 2; ++r) {
+        std::uint32_t w[8];
+        slice_words<S>(blk[r], w);
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            std::uint32_t w[8];
-            slice_words<S>(blk[r], w);
-#pragma unroll
-            for (int j = 0; j < T; ++j) {
-                part[r][j] = fmaf(d[j], float(dot8(w, a[j]) - sum[j]), part[r][j]);
-            }
-        }
-    } else {
-#pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            std::uint32_t w[8];
-            slice_words<S>(blk[r], w);
-#pragma unroll
-            for (int i = 0; i < 8; ++i) { w[i] = std::uint32_t(to_signed(w[i])); }
-#pragma unroll
-            for (int j = 0; j < T; ++j) { part[r][j] = fmaf(d[j], float(dot8(w, a[j])), part[r][j]); }
+        for (int j = 0; j < T; ++j) {
+            part[r][j] = fmaf(d[j], float(dot8(w, a[j]) - sum[j]), part[r][j]);
         }
     }
 }
 
-// Lanes a row set takes: the widest of 32, 16 and 8 that divides the blocks of a row.
-[[nodiscard]] inline int group_lanes(int k) {
-    const int blocks = k / kBlockValues;
-    return blocks % 32 == 0 ? 32 : blocks % 16 == 0 ? 16 : 8;
+// Warps an SM below which a product's row sets take more lanes each: a lane's blocks follow one
+// another, and too few warps leave the SM waiting on them (RTX 5090, the untransposed activation:
+// K = 17408 over 5120 rows took 14.9 us at 16 lanes a row set, 20.9 us at 8, 16.1 us at 32; 10240
+// rows over K = 5120, 9.9 us at 8 and 10.1 us at 16).
+inline constexpr int kMinWarpsPerSm = 6;
+// Blocks a lane takes in turn above which a row set takes more lanes, whatever the warps (RTX 3090:
+// K = 17408 over 5120 rows, 17 blocks a lane at 8 lanes and 7.8 warps an SM, takes 41.0 us against
+// 35.8 at 16 lanes).
+inline constexpr int kMaxLaneBlocks = 12;
+
+// Lanes a row set takes: 8, doubled up to 32 (and at most the row's blocks) while the product's row
+// sets would fill fewer than kMinWarpsPerSm warps an SM or a lane would take more than
+// kMaxLaneBlocks blocks. A product takes the same lanes alone and in a launch of several
+// (jobs_launch), so its sums keep their bits.
+[[nodiscard]] inline int group_lanes(int k, std::int64_t sets) {
+    const int blocks        = k / kBlockValues;
+    const std::int64_t want = std::int64_t(kMinWarpsPerSm) * device_facts().sm_count;
+    int group               = 8;
+    while (group < 32 && 2 * group <= blocks &&
+           (sets * group / 32 < want || blocks > kMaxLaneBlocks * group)) {
+        group *= 2;
+    }
+    return group;
 }
 
 [[nodiscard]] __host__ __device__ inline int row_sets(int rows, bool fused) {
@@ -239,7 +264,6 @@ __device__ __forceinline__ void rows(const VecArgs& p, int block, int blocks, in
     const int per    = 32 / group;
     const int q      = lane % group;
     const int nb     = p.k / kBlockValues;
-    const int slices = p.k / 32;
     const int sets   = row_sets(p.rows, Fused);
     for (int set0 = (block * kWarps + warp) * per; set0 < sets; set0 += blocks * kWarps * per) {
         const int mine = set0 + lane / group;
@@ -274,10 +298,17 @@ __device__ __forceinline__ void rows(const VecArgs& p, int block, int blocks, in
 #pragma unroll
                 for (int j = 0; j < T; ++j) { part[r][j] = 0.0f; }
             }
-            slice<T, 0>(p, slices, b, blk, part);
-            slice<T, 1>(p, slices, b, blk, part);
-            slice<T, 2>(p, slices, b, blk, part);
-            slice<T, 3>(p, slices, b, blk, part);
+            int4 scales[T];
+#pragma unroll
+            for (int j = 0; j < T; ++j) {
+                scales[j] = kSliceScales
+                                ? make_int4(0, 0, 0, 0)
+                                : __ldg(reinterpret_cast<const int4*>(p.ds) + std::int64_t(j) * nb + b);
+            }
+            slice<T, 0>(p, nb, b, blk, scales, part);
+            slice<T, 1>(p, nb, b, blk, scales, part);
+            slice<T, 2>(p, nb, b, blk, scales, part);
+            slice<T, 3>(p, nb, b, blk, scales, part);
 #pragma unroll
             for (int r = 0; r < 2; ++r) {
 #pragma unroll
@@ -322,10 +353,15 @@ __launch_bounds__(kWarps * 32) __global__ void kernel(VecArgs p, int group) {
     rows<T, Fused>(p, blockIdx.x, gridDim.x, group);
 }
 
+// Each product's lanes a row set, as it would take them alone.
+struct Groups {
+    int lanes[kMaxVecJobs];
+};
+
 // Up to kMaxVecJobs products of one K in one launch: blocks [p.first[j], p.first[j + 1]) take
 // product j's row sets as kernel() takes a product's.
 template <int T>
-__launch_bounds__(kWarps * 32) __global__ void jobs_kernel(VecJobs p, int group) {
+__launch_bounds__(kWarps * 32) __global__ void jobs_kernel(VecJobs p, Groups groups) {
     const int b = blockIdx.x;
     int j       = 0;
 #pragma unroll
@@ -333,13 +369,14 @@ __launch_bounds__(kWarps * 32) __global__ void jobs_kernel(VecJobs p, int group)
         if (i < p.count && b >= p.first[i]) { j = i; }
     }
     VecArgs job = p.job[0];
-    int first = p.first[0], last = p.first[1];
+    int first = p.first[0], last = p.first[1], group = groups.lanes[0];
 #pragma unroll
     for (int i = 1; i < kMaxVecJobs; ++i) {
         if (i == j) {
             job   = p.job[i];
             first = p.first[i];
             last  = p.first[i + 1];
+            group = groups.lanes[i];
         }
     }
     if (job.prefetch) { prefetch_first_rows<false>(job, b - first, group); }
@@ -363,7 +400,7 @@ int resident_blocks(Kernel kernel) {
 template <int T, bool Fused>
 void launch(const VecArgs& args, cudaStream_t stream) {
     static const int resident = resident_blocks(kernel<T, Fused>);
-    const int group           = group_lanes(args.k);
+    const int group           = group_lanes(args.k, row_sets(args.rows, Fused));
     const int blocks =
         std::min(launch_blocks(args.rows, Fused, group), resident * device_facts().sm_count);
     VecArgs a   = args;
@@ -377,15 +414,18 @@ void launch(const VecArgs& args, cudaStream_t stream) {
 template <int T>
 void jobs_launch(const VecJobs& args, cudaStream_t stream) {
     static const int resident = resident_blocks(jobs_kernel<T>);
-    const int group           = group_lanes(args.job[0].k);
+    int group[kMaxVecJobs]    = {};
+    for (int i = 0; i < args.count; ++i) {
+        group[i] = group_lanes(args.job[i].k, row_sets(args.job[i].rows, false));
+    }
     const int budget          = kJobsBlocksPerSm * device_facts().sm_count;
     const int cap             = resident * device_facts().sm_count;
     const bool prefetch       = ninfer::pdl::arch_dependent(stream);
     for (int begin = 0; begin < args.count;) {
         int end    = begin + 1;
-        int blocks = launch_blocks(args.job[begin].rows, false, group);
+        int blocks = launch_blocks(args.job[begin].rows, false, group[begin]);
         while (end < args.count) {
-            const int more = launch_blocks(args.job[end].rows, false, group);
+            const int more = launch_blocks(args.job[end].rows, false, group[end]);
             if (blocks + more > budget) { break; }
             blocks += more;
             ++end;
@@ -396,12 +436,14 @@ void jobs_launch(const VecJobs& args, cudaStream_t stream) {
             continue;
         }
         VecJobs part{};
+        Groups lanes{};
         part.count = end - begin;
         int want[kMaxVecJobs] = {}, total = 0;
         for (int i = 0; i < part.count; ++i) {
             part.job[i]          = args.job[begin + i];
             part.job[i].prefetch = prefetch;
-            want[i]              = launch_blocks(part.job[i].rows, false, group);
+            lanes.lanes[i]       = group[begin + i];
+            want[i]              = launch_blocks(part.job[i].rows, false, lanes.lanes[i]);
             total += want[i];
         }
         part.first[0] = 0;
@@ -411,7 +453,7 @@ void jobs_launch(const VecJobs& args, cudaStream_t stream) {
             part.first[i + 1] = part.first[i] + share;
         }
         ninfer::pdl::launch_arch(part.first[part.count], kWarps * 32, 0, stream, jobs_kernel<T>,
-                                 part, group);
+                                 part, lanes);
         check(cudaGetLastError(), "ptq1 vector products launch");
         begin = end;
     }
@@ -429,37 +471,3 @@ void launch_columns(const VecJobs& args, bool fused, cudaStream_t stream) {
 }
 
 } // namespace ninfer::ops::gguf::detail::ptq1
-
-namespace ninfer::ops::gguf::detail {
-
-template <>
-void vec_launch<GGML_TYPE_PTQ1_0>(const VecJobs& args, int columns, bool fused,
-                                  cudaStream_t stream) {
-    if (args.count < 1 || args.count > kMaxVecJobs || (fused && args.count != 1)) {
-        throw std::invalid_argument("gguf vector product: 1..4 products, one when fused");
-    }
-    for (int i = 0; i < args.count; ++i) {
-        const VecArgs& job = args.job[i];
-        // Rows start on a word: the lanes read each block as seven aligned words.
-        if (job.k <= 0 || job.k % ptq1::kBlockValues != 0 ||
-            job.row_bytes < std::int64_t(job.k / ptq1::kBlockValues) * ptq1::kBlockBytes ||
-            job.row_bytes % 4 != 0 || reinterpret_cast<std::uintptr_t>(job.weight) % 4 != 0 ||
-            job.rows <= 0 || job.k != args.job[0].k || job.row_bytes != args.job[0].row_bytes) {
-            throw std::invalid_argument("gguf vector product: unsupported PTQ1_0 geometry");
-        }
-    }
-    switch (columns) {
-    case 1: return ptq1::launch_columns<1>(args, fused, stream);
-    case 2: return ptq1::launch_columns<2>(args, fused, stream);
-    case 3: return ptq1::launch_columns<3>(args, fused, stream);
-    case 4: return ptq1::launch_columns<4>(args, fused, stream);
-    case 5: return ptq1::launch_columns<5>(args, fused, stream);
-    case 6: return ptq1::launch_columns<6>(args, fused, stream);
-    case 7: return ptq1::launch_columns<7>(args, fused, stream);
-    case 8: return ptq1::launch_columns<8>(args, fused, stream);
-    default: break;
-    }
-    throw std::invalid_argument("gguf vector product: columns must be 1..8");
-}
-
-} // namespace ninfer::ops::gguf::detail

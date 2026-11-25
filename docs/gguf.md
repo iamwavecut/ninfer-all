@@ -11,12 +11,14 @@ multiplies them in place. The Qwen3.8-Flash-Next releases convert the same way w
 
 ## Formats
 
-Twenty block types: the fifteen llama.cpp writes for dense models, `Q8_0`, `Q2_K`, `Q3_K`,
+Twenty-one block types: the fifteen llama.cpp writes for dense models, `Q8_0`, `Q2_K`, `Q3_K`,
 `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`,
 `IQ4_NL` and `IQ4_XS`; `Q2_0`, `Q4_0` and `Q5_0`, which the Flash-Next releases use; `MXFP4`, the
 routed experts of DeepSeek-V4.1's DSpark GGUF drafter; and `NVFP4` (64 values in four groups of
 16 E2M1 codes with a UE4M3 scale each), the routed experts of the [Edge0](edge0.md) NVFP4 releases;
-stored as the `gguf_*` formats of the `gguf_blocks_v1` layout
+and PrismML's `PTQ1_0` (128 ternary values in 28 bytes, five base-3 digits a byte and one binary16
+scale), the [Ternary Bonsai 2.5](weight-conversion.md#ternary-bonsai-2-and-25-27b) PTQ1_0 release,
+dense products only; stored as the `gguf_*` formats of the `gguf_blocks_v1` layout
 ([tensor formats](maintainer/tensor-formats.md#35-gguf-block-formats),
 [storage layouts](maintainer/storage-layouts.md#6-gguf_blocks_v1)). A projection may mix types:
 the parts of a fused projection that share a type are multiplied together, the others one by one
@@ -34,7 +36,8 @@ passes 65,504 overflows the sum. Flint's routed SwiGLU
 products reach the second limit, so its executor scales them ([F16 activation
 sums](flint.md#f16-activation-sums)).
 
-- **Up to eight columns** (decode, speculative verification, small batches), the vector kernel
+- **Up to eight columns** (decode, speculative verification, small batches; `PTQ1_0` up to 20 on
+  sm_80 and newer), the vector kernel
   (`src/ops/linear/gguf/ggml_bridge_vec.cuh`) decodes each 32-value slice of a row once into int8
   words and dots it with every column. A warp owns two rows (four in routed expert products whose
   slices are not a whole number of 32): lane `l` adds slices `l`, `l + 32`, ... and the warp then
@@ -46,16 +49,36 @@ sums](flint.md#f16-activation-sums)).
   `silu(gate) * up`. A layer's separate products of one input format (Inkling's query, gate,
   relative, key and value rows; Gemma 4's and Flint's query, key and value parts of one block
   type) share launches of up to four products and 10 blocks per SM, each product's rows computed
-  as alone, so the outputs are the same bits.
+  as alone, so the outputs are the same bits. `PTQ1_0` has kernels of its own: its bytes hold five
+  values that lie 16 (or 8) apart, so a slice's eight words come from different bytes and digits in
+  each slice. One column (up to eight before sm_80) takes the lane kernel
+  (`src/ops/linear/gguf/ggml_bridge_ptq1.cuh`): a lane takes whole 128-value blocks and walks their
+  digits in value order, two rows share each activation load, and 8 lanes take a pair of rows, 16 or
+  32 when a product's row pairs would fill fewer than six warps an SM or a lane would walk more than
+  12 blocks (the 27B's down product, 5120 rows over K = 17408, takes 35.8 µs at 16 lanes and 41.0 µs
+  at 8 on an RTX 3090). It reads its `q8_1` activation transposed, in the order of PrismML's kernel:
+  value `e` of a 128-value block lies in plane `e / 16`, so the lanes of a row pair read neighbouring
+  16 bytes, and each 32-value slice keeps its scale beside its sum as an exact 16-bit integer. On
+  sm_120 each slice loads its own scale and sum; older cards load a block's four at once. On sm_80 and
+  newer, 2 to 20 columns take the integer tensor cores
+  (`src/ops/linear/gguf/ggml_bridge_ptq1_tc.cuh`): a warp multiplies 16 or 32 rows (or 16 gate rows
+  and their 16 up rows) by up to three 8-column tiles with `mma.m16n8k32.s8`, each lane reading three
+  of a block's seven words and placing their values in the k slots it shares with the activation's
+  bytes, and the eight warps of a block split the rows' blocks, their sums added in warp order. Each
+  slice's dot is an exact integer in both kernels, and within a kernel a column's sum does not
+  depend on the other columns; the two kernels add a row's blocks in different orders, so a
+  verification call's sums may differ from a decode call's in their last bits.
 - **More columns** (prompts) take llama.cpp's integer tensor-core kernel (`mul_mat_q`, vendored
   in `third_party/ggml-quants` under its MIT license with the changes its `README.ninfer.md`
-  lists) with its Ampere tile table. `IQ1_M` has no such kernel for dense matrices, whose wide
-  products dequantize to BF16 and run cuBLAS; routed experts in `IQ1_M` take that kernel with
-  NInfer's tile loader for the format once a call routes more than 16 rows to each expert on
-  average for gate and up products and 6 for down products, the vector kernel in groups of eight
-  columns below that (`--iq1m-experts`,
+  lists) with its Ampere tile table; `PTQ1_0` takes it with a tile loader that expands each
+  block to int8 values -1, 0 and 1 and its scale, as `Q2_0`'s does. `IQ1_M` has no such kernel for
+  dense matrices, whose wide products dequantize to BF16 and run cuBLAS; routed experts in `IQ1_M`
+  take that kernel with NInfer's tile loader for the format once a call routes more than 16 rows to
+  each expert on average for gate and up products and 6 for down products, the vector kernel in
+  groups of eight columns below that (`--iq1m-experts`,
   [DeepSeek-V4.1](deepseek-v41.md#iq1_m-experts-in-prompt-chunks)).
-- **Token table** rows are dequantized exactly.
+- **Token table** rows are dequantized exactly; a Bonsai table of `PTQ1_0` rows, stored rotated,
+  is restored by its Hadamard signs as it is gathered.
 
 The scales of `IQ2_XXS`, `IQ2_XS`, `IQ2_S` and `IQ3_XXS` are applied in FP32 where llama.cpp's
 vector kernels round an integer rescale, and the vector kernels round each step of the formats the

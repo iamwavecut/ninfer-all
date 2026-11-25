@@ -29,6 +29,7 @@
 #include <iostream>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -228,15 +229,18 @@ Error compare(const std::vector<float>& got, const std::vector<double>& want) {
     return {std::sqrt(num / std::max(den, 1e-30)), worst / std::max(scale, 1e-30)};
 }
 
+constexpr std::int32_t kWidths[] = {1, 2, 3, 4, 5, 8, 9, 17, 32, 33, 40, 70, 130, 257};
+
 // K = 1536 and K = 2560, Qwen3.8-Flash-Next's hidden width, whose 80 slices leave the vector
 // products' last pass over a row with half of a warp's lanes idle; and Gemma 4's widths 2816, 2112
 // and 704, which are no whole number of the matrix kernel's 512-value activation steps (2112 and
-// 704 not even of its 256-value weight steps).
-int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
-    constexpr std::int32_t kRows = 256;
-    const std::int32_t kK        = k;
-    const std::int32_t widths[]  = {1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130, 257};
-    const std::int32_t max_t     = 257;
+// 704 not even of its 256-value weight steps). `row_count` rows (and as many more up rows), at
+// `widths`.
+int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k, std::int32_t row_count = 256,
+             std::span<const std::int32_t> widths = kWidths) {
+    const std::int32_t kRows = row_count;
+    const std::int32_t kK    = k;
+    const std::int32_t max_t = *std::max_element(widths.begin(), widths.end());
     std::mt19937 rng(seed);
     int failures = 0;
 
@@ -396,7 +400,7 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
     }
 
     // The token-table gather is the exact weights rounded to BF16.
-    const std::vector<std::int32_t> ids{3, 0, 255, 17, 3};
+    const std::vector<std::int32_t> ids{3 % kRows, 0, kRows - 1, 17 % kRows, 3 % kRows};
     DeviceBuffer ids_device(ids.size() * sizeof(std::int32_t));
     ids_device.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
     DeviceBuffer rows_device(ids.size() * kK * sizeof(__nv_bfloat16));
@@ -436,20 +440,22 @@ int run_jobs(const TypeCase& c, std::uint32_t seed, std::int32_t kK, std::int32_
     const auto block             = gguf_block_shape(c.qtype);
     const std::int64_t row_bytes = std::int64_t(kK / block.elements) * block.bytes;
     const auto type              = ops::detail::gguf_type(c.qtype);
-    constexpr std::int32_t kMaxT = 8;
+    constexpr std::int32_t kMaxT = ops::gguf::kMaxTypeVectorColumns;
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::vector<__nv_bfloat16> x_host(std::size_t(kK) * kMaxT * 2);
     for (auto& v : x_host) { v = __float2bfloat16(normal(rng)); }
     DeviceBuffer x_device(x_host.size() * sizeof(__nv_bfloat16));
     x_device.copy_from_host(x_host.data(), x_host.size() * sizeof(__nv_bfloat16));
     int failures = 0;
-    for (const std::int32_t t : {1, 2, 3, 5, 8}) {
+    for (const std::int32_t t : {1, 2, 3, 5, 8, 9, 17, 20}) {
+        if (t > ops::gguf::vector_columns(type)) { continue; }
         const std::size_t bytes = ops::gguf::vector_activation_bytes(kK, t);
         DeviceBuffer acts(2 * bytes);
         for (int a = 0; a < 2; ++a) {
             ops::gguf::quantize_vector_activation(
                 static_cast<const __nv_bfloat16*>(x_device.p) + std::size_t(a) * kK * kMaxT, kK, t,
-                nullptr, static_cast<std::uint8_t*>(acts.p) + a * bytes, nullptr);
+                nullptr, static_cast<std::uint8_t*>(acts.p) + a * bytes, nullptr,
+                ops::gguf::vector_activation_transposed(type, t));
         }
         DeviceBuffer one(std::size_t(total) * t * sizeof(float)), all(one.bytes);
         std::vector<ops::gguf::VectorJob> jobs;
@@ -474,6 +480,56 @@ int run_jobs(const TypeCase& c, std::uint32_t seed, std::int32_t kK, std::int32_
             std::cerr << "FAIL " << c.name << " vector_products K=" << kK << " rows " << first
                       << " T=" << t << " differs from one launch per product\n";
             ++failures;
+        }
+    }
+    return failures;
+}
+
+// Column j of a PTQ1_0 vector product is the same at every width one kernel takes: a column's
+// arithmetic does not depend on the other columns. K = 5120 and 17408 at 96 rows, every width from
+// the kernel's first (2 where the tensor cores take 2 to 20 columns and one column the lane kernel,
+// else 1) to the type's vector width.
+int first_column_width(int most) { return most > 8 ? 2 : 1; }
+
+int run_column_widths(const TypeCase& c, std::uint32_t seed) {
+    const auto type   = ops::detail::gguf_type(c.qtype);
+    const int most    = ops::gguf::vector_columns(type);
+    constexpr int kRows = 96;
+    int failures      = 0;
+    for (const std::int32_t kK : {5120, 17408}) {
+        std::mt19937 rng(seed + kK);
+        const auto host_blocks = random_blocks(c, kRows, kK, rng);
+        DeviceBuffer blocks(host_blocks.size());
+        blocks.copy_from_host(host_blocks.data(), host_blocks.size());
+        const std::int64_t row_bytes = std::int64_t(kK / 128) * 28;
+        std::normal_distribution<float> normal(0.0f, 1.0f);
+        std::vector<__nv_bfloat16> x_host(std::size_t(kK) * most);
+        for (auto& v : x_host) { v = __float2bfloat16(normal(rng)); }
+        DeviceBuffer x_device(x_host.size() * sizeof(__nv_bfloat16));
+        x_device.copy_from_host(x_host.data(), x_host.size() * sizeof(__nv_bfloat16));
+        DeviceBuffer act(ops::gguf::vector_activation_bytes(kK, most));
+        DeviceBuffer out(std::size_t(kRows) * most * sizeof(float));
+        const auto run = [&](int t) {
+            ops::gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(x_device.p), kK,
+                                                  t, nullptr, act.p, nullptr,
+                                                  ops::gguf::vector_activation_transposed(type, t));
+            ops::gguf::VectorOutput o;
+            o.f32           = static_cast<float*>(out.p);
+            o.column_stride = kRows;
+            ops::gguf::vector_product(type, blocks.p, row_bytes, kRows, kK, act.p, t, o, nullptr);
+            check(cudaDeviceSynchronize(), "column widths");
+            std::vector<float> host(std::size_t(kRows) * t);
+            out.copy_to_host(host.data(), host.size() * sizeof(float));
+            return host;
+        };
+        const auto widest = run(most);
+        for (int t = first_column_width(most); t < most; ++t) {
+            const auto got = run(t);
+            if (std::memcmp(got.data(), widest.data(), got.size() * sizeof(float)) != 0) {
+                std::cerr << "FAIL " << c.name << " K=" << kK << " T=" << t
+                          << " columns differ from the same columns at T=" << most << '\n';
+                ++failures;
+            }
         }
     }
     return failures;
@@ -674,6 +730,27 @@ int main() {
                     failures += f;
                 }
             }
+        }
+        // PTQ1_0's vector kernels at rows that are no whole number of their row groups (32 rows, 16
+        // of a fused product, two of the lane kernel's row sets) at K = 384, fewer blocks than the
+        // tensor-core form has warps, and K = 17408, the 27B's down product, at the widths they take.
+        for (const auto& c : cases()) {
+            if (c.qtype != QType::GGUF_PTQ1_0) { continue; }
+            const int most = ops::gguf::vector_columns(ops::detail::gguf_type(c.qtype));
+            std::vector<std::int32_t> widths;
+            for (const std::int32_t t : {1, 2, 4, 8, 9, 16, 17, 20}) {
+                if (t <= most) { widths.push_back(t); }
+            }
+            for (const auto [k, rows] : {std::pair{384, 23}, std::pair{17408, 201}}) {
+                const int f = run_type(c, seed++, k, rows, widths);
+                std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
+                          << " rows " << rows << " T<=" << widths.back() << '\n';
+                failures += f;
+            }
+            const int f = run_column_widths(c, seed++);
+            std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " columns equal at T="
+                      << first_column_width(most) << ".." << most << '\n';
+            failures += f;
         }
         // The local Qwen3.8-27B artifact's IQ2_S table at its full vocabulary; the other formats
         // a 27B GGUF conversion may store its table in, over a smaller one.

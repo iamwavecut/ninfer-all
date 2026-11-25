@@ -117,9 +117,14 @@ struct VecJobs {
 // jobs.count products, or with `fused` one fused [gate; up] product.
 template <ggml_type type>
 void vec_launch(const VecJobs& jobs, int columns, bool fused, cudaStream_t stream);
-// PTQ1_0's products take their own kernel, a lane a whole block (ggml_bridge_ptq1.cuh).
+// PTQ1_0's products take their own kernels: a lane a whole block (ggml_bridge_ptq1.cuh), or on sm_80
+// and newer the integer tensor cores (ggml_bridge_ptq1_tc.cuh), which take up to
+// ptq1_vector_columns() columns.
 template <>
 void vec_launch<GGML_TYPE_PTQ1_0>(const VecJobs& jobs, int columns, bool fused, cudaStream_t stream);
+[[nodiscard]] int ptq1_vector_columns();
+// Whether the lane kernel takes `columns` columns, which read the transposed activation.
+[[nodiscard]] bool ptq1_lane_takes(int columns);
 
 // SiLU and the tanh-approximated GELU from correctly rounded operations (ops/common/silu.h): the
 // CPU's GGUF expert products compute the same bits.
