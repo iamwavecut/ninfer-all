@@ -450,6 +450,9 @@ struct ExpertMisses::Impl {
         std::uint64_t largest = 0, largest_file = 0, largest_cover = 0, widest = 0;
         for (const auto& layer : layers) {
             for (const auto& p : layer.projections) {
+                if (!p.device.empty() && p.device.size() != p.host.size()) {
+                    throw std::invalid_argument("expert misses: host and device alias counts differ");
+                }
                 for (const auto& location : p.located) {
                     std::uint64_t cover = 0;
                     for (const auto& run : location.runs) {
@@ -658,6 +661,20 @@ struct ExpertMisses::Impl {
     static const std::byte* held(const MissLayer::Projection& projection, std::int32_t expert) {
         return projection.located.empty() ? nullptr
                                           : projection.located[std::size_t(expert)].pinned;
+    }
+
+    static const std::byte* held_device(const MissLayer::Projection& projection,
+                                        std::int32_t expert) {
+        if (projection.located.empty()) { return nullptr; }
+        const auto& location = projection.located[std::size_t(expert)];
+        return location.pinned_device ? location.pinned_device : location.pinned;
+    }
+
+    static const void* host_expert_source(const MissLayer::Projection& projection,
+                                          std::int32_t expert, bool kernel) {
+        const std::size_t e = std::size_t(expert);
+        return kernel && !projection.device.empty() ? projection.device.at(e)
+                                                     : projection.host.at(e);
     }
 
     // Reads one projection of a disk expert into `host_out`; with a drive mirror, a run in an
@@ -1095,7 +1112,7 @@ struct ExpertMisses::Impl {
         }
         for (int k = 0; k < 3; ++k) {
             const auto& p = layer.projections[std::size_t(k)];
-            queue_copy(rank, kernel, admitted.slot[std::size_t(k)], p.host[std::size_t(e)],
+            queue_copy(rank, kernel, admitted.slot[std::size_t(k)], host_expert_source(p, e, kernel),
                        std::uint64_t(p.expert_bytes), cudaMemcpyHostToDevice);
             tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = admitted.slot[std::size_t(k)];
             bytes += std::uint64_t(p.expert_bytes);
@@ -1104,7 +1121,7 @@ struct ExpertMisses::Impl {
         if (admitted.victim >= 0) {
             patches[patch_count++] =
                 TablePatch{admitted.victim,
-                           {admitted.victim_host[0], admitted.victim_host[1], admitted.victim_host[2]}};
+                           {admitted.victim_entry[0], admitted.victim_entry[1], admitted.victim_entry[2]}};
         }
         return true;
     }
@@ -1125,7 +1142,7 @@ struct ExpertMisses::Impl {
             } else {
                 const void* source;
                 if (pinned != nullptr) {
-                    source = pinned;
+                    source = kernel ? held_device(p, e) : pinned;
                 } else if (disk) {
                     if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
                         throw std::runtime_error("expert misses: file staging exhausted");
@@ -1134,7 +1151,7 @@ struct ExpertMisses::Impl {
                     source = file_staging + file_used;
                     file_used += aligned(std::uint64_t(p.expert_bytes));
                 } else {
-                    source = p.host[std::size_t(e)];
+                    source = host_expert_source(p, e, kernel);
                 }
                 queue_copy(rank, kernel, at, source, std::uint64_t(p.expert_bytes),
                            cudaMemcpyHostToDevice);
@@ -1225,8 +1242,8 @@ struct ExpertMisses::Impl {
                     for (int k = 0; k < 3; ++k) {
                         const auto& p = layer.projections[std::size_t(k)];
                         const void* where;
-                        if (const std::byte* pinned = held(p, e)) {
-                            where = pinned;
+                        if (held(p, e)) {
+                            where = held_device(p, e);
                         } else if (disk) {
                             if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
                                 throw std::runtime_error("expert misses: file staging exhausted");
@@ -1235,7 +1252,7 @@ struct ExpertMisses::Impl {
                             where = file_staging + file_used;
                             file_used += aligned(std::uint64_t(p.expert_bytes));
                         } else {
-                            where = p.host[std::size_t(e)];
+                            where = host_expert_source(p, e, true);
                         }
                         tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = where;
                     }

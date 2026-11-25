@@ -42,7 +42,12 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return bytes_; }
 
+    // Translate a range inside one independently registered part to its device address.
+    [[nodiscard]] const std::byte* device_alias(std::size_t offset, std::size_t bytes) const;
+
 private:
+    struct RegistrationRange { std::size_t begin, end; };
+    std::vector<RegistrationRange> ranges_;
     std::byte* data_   = nullptr;
     std::size_t bytes_ = 0;
     std::size_t mapping_bytes_ = 0; // the reservation, which size() may end before

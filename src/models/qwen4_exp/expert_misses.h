@@ -55,7 +55,10 @@ struct MissLayer {
         std::int32_t rows         = 0;
         std::int32_t k            = 0;
         std::int64_t expert_bytes = 0;
-        std::vector<const void*> host;           // host experts: each expert's bytes in RAM
+        std::vector<const void*> host;           // host experts: each expert's CPU-readable bytes
+        // Device-readable aliases for host experts when host registration yields distinct VAs.
+        // Empty keeps the existing behavior for cudaHostAlloc buffers and test fixtures.
+        std::vector<const void*> device;
         std::span<const ExpertLocation> located; // disk experts: where each expert's bytes are
     };
     std::array<Projection, 3> projections;   // gate, up, down

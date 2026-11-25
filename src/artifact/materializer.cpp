@@ -830,6 +830,14 @@ std::span<const std::byte> MaterializedArtifact::pinned_block() const noexcept {
     return {static_cast<const std::byte*>(pinned_->data()), pinned_->size()};
 }
 
+const void* MaterializedArtifact::pinned_device_alias(const void* data, std::size_t bytes) const {
+    if (!pinned_ || !data) { return nullptr; }
+    const auto base = reinterpret_cast<std::uintptr_t>(pinned_->data());
+    const auto addr = reinterpret_cast<std::uintptr_t>(data);
+    if (addr < base || addr - base >= pinned_->size()) { return nullptr; }
+    return pinned_->device_alias(static_cast<std::size_t>(addr - base), bytes);
+}
+
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
                                  DeviceContext& device, const StartupObserver* startup_observer,
                                  std::unique_ptr<EvictableWeightPool> backing,
@@ -991,7 +999,6 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             checked_add(out.stats_.pinned_bytes, plan.mapped_capacity_bytes, "mapped Host bytes");
     }
     std::uint64_t pinned = 0;
-    void* pinned_alias = nullptr;
     if (out.pinned_ && !pinned_layout.fallback) {
         out.pinned_->pin(/*device_mapped=*/true);
         pinned = pinned_layout.end;
@@ -1004,14 +1011,6 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             throw ArtifactError("failed to pin " + std::to_string(pinned_layout.required_end >> 20) +
                                 " MiB of host memory: the host refused it");
         }
-    }
-    if (pinned > 0) {
-        // The address the primary device reads the pinned block at, as for the mapped block.
-        // Under unified addressing it is the host address, but only the runtime may say so; the
-        // latent experts' copy_segments_kernel reads these bytes in place, which WDDM only
-        // permits for a device-mapped registration.
-        check_cuda(cudaHostGetDevicePointer(&pinned_alias, out.pinned_->data(), 0),
-                   "resolve the pinned Host block's device address");
     }
     out.stats_.pinned_block_end         = pinned < pinned_layout.end ? PinnedBlockEnd::Refused
                                                                      : pinned_layout.ended_by;
@@ -1029,10 +1028,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         const std::span<std::byte> destination(out.pinned_->data() + pinned_layout.offsets[i],
                                                static_cast<std::size_t>(placement.bytes));
         const auto divisor = read_divisor(reader, placement.object, geometry, destination, out.stats_);
+        // CPU expert products and host-block consumers require the original CPU address.
         out.objects_.at(placement.object.index).pinned =
-            WeightParent{geometry,
-                         static_cast<const std::byte*>(pinned_alias) + pinned_layout.offsets[i],
-                         divisor};
+            WeightParent{geometry, destination.data(), divisor};
         ++out.stats_.pinned_object_count;
     }
     out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, pinned, "pinned Host bytes");
@@ -1045,11 +1043,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         storage.host_data = std::move(placement.data);
         if (placement.registered) {
-            // Device-mapped as for the pinned block: the copy-kernel miss service may read these
-            // rows in place; the fallback bytes' registration is per object, so the host address
-            // serves as its own device alias under unified addressing.
             storage.registration = std::make_unique<HostMemoryRegistration>(
-                storage.host_data.data(), storage.host_data.size(), /*mapped=*/true);
+                storage.host_data.data(), storage.host_data.size());
             out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, storage.host_data.size(),
                                                 "registered Host bytes");
             ++out.stats_.pinned_object_count;

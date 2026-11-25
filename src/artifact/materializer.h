@@ -162,6 +162,9 @@ public:
     // artifact's files).
     [[nodiscard]] bool pinned(ObjectHandle handle) const noexcept;
     [[nodiscard]] std::span<const std::byte> pinned_block() const noexcept;
+    // Device address for a subrange within a single registration of the pinned host block.
+    // nullptr means the input is not in that block; crossing registration boundaries is rejected.
+    [[nodiscard]] const void* pinned_device_alias(const void* data, std::size_t bytes) const;
     // A Residency::Mapped object: its data addresses the primary device's mapping of the mapped
     // Host block, which only device code may dereference.
     [[nodiscard]] const WeightParent& mapped_parent(ObjectHandle handle) const;
