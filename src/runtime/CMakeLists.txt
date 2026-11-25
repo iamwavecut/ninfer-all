@@ -21,7 +21,7 @@ while(_ninfer_profiles_length GREATER 0)
   string(SUBSTRING "${_ninfer_profiles_rest}" 0 ${_ninfer_profiles_cut} _ninfer_profiles_part)
   string(SUBSTRING "${_ninfer_profiles_rest}" ${_ninfer_profiles_cut} -1 _ninfer_profiles_rest)
   string(APPEND NINFER_DEVICE_PROFILES_PARTS
-         "            R\"ninfer_json(${_ninfer_profiles_part})ninfer_json\",\n")
+         "            R\"ninfer_json(${_ninfer_profiles_part})ninfer_json\"sv,\n")
   string(LENGTH "${_ninfer_profiles_rest}" _ninfer_profiles_length)
 endwhile()
 configure_file(engine/device_profiles_builtin.cpp.in
