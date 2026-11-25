@@ -590,14 +590,18 @@ int run_tests() {
                               dflash2.speculative.draft_tokens == k,
                           "CLI did not preserve the DFlash2 draft count");
     }
-    for (const auto k : {0U, 16U}) {
-        failures +=
-            check(rejects([&] {
-                      (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
-                                   "dflash2", "--draft-tokens", std::to_string(k)});
-                  }),
-                  "CLI accepted an unsupported DFlash2 draft count");
-    }
+    // Without --draft-tokens Inkling 2's DFlash2 rounds verify the drafter's whole block; the
+    // models that need a count refuse its absence in their Engines.
+    const auto dflash2_block =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dflash2"});
+    failures += check(dflash2_block.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                          dflash2_block.speculative.draft_tokens == 0,
+                      "CLI refused DFlash2 without a draft count");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "dflash2", "--draft-tokens", "16"});
+                      }),
+                      "CLI accepted an unsupported DFlash2 draft count");
     failures += check(
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "fp16"}).kv_cache ==
             ninfer::KvCacheStorage::Float16,
