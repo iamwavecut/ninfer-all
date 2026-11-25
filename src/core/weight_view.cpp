@@ -251,7 +251,8 @@ std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t 
     }
     const auto stride = geometry.row_stride_bytes ? geometry.row_stride_bytes
                                                   : geometry.scale_bytes_per_row;
-    return geometry.scale_offset + row * stride + group * 2;
+    const std::uint64_t scale_bytes = geometry.format == QType::MXFP8 ? 1 : 2;
+    return geometry.scale_offset + row * stride + group * scale_bytes;
 }
 
 WeightRowPlanes weight_row_planes(const WeightRegion& region) {
