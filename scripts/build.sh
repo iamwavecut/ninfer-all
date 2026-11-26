@@ -94,7 +94,7 @@ if (( benchmarks )); then benchmarks_option=ON; fi
 
 runtime=OFF
 if [[ "$package" == 1 ]]; then runtime=ON; fi
-# FFmpeg and dav1d are compiled from their pinned release archives (cmake/MediaSources.cmake).
+# FFmpeg, dav1d and Mbed TLS are compiled from their pinned release archives (cmake/MediaSources.cmake).
 scripts/fetch-media-sources.sh
 cmake -S . -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch" -DNINFER_SHARED_RUNTIME="$runtime" \
       -DNINFER_BUILD_BENCHMARKS="$benchmarks_option"

@@ -1,10 +1,11 @@
-// The media fetcher (product/media_acquire) against a local HTTP server: what it fetches, the
-// limits it keeps and the addresses it refuses; and the serving policy that decides whether a
-// request's URL is fetched at all (--media-urls).
+// The media fetcher (product/media_acquire) against local HTTP and HTTPS servers: what it fetches,
+// the limits it keeps, the certificates and addresses it refuses; and the serving policy that
+// decides whether a request's URL is fetched at all (--media-urls).
 
 #include "product/media_acquire/acquire.h"
 #include "serve/generation_service.h"
 #include "serve/request.h"
+#include "tls_fixture.h"
 
 #include <httplib.h>
 
@@ -194,6 +195,47 @@ private:
     std::atomic<bool> stopping_{false};
     int port_ = 0;
 };
+
+// HTTPS verifies the server against SSL_CERT_FILE (or SSL_CERT_DIR) when one is set, else against
+// the system's certificates, which do not hold the test CA.
+void secure(const LocalServer& plain) {
+    namespace tls = ninfer::test_tls;
+    tls::Server server;
+    server.server().Get("/image", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(body_of(4096), "image/png");
+    });
+    const std::string plain_image = plain.url("/image");
+    server.server().Get("/to-plain", [plain_image](const httplib::Request&, httplib::Response& res) {
+        res.set_redirect(plain_image);
+    });
+    server.start();
+    {
+        const tls::TrustedCa ca("media-" + std::to_string(plain.port()));
+        std::vector<std::uint8_t> bytes;
+        expect_outcome("an image over HTTPS",
+                       fetch(url(server.url("localhost", "/image")), local_policy(), &bytes),
+                       Outcome::Bytes);
+        const std::string expected = body_of(4096);
+        expect(bytes == std::vector<std::uint8_t>(expected.begin(), expected.end()),
+               "the bytes fetched over HTTPS differ from the served ones");
+        expect_outcome("a certificate for another host name",
+                       fetch(url(server.url("127.0.0.1", "/image")), local_policy()),
+                       Outcome::Unavailable);
+        expect_outcome("a redirect from HTTPS to HTTP",
+                       fetch(url(server.url("localhost", "/to-plain")), local_policy()),
+                       Outcome::Invalid);
+
+        tls::set_environment("SSL_CERT_FILE", "");
+        tls::set_environment("SSL_CERT_DIR",
+                             ca.path().parent_path().string() + "/ninfer-media-test-no-such-dir");
+        expect_outcome("a CA directory without the issuer",
+                       fetch(url(server.url("localhost", "/image")), local_policy()),
+                       Outcome::Unavailable);
+    }
+    expect_outcome("a server the system's certificates do not trust",
+                   fetch(url(server.url("localhost", "/image")), local_policy()),
+                   Outcome::Unavailable);
+}
 
 void fetches(const LocalServer& server) {
     std::vector<std::uint8_t> bytes;
@@ -387,6 +429,7 @@ int main() {
         fetches(server);
         limits(server);
         addresses(server);
+        secure(server);
         serving_policy();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

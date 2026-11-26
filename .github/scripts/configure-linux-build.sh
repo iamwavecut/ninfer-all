@@ -6,7 +6,7 @@ case "${1:-OFF}" in ON|OFF) testing="${1:-OFF}" ;; *) exit 2 ;; esac
 # Linux packages and the Docker images serve llama.cpp's WebUI at the release fetch-webui.sh pins.
 webui="$(scripts/fetch-webui.sh | sed -n 's/^configure with -DNINFER_WEBUI_DIR=//p')"
 test -n "$webui"
-# FFmpeg and dav1d are compiled from their pinned release archives (cmake/MediaSources.cmake).
+# FFmpeg, dav1d and Mbed TLS are compiled from their pinned release archives (cmake/MediaSources.cmake).
 scripts/fetch-media-sources.sh
 cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_ARCHITECTURES="$ARCHS" -DNINFER_SHARED_RUNTIME=ON \

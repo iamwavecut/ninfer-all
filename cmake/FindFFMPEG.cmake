@@ -1,6 +1,6 @@
 # FindFFMPEG.cmake — bridge for NInfer's `find_package(FFMPEG)` on native Windows.
 #
-# The ffmpeg vcpkg port (unlike curl) installs no CMake package config. Without the
+# The ffmpeg vcpkg port installs no CMake package config. Without the
 # vcpkg toolchain NInfer consumes a prebuilt vcpkg triplet tree that provides av*
 # import libs + headers + DLLs: the tree cmake/Dependencies.cmake resolved into
 # _ninfer_vcpkg_tree, from NINFER_VCPKG_TREE (scripts\build-native.bat passes it) or

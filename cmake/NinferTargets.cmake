@@ -144,15 +144,15 @@ endfunction()
 # Runtime DLL staging for the apps and tests.
 #
 # ninfer / ninfer-serve (and fully-linked test binaries) statically import the
-# FFmpeg + libcurl runtime DLLs (avutil/avcodec/avformat/swscale/swresample/libcurl
-# plus their own deps, e.g. z.dll). The vcpkg IMPORTED_LINK_DEPENDENT_LIBRARIES hook
+# FFmpeg runtime DLLs (avutil/avcodec/avformat/swscale/swresample plus their own
+# deps, e.g. z.dll). The vcpkg IMPORTED_LINK_DEPENDENT_LIBRARIES hook
 # does not reliably stage them into the output tree, and the Windows loader will not
 # search the vcpkg bin dir when the exe is launched directly -- it only searches the
 # exe's own directory, system dirs, and PATH. An unresolved import aborts the process
 # before main (0xC0000135). Stage the full closure next to each binary so it runs
 # standalone.
 
-# Collect the FFMPEG + libcurl runtime DLLs from the vcpkg bin tree into <out_var>.
+# Collect the FFmpeg runtime DLLs from the vcpkg bin tree into <out_var>.
 function(ninfer_runtime_dll_list out_var)
   set(_list "")
   if(WIN32 AND NINFER_WINDOWS_KERNEL_DLL AND TARGET ninfer_kernels)
@@ -161,7 +161,7 @@ function(ninfer_runtime_dll_list out_var)
   if(WIN32 AND DEFINED FFMPEG_VCPKG_TREE)
     foreach(_ninfer_dll_glob
       "avutil-*.dll" "avcodec-*.dll" "avformat-*.dll" "swscale-*.dll"
-      "swresample-*.dll" "libcurl*.dll" "z.dll")
+      "swresample-*.dll" "z.dll")
       file(GLOB _ninfer_dlls "${FFMPEG_VCPKG_TREE}/bin/${_ninfer_dll_glob}")
       list(APPEND _list ${_ninfer_dlls})
     endforeach()
@@ -183,10 +183,10 @@ function(ninfer_stage_runtime_dlls target)
   add_custom_command(TARGET ${target} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
       ${_ninfer_rt_dlls} $<TARGET_FILE_DIR:${target}>
-    COMMENT "Staging runtime DLLs (ffmpeg/curl) next to ${target}")
+    COMMENT "Staging runtime DLLs (FFmpeg) next to ${target}")
 endfunction()
 
-# Stage the shared FFMPEG/curl closure once next to the test executables. All test
+# Stage the shared FFmpeg closure once next to the test executables. All test
 # exes share a single per-config runtime directory, so one copy serves every one of
 # them (anchored on any always-built test target for the directory).
 function(ninfer_stage_test_runtime_dlls anchor_target)
@@ -201,5 +201,5 @@ function(ninfer_stage_test_runtime_dlls anchor_target)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${_ninfer_test_rt_dlls}
             "$<TARGET_FILE_DIR:${anchor_target}>"
-    COMMENT "Staging runtime DLLs (ffmpeg/curl) next to test executables")
+    COMMENT "Staging runtime DLLs (FFmpeg) next to test executables")
 endfunction()

@@ -53,8 +53,8 @@ It imports `vcvars64.bat`; setup-msbuild alone does not provide the compiler env
 Linux uses Debian 13. CUDA 13 uses NVIDIA's exact Debian 13 Toolkit metapackage. CUDA 12 uses
 NVIDIA's official runfile installer, with only the Toolkit selected. Debian 13 rejects the SHA-1
 binding in NVIDIA's Debian 12 APT key; the workflow does not relax signature verification.
-FFmpeg and dav1d come from the release archives that `cmake/MediaSources.cmake` pins, which
-`scripts/fetch-media-sources.sh` downloads before configure. CUDA 12.9 also needs matching
+FFmpeg, dav1d and Mbed TLS come from the release archives that `cmake/MediaSources.cmake` pins,
+which `scripts/fetch-media-sources.sh` downloads before configure (on Windows, Mbed TLS alone). CUDA 12.9 also needs matching
 `noexcept(true)` declarations for `sinpi`, `cospi`, `sinpif` and `cospif` with glibc 2.41.
 A version-guarded script patches those declarations and inline helper signatures, without changing
 function bodies. `BUILD-INFO.json` records the patch. The pre-build probe compiles CUDA headers

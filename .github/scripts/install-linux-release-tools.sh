@@ -7,7 +7,7 @@ suffix="${minor/./-}"
 apt-get update
 apt-get install -y --no-install-recommends \
   build-essential ninja-build pkg-config patchelf python3 python3-venv \
-  meson nasm libcurl4-openssl-dev zlib1g-dev
+  meson nasm zlib1g-dev
 # A temporary runner keeps the Toolkit between jobs: the glibc patch below marks a finished install.
 if [[ "$CUDA_VERSION" == 12.9.2 && -f "/usr/local/cuda-$minor/ninfer-toolchain-patches.txt" ]]; then
   echo "CUDA $CUDA_VERSION is already installed and patched."

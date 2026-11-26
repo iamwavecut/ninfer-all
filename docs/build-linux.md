@@ -99,12 +99,13 @@ Then install the host compiler and build tools:
 sudo apt-get update
 sudo apt-get install --yes \
   build-essential gcc-13 g++-13 cmake ninja-build pkg-config \
-  meson nasm zlib1g-dev libcurl4-openssl-dev
+  meson nasm zlib1g-dev
 ```
 
 The build compiles FFmpeg and dav1d (its AV1 decoder) from their release archives and links them
-in, with only the decoders of the [media formats](serving.md#media-formats). Download the archives
-once; the script checks their SHA-256 digests and keeps them in `third_party/media-sources`:
+in, with only the decoders of the [media formats](serving.md#media-formats), and Mbed TLS, the TLS
+library of [HTTPS media URLs](serving.md#trusted-certificates). Download the archives once; the
+script checks their SHA-256 digests and keeps them in `third_party/media-sources`:
 
 ```bash
 scripts/fetch-media-sources.sh
@@ -286,25 +287,6 @@ the [measurements](performance/tesla-v100-2026-10.md#models-on-a-16-gb-card).
 The V100-SXM2-16GB and V100-SXM2-32GB device route profiles are built in; another V100 part
 calibrates at first start, in about nine seconds (see [device profiles](device-profiles.md)).
 
-## Optional vcpkg dependencies
-
-Linux can take libcurl from the pinned `vcpkg.json` manifest instead of the system package.
-FFmpeg still comes from its release archive: vcpkg also builds the manifest's FFmpeg, which only
-Windows builds link. Bootstrap the pinned vcpkg revision:
-
-```bash
-git clone https://github.com/microsoft/vcpkg.git "$HOME/.local/share/vcpkg"
-git -C "$HOME/.local/share/vcpkg" checkout 4bca8fd8654e5ba76f92661db7bfe954768ad8ef
-"$HOME/.local/share/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
-```
-
-Add these options to the native CMake command:
-
-```text
--DCMAKE_TOOLCHAIN_FILE=$HOME/.local/share/vcpkg/scripts/buildsystems/vcpkg.cmake
--DVCPKG_TARGET_TRIPLET=x64-linux
-```
-
 ## Build options
 
 Every option below is off by default; a default build runs the tested routes. Pass them to the
@@ -323,7 +305,7 @@ CMake configure command as `-DNAME=VALUE`.
 | `NINFER_PDL=ON` | on a `120a` build of the `mma.sync` path, launches the Qwen3.5-core decode-graph kernels as programmatic dependents, so a kernel stages its weights while the one before it finishes (the native routes always do; Gemma 4, Flint and Inkling 2 do on every sm_90+ card without the option) |
 | `NINFER_TMA_STAGING=ON` | passes the NVFP4 TMA descriptors through device memory with a capturable staging kernel, as Windows builds must, so that path can be tested on Linux (`120a`) |
 | `NINFER_MULTICALL=ON` | Linux: links `ninfer`, `ninfer-serve`, `ninfer-calibrate` and `ninfer-perplexity` into one executable, `apps/ninfer-multicall`, with the four names as symlinks to it, so the kernel image (about 0.5 GB per architecture) is there once instead of four times; the container image is built this way |
-| `NINFER_MEDIA_SOURCES_DIR=PATH` | Linux: reads the FFmpeg and dav1d release archives from that directory instead of `third_party/media-sources` (`scripts/fetch-media-sources.sh PATH` fills it) |
+| `NINFER_MEDIA_SOURCES_DIR=PATH` | reads the release archives `cmake/MediaSources.cmake` pins (FFmpeg and dav1d on Linux, Mbed TLS everywhere) from that directory instead of `third_party/media-sources` (`scripts/fetch-media-sources.sh PATH` fills it) |
 | `NINFER_MEDIA_NATIVE_PNG=ON` | decodes PNG images natively instead of through FFmpeg, as Windows builds do by default, so that decoder can be tested on Linux |
 | `NINFER_DIRECTSTORAGE=ON` | Windows: fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores |
 

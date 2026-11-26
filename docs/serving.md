@@ -1609,8 +1609,8 @@ and `--max-request-mib`.
 
 A fetch:
 
-- uses HTTP or HTTPS only, verifies TLS certificates, and sends no credentials, goes through no
-  proxy and decodes no `Content-Encoding`;
+- uses HTTP or HTTPS only, verifies the server's TLS certificate and host name, and sends no
+  credentials, goes through no proxy and decodes no `Content-Encoding`;
 - connects only to the address that the host name resolved to, and only when that address is
   outside loopback, private, shared, link-local, documentation, benchmarking, reserved and multicast
   networks, including the IPv6 forms that carry such an IPv4 address;
@@ -1620,8 +1620,20 @@ A fetch:
   cancellation.
 
 A refused URL or address returns 400 `invalid_media`, a file over SIZE 400
-`media_budget_exceeded`, a failed fetch 502 `media_fetch_failed` and a timeout 504
-`media_fetch_timeout`.
+`media_budget_exceeded`, a failed fetch 502 `media_fetch_failed` (an untrusted certificate among
+them) and a timeout 504 `media_fetch_timeout`.
+
+#### Trusted certificates
+
+HTTPS media URLs use Mbed TLS 4.3.0, which every build compiles in
+from its pinned release (TLS 1.2 and 1.3), so no build needs a system TLS or HTTP library. It
+trusts the PEM bundle that the `SSL_CERT_FILE` environment variable names, else the certificate
+directory that `SSL_CERT_DIR` names, else the system's certificates: on Windows the certificate
+store, on Linux the first of `/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
+`/etc/ssl/ca-bundle.pem`, `/etc/pki/tls/cacert.pem` and `/etc/ssl/cert.pem` that exists (else the
+first of the directories `/etc/ssl/certs`, `/etc/pki/tls/certs` and `/usr/share/ca-certificates`).
+The container images install Ubuntu's or Debian's `ca-certificates`. A host without any of these
+needs `SSL_CERT_FILE`.
 
 ### Media formats
 
