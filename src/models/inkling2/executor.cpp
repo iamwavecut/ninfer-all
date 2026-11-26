@@ -565,7 +565,7 @@ struct Executor::Impl {
             }
             if (p.full && paged) {
                 p.pool_plane = 4 * full_visits++; // the pool holds the visit's four planes
-            } else if (kvfmt.quantized()) {
+            } else if (p.full && kvfmt.quantized()) {
                 // One code and one scale area per plane; a row is one head's whole block of
                 // slots (the F16 caches' row shape), position_bytes one slot's codes or scales.
                 const auto area = [&](KvCoding coding) {
