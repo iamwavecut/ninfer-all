@@ -23,8 +23,9 @@ inline constexpr const char* kMcpProxyHeaderPrefix = "x-llama-server-proxy-heade
 inline constexpr std::size_t kMcpProxyBufferBytes = std::size_t{1} << 20;
 
 struct McpProxyTarget {
+    bool https = false;
     std::string host;
-    int port = 80;
+    int port = 80; // 443 for an https url without a port
     std::string path; // path plus query
 };
 
@@ -36,8 +37,9 @@ struct McpProxyRequest {
     httplib::Headers headers; // forwarded upstream, prefix already stripped
 };
 
-// Splits an absolute http:// URL. https is refused rather than downgraded: the vendored httplib has
-// no TLS client, and a downgrade would put the caller's bearer token on the wire in the clear.
+// Splits an absolute http:// or https:// URL. An https target is reached over TLS with the server's
+// certificate and host name verified (product/https_client.h), never over plain HTTP, which would
+// put the caller's bearer token on the wire in the clear.
 McpProxyRequest parse_mcp_proxy_target(const std::string& url);
 
 // Target from the url query parameter, forwarded headers from the prefixed ones. Unprefixed headers

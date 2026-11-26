@@ -1084,8 +1084,10 @@ The WebUI's MCP client cannot reach an MCP server from the browser: the Streamab
 answer POST from a raw writer without CORS headers. `--webui-mcp-proxy` serves the `/cors-proxy`
 relay that the WebUI's "Use llama-server proxy" option targets (the target in the `url` query
 parameter, its headers prefixed with `x-llama-server-proxy-header-`) and reports
-`cors_proxy_enabled` in `/props`. The relay streams and forwards to any `http://` host it is given
-(`https://` is refused: there is no TLS client). It requires `--api-key` like every API route; the
+`cors_proxy_enabled` in `/props`. The relay streams and forwards to any `http://` or `https://`
+host it is given, and verifies an HTTPS server's certificate against the
+[same trusted certificates](#trusted-certificates) as media URL fetches; it never retries an
+`https://` target over plain HTTP. It requires `--api-key` like every API route; the
 WebUI sends its configured key unprefixed beside the MCP server's prefixed headers. It holds at most
 1 MiB of a reply the browser has not read yet and stops reading the MCP server until the browser
 catches up. It reaches any host, so enable it only on a trusted bind address.
@@ -1625,7 +1627,7 @@ them) and a timeout 504 `media_fetch_timeout`.
 
 #### Trusted certificates
 
-HTTPS media URLs use Mbed TLS 4.3.0, which every build compiles in
+HTTPS (media URLs and the [MCP relay](#webui)) uses Mbed TLS 4.3.0, which every build compiles in
 from its pinned release (TLS 1.2 and 1.3), so no build needs a system TLS or HTTP library. It
 trusts the PEM bundle that the `SSL_CERT_FILE` environment variable names, else the certificate
 directory that `SSL_CERT_DIR` names, else the system's certificates: on Windows the certificate
@@ -2705,7 +2707,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-max-tokens N` | output limit when omitted by a request; see [default output limit](#default-output-limit) | largest budget that keeps every lane admissible |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--no-webui` | stop serving a WebUI built in with `NINFER_WEBUI_DIR` | served when built in |
-| `--webui-mcp-proxy` | relay the WebUI's MCP traffic at `/cors-proxy` (http targets only) | off |
+| `--webui-mcp-proxy` | relay the WebUI's MCP traffic at `/cors-proxy` (http and https targets) | off |
 | `--ui-config-file PATH` | a JSON object of WebUI settings, reported as `/props` `ui_settings` ([WebUI](#webui)) | none |
 | `--structured-output` | enforce response formats (JSON, JSON Schema, regex, choice, GBNF) and strict tool arguments (see [Structured output](#structured-output)) | off |
 | `--unconstrained-response-format` | without `--structured-output`, generate a constrained request or strict tools unconstrained instead of refusing them | off |
