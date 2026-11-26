@@ -267,6 +267,20 @@ void decode_slice(QType format, const std::uint8_t* row, int slice, GgufCpuSlice
         out.factor[1] = d * float(2 * (scale >> 4) + 1) * 0.125F;
         return;
     }
+    case QType::GGUF_IQ2_XS: {
+        // d, 32 16-bit words (a 9-bit grid index and a 7-bit sign index each), 8 scale bytes.
+        const std::uint8_t* qs = block + 2 + 8 * sub;
+        const unsigned scale   = block[66 + sub];
+        for (int l = 0; l < 4; ++l) {
+            const unsigned q     = load16(qs + 2 * l);
+            const unsigned signs = ksigns_iq2xs[q >> 9];
+            const auto* grid     = reinterpret_cast<const std::uint8_t*>(iq2xs_grid + (q & 511U));
+            for (int j = 0; j < 8; ++j) { out.weights[8 * l + j] = signed_by(grid[j], signs & (1U << j)); }
+        }
+        out.factor[0] = d * float(2 * (scale & 15U) + 1) * 0.125F;
+        out.factor[1] = d * float(2 * (scale >> 4) + 1) * 0.125F;
+        return;
+    }
     case QType::GGUF_IQ2_XXS: {
         // d, then per sub-block four grid-index bytes and a word of four 7-bit sign indices and a
         // 4-bit scale.
@@ -357,7 +371,8 @@ void rows_scalar(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_beg
     const int tokens = x.tokens();
     const int slices = w.k / 32;
     const bool q2    = w.format == QType::GGUF_Q2_0;
-    const bool two   = w.format == QType::GGUF_IQ2_S || w.format == QType::GGUF_IQ1_M;
+    const bool two   = w.format == QType::GGUF_IQ2_S || w.format == QType::GGUF_IQ2_XS ||
+                     w.format == QType::GGUF_IQ1_M;
     const bool delta = w.format == QType::GGUF_IQ1_S;
     const bool six   = w.format == QType::GGUF_Q6_K || w.format == QType::GGUF_Q3_K ||
                      w.format == QType::GGUF_NVFP4;
@@ -480,6 +495,7 @@ bool gguf_cpu_supported(QType format) noexcept {
     case QType::GGUF_IQ1_S:
     case QType::GGUF_IQ1_M:
     case QType::GGUF_IQ2_XXS:
+    case QType::GGUF_IQ2_XS:
     case QType::GGUF_IQ2_S:
     case QType::GGUF_IQ3_XXS:
     case QType::GGUF_IQ3_S:

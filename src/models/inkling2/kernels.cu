@@ -655,8 +655,8 @@ __device__ __forceinline__ void query_post_block(const QueryArgs& a, int t, int 
     const float f    = fminf(1.0f, fmaxf(0.0f, a.qk_clip / norm));
     a.q_out[(std::int64_t(t) * a.heads + h) * kD + d] = x * f * tau;
     if (d >= 32) { return; }
-    const float r  = d < kRel ? row[a.relative_column + h * kRel + d] * a.relative_clip[h * kRel + d]
-                              : 0.0f;
+    const float* rel = a.relative + std::int64_t(t) * a.relative_stride;
+    const float r    = d < kRel ? rel[h * kRel + d] * a.relative_clip[h * kRel + d] : 0.0f;
     const float rn = sqrtf(warp_sum(r * r)) + 1e-6f;
     const float rf = fminf(1.0f, fmaxf(0.0f, a.rel_clip / rn));
     if (d < kRel) { a.r_out[(std::int64_t(t) * a.heads + h) * kRel + d] = r * rf * tau; }

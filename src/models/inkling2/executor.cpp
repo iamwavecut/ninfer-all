@@ -285,8 +285,13 @@ struct Executor::Impl {
     // head: the vocabulary's rows; head_tiles: the stored rows the matrix kernel reads for them,
     // whole 128-row tiles (the GGUF pads the vocabulary past them).
     Weight embedding, head, head_tiles;
-    // A model with BF16 matrices runs every call on BF16 rows: the BF16 products read no q8_1 form.
+    // A model whose attention output, experts or head is BF16 (or MXFP8) runs every call on BF16
+    // rows: those products read no q8_1 form.
     bool bf16_rows = false;
+    // A BF16 attention input projection (query, gate, relative, key or value) beside GGUF block
+    // matrices elsewhere (GSQ-RCO's relative features): it multiplies the call's BF16 rows, which
+    // a call of q8_1 rows then writes as well, and the other products keep their q8_1 form.
+    bool attention_bf16 = false;
     const float *embedding_norm = nullptr, *final_norm = nullptr, *output_mix = nullptr;
     std::vector<std::uint32_t> positions;
     // The position at which each sequence's rings last came whole from a prompt, a checkpoint or
@@ -387,7 +392,9 @@ struct Executor::Impl {
         output_mix     = fp32(model, w.output_mix, hidden);
         require_gguf(model, w.token_embedding, embedding);
         require_gguf(model, w.output_head, head);
-        bf16_rows = embedding.qtype == QType::BF16 || head.qtype == QType::BF16;
+        // The token table is only read row by row (table_rows), so its format leaves the calls'
+        // forms alone.
+        bf16_rows = head.qtype == QType::BF16;
         if (options.dspine && (model.dspine() == nullptr || options.draft_tokens == 0 ||
                                options.draft_tokens + 1 > model.dspine()->config().block_size)) {
             throw std::invalid_argument("inkling2 executor: DSpine drafting needs the model's "
@@ -659,10 +666,11 @@ struct Executor::Impl {
         require_gguf(model, aw.value, p.value);
         require_gguf(model, aw.output, p.output);
         for (const Weight& m : p.query) { require_gguf(model, aw.query, m); }
-        for (const Weight* m : {&p.key, &p.value, &p.output}) {
-            bf16_rows = bf16_rows || m->qtype == QType::BF16;
+        bf16_rows = bf16_rows || p.output.qtype == QType::BF16;
+        for (const Weight* m : {&p.key, &p.value}) {
+            attention_bf16 = attention_bf16 || m->qtype == QType::BF16;
         }
-        for (const Weight& m : p.query) { bf16_rows = bf16_rows || m.qtype == QType::BF16; }
+        for (const Weight& m : p.query) { attention_bf16 = attention_bf16 || m.qtype == QType::BF16; }
         const MoeWeights& mw = lw.moe;
         const int e = int(config.num_experts), width = int(config.moe_intermediate_size);
         p.router      = fp32(model, mw.router, e * hidden);
@@ -1573,7 +1581,8 @@ struct Executor::Impl {
         std::size_t query_rows = 0, gguf_scratch = 0, bf16_plane = 0;
         for (const LayerPlan& p : layers) {
             query_rows = std::max<std::size_t>(query_rows, p.query_rows);
-            // A BF16 matrix writing columns wider than its rows goes through a plane (project_f32).
+            // A BF16 query part writes a plane of its own rows: the relative feature's (visit) or
+            // project_f32's scratch for another part.
             for (const Weight& part : p.query) {
                 if (part.qtype == QType::BF16 && part.n != p.query_rows) {
                     bf16_plane = std::max<std::size_t>(bf16_plane, part.n);
@@ -1968,19 +1977,24 @@ struct Executor::Impl {
     }
 
     // W x into FP32 [T][column_stride] from row `row`, x in the call's form: q8_1 rows (up to 8)
-    // or BF16 rows.
+    // or BF16 rows. A BF16 W multiplies the BF16 rows in either form (a call of q8_1 rows writes
+    // them too where attention_bf16 needs them).
     void product(const Weight& w, const void* xq, const __nv_bfloat16* x, int t, float* out,
                  int column_stride, int row = 0) {
-        if (xq != nullptr) {
+        if (xq != nullptr && w.qtype != QType::BF16) {
             vector_f32(xq, w, t, out, column_stride, row);
             return;
+        }
+        if (x == nullptr) {
+            throw std::logic_error("inkling2: a BF16 product of a call without BF16 rows");
         }
         project_f32(Tensor(const_cast<__nv_bfloat16*>(x), DType::BF16, {w.k, t}), w, out,
                     column_stride, row);
     }
 
-    // product() for a layer's projections of one call: with q8_1 inputs those of one block type
-    // and row size share a launch (ops::detail::gguf_vector_project).
+    // product() for a layer's projections of one call: the GGUF matrices with q8_1 inputs of one
+    // block type and row size share a launch (ops::detail::gguf_vector_project); the others run
+    // one at a time.
     struct Projection {
         const Weight* w;
         const void* xq;
@@ -1990,20 +2004,20 @@ struct Executor::Impl {
         int row;
     };
     void products(std::span<const Projection> list, int t) {
-        if (std::any_of(list.begin(), list.end(), [](const Projection& p) { return p.xq == nullptr; })) {
-            for (const Projection& p : list) {
+        std::vector<ops::detail::GgufVectorProduct> queued;
+        queued.reserve(list.size());
+        for (const Projection& p : list) {
+            if (p.xq == nullptr || p.w->qtype == QType::BF16) {
                 product(*p.w, p.xq, p.x, t, p.out, p.column_stride, p.row);
+                continue;
             }
-            return;
+            ops::detail::GgufVectorProduct& q = queued.emplace_back();
+            q.weight            = p.w;
+            q.activation        = p.xq;
+            q.out.f32           = p.out + p.row;
+            q.out.column_stride = p.column_stride;
         }
-        std::vector<ops::detail::GgufVectorProduct> queued(list.size());
-        for (std::size_t i = 0; i < list.size(); ++i) {
-            queued[i].weight            = list[i].w;
-            queued[i].activation        = list[i].xq;
-            queued[i].out.f32           = list[i].out + list[i].row;
-            queued[i].out.column_stride = list[i].column_stride;
-        }
-        ops::detail::gguf_vector_project(queued, t, stream);
+        if (!queued.empty()) { ops::detail::gguf_vector_project(queued, t, stream); }
     }
 
     static constexpr std::size_t kStagingRegions = 4;
@@ -2120,15 +2134,16 @@ struct Executor::Impl {
         return m;
     }
 
+    // A call of BF16 rows writes them; a call of q8_1 rows writes those, and the BF16 rows where it
+    // holds them (`bf16` null otherwise: its attention inputs with attention_bf16).
     void set_outputs(const Call& c, __nv_bfloat16*& out, kernels::Q8Rows& out_q, float*& f32,
                      std::int64_t& q8_stride, __nv_bfloat16* bf16, const Q8Act& q,
                      std::size_t q_stride, float* rows) const {
         if (c.q8) {
             out_q     = q.rows;
             q8_stride = std::int64_t(q_stride);
-        } else {
-            out = bf16;
         }
+        out = bf16;
         f32 = rows;
     }
 
@@ -2375,9 +2390,23 @@ struct Executor::Impl {
         auto* qgr = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * lp.query_rows * 4).data);
         auto* kv  = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 4).data);
         auto* sinks = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * 4).data);
+        // The relative feature's rows: in the product's at column 2 q_floats, or, from a BF16
+        // matrix of its own (Linear's A16 route writes whole [N][T] planes), a plane of their own.
+        const float* relative        = qgr + 2 * q_floats;
+        std::int64_t relative_stride = lp.query_rows;
         std::vector<Projection> qkv;
         for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
-            qkv.push_back({&lp.query[i], input_q(c, 0), bf16_in(0), qgr, lp.query_rows, int(row)});
+            const Weight& part = lp.query[i];
+            if (part.qtype == QType::BF16 && int(row) == 2 * q_floats && part.n == query_heads * rel &&
+                part.n != lp.query_rows) {
+                auto* plane = static_cast<float*>(
+                    workspace->alloc_bytes(std::size_t(t) * part.n * 4).data);
+                qkv.push_back({&part, input_q(c, 0), bf16_in(0), plane, part.n, 0});
+                relative        = plane;
+                relative_stride = part.n;
+                continue;
+            }
+            qkv.push_back({&part, input_q(c, 0), bf16_in(0), qgr, lp.query_rows, int(row)});
         }
         qkv.push_back({&lp.key, input_q(c, ki), bf16_in(ki), kv, 2 * kvd, 0});
         qkv.push_back({&lp.value, input_q(c, vi), bf16_in(vi), kv, 2 * kvd, kvd});
@@ -2405,7 +2434,8 @@ struct Executor::Impl {
         kernels::QueryArgs qa;
         qa.qgr             = qgr;
         qa.stride          = lp.query_rows;
-        qa.relative_column = 2 * q_floats;
+        qa.relative        = relative;
+        qa.relative_stride = relative_stride;
         qa.tokens          = t;
         qa.heads           = query_heads;
         qa.query_clip      = lp.query_clip;
@@ -2980,6 +3010,10 @@ struct Executor::Impl {
             c.in_q_stride = q8_bytes(hidden, t);
             c.in_q        = alloc_q8(hidden, t, 3);
             c.ffn_q       = alloc_q8(hidden, t);
+            if (attention_bf16) {
+                c.in_bf16 = static_cast<__nv_bfloat16*>(
+                    workspace->alloc_bytes(std::size_t(3) * c.plane * 2).data);
+            }
         } else {
             c.in_bf16  = static_cast<__nv_bfloat16*>(
                 workspace->alloc_bytes(std::size_t(3) * c.plane * 2).data);

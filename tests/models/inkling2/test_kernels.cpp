@@ -6,8 +6,9 @@
 //  - gemm_f32 by the GEMV kernel (1..8 rows, strided) and by cuBLAS; gemm_f32_batch's products
 //    equal to gemm_f32's bit for bit.
 //  - The split rows of a short call (mix and residual over one-warp blocks): the row kernel's bits.
-//  - attention_inputs: Q and the relative feature clipped per head and scaled by the full layers'
-//    log factor below and above its floor; K and V: the short convolutions over the call's rows
+//  - attention_inputs: Q and the relative feature (in the product's rows or, from a BF16 relative
+//    projection, rows of its own) clipped per head and scaled by the full layers' log factor below
+//    and above its floor; K and V: the short convolutions over the call's rows
 //    and the history ring (decode rows of several sequences, a verification's consecutive rows, a
 //    prompt chunk after earlier positions), the dynamic taps, K's clip, V's norm, the cache slots
 //    and the history a decode call keeps; MXFP8 planes (a full visit of an mxfp8 run), decoded on
@@ -33,8 +34,9 @@
 //    BF16 values; another device's pairs (-1) keep their rows, and a second call gives the same
 //    bits. bf16_rows_f32: the table's rows exactly.
 //  - the routed experts of a call on the CPU (CpuExperts) against the GPU's vector kernels over
-//    the release's formats (NVFP4 with per-expert scales, Q5_K/Q5_0, Q4_K/Q5_0, IQ4_XS/IQ4_NL): the
-//    same 2^-32 fixed-point sums bit for bit, all on the CPU and half on each (add_fixed).
+//    the releases' formats (NVFP4 with per-expert scales, Q5_K/Q5_0, Q4_K/Q5_0, IQ4_XS/IQ4_NL, and
+//    GSQ-RCO's IQ1_S to IQ3_S [gate; up] banks over Q2_0 or IQ4_NL down banks): the same 2^-32
+//    fixed-point sums bit for bit, all on the CPU and half on each (add_fixed).
 // A BF16 output is compared with its oracle's value rounded once; FP32 arithmetic may land on the
 // other side of a rounding boundary, so those checks bound an RMS error instead of exact bits.
 
@@ -434,21 +436,34 @@ void control_case(int count, int tokens, std::mt19937& rng) {
 
 // ---- Attention inputs ---------------------------------------------------------------------------
 
-void query_case(bool log_scale, const std::vector<int>& positions, float sigma, std::mt19937& rng) {
+// `apart`: the relative feature in rows of its own (a BF16 relative projection's plane), else in
+// the product's rows after Q and the gate.
+void query_case(bool log_scale, const std::vector<int>& positions, float sigma, bool apart,
+                std::mt19937& rng) {
     const int t = int(positions.size());
     const std::int64_t stride = 2 * kHeads * kD + kHeads * kRel + 8, rel_col = 2 * kHeads * kD;
     const auto qgr  = normal(std::size_t(t) * stride, sigma, rng);
+    // The relative rows apart: the same values at kHeads * kRel + 4 floats a row.
+    const std::int64_t rel_stride = kHeads * kRel + 4;
+    std::vector<float> rel(std::size_t(t) * rel_stride, 0.0f);
+    for (int r = 0; r < t; ++r) {
+        for (int i = 0; i < kHeads * kRel; ++i) {
+            rel[std::size_t(r) * rel_stride + i] = qgr[std::size_t(r) * stride + rel_col + i];
+        }
+    }
     auto qclip      = normal(kHeads * kD, 0.3f, rng);
     auto rclip      = normal(kHeads * kRel, 0.3f, rng);
     for (auto& v : qclip) { v += 1.0f; }
     for (auto& v : rclip) { v += 1.0f; }
     std::vector<std::int32_t> pos(positions.begin(), positions.end());
-    DeviceBuffer d_qgr = upload(qgr), d_qc = upload(qclip), d_rc = upload(rclip), d_pos = upload(pos),
+    DeviceBuffer d_qgr = upload(qgr), d_rel = upload(rel), d_qc = upload(qclip),
+                 d_rc = upload(rclip), d_pos = upload(pos),
                  q_out(std::size_t(t) * kHeads * kD * 4), r_out(std::size_t(t) * kHeads * kRel * 4);
     k::QueryArgs a;
     a.qgr             = as<float>(d_qgr);
     a.stride          = stride;
-    a.relative_column = rel_col;
+    a.relative        = apart ? as<float>(d_rel) : as<float>(d_qgr) + rel_col;
+    a.relative_stride = apart ? rel_stride : stride;
     a.tokens          = t;
     a.heads           = kHeads;
     a.query_clip      = as<float>(d_qc);
@@ -490,7 +505,8 @@ void query_case(bool log_scale, const std::vector<int>& positions, float sigma, 
         }
     }
     report(eq.rel() < 1e-6 && er.rel() < 1e-6,
-           std::string("Q") + (log_scale ? " with the log factor" : "") + ", sigma " +
+           std::string("Q") + (log_scale ? " with the log factor" : "") +
+               (apart ? ", relative rows apart" : "") + ", sigma " +
                num(sigma) + ", " + std::to_string(clipped) + " clipped heads: q " + num(eq.rel()) +
                ", r " + num(er.rel()));
 }
@@ -624,7 +640,8 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
     k::QueryArgs q;
     q.qgr             = as<float>(d_qgr);
     q.stride          = q_stride;
-    q.relative_column = 2 * kHeads * kD;
+    q.relative        = as<float>(d_qgr) + 2 * kHeads * kD;
+    q.relative_stride = q_stride;
     q.tokens          = t;
     q.heads           = kHeads;
     q.query_clip      = as<float>(d_ones);
@@ -1649,6 +1666,18 @@ std::vector<std::uint8_t> expert_blocks(QType q, int rows, int depth, std::mt199
             continue;
         }
         const __half h = __float2half(scale(rng));
+        if (q == QType::GGUF_IQ1_M) {
+            // The multiplier's four nibbles top the four scale words.
+            std::uint16_t bits;
+            std::memcpy(&bits, &h, 2);
+            for (int w = 0; w < 4; ++w) {
+                std::uint16_t word;
+                std::memcpy(&word, &bytes[at + 48 + 2 * w], 2);
+                word = std::uint16_t((word & 0x0FFF) | (((bits >> (4 * w)) & 0xF) << 12));
+                std::memcpy(&bytes[at + 48 + 2 * w], &word, 2);
+            }
+            continue;
+        }
         std::memcpy(&bytes[at], &h, 2);
         if (q == QType::GGUF_Q4_K || q == QType::GGUF_Q5_K) { std::memcpy(&bytes[at + 2], &h, 2); }
     }
@@ -1822,8 +1851,9 @@ int main() {
         control_case(1, 3, rng);
         control_case(3, 7, rng);
 
-        query_case(false, {0, 5, 1000}, 1.0f, rng);
-        query_case(true, {0, 8190, 8191, 8192, 20000, 1048575}, 4.0f, rng);
+        query_case(false, {0, 5, 1000}, 1.0f, false, rng);
+        query_case(true, {0, 8190, 8191, 8192, 20000, 1048575}, 4.0f, false, rng);
+        query_case(true, {3, 8191, 9000}, 4.0f, true, rng);
 
         // Decode rows of three sequences; a verification's four rows of one sequence; a prompt
         // chunk after 50 positions; one at position 0; a chunk's branches.
@@ -1914,6 +1944,16 @@ int main() {
         cpu_experts_case("Q5_K/Q5_0", QType::GGUF_Q5_K, QType::GGUF_Q5_0, false, 3, rng);
         cpu_experts_case("Q4_K/Q5_0", QType::GGUF_Q4_K, QType::GGUF_Q5_0, false, 8, rng);
         cpu_experts_case("IQ4_XS/IQ4_NL", QType::GGUF_IQ4_XS, QType::GGUF_IQ4_NL, false, 2, rng);
+        // ISTA-DASLab's GSQ-RCO quantizations: IQ1_S to IQ3_S [gate; up] banks, Q2_0 or IQ4_NL
+        // down banks.
+        cpu_experts_case("IQ1_S/Q2_0", QType::GGUF_IQ1_S, QType::GGUF_Q2_0, false, 1, rng);
+        cpu_experts_case("IQ1_M/Q2_0", QType::GGUF_IQ1_M, QType::GGUF_Q2_0, false, 3, rng);
+        cpu_experts_case("IQ2_XXS/IQ4_NL", QType::GGUF_IQ2_XXS, QType::GGUF_IQ4_NL, false, 2, rng);
+        cpu_experts_case("IQ2_XS/Q2_0", QType::GGUF_IQ2_XS, QType::GGUF_Q2_0, false, 1, rng);
+        cpu_experts_case("IQ2_XS/IQ4_NL", QType::GGUF_IQ2_XS, QType::GGUF_IQ4_NL, false, 8, rng);
+        cpu_experts_case("IQ2_S/IQ4_NL", QType::GGUF_IQ2_S, QType::GGUF_IQ4_NL, false, 4, rng);
+        cpu_experts_case("IQ3_XXS/IQ4_NL", QType::GGUF_IQ3_XXS, QType::GGUF_IQ4_NL, false, 5, rng);
+        cpu_experts_case("IQ3_S/Q2_0", QType::GGUF_IQ3_S, QType::GGUF_Q2_0, false, 8, rng);
     } catch (const std::exception& e) {
         std::cout << "FAIL " << e.what() << '\n';
         return 1;
