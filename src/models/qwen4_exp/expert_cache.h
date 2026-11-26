@@ -41,6 +41,7 @@ struct ExpertBank {
     std::int64_t expert_bytes = 0; // one expert's rows
     std::vector<const void*> host; // each expert's rows in the pinned host block
     void* table = nullptr;         // the device table the kernels read
+    std::vector<const void*> device; // device aliases for host entries, if distinct
 };
 
 struct ExpertCacheLayer {
@@ -129,7 +130,7 @@ public:
     struct Admitted {
         std::array<void*, 3> slot{};              // the expert's projections in its slot
         std::int32_t victim = -1;                 // the expert that left the slot, or -1
-        std::array<const void*, 3> victim_host{}; // the victim's projections in host memory
+        std::array<const void*, 3> victim_entry{}; // the victim's entries as the device table named them
     };
     // Takes a slot of a handed-over `layer` for the uncached `expert`, which the call copies to the
     // GPU anyway and routes `pairs` times: a free one, else the tier's victim among the experts

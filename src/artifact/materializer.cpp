@@ -830,6 +830,14 @@ std::span<const std::byte> MaterializedArtifact::pinned_block() const noexcept {
     return {static_cast<const std::byte*>(pinned_->data()), pinned_->size()};
 }
 
+const void* MaterializedArtifact::pinned_device_alias(const void* data, std::size_t bytes) const {
+    if (!pinned_ || !data) { return nullptr; }
+    const auto base = reinterpret_cast<std::uintptr_t>(pinned_->data());
+    const auto addr = reinterpret_cast<std::uintptr_t>(data);
+    if (addr < base || addr - base >= pinned_->size()) { return nullptr; }
+    return pinned_->device_alias(static_cast<std::size_t>(addr - base), bytes);
+}
+
 MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& plan,
                                  DeviceContext& device, const StartupObserver* startup_observer,
                                  std::unique_ptr<EvictableWeightPool> backing,
@@ -992,12 +1000,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     std::uint64_t pinned = 0;
     if (out.pinned_ && !pinned_layout.fallback) {
-        out.pinned_->pin();
+        out.pinned_->pin(/*device_mapped=*/true);
         pinned = pinned_layout.end;
     } else if (out.pinned_) {
         // The required prefix, then each part of objects that may stay in the files while the
         // host pins it; the pages past the last pinned part go back.
-        pinned = out.pinned_->pin_prefix(pinned_layout.part_ends, pinned_layout.end);
+        pinned = out.pinned_->pin_prefix(pinned_layout.part_ends, pinned_layout.end,
+                                         /*device_mapped=*/true);
         if (pinned < pinned_layout.required_end) {
             throw ArtifactError("failed to pin " + std::to_string(pinned_layout.required_end >> 20) +
                                 " MiB of host memory: the host refused it");
@@ -1019,6 +1028,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         const std::span<std::byte> destination(out.pinned_->data() + pinned_layout.offsets[i],
                                                static_cast<std::size_t>(placement.bytes));
         const auto divisor = read_divisor(reader, placement.object, geometry, destination, out.stats_);
+        // CPU expert products and host-block consumers require the original CPU address.
         out.objects_.at(placement.object.index).pinned =
             WeightParent{geometry, destination.data(), divisor};
         ++out.stats_.pinned_object_count;

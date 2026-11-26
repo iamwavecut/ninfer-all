@@ -113,6 +113,10 @@ void pinned_or_files(DeviceContext& device) {
                     backing.stats().pinned_block_end == PinnedBlockEnd::Cap,
                 "a zero budget pinned an object that may stay in the files");
         const auto view = bind_view(row, backing);
+        // Pinned parents are used by CPU consumers as well as CUDA. They must address the host
+        // block, even on devices where a registered allocation has a different device alias.
+        require(view.parts.front().parent->data == backing.pinned_block().data(),
+                "pinned parent does not point to the CPU-readable host block");
         require(page_locked(view.parts.front().parent->data) &&
                     std::equal(backing.pinned_block().begin(), backing.pinned_block().end(),
                                fixture.payload.begin() + 256),
@@ -154,11 +158,24 @@ void pinned_or_files(DeviceContext& device) {
         HostPages pages(3 * kPart);
         for (std::size_t i = 0; i < pages.size(); i += 4096) { pages.data()[i] = std::byte(i >> 12); }
         const std::array<std::size_t, 3> ends{kPart, 2 * kPart, 3 * kPart};
-        require(pages.pin_prefix(ends, 2 * kPart + 100) == 2 * kPart && pages.size() == 2 * kPart,
+        require(pages.pin_prefix(ends, 2 * kPart + 100, true) == 2 * kPart && pages.size() == 2 * kPart,
                 "pin_prefix pinned past its limit");
         require(page_locked(pages.data()) && page_locked(pages.data() + kPart + 8) &&
                     pages.data()[kPart] == std::byte(kPart >> 12),
                 "pin_prefix lost a part's pages or bytes");
+        for (const std::size_t offset : {std::size_t{0}, kPart - 1, kPart, 2 * kPart - 1}) {
+            void* part_alias = nullptr;
+            const std::size_t part_start = offset < kPart ? 0 : kPart;
+            CUDA_CHECK(cudaHostGetDevicePointer(&part_alias, pages.data() + part_start, 0));
+            require(pages.device_alias(offset, 1) ==
+                        static_cast<const std::byte*>(part_alias) + (offset - part_start),
+                    "mapped prefix used the wrong part's device alias");
+            std::byte actual{};
+            CUDA_CHECK(cudaMemcpy(&actual, pages.device_alias(offset, 1), 1, cudaMemcpyDefault));
+            require(actual == pages.data()[offset], "device alias reads the wrong pinned byte");
+        }
+        rejects<std::out_of_range>([&] { (void)pages.device_alias(kPart - 1, 2); },
+                "mapped alias crossing separate registrations was accepted");
     }
     {
         // A part the host refuses (here: already registered) ends the block, and the refusal is

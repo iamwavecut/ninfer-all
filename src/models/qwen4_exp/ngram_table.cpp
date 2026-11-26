@@ -507,7 +507,7 @@ class NgramTableReader::Lookahead {
 public:
     explicit Lookahead(NgramTableReader& owner)
         : owner_(owner), payload_(std::size_t(owner.options_.depth) * owner.layout_.row_bytes),
-          pool_(1) {
+          pool_(1, "n-gram lookahead") {
         std::vector<std::filesystem::path> paths;
         for (const auto& segment : owner.layout_.segments) { paths.push_back(segment.path); }
         queue_ = FileReadQueue::open(paths, owner.options_.io == NgramIo::Direct,
@@ -520,13 +520,25 @@ public:
     }
 
     void discard() {
-        if (active_) { pool_.finish(); }
+        if (active_) {
+            try {
+                pool_.finish();
+            } catch (...) {}
+        }
         active_ = false;
     }
 
     void submit(std::span<const std::uint64_t> rows) {
         if (rows.empty() || (active_ && !complete_.load(std::memory_order_acquire))) { return; }
-        if (active_) { pool_.finish(); }
+        if (active_) {
+            try {
+                pool_.finish();
+            } catch (...) {
+                // Advisory work: a failed batch leaves the payload unusable, not the request.
+                active_ = false;
+                return;
+            }
+        }
         const auto count = std::min<std::size_t>(rows.size(), owner_.options_.depth);
         ids_.assign(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(count));
         reads_.clear();
@@ -555,18 +567,26 @@ public:
         succeeded_ = false;
         complete_.store(false, std::memory_order_relaxed);
         active_ = true;
-        pool_.start(1, [this, rb](std::size_t) {
-            try {
-                if (queue_) { queue_->read(reads_); }
-                else {
-                    for (std::size_t i = 0; i < ids_.size(); ++i) {
-                        owner_.read(ids_[i] * rb, payload_.data() + i * rb, rb);
+        try {
+            pool_.start(1, [this, rb](std::size_t) {
+                try {
+                    if (queue_) { queue_->read(reads_); }
+                    else {
+                        for (std::size_t i = 0; i < ids_.size(); ++i) {
+                            owner_.read(ids_[i] * rb, payload_.data() + i * rb, rb);
+                        }
                     }
-                }
-                succeeded_ = true;
-            } catch (...) {}
+                    succeeded_ = true;
+                } catch (...) {}
+                complete_.store(true, std::memory_order_release);
+            });
+        } catch (...) {
+            // Speculative only: a batch the pool cannot take is dropped, and a demand read
+            // behind it reports any real failure through its ordinary path.
+            active_ = false;
+            succeeded_ = false;
             complete_.store(true, std::memory_order_release);
-        });
+        }
     }
 
     bool copy(std::uint64_t row, std::uint8_t* destination) const {
@@ -599,7 +619,8 @@ public:
         std::uint64_t begin, bytes;
     };
 
-    explicit Hints(const NgramTableReader& owner) : owner_(owner), pool_(1) {}
+    explicit Hints(const NgramTableReader& owner)
+        : owner_(owner), pool_(1, "n-gram hints") {}
 
     ~Hints() {
         try { pool_.finish(); } catch (...) {}
@@ -612,12 +633,18 @@ public:
         ranges_ = std::move(ranges);
         complete_.store(false, std::memory_order_relaxed);
         active_ = true;
-        pool_.start(1, [this](std::size_t) {
-            for (const Range& range : ranges_) {
-                owner_.files_[range.segment]->prefetch(range.begin, range.bytes);
-            }
+        try {
+            pool_.start(1, [this](std::size_t) {
+                for (const Range& range : ranges_) {
+                    owner_.files_[range.segment]->prefetch(range.begin, range.bytes);
+                }
+                complete_.store(true, std::memory_order_release);
+            });
+        } catch (...) {
+            // A hint the pool cannot take is dropped: the demand read reports any real failure.
+            active_ = false;
             complete_.store(true, std::memory_order_release);
-        });
+        }
     }
 
 private:
@@ -661,7 +688,7 @@ NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptio
         throw std::runtime_error("n-gram table: the files hold " + std::to_string(covered) +
                                  " table bytes, the table needs " + std::to_string(table_bytes));
     }
-    pool_ = std::make_unique<ReadPool>(options_.depth);
+    pool_ = std::make_unique<ReadPool>(options_.depth, "n-gram rows");
     if (options_.residency == NgramResidency::Ram) {
         load_resident();
     } else if (options_.residency == NgramResidency::RamHot) {
@@ -676,7 +703,7 @@ NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptio
         if (queue_) {
             // Startup's parallel bulk loads are finished. One worker now drives the OS queue;
             // its depth bounds native reads instead of allocating a thread for every read.
-            pool_ = std::make_unique<ReadPool>(1);
+            pool_ = std::make_unique<ReadPool>(1, "n-gram rows");
         }
     }
     const bool staged_hints = options_.io == NgramIo::Direct

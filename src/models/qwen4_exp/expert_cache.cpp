@@ -54,6 +54,11 @@ struct ExpertCache::Layer {
         return k == 0 ? banks.gate : k == 1 ? banks.up : banks.down;
     }
 
+    [[nodiscard]] const std::vector<const void*>& device_bank(int k) const {
+        const auto& projection = bank(k);
+        return projection.device.empty() ? projection.host : projection.device;
+    }
+
     [[nodiscard]] std::byte* slot_base(std::int64_t slot) const {
         if (slot < std::int64_t(base_slots)) {
             return static_cast<std::byte*>(storage.p) + std::size_t(slot) * slot_bytes;
@@ -88,8 +93,9 @@ struct ExpertCache::Layer {
         }
         dirty = true;
     }
-    void point_host(std::int32_t expert) {
-        for (int k = 0; k < 3; ++k) { current[k][std::size_t(expert)] = bank(k).host[std::size_t(expert)]; }
+    // Names an expert in the device tables: a mapped host expert's device alias, not its CPU address.
+    void point_device(std::int32_t expert) {
+        for (int k = 0; k < 3; ++k) { current[k][std::size_t(expert)] = device_bank(k)[std::size_t(expert)]; }
         dirty = true;
     }
 };
@@ -177,6 +183,11 @@ ExpertCache::ExpertCache(DeviceContext& device, std::vector<ExpertCacheLayer> la
         if (experts == 0 || banks.up.host.size() != experts || banks.down.host.size() != experts) {
             throw std::invalid_argument("expert cache: a layer's banks differ in expert count");
         }
+        for (const auto* bank : {&banks.gate, &banks.up, &banks.down}) {
+            if (!bank->device.empty() && bank->device.size() != experts) {
+                throw std::invalid_argument("expert cache: host and device alias counts differ");
+            }
+        }
         if (profile != nullptr && (*profile)[index].size() != experts) {
             throw std::invalid_argument("expert cache: the profile's bank width differs");
         }
@@ -187,7 +198,7 @@ ExpertCache::ExpertCache(DeviceContext& device, std::vector<ExpertCacheLayer> la
         layer.pending.assign(experts, 0);
         layer.total.assign(experts, 0);
         layer.fresh.assign(experts, 0);
-        for (int k = 0; k < 3; ++k) { layer.current[k] = layer.bank(k).host; }
+        for (int k = 0; k < 3; ++k) { layer.current[k] = layer.device_bank(k); }
         layer.staging = staging_bytes;
         staging_bytes += 3 * experts * sizeof(void*);
         experts_per_layer.push_back(std::uint32_t(experts));
@@ -361,7 +372,7 @@ void ExpertCache::adapt() {
             slot = layer.slot_of[std::size_t(swap.out)];
             if (slot < 0 || layer.pending[std::size_t(swap.out)]) { continue; }
             layer.slot_of[std::size_t(swap.out)] = -1;
-            layer.point_host(swap.out);
+            layer.point_device(swap.out);
             tier_->set(swap.layer, swap.out, ExpertTier::State::Out);
         } else {
             if (layer.free_slots.empty()) { continue; }
@@ -524,8 +535,8 @@ bool ExpertCache::admit(std::size_t index, std::int32_t expert, int pairs,
         if (slot < 0 || layer.pending[std::size_t(victim.expert)]) { return false; }
         out.victim                                = victim.expert;
         layer.slot_of[std::size_t(victim.expert)] = -1;
-        for (int k = 0; k < 3; ++k) { out.victim_host[k] = layer.bank(k).host[std::size_t(victim.expert)]; }
-        layer.point_host(victim.expert);
+        for (int k = 0; k < 3; ++k) { out.victim_entry[k] = layer.device_bank(k)[std::size_t(victim.expert)]; }
+        layer.point_device(victim.expert);
         tier_->set(index, victim.expert, ExpertTier::State::Out);
     }
     place(layer, index, expert, slot, out);
@@ -737,12 +748,12 @@ void ExpertCache::reclaim(std::size_t rank, cudaStream_t transfer) {
                 to                 = colder[next++];
                 const auto victim  = layer.expert_of[std::size_t(to)];
                 layer.slot_of[std::size_t(victim)] = -1;
-                layer.point_host(victim);
+                layer.point_device(victim);
                 tier_->set(index, victim, ExpertTier::State::Out);
             }
             if (to < 0) {
                 layer.slot_of[std::size_t(expert)] = -1;
-                layer.point_host(expert);
+                layer.point_device(expert);
                 tier_->set(index, expert, ExpertTier::State::Out);
                 continue;
             }
