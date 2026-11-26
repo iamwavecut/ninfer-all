@@ -594,20 +594,11 @@ struct Executor::Impl {
                 }
             }
             if (!p.full && options.checkpoints) {
-                // The rings' checkpoint: a quantized visit's planes' bytes, the F16 pair's halves.
-                if (kvfmt.quantized()) {
-                    for (const KvArea* area :
-                         {&p.k_codes, &p.k_scales, &p.v_codes, &p.v_scales}) {
-                        p.checkpoint.emplace_back(std::size_t(area->row_bytes) * kv_heads *
-                                                  sequences);
-                        kv_bytes += p.checkpoint.back().bytes;
-                    }
-                } else {
-                    for (int c = 0; c < 2; ++c) {
-                        p.checkpoint.emplace_back(std::size_t(p.seq_stride) * sizeof(__half) *
-                                                  sequences);
-                        kv_bytes += p.checkpoint.back().bytes;
-                    }
+                // The rings' checkpoint: the F16 pair's halves.
+                for (int c = 0; c < 2; ++c) {
+                    p.checkpoint.emplace_back(std::size_t(p.seq_stride) * sizeof(__half) *
+                                              sequences);
+                    kv_bytes += p.checkpoint.back().bytes;
                 }
             }
             visits.push_back(std::move(p));
