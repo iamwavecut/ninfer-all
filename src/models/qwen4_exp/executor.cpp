@@ -1214,6 +1214,8 @@ struct Executor::Impl {
     // A span's expert call that a wider call of the same layer follows: the pool keeps that
     // layer's experts.
     bool span_hold = false;
+    // Executor::set_span_progress: told as a span queues each layer.
+    std::function<void(std::uint32_t, std::uint32_t)> span_progress;
     // A span's last expert call of a layer: the disk cache releases the layer's experts the span's
     // earlier calls read and this one does not route to.
     bool span_last = false;
@@ -5931,6 +5933,9 @@ struct Executor::Impl {
                     }
                     capture = {};
                 }
+                if (span_progress) {
+                    span_progress(std::uint32_t(i + 1), std::uint32_t(layers.size()));
+                }
             }
             span_hold   = false;
             span_last   = false;
@@ -7769,6 +7774,11 @@ void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tok
 }
 
 bool Executor::packs_prompts() const noexcept { return impl_->span_tokens != 0; }
+
+void Executor::set_span_progress(
+    std::function<void(std::uint32_t done, std::uint32_t layers)> progress) {
+    impl_->span_progress = std::move(progress);
+}
 std::uint32_t Executor::narrow_prompt_tokens() const noexcept {
     return impl_->span_tokens == 0
                ? 0

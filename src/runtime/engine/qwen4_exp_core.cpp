@@ -933,6 +933,8 @@ struct Qwen4ExpCore::Impl {
             restore_prefix_cache(store, cache_file, cache_identity, diagnostics);
             stats.host_kv_occupied_bytes = store.host_used();
         }
+        i.executor->set_span_progress(
+            [this](std::uint32_t done, std::uint32_t layers) { count_span(done, layers); });
         worker = std::thread([this] {
             const DeviceWaitWatch watched(device, "Qwen3.8-Flash-Next worker");
             device.bind_to_current_thread();
@@ -2113,8 +2115,11 @@ struct Qwen4ExpCore::Impl {
             cut = {.tokens = step.cut - r.prefilled, .state = &slot.snapshot};
         }
         // Only the prompt's last step leaves logits (end_prefill samples them).
-        executor.forward(r.slot, prompt.subspan(r.prefilled, n), r.prefilled + n < prompt_n ? 0 : 1,
-                         next, cut);
+        {
+            const SpanSharesScope shares(span_shares, {{&r, r.prefilled, n}});
+            executor.forward(r.slot, prompt.subspan(r.prefilled, n),
+                             r.prefilled + n < prompt_n ? 0 : 1, next, cut);
+        }
         end_prefill(request, n, 0, 1, step.cut);
     }
 
@@ -2208,6 +2213,11 @@ struct Qwen4ExpCore::Impl {
                                                      executor.prompt_step(),
                                                      last.prompt_tokens.size() - last_end));
         try {
+            std::vector<SpanShare> shares;
+            for (const Packed& p : packed) {
+                shares.push_back({p.request.get(), p.request->prefilled, p.tokens});
+            }
+            const SpanSharesScope scope(span_shares, std::move(shares));
             executor.forward_pieces(pieces, next);
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
@@ -2417,6 +2427,39 @@ struct Qwen4ExpCore::Impl {
         }
         if (r.branch_results.size() < branches.size()) { return; }
         finish_prompt(request);
+    }
+
+    // The prompt steps of the span the executor runs: each request's prefilled tokens before it
+    // and its tokens in it. A span lasts seconds with the experts off the GPU, so count_span()
+    // books each queued layer's share of its tokens instead of all of them at its end.
+    struct SpanShare {
+        Request* request      = nullptr;
+        std::uint32_t before  = 0;
+        std::uint32_t tokens  = 0;
+    };
+    std::vector<SpanShare> span_shares;
+
+    // Sets span_shares for one prompt call and clears them when it returns or throws.
+    struct SpanSharesScope {
+        std::vector<SpanShare>& shares;
+        SpanSharesScope(std::vector<SpanShare>& to, std::vector<SpanShare> from) : shares(to) {
+            shares = std::move(from);
+        }
+        ~SpanSharesScope() { shares.clear(); }
+        SpanSharesScope(const SpanSharesScope&)            = delete;
+        SpanSharesScope& operator=(const SpanSharesScope&) = delete;
+    };
+
+    // Executor::set_span_progress: `done` of the span's `layers` are queued.
+    void count_span(std::uint32_t done, std::uint32_t layers) {
+        if (layers == 0) { return; }
+        const Clock::time_point now = Clock::now();
+        for (const SpanShare& share : span_shares) {
+            Request& r              = *share.request;
+            const std::uint32_t at  = share.before + std::uint32_t(std::uint64_t(share.tokens) *
+                                                                  done / layers);
+            count_prefill(r, at > r.reused ? at - r.reused : 0, now);
+        }
     }
 
     // Adds the prompt tokens the request computed since its last count (`computed` in all) and
