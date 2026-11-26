@@ -1940,8 +1940,10 @@ __device__ __forceinline__ void key_row(const KvPlaneView& plane, const __half* 
         codes  = reinterpret_cast<const std::uint8_t*>(cache + base + std::int64_t(slot) * kD);
         scales = nullptr;
     } else {
-        codes  = plane.codes + codes0 + std::int64_t(slot) * plane.code_row;
-        scales = plane.scales + scales0 + std::int64_t(slot) * plane.scale_row;
+        // codes0/scales0 arrive as the kv_plane_offset for this slot (the caller resolves the
+        // block table for paged planes and the dense strides otherwise).
+        codes  = plane.codes + codes0;
+        scales = plane.scales + scales0;
     }
 }
 
