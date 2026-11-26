@@ -26,7 +26,7 @@ get_property(_ninfer_all_tests DIRECTORY PROPERTY TESTS)
 set_tests_properties(${_ninfer_all_tests} PROPERTIES SKIP_RETURN_CODE 77 SKIP_REGULAR_EXPRESSION
   "CUDA driver is a stub library;cudaErrorStubLibrary;no CUDA-capable device is detected;CUDA driver version is insufficient for CUDA runtime version")
 
-# Every test executable shares one per-config runtime directory; stage the FFmpeg/curl DLL closure
+# Every test executable shares one per-config runtime directory; stage the FFmpeg DLL closure
 # there once so they resolve their imports (the Windows loader only searches the executable's own
 # directory, the system directories and PATH).
 ninfer_stage_test_runtime_dlls(ninfer_tests)

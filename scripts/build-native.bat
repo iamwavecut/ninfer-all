@@ -1,12 +1,14 @@
 @echo off
 setlocal
 REM Native MSVC + CUDA build against a prebuilt vcpkg triplet tree, without the vcpkg toolchain
-REM file: FFmpeg and libcurl are found through cmake\FindFFMPEG.cmake and CMAKE_PREFIX_PATH in the
-REM tree this script passes as NINFER_VCPKG_TREE. That tree is NINFER_VCPKG_TREE when it is set;
-REM else the checkout's vcpkg_installed\<triplet> when it holds FFmpeg, which `vcpkg install` writes
-REM from vcpkg.json in manifest mode (the only mode of the vcpkg that Visual Studio bundles); else
-REM the classic tree NINFER_VCPKG_ROOT\installed\<triplet> of a standalone vcpkg. Every path below
-REM can be overridden from the environment.
+REM file: FFmpeg is found through cmake\FindFFMPEG.cmake and CMAKE_PREFIX_PATH in the tree this
+REM script passes as NINFER_VCPKG_TREE. That tree is NINFER_VCPKG_TREE when it is set; else the
+REM checkout's vcpkg_installed\<triplet> when it holds FFmpeg, which `vcpkg install` writes from
+REM vcpkg.json in manifest mode (the only mode of the vcpkg that Visual Studio bundles); else the
+REM classic tree NINFER_VCPKG_ROOT\installed\<triplet> of a standalone vcpkg. `configure` fetches
+REM the pinned Mbed TLS release archive (cmake\MediaSources.cmake) into NINFER_MEDIA_SOURCES,
+REM default third_party\media-sources, and the build compiles it. Every path below can be
+REM overridden from the environment.
 REM
 REM   scripts\build-native.bat configure
 REM   scripts\build-native.bat build
@@ -31,11 +33,17 @@ if not defined NINFER_VCPKG_TREE (
   )
 )
 
+if not defined NINFER_MEDIA_SOURCES set "NINFER_MEDIA_SOURCES=%CD%\third_party\media-sources"
+
 if "%1"=="configure" (
   echo vcpkg tree: "%NINFER_VCPKG_TREE%"
+  cmake -DNINFER_MEDIA_SOURCES_DIR="%NINFER_MEDIA_SOURCES%" -DNINFER_MEDIA_SOURCES_ONLY=MBEDTLS ^
+    -P cmake\FetchMediaSources.cmake
+  if errorlevel 1 exit /b 1
   cmake -S . -B "%NINFER_BUILD_DIR%" -G "%NINFER_GENERATOR%" -A x64 ^
     -T "cuda=%CUDA_PATH%" ^
     -DNINFER_VCPKG_TREE="%NINFER_VCPKG_TREE%" ^
+    -DNINFER_MEDIA_SOURCES_DIR="%NINFER_MEDIA_SOURCES%" ^
     -DCMAKE_CUDA_ARCHITECTURES=%NINFER_CUDA_ARCH% ^
     -DBUILD_TESTING=ON
 ) else if "%1"=="build" (

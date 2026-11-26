@@ -226,10 +226,10 @@ summarize "$OUT" | tee "$OUT/summary.txt"
 if (( ENGINE || TESTS )); then
   echo
   echo "=== BUILD for sm_$ARCH ==="
-  # libcurl and Python are configure-time requirements of the server target and the tests.
+  # Python is a configure-time requirement of the server target and the tests.
   apt-get update -qq
   apt-get install -y -qq cmake ninja-build build-essential pkg-config aria2 python3 \
-    meson nasm zlib1g-dev libcurl4-openssl-dev >/dev/null 2>&1
+    meson nasm zlib1g-dev >/dev/null 2>&1
 
   # CMakeLists needs 3.28; Ubuntu 22.04 ships 3.22 and 24.04 ships 3.28.
   cmake_version="$(cmake --version | awk 'NR == 1 {print $3}')"

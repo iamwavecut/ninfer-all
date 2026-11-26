@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Downloads the FFmpeg and dav1d release archives that Linux builds compile and link statically
-# (cmake/MediaSources.cmake pins them by SHA-256). The build itself never downloads anything, so
+# Downloads the release archives that builds compile and link statically: FFmpeg and dav1d on
+# Linux, Mbed TLS on every platform (cmake/MediaSources.cmake pins them by SHA-256). The build itself never downloads anything, so
 # offline and hermetic builds stay that way: run this first, once per checkout.
 #
 #   fetch-media-sources.sh [dir]

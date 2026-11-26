@@ -29,7 +29,6 @@ RUN apt-get update \
         cmake \
         file \
         git \
-        libcurl4-openssl-dev \
         make \
         meson \
         nasm \

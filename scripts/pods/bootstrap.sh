@@ -3,7 +3,7 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git cmake ninja-build build-essential pkg-config aria2 curl python3-venv ccache \
-    meson nasm zlib1g-dev libcurl4-openssl-dev
+    meson nasm zlib1g-dev
 # Python 3.11 is selected explicitly, independently of the CUDA image's default interpreter.
 curl -LsSf https://astral.sh/uv/install.sh | sh
 /root/.local/bin/uv python install 3.11

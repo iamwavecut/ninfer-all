@@ -162,11 +162,14 @@ jobs:
           python .github/scripts/hf-build-cache.py restore
           --directory ~/AppData/Local/vcpkg/archives
           --family vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ inputs.cuda }}
-      - name: Configure with real FFmpeg and curl libraries
+      - name: Configure with real FFmpeg libraries
         id: configure
         env:
           ARCHS: ${{ inputs.archs }}
         run: |
+          # The build compiles Mbed TLS from its pinned release archive (cmake/MediaSources.cmake).
+          cmake '-DNINFER_MEDIA_SOURCES_DIR=third_party/media-sources' '-DNINFER_MEDIA_SOURCES_ONLY=MBEDTLS' -P cmake/FetchMediaSources.cmake
+          if ($LASTEXITCODE -ne 0) { throw 'could not fetch the Mbed TLS release' }
           # The bootstrap downloads vcpkg.exe from GitHub's releases, which can answer 504 for minutes.
           foreach ($attempt in 0..5) {
             & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
