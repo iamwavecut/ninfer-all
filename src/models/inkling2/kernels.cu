@@ -2070,7 +2070,7 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
             const int p = p0 + gid + 8 * i;
             if (p >= lo && p < hi) {
                 const std::uint8_t *codes = nullptr, *scales = nullptr;
-                key_row<KC>(a.k_plane, a.k_cache,
+                key_row<KC>(a.k_plane, a.k_cache, base,
                             kv_plane_offset(a.k_plane, sequence, kv_head, p, a.k_plane.code_seq,
                                             a.k_plane.code_head, a.k_plane.code_row,
                                             a.k_plane.code_page),
@@ -2087,7 +2087,7 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
             const int p = p0 + 2 * tid4 + (i & 1) + 8 * (i >> 1);
             if (p >= lo && p < hi) {
                 const std::uint8_t *codes = nullptr, *scales = nullptr;
-                key_row<VC>(a.v_plane, a.v_cache,
+                key_row<VC>(a.v_plane, a.v_cache, base,
                             kv_plane_offset(a.v_plane, sequence, kv_head, p, a.v_plane.code_seq,
                                             a.v_plane.code_head, a.v_plane.code_row,
                                             a.v_plane.code_page),
