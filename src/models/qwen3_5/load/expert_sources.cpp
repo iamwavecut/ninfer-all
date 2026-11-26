@@ -89,6 +89,7 @@ ExpertBlob blob(const artifact::Reader& reader, const artifact::MaterializedArti
         }
         const auto* parent = backing.pinned_parent(spans.front().object).data;
         out.pinned = parent + spans.front().offset;
+        out.pinned_device = backing.pinned_device_alias(out.pinned, std::size_t(out.bytes));
         out.pinned_region = reinterpret_cast<std::uintptr_t>(parent);
     } else {
         for (const auto& span : spans) {

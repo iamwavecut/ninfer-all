@@ -4,7 +4,6 @@
 #include "calibration/device_calibration.h"
 #include "calibration/route_catalog.h"
 #include "core/arena.h"
-#include "core/mapped_host_copy.h"
 #include "ops/common/device_route.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/device_profile.h"
@@ -819,13 +818,6 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
         instance = std::make_unique<ModelInstance>(std::move(model), options);
         frontend.complete();
-        // Where a device's copies queue behind one another whatever their streams
-        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for missing
-        // host or disk experts can hold the copies the graph queued after it ahead of the
-        // delivery's own, which end that wait. Eager passes wait on the host.
-        if (!instance->model->expert_sources().layers.empty() && serialized_copy_queue()) {
-            options.use_cuda_graph = false;
-        }
         planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);
         overlay_window_bytes =
             models::qwen3_5::prepare_vision_overlay(instance->parameters, device, options);

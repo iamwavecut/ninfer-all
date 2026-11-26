@@ -427,9 +427,9 @@ ninfer-serve Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --model-id inkling-2-mini
   --host 127.0.0.1 --port 8094 --max-context 243200 --kv-dtype rk4v4 --expert-residency host
 ```
 
-Under WDDM Inkling 2 runs its passes with host experts eagerly, without CUDA Graphs
-([Windows build](../build-windows.md#build)). The build measured here kept no memory free beside
-them; the merged change keeps 64 MiB free for kernels CUDA loads at their first launch, about 7,500
+The build measured here ran Inkling 2's passes with host experts eagerly under WDDM, without CUDA
+Graphs, and kept no memory free beside them. Inkling 2 now keeps its CUDA Graphs there
+([Windows build](../build-windows.md#build)) and the 320 MiB it keeps free for them, about 37,400
 tokens of `rk4v4` context (8.75 KiB a token) below the ceiling measured here.
 
 - **Largest context.** On the 128-token grid the largest `--max-context` that started was 243,200

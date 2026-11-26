@@ -1,6 +1,7 @@
 #include "core/device.h"
 #include "core/device_buffer.h"
 #include "core/expert_delivery.h"
+#include "core/mapped_host_copy.h"
 #include "core/pinned_memory.h"
 #include "core/vmm.h"
 
@@ -9,12 +10,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,6 +28,9 @@ namespace {
 // How the disk fixtures' experts are read (a drive mirror, direct reads into a host window); the
 // Fixture copies its files into the mirror directory.
 ExpertDiskReads disk_reads;
+// How every scenario's delivery copies (ExpertDeliveryOptions::copy_kernel): main() runs them with
+// the copy engine and with the copy kernel.
+std::optional<bool> copy_kernel;
 
 const char* disk_label(bool disk) {
     if (!disk) { return "host"; }
@@ -173,6 +179,7 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
         bool shifting = false) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.copy_kernel = copy_kernel;
     options.disk          = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes = cache;
@@ -271,6 +278,7 @@ int run(DeviceContext& device, bool disk, std::uint64_t cache, const std::filesy
 int span_prefetch(DeviceContext& device, bool disk, const std::filesystem::path& path) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.copy_kernel = copy_kernel;
     options.disk          = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 0;
@@ -334,6 +342,7 @@ int prompt_settle(DeviceContext& device, bool disk, std::uint32_t top_k,
                   const std::filesystem::path& path) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.copy_kernel = copy_kernel;
     options.disk          = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 6ULL << 20;
@@ -409,6 +418,7 @@ int prompt_settle(DeviceContext& device, bool disk, std::uint32_t top_k,
 int lent_landing(DeviceContext& device, bool disk, const std::filesystem::path& path) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.copy_kernel = copy_kernel;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 3 * kLayers * (kGu + kDown + 2 * kTail + 512);
     options.staging_bytes = 4096;
@@ -481,6 +491,7 @@ int lent_landing(DeviceContext& device, bool disk, const std::filesystem::path& 
 int failure_control(DeviceContext& device, const std::filesystem::path& path, bool omit_wait) {
     Fixture fixture(true, path);
     ExpertDeliveryOptions options;
+    options.copy_kernel = copy_kernel;
     options.pair_capacity = kPairs;
     options.cache_bytes = 0;
     options.staging_bytes = 4096;
@@ -526,6 +537,7 @@ int admission_boundaries(DeviceContext& device) {
     layer.aliases = {{0, 0}};
     for (const bool suspendable : {false, true}) {
         ExpertDeliveryOptions options;
+        options.copy_kernel = copy_kernel;
         options.pair_capacity = 1;
         options.suspendable = suspendable;
         options.banks = 1;
@@ -613,6 +625,7 @@ int tier_policy(DeviceContext& device) {
         }
     }
     ExpertDeliveryOptions options;
+    options.copy_kernel = copy_kernel;
     options.pair_capacity = 64;
     options.cache_bytes = slots * 256;
     options.tier.every = 1; // a round at every pass
@@ -712,6 +725,7 @@ int cpu_share(DeviceContext& device, bool disk, double share, const std::filesys
     Fixture fixture(disk, path);
     PairEcho echo;
     ExpertDeliveryOptions options;
+    options.copy_kernel = copy_kernel;
     options.disk              = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes = 6ULL << 20;
@@ -790,6 +804,7 @@ int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path&
     // Every layer's slots alike, so the cache is one pool of interchangeable slots.
     Fixture fixture(disk, path, 0);
     ExpertDeliveryOptions options;
+    options.copy_kernel = copy_kernel;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 64ULL << 20; // every expert
     options.staging_bytes = 4096;
@@ -899,6 +914,7 @@ int elastic_cache(DeviceContext& device, bool disk, const std::filesystem::path&
 int lent_banks(DeviceContext& device, bool disk, const std::filesystem::path& path) {
     Fixture fixture(disk, path);
     ExpertDeliveryOptions options;
+    options.copy_kernel = copy_kernel;
     options.disk          = disk_reads;
     options.pair_capacity = kPairs;
     options.cache_bytes   = 0;
@@ -1074,6 +1090,7 @@ int slot_pools(DeviceContext& device) {
     };
     {
         ExpertDeliveryOptions options;
+        options.copy_kernel = copy_kernel;
         options.pair_capacity = 64;
         options.cache_bytes   = 2 * 8 * size(0) + 2 * 8 * size(2);
         options.lend_banks    = false;
@@ -1089,6 +1106,7 @@ int slot_pools(DeviceContext& device) {
     }
     {
         ExpertDeliveryOptions options;
+        options.copy_kernel = copy_kernel;
         options.pair_capacity = 64;
         options.cache_bytes   = 64ULL << 20; // every expert
         options.suspendable   = true;
@@ -1180,6 +1198,7 @@ int alignment(DeviceContext& device) {
         }
     };
     ExpertDeliveryOptions options;
+    options.copy_kernel = copy_kernel;
     options.pair_capacity = 64;
     options.cache_bytes   = 64ULL << 10; // fewer slots than experts: narrow calls also lend banks
     ExpertDelivery delivery(device.rank(0), {}, layers, options);
@@ -1252,36 +1271,50 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--no-ready-wait") {
             return failure_control(device, path, true);
         }
-        int failures = admission_boundaries(device);
-        failures += tier_policy(device);
-        failures += slot_pools(device);
-        failures += alignment(device);
-        for (bool disk : {false, true}) {
-            for (auto cache : {0ULL, 6ULL << 20, 64ULL << 20}) {
-                failures += run(device, disk, cache, path);
+        // Every scenario with the copy engine and with the copy kernel. Where copies queue behind
+        // one another (serialized_copy_queue) the graph replays' engine copies could wait for
+        // ever, so only the kernel runs; NINFER_MISS_COPY_KERNEL=0|1 runs only the copy it names.
+        std::vector<std::optional<bool>> copies{false, true};
+        if (std::getenv("NINFER_MISS_COPY_KERNEL") != nullptr) {
+            copies = {std::nullopt};
+        } else if (serialized_copy_queue()) {
+            copies = {true};
+        }
+        int failures = 0;
+        for (const auto copy : copies) {
+            copy_kernel = copy;
+            std::printf("-- %s\n", !copy ? "copies as forced" : *copy ? "copy kernel" : "copy engine");
+            failures += admission_boundaries(device);
+            failures += tier_policy(device);
+            failures += slot_pools(device);
+            failures += alignment(device);
+            for (bool disk : {false, true}) {
+                for (auto cache : {0ULL, 6ULL << 20, 64ULL << 20}) {
+                    failures += run(device, disk, cache, path);
+                }
+                failures += run(device, disk, 6ULL << 20, path, true);
+                for (const double share : {0.5, 1.0}) { failures += cpu_share(device, disk, share, path); }
+                failures += elastic_cache(device, disk, path);
+                failures += lent_banks(device, disk, path);
+                failures += span_prefetch(device, disk, path);
+                failures += lent_landing(device, disk, path);
+                for (const std::uint32_t top_k : {0U, 8U}) { failures += prompt_settle(device, disk, top_k, path); }
             }
-            failures += run(device, disk, 6ULL << 20, path, true);
-            for (const double share : {0.5, 1.0}) { failures += cpu_share(device, disk, share, path); }
-            failures += elastic_cache(device, disk, path);
-            failures += lent_banks(device, disk, path);
-            failures += span_prefetch(device, disk, path);
-            failures += lent_landing(device, disk, path);
-            for (const std::uint32_t top_k : {0U, 8U}) { failures += prompt_settle(device, disk, top_k, path); }
+            // Disk experts read directly (into the host window), from a drive mirror, and both.
+            const auto mirror = path / "mirror";
+            for (const auto& reads : {ExpertDiskReads{{}, ExpertDirect::On, true},
+                                      ExpertDiskReads{mirror, ExpertDirect::Off, false},
+                                      ExpertDiskReads{mirror, ExpertDirect::On, true}}) {
+                disk_reads = reads;
+                for (auto cache : {0ULL, 6ULL << 20}) { failures += run(device, true, cache, path); }
+                failures += run(device, true, 6ULL << 20, path, true);
+                failures += cpu_share(device, true, 0.5, path);
+                failures += lent_banks(device, true, path);
+                failures += span_prefetch(device, true, path);
+            }
+            disk_reads = {};
+            failures += failure_control(device, path, false);
         }
-        // Disk experts read directly (into the host window), from a drive mirror, and both.
-        const auto mirror = path / "mirror";
-        for (const auto& reads : {ExpertDiskReads{{}, ExpertDirect::On, true},
-                                  ExpertDiskReads{mirror, ExpertDirect::Off, false},
-                                  ExpertDiskReads{mirror, ExpertDirect::On, true}}) {
-            disk_reads = reads;
-            for (auto cache : {0ULL, 6ULL << 20}) { failures += run(device, true, cache, path); }
-            failures += run(device, true, 6ULL << 20, path, true);
-            failures += cpu_share(device, true, 0.5, path);
-            failures += lent_banks(device, true, path);
-            failures += span_prefetch(device, true, path);
-        }
-        disk_reads = {};
-        failures += failure_control(device, path, false);
         return failures ? 1 : 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL %s\n", error.what());

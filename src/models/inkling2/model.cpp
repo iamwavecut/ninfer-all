@@ -115,6 +115,7 @@ BankBlobs expert_blobs(const artifact::Reader& reader,
         blob.zero_tail = tail;
         if (pinned) {
             blob.pinned        = parent + offset;
+            blob.pinned_device = backing.pinned_device_alias(blob.pinned, std::size_t(bytes));
             blob.pinned_region = reinterpret_cast<std::uintptr_t>(parent);
         } else {
             const auto logical = reader.directory().tensor(part.object).offset + offset;

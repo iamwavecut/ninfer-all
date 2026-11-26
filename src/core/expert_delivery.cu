@@ -11,6 +11,7 @@
 #include "core/expert_split.h"
 #include "core/file_read_queue.h"
 #include "core/growable_region.h"
+#include "core/mapped_host_copy.h"
 #include "core/pinned_memory.h"
 #include "core/vmm.h"
 
@@ -34,6 +35,10 @@ namespace {
 
 // A round's copies a call's post work issues at most: experts, and bytes read from files.
 constexpr std::size_t kRoundExperts = 8;
+// Copy kernel segments between waits for the copies stream (a call's pieces, staged runs, zeros
+// and table uploads) and the rounds stream; a fuller list waits for its stream first.
+constexpr std::size_t kCallSegments  = 4096;
+constexpr std::size_t kRoundSegments = 256;
 constexpr std::uint64_t kRoundFileBytes = 8ULL << 20;
 
 // needed[e] of a call: its pairs routed to expert e, and whether the table entry the split read
@@ -311,6 +316,7 @@ struct ExpertDelivery::Impl {
     struct Piece {
         std::byte* target = nullptr;
         const std::byte* pinned = nullptr;
+        const std::byte* pinned_device = nullptr; // where the copy kernel reads `pinned`
         std::uintptr_t region = 0;
         std::vector<ExpertExtent> extents;
         std::uint64_t bytes = 0;
@@ -383,6 +389,11 @@ struct ExpertDelivery::Impl {
     std::chrono::steady_clock::time_point cpu_until{};
     std::optional<CudaHostHandshake> handshake;
     cudaStream_t copies = nullptr;
+    // With the copy kernel (ExpertDeliveryOptions::copy_kernel): the queues of `copies` and
+    // `rounds`, and -1 ids for a failed call's missing pairs.
+    bool copy_kernel = false;
+    std::unique_ptr<SegmentCopies> call_queue, round_queue;
+    std::unique_ptr<PinnedHostBuffer> unrouted;
     cudaEvent_t copied[2]{};
     std::uint64_t half_bytes = 0;
     int half = 0;
@@ -779,6 +790,15 @@ struct ExpertDelivery::Impl {
         CUDA_CHECK(cudaStreamCreateWithFlags(&copies, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamCreateWithFlags(&rounds, cudaStreamNonBlocking));
         try {
+            copy_kernel = options.copy_kernel.value_or(copy_kernel_default());
+            if (copy_kernel) {
+                call_queue  = std::make_unique<SegmentCopies>(copies, kCallSegments);
+                round_queue = std::make_unique<SegmentCopies>(rounds, kRoundSegments);
+                unrouted = std::make_unique<PinnedHostBuffer>(std::size_t(options.pair_capacity) * 4);
+                std::memset(unrouted->data(), 0xff, unrouted->size());
+                allocation.pinned_bytes += call_queue->pinned_bytes() +
+                                           round_queue->pinned_bytes() + unrouted->size();
+            }
             for (auto& event : copied) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
             CUDA_CHECK(cudaEventCreateWithFlags(&round_staged, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreate(&copies_begun));
@@ -822,6 +842,53 @@ struct ExpertDelivery::Impl {
     void check() const {
         std::lock_guard lock(mutex);
         if (failure) { std::rethrow_exception(failure); }
+    }
+
+    // With the copy kernel, the queue of `stream` (copies or rounds); else null.
+    [[nodiscard]] SegmentCopies* queue_of(cudaStream_t stream) const noexcept {
+        if (!copy_kernel) { return nullptr; }
+        return stream == copies ? call_queue.get() : round_queue.get();
+    }
+    // `bytes` from `source` to `target` on `stream`: a copy-engine copy, or a segment of the
+    // stream's next copy kernel launch that reads `device_source`, where the device reads a host
+    // source in place.
+    void transfer(cudaStream_t stream, void* target, const void* source, const void* device_source,
+                  std::size_t bytes, cudaMemcpyKind kind) {
+        if (auto* queue = queue_of(stream)) {
+            queue->queue(target, device_source, bytes);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(target, source, bytes, kind, stream));
+        }
+    }
+    // A source the device reads at its host address: device memory, cudaHostAlloc memory, the
+    // direct window.
+    void transfer(cudaStream_t stream, void* target, const void* source, std::size_t bytes,
+                  cudaMemcpyKind kind) {
+        transfer(stream, target, source, source, bytes, kind);
+    }
+    void zero(cudaStream_t stream, void* target, std::size_t bytes) {
+        if (auto* queue = queue_of(stream)) {
+            queue->queue(target, nullptr, bytes);
+        } else {
+            CUDA_CHECK(cudaMemsetAsync(target, 0, bytes, stream));
+        }
+    }
+    // Starts the copies queued on `stream`.
+    void launch(cudaStream_t stream) {
+        if (auto* queue = queue_of(stream)) { queue->launch(); }
+    }
+    void record(cudaEvent_t event, cudaStream_t stream) {
+        launch(stream);
+        CUDA_CHECK(cudaEventRecord(event, stream));
+    }
+    // Waits for every copy queued on `stream`.
+    void finish(cudaStream_t stream) {
+        launch(stream);
+        CUDA_CHECK(ninfer::wait_for_stream(stream));
+        if (auto* queue = queue_of(stream)) { queue->restart(); }
+    }
+    [[nodiscard]] static const void* device_source(const ExpertBlob& blob) noexcept {
+        return blob.pinned_device ? blob.pinned_device : blob.pinned;
     }
 
     template <typename Function> void each_storage(Function&& function) {
@@ -983,7 +1050,10 @@ struct ExpertDelivery::Impl {
         }
         bank_state[std::size_t(k)].layer = -1;
         std::fill(bank_state[std::size_t(k)].valid.begin(), bank_state[std::size_t(k)].valid.end(), 0);
-        CUDA_CHECK(cudaMemsetAsync(banks[std::size_t(k)].p, 0, banks[std::size_t(k)].bytes, copies));
+        zero(copies, banks[std::size_t(k)].p, banks[std::size_t(k)].bytes);
+        // The segments of one copy kernel launch run in no order: the call's misses may enter the
+        // bank's slots, so its zeros launch first.
+        launch(copies);
         for (std::uint32_t i = 0; i < per_bank; ++i) {
             auto& slot = lent_slots[std::size_t(k) * per_bank + i];
             slot.layer = slot.expert = -1;
@@ -1082,9 +1152,9 @@ struct ExpertDelivery::Impl {
             layer.next_upload = 1 - u;
             CUDA_CHECK(ninfer::wait_for_event(layer.uploaded[u]));
             std::memcpy(layer.upload[u]->data(), layer.mirror->data(), layer.mirror->size());
-            CUDA_CHECK(cudaMemcpyAsync(layer.tables.p, layer.upload[u]->data(), layer.mirror->size(),
-                                       cudaMemcpyHostToDevice, copies));
-            CUDA_CHECK(cudaEventRecord(layer.uploaded[u], copies));
+            transfer(copies, layer.tables.p, layer.upload[u]->data(), layer.mirror->size(),
+                     cudaMemcpyHostToDevice);
+            record(layer.uploaded[u], copies);
             layer.dirty = false;
         }
     }
@@ -1097,7 +1167,9 @@ struct ExpertDelivery::Impl {
             const bool target_follows = last.target + last.bytes == target;
             if (target_follows && blob.pinned && last.pinned && blob.pinned_region != 0 &&
                 blob.pinned_region == last.region &&
-                last.pinned + last.bytes == static_cast<const std::byte*>(blob.pinned)) {
+                last.pinned + last.bytes == static_cast<const std::byte*>(blob.pinned) &&
+                last.pinned_device + last.bytes ==
+                    static_cast<const std::byte*>(device_source(blob))) {
                 last.bytes += blob.bytes;
                 return;
             }
@@ -1117,6 +1189,7 @@ struct ExpertDelivery::Impl {
         Piece piece;
         piece.target = target;
         piece.pinned = static_cast<const std::byte*>(blob.pinned);
+        piece.pinned_device = static_cast<const std::byte*>(device_source(blob));
         piece.region = blob.pinned_region;
         piece.extents = blob.extents;
         piece.bytes = blob.bytes;
@@ -1168,11 +1241,10 @@ struct ExpertDelivery::Impl {
             read_now(batch_reads);
         }
         for (const auto& copy : batch_copies) {
-            CUDA_CHECK(cudaMemcpyAsync(copy.target, copy.source, copy.bytes,
-                                       direct ? cudaMemcpyDefault : cudaMemcpyHostToDevice,
-                                       copies));
+            transfer(copies, copy.target, copy.source, copy.bytes,
+                     direct ? cudaMemcpyDefault : cudaMemcpyHostToDevice);
         }
-        CUDA_CHECK(cudaEventRecord(copied[half], copies));
+        record(copied[half], copies);
         batch_reads.clear();
         direct_reads.clear();
         batch_copies.clear();
@@ -1230,17 +1302,16 @@ struct ExpertDelivery::Impl {
     void flush_pieces(ExpertDeliveryStats& delta) {
         for (const auto& piece : pieces) {
             if (piece.pinned) {
-                CUDA_CHECK(cudaMemcpyAsync(piece.target, piece.pinned, piece.bytes,
-                                           cudaMemcpyHostToDevice, copies));
+                transfer(copies, piece.target, piece.pinned, piece.pinned_device, piece.bytes,
+                         cudaMemcpyHostToDevice);
             } else {
                 stage(piece, delta);
             }
             delta.copied_bytes += piece.bytes;
         }
         flush_reads();
-        for (const auto& [target, bytes] : zeroes) {
-            CUDA_CHECK(cudaMemsetAsync(target, 0, bytes, copies));
-        }
+        for (const auto& [target, bytes] : zeroes) { zero(copies, target, bytes); }
+        launch(copies); // the CPU's products and file reads that follow overlap the copies
         pieces.clear();
         zeroes.clear();
     }
@@ -1379,6 +1450,7 @@ struct ExpertDelivery::Impl {
     // experts and file bytes at a time, so the next call's service is not delayed.
     void issue_rounds(ExpertDeliveryStats& delta) {
         if (queued.empty()) { return; }
+        if (round_queue) { round_queue->restart_if_idle(); }
         const cudaEvent_t done = take_event();
         std::uint64_t staged = 0;
         std::size_t issued = 0;
@@ -1414,8 +1486,8 @@ struct ExpertDelivery::Impl {
                 const auto& blob = expert[b];
                 std::byte* target = slot_blob(d.slot, b);
                 if (blob.pinned) {
-                    CUDA_CHECK(cudaMemcpyAsync(target, blob.pinned, blob.bytes, cudaMemcpyHostToDevice,
-                                               rounds));
+                    transfer(rounds, target, blob.pinned, device_source(blob), blob.bytes,
+                             cudaMemcpyHostToDevice);
                 } else if (direct) {
                     std::uint64_t at = 0;
                     for (const auto& extent : blob.extents) {
@@ -1441,9 +1513,7 @@ struct ExpertDelivery::Impl {
                     delta.read_bytes += blob.bytes;
                 }
                 auto& written = slots[std::size_t(d.slot)].written[b];
-                if (written > blob.bytes) {
-                    CUDA_CHECK(cudaMemsetAsync(target + blob.bytes, 0, written - blob.bytes, rounds));
-                }
+                if (written > blob.bytes) { zero(rounds, target + blob.bytes, written - blob.bytes); }
                 written = blob.bytes;
                 delta.copied_bytes += blob.bytes;
             }
@@ -1455,13 +1525,12 @@ struct ExpertDelivery::Impl {
                 read_now(reads);
             }
             for (const auto& copy : staged_copies) {
-                CUDA_CHECK(cudaMemcpyAsync(copy.target, copy.source, copy.bytes,
-                                           direct ? cudaMemcpyDefault : cudaMemcpyHostToDevice,
-                                           rounds));
+                transfer(rounds, copy.target, copy.source, copy.bytes,
+                         direct ? cudaMemcpyDefault : cudaMemcpyHostToDevice);
             }
-            CUDA_CHECK(cudaEventRecord(round_staged, rounds));
+            record(round_staged, rounds);
         }
-        CUDA_CHECK(cudaEventRecord(done, rounds));
+        record(done, rounds);
         for (std::size_t i = 0; i < issued; ++i) {
             auto d = queued[i];
             d.landed = done;
@@ -1523,8 +1592,8 @@ struct ExpertDelivery::Impl {
     void promote(std::int32_t s, std::size_t li, std::int32_t e, int bank, ExpertDeliveryStats& delta) {
         for (std::size_t b = 0; b < layers[li].source.experts[std::size_t(e)].size(); ++b) {
             const auto bytes = layers[li].source.experts[std::size_t(e)][b].bytes;
-            CUDA_CHECK(cudaMemcpyAsync(slot_blob(s, b), bank_blob(bank, li, e, b), bytes,
-                                       cudaMemcpyDeviceToDevice, copies));
+            transfer(copies, slot_blob(s, b), bank_blob(bank, li, e, b), bytes,
+                     cudaMemcpyDeviceToDevice);
             slot_written(s, b, bytes);
             delta.promoted_bytes += bytes;
         }
@@ -1581,7 +1650,7 @@ struct ExpertDelivery::Impl {
             issue();
             if (*flag != 0) {
                 *flag = 0;
-                CUDA_CHECK(cudaMemcpyAsync(cpu_flag.p, flag, 4, cudaMemcpyHostToDevice, copies));
+                transfer(copies, cpu_flag.p, flag, 4, cudaMemcpyHostToDevice);
             }
             return;
         }
@@ -1638,16 +1707,14 @@ struct ExpertDelivery::Impl {
         for (int e = 0; e < experts; ++e) {
             if (left(e)) { listed[1 + listed[0]++] = e; }
         }
-        CUDA_CHECK(cudaMemcpyAsync(missing_ids.p, missing, std::size_t(pairs) * 4, cudaMemcpyHostToDevice,
-                                   copies));
-        CUDA_CHECK(cudaMemcpyAsync(missing_experts, listed, std::size_t(1 + listed[0]) * 4,
-                                   cudaMemcpyHostToDevice, copies));
+        transfer(copies, missing_ids.p, missing, std::size_t(pairs) * 4, cudaMemcpyHostToDevice);
+        transfer(copies, missing_experts, listed, std::size_t(1 + listed[0]) * 4,
+                 cudaMemcpyHostToDevice);
         if (used != 0) {
-            CUDA_CHECK(cudaMemcpyAsync(products.p, host_products->data(), used, cudaMemcpyHostToDevice,
-                                       copies));
+            transfer(copies, products.p, host_products->data(), used, cudaMemcpyHostToDevice);
         }
         *flag = 1;
-        CUDA_CHECK(cudaMemcpyAsync(cpu_flag.p, flag, 4, cudaMemcpyHostToDevice, copies));
+        transfer(copies, cpu_flag.p, flag, 4, cudaMemcpyHostToDevice);
         double work_done = 0;
         for (const auto e : cpu) {
             const int n = int(needed[e] & kCountMask);
@@ -1799,9 +1866,9 @@ struct ExpertDelivery::Impl {
         const auto copied_before = delta.copied_bytes;
 
         const auto issue = [&] {
-            if (timed) { CUDA_CHECK(cudaEventRecord(copies_begun, copies)); }
+            if (timed) { record(copies_begun, copies); }
             flush_pieces(delta);
-            if (timed) { CUDA_CHECK(cudaEventRecord(copies_done, copies)); }
+            if (timed) { record(copies_done, copies); }
             learn();
         };
         if (layer.cpu && host_flag) {
@@ -1810,12 +1877,12 @@ struct ExpertDelivery::Impl {
             issue();
         }
         if (ranges_dirty) {
-            CUDA_CHECK(cudaMemcpyAsync(lent_ranges.p, host_ranges->data(), host_ranges->size(),
-                                       cudaMemcpyHostToDevice, copies));
+            transfer(copies, lent_ranges.p, host_ranges->data(), host_ranges->size(),
+                     cudaMemcpyHostToDevice);
             ranges_dirty = false;
         }
         upload_tables();
-        CUDA_CHECK(ninfer::wait_for_stream(copies));
+        finish(copies);
         if (timed) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, copies_begun, copies_done));
@@ -1911,16 +1978,31 @@ struct ExpertDelivery::Impl {
         pieces.clear();
         zeroes.clear();
         staging_cursor = 0;
+        if (copy_kernel) {
+            // The failed call's copies not launched yet are dropped; launched ones may still read
+            // their lists.
+            call_queue->discard();
+            round_queue->discard();
+        }
         if (request) {
             // Captured decode can finish safely; the caller checks before publishing output.
-            cudaMemsetAsync(missing_ids.p, 0xff, std::size_t(request->width) * 4, copies);
-            cudaMemsetAsync(missing_experts, 0, 4, copies);
-            if (cpu_flag.bytes) {
-                cudaMemsetAsync(cpu_flag.p, 0, 4, copies);
-                *static_cast<std::int32_t*>(host_flag->data()) = 0;
+            if (copy_kernel) {
+                try {
+                    call_queue->queue(missing_ids.p, unrouted->data(),
+                                      std::size_t(request->width) * 4);
+                    call_queue->queue(missing_experts, nullptr, 4);
+                    if (cpu_flag.bytes) { call_queue->queue(cpu_flag.p, nullptr, 4); }
+                    call_queue->launch();
+                } catch (...) {}
+            } else {
+                cudaMemsetAsync(missing_ids.p, 0xff, std::size_t(request->width) * 4, copies);
+                cudaMemsetAsync(missing_experts, 0, 4, copies);
+                if (cpu_flag.bytes) { cudaMemsetAsync(cpu_flag.p, 0, 4, copies); }
             }
+            if (cpu_flag.bytes) { *static_cast<std::int32_t*>(host_flag->data()) = 0; }
         }
         ninfer::wait_for_stream(copies);
+        if (copy_kernel) { call_queue->restart(); }
     }
 
     void run() {
@@ -2308,7 +2390,7 @@ void ExpertDelivery::prime(const std::vector<std::vector<std::uint64_t>>* profil
     }
     p.flush_pieces(delta);
     p.upload_tables();
-    CUDA_CHECK(ninfer::wait_for_stream(p.copies));
+    p.finish(p.copies);
     p.set_free();
     if (p.options.top_k != 0) {
         for (std::size_t li = 0; li < p.layers.size(); ++li) {

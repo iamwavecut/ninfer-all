@@ -5,7 +5,6 @@
 #include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
-#include "core/mapped_host_copy.h"
 #include "core/pdl_scope.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
@@ -312,12 +311,6 @@ struct Executor::Impl {
         // Beside an automatic cache of host or disk experts, the full-attention caches grow with
         // their sequences and the cache is elastic (ExpertDeliveryOptions::elastic).
         const int device_id = device.rank(0).device;
-        // Where a device's copies queue behind one another whatever their streams
-        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for a missing host
-        // or disk expert can hold back the copies that end it, so those placements run eager. Experts on
-        // the device capture their graphs as everywhere else.
-        if (!model.expert_banks().empty() && serialized_copy_queue()) { options.cuda_graphs = false; }
-
         growing = !model.expert_banks().empty() && !options.expert_cache_bytes &&
                   vmm::granularity(device_id) != 0;
         hidden      = int(config.hidden_size);
