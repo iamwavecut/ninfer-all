@@ -2388,10 +2388,17 @@ struct Executor::Impl {
         const int tap_columns = 2 * kv_heads * kTaps;
         if (lp.full) {
             taps = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * tap_columns * 4).data);
-            kernels::gemm_f32(kv_heads * kTaps, t, hidden, lp.key_taps, f32_in(ki), taps, stream, 0,
-                              tap_columns);
-            kernels::gemm_f32(kv_heads * kTaps, t, hidden, lp.value_taps, f32_in(vi),
-                              taps + kv_heads * kTaps, stream, 0, tap_columns);
+            // The key and value taps in one batch: gemm_f32_batch computes both exactly as
+            // gemm_f32 does (per-entry weights, activations and output columns).
+            kernels::GemvBatch tap_batch;
+            tap_batch.w[0]     = lp.key_taps;
+            tap_batch.x[0]     = f32_in(ki);
+            tap_batch.out[0]   = taps;
+            tap_batch.w[1]     = lp.value_taps;
+            tap_batch.x[1]     = f32_in(vi);
+            tap_batch.out[1]   = taps + kv_heads * kTaps;
+            tap_batch.count    = 2;
+            kernels::gemm_f32_batch(kv_heads * kTaps, t, hidden, tap_batch, stream, 0, tap_columns);
         }
         auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
         auto* r = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * rel * 4).data);
@@ -2494,17 +2501,18 @@ struct Executor::Impl {
         }
         kernels::attention_inputs(qa, ka, stream);
         if (quantized && kvfmt.staged()) {
-            for (const auto& [src, plane] :
-                 {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
-                kernels::KvStoreArgs store;
-                store.rows            = c.rows;
-                store.src             = src;
-                store.src_head_stride = std::int64_t(t) * kD;
-                store.rows_count      = t;
-                store.heads           = kv_heads;
-                store.dst             = plane;
-                kernels::kv_store(store, stream);
+            kernels::KvStoreArgs stores[2];
+            const __half* srcs[2] = {ka.k_cache, ka.v_cache};
+            const KvPlaneView* planes[2] = {&k_view, &v_view};
+            for (int i = 0; i < 2; ++i) {
+                stores[i].rows            = c.rows;
+                stores[i].src             = srcs[i];
+                stores[i].src_head_stride = std::int64_t(t) * kD;
+                stores[i].rows_count      = t;
+                stores[i].heads           = kv_heads;
+                stores[i].dst             = *planes[i];
             }
+            kernels::kv_store_pair(stores[0], stores[1], stream);
         }
         if (c.chunk) {
             const auto [begin, end] = kept_history(c);
