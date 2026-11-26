@@ -25,6 +25,9 @@ struct ExpertExtent {
 };
 struct ExpertBlob {
     const void* pinned = nullptr;
+    // Where a kernel reads `pinned` in place (ExpertDeliveryOptions::copy_kernel): the device
+    // address of a registered block, which under WDDM may differ from the host's. Null: `pinned`.
+    const void* pinned_device = nullptr;
     // The base of the host allocation `pinned` lies in. Neighbouring pinned blobs of one nonzero
     // region are copied together; a copy never spans two allocations.
     std::uintptr_t pinned_region = 0;
@@ -114,6 +117,12 @@ struct ExpertDeliveryOptions {
     // Which experts the cache holds once it is full (core/expert_tier.h), a pool per slot size.
     ExpertTierOptions tier{};
     ExpertCpuOptions cpu{};
+    // Whether the calls' copies and their post work's run as kernel launches on the delivery's copy
+    // streams that read their sources in place (core/mapped_host_copy.h, SegmentCopies) instead of
+    // the copy engine. Where a device's copies queue behind one another (serialized_copy_queue),
+    // a copy-engine copy could wait behind the copies a replayed graph queued after a layer's
+    // device-side wait for the call, and the wait would never end. Unset: copy_kernel_default().
+    std::optional<bool> copy_kernel;
 };
 struct ExpertDeliveryStats {
     std::uint64_t requests = 0, routes = 0, hits = 0, misses = 0, evictions = 0;

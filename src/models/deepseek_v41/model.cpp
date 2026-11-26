@@ -96,6 +96,7 @@ std::vector<ExpertBlob> expert_blobs(const artifact::Reader& reader,
             backing.pinned(part.object)) {
             const auto* parent = backing.pinned_parent(part.object).data;
             blob.pinned = parent + offset;
+            blob.pinned_device = backing.pinned_device_alias(blob.pinned, std::size_t(blob.bytes));
             blob.pinned_region = reinterpret_cast<std::uintptr_t>(parent);
         } else {
             const auto logical = reader.directory().tensor(part.object).offset + offset;
