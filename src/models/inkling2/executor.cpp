@@ -3670,21 +3670,11 @@ struct Executor::Impl {
 
     // A sliding visit's per-sequence ring spans, (start, bytes): the F16 pair's K and V, or a
     // quantized visit's planes' codes and scales (K's then V's).
-    std::vector<std::pair<std::uint8_t*, std::size_t>> ring_spans(const VisitPlan& p,
-                                                                  std::uint32_t sequence) const {
-        std::vector<std::pair<std::uint8_t*, std::size_t>> spans;
-        if (p.k_codes.p != nullptr) {
-            for (const KvArea* area : {&p.k_codes, &p.k_scales, &p.v_codes, &p.v_scales}) {
-                spans.emplace_back(static_cast<std::uint8_t*>(area->p) +
-                                       sequence * area->row_bytes * kv_heads,
-                                   area->row_bytes * kv_heads);
-            }
-        } else {
-            const std::size_t bytes = std::size_t(p.seq_stride) * sizeof(__half);
-            spans.emplace_back(static_cast<std::uint8_t*>(p.k.p) + sequence * bytes, bytes);
-            spans.emplace_back(static_cast<std::uint8_t*>(p.v.p) + sequence * bytes, bytes);
-        }
-        return spans;
+    std::array<std::pair<std::uint8_t*, std::size_t>, 2> ring_buffers(const VisitPlan& p,
+                                                                      std::uint32_t sequence) const {
+        const std::size_t bytes = std::size_t(p.seq_stride) * sizeof(__half);
+        return {{{static_cast<std::uint8_t*>(p.k.p) + sequence * bytes, bytes},
+                 {static_cast<std::uint8_t*>(p.v.p) + sequence * bytes, bytes}}};
     }
 
     [[nodiscard]] std::size_t sequence_history_bytes() const {
@@ -3717,11 +3707,11 @@ struct Executor::Impl {
         }
         for (const VisitPlan* p : cache_plans()) {
             if (p->full) { continue; }
-            const auto spans = ring_spans(*p, sequence);
-            for (std::size_t i = 0; i < spans.size(); ++i) {
-                auto* kept = static_cast<std::uint8_t*>(p->checkpoint[i].p) + sequence * spans[i].second;
-                CUDA_CHECK(cudaMemcpyAsync(save ? kept : spans[i].first,
-                                           save ? spans[i].first : kept, spans[i].second,
+            const auto rings = ring_buffers(*p, sequence);
+            for (std::size_t i = 0; i < rings.size(); ++i) {
+                auto* kept = static_cast<std::uint8_t*>(p->checkpoint[i].p) + sequence * rings[i].second;
+                CUDA_CHECK(cudaMemcpyAsync(save ? kept : rings[i].first,
+                                           save ? rings[i].first : kept, rings[i].second,
                                            cudaMemcpyDeviceToDevice, stream));
             }
         }
@@ -3747,7 +3737,7 @@ struct Executor::Impl {
                 (std::uint64_t(position) + page_tokens - 1) / page_tokens;
             bytes += groups * host_page_layout.page_stride;
             for (const VisitPlan* p : cache_plans()) {
-                if (!p->full) { for (const auto& s : ring_spans(*p, 0)) { bytes += s.second; } }
+                if (!p->full) { for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; } }
             }
         } else {
             for (const VisitPlan* p : cache_plans()) {
@@ -3759,7 +3749,7 @@ struct Executor::Impl {
                 } else if (p->full) {
                     bytes += 2 * std::uint64_t(kv_heads) * position * kD * sizeof(__half);
                 } else {
-                    for (const auto& s : ring_spans(*p, 0)) { bytes += s.second; }
+                    for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; }
                 }
             }
         }
@@ -3830,13 +3820,13 @@ struct Executor::Impl {
                     }
                     continue;
                 }
-                const auto spans = ring_spans(*p, sequence);
-                for (std::size_t i = 0; i < spans.size(); ++i) {
+                const auto rings = ring_buffers(*p, sequence);
+                for (std::size_t i = 0; i < rings.size(); ++i) {
                     std::uint8_t* device =
                         checkpoint
-                            ? static_cast<std::uint8_t*>(p->checkpoint[i].p) + sequence * spans[i].second
-                            : spans[i].first;
-                    copy(device, spans[i].second);
+                            ? static_cast<std::uint8_t*>(p->checkpoint[i].p) + sequence * rings[i].second
+                            : rings[i].first;
+                    copy(device, rings[i].second);
                 }
             }
         }
