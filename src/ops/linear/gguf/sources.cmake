@@ -64,7 +64,7 @@ ninfer_cuda_non_rdc_archive(ninfer_ggml_quants)
 target_compile_options(ninfer_ggml_quants PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=177>)
-target_link_libraries(ninfer_ggml_quants PRIVATE ${NINFER_CUDART_TARGET} CUDA::cublas)
+target_link_libraries(ninfer_ggml_quants PRIVATE ${NINFER_CUDART_TARGET} ${NINFER_CUBLAS_TARGET})
 # In a Windows kernel-DLL build the kernel DLL links these objects (src/ops/CMakeLists.txt).
 if(NOT NINFER_WINDOWS_KERNEL_DLL)
   target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants)

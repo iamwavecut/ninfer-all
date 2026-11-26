@@ -2,10 +2,18 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
 # Windows links the static CUDA runtime so shipped binaries do not depend on a cudart DLL.
-if(WIN32)
+# NINFER_STATIC_CUDA_LIBS links the CUDA runtime and cuBLAS statically on every platform.
+if(NINFER_STATIC_CUDA_LIBS)
   set(NINFER_CUDART_TARGET CUDA::cudart_static)
+  set(NINFER_CUBLAS_TARGET CUDA::cublas_static)
 else()
-  set(NINFER_CUDART_TARGET CUDA::cudart)
+  if(WIN32)
+    set(NINFER_CUDART_TARGET CUDA::cudart_static)
+  else()
+    set(NINFER_CUDART_TARGET CUDA::cudart)
+  endif()
+
+  set(NINFER_CUBLAS_TARGET CUDA::cublas)
 endif()
 
 # The Windows build takes FFmpeg from vcpkg's CMake packages. Linux builds FFmpeg from its pinned

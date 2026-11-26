@@ -12,4 +12,4 @@ target_sources(ninfer_model_runtime PRIVATE
 )
 # The FP32 products of the compressor, indexer, router and hyper-connections (prompt chunks),
 # and the vision tower's BF16 products.
-target_link_libraries(ninfer_model_runtime PRIVATE CUDA::cublas)
+target_link_libraries(ninfer_model_runtime PRIVATE ${NINFER_CUBLAS_TARGET})
