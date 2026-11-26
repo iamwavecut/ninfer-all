@@ -89,7 +89,7 @@ means the card calibrates once at its first start.
 
 | | GPU | Memory | Line | Profile | Models run |
 |:-:|---|---:|---|---|---|
-| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2 and 2.5, Qwen3.8-27B, IQ3_S, Flash-Next, Flint (experts in host memory), DeepSeek-V4.1-Flash (experts in host memory, on disk), Inkling 2 Mini; Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)) |
+| ✅ | RTX 4090 | 24 GB | GeForce | ✓ | Bonsai 2 and 2.5, Qwen3.8-27B, IQ3_S, Flash-Next, Flint (experts in host memory), DeepSeek-V4.1-Flash (experts in host memory, on disk), Inkling 2 Mini; Swift 1.5 IQ3_S ([field reports](performance/field-reports.md#rtx-4090-qwen-code-with-dflash2)); Qwen3.8-27B UD-Q3_K_XL ([field report](performance/field-reports.md#rtx-4090-llmprobe-hard-suite)) |
 | ⬜ | RTX 4090 D | 24 GB | GeForce | | |
 | ✅ | RTX 4080 Super | 16 GB | GeForce | ✓ | Inkling 2 Mini (experts in host memory) |
 | ✅ | RTX 4080 | 16 GB | GeForce | ✓ | IQ3_S ([field report](performance/field-reports.md#rtx-4080-and-rtx-4090-windows-11)) |

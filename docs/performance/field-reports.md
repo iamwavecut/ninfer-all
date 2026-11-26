@@ -12,6 +12,7 @@ or against each other as a benchmark. [Send a report](#send-a-report) to add a c
 | RTX 4090, 24 GB | Windows | Qwen3.8-27B GSQ-RCO IQ3_S, Swift 1.5 IQ3_S | Qwen Code sessions with DFlash2 5 and 7 | [RTX 4090: DFlash2](#rtx-4090-qwen-code-with-dflash2) |
 | RTX 4090, 24 GB | Windows | Swift Qwen3.8 GSQ-RCO IQ3_S | agent traffic with MTP 3, four lanes and the hybrid prefix cache | [RTX 4090: MTP 3](#rtx-4090-agent-traffic-with-mtp-3-and-the-hybrid-prefix-cache) |
 | RTX 4080 and RTX 4090 | Windows 11 | Qwen3.8-27B GSQ-RCO IQ3_S | Hermes Desktop | [RTX 4080 and 4090](#rtx-4080-and-rtx-4090-windows-11) |
+| RTX 4090, 24 GB | not given | Qwen3.8-27B UD-Q3_K_XL, GSQ-RCO IQ3_S | llmprobe's hard suite, 50 questions | [RTX 4090: llmprobe](#rtx-4090-llmprobe-hard-suite) |
 | RTX 5060 Ti, 16 GB, two and four | Linux | Qwen3.8-27B NVFP4 | `--tensor-parallel` prompts to 28.8K tokens, KV capacity | [RTX 5060 Ti](#rtx-5060-ti-two-and-four-cards) |
 | Tesla T10, 16 GB, two | Linux | Inkling 2 Mini UD-IQ4_XS | `--tensor-parallel` without peer access, retrieval prompts to 261,760 tokens, against llama.cpp | [Tesla T10](#tesla-t10-two-cards) |
 | RTX 3070 Ti, 8 GB | Windows 11 | Inkling 2 Mini UD-IQ4_XS | experts in host memory, the largest context with `rk4v4`, a 168K-token retrieval prompt | [RTX 3070 Ti](#rtx-3070-ti-windows-11) |
@@ -295,6 +296,24 @@ Reported by @jabbor in [iamwavecut/ninfer-all#70](https://github.com/iamwavecut/
 13 October 2026: `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` on an RTX 4080 and on an RTX 4090,
 each machine with 64 GB of RAM, served to Hermes Desktop. The reporter found it much faster than
 llama.cpp, with larger contexts. The report gives no rates.
+
+## RTX 4090: llmprobe hard suite
+
+Reported by @lin16303 in
+[iamwavecut/ninfer-all#471](https://github.com/iamwavecut/ninfer-all/issues/471), 25 November
+2026: [llmprobe](https://github.com/ddalcu/llmprobe) `--eval --eval-suite hard` on an RTX 4090, 50
+questions from GPQA Diamond, SuperGPQA, AIME 2025 and COMPSEC subsets, against two Qwen3.8-27B
+artifacts. llmprobe reports the decode rate and the time to the first token for information only.
+
+| Artifact | Decode | First token | Correct | Out of tokens | Tokens in / out | Wall time |
+|---|---:|---:|---:|---:|---:|---:|
+| Unsloth's UD-Q3_K_XL, converted by the reporter with `tools.convert` | 143.6 tok/s | 85 ms | 41 / 50 | 2 | 129,258 / 590,283 | 70 min 51 s |
+| `Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3` | 153.8 tok/s | 81 ms | 38 / 50 | 7 | 129,296 / 785,371 | 86 min 7 s |
+
+Three questions (6 points) separate the two scores; the standard error of the difference between
+two independent 50-question scores at these rates is about 8 points, and the report has no
+per-question results for a paired comparison. The OS, build, command, drafter, sampling settings and
+power limit are not in the report.
 
 ## RTX 5060 Ti, two and four cards
 
