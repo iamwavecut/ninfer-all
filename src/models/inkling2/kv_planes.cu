@@ -24,11 +24,7 @@ void check_launch(const char* what) {
 }
 
 template <KvCoding C>
-__launch_bounds__(kWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
-    constexpr int kCode = kv_code_bytes(C), kScale = kv_scale_bytes(C);
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int unit = blockIdx.x * kWarps + warp;
-    if (unit >= a.rows_count * a.heads) { return; }
+__device__ __forceinline__ void kv_store_row(const KvStoreArgs& a, int unit, int warp, int lane) {
     const int head = unit % a.heads;
     const int r    = unit / a.heads;
     const int slot = physical(a.rows, r);
@@ -42,6 +38,31 @@ __launch_bounds__(kWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
     std::uint8_t* scales = a.dst.scales + sequence * a.dst.scale_seq + head * a.dst.scale_head +
                            std::int64_t(slot) * a.dst.scale_row;
     kv::encode_row<C>(x, codes, scales, lane);
+}
+
+template <KvCoding C>
+__launch_bounds__(kWarps * 32) __global__ void kv_store_kernel(KvStoreArgs a) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int unit = blockIdx.x * kWarps + warp;
+    if (unit >= a.rows_count * a.heads) { return; }
+    kv_store_row<C>(a, unit, warp, lane);
+}
+
+// The key and value stores of one visit in one launch: plane 0 encodes with CK, plane 1 with CV
+// (the format's key and value codings differ). Every unit's row reads and encodes exactly as
+// kv_store_kernel's does, so the planes' bytes are its bit for bit.
+template <KvCoding CK, KvCoding CV>
+__launch_bounds__(kWarps * 32) __global__ void kv_store_pair_kernel(KvStoreArgs ak, KvStoreArgs av) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const bool value = int(blockIdx.y) != 0;
+    const KvStoreArgs& a = value ? av : ak;
+    const int unit = blockIdx.x * kWarps + warp;
+    if (unit >= a.rows_count * a.heads) { return; }
+    if (value) {
+        kv_store_row<CV>(a, unit, warp, lane);
+    } else {
+        kv_store_row<CK>(a, unit, warp, lane);
+    }
 }
 
 } // namespace
@@ -58,6 +79,55 @@ void kv_store(const KvStoreArgs& args, cudaStream_t stream) {
     default: throw std::invalid_argument("inkling2 kv_store: not an Inkling 2 plane coding");
     }
     check_launch("kv_store");
+}
+
+void kv_store_pair(const KvStoreArgs& key, const KvStoreArgs& value, cudaStream_t stream) {
+    const int units_k = key.rows_count * key.heads, units_v = value.rows_count * value.heads;
+    if (units_k <= 0 && units_v <= 0) { return; }
+    // The pair launch is for the codings where fusing was measured to win (the #473 review:
+    // int8 and rk8v4 gained 1-2% on a 3090, and our re-measurement in a steady thermal state
+    // found the fused and separate stores within noise). Lloyd4-keyed planes keep the two
+    // separate launches: the same review measured fused rk4v4 ~4.5% slower, and our
+    // investigation found no compile-level cause (no register spills in the fused kernel, the
+    // isolated store phase twice as fast) — the separate launches cost nothing measurable, so
+    // the conservative side wins on a contested point. An unknown coding throws: a silent skip
+    // would leave the cache unwritten.
+    const auto fuses = [](KvCoding c) {
+        return c == KvCoding::Int8G64 || c == KvCoding::Int4G32;
+    };
+    if (units_k != units_v || units_k <= 0 || key.dst.coding == KvCoding::F16 ||
+        value.dst.coding == KvCoding::F16 || !fuses(key.dst.coding) || !fuses(value.dst.coding)) {
+        kv_store(key, stream);
+        kv_store(value, stream);
+        return;
+    }
+    const dim3 grid((units_k + kWarps - 1) / kWarps, 2, 1), block(kWarps * 32);
+    const auto launch = [&](auto ck, auto cv) {
+        kv_store_pair_kernel<decltype(ck)::value, decltype(cv)::value><<<grid, block, 0, stream>>>(
+            key, value);
+    };
+    switch (key.dst.coding) {
+    case KvCoding::Int8G64:
+        switch (value.dst.coding) {
+        case KvCoding::Int8G64: launch(std::integral_constant<KvCoding, KvCoding::Int8G64>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int8G64>{}); break;
+        case KvCoding::Int4G32: launch(std::integral_constant<KvCoding, KvCoding::Int8G64>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int4G32>{}); break;
+        default: throw std::invalid_argument("inkling2 kv_store_pair: unsupported value coding");
+        }
+        break;
+    case KvCoding::Int4G32:
+        switch (value.dst.coding) {
+        case KvCoding::Int8G64: launch(std::integral_constant<KvCoding, KvCoding::Int4G32>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int8G64>{}); break;
+        case KvCoding::Int4G32: launch(std::integral_constant<KvCoding, KvCoding::Int4G32>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int4G32>{}); break;
+        default: throw std::invalid_argument("inkling2 kv_store_pair: unsupported value coding");
+        }
+        break;
+    default: throw std::invalid_argument("inkling2 kv_store_pair: unsupported key coding");
+    }
+    check_launch("kv_store_pair");
 }
 
 } // namespace ninfer::models::inkling2::kernels
