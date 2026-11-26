@@ -716,13 +716,19 @@ __device__ __forceinline__ void kv_post_block(const KvArgs& a, int t, int kh) {
         const KvPlaneView& kp = a.k_plane;
         const KvPlaneView& vp = a.v_plane;
         const std::int64_t row = std::int64_t(slot);
-        kp.codes[sequence * kp.code_seq + kh * kp.code_head + row * kp.code_row + d] = kv::mxfp8_code(kx, ke);
-        vp.codes[sequence * vp.code_seq + kh * vp.code_head + row * vp.code_row + d] = kv::mxfp8_code(vx, ve);
+        const std::int64_t koff = kv_plane_offset(kp, sequence, kh, row, kp.code_seq,
+                                                  kp.code_head, kp.code_row, kp.code_page);
+        const std::int64_t voff = kv_plane_offset(vp, sequence, kh, row, vp.code_seq,
+                                                  vp.code_head, vp.code_row, vp.code_page);
+        const std::int64_t ksoff = kv_plane_offset(kp, sequence, kh, row, kp.scale_seq,
+                                                   kp.scale_head, kp.scale_row, kp.scale_page);
+        const std::int64_t vsoff = kv_plane_offset(vp, sequence, kh, row, vp.scale_seq,
+                                                   vp.scale_head, vp.scale_row, vp.scale_page);
+        kp.codes[koff + d] = kv::mxfp8_code(kx, ke);
+        vp.codes[voff + d] = kv::mxfp8_code(vx, ve);
         if ((d & 31) == 0) {
-            kp.scales[sequence * kp.scale_seq + kh * kp.scale_head + row * kp.scale_row + d / 32] =
-                std::uint8_t(ke);
-            vp.scales[sequence * vp.scale_seq + kh * vp.scale_head + row * vp.scale_row + d / 32] =
-                std::uint8_t(ve);
+            kp.scales[ksoff + d / 32] = std::uint8_t(ke);
+            vp.scales[vsoff + d / 32] = std::uint8_t(ve);
         }
     } else {
         const std::int64_t at = std::int64_t(sequence) * a.seq_stride +
@@ -1239,12 +1245,12 @@ __global__ void __launch_bounds__(64 * Group * Groups, 2 / Groups)
             const int slot = a.ring != 0 ? p % a.ring : p;
             const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
             if (plane.coding != KvCoding::F16) {
-                const std::int64_t codes_row = std::int64_t(sequence) * plane.code_seq +
-                                               std::int64_t(kv_head) * plane.code_head +
-                                               std::int64_t(slot) * plane.code_row;
-                const std::int64_t scales_row = std::int64_t(sequence) * plane.scale_seq +
-                                                std::int64_t(kv_head) * plane.scale_head +
-                                                std::int64_t(slot) * plane.scale_row;
+                const std::int64_t codes_row =
+                    kv_plane_offset(plane, sequence, kv_head, slot, plane.code_seq,
+                                    plane.code_head, plane.code_row, plane.code_page);
+                const std::int64_t scales_row =
+                    kv_plane_offset(plane, sequence, kv_head, slot, plane.scale_seq,
+                                    plane.scale_head, plane.scale_row, plane.scale_page);
                 words[i] = chunk_bits(plane, plane.codes + codes_row, plane.scales + scales_row, c);
             } else {
                 const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
@@ -1498,12 +1504,12 @@ __global__ void __launch_bounds__(64 * Group) near_attention_kernel(AttentionArg
             const int slot = a.ring != 0 ? p % a.ring : p;
             const KvPlaneView& plane = matrix == 0 ? a.k_plane : a.v_plane;
             if (plane.coding != KvCoding::F16) {
-                const std::int64_t codes_row = std::int64_t(sequence) * plane.code_seq +
-                                               std::int64_t(kv_head) * plane.code_head +
-                                               std::int64_t(slot) * plane.code_row;
-                const std::int64_t scales_row = std::int64_t(sequence) * plane.scale_seq +
-                                                std::int64_t(kv_head) * plane.scale_head +
-                                                std::int64_t(slot) * plane.scale_row;
+                const std::int64_t codes_row =
+                    kv_plane_offset(plane, sequence, kv_head, slot, plane.code_seq,
+                                    plane.code_head, plane.code_row, plane.code_page);
+                const std::int64_t scales_row =
+                    kv_plane_offset(plane, sequence, kv_head, slot, plane.scale_seq,
+                                    plane.scale_head, plane.scale_row, plane.scale_page);
                 words[i] = chunk_bits(plane, plane.codes + codes_row, plane.scales + scales_row, c);
             } else {
                 const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;
@@ -2029,14 +2035,6 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
     const int sequence = row_sequence(a.rows, t0);
     const std::int64_t base = std::int64_t(sequence) * a.seq_stride +
                               std::int64_t(kv_head) * a.head_stride;
-    const std::int64_t kc0 = std::int64_t(sequence) * a.k_plane.code_seq +
-                             std::int64_t(kv_head) * a.k_plane.code_head;
-    const std::int64_t ks0 = std::int64_t(sequence) * a.k_plane.scale_seq +
-                             std::int64_t(kv_head) * a.k_plane.scale_head;
-    const std::int64_t vc0 = std::int64_t(sequence) * a.v_plane.code_seq +
-                             std::int64_t(kv_head) * a.v_plane.code_head;
-    const std::int64_t vs0 = std::int64_t(sequence) * a.v_plane.scale_seq +
-                             std::int64_t(kv_head) * a.v_plane.scale_head;
 
     // Every product and sum below that rounds is an explicit operation (__fmaf_rn, __fmul_rn,
     // __fadd_rn, __fdiv_rn). Left to the compiler, a block's second row could be contracted in
@@ -2070,8 +2068,14 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
             const int p = p0 + gid + 8 * i;
             if (p >= lo && p < hi) {
                 const std::uint8_t *codes = nullptr, *scales = nullptr;
-                key_row<KC>(a.k_plane, a.k_cache, base, kc0, ks0, a.ring != 0 ? p % a.ring : p,
-                            codes, scales);
+                key_row<KC>(a.k_plane, a.k_cache,
+                            kv_plane_offset(a.k_plane, sequence, kv_head, p, a.k_plane.code_seq,
+                                            a.k_plane.code_head, a.k_plane.code_row,
+                                            a.k_plane.code_page),
+                            kv_plane_offset(a.k_plane, sequence, kv_head, p, a.k_plane.scale_seq,
+                                            a.k_plane.scale_head, a.k_plane.scale_row,
+                                            a.k_plane.scale_page),
+                            a.ring != 0 ? p % a.ring : p, codes, scales);
                 KR::load(codes, 4 * tid4, c.k[i]);
                 c.ks[i] = KR::scale(scales, 4 * tid4);
             }
@@ -2081,8 +2085,14 @@ __global__ void __launch_bounds__(32 * kOctetWarps * (kRows == 1 ? 1 : kMaxRowGr
             const int p = p0 + 2 * tid4 + (i & 1) + 8 * (i >> 1);
             if (p >= lo && p < hi) {
                 const std::uint8_t *codes = nullptr, *scales = nullptr;
-                key_row<VC>(a.v_plane, a.v_cache, base, vc0, vs0, a.ring != 0 ? p % a.ring : p,
-                            codes, scales);
+                key_row<VC>(a.v_plane, a.v_cache,
+                            kv_plane_offset(a.v_plane, sequence, kv_head, p, a.v_plane.code_seq,
+                                            a.v_plane.code_head, a.v_plane.code_row,
+                                            a.v_plane.code_page),
+                            kv_plane_offset(a.v_plane, sequence, kv_head, p, a.v_plane.scale_seq,
+                                            a.v_plane.scale_head, a.v_plane.scale_row,
+                                            a.v_plane.scale_page),
+                            a.ring != 0 ? p % a.ring : p, codes, scales);
                 VR::load(codes, 2 * gid, c.v[i]);
                 c.vs[i] = VR::scale(scales, 2 * gid);
             }
