@@ -61,8 +61,18 @@ class Weights:
         """Rows [begin, end) of a matrix (a 3-D bank counts its rows over every expert)."""
         info = self.gguf.info(name)
         if info.type_id in DIRECT_TYPES:
-            values = self.gguf.read_direct(name).astype(np.float64).reshape(-1, info.shape[-1])
-            return values[begin:end]
+            # Only the rows asked for: a BF16 token table (GSQ-RCO's) is read a row at a time.
+            width = info.shape[-1]
+            end = int(np.prod(info.shape[:-1])) if end is None else end
+            size = 4 if info.type_id == TYPE_F32 else 2
+            raw = self.gguf.tensor_bytes(name, begin * width * size, end * width * size)
+            if info.type_id == TYPE_F32:
+                values = np.frombuffer(raw, dtype="<f4")
+            elif info.type_id == TYPE_F16:
+                values = np.frombuffer(raw, dtype="<f2")
+            else:
+                values = (np.frombuffer(raw, dtype="<u2").astype(np.uint32) << 16).view(np.float32)
+            return values.astype(np.float64).reshape(end - begin, width)
         blocks = self.gguf.read_blocks(name, begin, end)
         return dequantize_blocks(info.type_id, blocks).numpy().astype(np.float64)
 
