@@ -918,6 +918,18 @@ int main() {
              4,
              {1, 2, 8},
              kExperts},
+            // IQ2_XS's two half-slice factors (GSQ-RCO's and Unsloth's IQ2_XS banks) on both
+            // kernels, against the CPU's products.
+            {"iq2_xs bank",
+             Q::GGUF_IQ2_XS,
+             Q::GGUF_IQ2_XS,
+             Q::GGUF_Q2_0,
+             Q::GGUF_IQ4_XS,
+             Q::GGUF_IQ4_XS,
+             Q::GGUF_IQ4_NL,
+             4,
+             {1, 2, 8, 24},
+             kExperts},
             {"iq1_m/iq3_xxs",
              Q::GGUF_IQ1_M,
              Q::GGUF_IQ1_M,

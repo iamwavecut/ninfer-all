@@ -668,7 +668,9 @@ struct Decoder<GGML_TYPE_IQ2_XS> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return d * (s.f[0] * float(dot4(s.w, a, 0)) + s.f[1] * float(dot4(s.w + 4, a + 4, 0)));
+        // Spelled out as the CPU's product computes it (gguf_expert_cpu), as IQ2_S's.
+        return __fmul_rn(d, __fmaf_rn(s.f[0], float(dot4(s.w, a, 0)),
+                                      __fmul_rn(s.f[1], float(dot4(s.w + 4, a + 4, 0)))));
     }
 };
 
@@ -806,9 +808,10 @@ struct Decoder<GGML_TYPE_IQ1_M> {
     }
 };
 
-// Decoders whose dot() leaves its products and sums to the compiler, which may contract them
-// differently where they are inlined, keep every slice of a lane in one loop; the others' kernels
-// spread a row's last slices over the lanes (vec_rows, moe_rows_kernel).
+// Q2_K, whose dot() leaves its products and sums to the compiler (which may contract them
+// differently where they are inlined), keeps every slice of a lane in one loop, and so does IQ2_XS,
+// whose loop form is the one the device profiles calibrate (no `spread` route keys); the others'
+// kernels spread a row's last slices over the lanes (vec_rows, moe_rows_kernel).
 template <ggml_type type>
 inline constexpr bool kSpreadForm = type != GGML_TYPE_Q2_K && type != GGML_TYPE_IQ2_XS;
 

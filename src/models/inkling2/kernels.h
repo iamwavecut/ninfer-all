@@ -150,15 +150,18 @@ __device__ __forceinline__ int physical(const Rows& r, int t) {
     return r.chunk ? r.first + t : r.positions[t];
 }
 
-// Q and the relative feature of each row from the [Q; gate; relative] product (FP32 rows
-// `stride` apart, Q at column 0, the relative feature at `relative_column`): per head
+// Q and the relative feature of each row from the [Q; gate; relative] product (Q: FP32 rows
+// `stride` apart from `qgr`; the relative feature: FP32 rows `relative_stride` apart from
+// `relative`, the same rows at a later column or a plane of their own): per head
 //   q = clip(q * query_clip[h], qk_clip) * tau,   r = clip(r * relative_clip[h], relative_clip) * tau
 // where clip(x, c) = x * min(1, c / (|x| + 1e-6)) and tau = 1 + alpha log(max(1, (p + 1) / floor))
 // at the row's logical position p (1 without `log_scale`). q_out FP32 [T][heads][128], r_out
 // FP32 [T][heads][16].
 struct QueryArgs {
     const float* qgr = nullptr;
-    std::int64_t stride = 0, relative_column = 0;
+    std::int64_t stride = 0;
+    const float* relative = nullptr;
+    std::int64_t relative_stride = 0;
     int tokens = 0, heads = 0;
     const float* query_clip    = nullptr; // [heads][128]
     const float* relative_clip = nullptr; // [heads][16]

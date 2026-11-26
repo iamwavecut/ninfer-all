@@ -134,7 +134,8 @@ inline __m256i odd_words(const std::uint8_t* p) {
 }
 
 // The integer dots of a group's eight slices for one token, lane i slice i's: its first 16 values
-// and its last 16 (IQ2_S's and Q6_K's halves, which have their own factors), or its whole dot.
+// and its last 16 (IQ2_XS's, IQ2_S's and Q6_K's halves, which have their own factors), or its
+// whole dot.
 struct Dots {
     __m256i first, second;
 };
@@ -176,7 +177,7 @@ inline __m256i live_ints(const std::int32_t* from, int live) {
 constexpr int kMaxTokens = 16;
 
 // A slice's product from its dots (decode_slice's factors f0, f1 and the activation's scale a):
-// Whole (f0 a) dot; Halves IQ2_S's and IQ1_M's a fma(f0, dot0, f1 dot1); SixK Q6_K's
+// Whole (f0 a) dot; Halves IQ2_XS's, IQ2_S's and IQ1_M's a fma(f0, dot0, f1 dot1); SixK Q6_K's
 // a (f0 dot0 + f1 dot1); Minimum the K-quants' (f0 a) dot - f1 s and Delta IQ1_S's
 // f0 fma(a, dot, f1 s), s the activation's value sum.
 enum class Form { Whole, Halves, SixK, Minimum, Delta };
@@ -287,8 +288,8 @@ inline void iq_factors(const std::uint8_t* block, Group& out) {
         out.factor[1] = times(times(d, odd_floats(_mm256_and_si256(_mm256_srli_epi32(tmp, 3), seven))), eighth);
     } else if constexpr (F == QType::GGUF_IQ2_XXS) {
         out.factor[0] = times(times(d, odd_floats(_mm256_srli_epi32(odd_words(block + 2), 28))), eighth);
-    } else if constexpr (F == QType::GGUF_IQ2_S) {
-        const __m256i scale = u8x8(block + 74);
+    } else if constexpr (F == QType::GGUF_IQ2_S || F == QType::GGUF_IQ2_XS) {
+        const __m256i scale = u8x8(block + (F == QType::GGUF_IQ2_S ? 74 : 66));
         out.factor[0] = times(times(d, odd_floats(_mm256_and_si256(scale, _mm256_set1_epi32(15)))), eighth);
         out.factor[1] = times(times(d, odd_floats(_mm256_srli_epi32(scale, 4))), eighth);
     } else if constexpr (F == QType::GGUF_IQ3_XXS) {
@@ -389,6 +390,18 @@ inline void iq_slice(const std::uint8_t* block, int sub, __m256i& magnitude, __m
                                                     static_cast<long long>(iq2s_grid[qs[2] | ((qh << 4) & 0x300U)]),
                                                     static_cast<long long>(iq2s_grid[qs[3] | ((qh << 2) & 0x300U)]));
         sign = sign_bytes(load32(block + 34 + 4 * sub));
+    } else if constexpr (F == QType::GGUF_IQ2_XS) {
+        // Four 16-bit words: a 9-bit grid index and a 7-bit sign index each.
+        std::uint16_t q[4];
+        std::memcpy(q, block + 2 + 8 * sub, 8);
+        magnitude = _mm256_setr_epi64x(static_cast<long long>(iq2xs_grid[q[0] & 511U]),
+                                       static_cast<long long>(iq2xs_grid[q[1] & 511U]),
+                                       static_cast<long long>(iq2xs_grid[q[2] & 511U]),
+                                       static_cast<long long>(iq2xs_grid[q[3] & 511U]));
+        sign = sign_bytes(std::uint32_t(ksigns_iq2xs[q[0] >> 9]) |
+                          std::uint32_t(ksigns_iq2xs[q[1] >> 9]) << 8 |
+                          std::uint32_t(ksigns_iq2xs[q[2] >> 9]) << 16 |
+                          std::uint32_t(ksigns_iq2xs[q[3] >> 9]) << 24);
     } else if constexpr (F == QType::GGUF_IQ3_S) {
         const std::uint8_t* qs = block + 2 + 8 * sub;
         const unsigned qh      = block[66 + sub];
@@ -420,7 +433,7 @@ template <QType F>
 void iq_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin, int row_end,
              float* y, std::size_t y_stride) {
     constexpr int bytes   = gguf_block_shape(F).bytes;
-    constexpr bool halves = F == QType::GGUF_IQ2_S || F == QType::GGUF_IQ1_M;
+    constexpr bool halves = F == QType::GGUF_IQ2_S || F == QType::GGUF_IQ2_XS || F == QType::GGUF_IQ1_M;
     constexpr bool delta  = F == QType::GGUF_IQ1_S; // unsigned codes
     const auto dots = [](const __m256i* u) {
         const Dots d = halves8(u);
@@ -754,6 +767,8 @@ void rows_avx2(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_begin
     case QType::GGUF_IQ1_M: return iq_rows<QType::GGUF_IQ1_M>(w, x, row_begin, row_end, y, y_stride);
     case QType::GGUF_IQ2_XXS:
         return iq_rows<QType::GGUF_IQ2_XXS>(w, x, row_begin, row_end, y, y_stride);
+    case QType::GGUF_IQ2_XS:
+        return iq_rows<QType::GGUF_IQ2_XS>(w, x, row_begin, row_end, y, y_stride);
     case QType::GGUF_IQ2_S: return iq_rows<QType::GGUF_IQ2_S>(w, x, row_begin, row_end, y, y_stride);
     case QType::GGUF_IQ3_XXS:
         return iq_rows<QType::GGUF_IQ3_XXS>(w, x, row_begin, row_end, y, y_stride);

@@ -1,7 +1,7 @@
 // GGUF CPU expert rows (Q2_0, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S, IQ1_M,
-// IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, NVFP4) against FP64 from independently decoded stored
-// blocks, at the Flash-Next, Gemma 4, DeepSeek-V4.1 and Edge0 expert shapes, for every backend this
-// host supports.
+// IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, NVFP4) against FP64 from independently decoded
+// stored blocks, at the Flash-Next, Gemma 4, DeepSeek-V4.1, Edge0 and Inkling 2 expert shapes, for
+// every backend this host supports.
 // Blocks are decoded by ggml's reference dequantizers. Two oracles: the exact product bounds the
 // int8 activation's error, and the q8_1 product (the activation quantized per 32 values as the GPU
 // does, d = amax / 127 rounded to binary16, codes round(v / d); a K-quant's minimum and IQ1_S's
@@ -335,6 +335,24 @@ void reference_block(QType format, const std::uint8_t* bytes, double* y, double*
             }
             y += 32;
             qs += 16;
+        }
+        return;
+    }
+    if (format == QType::GGUF_IQ2_XS) {
+        const auto* x  = reinterpret_cast<const block_iq2_xs*>(bytes);
+        const double d = exact_half(x->d);
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            const double db[2] = {d * (0.5 + (x->scales[ib32] & 0xf)) * 0.25,
+                                  d * (0.5 + (x->scales[ib32] >> 4)) * 0.25};
+            for (int l = 0; l < 4; ++l) {
+                const std::uint16_t q    = x->qs[4 * ib32 + l];
+                const auto* grid         = reinterpret_cast<const std::uint8_t*>(iq2xs_grid + (q & 511));
+                const std::uint8_t signs = ksigns_iq2xs[q >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    y[j] = db[l / 2] * grid[j] * (signs & kmask_iq2xs[j] ? -1.0 : 1.0);
+                }
+                y += 8;
+            }
         }
         return;
     }
@@ -793,7 +811,7 @@ int main() {
         }
         // DeepSeek-V4.1-Flash: [gate; up] rows of 5120 values (20 blocks), down rows of 2304 (9).
         for (const QType format : {QType::GGUF_IQ1_S, QType::GGUF_IQ1_M, QType::GGUF_IQ2_XXS,
-                                   QType::GGUF_IQ2_S}) {
+                                   QType::GGUF_IQ2_XS, QType::GGUF_IQ2_S}) {
             const Matrix gate_up = make(format, 512, 5120, rng);
             const Matrix down    = make(format, 640, 2304, rng);
             for (const int tokens : {1, 2, 3, 6, 8, 9}) {
@@ -813,7 +831,19 @@ int main() {
             const Matrix down = make(QType::GGUF_NVFP4, ell, 640, rng);
             for (const int tokens : {1, 2, 8}) { check(down, tokens, rng); }
         }
-        require(!gguf_cpu_supported(QType::GGUF_IQ2_XS), "an unimplemented format is supported");
+        // Inkling 2's GSQ-RCO quantizations: [gate; up] rows of 2304 values (nine blocks) in
+        // IQ1_S to IQ3_S, down rows of 1152 (18 Q2_0 blocks, 36 IQ4_NL blocks).
+        for (const QType format : {QType::GGUF_IQ1_S, QType::GGUF_IQ1_M, QType::GGUF_IQ2_XXS,
+                                   QType::GGUF_IQ2_XS, QType::GGUF_IQ2_S, QType::GGUF_IQ3_XXS,
+                                   QType::GGUF_IQ3_S}) {
+            const Matrix gate_up = make(format, 256, 2304, rng);
+            for (const int tokens : {1, 3, 8}) { check(gate_up, tokens, rng); }
+        }
+        for (const QType format : {QType::GGUF_Q2_0, QType::GGUF_IQ4_NL}) {
+            const Matrix down = make(format, 512, 1152, rng);
+            for (const int tokens : {1, 2, 8, 9}) { check(down, tokens, rng); }
+        }
+        require(!gguf_cpu_supported(QType::GGUF_Q2_K), "an unimplemented format is supported");
         bool refused = false;
         try {
             GgufCpuActivation a(1, 2560);
