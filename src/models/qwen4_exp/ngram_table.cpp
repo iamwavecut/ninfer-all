@@ -502,7 +502,9 @@ private:
 // Keep one bounded speculative batch separately from
 // demand reads; only a completely successful batch may supply bytes to a later request. The
 // owner never waits for speculative work in prefetch() or submit(). Failed hints are discarded:
-// a demand read still reports the underlying failure through its ordinary path.
+// a demand read still reports the underlying failure through its ordinary path. Submissions come
+// from the draft prefetch's stream callbacks while the executor's thread copies and discards, so
+// every member function but the destructor holds `mutex_`.
 class NgramTableReader::Lookahead {
 public:
     explicit Lookahead(NgramTableReader& owner)
@@ -520,25 +522,15 @@ public:
     }
 
     void discard() {
-        if (active_) {
-            try {
-                pool_.finish();
-            } catch (...) {}
-        }
+        std::lock_guard lock(mutex_);
+        if (active_) { pool_.finish(); }
         active_ = false;
     }
 
     void submit(std::span<const std::uint64_t> rows) {
+        std::lock_guard lock(mutex_);
         if (rows.empty() || (active_ && !complete_.load(std::memory_order_acquire))) { return; }
-        if (active_) {
-            try {
-                pool_.finish();
-            } catch (...) {
-                // Advisory work: a failed batch leaves the payload unusable, not the request.
-                active_ = false;
-                return;
-            }
-        }
+        if (active_) { pool_.finish(); }
         const auto count = std::min<std::size_t>(rows.size(), owner_.options_.depth);
         ids_.assign(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(count));
         reads_.clear();
@@ -567,29 +559,22 @@ public:
         succeeded_ = false;
         complete_.store(false, std::memory_order_relaxed);
         active_ = true;
-        try {
-            pool_.start(1, [this, rb](std::size_t) {
-                try {
-                    if (queue_) { queue_->read(reads_); }
-                    else {
-                        for (std::size_t i = 0; i < ids_.size(); ++i) {
-                            owner_.read(ids_[i] * rb, payload_.data() + i * rb, rb);
-                        }
+        pool_.start(1, [this, rb](std::size_t) {
+            try {
+                if (queue_) { queue_->read(reads_); }
+                else {
+                    for (std::size_t i = 0; i < ids_.size(); ++i) {
+                        owner_.read(ids_[i] * rb, payload_.data() + i * rb, rb);
                     }
-                    succeeded_ = true;
-                } catch (...) {}
-                complete_.store(true, std::memory_order_release);
-            });
-        } catch (...) {
-            // Speculative only: a batch the pool cannot take is dropped, and a demand read
-            // behind it reports any real failure through its ordinary path.
-            active_ = false;
-            succeeded_ = false;
+                }
+                succeeded_ = true;
+            } catch (...) {}
             complete_.store(true, std::memory_order_release);
-        }
+        });
     }
 
     bool copy(std::uint64_t row, std::uint8_t* destination) const {
+        std::lock_guard lock(mutex_);
         if (!active_ || !complete_.load(std::memory_order_acquire) || !succeeded_) { return false; }
         const auto found = std::lower_bound(ids_.begin(), ids_.end(), row);
         if (found == ids_.end() || *found != row) { return false; }
@@ -606,6 +591,7 @@ private:
     std::unique_ptr<FileReadQueue> queue_;
     bool active_ = false, succeeded_ = false;
     std::atomic<bool> complete_{false};
+    mutable std::mutex mutex_;
     ReadPool pool_;
 };
 
@@ -633,18 +619,12 @@ public:
         ranges_ = std::move(ranges);
         complete_.store(false, std::memory_order_relaxed);
         active_ = true;
-        try {
-            pool_.start(1, [this](std::size_t) {
-                for (const Range& range : ranges_) {
-                    owner_.files_[range.segment]->prefetch(range.begin, range.bytes);
-                }
-                complete_.store(true, std::memory_order_release);
-            });
-        } catch (...) {
-            // A hint the pool cannot take is dropped: the demand read reports any real failure.
-            active_ = false;
+        pool_.start(1, [this](std::size_t) {
+            for (const Range& range : ranges_) {
+                owner_.files_[range.segment]->prefetch(range.begin, range.bytes);
+            }
             complete_.store(true, std::memory_order_release);
-        }
+        });
     }
 
 private:
@@ -880,6 +860,8 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
     admissions_.clear();
     copies_.clear();
     std::uint64_t hits = 0;
+    std::unique_lock cache_lock(cache_mutex_, std::defer_lock);
+    if (cache_) { cache_lock.lock(); }
     for (std::size_t i = 0; i < row_ids.size(); ++i) {
         if (cache_ && cache_->copy(row_ids[i], out.data() + i * rb)) {
             ++hits;
@@ -903,6 +885,7 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
         std::memcpy(out.data() + i * rb, resident_->data() + std::uint64_t(slot) * rb, rb);
         ++hits;
     }
+    if (cache_lock.owns_lock()) { cache_lock.unlock(); }
     if (options_.dedupe && misses_.size() > 1) {
         // Each row the files serve once, in file order; its repeats copy it in wait().
         order_.clear();
@@ -1000,6 +983,7 @@ void NgramTableReader::wait() {
         }
     }
     if (!failure && cache_) {
+        std::lock_guard lock(cache_mutex_);
         for (const std::size_t i : admissions_) {
             cache_->insert(batch_ids_[i], batch_out_.data() + i * layout_.row_bytes);
         }
@@ -1031,10 +1015,14 @@ void NgramTableReader::prefetch(std::span<const std::uint64_t> row_ids) {
     if (options_.residency == NgramResidency::Ram) { return; }
     std::vector<std::uint64_t> rows;
     rows.reserve(row_ids.size());
-    for (const auto row : row_ids) {
-        if (cache_ && cache_->contains(row)) { continue; }
-        if (options_.residency == NgramResidency::RamHot && hot_slot(row) >= 0) { continue; }
-        rows.push_back(row);
+    {
+        std::unique_lock cache_lock(cache_mutex_, std::defer_lock);
+        if (cache_) { cache_lock.lock(); }
+        for (const auto row : row_ids) {
+            if (cache_ && cache_->contains(row)) { continue; }
+            if (options_.residency == NgramResidency::RamHot && hot_slot(row) >= 0) { continue; }
+            rows.push_back(row);
+        }
     }
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
