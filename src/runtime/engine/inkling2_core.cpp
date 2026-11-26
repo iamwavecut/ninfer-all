@@ -161,8 +161,6 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
                                     "archive, --mtp-attention-window or proposal head, "
                                     "--adaptive-mtp only with --spec dspark or dflash2 and "
                                     "--draft-min-p only with --spec dspine, dspark or dflash2");
-                                    "--adaptive-mtp only with --spec dspark and --draft-min-p only "
-                                    "with --spec dspine or dspark");
     }
     if (options.kv_cache != KvCacheStorage::BFloat16 &&
         options.kv_cache != KvCacheStorage::Float16 &&
@@ -768,9 +766,6 @@ struct Inkling2Core::Impl {
                                                                : i.executor->block_drafts()),
           block_width(i.executor->block_drafts() + 1),
           draft_floor(options.speculative.draft_min_p.value_or(0.0F)),
-          reserve_chunked(options.kv_reserve_mode == KvReserveMode::Chunked),
-          reserve_gen_chunk(options.kv_reserve_gen_chunk),
-          shortest_queue(options.kv_queue_order == KvQueueOrder::Shortest),
           diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
           decode_rounds_per_prefill(
@@ -1422,7 +1417,7 @@ struct Inkling2Core::Impl {
                         best = s;
                         continue;
                     }
-                    const Request& prompt = *pending[pick];
+                    const Request& prompt = *pending.front();
                     const auto candidate  = reuse(slots[s], prompt);
                     const auto current   = reuse(slots[*best], prompt);
                     if (candidate > current ||
@@ -1529,9 +1524,7 @@ struct Inkling2Core::Impl {
                                                effective_output_capacity(
                                                    r.options.execution.requested_output_tokens,
                                                    max_context, prompt_n),
-                                               reserve_chunked
-                                                   ? reserve_chunk_for(reserve_gen_chunk)
-                                                   : 0U))) {
+                                               0U))) {
                 throw RequestError(RequestErrorKind::ContextLengthExceeded,
                                    "the page pool cannot hold the request beside the others");
             }
@@ -3496,7 +3489,7 @@ MemorySummary Inkling2Core::memory_summary() const {
     out.kv_dedup_hits               = memory.kv_dedup_hits;
     out.kv_dedup_offers             = memory.kv_dedup_offers;
     out.kv_dedup_collisions         = memory.kv_dedup_collisions;
-    out.host_kv_capacity_bytes = impl_->host_budget;
+    out.host_kv_capacity_bytes = impl_->store.host_budget();
     {
         std::lock_guard lock(impl_->stats_mutex);
         out.host_kv_occupied_bytes = impl_->stats.host_kv_occupied_bytes;

@@ -497,7 +497,6 @@ struct Executor::Impl {
                                                          DType::FP32, spine_options());
             }
             if (options.dspark) { needed += spark_planned_bytes(); }
-            const std::size_t plan = needed; // the worst case, for the refusal's message
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
             const std::size_t reserve = start_reserve();
@@ -528,36 +527,13 @@ struct Executor::Impl {
                 }
                 pool_pages = std::uint32_t(ceiling);
                 needed += std::size_t(pool_pages) * page_group + tables_bytes;
-            } else if (growing) {
-                // The full-attention planes' worst case is a reservation: their granules back
-                // only as the sequences reach them (back()), so admission demands everything
-                // but them (the rings, checkpoints, histories, staging and drafter state,
-                // which are dense) beside the workspace reserve. A sequence whose next tile
-                // would not fit fails its request, not the server.
-                for (const auto& [layer, pass] : schedule) {
-                    if (config.full_attention[layer]) {
-                        needed -= std::size_t(global_slots) * slot_bytes;
-                    }
-                }
-                if (options.dspark) {
-                    const DSparkConfig& dc = *model.dspark_config();
-                    const std::size_t spark_kv =
-                        2 * std::size_t(dc.num_key_value_heads) * dc.head_dim * sizeof(__half) *
-                        std::size_t(sequences);
-                    for (const bool full : dc.full_attention) {
-                        if (full) { needed -= std::size_t(global_slots) * spark_kv; }
-                    }
-                }
             }
             if (needed + reserve > free_bytes) {
                 throw InsufficientMemory(
                     "Inkling 2: the KV caches, histories, checkpoints and drafter state of " +
                     std::to_string(sequences) + " sequence(s) of " +
                     std::to_string(options.max_context) + " tokens need " +
-                    std::to_string(needed >> 20) + " MiB" +
-                    (growing ? " backed as the sequences reach them (worst case " +
-                                   std::to_string(plan >> 20) + " MiB)" : "") +
-                    " beside " + std::to_string(reserve >> 20) +
+                    std::to_string(needed >> 20) + " MiB beside " + std::to_string(reserve >> 20) +
                     " MiB for the workspace and CUDA graphs, and " +
                     std::to_string(free_bytes >> 20) +
                     " MiB are free after the weights; lower --max-concurrency or --max-context");
@@ -2915,28 +2891,7 @@ struct Executor::Impl {
             keep.dst_ring        = prefill_ring;
             keep.begin           = std::max(0, c.first - window);
             keep.end             = c.first;
-            if (quantized) {
-                // The window before the chunk comes over from the ring planes, decoded.
-                kernels::RingLoadArgs load;
-                load.src_k = k_view;
-                load.src_v = v_view;
-                load.dst_k = keep.dst_k;
-                load.dst_v = keep.dst_v;
-                load.dst_head_stride = keep.dst_head_stride;
-                load.src_ring  = vp.ring;
-                load.dst_ring  = prefill_ring;
-                load.kv_heads  = kv_heads;
-                load.begin     = keep.begin;
-                load.end       = keep.end;
-                load.sequence  = int(c.sequence);
-                kernels::ring_load(load, stream);
-            } else {
-                keep.src_k           = static_cast<const __half*>(vp.k.p) + seq_offset;
-                keep.src_v           = static_cast<const __half*>(vp.v.p) + seq_offset;
-                keep.src_head_stride = vp.head_stride;
-                keep.src_ring        = vp.ring;
-                kernels::ring_copy(keep, stream);
-            }
+            kernels::ring_copy(keep, stream);
             ka.k_cache     = static_cast<__half*>(staging_k.p);
             ka.v_cache     = static_cast<__half*>(staging_v.p);
             ka.seq_stride  = 0;
@@ -3792,7 +3747,7 @@ struct Executor::Impl {
                 (std::uint64_t(position) + page_tokens - 1) / page_tokens;
             bytes += groups * host_page_layout.page_stride;
             for (const VisitPlan* p : cache_plans()) {
-                if (!p->full) { for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; } }
+                if (!p->full) { for (const auto& s : ring_spans(*p, 0)) { bytes += s.second; } }
             }
         } else {
             for (const VisitPlan* p : cache_plans()) {
@@ -3804,7 +3759,7 @@ struct Executor::Impl {
                 } else if (p->full) {
                     bytes += 2 * std::uint64_t(kv_heads) * position * kD * sizeof(__half);
                 } else {
-                    for (const auto& r : ring_buffers(*p, 0)) { bytes += r.second; }
+                    for (const auto& s : ring_spans(*p, 0)) { bytes += s.second; }
                 }
             }
         }
@@ -3832,31 +3787,22 @@ struct Executor::Impl {
                 at += in_page;
             }
         };
-        const std::size_t head_bytes = std::size_t(global_slots) * kD * sizeof(__half);
-        for (const VisitPlan* p : cache_plans()) {
-            if (p->full) {
-                if (p->k_codes.p != nullptr) {
-                    for (const KvArea* area :
-                         {&p->k_codes, &p->k_scales, &p->v_codes, &p->v_scales}) {
-                        auto* base = static_cast<std::uint8_t*>(area->p) +
-                                     sequence * area->row_bytes * kv_heads;
-                        for (int h = 0; h < kv_heads; ++h) {
-                            copy(base + h * area->row_bytes,
-                                 std::size_t(position) * area->position_bytes);
-                        }
-                    }
-                    continue;
-                }
-                for (const KvArea* area : {&p->k, &p->v}) {
-                    auto* base = static_cast<std::uint8_t*>(area->p) + sequence * head_bytes * kv_heads;
-                    for (int h = 0; h < kv_heads; ++h) {
-                        copy(base + h * head_bytes, std::size_t(position) * kD * sizeof(__half));
-                    }
+        if (paged) {
+            // The eight visits' rows as whole page-group records first (every visit's planes
+            // move together, one record per group), packed one after another across the host
+            // slices; the rings, histories and the rest keep the dense stream after them.
+            const std::uint32_t groups =
+                std::uint32_t((std::uint64_t(position) + page_tokens - 1) / page_tokens);
+            for (std::uint32_t g = 0; g < groups; ++g) {
+                const std::size_t record_at = at;
+                const DeviceKVPageHandle page = lane_groups[sequence][g].mapped;
+                for (std::size_t plane_index = 0; plane_index < pool->plane_count();
+                     ++plane_index) {
+                    const KVPlaneByteRange range = pool->plane_page_range(plane_index, page);
+                    copy(const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(range.base)),
+                         range.bytes);
                 }
                 at = record_at + host_page_layout.page_stride; // the next record's own offset
-            }
-            for (const VisitPlan* p : cache_plans()) {
-                if (!p->full) { copy_rings(p); }
             }
         } else {
             const std::size_t head_bytes = std::size_t(global_slots) * kD * sizeof(__half);
@@ -3875,14 +3821,23 @@ struct Executor::Impl {
                         continue;
                     }
                     for (const KvArea* area : {&p->k, &p->v}) {
-                        auto* base = static_cast<std::uint8_t*>(area->p) + sequence * head_bytes * kv_heads;
+                        auto* base = static_cast<std::uint8_t*>(area->p) +
+                                     sequence * head_bytes * kv_heads;
                         for (int h = 0; h < kv_heads; ++h) {
-                            copy(base + h * head_bytes, std::size_t(position) * kD * sizeof(__half));
+                            copy(base + h * head_bytes,
+                                 std::size_t(position) * kD * sizeof(__half));
                         }
                     }
                     continue;
                 }
-                copy_rings(p);
+                const auto spans = ring_spans(*p, sequence);
+                for (std::size_t i = 0; i < spans.size(); ++i) {
+                    std::uint8_t* device =
+                        checkpoint
+                            ? static_cast<std::uint8_t*>(p->checkpoint[i].p) + sequence * spans[i].second
+                            : spans[i].first;
+                    copy(device, spans[i].second);
+                }
             }
         }
         if (spark) {
