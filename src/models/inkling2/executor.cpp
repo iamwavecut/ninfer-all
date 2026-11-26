@@ -1797,13 +1797,16 @@ struct Executor::Impl {
         const std::uint32_t groups = std::uint32_t(
             (std::uint64_t(tokens) + page_tokens - 1) / page_tokens);
         auto& reservation = page_reservations[sequence];
-        // The lanes' held groups count toward their extent: a lane resuming its own retained
+        // The lane's held groups count toward their extent: a lane resuming its own retained
         // prefix needs only the delta past them.
         const std::uint32_t held = std::uint32_t(lane_groups[sequence].size());
-        if (held + reservation.pages() >= groups) { return true; }
+        if (held >= groups) { return true; }
         const std::uint32_t remaining = groups - held;
         if (!pool->can_resize_reservation(reservation, remaining)) { return false; }
         pool->resize_reservation(reservation, remaining);
+        // The row is whole from admission: the decode and prefill graphs replay back() as it
+        // was captured, so the tables' ids past the captured positions must already be here.
+        materialize_pages(sequence, groups);
         return true;
     }
 
