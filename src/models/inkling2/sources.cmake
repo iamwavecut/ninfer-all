@@ -5,6 +5,7 @@ target_sources(ninfer_model_loading PRIVATE
 target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/cpu_experts.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/executor.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/page_dedup.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/kernels.cu"
   "${CMAKE_CURRENT_LIST_DIR}/kv_format.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/kv_planes.cu"

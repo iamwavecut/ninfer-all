@@ -2,6 +2,7 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 
@@ -139,6 +140,25 @@ int main() {
     int failures = 0;
     failures += check(!parse({"ninfer-serve", "model.ninfer"}).speculative.draft_min_p,
                       "draft confidence must be opt-in");
+    // The page-group size: a power-of-two divisor of the window, or a clean refusal.
+    for (const auto* group : {"8", "16", "32", "64", "128", "256", "512", "1024"}) {
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--kv-page-group", group})
+                              .kv_page_group == static_cast<std::uint32_t>(std::atoi(group)),
+                          "server refused a valid page-group size");
+    }
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).kv_page_group == 64,
+                      "the page-group default is not the landed 64");
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).kv_page_dedup &&
+                          !parse({"ninfer-serve", "model.ninfer", "--no-kv-page-dedup"})
+                               .kv_page_dedup,
+                      "the page-group dedup default or its opt-out broke");
+    for (const auto* group : {"0", "48", "100", "2048", "-64", "3", "x"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--kv-page-group", group});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid page-group size");
+    }
     // Without --spec the floor is kept for the MTP the Engine chooses, zero included.
     for (const auto* floor : {"0", "0.3"}) {
         const auto automatic = parse({"ninfer-serve", "model.ninfer", "--draft-min-p", floor});

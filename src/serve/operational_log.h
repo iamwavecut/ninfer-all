@@ -57,6 +57,8 @@ public:
     void http_failure(std::string_view endpoint, const RequestFailure& failure,
                       std::string_view request_id = {}) const;
     void engine_capacity(const GenerationService& service) const;
+    // The page pool's live usage (one line at the stats interval; silent without a pool).
+    void engine_pages(const ninfer::MemorySummary& memory) const;
     void slot_saved(std::uint32_t slot, std::string_view filename,
                     const ninfer::SlotSaveResult& result) const;
     void slot_restored(std::uint32_t slot, std::string_view filename,

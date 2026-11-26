@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <functional>
 #include <optional>
 #include <span>
@@ -116,6 +117,10 @@ plan_device_kv_page_pool(std::span<LayoutBuilder* const> builders,
 [[nodiscard]] KVExecutionTableLayout plan_kv_execution_tables(LayoutBuilder& builder,
                                                               const KVExecutionTableSpec& spec,
                                                               std::size_t rank = 0);
+
+// paged_kv_equal.cu: one plane's byte compare, a mismatch counter on the device.
+void launch_pages_equal(const void* a, const void* b, std::size_t bytes, void* mismatches,
+                        cudaStream_t stream);
 
 class DeviceKVPagePool;
 class KVExecutionTablePool;
@@ -239,6 +244,13 @@ public:
     // single device, so a pool spanning several ranks refuses it.
     [[nodiscard]] KVPlaneByteRange plane_page_range(std::size_t plane, std::int32_t first_page,
                                                     std::uint32_t count) const;
+    // Device bytes one plane devotes to the page group `handle` names (single-rank pools).
+    [[nodiscard]] KVPlaneByteRange plane_page_range(std::size_t plane,
+                                                    DeviceKVPageHandle handle) const;
+    // Whether the two page groups' bytes are equal on every plane: one compare kernel per plane
+    // on its rank's stream, the verdict read after the streams drain. This is the page-sharing
+    // path's byte-for-byte check behind a hash match.
+    bool pages_equal(DeviceKVPageHandle a, DeviceKVPageHandle b, RankStreams streams = {}) const;
 
     // Device bytes the free pages occupy: one extent per plane and free run on page-major planes,
     // one per plane, run and head on head-major ones. A free page is written before it is ever
@@ -341,8 +353,7 @@ private:
     [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
     // One page from the residue sibling holding `source` to the one holding `destination`.
     void copy_residue_page(std::size_t first_sibling, std::int32_t source,
-                           std::int32_t destination, RankStreams streams) const;
-    void copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin, std::size_t plane_end,
+                           std::int32_t destination, RankStreams streams) const;    void copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin, std::size_t plane_end,
                        std::int32_t first, std::size_t count, std::byte* host_base,
                        std::size_t host_pitch, const HostKVPageLayout& host,
                        RankStreams streams) const;
@@ -368,6 +379,13 @@ private:
     // (HoldingDeviceBinding).
     std::vector<int> plane_devices_;
     std::size_t rank_count_ = 1;
+    // pages_equal's verdict scratch (device counter and its pinned reader), allocated on first use.
+    struct EqualScratch {
+        std::uint32_t* device = nullptr;
+        std::uint32_t* pinned = nullptr;
+        ~EqualScratch();
+    };
+    mutable std::unique_ptr<EqualScratch> equal_scratch_;
     std::vector<KVPageRun> free_page_runs_;
     std::vector<std::uint32_t> page_generations_;
     std::vector<bool> page_allocated_;

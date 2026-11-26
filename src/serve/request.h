@@ -31,6 +31,8 @@ struct ApiError {
     std::string message;
     std::string param; // optional
     std::string code;  // optional
+    // Suggested Retry-After seconds for 503-class responses; 0 = no header.
+    std::uint32_t retry_after = 0;
 };
 
 class ApiException : public std::runtime_error {

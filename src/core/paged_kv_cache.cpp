@@ -39,8 +39,8 @@ std::size_t checked_table_bytes(const KVExecutionTableSpec& spec) {
 }
 
 void validate_geometry(const KVPageGeometry& geometry) {
-    if (geometry.page_tokens != static_cast<std::uint32_t>(kPagedKVPageSize)) {
-        throw std::invalid_argument("Paged KV device geometry requires 64-token pages");
+    if (geometry.page_tokens == 0) {
+        throw std::invalid_argument("Paged KV device geometry requires positive page tokens");
     }
     if (geometry.planes.empty()) { throw std::invalid_argument("Paged KV geometry has no planes"); }
     for (std::size_t index = 0; index < geometry.planes.size(); ++index) {
@@ -149,11 +149,13 @@ DeviceKVPagePoolLayout plan_device_kv_page_pool(std::span<LayoutBuilder* const> 
         }
         if (spec.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
             planned.storage = builder.add_tensor(
-                plane.dtype, {plane.leading_extent, kPagedKVPageSize, plane.head_extent, pages},
+                plane.dtype, {plane.leading_extent, spec.geometry.page_tokens, plane.head_extent,
+                              pages},
                 plane.alignment, label);
         } else {
             planned.storage = builder.add_tensor(
-                plane.dtype, {plane.leading_extent, kPagedKVPageSize, pages, plane.head_extent},
+                plane.dtype,
+                {plane.leading_extent, spec.geometry.page_tokens, pages, plane.head_extent},
                 plane.alignment, label);
         }
         layout.planes.push_back(planned);
@@ -264,6 +266,11 @@ void DeviceKVPageReservation::release() noexcept {
     pages_ = 0;
 }
 
+DeviceKVPagePool::EqualScratch::~EqualScratch() {
+    if (device != nullptr) { (void)cudaFree(device); }
+    if (pinned != nullptr) { (void)cudaFreeHost(pinned); }
+}
+
 DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLayout& layout)
     : DeviceKVPagePool(std::span<const DeviceSpan>(&backing, 1), layout) {}
 
@@ -295,7 +302,7 @@ DeviceKVPagePool::DeviceKVPagePool(std::span<const DeviceSpan> backings,
         plane_ranks_.push_back(planned.rank);
         Tensor plane = planned.storage.bind(backings[planned.rank]);
         if (plane.dtype != expected.dtype || plane.ne[0] != expected.leading_extent ||
-            plane.ne[1] != kPagedKVPageSize) {
+            plane.ne[1] != static_cast<std::int64_t>(spec_.geometry.page_tokens)) {
             throw std::logic_error("Paged KV device plane tensor is inconsistent");
         }
         const std::int32_t pages = expected.local_pages(physical_pages);
@@ -369,6 +376,49 @@ KVPlaneByteRange DeviceKVPagePool::plane_page_range(std::size_t plane_index,
     return KVPlaneByteRange{.base  = static_cast<const std::byte*>(plane.data) +
                                     static_cast<std::size_t>(first_page) * page_bytes,
                             .bytes = page_bytes * count};
+}
+
+KVPlaneByteRange DeviceKVPagePool::plane_page_range(std::size_t plane_index,
+                                                    DeviceKVPageHandle handle) const {
+    if (rank_count_ != 1) {
+        throw std::logic_error("Paged KV page ranges are only defined for a single-rank pool");
+    }
+    return plane_page_range(plane_index, physical_index(handle), 1);
+}
+
+bool DeviceKVPagePool::pages_equal(DeviceKVPageHandle a, DeviceKVPageHandle b,
+                                   RankStreams streams) const {
+    if (a.owner_ != this || b.owner_ != this) {
+        throw std::invalid_argument("Paged KV page equality needs handles of this pool");
+    }
+    const std::int32_t first = physical_index(a);
+    const std::int32_t second = physical_index(b);
+    if (first == second) { return true; }
+    if (equal_scratch_ == nullptr) {
+        auto scratch           = std::make_unique<EqualScratch>();
+        CUDA_CHECK(cudaMalloc(&scratch->device, 4));
+        CUDA_CHECK(cudaHostAlloc(&scratch->pinned, 4, cudaHostAllocDefault));
+        equal_scratch_ = std::move(scratch);
+    }
+    EqualScratch& scratch = *equal_scratch_;
+    bool equal            = true;
+    for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
+        const KVPlaneByteRange left  = plane_page_range(plane_index, first, 1);
+        const KVPlaneByteRange right = plane_page_range(plane_index, second, 1);
+        if (left.bytes != right.bytes) {
+            throw std::logic_error("Paged KV plane geometry differs between the compared pages");
+        }
+        if (left.bytes == 0) { continue; }
+        const cudaStream_t stream = streams[plane_ranks_[plane_index]];
+        const HoldingDeviceBinding bind(plane_devices_[plane_index]);
+        CUDA_CHECK(cudaMemsetAsync(scratch.device, 0, 4, stream));
+        launch_pages_equal(left.base, right.base, left.bytes, scratch.device, stream);
+        CUDA_CHECK(cudaMemcpyAsync(scratch.pinned, scratch.device, 4, cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (scratch.pinned[0] != 0) { equal = false; break; }
+    }
+    return equal;
 }
 
 std::vector<DeviceKVPagePool::FreeExtent> DeviceKVPagePool::free_extents() const {
@@ -901,8 +951,19 @@ void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begi
                 return;
             }
             if (to_host) {
-                CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, row_pitch, device_ptr, device_pitch, width,
-                                             rows, cudaMemcpyDeviceToHost, stream));
+                const cudaError_t status = cudaMemcpy2DAsync(
+                    host_ptr, row_pitch, device_ptr, device_pitch, width, rows,
+                    cudaMemcpyDeviceToHost, stream);
+                if (status != cudaSuccess) {
+                    std::fprintf(stderr,
+                                 "copy2d D2H failed: plane %zu rows %zu width %zu row_pitch %zu "
+                                 "device_pitch %zu host %p device %p first %d capacity %u\n",
+                                 plane_index, rows, width, row_pitch, device_pitch,
+                                 static_cast<const void*>(host_ptr),
+                                 static_cast<const void*>(device_ptr), first,
+                                 spec_.page_group_count);
+                }
+                CUDA_CHECK(status);
             } else {
                 CUDA_CHECK(cudaMemcpy2DAsync(device_ptr, device_pitch, host_ptr, row_pitch, width,
                                              rows, cudaMemcpyHostToDevice, stream));

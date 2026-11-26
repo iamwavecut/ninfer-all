@@ -103,6 +103,20 @@ struct ServeOptions {
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     bool kv_cache_automatic                = false; // no --kv-dtype (EngineOptions::kv_cache_automatic)
     LoopKvCache loop_kv                    = LoopKvCache::PerPass; // Inkling 2: --loop-kv
+    // Inkling 2: --kv-paging pools the eight full-attention visits' quantized planes;
+    // --kv-page-budget caps the pool in MiB (0: sized from free memory).
+    bool kv_paging                         = false;
+    std::uint32_t kv_page_budget_mib       = 0;
+    // --kv-page-group: positions of one page group (a power-of-two divisor of the window).
+    std::uint32_t kv_page_group            = 64;
+    // --kv-page-dedup / --no-kv-page-dedup: content-addressed sharing of byte-identical groups.
+    bool kv_page_dedup                     = true;
+    // Inkling 2 paging queue: admission grant shape (--kv-reserve-mode upfront|chunked), the
+    // chunked grant's generation tokens (--kv-reserve-gen-chunk), and the admission order
+    // (--kv-queue-order fifo|shortest).
+    KvReserveMode kv_reserve_mode          = KvReserveMode::Upfront;
+    std::uint32_t kv_reserve_gen_chunk     = 256;
+    KvQueueOrder kv_queue_order            = KvQueueOrder::Fifo;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;

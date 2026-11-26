@@ -30,6 +30,7 @@
 
 #include "core/device.h"
 #include "core/expert_disk.h"
+#include "core/paged_kv_page.h"
 #include "core/tensor.h"
 #include "models/expert_profile.h"
 #include "models/inkling2/kv_format.h"
@@ -69,6 +70,21 @@ struct ExecutorOptions {
     // sliding-window visits share the last pass's ring and its checkpoint the same way. The
     // convolution histories stay every visit's own.
     LoopKvCache loop_kv = LoopKvCache::PerPass;
+    // The eight full-attention visits' planes live in a shared pool of 64-token page groups
+    // (--kv-paging) instead of dense per-sequence planes: a lane leases page groups as it grows,
+    // uneven lane usage packs, and admission reserves what a request may claim. Needs kv_cache
+    // rk8v4 / rk4v4 (the pool stores the quantized planes; the F16 caches keep their dense path).
+    bool paged_kv               = false;
+    // The pool's device-byte ceiling (0: as much as the device frees beside the fixed caches).
+    std::uint64_t paged_kv_budget_bytes = 0;
+    // Positions of one page group (--kv-page-group): a power-of-two divisor of the model's
+    // sliding window. Bigger groups trade coarser allocation granularity for smaller execution
+    // tables and fewer of them.
+    std::uint32_t paged_kv_page_tokens = kPagedKVPageSize;
+    // --kv-page-dedup: content-addressed sharing of byte-identical page groups across the lanes
+    // (a shared prompt prefix stores once), with copy-on-write on divergent writes. Off gives
+    // every lane its own pages.
+    bool paged_kv_dedup                = true;
     // Proposed tokens a verification may carry per sequence after its anchor (0: no
     // verification); a verification's rows, the anchors and drafts of all its sequences, are at
     // most 8.
@@ -101,9 +117,20 @@ struct ExecutorOptions {
 struct ExecutorMemory {
     std::uint64_t kv_bytes        = 0;
     // Beside an elastic expert cache, the full-attention caches grow with their sequences: the
-    // bytes backed now, of kv_bytes at most.
+    // bytes backed now, of kv_bytes at most. With the page pool the lanes' leased page groups.
     std::uint64_t kv_backed_bytes = 0;
     bool kv_grows                 = false;
+    // The page pool (--kv-paging): bytes of one page group, the groups the lanes hold now and
+    // the pool's capacity. Zero groups without it.
+    std::uint64_t kv_page_group_bytes = 0;
+    std::uint32_t kv_pages            = 0;
+    std::uint32_t kv_pages_max        = 0;
+    // --kv-page-dedup: page groups two or more lanes map now, and the group offers that have
+    // shared an existing page so far.
+    std::uint32_t kv_pages_shared     = 0;
+    std::uint64_t kv_dedup_hits       = 0;
+    std::uint64_t kv_dedup_offers     = 0;
+    std::uint64_t kv_dedup_collisions = 0;
     // The short convolutions' histories (and their checkpoints), inside kv_bytes.
     std::uint64_t history_bytes   = 0;
     std::uint64_t workspace_bytes = 0;
@@ -149,6 +176,12 @@ public:
 
     [[nodiscard]] const ExecutorOptions& options() const noexcept;
     [[nodiscard]] ExecutorMemory memory() const noexcept;
+    // --kv-paging: whether the sequence may grow to `tokens` positions (its prompt and output) —
+    // reserves that many page groups beside the other sequences' reservations. False: the pool
+    // cannot hold it and nothing changed; the request waits in the queue. Without the pool true.
+    bool reserve_pages(std::uint32_t sequence, std::uint32_t tokens);
+    // --kv-paging: whether the page pool holds the full-attention planes.
+    [[nodiscard]] bool paged_kv() const noexcept;
     // Logit rows of a column: the unpadded vocabulary.
     [[nodiscard]] std::uint32_t vocab() const noexcept;
     void reset(std::uint32_t sequence);

@@ -995,13 +995,11 @@ __global__ void __launch_bounds__(kRows == 1 ? 128 * kMaxRowGroup : 256)
                 const int slot = a.ring != 0 ? p % a.ring : p;
                 if (plane.coding != KvCoding::F16) {
                     const std::int64_t codes_row =
-                        std::int64_t(sequence) * plane.code_seq +
-                        std::int64_t(kv_head) * plane.code_head +
-                        std::int64_t(slot) * plane.code_row;
+                        kv_plane_offset(plane, sequence, kv_head, slot, plane.code_seq,
+                                        plane.code_head, plane.code_row, plane.code_page);
                     const std::int64_t scales_row =
-                        std::int64_t(sequence) * plane.scale_seq +
-                        std::int64_t(kv_head) * plane.scale_head +
-                        std::int64_t(slot) * plane.scale_row;
+                        kv_plane_offset(plane, sequence, kv_head, slot, plane.scale_seq,
+                                        plane.scale_head, plane.scale_row, plane.scale_page);
                     word = chunk_word(plane, plane.codes + codes_row, plane.scales + scales_row, c);
                 } else {
                     const __half* cache = matrix == 0 ? a.k_cache : a.v_cache;

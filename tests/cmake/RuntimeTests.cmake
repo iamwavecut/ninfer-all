@@ -55,10 +55,19 @@ ninfer_add_test(ninfer_effective_thinking_budget_test
   STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_effective_thinking_budget.cpp")
 
+ninfer_add_test(ninfer_queue_policy_test
+  STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_queue_policy.cpp")
+
 ninfer_add_test(ninfer_engine_logprobs_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_logprobs_real.cpp"
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_engine_logprobs_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_paged_8lane_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_paged_8lane_real.cpp"
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_paged_8lane_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_engine_stop_string_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_stop_string_real.cpp"

@@ -55,6 +55,7 @@ add_library(ninfer_core STATIC
   expert_mirror.cpp
   expert_direct.cpp
   paged_kv_cache.cpp
+  paged_kv_equal.cu
   kv_expert_loan.cpp
   linear_attention_state.cpp
   layout.cpp

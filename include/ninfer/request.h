@@ -567,13 +567,19 @@ enum class RequestErrorKind : std::uint8_t {
 
 class RequestError final : public std::invalid_argument {
 public:
-    RequestError(RequestErrorKind kind, std::string message)
-        : std::invalid_argument(std::move(message)), kind_(kind) {}
+    RequestError(RequestErrorKind kind, std::string message,
+                 std::uint32_t retry_after_seconds = 0)
+        : std::invalid_argument(std::move(message)), kind_(kind),
+          retry_after_(retry_after_seconds) {}
 
     [[nodiscard]] RequestErrorKind kind() const noexcept { return kind_; }
 
+    // Suggested Retry-After seconds for the HTTP error response; 0 = no header.
+    [[nodiscard]] std::uint32_t retry_after_seconds() const noexcept { return retry_after_; }
+
 private:
     RequestErrorKind kind_;
+    std::uint32_t retry_after_;
 };
 
 struct PromptSummary {

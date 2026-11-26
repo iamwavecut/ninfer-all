@@ -363,6 +363,36 @@ std::string serve_usage_text(const char* argv0) {
            "                                fp16: Flash-Next, Gemma 4 and Flint; mxfp8:\n"
            "                                Inkling 2 (its default)\n" +
            std::string(product::kKvResidentHelp) + std::string(product::kLoopKvHelp) +
+           "                                fp16: Flash-Next, Gemma 4 and Flint\n"
+           "  --kv-paging                   Inkling 2: the eight full-attention visits'\n"
+           "                                quantized planes (rk8v4 / rk4v4) live in a shared\n"
+           "                                pool of 64-token page groups that lanes lease as\n"
+           "                                they grow; uneven lane usage packs, and requests\n"
+           "                                that do not fit wait in the queue\n"
+           "  --kv-page-budget N            the pool's device-byte ceiling in MiB (0: sized\n"
+           "                                from free memory; default 0)\n"
+           "  --kv-page-group N             positions of one page group, a power-of-two divisor\n"
+           "                                of the 1,024-position window (8..1024; default 64)\n"
+           "  --kv-reserve-mode upfront|chunked  Inkling 2 paging queue: admission grants\n"
+           "                                prompt + the whole max_tokens (upfront,\n"
+           "                                the default) or prompt + the first\n"
+           "                                --kv-reserve-gen-chunk tokens, extended\n"
+           "                                per decode round (more queued requests\n"
+           "                                fit the same budget; a lane whose\n"
+           "                                extension cannot be granted fails its\n"
+           "                                own request with a clean 503)\n"
+           "  --kv-reserve-gen-chunk N    chunked grant size in tokens (default 256)\n"
+           "  --kv-queue-order fifo|shortest  Inkling 2 paging queue admission order:\n"
+           "                                fifo (default, longest-waiting first) or\n"
+           "                                smallest prompt+max_tokens first\n"
+           "  --kv-queue-timeout-ms N     the paging queue deadline in ms (alias of\n"
+           "                                --pending-timeout-ms; expired requests\n"
+           "                                answer 503 with Retry-After)\n"
+"  --kv-page-dedup / --no-kv-page-dedup\n"
+           "                                with --kv-paging: share byte-identical page groups\n"
+           "                                across the lanes (a shared prompt prefix stores\n"
+           "                                once); divergent writes copy first (default on)\n" +
+           std::string(product::kKvResidentHelp) +
            "\n"
            "CONTEXT CACHE\n"
            "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
@@ -1360,6 +1390,67 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         if (arg == "--kv-dtype") {
             options.kv_cache  = parse_kv_dtype(require_value("--kv-dtype"));
             kv_dtype_explicit = true;
+            continue;
+        }
+        if (product::switch_option(arg, "kv-paging", [&](bool on) { options.kv_paging = on; })) {
+            continue;
+        }
+        if (arg == "--kv-page-budget") {
+            options.kv_page_budget_mib = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-page-budget"), "kv-page-budget"));
+            continue;
+        }
+        if (product::switch_option(arg, "kv-page-dedup",
+                                   [&](bool on) { options.kv_page_dedup = on; })) {
+            continue;
+        }
+        if (arg == "--kv-page-group") {
+            const std::uint32_t group = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-page-group"), "kv-page-group"));
+            if (group == 0 || (group & (group - 1)) != 0 || group > 1024 || 1024 % group != 0) {
+                throw std::invalid_argument(
+                    "--kv-page-group needs a power-of-two divisor of the 1,024-position window "
+                    "(8..1024), got " + std::to_string(group));
+            }
+            options.kv_page_group = group;
+            continue;
+        }
+        if (arg == "--kv-reserve-mode") {
+            const std::string mode = require_value("--kv-reserve-mode");
+            if (mode == "upfront") {
+                options.kv_reserve_mode = KvReserveMode::Upfront;
+            } else if (mode == "chunked") {
+                options.kv_reserve_mode = KvReserveMode::Chunked;
+            } else {
+                throw std::invalid_argument(
+                    "invalid kv-reserve-mode: " + mode + " (upfront or chunked)");
+            }
+            continue;
+        }
+        if (arg == "--kv-reserve-gen-chunk") {
+            options.kv_reserve_gen_chunk = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-reserve-gen-chunk"),
+                                      "kv-reserve-gen-chunk"));
+            continue;
+        }
+        if (arg == "--kv-queue-order") {
+            const std::string order = require_value("--kv-queue-order");
+            if (order == "fifo") {
+                options.kv_queue_order = KvQueueOrder::Fifo;
+            } else if (order == "shortest") {
+                options.kv_queue_order = KvQueueOrder::Shortest;
+            } else {
+                throw std::invalid_argument(
+                    "invalid kv-queue-order: " + order + " (fifo or shortest)");
+            }
+            continue;
+        }
+        if (arg == "--kv-queue-timeout-ms") {
+            // The paging queue's name for the pending deadline: the same budget, named for the
+            // queue path it bounds.
+            options.pending_timeout_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-queue-timeout-ms"),
+                                      "kv-queue-timeout-ms"));
             continue;
         }
         if (arg == "--spec") {
