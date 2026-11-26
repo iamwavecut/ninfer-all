@@ -631,7 +631,7 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   the BF16 middle quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same
   2^-32 fixed-point sums ([the CPU share](qwen3-8-flash-next.md#the-cpu-share) describes the
   arithmetic), so outputs do not depend on the split. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K,
-  IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
+  IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
   layers copy every miss.
   An expert the CPU computed takes no slot; the cache's rounds decide whether it enters.
   Flash-Next's CPU share also covers the missing experts with at most eight pairs in calls of 9 to
