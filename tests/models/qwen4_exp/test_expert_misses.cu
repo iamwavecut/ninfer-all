@@ -28,6 +28,7 @@
 
 #include "core/device.h"
 #include "core/device_buffer.h"
+#include "core/host_pages.h"
 #include "core/mapped_host_copy.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
@@ -137,10 +138,12 @@ private:
 // so all routed experts are missing.
 struct Fixture {
     std::array<std::unique_ptr<PinnedHostBuffer>, 3> matrices;
+    std::array<std::unique_ptr<HostPages>, 3> registered_matrices;
     DeviceBuffer gate_table, ids, input;
     std::unique_ptr<ExpertMisses> misses;
 
-    Fixture(DeviceContext& device, double cpu_share, std::optional<bool> copy_kernel) {
+    Fixture(DeviceContext& device, double cpu_share, std::optional<bool> copy_kernel,
+            bool registered = false) {
         MissLayer layer;
         layer.rank    = 0;
         layer.experts = kExperts;
@@ -152,9 +155,19 @@ struct Fixture {
             projection.rows         = rows[p];
             projection.k            = ks[p];
             projection.expert_bytes = projection.row_bytes * rows[p];
-            matrices[p] = std::make_unique<PinnedHostBuffer>(std::size_t(projection.expert_bytes));
-            std::memset(matrices[p]->data(), 0, matrices[p]->size());
-            projection.host.assign(kExperts, matrices[p]->data());
+            if (registered) {
+                registered_matrices[p] = std::make_unique<HostPages>(std::size_t(projection.expert_bytes));
+                std::memset(registered_matrices[p]->data(), 0, registered_matrices[p]->size());
+                registered_matrices[p]->pin(true);
+                projection.host.assign(kExperts, registered_matrices[p]->data());
+                void* alias = nullptr;
+                CUDA_CHECK(cudaHostGetDevicePointer(&alias, registered_matrices[p]->data(), 0));
+                projection.device.assign(kExperts, alias);
+            } else {
+                matrices[p] = std::make_unique<PinnedHostBuffer>(std::size_t(projection.expert_bytes));
+                std::memset(matrices[p]->data(), 0, matrices[p]->size());
+                projection.host.assign(kExperts, matrices[p]->data());
+            }
         }
         gate_table = DeviceBuffer(kExperts * sizeof(void*));
         gate_table.fill(0);
@@ -588,6 +601,12 @@ int run() {
     RankBinding bind(device, 0);
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    // Registered VirtualAlloc pages can have distinct host and device addresses. The CPU must
+    // read the host address while the copy kernel reads the device alias in the same request.
+    {
+        Fixture f(device, 0.5, true, true);
+        eager_late(f, stream, true, "registered pages, mixed CPU and kernel copies");
+    }
     // The copies a narrow call takes: the one the environment forces, else the copy kernel and,
     // where copies do not queue behind one another, the copy engine too.
     std::vector<std::optional<bool>> copies;

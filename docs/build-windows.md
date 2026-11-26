@@ -108,7 +108,10 @@ with queued copies; it uses mapped host memory and a copy kernel on Windows and 
 misses, whose service copies the missing experts while a replayed layer waits for them on the
 device, hung while the warm-up prepared the CUDA Graphs on Windows; on Windows and under WSL2 the
 service copies a decode or verification call's experts with a kernel that reads them in place
-(`NINFER_MISS_COPY_KERNEL=0` forces the copy engine, `1` the kernel on any driver). Native Qwen
+(`NINFER_MISS_COPY_KERNEL=0` forces the copy engine, `1` the kernel on any driver). The pinned
+expert block is registered as mapped, and kernels read it at the device address CUDA gives each
+registered part: under WDDM that address may differ from the host's, and an RTX 4090 D faulted
+reading the host address. Native Qwen
 MoE, Gemma MoE, Flint, DeepSeek-V4.1-Flash and Inkling 2 with host or disk experts deliver the
 missing experts while a replayed graph waits for them on the device, so on Windows and under WSL2
 they run their passes eagerly, without CUDA Graphs, and wait for the misses on the host. The
@@ -117,7 +120,8 @@ Inkling 2 then keep 64 MiB free for the kernels CUDA loads at their first launch
 320 MiB they keep for the graphs; experts on the GPU keep their graphs and that reserve. This
 repository has no Windows or WSL2 host:
 `ninfer_qwen4_exp_hybrid_experts_test` and `ninfer_qwen4_exp_expert_misses_test` run both forms on
-Linux and only the kernel under WDDM, where they have not run yet. Inkling 2's eager passes ran
+Linux and only the kernel under WDDM, where a contributor ran the second on an RTX 4090 D, and
+Edge0-145B with host experts served there with CUDA Graphs. Inkling 2's eager passes ran
 under Windows 11 in a [field report](performance/field-reports.md#rtx-3070-ti-windows-11); those
 of the other families have not run there. A process started
 by a low-priority parent (a Task Scheduler task at its default priority, a service, some IDE

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -90,8 +91,8 @@ public:
     // up to depth direct reads (also Windows buffered reads) into
     // bounded staging. Hints do not change demand counters or admit rows to the resident cache.
     // A batch of more than kInlineHints page ranges is hinted by a worker thread and dropped
-    // while the worker still hints the previous one. Like submit/wait, called by the reader's
-    // owner, never concurrently with them.
+    // while the worker still hints the previous one. Unlike submit/wait, it may run on another
+    // thread while the owner reads (the draft prefetch calls it from stream callbacks).
     void prefetch(std::span<const std::uint64_t> row_ids);
     static constexpr std::size_t kInlineHints = 256;
 
@@ -119,6 +120,7 @@ private:
     std::vector<std::uint64_t> starts_;        // table offset of each segment
     std::unique_ptr<Memory> resident_;         // Ram: the table; RamHot: the hot rows by row id
     std::unique_ptr<RowCache> cache_;          // Disk: bounded rows, populated after successful reads
+    mutable std::mutex cache_mutex_;           // cache_ between the owner and prefetch()
     std::atomic<std::uint64_t> resident_rows_{0};
     // RamHot: bit per table row, and the hot rows before each 512-row block.
     std::vector<std::uint64_t> hot_bits_;

@@ -173,7 +173,7 @@ struct ExpertStream::Impl {
     std::uint64_t call       = 0;
     bool grew                = false;
     ExpertStreamStats stats;
-    ReadPool reads{kReadThreads - 1}; // the caller reads too
+    ReadPool reads{kReadThreads - 1, "expert stream"}; // the caller reads too
 
     // The batch being staged in the current half: its reads, then the copies out of the half (a
     // copy without a source zeroes its target).

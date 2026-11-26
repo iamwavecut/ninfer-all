@@ -6,14 +6,19 @@
 // short file, a row past the table, a hot-row budget below its index, and a profile naming a row
 // twice or past the table; a row read that fails raises FileReadError. A hot-row profile reads
 // back as written and is refused for other hash constants.
-// Hints, including the batches of many pages a worker thread issues, leave demand reads unchanged.
+// Hints, including the batches of many pages a worker thread issues, leave demand reads unchanged,
+// also while another thread hints and stages rows as the owner reads, as the draft prefetch's stream
+// callbacks do.
 #include "core/file_read_error.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/ngram_profile.h"
 #include "models/qwen4_exp/ngram_table.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -242,6 +247,38 @@ int run() {
         require(all == expected, "bounded staged hints changed demand output");
         // Destruction drains a still-running speculative read before closing files or buffers.
         reader.prefetch(hinted);
+    }
+
+    for (const auto io : {NgramIo::Buffered, NgramIo::Direct, NgramIo::Mapped}) {
+        if (io == NgramIo::Direct && direct_skipped) { continue; }
+        // The draft prefetch hints from a stream callback while the owner reads: a thread
+        // prefetches random rows as fast as it can while the owner's batches, with a demand cache
+        // that both sides consult, still return the file's bytes.
+        NgramTableReader reader(split_layout, {.io = io, .budget_bytes = 16384, .depth = 8});
+        std::atomic<bool> stop{false};
+        std::exception_ptr hint_failure;
+        std::thread hinter([&] {
+            try {
+                std::mt19937 local(4242u);
+                std::vector<std::uint64_t> rows(12);
+                while (!stop.load(std::memory_order_relaxed)) {
+                    for (auto& row : rows) { row = local() % kRows; }
+                    reader.prefetch(rows);
+                }
+            } catch (...) { hint_failure = std::current_exception(); }
+        });
+        std::vector<std::uint8_t> out(expected.size());
+        std::exception_ptr read_failure;
+        try {
+            for (int round = 0; round < 400; ++round) {
+                reader.read_rows(ids, out);
+                require(out == expected, "rows read while another thread hints differ from the file");
+            }
+        } catch (...) { read_failure = std::current_exception(); }
+        stop.store(true, std::memory_order_relaxed);
+        hinter.join();
+        if (read_failure) { std::rethrow_exception(read_failure); }
+        if (hint_failure) { std::rethrow_exception(hint_failure); }
     }
 
     {

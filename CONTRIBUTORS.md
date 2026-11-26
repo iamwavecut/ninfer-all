@@ -29,6 +29,7 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | [cedrik-fuoco](https://github.com/cedrik-fuoco) | The CUDA Graph reserve of Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 charged only where the graphs run, and the Inkling 2 Mini field report on an 8 GB RTX 3070 Ti under Windows 11 | [#467](https://github.com/iamwavecut/ninfer-all/pull/467) |
 | [hksdpc255](https://github.com/hksdpc255) | The built-in device profiles compiled by Clang with libstdc++ | [#474](https://github.com/iamwavecut/ninfer-all/pull/474) |
 | [volkermauel](https://github.com/volkermauel) (Volker Mauel) | Inkling 2's int8 and rk8v4 key and value plane stores in one launch, and its key and value taps in one batch | [#473](https://github.com/iamwavecut/ninfer-all/pull/473) |
+| [hshamilt](https://github.com/hshamilt) (Howard S. Hamilton) | Flash-Next and Edge0 host experts read by kernels at the pinned block's device address under WDDM, which ended their startup fault on Windows | [#478](https://github.com/iamwavecut/ninfer-all/pull/478) |
 
 ## Work carried from other forks
 
