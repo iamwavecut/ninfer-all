@@ -43,13 +43,20 @@ private:
 // runs and diagnosis, else serialized_copy_queue().
 [[nodiscard]] bool copy_kernel_default();
 
+// A non-blocking stream for such a service's copies on the current device. With `kernel` (its
+// copies are SegmentCopies launches) it has the device's greatest priority, so the copies' few
+// blocks start ahead of the waiting blocks of a prompt pass's kernels instead of behind them; else
+// the default priority.
+[[nodiscard]] cudaStream_t create_copy_stream(bool kernel);
+
 // Copies queued for one stream that run as kernel launches on it, outside the copy queue: where
 // serialized_copy_queue() holds, a copy-engine copy that a replayed graph's device-side wait
 // depends on can sit behind the copies the graph queued after that wait, and the wait never ends.
 // A launch reads its sources in place when it runs: device memory, or pinned host memory at its
-// device address. The segments of one launch run in no particular order; launches run in stream
-// order. The segment list is pinned host memory the launches read; one thread at a time uses the
-// queue.
+// device address. Each launch is a small fixed grid whose blocks stride over its segments, so it
+// leaves the rest of the device to the kernels beside it. The segments of one launch run in no
+// particular order; launches run in stream order. The segment list is pinned host memory the
+// launches read; one thread at a time uses the queue.
 class SegmentCopies {
 public:
     // Up to `capacity` segments between restarts; queuing one more first waits for the stream.

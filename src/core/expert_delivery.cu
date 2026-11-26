@@ -787,10 +787,10 @@ struct ExpertDelivery::Impl {
         }
         CUDA_CHECK(cudaFuncSetAttribute(split_routes, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         int(max_experts * 4)));
-        CUDA_CHECK(cudaStreamCreateWithFlags(&copies, cudaStreamNonBlocking));
-        CUDA_CHECK(cudaStreamCreateWithFlags(&rounds, cudaStreamNonBlocking));
+        copy_kernel = options.copy_kernel.value_or(copy_kernel_default());
+        copies      = create_copy_stream(copy_kernel);
         try {
-            copy_kernel = options.copy_kernel.value_or(copy_kernel_default());
+            rounds = create_copy_stream(copy_kernel);
             if (copy_kernel) {
                 call_queue  = std::make_unique<SegmentCopies>(copies, kCallSegments);
                 round_queue = std::make_unique<SegmentCopies>(rounds, kRoundSegments);
@@ -810,7 +810,7 @@ struct ExpertDelivery::Impl {
                 if (event) { cudaEventDestroy(event); }
             }
             cudaStreamDestroy(copies);
-            cudaStreamDestroy(rounds);
+            if (rounds) { cudaStreamDestroy(rounds); }
             throw;
         }
     }

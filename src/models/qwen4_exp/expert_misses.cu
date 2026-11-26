@@ -510,7 +510,7 @@ struct ExpertMisses::Impl {
                 }
             }
             rank.patches = std::make_unique<PinnedHostBuffer>(2 * kMaxExperts * sizeof(TablePatch));
-            CUDA_CHECK(cudaStreamCreateWithFlags(&rank.copies, cudaStreamNonBlocking));
+            rank.copies = create_copy_stream(copy_kernel);
             if (copy_kernel) {
                 rank.segments = std::make_unique<SegmentCopies>(rank.copies, kCopySegments);
             }

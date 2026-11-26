@@ -116,7 +116,13 @@ MoE, Gemma MoE, Flint, DeepSeek-V4.1-Flash and Inkling 2 with host or disk exper
 missing experts while a replayed graph waits for them on the device; on Windows and under WSL2
 their delivery runs every copy of a call and of the work after it (layer banks, promotions, the
 cache's rounds) as the same kernel, reading the pinned block at its device addresses, and they keep
-their CUDA Graphs (`NINFER_MISS_COPY_KERNEL` forces either copy here too). This repository has no
+their CUDA Graphs (`NINFER_MISS_COPY_KERNEL` forces either copy here too). Each launch is a grid of
+32 blocks at the device's greatest stream priority, which leaves the rest of the device to the
+prompt's kernels. Forced on Linux on an RTX 4090 (PCIe 4.0 x16, 5,753-token prompt, 128 tokens),
+the kernel prefilled Inkling 2 with host experts 4.9% slower than the copy engine (4.08k against
+4.29k tokens/s), Gemma MoE, Flint and Qwen3.6-35B-A3B with host experts 0.8-1.7% faster, and the
+five families with disk experts 0.9% (DeepSeek-V4.1-Flash) to 16% faster; decode changed by
+−1.9% (DeepSeek-V4.1-Flash) to +10.8% (Qwen3.6-35B-A3B). This repository has no
 Windows or WSL2 host: `ninfer_qwen4_exp_hybrid_experts_test`,
 `ninfer_qwen4_exp_expert_misses_test` and `ninfer_expert_delivery_test` run both forms on Linux and
 only the kernel under WDDM, where a contributor ran the second on an RTX 4090 D, and Edge0-145B
