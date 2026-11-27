@@ -366,17 +366,17 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     return resolved;
 }
 
-// Requests the families with an Engine core of their own run at once: their decode takes no more
-// rows than a speculative round. They choose no automatic count.
-void require_own_core_concurrency(const EngineOptions& options, const char* family) {
+// Requests the families with an Engine core of their own run at once: up to `maximum`. They choose
+// no automatic count.
+void require_own_core_concurrency(const EngineOptions& options, const char* family,
+                                  std::uint32_t maximum) {
     if (options.max_concurrency_auto) {
         throw std::invalid_argument(std::string("--max-concurrency auto is not available for ") +
-                                    family + "; give a count of 1 to " +
-                                    std::to_string(kMaximumSpeculativeRows));
+                                    family + "; give a count of 1 to " + std::to_string(maximum));
     }
-    if (options.max_concurrency > kMaximumSpeculativeRows) {
+    if (options.max_concurrency > maximum) {
         throw std::invalid_argument(std::string(family) + " runs at most " +
-                                    std::to_string(kMaximumSpeculativeRows) +
+                                    std::to_string(maximum) +
                                     " requests at once; max_concurrency is " +
                                     std::to_string(options.max_concurrency));
     }
@@ -580,7 +580,7 @@ public:
         report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::is_gemma4_artifact(options.artifact_path)) {
-            require_own_core_concurrency(options, "Gemma 4");
+            require_own_core_concurrency(options, "Gemma 4", kMaximumConcurrency);
             auto constructed    = runtime::construct_gemma4(options, device);
             gemma               = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -599,7 +599,7 @@ public:
             return;
         }
         if (runtime::is_flint_artifact(options.artifact_path)) {
-            require_own_core_concurrency(options, "Flint");
+            require_own_core_concurrency(options, "Flint", kMaximumSpeculativeRows);
             auto constructed    = runtime::construct_flint(options, device);
             flint               = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -614,7 +614,7 @@ public:
             return;
         }
         if (runtime::is_inkling2_artifact(options.artifact_path)) {
-            require_own_core_concurrency(options, "Inkling 2");
+            require_own_core_concurrency(options, "Inkling 2", kMaximumSpeculativeRows);
             auto constructed    = runtime::construct_inkling2(options, device);
             inkling             = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -629,7 +629,7 @@ public:
             return;
         }
         if (runtime::is_deepseek_v41_artifact(options.artifact_path)) {
-            require_own_core_concurrency(options, "DeepSeek-V4.1-Flash");
+            require_own_core_concurrency(options, "DeepSeek-V4.1-Flash", kMaximumSpeculativeRows);
             auto constructed    = runtime::construct_deepseek_v41(options, device);
             deepseek            = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -644,7 +644,7 @@ public:
             return;
         }
         if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
-            require_own_core_concurrency(options, "Qwen3.8-Flash-Next");
+            require_own_core_concurrency(options, "Qwen3.8-Flash-Next", kMaximumSpeculativeRows);
             auto constructed    = runtime::construct_qwen4_exp(options, device);
             flash               = std::move(constructed.instance);
             load                = std::move(constructed.load);
