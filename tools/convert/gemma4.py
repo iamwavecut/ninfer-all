@@ -12,6 +12,10 @@ stay F32 vectors that the runtime applies.
 `HF_DIR` holds the release's `config.json`, `tokenizer.json`, `tokenizer_config.json`,
 `chat_template.jinja` and `generation_config.json` (no weights are read from it).
 
+The stored `tokenizer.json` carries Google's glitch-token remediation (see
+`remediate_glitch_tokens`): the BPE merges that build the tokens Google flagged in Gemma 4 E2B,
+E4B and 12B are removed, so their strings encode as trained subwords.
+
 `--components text,mtp --source mtp=ASSISTANT.gguf` adds the release's multi-token-prediction
 assistant (Gemma4AssistantForCausalLM, llama.cpp architecture `gemma4-assistant`) as the `mtp`
 component, its blocks imported the same way: a four-block drafter that reads the target's last
@@ -111,6 +115,53 @@ def text_config(source: dict) -> dict:
 
 VISION_RESOURCES = ("processor_config.json",)
 
+GLITCH_TOKENS = Path(__file__).with_name("gemma4_glitch_tokens.json")
+
+
+def remediate_glitch_tokens(data: bytes) -> tuple[bytes, dict]:
+    """Google's glitch-token remediation of the Gemma 4 tokenizer, for every model size.
+
+    The Gemma 4 releases share one tokenizer. Google patched it in E2B, E4B and 12B
+    (gemma4_glitch_tokens.json names the pull requests): tokens whose embeddings collapsed to
+    nearly one vector lose the BPE merges that build them, and the one single-character token
+    among them is renamed to a placeholder, so its character falls back to its UTF-8 bytes. Token
+    ids and the vocabulary size stay. Each patch lists the tokens flagged in its own model; the
+    union applies here, to the 26B-A4B and 31B releases that Google has not patched, whose token
+    tables hold all 261 of these tokens in the same collapsed cluster. The edit removes the listed
+    merges still present and renames the token where the original character still names it, then
+    writes the file as the release formats it (Python's JSON, two-space indent), so applying one
+    model's list alone reproduces Google's patched file byte for byte. A tokenizer without any of
+    them (already remediated) is returned unchanged."""
+
+    patch = json.loads(GLITCH_TOKENS.read_text(encoding="utf-8"))
+    tokenizer = json.loads(data)
+    model = tokenizer.get("model")
+    if not isinstance(model, dict) or model.get("type") != "BPE":
+        raise ValueError("tokenizer.json: Gemma 4 uses a BPE model")
+    merges, vocab = model["merges"], model["vocab"]
+    removed = {tuple(pair) for pair in patch["removed_merges"]}
+
+    def pair(merge):
+        return tuple(merge) if isinstance(merge, list) else tuple(merge.split(" ", 1))
+
+    kept = [merge for merge in merges if pair(merge) not in removed]
+    names = {index: token for token, index in vocab.items()}
+    renames = {}
+    for entry in patch["renamed"]:
+        name = names.get(entry["id"])
+        if name == entry["token"]:
+            renames[name] = entry["placeholder"]
+        elif name not in (None, entry["placeholder"]):
+            raise ValueError(f"tokenizer.json: token {entry['id']} is {name!r}, not Gemma 4's "
+                             f"{entry['token']!r}")
+    edit = {"removed_merges": len(merges) - len(kept), "renamed_tokens": len(renames)}
+    if not edit["removed_merges"] and not renames:
+        return data, edit
+    model["merges"] = kept
+    # The renamed entry keeps its place in the vocabulary.
+    model["vocab"] = {renames.get(token, token): index for token, index in vocab.items()}
+    return json.dumps(tokenizer, ensure_ascii=False, indent=2).encode("utf-8"), edit
+
 
 def _load_resources(root: Path, vocab: int, overrides: dict, vision: bool):
     references, payloads = {"text": {}}, {}
@@ -124,10 +175,12 @@ def _load_resources(root: Path, vocab: int, overrides: dict, vision: bool):
         object_id = f"resource/{component}/{role}"
         references.setdefault(component, {})[role] = object_id
         payloads[object_id] = data
+    payloads["resource/text/tokenizer.json"], edit = remediate_glitch_tokens(
+        payloads["resource/text/tokenizer.json"])
     tokenizer = json.loads(payloads["resource/text/tokenizer.json"])
     tokenizer_config = json.loads(payloads["resource/text/tokenizer_config.json"])
     count, special = token_domain(tokenizer, tokenizer_config, vocab)
-    return references, payloads, count, special
+    return references, payloads, count, special, edit
 
 
 def _direct(gguf: GGUFFile, tensor: str, shape: tuple[int, ...]) -> LogicalSource:
@@ -283,7 +336,7 @@ def build_model(base, gguf: GGUFFile, *, mtp: GGUFFile | None = None,
 
     config = text_config(base.config)
     h, vocab = config["hidden_size"], config["vocab_size"]
-    references, payloads, count, special = _load_resources(
+    references, payloads, count, special, edit = _load_resources(
         base.root, vocab, dict(resource_overrides or {}), vision is not None)
     records = {"text": {"config": config, "resources": references["text"]}}
     if mtp is not None:
@@ -291,7 +344,8 @@ def build_model(base, gguf: GGUFFile, *, mtp: GGUFFile | None = None,
     if vision is not None:
         records["vision"] = {"config": vision_config(vision, base.config, config),
                              "resources": references["vision"], "target": "text"}
-    model = Model(records, resources=payloads, token_count=count, special_token_ids=special)
+    model = Model(records, resources=payloads, token_count=count, special_token_ids=special,
+                  resource_edits={"tokenizer.json": {"glitch_tokens": edit}})
 
     def matrix(name, tensor, shape, inputs, source=gguf):
         model.add(Parameter(name, shape, _matrix(source, tensor, shape), inputs=tuple(inputs),

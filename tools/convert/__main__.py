@@ -442,7 +442,7 @@ def main(argv=None):
             report = convert(
                 model, recipe, args.out, name=args.name,
                 provenance={"converter": "ninfer-v3", "recipe": args.recipe,
-                            "sources": source_paths},
+                            "sources": source_paths, "resource_edits": model.resource_edits},
                 device=args.device, rows_per_chunk=args.rows_per_chunk,
                 max_file_bytes=args.max_file_bytes,
                 progress=lambda index, total, job: print(

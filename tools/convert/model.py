@@ -36,6 +36,8 @@ class Model:
     special_token_ids: tuple[int, ...] = ()
     # Flash-Next slices bind local text layer i to this layer in the source checkpoint.
     source_layers: tuple[int, ...] | None = None
+    # What a recipe changed in a source resource, recorded in the artifact's provenance.
+    resource_edits: dict = field(default_factory=dict)
 
     @property
     def config(self) -> dict:
