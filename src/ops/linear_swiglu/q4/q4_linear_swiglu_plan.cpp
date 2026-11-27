@@ -191,7 +191,7 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
     using Id = Q4LinearSwiGluScheduleId;
     static constexpr std::array<DeviceRouteCandidate<Id>, 6> kCandidates{{
         {"gemv_pair", Id::GemvPair, 1},
-        {"small_t_tiled", Id::SmallTTiled, 32},
+        {"small_t_tiled", Id::SmallTTiled, kQ4LinearSwiGluSmallTMaxCols},
         {"split_half_pair_c40", Id::MmaSplitHalfPairR32C40, 0},
         {"split_half_pair_c48", Id::MmaSplitHalfPairR32C48, 0},
         {"split_half_pair_c128", Id::MmaSplitHalfPairR32C128, 0},

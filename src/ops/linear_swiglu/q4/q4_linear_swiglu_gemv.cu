@@ -90,10 +90,14 @@ using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStrea
 //
 // Two tiles per warp (each B fragment feeds both) only pays at 24 columns: kwarps 4, two stages,
 // 163.8 us against 189.4; at 16 and 32 it is 139.3 / 230.4-278.4, no better or worse.
+//
+// Past 32 columns (a decode round of 33 to 64 requests) the tile keeps two K warps and grows to
+// eight column fragments; a 64-column ring stage no longer fits twice in the 48 KiB of static shared
+// memory, so that width runs one stage.
 template <int TileCols>
 struct Q4SwiGluSmallTTile {
     static constexpr int kKWarps       = TileCols <= 8 ? 8 : (TileCols <= 24 ? 4 : 2);
-    static constexpr int kStages       = TileCols <= 16 ? 1 : 2;
+    static constexpr int kStages       = TileCols <= 16 || TileCols > 56 ? 1 : 2;
     static constexpr int kTilesPerWarp = TileCols == 24 ? 2 : 1;
     // Occupancy ceiling, and a measured dead end. ncu puts this kernel at 31% occupancy at T=32,
     // register-limited to two blocks per SM, with tensor, L1 and DRAM all near 38% -- nothing
@@ -117,8 +121,7 @@ struct Q4SwiGluSmallTTile {
 // instantiation lets both fold away.
 template <int ActiveCols, bool Masked>
 void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
-    constexpr int TileCols =
-        ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
+    constexpr int TileCols = (ActiveCols + 7) / 8 * 8;
     using Tile            = Q4SwiGluSmallTTile<TileCols>;
     using Layout          = SmallTLayout<Tile::kKWarps, Tile::kTilesPerWarp>;
     constexpr int kBlocks = kIntermediate / (Q4SwiGluSmallTRows::kOutputRowsPerTile *
@@ -148,9 +151,12 @@ constexpr auto make_small_t_exact_launchers(std::index_sequence<Offsets...>) {
         &launch_small_t_active<8 * (1 + static_cast<int>(Offsets)), Offsets == 0>...};
 }
 
-constexpr auto kSmallTLaunchers = make_small_t_launchers<true>(std::make_index_sequence<4>{});
+// One launcher per eight-column tile width, 8 to 64; the unified templates take up to 32.
+constexpr std::size_t kSmallTWidths = 8;
+constexpr auto kSmallTLaunchers =
+    make_small_t_launchers<true>(std::make_index_sequence<kSmallTWidths>{});
 constexpr auto kSmallTExactLaunchers =
-    make_small_t_exact_launchers(std::make_index_sequence<4>{});
+    make_small_t_exact_launchers(std::make_index_sequence<kSmallTWidths>{});
 
 using SmallTI8Launcher = void (*)(const Tensor&, const Weight&, Tensor&, const std::int8_t*,
                                   const __half*, cudaStream_t);
@@ -425,10 +431,11 @@ void q4_linear_swiglu_two_parent_gemv_launch(const Tensor& x, const Weight& gate
 
 void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream) {
-    if (x.ne[1] < 2 || x.ne[1] > 32) {
-        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
+    if (x.ne[1] < 2 || x.ne[1] > kQ4LinearSwiGluSmallTMaxCols) {
+        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..64");
     }
-    if (fused_route_table("unified/q4_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+    if (x.ne[1] <= 32 &&
+        fused_route_table("unified/q4_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
         q4_linear_swiglu_small_t_unified_launch(x, w, out, stream);
         return;
     }
@@ -455,8 +462,8 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
 // one above inside a single process. Nothing on the inference path should call this.
 void q4_linear_swiglu_small_t_tiled_masked_launch(const Tensor& x, const Weight& w, Tensor& out,
                                                   cudaStream_t stream) {
-    if (x.ne[1] < 2 || x.ne[1] > 32) {
-        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
+    if (x.ne[1] < 2 || x.ne[1] > kQ4LinearSwiGluSmallTMaxCols) {
+        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..64");
     }
     kSmallTLaunchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
 }

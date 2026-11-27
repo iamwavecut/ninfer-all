@@ -20,10 +20,11 @@ int main() {
         // 8, 16 and 17 straddle the small-T dispatch's exact-width boundary as well as the
         // registered intervals: a width that fills its tile runs an instantiation with no runtime
         // column count, and the widths either side of it do not (q4_linear_swiglu_gemv.cu).
-        constexpr std::array<std::int32_t, 36> kTokenCases{
-            1,   2,   7,   8,   9,   16,  17,  24,  25,  31,   32,  33,
-            40,  41,  48,  49,  96,  128, 129, 152, 153, 168,  169, 176,
-            192, 224, 225, 256, 257, 384, 385, 512, 513, 640,  641, 1024,
+        // 33 to 64 are the decode widths of 33 to 64 requests at once.
+        constexpr std::array<std::int32_t, 41> kTokenCases{
+            1,   2,   7,   8,   9,   16,  17,  24,  25,  31,  32,  33,  40,  41,
+            48,  49,  56,  57,  63,  64,  65,  96,  128, 129, 152, 153, 168, 169,
+            176, 192, 224, 225, 256, 257, 384, 385, 512, 513, 640, 641, 1024,
         };
         const int failures =
             run_profile("LinearSwiGLU Q4_A16",
