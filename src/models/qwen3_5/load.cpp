@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::models::qwen3_5 {
 
@@ -512,7 +513,7 @@ RankBytes rank_bytes(const artifact::Reader& reader, const LoadOptions& options,
 
 bool host_embedding_suits(const artifact::Reader& reader, const LoadOptions& options) {
     if (options.embedding_q4 || options.embedding_q6 || options.overlay_vision() ||
-        options.expert_residency != ExpertResidency::Device || serialized_copy_queue()) {
+        serialized_copy_queue()) {
         return false;
     }
     const auto& bindings = reader.directory().bindings;
@@ -525,6 +526,22 @@ bool host_embedding_suits(const artifact::Reader& reader, const LoadOptions& opt
             if (part.object.index == other.object.index) { return false; }
         }
         bytes += reader.geometry(part.object).bytes;
+    }
+    // Host experts pin their bytes and disk experts read them through the page cache: the table
+    // takes host memory only where every routed expert still fits beside it, so it pushes none of
+    // them out of the pinned block or the cache.
+    if (options.expert_residency != ExpertResidency::Device) {
+        std::vector<std::size_t> seen;
+        for (const auto& [name, binding] : bindings) {
+            if (!name.starts_with("text/layers/") || name.find("/moe/experts/") == std::string::npos) {
+                continue;
+            }
+            for (const auto& part : binding.parts) {
+                if (std::find(seen.begin(), seen.end(), part.object.index) != seen.end()) { continue; }
+                seen.push_back(part.object.index);
+                bytes += reader.geometry(part.object).bytes;
+            }
+        }
     }
     const std::optional<std::uint64_t> available = available_host_memory_bytes();
     return available && *available >= bytes &&

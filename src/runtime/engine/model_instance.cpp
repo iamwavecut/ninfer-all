@@ -728,15 +728,20 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
     }
     // Before the splits below, which size the head stage with the table where it will live. Only
-    // a KV pool that takes all free memory turns the table's device memory into KV: automatic
-    // capacity with the hybrid prefix cache, whose pages no request holds are block cache. Any
-    // other automatic pool stops at --max-context per request. A draft step gathers its token's
-    // row over the bus on its round's critical path (MTP with 3 drafts decoded 0.15% to 0.39%
-    // slower), so drafting keeps the table on the device.
+    // a pool that takes all free memory puts the table's device memory to use: automatic KV
+    // capacity with the hybrid prefix cache, whose pages no request holds are block cache, or
+    // the device cache of host or disk experts, which takes what automatic KV leaves
+    // (expert_admission.h). Any other automatic pool stops at --max-context per request. A draft
+    // step gathers its token's row over the bus on its round's critical path (MTP with 3 drafts
+    // decoded 0.15% to 0.39% slower), so drafting keeps the table on the device.
     if (options.embedding_residency == EmbeddingResidency::Auto) {
-        const bool kv_fills_memory = options.kv_capacity.mode == KvCapacityMode::Automatic &&
-                                     options.context_cache.enabled &&
-                                     options.context_cache.mode == ContextCacheMode::Hybrid;
+        const bool automatic_kv = options.kv_capacity.mode == KvCapacityMode::Automatic;
+        const bool kv_fills_memory =
+            automatic_kv &&
+            ((options.context_cache.enabled &&
+              options.context_cache.mode == ContextCacheMode::Hybrid) ||
+             (options.expert_residency != ExpertResidency::Device &&
+              options.expert_cache_bytes.value_or(1) != 0));
         const bool drafts = options.speculative.backend != SpeculativeBackend::None ||
                             options.speculative.lookup_ngram != 0;
         options.embedding_residency =
