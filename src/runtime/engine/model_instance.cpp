@@ -1044,22 +1044,19 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         const std::uint32_t asked = options.max_concurrency;
         adopt_concurrency(options, fitted);
         plan_sequences();
-        const auto& curve        = planner->capacity_curve();
-        const std::uint32_t pages = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
-            std::uint64_t(fitted) * context_pages + curve.resident_main_pages,
-            curve.minimum_main_page_groups, curve.maximum_main_page_groups));
+        // The default snapshot slots yield afterwards (resolve_capacity), and say so.
+        const auto& curve = planner->capacity_curve();
         constexpr double kMiB = 1024.0 * 1024.0;
         publish_diagnostic(
             options.diagnostic_observer, DiagnosticLevel::Info,
-            "--max-concurrency auto: %u of %u requests fit, each with %.1f MiB of state and %.1f "
-            "MiB of KV (%u tokens); the plan reserves %.1f MiB of the %.1f MiB free after the "
-            "weights",
-            fitted, asked, static_cast<double>(curve.bytes_per_state_slot) / kMiB,
+            "--max-concurrency auto: %u of %u requests fit in the %.1f MiB free after the "
+            "weights, each with %.1f MiB of state and %.1f MiB of KV (%u tokens)",
+            fitted, asked, static_cast<double>(free_by_rank.front()) / kMiB,
+            static_cast<double>(curve.bytes_per_state_slot) / kMiB,
             static_cast<double>(std::uint64_t(context_pages) *
                                 curve.bytes_per_additional_main_page_group) /
                 kMiB,
-            options.max_context, static_cast<double>(curve.reservation_bytes(pages)) / kMiB,
-            static_cast<double>(free_by_rank.front()) / kMiB);
+            options.max_context);
     }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
