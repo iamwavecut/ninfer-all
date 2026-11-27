@@ -92,8 +92,18 @@ void kv_store_pair(const KvStoreArgs& key, const KvStoreArgs& value, cudaStream_
     // One launch for int8 G64 and int4 G32 planes (int8, rk8v4); Lloyd4 keys (rk4v4), MXFP8
     // planes and unequal row counts take the two kv_store launches, which decoded rk4v4 faster
     // on an RTX 3090.
-    const auto fuses = [](KvCoding c) {
-        return c == KvCoding::Int8G64 || c == KvCoding::Int4G32;
+    static const int sm_major = [] {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return major;
+    }();
+    const auto fuses = [&](KvCoding c) {
+        if (c == KvCoding::Int8G64 || c == KvCoding::Int4G32) { return true; }
+        // Lloyd4 keys (rk4v4): the merged pair measured 25 vs 45 us per store step
+        // on an RTX 5090; the two launches stay faster on an RTX 3090, so the merge
+        // is gated on compute capability 9.0+.
+        return sm_major >= 9 && c == KvCoding::Lloyd4;
     };
     if (units_k != units_v || units_k <= 0 || key.dst.coding == KvCoding::F16 ||
         value.dst.coding == KvCoding::F16 || !fuses(key.dst.coding) || !fuses(value.dst.coding)) {
@@ -121,6 +131,13 @@ void kv_store_pair(const KvStoreArgs& key, const KvStoreArgs& value, cudaStream_
         case KvCoding::Int8G64: launch(std::integral_constant<KvCoding, KvCoding::Int4G32>{},
                                        std::integral_constant<KvCoding, KvCoding::Int8G64>{}); break;
         case KvCoding::Int4G32: launch(std::integral_constant<KvCoding, KvCoding::Int4G32>{},
+                                       std::integral_constant<KvCoding, KvCoding::Int4G32>{}); break;
+        default: throw std::invalid_argument("inkling2 kv_store_pair: unsupported value coding");
+        }
+        break;
+    case KvCoding::Lloyd4:
+        switch (value.dst.coding) {
+        case KvCoding::Int4G32: launch(std::integral_constant<KvCoding, KvCoding::Lloyd4>{},
                                        std::integral_constant<KvCoding, KvCoding::Int4G32>{}); break;
         default: throw std::invalid_argument("inkling2 kv_store_pair: unsupported value coding");
         }
