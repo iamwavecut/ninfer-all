@@ -5,6 +5,7 @@
 #include "core/device_launch.h"
 #include "ops/common/math.h"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kv_cache/append/sequence.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/bf16p_codec.cuh"
 
@@ -18,19 +19,6 @@ namespace {
 constexpr int kWarps = 8;
 
 // The metadata of a batched call's sequence `row` (blockIdx.y): its table row and valid columns.
-__device__ __forceinline__ PagedKVDirectMetadata bf16p_sequence_metadata(PagedKVDirectMetadata metadata,
-                                                                        int) {
-    return metadata;
-}
-
-template <bool Masked>
-__device__ __forceinline__ PagedKVBatchMetadata<Masked>
-bf16p_sequence_metadata(PagedKVBatchMetadata<Masked> metadata, int row) {
-    metadata.table_rows += row;
-    if constexpr (Masked) { metadata.valid_columns += row; }
-    return metadata;
-}
-
 // One warp a (token, KV head) of sequence blockIdx.y: its K row, then its V row. Lane L packs
 // values 8 L .. 8 L + 7.
 template <typename Geometry, typename Metadata>
@@ -44,7 +32,7 @@ __launch_bounds__(kWarps * 32) __global__
                                       std::uint8_t* __restrict__ side_v, std::int32_t width) {
     __shared__ __align__(16) unsigned scratch[kWarps][kBf16pRowValues];
     const int sequence = static_cast<int>(blockIdx.y);
-    metadata           = bf16p_sequence_metadata(metadata, sequence);
+    metadata           = paged_kv_sequence_row(metadata, sequence);
     positions += static_cast<std::int64_t>(width) * sequence;
     k += static_cast<std::int64_t>(width) * sequence * Geometry::KVHeads * kBf16pRowValues;
     v += static_cast<std::int64_t>(width) * sequence * Geometry::KVHeads * kBf16pRowValues;

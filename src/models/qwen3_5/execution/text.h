@@ -291,6 +291,13 @@ public:
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
+    // An ordinary round's alignment: the MTP layer's K and V at each row's one column, which the
+    // next speculative round attends to. A divided layer runs whole (mtp_hidden is its scratch).
+    void mtp_align_decode_batch(const Tensor& ids, const Tensor& hidden,
+                                const Tensor& cache_positions, const Tensor& rope_positions,
+                                const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                ops::CausalAttentionExecutionEnvelope envelope,
+                                Tensor& mtp_hidden);
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,

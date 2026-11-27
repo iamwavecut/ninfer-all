@@ -4,6 +4,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kv_cache/append/sequence.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
@@ -76,6 +77,8 @@ kv_cache_append_full_16bit_kernel(const Input* __restrict__ k, const Input* __re
                                   const std::int32_t* __restrict__ positions, Metadata metadata,
                                   Stored* __restrict__ cache_k, Stored* __restrict__ cache_v,
                                   std::int32_t width) {
+    paged_kv_select_sequence(k, v, positions, metadata, width,
+                             Geometry::KVHeads * kKVCacheAppendFullHeadDim);
     constexpr int VecElems = 8;
     const int tokens       = metadata.valid_tokens(width);
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -137,6 +140,8 @@ __launch_bounds__(256) __global__
                                          std::uint8_t* __restrict__ cache_v,
                                          __half* __restrict__ scale_k, __half* __restrict__ scale_v,
                                          std::int32_t width) {
+    paged_kv_select_sequence(k, v, positions, metadata, width,
+                             Geometry::KVHeads * kKVCacheAppendFullHeadDim);
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffU;
     const int tokens            = metadata.valid_tokens(width);
@@ -203,6 +208,8 @@ __launch_bounds__(256) __global__
                                         std::int8_t* __restrict__ cache_v,
                                         __half* __restrict__ scale_k, __half* __restrict__ scale_v,
                                         std::int32_t width) {
+    paged_kv_select_sequence(k, v, positions, metadata, width,
+                             Geometry::KVHeads * kKVCacheAppendFullHeadDim);
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffu;
     const int tokens            = metadata.valid_tokens(width);

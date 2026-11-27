@@ -6,6 +6,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kv_cache/append/sequence.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
@@ -79,6 +80,8 @@ __launch_bounds__(256) __global__
                                           std::uint8_t* __restrict__ cache_v,
                                           __half* __restrict__ scale_k,
                                           std::uint8_t* __restrict__ scale_v, std::int32_t width) {
+    paged_kv_select_sequence(k, v, positions, metadata, width,
+                             Geometry::KVHeads * kKVCacheAppendFullHeadDim);
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffU;
     __shared__ float scratch[Warps][kKVCacheNvfp4HeadDim];

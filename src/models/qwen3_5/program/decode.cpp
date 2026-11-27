@@ -79,13 +79,13 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                     ordinary.sampling, sample_positions, ops::kSamplePurposeDecode,
                     state.execution.work, state.execution.device.stream);
         if (state.mtp_cache != nullptr) {
-            // The MTP layer's column at each row's position reads the sampled token and the
-            // target's hidden there, as a speculative round's alignment does for its accepted
-            // tokens, so the next speculative round finds the MTP KV at the row's frontier.
+            // The MTP layer's K and V at each row's position, from the sampled token and the
+            // target's hidden there, as a speculative round's alignment stores them for its
+            // accepted tokens: the next speculative round finds the MTP KV at the row's frontier.
             const auto hidden_size = hidden.ne[0];
             Tensor mtp_hidden      = ordinary.mtp_hidden.slice(1, 0, batch_size);
             Tensor mtp_out         = mtp_hidden.view({hidden_size, 1, batch_size});
-            card.mtp_forward_decode_batch(
+            card.mtp_align_decode_batch(
                 sampled.view({1, batch_size}), hidden.view({hidden_size, 1, batch_size}),
                 cache_positions.view({1, batch_size}), rope_positions.view({1, batch_size}),
                 ordinary.mtp_valid_columns.slice(0, 0, batch_size),

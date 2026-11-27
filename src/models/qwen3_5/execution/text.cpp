@@ -1488,6 +1488,61 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden, nullptr);
 }
 
+// Only K and V: the layer's output after attention is what a proposal reads, and an ordinary
+// round proposes nothing. The stem and projection are mtp_forward_decode_batch's, and the separate
+// key norm and rotation store the bits its fused text form stores, so the cache matches the whole
+// layer's byte for byte.
+void TextContext::mtp_align_decode_batch(const Tensor& ids, const Tensor& hidden,
+                                         const Tensor& cache_positions,
+                                         const Tensor& rope_positions,
+                                         const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                         ops::CausalAttentionExecutionEnvelope envelope,
+                                         Tensor& mtp_hidden) {
+    if (!mtp_->rank_attention.empty()) {
+        mtp_forward_decode_batch(ids, hidden, cache_positions, rope_positions, valid_columns,
+                                 kv_table_rows, envelope, mtp_hidden);
+        return;
+    }
+    if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    const std::int32_t batch = ids.ne[1];
+    if (ids.ne[0] != 1 || !ops::batch_rows_admitted(1, batch)) {
+        throw std::invalid_argument("MTP alignment takes one column a row");
+    }
+    require_tensor_shape(ids, DType::I32, {1, batch}, "MTP alignment ids");
+    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), 1, batch},
+                         "MTP alignment target hidden");
+    require_tensor_shape(cache_positions, DType::I32, {1, batch}, "MTP alignment positions");
+    require_tensor_shape(rope_positions, DType::I32, {1, batch}, "MTP alignment RoPE positions");
+    require_tensor_shape(valid_columns, DType::I32, {batch}, "MTP alignment valid columns");
+    require_tensor_shape(kv_table_rows, DType::I32, {batch}, "MTP alignment KV rows");
+    nvtx::ScopedRange forward_range(nvtx::Name::MtpForward, nvtx::Category::Mtp,
+                                    static_cast<std::uint64_t>(batch));
+    cudaStream_t s     = ctx_.stream;
+    auto scratch_scope = work_.scope();
+    Tensor x;
+    Tensor ah;
+    mtp_forward_stem(ids, hidden, nullptr, x, &ah);
+    const AttentionConfig& attention = *config_.attention;
+    const auto head_dim              = dimension(attention.head_dim);
+    const auto kv_heads              = dimension(attention.num_key_value_heads);
+    Tensor k_flat = work_.alloc(DType::BF16, {dimension(attention.key_width()), batch});
+    Tensor v_flat = work_.alloc(DType::BF16, {dimension(attention.key_width()), batch});
+    mtp_kv_projection(ah, mtp_->projection, attention, k_flat, v_flat, work_, s);
+    Tensor kn = work_.alloc(DType::BF16, {head_dim, kv_heads, batch});
+    ops::rmsnorm(k_flat.view({head_dim, kv_heads, batch}), mtp_->key_norm, config_.rms_norm_eps,
+                 true, kn, s);
+    text_rope(rope_positions.view({batch}), *config_.rope_parameters, rope_yarn_, kn, s);
+    Tensor positions  = cache_positions;
+    Tensor table_rows = kv_table_rows;
+    auto view         = batch_mtp_kv_->batch_layer_view(0);
+    if (mtp_attention_window_.keys != 0) {
+        window_mtp_attention(view, table_rows, positions, valid_columns);
+    }
+    ops::kv_cache_append(kn.view({head_dim, kv_heads, 1, batch}),
+                         v_flat.view({head_dim, kv_heads, 1, batch}), positions, valid_columns,
+                         table_rows, view, s);
+}
+
 void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
     const std::int32_t batch = hidden.ne[1];
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
