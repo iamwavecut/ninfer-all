@@ -1734,8 +1734,8 @@ int main() {
                       "serve help omits --devices");
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
-    failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=
-                          std::string::npos,
+    failures += check(serve_usage_text("ninfer-serve")
+                              .find("device-state=min(max-concurrency,8)") != std::string::npos,
                       "serve help omits context-cache defaults");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
