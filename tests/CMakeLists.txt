@@ -13,6 +13,7 @@ include(models/flint/tests.cmake)
 include(models/inkling2/tests.cmake)
 include(models/deepseek_v41/tests.cmake)
 include(models/dspine/tests.cmake)
+include(models/dflash/tests.cmake)
 include(ops/tests.cmake)
 
 ninfer_finalize_bundle(ninfer_tests)

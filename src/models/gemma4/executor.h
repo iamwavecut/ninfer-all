@@ -11,8 +11,8 @@
 // over the target's caches, proposes the tokens after it; verify() runs the anchor and the drafts
 // of each sequence as decode rows, and commit() keeps the first ones.
 //
-// With ExecutorOptions::dspine, a standalone DSpine drafter (models/dspine/runtime.h) drafts in the
-// assistant's place: every pass leaves the residual after each block the drafter taps, a prompt
+// With ExecutorOptions::dspine, a masked block drafter (models/dspine/runtime.h), a standalone
+// DSpine drafter or the artifact's DFlash or DSpark drafter, drafts in the assistant's place: every pass leaves the residual after each block the drafter taps, a prompt
 // chunk's last window of rows, a decode step's rows and the rows commit() keeps continue each
 // sequence's lane of its context ring, and draft() proposes for several sequences at once. Branch
 // passes keep nothing there. A rewind leaves the lane's later positions in place, which the
@@ -79,8 +79,9 @@ struct ExecutorOptions {
     ExpertDiskReads expert_disk{};
     // --gumbel-sampling: draft() may take samplers, whose rows' assistant then draws its drafts.
     bool sampled_drafts = false;
-    // The model's standalone DSpine drafter (Model::dspine()) drafts draft_tokens a round in the
-    // assistant's place.
+    // The model's masked block drafter, its standalone DSpine drafter (Model::dspine()) or its
+    // DFlash or DSpark drafter (Model::dflash()), drafts draft_tokens a round in the assistant's
+    // place.
     bool dspine = false;
     // YaRN past the model's native window (a factor above one) for the full-attention blocks'
     // rotation, the assistant's included: their proportional schedule takes YaRN's frequencies,
@@ -113,7 +114,7 @@ struct ExecutorMemory {
     // the tower owns beside the model's weights (the streamed window and its resident copies).
     std::uint64_t vision_encode_bytes = 0;
     std::uint64_t vision_owned_bytes  = 0;
-    // A DSpine drafter's ring, head-write table, features, operands and workspace.
+    // A masked block drafter's rings, head-write table, features, operands and workspace.
     std::uint64_t dspine_bytes = 0;
     ExpertDeliveryMemory experts;
 };
