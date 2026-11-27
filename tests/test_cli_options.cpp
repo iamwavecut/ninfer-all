@@ -389,6 +389,19 @@ int run_tests() {
                                        "--embedding-residency", "disk"});
                       }),
                       "CLI accepted an invalid embedding residency");
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).kv_host_tier.enabled() &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--kv-host-mib",
+                                 "2048"})
+                                  .kv_host_tier.bytes == (2048ULL << 20) &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--kv-host-mib",
+                                 "auto"})
+                                  .kv_host_tier.automatic,
+                      "CLI did not default the KV host tier off or keep --kv-host-mib");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                       "--kv-host-mib", "-1"});
+                      }),
+                      "CLI accepted an invalid --kv-host-mib");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency",
                              "host"}).hybrid_experts.tail_skip_rank == 0 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
@@ -672,6 +685,7 @@ int run_tests() {
                                         "--kv-capacity",
                                         "--kv-dtype",
                                         "--kv-headroom-mib",
+                                        "--kv-host-mib",
                                         "--lm-head-draft",
                                         "--lm-head-q4",
                                         "--lm-head-q6",

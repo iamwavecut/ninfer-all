@@ -417,6 +417,7 @@ int main(int argc, char** argv) {
         engine_options.hybrid_experts                = cli.hybrid_experts;
         engine_options.max_context              = cli.max_context;
         engine_options.kv_capacity              = cli.kv_capacity;
+        engine_options.kv_host_tier             = cli.kv_host_tier;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.kv_cache_automatic       = cli.kv_cache_automatic;

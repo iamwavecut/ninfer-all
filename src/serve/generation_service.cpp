@@ -358,6 +358,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.expert_residency           = options.expert_residency;
     engine_options.ngram_table                = options.ngram_table;
     engine_options.kv_resident_positions      = options.kv_resident_positions;
+    engine_options.kv_host_tier               = options.kv_host_tier;
     engine_options.expert_cache_bytes         = options.expert_cache_bytes;
     engine_options.hybrid_experts             = options.hybrid_experts;
     engine_options.context_cost.preset_path = options.context_cost_presets;

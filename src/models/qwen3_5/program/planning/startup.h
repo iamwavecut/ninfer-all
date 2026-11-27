@@ -200,6 +200,10 @@ struct SequencePlanImpl {
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;
     std::size_t device_reservation_bytes = 0;
+    // KV host tier: the last this many pages of the Main pool, and of the MTP pool, are backed by
+    // pinned host memory. Their device bytes are still in device_reservation_bytes, which the
+    // capacity resolution balanced against free memory raised by the same host bytes.
+    std::uint32_t kv_host_pages = 0;
     // What each further device reserves (device 1 first): its persistent state, the scratch its
     // stage runs in, and its share of the graph allowance.
     std::vector<std::size_t> extra_rank_reservation_bytes;
@@ -262,7 +266,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
                            const EngineOptions& options, std::uint32_t resident_main_pages);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
-                            std::uint32_t main_page_groups);
+                            std::uint32_t main_page_groups, std::uint32_t kv_host_pages = 0);
 
 // Resolves the single Host RAM budget into the plan's context-cache shape: one StateImage per
 // position it retains and Host KV for everything else. StateImages are the fixed per-position cost

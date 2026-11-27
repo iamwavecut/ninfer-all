@@ -271,6 +271,22 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted an invalid embedding residency");
     }
+    {
+        const ninfer::KvHostTier off = parse({"ninfer-serve", "model.ninfer"}).kv_host_tier;
+        const ninfer::KvHostTier mib =
+            parse({"ninfer-serve", "model.ninfer", "--kv-host-mib", "6144"}).kv_host_tier;
+        const ninfer::KvHostTier automatic =
+            parse({"ninfer-serve", "model.ninfer", "--kv-host-mib", "auto"}).kv_host_tier;
+        failures += check(!off.enabled() && mib.enabled() && !mib.automatic &&
+                              mib.bytes == (6144ULL << 20) && automatic.enabled() &&
+                              automatic.automatic && automatic.bytes == 0,
+                          "server did not default the KV host tier off or keep --kv-host-mib");
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--kv-host-mib", "lots"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid --kv-host-mib");
+    }
     failures += check(!parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host"})
                                .hybrid_experts.dma_share.has_value(),
                       "server must default the expert DMA share to automatic");
@@ -1568,6 +1584,7 @@ int main() {
                                         "--kv-capacity",
                                         "--kv-dtype",
                                         "--kv-headroom-mib",
+                                        "--kv-host-mib",
                                         "--kv-lease-growth",
                                         "--lenient-assistant-history",
                                         "--lenient-image-detail",

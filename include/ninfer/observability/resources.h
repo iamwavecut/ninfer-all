@@ -91,6 +91,10 @@ struct MemorySummary {
     // than the card holds), which leaves the difference only a lower bound.
     std::optional<std::size_t> cuda_graph_measured_bytes = 0;
     std::size_t kv_payload_bytes                  = 0;
+    // KV host tier: the pinned host memory backing the KV pool's last pages, and how many of the
+    // Main pool's pages (and of the MTP pool's) lie there; zero without a tier.
+    std::size_t kv_host_tier_bytes   = 0;
+    std::uint32_t kv_host_tier_pages = 0;
     std::uint32_t host_state_capacity_slots       = 0;
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;

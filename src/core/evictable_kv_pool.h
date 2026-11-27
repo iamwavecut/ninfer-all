@@ -32,6 +32,10 @@ public:
         std::size_t lendable_prefix_bytes = 0; // KV payload prefix eligible for lending
         // Largest extent one lease may hand out; zero: no leases, granule releases only.
         std::size_t window_capacity_bytes = 0;
+        // Granules of the lendable prefix backed by pinned host memory instead of device memory
+        // (the KV host tier): strictly increasing. The device reads and writes them across the
+        // bus at their home addresses; they are never lent or released.
+        std::vector<std::size_t> host_granules;
     };
 
     struct LeaseStats {
@@ -88,6 +92,9 @@ public:
     // Granules covering the lendable prefix; indices beyond this are permanently resident.
     [[nodiscard]] std::size_t lendable_granules() const noexcept;
     [[nodiscard]] std::size_t window_capacity_bytes() const noexcept;
+    // Whether a granule is backed by host memory, and how many bytes the host backs in all.
+    [[nodiscard]] bool host_granule(std::size_t granule) const noexcept;
+    [[nodiscard]] std::size_t host_bytes() const noexcept;
     [[nodiscard]] bool lease_open() const noexcept;
     [[nodiscard]] bool poisoned() const noexcept;
 

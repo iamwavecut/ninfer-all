@@ -70,6 +70,36 @@ CUmemGenericAllocationHandle create(std::size_t bytes, int device) {
     return handle;
 }
 
+namespace {
+
+CUmemAllocationProp host_allocation_properties() {
+    CUmemAllocationProp prop{};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_HOST;
+    prop.location.id   = 0;
+    return prop;
+}
+
+} // namespace
+
+std::size_t host_granularity(int device) {
+    if (!supported(device)) { return 0; }
+    const CUmemAllocationProp prop = host_allocation_properties();
+    std::size_t value              = 0;
+    if (cuMemGetAllocationGranularity(&value, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) !=
+        CUDA_SUCCESS) {
+        return 0;
+    }
+    return value;
+}
+
+CUmemGenericAllocationHandle create_host(std::size_t bytes) {
+    const CUmemAllocationProp prop = host_allocation_properties();
+    CUmemGenericAllocationHandle handle{};
+    NINFER_CU_CHECK(cuMemCreate(&handle, bytes, &prop, 0));
+    return handle;
+}
+
 void set_access(CUdeviceptr va, std::size_t bytes, std::span<const int> devices) {
     std::vector<CUmemAccessDesc> access(devices.size());
     for (std::size_t index = 0; index < devices.size(); ++index) {

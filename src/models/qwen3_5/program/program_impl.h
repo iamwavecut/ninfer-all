@@ -985,6 +985,7 @@ public:
     // columns they fill.
     const bool gumbel_sampling;
     const std::size_t kv_payload_bytes;
+    const std::uint32_t kv_host_pages;
     const std::size_t graph_allowance_bytes;
     // Free device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
     // launch of every executable), for comparison with graph_allowance_bytes; empty when no free

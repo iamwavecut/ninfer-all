@@ -45,6 +45,10 @@ std::size_t SequencePlan::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
 }
 
+std::uint32_t SequencePlan::kv_host_pages() const noexcept {
+    return impl_ != nullptr ? impl_->kv_host_pages : 0;
+}
+
 const ContextCacheOptions& SequencePlan::context_cache_options() const noexcept {
     static const ContextCacheOptions empty;
     return impl_ != nullptr ? impl_->context_cache : empty;
@@ -64,9 +68,35 @@ const runtime::SequenceCapacityCurve& SequencePlanner::capacity_curve() const no
     return impl_ != nullptr ? impl_->curve : empty;
 }
 
-SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups) && {
+SequencePlan SequencePlanner::finalize(std::uint32_t main_page_groups,
+                                      std::uint32_t kv_host_pages) && {
     if (impl_ == nullptr) { throw std::logic_error("sequence planner is empty"); }
-    return SequencePlan(detail::finalize_sequence_plan_impl(std::move(impl_), main_page_groups));
+    return SequencePlan(
+        detail::finalize_sequence_plan_impl(std::move(impl_), main_page_groups, kv_host_pages));
+}
+
+SequencePlanner::HostTierShape SequencePlanner::host_tier_shape() const {
+    if (impl_ == nullptr || impl_->minimum == nullptr) {
+        throw std::logic_error("sequence planner is empty");
+    }
+    const detail::SequencePlanImpl& plan = *impl_->minimum;
+    if (!plan.extra_rank_reservation_bytes.empty() ||
+        (plan.persistent.dflash && plan.persistent.dflash->full)) {
+        return {};
+    }
+    HostTierShape out;
+    const auto add = [&](const qwen3_5::PagedKVCacheLayout& cache) {
+        if (cache.pages.spec.geometry.device_plane_order != PagedKVPlaneOrder::PageMajor) { return; }
+        for (const DeviceKVPlaneLayout& plane : cache.pages.planes) {
+            const auto& shape = plane.storage.shape;
+            out.page_bytes += static_cast<std::size_t>(shape[0]) * static_cast<std::size_t>(shape[1]) *
+                              static_cast<std::size_t>(shape[2]) * dtype_size(plane.storage.dtype);
+            ++out.planes;
+        }
+    };
+    add(plan.persistent.decoder.text_kv);
+    if (plan.persistent.decoder.mtp_kv) { add(*plan.persistent.decoder.mtp_kv); }
+    return out;
 }
 
 RequestBasePlan::RequestBasePlan(std::unique_ptr<detail::RequestBasePlanImpl> impl) noexcept

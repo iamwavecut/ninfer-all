@@ -489,6 +489,17 @@ DeviceKVPagePool::contiguous_run_count(std::span<const DeviceKVPageHandle> pages
     return runs;
 }
 
+void DeviceKVPagePool::set_host_tier(std::uint32_t first_host_page) {
+    if (first_host_page > capacity_pages()) {
+        throw std::invalid_argument("Paged KV host tier starts past the pool");
+    }
+    host_tier_begin_ = first_host_page;
+}
+
+std::uint32_t DeviceKVPagePool::device_page_limit() const noexcept {
+    return std::min(host_tier_begin_, capacity_pages());
+}
+
 std::optional<DeviceKVPageReservation> DeviceKVPagePool::reserve(std::uint32_t pages) noexcept {
     if (pages == 0 || pages > available_pages() || !cover(pages)) { return std::nullopt; }
     reserved_pages_ += pages;
@@ -552,6 +563,21 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
         preferred = destination.back().index_ + 1;
     }
 
+    // With a host tier, a contiguous placement that would reach host pages while device pages are
+    // free gives way to taking the lowest free pages, so device pages fill first.
+    const std::uint32_t limit = device_page_limit();
+    const bool tiered         = limit < capacity_pages();
+    std::uint32_t free_device = 0;
+    if (tiered) {
+        for (const KVPageRun& run : free_page_runs_) {
+            const auto begin = static_cast<std::uint32_t>(run.begin);
+            if (begin >= limit) { break; }
+            free_device += std::min(begin + run.count, limit) - begin;
+        }
+    }
+    const auto placeable = [&](std::uint64_t end) {
+        return !tiered || free_device == 0 || end <= limit;
+    };
     std::size_t selected        = free_page_runs_.size();
     std::int32_t selected_begin = 0;
     if (preferred && *preferred >= 0) {
@@ -563,16 +589,19 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
             const std::uint64_t run_end =
                 static_cast<std::uint64_t>(candidate->begin) + candidate->count;
             const std::uint64_t requested_end = static_cast<std::uint64_t>(*preferred) + count;
-            if (*preferred >= candidate->begin && requested_end <= run_end) {
+            if (*preferred >= candidate->begin && requested_end <= run_end &&
+                placeable(requested_end)) {
                 selected       = static_cast<std::size_t>(candidate - free_page_runs_.begin());
                 selected_begin = *preferred;
             }
         }
     }
     if (selected == free_page_runs_.size()) {
-        const auto contiguous =
-            std::find_if(free_page_runs_.begin(), free_page_runs_.end(),
-                         [count](const KVPageRun& run) { return run.count >= count; });
+        const auto contiguous = std::find_if(
+            free_page_runs_.begin(), free_page_runs_.end(), [&](const KVPageRun& run) {
+                return run.count >= count &&
+                       placeable(static_cast<std::uint64_t>(run.begin) + count);
+            });
         if (contiguous != free_page_runs_.end()) {
             selected       = static_cast<std::size_t>(contiguous - free_page_runs_.begin());
             selected_begin = contiguous->begin;

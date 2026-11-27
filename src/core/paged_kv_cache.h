@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <span>
 #include <vector>
@@ -261,6 +262,12 @@ public:
     // or throws, and the reservation fails. A loan takes only free pages no reservation needs.
     void loan_pages(std::int32_t begin, std::uint32_t count);
     void recall_pages(std::int32_t begin, std::uint32_t count);
+    // KV host tier: the pages from `first_host_page` up are backed by pinned host memory, which the
+    // device reads and writes across the bus in place. Materialization takes device pages first,
+    // and loans (which lend device memory) never take host pages. Without a tier every page is a
+    // device page.
+    void set_host_tier(std::uint32_t first_host_page);
+    [[nodiscard]] std::uint32_t device_page_limit() const noexcept;
     void set_recall(std::function<void(std::uint32_t pages)> recall);
     [[nodiscard]] std::uint32_t loaned_pages() const noexcept;
     // Free pages beyond what the reservations will materialize: what a loan of either kind may take.
@@ -377,6 +384,7 @@ private:
     std::uint32_t reserved_pages_           = 0;
     std::uint32_t lent_pages_               = 0;
     std::uint32_t loaned_pages_             = 0;
+    std::uint32_t host_tier_begin_          = std::numeric_limits<std::uint32_t>::max();
     std::function<void(std::uint32_t)> recall_;
 };
 

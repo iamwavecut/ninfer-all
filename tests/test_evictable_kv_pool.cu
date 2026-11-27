@@ -366,6 +366,70 @@ int main() {
                                "recall_all backs every granule and returns every page");
         }
 
+        // A KV host tier: granules 2 and 3 of the prefix are pinned host memory that the device
+        // writes and reads at their home addresses. They are never lent or released, stay host
+        // memory across a suspend, and add nothing to the device's use.
+        {
+            std::size_t free_before = 0;
+            std::size_t total       = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+            ninfer::EvictableKVPool tiered(device, ninfer::EvictableKVPool::Config{
+                                                       .arena_bytes           = 6 * granule,
+                                                       .lendable_prefix_bytes = 6 * granule,
+                                                       .window_capacity_bytes = 2 * granule,
+                                                       .host_granules         = {2, 3},
+                                                   });
+            std::size_t free_after = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+            failures += expect(tiered.host_granule(2) && tiered.host_granule(3) &&
+                                   !tiered.host_granule(1) && !tiered.host_granule(4) &&
+                                   tiered.host_bytes() == 2 * granule,
+                               "the host tier backs exactly its granules");
+            failures += expect(free_before - free_after < 5 * granule,
+                               "host granules take device memory");
+            const ninfer::DeviceSpan home = tiered.arena();
+            fill(home.data, std::byte{0x5a}, home.bytes);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            failures += expect(read_one(at(home, 2 * granule + 17)) == std::byte{0x5a} &&
+                                   read_one(at(home, 4 * granule - 1)) == std::byte{0x5a} &&
+                                   read_one(at(home, 5 * granule)) == std::byte{0x5a},
+                               "the device writes host granules in place");
+            bool lease_refused = false;
+            try {
+                const std::size_t host_one[] = {2};
+                auto refused = tiered.lease(host_one, device.stream);
+            } catch (const std::invalid_argument&) { lease_refused = true; }
+            failures += expect(lease_refused, "a host granule was lent");
+            bool release_refused = false;
+            try {
+                const std::size_t host_one[] = {3};
+                tiered.release_granules(host_one);
+            } catch (const std::invalid_argument&) { release_refused = true; }
+            failures += expect(release_refused && tiered.released_granules() == 0,
+                               "a host granule was released");
+            {
+                const std::size_t device_ones[] = {0, 1};
+                auto window = tiered.lease(device_ones, device.stream);
+                failures += expect(window.open(), "device granules beside the tier are lent");
+            }
+            tiered.release_backing();
+            tiered.restore_backing();
+            fill(home.data, std::byte{0x3c}, home.bytes);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            failures += expect(tiered.host_granule(2) && tiered.host_bytes() == 2 * granule &&
+                                   read_one(at(home, 3 * granule + 5)) == std::byte{0x3c},
+                               "the host tier survives a suspend");
+            bool unordered_refused = false;
+            try {
+                ninfer::EvictableKVPool unordered(device, ninfer::EvictableKVPool::Config{
+                                                              .arena_bytes           = 4 * granule,
+                                                              .lendable_prefix_bytes = 4 * granule,
+                                                              .host_granules         = {2, 1},
+                                                          });
+            } catch (const std::invalid_argument&) { unordered_refused = true; }
+            failures += expect(unordered_refused, "unordered host granules were accepted");
+        }
+
         if (failures != 0) {
             std::cerr << failures << " expectation(s) failed\n";
             return 1;
