@@ -213,7 +213,11 @@ The conversion writes one 16,595,277,824-byte (15.5 GiB) `.ninfer` file of 1,185
 model, the vision tower (Q8_0 matrices) and the DSpark drafter (Q8_0, its Markov embedding BF16 as
 the GGUF stores it, and its Markov output table BF16; a drafter GGUF with table values that BF16
 does not hold is refused). With Unsloth's `mmproj-BF16.gguf` as the `vision` source the tower keeps
-BF16 matrices and the file is 295,895,040 bytes larger. Unsloth's repository holds each
+BF16 matrices and the file is 295,895,040 bytes larger. A BF16 drafter GGUF (ISTA-DASLab's
+`dspark-Inkling-2-Mini-BF16.gguf`) keeps BF16 matrices too, and the drafter then runs on BF16
+rows: on an RTX 4090 with the GSQ-RCO IQ2_S model and 7 drafts it generated the same tokens as the
+Q8_0 drafter and as `--spec none` for three greedy 200-token answers, accepted 22.4% of its drafts
+against the Q8_0 drafter's 23.2%, and decoded 2-4% slower. Unsloth's repository holds each
 quantization in two layouts: llama.cpp's `inkling2_loop` (24 blocks), the root files since
 2026-11-23, and the earlier `inkling2` (48 unrolled blocks in its metadata), now
 `Old_Support/*.gguf_file`. Both convert to the same artifact: from UD-IQ4_XS the two payloads are
