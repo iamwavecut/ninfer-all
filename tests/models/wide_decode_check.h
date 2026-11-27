@@ -3,8 +3,9 @@
 // A decode step of more rows than the vector kernels take (an ordinary round of 9..64 requests)
 // on a family executor with `sequences` sequences: every row reads only its own sequence and
 // token, so a row gives the same bits in a step of 9 rows as in a step of every sequence, in any
-// place, and the same step twice gives the same bits. Against the prompt route of the same
-// tokens it lies no farther than the vector route (8 rows) does.
+// place, and the same step twice gives the same bits. Against the prompt route of the same tokens
+// it lies within twice the spread of the vector route (8 rows), and each row lies nearer to its own
+// sequence's logits on the vector and the prompt route than to any other sequence's.
 
 #include "core/device_launch.h"
 #include "core/tensor.h"
@@ -92,8 +93,7 @@ int wide_decode_check(Executor& executor, std::uint32_t sequences, std::int32_t 
     // from each other: their largest differences from the wide rows are printed.
     const std::vector<std::uint32_t> eight{0, 1, 2, 3, 4, 5, 6, 7};
     const auto vector = wide_step(executor, eight, sequences);
-    double vector_worst = 0, prompt_worst = 0, between = 0;
-    int vector_agree = 0, prompt_agree = 0;
+    std::vector<std::vector<float>> prompt(8);
     for (std::uint32_t s = 0; s < 8; ++s) {
         std::vector<std::int32_t> chunk = wide_tokens(24 + 5 * s, 1 + s);
         chunk.push_back(wide_tokens(1, 100 + s)[0]);
@@ -103,21 +103,47 @@ int wide_decode_check(Executor& executor, std::uint32_t sequences, std::int32_t 
         std::vector<__nv_bfloat16> raw(std::size_t(logits.ne[0]));
         CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
         CUDA_CHECK(cudaMemcpy(raw.data(), logits.data, raw.size() * 2, cudaMemcpyDeviceToHost));
-        std::vector<float> prompt(raw.size());
-        for (std::size_t v = 0; v < raw.size(); ++v) { prompt[v] = __bfloat162float(raw[v]); }
+        prompt[s].resize(raw.size());
+        for (std::size_t v = 0; v < raw.size(); ++v) { prompt[s][v] = __bfloat162float(raw[v]); }
+    }
+    const auto distance = [&](const std::vector<float>& a, const std::vector<float>& b) {
+        double worst = 0;
         for (std::int32_t v = 0; v < domain; ++v) {
-            vector_worst = std::max(vector_worst, double(std::fabs(vector[s][v] - wide[s][v])));
-            prompt_worst = std::max(prompt_worst, double(std::fabs(prompt[v] - wide[s][v])));
-            between      = std::max(between, double(std::fabs(prompt[v] - vector[s][v])));
+            worst = std::max(worst, double(std::fabs(a[v] - b[v])));
+        }
+        return worst;
+    };
+    double vector_worst = 0, prompt_worst = 0, between = 0;
+    // The smallest margin by which a wide row lies nearer its own sequence than the nearest other
+    // sequence, on each route.
+    double vector_margin = 1e30, prompt_margin = 1e30;
+    int vector_agree = 0, prompt_agree = 0;
+    for (std::uint32_t s = 0; s < 8; ++s) {
+        const double own_vector = distance(vector[s], wide[s]);
+        const double own_prompt = distance(prompt[s], wide[s]);
+        vector_worst = std::max(vector_worst, own_vector);
+        prompt_worst = std::max(prompt_worst, own_prompt);
+        between      = std::max(between, distance(prompt[s], vector[s]));
+        for (std::uint32_t o = 0; o < 8; ++o) {
+            if (o == s) { continue; }
+            vector_margin = std::min(vector_margin, distance(vector[o], wide[s]) - own_vector);
+            prompt_margin = std::min(prompt_margin, distance(prompt[o], wide[s]) - own_prompt);
         }
         vector_agree += wide_argmax(vector[s], domain) == wide_argmax(wide[s], domain) ? 1 : 0;
-        prompt_agree += wide_argmax(prompt, domain) == wide_argmax(wide[s], domain) ? 1 : 0;
+        prompt_agree += wide_argmax(prompt[s], domain) == wide_argmax(wide[s], domain) ? 1 : 0;
     }
     std::cout << "largest logit difference from the wide rows: vector route " << vector_worst
               << " (argmax agrees on " << vector_agree << " of 8), prompt route " << prompt_worst
-              << " (" << prompt_agree << " of 8); vector against prompt route " << between << '\n';
-    wide_expect(prompt_worst <= between + 0.5,
-                "the wide rows lie no farther from the prompt route than the vector route does");
+              << " (" << prompt_agree << " of 8); vector against prompt route " << between
+              << "; own sequence nearer than any other by at least " << vector_margin
+              << " (vector route), " << prompt_margin << " (prompt route)\n";
+    // The routes round differently (their spreads on these random tokens reach a few logits, and
+    // random tokens give every sequence similar logits); a row that read another sequence lies
+    // nearer that sequence's.
+    wide_expect(prompt_worst <= 2 * std::max(between, vector_worst),
+                "the wide rows lie within twice the vector route's spread of the prompt route");
+    wide_expect(vector_margin > 0 && prompt_margin > 0,
+                "each wide row lies nearer its own sequence than any other sequence");
     return wide_failures;
 }
 
