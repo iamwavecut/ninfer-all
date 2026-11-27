@@ -16,9 +16,10 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   no positional encoding at all. Blocks 0 and 1 run a dense SwiGLU MLP (6144); the other 47 route
   each token to 6 of 256 experts (SwiGLU, width 512) by sigmoid scores renormalized over the six,
   beside an always-active shared SwiGLU expert (1024). An untied 150,144-token head.
-- **The weights stay the GGUF's blocks.** Every matrix keeps its ggml format (UD-Q4_K_XL mixes
-  Q8_0, Q6_K, Q5_K, Q4_K, IQ4_XS and IQ3_S), imported row for row without requantization and
-  multiplied by the GGUF kernels: vector kernels for up to eight tokens, integer matrix kernels for
+- **The weights stay the GGUF's blocks.** Every matrix keeps its ggml format (UD-Q4_K_XL mixes Q8_0,
+  Q6_K, Q5_K, Q4_K, IQ4_XS and IQ3_S), imported row for row without requantization and multiplied by
+  the GGUF kernels: vector kernels for up to eight tokens and for decode and verification calls of 9
+  to 64 where they are no slower ([GGUF products](gguf.md#products)), integer matrix kernels for
   prompt chunks, the expert products over the routed experts only. The router, norms and sinks are
   FP32 vectors.
 - **Attention.** Prompt chunks run llama.cpp's tensor-core flash attention with the sinks added to
@@ -364,11 +365,10 @@ rounds and the growing KV):
   stored blocks while the GPU copies and runs the rest (`--expert-dma-share`, `auto` by default;
   `--expert-cpu-threads`). The CPU computes SwiGLU over the [gate; up] rows, the BF16 middle
   quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same 2^-32
-  fixed-point sums, so outputs do not depend on the split. Calls of more than eight tokens always
-  use the GPU. Flash-Next's CPU share also covers the missing experts with at most eight pairs in
-  calls of 9 to 64 tokens ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); Flint does not
-  have that route yet: its expert kernels take one route per call, and the shared expert delivery
-  serves only narrow calls.
+  fixed-point sums, so outputs do not depend on the split. A decode or verification call of 9 to 64
+  tokens has a CPU share when its experts take the vector kernels ([GGUF
+  products](gguf.md#products)) and it routes to fewer than half the layer's experts; a call on the
+  matrix kernel or routing to half of them or more, and every prompt chunk, use the GPU.
 - **Disk reads.** `--expert-mirror` spreads disk experts' reads over a second drive and
   `--expert-direct` lets the drive write them into device memory
   ([disk expert reads](expert-disk-reads.md)).
