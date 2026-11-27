@@ -1325,7 +1325,11 @@ a stop string or a cancellation, or when prose, a quoted marker or a cut call fo
 call; the recovery pass for broken calls does not apply to thinking. Under strict tools the grammar
 admits the stop token only after the thinking closes, so a constrained turn never ends inside it.
 Gemma 4's, Flint's, DeepSeek-V4.1's and Inkling 2's tool calls are read by their own decoders and are not
-recovered from their reasoning.
+recovered from their reasoning. Instead, when the request declares tools, a call that Gemma 4, Flint
+or Inkling 2 opens while its reasoning is still open ends the reasoning there, as the close marker
+would, and is read as a call: Gemma 4 can open `<|tool_call>` without writing `<channel|>` first.
+Each of these models opens a call with one token. DeepSeek-V4.1 opens a calls block with several
+tokens of text, so a block inside its reasoning stays reasoning.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. With `--assistant-prefill` a final assistant

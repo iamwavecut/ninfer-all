@@ -19,10 +19,12 @@ namespace ninfer::models::qwen3_5::frontend {
 class Tokenizer;
 struct ToolCallOutputContract;
 
-// The reasoning markers, single tokens of Flint's vocabulary; -1 where the vocabulary lacks one.
+// The reasoning markers and the call opener, single tokens of Flint's vocabulary; -1 where the
+// vocabulary lacks one.
 struct FlintMarkers {
     std::int32_t think_open  = -1; // <think>
     std::int32_t think_close = -1; // </think>
+    std::int32_t call_open   = -1; // <tool_call>
 
     [[nodiscard]] static FlintMarkers from(const Tokenizer& tokenizer);
 };
