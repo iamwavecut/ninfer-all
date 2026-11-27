@@ -87,6 +87,8 @@ private:
 
     AnthropicResponseIdentity identity_;
     std::string reasoning_;
+    // The open thinking block's reasoning: its signature under hidden display.
+    std::string block_reasoning_;
     std::string content_;
     int input_tokens_   = 0;
     bool hide_thinking_ = false;

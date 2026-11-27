@@ -5,7 +5,9 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${NINFER_DEVICE_P
 file(READ ${NINFER_DEVICE_PROFILES_FILE} _ninfer_profiles_rest)
 # MSVC rejects a string literal over 16,380 bytes (C2026) and adjacent literals that join to over
 # 65,535 (C1091), so the JSON goes in as an array of raw literals of at most 8 KiB, each ending on a
-# line boundary, which the generated function joins once.
+# line boundary, which the generated function joins once. Each part is an `sv` literal, whose
+# length the compiler already knows: with libstdc++, Clang measures a plain literal's characters one
+# step at a time and exceeds its constexpr step budget over the whole array.
 set(NINFER_DEVICE_PROFILES_PARTS "")
 string(LENGTH "${_ninfer_profiles_rest}" _ninfer_profiles_length)
 while(_ninfer_profiles_length GREATER 0)
@@ -21,7 +23,7 @@ while(_ninfer_profiles_length GREATER 0)
   string(SUBSTRING "${_ninfer_profiles_rest}" 0 ${_ninfer_profiles_cut} _ninfer_profiles_part)
   string(SUBSTRING "${_ninfer_profiles_rest}" ${_ninfer_profiles_cut} -1 _ninfer_profiles_rest)
   string(APPEND NINFER_DEVICE_PROFILES_PARTS
-         "            R\"ninfer_json(${_ninfer_profiles_part})ninfer_json\",\n")
+         "            R\"ninfer_json(${_ninfer_profiles_part})ninfer_json\"sv,\n")
   string(LENGTH "${_ninfer_profiles_rest}" _ninfer_profiles_length)
 endwhile()
 configure_file(engine/device_profiles_builtin.cpp.in

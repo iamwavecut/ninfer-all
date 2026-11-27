@@ -126,7 +126,7 @@ int test_request_envelope_and_sampling() {
     failures +=
         check(options(parse(post_thinking).generation).execution.post_thinking_sampling.has_value(),
               "an empty post_thinking object selects the preset");
-    for (const Json& bad : {Json(0.2), Json{{"temperature", 2.5}}, Json{{"top_k", -1}},
+    for (const Json& bad : {Json(0.2), Json{{"temperature", -2.5}}, Json{{"top_k", -1}},
                             Json{{"stop", "x"}}, Json{{"seed", 1.5}}}) {
         post_thinking["post_thinking"] = bad;
         failures +=
@@ -1265,15 +1265,24 @@ int test_stops_and_ranges() {
     failures += check(api_error([&] { (void)parse(body); }).param == "ignore_eos",
                       "a non-boolean ignore_eos is rejected");
 
-    // The translator owns the sampler value range. Above the 20-candidate domain it clamps, so a
-    // client carrying the llama.cpp/Ollama default of 40 is served; negative values stay errors.
+    // The translator owns the sampler value range. Above the 64-candidate domain it clamps;
+    // negative values stay errors. Temperature has no upper bound and penalties none at all.
     body                                 = base_request();
-    body["top_k"]                        = 40;
+    body["top_k"]                        = 100;
+    body["temperature"]                  = 3.5;
+    body["presence_penalty"]             = 4.0;
+    body["frequency_penalty"]            = -3.0;
     const GenerationRequest wide_top_k   = parse(body).generation;
-    failures += check(options(wide_top_k).execution.sampling.top_k == 20,
-                      "Engine translator did not clamp top_k to the candidate domain");
-    body["post_thinking"]                = Json{{"top_k", 64}};
-    failures += check(options(parse(body).generation).execution.post_thinking_sampling->top_k == 20,
+    failures += check(options(wide_top_k).execution.sampling.top_k == 64 &&
+                          options(wide_top_k).execution.sampling.temperature == 3.5F &&
+                          options(wide_top_k).execution.sampling.presence_penalty == 4.0F &&
+                          options(wide_top_k).execution.sampling.frequency_penalty == -3.0F,
+                      "Engine translator did not keep wide sampling values (top_k clamped to 64)");
+    body.erase("temperature");
+    body.erase("presence_penalty");
+    body.erase("frequency_penalty");
+    body["post_thinking"]                = Json{{"top_k", 65}};
+    failures += check(options(parse(body).generation).execution.post_thinking_sampling->top_k == 64,
                       "post_thinking top_k was not clamped to the candidate domain");
     body.erase("post_thinking");
     body["top_k"]                        = -3;
@@ -1473,6 +1482,30 @@ int test_stream_response() {
             tool_delta["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "Edit" &&
             parse_sse(tool_events[1])["choices"][0]["finish_reason"] == "tool_calls",
         "stream encoder owns stable OpenAI tool-call shape");
+    return failures;
+}
+
+// Reasoning after content (a template that opens the text block in the prompt, Inkling 2) streams
+// as reasoning_content deltas after the content ones, live and as a terminal tail.
+int test_stream_reasoning_after_content() {
+    int failures = 0;
+    OpenAIChatStream stream(identity(), false);
+    (void)stream.start();
+    (void)stream.content_delta("answer");
+    const Json late = parse_sse(stream.reasoning_delta("checked"));
+    failures += check(late["choices"][0]["delta"]["reasoning_content"] == "checked" &&
+                          !late["choices"][0]["delta"].contains("content"),
+                      "reasoning after content did not stream as a reasoning_content delta");
+    GenerationOutcome outcome             = sample_outcome();
+    outcome.text                          = "answer";
+    outcome.reasoning                     = "checked twice";
+    const std::vector<std::string> events = stream.finish(outcome);
+    failures += check(events.size() == 3 &&
+                          parse_sse(events[0])["choices"][0]["delta"]["reasoning_content"] ==
+                              " twice" &&
+                          parse_sse(events[1])["choices"][0]["finish_reason"] == "stop" &&
+                          events[2] == "data: [DONE]\n\n",
+                      "a terminal reasoning tail after content was not emitted");
     return failures;
 }
 
@@ -1809,6 +1842,7 @@ int main() {
     failures += test_bad_words();
     failures += test_aggregate_response();
     failures += test_stream_response();
+    failures += test_stream_reasoning_after_content();
     failures += test_stream_observations();
     failures += test_common_objects();
     failures += test_assistant_continuation_mode();

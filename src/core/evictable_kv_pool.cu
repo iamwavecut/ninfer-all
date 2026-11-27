@@ -42,7 +42,9 @@ struct EvictableKVPool::Impl {
     std::vector<std::size_t> sizes;
     std::vector<std::size_t> lent; // granule indices currently mapped at the overlay range
     std::vector<unsigned char> released; // by piece: no physical piece (release_granules)
+    std::vector<unsigned char> host;     // by piece: pinned host memory (Config::host_granules)
     std::size_t released_count = 0;
+    std::size_t host_bytes     = 0;
     bool poisoned = false;
     bool backed   = false; // physical pieces exist and are mapped home or at the overlay
     // Test seam; see inject_lease_fault.
@@ -50,6 +52,20 @@ struct EvictableKVPool::Impl {
     std::size_t fault_rank = 0;
 
     explicit Impl(DeviceContext& context) : device(context) {}
+
+    CUmemGenericAllocationHandle create(std::size_t piece) const {
+        return host[piece] ? vmm::create_host(sizes[piece])
+                           : vmm::create(sizes[piece], device.device);
+    }
+
+    void refuse_host(std::span<const std::size_t> granules, const char* action) const {
+        for (const std::size_t granule : granules) {
+            if (granule < host.size() && host[granule]) {
+                throw std::invalid_argument(std::string("evictable KV ") + action +
+                                            " names a host-memory granule");
+            }
+        }
+    }
 
     void set_access(CUdeviceptr va, std::size_t bytes) {
         vmm::set_access(va, bytes, std::span(&device.device, 1));
@@ -160,6 +176,25 @@ EvictableKVPool::EvictableKVPool(DeviceContext& device, const Config& config)
 
     impl.handles.resize(impl.offsets.size());
     impl.released.assign(impl.offsets.size(), 0);
+    impl.host.assign(impl.offsets.size(), 0);
+    if (!config.host_granules.empty()) {
+        const std::size_t host_granularity = vmm::host_granularity(device.device);
+        if (host_granularity == 0 || impl.granularity % host_granularity != 0) {
+            throw std::invalid_argument(
+                "the KV host tier needs a driver that maps pinned host memory into the device's "
+                "address range (CUDA 12.2 or newer with virtual memory management)");
+        }
+        for (std::size_t index = 0; index < config.host_granules.size(); ++index) {
+            const std::size_t granule = config.host_granules[index];
+            if (granule >= impl.lendable_granules ||
+                (index != 0 && granule <= config.host_granules[index - 1])) {
+                throw std::invalid_argument(
+                    "evictable KV host granules must strictly increase inside the lendable prefix");
+            }
+            impl.host[granule] = 1;
+            impl.host_bytes += impl.sizes[granule];
+        }
+    }
     restore_backing();
 }
 
@@ -207,7 +242,7 @@ void EvictableKVPool::restore_backing() {
     std::size_t created = 0;
     try {
         for (; created < impl.handles.size(); ++created) {
-            impl.handles[created] = vmm::create(impl.sizes[created], impl.device.device);
+            impl.handles[created] = impl.create(created);
             try {
                 impl.map_home(created);
             } catch (...) {
@@ -236,6 +271,12 @@ std::size_t EvictableKVPool::lendable_granules() const noexcept { return impl_->
 std::size_t EvictableKVPool::window_capacity_bytes() const noexcept {
     return impl_->window_reserved;
 }
+
+bool EvictableKVPool::host_granule(std::size_t granule) const noexcept {
+    return granule < impl_->host.size() && impl_->host[granule] != 0;
+}
+
+std::size_t EvictableKVPool::host_bytes() const noexcept { return impl_->host_bytes; }
 
 bool EvictableKVPool::lease_open() const noexcept { return !impl_->lent.empty(); }
 
@@ -274,6 +315,9 @@ EvictableKVPool::Transaction EvictableKVPool::lease(std::span<const std::size_t>
         }
         if (impl.released[granules[rank]]) {
             throw std::invalid_argument("evictable KV lease names a released granule");
+        }
+        if (impl.host[granules[rank]]) {
+            throw std::invalid_argument("evictable KV lease names a host-memory granule");
         }
         if (rank != 0 && granules[rank] <= granules[rank - 1]) {
             throw std::invalid_argument("evictable KV lease granules must strictly increase");
@@ -320,6 +364,7 @@ void EvictableKVPool::release_granules(std::span<const std::size_t> granules) {
             throw std::invalid_argument("evictable KV release names a resident or released granule");
         }
     }
+    impl.refuse_host(granules, "release");
     for (const std::size_t granule : granules) {
         NINFER_CU_CHECK(vmm::unmap(impl.home + impl.offsets[granule], impl.sizes[granule]));
         NINFER_CU_CHECK(cuMemRelease(impl.handles[granule]));

@@ -56,29 +56,47 @@ void tail(Bindings& b, WeightId id) {
     }
 }
 
-// Resolve stored GGUF rows directly. Disk mode validates without materializing the bank.
+// A bank's stored rows, one blob an expert: MXFP8 has a code blob and a scale blob.
+struct BankBlobs {
+    std::vector<ExpertBlob> rows;   // per expert: GGUF block rows, BF16 rows or MXFP8 codes
+    std::vector<ExpertBlob> scales; // per expert: MXFP8 scale rows; empty for other formats
+};
+
+// Resolve stored bank rows directly. Disk mode validates without materializing the bank.
 // Host mode borrows the materializer's pinned parent. Neither path repacks model weights.
-std::vector<ExpertBlob> expert_blobs(const artifact::Reader& reader,
-                                    const artifact::ParameterReference& reference,
-                                    const artifact::MaterializedArtifact& backing,
-                                    std::uint64_t experts, std::uint64_t rows, std::uint64_t k,
-                                    QType& format, std::uint64_t& row_bytes) {
-    std::vector<ExpertBlob> result;
+// MXFP8 rows are split (codes, then scales), so each expert gets a code blob and a scale blob.
+BankBlobs expert_blobs(const artifact::Reader& reader,
+                       const artifact::ParameterReference& reference,
+                       const artifact::MaterializedArtifact& backing, std::uint64_t experts,
+                       std::uint64_t rows, std::uint64_t k, QType& format,
+                       std::uint64_t& row_bytes) {
+    BankBlobs result;
     const auto& parts = reference.binding.parts;
     if (parts.size() != 1) {
         throw artifact::ArtifactError(reference.name + ": expert bank must be one stored region");
     }
     const auto& part = parts.front();
     const auto& geometry = reader.geometry(part.object);
-    const bool bf16 = geometry.format == QType::BF16;
-    if ((!is_gguf(geometry.format) && !bf16) || geometry.shape.size() != 2 ||
+    const bool bf16  = geometry.format == QType::BF16;
+    const bool mxfp8 = geometry.format == QType::MXFP8;
+    if ((!is_gguf(geometry.format) && !bf16 && !mxfp8) || geometry.shape.size() != 2 ||
         geometry.shape[1] != k || part.begin % k || part.end - part.begin != experts * rows * k) {
         throw artifact::ArtifactError(reference.name +
-                                      ": experts must be stored GGUF block rows or BF16 rows");
+                                      ": experts must be stored GGUF block, BF16 or MXFP8 rows");
     }
     format = geometry.format;
+    std::uint64_t scale_row_bytes = 0;
     if (bf16) {
         row_bytes = k * 2;
+    } else if (mxfp8) {
+        // The expert products step through K unpadded: a row of codes is K bytes, of scales K/32.
+        if (geometry.layout != QuantLayout::RowSplit || geometry.padded_columns != k ||
+            geometry.code_bytes_per_row != k || geometry.scale_bytes_per_row != k / 32) {
+            throw artifact::ArtifactError(
+                reference.name + ": MXFP8 experts need row-split rows of K a multiple of 128");
+        }
+        row_bytes       = k;
+        scale_row_bytes = k / 32;
     } else {
         const auto block = gguf_block_shape(format);
         if (k % block.elements) {
@@ -87,25 +105,35 @@ std::vector<ExpertBlob> expert_blobs(const artifact::Reader& reader,
         row_bytes = k / block.elements * block.bytes;
     }
     reader.validate_object(part.object);
-    const auto start = part.begin / k * row_bytes;
-    for (std::uint64_t e = 0; e < experts; ++e) {
+    // A host expert the pinned block could not hold is read from the files, as on disk.
+    const bool pinned = reference.residency == artifact::Residency::PinnedOrFiles &&
+                        backing.pinned(part.object);
+    const auto* parent = pinned ? backing.pinned_parent(part.object).data : nullptr;
+    const auto blob_at = [&](std::uint64_t offset, std::uint64_t bytes, std::uint64_t tail) {
         ExpertBlob blob;
-        blob.bytes = rows * row_bytes;
-        blob.zero_tail = kRowTail;
-        const auto offset = start + e * blob.bytes;
-        // A host expert the pinned block could not hold is read from the files, as on disk.
-        if (reference.residency == artifact::Residency::PinnedOrFiles &&
-            backing.pinned(part.object)) {
-            const auto* parent = backing.pinned_parent(part.object).data;
-            blob.pinned = parent + offset;
+        blob.bytes     = bytes;
+        blob.zero_tail = tail;
+        if (pinned) {
+            blob.pinned        = parent + offset;
+            blob.pinned_device = backing.pinned_device_alias(blob.pinned, std::size_t(bytes));
             blob.pinned_region = reinterpret_cast<std::uintptr_t>(parent);
         } else {
             const auto logical = reader.directory().tensor(part.object).offset + offset;
-            for (const auto& segment : reader.segments(logical, blob.bytes)) {
+            for (const auto& segment : reader.segments(logical, bytes)) {
                 blob.extents.push_back({segment.file_index, segment.file_offset, segment.bytes});
             }
         }
-        result.push_back(std::move(blob));
+        return blob;
+    };
+    const auto first_row = part.begin / k;
+    for (std::uint64_t e = 0; e < experts; ++e) {
+        const auto row = first_row + e * rows;
+        // The MXFP8 products read no byte past a row; GGUF products may read whole K steps past it.
+        result.rows.push_back(blob_at(row * row_bytes, rows * row_bytes, mxfp8 ? 0 : kRowTail));
+        if (mxfp8) {
+            result.scales.push_back(blob_at(geometry.scale_offset + row * scale_row_bytes,
+                                            rows * scale_row_bytes, 0));
+        }
     }
     return result;
 }
@@ -515,11 +543,26 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                                bank.gate_up_row_bytes);
         auto down = expert_blobs(reader, reference[1], backing, e, h, w, bank.down_type,
                                  bank.down_row_bytes);
-        for (std::size_t x = 0; x < gu.size(); ++x) {
-            bank.delivery.experts.push_back({std::move(gu[x]), std::move(down[x])});
+        const bool mxfp8 = bank.gate_up_type == QType::MXFP8;
+        if (mxfp8 != (bank.down_type == QType::MXFP8)) {
+            throw artifact::ArtifactError(reference[0].name +
+                                          ": a layer's expert banks are both MXFP8 or neither");
         }
-        // Gate rows, up rows, the [gate; up] parent, down rows: the executor's expert tables.
-        bank.delivery.aliases = {{0, 0}, {0, w * bank.gate_up_row_bytes}, {0, 0}, {1, 0}};
+        for (std::size_t x = 0; x < gu.rows.size(); ++x) {
+            if (mxfp8) {
+                bank.delivery.experts.push_back({std::move(gu.rows[x]), std::move(down.rows[x]),
+                                                 std::move(gu.scales[x]),
+                                                 std::move(down.scales[x])});
+            } else {
+                bank.delivery.experts.push_back({std::move(gu.rows[x]), std::move(down.rows[x])});
+            }
+        }
+        // The executor's expert tables: gate rows, up rows, the [gate; up] parent and down rows,
+        // or for MXFP8 the [gate; up] scales, down scales, [gate; up] codes and down codes.
+        bank.delivery.aliases =
+            mxfp8 ? std::vector<ExpertAlias>{{2, 0}, {3, 0}, {0, 0}, {1, 0}}
+                  : std::vector<ExpertAlias>{
+                        {0, 0}, {0, w * bank.gate_up_row_bytes}, {0, 0}, {1, 0}};
         expert_banks.push_back(std::move(bank));
     }
     auto model = std::unique_ptr<Model>(new Model(std::move(config), std::move(weights),

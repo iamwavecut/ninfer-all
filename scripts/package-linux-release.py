@@ -216,8 +216,8 @@ def main():
         run(str(package / command), '--version', env=clean_env, timeout=60)
     (package / 'packages').mkdir()
     (package / 'packages/multi.txt').write_text(''.join(f'{p}\n' for p in sorted(packages)))
-    # The runtime links FFmpeg (LGPL 2.1 or later) and dav1d statically: ship each exact release
-    # archive with its licence beside the binaries.
+    # The runtime links FFmpeg (LGPL 2.1 or later), dav1d and Mbed TLS statically: ship each exact
+    # release archive with its licence beside the binaries.
     media = json.loads((build / 'third_party/media/sources.json').read_text())
     (package / 'sources').mkdir()
     for library, source in sorted(media.items()):

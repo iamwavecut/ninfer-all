@@ -1,14 +1,23 @@
-# cmake -DNINFER_MEDIA_SOURCES_DIR=<dir> -P cmake/FetchMediaSources.cmake
+# cmake -DNINFER_MEDIA_SOURCES_DIR=<dir> [-DNINFER_MEDIA_SOURCES_ONLY=<names>] -P cmake/FetchMediaSources.cmake
 #
 # Downloads the archives cmake/MediaSources.cmake pins into <dir> and checks their digests. An
 # archive already there with the pinned digest is kept, so a second run downloads nothing.
+# NINFER_MEDIA_SOURCES_ONLY names a subset (MBEDTLS for a Windows build, which takes FFmpeg from
+# vcpkg).
 cmake_minimum_required(VERSION 3.28)
 include(${CMAKE_CURRENT_LIST_DIR}/MediaSources.cmake)
 if(NOT NINFER_MEDIA_SOURCES_DIR)
   message(FATAL_ERROR "Pass -DNINFER_MEDIA_SOURCES_DIR=<directory>")
 endif()
 file(MAKE_DIRECTORY "${NINFER_MEDIA_SOURCES_DIR}")
-foreach(source IN LISTS NINFER_MEDIA_SOURCES)
+set(sources ${NINFER_MEDIA_SOURCES})
+if(DEFINED NINFER_MEDIA_SOURCES_ONLY)
+  set(sources ${NINFER_MEDIA_SOURCES_ONLY})
+endif()
+foreach(source IN LISTS sources)
+  if(NOT source IN_LIST NINFER_MEDIA_SOURCES)
+    message(FATAL_ERROR "${source} is not a source cmake/MediaSources.cmake pins")
+  endif()
   set(archive "${NINFER_MEDIA_SOURCES_DIR}/${NINFER_${source}_ARCHIVE}")
   set(expected "${NINFER_${source}_SHA256}")
   if(EXISTS "${archive}")

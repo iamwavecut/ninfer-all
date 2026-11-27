@@ -6,8 +6,9 @@
 //  - gemm_f32 by the GEMV kernel (1..8 rows, strided) and by cuBLAS; gemm_f32_batch's products
 //    equal to gemm_f32's bit for bit.
 //  - The split rows of a short call (mix and residual over one-warp blocks): the row kernel's bits.
-//  - attention_inputs: Q and the relative feature clipped per head and scaled by the full layers'
-//    log factor below and above its floor; K and V: the short convolutions over the call's rows
+//  - attention_inputs: Q and the relative feature (in the product's rows or, from a BF16 relative
+//    projection, rows of its own) clipped per head and scaled by the full layers' log factor below
+//    and above its floor; K and V: the short convolutions over the call's rows
 //    and the history ring (decode rows of several sequences, a verification's consecutive rows, a
 //    prompt chunk after earlier positions), the dynamic taps, K's clip, V's norm, the cache slots
 //    and the history a decode call keeps; MXFP8 planes (a full visit of an mxfp8 run), decoded on
@@ -33,8 +34,9 @@
 //    BF16 values; another device's pairs (-1) keep their rows, and a second call gives the same
 //    bits. bf16_rows_f32: the table's rows exactly.
 //  - the routed experts of a call on the CPU (CpuExperts) against the GPU's vector kernels over
-//    the release's formats (NVFP4 with per-expert scales, Q5_K/Q5_0, Q4_K/Q5_0, IQ4_XS/IQ4_NL): the
-//    same 2^-32 fixed-point sums bit for bit, all on the CPU and half on each (add_fixed).
+//    the releases' formats (NVFP4 with per-expert scales, Q5_K/Q5_0, Q4_K/Q5_0, IQ4_XS/IQ4_NL, and
+//    GSQ-RCO's IQ1_S to IQ3_S [gate; up] banks over Q2_0 or IQ4_NL down banks): the same 2^-32
+//    fixed-point sums bit for bit, all on the CPU and half on each (add_fixed).
 // A BF16 output is compared with its oracle's value rounded once; FP32 arithmetic may land on the
 // other side of a rounding boundary, so those checks bound an RMS error instead of exact bits.
 
@@ -434,21 +436,34 @@ void control_case(int count, int tokens, std::mt19937& rng) {
 
 // ---- Attention inputs ---------------------------------------------------------------------------
 
-void query_case(bool log_scale, const std::vector<int>& positions, float sigma, std::mt19937& rng) {
+// `apart`: the relative feature in rows of its own (a BF16 relative projection's plane), else in
+// the product's rows after Q and the gate.
+void query_case(bool log_scale, const std::vector<int>& positions, float sigma, bool apart,
+                std::mt19937& rng) {
     const int t = int(positions.size());
     const std::int64_t stride = 2 * kHeads * kD + kHeads * kRel + 8, rel_col = 2 * kHeads * kD;
     const auto qgr  = normal(std::size_t(t) * stride, sigma, rng);
+    // The relative rows apart: the same values at kHeads * kRel + 4 floats a row.
+    const std::int64_t rel_stride = kHeads * kRel + 4;
+    std::vector<float> rel(std::size_t(t) * rel_stride, 0.0f);
+    for (int r = 0; r < t; ++r) {
+        for (int i = 0; i < kHeads * kRel; ++i) {
+            rel[std::size_t(r) * rel_stride + i] = qgr[std::size_t(r) * stride + rel_col + i];
+        }
+    }
     auto qclip      = normal(kHeads * kD, 0.3f, rng);
     auto rclip      = normal(kHeads * kRel, 0.3f, rng);
     for (auto& v : qclip) { v += 1.0f; }
     for (auto& v : rclip) { v += 1.0f; }
     std::vector<std::int32_t> pos(positions.begin(), positions.end());
-    DeviceBuffer d_qgr = upload(qgr), d_qc = upload(qclip), d_rc = upload(rclip), d_pos = upload(pos),
+    DeviceBuffer d_qgr = upload(qgr), d_rel = upload(rel), d_qc = upload(qclip),
+                 d_rc = upload(rclip), d_pos = upload(pos),
                  q_out(std::size_t(t) * kHeads * kD * 4), r_out(std::size_t(t) * kHeads * kRel * 4);
     k::QueryArgs a;
     a.qgr             = as<float>(d_qgr);
     a.stride          = stride;
-    a.relative_column = rel_col;
+    a.relative        = apart ? as<float>(d_rel) : as<float>(d_qgr) + rel_col;
+    a.relative_stride = apart ? rel_stride : stride;
     a.tokens          = t;
     a.heads           = kHeads;
     a.query_clip      = as<float>(d_qc);
@@ -490,7 +505,8 @@ void query_case(bool log_scale, const std::vector<int>& positions, float sigma, 
         }
     }
     report(eq.rel() < 1e-6 && er.rel() < 1e-6,
-           std::string("Q") + (log_scale ? " with the log factor" : "") + ", sigma " +
+           std::string("Q") + (log_scale ? " with the log factor" : "") +
+               (apart ? ", relative rows apart" : "") + ", sigma " +
                num(sigma) + ", " + std::to_string(clipped) + " clipped heads: q " + num(eq.rel()) +
                ", r " + num(er.rel()));
 }
@@ -624,7 +640,8 @@ void kv_case(const std::string& name, const RowsCase& c, bool dynamic, std::mt19
     k::QueryArgs q;
     q.qgr             = as<float>(d_qgr);
     q.stride          = q_stride;
-    q.relative_column = 2 * kHeads * kD;
+    q.relative        = as<float>(d_qgr) + 2 * kHeads * kD;
+    q.relative_stride = q_stride;
     q.tokens          = t;
     q.heads           = kHeads;
     q.query_clip      = as<float>(d_ones);
@@ -1448,6 +1465,100 @@ void bf16_experts_case(int tokens, int rows, int k_, int x_div, int experts, std
                            std::to_string(k_) + ": " + std::to_string(wrong) + " values differ");
 }
 
+// An MXFP8 value: an E4M3 code's (no NaN codes reach here) times 2^(scale - 127).
+double mxfp8_value(std::uint8_t code, std::uint8_t scale) {
+    return e4m3_value(code) * std::ldexp(1.0, int(scale) - 127);
+}
+
+// MXFP8 banks as the converter stores them: random finite codes over every exponent and the
+// subnormals, a scale per 32 columns. The products equal an FP64 sum over the codes' values and
+// bf16_expert_rows's bits over the same values stored as BF16 (which holds every one exactly).
+void mxfp8_experts_case(int tokens, int rows, int k_, int x_div, int experts, std::mt19937& rng) {
+    const int pairs = tokens * kTopK, inputs = x_div == 1 ? pairs : tokens;
+    std::vector<std::int32_t> ids(pairs);
+    std::vector<int> order(experts);
+    std::iota(order.begin(), order.end(), 0);
+    for (int t = 0; t < tokens; ++t) {
+        std::shuffle(order.begin(), order.end(), rng);
+        for (int j = 0; j < kTopK; ++j) { ids[t * kTopK + j] = order[j]; }
+    }
+    for (int p = 5; p < pairs; p += 11) { ids[p] = -1; }
+    const std::size_t values = std::size_t(experts) * rows * k_;
+    std::vector<std::uint8_t> codes(values), scales(values / 32);
+    std::vector<bf16> w(values), x(std::size_t(inputs) * k_);
+    std::uniform_int_distribution<int> code_dist(0, 255), scale_dist(127 - 18, 127 - 6);
+    for (auto& c : codes) {
+        do { c = std::uint8_t(code_dist(rng)); } while ((c & 0x7F) == 0x7F);
+    }
+    for (auto& g : scales) { g = std::uint8_t(scale_dist(rng)); }
+    for (std::size_t i = 0; i < values; ++i) {
+        const double v = mxfp8_value(codes[i], scales[i / 32]);
+        w[i]           = __float2bfloat16(float(v));
+        if (double(__bfloat162float(w[i])) != v) {
+            throw std::logic_error("BF16 misses an MXFP8 value");
+        }
+    }
+    {
+        const auto xf = normal(x.size(), 1.0f, rng);
+        for (std::size_t i = 0; i < x.size(); ++i) { x[i] = __float2bfloat16(xf[i]); }
+    }
+    DeviceBuffer d_w = upload(w), d_x = upload(x), d_ids = upload(ids);
+    DeviceBuffer d_codes = upload(codes), d_scales = upload(scales);
+    std::vector<const void*> bf16_table(experts), codes_table(experts), scales_table(experts);
+    for (int e = 0; e < experts; ++e) {
+        bf16_table[e]   = as<bf16>(d_w) + std::int64_t(e) * rows * k_;
+        codes_table[e]  = as<std::uint8_t>(d_codes) + std::int64_t(e) * rows * k_;
+        scales_table[e] = as<std::uint8_t>(d_scales) + std::int64_t(e) * rows * (k_ / 32);
+    }
+    DeviceBuffer d_bf16_table = upload(bf16_table), d_codes_table = upload(codes_table),
+                 d_scales_table = upload(scales_table);
+    DeviceBuffer space(gguf::moe_routing_bytes(experts, pairs));
+    const gguf::MoeRouting routing =
+        gguf::moe_sort_routes(as<std::int32_t>(d_ids), pairs, experts, space.p, nullptr);
+    const float sentinel = 12345.0f;
+    const std::vector<float> fill(std::size_t(pairs) * rows, sentinel);
+    DeviceBuffer out_bf16 = upload(fill), out_mxfp8 = upload(fill);
+    k::bf16_expert_rows(static_cast<const void* const*>(d_bf16_table.p), rows, k_, routing.bounds,
+                        routing.sorted, routing.active, routing.active_count,
+                        std::min(pairs, experts), as<bf16>(d_x), x_div, as<float>(out_bf16),
+                        nullptr);
+    k::mxfp8_expert_rows(static_cast<const void* const*>(d_codes_table.p),
+                         static_cast<const void* const*>(d_scales_table.p), rows, k_,
+                         routing.bounds, routing.sorted, routing.active, routing.active_count,
+                         std::min(pairs, experts), as<bf16>(d_x), x_div, as<float>(out_mxfp8),
+                         nullptr);
+    sync("mxfp8_expert_rows");
+    const auto got_bf16  = download<float>(out_bf16, std::size_t(pairs) * rows);
+    const auto got       = download<float>(out_mxfp8, std::size_t(pairs) * rows);
+    const int step       = pairs > 64 ? 13 : 1;
+    Error e;
+    std::size_t kept_wrong = 0;
+    for (int p = 0; p < pairs; ++p) {
+        if (ids[p] < 0) {
+            for (int r = 0; r < rows; ++r) {
+                kept_wrong += got[std::size_t(p) * rows + r] != sentinel;
+            }
+            continue;
+        }
+        const bf16* xp = x.data() + std::size_t(x_div == 1 ? p : p / kTopK) * k_;
+        const std::size_t base = std::size_t(ids[p]) * rows * k_;
+        for (int r = 0; r < rows; r += step) {
+            double sum = 0;
+            for (int j = 0; j < k_; ++j) {
+                const std::size_t i = base + std::size_t(r) * k_ + j;
+                sum += mxfp8_value(codes[i], scales[i / 32]) * double(__bfloat162float(xp[j]));
+            }
+            e.add(got[std::size_t(p) * rows + r], sum);
+        }
+    }
+    report(e.rel() < 2e-6 && kept_wrong == 0 && same_bits(got, got_bf16),
+           "mxfp8_expert_rows " + std::to_string(rows) + "x" + std::to_string(k_) + ", " +
+               std::to_string(pairs) + " pairs over " + std::to_string(experts) +
+               " experts (x per " + (x_div == 1 ? "pair" : "token") + "): rel " + num(e.rel()) +
+               ", " + std::to_string(kept_wrong) + " foreign rows changed, BF16 bits " +
+               (same_bits(got, got_bf16) ? "equal" : "differ"));
+}
+
 void elementwise_case(std::mt19937& rng) {
     constexpr std::int64_t n = 200058;
     auto x = normal(n, 20.0f, rng);
@@ -1555,6 +1666,18 @@ std::vector<std::uint8_t> expert_blocks(QType q, int rows, int depth, std::mt199
             continue;
         }
         const __half h = __float2half(scale(rng));
+        if (q == QType::GGUF_IQ1_M) {
+            // The multiplier's four nibbles top the four scale words.
+            std::uint16_t bits;
+            std::memcpy(&bits, &h, 2);
+            for (int w = 0; w < 4; ++w) {
+                std::uint16_t word;
+                std::memcpy(&word, &bytes[at + 48 + 2 * w], 2);
+                word = std::uint16_t((word & 0x0FFF) | (((bits >> (4 * w)) & 0xF) << 12));
+                std::memcpy(&bytes[at + 48 + 2 * w], &word, 2);
+            }
+            continue;
+        }
         std::memcpy(&bytes[at], &h, 2);
         if (q == QType::GGUF_Q4_K || q == QType::GGUF_Q5_K) { std::memcpy(&bytes[at + 2], &h, 2); }
     }
@@ -1728,8 +1851,9 @@ int main() {
         control_case(1, 3, rng);
         control_case(3, 7, rng);
 
-        query_case(false, {0, 5, 1000}, 1.0f, rng);
-        query_case(true, {0, 8190, 8191, 8192, 20000, 1048575}, 4.0f, rng);
+        query_case(false, {0, 5, 1000}, 1.0f, false, rng);
+        query_case(true, {0, 8190, 8191, 8192, 20000, 1048575}, 4.0f, false, rng);
+        query_case(true, {3, 8191, 9000}, 4.0f, true, rng);
 
         // Decode rows of three sequences; a verification's four rows of one sequence; a prompt
         // chunk after 50 positions; one at position 0; a chunk's branches.
@@ -1811,6 +1935,8 @@ int main() {
         for (const int tokens : {1, 8, 300}) {
             bf16_experts_case(tokens, 2 * kWidth, kHidden, kTopK, 16, rng);
             bf16_experts_case(tokens, kHidden, kWidth, 1, 16, rng);
+            mxfp8_experts_case(tokens, 2 * kWidth, kHidden, kTopK, 16, rng);
+            mxfp8_experts_case(tokens, kHidden, kWidth, 1, 16, rng);
         }
 
         cpu_experts_case("NVFP4/NVFP4", QType::GGUF_NVFP4, QType::GGUF_NVFP4, true, 1, rng);
@@ -1818,6 +1944,16 @@ int main() {
         cpu_experts_case("Q5_K/Q5_0", QType::GGUF_Q5_K, QType::GGUF_Q5_0, false, 3, rng);
         cpu_experts_case("Q4_K/Q5_0", QType::GGUF_Q4_K, QType::GGUF_Q5_0, false, 8, rng);
         cpu_experts_case("IQ4_XS/IQ4_NL", QType::GGUF_IQ4_XS, QType::GGUF_IQ4_NL, false, 2, rng);
+        // ISTA-DASLab's GSQ-RCO quantizations: IQ1_S to IQ3_S [gate; up] banks, Q2_0 or IQ4_NL
+        // down banks.
+        cpu_experts_case("IQ1_S/Q2_0", QType::GGUF_IQ1_S, QType::GGUF_Q2_0, false, 1, rng);
+        cpu_experts_case("IQ1_M/Q2_0", QType::GGUF_IQ1_M, QType::GGUF_Q2_0, false, 3, rng);
+        cpu_experts_case("IQ2_XXS/IQ4_NL", QType::GGUF_IQ2_XXS, QType::GGUF_IQ4_NL, false, 2, rng);
+        cpu_experts_case("IQ2_XS/Q2_0", QType::GGUF_IQ2_XS, QType::GGUF_Q2_0, false, 1, rng);
+        cpu_experts_case("IQ2_XS/IQ4_NL", QType::GGUF_IQ2_XS, QType::GGUF_IQ4_NL, false, 8, rng);
+        cpu_experts_case("IQ2_S/IQ4_NL", QType::GGUF_IQ2_S, QType::GGUF_IQ4_NL, false, 4, rng);
+        cpu_experts_case("IQ3_XXS/IQ4_NL", QType::GGUF_IQ3_XXS, QType::GGUF_IQ4_NL, false, 5, rng);
+        cpu_experts_case("IQ3_S/Q2_0", QType::GGUF_IQ3_S, QType::GGUF_Q2_0, false, 8, rng);
     } catch (const std::exception& e) {
         std::cout << "FAIL " << e.what() << '\n';
         return 1;

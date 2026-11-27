@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Native Linux build in explicit steps, the counterpart of build-native.bat: CUDA from
-# NINFER_CUDA_PATH, libcurl from pkg-config, optionally under a prebuilt dependency prefix
-# (NINFER_PREFIX, added to CMAKE_PREFIX_PATH and PKG_CONFIG_PATH), and FFmpeg and dav1d compiled
-# from the pinned release archives that `configure` fetches into NINFER_MEDIA_SOURCES. The Docker
+# NINFER_CUDA_PATH, optionally a prebuilt dependency prefix (NINFER_PREFIX, added to
+# CMAKE_PREFIX_PATH and PKG_CONFIG_PATH), and FFmpeg, dav1d and Mbed TLS compiled from the pinned
+# release archives that `configure` fetches into NINFER_MEDIA_SOURCES. The Docker
 # image and CI build through this script. Every setting below can be overridden from the environment.
 #
 #   scripts/build-native.sh configure
@@ -17,7 +17,7 @@
 #   NINFER_MULTICALL   ON or OFF: the programs as one multi-call executable, ninfer-multicall,
 #                      with their names as symlinks (apps/CMakeLists.txt)   (default OFF)
 #   NINFER_PREFIX      prebuilt dependency prefix   (default none)
-#   NINFER_MEDIA_SOURCES  FFmpeg and dav1d release archives (default third_party/media-sources)
+#   NINFER_MEDIA_SOURCES  the pinned release archives (default third_party/media-sources)
 #   NINFER_COMPILER_LAUNCHER  explicit compiler cache (default: ccache when installed)
 #   NINFER_JOBS        build parallelism            (default: all cores)
 set -euo pipefail

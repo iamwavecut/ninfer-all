@@ -65,8 +65,8 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
         !finite(sampling.presence_penalty) || !finite(sampling.frequency_penalty)) {
         invalid_sampling("sampling parameters must be finite", "sampling");
     }
-    if (sampling.temperature && (*sampling.temperature < 0.0F || *sampling.temperature > 2.0F)) {
-        invalid_sampling("temperature must be in [0,2]", "temperature");
+    if (sampling.temperature && *sampling.temperature < 0.0F) {
+        invalid_sampling("temperature must not be negative", "temperature");
     }
     if (sampling.top_p && (*sampling.top_p < 0.0F || *sampling.top_p > 1.0F)) {
         invalid_sampling("top_p must be in [0,1]", "top_p");
@@ -77,14 +77,6 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     if (sampling.top_k) { sampling.top_k = clamp_request_top_k(*sampling.top_k); }
     if (sampling.min_p && (*sampling.min_p < 0.0F || *sampling.min_p > 1.0F)) {
         invalid_sampling("min_p must be in [0,1]", "min_p");
-    }
-    if (sampling.presence_penalty &&
-        (*sampling.presence_penalty < -2.0F || *sampling.presence_penalty > 2.0F)) {
-        invalid_sampling("presence_penalty must be in [-2,2]", "presence_penalty");
-    }
-    if (sampling.frequency_penalty &&
-        (*sampling.frequency_penalty < -2.0F || *sampling.frequency_penalty > 2.0F)) {
-        invalid_sampling("frequency_penalty must be in [-2,2]", "frequency_penalty");
     }
     if (server.greedy) { sampling.temperature = 0.0F; }
     return sampling;

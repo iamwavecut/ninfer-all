@@ -2,7 +2,7 @@ add_library(ninfer_media_acquire STATIC
   media_acquire/acquire.cpp
 )
 ninfer_internal_includes(ninfer_media_acquire)
-target_link_libraries(ninfer_media_acquire PRIVATE ${NINFER_CURL_TARGET})
+target_link_libraries(ninfer_media_acquire PRIVATE ninfer::httplib)
 if(WIN32)
   target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
 endif()
@@ -29,3 +29,14 @@ add_library(ninfer_product_launch_config STATIC
 )
 ninfer_internal_includes(ninfer_product_launch_config)
 target_link_libraries(ninfer_product_launch_config PRIVATE ninfer::json)
+
+# Artifacts named by their Hugging Face repository (OWNER/REPO[:FILE]), fetched into the Hub's
+# cache layout before a program opens them.
+add_library(ninfer_product_hub STATIC
+  hub/hub.cpp
+)
+ninfer_internal_includes(ninfer_product_hub)
+target_link_libraries(ninfer_product_hub PRIVATE ninfer::httplib ninfer::json Threads::Threads)
+if(WIN32)
+  target_link_libraries(ninfer_product_hub PRIVATE ws2_32)
+endif()

@@ -74,16 +74,41 @@ __device__ __forceinline__ bool better(float value, int index, float other, int 
 
 // Token t's selection from its logits `row` (the E experts, then the shared gate), by one warp.
 // The loads bypass L1: in the GEMV's last CTA, other CTAs wrote the row.
+// With `held` (the route bias), the selection ranks p = softmax(logits) plus held.bias for each
+// held expert, and `chosen` takes the chosen experts' logits back for their weights.
 __device__ __forceinline__ void select_token(const float* __restrict__ row, int experts, int t,
                                              int lane, int* __restrict__ ids,
                                              float* __restrict__ weights,
-                                             float* __restrict__ shared) {
+                                             float* __restrict__ shared,
+                                             const ExpertRouteBias& held) {
     // Lane l holds experts l, l + 32, ...: ascending within a lane.
     float values[kLogitsPerLane];
 #pragma unroll
     for (int i = 0; i < kLogitsPerLane; ++i) {
         const int e = lane + 32 * i;
         values[i]   = e < experts ? route_order(__ldcg(row + e)) : -INFINITY;
+    }
+    if (held.enabled()) {
+        float top = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < kLogitsPerLane; ++i) { top = fmaxf(top, values[i]); }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            top = fmaxf(top, __shfl_xor_sync(0xffffffffu, top, offset));
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kLogitsPerLane; ++i) {
+            if (lane + 32 * i < experts) { sum += __expf(values[i] - top); }
+        }
+        sum = warp_sum(sum);
+#pragma unroll
+        for (int i = 0; i < kLogitsPerLane; ++i) {
+            const int e = lane + 32 * i;
+            if (e < experts) {
+                values[i] = __expf(values[i] - top) / sum + expert_route_bonus(held, e);
+            }
+        }
     }
     float chosen[kTopK];
     int chosen_index[kTopK];
@@ -120,11 +145,20 @@ __device__ __forceinline__ void select_token(const float* __restrict__ row, int 
     }
     if (lane != 0) { return; }
     shared[t] = 1.0f / (1.0f + __expf(-__ldcg(row + experts)));
-    // Renormalised softmax over the chosen ten: the full softmax's denominator cancels.
+    // Renormalised softmax over the chosen ten: the full softmax's denominator cancels. Under a
+    // route bias, relative to the largest chosen logit.
+    float top = chosen[0];
+    if (held.enabled()) {
+#pragma unroll
+        for (int k = 0; k < kTopK; ++k) { chosen[k] = route_order(__ldcg(row + chosen_index[k])); }
+        top = chosen[0];
+#pragma unroll
+        for (int k = 1; k < kTopK; ++k) { top = fmaxf(top, chosen[k]); }
+    }
     float sum = 0.0f;
     float e[kTopK];
 #pragma unroll
-    for (int k = 0; k < kTopK; ++k) { sum += (e[k] = __expf(chosen[k] - chosen[0])); }
+    for (int k = 0; k < kTopK; ++k) { sum += (e[k] = __expf(chosen[k] - top)); }
 #pragma unroll
     for (int k = 0; k < kTopK; ++k) {
         ids[t * kTopK + k]     = chosen_index[k];
@@ -135,12 +169,12 @@ __device__ __forceinline__ void select_token(const float* __restrict__ row, int 
 __global__ void __launch_bounds__(kSelectWarps * 32)
     moe_route_select_kernel(const float* __restrict__ logits, int experts, int tokens,
                             int* __restrict__ ids, float* __restrict__ weights,
-                            float* __restrict__ shared) {
+                            float* __restrict__ shared, ExpertRouteBias held) {
     const int t    = blockIdx.x * kSelectWarps + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (t >= tokens) { return; }
     select_token(logits + static_cast<std::int64_t>(t) * (experts + 1), experts, t, lane, ids,
-                 weights, shared);
+                 weights, shared, held);
 }
 
 // logits[t, row] for rows 0..E (row E the shared gate), FP32 [E + 1, tokens]. With Select (one
@@ -153,7 +187,7 @@ __global__ void __launch_bounds__(kRowWarps * 32)
                             const __nv_bfloat16* __restrict__ shared_gate, int experts, int tokens,
                             float* __restrict__ logits, unsigned int* __restrict__ done,
                             int* __restrict__ ids, float* __restrict__ weights,
-                            float* __restrict__ shared) {
+                            float* __restrict__ shared, ExpertRouteBias held) {
     const int row    = blockIdx.x * kRowWarps + (threadIdx.x >> 5);
     const int lane   = threadIdx.x & 31;
     const int t0     = blockIdx.y * kColumnChunk;
@@ -205,7 +239,7 @@ __global__ void __launch_bounds__(kRowWarps * 32)
         __threadfence();
         for (int t = threadIdx.x >> 5; t < count; t += kRowWarps) {
             select_token(logits + static_cast<std::int64_t>(t) * (experts + 1), experts, t, lane,
-                         ids, weights, shared);
+                         ids, weights, shared, held);
         }
         if (threadIdx.x == 0) { *done = 0; }
     }
@@ -260,7 +294,7 @@ std::size_t moe_route_workspace_bytes(std::int32_t tokens, std::int32_t experts)
 
 void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
                WorkspaceArena& workspace, Tensor& ids, Tensor& weights, Tensor& shared,
-               cudaStream_t stream, std::uint32_t* done) {
+               cudaStream_t stream, std::uint32_t* done, const ExpertRouteBias& held) {
     require((m.dtype == DType::BF16 || m.dtype == DType::FP32) && m.is_contiguous() &&
                 m.data != nullptr && aligned16(m.data) && m.ne[0] == kHidden && m.ne[1] > 0 &&
                 m.ne[2] == 1,
@@ -298,7 +332,7 @@ void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
     const bool fused = done != nullptr && tokens <= kColumnChunk;
     const auto gemv  = [&]<typename Input, bool Select>(const Input* x) {
         moe_route_logits_kernel<Input, Select><<<grid, kRowWarps * 32, 0, stream>>>(
-            x, r, g, experts, tokens, logits_p, done, ids_p, weights_p, shared_p);
+            x, r, g, experts, tokens, logits_p, done, ids_p, weights_p, shared_p, held);
     };
     if (m.dtype == DType::FP32) {
         const auto* x = static_cast<const float*>(m.data);
@@ -316,7 +350,7 @@ void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
     if (fused) { return; }
     moe_route_select_kernel<<<static_cast<unsigned>((tokens + kSelectWarps - 1) / kSelectWarps),
                               kSelectWarps * 32, 0, stream>>>(logits_p, experts, tokens, ids_p,
-                                                              weights_p, shared_p);
+                                                              weights_p, shared_p, held);
     CUDA_CHECK(cudaGetLastError());
 }
 

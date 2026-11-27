@@ -18,6 +18,10 @@ namespace ninfer::runtime {
 // calibrating a device that has no measured profile.
 void install_device_route_profile_for(const EngineOptions& options, const DeviceContext& device);
 
+// Refuses a route bias (HybridExpertOptions::route_bias) out of 0..1, with device experts or with
+// tensor parallelism, whose devices would each route by their own cache.
+void check_expert_route_bias(const EngineOptions& options);
+
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
 

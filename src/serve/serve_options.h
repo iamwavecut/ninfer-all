@@ -56,8 +56,14 @@ struct ServeOptions {
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::optional<std::size_t> kv_headroom_mib;
+    KvHostTier kv_host_tier;           // --kv-host-mib
     std::uint32_t max_concurrency      = 1;
+    // --max-concurrency auto: max_concurrency is the most requests, and the Engine lowers it to
+    // the most that fit (EngineOptions::max_concurrency_auto).
+    bool max_concurrency_auto          = false;
+    // Default max(16, max_concurrency) unless --max-pending-requests gives it.
     std::uint32_t max_pending_requests = 16;
+    bool max_pending_requests_given    = false;
     // Admission waits behind the active set, so the deadline has to cover the generation
     // time of the requests ahead in the FIFO. One 1K-token response already runs past 15 s
     // at C1 on an RTX 3090, and a 6.5K-token one past 100 s; a 30 s deadline expired those
@@ -123,7 +129,7 @@ struct ServeOptions {
     bool lm_head_q6         = false;
     bool embedding_q4       = false;
     bool embedding_q6       = false;
-    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Auto;
     bool mtp_experts_q4     = false;
     bool gdn_state_fp16     = false;
     bool rope_yarn          = false;

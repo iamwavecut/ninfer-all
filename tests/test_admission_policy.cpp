@@ -273,7 +273,8 @@ int main() {
     failures += check(!scheduler.has_prefill_lane() && scheduler.select_prefill_lane() == std::nullopt &&
                           throws_logic([&] { scheduler.clear_prefill_lane(0); }),
                       "staged-prefill lane clearing changed");
-    failures += check(throws_logic([&] { scheduler.set_prefill_lane(8); }),
+    failures += check(
+        throws_logic([&] { scheduler.set_prefill_lane(ninfer::kMaximumConcurrency); }),
                       "staged-prefill lane bound check changed");
     scheduler.set_prefill_lane(1);
     scheduler.set_prefill_lane(2);

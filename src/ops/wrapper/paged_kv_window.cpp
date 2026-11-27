@@ -21,12 +21,14 @@ void require_i32(const Tensor& tensor, std::int32_t ne0, std::int32_t ne1, const
 
 void paged_kv_window_rows(const Tensor& block_tables, const Tensor& table_rows,
                           const Tensor& positions, const Tensor& valid_columns,
-                          std::int32_t sink_pages, std::int32_t window_keys, Tensor& window_tables,
-                          Tensor& window_rows, Tensor& window_positions, cudaStream_t stream) {
+                          std::int32_t sink_pages, std::int32_t window_keys,
+                          std::int32_t from_position, Tensor& window_tables, Tensor& window_rows,
+                          Tensor& window_positions, cudaStream_t stream) {
     const std::int32_t pages = block_tables.ne[0];
     const std::int32_t rows  = table_rows.ne[0];
     const std::int32_t width = positions.ne[0];
-    if (pages <= 0 || rows <= 0 || width <= 0 || sink_pages < 0 || window_keys <= 0) {
+    if (pages <= 0 || rows <= 0 || width <= 0 || sink_pages < 0 || window_keys <= 0 ||
+        from_position < 0) {
         throw std::invalid_argument("paged_kv_window_rows: empty extent or invalid window");
     }
     require_i32(block_tables, pages, block_tables.ne[1], "block_tables");
@@ -37,8 +39,8 @@ void paged_kv_window_rows(const Tensor& block_tables, const Tensor& table_rows,
     require_i32(window_rows, rows, 1, "window_rows");
     require_i32(window_positions, width, rows, "window_positions");
     detail::paged_kv_window_rows_launch(block_tables, table_rows, positions, valid_columns,
-                                        sink_pages, window_keys, window_tables, window_rows,
-                                        window_positions, stream);
+                                        sink_pages, window_keys, from_position, window_tables,
+                                        window_rows, window_positions, stream);
 }
 
 } // namespace ninfer::ops

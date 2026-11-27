@@ -22,7 +22,7 @@ checks the downloaded volumes. The inner `SHA256SUMS.txt` checks the extracted f
   - local packages carry the architectures selected by their builder
 - Microsoft Visual C++ 2022 runtime
 
-Everything else is in the archive: the FFmpeg and libcurl DLLs, and NVIDIA's cuBLAS runtime
+Everything else is in the archive: the FFmpeg DLLs, and NVIDIA's cuBLAS runtime
 (`cublas64_12.dll` and `cublasLt64_12.dll`, or their CUDA 13 counterparts). You do **not** need the CUDA Toolkit installed.
 Packages built with `kernel_dll: true` in `BUILD-INFO.json` also require the included
 `ninfer_kernels.dll`. Keep it in its backend directory; it contains NInfer's GGML and INT8
@@ -93,11 +93,11 @@ API key blank.
 | `download-model.bat` | pinned, resumable artifact downloads with verification |
 | `run.bat` | serving profiles: `run.bat <model> [profile]`, or double-click it to pick a model |
 | `configs\*.ini` | [launch configuration files](cli.md#launch-configuration-files) of the [launch recipes](recipes.md): `ninfer-serve.exe --config configs\<file>.ini` |
-| `backends/cuda*/*.dll` | the FFmpeg and libcurl runtime dependencies, and NVIDIA's cuBLAS for the selected CUDA version |
+| `backends/cuda*/*.dll` | the FFmpeg runtime dependencies, and NVIDIA's cuBLAS for the selected CUDA version |
 | `backends/cuda*/NVIDIA-CUDA-EULA.txt` | the licence under which the two cuBLAS DLLs are redistributed |
 | `SHA256SUMS.txt` | checksums for the package files, including subdirectories |
 | `BUILD-INFO.json` | source, Toolkit, device images and validation scope |
-| `LICENSE-*.txt` | dependency notices from vcpkg |
+| `LICENSE-*.txt` | dependency notices from vcpkg, and `LICENSE-mbedtls.txt` for Mbed TLS, which the executables link statically for HTTPS media URLs |
 
 ## Overrides
 

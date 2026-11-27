@@ -655,8 +655,8 @@ __device__ __forceinline__ void query_post_block(const QueryArgs& a, int t, int 
     const float f    = fminf(1.0f, fmaxf(0.0f, a.qk_clip / norm));
     a.q_out[(std::int64_t(t) * a.heads + h) * kD + d] = x * f * tau;
     if (d >= 32) { return; }
-    const float r  = d < kRel ? row[a.relative_column + h * kRel + d] * a.relative_clip[h * kRel + d]
-                              : 0.0f;
+    const float* rel = a.relative + std::int64_t(t) * a.relative_stride;
+    const float r    = d < kRel ? rel[h * kRel + d] * a.relative_clip[h * kRel + d] : 0.0f;
     const float rn = sqrtf(warp_sum(r * r)) + 1e-6f;
     const float rf = fminf(1.0f, fmaxf(0.0f, a.rel_clip / rn));
     if (d < kRel) { a.r_out[(std::int64_t(t) * a.heads + h) * kRel + d] = r * rf * tau; }
@@ -2426,8 +2426,8 @@ __global__ void __launch_bounds__(kRowBlock) keep_products_kernel(ResidualArgs a
 
 constexpr int kRouteThreads = 256; // at least the experts
 
-// Block per row: thread e the expert. The top_k by p + bias, lower id first: expert e is chosen
-// k-th when k experts precede it in that order.
+// Block per row: thread e the expert. The top_k by p + bias (+ held.bias when held), lower id
+// first: expert e is chosen k-th when k experts precede it in that order.
 // The call's fixed-point expert sums from zero, over every thread of the route launch.
 __device__ __forceinline__ void zero_sums(const RouteArgs& a) {
     const std::int64_t step = std::int64_t(gridDim.x) * blockDim.x;
@@ -2446,7 +2446,8 @@ __global__ void route_kernel(RouteArgs a) {
     __shared__ float chosen_p[8];
     const float logit = e < a.experts ? a.logits[std::int64_t(t) * a.experts + e] : 0.0f;
     const float p     = sigmoidf(logit);
-    const float selection = e < a.experts ? p + a.bias[e] : -INFINITY;
+    const float selection =
+        e < a.experts ? p + a.bias[e] + expert_route_bonus(a.held, e) : -INFINITY;
     selections[e]         = selection;
     __syncthreads();
     if (e < a.experts) {
@@ -2493,7 +2494,7 @@ __global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
     const bool expert = e < a.experts;
     const float logit = expert ? a.logits[std::int64_t(t) * a.experts + e] : 0.0f;
     const float p     = sigmoidf(logit);
-    const float selection = expert ? p + a.bias[e] : -INFINITY;
+    const float selection = expert ? p + a.bias[e] + expert_route_bonus(a.held, e) : -INFINITY;
     selections[t][e]      = selection;
     __syncthreads();
     int rank = -1;
@@ -2617,23 +2618,54 @@ __device__ __forceinline__ void bf16x8(const uint4& v, float (&f)[8]) {
     }
 }
 
+// An expert's stored rows as expert_rows_kernel reads them: eight FP32 values of row `row` from
+// column c, each the stored value exactly.
+struct Bf16Rows {
+    const void* const* table;
+    struct Expert {
+        const __nv_bfloat16* w;
+        __device__ void load(int row, int k, int c, float (&f)[8]) const {
+            bf16x8(*reinterpret_cast<const uint4*>(w + std::int64_t(row) * k + c), f);
+        }
+    };
+    __device__ Expert expert(int e) const { return {static_cast<const __nv_bfloat16*>(table[e])}; }
+};
+
+// MXFP8 rows: K E4M3 codes and K/32 E8M0 scales a row, decoded as the MXFP8 KV planes are.
+struct Mxfp8Rows {
+    const void* const* codes;
+    const void* const* scales;
+    struct Expert {
+        const std::uint8_t *codes, *scales;
+        __device__ void load(int row, int k, int c, float (&f)[8]) const {
+            ops::kv_row::Chunk<KvCoding::Mxfp8>::decode(
+                *reinterpret_cast<const uint2*>(codes + std::int64_t(row) * k + c),
+                scales[std::int64_t(row) * (k / 32) + c / 32], f);
+        }
+    };
+    __device__ Expert expert(int e) const {
+        return {static_cast<const std::uint8_t*>(codes[e]),
+                static_cast<const std::uint8_t*>(scales[e])};
+    }
+};
+
 // Block (row tile, active slot a): expert e = active[a]'s rows [8 tile, 8 tile + 8), each warp
 // two of them, against the expert's pairs 32 at a time. The pairs' inputs pass through shared
 // memory 256 columns at a time; lane l multiplies columns [8 l, 8 l + 8) of each, in order, into
-// one FP32 sum per (row, pair), and the warp adds its lanes' sums.
+// one FP32 sum per (row, pair), and the warp adds its lanes' sums. The weights' storage changes
+// only how a lane reads its eight values, so equal values give equal bits.
+template <class Rows>
 __global__ void __launch_bounds__(kBfWarps * 32)
-    bf16_expert_rows_kernel(const void* const* __restrict__ table, int rows, int k,
-                            const std::int32_t* __restrict__ bounds,
-                            const std::int32_t* __restrict__ sorted,
-                            const std::int32_t* __restrict__ active,
-                            const std::int32_t* __restrict__ active_count,
-                            const __nv_bfloat16* __restrict__ x, int x_div,
-                            float* __restrict__ out) {
+    expert_rows_kernel(Rows stored, int rows, int k, const std::int32_t* __restrict__ bounds,
+                       const std::int32_t* __restrict__ sorted,
+                       const std::int32_t* __restrict__ active,
+                       const std::int32_t* __restrict__ active_count,
+                       const __nv_bfloat16* __restrict__ x, int x_div, float* __restrict__ out) {
     ninfer::pdl::arch_enter();
     if (int(blockIdx.y) >= *active_count) { return; }
     const int e     = active[blockIdx.y];
     const int begin = bounds[e], end = bounds[e + 1];
-    const auto* w   = static_cast<const __nv_bfloat16*>(table[e]);
+    const auto w    = stored.expert(e);
     const int warp = int(threadIdx.x) >> 5, lane = int(threadIdx.x) & 31;
     const int row0 = int(blockIdx.x) * kBfRows + warp * kBfRowsPerWarp;
     __shared__ __align__(16) __nv_bfloat16 xs[kBfPairs][kBfChunk];
@@ -2659,8 +2691,7 @@ __global__ void __launch_bounds__(kBfWarps * 32)
 #pragma unroll
             for (int r = 0; r < kBfRowsPerWarp; ++r) {
                 const int row = min(row0 + r, rows - 1); // a row past the end is never written
-                bf16x8(*reinterpret_cast<const uint4*>(w + std::int64_t(row) * k + c + 8 * lane),
-                       wf[r]);
+                w.load(row, k, c + 8 * lane, wf[r]);
             }
 #pragma unroll
             for (int p = 0; p < kBfPairs; ++p) {
@@ -2898,7 +2929,15 @@ __global__ void __launch_bounds__(256) spark_logits_kernel(SparkStepArgs a) {
     if (lane == 0) {
         const float logit = a.candidate_values[at] + a.c[v] + dot;
         a.logits[o]       = a.cap * tanhf(logit * (1.0f / a.cap));
+        if (a.scores != nullptr) { a.scores[v] = a.logits[o]; }
     }
+}
+
+// A sampled step's row: -inf everywhere, before spark_logits_kernel writes the candidates.
+__global__ void __launch_bounds__(256) spark_clear_kernel(float* scores, int vocab) {
+    ninfer::pdl::arch_enter_glue();
+    const int v = int(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v < vocab) { scores[v] = -INFINITY; }
 }
 
 // The running (maximum, its first index, sum of e^(x - maximum)) of a set of logits.
@@ -2948,10 +2987,14 @@ __device__ Pick block_pick(Pick p) {
 }
 
 // One block: the first maximum of the step's candidate logits (the lowest id among equal ones),
-// its probability over the candidates, then the state update.
+// or the sampled id, its probability over the candidates, then the state update.
 __global__ void __launch_bounds__(kSparkPickThreads) spark_pick_kernel(SparkStepArgs a) {
     ninfer::pdl::arch_enter_glue();
+    __shared__ float drawn;
     const std::int32_t* ids = a.candidate_ids + std::int64_t(a.row - 1) * kSparkCandidates;
+    const int token = a.sampled != nullptr ? *a.sampled : -1;
+    if (threadIdx.x == 0) { drawn = -INFINITY; }
+    __syncthreads();
     Pick p;
     for (int o = threadIdx.x; o < kSparkCandidates; o += blockDim.x) {
         Pick one;
@@ -2959,12 +3002,16 @@ __global__ void __launch_bounds__(kSparkPickThreads) spark_pick_kernel(SparkStep
         one.index = ids[o];
         one.sum   = 1.0f;
         p         = merge_pick(p, one);
+        if (one.index == token) { drawn = one.top; } // candidate ids are distinct
     }
-    p = block_pick(p);
+    p = block_pick(p); // its __syncthreads publishes `drawn`
     if (threadIdx.x == 0) {
-        *a.prev                 = p.index;
-        a.drafts[a.row - 1]     = p.index;
-        a.confidence[a.row - 1] = 1.0f / p.sum;
+        // A draw outside the candidates (none passed the sampler's filters) keeps the argmax.
+        const bool take         = a.sampled != nullptr && drawn != -INFINITY;
+        const int id            = take ? token : p.index;
+        *a.prev                 = id;
+        a.drafts[a.row - 1]     = id;
+        a.confidence[a.row - 1] = take ? expf(drawn - p.top) / p.sum : 1.0f / p.sum;
     }
     for (int r = threadIdx.x; r < kSparkRank; r += blockDim.x) {
         const float gate      = sigmoidf(a.joint[r]);
@@ -3550,9 +3597,25 @@ void bf16_expert_rows(const void* const* table, int rows, int k, const std::int3
     }
     if (max_active <= 0) { return; }
     ninfer::pdl::launch_arch(dim3(blocks_for(rows, kBfRows), unsigned(max_active)), kBfWarps * 32,
-                             0, stream, bf16_expert_rows_kernel, table, rows, k, bounds, sorted,
-                             active, active_count, x, x_div, out);
+                             0, stream, expert_rows_kernel<Bf16Rows>, Bf16Rows{table}, rows, k,
+                             bounds, sorted, active, active_count, x, x_div, out);
     check_launch("bf16_expert_rows");
+}
+
+void mxfp8_expert_rows(const void* const* codes_table, const void* const* scales_table, int rows,
+                       int k, const std::int32_t* bounds, const std::int32_t* sorted,
+                       const std::int32_t* active, const std::int32_t* active_count,
+                       int max_active, const __nv_bfloat16* x, int x_div, float* out,
+                       cudaStream_t stream) {
+    if (rows <= 0 || k <= 0 || k % 32 != 0 || x_div <= 0) {
+        throw std::invalid_argument("inkling2 mxfp8_expert_rows: rows, k a multiple of 32, x_div");
+    }
+    if (max_active <= 0) { return; }
+    ninfer::pdl::launch_arch(dim3(blocks_for(rows, kBfRows), unsigned(max_active)), kBfWarps * 32,
+                             0, stream, expert_rows_kernel<Mxfp8Rows>,
+                             Mxfp8Rows{codes_table, scales_table}, rows, k, bounds, sorted, active,
+                             active_count, x, x_div, out);
+    check_launch("mxfp8_expert_rows");
 }
 
 void bf16_rows_f32(const __nv_bfloat16* table, int k, const std::int32_t* ids, int rows,
@@ -3662,19 +3725,32 @@ void spark_candidates(const float* base, std::int64_t stride, int vocab, int row
     check_launch("spark_candidates write");
 }
 
-void spark_step(const SparkStepArgs& a, cudaStream_t stream) {
+void spark_score(const SparkStepArgs& a, cudaStream_t stream) {
     if (a.row < 1 || a.hidden_size % 4 != 0 || a.cap <= 0.0f || a.candidate_ids == nullptr ||
-        a.candidate_values == nullptr) {
+        a.candidate_values == nullptr || (a.scores != nullptr && a.vocab < kSparkCandidates)) {
         throw std::invalid_argument("inkling2 spark_step: invalid step");
     }
     const int k = 2 * kSparkRank + 2 * a.hidden_size;
     ninfer::pdl::launch_arch(3 * kSparkRank / 8, 256, std::size_t(k) * 4, stream,
                              spark_joint_kernel, a);
     check_launch("spark_joint");
+    if (a.scores != nullptr) {
+        ninfer::pdl::launch_arch(blocks_for(a.vocab, 256), 256, 0, stream, spark_clear_kernel,
+                                 a.scores, a.vocab);
+        check_launch("spark_clear");
+    }
     ninfer::pdl::launch_arch(kSparkCandidates / 8, 256, 0, stream, spark_logits_kernel, a);
     check_launch("spark_logits");
+}
+
+void spark_take(const SparkStepArgs& a, cudaStream_t stream) {
     ninfer::pdl::launch_arch(1, kSparkPickThreads, 0, stream, spark_pick_kernel, a);
     check_launch("spark_pick");
+}
+
+void spark_step(const SparkStepArgs& a, cudaStream_t stream) {
+    spark_score(a, stream);
+    spark_take(a, stream);
 }
 
 void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,

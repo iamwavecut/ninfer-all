@@ -17,6 +17,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "runtime/contract/draft_sampling.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/lookup_draft.h"
@@ -147,7 +148,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         throw std::invalid_argument("DeepSeek-V4.1 verifies 1 to 7 drafts a round (--draft-tokens)");
     }
     if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine) ||
-        speculative.mtp_attention_window != 0 || speculative.ngram_draft_tokens != 0 ||
+        speculative.mtp_attention_window.value_or(0) != 0 || speculative.ngram_draft_tokens != 0 ||
         speculative.ngram_archive_bytes != 0 ||
         speculative.proposal_head == ProposalHead::Optimized ||
         (speculative.proposal_head != ProposalHead::Auto && !dspine) ||
@@ -173,6 +174,7 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
+    check_expert_route_bias(options);
     if (options.tensor_parallel ? device.size() < 2 : device.size() != 1) {
         throw std::invalid_argument("DeepSeek-V4.1 runs on one device, or divides its routed "
                                     "experts over several with --tensor-parallel");
@@ -310,9 +312,12 @@ ConstructedDeepSeekV41 construct_deepseek_v41(const EngineOptions& options, Devi
     executor.cuda_graphs        = options.use_cuda_graph;
     executor.draft_tokens       = drafts;
     executor.dspine             = dspine;
+    executor.sampled_drafts     = dspark && options.gumbel_sampling;
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    executor.expert_route_bias  = hybrid.route_bias;
+    executor.expert_route_bias_prompts = hybrid.route_bias_prompts;
     executor.expert_disk        = {hybrid.mirror, hybrid.direct};
     // Expert parallelism: every device serves a share of the routed experts from host memory or
     // the files over its own bus; without --tensor-split the executor sizes the shares by each
@@ -2551,12 +2556,16 @@ struct DeepSeekV41Core::Impl {
 
     // The drafter's drafts after the request's anchor while their confidence holds (the floor
     // Strata's DSpark rounds use), at most `steps`; or a context lookup's. The count proposed.
-    std::uint32_t propose(const Request& r, std::uint32_t steps, TokenId* out) {
+    // The chain draws them with the keys the verification columns draw the target's tokens with
+    // (runtime::draft_sampling).
+    std::uint32_t propose(Request& r, std::uint32_t steps, TokenId* out) {
         if (dspark_block == 0) { return lookup(r, steps, out); }
         if (r.position + dspark_block > max_context) { return 0; }
         std::vector<std::int32_t> drafted(dspark_block);
         std::vector<float> confidence(dspark_block);
-        instance.executor->draft(r.slot, r.feed.front(), drafted, confidence);
+        const ops::SamplingConfig sampler = runtime::draft_sampling(*sample_row(r).params);
+        instance.executor->draft(r.slot, r.feed.front(), drafted, confidence, &sampler,
+                                 static_cast<std::int32_t>(r.position));
         std::uint32_t kept = 0;
         while (kept < steps && confidence[kept] >= dspark_floor &&
                drafted[kept] >= 0 && std::uint32_t(drafted[kept]) < domain) {

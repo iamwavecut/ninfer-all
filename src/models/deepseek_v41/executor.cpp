@@ -5,7 +5,6 @@
 #include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
-#include "core/mapped_host_copy.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -18,6 +17,7 @@
 #include "models/divided_head.h"
 #include "models/dspine/runtime.h"
 #include "ninfer/ops/linear_policy.h"
+#include "ninfer/ops/sampling.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
@@ -438,6 +438,9 @@ struct Executor::Impl {
         DeviceBuffer taps, ids, values, scratch;
         std::unique_ptr<PinnedHostBuffer> host;
         std::unique_ptr<CudaCompletionEvent> copied;
+        // Sampled drafts (ExecutorOptions::sampled_drafts): the row's config, then its keys.
+        DeviceBuffer sampling;
+        std::unique_ptr<PinnedHostBuffer> host_sampling;
     };
     std::optional<Drafter> drafter;
     // A standalone DSpine drafter (ExecutorOptions::dspine): its ring, table and features, and the
@@ -446,6 +449,9 @@ struct Executor::Impl {
     std::unique_ptr<dspine::Runtime> spine;
     DeviceBuffer spine_stage;
     bool in_branches = false;
+    // The pass whose blocks run is a prompt chunk's (a decode or verification pass's routers take
+    // the route bias, ExecutorOptions::expert_route_bias).
+    bool prompt_pass = false;
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(std::move(o)), config(m.config()),
@@ -712,11 +718,12 @@ struct Executor::Impl {
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-            if (workspace_bytes + kGraphReserve + unbacked() > free_bytes) {
+            if (workspace_bytes + launch_reserve() + unbacked() > free_bytes) {
                 throw InsufficientMemory(
                     "DeepSeek-V4.1: the workspace of " + std::to_string(workspace_bytes >> 20) +
-                    " MiB and " + std::to_string(kGraphReserve >> 20) +
-                    " MiB for the CUDA graphs need more than the " + std::to_string(free_bytes >> 20) +
+                    " MiB and " + std::to_string(launch_reserve() >> 20) +
+                    " MiB kept free for CUDA graphs and kernel loading need more than the " +
+                    std::to_string(free_bytes >> 20) +
                     " MiB free after the caches; lower --prefill-chunk, --max-concurrency or "
                     "--max-context");
             }
@@ -1091,6 +1098,11 @@ struct Executor::Impl {
         d.scratch = DeviceBuffer(kernels::markov_scratch_bytes());
         d.host    = std::make_unique<PinnedHostBuffer>(std::size_t(2 * d.block) * 4);
         d.copied  = std::make_unique<CudaCompletionEvent>(device);
+        if (options.sampled_drafts) {
+            const std::size_t bytes = sizeof(ops::SamplingConfig) + std::size_t(d.block) * 4;
+            d.sampling      = DeviceBuffer(bytes);
+            d.host_sampling = std::make_unique<PinnedHostBuffer>(bytes);
+        }
         kv_bytes += d.taps.bytes;
     }
 
@@ -1142,17 +1154,18 @@ struct Executor::Impl {
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         const auto cache = options.expert_cache_bytes.value_or(0);
-        if (bank + metadata + cache + unbacked() + kGraphReserve > free) {
+        if (bank + metadata + cache + unbacked() + launch_reserve() > free) {
             throw InsufficientMemory("DeepSeek-V4.1: expert delivery needs " +
                 std::to_string((bank + metadata + cache) >> 20) + " MiB beside " +
-                std::to_string(unbacked() >> 20) +
-                " MiB for the growing caches and the CUDA Graph reserve after workspace allocation");
+                std::to_string(unbacked() >> 20) + " MiB for the growing caches and " +
+                std::to_string(launch_reserve() >> 20) +
+                " MiB kept free for CUDA graphs and kernel loading after workspace allocation");
         }
         ExpertDeliveryOptions transport;
         transport.pair_capacity   = options.prefill_chunk * config.top_k_experts;
         transport.top_k           = config.top_k_experts;
         transport.cache_bytes     = options.expert_cache_bytes;
-        transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
+        transport.keep_free_bytes = launch_reserve() + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
         transport.disk            = options.expert_disk;
         const float dma_share     = options.expert_dma_share.value_or(0.0F);
@@ -1186,28 +1199,24 @@ struct Executor::Impl {
         }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
-        // Where a device's copies queue behind one another whatever their streams
-        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for the
-        // misses can hold the copies the graph queued after it ahead of the delivery's own, which
-        // end that wait. Eager passes wait on the host and queue nothing behind the wait.
-        if (serialized_copy_queue()) { options.cuda_graphs = false; }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             const auto [begin, end] = expert_ranges[r];
             RankBinding bind(device, r);
             std::size_t free_r = 0, total_r = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_r, &total_r));
-            if (bank_bytes(end - begin) + metadata + cache + kGraphReserve > free_r) {
+            if (bank_bytes(end - begin) + metadata + cache + launch_reserve() > free_r) {
                 throw InsufficientMemory(
                     "DeepSeek-V4.1: expert delivery of device rank " + std::to_string(r) +
                     " needs " + std::to_string((bank_bytes(end - begin) + metadata + cache) >> 20) +
-                    " MiB beside the CUDA Graph reserve, and " + std::to_string(free_r >> 20) +
-                    " MiB are free");
+                    " MiB beside " + std::to_string(launch_reserve() >> 20) +
+                    " MiB kept free for CUDA graphs and kernel loading, and " +
+                    std::to_string(free_r >> 20) + " MiB are free");
             }
             ExpertDeliveryOptions peer;
             peer.pair_capacity   = transport.pair_capacity;
             peer.top_k           = transport.top_k;
             peer.cache_bytes     = options.expert_cache_bytes;
-            peer.keep_free_bytes = kGraphReserve;
+            peer.keep_free_bytes = launch_reserve();
             peer.disk            = options.expert_disk;
             // The delivery serves the calls on the rank's expert-parallel stream.
             RankContext rank         = device.rank(r);
@@ -1250,7 +1259,7 @@ struct Executor::Impl {
         std::vector<double> room(device.size());
         for (std::size_t r = 0; r < device.size(); ++r) {
             const std::uint64_t keep =
-                kGraphReserve + metadata + (r == 0 && growing ? kKvHeadroom : 0);
+                launch_reserve() + metadata + (r == 0 && growing ? kKvHeadroom : 0);
             room[r] = options.expert_cache_bytes ? double(*options.expert_cache_bytes)
                       : free_bytes[r] > keep      ? double(free_bytes[r] - keep)
                                                   : 0.0;
@@ -1346,6 +1355,17 @@ struct Executor::Impl {
     }
 
     static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
+    // Without graphs the device still keeps room for the kernels CUDA loads at their first
+    // launch (lazy module loading): a prompt or reply reaches kernels that startup never
+    // launched, and with every byte given to the expert cache that load fails ("out of memory").
+    static constexpr std::size_t kKernelReserve = std::size_t(64) << 20;
+
+    // What the device keeps free beside the planned memory: the CUDA graphs' reserve where this run
+    // captures them (graphs are off for --no-cuda-graph, and for host or disk experts where a
+    // device's copies queue behind one another), else the kernels' reserve.
+    [[nodiscard]] std::size_t launch_reserve() const {
+        return options.cuda_graphs ? kGraphReserve : kKernelReserve;
+    }
     static constexpr std::size_t kKvHeadroom   = std::size_t(256) << 20;
 
     std::size_t start_reserve() const {
@@ -1367,8 +1387,9 @@ struct Executor::Impl {
         const std::uint64_t chunk = plan_workspace(0), bank = bank_bytes();
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        const std::uint64_t fixed = chunk + kGraphReserve + unbacked() + (growing ? kKvHeadroom : 0) +
-                                    delivery_metadata() + options.expert_cache_bytes.value_or(0);
+        const std::uint64_t fixed = chunk + launch_reserve() + unbacked() +
+                                    (growing ? kKvHeadroom : 0) + delivery_metadata() +
+                                    options.expert_cache_bytes.value_or(0);
         if (free <= fixed + 2 * bank) { return 0; }
         const std::uint64_t room = free - fixed - 2 * bank;
         const std::uint64_t row  = 12 + (options.engram_table ? std::uint64_t(hasher.rows_per_token()) *
@@ -1556,7 +1577,7 @@ struct Executor::Impl {
 
     // Before a call that writes or reads `sequence`'s positions below `end`: its compressed rows
     // are backed up to the 256-position tile that holds `end`, the expert cache giving memory back
-    // when the device keeps less than the CUDA Graph reserve beside them. Outside capture.
+    // when the device keeps less than launch_reserve() beside them. Outside capture.
     void back(std::uint32_t sequence, std::uint32_t end) {
         if (!growing) { return; }
         const auto upto = std::uint32_t(std::min<std::size_t>(round_up(end, 256), options.max_context));
@@ -1573,7 +1594,9 @@ struct Executor::Impl {
         }
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        if (free < need + kGraphReserve) { delivery->shrink_cache(need + kGraphReserve - free); }
+        if (free < need + launch_reserve()) {
+            delivery->shrink_cache(need + launch_reserve() - free);
+        }
         while (!apply()) {
             if (delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
                 count_backed();
@@ -1585,10 +1608,10 @@ struct Executor::Impl {
     }
 
     // Beside an elastic expert cache, before a span of `n` tokens: its span_buffers, the cache
-    // giving memory back when the device keeps less than them and the CUDA Graph reserve. Empty
+    // giving memory back when the device keeps less than them and launch_reserve(). Empty
     // when the cache has no more to give. Outside capture.
     DeviceBuffer borrow_span(std::uint32_t n) {
-        const std::size_t bytes = span_buffers(n), need = bytes + kGraphReserve;
+        const std::size_t bytes = span_buffers(n), need = bytes + launch_reserve();
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         while (free < need) {
@@ -1776,6 +1799,10 @@ struct Executor::Impl {
             const std::size_t r = std::min<std::size_t>(window, std::max<std::size_t>(t, n));
             seed_bytes = sum({r * std::size_t(drafter->targets) * h * 2, r * h * 4, r * h * 2,
                               r * drafter->layers.size() * kLatent * 4, r * 4});
+            if (options.sampled_drafts) { // a sampled step's scores and its sampler
+                seed_bytes += sum({std::size_t(drafter->domain) * 4,
+                                   ops::sampling_workspace_capacity_bytes(drafter->domain, 1, 1)});
+            }
         }
         return pass + std::max({engram_bytes, attention, ffn, head_bytes}) + seed_bytes + gguf_scratch +
                stq_scratch + allocations * kAlign + (32u << 20);
@@ -2676,8 +2703,13 @@ struct Executor::Impl {
         kernels::gemm_f32(e, t, hidden, p.router, x32, logits, stream);
         auto* ids     = alloc<std::int32_t>(pairs);
         auto* weights = alloc<float>(pairs);
+        const ExpertRouteBias held =
+            p.delivery_layer >= 0 && options.expert_route_bias > 0 &&
+                    (!prompt_pass || options.expert_route_bias_prompts)
+                ? delivery->route_bias(std::size_t(p.delivery_layer), options.expert_route_bias)
+                : ExpertRouteBias{};
         kernels::route(logits, p.router_bias, t, e, k, config.routed_scaling_factor, ids, weights,
-                       stream, p.image_bias, p.image_bias != nullptr ? image_mask : nullptr);
+                       stream, p.image_bias, p.image_bias != nullptr ? image_mask : nullptr, held);
         const auto* xb   = static_cast<const __nv_bfloat16*>(x.data);
         if (p.stq) {
             // An STQ drafter block's resident experts: a pair per routed expert of a row through its
@@ -2946,9 +2978,10 @@ struct Executor::Impl {
 
     // The drafter's block over staged rows (the anchor, then the noise token, at the sequence's
     // next positions; then each row's visible position, the block's last): its blocks, the head
-    // over the final norm of the collapsed streams, the Markov chain's greedy drafts and their
-    // confidences, copied to the pinned buffer.
-    void draft_pass(int b) {
+    // over the final norm of the collapsed streams, the Markov chain's greedy drafts (`sampled`:
+    // its draws with the staged config and keys) and their confidences, copied to the pinned
+    // buffer.
+    void draft_pass(int b, bool sampled) {
         Drafter& d = *drafter;
         workspace->reset();
         auto scope     = workspace->scope();
@@ -2982,9 +3015,24 @@ struct Executor::Impl {
         project(x, head, plane, vocab);
         auto* ids = static_cast<std::int32_t*>(d.ids.p);
         CUDA_CHECK(cudaMemcpyAsync(ids, d_tokens.p, 4, cudaMemcpyDeviceToDevice, stream));
-        for (int i = 0; i < b; ++i) {
-            kernels::markov_step(plane + std::size_t(i) * vocab, d.markov_head, d.markov_embed, d.domain,
-                                 ids, i, d.scratch.p, stream);
+        if (!sampled) {
+            for (int i = 0; i < b; ++i) {
+                kernels::markov_step(plane + std::size_t(i) * vocab, d.markov_head, d.markov_embed,
+                                     d.domain, ids, i, d.scratch.p, stream);
+            }
+        } else {
+            auto* scores        = alloc<float>(std::size_t(d.domain));
+            const auto* configs = static_cast<const ops::SamplingConfig*>(d.sampling.p);
+            auto* keys          = reinterpret_cast<std::int32_t*>(
+                static_cast<std::byte*>(d.sampling.p) + sizeof(ops::SamplingConfig));
+            const Tensor row(scores, DType::FP32, {d.domain, 1});
+            for (int i = 0; i < b; ++i) {
+                kernels::markov_scores(plane + std::size_t(i) * vocab, d.markov_head, d.markov_embed,
+                                       d.domain, ids, i, scores, stream);
+                Tensor drawn(ids + i + 1, DType::I32, {1});
+                ops::sample(row, drawn, d.domain, configs, Tensor(keys + i, DType::I32, {1}),
+                            ops::kSamplePurposeDecode, *workspace, stream);
+            }
         }
         kernels::dspark_confidence(h, pre, b, streams, hidden, d.confidence, d.markov_embed, ids,
                                    static_cast<float*>(d.values.p), stream);
@@ -2995,7 +3043,8 @@ struct Executor::Impl {
     }
 
     void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
-               std::span<float> confidence) {
+               std::span<float> confidence, const ops::SamplingConfig* sampler = nullptr,
+               std::int32_t length = 0) {
         if (!drafter) { throw std::logic_error("deepseek_v41 draft: no DSpark drafter"); }
         Drafter& d  = *drafter;
         const int b = d.block;
@@ -3015,7 +3064,26 @@ struct Executor::Impl {
             pos[std::size_t(b + i)] = std::int32_t(first) + b - 1;
         }
         stage(tokens, pos, seq);
-        run_graph(32 + std::uint32_t(b), [&] { draft_pass(b); });
+        const bool sampled =
+            options.sampled_drafts && sampler != nullptr && sampler->temperature > 0.0F;
+        if (sampled) {
+            // The target's own draw of draft i's position is keyed (seed, length + i + 1).
+            auto* host            = static_cast<std::byte*>(d.host_sampling->data());
+            ops::SamplingConfig c = *sampler;
+            c.presence_penalty    = 0.0F;
+            c.frequency_penalty   = 0.0F;
+            c.token_counts        = nullptr;
+            c.token_mask          = nullptr;
+            c.token_mask_stride   = 0;
+            c.non_finite_token    = 0;
+            std::memcpy(host, &c, sizeof(c));
+            auto* keys = reinterpret_cast<std::int32_t*>(host + sizeof(c));
+            for (int i = 0; i < b; ++i) { keys[i] = length + i + 1; }
+            CUDA_CHECK(cudaMemcpyAsync(d.sampling.p, host, sizeof(c) + std::size_t(b) * 4,
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        run_graph((sampled ? 0x10000U : 0U) | (32 + std::uint32_t(b)),
+                  [&] { draft_pass(b, sampled); });
         d.copied->record(stream);
         d.copied->synchronize();
         const auto* host = static_cast<const std::int32_t*>(d.host->data());
@@ -3027,6 +3095,7 @@ struct Executor::Impl {
     // Engram rows copied).
     void run(const Pass& s) {
         const int t = s.t;
+        prompt_pass = s.chunk;
         image_mask  = step_images.empty() ? nullptr : static_cast<const std::uint8_t*>(d_image.p) + s.row;
         workspace->reset();
         auto scope = workspace->scope();
@@ -3317,6 +3386,7 @@ struct Executor::Impl {
         };
         // The span's rows a DSpine drafter keeps.
         const int spine_row = spine_start(first, n, state_at);
+        prompt_pass         = true;
         for (std::size_t l = 0; l < layers.size(); ++l) {
             const LayerPlan& p = layers[l];
             const int from     = p.decoder ? decoder_row : 0;
@@ -3716,6 +3786,11 @@ struct Executor::Impl {
                 std::vector<std::int32_t> drafts(std::size_t(drafter->block));
                 std::vector<float> confidence(drafts.size());
                 draft(0, 2, drafts, confidence);
+                if (options.sampled_drafts) {
+                    ops::SamplingConfig sampler;
+                    sampler.temperature = 1.0F;
+                    draft(0, 2, drafts, confidence, &sampler, 1);
+                }
                 reset_state(0);
             }
         }
@@ -3996,8 +4071,9 @@ std::uint32_t Executor::dspark_block() const noexcept {
 }
 
 void Executor::draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
-                     std::span<float> confidence) {
-    impl_->draft(sequence, anchor, drafts, confidence);
+                     std::span<float> confidence, const ops::SamplingConfig* sampler,
+                     std::int32_t length) {
+    impl_->draft(sequence, anchor, drafts, confidence, sampler, length);
 }
 
 void Executor::draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,

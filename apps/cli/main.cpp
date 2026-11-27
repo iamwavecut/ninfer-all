@@ -4,6 +4,7 @@
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
+#include "product/hub/hub.h"
 #include "product/log_colour/log_colour.h"
 #include "product/prompt_input/prompt_input.h"
 #include "product/speculative_options.h"
@@ -374,6 +375,9 @@ int main(int argc, char** argv) {
     ninfer::product::StartupLogRenderer startup_log(logging);
 
     try {
+        // OWNER/REPO[:FILE] names an artifact on the Hugging Face Hub, fetched into its cache.
+        cli.artifact_path = ninfer::product::hub::resolve_artifact(
+            cli.artifact_path.string(), [&](const std::string& line) { logger->info("{}", line); });
         ninfer::PromptInput input =
             cli.messages_path.empty()
                 ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
@@ -413,6 +417,7 @@ int main(int argc, char** argv) {
         engine_options.hybrid_experts                = cli.hybrid_experts;
         engine_options.max_context              = cli.max_context;
         engine_options.kv_capacity              = cli.kv_capacity;
+        engine_options.kv_host_tier             = cli.kv_host_tier;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.kv_cache_automatic       = cli.kv_cache_automatic;

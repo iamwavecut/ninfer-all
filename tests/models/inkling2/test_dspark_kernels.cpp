@@ -15,6 +15,9 @@
 //  - spark_step: the recurrent head's joint projection, the soft-capped logits over the head's
 //    table for the row's candidates, the first maximum (an exact tie included), its probability
 //    over the candidates and the state update, three steps chained; silu_mul and add_rows.
+//  - a sampled step (spark_score with a vocabulary row, spark_take with a draw): the row holds
+//    exactly the candidates' logits and -inf elsewhere; a drawn candidate becomes the draft with
+//    its probability over the candidates; a draw outside the candidates keeps the first maximum.
 // BF16 and F16 outputs are compared by RMS error relative to the oracle's.
 
 #include "core/device_buffer.h"
@@ -493,7 +496,9 @@ void candidates_case(const std::string& name, int vocab, int rows, bool boundary
 }
 
 
-void step_case(const std::string& name, int vocab, bool tie, std::mt19937& rng) {
+// `sampled`: each step draws the candidate of the second largest logit, the second step an id
+// outside the candidates.
+void step_case(const std::string& name, int vocab, bool tie, bool sampled, std::mt19937& rng) {
     const int k_ = 2 * kRank + 2 * kHidden, steps = 3;
     const auto weight = normal(std::size_t(3 * kRank) * k_, 0.02f, rng);
     const auto bias   = normal(3 * kRank, 0.3f, rng);
@@ -550,9 +555,44 @@ void step_case(const std::string& name, int vocab, bool tie, std::mt19937& rng) 
     a.confidence   = as<float>(conf);
     a.joint        = as<float>(scratch);
     a.logits       = a.joint + 3 * kRank;
+    DeviceBuffer scores(sampled ? std::size_t(vocab) * 4 : 4), draw(4);
+    std::vector<std::int32_t> drawn(steps, -1); // the sampled steps' draws
+    std::size_t row_wrong = 0;
+    if (sampled) {
+        a.scores  = as<float>(scores);
+        a.vocab   = vocab;
+        a.sampled = as<std::int32_t>(draw);
+    }
     for (int row = 1; row <= steps; ++row) {
         a.row = row;
-        k::spark_step(a, nullptr);
+        if (!sampled) {
+            k::spark_step(a, nullptr);
+            continue;
+        }
+        k::spark_score(a, nullptr);
+        sync("spark_score");
+        const auto got_row  = download<float>(scores, vocab);
+        const auto got_l    = download<float>(scratch, k::spark_step_floats());
+        const auto got_ids  = download<std::int32_t>(cand_ids, std::size_t(steps) * k::kSparkCandidates);
+        std::vector<float> want(vocab, -INFINITY);
+        int first = -1, second = -1;
+        for (int o = 0; o < k::kSparkCandidates; ++o) {
+            const int v   = got_ids[std::size_t(row - 1) * k::kSparkCandidates + o];
+            const float l = got_l[3 * kRank + o];
+            want[v]       = l;
+            if (first < 0 || l > want[first] || (l == want[first] && v < first)) {
+                second = first;
+                first  = v;
+            } else if (second < 0 || l > want[second] || (l == want[second] && v < second)) {
+                second = v;
+            }
+        }
+        for (int v = 0; v < vocab; ++v) { row_wrong += std::memcmp(&got_row[v], &want[v], 4) != 0; }
+        int outside = 0;
+        while (want[outside] != -INFINITY) { ++outside; }
+        drawn[row - 1] = row == 2 ? outside : second;
+        check(cudaMemcpy(draw.p, &drawn[row - 1], 4, cudaMemcpyHostToDevice), "draw");
+        k::spark_take(a, nullptr);
     }
     sync("spark_step");
     const auto got_drafts = download<std::int32_t>(drafts, steps);
@@ -597,14 +637,20 @@ void step_case(const std::string& name, int vocab, bool tie, std::mt19937& rng) 
         double sum = 0;
         for (const double l : logits) { sum += std::exp(l - top); }
         const int got = got_drafts[row - 1];
-        if (got != best) {
-            if (top - logits[std::size_t(std::clamp(got, 0, vocab - 1))] < 1e-4) {
-                ++near;
-            } else {
-                ++mismatched;
+        const bool taken = sampled && row != 2; // a draw among the candidates
+        if (taken) {
+            mismatched += got != drawn[row - 1];
+            ep.add(got_conf[row - 1], std::exp(logits[std::size_t(got)] - top) / sum);
+        } else {
+            if (got != best) {
+                if (top - logits[std::size_t(std::clamp(got, 0, vocab - 1))] < 1e-4) {
+                    ++near;
+                } else {
+                    ++mismatched;
+                }
             }
+            ep.add(got_conf[row - 1], 1.0 / sum);
         }
-        ep.add(got_conf[row - 1], 1.0 / sum);
         for (int r = 0; r < kRank; ++r) {
             const double gate = sigmoid(j[r]), candidate = std::tanh(j[kRank + r]);
             s[r] = candidate + gate * (s[r] - candidate);
@@ -613,11 +659,12 @@ void step_case(const std::string& name, int vocab, bool tie, std::mt19937& rng) 
     }
     for (int r = 0; r < kRank; ++r) { es.add(got_state[r], s[r]); }
     const bool tie_ok = !tie || (got_drafts[0] == 7 && got_drafts[1] == 7 && got_drafts[2] == 7);
-    report(mismatched == 0 && ep.rel() < 1e-4 && es.rel() < 1e-4 && tie_ok,
+    report(mismatched == 0 && row_wrong == 0 && ep.rel() < 1e-4 && es.rel() < 1e-4 && tie_ok,
            "spark_step " + name + ": " + std::to_string(steps) + " steps, " +
                std::to_string(mismatched) + " drafts off (" + std::to_string(near) +
                " near ties), probability " + num(ep.rel()) + ", state " + num(es.rel()) +
-               (tie ? (tie_ok ? ", ties to the lower id" : ", tie broken wrongly") : ""));
+               (tie ? (tie_ok ? ", ties to the lower id" : ", tie broken wrongly") : "") +
+               (sampled ? ", " + std::to_string(row_wrong) + " row values differ" : ""));
 }
 
 void elementwise_case(std::mt19937& rng) {
@@ -671,8 +718,9 @@ int main() {
         candidates_case("vocabulary of 201,088, 7 rows", 201088, 7, false, rng);
         candidates_case("ties across the last candidate, 3 rows", 50001, 3, true, rng);
         candidates_case("every product a candidate", k::kSparkCandidates, 1, false, rng);
-        step_case("vocabulary of 20,000", 20000, false, rng);
-        step_case("an exact tie", 17000, true, rng);
+        step_case("vocabulary of 20,000", 20000, false, false, rng);
+        step_case("an exact tie", 17000, true, false, rng);
+        step_case("sampled, vocabulary of 20,000", 20000, false, true, rng);
         elementwise_case(rng);
     } catch (const std::exception& e) {
         std::cout << "FAIL " << e.what() << '\n';

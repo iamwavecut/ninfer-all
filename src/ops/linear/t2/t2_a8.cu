@@ -147,6 +147,12 @@ using SmallScheduleR16C16W1 = T2SmallTI8Schedule<8, 1, 2, 2, 4, 1>;
 using SmallScheduleR32C16   = T2SmallTI8Schedule<4, 1, 2, 2, 4, 2>;
 using SmallScheduleR16C32   = T2SmallTI8Schedule<8, 1, 4, 2, 3, 2>;
 using SmallScheduleR32C16K8 = T2SmallTI8Schedule<8, 2, 2, 2, 4, 2>;
+// One pass over the weights for 33 to 64 columns (a decode round of that many requests) where a
+// profile names one; the compiled route launches 32 columns at a time, which measured 2.5-6.9%
+// faster on the RTX 3090 at 40-64 columns than r32c64 in Ternary Bonsai 2's decode.
+using SmallScheduleR32C64   = T2SmallTI8Schedule<4, 1, 8, 2, 2, 2>;
+using SmallScheduleR32C64W1 = T2SmallTI8Schedule<4, 1, 8, 2, 2, 1>;
+using SmallScheduleR16C64W1 = T2SmallTI8Schedule<8, 1, 8, 2, 2, 1>;
 
 // The span's schedule by profile name; false when the name is unknown or cannot take the span.
 template <class Epilogue>
@@ -173,6 +179,9 @@ bool small_named(std::string_view schedule, const T2A8Activations& x, SmallColum
     if (schedule == "r32c16") { return take.template operator()<SmallScheduleR32C16>(); }
     if (schedule == "r16c32") { return take.template operator()<SmallScheduleR16C32>(); }
     if (schedule == "r32c16k8") { return take.template operator()<SmallScheduleR32C16K8>(); }
+    if (schedule == "r32c64") { return take.template operator()<SmallScheduleR32C64>(); }
+    if (schedule == "r32c64w1") { return take.template operator()<SmallScheduleR32C64W1>(); }
+    if (schedule == "r16c64w1") { return take.template operator()<SmallScheduleR16C64W1>(); }
     return false;
 }
 
@@ -185,14 +194,26 @@ std::string small_route_key(const Weight& first, const Weight* second, std::int3
 
 // Launches of at most 32 columns each: from 33 columns the weights stream once per launch, and six
 // launches (192 columns) still beat the A16 route and the prefill GEMM's 256-column tile on the
-// text-layer shapes (the padded GEMM reloads its activation columns in every 64-row CTA).
+// text-layer shapes (the padded GEMM reloads its activation columns in every 64-row CTA). A
+// profile may name a 64-column schedule for the widths 33..64 of what is left, which takes them in
+// one launch.
 template <class Epilogue>
 void small_route(const T2A8Activations& x, const SmallParent<Epilogue>& first,
                  const SmallParent<Epilogue>* second, cudaStream_t stream) {
     const std::string key =
         small_route_key(*first.weight, second != nullptr ? second->weight : nullptr, x.input_rows);
-    for (std::int32_t col0 = 0; col0 < x.tokens; col0 += kT2I8LaunchColumns) {
-        const SmallColumns span{col0, std::min(kT2I8LaunchColumns, x.tokens - col0)};
+    for (std::int32_t col0 = 0; col0 < x.tokens;) {
+        const std::int32_t left = x.tokens - col0;
+        if (left > kT2I8LaunchColumns) {
+            const SmallColumns wide{col0, std::min(kT2I8WideLaunchColumns, left)};
+            const std::string_view routed = device_route_schedule(key, wide.cols);
+            if (!routed.empty() && small_named(routed, x, wide, first, second, stream)) {
+                col0 += wide.cols;
+                continue;
+            }
+        }
+        const SmallColumns span{col0, std::min(kT2I8LaunchColumns, left)};
+        col0 += span.cols;
         const std::string_view routed = device_route_schedule(key, span.cols);
         if (!routed.empty() && small_named(routed, x, span, first, second, stream)) { continue; }
         if (span.cols <= 8) {

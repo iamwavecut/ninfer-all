@@ -35,13 +35,19 @@ public:
     // RAM). Returns the bytes pinned: the end of the last pinned part, or 0. The pages past them
     // go back to the system and size() becomes that end; their bytes are lost. Faults in the pages
     // nobody wrote first, as pin().
-    std::size_t pin_prefix(std::span<const std::size_t> ends, std::size_t limit);
+    std::size_t pin_prefix(std::span<const std::size_t> ends, std::size_t limit,
+                           bool device_mapped = false);
 
     [[nodiscard]] std::byte* data() const noexcept { return data_; }
 
     [[nodiscard]] std::size_t size() const noexcept { return bytes_; }
 
+    // Translate a range inside one independently registered part to its device address.
+    [[nodiscard]] const std::byte* device_alias(std::size_t offset, std::size_t bytes) const;
+
 private:
+    struct RegistrationRange { std::size_t begin, end; };
+    std::vector<RegistrationRange> ranges_;
     std::byte* data_   = nullptr;
     std::size_t bytes_ = 0;
     std::size_t mapping_bytes_ = 0; // the reservation, which size() may end before

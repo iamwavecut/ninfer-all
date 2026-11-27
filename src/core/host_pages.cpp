@@ -3,6 +3,8 @@
 #include "core/host_memory.h"
 #include "core/pinned_memory.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <exception>
 #include <new>
@@ -97,19 +99,23 @@ HostPages::~HostPages() {
 void HostPages::pin(bool device_mapped) {
     if (!registrations_.empty()) { return; }
     touch_pages(data_, 0, bytes_);
+    ranges_.reserve(1);
     try {
         registrations_.push_back(
             std::make_unique<HostMemoryRegistration>(data_, bytes_, device_mapped));
+        ranges_.push_back({0, bytes_});
     } catch (const std::exception& error) {
         throw std::runtime_error("failed to pin " + mib(bytes_) + " MiB of host memory (" +
                                  error.what() + ")");
     }
 }
 
-std::size_t HostPages::pin_prefix(std::span<const std::size_t> ends, std::size_t limit) {
+std::size_t HostPages::pin_prefix(std::span<const std::size_t> ends, std::size_t limit,
+                                  bool device_mapped) {
     if (!registrations_.empty()) { throw std::logic_error("HostPages: the block is pinned"); }
     // Two registrations may not share a page, so each part but the block's last ends on one.
     const std::size_t page = page_bytes();
+    ranges_.reserve(ends.size());
     std::size_t pinned = 0, registered = 0;
     for (std::size_t i = 0; i < ends.size(); ++i) {
         const std::size_t end = ends[i];
@@ -122,7 +128,8 @@ std::size_t HostPages::pin_prefix(std::span<const std::size_t> ends, std::size_t
             touch_pages(data_, registered, through);
             try {
                 registrations_.push_back(std::make_unique<HostMemoryRegistration>(
-                    data_ + registered, through - registered));
+                    data_ + registered, through - registered, device_mapped));
+                ranges_.push_back({registered, through});
             } catch (const std::exception&) { break; }
             registered = through;
         }
@@ -139,6 +146,28 @@ std::size_t HostPages::pin_prefix(std::span<const std::size_t> ends, std::size_t
     }
     bytes_ = pinned;
     return pinned;
+}
+
+const std::byte* HostPages::device_alias(std::size_t offset, std::size_t bytes) const {
+    if (bytes == 0 || offset >= bytes_ || bytes > bytes_ - offset) {
+        throw std::out_of_range("HostPages: device alias range is outside pinned bytes");
+    }
+    const auto it = std::upper_bound(ranges_.begin(), ranges_.end(), offset,
+                                     [](std::size_t value, const RegistrationRange& range) {
+                                         return value < range.begin;
+                                     });
+    if (it == ranges_.begin()) { throw std::out_of_range("HostPages: range is not registered"); }
+    const auto& range = *std::prev(it);
+    if (offset < range.begin || offset >= range.end || bytes > range.end - offset) {
+        throw std::out_of_range("HostPages: device alias crosses registrations");
+    }
+    void* alias = nullptr;
+    const cudaError_t error = cudaHostGetDevicePointer(&alias, data_ + range.begin, 0);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string("HostPages: cudaHostGetDevicePointer: ") +
+                                 cudaGetErrorString(error));
+    }
+    return static_cast<const std::byte*>(alias) + (offset - range.begin);
 }
 
 } // namespace ninfer

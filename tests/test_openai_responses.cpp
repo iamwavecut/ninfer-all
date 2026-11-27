@@ -608,15 +608,17 @@ int test_assistant_item_boundaries_and_errors() {
                 Json{{"model", "m"}, {"input", std::move(input)}}, limits());
         });
     };
-    const ApiError reasoning_after_content = rejected(Json::array({first, reasoning}));
-    failures +=
-        check(reasoning_after_content.status == 400 &&
-                  reasoning_after_content.type == "invalid_request_error" &&
-                  reasoning_after_content.code == "invalid_assistant_history" &&
-                  reasoning_after_content.param == "input" &&
-                  reasoning_after_content.message.find(
-                      "reasoning cannot follow assistant message content") != std::string::npos,
-              "reasoning after assistant content did not fail precisely");
+    // Reasoning after content, and a second reasoning Item, join the turn's reasoning in order: a
+    // streamed response whose model reasoned after its content returns them that way.
+    const OpenAIResponsesCreateRequest late_reasoning = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", Json::array({reasoning, first, reasoning, second})}},
+        limits());
+    failures += check(late_reasoning.prompt.input_turns.size() == 1 &&
+                          late_reasoning.prompt.input_turns[0].reasoning_content ==
+                              "thoughtthought" &&
+                          late_reasoning.prompt.input_turns[0].content.size() == 2 &&
+                          late_reasoning.prompt.input_turns[0].content[1].text == "second",
+                      "reasoning after assistant content did not join the turn in order");
     const ApiError content_after_call = rejected(Json::array({call, first}));
     failures += check(content_after_call.code == "invalid_assistant_history" &&
                           content_after_call.message.find(
@@ -638,12 +640,11 @@ int test_assistant_item_boundaries_and_errors() {
                           joined.prompt.input_turns[0].content[0].text == "first " &&
                           joined.prompt.input_turns[0].reasoning_content == "thought\n\nthought",
                       "--lenient-assistant-history did not join text and reasoning after calls");
-    const ApiError duplicate_reasoning = rejected(Json::array({reasoning, reasoning}));
-    failures +=
-        check(duplicate_reasoning.code == "invalid_assistant_history" &&
-                  duplicate_reasoning.message.find(
-                      "reasoning cannot follow another reasoning Item") != std::string::npos,
-              "duplicate reasoning Items were silently overwritten");
+    const OpenAIResponsesCreateRequest two_reasoning = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", Json::array({reasoning, reasoning})}}, limits());
+    failures += check(two_reasoning.prompt.input_turns.size() == 1 &&
+                          two_reasoning.prompt.input_turns[0].reasoning_content == "thoughtthought",
+                      "a second reasoning Item overwrote the first");
     return failures;
 }
 
@@ -1539,6 +1540,116 @@ int test_sse_sequence_and_failures() {
     return failures;
 }
 
+// A model that reasons after its content (a template that opens the text block in the prompt):
+// the Items open and close in the order it wrote them, the terminal output holds the same Items,
+// and returning them restores the reasoning and the content.
+int test_sse_reasoning_after_content() {
+    const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
+        Json{{"model", "m"},
+             {"input", "hello"},
+             {"include", Json::array({"reasoning.encrypted_content"})},
+             {"stream", true}},
+        limits());
+    int failures   = 0;
+    const auto run = [&](const std::vector<std::pair<bool, std::string>>& deltas,
+                         const GenerationOutcome& outcome) {
+        OpenAIResponsesEventStream encoder("resp_late", 123, request, {});
+        std::vector<std::string> wire = encoder.start();
+        for (const auto& [reasoning, text] : deltas) {
+            std::vector<std::string> next =
+                reasoning ? encoder.reasoning_delta(text) : encoder.content_delta(text);
+            wire.insert(wire.end(), next.begin(), next.end());
+        }
+        OpenAIResponsesStreamFinish finish = encoder.finish(outcome);
+        wire.insert(wire.end(), finish.events_before_terminal.begin(),
+                    finish.events_before_terminal.end());
+        wire.push_back(encoder.terminal(finish.response));
+        std::vector<Json> events;
+        for (const std::string& event : wire) { events.push_back(parse_event(event)); }
+        return events;
+    };
+    // The Items' order, each done Item's text, and whether one was added while another was open.
+    const auto items = [&](const std::vector<Json>& events) {
+        std::vector<Json> done;
+        bool overlapped = false;
+        int open        = -1;
+        for (const Json& event : events) {
+            if (event.at("type") == "response.output_item.added") {
+                overlapped = overlapped || open >= 0;
+                open       = event.at("output_index").get<int>();
+            } else if (event.at("type") == "response.output_item.done") {
+                overlapped = overlapped || event.at("output_index") != open;
+                open       = -1;
+                done.push_back(event.at("item"));
+            }
+        }
+        return std::pair{done, overlapped};
+    };
+    const auto text_of = [](const Json& item) {
+        return item.at("content").at(0).at("text").get<std::string>();
+    };
+
+    GenerationOutcome outcome = sample_outcome();
+    outcome.reasoning         = "first thought, second thought";
+    outcome.text              = "answer, amended";
+    const std::vector<Json> events =
+        run({{true, "first thought"}, {false, "answer"}, {true, ", second thought"},
+             {false, ", amended"}},
+            outcome);
+    const auto [done, overlapped] = items(events);
+    const Json output             = events.back().at("response").at("output");
+    failures += check(done.size() == 4 && !overlapped && done[0].at("type") == "reasoning" &&
+                          done[1].at("type") == "message" && done[2].at("type") == "reasoning" &&
+                          done[3].at("type") == "message" && text_of(done[0]) == "first thought" &&
+                          text_of(done[1]) == "answer" &&
+                          text_of(done[2]) == ", second thought" &&
+                          text_of(done[3]) == ", amended" &&
+                          done[2].at("encrypted_content") == ", second thought",
+                      "reasoning after content did not stream as Items in the model's order");
+    bool same_output = output.size() == done.size();
+    for (std::size_t i = 0; same_output && i < done.size(); ++i) {
+        same_output = output[i].at("id") == done[i].at("id") &&
+                      output[i].at("type") == done[i].at("type") &&
+                      text_of(output[i]) == text_of(done[i]);
+    }
+    failures += check(same_output, "the terminal output differs from the streamed Items");
+
+    Json input = Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "hello"}}});
+    for (const Json& item : output) { input.push_back(item); }
+    input.push_back(Json{{"type", "message"}, {"role", "user"}, {"content", "next"}});
+    const OpenAIResponsesCreateRequest returned =
+        parse_openai_responses_create_request(Json{{"model", "m"}, {"input", input}}, limits());
+    const ChatTurn& assistant = returned.prompt.input_turns.at(1);
+    std::string content;
+    for (const auto& part : assistant.content) { content += part.text; }
+    failures += check(returned.prompt.input_turns.size() == 3 &&
+                          assistant.reasoning_content == outcome.reasoning &&
+                          content == outcome.text,
+                      "returned Items did not restore the reasoning and the content");
+
+    // Content first, then the only reasoning: the message is the first Item.
+    GenerationOutcome late = sample_outcome();
+    late.reasoning         = "checked";
+    late.text              = "answer";
+    const auto [late_done, late_overlapped] = items(run({{false, "answer"}, {true, "checked"}}, late));
+    failures += check(late_done.size() == 2 && !late_overlapped &&
+                          late_done[0].at("type") == "message" &&
+                          late_done[1].at("type") == "reasoning" &&
+                          text_of(late_done[1]) == "checked",
+                      "reasoning after the only content did not follow the message Item");
+
+    // A held-back tail of each channel at the end joins the open Item of its kind first.
+    GenerationOutcome tails = sample_outcome();
+    tails.reasoning         = "thought";
+    tails.text              = "answer";
+    const auto [tail_done, tail_overlapped] = items(run({{true, "tho"}, {false, "ans"}}, tails));
+    failures += check(tail_done.size() == 3 && !tail_overlapped &&
+                          text_of(tail_done[0]) == "tho" && text_of(tail_done[1]) == "answer" &&
+                          text_of(tail_done[2]) == "ught",
+                      "terminal tails did not join the open Item first");
+    return failures;
+}
+
 int test_input_tokens_uses_shared_state_path() {
     OpenAIResponsesStore store(8, 1ULL << 20);
     store.put(stored_parent(
@@ -1680,6 +1791,7 @@ int main() {
     failures += test_prompt_cache_key_retention();
     failures += test_reasoning_summary_options();
     failures += test_response_object();
+    failures += test_sse_reasoning_after_content();
     failures += test_logprobs_response();
     failures += test_sse_sequence_and_failures();
     failures += test_input_tokens_uses_shared_state_path();

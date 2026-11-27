@@ -45,11 +45,14 @@ struct Policy {
     std::function<bool()> is_cancelled;
 };
 
-// A URL is fetched over HTTP(S) only, without credentials, a proxy or content decoding, with TLS
-// verified. Its host must resolve to an address outside private, loopback, link-local, reserved and
-// multicast networks (unless allow_private_network), and the fetch connects to that address alone.
-// Redirects are followed by hand, at most max_redirects, each checked the same way and none from
-// HTTPS to HTTP. The body stops at max_bytes, the transfer at timeout_ms and the deadline.
+// A URL is fetched over HTTP(S) only, without credentials, a proxy or content decoding. HTTPS
+// verifies the server's certificate and host name (product/https_client.h). Its host must resolve
+// to an address outside private, loopback, link-local, reserved and multicast networks (unless
+// allow_private_network), and the fetch connects to that address alone. Redirects are followed by hand, at most max_redirects, each
+// checked the same way and none from HTTPS to HTTP. The body stops at max_bytes, each request at
+// timeout_ms and the deadline. While a request waits for its server, another thread of the fetch
+// calls is_cancelled; the caller's thread is inside acquire_bytes meanwhile, so no two calls
+// overlap.
 std::vector<std::uint8_t> acquire_bytes(const Source& source, const Policy& policy = {});
 
 namespace detail {

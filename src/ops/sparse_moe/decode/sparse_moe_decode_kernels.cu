@@ -103,10 +103,10 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
 
 __global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int* __restrict__ ids,
                                           float* __restrict__ alpha,
-                                          float* __restrict__ shared_scale) {
+                                          float* __restrict__ shared_scale, ExpertRouteBias held) {
     __shared__ float selected_logits[kTopK];
     if (threadIdx.x == 0) { pdl::trigger_dependents(); }
-    sparse_moe_select_top8_warp(scores, ids, alpha, shared_scale, selected_logits);
+    sparse_moe_select_top8_warp(scores, ids, alpha, shared_scale, selected_logits, held);
 }
 
 struct Q4Codec {
@@ -1003,7 +1003,8 @@ void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
     auto* ids          = static_cast<int*>(workspace.ids.data);
     auto* alpha        = static_cast<float*>(workspace.alpha.data);
     auto* shared_scale = static_cast<float*>(workspace.shared_scale.data);
-    sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale);
+    sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale,
+                                                    ExpertRouteBias{});
     CUDA_CHECK(cudaGetLastError());
 
     switch (weights.routed_gate_up.qtype) {
@@ -1194,7 +1195,7 @@ void launch_d4_small_t_codec(const SparseMoeWeights& weights, Tensor& destinatio
 
 void sparse_moe_stream_decode_route(const Tensor& x, const Weight& router,
                                      const SparseMoeSmallTWorkspace& workspace,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream, const ExpertRouteBias& held) {
     sparse_moe_d1_kernel<<<kRouterRows, kD1Warps * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const __nv_bfloat16*>(router.qdata),
@@ -1204,7 +1205,7 @@ void sparse_moe_stream_decode_route(const Tensor& x, const Weight& router,
         static_cast<const float*>(workspace.scratch.data),
         static_cast<int*>(workspace.token_ids.data),
         static_cast<float*>(workspace.token_alpha.data),
-        static_cast<float*>(workspace.shared_scale.data));
+        static_cast<float*>(workspace.shared_scale.data), held);
     CUDA_CHECK(cudaGetLastError());
 }
 

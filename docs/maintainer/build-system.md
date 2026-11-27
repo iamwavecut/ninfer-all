@@ -206,6 +206,7 @@ The default configuration is Release. Ninja links and archives share the single-
 | `NINFER_BUILD_APPS` | ON | CLI, HTTP server, perplexity evaluator and `ninfer-calibrate` |
 | `BUILD_TESTING` | OFF | C++ tests and registered Python interoperability tests |
 | `NINFER_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
+| `NINFER_STATIC_CUDA_LIBS` | OFF | Statically link CUDA runtime and cuBLAS |
 
 The opt-in kernel, build and platform options (`NINFER_SM120_NATIVE`, `NINFER_PDL`,
 `NINFER_MULTICALL`, the SFU and Windows options, and the rest) are listed in the
@@ -213,8 +214,8 @@ The opt-in kernel, build and platform options (`NINFER_SM120_NATIVE`, `NINFER_PD
 
 Apps or tests enable the internal product support components: media acquisition, prompt input,
 logging and serving. This is one derived condition, not a separate user option. FFmpeg belongs
-to model media decoding and remains required when apps are disabled. Curl and spdlog are needed
-only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
+to model media decoding and remains required when apps are disabled. Mbed TLS and spdlog are
+needed only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
 Python 3.11 describes the maintained environment, not a configuration version gate. The CUDA
@@ -225,9 +226,7 @@ version gates refuse the releases that miscompile a target's kernels: a `120a` b
 `--version` and the startup log print.
 Windows builds find vcpkg's FFmpeg without imposing library version floors; Linux builds compile
 the release that `cmake/MediaSources.cmake` pins. Actual language/API support is exercised by
-compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
-media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
-[that release](https://curl.se/libcurl/c/CURLOPT_PROTOCOLS_STR.html).
+compilation and tests.
 
 The checked-in `CMakePresets.json` provides:
 
@@ -264,8 +263,13 @@ package export or configure-time dependency download.
 
 ## Targets and dependencies
 
-`cmake/Dependencies.cmake` discovers system CUDA, Threads and conditional curl, takes FFmpeg from
-vcpkg on Windows, and exposes the repository-pinned JSON/HTTP headers and conditional spdlog library.
+`cmake/Dependencies.cmake` discovers system CUDA and Threads, takes FFmpeg from vcpkg on Windows,
+and exposes the repository-pinned JSON/HTTP headers and conditional spdlog library. With the
+product targets, `cmake/NinferMbedTLS.cmake` compiles Mbed TLS from its pinned release archive in
+`NINFER_MEDIA_SOURCES_DIR` as cpp-httplib's TLS backend on every platform. The whole
+`ninfer::httplib` target defines `CPPHTTPLIB_MBEDTLS_SUPPORT`, so every user of the header sees
+one class layout. Windows builds fetch that one archive
+(`-DNINFER_MEDIA_SOURCES_ONLY=MBEDTLS -P cmake/FetchMediaSources.cmake`).
 On Linux, `cmake/NinferFFmpeg.cmake` builds dav1d and FFmpeg as static PIC libraries from the release
 archives in `NINFER_MEDIA_SOURCES_DIR` (an `ExternalProject` each, through the compiler launcher)
 and records their versions, digests and options in `third_party/media/sources.json` of the build

@@ -47,13 +47,56 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
     return *options.max_private_continuations;
 }
 
+// Granules of the persistent arena that hold only the KV host tier's pages: in every page-major
+// plane of the Main and MTP pools, the whole granules inside its last `host_pages` pages. A
+// granule shared with a device page, or with the next plane, stays device memory.
+std::vector<std::size_t> kv_host_granules(const SequencePlanImpl& plan, std::size_t granularity) {
+    std::vector<std::size_t> out;
+    const auto add = [&](const qwen3_5::PagedKVCacheLayout& cache) {
+        if (cache.pages.spec.geometry.device_plane_order != PagedKVPlaneOrder::PageMajor) {
+            throw std::invalid_argument("the KV host tier needs page-major KV pools");
+        }
+        const std::uint32_t pages = cache.pages.spec.page_group_count;
+        if (plan.kv_host_pages > pages) {
+            throw std::logic_error("KV host tier pages exceed a pool");
+        }
+        for (const DeviceKVPlaneLayout& plane : cache.pages.planes) {
+            if (plane.rank != 0 || plane.geometry.page_stride != 1) {
+                throw std::invalid_argument("the KV host tier needs one device");
+            }
+            const auto& shape = plane.storage.shape;
+            const std::size_t page_bytes =
+                static_cast<std::size_t>(shape[0]) * static_cast<std::size_t>(shape[1]) *
+                static_cast<std::size_t>(shape[2]) * dtype_size(plane.storage.dtype);
+            const std::size_t offset = plane.storage.region.offset;
+            const std::size_t begin  = offset + (pages - plan.kv_host_pages) * page_bytes;
+            const std::size_t end    = offset + static_cast<std::size_t>(pages) * page_bytes;
+            for (std::size_t granule = (begin + granularity - 1) / granularity;
+                 granule < end / granularity; ++granule) {
+                out.push_back(granule);
+            }
+        }
+    };
+    add(plan.persistent.decoder.text_kv);
+    if (plan.persistent.decoder.mtp_kv) { add(*plan.persistent.decoder.mtp_kv); }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 // The persistent arena is virtual memory whose free KV granules can fund a Vision window (overlay
-// Vision residency) or an elastic expert cache (host or disk experts on one device). The lendable
-// prefix ends past the last page-major KV plane.
+// Vision residency) or an elastic expert cache (host or disk experts on one device), and whose KV
+// host tier granules are pinned host memory. The lendable prefix ends past the last page-major KV
+// plane.
 std::unique_ptr<EvictableKVPool> make_kv_arena(DeviceContext& device,
                                                const execution::Parameters& parameters,
                                                const SequencePlanImpl& plan, bool expert_loan) {
     const std::size_t granularity = EvictableKVPool::device_granularity(device);
+    if (plan.kv_host_pages != 0 &&
+        (granularity == 0 || plan.persistent.lendable_kv_end_bytes == 0)) {
+        throw std::invalid_argument(
+            "the KV host tier needs CUDA virtual memory management on the device");
+    }
     if (granularity == 0 || plan.persistent.lendable_kv_end_bytes == 0) { return nullptr; }
     const std::size_t lendable = plan.persistent.lendable_kv_end_bytes / granularity * granularity;
     std::size_t window = 0;
@@ -66,12 +109,15 @@ std::unique_ptr<EvictableKVPool> make_kv_arena(DeviceContext& device,
         // runs: every window then borrows the weight tail.
         window = pool->window_capacity_bytes() <= lendable ? pool->window_capacity_bytes() : 0;
     }
-    if (window == 0 && !expert_loan) { return nullptr; }
+    std::vector<std::size_t> host_granules;
+    if (plan.kv_host_pages != 0) { host_granules = kv_host_granules(plan, granularity); }
+    if (window == 0 && !expert_loan && host_granules.empty()) { return nullptr; }
     return std::make_unique<EvictableKVPool>(
         device, EvictableKVPool::Config{
                     .arena_bytes           = plan.persistent.bytes,
                     .lendable_prefix_bytes = plan.persistent.lendable_kv_end_bytes,
                     .window_capacity_bytes = window,
+                    .host_granules         = std::move(host_granules),
                 });
 }
 
@@ -280,7 +326,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       mtp_attention_window(plan.mtp_attention_window), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
       gumbel_sampling(plan.gumbel_sampling),
-      kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      kv_payload_bytes(plan.persistent.kv_payload_bytes), kv_host_pages(plan.kv_host_pages),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       kv_arena(make_kv_arena(device_in, parameters_in, plan,
                              expert_runtime && expert_runtime->elastic() && device_in.size() == 1)),
@@ -299,9 +345,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
       experts(std::move(expert_runtime)),
-      round_host(plan.causal_scoring
-                     ? std::nullopt
-                     : std::make_optional<PinnedHostBuffer>(kMaximumConcurrency * sizeof(TokenId))),
+      round_host(plan.causal_scoring ? std::nullopt
+                                     : std::make_optional<PinnedHostBuffer>(
+                                           std::size_t(plan.max_concurrency) * sizeof(TokenId))),
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreMaximumTile * sizeof(float))
                                               : std::nullopt),
@@ -389,6 +435,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     };
 
     decoder = std::make_unique<qwen3_5::DecoderState>(backings, plan.persistent.decoder);
+    if (plan.kv_host_pages != 0) {
+        // Requests take device pages first; the tier's pages hold only what the device cannot.
+        for (DeviceKVPagePool* pool :
+             {&decoder->text_kv.page_pool(),
+              decoder->mtp_kv ? &decoder->mtp_kv->page_pool() : nullptr}) {
+            if (pool != nullptr) {
+                pool->set_host_tier(pool->capacity_pages() - plan.kv_host_pages);
+            }
+        }
+    }
     text_host_kv_page_stride =
         plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()).page_stride;
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
@@ -455,6 +511,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         stop_hold_slots_ >= static_cast<std::uint32_t>(state_images->slot_count())) {
         throw std::logic_error("Qwen3.5 StateImage pool does not cover its stop-string holds");
     }
+    stop_hold_free_ = stop_hold_slots_ >= 64U ? ~0ULL : (1ULL << stop_hold_slots_) - 1ULL;
     const std::uint32_t catalog_state_slots =
         static_cast<std::uint32_t>(state_images->slot_count()) - stop_hold_slots_;
     const std::uint64_t logical_state_capacity =
@@ -1217,6 +1274,8 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_measured_bytes    = graph_measured_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+    out.kv_host_tier_bytes           = kv_arena ? kv_arena->host_bytes() : 0;
+    out.kv_host_tier_pages           = kv_host_pages;
     out.host_state_image_bytes       = state_images->host_layout().image_bytes;
     out.host_kv_page_group_bytes     = text_host_kv_page_stride;
     out.host_cache_budget_bytes      = context_cache.host_cache_budget_bytes.value_or(0);

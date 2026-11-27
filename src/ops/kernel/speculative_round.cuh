@@ -324,39 +324,58 @@ speculative_sparse_warp_accept(SamplingWorkspace workspace, const Logit* logits,
             }
         }
     } else {
-        const int n  = workspace.dist_support[a];
-        int token    = 0;
-        float weight = 0.0f;
-        if (lane < n) {
-            const int at = sampling_dist_offset(a, lane);
-            token        = workspace.dist_idx[at];
-            weight       = workspace.dist_prob[at];
-            if (a < extent) {
-                const int q_at = (row * k + a) * kSparseSpeculativeCandidates;
-                weight         = fmaxf(weight - speculative_sparse_probability(candidate_ids + q_at,
-                                                                               proposal_q + q_at, token),
-                                       0.0f);
-            }
-        }
-        float cdf = weight;
+        // Up to kSamplerCandidateCap (64) candidates, two per lane: ranks lane and lane + 32.
+        static_assert(kSamplerCandidateCap <= 64, "the residual draw holds two candidates per lane");
+        const int n = workspace.dist_support[a];
+        int token[2]     = {0, 0};
+        float weight[2]  = {0.0f, 0.0f};
+        float cdf[2]     = {0.0f, 0.0f};
+        float carry      = 0.0f;
 #pragma unroll
-        for (int offset = 1; offset < 32; offset *= 2) {
-            const float earlier = __shfl_up_sync(0xffffffffU, cdf, offset);
-            if (lane >= offset) cdf += earlier;
+        for (int half = 0; half < 2; ++half) {
+            const int rank = half * 32 + lane;
+            if (rank < n) {
+                const int at = sampling_dist_offset(a, rank);
+                token[half]  = workspace.dist_idx[at];
+                weight[half] = workspace.dist_prob[at];
+                if (a < extent) {
+                    const int q_at = (row * k + a) * kSparseSpeculativeCandidates;
+                    weight[half]   = fmaxf(weight[half] -
+                                               speculative_sparse_probability(
+                                                   candidate_ids + q_at, proposal_q + q_at, token[half]),
+                                           0.0f);
+                }
+            }
+            cdf[half] = weight[half];
+#pragma unroll
+            for (int offset = 1; offset < 32; offset *= 2) {
+                const float earlier = __shfl_up_sync(0xffffffffU, cdf[half], offset);
+                if (lane >= offset) cdf[half] += earlier;
+            }
+            cdf[half] += carry;
+            carry = __shfl_sync(0xffffffffU, cdf[half], 31);
         }
-        const float mass = __shfl_sync(0xffffffffU, cdf, 31);
+        const float mass = carry;
         const int purpose =
             a < extent ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus;
-        const float u           = sampling_uniform(cfg.seed, old_length + a + 1, purpose, 0);
-        const float goal        = u * mass;
-        const unsigned positive = __ballot_sync(0xffffffffU, lane < n && weight > 0.0f);
-        const unsigned candidates =
-            __ballot_sync(0xffffffffU, lane < n && weight > 0.0f && goal < cdf);
-        const int selected = !(mass > 0.0f) ? 0
-                             : candidates   ? __ffs(candidates) - 1
-                             : positive     ? 31 - __clz(positive)
-                                            : 0;
-        terminal           = __shfl_sync(0xffffffffU, token, selected);
+        const float u    = sampling_uniform(cfg.seed, old_length + a + 1, purpose, 0);
+        const float goal = u * mass;
+        unsigned positive[2];
+        unsigned candidates[2];
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const bool live    = half * 32 + lane < n && weight[half] > 0.0f;
+            positive[half]     = __ballot_sync(0xffffffffU, live);
+            candidates[half]   = __ballot_sync(0xffffffffU, live && goal < cdf[half]);
+        }
+        const int selected = !(mass > 0.0f)  ? 0
+                             : candidates[0] ? __ffs(candidates[0]) - 1
+                             : candidates[1] ? 32 + __ffs(candidates[1]) - 1
+                             : positive[1]   ? 32 + 31 - __clz(positive[1])
+                             : positive[0]   ? 31 - __clz(positive[0])
+                                             : 0;
+        terminal           = __shfl_sync(0xffffffffU, selected < 32 ? token[0] : token[1],
+                                         selected & 31);
         // mass is the residual probability the selection drew from, and the stochastic branch does
         // write dist_prob, so this one is real. A NaN column makes mass NaN, and `!(mass > 0.0f)`
         // above already forces `selected` to 0 -- committing lane 0's token would be exactly the
@@ -428,8 +447,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_draf
     __shared__ float cand_val[kSamplerCandidateCap];
     __shared__ int cand_idx[kSamplerCandidateCap];
     __shared__ float prob[kSamplerCandidateCap];
-    __shared__ float merge_val[kSamplerBlock * kSamplerFastCandidates];
-    __shared__ int merge_idx[kSamplerBlock * kSamplerFastCandidates];
+    __shared__ SamplingBlockTopKStorage block_storage;
     __shared__ int n_support;
     __shared__ int a_sh;
     __shared__ int done_sh;
@@ -519,9 +537,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_draf
             sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val, red_idx,
                                            cand_val, cand_idx, prob, &n_support, row_drafts, i);
         } else {
-            sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg, merge_val,
-                                                merge_idx, cand_val, cand_idx, prob, &n_support,
-                                                row_drafts, i);
+            sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg,
+                                                block_storage, cand_val, cand_idx, prob,
+                                                &n_support, row_drafts, i);
         }
         // The loop leaves at the barrier below once the row is decided, so no thread reads the
         // shared flag here while thread 0 may be writing it.
@@ -691,13 +709,12 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
 
-    __shared__ SamplingTileTopKStorage topk_storage;
+    __shared__ SamplingMergeStorage merge_storage;
     __shared__ float cand_val[kSamplerCandidateCap];
     __shared__ int cand_idx[kSamplerCandidateCap];
     __shared__ float prob[kSamplerCandidateCap];
     __shared__ int n_support;
     __shared__ int is_last_group;
-    unsigned long long keys[kSamplerGroupItemsPerThread];
 
     const int cap = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     // The preceding partial launch initializes all caller-owned counters. CUDA
@@ -707,20 +724,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     int group_partials    = partial_blocks - group_begin;
     if (group_partials < 0) { group_partials = 0; }
     if (group_partials > kSamplerPartialsPerGroup) { group_partials = kSamplerPartialsPerGroup; }
-    const int group_n = group_partials * cap;
-#pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int p = item * blockDim.x + tid;
-        if (p < group_n) {
-            const int partial = group_begin + p / cap;
-            const int j       = p - (p / cap) * cap;
-            const int off     = sampling_partial_offset(workspace, col, partial, j);
-            keys[item]        = workspace.partial_keys[off];
-        } else {
-            keys[item] = 0ull;
-        }
-    }
-    sampling_store_tile_topk(keys, cap, workspace, col, partial_blocks + group, topk_storage);
+    sampling_merge_workspace_lists(workspace, col, group_begin, group_partials, cap,
+                                   merge_storage);
+    sampling_store_merged(workspace, col, partial_blocks + group, cap, merge_storage);
     __syncthreads();
 
     if (tid == 0) {
@@ -731,27 +737,11 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     __syncthreads();
     if (!is_last_group) { return; }
 
-    const int final_n = group_count * cap;
-#pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int p = item * blockDim.x + tid;
-        if (p < final_n) {
-            const int partial = partial_blocks + p / cap;
-            const int j       = p - (p / cap) * cap;
-            const int off     = sampling_partial_offset(workspace, col, partial, j);
-            keys[item]        = workspace.partial_keys[off];
-        } else {
-            keys[item] = 0ull;
-        }
-    }
-    sampling_store_tile_topk(keys, cap, workspace, col, partial_blocks + group, topk_storage);
-    __syncthreads();
-
+    sampling_merge_workspace_lists(workspace, col, partial_blocks, group_count, cap,
+                                   merge_storage);
     if (tid < cap) {
-        const int off = sampling_partial_offset(workspace, col, partial_blocks + group, tid);
-        const unsigned long long key = workspace.partial_keys[off];
-        cand_val[tid]                = sampling_key_float(key);
-        cand_idx[tid]                = sampling_key_index(key);
+        cand_val[tid] = sampling_key_float(merge_storage.merged[tid]);
+        cand_idx[tid] = sampling_key_index(merge_storage.merged[tid]);
     }
     __syncthreads();
 

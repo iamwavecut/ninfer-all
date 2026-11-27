@@ -574,7 +574,7 @@ enum class AssistantInputPhase {
 
 [[noreturn]] void invalid_assistant_history(std::size_t index, std::string message) {
     bad_request("input Item " + std::to_string(index) + " " + std::move(message) +
-                    "; supported assistant Item order is reasoning, message content, then "
+                    "; supported assistant Item order is reasoning and message content, then "
                     "function calls",
                 "input", "invalid_assistant_history");
 }
@@ -589,9 +589,12 @@ struct AssistantInputRun {
             phase                  = AssistantInputPhase::Reasoning;
             return;
         case AssistantInputPhase::Reasoning:
-            invalid_assistant_history(index, "reasoning cannot follow another reasoning Item");
         case AssistantInputPhase::Content:
-            invalid_assistant_history(index, "reasoning cannot follow assistant message content");
+            // A response whose model reasoned after its content streams a reasoning Item after the
+            // message (and content after that in another message): the Items return its reasoning
+            // and its content in pieces, which join in order, as the response's own texts did.
+            turn.reasoning_content += reasoning;
+            return;
         case AssistantInputPhase::Calls:
             if (!lenient_) {
                 invalid_assistant_history(index, "reasoning cannot follow function_call Items");
@@ -1413,16 +1416,14 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     }
 
     if (const std::optional<double> temperature = optional_number(body, "temperature")) {
-        if (*temperature < 0.0 || *temperature > 2.0) {
-            bad_request("temperature must be in [0,2]", "temperature");
-        }
+        if (*temperature < 0.0) { bad_request("temperature must not be negative", "temperature"); }
         out.prompt.generation.sampling.temperature = *temperature;
     }
     if (const std::optional<double> top_p = optional_number(body, "top_p")) {
         if (*top_p < 0.0 || *top_p > 1.0) { bad_request("top_p must be in [0,1]", "top_p"); }
         out.prompt.generation.sampling.top_p = *top_p;
     }
-    out.prompt.generation.post_thinking = parse_post_thinking(body, 2.0);
+    out.prompt.generation.post_thinking = parse_post_thinking(body);
     if (const std::optional<int> max_output = optional_int(body, "max_output_tokens")) {
         if (*max_output < 0) {
             bad_request("max_output_tokens must be non-negative", "max_output_tokens");

@@ -341,11 +341,11 @@ void test_tool_calls() {
     }
 }
 
-// Flint's role and reasoning markers as special tokens after the 256 bytes.
-constexpr std::array<std::string_view, 9> kMarkers = {
-    "<|begin_of_text|>", "<|end_of_text|>", "<|system|>", "<|user|>",   "<|assistant|>",
-    "<|observation|>",   "<think>",         "</think>",   "<|developer|>"};
-constexpr int kEosId = 257, kThinkOpenId = 262, kThinkCloseId = 263;
+// Flint's role, reasoning and call-opening markers as special tokens after the 256 bytes.
+constexpr std::array<std::string_view, 10> kMarkers = {
+    "<|begin_of_text|>", "<|end_of_text|>", "<|system|>",    "<|user|>",   "<|assistant|>",
+    "<|observation|>",   "<think>",         "</think>",      "<|developer|>", "<tool_call>"};
+constexpr int kEosId = 257, kThinkOpenId = 262, kThinkCloseId = 263, kCallOpenId = 265;
 
 ninfer::models::qwen3_5::Frontend flint_frontend() {
     static const std::string chat = read_fixture("chat_template.jinja");
@@ -483,6 +483,52 @@ void test_thinking_control() {
     }
 }
 
+// A call the model opens before </think>: with tools declared the call ends the reasoning, as
+// </think> would, and becomes a structured call; without tools its markup stays in the reasoning.
+void test_call_in_open_thought() {
+    const auto frontend = flint_frontend();
+    for (const bool tools : {true, false}) {
+        ninfer::PromptInput input;
+        input.messages.push_back(
+            {.role  = ninfer::ChatRole::User,
+             .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "Weather?"}}});
+        input.options.continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
+        if (tools) {
+            input.options.tool_jsons = {
+                R"({"type":"function","function":{"name":"get_weather","parameters":)"
+                R"({"type":"object","properties":{"city":{"type":"string"}}}}})"};
+        }
+        const auto prompt = frontend.prepare(std::move(input));
+        auto session      = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+        std::string reasoning, content;
+        auto tokens = tokens_of({kThinkOpenId}, "Plan");
+        for (const ninfer::TokenId id :
+             tokens_of({kCallOpenId},
+                       "get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>")) {
+            tokens.push_back(id);
+        }
+        tokens.push_back(kEosId);
+        (void)session.preview_model(tokens, 256, ninfer::FinishReason::OutputLimit);
+        for (const ninfer::OutputDelta& delta : session.commit_preview()) {
+            (delta.channel == ninfer::OutputChannel::Reasoning ? reasoning : content) += delta.text;
+        }
+        const auto calls = session.take_tool_calls();
+        if (tools) {
+            expect(reasoning == "Plan" && content.empty() && calls.size() == 1 &&
+                       calls[0].name == "get_weather" &&
+                       Json::parse(calls[0].arguments_json) == Json({{"city", "Oslo"}}),
+                   "a call before </think> ends the reasoning: reasoning '" + reasoning +
+                       "', content '" + content + "', calls " + std::to_string(calls.size()));
+        } else {
+            expect(reasoning.starts_with("Plan") &&
+                       reasoning.find("get_weather<arg_key>") != std::string::npos &&
+                       content.empty() && calls.empty(),
+                   "without tools the markup stays reasoning: reasoning '" + reasoning + "'");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -492,6 +538,7 @@ int main() {
         test_chat_template();
         test_tool_calls();
         test_thinking_control();
+        test_call_in_open_thought();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         return 1;

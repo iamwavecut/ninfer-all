@@ -1,6 +1,7 @@
 #include "core/device.h"
 #include "core/device_buffer.h"
 #include "core/host_kv_arena.h"
+#include "core/kv_loan.h"
 #include "core/paged_kv_cache.h"
 #include "core/pinned_memory.h"
 #include "cuda_availability.h"
@@ -216,6 +217,44 @@ int exercise_page_lending(ninfer::DeviceContext& context) {
         pool.lend_pages(14, 4);
     } catch (const std::out_of_range&) { outside_rejected = true; }
     failures += expect(outside_rejected, "a loan past the pool is rejected");
+    return failures;
+}
+
+// A KV host tier's pages are the pool's highest. Device pages fill first even where only host
+// pages offer a contiguous run, host pages serve what the device cannot, and a loan (which lends
+// device memory) never reaches them.
+int exercise_host_tier(ninfer::DeviceContext& context) {
+    (void)context;
+    int failures = 0;
+    ninfer::KVPageGeometry geometry{.planes = {{ninfer::DType::I8, 8, 2, 256}}};
+    PlannedCache plan = plan_cache(16, 16, 1, geometry);
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    failures += expect_size(pool.device_page_limit(), 16, "a pool without a tier is all device");
+    pool.set_host_tier(8);
+    failures += expect_size(pool.device_page_limit(), 8, "the tier starts at its first host page");
+
+    std::vector<ninfer::DeviceKVPageLease> first = materialize(pool, 8);
+    failures += expect(pool.free_runs().size() == 1 && pool.free_runs()[0].begin == 8,
+                       "the first eight pages were not the device pages");
+    // Free every other device page: the device keeps four single free pages, the tier one run.
+    for (std::size_t index = 1; index < first.size(); index += 2) { first[index].release(); }
+    failures += expect_size(ninfer::device_free_runs(pool).size(), 4,
+                            "a loan sees the four free device pages");
+    std::vector<ninfer::DeviceKVPageLease> second = materialize(pool, 4);
+    failures += expect(pool.free_runs().size() == 1 && pool.free_runs()[0].begin == 8 &&
+                           pool.free_runs()[0].count == 8,
+                       "a contiguous host run was taken while device pages were free");
+    failures += expect(ninfer::device_free_runs(pool).empty(), "a loan reached host pages");
+    std::vector<ninfer::DeviceKVPageLease> third = materialize(pool, 2);
+    failures += expect(pool.free_runs().size() == 1 && pool.free_runs()[0].begin == 10,
+                       "host pages did not serve what the device could not");
+
+    bool past_rejected = false;
+    try {
+        pool.set_host_tier(17);
+    } catch (const std::invalid_argument&) { past_rejected = true; }
+    failures += expect(past_rejected, "a host tier past the pool was accepted");
     return failures;
 }
 
@@ -651,6 +690,7 @@ int main() {
         ninfer::DeviceContext context(0);
         int failures = exercise_reservation_and_mapping(context);
         failures += exercise_page_lending(context);
+        failures += exercise_host_tier(context);
         failures += exercise_republish_while_copy_queued(context);
         failures += exercise_layout_and_transfer(
             context,

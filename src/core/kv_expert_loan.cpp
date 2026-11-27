@@ -59,8 +59,7 @@ std::uint64_t KvExpertLoan::lend(std::uint32_t minimum_pages) {
         const std::uint32_t free = pool.pages->unpromised_free_pages();
         std::uint32_t spare      = free > pool.keep ? (free - pool.keep) / unit * unit : 0;
         if (spare == 0 || spare < minimum_pages) { continue; }
-        const std::span<const KVPageRun> runs = pool.pages->free_runs();
-        const std::vector<KVPageRun> candidates(runs.begin(), runs.end());
+        const std::vector<KVPageRun> candidates = device_free_runs(*pool.pages);
         for (auto run = candidates.rbegin(); run != candidates.rend() && spare != 0; ++run) {
             const std::uint32_t length = std::min(run->count, spare) / unit * unit;
             if (length == 0) { continue; }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/expert_route_bias.h"
+
 // The routed experts a layer's call needs but its device cache lacks, served while the cached ones
 // run. After a layer's routing a kernel splits its pairs: the cached ones run at once from the
 // device tables.
@@ -55,7 +57,10 @@ struct MissLayer {
         std::int32_t rows         = 0;
         std::int32_t k            = 0;
         std::int64_t expert_bytes = 0;
-        std::vector<const void*> host;           // host experts: each expert's bytes in RAM
+        std::vector<const void*> host;           // host experts: each expert's CPU-readable bytes
+        // Device-readable aliases for host experts when host registration yields distinct VAs.
+        // Empty keeps the existing behavior for cudaHostAlloc buffers and test fixtures.
+        std::vector<const void*> device;
         std::span<const ExpertLocation> located; // disk experts: where each expert's bytes are
     };
     std::array<Projection, 3> projections;   // gate, up, down
@@ -178,6 +183,9 @@ public:
     void raise_failure();
     // The layer's cached blocks changed (the cache grew); the device copy the kernels read follows.
     void set_resident(std::size_t layer, const ExpertCache::Ranges& resident);
+    // The route bias `bias` toward layer `layer`'s experts in its cached blocks (the gate table's
+    // entries in the device ranges set_resident keeps).
+    [[nodiscard]] ExpertRouteBias route_bias(std::size_t layer, float bias) const;
     [[nodiscard]] MissStats stats() const;
     [[nodiscard]] bool cpu_enabled() const noexcept;
     // With a CPU share: its threads and vector backend, e.g. "15 pinned threads, avx2"; else

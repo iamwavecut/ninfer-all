@@ -39,7 +39,9 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   target verifies them in one pass and every token it keeps is its own sample, so the output is
   what plain decoding produces. See [below](#speculative-decoding-with-the-assistant). With
   `--gumbel-sampling` a sampled request drafts the assistant's own draws
-  ([coupled draws](cli.md#speculative-decoding)).
+  ([coupled draws](cli.md#speculative-decoding)). The 31B also drafts with z-lab-layout DFlash and
+  DSpark drafters converted into its artifact (`--spec dflash`, `--spec dspark`; see
+  [below](#dflash-and-dspark-drafters-for-the-31b)).
 - **Images and video.** The release's vision tower (27 blocks of width 1152) turns each picture or
   video frame into soft tokens in the prompt, on the GPU, streamed from pinned host memory, or on
   CPU threads (`--vision-residency`); see [below](#images-and-video).
@@ -49,9 +51,17 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   output, tool calls in Gemma's
   `<|tool_call>call:NAME{...}<tool_call|>` form returned as OpenAI tool calls (a forced
   `tool_choice` ends the generation prompt with Gemma's own opener, `<|tool_call>call:NAME{`, so
-  the model continues with the arguments; see [forced selection](serving.md#function-tools)),
+  the model continues with the arguments; see [forced selection](serving.md#function-tools); a
+  call the model opens before it closes its thought ends the thought and is returned as a call),
   streaming, reasoning in its own channel when thinking is on, and causal scoring
   (`ninfer-perplexity`).
+- **Tool history.** An assistant message with both text and `tool_calls` renders its text before
+  the calls, the order the model writes them in, and the model turn stays open after the tool
+  response. The release's template alone writes that text after the response and closes the turn,
+  so the next generation starts without a `<|turn>model` header and the answer opens with a stray
+  `thought` line. NInfer gives the template such a message as two messages of one turn; the
+  template itself is the release's. With `preserve_thinking`, a message with reasoning that a later
+  user message follows is left whole. Argument keys the model wraps in plain quotes lose them.
 - **Dependent launches.** On sm_90 and newer cards the decode graph launches each kernel as a
   programmatic dependent of the one before it
   ([programmatic dependent launch](maintainer/op-development.md#programmatic-dependent-launch)).
@@ -67,8 +77,8 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   closes the channel with Qwen's early-close guidance and `<channel|>`, masks `<|channel>` for the
   rest of the response, and the model answers. `--reasoning-loop conclude` closes it the same way
   ([Serving](serving.md#openai-chat-completions)).
-- **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with
-  top-k held at the sampler's 20 candidates.
+- **Sampling defaults.** The release's `generation_config.json`: temperature 1.0, top-k 64, top-p
+  0.95.
 
 Not built for this family: DFlash and ngram copy drafts, pipeline stages over several GPUs, and of
 the context cache the shared paged KV pool. Several GPUs divide
@@ -105,6 +115,24 @@ python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf \
 ```
 
 The conversion takes under three minutes and writes one 14.5 GB `.ninfer` file.
+
+The stored `tokenizer.json` carries Google's glitch-token remediation. The Gemma 4 releases share
+one tokenizer, and Google patched it in E2B, E4B and 12B
+([E2B-it #51](https://huggingface.co/google/gemma-4-E2B-it/discussions/51),
+[E4B-it #50](https://huggingface.co/google/gemma-4-E4B-it/discussions/50),
+[12B-it #55](https://huggingface.co/google/gemma-4-12B-it/discussions/55)) but not in 26B-A4B or
+31B: tokens whose embeddings collapsed to nearly one vector (`CYCLONEDB`, `drawingCodehint`) lose
+the BPE merges that build them, so their text encodes as trained subwords, and the one
+single-character token among them, `𡉺`, becomes `<glitch_pruned_249788>`, so the character falls
+back to its UTF-8 bytes. The converter applies the union of the three patches
+([`gemma4_glitch_tokens.json`](../tools/convert/gemma4_glitch_tokens.json): 298 merges of 260
+tokens and the one renamed token); applying one patch's list alone reproduces Google's file for that
+model byte for byte. In the 26B-A4B and 31B QAT token tables these 261 tokens sit in the same
+cluster: their cosine to its centroid is 0.869 to 0.999 (median 0.981 and 0.998), against a median of
+0.155 and 0.076 for random tokens. Token ids and the vocabulary stay; 257 of the 261 strings now
+encode differently (the other 4 were already encoded through other tokens), and 2.27 million tokens
+of WikiText, C++ and Markdown encode exactly as before. The artifact's provenance records the edit
+(`resource_edits`).
 
 The assistant joins as the artifact's `mtp` component from a llama.cpp `gemma4-assistant` GGUF.
 The QAT model takes the QAT assistant (Google's model card: a QAT target needs a QAT drafter);
@@ -250,7 +278,8 @@ The startup check counts everything that grows with the context or the sequences
 checkpoints, the prompt chunk's derived keys, F16 values and full-attention mask) and keeps 1.5 GiB
 for the rest of the workspace and the CUDA graphs. A card without that room (a 16 GB one with the
 assistant or the vision tower) prefills in 1,024- or 512-token chunks instead: the check then keeps
-512 MiB, and the chunk's planned workspace with 320 MiB beside it must fit what the caches leave.
+512 MiB, and the chunk's planned workspace with 320 MiB for the CUDA graphs beside it (64 MiB for
+kernel loading when the graphs are off) must fit what the caches leave.
 
 ### Quality and speed
 
@@ -405,6 +434,73 @@ A [DSpine](maintainer/dspine.md) drafter trained for this model can take the ass
 `--spec dspine --draft-model PATH --draft-tokens N` (1 to 7) loads it, and the assistant stays
 unloaded. Its rounds verify the same way, and `--draft-min-p P` verifies through the first draft
 whose confidence is at or below P. No DSpine drafter for Gemma 4 is published yet.
+
+### DFlash and DSpark drafters for the 31B
+
+The 31B artifact can also carry z-lab-layout block drafters as its `dflash` and `dspark`
+components ([DFlash](maintainer/dflash.md#gemma-4)): `--spec dflash --draft-tokens N` or
+`--spec dspark --draft-tokens N` (1 to 7) drafts with one of them in the assistant's place, and
+the output stays the one plain decoding gives. Both drafters have five layers over six of the
+target's 60 blocks and draft from one forward pass a round; `dspark` adds a Markov head that
+conditions each draft on the previous one. Converting the heretic 31B in mradermacher's i1-IQ4_XS
+GGUF with manateelazycat's heretic DFlash drafter and Hikari07jp's DSpark drafter (trained on the
+original 31B). The heretic release's chat template is an older copy of Google's, without its
+fixes for tool-calling turns, so the template comes from the 31B release:
+
+```bash
+hf download coder3101/gemma-4-31B-it-heretic config.json tokenizer.json tokenizer_config.json \
+  generation_config.json --local-dir models/gemma4-31b-heretic/hf
+hf download google/gemma-4-31B-it chat_template.jinja \
+  --revision 842da3794eaa0b77d5f08bae87a17459d91ff475 --local-dir models/gemma4-31b-heretic/hf
+hf download mradermacher/gemma-4-31B-it-heretic-i1-GGUF gemma-4-31B-it-heretic.i1-IQ4_XS.gguf \
+  --local-dir models/gemma4-31b-heretic
+hf download manateelazycat/Gemma-4-31B-IT-Heretic-Draft-DFlash config.json model.safetensors \
+  --local-dir models/gemma4-31b-heretic/dflash
+hf download Hikari07jp/DSpark-Gemma-4-31B-draft config.json model.safetensors \
+  --local-dir models/gemma4-31b-heretic/dspark
+
+python -m tools.convert --model models/gemma4-31b-heretic/hf --recipe gemma4_gguf \
+  --components text,dflash,dspark \
+  --source gguf=models/gemma4-31b-heretic/gemma-4-31B-it-heretic.i1-IQ4_XS.gguf \
+  --source dflash=models/gemma4-31b-heretic/dflash --source dspark=models/gemma4-31b-heretic/dspark \
+  --name Gemma-4-31B-it-heretic-i1-IQ4_XS-DFlash-DSpark --device cpu \
+  --out models/gemma-4-31B-it-heretic-i1-IQ4_XS-dflash-dspark.ninfer
+
+ninfer models/gemma-4-31B-it-heretic-i1-IQ4_XS-dflash-dspark.ninfer --prompt "..." \
+  --spec dspark --draft-tokens 3
+```
+
+The conversion takes 87 seconds and writes one 18.9 GiB file, published as
+[WaveCut/gemma-4-31B-it-heretic-i1-IQ4_XS-DFlash-DSpark-NInfer-v3](https://huggingface.co/WaveCut/gemma-4-31B-it-heretic-i1-IQ4_XS-DFlash-DSpark-NInfer-v3):
+the GGUF's blocks as stored and each drafter's projections as Q8_G32 rows (1.5 GiB each). A run
+loads only the drafter it names: the weights take 15.6 GiB on the GPU without one, 17.1 GiB with
+DFlash and 17.3 GiB with DSpark (its Markov tables), and the drafter's rings, features and
+workspace 245 MiB at `--max-context 4096`.
+
+Five greedy answers of up to 256 tokens from the `ninfer` CLI on an RTX 3090 (`--no-thinking
+--max-context 4096`, a CUDA 13.4 build); every speculative answer is byte for byte the plain one:
+
+| Decode tok/s | plain | dflash, 7 drafts | dspark, 7 | dflash, 3 | dspark, 3 |
+|---|---:|---:|---:|---:|---:|
+| Python function with doctests | 45.1 | 113.3 | 111.8 | 95.3 | 100.3 |
+| Explanation of RoPE | 45.1 | 53.3 | 56.3 | 68.2 | 69.7 |
+| Translation into French and German | 45.3 | 48.2 | 46.7 | 58.5 | 56.4 |
+| Short story in Russian | 45.1 | 30.7 | 30.6 | 40.1 | 40.1 |
+| First 25 primes and their sum | 45.1 | 154.3 | 161.0 | 108.1 | 109.6 |
+
+A round costs about 47 ms with 7 drafts and 36 ms with 3, against 22 ms for one plain step: the
+target verifies 8 or 4 rows of IQ4_XS blocks in one pass. Seven drafts pay on code and other
+predictable text (5.2 to 7.5 tokens a round); on English prose the drafters keep 2.0 to 2.7
+tokens a round, where three drafts are faster. Both drafters were trained on English-heavy data:
+on the Russian story they keep 1.44 tokens a round, and plain decoding is faster. Five drafts fall
+between (dflash: 99.8, 58.7, 51.9, 33.1 and 130.3 tok/s in the table's order). With `--spec
+dspark`, `--draft-min-p P` ends a round after its first draft whose confidence is at or below P:
+at P 0.3 and 7 drafts the explanation decodes at 59.8 tok/s and the Russian story at 37.6, the
+others as without it. The command line refuses `--draft-min-p` with `--spec dflash`, and Gemma 4
+refuses `--draft-confidence` and `--draft-experts`, the DSpark options of DeepSeek-V4.1 and
+Inkling 2. Through `ninfer-serve`, a request with a tool and the follow-up after the tool's
+response return the same call and the same answer with `--spec none` and with either drafter at 3
+and 7 drafts.
 
 Ten chat requests one at a time to `ninfer-serve` (code in Python and C++, an explanation, a
 summary of a 1,000-token source excerpt, a factual question, a translation, a math word problem, a
@@ -630,7 +726,7 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   the BF16 middle quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same
   2^-32 fixed-point sums ([the CPU share](qwen3-8-flash-next.md#the-cpu-share) describes the
   arithmetic), so outputs do not depend on the split. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K,
-  IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
+  IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
   layers copy every miss.
   An expert the CPU computed takes no slot; the cache's rounds decide whether it enters.
   Flash-Next's CPU share also covers the missing experts with at most eight pairs in calls of 9 to
@@ -648,12 +744,12 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   chunk's derived keys, F16 values and mask are backed only as far as their sequences reach (in
   256-position tiles, on devices with CUDA virtual memory management), and the cache takes the rest
   of the device. When the next positions need memory the device lacks beside its 320 MiB graph
-  reserve, the cache gives slots back: it keeps its most routed experts, moved by device copies into
-  the slots that stay, and the others leave. A reset sequence's rows go back to the device, and the
-  cache takes what is free beyond 256 MiB of headroom for the next positions. Startup still checks
-  that every sequence's whole context fits beside the layer banks, so a context never runs out of
-  memory: the cache can shrink to no slots. An explicit `--expert-cache-mib` and device experts keep
-  the whole KV allocated.
+  reserve (64 MiB for kernel loading when the graphs are off), the cache gives slots back: it keeps
+  its most routed experts, moved by device copies into the slots that stay, and the others leave. A
+  reset sequence's rows go back to the device, and the cache takes what is free beyond 256 MiB of
+  headroom for the next positions. Startup still checks that every sequence's whole context fits
+  beside the layer banks, so a context never runs out of memory: the cache can shrink to no slots.
+  An explicit `--expert-cache-mib` and device experts keep the whole KV allocated.
 
 On an RTX 4090 (450 W, PCIe 4.0 x16, CUDA 12.8) with the QAT artifact, host experts, four sequences
 of 131,072 positions and three drafts a round, 2026-10-20: commit `5ed86dff9`, which reserves every

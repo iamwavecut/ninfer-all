@@ -234,6 +234,10 @@ public:
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
+    [[nodiscard]] const void* pinned_device_alias(const void* data, std::size_t bytes) const {
+        return backing_.pinned_device_alias(data, bytes);
+    }
+
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
 
     // The weight's one mathematical use, as a projection operand, its auxiliaries on the weight's

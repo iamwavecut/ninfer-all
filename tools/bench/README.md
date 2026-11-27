@@ -235,6 +235,36 @@ python3 tools/bench/refbench.py --base-url http://127.0.0.1:8080 --model bonsai2
 
 Rows land in `<out>/<suite>.jsonl`; a rerun skips the keys already there.
 
+## Request bursts (`serve_load.py`)
+
+`serve_load.py` sends N streaming requests at once to one running `ninfer-serve` for each N of
+`--clients` and writes one row per N to `<out>/<profile>.jsonl`. It needs only the standard
+library. Every request is greedy with thinking off, starts with a nonce and ignores EOS, so each
+answer has exactly `--max-tokens` tokens (`--natural-eos` lets answers end). The profiles:
+
+| `--profile` | Requests |
+|---|---|
+| `chat` | a short prompt of about 60 tokens |
+| `history` | a document of `--prompt-tokens` per client, sent once to warm its session, then again with a question |
+| `document` | a new document of `--prompt-tokens` per client and a question |
+| `prefix` | one shared system prompt of `--prompt-tokens` and a different short question per client |
+
+Each row holds the burst's total tok/s (generated tokens over its wall time) and `steady_tps`, the
+rate while all N streams decode at once (from the latest first token to the earliest last token),
+with `round_ms = 1000 N / steady_tps`, the round time t(N) of N rows. It also holds TTFT and
+inter-token gaps (p50, p99, maximum), each request's decode rate, finish reasons, prompt and cached
+tokens, the device memory peak and the server's `ninfer:` metrics after the burst.
+
+```bash
+python3 tools/bench/serve_load.py --base-url http://127.0.0.1:8080 --out results/c64 \
+  --profile chat --clients 1,2,4,8,16,32,64 --max-tokens 512
+python3 tools/bench/serve_load.py --out results/c64 --profile prefix --clients 64 \
+  --prompt-tokens 2048 --max-tokens 32 --corpus eval/corpora/perplexity-1m/data/wikitext/00.txt
+```
+
+A server needs `--max-pending-requests` of at least N minus `--max-concurrency` to queue the whole
+burst instead of answering HTTP 429.
+
 ## Chat decode A/B (`run_chat_decode.py`)
 
 Decode rate on a chat prompt set through `ninfer-serve`'s OpenAI Chat Completions endpoint,

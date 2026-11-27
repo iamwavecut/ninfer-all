@@ -1,10 +1,12 @@
 #include "runtime/engine/model_instance.h"
 
 #include "core/vmm.h"
+#include "core/mapped_host_copy.h"
+#include "core/host_memory.h"
+#include "artifact/materializer.h"
 #include "calibration/device_calibration.h"
 #include "calibration/route_catalog.h"
 #include "core/arena.h"
-#include "core/mapped_host_copy.h"
 #include "ops/common/device_route.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/device_profile.h"
@@ -26,6 +28,7 @@
 #include "runtime/contract/rope_scaling.h"
 
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <cmath>
 #include <filesystem>
@@ -92,7 +95,8 @@ void validate_options(const EngineOptions& options) {
         }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+        throw std::invalid_argument("Engine max_concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "]");
     }
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
@@ -120,6 +124,21 @@ void validate_options(const EngineOptions& options) {
     if (options.cuda_graph_allowance_bytes != 0 && !options.use_cuda_graph) {
         throw std::invalid_argument(
             "Engine cuda_graph_allowance_bytes requires CUDA graphs to be enabled");
+    }
+    if (options.kv_host_tier.enabled()) {
+        // One device's arena; host-memory pages the device reads in place; and pinned host
+        // memory that host or disk experts would compete for.
+        if (options.devices.size() > 1 || options.tensor_parallel) {
+            throw std::invalid_argument("--kv-host-mib runs on one device");
+        }
+        if (options.expert_residency != ExpertResidency::Device) {
+            throw std::invalid_argument("--kv-host-mib requires --expert-residency device");
+        }
+        if (serialized_copy_queue()) {
+            throw std::invalid_argument(
+                "--kv-host-mib needs a native Linux driver: Windows and WSL2 charge pinned host "
+                "memory to the GPU's shared segment");
+        }
     }
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
@@ -284,6 +303,30 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
     return scoped;
 }
 
+// Past this many requests a request's Device KV lease is by default a bounded window of its output
+// (ContextCacheOptions::kv_lease_growth).
+constexpr std::uint32_t kLeaseGrowthDefaultConcurrency = 8;
+
+// The options of `options` at `concurrency` requests: the counts its normalization derived from
+// the request count follow it (the hybrid cache's lanes and its default snapshot slots, and a
+// default KV lease). The catalog keeps the capacities it was normalized with, which cover fewer
+// requests too.
+void adopt_concurrency(EngineOptions& options, std::uint32_t concurrency) {
+    options.max_concurrency    = concurrency;
+    ContextCacheOptions& cache = options.context_cache;
+    if (cache.enabled && !cache.kv_lease_growth) {
+        cache.kv_lease_growth = concurrency > kLeaseGrowthDefaultConcurrency;
+    }
+    if (!cache.enabled || cache.mode == ContextCacheMode::Hybrid) {
+        cache.max_private_continuations = concurrency;
+    }
+    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid &&
+        cache.hybrid.fit_device_snapshot_slots) {
+        cache.hybrid.device_snapshot_slots = std::min(concurrency, kDefaultCheckpointImages) + 2U;
+        cache.device_state_slots           = cache.hybrid.device_snapshot_slots;
+    }
+}
+
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
@@ -295,6 +338,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             throw std::invalid_argument("a CausalScoring Engine takes no prompt grafts");
         }
         options.max_concurrency      = 1;
+        options.max_concurrency_auto = false;
         options.max_pending_requests = 1;
         options.prefill_chunk        = 1024;
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
@@ -307,7 +351,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine purpose is invalid");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+        throw std::invalid_argument("Engine max_concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "]");
+    }
+    // An automatic count with a drafter looks no further than a speculative round's rows.
+    if (options.max_concurrency_auto && options.speculative.backend != SpeculativeBackend::None) {
+        options.max_concurrency = std::min(options.max_concurrency, kMaximumSpeculativeRows);
     }
     ContextCacheOptions& cache = options.context_cache;
     if (options.speculative.ngram_archive_bytes != 0 &&
@@ -327,6 +376,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("ngram draft widths above 15 require engine concurrency one");
     }
     const std::uint32_t concurrency = options.max_concurrency;
+    // An automatic count resolves its default lease with the count (adopt_concurrency).
+    if (cache.enabled && !options.max_concurrency_auto) {
+        cache.kv_lease_growth =
+            cache.kv_lease_growth.value_or(concurrency > kLeaseGrowthDefaultConcurrency);
+    }
     // Injected grafts stay resident for the life of the Engine, each in a StateImage and a
     // shared-prefix slot of its own, so the pools grow by that many beyond what requests use.
     const std::uint32_t direct_grafts = models::qwen3_5::count_direct_grafts(options.grafts);
@@ -377,15 +431,18 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         }
         const bool host_tier = cache.host_cache_auto || *cache.host_cache_budget_bytes != 0;
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
-        // One resident snapshot per request lane keeps every live conversation's latest
-        // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
-        // their Host copies are written, and one more keeps a shared prefix or another
-        // conversation's snapshot. A Host tier smaller than the conversations it serves cannot
-        // stand in for that slot: its images would take the slabs their blocks need.
+        // One resident snapshot per request lane, up to kDefaultCheckpointImages lanes, keeps
+        // every live conversation's latest endpoint restorable without PCIe traffic; one more slot
+        // stages taps and endpoints while their Host copies are written, and one more keeps a
+        // shared prefix or another conversation's snapshot. A Host tier smaller than the
+        // conversations it serves cannot stand in for that slot: its images would take the slabs
+        // their blocks need. Past kDefaultCheckpointImages lanes more snapshots would take the
+        // memory the requests' own states need, and the Host tier keeps the other conversations.
         // The default yields to a KV capacity that would not fit beside it (kv_capacity.cpp).
         hybrid.fit_device_snapshot_slots =
             hybrid.fit_device_snapshot_slots || !hybrid.device_snapshot_slots.has_value();
-        hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(concurrency + 2U);
+        hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(
+            std::min(concurrency, kDefaultCheckpointImages) + 2U);
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
         // Ladder taps are realized on prefill chunk boundaries, so the ladder never refines below
@@ -455,7 +512,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         return options;
     }
 
-    cache.device_state_slots = cache.device_state_slots.value_or(concurrency) + direct_grafts;
+    // Checkpoint images grow with the request count up to kDefaultCheckpointImages.
+    cache.device_state_slots =
+        cache.device_state_slots.value_or(std::min(concurrency, kDefaultCheckpointImages)) +
+        direct_grafts;
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
@@ -615,6 +675,22 @@ void install_device_route_profile_for(const EngineOptions& options, const Device
     }
 }
 
+void check_expert_route_bias(const EngineOptions& options) {
+    const float bias = options.hybrid_experts.route_bias;
+    if (!(bias >= 0 && bias <= 1)) {
+        throw std::invalid_argument("the expert route bias takes a finite value in 0..1");
+    }
+    if (bias == 0) { return; }
+    if (options.expert_residency == ExpertResidency::Device) {
+        throw std::invalid_argument("--expert-route-bias requires host or disk experts "
+                                    "(--expert-residency host|disk)");
+    }
+    if (options.tensor_parallel) {
+        throw std::invalid_argument("--expert-route-bias runs on one device: with "
+                                    "--tensor-parallel each device would route by its own cache");
+    }
+}
+
 bool ModelInstance::suspendable() const noexcept {
     return model->weights_suspendable() && program->device_state_suspendable();
 }
@@ -728,6 +804,29 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                             reader.directory().component("text").proposal.has_value();
         options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
     }
+    // Before the splits below, which size the head stage with the table where it will live. Only
+    // a pool that takes all free memory puts the table's device memory to use: automatic KV
+    // capacity with the hybrid prefix cache, whose pages no request holds are block cache, or
+    // the device cache of host or disk experts, which takes what automatic KV leaves
+    // (expert_admission.h). Any other automatic pool stops at --max-context per request. A draft
+    // step gathers its token's row over the bus on its round's critical path (MTP with 3 drafts
+    // decoded 0.15% to 0.39% slower), so drafting keeps the table on the device.
+    if (options.embedding_residency == EmbeddingResidency::Auto) {
+        const bool automatic_kv = options.kv_capacity.mode == KvCapacityMode::Automatic;
+        const bool kv_fills_memory =
+            automatic_kv &&
+            ((options.context_cache.enabled &&
+              options.context_cache.mode == ContextCacheMode::Hybrid) ||
+             (options.expert_residency != ExpertResidency::Device &&
+              options.expert_cache_bytes.value_or(1) != 0));
+        const bool drafts = options.speculative.backend != SpeculativeBackend::None ||
+                            options.speculative.lookup_ngram != 0;
+        options.embedding_residency =
+            kv_fills_memory && !drafts &&
+                    models::qwen3_5::host_embedding_suits(reader, models::load_options(options))
+                ? EmbeddingResidency::Host
+                : EmbeddingResidency::Device;
+    }
     // Without --tensor-split the first load takes default_tensor_split's shares. Only the loaded
     // model's planner knows what the Engine reserves on each device; a device left short of it
     // (or with room the estimate did not give it) loads the model again with the shares
@@ -819,13 +918,6 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
         instance = std::make_unique<ModelInstance>(std::move(model), options);
         frontend.complete();
-        // Where a device's copies queue behind one another whatever their streams
-        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for missing
-        // host or disk experts can hold the copies the graph queued after it ahead of the
-        // delivery's own, which end that wait. Eager passes wait on the host.
-        if (!instance->model->expert_sources().layers.empty() && serialized_copy_queue()) {
-            options.use_cuda_graph = false;
-        }
         planning.emplace(options.startup_observer, StartupPhase::TargetFinalize);
         overlay_window_bytes =
             models::qwen3_5::prepare_vision_overlay(instance->parameters, device, options);
@@ -903,6 +995,69 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         device.synchronize();
         options.tensor_split = std::move(*refit);
     }
+    // --max-concurrency auto: the most requests, up to the count asked for, whose recurrent states
+    // and one --max-context KV window each fit beside the weights (with an explicit KV capacity,
+    // whose windows it holds), the default hybrid snapshot slots yielding as they do to KV.
+    if (options.max_concurrency_auto) {
+        const auto extra_free = std::span<const std::size_t>(free_by_rank).subspan(1);
+        const std::uint32_t page_tokens = planner->capacity_curve().main_page_tokens;
+        const std::uint32_t context_pages =
+            (options.max_context + page_tokens - 1U) / page_tokens;
+        const std::uint64_t explicit_pages =
+            options.kv_capacity.mode == KvCapacityMode::Explicit
+                ? (std::uint64_t(options.kv_capacity.explicit_tokens) + page_tokens - 1U) /
+                      page_tokens
+                : std::numeric_limits<std::uint64_t>::max();
+        const auto fits = [&](std::uint32_t concurrency) {
+            if (std::uint64_t(concurrency) * context_pages > explicit_pages) { return false; }
+            EngineOptions trial = options;
+            adopt_concurrency(trial, concurrency);
+            const auto trial_planner = models::qwen3_5::make_sequence_planner(
+                instance->parameters, device,
+                artifact_scoped_disk_tier(trial, instance->model->info().artifact_id,
+                                          control_vectors_digest(instance->steering.get()),
+                                          instance->model->dspine() != nullptr
+                                              ? instance->model->dspine()->artifact_hex()
+                                              : std::string()),
+                graft_main_pages);
+            const auto& curve = trial_planner.capacity_curve();
+            std::vector<std::int64_t> spare =
+                kv_capacity_spare(options.kv_capacity, curve, concurrency * context_pages,
+                                  free_by_rank.front(), extra_free);
+            if (curve.state_slots_automatic) {
+                spare.front() += static_cast<std::int64_t>(
+                    std::uint64_t(curve.state_slots - curve.minimum_state_slots) *
+                    curve.bytes_per_state_slot);
+            }
+            return std::ranges::all_of(spare, [](std::int64_t bytes) { return bytes >= 0; });
+        };
+        std::uint32_t fitted = 1;
+        std::uint32_t last   = options.max_concurrency;
+        while (fitted < last) {
+            const std::uint32_t middle = fitted + (last - fitted + 1U) / 2U;
+            if (fits(middle)) {
+                fitted = middle;
+            } else {
+                last = middle - 1U;
+            }
+        }
+        const std::uint32_t asked = options.max_concurrency;
+        adopt_concurrency(options, fitted);
+        plan_sequences();
+        // The default snapshot slots yield afterwards (resolve_capacity), and say so.
+        const auto& curve = planner->capacity_curve();
+        constexpr double kMiB = 1024.0 * 1024.0;
+        publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Info,
+            "--max-concurrency auto: %u of %u requests fit in the %.1f MiB free after the "
+            "weights, each with %.1f MiB of state and %.1f MiB of KV (%u tokens)",
+            fitted, asked, static_cast<double>(free_by_rank.front()) / kMiB,
+            static_cast<double>(curve.bytes_per_state_slot) / kMiB,
+            static_cast<double>(std::uint64_t(context_pages) *
+                                curve.bytes_per_additional_main_page_group) /
+                kMiB,
+            options.max_context);
+    }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
         {.hardware_class =
@@ -958,7 +1113,93 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             plan_sequences();
         }
     };
+    // KV host tier: the pool continues past the device into pinned host memory. Free memory is
+    // raised by the tier's host bytes less what each KV plane may keep of its host pages on the
+    // device (two partial granules at most), so a plan of M pages keeps no more than the device
+    // holds once its last kv_host_pages pages are host memory.
+    std::uint32_t kv_host_pages  = 0;
+    std::uint64_t kv_device_pages = 0;
+    if (options.kv_host_tier.enabled()) {
+        const auto shape              = planner->host_tier_shape();
+        const auto& curve             = planner->capacity_curve();
+        const std::size_t granularity = vmm::granularity(device.device);
+        const std::uint64_t step      = curve.bytes_per_additional_main_page_group;
+        if (shape.planes == 0 || granularity == 0 || step == 0 || step != shape.page_bytes) {
+            throw std::invalid_argument(
+                "--kv-host-mib needs one device with CUDA virtual memory management and no "
+                "full-attention draft layers");
+        }
+        const std::uint64_t slack    = 2ULL * granularity * shape.planes;
+        const std::uint64_t headroom = options.kv_capacity.mode == KvCapacityMode::Automatic
+                                           ? options.kv_capacity.automatic_headroom_bytes
+                                           : 0;
+        const std::uint64_t fixed    = headroom + slack + curve.minimum_device_reservation_bytes;
+        const std::uint64_t free     = free_by_rank.front();
+        if (free <= fixed - std::min<std::uint64_t>(fixed, curve.minimum_main_page_groups * step)) {
+            throw std::invalid_argument(
+                "--kv-host-mib: the device lacks room for the Program beside its KV pages");
+        }
+        // Main pages the device holds beside the slack: what stays device memory.
+        const std::int64_t device_pages =
+            static_cast<std::int64_t>(curve.minimum_main_page_groups) +
+            (free >= fixed ? static_cast<std::int64_t>((free - fixed) / step)
+                           : -static_cast<std::int64_t>((fixed - free + step - 1) / step));
+        const std::uint64_t context_pages =
+            (std::uint64_t(options.max_context) + curve.main_page_tokens - 1U) /
+            curve.main_page_tokens;
+        std::uint64_t budget_pages = 0;
+        if (options.kv_host_tier.automatic) {
+            // Pinned host memory left once the hybrid cache's Host tier and the media caches
+            // have theirs, less the headroom every pinned allocation keeps.
+            const std::optional<std::uint64_t> available = available_host_memory_bytes();
+            if (!available) {
+                throw std::runtime_error(
+                    "--kv-host-mib auto needs the host's available memory, which this platform "
+                    "does not report; give the tier in MiB");
+            }
+            std::uint64_t taken = artifact::kPinnedHeadroomBytes +
+                                  options.context_cache.host_cache_budget_bytes.value_or(0) +
+                                  (options.enable_vision ? std::uint64_t(options.media_cache_bytes) +
+                                                               options.media_live_bytes
+                                                         : 0U);
+            budget_pages = *available > taken ? (*available - taken) / step : 0;
+        } else {
+            budget_pages = options.kv_host_tier.bytes / step;
+        }
+        std::uint64_t target_pages =
+            options.kv_capacity.mode == KvCapacityMode::Explicit
+                ? (std::uint64_t(options.kv_capacity.explicit_tokens) + curve.main_page_tokens -
+                   1U) / curve.main_page_tokens + curve.resident_main_pages
+            : options.kv_host_tier.automatic
+                ? context_pages * options.max_concurrency + curve.resident_main_pages
+                : static_cast<std::uint64_t>(std::max<std::int64_t>(device_pages, 0)) +
+                      budget_pages;
+        target_pages = std::min<std::uint64_t>(target_pages, curve.maximum_main_page_groups);
+        const std::uint64_t held = static_cast<std::uint64_t>(std::max<std::int64_t>(device_pages, 0));
+        if (target_pages > held) {
+            if (device_pages <= 0) {
+                throw std::invalid_argument(
+                    "--kv-host-mib: the device holds no KV page beside the Program");
+            }
+            const std::uint64_t host = std::min(target_pages - held, budget_pages);
+            if (host > 0) {
+                kv_host_pages   = static_cast<std::uint32_t>(host);
+                kv_device_pages = held;
+                free_by_rank.front() += host * step - slack;
+            }
+        }
+        if (kv_host_pages == 0) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "KV host tier: the device holds the pool, no host pages");
+        }
+    }
     auto resolution = resolve_capacity();
+    if (kv_host_pages != 0) {
+        // The pages beyond what the device holds: fewer when the pool's maximum capped the plan.
+        const std::uint64_t resolved = resolution.main_page_groups;
+        kv_host_pages = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            kv_host_pages, resolved > kv_device_pages ? resolved - kv_device_pages : 0));
+    }
     std::unique_ptr<models::qwen3_5::execution::NativeExpertRuntime> experts;
     if (!instance->model->expert_sources().layers.empty()) {
         // Price startup with the real allocations before the KV plan is finalized: the delivery
@@ -995,6 +1236,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             models::qwen3_5::execution::NativeExpertCpu{options.hybrid_experts.dma_share,
                                                         options.hybrid_experts.cpu_threads},
             ExpertDiskReads{options.hybrid_experts.mirror, options.hybrid_experts.direct});
+        experts->set_route_bias(options.hybrid_experts.route_bias,
+                                options.hybrid_experts.route_bias_prompts);
         if (const std::string cpu = experts->cpu_description(); !cpu.empty()) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                                "native experts: missing experts split between copies and %s (%s)",
@@ -1006,7 +1249,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                                           instance->model->storage_stats().device_capacity_bytes);
         resolution = resolve_capacity();
     }
-    auto sequence   = std::move(*planner).finalize(resolution.main_page_groups);
+    auto sequence = std::move(*planner).finalize(resolution.main_page_groups, kv_host_pages);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens ||
         !std::ranges::equal(sequence.extra_rank_reservation_bytes(),

@@ -528,6 +528,7 @@ The converter currently writes these formats:
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax`, `grouped_search` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
+| `mxfp8` | None: it stores exact values only | `import_encoded` (Inkling 2's exact BF16 expert banks) |
 
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `grouped_search` stores
 the same words but picks each group's scale from about seventy candidates by the rounding error

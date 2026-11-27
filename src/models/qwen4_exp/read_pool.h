@@ -18,7 +18,8 @@ namespace ninfer::models::qwen4_exp {
 
 class ReadPool {
 public:
-    explicit ReadPool(std::size_t threads);
+    // The name says which pool a misuse came from; nothing reads it otherwise.
+    explicit ReadPool(std::size_t threads, const char* name = "read pool");
     ~ReadPool();
     ReadPool(const ReadPool&)            = delete;
     ReadPool& operator=(const ReadPool&) = delete;
@@ -43,6 +44,7 @@ private:
     bool stop_             = false;
     std::exception_ptr failure_;
     std::vector<std::thread> workers_;
+    const char* name_;
 };
 
 } // namespace ninfer::models::qwen4_exp

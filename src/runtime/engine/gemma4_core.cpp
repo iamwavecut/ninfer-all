@@ -118,29 +118,44 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         vision_budget = models::qwen3_5::frontend::gemma_budget_at_most(
             options.vision_max_merged_tokens);
     }
-    // A speculative round verifies what the release's assistant proposes (--spec mtp) or what a
-    // standalone DSpine drafter does (--spec dspine --draft-model), where no context lookup
-    // matches (--lookup-ngram).
+    // A speculative round verifies what the release's assistant proposes (--spec mtp), what a
+    // standalone DSpine drafter does (--spec dspine --draft-model) or what the artifact's DFlash
+    // or DSpark drafter does (--spec dflash, --spec dspark), where no context lookup matches
+    // (--lookup-ngram). The last three are masked block drafters.
     const SpeculativeOptions& speculative = options.speculative;
     const bool mtp    = speculative.backend == SpeculativeBackend::Mtp;
     const bool dspine = speculative.backend == SpeculativeBackend::DSpine;
-    if (speculative.backend != SpeculativeBackend::None && !mtp && !dspine) {
-        throw std::invalid_argument("Gemma 4 drafts with its assistant (--spec mtp) or a DSpine "
-                                    "drafter (--spec dspine --draft-model)");
+    const bool dflash = speculative.backend == SpeculativeBackend::DFlash ||
+                        speculative.backend == SpeculativeBackend::DSpark;
+    const bool block  = dspine || dflash;
+    const char* spec  = mtp      ? "mtp"
+                        : dspine ? "dspine"
+                        : speculative.backend == SpeculativeBackend::DFlash ? "dflash"
+                                                                            : "dspark";
+    if (speculative.backend != SpeculativeBackend::None && !mtp && !block) {
+        throw std::invalid_argument("Gemma 4 drafts with its assistant (--spec mtp), a DSpine "
+                                    "drafter (--spec dspine --draft-model) or the artifact's "
+                                    "DFlash or DSpark drafter (--spec dflash, --spec dspark)");
     }
-    if ((mtp || dspine) && (speculative.draft_tokens == 0 || speculative.draft_tokens > 7)) {
-        throw std::invalid_argument(std::string("Gemma 4: --spec ") + (mtp ? "mtp" : "dspine") +
+    if ((mtp || block) && (speculative.draft_tokens == 0 || speculative.draft_tokens > 7)) {
+        throw std::invalid_argument(std::string("Gemma 4: --spec ") + spec +
                                     " requires --draft-tokens in [1,7]");
     }
-    if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine) ||
-        speculative.mtp_attention_window != 0 || speculative.ngram_archive_bytes != 0 ||
+    if ((speculative.draft_min_p.value_or(0.0F) != 0 && !block) ||
+        speculative.mtp_attention_window.value_or(0) != 0 || speculative.ngram_archive_bytes != 0 ||
         speculative.proposal_head == ProposalHead::Optimized ||
-        (speculative.proposal_head != ProposalHead::Auto && !dspine)) {
+        (speculative.proposal_head != ProposalHead::Auto && !block)) {
         throw std::invalid_argument("Gemma 4 has no n-gram archive, --mtp-attention-window or "
-                                    "proposal head, and --draft-min-p only with --spec dspine");
+                                    "proposal head, and --draft-min-p only with --spec dspine, "
+                                    "dflash or dspark");
     }
-    if (!mtp && !dspine && speculative.lookup_ngram != 0) {
-        throw std::invalid_argument("--lookup-ngram requires --spec mtp or --spec dspine");
+    if (speculative.draft_confidence || speculative.draft_experts) {
+        throw std::invalid_argument("Gemma 4 has no --draft-confidence or --draft-experts; "
+                                    "--draft-min-p sets a DSpark or DSpine round's floor");
+    }
+    if (!mtp && !block && speculative.lookup_ngram != 0) {
+        throw std::invalid_argument("--lookup-ngram requires --spec mtp, dspine, dflash or "
+                                    "dspark");
     }
     if (!mtp && speculative.mtp_policy == MtpDraftPolicy::Adaptive) {
         throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
@@ -157,6 +172,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
+    check_expert_route_bias(options);
     if (options.tensor_parallel ? device.size() < 2 : device.size() != 1) {
         throw std::invalid_argument("Gemma 4 runs on one device, or divides its routed experts "
                                     "over several with --tensor-parallel");
@@ -180,6 +196,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                                      .experts   = options.expert_residency,
                                      .expert_host_bytes = options.hybrid_experts.host_bytes};
     if (dspine) { load.dspine = speculative.draft_model; }
+    if (dflash) { load.dflash = spec; }
     // Expert parallelism: the routed experts divided over the devices, everything else on the
     // first. Without --tensor-split each device takes a share of its speed that fits beside what
     // it holds.
@@ -222,11 +239,13 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     executor.max_context   = options.max_context + 1;
     executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
     executor.cuda_graphs   = options.use_cuda_graph;
-    executor.draft_tokens  = mtp || dspine ? speculative.draft_tokens : 0;
-    executor.dspine        = dspine;
+    executor.draft_tokens  = mtp || block ? speculative.draft_tokens : 0;
+    executor.dspine        = block;
     executor.kv_cache      = options.kv_cache;
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
+    executor.expert_route_bias  = hybrid.route_bias;
+    executor.expert_route_bias_prompts = hybrid.route_bias_prompts;
     executor.expert_cpu_threads = hybrid.cpu_threads;
     executor.expert_disk        = {hybrid.mirror, hybrid.direct};
     executor.sampled_drafts     = options.gumbel_sampling;
@@ -353,7 +372,17 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                            double(drafter.device_bytes()) / 1048576.0,
                            double(instance->executor->memory().dspine_bytes) / 1048576.0);
     }
-    if ((mtp || dspine) && speculative.ngram_draft_tokens != 0) {
+    if (dflash) {
+        const auto& drafter = *model->dflash();
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Gemma 4: the artifact's %s drafter (%u layers, %u query heads), up to "
+                           "%u drafts a round%s; rings, features and workspace %.0f MiB",
+                           drafter.component.c_str(), drafter.config.num_hidden_layers,
+                           drafter.config.num_attention_heads, executor.draft_tokens,
+                           speculative.lookup_ngram != 0 ? " where no context lookup matches" : "",
+                           double(instance->executor->memory().dspine_bytes) / 1048576.0);
+    }
+    if ((mtp || block) && speculative.ngram_draft_tokens != 0) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                            "Gemma 4 drafts with its drafter and context lookup (--lookup-ngram); "
                            "n-gram copy proposals (--ngram-draft-tokens) are not available for it");
@@ -573,8 +602,11 @@ struct Gemma4Core::Impl {
     const bool reuse_prefixes;
     const std::uint32_t drafts;       // the drafter's drafts a round; 0 without speculation
     const std::uint32_t lookup_ngram; // --lookup-ngram: tokens a context lookup matches; 0 is off
-    const bool dspine;                // --spec dspine: a DSpine drafter in the assistant's place
-    // --draft-min-p: a DSpine round verifies through its first draft at or below this probability.
+    // --spec dspine, dflash or dspark: a masked block drafter in the assistant's place.
+    const bool dspine;
+    const SpeculativeBackend backend;
+    // --draft-min-p: a masked block drafter's round verifies through its first draft at or below
+    // this probability.
     const float draft_floor;
     const DiagnosticObserver diagnostics;
     // With --adaptive-mtp, the drafts a round proposes and verifies, 1..drafts.
@@ -652,7 +684,10 @@ struct Gemma4Core::Impl {
           structured_output(options.structured_output),
           reuse_prefixes(i.executor->options().checkpoints), drafts(i.executor->draft_tokens()),
           lookup_ngram(options.speculative.lookup_ngram),
-          dspine(options.speculative.backend == SpeculativeBackend::DSpine),
+          dspine(options.speculative.backend == SpeculativeBackend::DSpine ||
+                 options.speculative.backend == SpeculativeBackend::DFlash ||
+                 options.speculative.backend == SpeculativeBackend::DSpark),
+          backend(options.speculative.backend),
           draft_floor(options.speculative.draft_min_p.value_or(0.0F)),
           diagnostics(options.diagnostic_observer),
           slots(i.executor->options().sequences),
@@ -676,10 +711,13 @@ struct Gemma4Core::Impl {
                 sized.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
             auto* executor            = i.executor.get();
             const auto* spine_model   = i.model->dspine();
+            const auto* dflash_model  = i.model->dflash();
             const std::string profile = context_image_profile(
                 "gemma4", i.model->info().artifact_id, options.kv_cache, executor->image_bytes(0),
                 executor->image_bytes(1),
-                spine_model != nullptr ? "-dspine" + spine_model->artifact_hex() : std::string());
+                spine_model != nullptr    ? "-dspine" + spine_model->artifact_hex()
+                : dflash_model != nullptr ? "-" + dflash_model->component
+                                          : std::string());
             store.configure(
                 context_image_store_options(cache, budget, budget, profile), profile,
                 [executor](std::uint32_t position) { return executor->image_bytes(position); },
@@ -1409,7 +1447,7 @@ struct Gemma4Core::Impl {
         r.reused = r.prefilled = reused;
         if (reused > 0) { place_checkpoint(r, reused); }
         if (drafts > 0) {
-            r.speculative.backend      = dspine ? SpeculativeBackend::DSpine : SpeculativeBackend::Mtp;
+            r.speculative.backend      = backend;
             r.speculative.enabled      = true;
             r.speculative.draft_window = drafts;
             r.speculative.accepted_per_position.assign(drafts, 0);
@@ -2579,8 +2617,8 @@ struct Gemma4Core::Impl {
                 mtp_lengths.push_back(static_cast<std::int32_t>(batch[j]->position));
             }
             std::vector<TokenId> mtp_drafts(mtp_sequences.size() * steps);
-            // A DSpine drafter's greedy drafts, each row's cut after its first draft at or below
-            // the floor (--draft-min-p).
+            // A masked block drafter's greedy drafts, each row's cut after its first draft at or
+            // below the floor (--draft-min-p).
             std::vector<std::uint32_t> lengths(mtp_sequences.size(), steps);
             if (dspine) {
                 std::vector<float> confidence(mtp_drafts.size());
@@ -2589,7 +2627,7 @@ struct Gemma4Core::Impl {
                     for (std::uint32_t i = 0; i < steps; ++i) {
                         const float p = confidence[m * steps + i];
                         if (!std::isfinite(p)) {
-                            throw std::runtime_error("Gemma 4: non-finite DSpine draft confidence");
+                            throw std::runtime_error("Gemma 4: non-finite draft confidence");
                         }
                         if (draft_floor > 0 && lengths[m] == steps && p <= draft_floor) {
                             lengths[m] = i + 1;

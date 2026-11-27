@@ -4,6 +4,15 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+// Rounds of at most this many rows replay a CUDA Graph captured for their exact row count. A wider
+// ordinary round runs its kernels directly at its exact row count: its kernels are long enough that
+// the launches keep ahead of the device, and it needs no capture, padding or graph memory.
+inline constexpr std::uint32_t kMaximumGraphRows = 8;
+
+[[nodiscard]] constexpr std::uint32_t graph_rows(std::uint32_t max_concurrency) {
+    return max_concurrency < kMaximumGraphRows ? max_concurrency : kMaximumGraphRows;
+}
+
 // One-token decode profiles; profiles whose attention takes the same route share an executable.
 [[nodiscard]] std::vector<GraphExecutionProfile>
 ordinary_graph_profiles(std::uint32_t capacity, ops::AttentionHeadGeometry attention,

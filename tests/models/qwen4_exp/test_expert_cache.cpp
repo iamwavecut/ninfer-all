@@ -227,7 +227,7 @@ void fill(const Model& model, std::size_t l, std::int32_t expert, const ExpertCa
                     cudaSuccess,
                 "patch an admitted entry");
         if (out.victim >= 0) {
-            require(cudaMemcpy(table + out.victim, &out.victim_host[k], sizeof(void*),
+            require(cudaMemcpy(table + out.victim, &out.victim_entry[k], sizeof(void*),
                                cudaMemcpyHostToDevice) == cudaSuccess,
                     "patch a victim entry");
         }

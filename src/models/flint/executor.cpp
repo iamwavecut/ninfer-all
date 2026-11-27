@@ -5,7 +5,6 @@
 #include "core/device_wait.h"
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
-#include "core/mapped_host_copy.h"
 #include "core/pdl_scope.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
@@ -179,6 +178,9 @@ struct Executor::Impl {
     // the prompt chunk's mask grow as far as the sequences reach: the expert cache gives memory
     // back when they need it and takes it again when a sequence is reset.
     bool growing = false;
+    // The blocks run a prompt chunk (forward), not a decode or verification pass, whose routers
+    // take the route bias (ExecutorOptions::expert_route_bias).
+    bool prompt_pass = false;
     std::vector<KvArea*> sequence_areas, chunk_areas;
     std::atomic<std::uint64_t> kv_backed{0};
     std::uint64_t kv_fixed = 0; // the caches' bytes that do not grow
@@ -529,11 +531,11 @@ struct Executor::Impl {
             std::size_t free_bytes = 0, total_bytes = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
             if (options.prefill_chunk < kFullChunk &&
-                workspace_bytes + kGraphReserve + unbacked() > free_bytes) {
+                workspace_bytes + launch_reserve() + unbacked() > free_bytes) {
                 throw InsufficientMemory(
                     "Flint: the workspace of " + std::to_string(workspace_bytes >> 20) +
-                    " MiB and " + std::to_string(kGraphReserve >> 20) +
-                    " MiB for the CUDA graphs need more than the " +
+                    " MiB and " + std::to_string(launch_reserve() >> 20) +
+                    " MiB kept free for CUDA graphs and kernel loading need more than the " +
                     std::to_string(free_bytes >> 20) +
                     " MiB free after the caches; lower --max-concurrency or --max-context");
             }
@@ -628,11 +630,12 @@ struct Executor::Impl {
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         const auto cache = options.expert_cache_bytes.value_or(0);
         // The caches that grow later need their memory too: the elastic cache gives it back.
-        if (bank + metadata + cache + unbacked() + kGraphReserve > free) {
+        if (bank + metadata + cache + unbacked() + launch_reserve() > free) {
             throw InsufficientMemory("Flint: expert delivery needs " +
                 std::to_string((bank + metadata + cache) >> 20) + " MiB beside " +
-                std::to_string(unbacked() >> 20) +
-                " MiB for the growing caches and the CUDA Graph reserve after workspace allocation");
+                std::to_string(unbacked() >> 20) + " MiB for the growing caches and " +
+                std::to_string(launch_reserve() >> 20) +
+                " MiB kept free for CUDA graphs and kernel loading after workspace allocation");
         }
         ExpertDeliveryOptions transport;
         transport.pair_capacity = options.prefill_chunk * config.top_k_experts;
@@ -640,7 +643,7 @@ struct Executor::Impl {
         transport.cache_bytes   = options.expert_cache_bytes;
         // A growing cache's next positions come from the headroom before the expert cache has to
         // give memory back.
-        transport.keep_free_bytes = kGraphReserve + (growing ? kKvHeadroom : 0);
+        transport.keep_free_bytes = launch_reserve() + (growing ? kKvHeadroom : 0);
         transport.elastic         = growing;
         transport.disk            = options.expert_disk;
         const float dma_share     = options.expert_dma_share.value_or(0.0F);
@@ -668,11 +671,6 @@ struct Executor::Impl {
         }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
-        // Where a device's copies queue behind one another whatever their streams
-        // (serialized_copy_queue: Windows, WSL2), a replayed graph's device-side wait for the
-        // misses can hold the copies the graph queued after it ahead of the delivery's own, which
-        // end that wait. Eager passes wait on the host and queue nothing behind the wait.
-        if (serialized_copy_queue()) { options.cuda_graphs = false; }
         // Aliases 0 to 2 (gate, up, gate_up) point into the gate/up blob, 3 into the down blob.
         for (auto& p : layers) {
             if (p.delivery_layer < 0) { continue; }
@@ -687,9 +685,20 @@ struct Executor::Impl {
 
     // The startup check's room for the workspace and the CUDA graphs: 1.5 GiB at the full
     // 2048-token chunk; a narrower chunk keeps the least its workspace takes and then checks the
-    // planned workspace with kGraphReserve beside it.
+    // planned workspace with launch_reserve() beside it.
     static constexpr std::uint32_t kFullChunk  = 2048;
     static constexpr std::size_t kGraphReserve = std::size_t(320) << 20;
+    // Without graphs the device still keeps room for the kernels CUDA loads at their first
+    // launch (lazy module loading): a prompt or reply reaches kernels that startup never
+    // launched, and with every byte given to the expert cache that load fails ("out of memory").
+    static constexpr std::size_t kKernelReserve = std::size_t(64) << 20;
+
+    // What the device keeps free beside the planned memory: the CUDA graphs' reserve where this run
+    // captures them (graphs are off for --no-cuda-graph, and for host or disk experts where a
+    // device's copies queue behind one another), else the kernels' reserve.
+    [[nodiscard]] std::size_t launch_reserve() const {
+        return options.cuda_graphs ? kGraphReserve : kKernelReserve;
+    }
     static constexpr std::size_t kKvHeadroom   = std::size_t(256) << 20;
 
     // ---- KV storage ----------------------------------------------------------------------------
@@ -805,8 +814,8 @@ struct Executor::Impl {
 
     // Before a call that writes or reads `sequence`'s positions below `end`: its full-attention
     // rows (and with `chunk`, the prompt chunk's mask) are backed up to the 256-slot tile that
-    // holds `end`, the expert cache giving memory back when the device keeps less than the CUDA
-    // Graph reserve beside them. Outside capture.
+    // holds `end`, the expert cache giving memory back when the device keeps less than
+    // launch_reserve() beside them. Outside capture.
     void back(std::uint32_t sequence, std::uint32_t end, bool chunk) {
         if (!growing) { return; }
         const auto positions = std::uint32_t(round_up(end, 256));
@@ -829,7 +838,9 @@ struct Executor::Impl {
         }
         std::size_t free = 0, total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
-        if (free < need + kGraphReserve) { delivery->shrink_cache(need + kGraphReserve - free); }
+        if (free < need + launch_reserve()) {
+            delivery->shrink_cache(need + launch_reserve() - free);
+        }
         while (!apply()) {
             if (delivery->shrink_cache(std::max(need, std::size_t(64) << 20)) == 0) {
                 count_backed();
@@ -1335,6 +1346,11 @@ struct Executor::Impl {
         auto* logits   = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * e * 4).data);
         void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
         const bool vector   = t <= gguf::kMaxVectorColumns;
+        const ExpertRouteBias held =
+            delivery && p.delivery_layer >= 0 && options.expert_route_bias > 0 &&
+                    (!prompt_pass || options.expert_route_bias_prompts)
+                ? delivery->route_bias(std::size_t(p.delivery_layer), options.expert_route_bias)
+                : ExpertRouteBias{};
         gguf::MoeRouting routing;
         if (vector) {
             auto* base = static_cast<std::int32_t*>(routing_space);
@@ -1344,9 +1360,9 @@ struct Executor::Impl {
             routing.active_count = base + e + 1 + pairs + e;
             kernels::route_select(router_x, hidden, t, p.router, e, k, logits, ids, weights, base,
                                   base + e + 1, base + e + 1 + pairs, base + e + 1 + pairs + e,
-                                  static_cast<std::uint32_t*>(route_done.p), stream);
+                                  static_cast<std::uint32_t*>(route_done.p), stream, held);
         } else {
-            kernels::route(router_x, hidden, t, p.router, e, k, logits, ids, weights, stream);
+            kernels::route(router_x, hidden, t, p.router, e, k, logits, ids, weights, stream, held);
             if (!model.expert_parallel()) {
                 routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
             }
@@ -1535,6 +1551,7 @@ struct Executor::Impl {
             throw std::invalid_argument("flint forward: context capacity exceeded");
         }
         back(sequence, first + std::uint32_t(t), true);
+        prompt_pass = true;
         std::vector<std::int32_t> pos(t);
         for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
         // A branch pass: each branch row rotates at its branch's position, and takes the cache
@@ -1756,6 +1773,7 @@ struct Executor::Impl {
     // `keep` (a decode step) each row's drafter taps go into its sequence's lane; a verification
     // keeps them for commit().
     void decode_body(int b, bool keep) {
+        prompt_pass = false;
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);

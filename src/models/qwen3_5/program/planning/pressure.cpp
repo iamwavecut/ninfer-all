@@ -2668,13 +2668,14 @@ bool ProgramImpl::persistent_backfill_safe(
     }
 
     detail::PhysicalResources borrowers;
-    std::uint32_t observed_lanes = 0;
+    std::uint64_t observed_lanes = 0;
+    static_assert(kMaximumConcurrency <= 64, "the backfill proof keeps one bit per lane");
     for (const SequenceHandle sequence : persistent_borrowers) {
         if (!valid_sequence(sequence)) {
             throw std::logic_error("persistent backfill proof contains a stale sequence");
         }
         const std::uint32_t lane = ContractAccess::lane(sequence).value;
-        const std::uint32_t bit  = 1U << lane;
+        const std::uint64_t bit  = 1ULL << lane;
         if ((observed_lanes & bit) != 0) {
             throw std::logic_error("persistent backfill proof contains a duplicate sequence");
         }

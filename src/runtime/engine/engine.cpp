@@ -78,12 +78,26 @@ EngineOptions with_family_context_cache(EngineOptions options) {
 }
 
 // The host token embedding is a Qwen3.5 load placement; the other families bind their own tables.
+// The other families keep their tables on the device, which `auto` selects for them.
 EngineOptions with_family_embedding(EngineOptions options) {
-    if (options.embedding_residency != EmbeddingResidency::Device &&
-        own_family_artifact(options.artifact_path)) {
+    if (options.embedding_residency == EmbeddingResidency::Device ||
+        !own_family_artifact(options.artifact_path)) {
+        return options;
+    }
+    if (options.embedding_residency == EmbeddingResidency::Host) {
         throw std::invalid_argument(
             "--embedding-residency host applies to Qwen3_5ForCausalLM and "
             "Qwen3_5MoeForCausalLM artifacts");
+    }
+    options.embedding_residency = EmbeddingResidency::Device;
+    return options;
+}
+
+// The KV host tier extends the Qwen3.5 Program's paged pool.
+EngineOptions with_family_kv_host_tier(EngineOptions options) {
+    if (options.kv_host_tier.enabled() && own_family_artifact(options.artifact_path)) {
+        throw std::invalid_argument(
+            "--kv-host-mib applies to Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM artifacts");
     }
     return options;
 }
@@ -352,6 +366,22 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     return resolved;
 }
 
+// Requests the families with an Engine core of their own run at once: their decode takes no more
+// rows than a speculative round. They choose no automatic count.
+void require_own_core_concurrency(const EngineOptions& options, const char* family) {
+    if (options.max_concurrency_auto) {
+        throw std::invalid_argument(std::string("--max-concurrency auto is not available for ") +
+                                    family + "; give a count of 1 to " +
+                                    std::to_string(kMaximumSpeculativeRows));
+    }
+    if (options.max_concurrency > kMaximumSpeculativeRows) {
+        throw std::invalid_argument(std::string(family) + " runs at most " +
+                                    std::to_string(kMaximumSpeculativeRows) +
+                                    " requests at once; max_concurrency is " +
+                                    std::to_string(options.max_concurrency));
+    }
+}
+
 std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_context) {
     return "prepared prompt has " + std::to_string(prompt_tokens) +
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
@@ -543,12 +573,14 @@ public:
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(with_family_speculation(
               with_family_context_cache(with_family_attention(with_family_steering(
-                  with_family_embedding(with_expert_disk_reads(std::move(engine_options))))))))),
+                  with_family_embedding(with_family_kv_host_tier(
+                      with_expert_disk_reads(std::move(engine_options)))))))))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::is_gemma4_artifact(options.artifact_path)) {
+            require_own_core_concurrency(options, "Gemma 4");
             auto constructed    = runtime::construct_gemma4(options, device);
             gemma               = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -567,6 +599,7 @@ public:
             return;
         }
         if (runtime::is_flint_artifact(options.artifact_path)) {
+            require_own_core_concurrency(options, "Flint");
             auto constructed    = runtime::construct_flint(options, device);
             flint               = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -581,6 +614,7 @@ public:
             return;
         }
         if (runtime::is_inkling2_artifact(options.artifact_path)) {
+            require_own_core_concurrency(options, "Inkling 2");
             auto constructed    = runtime::construct_inkling2(options, device);
             inkling             = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -595,6 +629,7 @@ public:
             return;
         }
         if (runtime::is_deepseek_v41_artifact(options.artifact_path)) {
+            require_own_core_concurrency(options, "DeepSeek-V4.1-Flash");
             auto constructed    = runtime::construct_deepseek_v41(options, device);
             deepseek            = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -609,6 +644,7 @@ public:
             return;
         }
         if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+            require_own_core_concurrency(options, "Qwen3.8-Flash-Next");
             auto constructed    = runtime::construct_qwen4_exp(options, device);
             flash               = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -630,6 +666,7 @@ public:
                 "mapped misses, tail skip, prefill buffers and the adaptive expert cache require "
                 "Qwen3.8-Flash-Next host or disk experts");
         }
+        runtime::check_expert_route_bias(options);
         if ((options.hybrid_experts.dma_share || options.hybrid_experts.cpu_threads != 0) &&
             options.expert_residency == ExpertResidency::Device) {
             throw std::invalid_argument("expert DMA shares and CPU threads require host or disk "

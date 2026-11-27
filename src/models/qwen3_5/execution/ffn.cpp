@@ -236,7 +236,8 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         auto& delivery = experts->layer(moe->delivery_layer);
         delivery.check();
         ops::detail::sparse_moe_stream(hidden, moe->weights, residual, delivery,
-                                       experts->local_layer(moe->delivery_layer), workspace, stream);
+                                       experts->local_layer(moe->delivery_layer), workspace, stream,
+                                       mtp ? 0.0F : experts->route_bias(verify));
         return;
     }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {

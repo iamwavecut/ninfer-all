@@ -75,7 +75,7 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   A reached thinking budget, or the [reasoning-loop guard](serving.md#openai-chat-completions)
   under `conclude`, closes the reasoning with Qwen's early-close guidance and the `</think>` token,
   and the model answers from what it has thought.
-- **Sampling defaults.** The release's: temperature 1.0, top-p 1.0 (top-k 20, the candidates the
+- **Sampling defaults.** The release's: temperature 1.0, top-p 1.0 (top-k 64, the candidates the
   sampler keeps).
 - **Speculative decoding with the DSpark drafter.** An artifact converted with the release's drafter
   (the `dspark` component, from beamster's STQ pack as in the published artifact, or from Unsloth's
@@ -192,9 +192,9 @@ and comes only in llama.cpp's layout. It converts with the same command, its fir
 `--source gguf` and the base release's config; the converter takes the expert count from the GGUF.
 Its repository's Engram GGUF and mmproj are the base repository's files, so it uses the same Engram
 table. The model is one file of 71.9 GiB, published with the STQ drafter and the vision tower
-([running](#running)). 11 of its 80 expert banks, in 10 of its 40 blocks, are IQ2_XS, which CPU
-threads do not compute: in those blocks the GPU copies every miss whatever `--expert-dma-share`
-says.
+([running](#running)). 11 of its 80 expert banks, in 10 of its 40 blocks, are IQ2_XS; CPU threads
+compute a share of those blocks' misses as they do in the other blocks (in the measurements below,
+which predate that, the GPU copied every miss of the 10 blocks).
 
 The model reads the Engram GGUF only for the table's digest, and of the STQ pack only its config,
 its index and its six drafter files (3.85 GB), checking that the pack states the release's model and
@@ -304,7 +304,7 @@ then adds the CPU's sums to its own:
   quantized as q8_1, and the down rows, and adds each row times the pair's route weight into its
   token's 2^-32 fixed-point sums, as the GPU's vector kernels compute them
   ([Qwen3.8-Flash-Next's CPU share](qwen3-8-flash-next.md#the-cpu-share) gives the IQ1_S, IQ1_M,
-  IQ2_XXS and IQ2_S slice products). Integer sums do not depend on their order, so tokens, log
+  IQ2_XXS, IQ2_XS and IQ2_S slice products). Integer sums do not depend on their order, so tokens, log
   probabilities and context states do not depend on the split, the share or the thread count.
 - **Disk experts.** An expert the CPU computes from disk needs the same file read as a copied one,
   and on the host below every split of disk experts decoded slower than copying every miss
@@ -478,7 +478,9 @@ model:
 - **A round.** The drafter runs the last accepted token and four noise tokens through its three
   blocks in one pass (each row attends over the ring and over all five rows; the MoE routes each
   row to 3 of 128 experts beside a shared expert), adds a rank-256 Markov term of the previous token
-  to the backbone's head logits and takes each row's greedy token, so five rows give five drafts.
+  to the backbone's head logits and takes each row's greedy token (with `--gumbel-sampling`, a
+  sampled request's draw under the target's keyed noise,
+  [coupled draws](cli.md#speculative-decoding)), so five rows give five drafts.
   A confidence head scores each draft; the round keeps the drafts up to the first scored below
   `--draft-confidence` (0.5 by default, Strata's for this drafter; 0 keeps every draft), at most
   `--draft-tokens`, and with none decodes one token.
@@ -1062,7 +1064,8 @@ cache. The model has 7,680 routed experts:
 - **The CPU share.** With the CLI and its default context the code request decoded at 31.7 tok/s
   with every miss copied, 37.5 with half of them on 30 CPU threads and 37.3 with the automatic
   share (11% of the routed experts on the CPU), with the same tokens; disk experts decoded it at
-  16.1 tok/s. In the 10 blocks with an IQ2_XS bank the GPU copies every miss.
+  16.1 tok/s. In these runs the GPU copied every miss of the 10 blocks with an IQ2_XS bank, which
+  had no CPU product then; the CPU share of those blocks has not been measured on this model.
 - **The cache.** These runs filled it from the first requests: the code request hit 70 to 72% of
   its routed experts. The build now starts it from the Coder build's own routing profile, recorded
   on 48 coding, agent and reasoning requests. On November 4, on another RTX 4090 host (450 W, a

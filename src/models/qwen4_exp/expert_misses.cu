@@ -190,69 +190,10 @@ __global__ void patch_kernel(const void** gate, const void** up, const void** do
     }
 }
 
-// One copy of a request's copy_segments_kernel launch: `bytes` from `source` (device memory, or
-// pinned host memory the device reads in place) to `target`, or zeros without a source.
-struct CopySegment {
-    std::byte* target       = nullptr;
-    const std::byte* source = nullptr;
-    std::uint64_t bytes     = 0;
-};
-
-constexpr int kCopyThreads = 256;
-// A block takes eight 16-byte words a thread of a pass over the widest segment, at most this many
-// blocks a segment.
-constexpr std::uint64_t kCopyBlockBytes = std::uint64_t(kCopyThreads) * 16 * 8;
-constexpr std::uint64_t kCopyMaxBlocks  = 64;
-// A request's segments: three projections and a down's zeros an expert, its pairs, and a direct
-// read's runs; a request that queues more waits for a launch before it goes on.
+// A request's copy kernel segments (core/mapped_host_copy.h): three projections and a down's zeros
+// an expert, its pairs, and a direct read's runs; a request that queues more waits for a launch
+// before it goes on.
 constexpr std::size_t kCopySegments = 4 * std::size_t(kMaxExperts) + 64;
-
-template <class Word>
-__device__ void copy_words(std::byte* target, const std::byte* source, std::uint64_t words,
-                           std::uint64_t first, std::uint64_t stride) {
-    auto* to         = reinterpret_cast<Word*>(target);
-    const auto* from = reinterpret_cast<const Word*>(source);
-    for (std::uint64_t i = first; i < words; i += stride) { to[i] = from ? from[i] : Word{}; }
-}
-
-// Row y of the grid copies segment y, its blocks striding over the bytes: 16-byte words where
-// target and source share their offset in a 16-byte word, else 4-byte words, else bytes, the bytes
-// before the target's first whole word and after its last taken one at a time.
-__global__ void __launch_bounds__(kCopyThreads) copy_segments_kernel(const CopySegment* segments) {
-    const CopySegment segment = segments[blockIdx.y];
-    std::byte* target         = segment.target;
-    const std::byte* source   = segment.source;
-    const std::uint64_t bytes = segment.bytes;
-    const std::uint64_t first  = std::uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::uint64_t stride = std::uint64_t(gridDim.x) * blockDim.x;
-    const auto at              = reinterpret_cast<std::uintptr_t>(target);
-    const std::uintptr_t skew  = source ? at ^ reinterpret_cast<std::uintptr_t>(source) : 0;
-    const std::uint64_t word   = (skew & 15U) == 0 ? 16 : (skew & 3U) == 0 ? 4 : 1;
-    const std::uint64_t lead   = (word - (at & (word - 1))) & (word - 1);
-    const std::uint64_t head   = lead < bytes ? lead : bytes;
-    const std::uint64_t words  = (bytes - head) / word;
-    const auto byte_at = [&](std::uint64_t i) { target[i] = source ? source[i] : std::byte{0}; };
-    for (std::uint64_t i = first; i < head; i += stride) { byte_at(i); }
-    const std::byte* from = source ? source + head : nullptr;
-    if (word == 16) {
-        copy_words<uint4>(target + head, from, words, first, stride);
-    } else if (word == 4) {
-        copy_words<std::uint32_t>(target + head, from, words, first, stride);
-    } else {
-        copy_words<unsigned char>(target + head, from, words, first, stride);
-    }
-    for (std::uint64_t i = head + words * word + first; i < bytes; i += stride) { byte_at(i); }
-}
-
-// MissOptions::copy_kernel, unset: NINFER_MISS_COPY_KERNEL=0|1 forces either copy for A/B runs and
-// diagnosis; else serialized_copy_queue().
-bool copy_kernel_default() {
-    const char* value = std::getenv("NINFER_MISS_COPY_KERNEL");
-    if (value != nullptr && (value[0] == '0' || value[0] == '1') && value[1] == '\0') {
-        return value[0] == '1';
-    }
-    return serialized_copy_queue();
-}
 
 bool capturing(cudaStream_t stream) {
     cudaStreamCaptureStatus status;
@@ -352,12 +293,8 @@ struct ExpertMisses::Impl {
         std::vector<DirectRead> window_reads;
         std::unique_ptr<PinnedHostBuffer> patches;      // one request's table changes
         cudaStream_t copies    = nullptr;
-        // With the copy kernel: the segments of the request being served, those from
-        // `segments_launched` on not launched yet, and the event a full list waits for.
-        std::unique_ptr<PinnedHostBuffer> segments;
-        std::size_t segment_count = 0, segments_launched = 0;
-        std::uint64_t segment_widest = 0;
-        cudaEvent_t segments_free    = nullptr;
+        // With the copy kernel: the copies of the request being served.
+        std::unique_ptr<SegmentCopies> segments;
         cudaEvent_t copying    = nullptr; // balance only: before a request's copies
         cudaEvent_t copied     = nullptr; // after them (timed for the balance)
         std::uint32_t served   = 0;
@@ -387,8 +324,8 @@ struct ExpertMisses::Impl {
     ops::GgufCpuBackend backend = ops::GgufCpuBackend::Automatic;
     std::uint32_t cpu_threads   = 0; // the pool's workers and the service thread
     bool disk = false;
-    // A narrow request's copies run as copy_segments_kernel launches on the rank's copy stream
-    // instead of copy-engine copies (MissOptions::copy_kernel).
+    // A narrow request's copies run as copy kernel launches on the rank's copy stream instead of
+    // copy-engine copies (MissOptions::copy_kernel).
     bool copy_kernel = false;
 
     // CPU work of one request.
@@ -450,6 +387,9 @@ struct ExpertMisses::Impl {
         std::uint64_t largest = 0, largest_file = 0, largest_cover = 0, widest = 0;
         for (const auto& layer : layers) {
             for (const auto& p : layer.projections) {
+                if (!p.device.empty() && p.device.size() != p.host.size()) {
+                    throw std::invalid_argument("expert misses: host and device alias counts differ");
+                }
                 for (const auto& location : p.located) {
                     std::uint64_t cover = 0;
                     for (const auto& run : location.runs) {
@@ -570,11 +510,9 @@ struct ExpertMisses::Impl {
                 }
             }
             rank.patches = std::make_unique<PinnedHostBuffer>(2 * kMaxExperts * sizeof(TablePatch));
-            CUDA_CHECK(cudaStreamCreateWithFlags(&rank.copies, cudaStreamNonBlocking));
+            rank.copies = create_copy_stream(copy_kernel);
             if (copy_kernel) {
-                rank.segments =
-                    std::make_unique<PinnedHostBuffer>(kCopySegments * sizeof(CopySegment));
-                CUDA_CHECK(cudaEventCreateWithFlags(&rank.segments_free, cudaEventDisableTiming));
+                rank.segments = std::make_unique<SegmentCopies>(rank.copies, kCopySegments);
             }
             // Timed only for the balance, which reads the copies' durations.
             const unsigned timing = options.cpu_balance ? cudaEventDefault : cudaEventDisableTiming;
@@ -585,14 +523,10 @@ struct ExpertMisses::Impl {
                 CUDA_CHECK(cudaEventCreate(&rank.wide_copied));
             }
             // Load every kernel the misses launch now: a lazy load while a layer waits on the
-            // device for this service could wait for that layer (see the executor's pass()).
+            // device for this service could wait for that layer (see the executor's pass()). The
+            // copy kernel loaded with its queue.
             patch_kernel<<<1, 32, 0, rank.copies>>>(nullptr, nullptr, nullptr, nullptr, 0);
             wait_kernel<<<1, 1, 0, rank.copies>>>(rank.box, static_cast<const std::uint32_t*>(rank.need->data()));
-            if (copy_kernel) {
-                std::memset(rank.segments->data(), 0, sizeof(CopySegment));
-                copy_segments_kernel<<<1, kCopyThreads, 0, rank.copies>>>(
-                    static_cast<const CopySegment*>(rank.segments->data()));
-            }
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(ninfer::wait_for_stream(rank.copies));
         }
@@ -623,7 +557,6 @@ struct ExpertMisses::Impl {
         if (service.joinable()) { service.join(); }
         for (auto& rank : ranks) {
             if (rank.copies) { cudaStreamDestroy(rank.copies); }
-            if (rank.segments_free) { cudaEventDestroy(rank.segments_free); }
             if (rank.copying) { cudaEventDestroy(rank.copying); }
             if (rank.copied) { cudaEventDestroy(rank.copied); }
             if (rank.window_free) { cudaEventDestroy(rank.window_free); }
@@ -660,6 +593,20 @@ struct ExpertMisses::Impl {
                                           : projection.located[std::size_t(expert)].pinned;
     }
 
+    static const std::byte* held_device(const MissLayer::Projection& projection,
+                                        std::int32_t expert) {
+        if (projection.located.empty()) { return nullptr; }
+        const auto& location = projection.located[std::size_t(expert)];
+        return location.pinned_device ? location.pinned_device : location.pinned;
+    }
+
+    static const void* host_expert_source(const MissLayer::Projection& projection,
+                                          std::int32_t expert, bool kernel) {
+        const std::size_t e = std::size_t(expert);
+        return kernel && !projection.device.empty() ? projection.device.at(e)
+                                                     : projection.host.at(e);
+    }
+
     // Reads one projection of a disk expert into `host_out`; with a drive mirror, a run in an
     // odd stripe from the mirror's copy.
     void fetch(const MissLayer::Projection& projection, std::int32_t expert, std::byte* host_out) {
@@ -675,8 +622,7 @@ struct ExpertMisses::Impl {
     }
 
     // Queues `bytes` from `source` (or zeros without one) to `target` on the rank's copy stream: a
-    // copy-engine copy, or with `kernel` a segment of the request's next copy_segments_kernel
-    // launch.
+    // copy-engine copy, or with `kernel` a segment of the request's next copy kernel launch.
     void queue_copy(Rank& rank, bool kernel, void* target, const void* source, std::uint64_t bytes,
                     cudaMemcpyKind kind) {
         if (!kernel) {
@@ -687,33 +633,7 @@ struct ExpertMisses::Impl {
             }
             return;
         }
-        if (bytes == 0) { return; }
-        if (rank.segment_count == kCopySegments) { drain_copies(rank); }
-        static_cast<CopySegment*>(rank.segments->data())[rank.segment_count++] = CopySegment{
-            static_cast<std::byte*>(target), static_cast<const std::byte*>(source), bytes};
-        rank.segment_widest = std::max(rank.segment_widest, bytes);
-    }
-
-    // Launches copy_segments_kernel over the segments queued since the last launch.
-    void launch_copies(Rank& rank) {
-        const std::size_t count = rank.segment_count - rank.segments_launched;
-        if (count == 0) { return; }
-        const auto blocks = unsigned(std::clamp<std::uint64_t>(
-            (rank.segment_widest + kCopyBlockBytes - 1) / kCopyBlockBytes, 1, kCopyMaxBlocks));
-        copy_segments_kernel<<<dim3(blocks, unsigned(count)), kCopyThreads, 0, rank.copies>>>(
-            static_cast<const CopySegment*>(rank.segments->data()) + rank.segments_launched);
-        CUDA_CHECK(cudaGetLastError());
-        rank.segments_launched = rank.segment_count;
-        rank.segment_widest    = 0;
-    }
-
-    // Launches the queued segments and waits until every launch has read its list, which then
-    // takes segments from its start again.
-    void drain_copies(Rank& rank) {
-        launch_copies(rank);
-        CUDA_CHECK(cudaEventRecord(rank.segments_free, rank.copies));
-        CUDA_CHECK(ninfer::wait_for_event(rank.segments_free));
-        rank.segment_count = rank.segments_launched = 0;
+        rank.segments->queue(target, source, bytes);
     }
 
     // Reads one projection of a disk expert into the rank's window and queues its copies to
@@ -726,7 +646,7 @@ struct ExpertMisses::Impl {
         for (const auto& run : location.runs) { cover += direct_cover(run.offset, run.bytes); }
         if (rank.window_used + cover > rank.window->bytes()) {
             if (kernel) {
-                drain_copies(rank);
+                rank.segments->drain();
             } else {
                 CUDA_CHECK(cudaEventRecord(rank.window_free, rank.copies));
                 CUDA_CHECK(ninfer::wait_for_event(rank.window_free));
@@ -1095,7 +1015,7 @@ struct ExpertMisses::Impl {
         }
         for (int k = 0; k < 3; ++k) {
             const auto& p = layer.projections[std::size_t(k)];
-            queue_copy(rank, kernel, admitted.slot[std::size_t(k)], p.host[std::size_t(e)],
+            queue_copy(rank, kernel, admitted.slot[std::size_t(k)], host_expert_source(p, e, kernel),
                        std::uint64_t(p.expert_bytes), cudaMemcpyHostToDevice);
             tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = admitted.slot[std::size_t(k)];
             bytes += std::uint64_t(p.expert_bytes);
@@ -1104,7 +1024,7 @@ struct ExpertMisses::Impl {
         if (admitted.victim >= 0) {
             patches[patch_count++] =
                 TablePatch{admitted.victim,
-                           {admitted.victim_host[0], admitted.victim_host[1], admitted.victim_host[2]}};
+                           {admitted.victim_entry[0], admitted.victim_entry[1], admitted.victim_entry[2]}};
         }
         return true;
     }
@@ -1125,7 +1045,7 @@ struct ExpertMisses::Impl {
             } else {
                 const void* source;
                 if (pinned != nullptr) {
-                    source = pinned;
+                    source = kernel ? held_device(p, e) : pinned;
                 } else if (disk) {
                     if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
                         throw std::runtime_error("expert misses: file staging exhausted");
@@ -1134,7 +1054,7 @@ struct ExpertMisses::Impl {
                     source = file_staging + file_used;
                     file_used += aligned(std::uint64_t(p.expert_bytes));
                 } else {
-                    source = p.host[std::size_t(e)];
+                    source = host_expert_source(p, e, kernel);
                 }
                 queue_copy(rank, kernel, at, source, std::uint64_t(p.expert_bytes),
                            cudaMemcpyHostToDevice);
@@ -1225,8 +1145,8 @@ struct ExpertMisses::Impl {
                     for (int k = 0; k < 3; ++k) {
                         const auto& p = layer.projections[std::size_t(k)];
                         const void* where;
-                        if (const std::byte* pinned = held(p, e)) {
-                            where = pinned;
+                        if (held(p, e)) {
+                            where = held_device(p, e);
                         } else if (disk) {
                             if (file_used + std::uint64_t(p.expert_bytes) > file_half_bytes) {
                                 throw std::runtime_error("expert misses: file staging exhausted");
@@ -1235,7 +1155,7 @@ struct ExpertMisses::Impl {
                             where = file_staging + file_used;
                             file_used += aligned(std::uint64_t(p.expert_bytes));
                         } else {
-                            where = p.host[std::size_t(e)];
+                            where = host_expert_source(p, e, true);
                         }
                         tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = where;
                     }
@@ -1261,7 +1181,7 @@ struct ExpertMisses::Impl {
                            std::uint64_t(pairs) * 4, cudaMemcpyHostToDevice);
                 copies = true;
             }
-            if (copy_kernel) { launch_copies(rank); }
+            if (copy_kernel) { rank.segments->launch(); }
             if (copies) { CUDA_CHECK(cudaEventRecord(rank.copied, rank.copies)); }
         };
         // The CPU's share, while this thread issues the copies (disk experts read the GPU's share
@@ -1311,7 +1231,7 @@ struct ExpertMisses::Impl {
             if (rank.product_count) { *static_cast<std::int32_t*>(rank.product_count->data()) = 0; }
         }
         if (copies) { CUDA_CHECK(ninfer::wait_for_event(rank.copied)); }
-        rank.segment_count = rank.segments_launched = 0;
+        if (rank.segments) { rank.segments->restart(); }
         if (options.cpu_balance && gpu_count > 0 && staged_bytes > 0 && mapped == 0) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, rank.copying, rank.copied));
@@ -1380,7 +1300,7 @@ struct ExpertMisses::Impl {
                     if (copy_kernel) {
                         // The request's launches may still read the segment list.
                         (void)cudaStreamSynchronize(rank.copies);
-                        rank.segment_count = rank.segments_launched = 0;
+                        rank.segments->restart();
                     }
                     // Release the GPU with an empty stage two; the failure surfaces at the
                     // executor's next check.
@@ -1728,6 +1648,12 @@ void ExpertMisses::set_resident(std::size_t layer, const ExpertCache::Ranges& re
     target.resident = resident;
     RankBinding bind(impl_->device, target.rank);
     Impl::write_ranges(impl_->ranges.at(layer), resident);
+}
+ExpertRouteBias ExpertMisses::route_bias(std::size_t layer, float bias) const {
+    return {.tables = impl_->layers.at(layer).gate_table,
+            .ranges = static_cast<const std::uintptr_t*>(impl_->ranges.at(layer).p),
+            .count  = kRanges,
+            .bias   = bias};
 }
 MissStats ExpertMisses::stats() const {
     std::lock_guard lock(impl_->stats_mutex);

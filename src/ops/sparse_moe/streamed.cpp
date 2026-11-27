@@ -32,14 +32,15 @@ std::size_t sparse_moe_stream_workspace_bytes(std::int32_t tokens, QType routed_
 
 void sparse_moe_stream(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                        ExpertDelivery& delivery, std::size_t layer, WorkspaceArena& workspace,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, float route_bias) {
     const auto tokens = static_cast<std::int32_t>(x.ne[1]);
     const QType gate = weights.routed_gate_up.qtype, down = weights.routed_down.qtype;
     auto scope = workspace.scope();
     if (sparse_moe_uses_prefill(tokens, gate, down)) {
         const auto plan  = resolve_sparse_moe_prefill_plan(tokens, gate, down);
         const auto views = allocate_sparse_moe_prefill_workspace(workspace, plan.slice_tokens, plan.nvfp4);
-        sparse_moe_stream_prefill(x, weights, destination, plan, views, delivery, layer, stream);
+        sparse_moe_stream_prefill(x, weights, destination, plan, views, delivery, layer, stream,
+                                  route_bias);
         return;
     }
     if (tokens > kSparseMoeSmallTMax) {
@@ -47,7 +48,9 @@ void sparse_moe_stream(const Tensor& x, const SparseMoeWeights& weights, Tensor&
     }
     const auto views = allocate_sparse_moe_small_t_workspace(workspace, tokens);
     Tensor products  = allocate_products(workspace, tokens);
-    sparse_moe_stream_route(x, weights.router_shared_gate, views, stream);
+    sparse_moe_stream_route(x, weights.router_shared_gate, views, stream,
+                            route_bias > 0 ? delivery.route_bias(layer, route_bias)
+                                           : ExpertRouteBias{});
     const auto* ids   = static_cast<const std::int32_t*>(views.token_ids.data);
     const auto* alpha = static_cast<const float*>(views.token_alpha.data);
     // The CPU's operands, should the delivery leave it a share (streamed_cpu.h).

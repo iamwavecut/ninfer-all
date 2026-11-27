@@ -220,16 +220,13 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 // bounding prompt rendering and the streaming parser.
 inline constexpr std::size_t kMaximumToolNameLength = 256;
 
-// The sampler's candidate domain: each block reduces its vocabulary tile to 20 candidates
-// (kSamplerFastCandidates), and the runtime contract accepts top_k in [1,20]. A request top_k above
-// it is clamped rather than refused: llama.cpp and Ollama default to 40 (Strata caps at 64), and
-// with top_p or min_p active over the full vocabulary the nucleus almost always closes inside 20
-// candidates, so the wider value selects the same token nearly always. The effective value is what
-// reaches the Engine and the request log. Negative values stay errors.
-inline constexpr int kSamplerTopKCap = 20;
-
+// The sampler keeps at most kSamplingTopKCap (64) candidates, the runtime contract accepts top_k in
+// [1,64]. A request top_k above it is clamped rather than refused, like Strata's cap at 64: with
+// top_p or min_p active over the full vocabulary the nucleus almost always closes inside 64
+// candidates. The effective value is what reaches the Engine and the request log. Negative values
+// stay errors.
 [[nodiscard]] constexpr int clamp_request_top_k(int top_k) noexcept {
-    return top_k > kSamplerTopKCap ? kSamplerTopKCap : top_k;
+    return top_k > kSamplingTopKCap ? kSamplingTopKCap : top_k;
 }
 
 // One piece of a raw prompt: text the artifact's tokenizer encodes, or a token id used as it is.

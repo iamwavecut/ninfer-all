@@ -318,6 +318,79 @@ def _exact_bf16(gguf: GGUFFile, tensor: str, shape: tuple[int, ...]) -> LogicalS
     return source
 
 
+def encode_mxfp8_exact(bf16_rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Encode `(rows, k)` BF16 values (`k % 32 == 0`) into packed MXFP8 `(codes, scales)` if
+    every element round-trips bit-exactly to BF16; otherwise return `None`."""
+
+    if bf16_rows.ndim != 2 or bf16_rows.shape[1] % 32 != 0:
+        return None
+    n, k = bf16_rows.shape
+    f32 = bf16_rows.to(torch.float32)
+    blocks = f32.reshape(n, k // 32, 32)
+    amax = blocks.abs().amax(dim=-1)
+    nonzero = amax > 0
+    k_exp = torch.zeros_like(amax, dtype=torch.int32)
+    if nonzero.any():
+        amax_nz = amax[nonzero]
+        _, exp_frexp = torch.frexp(amax_nz)
+        e_floor = exp_frexp - 1
+        thr = 1.75 * torch.ldexp(torch.ones_like(amax_nz), e_floor)
+        k_nz = torch.where(amax_nz > thr, e_floor - 7, e_floor - 8).clamp(-127, 119)
+        k_exp[nonzero] = k_nz
+    scales_u8 = torch.where(nonzero, k_exp + 127, 127).to(torch.uint8)
+    inv_scale = torch.ldexp(torch.ones_like(amax), -k_exp).unsqueeze(-1)
+    e4m3 = (blocks * inv_scale).to(torch.float8_e4m3fn)
+    decoded = e4m3.to(torch.float32) * torch.ldexp(torch.ones_like(amax), k_exp).unsqueeze(-1)
+    if not torch.equal(decoded, blocks):
+        return None
+    codes_u8 = e4m3.view(torch.uint8).reshape(n, k)
+    k_pad = ((k + 127) // 128) * 128
+    if k_pad != k:
+        padded_codes = torch.zeros((n, k_pad), dtype=torch.uint8)
+        padded_codes[:, :k] = codes_u8
+        padded_scales = torch.full((n, k_pad // 32), 127, dtype=torch.uint8)
+        padded_scales[:, : k // 32] = scales_u8
+        return padded_codes, padded_scales
+    return codes_u8.contiguous(), scales_u8.contiguous()
+
+
+def _mxfp8_bank(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource | None:
+    """A BF16 expert bank as MXFP8 rows (`mxfp8`) when every value round-trips exactly and K is a
+    multiple of 128 (the expert products step through unpadded rows); otherwise None."""
+
+    if gguf.info(tensor).type_id != TYPE_BF16 or shape[1] % 128 != 0:
+        return None
+    source = _matrix(gguf, tensor, shape)
+    rows_total, k = shape
+    chunk_rows = max(1, min(rows_total, (16 * 1024 * 1024) // k))
+    for begin in range(0, rows_total, chunk_rows):
+        end = min(rows_total, begin + chunk_rows)
+        vals = source.values(begin * k, end * k).reshape(end - begin, k).to(torch.bfloat16)
+        if encode_mxfp8_exact(vals) is None:
+            return None
+
+    def encoded(begin: int, end: int) -> EncodedRows:
+        vals = source.values(begin * k, end * k).reshape(end - begin, k).to(torch.bfloat16)
+        res = encode_mxfp8_exact(vals)
+        if res is None:
+            raise ValueError(f"{tensor}: unexpected non-exact MXFP8 rows in [{begin}, {end})")
+        codes_u8, scales_u8 = res
+        return EncodedRows("mxfp8", codes_u8, scales_u8, packed=True)
+
+    return replace(source, label=f"{tensor}[bf16 as exact mxfp8]{list(shape)}",
+                   read_encoded=encoded)
+
+
+def _expert_banks(gguf: GGUFFile, gate_up: str, gate_up_shape: tuple[int, int], down: str,
+                  down_shape: tuple[int, int]) -> tuple[LogicalSource, LogicalSource]:
+    """A layer's two expert banks: both MXFP8 when both are exact BF16 banks, else as stored."""
+
+    exact = (_mxfp8_bank(gguf, gate_up, gate_up_shape), _mxfp8_bank(gguf, down, down_shape))
+    if exact[0] is not None and exact[1] is not None:
+        return exact
+    return _matrix(gguf, gate_up, gate_up_shape), _matrix(gguf, down, down_shape)
+
+
 def _matrix(gguf: GGUFFile, tensor: str, shape: tuple[int, int]) -> LogicalSource:
     """A matrix as stored: ggml block rows (encoded), or BF16 words (values, no read_encoded)."""
 
@@ -690,8 +763,10 @@ def build_model(base, gguf: GGUFFile, *, vision: GGUFFile | None = None,
         vector(p + "ffn_norm", g + "ffn_norm.weight", (h,))
         vector(m + "router", g + "ffn_gate_inp.weight", (e, h))
         vector(m + "router_bias", g + "exp_probs_b.bias", (e,))
-        matrix(m + "gate_up", g + "ffn_gate_up_exps.weight", (e * 2 * w, h), (m + "input",))
-        matrix(m + "down", g + "ffn_down_exps.weight", (e * h, w), (m + "product",))
+        gate_up, down = _expert_banks(gguf, g + "ffn_gate_up_exps.weight", (e * 2 * w, h),
+                                      g + "ffn_down_exps.weight", (e * h, w))
+        model.add(Parameter(m + "gate_up", (e * 2 * w, h), gate_up, inputs=(m + "input",)))
+        model.add(Parameter(m + "down", (e * h, w), down, inputs=(m + "product",)))
         for tensor, name in (("ffn_gate_up_exps.scale", "gate_up_scale"),
                              ("ffn_down_exps.scale", "down_scale")):
             if g + tensor in gguf.tensors:
@@ -878,8 +953,9 @@ def inkling2_gguf(model, recipe, sources):
                           source=parameter.source)
             continue
         fmt = formats[name] = parameter.source.read_encoded(0, 1).format
-        # The tower decodes its blocks to BF16 rows and keeps its inputs BF16.
-        policy = "A16Only" if name.startswith("vision/") else "AllowA8"
+        # The tower decodes its blocks to BF16 rows and keeps its inputs BF16; MXFP8 experts take
+        # BF16 inputs directly.
+        policy = "A16Only" if (name.startswith("vision/") or fmt == "mxfp8") else "AllowA8"
         recipe.assign(name, format=fmt, method=import_encoded, source=parameter.source,
                       **({"activation_policy": policy} if parameter.projection else {}))
 

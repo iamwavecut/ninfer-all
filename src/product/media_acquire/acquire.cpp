@@ -1,6 +1,8 @@
 #include "product/media_acquire/acquire.h"
 
-#include <curl/curl.h>
+#include "product/https_client.h"
+
+#include <httplib.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -13,6 +15,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <chrono>
 #include <cstdint>
@@ -25,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace ninfer::product::media_acquire {
@@ -44,8 +49,8 @@ void check_control(const Policy& policy) {
 long bounded_timeout_ms(const Policy& policy, int configured) {
     if (policy.deadline == Clock::time_point{}) { return configured; }
     check_control(policy);
-    // Rounded up, with one millisecond for curl's whole-millisecond clock: a curl timer that the
-    // deadline bounds expires after the deadline, so check_control reports the deadline.
+    // Rounded up, with one millisecond more: a limit that the deadline bounds expires after the
+    // deadline, so check_control reports the deadline.
     const auto remaining =
         std::chrono::ceil<std::chrono::milliseconds>(policy.deadline - Clock::now()).count() + 1;
     return std::min<long>(configured, std::max<std::int64_t>(1, remaining));
@@ -157,37 +162,168 @@ bool disallowed_address(const sockaddr* address) {
     return true;
 }
 
+// A media URL as a fetch uses it: the scheme and host in lower case, the host without the brackets
+// of an IPv6 literal, the port (the scheme's default when the URL has none) and the request target
+// (path and query; "/" when the path is empty).
 struct UrlParts {
     std::string scheme;
     std::string host;
-    std::string port;
+    int port = 0;
+    std::string target;
+    bool ipv6 = false;
 };
 
-std::string curlu_part(CURLU* url, CURLUPart part, unsigned flags = 0) {
-    char* raw            = nullptr;
-    const CURLUcode code = curl_url_get(url, part, &raw, flags);
-    if (code != CURLUE_OK || raw == nullptr) { return {}; }
-    std::string out(raw);
-    curl_free(raw);
+char lower(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; }
+
+bool alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+
+bool digit(char c) { return c >= '0' && c <= '9'; }
+
+// The length of a reference's scheme with its colon, or 0 when the reference has none.
+std::size_t scheme_length(std::string_view value) {
+    if (value.empty() || !alpha(value.front())) { return 0; }
+    for (std::size_t i = 1; i < value.size(); ++i) {
+        const char c = value[i];
+        if (c == ':') { return i + 1; }
+        if (!alpha(c) && !digit(c) && c != '+' && c != '-' && c != '.') { return 0; }
+    }
+    return 0;
+}
+
+// The request target as sent: bytes outside ASCII percent-encoded, everything else as given.
+std::string request_target(std::string_view path_and_query) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out = path_and_query.empty() || path_and_query.front() == '?' ? "/" : "";
+    for (const char c : path_and_query) {
+        const auto byte = static_cast<unsigned char>(c);
+        if (byte >= 0x80) {
+            out += '%';
+            out += hex[byte >> 4U];
+            out += hex[byte & 15U];
+        } else {
+            out += c;
+        }
+    }
     return out;
 }
 
 UrlParts parse_url(std::string_view value) {
-    std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> url(curl_url(), curl_url_cleanup);
-    if (!url ||
-        curl_url_set(url.get(), CURLUPART_URL, std::string(value).c_str(), 0) != CURLUE_OK) {
-        throw std::invalid_argument("invalid media URL");
+    for (const char c : value) {
+        const auto byte = static_cast<unsigned char>(c);
+        if (byte <= 0x20 || byte == 0x7f) { throw std::invalid_argument("invalid media URL"); }
     }
+    const std::size_t colon = scheme_length(value);
+    if (colon == 0) { throw std::invalid_argument("invalid media URL"); }
     UrlParts out;
-    out.scheme             = curlu_part(url.get(), CURLUPART_SCHEME);
-    out.host               = curlu_part(url.get(), CURLUPART_HOST);
-    out.port               = curlu_part(url.get(), CURLUPART_PORT, CURLU_DEFAULT_PORT);
-    const std::string user = curlu_part(url.get(), CURLUPART_USER);
-    if ((out.scheme != "http" && out.scheme != "https") || out.host.empty() || out.port.empty() ||
-        !user.empty()) {
+    for (const char c : value.substr(0, colon - 1)) { out.scheme += lower(c); }
+    if (out.scheme != "http" && out.scheme != "https") {
         throw std::invalid_argument("media URL must be credential-free HTTP(S)");
     }
+    std::string_view rest = value.substr(colon);
+    if (!rest.starts_with("//")) { throw std::invalid_argument("invalid media URL"); }
+    rest.remove_prefix(2);
+    const std::size_t authority_end = std::min(rest.find_first_of("/?#"), rest.size());
+    const std::string_view authority = rest.substr(0, authority_end);
+    if (authority.find('@') != std::string_view::npos) {
+        throw std::invalid_argument("media URL must be credential-free HTTP(S)");
+    }
+    std::string_view port;
+    if (authority.starts_with('[')) {
+        const std::size_t close = authority.find(']');
+        if (close == std::string_view::npos) { throw std::invalid_argument("invalid media URL"); }
+        out.host = std::string(authority.substr(1, close - 1));
+        in6_addr address{};
+        if (inet_pton(AF_INET6, out.host.c_str(), &address) != 1) {
+            throw std::invalid_argument("invalid media URL host");
+        }
+        out.ipv6 = true;
+        const std::string_view after = authority.substr(close + 1);
+        if (!after.empty()) {
+            if (after.front() != ':') { throw std::invalid_argument("invalid media URL"); }
+            port = after.substr(1);
+        }
+    } else {
+        const std::size_t separator = authority.find(':');
+        const std::string_view host = authority.substr(0, separator);
+        if (separator != std::string_view::npos) { port = authority.substr(separator + 1); }
+        for (const char c : host) {
+            if (!alpha(c) && !digit(c) && c != '-' && c != '.' && c != '_') {
+                throw std::invalid_argument("invalid media URL host");
+            }
+            out.host += lower(c);
+        }
+    }
+    if (out.host.empty()) { throw std::invalid_argument("media URL must be credential-free HTTP(S)"); }
+    out.port = out.scheme == "https" ? 443 : 80;
+    if (!port.empty()) {
+        if (port.size() > 5 || !std::all_of(port.begin(), port.end(), digit)) {
+            throw std::invalid_argument("invalid media URL port");
+        }
+        out.port = std::stoi(std::string(port));
+        if (out.port < 1 || out.port > 65535) { throw std::invalid_argument("invalid media URL port"); }
+    }
+    std::string_view target = rest.substr(authority_end);
+    target = target.substr(0, target.find('#'));
+    out.target = request_target(target);
     return out;
+}
+
+// RFC 3986 section 5.2.4.
+std::string remove_dot_segments(std::string_view input) {
+    std::string output;
+    while (!input.empty()) {
+        if (input.starts_with("../")) {
+            input.remove_prefix(3);
+        } else if (input.starts_with("./")) {
+            input.remove_prefix(2);
+        } else if (input.starts_with("/./")) {
+            input.remove_prefix(2);
+        } else if (input == "/.") {
+            input = "/";
+        } else if (input.starts_with("/../") || input == "/..") {
+            input = input.size() == 3 ? std::string_view("/") : input.substr(3);
+            const std::size_t last = output.rfind('/');
+            output.erase(last == std::string::npos ? 0 : last);
+        } else if (input == "." || input == "..") {
+            input = {};
+        } else {
+            const std::size_t next = input.find('/', input.front() == '/' ? 1 : 0);
+            const std::size_t end  = next == std::string_view::npos ? input.size() : next;
+            output.append(input.substr(0, end));
+            input.remove_prefix(end);
+        }
+    }
+    return output;
+}
+
+// The absolute URL a Location header names, resolved against the URL that answered with it
+// (RFC 3986 section 5.2.2).
+std::string resolve_location(const UrlParts& base, std::string_view location) {
+    if (scheme_length(location) != 0) { return std::string(location); }
+    if (location.starts_with("//")) { return base.scheme + ":" + std::string(location); }
+    std::string origin = base.scheme + "://" + (base.ipv6 ? "[" + base.host + "]" : base.host) +
+                         ":" + std::to_string(base.port);
+    location = location.substr(0, location.find('#'));
+    const std::size_t query_at = location.find('?');
+    const std::string_view path = location.substr(0, query_at);
+    const std::string_view query =
+        query_at == std::string_view::npos ? std::string_view{} : location.substr(query_at);
+    const std::string_view base_target = base.target;
+    const std::size_t base_query_at    = base_target.find('?');
+    const std::string_view base_path   = base_target.substr(0, base_query_at);
+    if (path.empty()) {
+        const std::string_view base_query = base_query_at == std::string_view::npos
+                                                ? std::string_view{}
+                                                : base_target.substr(base_query_at);
+        return origin + std::string(base_path) +
+               std::string(query_at == std::string_view::npos ? base_query : query);
+    }
+    if (path.front() == '/') { return origin + remove_dot_segments(path) + std::string(query); }
+    const std::size_t slash = base_path.rfind('/');
+    const std::string merged =
+        std::string(base_path.substr(0, slash == std::string_view::npos ? 0 : slash + 1)) +
+        std::string(path);
+    return origin + remove_dot_segments(merged) + std::string(query);
 }
 
 std::string resolve_public(const UrlParts& url, bool allow_private) {
@@ -206,11 +342,8 @@ std::string resolve_public(const UrlParts& url, bool allow_private) {
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* raw     = nullptr;
-    // An IPv6 literal comes bracketed from the URL; the resolver takes it bare.
-    const std::string host = url.host.size() > 2 && url.host.front() == '[' && url.host.back() == ']'
-                                 ? url.host.substr(1, url.host.size() - 2)
-                                 : url.host;
-    const int rc      = getaddrinfo(host.c_str(), url.port.c_str(), &hints, &raw);
+    const std::string port = std::to_string(url.port);
+    const int rc           = getaddrinfo(url.host.c_str(), port.c_str(), &hints, &raw);
     if (rc != 0) {
         throw Error(ErrorKind::RemoteUnavailable,
 #ifdef _WIN32
@@ -241,40 +374,153 @@ std::string resolve_public(const UrlParts& url, bool allow_private) {
     return selected;
 }
 
-struct CurlBuffer {
-    std::vector<std::uint8_t> bytes;
-    std::size_t limit = 0;
+// Stops a request from its own thread when the request's time runs out, its deadline passes or it
+// is cancelled: a connect or read that waits for the server wakes only so. While a request runs
+// only this thread calls the policy's cancellation callback; the fetch's thread waits in the
+// request meanwhile and calls it again once this thread has ended.
+class Watchdog {
+public:
+    Watchdog(httplib::ClientImpl& client, const Policy& policy, Clock::time_point end)
+        : client_(client), policy_(policy), end_(end), thread_([this] { run(); }) {}
+    ~Watchdog() {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            done_ = true;
+        }
+        wake_.notify_all();
+        thread_.join();
+    }
+    Watchdog(const Watchdog&)            = delete;
+    Watchdog& operator=(const Watchdog&) = delete;
+
+    [[nodiscard]] bool stopped() const noexcept { return stopped_.load(); }
+    [[nodiscard]] bool timed_out() const noexcept { return timed_out_.load(); }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!done_) {
+            const auto now = Clock::now();
+            bool stop      = stopped_.load();
+            if (!stop && now >= end_) { timed_out_ = stop = true; }
+            if (!stop && policy_.deadline != Clock::time_point{} && now >= policy_.deadline) {
+                stop = true;
+            }
+            if (!stop && policy_.is_cancelled) {
+                try {
+                    stop = policy_.is_cancelled();
+                } catch (...) { stop = true; }
+            }
+            if (stop) {
+                stopped_ = true;
+                // A request that starts clears the client's stop, so this repeats until it ends.
+                client_.stop();
+            }
+            wake_.wait_for(lock, std::chrono::milliseconds(20));
+        }
+    }
+
+    httplib::ClientImpl& client_;
+    const Policy& policy_;
+    const Clock::time_point end_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    bool done_ = false;
+    std::atomic<bool> stopped_{false};
+    std::atomic<bool> timed_out_{false};
+    std::thread thread_;
 };
 
-int curl_progress(void* opaque, curl_off_t, curl_off_t, curl_off_t, curl_off_t) noexcept {
-    const auto& policy = *static_cast<const Policy*>(opaque);
-    try {
-        return (policy.is_cancelled && policy.is_cancelled()) ||
-                       (policy.deadline != Clock::time_point{} && Clock::now() >= policy.deadline)
-                   ? 1
-                   : 0;
-    } catch (...) { return 1; }
+struct Reply {
+    int status = 0;
+    std::string location;
+    std::vector<std::uint8_t> body;
+};
+
+// A response's Content-Length, or 0 without one; a length past 64 bits reads as the largest.
+std::uint64_t declared_length(const httplib::Response& response) {
+    if (!response.has_header("Content-Length")) { return 0; }
+    std::uint64_t length = 0;
+    for (const char c : response.get_header_value("Content-Length")) {
+        if (!digit(c)) { return 0; }
+        if (length > (std::numeric_limits<std::uint64_t>::max() - 9) / 10) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        length = length * 10 + static_cast<std::uint64_t>(c - '0');
+    }
+    return length;
 }
 
-std::size_t curl_write(char* data, std::size_t size, std::size_t count, void* opaque) {
-    auto& out = *static_cast<CurlBuffer*>(opaque);
-    if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) { return 0; }
-    const std::size_t amount = size * count;
-    if (amount > out.limit - std::min(out.limit, out.bytes.size())) { return 0; }
-    out.bytes.insert(out.bytes.end(), reinterpret_cast<std::uint8_t*>(data),
-                     reinterpret_cast<std::uint8_t*>(data) + amount);
-    return amount;
+Reply request(const UrlParts& url, const std::string& address, const Policy& policy) {
+    const auto hop_ms = bounded_timeout_ms(policy, policy.timeout_ms);
+    std::unique_ptr<httplib::ClientImpl> client;
+    if (url.scheme == "https") {
+        client = product::verifying_https_client(url.host, url.port);
+    } else {
+        client = std::make_unique<httplib::ClientImpl>(url.host, url.port);
+    }
+    client->set_direct_hostname_addr_map({{url.host, address}});
+    client->set_follow_location(false);
+    client->set_decompress(false);
+    client->set_path_encode(false);
+    client->set_keep_alive(false);
+    client->set_connection_timeout(
+        std::chrono::milliseconds(bounded_timeout_ms(policy, policy.connect_timeout_ms)));
+    // The watchdog ends the request at hop_ms; the client's own limits come later, so a request
+    // that runs out of time is always reported as a timeout.
+    client->set_read_timeout(std::chrono::milliseconds(hop_ms + 1'000));
+    client->set_write_timeout(std::chrono::milliseconds(hop_ms + 1'000));
+
+    Reply reply;
+    bool over_limit = false;
+    httplib::Result result;
+    bool timed_out = false;
+    {
+        const Watchdog watchdog(*client, policy, Clock::now() + std::chrono::milliseconds(hop_ms));
+        const httplib::Headers headers = {{"User-Agent", "ninfer/vision"}};
+        result = client->Get(
+            url.target, headers,
+            [&](const httplib::Response& response) {
+                reply.status = response.status;
+                if (response.status >= 300 && response.status < 400) {
+                    reply.location = response.get_header_value("Location");
+                }
+                if (response.status >= 200 && response.status < 300 &&
+                    declared_length(response) > policy.max_bytes) {
+                    over_limit = true;
+                    return false;
+                }
+                return !watchdog.stopped();
+            },
+            [&](const char* data, std::size_t length) {
+                if (reply.status < 200 || reply.status >= 300) { return !watchdog.stopped(); }
+                if (length > policy.max_bytes - reply.body.size()) {
+                    over_limit = true;
+                    return false;
+                }
+                reply.body.insert(reply.body.end(), reinterpret_cast<const std::uint8_t*>(data),
+                                  reinterpret_cast<const std::uint8_t*>(data) + length);
+                return !watchdog.stopped();
+            });
+        timed_out = watchdog.timed_out();
+    }
+    check_control(policy);
+    if (over_limit) { throw Error(ErrorKind::BudgetExceeded, "media URL exceeds byte limit"); }
+    if (!result) {
+        const httplib::Error error = result.error();
+        if (timed_out || error == httplib::Error::ConnectionTimeout ||
+            error == httplib::Error::Timeout) {
+            throw Error(ErrorKind::RemoteTimeout,
+                        "media URL fetch timed out: " + httplib::to_string(error));
+        }
+        throw Error(ErrorKind::RemoteUnavailable,
+                    "failed to fetch media URL: " + httplib::to_string(error));
+    }
+    return reply;
 }
 
 std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
     if (!policy.allow_remote) { throw std::invalid_argument("remote media URLs are disabled"); }
-    static std::once_flag init;
-    std::call_once(init, [] {
-        if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
-            throw std::runtime_error("failed to initialize libcurl");
-        }
-    });
-
     std::string previous_scheme;
     for (int redirect = 0; redirect <= policy.max_redirects; ++redirect) {
         check_control(policy);
@@ -282,69 +528,22 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         if (previous_scheme == "https" && parts.scheme != "https") {
             throw std::invalid_argument("media URL redirects from HTTPS to HTTP");
         }
-        previous_scheme = parts.scheme;
+        previous_scheme      = parts.scheme;
         const std::string ip = resolve_public(parts, policy.allow_private_network);
         check_control(policy);
-        std::string resolve = parts.host + ":" + parts.port + ":";
-        resolve += ip.find(':') == std::string::npos ? ip : "[" + ip + "]";
-        curl_slist* resolve_list = curl_slist_append(nullptr, resolve.c_str());
-        if (resolve_list == nullptr) { throw std::bad_alloc(); }
-        std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> resolve_guard(
-            resolve_list, curl_slist_free_all);
-        std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(),
-                                                                 curl_easy_cleanup);
-        if (!curl) { throw std::runtime_error("failed to create libcurl handle"); }
-        CurlBuffer buffer{.bytes = {}, .limit = policy.max_bytes};
-        curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, "http,https");
-        curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
-        curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 0L);
-        curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS,
-                         bounded_timeout_ms(policy, policy.connect_timeout_ms));
-        curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS,
-                         bounded_timeout_ms(policy, policy.timeout_ms));
-        curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-        curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(curl.get(), CURLOPT_SSL_VERIFYHOST, 2L);
-        curl_easy_setopt(curl.get(), CURLOPT_PROXY, "");
-        curl_easy_setopt(curl.get(), CURLOPT_RESOLVE, resolve_list);
-        curl_easy_setopt(curl.get(), CURLOPT_MAXFILESIZE_LARGE,
-                         static_cast<curl_off_t>(policy.max_bytes));
-        curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_write);
-        curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &buffer);
-        curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
-        curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, curl_progress);
-        curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &policy);
-        curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "ninfer/vision");
-        const CURLcode code = curl_easy_perform(curl.get());
-        if (code != CURLE_OK) {
+        Reply reply = request(parts, ip, policy);
+        if (reply.status >= 200 && reply.status < 300) {
             check_control(policy);
-            if (code == CURLE_OPERATION_TIMEDOUT) {
-                throw Error(ErrorKind::RemoteTimeout,
-                            "media URL fetch timed out: " + std::string(curl_easy_strerror(code)));
-            }
-            if (code == CURLE_FILESIZE_EXCEEDED || code == CURLE_WRITE_ERROR) {
-                throw Error(ErrorKind::BudgetExceeded, "media URL exceeds byte limit");
-            }
+            return std::move(reply.body);
+        }
+        if (reply.status < 300 || reply.status >= 400 || redirect == policy.max_redirects) {
             throw Error(ErrorKind::RemoteUnavailable,
-                        "failed to fetch media URL: " + std::string(curl_easy_strerror(code)));
+                        "media URL returned HTTP " + std::to_string(reply.status));
         }
-        long status = 0;
-        curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
-        if (status >= 200 && status < 300) {
-            check_control(policy);
-            return buffer.bytes;
-        }
-        if (status < 300 || status >= 400 || redirect == policy.max_redirects) {
-            throw Error(ErrorKind::RemoteUnavailable,
-                        "media URL returned HTTP " + std::to_string(status));
-        }
-        char* next = nullptr;
-        curl_easy_getinfo(curl.get(), CURLINFO_REDIRECT_URL, &next);
-        if (next == nullptr || *next == '\0') {
+        if (reply.location.empty()) {
             throw Error(ErrorKind::RemoteUnavailable, "media URL redirect has no location");
         }
-        url = next;
+        url = resolve_location(parts, reply.location);
     }
     throw Error(ErrorKind::RemoteUnavailable, "too many media URL redirects");
 }

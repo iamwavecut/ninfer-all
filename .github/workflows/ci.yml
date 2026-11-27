@@ -224,8 +224,8 @@ jobs:
           "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       # Headers and import libraries are all a host-only compile reads: FFmpeg from BtbN's builds,
       # laid out as the vcpkg triplet tree cmake/FindFFMPEG.cmake reads, zlib for the native PNG
-      # decoder from the runner's vcpkg, and libcurl from curl.se.
-      - name: FFmpeg, zlib and libcurl headers
+      # decoder from the runner's vcpkg, and Mbed TLS from its pinned release archive.
+      - name: FFmpeg, zlib and Mbed TLS headers
         shell: pwsh
         run: |
           $deps = Join-Path $env:RUNNER_TEMP 'deps'
@@ -244,12 +244,10 @@ jobs:
           Copy-Item -Path "$zlib\include\zlib.h", "$zlib\include\zconf.h" -Destination "$tree\include"
           # Nothing links: the library only has to exist where src/media/CMakeLists.txt names it.
           New-Item -ItemType File -Force -Path "$tree\lib\z.lib" | Out-Null
-          Invoke-WebRequest -MaximumRetryCount 3 -RetryIntervalSec 10 -Uri 'https://curl.se/windows/latest.cgi?p=win64-mingw.zip' -OutFile "$deps\curl.zip"
-          Expand-Archive -Path "$deps\curl.zip" -DestinationPath $deps
-          $curl = Get-ChildItem -Path $deps -Directory -Filter 'curl-*' | Select-Object -First 1
+          cmake '-DNINFER_MEDIA_SOURCES_DIR=third_party/media-sources' '-DNINFER_MEDIA_SOURCES_ONLY=MBEDTLS' -P cmake/FetchMediaSources.cmake
+          if ($LASTEXITCODE -ne 0) { throw 'could not fetch the Mbed TLS release' }
           "VCPKG_ROOT=$deps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "VCPKG_TARGET_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CURL_ROOT_DIR=$($curl.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       # vcvars64 writes its environment into its own cmd process only: carry it into the later steps.
       - name: Visual Studio 2022 environment
         shell: pwsh
@@ -269,7 +267,6 @@ jobs:
         run: |
           cl 2>&1 | Select-Object -First 1
           nvcc --version | Select-Object -Last 2
-          $curl = $env:CURL_ROOT_DIR
           foreach ($arch in '${{ matrix.build.archs }}'.Split(' ')) {
             # A list of architectures names its build directory with underscores: CMake reads a
             # semicolon in a path as a list separator.
@@ -278,8 +275,7 @@ jobs:
               -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
               -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=OFF -DCMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES=OFF `
               -DBUILD_TESTING=ON -DNINFER_BUILD_APPS=ON -DNINFER_BUILD_BENCHMARKS=ON `
-              "-DCMAKE_PREFIX_PATH=$env:VCPKG_ROOT\installed\x64-windows" `
-              "-DCURL_INCLUDE_DIR=$curl\include" "-DCURL_LIBRARY=$curl\lib\libcurl.dll.a"
+              "-DCMAKE_PREFIX_PATH=$env:VCPKG_ROOT\installed\x64-windows"
             if ($LASTEXITCODE -ne 0) { throw "configure for sm_$arch failed ($LASTEXITCODE)" }
           }
       - name: Run scripts/check-host-compile.py

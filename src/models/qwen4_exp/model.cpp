@@ -1073,7 +1073,8 @@ const char* family_name(const TextConfig& config) noexcept {
 // holds it (ExpertLocation::pinned) and read from the files where it does not; the residency
 // becomes Disk.
 void settle_host_experts(TextWeights& weights, std::optional<MtpWeights>& mtp,
-                         const std::vector<BoundWeight>& bound, LoadOptions& options) {
+                         const std::vector<BoundWeight>& bound, LoadOptions& options,
+                         const artifact::MaterializedArtifact& backing) {
     std::vector<MoeWeights*> blocks;
     for (auto& layer : weights.layers) { blocks.push_back(&layer.moe); }
     if (mtp) { blocks.push_back(&mtp->layer.moe); }
@@ -1103,7 +1104,13 @@ void settle_host_experts(TextWeights& weights, std::optional<MtpWeights>& mtp,
                 for (std::size_t e = 0; e < ids->size(); ++e) {
                     const auto& view = bound.at((*ids)[e].index).view;
                     if (!view.parts.empty()) {
-                        (*places)[e].pinned = static_cast<const std::byte*>(native_weight(view).qdata);
+                        auto& location = (*places)[e];
+                        location.pinned = static_cast<const std::byte*>(native_weight(view).qdata);
+                        location.pinned_device = static_cast<const std::byte*>(
+                            backing.pinned_device_alias(location.pinned, std::size_t(location.bytes)));
+                        if (!location.pinned_device) {
+                            throw artifact::ArtifactError("pinned expert is outside the pinned block");
+                        }
                     }
                 }
                 ids->clear();
@@ -1372,7 +1379,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                                          nullptr, {.files_after_bytes = options.expert_host_bytes});
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
     LoadOptions settled = options;
-    settle_host_experts(weights, mtp_weights, bound, settled);
+    settle_host_experts(weights, mtp_weights, bound, settled, backing);
     auto model           = std::unique_ptr<Model>(
         new Model(std::move(config), std::move(settled), std::move(weights), std::move(stages),
                   std::move(bound), std::move(resources), std::move(info), std::move(backing)));

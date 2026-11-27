@@ -41,6 +41,8 @@
 //                              sends; it repeats the reply's tokens under any template)
 //   NINFER_STOP_BYTES          the stop string's bytes, 14 by default (more than a round of
 //                              drafts holds, so its match spans rounds)
+//   NINFER_STOP_CONCURRENCY    the Engine's --max-concurrency, 1 by default (past eight the
+//                              requests share eight stop-hold images)
 // The next prompt repeats the turn's tokens up to some position, which the test measures; a
 // family whose template renders the reply anew repeats none of it, and its reuse is only reported.
 namespace {
@@ -66,6 +68,11 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.max_concurrency       = 1;
     options.max_pending_requests  = 1;
     options.context_cache.enabled = true;
+    if (const auto concurrency = variable("NINFER_STOP_CONCURRENCY"); !concurrency.empty()) {
+        options.max_concurrency =
+            static_cast<std::uint32_t>(std::stoul(std::string(concurrency)));
+        options.max_pending_requests = options.max_concurrency;
+    }
     if (const auto devices = variable("NINFER_STOP_DEVICES"); !devices.empty()) {
         const std::string list(devices);
         for (std::size_t begin = 0; begin < list.size();) {

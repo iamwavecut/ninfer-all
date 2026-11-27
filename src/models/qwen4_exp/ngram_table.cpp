@@ -502,12 +502,14 @@ private:
 // Keep one bounded speculative batch separately from
 // demand reads; only a completely successful batch may supply bytes to a later request. The
 // owner never waits for speculative work in prefetch() or submit(). Failed hints are discarded:
-// a demand read still reports the underlying failure through its ordinary path.
+// a demand read still reports the underlying failure through its ordinary path. Submissions come
+// from the draft prefetch's stream callbacks while the executor's thread copies and discards, so
+// every member function but the destructor holds `mutex_`.
 class NgramTableReader::Lookahead {
 public:
     explicit Lookahead(NgramTableReader& owner)
         : owner_(owner), payload_(std::size_t(owner.options_.depth) * owner.layout_.row_bytes),
-          pool_(1) {
+          pool_(1, "n-gram lookahead") {
         std::vector<std::filesystem::path> paths;
         for (const auto& segment : owner.layout_.segments) { paths.push_back(segment.path); }
         queue_ = FileReadQueue::open(paths, owner.options_.io == NgramIo::Direct,
@@ -520,11 +522,13 @@ public:
     }
 
     void discard() {
+        std::lock_guard lock(mutex_);
         if (active_) { pool_.finish(); }
         active_ = false;
     }
 
     void submit(std::span<const std::uint64_t> rows) {
+        std::lock_guard lock(mutex_);
         if (rows.empty() || (active_ && !complete_.load(std::memory_order_acquire))) { return; }
         if (active_) { pool_.finish(); }
         const auto count = std::min<std::size_t>(rows.size(), owner_.options_.depth);
@@ -570,6 +574,7 @@ public:
     }
 
     bool copy(std::uint64_t row, std::uint8_t* destination) const {
+        std::lock_guard lock(mutex_);
         if (!active_ || !complete_.load(std::memory_order_acquire) || !succeeded_) { return false; }
         const auto found = std::lower_bound(ids_.begin(), ids_.end(), row);
         if (found == ids_.end() || *found != row) { return false; }
@@ -586,6 +591,7 @@ private:
     std::unique_ptr<FileReadQueue> queue_;
     bool active_ = false, succeeded_ = false;
     std::atomic<bool> complete_{false};
+    mutable std::mutex mutex_;
     ReadPool pool_;
 };
 
@@ -599,7 +605,8 @@ public:
         std::uint64_t begin, bytes;
     };
 
-    explicit Hints(const NgramTableReader& owner) : owner_(owner), pool_(1) {}
+    explicit Hints(const NgramTableReader& owner)
+        : owner_(owner), pool_(1, "n-gram hints") {}
 
     ~Hints() {
         try { pool_.finish(); } catch (...) {}
@@ -661,7 +668,7 @@ NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptio
         throw std::runtime_error("n-gram table: the files hold " + std::to_string(covered) +
                                  " table bytes, the table needs " + std::to_string(table_bytes));
     }
-    pool_ = std::make_unique<ReadPool>(options_.depth);
+    pool_ = std::make_unique<ReadPool>(options_.depth, "n-gram rows");
     if (options_.residency == NgramResidency::Ram) {
         load_resident();
     } else if (options_.residency == NgramResidency::RamHot) {
@@ -676,7 +683,7 @@ NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptio
         if (queue_) {
             // Startup's parallel bulk loads are finished. One worker now drives the OS queue;
             // its depth bounds native reads instead of allocating a thread for every read.
-            pool_ = std::make_unique<ReadPool>(1);
+            pool_ = std::make_unique<ReadPool>(1, "n-gram rows");
         }
     }
     const bool staged_hints = options_.io == NgramIo::Direct
@@ -853,6 +860,8 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
     admissions_.clear();
     copies_.clear();
     std::uint64_t hits = 0;
+    std::unique_lock cache_lock(cache_mutex_, std::defer_lock);
+    if (cache_) { cache_lock.lock(); }
     for (std::size_t i = 0; i < row_ids.size(); ++i) {
         if (cache_ && cache_->copy(row_ids[i], out.data() + i * rb)) {
             ++hits;
@@ -876,6 +885,7 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
         std::memcpy(out.data() + i * rb, resident_->data() + std::uint64_t(slot) * rb, rb);
         ++hits;
     }
+    if (cache_lock.owns_lock()) { cache_lock.unlock(); }
     if (options_.dedupe && misses_.size() > 1) {
         // Each row the files serve once, in file order; its repeats copy it in wait().
         order_.clear();
@@ -973,6 +983,7 @@ void NgramTableReader::wait() {
         }
     }
     if (!failure && cache_) {
+        std::lock_guard lock(cache_mutex_);
         for (const std::size_t i : admissions_) {
             cache_->insert(batch_ids_[i], batch_out_.data() + i * layout_.row_bytes);
         }
@@ -1004,10 +1015,14 @@ void NgramTableReader::prefetch(std::span<const std::uint64_t> row_ids) {
     if (options_.residency == NgramResidency::Ram) { return; }
     std::vector<std::uint64_t> rows;
     rows.reserve(row_ids.size());
-    for (const auto row : row_ids) {
-        if (cache_ && cache_->contains(row)) { continue; }
-        if (options_.residency == NgramResidency::RamHot && hot_slot(row) >= 0) { continue; }
-        rows.push_back(row);
+    {
+        std::unique_lock cache_lock(cache_mutex_, std::defer_lock);
+        if (cache_) { cache_lock.lock(); }
+        for (const auto row : row_ids) {
+            if (cache_ && cache_->contains(row)) { continue; }
+            if (options_.residency == NgramResidency::RamHot && hot_slot(row) >= 0) { continue; }
+            rows.push_back(row);
+        }
     }
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());

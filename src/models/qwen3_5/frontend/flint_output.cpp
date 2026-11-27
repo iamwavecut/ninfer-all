@@ -46,6 +46,7 @@ FlintMarkers FlintMarkers::from(const Tokenizer& tokenizer) {
     FlintMarkers out;
     out.think_open  = single_token(tokenizer, kFlintThinkOpen);
     out.think_close = single_token(tokenizer, kFlintThinkClose);
+    out.call_open   = single_token(tokenizer, kFlintCallOpen);
     return out;
 }
 

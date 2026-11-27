@@ -27,7 +27,9 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Novelties only: a new model, family, artifact, platform, option, endpoint, format or mode, or a measured speedup of a path that worked. No fixes of any kind (crashes, wrong output, failed starts, missed cases, regressions and the speedups that win them back, the options and defaults they bring), no guards, diagnostics, internal, CI, build, test or documentation changes, and no chronicle: a date without a novelty gets no line. One line per date, a few words per item, each linked to the document with its details; no descriptions, mechanisms, measurements or hardware. Full rule: CONTRIBUTING.md, "Documentation describes the current state". -->
 
-- **2026-11-25:** [Ternary Bonsai 2.5 27B](docs/performance/bonsai-2-5-2026-11.md) in both of PrismML's forms, PTQ1_0 and PQ2_0, with its MTP head and vision tower, [published](#supported-models); PrismML's [PTQ1_0 ternary blocks](docs/gguf.md#formats), multiplied as stored.
+- **2026-11-27:** [Tess-4.5-26B-A3B](docs/inkling2.md#tess-45), an Inkling 2 Mini fine-tune, [published](#inkling-2-mini); Qwen3.5-core models [decoding up to 64 requests at once](docs/performance.md#up-to-64-requests-at-once) (`--max-concurrency 1..64|auto`); sampling with [top-k up to 64](docs/cli.md#common-options) (Gemma 4's release default), temperatures above 2 and presence and frequency penalties beyond ±2; Inkling 2's and DeepSeek-V4.1's DSpark drafts [drawn under `--gumbel-sampling`'s noise](docs/cli.md#speculative-decoding) (Inkling 2 at temperature 1.0: 126.1 to 129.9 tok/s); the CPU expert share's integer dots [by `vpdpbusd` on AVX-VNNI and AVX512-VNNI CPUs](docs/qwen3-8-flash-next.md#the-cpu-share) (one thread's rows +3.5% to +8.4% at the median); a [KV host tier](docs/cli.md#kv-host-tier) for Qwen3.5-core models (`--kv-host-mib`); artifacts named by their [Hugging Face repository](docs/cli.md#artifacts-from-the-hugging-face-hub) (`OWNER/REPO` or `OWNER/REPO:FILE`) in place of a path; Qwen3.5-core MTP drafts [reading the newest 4096 keys](docs/serving.md#mtp-attention-window) past 32,768 tokens by default (`--mtp-attention-window auto`); [routing biased toward the experts the GPU holds](docs/cli.md#route-bias-toward-held-experts) (`--expert-route-bias B`), an opt-in, lossy mode for host and disk experts in every MoE family (Qwen3.6-35B-A3B with a 3 GiB expert cache on an RTX 4080: 123.5 to 140.1 tok/s at +1.3% perplexity); Gemma 4 31B drafting with [DFlash and DSpark drafters](docs/gemma4.md#dflash-and-dspark-drafters-for-the-31b) converted into its artifact (`--spec dflash`, `--spec dspark`), in coder3101's heretic 31B, [published](#gemma-4).
+- **2026-11-26:** ISTA-DASLab's [GSQ-RCO IQ2_S and IQ3_S](docs/inkling2.md#gsq-rco) of Inkling 2 Mini, [published](#inkling-2-mini); IQ2_XS expert banks in the [CPU share](docs/qwen3-8-flash-next.md#the-cpu-share) of host and disk experts; the WebUI's [MCP relay](docs/serving.md#webui) reaching `https://` MCP servers.
+- **2026-11-25:** Inkling 2's [MXFP8 expert banks](docs/inkling2.md#ud-q8_k_xl) (`mxfp8`) in UD-Q8_K_XL; [Ternary Bonsai 2.5 27B](docs/performance/bonsai-2-5-2026-11.md) in both of PrismML's forms, PTQ1_0 and PQ2_0, with its MTP head and vision tower, [published](#supported-models); PrismML's [PTQ1_0 ternary blocks](docs/gguf.md#formats), multiplied as stored.
 - **2026-11-24:** Inkling 2 [drafting with DSpark faster](docs/inkling2.md#what-runs): its Markov head scores each draft row's 16,384 likeliest tokens; every MoE family with host or disk experts [decoding faster](docs/qwen3-8-flash-next.md#the-expert-cache) (Qwen3.6-35B-A3B 15%, Flint 4.5%): the device cache's tier trades an expert only for 1.5 times its routes and places the experts a prompt calls for; Inkling 2 [prefilling long prompts faster](docs/inkling2.md#long-contexts); Inkling 2's [shared loop KV](docs/inkling2.md#shared-loop-kv) (`--loop-kv`), an opt-in, lossy mode; Inkling 2 [drafting with incoai's DFlash2 drafter](docs/inkling2.md#dflash2) (`--spec dflash2`), in its six [published artifacts](#inkling-2-mini).
 - **2026-11-23:** Inkling 2 [decoding faster](docs/inkling2.md#what-runs), [decoding faster after long prompts](docs/inkling2.md#long-contexts) and [prefilling long prompts faster](docs/inkling2.md#long-contexts); Gemma 4 and Flint decoding faster on Blackwell cards ([Gemma 4](docs/gemma4.md#what-runs), [Flint](docs/flint.md#what-runs)); Flint [decoding faster with `int8`, `rk8v4` and `rk4v4` KV](docs/flint.md#kv-cache); Flash-Next [prefilling long prompts faster](docs/qwen3-8-flash-next.md#execution); faster prompt chunks with [`cp.async` tiles](docs/device-profiles.md#what-is-calibrated) for NVFP4 weights; vLLM's [`bad_words`](docs/serving.md#banned-words), strings a reply never writes, and the CLI's [`--bad-word`](docs/cli.md); [`--no-structured-output-instruction`](docs/serving.md#structured-output), which keeps a constrained request's messages as the caller sent them; [device profiles](docs/gpus.md) for six more GPUs; Inkling 2 Mini [on Turing](docs/inkling2.md#long-contexts).
 - **2026-11-22:** [POST /shutdown](docs/serving.md#stop-the-server), the HTTP form of the graceful stop, registered by [`--admin-token`](docs/serving.md#server-options); [POST /v1/answer_now](docs/serving.md#answer-now), which ends a running reply's thinking; Inkling 2's [MXFP8 KV cache](docs/inkling2.md#kv-cache), its default (`--kv-dtype mxfp8`), and its [`int8`, `rk8v4` and `rk4v4` KV formats](docs/inkling2.md#kv-cache); Flint's [`int8`, `rk8v4` and `rk4v4` KV formats](docs/flint.md#kv-cache); for Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Flash-Next a [disk tier, prefix cache file and session slots](docs/serving.md#context-cache-of-the-other-families) (`--disk-kv-path`, `--prefix-cache-file`, `--slot-save-path`), and a checkpoint inside a long message, so a document followed by another question resumes after the document; [thinking budgets](docs/serving.md#openai-chat-completions) and `--reasoning-loop conclude` for Inkling 2, Flint and Gemma 4; Inkling 2 [prefilling and decoding faster at long contexts](docs/inkling2.md#long-contexts).
@@ -115,6 +117,11 @@ ninfer-serve models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b
 
 # The same options from the repository's configuration file.
 ninfer-serve --config configs/bonsai2-27b-dflash2.ini
+
+# The repository in place of the path: the file is fetched into the Hugging Face cache first.
+ninfer-serve WaveCut/Ternary-Bonsai-2-27B-NInfer-v3 --model-id bonsai2-27b \
+  --max-context 262144 --kv-capacity 262144 --kv-dtype rk8v4 --gdn-state-fp16 \
+  --spec dflash2 --draft-tokens 5
 ```
 
 A build listens on 127.0.0.1:8080 unless `--host` and `--port` say otherwise. [Building](#building) shows
@@ -194,7 +201,8 @@ Every card by name, with what has run on it:
 
 ## Supported Models
 
-Each name links to its Hugging Face card. `hf download REPO FILE.ninfer --local-dir models` fetches a file.
+Each name links to its Hugging Face card. `hf download REPO FILE.ninfer --local-dir models` fetches a file, and the
+programs also take the repository itself in place of a path ([artifacts from the Hub](docs/cli.md#artifacts-from-the-hugging-face-hub)).
 The Bonsai, GSQ-RCO, Flash-Next, Edge0, Gemma 4, Flint, DeepSeek-V4.1-Flash and Inkling 2 artifacts use formats that only this engine reads.
 Rows go from the fewest bits per weight to the most.
 ✓ means the artifact carries the component, — that it does not.
@@ -255,6 +263,7 @@ their Notes link it, and [N-gram tables](#n-gram-tables) lists them all.
 
 | Model | Size, GiB | Weights | Vision | Drafting | Notes |
 |---|---:|---|:-:|---|---|
+| [Gemma 4 31B it heretic i1-IQ4_XS](https://huggingface.co/WaveCut/gemma-4-31B-it-heretic-i1-IQ4_XS-DFlash-DSpark-NInfer-v3) | 18.89 | GGUF IQ4_XS blocks | — | DFlash<br>DSpark | coder3101's heretic (decensored) tune in mradermacher's imatrix GGUF byte for byte; manateelazycat's DFlash drafter for the tune, Hikari07jp's DSpark drafter for the original 31B |
 | [Gemma 4 26B-A4B it QAT](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) | 14.75 | GGUF Q4_0 blocks | ✓ | MTP | Google's QAT GGUF byte for byte; MTP is Google's QAT assistant |
 | [Gemma 4 31B it QAT](https://huggingface.co/WaveCut/gemma-4-31B-it-QAT-Q4_0-MTP-NInfer-v3) | 17.77 | GGUF Q4_0 blocks | ✓ | MTP | Google's QAT GGUF byte for byte, the dense model; MTP is Google's QAT assistant for it |
 
@@ -276,11 +285,14 @@ their Notes link it, and [N-gram tables](#n-gram-tables) lists them all.
 | Model | Size, GiB | Weights | Vision | Drafting | Notes |
 |---|---:|---|:-:|---|---|
 | [Inkling 2 Mini UD-IQ1_M](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ1_M-NInfer-v3) | 8.87 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 down banks | ✓ | DSpark<br>DFlash2 | Unsloth's UD-IQ1_M GGUF byte for byte; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini GSQ-RCO IQ2_S](https://huggingface.co/WaveCut/Inkling-2-Mini-GSQ-RCO-IQ2_S-NInfer-v3) | 9.75 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 and IQ4_NL down banks; BF16 token table and relative projections | ✓ | DSpark<br>DFlash2 | ISTA-DASLab's GSQ-RCO IQ2_S GGUF byte for byte; otherwise as UD-IQ4_XS |
 | [Inkling 2 Mini UD-Q2_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q2_K_XL-NInfer-v3) | 10.07 | GGUF blocks, IQ1_S to IQ2_S [gate; up], Q2_0 and NVFP4 down banks | ✓ | DSpark<br>DFlash2 | Unsloth's UD-Q2_K_XL GGUF byte for byte, its one MXFP4 bank as the same values in Q8_0; otherwise as UD-IQ4_XS |
+| [Inkling 2 Mini GSQ-RCO IQ3_S](https://huggingface.co/WaveCut/Inkling-2-Mini-GSQ-RCO-IQ3_S-NInfer-v3) | 12.03 | GGUF blocks, IQ1_S to IQ3_S [gate; up], IQ4_NL and Q2_0 down banks; BF16 token table and relative projections | ✓ | DSpark<br>DFlash2 | ISTA-DASLab's GSQ-RCO IQ3_S GGUF byte for byte; otherwise as UD-IQ4_XS |
 | [Inkling 2 Mini APEX-I MiniPlus V2.1](https://huggingface.co/WaveCut/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-NInfer-v3) | 13.48 | GGUF blocks, IQ3_XXS and IQ3_S experts | ✓ | DSpark<br>DFlash2 | IsValorum's APEX-I MiniPlus GGUF byte for byte with its Q8_0 vision tower; Unsloth's DSpark drafter; otherwise as UD-IQ4_XS |
 | [Inkling 2 Mini UD-Q3_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q3_K_XL-NInfer-v3) | 14.09 | GGUF blocks, NVFP4 and IQ3 experts | ✓ | DSpark<br>DFlash2 | Unsloth's UD-Q3_K_XL GGUF byte for byte; otherwise as UD-IQ4_XS |
 | [Inkling 2 Mini UD-IQ4_XS](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3) | 16.05 | GGUF blocks, NVFP4 experts in 20 of 24 layers | ✓ | DSpark<br>DFlash2 | Unsloth's UD-IQ4_XS GGUF byte for byte; Q8_0 vision tower (images); DSpark drafter, by default for one request at a time, incoai's DFlash2 drafter (`--spec dflash2`) or context lookup |
-| [Inkling 2 Mini UD-Q8_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q8_K_XL-NInfer-v3) | 22.74 | BF16 attention, head, token table and layers 20-23's experts; NVFP4 experts in 20 layers | ✓ | DSpark<br>DFlash2 | Unsloth's UD-Q8_K_XL GGUF byte for byte; a card of 32 GB or more, or host experts; otherwise as UD-IQ4_XS |
+| [Tess-4.5-26B-A3B NVFP4](https://huggingface.co/WaveCut/Tess-4.5-26B-A3B-NVFP4-NInfer-v3) | 17.69 | GGUF blocks, NVFP4 experts in 20 of 24 layers | ✓ | DSpark<br>DFlash2 | Migel Tissera's [agentic-coding fine-tune](docs/inkling2.md#tess-45) of Inkling 2 Mini, the author's NVFP4 GGUF byte for byte; Q8_0 vision tower; IQ4_NL DSpark drafter |
+| [Inkling 2 Mini UD-Q8_K_XL](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-Q8_K_XL-NInfer-v3) | 19.07 | BF16 attention, head and token table; MXFP8 experts in layers 20-23, NVFP4 in the other 20 | ✓ | DSpark<br>DFlash2 | Unsloth's UD-Q8_K_XL GGUF byte for byte except layers 20-23's BF16 experts, the same values in MXFP8; a card of 24 GB, or host experts; otherwise as UD-IQ4_XS |
 
 Tencent's [DSpine drafter for Qwen3.8-27B](https://huggingface.co/WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3)
 (2.27 GiB, Q8 layers and a BF16 code bridge) is an artifact of its own, which
@@ -566,8 +578,8 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
   Strata 0.2.6 decodes at 34 to 40 tok/s and prefills at 635 to 690
   ([DeepSeek-V4.1-Flash](docs/deepseek-v41.md)).
 - **Inkling 2 Mini.** Thinking Machines' looped 26.4B MoE (3.4B active per token), the engine's
-  first looped transformer, from Unsloth's UD-IQ4_XS GGUF (15.4 GiB), its UD-IQ1_M to UD-Q3_K_XL (8.2 to 13.4 GiB), its UD-Q8_K_XL (22.1 GiB) or
-  IsValorum's APEX-I MiniPlus (12.8 GiB) imported block for block: 24 stored layers run as 48 visits, the 12 core layers three
+  first looped transformer, from Unsloth's UD-IQ4_XS GGUF (15.4 GiB), its UD-IQ1_M to UD-Q3_K_XL (8.2 to 13.4 GiB), its UD-Q8_K_XL (18.5 GiB),
+  IsValorum's APEX-I MiniPlus (12.8 GiB) or ISTA-DASLab's GSQ-RCO IQ2_S and IQ3_S (8.4 and 10.6 GiB) imported block for block: 24 stored layers run as 48 visits, the 12 core layers three
   times with messages between passes, sliding-window and full attention with a learned distance
   table and sinks, depth attention over the earlier layers' states, 128 routed experts, up to eight
   concurrent requests with prefix reuse through host memory, the model's own reasoning and tool-call
@@ -648,8 +660,9 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
   ([Serving](docs/serving.md#context-cache-of-the-other-families)).
 - Precision trades that buy context: `--embedding-q4`, `--lm-head-q6`, `--gdn-state-fp16`
   ([quality trades](docs/maintainer/quality-trade-experiments.md)).
-- A token embedding kept in mapped host memory (`--embedding-residency host`), which frees its
-  VRAM for context with no change to the output.
+- A token embedding kept in mapped host memory, which frees its VRAM for context with no change to
+  the output: the server's default for Qwen3.5-family models on Linux whose KV pool takes free
+  memory and that run without drafting (`--embedding-residency auto`), or `host` explicitly.
 
 </details>
 

@@ -849,7 +849,10 @@ std::string format_server_start_json(
         {"speculative_draft_window", engine_options.speculative.draft_tokens},
         {"mtp_policy",
          engine_options.speculative.mtp_policy == MtpDraftPolicy::Adaptive ? "adaptive" : "fixed"},
-        {"mtp_attention_window", engine_options.speculative.mtp_attention_window},
+        {"mtp_attention_window",
+         engine_options.speculative.mtp_attention_window
+             ? Json(*engine_options.speculative.mtp_attention_window)
+             : Json("auto")},
         {"ngram_draft_window", engine_options.speculative.ngram_draft_tokens},
         {"ngram_min_match", engine_options.speculative.ngram_min_match},
         {"ngram_archive_bytes", engine_options.speculative.ngram_archive_bytes},
@@ -879,7 +882,7 @@ std::string format_server_start_json(
              {"thorough_admission_search", cache.thorough_admission_search},
              {"recency_eviction", cache.recency_eviction},
              {"value_aware_demote", cache.value_aware_demote},
-             {"kv_lease_growth", cache.kv_lease_growth},
+             {"kv_lease_growth", cache.kv_lease_growth.value_or(false)},
              {"automatic_long_anchors", cache.automatic_long_anchors},
              {"branch_anchors", cache.branch_anchors},
              {"endpoint_anchors", cache.endpoint_anchors},
@@ -925,6 +928,8 @@ std::string format_server_start_json(
                                                ? Json(*memory.cuda_graph_measured_bytes)
                                                : Json(nullptr)},
              {"kv_payload_bytes", memory.kv_payload_bytes},
+             {"kv_host_tier_bytes", memory.kv_host_tier_bytes},
+             {"kv_host_tier_pages", memory.kv_host_tier_pages},
              {"host_state_capacity_slots", memory.host_state_capacity_slots},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
              {"host_state_image_bytes", memory.host_state_image_bytes},

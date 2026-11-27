@@ -1,6 +1,7 @@
 #include "serve/mcp_proxy.h"
 
 #include "serve/http_server.h"
+#include "tls_fixture.h"
 
 #include <algorithm>
 #include <atomic>
@@ -96,10 +97,13 @@ struct Relay {
     }
 };
 
-std::string relay_path(int upstream_port) {
+std::string relay_path(const std::string& upstream_url) {
     return std::string(kMcpProxyPath) + "?" + kMcpProxyUrlParam + "=" +
-           httplib::encode_query_component("http://127.0.0.1:" + std::to_string(upstream_port) +
-                                           "/mcp");
+           httplib::encode_query_component(upstream_url);
+}
+
+std::string relay_path(int upstream_port) {
+    return relay_path("http://127.0.0.1:" + std::to_string(upstream_port) + "/mcp");
 }
 
 // POSTs to the relay for the upstream's /mcp; `receive` sees every chunk of the relayed body and
@@ -202,6 +206,39 @@ int test_bodyless_replies_pass() {
     return failures;
 }
 
+// An https target is reached over TLS and verified: its reply arrives as the MCP server sent it
+// while the test CA is trusted, and a certificate for another host name or from an untrusted CA
+// ends in 502 without a plain-HTTP attempt.
+int test_https_upstream() {
+    namespace tls = ninfer::test_tls;
+    tls::Server upstream;
+    upstream.server().Post("/mcp", [](const httplib::Request& request, httplib::Response& response) {
+        response.set_header("Mcp-Session-Id", "secure");
+        response.set_content("echo:" + request.body, "application/json");
+    });
+    upstream.start();
+    Relay relay;
+    httplib::Client client("127.0.0.1", relay.loopback.port);
+    client.set_read_timeout(std::chrono::seconds(30));
+    const std::string path = relay_path(upstream.url("localhost", "/mcp"));
+    int failures           = 0;
+    {
+        const tls::TrustedCa ca("mcp-" + std::to_string(upstream.port()));
+        const httplib::Result relayed = client.Post(path, "{}", "application/json");
+        failures += check(relayed && relayed->status == 200 && relayed->body == "echo:{}" &&
+                              relayed->get_header_value("Mcp-Session-Id") == "secure",
+                          "an https MCP server's reply did not arrive through the relay");
+        const httplib::Result mismatch =
+            client.Post(relay_path(upstream.url("127.0.0.1", "/mcp")), "{}", "application/json");
+        failures += check(mismatch && mismatch->status == 502,
+                          "an https MCP server with a certificate for another host was relayed");
+    }
+    const httplib::Result untrusted = client.Post(path, "{}", "application/json");
+    failures += check(untrusted && untrusted->status == 502,
+                      "an https MCP server that the system's certificates do not trust was relayed");
+    return failures;
+}
+
 int test_relay_requires_the_api_key() {
     const auto request = [](const std::string& method, const std::string& path) {
         httplib::Request r;
@@ -262,10 +299,17 @@ int main() {
                           ipv6_default.target.port == 80,
                       "a bracketed IPv6 literal without a port was misparsed");
 
-    // https must be refused outright: silently downgrading to http would send the
-    // caller's Authorization header over the wire in the clear.
-    failures += check(!parse_mcp_proxy_target("https://example.test/mcp").ok,
-                      "an https target was accepted despite there being no TLS client");
+    failures += check(!plain.target.https, "an http target was marked https");
+    const McpProxyRequest secure = parse_mcp_proxy_target("https://example.test/mcp");
+    failures += check(secure.ok && secure.target.https && secure.target.host == "example.test" &&
+                          secure.target.port == 443 && secure.target.path == "/mcp",
+                      "an https target without a port did not default to 443");
+    const McpProxyRequest secure_ipv6 = parse_mcp_proxy_target("HTTPS://[::1]:8443/sse");
+    failures += check(secure_ipv6.ok && secure_ipv6.target.https &&
+                          secure_ipv6.target.host == "::1" && secure_ipv6.target.port == 8443,
+                      "an https target with an IPv6 literal and a port was misparsed");
+    failures += check(!parse_mcp_proxy_target("ftp://example.test/mcp").ok,
+                      "a target of another scheme was accepted");
     failures += check(!parse_mcp_proxy_target("example.test/mcp").ok,
                       "a schemeless target was accepted");
     failures += check(!parse_mcp_proxy_target("http://").ok, "a hostless target was accepted");
@@ -332,6 +376,7 @@ int main() {
     failures += test_slow_reader_bounds_the_relay();
     failures += test_hang_up_releases_the_upstream();
     failures += test_bodyless_replies_pass();
+    failures += test_https_upstream();
 
     if (failures == 0) { std::cout << "mcp proxy ok\n"; }
     return failures == 0 ? 0 : 1;

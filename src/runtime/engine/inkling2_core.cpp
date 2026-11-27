@@ -19,6 +19,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "runtime/contract/draft_sampling.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/lookup_draft.h"
@@ -151,7 +152,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     }
     if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine && !block) ||
         speculative.draft_confidence.has_value() ||
-        speculative.mtp_attention_window != 0 ||
+        speculative.mtp_attention_window.value_or(0) != 0 ||
         (speculative.ngram_draft_tokens != 0 && !dflash2) || speculative.ngram_archive_bytes != 0 ||
         speculative.proposal_head == ProposalHead::Optimized ||
         (speculative.proposal_head != ProposalHead::Auto && !dspine) ||
@@ -174,6 +175,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
+    check_expert_route_bias(options);
     if (options.tensor_parallel ? device.size() < 2 : device.size() != 1) {
         throw std::invalid_argument("Inkling 2 runs on one device, or divides its routed experts over "
                                     "several with --tensor-parallel");
@@ -257,6 +259,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.dspine        = dspine;
     executor.dspark        = dspark;
     executor.dflash2       = dflash2;
+    executor.sampled_drafts = dspark && options.gumbel_sampling;
     if (block) {
         // The drafter's block less its anchor a round, or fewer with --draft-tokens; a round of a
         // context lookup's may verify as many as the lookup proposes.
@@ -276,6 +279,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    executor.expert_route_bias  = hybrid.route_bias;
+    executor.expert_route_bias_prompts = hybrid.route_bias_prompts;
     executor.expert_disk        = {hybrid.mirror, hybrid.direct};
     // An image of `budget` cells has 2 x 2 patches each.
     executor.vision_max_patches = 4 * vision_budget;
@@ -2437,13 +2442,19 @@ struct Inkling2Core::Impl {
         if (block_drafts != 0) { steps = std::min(steps, block_drafts); }
         std::vector<std::uint32_t> sequences;
         std::vector<std::int32_t> anchors;
+        // DSpark draws each row's drafts with the keys its verification columns draw the target's
+        // tokens with (runtime::draft_sampling); the other drafters stay greedy.
+        std::vector<ops::SamplingConfig> configs;
+        std::vector<std::int32_t> lengths;
         for (const auto& request : rows) {
             sequences.push_back(request->slot);
             anchors.push_back(request->feed.front());
+            configs.push_back(runtime::draft_sampling(*sample_row(*request).params));
+            lengths.push_back(static_cast<std::int32_t>(request->position));
         }
         std::vector<std::int32_t> drafted(rows.size() * steps);
         std::vector<float> confidence(rows.size() * steps);
-        instance.executor->draft(sequences, anchors, steps, drafted, confidence);
+        instance.executor->draft(sequences, anchors, steps, drafted, confidence, configs, lengths);
         std::vector<std::vector<TokenId>> out(rows.size());
         for (std::size_t j = 0; j < rows.size(); ++j) {
             std::uint32_t length = steps;

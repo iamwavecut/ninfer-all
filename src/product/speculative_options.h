@@ -114,9 +114,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         throw OptionConflict({"ngram-draft-tokens", "spec"},
                              "ngram drafting requires --spec mtp|dflash|dflash2|dspine");
     }
-    if (options.mtp_attention_window != 0 &&
+    if (options.mtp_attention_window.value_or(0) != 0 &&
         (options.backend != SpeculativeBackend::Mtp ||
-         options.mtp_attention_window < options.draft_tokens + 1)) {
+         *options.mtp_attention_window < options.draft_tokens + 1)) {
         throw OptionConflict(
             {"mtp-attention-window", "spec", "draft-tokens"},
             "--mtp-attention-window requires --spec mtp and at least --draft-tokens + 1 keys");
@@ -144,11 +144,18 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         return;
     case SpeculativeBackend::Mtp:
     case SpeculativeBackend::DFlash:
-    case SpeculativeBackend::DFlash2:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw OptionConflict({"spec", "draft-tokens"},
                                  std::string("--spec ") + speculative_backend_name(options.backend) +
                                      " requires --draft-tokens in [1,15]");
+        }
+        return;
+    case SpeculativeBackend::DFlash2:
+        // Without --draft-tokens Inkling 2's round verifies the drafter's whole block; the
+        // Qwen3.5-core models and Qwen3.8-Flash-Next refuse that themselves.
+        if (options.draft_tokens > 15) {
+            throw OptionConflict({"spec", "draft-tokens"},
+                                 "--spec dflash2 takes --draft-tokens up to 15");
         }
         return;
     case SpeculativeBackend::DSpark:

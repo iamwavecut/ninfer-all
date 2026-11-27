@@ -1401,7 +1401,7 @@ void ProgramImpl::stop_hold_copy(SequenceState& sequence) {
         sequence.state.fork_pending ||
         sequence.state.read != sequence.state.write || !state_store->valid(sequence.state.write) ||
         state_store->role(sequence.state.write) != StateImageRole::ActiveMutable) {
-        if (!hybrid_ && sequence.lane < max_concurrency) { stop_holds_[sequence.lane].reset(); }
+        if (!hybrid_ && sequence.lane < max_concurrency) { stop_hold_release(sequence.lane); }
         return;
     }
     if (!hybrid_) {
@@ -1436,8 +1436,22 @@ std::optional<std::int32_t> ProgramImpl::stop_hold_slot(SequenceState& sequence,
         frontier == 0 || frontier < sequence.execution_frontier) {
         return std::nullopt;
     }
+    std::optional<std::uint32_t>& image = stop_hold_images_[sequence.lane];
+    if (!image) {
+        // Every image is another lane's: this turn keeps no hold.
+        if (stop_hold_free_ == 0) { return std::nullopt; }
+        image = static_cast<std::uint32_t>(std::countr_zero(stop_hold_free_));
+        stop_hold_free_ &= stop_hold_free_ - 1ULL;
+    }
     return state_images->slot_count() - static_cast<std::int32_t>(stop_hold_slots_) +
-           static_cast<std::int32_t>(sequence.lane);
+           static_cast<std::int32_t>(*image);
+}
+
+void ProgramImpl::stop_hold_release(std::uint32_t lane) noexcept {
+    if (lane >= max_concurrency) { return; }
+    stop_holds_[lane].reset();
+    const std::optional<std::uint32_t> image = std::exchange(stop_hold_images_[lane], std::nullopt);
+    if (image) { stop_hold_free_ |= 1ULL << *image; }
 }
 
 void ProgramImpl::stop_hold_keep(SequenceState& sequence, std::uint32_t frontier,
@@ -1456,8 +1470,14 @@ void ProgramImpl::stop_hold_keep(SequenceState& sequence, std::uint32_t frontier
 void ProgramImpl::stop_hold_rewind(std::uint32_t lane) {
     if (hybrid_ || lane >= max_concurrency) { return; }
     const std::optional<StopHold> hold = std::exchange(stop_holds_[lane], std::nullopt);
-    RequestControl& request            = requests[lane];
-    if (!hold || request.lifecycle != Lifecycle::Finishable || !request.publish_continuation) {
+    // The lane's turn ends here: its image goes back once the copy below is queued, ahead of any
+    // later writer on the same streams.
+    const std::optional<std::uint32_t> image =
+        std::exchange(stop_hold_images_[lane], std::nullopt);
+    if (image) { stop_hold_free_ |= 1ULL << *image; }
+    RequestControl& request = requests[lane];
+    if (!hold || !image || request.lifecycle != Lifecycle::Finishable ||
+        !request.publish_continuation) {
         return;
     }
     SequenceState& sequence      = active_sequence(lane);
@@ -1481,7 +1501,7 @@ void ProgramImpl::stop_hold_rewind(std::uint32_t lane) {
     }
     state_images->copy_slot(state_images->slot_count() -
                                 static_cast<std::int32_t>(stop_hold_slots_) +
-                                static_cast<std::int32_t>(lane),
+                                static_cast<std::int32_t>(*image),
                             state_store->physical_slot(sequence.state.write), compute_streams);
     // The token that began the match stays the ledger's last one, sampled and not read, as after
     // any round.

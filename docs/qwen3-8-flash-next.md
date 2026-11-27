@@ -8,9 +8,8 @@ without requantization:
   Q2_0 (37.6 GB), IQ2_XS (39.2 GB), IQ3_XXS (47.0 GB), IQ3_S (54.8 GB);
 - [Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF);
 - [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF): UD-IQ2_XS
-  (47.0 GB) and UD-IQ3_XXS (54.8 GB) were converted and run. Of its other sizes, UD-IQ1_M stores
-  IQ2_XS expert blocks, which have no CPU product, and UD-Q4_K_XL and the larger ones store Q5_1
-  tensors, which have no kernel; none of those was converted.
+  (47.0 GB) and UD-IQ3_XXS (54.8 GB) were converted and run. Of its other sizes, UD-IQ1_M was not
+  converted, and UD-Q4_K_XL and the larger ones store Q5_1 tensors, which have no kernel.
 
 Each GSQ-RCO release is two GGUF shards: the model, and the 28.8 GB n-gram table of the model's
 per-layer embedding (PLE), byte for byte the same in every release, the Coder build's included. The
@@ -271,6 +270,7 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--expert-misses staged\|mapped` | GGUF host experts: a decode or verification call copies each routed expert its device cache lacks into device memory by the copy engine while the cached ones run, into a cache slot when one is free or when the expert's routes beat the coldest cached expert the call does not route ([the expert cache](#the-expert-cache)), else into staging (`staged`, the default); or its expert kernels read the missing experts across the bus (`mapped`) |
 | `--expert-dma-share F\|auto` | host or disk experts: fraction of a call's missing experts the GPU runs (copied to it), `0..1`; the CPU computes the rest from RAM while the GPU runs the cached ones. `auto` (the default) gives each call of GGUF experts the split whose copies and CPU products end soonest by the times measured on earlier calls, and copies every miss of native experts. Calls of up to eight tokens (decode steps, one request's verification) give the CPU any missing expert, calls of 9 to 64 tokens (several requests' verifications, short prompt chunks) those with at most eight pairs; wider calls run every expert on the GPU. GGUF CPU products are the GPU's bit for bit ([the CPU share](#the-cpu-share)) |
 | `--expert-tail-skip N` | GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten, instead of copying it; the remaining experts keep their router weights (no renormalization). Lossy, off by default; prefill always runs every routed expert. On an RTX 3090 with Q2_0 and four short chat prompts, `7` decoded 9.0-17.6% and `6` 11.9-24.4% faster, copying 22-43% and 29-52% fewer expert bytes; perplexity over 5,115 tokens scored one token per call went from 4.667 to 4.710 with `7` and 4.688 with `6`, an order opposite to how much each leaves out, so that sample does not resolve the cost |
+| `--expert-route-bias B` | GGUF host or disk experts with staged misses: `0..1` added to the softmax probability of each expert the GPU holds when a decode or verification call picks a text layer's ten experts, which keep the weights of their unbiased probabilities. Lossy, off by default; prompts and the MTP block route as trained; also Edge0 ([route bias](cli.md#route-bias-toward-held-experts)) |
 | `--expert-prefill-buffers 1\|2` | GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts into; `2` alternates two, so the next layer's copies run while this layer's experts do, when half the free memory holds both. When half the free memory holds not even one, prompt chunks and verifications copy their missing experts through the staging in rounds instead. Default: `2` with the automatic cache, where both buffers hold cache slots between prompts, else `1`; with an explicit `--expert-cache-mib` the buffers take memory beside the cache. On an RTX 4090 with IQ3_S host experts the second buffer prefilled a 31,865-token prompt at 3,430 instead of 2,683 tokens/s and decoded within 2.4% of the one-buffer speed (one run each); on an RTX 3090 with Q2_0, before the buffers became cache slots, 8.5-10.5% faster at 5,462 tokens and 1.9-2.3% at 31,860 |
 | `--iq1m-experts matrix\|vector` | GGUF IQ1_M experts of calls past eight tokens: ggml's integer matrix kernel once a call routes more than 16 rows to each expert on average for gate and up products and 6 for down products, the vector kernel below (default), or always the vector kernel in groups of eight columns; the two round the sums differently ([IQ1_M experts](deepseek-v41.md#iq1_m-experts-in-prompt-chunks)) |
 | `--expert-cpu-threads N` | host or disk experts with a CPU share: `1..256` CPU threads, the calling one included; default is one per physical core the process may use (its affinity mask), at most half its CPUs (the mask and a container CPU quota); the rest stay with the threads that drive the GPU and serve requests ([the CPU share on one RTX 4090](#the-cpu-share-on-one-rtx-4090)). Each thread is pinned to a physical core and spins while requests decode |
@@ -434,7 +434,7 @@ images do not depend on the share, on `auto`'s choices or on the thread count. T
 quantized as the GPU quantizes them (q8_1: per 32 values `d = amax / 127`, codes `round(v / d)`,
 `d` rounded to binary16). A 32-value slice gives the exact integer dot of its codes and the
 activation's, and its product is `(factor * d) * dot`, each step rounded, with the slice's exact
-factor (the block's binary16 multiplier times its integer scale); IQ2_S's and IQ1_M's are
+factor (the block's binary16 multiplier times its integer scale); IQ2_XS's, IQ2_S's and IQ1_M's are
 `d * fma(factor0, dot0, factor1 * dot1)` over their two halves (IQ1_M's codes are eight times its
 values, `8c - 7` or `8c - 9`, and its factors `d (2s + 1) / 8` carry the eighth), Q6_K's
 `d * (factor0 * dot0 + factor1 * dot1)`, Q4_K's and Q5_K's `(factor * d) * dot` less the
@@ -444,9 +444,29 @@ slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apar
 Gemma 4's GELU) is `ops/common/silu.h` on both sides, built from correctly rounded operations only,
 and the middle is rounded to BF16 before it is quantized for the down product. No compiler fuses
 these steps on either side: the GPU kernels spell them with `_rn` intrinsics and the CPU sources
-build without floating-point contraction. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S,
-IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS have CPU products, in AVX2 (with FMA and F16C) where the CPU has it and
-in portable C++ elsewhere, with the same bits.
+build without floating-point contraction. Q2_0, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL,
+IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and NVFP4 have CPU products, in AVX2
+(with FMA and F16C) where the CPU has it and in portable C++ elsewhere, with the same bits. CPUs with
+AVX-VNNI (Intel 12th generation and later, AMD Zen 5) or AVX512-VNNI with AVX512VL (AMD Zen 4, Intel
+Xeon since Cascade Lake) run the AVX2 code with one `vpdpbusd` for each integer dot instead of
+`vpmaddubsw` and `vpmaddwd`: the codes are at most 128 and the activations at most 127 in magnitude,
+so the two instructions' 16-bit sums never saturate and both give the same integers. The formats
+whose `vpdpbusd` rows measured slower keep AVX2's: Q8_0 on both, IQ2_XXS and IQ2_S also on AMD's
+AVX-VNNI, and IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S and IQ3_S on AVX512-VNNI. Rows of 1, 4 and 8 tokens
+against AVX2's (`ninfer_gguf_cpu_rows_bench`, the 18 formats, medians of three rounds, 2026-11-27):
+
+| CPU | Dots | One thread: median (lowest to highest) | One thread a core |
+|---|---|---|---|
+| Ryzen 9 9950X | AVX-VNNI | +3.5% (-1.0% to +20.3%) | 16 threads: +0.4% (-1.4% to +16.4%) |
+| Ryzen 7 7700X | AVX512-VNNI | +4.4% (0.0% to +22.2%) | 8 threads: 0.0% (-0.4% to +24.1%) |
+| Core i5-12600K | AVX-VNNI | +8.4% (-0.6% to +27.2%) | 8 threads: +2.6% (-0.1% to +33.6%) |
+| Xeon Gold 6244 (12 formats) | AVX512-VNNI | +6.1% (-1.1% to +48.6%) | not measured: other tenants' load |
+
+The gains are largest on one thread and with several tokens; with one thread a core, most rows of
+one token ran at AVX2's speed. Inkling 2 Mini UD-IQ4_XS with its experts in host memory and a 2 GiB
+device cache (RTX 4080 and the 9950X) decoded 62.5 tok/s with AVX2's dots and 62.9 with AVX-VNNI's
+at the measured CPU share, and 48.1 and 48.4 tok/s with the CPU computing every miss, the same text
+each time.
 
 ### The n-gram rows
 
@@ -853,8 +873,8 @@ counts, but not its experts: only a draft reads the stack they leave. Up to eigh
 rounds together, one MTP pass for all of them per draft and one verification pass. A request decodes
 without drafts when its prompt ends with a media token, near the end of its context, with one token
 left in its output or thinking budget, and while a `--post-thinking` request still reasons. N-gram
-copy proposals (`--ngram-draft-tokens`) are not available for this model; `--mtp-attention-window` and
-`--lm-head-draft` are refused.
+copy proposals (`--ngram-draft-tokens`) are not available for this model; a nonzero
+`--mtp-attention-window` and `--lm-head-draft` are refused.
 
 With `--lookup-ngram N`, a request whose last `N` tokens (the token it feeds next last) appeared
 earlier in its sequence proposes what followed them then, up to the round's width (`--draft-tokens`,

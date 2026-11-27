@@ -82,7 +82,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
                            std::uint32_t verify_window, std::uint32_t draft_window,
                            MtpCausalAttentionEnvelopes envelopes) {
     return [&state, batch_size, verify_window, draft_window, envelopes] {
-        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumSpeculativeRows) ||
             verify_window == 0 || verify_window > kMtpVerifyMaximumDrafts || draft_window == 0 ||
             draft_window > kMtpDecodeMaximumDrafts ||
             state.frame.current_drafts.ne[0] != static_cast<std::int32_t>(verify_window)) {

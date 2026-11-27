@@ -69,7 +69,7 @@ Copy-Item -Path (Join-Path $BuildRoot "portable\backends\cuda$CudaMajor\*.dll") 
 Copy-Item -LiteralPath (Join-Path $BuildRoot "portable\backends\cuda$CudaMajor\architectures.txt") -Destination $BackendRoot
 $RecordedArchs = ((Get-Content -LiteralPath (Join-Path $BackendRoot 'architectures.txt') -Raw).Trim() -split '\s+') -join ';'
 if ($RecordedArchs -ne ($Archs -join ';')) { throw 'Backend architecture metadata differs from the build' }
-# Include the vcpkg runtime closure, including dependencies of FFmpeg and curl.
+# Include the vcpkg runtime closure, including the dependencies of FFmpeg.
 $DllDirectories = @()
 $VcpkgEntry = @($Cache | Where-Object { $_ -match '^VCPKG_INSTALLED_DIR:[^=]+=' })
 if ($VcpkgEntry.Count -eq 1) {
@@ -103,6 +103,8 @@ if ($VcpkgEntry.Count -eq 1) {
         Copy-Item -LiteralPath $notice.FullName -Destination (Join-Path $ProductRoot "LICENSE-$name.txt")
     }
 }
+# Mbed TLS is compiled into the binaries from its pinned release (cmake/NinferMbedTLS.cmake).
+Copy-Item -LiteralPath (Join-Path $BuildRoot 'third_party\mbedtls\LICENSE') -Destination (Join-Path $ProductRoot 'LICENSE-mbedtls.txt')
 $Cuobjdump = Join-Path $CudaRoot 'bin\cuobjdump.exe'
 # The Windows loader refuses an image whose SizeOfImage passes 0x77000000 (1904 MiB): LoadLibrary
 # then fails with error 193 although the file is well below the linker's 2 GiB.

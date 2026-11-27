@@ -108,7 +108,7 @@ public:
           branch_anchors_(options.context_cache.enabled && options.context_cache.branch_anchors),
           endpoint_anchors_(options.context_cache.enabled && options.context_cache.endpoint_anchors),
           recover_invariant_failures_(options.recover_invariant_failures),
-          kv_lease_growth_(options.context_cache.kv_lease_growth),
+          kv_lease_growth_(options.context_cache.kv_lease_growth.value_or(false)),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -3186,6 +3186,7 @@ private:
                     *instance_.program, shortfall->main_pages, shortfall->backend_pages);
                 if (instance_.program->resume_device_kv_lease(*request->sequence)) {
                     if (released != 0) {
+                        ++cumulative_stats_.kv_lease_reclaimed_extensions;
                         publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
                                            "Device KV lease of lane %u extended: released %u "
                                            "retained cache owner(s)",
@@ -3195,6 +3196,7 @@ private:
                 }
                 if (!request->lease_shortfall_reported) {
                     request->lease_shortfall_reported = true;
+                    ++cumulative_stats_.kv_lease_cut_requests;
                     publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
                                        "Device KV lease of lane %u cannot grow after releasing %u "
                                        "retained cache owner(s); still short %u main / %u backend "

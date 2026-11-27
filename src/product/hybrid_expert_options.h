@@ -38,6 +38,11 @@ inline constexpr const char* kHybridExpertHelp =
     "                                straight into device memory through the kernel modules\n"
     "                                in kernel/ninfer-direct (auto, the default: when they are\n"
     "                                loaded and a self-test read passes)\n"
+    "  --expert-route-bias B         add B (0..1) to the routing score of each expert the GPU\n"
+    "                                holds when a decode or verification call chooses a\n"
+    "                                layer's experts, so more of them are hits; changes\n"
+    "                                results (default 0: routing as trained; not with\n"
+    "                                --tensor-parallel or Flash-Next native host experts)\n"
     "  Flash-Next-only expert options:\n"
     "  --expert-misses staged|mapped GGUF experts: copy misses into device staging while the\n"
     "                                cached experts run (default), or read host experts across\n"
@@ -83,6 +88,15 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
             throw std::invalid_argument("--expert-tail-skip takes an integer in 1..9");
         }
         out.tail_skip_rank = rank;
+    } else if (option == "--expert-route-bias") {
+        const std::string text(value());
+        float bias = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), bias);
+        if (error != std::errc{} || end != text.data() + text.size() || !std::isfinite(bias) ||
+            bias < 0 || bias > 1) {
+            throw std::invalid_argument("--expert-route-bias takes a finite value in 0..1");
+        }
+        out.route_bias = bias;
     } else if (option == "--expert-prefill-buffers") {
         const std::string_view count(value());
         if (count != "1" && count != "2") {

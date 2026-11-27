@@ -6,9 +6,10 @@ mixture-of-experts model of 26.4B parameters with 3.4B active per token (5.4B wi
 passes), from a llama.cpp GGUF: Unsloth's
 [UD-IQ4_XS](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (or its UD-IQ1_M, UD-Q2_K_XL,
 UD-Q3_K_XL and UD-Q8_K_XL), IsValorum's
-[APEX-I MiniPlus](https://huggingface.co/IsValorum/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-GGUF) or
-another quantization of the release, with the release's vision tower (BF16 or Q8_0) and DSpark
-drafter. It is the engine's first looped
+[APEX-I MiniPlus](https://huggingface.co/IsValorum/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-GGUF),
+ISTA-DASLab's [GSQ-RCO](https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF) IQ2_S and
+IQ3_S or another quantization of the release, with the release's vision tower (BF16 or Q8_0) and DSpark
+drafter, and fine-tunes of the release such as [Tess 4.5](#tess-45). It is the engine's first looped
 transformer and its own model family: its own executor (`src/models/inkling2`) and Engine core
 (`src/runtime/engine/inkling2_core`), sharing the Qwen3.5 frontend in an Inkling dialect for
 tokenization, the chat template, output parsing and the serving protocols.
@@ -48,10 +49,17 @@ tokenization, the chat template, output parsing and the serving protocols.
   prefilled at 3.07-3.08k instead of 2.96-2.97k tokens/s on an RTX 3090, 4.61-4.62k instead of
   4.31-4.33k on an RTX PRO 4500 Blackwell and 6.81-6.82k instead of 6.43k on an RTX 4090. A GGUF's
   BF16 matrices keep their words: UD-Q8_K_XL stores
-  attention, the token table, the head and layers 20-23's expert banks in BF16. A model with any
-  BF16 matrix runs every call on BF16 rows: Linear's A16 route multiplies the BF16 matrices into
-  FP32, a SIMT kernel the BF16 experts (FP32 sums of each expert's pairs, 32 at a time), and the
-  integer matrix kernels the GGUF matrices at every width.
+  attention, the token table, the head and layers 20-23's expert banks in BF16. Every value of
+  those banks is an MXFP8 value, so the converter stores them as `mxfp8` rows (E4M3 codes, one
+  E8M0 scale per 32 values), the same values in 33/64 of the bytes. A model whose attention
+  output, experts or head is BF16 or MXFP8 runs every call on BF16 rows: Linear's A16 route
+  multiplies the BF16 matrices into FP32, a SIMT kernel the MXFP8 or BF16 experts (FP32 sums of
+  each expert's pairs, 32 at a time, the same bits from either form), and the integer matrix
+  kernels the GGUF matrices at every width. BF16 query, gate, relative, key or value projections
+  beside GGUF matrices elsewhere (the GSQ-RCO releases' relative projections) leave the other
+  products their q8_1 form: a call of up to eight tokens writes its BF16 rows beside its q8_1 rows,
+  and Linear's A16 route multiplies those projections. The token table is read a row at a time,
+  so its format (BF16 in the GSQ-RCO releases) does not change the calls' form.
 - **The looped state.** A decode or verification call of at most 16 rows spreads each depth mix
   and residual update over one-warp blocks of 128 channels instead of one block per row. Each warp
   keeps its sums, and every reader adds them in the order the one-block kernel adds its warps', so
@@ -128,7 +136,8 @@ tokenization, the chat template, output parsing and the serving protocols.
   reached, the engine closes the open block with Qwen's early-close guidance and `<|end_message|>`,
   masks `<|content_thinking|>` for the rest of the response and decodes it without drafts.
   `--reasoning-loop conclude` closes it the same way ([Serving](serving.md#openai-chat-completions)).
-- **Sampling defaults.** The release's: temperature 1.0.
+- **Sampling defaults.** The release's: temperature 1.0 (top-k 64, the candidates the sampler
+  keeps).
 - **Speculative decoding.** The release's DSpark drafter (the artifact's `dspark` component,
   `--spec dspark`) proposes a block of up to 7 drafts from the target's tapped hidden states: three
   non-causal blocks over the anchor and mask rows, then a recurrent Markov head of rank 256 that
@@ -136,7 +145,9 @@ tokenization, the chat template, output parsing and the serving protocols.
   converter folded with the release's BF16 head. The head scores only each row's 16,384 candidates,
   its largest head logits by their BF16 truncation (the lowest ids among those equal to the
   16,384th), as vLLM's top-k Markov sampling does when a drafter's config asks for it; a draft is
-  the best candidate and its probability is taken over the candidates. Without `--spec`, an artifact
+  the best candidate (with `--gumbel-sampling`, a sampled request's draw among the candidates under
+  the target's keyed noise, [coupled draws](cli.md#speculative-decoding)) and its probability is
+  taken over the candidates. Without `--spec`, an artifact
   that carries the drafter drafts with it while the Engine serves one request at a time: 3 drafts a
   round, the round's width adapting from 1 to 3 by how far the drafts survive and how long the
   rounds take (`--adaptive-mtp`), each proposal ending after its first draft at or below probability
@@ -202,7 +213,11 @@ The conversion writes one 16,595,277,824-byte (15.5 GiB) `.ninfer` file of 1,185
 model, the vision tower (Q8_0 matrices) and the DSpark drafter (Q8_0, its Markov embedding BF16 as
 the GGUF stores it, and its Markov output table BF16; a drafter GGUF with table values that BF16
 does not hold is refused). With Unsloth's `mmproj-BF16.gguf` as the `vision` source the tower keeps
-BF16 matrices and the file is 295,895,040 bytes larger. Unsloth's repository holds each
+BF16 matrices and the file is 295,895,040 bytes larger. A BF16 drafter GGUF (ISTA-DASLab's
+`dspark-Inkling-2-Mini-BF16.gguf`) keeps BF16 matrices too, and the drafter then runs on BF16
+rows: on an RTX 4090 with the GSQ-RCO IQ2_S model and 7 drafts it generated the same tokens as the
+Q8_0 drafter and as `--spec none` for three greedy 200-token answers, accepted 22.4% of its drafts
+against the Q8_0 drafter's 23.2%, and decoded 2-4% slower. Unsloth's repository holds each
 quantization in two layouts: llama.cpp's `inkling2_loop` (24 blocks), the root files since
 2026-11-23, and the earlier `inkling2` (48 unrolled blocks in its metadata), now
 `Old_Support/*.gguf_file`. Both convert to the same artifact: from UD-IQ4_XS the two payloads are
@@ -234,11 +249,15 @@ on a rented RTX 3090 host's container.
 
 Unsloth's UD-IQ1_M, UD-Q2_K_XL and UD-Q3_K_XL convert like UD-IQ4_XS (`--source gguf=` names the
 file) to 8,885,967,616, 10,180,728,064 and 14,493,304,576 bytes, in 17 to 21 seconds each on a
-rented RTX 3090 host. UD-Q2_K_XL stores layer 20's down bank in MXFP4, which the expert products
+rented RTX 3090 host. ISTA-DASLab's GSQ-RCO IQ2_S and IQ3_S convert the same way, their BF16
+token table and relative projections kept BF16 ([GSQ-RCO](#gsq-rco)). UD-Q2_K_XL stores layer 20's down bank in MXFP4, which the expert products
 do not take: the converter writes the same values as Q8_0 blocks, each code's doubled value as
 the int8 code and 2^(e - 128) as the F16 scale, checking every block against the MXFP4 decode.
-UD-Q8_K_XL converts the same way to 23,785,597,440 bytes in 27 seconds on the same host;
-its BF16 matrices, expert banks included, are copied word for word.
+UD-Q8_K_XL converts the same way; its BF16 matrices are copied word for word except layers
+20-23's expert banks. The converter checks that every value of a layer's two banks is an MXFP8
+value and stores both as `mxfp8` rows; a bank with any other value keeps its layer's banks BF16.
+With the DFlash2 drafter (below) it wrote 20,471,680,000 bytes in 139 seconds on a rented RTX
+3090 host, 3,949,461,504 bytes fewer than with BF16 banks (96 seconds there).
 
 incoai's DFlash2 drafter converts beside the others from the release's folder
 (`config.json` and `model.safetensors`, BF16):
@@ -263,7 +282,8 @@ object keeps its bytes: the six published artifacts, converted this way with the
 November 24 in 18 to 29 seconds each, equal the files without it object for object apart from the
 81 new ones (45 BF16, 36 Q8_G32). They are 9,521,507,584 bytes (UD-IQ1_M), 10,816,268,032
 (UD-Q2_K_XL), 14,476,376,832 (APEX-I MiniPlus V2.1), 15,128,844,544 (UD-Q3_K_XL), 17,230,821,888
-(UD-IQ4_XS) and 24,421,141,504 (UD-Q8_K_XL). The converter checks the release's geometry, taps and
+(UD-IQ4_XS) and 24,421,141,504 (UD-Q8_K_XL, since November 25 20,471,680,000 with its
+MXFP8 banks). The converter checks the release's geometry, taps and
 selector settings and refuses a tensor stored other than BF16.
 
 ## Running
@@ -794,25 +814,136 @@ run's 384 greedy tokens, reasoning included, byte for byte, as did DSpark, on bo
 3090's cache held every expert. Each names the mailbox's 24 and the sun on the right in the image
 prompt of examples/cli/messages/image_natural.json. No card under 24 GB has run them.
 
+### GSQ-RCO
+
+ISTA-DASLab's [GSQ-RCO GGUFs](https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF)
+(revision `fd437345`) choose a ggml type for every tensor by a search under a size budget; the
+artifacts carry the smallest, IQ2_S (2.75 bits a weight), and the largest, IQ3_S (3.50). Both keep
+the token table and the 24 relative projections in BF16 and the other matrices as ggml blocks:
+[gate; up] banks of IQ1_S to IQ2_S (IQ2_S) or IQ1_S to IQ3_S (IQ3_S: IQ3_XXS in 6 layers and IQ3_S
+in 4), down banks Q2_0 or IQ4_NL, attention and head Q4_K to Q8_0 and IQ4_XS. With the Q8_0 tower,
+Unsloth's DSpark drafter and incoai's DFlash2 drafter they convert like UD-IQ4_XS
+([converting](#converting)) to 10,472,926,720 bytes (9.75 GiB) and 12,922,322,944 bytes
+(12.0 GiB), in 19 and 20 seconds on the host below.
+
+The CLI's 384-token greedy essay (`--spec none` unless named) on a rented RTX 3090 (350 W, PCIe 4.0
+x16, a Threadripper 3960X host, a CUDA 13.4.3 build), November 26, 2026, against master's build of
+that day, which ran every call of these files on BF16 rows ([what runs](#what-runs)), the two
+builds alternating, in tok/s:
+
+| Quantization | Master's build | This build | Host experts | Disk experts | DSpark | DFlash2, `--draft-min-p 0.5` | Mean NLL, 40 KB WikiText |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GSQ-RCO IQ2_S | 106.4, 106.9 | 141.3, 141.6 | 123.1 | 124.9 | 140.5 (1.50 a round) | 142.3 (2.28) | 1.949484 (+4.87%) |
+| GSQ-RCO IQ3_S | 99.7, 100.4 | 129.8, 130.9 | 115.3 | 115.6 | 132.8 (1.57) | 138.7 (2.43) | 1.880629 (+1.16%) |
+
+UD-IQ4_XS decoded the essay at 118.2 tok/s on the same host and scored a mean NLL of 1.858990 there
+(`--kv-dtype bf16`, 9,718 scored tokens), the base of the NLL differences. On this text IQ2_S
+(9.75 GiB) scores worse than UD-IQ1_M (8.87 GiB, 1.929600) and UD-Q2_K_XL (10.1 GiB, 1.901978), and
+IQ3_S (12.0 GiB) between UD-Q2_K_XL and APEX-I MiniPlus (13.5 GiB, 1.870942); those three were
+scored by the build of November 21 ([above](#smaller-quantizations)), which gave UD-IQ4_XS
+1.859871, 0.05% more. ISTA-DASLab measured task scores instead: 94.3% (IQ2_S) and 99.2% (IQ3_S)
+of the release's average over AIME25, GPQA-Diamond and LiveCodeBench v6.
+
+On the 1,150 WikiText tokens that `tools/reference/inkling2.py` scores in FP64
+([numerical checks](#numerical-checks)), NInfer-all scores a mean NLL of 1.674014 against 1.671201
+(+0.17%) for IQ2_S and 1.599721 against 1.596036 (+0.23%) for IQ3_S. Master's build gives IQ2_S the
+same 1.674014, and both builds give UD-IQ4_XS 1.560974 against 1.559721 (+0.08%). What makes the
+GSQ-RCO differences larger has not been found.
+
+- **The two builds.** The essays differ from the first tokens on: master's build multiplies BF16
+  rows, this one q8_1 rows, and the activations round differently; both texts read alike. Within
+  this build the host, disk, DSpark and DFlash2 runs wrote the `--spec none` text byte for byte.
+  In the host and disk runs of the table the device cache held all 3,072 experts and the CPU
+  computed none.
+- **CPU share.** With a 1,024 MiB cache (`--expert-cache-mib 1024`) host experts decoded the essay
+  at 67.3 and 57.2 tok/s with `--expert-dma-share 0.5` (11 pinned threads computed 12.5% and 14.7%
+  of the routes), 66.5 and 49.5 with `1` (the GPU copies every miss) and 45.8 and 37.1 with `0`
+  (the CPU computes every miss, 33.0% and 40.4% of the routes); disk experts 21.0 and 14.8 with
+  `0.5`. Every run wrote the device run's text byte for byte.
+- **Drafting.** DSpark accepted 1.50 and 1.57 tokens a round, against 1.84 to 1.98 for Unsloth's
+  smaller quantizations on November 24, and decoded the essay 0.99 and 1.02 times as fast as
+  `--spec none`; DFlash2 1.01 and 1.06 times as fast.
+- **Memory.** 8.35 and 10.6 GiB of weights on the GPU, 9.14 and 11.4 GiB with the tower and DSpark.
+  One sequence with the tower and DSpark plans 10.9 and 13.2 GiB of the GPU at 12,288 tokens, 11.3
+  and 13.6 GiB at 32,768 and 11.9 and 14.2 GiB at 65,536 (`configs/inkling2-mini.ini`); 10.0 and
+  12.3 GiB at 12,288 with `--spec none`. `--expert-residency host` pins 6.74 and 8.87 GiB for the
+  routed experts and keeps 1.61 and 1.76 GiB of weights and two layer banks of 780 and 921 MiB on
+  the GPU.
+- **Images.** Both name the mailbox's 24 and the sun on the right in the image prompt of
+  examples/cli/messages/image_natural.json (greedy).
+
 ### UD-Q8_K_XL
 
-Unsloth's UD-Q8_K_XL (22.2 GiB), the reference of Unsloth's KL measurements, keeps BF16 attention,
-token table, head and layers 20-23's experts, and NVFP4 experts in layers 0-19. On a rented RTX
-A6000 (300 W, PCIe 4.0 x16, CUDA 12.8), November 21, 2026, one run each:
+Unsloth's UD-Q8_K_XL, the reference of Unsloth's KL measurements, keeps BF16 attention, token
+table, head and layers 20-23's experts, and NVFP4 experts in layers 0-19. Every value of layers
+20-23's experts is an MXFP8 value, and the artifact stores them as `mxfp8` rows: 19.1 GiB with the
+tower and both drafters, against 22.7 GiB with BF16 banks. The CLI's 384-token greedy essay
+(`--spec none`) on a rented RTX 3090 (370 W, PCIe 4.0 x16, a CUDA 13.4.3 build), November 25, 2026,
+one run each, against the artifact with BF16 banks under master's build of that day, in tok/s:
 
-- **Memory.** 21.3 GiB of weights, 22.1 GiB with the tower and the drafter; one sequence plans
-  22.9 GiB of the GPU at 8,192 tokens with `--spec none` and 24.7 GiB at 32,768 with the tower and
-  the drafter. `--expert-residency host` pins 18.3 GiB of host memory and keeps 3.07 GiB of weights
-  and two 1,944 MiB layer banks on the GPU.
-- **Speed.** A 9,742-token prompt prefills at 1,710 tok/s, then decodes at 61.6 tok/s. On another
-  RTX A6000 (300 W, PCIe 4.0 x16, a CUDA 13.4.3 build, November 24, the mainline drafter) the
-  384-token greedy essay decodes at 71.3 tok/s with `--spec none`, 90.2 with DSpark and the tower
-  (2.08 tokens a round), 68.2 with host experts and 67.8 with disk experts (the A6000's cache held
-  every expert), all with the same text; UD-IQ4_XS there 105.8 and 124.7 (2.06).
-- **Quality.** A mean NLL of 1.857855 on the 40 KB WikiText slice (`--kv-dtype bf16`, 9,718
-  scored tokens), against UD-IQ4_XS's 1.859871 (-0.11%). Host, disk and DSpark runs give the
-  device run's 384 greedy tokens byte for byte; the image prompt gives the mailbox's 24 and the sun
-  on the right.
+| Experts | MXFP8 banks | BF16 banks |
+|---|---:|---:|
+| on the GPU | 81.7 | 79.7 |
+| in pinned host memory | 76.5 | 70.8 |
+| read from the file | 76.2 | 62.0 |
+
+All six runs wrote the same text. With host or disk experts the MXFP8 cache held all 3,072
+experts (100% hits) and the BF16 cache 2,341 (99.2%), and the 25-token prompt prefilled at 330 to
+344 tok/s against 52 to 109: a prompt chunk copies whole layer banks, half as large in MXFP8.
+
+- **Memory.** 17.7 GiB of weights (21.3 with BF16 banks), 18.4 GiB with the tower and DSpark; one
+  sequence plans 19.3 GiB of the GPU at 12,288 tokens with `--spec none`, and 20.2, 20.6 and
+  21.2 GiB at 12,288, 32,768 and 65,536 tokens with the tower and DSpark, so
+  `configs/inkling2-mini.ini` fits a 24 GB card (1.69 GiB free after startup on the RTX 3090). At
+  the CLI's 2,048 tokens 3.90 GiB stay free after startup instead of 809 MiB, and prompts run in
+  chunks of 2,048 tokens instead of 1,024. `--expert-residency host` pins 14.6 GiB of host memory
+  (18.3 with BF16 banks) and keeps 3.07 GiB of weights and two layer banks of 2,005 MiB together
+  (3,888) on the GPU.
+- **Drafting, KV formats and two cards.** Another RTX 3090 of the host (420 W, PCIe 3.0 x16) gave
+  the BF16 banks' text with DSpark (81.3 tok/s, 1.56 tokens a round; 79.6 with BF16 banks), DFlash2
+  (76.9; 76.0), each `--kv-dtype` and both cards dividing the experts (`--tensor-parallel`, 64.7;
+  64.1).
+- **Quality.** Measured with BF16 banks, whose products the MXFP8 rows reproduce bit for bit, on a
+  rented RTX A6000 (300 W, PCIe 4.0 x16, CUDA 12.8), November 21: a mean NLL of 1.857855 on the
+  40 KB WikiText slice (`--kv-dtype bf16`, 9,718 scored tokens), against UD-IQ4_XS's 1.859871
+  (-0.11%). Host, disk and DSpark runs gave the device run's 384 greedy tokens byte for byte; the
+  image prompt gives the mailbox's 24 and the sun on the right.
+
+### Tess 4.5
+
+Migel Tissera's [Tess-4.5-26B-A3B](https://huggingface.co/migtissera/Tess-4.5-26B-A3B) is an
+agentic-coding fine-tune of Inkling 2 Mini. Its
+[NVFP4 GGUF](https://huggingface.co/migtissera/Tess-4.5-26B-A3B-GGUF) converts like the other
+quantizations ([converting](#converting)). The
+[published artifact](https://huggingface.co/WaveCut/Tess-4.5-26B-A3B-NVFP4-NInfer-v3) (17.7 GiB)
+keeps that GGUF byte for byte, with incoai's DFlash2 drafter of the base model, ggml-org's Q8_0
+vision tower, as in the Inkling 2 Mini artifacts (Tess's BF16 tower equals the base's, and the
+Q8_0 matrices are its Q8_0 form), and the DSpark drafter re-quantized to IQ4_NL from the
+repository's BF16 file (373 MB, 749 in BF16). On a rented RTX 3090 (350 W, PCIe 4.0 x16), November
+27, 2026, one run each:
+
+| Prompt, greedy, up to 384 tokens | `--spec none` | DSpark (a round) | DFlash2, `--draft-min-p 0.5` | Host experts, DSpark |
+|---|---:|---:|---:|---:|
+| agentic task with tools (a tool call, 46 tokens) | 115.4 tok/s | 203.2 (3.54) | 190.7 | 191.8 |
+| Python task | 116.1 | 142.8 (2.21) | 137.5 | 135.8 |
+| explanation | 116.4 | 139.8 (2.15) | 135.0 | 132.7 |
+| question in Russian | 116.2 | 113.1 (1.67) | 112.1 | 107.1 |
+
+- **Text.** Every drafted and host-memory run wrote its `--spec none` twin's text. In Russian both
+  drafters decode about 3% slower than `--spec none`. The speeds were measured on a file with a
+  4-bit tower, whose objects outside the tower equal the published file's byte for byte; from the
+  published file release `2026-11-27.5` wrote the same text with `--spec none`, DSpark and DFlash2.
+- **Drafter quantization.** At 7 drafts a round over the four prompts the IQ4_NL drafter had 666 of
+  3,637 drafts accepted, the BF16 drafter 667 of 3,628, Q8_0 666 of 3,635 and Q4_K 662 of 3,663.
+- **Vision tower.** Against the BF16 tower's output rows on nine images the Q8_0 tower has a mean
+  cosine of 0.99965, a first percentile of 0.9970 and a relative RMS error of 2.3%; on the five
+  rendered images its greedy answers state the same facts as the BF16 tower's.
+- **Memory.** 16.4 GiB of weights on the GPU, 16.8 GiB with DSpark; one sequence of 8,192 tokens
+  plans 18.0 and 18.4 GiB of the GPU. With `--vision --max-context 65536` the server leaves
+  2.64 GiB of the card free.
+- **Not measured.** No perplexity and no task benchmark. The GGUF was compared with the checkpoint
+  on two experts of layers 0 and 20 only: layer 0's NVFP4 values are equal, layer 20's Q8_0 differs
+  from the checkpoint's MXFP8 by 0.54-0.55% relative RMS.
 
 ### Across cards
 
@@ -967,7 +1098,8 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
   `ninfer_inkling2_vision_kernels_test` qualifies the tower's kernels.
 - **Against an FP64 forward.** `tools/reference/inkling2.py` runs the model in FP64 over the GGUF's
   exactly decoded blocks. On 1,150 WikiText tokens (past the 1,024-position window) NInfer-all
-  scores a mean NLL of 1.560199 against its 1.559721 (+0.03%).
+  scores UD-IQ4_XS a mean NLL of 1.560974 against its 1.559721 (+0.08%) with the build of
+  November 26, 1.560199 (+0.03%) with that of November 21; GSQ-RCO's files in [GSQ-RCO](#gsq-rco).
 - **Against llama.cpp.** Perplexity on 120 KB of WikiText (`--context 4096 --stride 2048`) over the
   six 4,096-token windows both score alike: a mean NLL of 1.733757 against llama.cpp's 1.734757
   (-0.06%); per window -0.30% to +0.08% (llama.cpp's windows read from its four-digit running
@@ -1008,7 +1140,7 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
 
 ## Expert residency
 
-`--expert-residency device` keeps the routed GGUF banks on the GPU. `host` keeps them in pinned host
+`--expert-residency device` keeps the routed banks on the GPU. `host` keeps them in pinned host
 memory and `disk` in the artifact's files, read through the OS page cache. Both run the experts
 with the resident kernels on the GPU, except the share of decode and verification misses that CPU
 threads compute, through the transport Gemma 4 and Flint use
@@ -1016,8 +1148,8 @@ threads compute, through the transport Gemma 4 and Flint use
 rounds and the growing KV): a whole-layer bank for a prompt chunk's missing experts, a cache of the
 experts decode routes most (`--expert-cache-mib`), and a CPU share of a decode call's misses
 (`--expert-dma-share`, `--expert-cpu-threads`) computed from the stored blocks into the same 2^-32
-fixed-point sums as the GPU's, so outputs do not depend on the split. A model with BF16 matrices
-(UD-Q8_K_XL) has no CPU share: its calls read BF16 rows, and the GPU copies every miss. At startup the cache takes
+fixed-point sums as the GPU's, so outputs do not depend on the split. A model whose calls run on
+BF16 rows (UD-Q8_K_XL, [above](#what-runs)) has no CPU share: the GPU copies every miss. At startup the cache takes
 the most routed experts of the build's routing profile for this geometry, recorded over four chat
 requests unlike the measured ones (`--expert-profile PATH` reads another); from then on it follows
 the routes.

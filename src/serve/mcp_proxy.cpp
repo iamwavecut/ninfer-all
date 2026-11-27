@@ -1,5 +1,6 @@
 #include "serve/mcp_proxy.h"
 
+#include "product/https_client.h"
 #include "serve/http_server.h"
 
 #include <algorithm>
@@ -35,10 +36,15 @@ McpProxyRequest reject(std::string message) {
 
 // State shared between the handler, the chunked provider and the upstream thread. The upstream
 // thread holds only this, never the thread handle, so it can never be the one to join itself.
-struct McpProxyExchange {
-    explicit McpProxyExchange(const McpProxyTarget& target) : client(target.host, target.port) {}
+std::unique_ptr<httplib::ClientImpl> upstream_client(const McpProxyTarget& target) {
+    if (target.https) { return product::verifying_https_client(target.host, target.port); }
+    return std::make_unique<httplib::ClientImpl>(target.host, target.port);
+}
 
-    httplib::Client client;
+struct McpProxyExchange {
+    explicit McpProxyExchange(const McpProxyTarget& target) : client(upstream_client(target)) {}
+
+    std::unique_ptr<httplib::ClientImpl> client;
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<std::string> chunks;
@@ -74,7 +80,7 @@ struct McpProxyRelay {
         // issued before the connection opened would otherwise miss it.
         while (!exchange->finished) {
             lock.unlock();
-            exchange->client.stop();
+            exchange->client->stop();
             lock.lock();
             exchange->cv.wait_for(lock, std::chrono::milliseconds(50));
         }
@@ -112,7 +118,7 @@ void run_upstream(const std::shared_ptr<McpProxyExchange>& exchange, httplib::Re
         exchange->cv.notify_all();
         return true;
     };
-    const httplib::Result result = exchange->client.send(upstream);
+    const httplib::Result result = exchange->client->send(upstream);
     {
         std::lock_guard<std::mutex> lock(exchange->mutex);
         // httplib calls no response handler for a 204, which has no body to read.
@@ -143,13 +149,12 @@ void write_relay_error(httplib::Response& response, int status, const char* type
 
 McpProxyRequest parse_mcp_proxy_target(const std::string& url) {
     if (url.empty()) { return reject("proxy target url is empty"); }
-    if (starts_with_ci(url, "https://")) {
-        return reject("https proxy targets are unsupported: this build has no TLS client");
+    const bool https = starts_with_ci(url, "https://");
+    if (!https && !starts_with_ci(url, "http://")) {
+        return reject("proxy target url must be an absolute http:// or https:// url");
     }
-    if (!starts_with_ci(url, "http://")) {
-        return reject("proxy target url must be an absolute http:// url");
-    }
-    const std::string_view rest = std::string_view(url).substr(std::string_view("http://").size());
+    const std::string_view rest =
+        std::string_view(url).substr(std::string_view(https ? "https://" : "http://").size());
     const std::size_t authority_end = rest.find_first_of("/?#");
     const std::string_view authority =
         authority_end == std::string_view::npos ? rest : rest.substr(0, authority_end);
@@ -175,7 +180,9 @@ McpProxyRequest parse_mcp_proxy_target(const std::string& url) {
     if (host_part.empty()) { return reject("proxy target url has no host"); }
 
     McpProxyRequest request;
-    request.ok = true;
+    request.ok           = true;
+    request.target.https = https;
+    request.target.port  = https ? 443 : 80;
     if (!port_part.empty()) {
         if (!std::all_of(port_part.begin(), port_part.end(),
                          [](unsigned char c) { return std::isdigit(c) != 0; }) ||
@@ -241,7 +248,7 @@ void relay_mcp_proxy(const httplib::Request& request, httplib::Response& respons
 
     auto relay      = std::make_shared<McpProxyRelay>();
     relay->exchange = std::make_shared<McpProxyExchange>(parsed.target);
-    auto& client    = relay->exchange->client;
+    auto& client    = *relay->exchange->client;
     client.set_connection_timeout(std::chrono::seconds(5));
     // The MCP GET channel stays open for the session and is silent between events; a short read
     // timeout would tear it down mid-session.

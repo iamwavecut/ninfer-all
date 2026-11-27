@@ -893,12 +893,13 @@ DSpark rounds draft there by default ([measurements](../inkling2.md#measurements
   shares by each card's copy bandwidth within its free memory (`models::default_expert_split`).
   DeepSeek sizes them once the deliveries are about to start, so that every rank's misses take the
   same time over its bus (`delivery_shares`): rank r's cache holds `room_r` bytes of its share
-  (its free memory beside the CUDA Graph reserve and the delivery's tables; rank 0's beside the
-  model, its caches and workspace) and its bus copies the rest at `bus_r` (a pinned host copy
-  measured at startup, `rank_host_copy_bandwidth`), so with `B` bytes of experts in all each rank
-  takes `(room_r + t * bus_r) / B` with `t = (B - sum room) / sum bus`. Rank 0, which also holds
-  the model, takes fewer experts; when the caches together hold every expert the shares follow the
-  cards' copy bandwidth within that room. DeepSeek runs a prompt in spans as on one device
+  (its free memory beside the delivery's tables and the launch reserve, 320 MiB with CUDA graphs and
+  64 MiB without; rank 0's beside the model, its caches and workspace) and its bus copies the rest
+  at `bus_r` (a pinned host copy measured at startup, `rank_host_copy_bandwidth`), so with `B` bytes
+  of experts in all each rank takes `(room_r + t * bus_r) / B` with
+  `t = (B - sum room) / sum bus`. Rank 0, which also holds the model, takes fewer experts; when the
+  caches together hold every expert the shares follow the cards' copy bandwidth within that room.
+  DeepSeek runs a prompt in spans as on one device
   ([prompt spans](../deepseek-v41.md#prompt-spans)): the span's buffers stay on rank 0, every MoE
   call keeps a chunk's width, and each rank's delivery fills a block's bank once for all of the
   span's chunks. Refused: Gemma 4's, Flint's and Inkling 2's host or disk experts, DeepSeek's

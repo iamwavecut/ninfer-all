@@ -34,6 +34,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -240,6 +241,11 @@ public:
                  PromptCut cut = {});
     // Whether forward_pieces() runs: prompt steps are layer-major spans.
     [[nodiscard]] bool packs_prompts() const noexcept;
+    // Called on the calling thread of forward() and forward_pieces() as a layer-major span has
+    // queued each layer: the layers done and the span's layers. With the experts off the GPU the
+    // host waits for each layer's routes, so the count follows the device within a layer. Empty:
+    // none.
+    void set_span_progress(std::function<void(std::uint32_t done, std::uint32_t layers)> progress);
     // The widest prompt chunk a span runs alone over the cache and the missed experts rather than
     // from the layer's copied experts (64 tokens without the lossy tail skip, else 8); 0 without
     // spans. A step of such chunks only copies the experts it misses.

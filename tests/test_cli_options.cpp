@@ -389,6 +389,19 @@ int run_tests() {
                                        "--embedding-residency", "disk"});
                       }),
                       "CLI accepted an invalid embedding residency");
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).kv_host_tier.enabled() &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--kv-host-mib",
+                                 "2048"})
+                                  .kv_host_tier.bytes == (2048ULL << 20) &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--kv-host-mib",
+                                 "auto"})
+                                  .kv_host_tier.automatic,
+                      "CLI did not default the KV host tier off or keep --kv-host-mib");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                       "--kv-host-mib", "-1"});
+                      }),
+                      "CLI accepted an invalid --kv-host-mib");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency",
                              "host"}).hybrid_experts.tail_skip_rank == 0 &&
                           parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
@@ -415,6 +428,21 @@ int run_tests() {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-tail-skip", rank});
         }), "CLI accepted an invalid expert tail skip");
+    }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                                  .hybrid_experts.route_bias == 0.0F &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-route-bias", "0.1"})
+                                  .hybrid_experts.route_bias == 0.1F &&
+                          !parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                  "--expert-route-bias", "0.1"})
+                               .hybrid_experts.route_bias_prompts,
+                      "CLI did not leave the route bias off by default or preserve 0.1 for "
+                      "decode calls only");
+    for (const auto* bias : {"-0.1", "1.5", "nan", "0.1x"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-route-bias", bias});
+        }), "CLI accepted an invalid expert route bias");
     }
     for (const auto* budget : {"0", "32", "4096"}) {
         const auto disk = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
@@ -590,14 +618,18 @@ int run_tests() {
                               dflash2.speculative.draft_tokens == k,
                           "CLI did not preserve the DFlash2 draft count");
     }
-    for (const auto k : {0U, 16U}) {
-        failures +=
-            check(rejects([&] {
-                      (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
-                                   "dflash2", "--draft-tokens", std::to_string(k)});
-                  }),
-                  "CLI accepted an unsupported DFlash2 draft count");
-    }
+    // Without --draft-tokens Inkling 2's DFlash2 rounds verify the drafter's whole block; the
+    // models that need a count refuse its absence in their Engines.
+    const auto dflash2_block =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec", "dflash2"});
+    failures += check(dflash2_block.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+                          dflash2_block.speculative.draft_tokens == 0,
+                      "CLI refused DFlash2 without a draft count");
+    failures += check(rejects([&] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
+                                       "dflash2", "--draft-tokens", "16"});
+                      }),
+                      "CLI accepted an unsupported DFlash2 draft count");
     failures += check(
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype", "fp16"}).kv_cache ==
             ninfer::KvCacheStorage::Float16,
@@ -668,6 +700,7 @@ int run_tests() {
                                         "--kv-capacity",
                                         "--kv-dtype",
                                         "--kv-headroom-mib",
+                                        "--kv-host-mib",
                                         "--lm-head-draft",
                                         "--lm-head-q4",
                                         "--lm-head-q6",
@@ -772,7 +805,7 @@ int run_tests() {
                       "CLI accepted an unknown log level");
     failures +=
         check(rejects([] {
-                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
+                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "65"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
     failures += check(rejects([] {
@@ -900,7 +933,16 @@ int run_tests() {
                       "--invariant-attention did not reach the options");
     failures += check(parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
                              "--draft-tokens", "3", "--mtp-attention-window", "2048"})
-                              .speculative.mtp_attention_window == 2048,
+                              .speculative.mtp_attention_window == 2048 &&
+                          !parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                  "--draft-tokens", "3"})
+                               .speculative.mtp_attention_window &&
+                          !parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                  "--draft-tokens", "3", "--mtp-attention-window", "auto"})
+                               .speculative.mtp_attention_window &&
+                          parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                 "--draft-tokens", "3", "--mtp-attention-window", "0"})
+                                  .speculative.mtp_attention_window == 0U,
                       "CLI --mtp-attention-window not parsed");
     failures += check(rejects([] {
                           (void)parse({"ninfer", "model.ninfer", "--prompt", "x",

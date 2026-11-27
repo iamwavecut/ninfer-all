@@ -188,6 +188,7 @@ if(_ninfer_architecture_count GREATER 1 AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 # --- Global settings ---------------------------------------------------------
+option(NINFER_STATIC_CUDA_LIBS "Statically link CUDA runtime and cuBLAS" OFF)
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)

@@ -208,7 +208,8 @@ def main(argv=None):
         "--source dspark=DRAFTER.gguf or an STQ pack directory) and vision (its tower, from "
         "--source vision=MMPROJ.gguf and --source bias_vl=BIAS_VL.safetensors) beside text; "
         "for Inkling 2 vision, dspark and dflash2 (incoai's drafter, from --source dflash2=DIR) "
-        "beside text",
+        "beside text; for Gemma 4 mtp, vision, dflash and dspark (DFlashDraftModel directories, "
+        "from --source dflash=DIR and --source dspark=DIR) beside text",
     )
     parser.add_argument(
         "--resource",
@@ -419,35 +420,39 @@ def main(argv=None):
             return
         if gemma4:
             wanted = (args.components or "text").split(",")
+            optional = ("mtp", "vision", "dflash", "dspark")
             if ("gguf" not in paths or args.layers or wanted[0] != "text"
-                    or not set(wanted) <= {"text", "mtp", "vision"}
+                    or not set(wanted) <= {"text", *optional}
                     or len(set(wanted)) != len(wanted)
-                    or ("mtp" in wanted) != ("mtp" in paths)
-                    or ("vision" in wanted) != ("vision" in paths)):
+                    or any((name in wanted) != (name in paths) for name in optional)):
                 raise ValueError("Gemma 4 converts its text component from --source gguf=FILE; "
                                  "--components text,mtp adds its assistant from --source "
-                                 "mtp=FILE and text,vision its vision tower from --source "
-                                 "vision=MMPROJ.gguf")
+                                 "mtp=FILE, text,vision its vision tower from --source "
+                                 "vision=MMPROJ.gguf, text,dflash a DFlash drafter from --source "
+                                 "dflash=DIR and text,dspark a DSpark drafter from --source "
+                                 "dspark=DIR")
             gguf = stack.enter_context(GGUFFile(paths["gguf"]))
             mtp = stack.enter_context(GGUFFile(paths["mtp"])) if "mtp" in paths else None
             vision = stack.enter_context(GGUFFile(paths["vision"])) if "vision" in paths else None
-            model = build_gemma4(base, gguf, mtp=mtp, vision=vision,
+            drafters = {name: stack.enter_context(SafetensorsSource(paths[name]))
+                        for name in ("dflash", "dspark") if name in paths}
+            model = build_gemma4(base, gguf, mtp=mtp, vision=vision, drafters=drafters,
                                  resource_overrides=overrides)
             recipe = Recipe(model)
             gemma_sources = ({"base": base, "gguf": gguf} | ({"mtp": mtp} if mtp else {})
-                             | ({"vision": vision} if vision else {}))
+                             | ({"vision": vision} if vision else {}) | drafters)
             _function(args.recipe)(model, recipe, gemma_sources)
             if args.override:
                 _function(args.override)(model, recipe, gemma_sources)
             source_paths = {"base": {"path": str(args.model)},
                             "gguf": {"path": str(paths["gguf"])}}
-            for name in ("mtp", "vision"):
+            for name in optional:
                 if name in paths:
                     source_paths[name] = {"path": str(paths[name])}
             report = convert(
                 model, recipe, args.out, name=args.name,
                 provenance={"converter": "ninfer-v3", "recipe": args.recipe,
-                            "sources": source_paths},
+                            "sources": source_paths, "resource_edits": model.resource_edits},
                 device=args.device, rows_per_chunk=args.rows_per_chunk,
                 max_file_bytes=args.max_file_bytes,
                 progress=lambda index, total, job: print(

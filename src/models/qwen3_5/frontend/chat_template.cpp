@@ -320,7 +320,31 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         regions.push_back({std::move(pointer), id});
         return id;
     };
+    // Gemma 4's template writes an assistant message's calls and their responses before its text,
+    // then closes the turn: text the model wrote before a call reads as its answer to the response,
+    // and a prompt that ends there has no model turn to write in. Such a message goes to the
+    // template as two messages of one model turn, the text first. Kept thinking of an earlier turn
+    // renders only on a message with calls, so that message stays whole.
+    const auto text_before_calls = [&](std::size_t index) {
+        const ChatMessage& message = messages[index];
+        if (options.tool_call_syntax != ToolCallSyntax::Gemma ||
+            message.role != ChatRole::Assistant || message.tool_calls.empty()) {
+            return false;
+        }
+        const bool shown =
+            message.has_media() ||
+            std::any_of(message.parts.begin(), message.parts.end(), [](const ChatPart& part) {
+                return part.text.find_first_not_of(" \t\r\n\f\v") != std::string::npos;
+            });
+        if (!shown) return false;
+        return message.reasoning_content.empty() || !context.value("preserve_thinking", false) ||
+               std::none_of(messages.begin() + static_cast<std::ptrdiff_t>(index) + 1,
+                            messages.end(),
+                            [](const ChatMessage& later) { return later.role == ChatRole::User; });
+    };
     std::vector<ContentSource> sources(messages.size());
+    // The template messages that the first n input messages became.
+    std::vector<std::size_t> context_ends(messages.size() + 1);
     std::vector<Modality> media;
     for (std::size_t i = 0; i < messages.size(); ++i) {
         const auto& message = messages[i];
@@ -332,7 +356,7 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         Json value{{"role", message.role == ChatRole::Developer && developer_as_system
                                 ? role_name(ChatRole::System)
                                 : role_name(message.role)}};
-        const auto pointer = "/messages/" + std::to_string(i);
+        const auto pointer = "/messages/" + std::to_string(context["messages"].size());
         auto& origin       = sources[i];
         if (!message.has_media()) {
             std::string content;
@@ -378,7 +402,17 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
             }
         }
         if (!message.tool_call_id.empty()) value["tool_call_id"] = message.tool_call_id;
-        context["messages"].push_back(std::move(value));
+        if (text_before_calls(i)) {
+            Json calls{{"role", value["role"]},
+                       {"content", ""},
+                       {"tool_calls", std::move(value["tool_calls"])}};
+            value.erase("tool_calls");
+            context["messages"].push_back(std::move(value));
+            context["messages"].push_back(std::move(calls));
+        } else {
+            context["messages"].push_back(std::move(value));
+        }
+        context_ends[i + 1] = context["messages"].size();
     }
     std::vector<std::uint32_t> tool_tags;
     if (!options.tool_jsons.empty()) {
@@ -506,7 +540,7 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
             } else {
                 Json probe = context;
                 probe["messages"].erase(probe["messages"].begin() +
-                                            static_cast<std::ptrdiff_t>(count),
+                                            static_cast<std::ptrdiff_t>(context_ends[count]),
                                         probe["messages"].end());
                 probe["add_generation_prompt"] = false;
                 rendered                       = compiled_.render(probe, execution);

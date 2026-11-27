@@ -277,11 +277,12 @@ retained proposal distribution by rejection sampling.
 `--gumbel-sampling` draws each sampled token by Gumbel-max instead: the token whose logit plus
 keyed Gumbel noise (keyed by the seed, the position and the token) is largest. The tokens follow the
 same distribution, but a seed gives other tokens than the default draw, so the option is off by
-default. Drafts from an MTP block (Qwen3.5-core models, Qwen3.8-Flash-Next) and from Gemma 4's
-assistant then are the drafter's own draws under the same noise, so a draft and the target's draw
-agree wherever the two distributions agree. Whether the target keeps more of these drafts than of
-greedy ones depends on the drafter and the temperature: Qwen3.6-35B-A3B's MTP block kept fewer at
-0.7 and more at 1.0. DSpark and lookup drafts, and DSpine's outside the Qwen3.5 core, stay
+default. Drafts from an MTP block (Qwen3.5-core models, Qwen3.8-Flash-Next), from Gemma 4's
+assistant and from the DSpark drafters of Inkling 2 and DeepSeek-V4.1 then are the drafter's own
+draws under the same noise (Inkling 2's among each draft row's 16,384 candidates), so a draft and
+the target's draw agree wherever the two distributions agree. Whether the target keeps more of these
+drafts than of greedy ones depends on the drafter and the temperature: Qwen3.6-35B-A3B's MTP block
+kept fewer at 0.7 and more at 1.0. Lookup drafts, and DSpine's outside the Qwen3.5 core, stay
 greedy; DFlash2 and DSpine on Qwen3.5-core models keep their rejection sampling for the tokens they
 verify. A greedy request drafts and decodes as without the option (on Qwen3.6-35B-A3B, 3 of 3
 answers with the same bytes and log probabilities). One request, three prompts, seeds 1 to 3, 256
@@ -302,6 +303,18 @@ Qwen3.6-35B-A3B, an RTX 5090 (2026-11-12):
 With the option, Gemma 4's and Flash-Next's speculative answers were the bytes of their plain answers
 with the same seed (21 of 21 each); Qwen3.8-27B's and Qwen3.6-35B-A3B's differed as their greedy
 ones do, by the verification width's floating-point effect.
+
+Inkling 2 Mini UD-IQ4_XS with its experts in host memory, drawn DSpark drafts against the greedy
+drafts they replace, both with the option (the same prompts and seeds, RTX 4080, 2026-11-27):
+
+| Drafter | Temperature | Acceptance, greedy drafts | Acceptance, drawn drafts | tok/s, greedy drafts | tok/s, drawn drafts | Runs faster |
+|---|---|---|---|---|---|---|
+| DSpark, default draft count | 1.0 | 0.452 | 0.505 | 126.1 | 129.9 | 7 of 9 (-1.0% to +10.3%) |
+| `--spec dspark` | 1.0 | 0.166 | 0.183 | 94.1 | 98.2 | 7 of 9 (-2.8% to +12.1%) |
+| `--spec dspark` | 0.7 | 0.189 | 0.197 | 100.7 | 101.8 | 6 of 9 (-5.3% to +4.9%) |
+
+The answers were the same bytes in all 27 pairs. DeepSeek-V4.1's DSpark drafts take the same path
+and have no end-to-end measurement.
 
 ### Choosing a draft count
 
@@ -338,6 +351,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--rope-scaling-original-context N` | the interpolation threshold | the native window |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--kv-headroom-mib N` | device memory in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto`. `--vram-headroom-mib` is accepted as an alias | `1024` |
+| `--kv-host-mib N\|auto` | Qwen3.5 family on one device under Linux: continue the KV pool into N MiB of pinned host memory that the GPU reads in place, exact but slower for the part of a context there ([KV host tier](#kv-host-tier)); `auto` sizes it for `--max-context` | `0` (off) |
 | `--prefill-chunk N` | text-prefill chunk, in multiples of 128; with an `int8` or `rk*` KV cache a Qwen3.5-core model runs the nearby multiple of 128 that best fills the GPU's prompt-attention waves, up to 256 tokens more (see [device profiles](device-profiles.md)) | `1024`; `4096` for native MoE experts in host memory or files; `2048` for Qwen3.8-Flash-Next with `--tensor-parallel` when every device has room ([prompt pieces](maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next)); `2048` for DeepSeek-V4.1, which takes at most `4096` and a narrower chunk where the card lacks room ([its prompt chunks](deepseek-v41.md#prompt-spans)) |
 | `--prefill-tail exact\|full\|N` | DeepSeek-V4.1: the prompt rows that blocks 21 to 39, which keep no compressed cache, run: `exact` runs those the kept state and the last token's logits depend on, from the prompt chunk at or below them, so the output is `full`'s; `full` runs every row; `N` (at least 128) runs the last `N` rows before each kept state, a lossy mode: the output changes ([the prefill tail](deepseek-v41.md#the-prefill-tail)) | `exact` |
 | `--max-new N` | requested output-token limit | `128` |
@@ -358,6 +372,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--expert-dma-share F\|auto` | Host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF and Qwen3.5/3.6 MoE experts: the GPU's results bit for bit); `auto` splits each such call by the copy and CPU times measured on earlier calls and copies every miss of Flash-Next native experts. Flash-Next host experts' calls of 9 to 64 tokens give the CPU only missing experts with at most eight pairs; wider Flash-Next calls, Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 calls of more than eight tokens, and Qwen3.5/3.6 calls at or past the codec's prefill frontier or that route to half the experts or more, always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); DeepSeek-V4.1's `auto` copies every miss of disk experts ([its CPU share](deepseek-v41.md#the-cpu-share)) | `auto` |
 | `--iq1m-experts matrix\|vector` | DeepSeek-V4.1 and Qwen3.8-Flash-Next: IQ1_M routed experts of calls past eight tokens on the integer matrix kernel once a call routes more than 16 rows to each expert on average for their gate and up products and 6 for their down products (the vector kernel below), or always on the vector kernel in groups of eight columns; the two round the sums differently, so outputs differ slightly ([IQ1_M experts](deepseek-v41.md#iq1_m-experts-in-prompt-chunks)) | `matrix` |
 | `--expert-tail-skip N` | Qwen3.8-Flash-Next only, GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten; the other experts keep their router weights, so results change | off |
+| `--expert-route-bias B` | Host or disk experts: `0..1` added to the routing score of each expert the GPU holds when a decode or verification call chooses a layer's experts, so more of them are cache hits; the chosen experts keep the weights of their unbiased scores. Lossy: which experts a call takes, and so its output, depend on what the cache holds; prompts route as trained. Not with `--tensor-parallel` or Flash-Next native host experts ([route bias](#route-bias-toward-held-experts)) | `0` (off) |
 | `--expert-prefill-buffers 1\|2` | Qwen3.8-Flash-Next only, GGUF host experts: device buffers a long prompt's uncached experts are copied into; `2` copies the next layer's while the current layer's experts run, when half the free memory holds both. With the automatic cache the buffers hold expert cache slots between prompts ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)) | `2` with the automatic expert cache, else `1` |
 | `--expert-cpu-threads N` | Host or disk experts with a CPU share: `1..256` CPU threads, the calling one included, pinned one to a physical core | `min(physical cores, usable CPUs / 2)`, at least one. Usable CPUs: the process's affinity mask, bounded by a container's CPU quota; physical cores: those in the mask. A 30-CPU container quota gives 15 threads, a 16-core/32-thread desktop 16 |
 | `--expert-cache-adaptive` | Qwen3.8-Flash-Next only: replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
@@ -378,15 +393,15 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--kv-dtype bf16\|fp16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4\|bf16p\|mxfp8` | KV-cache storage. `fp16` is [native FP16 for Flash-Next and Edge0](qwen3-8-flash-next.md#native-fp16-kv), with FP32 K/V production and one FP16 rounding; for Gemma 4, Flint and Inkling 2 it names the F16 cache that `bf16` selects; Qwen3.5-core models and DeepSeek-V4.1 refuse it. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; those nine are accepted on every build target; `bf16p` is opt-in BF16 packed losslessly into 23% fewer bytes, for Qwen3.5 and Qwen3.8-Flash-Next from sm_75, without `--tensor-attention positions` (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV; for Gemma 4 the sliding-window blocks' K and V, with the full-attention blocks' one value plane in an unrotated coding (see [Gemma 4](gemma4.md#kv-cache-formats)); for Inkling 2 the eight full-attention visits' planes, `int8` (int8 G64 keys and values) or int8 G64 (`rk8v4`) or Lloyd-Max 4-bit (`rk4v4`) keys over packed int4 values, all unrotated, with the sliding visits' rings F16; `mxfp8`, E4M3 values over a power-of-two scale per 32, stores those planes for Inkling 2 only, its default (see [Inkling 2](inkling2.md#kv-cache)); for Flint the 14 full-attention blocks' planes, `int8` (int8 G64 keys and values), `rk8v4` (int8 G64 keys over packed int4 values) or `rk4v4` (Hadamard-rotated Lloyd-Max 4-bit keys over the same values), with the sliding blocks' rings F16 (see [Flint](flint.md#kv-cache)); DeepSeek-V4.1 keeps the release's FP8/FP4 caches (`bf16` only) | `bf16`; `mxfp8` for Inkling 2 |
 | `--kv-resident N\|all\|auto` | Qwen3.8-Flash-Next: positions of each sparse-attention layer's KV a sequence keeps in device memory; past them the layers' KV streams from pinned host memory (see [streamed KV](qwen3-8-flash-next.md#streamed-sparse-attention-kv)) | `auto`: 32,768 with host or disk experts, all with device experts |
 | `--loop-kv per-pass\|last-full\|last-all` | Inkling 2: the keys and values of its looped core's three passes. `per-pass` keeps every pass's own; `last-full` keeps only the last pass's for the core's two full-attention layers, which the earlier passes read for the positions before a call, half the KV that grows with the context in every `--kv-dtype`; `last-all` also shares the core's windowed rings, transformers' `last_loop`. Both raise the perplexity (+0.85% and +2.23% on WikiText, more for decoded tokens), depend on how the tokens are split into calls, so DSpark changes the reply, and other families refuse them (see [Inkling 2](inkling2.md#shared-loop-kv)) | `per-pass` |
-| `--spec none\|mtp\|dflash\|dflash2\|dspark\|dspine` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) and `dflash2` from one carrying its DFlash2 drafter (see [DFlash2 speculative decoding](qwen3-8-flash-next.md#dflash2-speculative-decoding)), Gemma 4 from one converted with its assistant (see [Gemma 4](gemma4.md#speculative-decoding-with-the-assistant)); DeepSeek-V4.1 takes `dspark` from an artifact converted with its DSpark drafter (see [the DSpark drafter](deepseek-v41.md#the-dspark-drafter)), as Inkling 2 does (see [Inkling 2](inkling2.md#what-runs)), which also takes `dflash2` from an artifact converted with incoai's DFlash2 drafter (see [DFlash2 on Inkling 2](maintainer/dflash.md#inkling-2)); every family takes `dspine` with `--draft-model` (see [DSpine](maintainer/dspine.md)); Flint has no drafter of its own and takes `--lookup-ngram` without `--spec`, as DeepSeek-V4.1 does without `dspark` | for Flash-Next artifacts with host experts `dflash2` with 4 drafts (with `--draft-min-p 0.7`) on one device when they carry the DFlash2 drafter, else (over pipeline stages too) `mtp` with 3 drafts (with `--draft-min-p 0.5`) when they carry the MTP block, a round of several requests with a CPU share verifying at most 64 tokens ([MTP with several requests](qwen3-8-flash-next.md#mtp-with-several-requests)); for [Edge0](edge0.md#drafting) artifacts also with device experts and `--max-concurrency 1`; `mtp` with 3 drafts for Gemma 4 artifacts with their assistant and host or disk experts; `dspark` with 3 drafts adapting (`--adaptive-mtp`, with `--draft-min-p 0.5`) for Inkling 2 artifacts with their drafter at `--max-concurrency 1`; otherwise off |
+| `--spec none\|mtp\|dflash\|dflash2\|dspark\|dspine` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) and `dflash2` from one carrying its DFlash2 drafter (see [DFlash2 speculative decoding](qwen3-8-flash-next.md#dflash2-speculative-decoding)), Gemma 4 from one converted with its assistant (see [Gemma 4](gemma4.md#speculative-decoding-with-the-assistant)), and the 31B `dflash` or `dspark` from one converted with that drafter (see [DFlash and DSpark drafters](gemma4.md#dflash-and-dspark-drafters-for-the-31b)); DeepSeek-V4.1 takes `dspark` from an artifact converted with its DSpark drafter (see [the DSpark drafter](deepseek-v41.md#the-dspark-drafter)), as Inkling 2 does (see [Inkling 2](inkling2.md#what-runs)), which also takes `dflash2` from an artifact converted with incoai's DFlash2 drafter (see [DFlash2 on Inkling 2](maintainer/dflash.md#inkling-2)); every family takes `dspine` with `--draft-model` (see [DSpine](maintainer/dspine.md)); Flint has no drafter of its own and takes `--lookup-ngram` without `--spec`, as DeepSeek-V4.1 does without `dspark` | for Flash-Next artifacts with host experts `dflash2` with 4 drafts (with `--draft-min-p 0.7`) on one device when they carry the DFlash2 drafter, else (over pipeline stages too) `mtp` with 3 drafts (with `--draft-min-p 0.5`) when they carry the MTP block, a round of several requests with a CPU share verifying at most 64 tokens ([MTP with several requests](qwen3-8-flash-next.md#mtp-with-several-requests)); for [Edge0](edge0.md#drafting) artifacts also with device experts and `--max-concurrency 1`; `mtp` with 3 drafts for Gemma 4 artifacts with their assistant and host or disk experts; `dspark` with 3 drafts adapting (`--adaptive-mtp`, with `--draft-min-p 0.5`) for Inkling 2 artifacts with their drafter at `--max-concurrency 1`; otherwise off |
 | `--draft-model PATH` | DSpine only: the drafter artifact, trained for the model | unset |
-| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for the DFlash2 drafters of Qwen3.8-Flash-Next and Inkling 2 (their block of 8), Gemma 4's assistant and the context lookup of Flint, DeepSeek-V4.1 and Inkling 2; DSpark up to its block, `1..5` on DeepSeek-V4.1 and `1..7` on Inkling 2; for DSpine up to its block less one and at most 15, or 7 on Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 | unset (their lookup: 3; DSpark: its block, 5 or 7; Inkling 2's DFlash2: 7) |
-| `--draft-min-p P` | Flash-Next MTP and DFlash2, Inkling 2's DSpark and DFlash2, and DSpine on every family but the Qwen3.5 core: verify a round's drafts through the first at or below this probability (MTP: its absolute probability, which also ends the drafting; DFlash2 and DSpine: the drafter's confidence; Inkling 2's DSpark: the drafter's probability of its draft; Inkling 2's DFlash2: the selector's confidence, as Flash-Next's); see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding), [DFlash2](qwen3-8-flash-next.md#dflash2-speculative-decoding) and [DSpine](maintainer/dspine.md#verification-by-family) | `0` (off) with `--spec`; `0.5` when the engine chooses MTP or Inkling 2's DSpark and `0.7` when it chooses DFlash2 (no `--spec`), unless set |
+| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for the DFlash2 drafters of Qwen3.8-Flash-Next and Inkling 2 (their block of 8), Gemma 4's assistant and its DFlash and DSpark drafters, and the context lookup of Flint, DeepSeek-V4.1 and Inkling 2; DSpark up to its block, `1..5` on DeepSeek-V4.1 and `1..7` on Inkling 2 and Gemma 4; for DSpine up to its block less one and at most 15, or 7 on Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 | unset (their lookup: 3; DSpark: its block, 5 or 7; Inkling 2's DFlash2: 7) |
+| `--draft-min-p P` | Flash-Next MTP and DFlash2, Inkling 2's DSpark and DFlash2, the Gemma 4 31B's DSpark, and DSpine on every family but the Qwen3.5 core: verify a round's drafts through the first at or below this probability (MTP: its absolute probability, which also ends the drafting; DFlash2 and DSpine: the drafter's confidence; Inkling 2's DSpark: the drafter's probability of its draft; the Gemma 4 31B's DSpark: the drafter's confidence; Inkling 2's DFlash2: the selector's confidence, as Flash-Next's); see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding), [DFlash2](qwen3-8-flash-next.md#dflash2-speculative-decoding) and [DSpine](maintainer/dspine.md#verification-by-family) | `0` (off) with `--spec`; `0.5` when the engine chooses MTP or Inkling 2's DSpark and `0.7` when it chooses DFlash2 (no `--spec`), unless set |
 | `--draft-experts N` | DSpark only: each drafter block keeps its `N` most routed experts on the GPU and routes among them, the rest in pinned memory; `0` keeps all ([details](deepseek-v41.md#the-drafters-experts)) | `64` with the STQ drafter and host or disk experts, otherwise all |
 | `--draft-confidence C` | DSpark only: verify a round's drafts up to the first its confidence head scores below `C` (`0..1`); `0` verifies every draft | `0.5` |
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
-| `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query, verification keeps full attention (see [serving](serving.md#mtp-attention-window)) | `0` (whole history) |
+| `--mtp-attention-window auto\|N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query, verification keeps full attention; `0` reads the whole history (see [serving](serving.md#mtp-attention-window)) | `auto` (Qwen3.5-core models: 4096 from position 32768) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Flint, DeepSeek-V4.1 and Inkling 2 without it; DeepSeek-V4.1 refuses it beside `--spec dspark`): the last `N` tokens are matched against the sequence so far and what followed is proposed, from the occurrence the sequence was already copying while it still matches, else from the newest; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; with DFlash, DFlash2 or DSpine at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
@@ -404,7 +419,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from the evictable text weight tail (no resident Vision cost; needs CUDA VMM); for Gemma 4 the tower's blocks stay pinned and stream through a two-block device window. `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` encodes on CPU threads from host FP32 weights, with no device Vision memory and `--vision-max-merged` capped at 256 unless given. Qwen3.8-Flash-Next keeps its tower resident; DeepSeek-V4.1 keeps it resident or, with `overlay`, streams its blocks from pinned memory through a two-block device window, and refuses `cpu` ([DeepSeek-V4.1](deepseek-v41.md#images)) | `resident` |
 | `--vision-cpu` | `--vision` with `--vision-residency cpu` | off |
 | `--vision-max-merged N` | merged-token budget of one media item; larger media downscales at preprocessing. Gemma 4: the most soft tokens an image or video frame may take, rounded down to its budgets 70, 140, 280, 560, 1120 (an image takes 280, 70 with `detail: low` and this bound with `detail: high`; a video frame 70). DeepSeek-V4.1: the most prompt positions an image's span takes, at most the release's 1024 (a quarter with `detail: low`) | 16384 |
-| `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--no-cuda-graph` | disable CUDA Graph decode; Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 then keep 64 MiB free for kernel loading instead of their 320 MiB graph reserve | graphs on |
 | `--gpu-clock-floor MHZ` | hold the graphics clock of the model's GPUs at MHZ or more while requests run and for 2 s after the last one (NVML locked clocks; an idle card then returns to the driver's clocks and idle power), so the stages of a layer pipeline do not wait at idle clocks (four RTX 3060 under Windows idled at 210 MHz between stages; two RTX 4090 under Linux kept their boost clocks without it, and decode stayed within 0.6 %). Giving the clocks back resets the cards' locked clocks, including a lock set before the start; a killed process leaves them locked until `nvidia-smi -rgc`. Needs administrator rights on Windows and root on Linux (a container usually lacks them); without them the start reports it and keeps the driver's clocks | off |
 | `--wddm-evictable-budget` | Windows builds: budget the KV cache against dedicated memory less the weights and a 512 MiB desktop floor, committing the device arenas at startup; another process taking memory can then slow generation | off |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
@@ -418,12 +433,12 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--post-thinking-sampler temp=F,top_p=F,top_k=N[,min_p=F,presence=F,frequency=F]` | the same overrides in one flag | preset |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
-| `--top-k N` | top-k-threshold override (`0..20`; zero selects the top-20 cap) | registered model/mode default |
+| `--top-k N` | top-k-threshold override (`0..64`; zero selects the top-64 cap) | registered model/mode default |
 | `--min-p F` | min-p-threshold override | registered model/mode default |
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
-| `--gumbel-sampling` | draw sampled tokens by Gumbel-max over keyed noise, and MTP-style drafts as the drafter's own draws under that noise ([coupled draws](#speculative-decoding)); a seed gives other tokens than the default draw | off |
+| `--gumbel-sampling` | draw sampled tokens by Gumbel-max over keyed noise, and MTP-style and DSpark drafts as the drafter's own draws under that noise ([coupled draws](#speculative-decoding)); a seed gives other tokens than the default draw | off |
 | `--lora FNAME[,...]`, `--lora-scaled FNAME:SCALE[,...]` | llama.cpp LoRA adapters that remove a residual direction, at scale 1 or the given scale ([adapters and control vectors](serving.md#lora-adapters-and-control-vectors)) | none |
 | `--lora-init-without-apply` | load the adapters at scale 0 | off |
 | `--control-vector FNAME[,...]`, `--control-vector-scaled FNAME:SCALE[,...]` | llama.cpp control vectors added to the residual, at scale 1 or the given scale | none |
@@ -458,6 +473,70 @@ masks ([banned words](serving.md#banned-words)), and its report adds the rewinds
 dropped and the delay they added when the reply rewound.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
+
+### Route bias toward held experts
+
+`--expert-route-bias B` trades exactness for decode speed when the routed experts live in host
+memory or the artifact's files (`--expert-residency host|disk`). A decode or verification call
+adds `B` to the routing score of each expert whose weights the GPU holds now (its expert cache,
+a lent prefill bank, Flash-Next's disk pools) before it picks a layer's experts, so a cached expert
+whose score lies within `B` of an uncached one takes its place and the call copies fewer experts
+across the bus or leaves fewer to the CPU. The chosen experts are weighted by their unbiased
+scores. Prompt chunks route as the model was trained, so the prompt's keys and values stay exact.
+The idea is EMBER's "Lite" tier (rb 0.1 on DeepSeek-V4.1).
+
+The score is the one each router weights its experts by, so a value means different things per
+family: the softmax probability for Qwen3.5/3.6 MoE, Gemma 4, Qwen3.8-Flash-Next and Edge0 (a
+layer's probabilities add up to one), the sigmoid for Flint and Inkling 2 (each in `0..1`;
+Inkling 2's selection bias added) and DeepSeek-V4.1's square root of softplus with its selection
+bias. Output then depends on what the cache holds, which differs between runs, prompts and cache
+sizes, so two runs of the same request can answer differently even with greedy sampling.
+`ninfer-perplexity --expert-route-bias B` applies the bias to its scored chunks too, which
+measures its cost on every token, prompt included.
+
+Measured on an RTX 4080 (16 GB, 320 W) with a Ryzen 9 9950X and host experts
+(`--expert-residency host`), greedy, 384 new tokens after a 28- to 70-token prompt, one run each;
+perplexity over the first 40 KB of `eval/corpora/perplexity-1m/data/wikitext/00.txt` at the small
+cache with the bias in every scored chunk. Flash-Next and Edge0 ran with `--no-ngram-table`.
+
+| Model | Expert cache | `B` | Decode, tok/s | Expert hits | Perplexity |
+|---|---|---:|---:|---:|---:|
+| Inkling 2 Mini UD-IQ4_XS | 2,048 MiB | 0 | 64.4 | 76.5% | 6.4160 |
+| | | 0.05 | 73.9 (+14.8%) | 82.8% | 6.4231 (+0.11%) |
+| | | 0.1 | 80.9 (+25.6%) | 86.3% | 6.4645 (+0.76%) |
+| | auto | 0 / 0.1 | 106.1 / 109.3 (+3.0%) | 98.3% / 99.1% | |
+| Flint UD-Q4_K_XL | 3,072 MiB | 0 | 98.4 | 48.4% | 19.409 |
+| | | 0.05 | 109.8 (+11.6%) | 60.7% | 19.377 (−0.16%) |
+| | | 0.1 | 117.3 (+19.2%) | 66.4% | 19.866 (+2.36%) |
+| | auto | 0 / 0.1 | 133.6 / 153.1 (+14.6%) | 80.8% / 88.8% | |
+| Gemma 4 26B-A4B QAT Q4_0 | 2,048 MiB | 0 | 128.9 | 71.8% | 2,241 |
+| | | 0.005 | 144.5 (+12.1%) | 78.5% | 2,013 (−10.2%) |
+| | | 0.02 | 165.2 (+28.2%) | 85.4% | 2,390 (+6.6%) |
+| | auto | 0 / 0.02 | 190.1 / 188.4 (−0.9%) | 99.7% / 99.8% | |
+| Qwen3.6-35B-A3B (official) | 3,072 MiB | 0 | 123.5 | 75.2% | 6.1888 |
+| | | 0.005 | 140.1 (+13.4%) | 83.2% | 6.2677 (+1.27%) |
+| | | 0.02 | 159.4 (+29.1%) | 90.5% | 7.0630 (+14.1%) |
+| | auto | 0 / 0.02 | 164.9 / 175.9 (+6.7%) | 94.9% / 98.2% | |
+| Qwen3.8-Flash-Next UD-IQ2_XS | 4,096 MiB | 0 | 56.2 | 50.9% | 5.3039 |
+| | | 0.005 | 64.7 (+15.1%) | 65.8% | 5.4792 (+3.3%) |
+| | | 0.02 | 75.0 (+33.5%) | 79.9% | 10.713 (+102%) |
+| | auto | 0 / 0.02 | 65.6 / 77.0 (+17.4%) | 67.8% / 84.8% | |
+| Edge0-120B-q3k | 4,096 MiB | 0 | 56.7 | 60.0% | 9.4346 |
+| | | 0.005 | 58.8 (+3.7%) | 71.0% | 9.4932 (+0.62%) |
+| | | 0.02 | 64.6 (+13.9%) | 82.8% | 13.380 (+41.8%) |
+| | auto | 0 / 0.02 | 59.5 / 64.8 (+8.9%) | 71.4% / 85.1% | |
+
+The cost grows faster than the gain: past the smaller value of each row, the perplexity of
+Qwen3.6-35B-A3B, Flash-Next and Edge0 rises by 14-102%, and Edge0 at 0.02 no longer started its
+answer within the 384 tokens it answered in at 0. Gemma 4's instruction-tuned checkpoint scores
+raw wikitext at a perplexity near 2,000, where a change of 10% in either direction says little
+about its answers. DeepSeek-V4.1-Flash (its artifact is 224 GiB) was checked only by the router
+test, which compares every family's biased routes with an FP64 oracle
+(`ninfer_expert_route_bias_test`).
+
+The option needs host or disk experts on one device: with `--tensor-parallel` each device would
+route by its own cache, and Flash-Next's native host experts keep their cache's contents on the
+host, where the router cannot read them. Flash-Next also refuses it with `--expert-misses mapped`.
 
 ## Launch configuration files
 
@@ -542,6 +621,43 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
 
 The container's address (`NINFER_HOST`, `NINFER_PORT`) is the first layer, so a file's or the command
 line's `host` and `port` override it.
+
+## Artifacts from the Hugging Face Hub
+
+`ninfer`, `ninfer-serve`, `ninfer-perplexity` and `ninfer-ngram-profile` also take a Hugging Face
+repository where they take the artifact's path, on the command line or as a launch file's `model`:
+
+```bash
+# The repository's one .ninfer file.
+./build/apps/ninfer-serve WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3 --kv-dtype rk8v4
+# A named file, for a repository that holds several.
+./build/apps/ninfer WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3:Qwen3.8-27B-DSpine-b16-ninfer-v3.ninfer \
+  --prompt "Hello"
+```
+
+`OWNER/REPO` names the repository's `.ninfer` file and fails, listing them, when it holds several;
+`OWNER/REPO:FILE` names one. An argument is a repository only when nothing exists at that path and it
+is two names of letters, digits, `-`, `_` and `.`; a missing path that ends in `.ninfer` stays a missing
+file.
+
+The program asks the Hub for the repository's `main` revision and runs the file from the Hub's cache,
+in the layout `hf download` writes: `HF_HUB_CACHE`, else `HF_HOME/hub`, else
+`~/.cache/huggingface/hub`, so either tool uses what the other fetched. A file the cache lacks at that
+revision is downloaded first over 16 connections in 64 MiB pieces; an interrupted download resumes
+from the pieces it finished (the `.pieces` file beside the blob), and the finished file is checked
+against the SHA-256 the Hub records for it. A file that fails the check is deleted.
+
+- `HF_TOKEN`, else the token file of `hf auth login` (`HF_TOKEN_PATH`, else `HF_HOME/token`), reaches
+  gated and private repositories. The token goes to `huggingface.co` only, not to the storage host
+  a download is redirected to.
+- `HF_HUB_OFFLINE=1`, or a Hub that cannot be reached, runs the file of the revision the cache
+  recorded last.
+- Windows without developer mode cannot make links: the file is then moved into the snapshot folder
+  itself, as `hf download` does.
+- Run one download of a file at a time: two programs downloading the same file at once write the
+  same pieces.
+
+`--draft-model`, `--ngram-table`, `--models-dir` and `--models-preset` take paths only.
 
 ## CUDA synchronization
 
@@ -646,9 +762,57 @@ each device free for the kernels CUDA loads on their first launch. `--kv-capacit
 selected weights, measures the remaining GPU memory, and directly chooses the largest legal page
 capacity for the complete enabled runtime layout. This includes the selected speculative backend,
 fixed sequence state, unified workspace, and CUDA Graph allowance, while leaving the default 1 GiB
-automatic headroom unallocated. It does not probe allocations or resize the pool at request time.
+automatic headroom unallocated. The allowance prices each MTP or DFlash graph class at 24 MiB per 64
+text layers on compute 8.6 (RTX 30 series) and 12.0 (RTX 50 series, RTX PRO 6000 Blackwell), from
+startup measurements of at most 14.5 MiB a class; other cards keep 64 to 96 MiB a class. Qwen3.8-27B
+with `rk8v4` KV on an RTX 3090 holds 250,368 KV tokens instead of 142,464 with DFlash2 5 and four
+requests, and 353,536 instead of 328,704 with MTP 3; an RTX 5070 Ti now starts MTP 3 with four
+requests at `--max-context 40960`. It does not probe allocations or resize the pool at request time.
 The single-request CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
+
+### KV host tier
+
+`--kv-host-mib N|auto` continues the Qwen3.5 family's KV pool past the device into N MiB of pinned
+host memory. The pool's last pages are host memory mapped at the same device addresses, and the
+kernels read and write them across the bus in place, so the answers are the ones the all-device
+pool gives, byte for byte. `auto` adds the pages that every request needs to reach
+`--max-context` (`--kv-capacity` when given), within the host's available memory less 4 GiB, the
+hybrid cache's host budget and the media caches. Requests take device pages first: a request runs at
+full speed until its context outgrows the device pages, and from then on every decode step reads the
+host part across the bus once, and every prompt chunk reads it several times.
+
+Measured with Qwen3.8-27B GSQ-RCO IQ3_S, `--kv-dtype rk8v4 --gdn-state-fp16`, one request,
+128 greedy tokens (2026-11-27):
+
+| Card, bus | Pool | Prompt | Of it on the host | Prefill | Decode |
+|---|---|---:|---:|---:|---:|
+| RTX 3090, PCIe 4.0 x16 | device only, 455,104 tokens | 162,840 | — | 1,138 tok/s | 44.6 tok/s |
+| RTX 3090, PCIe 4.0 x16 | `--kv-headroom-mib 7168 --kv-host-mib auto`: 64,000 of 262,144 on the host | 162,840 | 0 | 1,136 tok/s | 44.6 tok/s |
+| RTX 3090, PCIe 4.0 x16 | `--kv-headroom-mib 10240 --kv-host-mib auto`: 187,392 of 262,144 on the host | 162,840 | 88,088 | 488 tok/s | 8.6 tok/s |
+| RTX 5070 Ti 16 GB, PCIe 5.0 x16 | `--kv-host-mib auto`: 145,472 of 262,144 on the host | 97,867 | 0 | 1,954 tok/s | 52.6 tok/s |
+| RTX 5070 Ti 16 GB, PCIe 5.0 x16 | the same | 203,563 | 86,891 | 255 tok/s | 11.2 tok/s |
+| RTX 5070 Ti 16 GB, PCIe 5.0 x16 | the same with `--spec mtp --draft-tokens 3 --mtp-attention-window 0`: 203,840 on the host | 203,563 | 145,259 | 230 tok/s | 28.1 tok/s |
+| RTX 5070 Ti 16 GB, PCIe 5.0 x16 | the same with the default [MTP attention window](serving.md#mtp-attention-window) | 203,563 | 145,259 | 230 tok/s | 29.9 tok/s |
+| RTX 3090, PCIe 4.0 x16 | `--spec dflash2 --draft-tokens 5`, device only, 291,072 tokens | 81,528 | — | 1,351 tok/s | 116.8 tok/s |
+| RTX 3090, PCIe 4.0 x16 | the same with `--kv-headroom-mib 6144 --kv-host-mib auto`: 186,944 of 262,144 on the host | 81,528 | 6,328 | 1,340 tok/s | 114.2 tok/s |
+| RTX 3090, PCIe 4.0 x16 | DFlash2 5, device only | 105,897 | — | 1,279 tok/s | 97.2 tok/s |
+| RTX 3090, PCIe 4.0 x16 | DFlash2 5 with the tier | 105,897 | 30,697 | 1,078 tok/s | 61.9 tok/s |
+
+Each 1,000 tokens on the host add about 1.1 ms to a decode step on PCIe 4.0, and about 0.8 ms on
+PCIe 5.0 (against an all-device step extrapolated from the 97,867-token row). MTP pays that read
+once per round for all the tokens the round verifies: with three drafts the RTX 5070 Ti decodes
+2.5 times as fast as without, although its larger Program leaves 58,304 tokens on the device instead
+of 116,672.
+DFlash2 pays the read once per round: 0.8 ms more a round with 6,328 tokens on the host and 20.3
+ms more with 30,697. The answers of the first three RTX 3090 rows are identical, and so are the
+answers of each DFlash2 pair. Without the tier the RTX 5070 Ti does not
+start this model at `--max-context 131072`. A smaller KV format holds more on the device at full
+speed for a quality cost (`rk4v4`, `rk2v4-e8` above); the tier keeps the format's exact values. The
+tier runs on one device with the routed experts on the GPU, under a native Linux driver (not Windows
+or WSL2), and refuses a DFlash drafter with full-attention layers (Qwen3.6-35B-A3B's), whose
+head-major pool has no page tail to place in host memory; MTP and DFlash2 run with it. Vision windows
+and the expert cache borrow device pages only.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program workspace, and a separate CUDA Graph driver allowance. With Vision enabled, that one

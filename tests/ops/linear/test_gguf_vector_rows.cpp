@@ -287,9 +287,9 @@ int main() {
                        {"Q5_K", QType::GGUF_Q5_K},       {"Q6_K", QType::GGUF_Q6_K},
                        {"IQ4_NL", QType::GGUF_IQ4_NL},   {"IQ1_S", QType::GGUF_IQ1_S},
                        {"IQ1_M", QType::GGUF_IQ1_M},     {"IQ2_XXS", QType::GGUF_IQ2_XXS},
-                       {"IQ2_S", QType::GGUF_IQ2_S},     {"IQ3_XXS", QType::GGUF_IQ3_XXS},
-                       {"IQ3_S", QType::GGUF_IQ3_S},     {"IQ4_XS", QType::GGUF_IQ4_XS},
-                       {"NVFP4", QType::GGUF_NVFP4}};
+                       {"IQ2_XS", QType::GGUF_IQ2_XS},   {"IQ2_S", QType::GGUF_IQ2_S},
+                       {"IQ3_XXS", QType::GGUF_IQ3_XXS}, {"IQ3_S", QType::GGUF_IQ3_S},
+                       {"IQ4_XS", QType::GGUF_IQ4_XS},   {"NVFP4", QType::GGUF_NVFP4}};
         const int ks[] = {640, 704, 1024, 1152, 1280, 1792, 2048, 2304, 2560, 2816};
         for (const auto& [name, format] : formats) {
             require(ops::gguf_cpu_supported(format), "a format has no CPU product");

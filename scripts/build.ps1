@@ -110,6 +110,10 @@ try {
     # that begins with "-D", and cmake then sees the literal "$Arch".
     $RuntimeOption = if ($Package) { 'ON' } else { 'OFF' }
     $BenchmarksOption = if ($BuildBenchmarks) { 'ON' } else { 'OFF' }
+    # The build compiles Mbed TLS from its pinned release archive (cmake/MediaSources.cmake).
+    cmake '-DNINFER_MEDIA_SOURCES_DIR=third_party/media-sources' '-DNINFER_MEDIA_SOURCES_ONLY=MBEDTLS' `
+          -P cmake/FetchMediaSources.cmake
+    if ($LASTEXITCODE -ne 0) { throw "fetching the Mbed TLS release failed ($LASTEXITCODE)" }
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
           "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DNINFER_SHARED_RUNTIME=$RuntimeOption"
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }

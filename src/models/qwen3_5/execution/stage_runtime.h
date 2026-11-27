@@ -97,6 +97,7 @@ struct StageRuntime {
     // carry the control tensors and the incoming residual (or the hidden a divided head projects)
     // from rank 0 to rank r, and `back` is absent.
     struct TensorParallel {
+        TensorParallel() noexcept {}
         // shares[r] is rank r's GDN heads, KV heads and dense FFN rows or experts, and shards[r]
         // the model as that share sees it.
         std::vector<TensorShare> shares;

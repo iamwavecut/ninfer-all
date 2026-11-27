@@ -6,6 +6,7 @@
 #include <fstream>
 
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -257,16 +258,35 @@ int main() {
         failures += check(rejected, "server accepted --draft-tokens without --spec or --lookup-ngram");
     }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).embedding_residency ==
-                              ninfer::EmbeddingResidency::Device &&
+                              ninfer::EmbeddingResidency::Auto &&
                           parse({"ninfer-serve", "model.ninfer", "--embedding-residency", "host"})
-                                  .embedding_residency == ninfer::EmbeddingResidency::Host,
-                      "server did not default the embedding to the device or keep a host one");
+                                  .embedding_residency == ninfer::EmbeddingResidency::Host &&
+                          parse({"ninfer-serve", "model.ninfer", "--embedding-residency",
+                                 "device"})
+                                  .embedding_residency == ninfer::EmbeddingResidency::Device,
+                      "server did not default the embedding to auto or keep a chosen residency");
     {
         bool rejected = false;
         try {
             (void)parse({"ninfer-serve", "model.ninfer", "--embedding-residency", "ram"});
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "server accepted an invalid embedding residency");
+    }
+    {
+        const ninfer::KvHostTier off = parse({"ninfer-serve", "model.ninfer"}).kv_host_tier;
+        const ninfer::KvHostTier mib =
+            parse({"ninfer-serve", "model.ninfer", "--kv-host-mib", "6144"}).kv_host_tier;
+        const ninfer::KvHostTier automatic =
+            parse({"ninfer-serve", "model.ninfer", "--kv-host-mib", "auto"}).kv_host_tier;
+        failures += check(!off.enabled() && mib.enabled() && !mib.automatic &&
+                              mib.bytes == (6144ULL << 20) && automatic.enabled() &&
+                              automatic.automatic && automatic.bytes == 0,
+                          "server did not default the KV host tier off or keep --kv-host-mib");
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--kv-host-mib", "lots"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted an invalid --kv-host-mib");
     }
     failures += check(!parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host"})
                                .hybrid_experts.dma_share.has_value(),
@@ -301,6 +321,47 @@ int main() {
     }
     failures += check(serve_usage_text("ninfer-serve").find("--loop-kv") != std::string::npos,
                       "serve help omits --loop-kv");
+    // --max-concurrency: one request by default, up to 64, or `auto` for as many as fit; --spec
+    // keeps eight, and the queue holds at least as many requests as run.
+    {
+        const auto single = parse({"ninfer-serve", "model.ninfer"});
+        failures += check(single.max_concurrency == 1 && !single.max_concurrency_auto &&
+                              single.max_pending_requests == 16,
+                          "server changed the default concurrency or queue");
+        const auto wide = parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "64"});
+        failures += check(wide.max_concurrency == 64 && !wide.max_concurrency_auto &&
+                              wide.max_pending_requests == 64,
+                          "server did not run 64 requests with a queue of 64");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "64",
+                                 "--max-pending-requests", "4"})
+                                  .max_pending_requests == 4,
+                          "server did not keep an explicit --max-pending-requests");
+        const auto fitted = parse({"ninfer-serve", "model.ninfer", "--max-concurrency", "auto"});
+        failures += check(fitted.max_concurrency_auto && fitted.max_concurrency == 64 &&
+                              make_engine_options(fitted).max_concurrency_auto &&
+                              make_engine_options(fitted).max_concurrency == 64,
+                          "--max-concurrency auto did not reach the Engine as a bound of 64");
+        const auto drafted = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                    "--draft-tokens", "3", "--max-concurrency", "auto"});
+        failures += check(drafted.max_concurrency_auto && drafted.max_concurrency == 8,
+                          "--spec did not bound --max-concurrency auto to eight requests");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                                 "3", "--max-concurrency", "8"})
+                                  .max_concurrency == 8,
+                          "--spec refused eight requests");
+        bool refused = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                         "--max-concurrency", "9"});
+        } catch (const std::invalid_argument&) { refused = true; }
+        failures += check(refused, "--spec accepted nine requests");
+        for (const auto* value : {"0", "65", "Auto", "auto64", ""}) {
+            bool rejected = false;
+            try { (void)parse({"ninfer-serve", "model.ninfer", "--max-concurrency", value}); }
+            catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "server accepted an invalid --max-concurrency");
+        }
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "none"}).speculative.automatic &&
                           !parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"})
@@ -1300,7 +1361,7 @@ int main() {
                       "server sampling flags did not preserve explicit values and zeros");
     bool oversized_top_k_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--top-k", "21"});
+        (void)parse({"ninfer-serve", "model.ninfer", "--top-k", "65"});
     } catch (const std::invalid_argument&) { oversized_top_k_rejected = true; }
     failures += check(oversized_top_k_rejected,
                       "server accepted top_k beyond the executable candidate domain");
@@ -1565,6 +1626,7 @@ int main() {
                                         "--kv-capacity",
                                         "--kv-dtype",
                                         "--kv-headroom-mib",
+                                        "--kv-host-mib",
                                         "--kv-lease-growth",
                                         "--lenient-assistant-history",
                                         "--lenient-image-detail",
@@ -1672,8 +1734,8 @@ int main() {
                       "serve help omits --devices");
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
-    failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=
-                          std::string::npos,
+    failures += check(serve_usage_text("ninfer-serve")
+                              .find("device-state=min(max-concurrency,8)") != std::string::npos,
                       "serve help omits context-cache defaults");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
@@ -1940,9 +2002,17 @@ int main() {
                 parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                        "--mtp-attention-window", "4096"})
                             .speculative.mtp_attention_window == 4096 &&
-                    parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"})
-                            .speculative.mtp_attention_window == 0,
-                "--mtp-attention-window was not an off-by-default MTP option");
+                    !parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"})
+                         .speculative.mtp_attention_window &&
+                    !parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                            "--mtp-attention-window", "auto"})
+                         .speculative.mtp_attention_window &&
+                    parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                           "--mtp-attention-window", "0"})
+                            .speculative.mtp_attention_window == 0U &&
+                    parse({"ninfer-serve", "model.ninfer", "--mtp-attention-window", "0"})
+                            .speculative.mtp_attention_window == 0U,
+                "--mtp-attention-window did not take auto (the default), 0 or a width");
             for (const std::vector<std::string>& bad :
                  {std::vector<std::string>{"--mtp-attention-window", "4096"},
                   std::vector<std::string>{"--spec", "mtp", "--draft-tokens", "5",
@@ -2021,8 +2091,8 @@ int main() {
                                   !fields.post_thinking_overrides->min_p,
                               "--post-thinking-* fields were not parsed");
             for (const std::vector<std::string>& bad :
-                 {std::vector<std::string>{"--post-thinking-temperature", "2.5"},
-                  std::vector<std::string>{"--post-thinking-top-k", "21"},
+                 {std::vector<std::string>{"--post-thinking-temperature", "-0.5"},
+                  std::vector<std::string>{"--post-thinking-top-k", "65"},
                   std::vector<std::string>{"--post-thinking-sampler", "temp"},
                   std::vector<std::string>{"--post-thinking-sampler", "seed=1"},
                   std::vector<std::string>{"--post-thinking-sampler", "top_p=nan"}}) {
@@ -2041,9 +2111,11 @@ int main() {
                   "--value-aware-demote was not an off-by-default switch");
         failures +=
             check(parse({"ninfer-serve", "model.ninfer", "--kv-lease-growth"})
-                          .context_cache.kv_lease_growth &&
+                          .context_cache.kv_lease_growth == std::optional<bool>(true) &&
+                      parse({"ninfer-serve", "model.ninfer", "--no-kv-lease-growth"})
+                              .context_cache.kv_lease_growth == std::optional<bool>(false) &&
                       !parse({"ninfer-serve", "model.ninfer"}).context_cache.kv_lease_growth,
-                  "--kv-lease-growth was not an off-by-default switch");
+                  "--kv-lease-growth did not leave its default to the Engine");
         failures += check(!parse({"ninfer-serve", "model.ninfer"}).log_colours &&
                               parse({"ninfer-serve", "model.ninfer", "--log-colours", "on"})
                                       .log_colours == true &&

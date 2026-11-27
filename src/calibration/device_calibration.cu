@@ -1164,12 +1164,15 @@ void calibrate_ternary(ops::DeviceRouteProfile& profile, Timer& timer,
         CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
                                          cudaMemcpyDeviceToDevice));
     };
+    // The decode widths of up to 64 requests: past 32 the candidates are the 64-column schedules.
+    std::vector<std::int32_t> widths = decode_widths();
+    widths.insert(widths.end(), {40, 48, 56, 64});
     const std::vector<Family> families = {
-        {"t2_i8_small/4096+12288x5120", decode_widths(), gdn_pair, view(qkv, 10240), {}},
-        {"t2_i8_small/7168+7168x5120", decode_widths(), attn_pair, view(q, 6144), {}},
-        {"t2_i8_small/5120x6144", decode_widths(), out_add, view(residual, hidden), reset_residual},
-        {"t2_i8_small/34816x5120", decode_widths(), gate_up_linear, view(wide, 34816), {}},
-        {"t2_i8_small/5120x17408", decode_widths(), down_add, view(residual, hidden), reset_residual},
+        {"t2_i8_small/4096+12288x5120", widths, gdn_pair, view(qkv, 10240), {}},
+        {"t2_i8_small/7168+7168x5120", widths, attn_pair, view(q, 6144), {}},
+        {"t2_i8_small/5120x6144", widths, out_add, view(residual, hidden), reset_residual},
+        {"t2_i8_small/34816x5120", widths, gate_up_linear, view(wide, 34816), {}},
+        {"t2_i8_small/5120x17408", widths, down_add, view(residual, hidden), reset_residual},
         {"t2_i8_small/248320x5120", {1, 2, 3, 4, 5, 6, 7, 8, 12, 16}, head_linear,
          view(logits, 248320), {}},
         {"t2_i8_route",

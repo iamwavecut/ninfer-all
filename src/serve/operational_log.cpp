@@ -604,6 +604,19 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                           : " | expert cache " +
                                 product::format_pretty_bytes(stage.expert_cache_bytes));
     }
+    if (engine.embedding_residency == ninfer::EmbeddingResidency::Host) {
+        logger_->info("embedding | pinned host memory, read in place");
+    }
+    if (memory.kv_host_tier_pages != 0) {
+        logger_->info("KV host tier | last {} pages ({} tokens) in {} of pinned host memory, read "
+                      "in place",
+                      memory.kv_host_tier_pages,
+                      memory.kv_capacity_page_groups == 0
+                          ? std::uint64_t{0}
+                          : std::uint64_t(memory.kv_host_tier_pages) * memory.kv_capacity /
+                                memory.kv_capacity_page_groups,
+                      product::format_pretty_bytes(memory.kv_host_tier_bytes));
+    }
 
     const std::string& architecture = service.load_summary().architecture;
     const bool own_cache = architecture == "Gemma4ForCausalLM" ||

@@ -1282,6 +1282,77 @@ int test_open_turn_rewrite_checkpoint() {
     return failures;
 }
 
+// Gemma 4's template writes a message's calls and responses before its text. Text the model wrote
+// before its calls renders before them, and the model turn stays open after the response.
+int test_gemma_text_before_calls() {
+    // The release template's turn rules, reduced to what orders a message and closes its turn.
+    const auto compiled = fi::CompiledChatTemplate::resolve(
+        "{%- set ns = namespace(prev=none, responded=false) -%}"
+        "{%- for m in messages -%}{%- if m.role != 'tool' -%}"
+        "{%- set ns.responded = false -%}"
+        "{%- set next = namespace(role=none, stop=false) -%}"
+        "{%- for later in messages[loop.index0 + 1:] -%}"
+        "{%- if not next.stop and later.role != 'tool' -%}"
+        "{%- set next.role = later.role -%}{%- set next.stop = true -%}{%- endif -%}"
+        "{%- endfor -%}"
+        "{%- if not (m.role == 'assistant' and ns.prev == 'assistant') -%}"
+        "{{- '<|turn>' + ('model' if m.role == 'assistant' else m.role) + '\n' -}}{%- endif -%}"
+        "{%- if m.tool_calls -%}"
+        "{%- for c in m.tool_calls -%}"
+        "{{- '<|tool_call>call:' + c.function.name + '<tool_call|>' -}}{%- endfor -%}"
+        "{%- set scan = namespace(stop=false) -%}"
+        "{%- for later in messages[loop.index0 + 1:] -%}"
+        "{%- if later.role != 'tool' -%}{%- set scan.stop = true -%}{%- endif -%}"
+        "{%- if not scan.stop -%}{{- '<|tool_response>' + later.content + '<tool_response|>' -}}"
+        "{%- set ns.responded = true -%}{%- endif -%}"
+        "{%- endfor -%}{%- endif -%}"
+        "{{- m.content -}}"
+        "{%- if m.role == 'assistant' and next.role == 'assistant' and "
+        "(not m.tool_calls or ns.responded) -%}"
+        "{%- elif not (ns.responded and not m.content and next.role is none) -%}"
+        "{{- '<turn|>\n' -}}{%- endif -%}"
+        "{%- set ns.prev = m.role -%}"
+        "{%- endif -%}{%- endfor -%}"
+        "{%- if add_generation_prompt and not ns.responded -%}"
+        "{{- '<|turn>model\n' -}}{%- endif -%}");
+
+    auto call = chat_message(ninfer::ChatRole::Assistant, "On it.");
+    call.tool_calls.push_back({.id = "c1", .name = "get_record", .arguments_json = R"({"id":1})"});
+    std::vector<fi::ChatMessage> history{chat_message(ninfer::ChatRole::User, "question"), call,
+                                         chat_message(ninfer::ChatRole::Tool, "record one")};
+    const std::string turn = "<|turn>model\nOn it.<|tool_call>call:get_record<tool_call|>"
+                             "<|tool_response>record one<tool_response|>";
+    fi::ChatRenderOptions options;
+    options.tool_call_syntax = fi::ToolCallSyntax::Gemma;
+
+    const fi::RenderedChat loop = compiled.render(history, options);
+    int failures = check(loop.text == "<|turn>user\nquestion<turn|>\n" + turn,
+                         "text before a call did not render first with the turn left open");
+
+    history.push_back(chat_message(ninfer::ChatRole::User, "next"));
+    const fi::RenderedChat next = compiled.render(history, options);
+    failures += check(next.text == "<|turn>user\nquestion<turn|>\n" + turn +
+                                       "<turn|>\n<|turn>user\nnext<turn|>\n<|turn>model\n",
+                      "a next user turn did not close the model turn after the response");
+    failures += check(
+        next.message_boundaries.size() == history.size() + 1 && next.message_boundaries[1] &&
+            next.text.substr(0, *next.message_boundaries[1]) == "<|turn>user\nquestion<turn|>\n",
+        "message boundaries lost their input indices around a divided message");
+
+    // Kept thinking of an earlier turn renders only on a message with calls: it stays whole.
+    history[1].reasoning_content = "plan";
+    options.preserve_thinking    = true;
+    const fi::RenderedChat kept  = compiled.render(history, options);
+    failures += check(kept.text.find("<tool_response|>On it.") != std::string::npos,
+                      "a message with kept thinking was divided");
+
+    options                      = {};
+    const fi::RenderedChat other = compiled.render(history, options);
+    failures += check(other.text.find("<tool_response|>On it.") != std::string::npos,
+                      "another dialect's history was divided");
+    return failures;
+}
+
 int test_selected_template_recovery_boundary() {
     auto assistant              = chat_message(ninfer::ChatRole::Assistant, "answer");
     assistant.reasoning_content = "retained reasoning";
@@ -4819,6 +4890,7 @@ int main() {
     failures += test_assistant_continuation();
     failures += test_rewrite_checkpoint_trace();
     failures += test_open_turn_rewrite_checkpoint();
+    failures += test_gemma_text_before_calls();
     failures += test_adjacent_tool_message_boundary();
     failures += test_literal_cache_boundary();
     failures += test_reasoning_effort_substitution();

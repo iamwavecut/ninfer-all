@@ -43,7 +43,7 @@ echo "--- installing build dependencies ---"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git cmake ninja-build build-essential pkg-config \
-  meson nasm zlib1g-dev libcurl4-openssl-dev >/dev/null 2>&1
+  meson nasm zlib1g-dev >/dev/null 2>&1
 
 echo "--- cloning ${BRANCH} ---"
 git clone --depth 1 --branch "$BRANCH" "$REPO" /root/src || { echo "CLONE_FAILED"; exit 1; }

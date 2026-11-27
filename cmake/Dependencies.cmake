@@ -2,16 +2,23 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
 
 # Windows links the static CUDA runtime so shipped binaries do not depend on a cudart DLL.
-if(WIN32)
+# NINFER_STATIC_CUDA_LIBS links the CUDA runtime and cuBLAS statically on every platform.
+if(NINFER_STATIC_CUDA_LIBS)
   set(NINFER_CUDART_TARGET CUDA::cudart_static)
+  set(NINFER_CUBLAS_TARGET CUDA::cublas_static)
 else()
-  set(NINFER_CUDART_TARGET CUDA::cudart)
+  if(WIN32)
+    set(NINFER_CUDART_TARGET CUDA::cudart_static)
+  else()
+    set(NINFER_CUDART_TARGET CUDA::cudart)
+  endif()
+
+  set(NINFER_CUBLAS_TARGET CUDA::cublas)
 endif()
 
-# The Windows build takes FFmpeg and libcurl from vcpkg's CMake packages. Linux builds FFmpeg from
-# its pinned release and links it statically (cmake/NinferFFmpeg.cmake), and finds libcurl through
-# pkg-config, or through vcpkg's package with its toolchain. Both paths produce the same two
-# consumer targets. With vcpkg's CMake toolchain its own FFmpeg find wrapper serves find_package.
+# The Windows build takes FFmpeg from vcpkg's CMake packages. Linux builds FFmpeg from its pinned
+# release and links it statically (cmake/NinferFFmpeg.cmake). Both paths produce the same consumer
+# target. With vcpkg's CMake toolchain its own FFmpeg find wrapper serves find_package.
 # Without it a prebuilt triplet tree serves them:
 # NINFER_VCPKG_TREE, which scripts\build-native.bat passes, or else the classic tree that the
 # VCPKG_ROOT and VCPKG_TARGET_TRIPLET environment variables name. cmake/FindFFMPEG.cmake reads it
@@ -25,7 +32,7 @@ if(WIN32 AND NOT VCPKG_TOOLCHAIN)
   endif()
   if(NOT _ninfer_vcpkg_tree)
     message(FATAL_ERROR
-      "A Windows build takes FFmpeg and curl from vcpkg: configure with the vcpkg toolchain "
+      "A Windows build takes FFmpeg from vcpkg: configure with the vcpkg toolchain "
       "(CMAKE_TOOLCHAIN_FILE), or name a prebuilt triplet tree in NINFER_VCPKG_TREE "
       "(scripts\\build-native.bat passes one)")
   endif()
@@ -56,33 +63,14 @@ add_subdirectory(third_party/llama-jinja EXCLUDE_FROM_ALL)
 add_subdirectory(third_party/xgrammar EXCLUDE_FROM_ALL)
 
 if(NINFER_BUILD_PRODUCT_SUPPORT)
-  # Media acquisition uses CURLOPT_PROTOCOLS_STR and CURLOPT_REDIR_PROTOCOLS_STR,
-  # introduced in libcurl 7.85 (not merely the version of the maintainer environment).
-  if(WIN32 OR DEFINED VCPKG_TARGET_TRIPLET)
-    find_package(CURL 7.85 REQUIRED)
-    set(NINFER_CURL_TARGET CURL::libcurl)
-    # CURL::libcurl is an ALIAS of the concrete imported target, and the DLLs its import library
-    # references are staged only when declared on that target.
-    if(DEFINED FFMPEG_VCPKG_TREE)
-      if(TARGET CURL::libcurl_shared)
-        set(_curl_real CURL::libcurl_shared)
-      else()
-        set(_curl_real CURL::libcurl_static)
-      endif()
-      if(TARGET ${_curl_real})
-        file(GLOB _curl_dlls "${FFMPEG_VCPKG_TREE}/bin/*.dll")
-        if(_curl_dlls)
-          set_target_properties(${_curl_real} PROPERTIES
-            IMPORTED_LINK_DEPENDENT_LIBRARIES "${_curl_dlls}")
-        endif()
-      endif()
-    endif()
-  else()
-    pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
-    set(NINFER_CURL_TARGET PkgConfig::LIBCURL)
-  endif()
+  # cpp-httplib serves the HTTP API and fetches media URLs; Mbed TLS (cmake/NinferMbedTLS.cmake) is
+  # its TLS backend. Every target that includes the header sees the same backend, so its classes
+  # have one layout in the whole program.
+  include(${CMAKE_CURRENT_LIST_DIR}/NinferMbedTLS.cmake)
   add_library(ninfer::httplib INTERFACE IMPORTED GLOBAL)
   target_include_directories(ninfer::httplib INTERFACE
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+  target_compile_definitions(ninfer::httplib INTERFACE CPPHTTPLIB_MBEDTLS_SUPPORT)
+  target_link_libraries(ninfer::httplib INTERFACE ${NINFER_MBEDTLS_TARGET})
   add_subdirectory(third_party/spdlog)
 endif()

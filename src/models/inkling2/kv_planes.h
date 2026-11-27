@@ -22,4 +22,7 @@ struct KvStoreArgs {
 };
 void kv_store(const KvStoreArgs& args, cudaStream_t stream);
 
+// The key and value stores of one visit, the planes' bytes kv_store's bit for bit: one launch for
+// int8 G64 and int4 G32 planes holding the same rows (int8, rk8v4), else kv_store's two launches.
+void kv_store_pair(const KvStoreArgs& key, const KvStoreArgs& value, cudaStream_t stream);
 } // namespace ninfer::models::inkling2::kernels

@@ -791,6 +791,29 @@ The same server runs as for Bonsai 2, total generated tok/s:
 | RTX 3090 | MTP 3 | 88.2 | 154.8 | 238.4 | 328.9 |
 | RTX 3090 | DFlash2 5 | 89.1 | 155.4 | 206.0 | |
 
+### Up to 64 requests at once
+
+Server with `--max-concurrency 64 --kv-dtype rk8v4` and the hybrid cache's automatic KV capacity,
+`tools/bench/serve_load.py --profile chat`: N short-chat requests of 256 tokens arrive together,
+EOS ignored. tok/s while all N decode at once (`steady_tps`); without drafts, as `--spec` runs at
+most eight requests. Rounds of more than eight requests run without a CUDA graph.
+
+| Card | Model | `--max-context` | 8 | 16 | 32 | 48 | 64 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| RTX 5090 | Qwen3.8-27B | 2,048 | 607.3 | 980.3 | 1,233.5 | 1,276.0 | 1,401.4 |
+| RTX 5090 | Ternary Bonsai 2 27B | 4,096 | 1,080.3 | 1,646.2 | 1,780.6 | 1,839.9 | 1,982.9 |
+| RTX 3090 | Ternary Bonsai 2 27B | 2,048 | 549.0 | 744.8 | 862.7 | 838.6 | 903.0 |
+
+Qwen3.8-27B's Q4 gate and up projection runs its small-T kernel up to 64 columns: 186 µs against
+319 µs for the 64-by-128 tile at 64 columns on the RTX 5090, 432 µs against 782 µs on the
+RTX 3090. The RTX 5090's profile routes 33 to 64 ternary columns to 64-column schedules. On the
+RTX 3090 those schedules lose to two 32-column launches, so Bonsai 2 there still decodes 40 and 48
+requests slower than 32 (777.9 tok/s at 40). At 64 requests a Qwen3.8-27B round on the RTX 5090
+takes 45.7 ms: recurrent state 11.5 ms, gate and up 11.3 ms, down 11.1 ms. `--max-concurrency auto --max-context 4096` admits 29 Qwen3.8-27B requests on the
+RTX 3090 (552.1 tok/s with 29 streams) and 60 on the RTX 5090 (1,111.1 tok/s with 60), 63 Bonsai 2
+requests on the RTX 3090 (891.4 tok/s): each request holds 146.8 MiB of recurrent state and
+102.0 MiB of KV.
+
 ### RTX PRO 6000 against RTX 5090, October 2026
 
 The PRO 6000's server rows measured again next to an RTX 5090 (600 W boards), build `796f98500`,

@@ -30,6 +30,12 @@ void ensure_driver_initialized();
 
 [[nodiscard]] CUmemGenericAllocationHandle create(std::size_t bytes, int device);
 
+// Pinned host memory that cuMemMap places in a device's address range, where kernels read and
+// write it across the bus in place. Its granularity, or zero when the driver maps no host memory
+// (no virtual memory management, or a driver before CUDA 12.2).
+[[nodiscard]] std::size_t host_granularity(int device);
+[[nodiscard]] CUmemGenericAllocationHandle create_host(std::size_t bytes);
+
 // Grants read/write access to `[va, va + bytes)` for each device in `devices`. The first device is
 // the one that owns the physical memory; the rest are peers that address it directly.
 void set_access(CUdeviceptr va, std::size_t bytes, std::span<const int> devices);

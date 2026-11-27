@@ -116,7 +116,7 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
         throw std::invalid_argument("Flint verifies 1 to 7 drafts a round (--draft-tokens)");
     }
     if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine) ||
-        speculative.mtp_attention_window != 0 || speculative.ngram_draft_tokens != 0 ||
+        speculative.mtp_attention_window.value_or(0) != 0 || speculative.ngram_draft_tokens != 0 ||
         speculative.ngram_archive_bytes != 0 ||
         speculative.proposal_head == ProposalHead::Optimized ||
         (speculative.proposal_head != ProposalHead::Auto && !dspine) ||
@@ -138,6 +138,7 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
+    check_expert_route_bias(options);
     if (options.tensor_parallel ? device.size() < 2 : device.size() != 1) {
         throw std::invalid_argument("Flint runs on one device, or divides its routed experts over "
                                     "several with --tensor-parallel");
@@ -192,6 +193,8 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    executor.expert_route_bias  = hybrid.route_bias;
+    executor.expert_route_bias_prompts = hybrid.route_bias_prompts;
     executor.expert_disk        = {hybrid.mirror, hybrid.direct};
     executor.kv_cache           = options.kv_cache;
     // The full-attention blocks carry no rotation and the sliding ones never rotate a distance past

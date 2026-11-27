@@ -114,8 +114,8 @@ added in a fixed order, so the result depends on the split (Flash-Next's expert 
 fixed-point sums).
 
 Dense Qwen4 has no routed experts. The engine refuses `--expert-residency host|disk`,
-`--expert-cache-mib`, `--expert-host-mib`, `--expert-dma-share`, the other hybrid-expert options
-and routing profiles for it. No DFlash2 drafter exists for it.
+`--expert-cache-mib`, `--expert-host-mib`, `--expert-dma-share`, `--expert-route-bias`, the other
+hybrid-expert options and routing profiles for it. No DFlash2 drafter exists for it.
 
 `--vision` runs the artifact's `vision` component: the checkpoint's Qwen3.5 Vision tower, whose
 merger writes the text model's hidden width, resident on the device through the Flash-Next Vision

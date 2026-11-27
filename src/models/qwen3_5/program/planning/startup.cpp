@@ -51,6 +51,13 @@ using execution::dimension;
 namespace workspace = execution::workspace;
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
+// The device memory reserved for one MTP or DFlash graph topology class per 64 text layers on the
+// measured capabilities (SequencePlanningInputs::measured_graph_price). Every class is instantiated
+// and uploaded at startup (graphs.cpp), so cuda_graph_measured_bytes over the classes a
+// configuration captures is their whole cost (2026-11-27, one to four requests, MTP 3, adaptive MTP
+// 4 and DFlash2 5): Qwen3.8-27B (64 layers) at most 14.5 MiB a class on sm_86 and 7 MiB on sm_120,
+// Qwen3.6-35B-A3B (40 layers, host experts) 2.5 MiB on sm_120.
+constexpr std::size_t kMeasuredDraftGraphClassBytes = 24ULL * kMiB;
 constexpr std::size_t kArenaAlign = 256ULL;
 
 enum class GdnWorkspacePath : std::uint8_t {
@@ -811,7 +818,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             scratch(share_layout,
                     execution::attention_projection_workspace_bytes(p, tokens, tokens));
             (void)workspace::mtp_attention_results(share_layout, share, tokens);
-            if (plan.mtp_attention_window != 0) {
+            if (plan.mtp_attention_window.keys != 0) {
                 (void)workspace::paged_kv_window(
                     share_layout, static_cast<std::int32_t>(page_count(plan.capacity)), width,
                     batch);
@@ -835,7 +842,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, execution::mtp_projection_workspace_bytes(parameters.mtp->projection,
                                                                   tokens, tokens));
         (void)workspace::mtp_attention_results(layout, config, tokens);
-        if (plan.mtp_attention_window != 0) {
+        if (plan.mtp_attention_window.keys != 0) {
             (void)workspace::paged_kv_window(
                 layout, static_cast<std::int32_t>(page_count(plan.capacity)), tokens, 1);
         }
@@ -1045,7 +1052,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 scratch(layout, execution::mtp_projection_workspace_bytes(
                                     parameters.mtp->projection, tokens, tokens));
                 (void)workspace::mtp_attention_results(layout, config, tokens);
-                if (plan.mtp_attention_window != 0) {
+                if (plan.mtp_attention_window.keys != 0) {
                     (void)workspace::paged_kv_window(
                         layout, static_cast<std::int32_t>(page_count(plan.capacity)), width, batch);
                 }
@@ -1450,13 +1457,23 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("max_concurrency must be in [1,8]");
+        throw std::invalid_argument("max_concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "]");
+    }
+    // Speculative rounds keep at most kMaximumSpeculativeRows rows: past eight requests a round of
+    // drafts costs more than the tokens it saves (docs/performance.md, "Several requests at once").
+    if (options.speculative.backend != SpeculativeBackend::None &&
+        options.max_concurrency > kMaximumSpeculativeRows) {
+        throw std::invalid_argument("a speculative backend runs at most " +
+                                    std::to_string(kMaximumSpeculativeRows) +
+                                    " requests at once; max_concurrency is " +
+                                    std::to_string(options.max_concurrency));
     }
     // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
     // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
     // would put a weight-sized scratch into every round workspace and change decode numerics -- so
     // the widest round sits at or below the floor no device profile moves its width gate past.
-    static_assert(kMaximumConcurrency * kMtpDecodeMaximumWidth <=
+    static_assert(std::max(kMaximumConcurrency, kMaximumSpeculativeRows * kMtpDecodeMaximumWidth) <=
                       static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens),
                   "the widest decode/verify round must stay below the cuBLAS prefill width gate");
     if (parameters.text.rank_count != device.size()) {
@@ -1488,7 +1505,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     default:
         throw std::invalid_argument("unknown kv_capacity policy");
     }
-    if (options.speculative.mtp_attention_window != 0 &&
+    if (options.speculative.mtp_attention_window.value_or(0) != 0 &&
         options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("an MTP attention window requires the MTP backend");
     }
@@ -1512,8 +1529,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
             throw std::invalid_argument("MTP draft window must be in [1,15]");
         }
-        if (options.speculative.mtp_attention_window != 0 &&
-            options.speculative.mtp_attention_window < options.speculative.draft_tokens + 1) {
+        if (options.speculative.mtp_attention_window.value_or(0) != 0 &&
+            *options.speculative.mtp_attention_window < options.speculative.draft_tokens + 1) {
             throw std::invalid_argument(
                 "MTP attention window must hold at least draft_tokens + 1 keys");
         }
@@ -1685,13 +1702,18 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             static_cast<std::int32_t>(text_attention.head_dim),
             static_cast<std::int32_t>(text_attention.num_attention_heads),
             static_cast<std::int32_t>(text_attention.num_key_value_heads)};
+        // On a measured capability every drafting class takes the measured price, scaled by the
+        // text layers past 64; elsewhere the earlier per-class allowances stand.
+        const std::size_t measured_draft_class =
+            kMeasuredDraftGraphClassBytes *
+            std::max<std::size_t>(impl->parameters->text.layers.size(), 64) / 64;
         if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes = checked_mul(
                 graph_topology_allowance(
                     ordinary_graph_profiles(impl->capacity, attention_geometry, impl->kv_storage),
                     [](GraphExecutionProfile) { return 12ULL * kMiB; },
                     "ordinary graph allowance"),
-                impl->max_concurrency, "ordinary exact-b graph allowance");
+                graph_rows(impl->max_concurrency), "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             // Adaptive MTP captures one graph set per verification width it can select, and copy
             // rounds one more at the ngram window for every batch size they admit.
@@ -1701,7 +1723,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                        attention_geometry, impl->kv_storage);
                 return graph_topology_allowance(
                     profiles,
-                    [&](GraphExecutionProfile profile) {
+                    [&](GraphExecutionProfile profile) -> std::size_t {
+                        if (inputs.measured_graph_price) { return measured_draft_class; }
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity, static_cast<std::uint64_t>(profile.max) +
                                                 verify_window + impl->draft_window);
@@ -1748,7 +1771,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                                             impl->capacity, width, batch_size);
                 return graph_topology_allowance(
                     profiles,
-                    [&](GraphExecutionProfile profile) {
+                    [&](GraphExecutionProfile profile) -> std::size_t {
+                        if (inputs.measured_graph_price) { return measured_draft_class; }
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity, static_cast<std::uint64_t>(profile.max) + width + 1ULL);
                         return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
@@ -1935,6 +1959,26 @@ ops::RopeYarn planned_rope_yarn(const execution::Parameters& parameters,
         .yarn;
 }
 
+// An explicit --mtp-attention-window applies from the first position; auto applies
+// kAutomaticMtpAttentionWindow when MTP drafts and a context can pass its threshold.
+MtpAttentionWindow planned_mtp_attention_window(const EngineOptions& options) {
+    const auto& speculative = options.speculative;
+    if (speculative.backend != SpeculativeBackend::Mtp) { return {}; }
+    if (speculative.mtp_attention_window) { return {*speculative.mtp_attention_window, 0}; }
+    return options.max_context > kAutomaticMtpAttentionWindow.from ? kAutomaticMtpAttentionWindow
+                                                                     : MtpAttentionWindow{};
+}
+
+// Whether every device's capability has a measured drafting graph price
+// (kMeasuredDraftGraphClassBytes).
+bool measured_graph_price(const DeviceContext& device) {
+    for (std::size_t rank = 0; rank < device.size(); ++rank) {
+        const int capability = device.rank(rank).compute_capability();
+        if (capability != 86 && capability != 120) { return false; }
+    }
+    return true;
+}
+
 // Every chunk but a prompt's last one has the effective width, so it is chosen near the request
 // where the prompt-attention grid of this device leaves the least of a last wave idle.
 // NINFER_PREFILL_ALIGN=0 keeps the requested chunk.
@@ -1975,11 +2019,12 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .kv_storage                 = options.kv_cache,
         .proposal_head = models::planned_proposal_head(options.speculative.proposal_head),
         .rope_yarn                  = planned_rope_yarn(parameters, options),
-        .mtp_attention_window       = options.speculative.mtp_attention_window,
+        .mtp_attention_window       = planned_mtp_attention_window(options),
         .features                   = models::load_options(options),
         .expert_cache_bytes         = options.expert_cache_bytes,
         .use_cuda_graph             = options.use_cuda_graph,
         .cuda_graph_allowance_bytes = options.cuda_graph_allowance_bytes,
+        .measured_graph_price       = measured_graph_price(device),
         .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,
         .structured_output          = options.structured_output,
         .gumbel_sampling            = options.gumbel_sampling,
@@ -2080,7 +2125,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 
 std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
-                            std::uint32_t main_page_groups) {
+                            std::uint32_t main_page_groups, std::uint32_t kv_host_pages) {
     if (planner == nullptr || planner->minimum == nullptr) {
         throw std::invalid_argument("Qwen3.5 sequence planner is empty");
     }
@@ -2102,6 +2147,15 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
                 "Qwen3.5 physical sequence layout is not affine in Main KV page capacity on a "
                 "further device");
         }
+    }
+    if (kv_host_pages != 0) {
+        if (kv_host_pages > main_page_groups || !plan->extra_rank_reservation_bytes.empty() ||
+            (plan->persistent.dflash && plan->persistent.dflash->full)) {
+            throw std::invalid_argument(
+                "the KV host tier needs one device, page-major KV pools and host pages within the "
+                "Main pool");
+        }
+        plan->kv_host_pages = kv_host_pages;
     }
     return plan;
 }

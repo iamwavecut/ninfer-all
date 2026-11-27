@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "product/hub/hub.h"
 #include "product/kv_resident_options.h"
 #include "product/loop_kv_options.h"
 #include "product/option_layers.h"
@@ -21,6 +22,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -201,7 +203,8 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [options]\n"
            "\n"
-           "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n"
+           "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n" +
+           std::string(product::hub::kArtifactReferenceHelp) +
            "  --help, -h                    show this help and exit\n"
            "  --version                     print the build version and exit\n"
            "  --config FILE                 read options from an INI or flat JSON launch file\n"
@@ -213,7 +216,10 @@ std::string serve_usage_text(const char* argv0) {
            "MODEL & CONTEXT\n"
            "  --max-context N               logical context ceiling of each request (default\n"
            "                                8192)\n"
-           "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
+           "  --max-concurrency N|auto      requests decoded together, 1..64 (default 1); at\n"
+           "                                most 8 with --spec and for the families with an\n"
+           "                                Engine core of their own; auto: the most whose\n"
+           "                                states and --max-context KV windows fit\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024; 4096 for native MoE experts\n"
            "                                in host memory or files; 2048 for\n"
@@ -252,8 +258,11 @@ std::string serve_usage_text(const char* argv0) {
            std::string(product::kInvariantAttentionHelp) +
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
-           "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
-           "                                mapped pinned host memory, read in place\n"
+           "  --embedding-residency auto|device|host  token embedding on GPU or in mapped\n"
+           "                                pinned host memory, read in place; auto (default):\n"
+           "                                host where the hybrid cache sizes the KV pool from\n"
+           "                                free memory, nothing drafts and the table is\n"
+           "                                untied, on Linux\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
            "                                Gemma, Flint and DeepSeek-V4.1 allow 0 (layer\n"
            "                                banks only).\n"
@@ -358,6 +367,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
+           "  --kv-host-mib N|auto          Qwen3.5 family, one device, Linux: extend the KV\n"
+           "                                pool past the device by N MiB of pinned host\n"
+           "                                memory the GPU reads across the bus (default 0,\n"
+           "                                off); auto: enough for every request to reach\n"
+           "                                --max-context, within the host's free memory\n"
            "  --kv-dtype T                  KV storage: bf16 (default), int8, fp8, rk8v4,\n"
            "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
            "                                fp16: Flash-Next, Gemma 4 and Flint; mxfp8:\n"
@@ -373,7 +387,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-prefix-reuse             disable compatible-prefix caching (on by\n"
            "                                default); excludes the options below\n"
            "  --device-state-slots N        checkpoint states on the device beyond the\n"
-           "                                active lanes (default max-concurrency)\n"
+           "                                active lanes (default min(max-concurrency,8))\n"
            "  --host-state-slots N          pinned host checkpoint states (default 8)\n"
            "  --host-kv-mib N               pinned host KV in MiB (default 8192)\n"
            "  --host-cache-mib N            one pinned host RAM ceiling instead of the two\n"
@@ -450,7 +464,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                cheapest to rebuild and demoting the costliest\n"
            "  --kv-lease-growth             reserve a 4096-token output window and extend it\n"
            "                                instead of the whole max_tokens budget; an answer\n"
-           "                                the pool cannot extend ends with length\n"
+           "                                the pool cannot extend ends with length (default\n"
+           "                                on past eight requests at once)\n"
            "  --concurrent-prefill          admit waiting requests to free lanes while other\n"
            "                                requests prefill\n"
            "  --disk-kv-path DIR            disk tier: evicted continuations write their KV\n"
@@ -476,9 +491,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --use-original-prefix-caching the checkpoint catalog instead of the hybrid\n"
            "                                prefix cache\n"
            "  --device-snapshot-slots N     hybrid: device state snapshot slots (default\n"
-           "                                concurrency + 2, lowered as far as one when the\n"
-           "                                KV capacity would not fit beside them; a given\n"
-           "                                count is kept)\n"
+           "                                min(concurrency,8) + 2, lowered as far as one\n"
+           "                                when the KV capacity would not fit beside them;\n"
+           "                                a given count is kept)\n"
            "  --cache-taps-per-request N    hybrid: new prefill snapshots per request\n"
            "                                (default 8; 2 without a Host tier)\n"
            "  --cache-tap-ladder N          hybrid: ladder base in tokens for history\n"
@@ -507,20 +522,22 @@ std::string serve_usage_text(const char* argv0) {
            "                                drafter, else none; dspark: the release's\n"
            "                                DSpark drafter\n"
            "                                (DeepSeek-V4.1, Inkling 2); dflash2 on Inkling 2:\n"
-           "                                incoai's DFlash2 drafter;\n"
+           "                                incoai's DFlash2 drafter; dflash and dspark on\n"
+           "                                the Gemma 4 31B: the artifact's DFlash or DSpark\n"
+           "                                drafter;\n"
            "                                dspine: the DSpine drafter --draft-model names)\n"
            "  --draft-model PATH            dspine: the DSpine drafter artifact, trained for\n"
            "                                this model\n"
            "  --draft-tokens N              drafts per round, 1..15 (Flash-Next dflash2: 1..7;\n"
            "                                Inkling 2 dflash2: 1..7, 7 the default;\n"
            "                                dspark: up to its block of 5, the default, 7 for\n"
-           "                                Inkling 2; dspine:\n"
-           "                                up to its block less one, 7 for Gemma 4, Flint\n"
-           "                                and DeepSeek-V4.1)\n"
+           "                                Inkling 2; Gemma 4 dflash and dspark: 1..7;\n"
+           "                                dspine: up to its block less one, 7 for Gemma 4,\n"
+           "                                Flint and DeepSeek-V4.1)\n"
            "  --draft-min-p P               confidence floor 0..1 of Flash-Next MTP, DFlash2\n"
            "                                or DSpine, of DSpine on Gemma 4, Flint or\n"
-           "                                DeepSeek-V4.1 and of DSpark or DFlash2 on\n"
-           "                                Inkling 2: a round\n"
+           "                                DeepSeek-V4.1, of DSpark on Gemma 4 and of\n"
+           "                                DSpark or DFlash2 on Inkling 2: a round\n"
            "                                ends after its first draft at or below P\n"
            "                                (default 0 with --spec, 0.5 when\n"
            "                                the engine chooses MTP or Inkling 2's DSpark,\n"
@@ -543,10 +560,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                --draft-tokens or half of them; with DSpark or\n"
            "                                DFlash2 on Inkling 2 a lone request's round takes\n"
            "                                1..--draft-tokens drafts\n"
-           "  --mtp-attention-window N      the MTP draft head attends to its first 64 keys\n"
+           "  --mtp-attention-window auto|N the MTP draft head attends to its first 64 keys\n"
            "                                and the newest N before its query, not the\n"
-           "                                whole history; verification is unchanged\n"
-           "                                (default 0: whole history)\n"
+           "                                whole history; verification is unchanged; 0\n"
+           "                                reads the whole history (default auto: Qwen3.5-\n"
+           "                                core models the newest 4096 from position 32768)\n"
            "  --ngram-draft-tokens N        copy up to N tokens (1..63) per round from\n"
            "                                earlier prompt, tool-result or output text,\n"
            "                                verified alongside --spec; on with 15 whenever\n"
@@ -588,26 +606,27 @@ std::string serve_usage_text(const char* argv0) {
            "                                most 16)\n"
            "\n"
            "SAMPLING & THINKING\n"
-           "  --temperature F               0..2\n"
+           "  --temperature F               0 or more\n"
            "  --top-p F                     0..1\n"
-           "  --top-k N                     0..20\n"
+           "  --top-k N                     0..64\n"
            "  --min-p F                     0..1\n"
-           "  --presence-penalty F          -2..2\n"
-           "  --frequency-penalty F         -2..2\n"
+           "  --presence-penalty F          any finite value\n"
+           "  --frequency-penalty F         any finite value\n"
            "  --seed N                      seed of a request that sets none (default: fresh\n"
            "                                per request)\n"
            "  --greedy                      force temperature 0 (exact argmax)\n"
            "  --gumbel-sampling             draw sampled tokens by Gumbel-max over keyed\n"
-           "                                noise, and MTP-style drafts as the drafter's\n"
-           "                                draws under the same noise: other tokens than\n"
-           "                                the default draw for the same seed (default off)\n"
+           "                                noise, and MTP-style and DSpark drafts as the\n"
+           "                                drafter's draws under the same noise: other\n"
+           "                                tokens than the default draw for the same seed\n"
+           "                                (default off)\n"
            "  --post-thinking               sample a thinking request's answer with the\n"
            "                                post-thinking preset (temperature 0.2) from the\n"
            "                                token after its reasoning closes (default off;\n"
            "                                a request opts in with a post_thinking object)\n"
-           "  --post-thinking-temperature F 0..2; implies --post-thinking\n"
+           "  --post-thinking-temperature F 0 or more; implies --post-thinking\n"
            "  --post-thinking-top-p F       0..1; implies --post-thinking\n"
-           "  --post-thinking-top-k N       0..20; implies --post-thinking\n"
+           "  --post-thinking-top-k N       0..64; implies --post-thinking\n"
            "  --post-thinking-sampler temp=F,top_p=F,top_k=N[,min_p=F,presence=F,frequency=F]\n"
            "                                the same fields in one flag\n"
            "  --no-thinking                 disable thinking by default\n"
@@ -678,15 +697,16 @@ std::string serve_usage_text(const char* argv0) {
            "  --cors                        send permissive CORS headers for browser clients\n"
            "  --no-webui                    do not serve a WebUI built in with\n"
            "                                NINFER_WEBUI_DIR on GET /\n"
-           "  --webui-mcp-proxy             relay the WebUI's MCP traffic at /cors-proxy;\n"
-           "                                http targets only and reaches any host, so only\n"
-           "                                on a trusted bind\n"
+           "  --webui-mcp-proxy             relay the WebUI's MCP traffic at /cors-proxy to\n"
+           "                                http and https targets; it reaches any host, so\n"
+           "                                only on a trusted bind\n"
            "  --ui-config-file PATH         JSON object of WebUI settings that /props reports\n"
            "                                as ui_settings, the WebUI's defaults (MCP servers\n"
            "                                among them)\n"
            "  --max-request-mib N           request body limit, enforced before parsing\n"
            "                                (default 384)\n"
-           "  --max-pending-requests N      requests waiting for admission (default 16)\n"
+           "  --max-pending-requests N      requests waiting for admission (default\n"
+           "                                max(16, max-concurrency))\n"
            "  --pending-timeout-ms N        preparation-plus-admission wait (default 600000)\n"
            "  --recover-invariant-failures  on a broken internal invariant, fail the active\n"
            "                                requests and keep serving the queue instead of\n"
@@ -712,9 +732,9 @@ std::string serve_usage_text(const char* argv0) {
            "NOTES\n"
            "  Sampler defaults come from the loaded model and the resolved thinking mode;\n"
            "  server flags and request fields override individual values.\n"
-           "  context cache defaults: device-state=max-concurrency, private=2x concurrency,\n"
-           "  shared=max(max-concurrency,7), anchors=2 (4 with --auto-long-anchors),\n"
-           "  Host state=8 slots, Host KV=8192 MiB.\n";
+           "  context cache defaults: device-state=min(max-concurrency,8), private=2x\n"
+           "  concurrency, shared=max(max-concurrency,7), anchors=2 (4 with\n"
+           "  --auto-long-anchors), Host state=8 slots, Host KV=8192 MiB.\n";
 }
 
 // "1,2,3" selects the ordered devices the model's pipeline stages run on; the first also holds the
@@ -851,14 +871,33 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             kv_headroom_mib = static_cast<std::size_t>(mib);
             continue;
         }
+        if (arg == "--kv-host-mib") {
+            const std::string value = require_value("--kv-host-mib");
+            if (value == "auto") {
+                options.kv_host_tier = KvHostTier{.bytes = 0, .automatic = true};
+                continue;
+            }
+            const std::uint64_t mib = parse_u64(value.c_str(), "kv-host-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--kv-host-mib is out of range");
+            }
+            options.kv_host_tier = KvHostTier{.bytes = static_cast<std::size_t>(mib << 20)};
+            continue;
+        }
         if (arg == "--max-concurrency") {
-            options.max_concurrency = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
+            const std::string value = require_value("--max-concurrency");
+            options.max_concurrency_auto = value == "auto";
+            options.max_concurrency =
+                options.max_concurrency_auto
+                    ? kMaximumConcurrency
+                    : static_cast<std::uint32_t>(
+                          parse_nonnegative_int(value.c_str(), "max-concurrency"));
             continue;
         }
         if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));
+            options.max_pending_requests_given = true;
             continue;
         }
         if (arg == "--pending-timeout-ms") {
@@ -1568,9 +1607,11 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             continue;
         }
         if (arg == "--mtp-attention-window") {
+            const char* text = require_value("--mtp-attention-window");
             options.speculative.mtp_attention_window =
-                static_cast<std::uint32_t>(parse_nonnegative_int(
-                    require_value("--mtp-attention-window"), "mtp-attention-window"));
+                std::string_view(text) == "auto" ? std::nullopt
+                               : std::optional(static_cast<std::uint32_t>(
+                                     parse_nonnegative_int(text, "mtp-attention-window")));
             continue;
         }
         if (product::switch_option(arg, "lm-head-q4", [&](bool on) { options.lm_head_q4 = on; })) {
@@ -1581,12 +1622,14 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (arg == "--embedding-residency") {
             const std::string residency = require_value("--embedding-residency");
-            if (residency == "device") {
+            if (residency == "auto") {
+                options.embedding_residency = EmbeddingResidency::Auto;
+            } else if (residency == "device") {
                 options.embedding_residency = EmbeddingResidency::Device;
             } else if (residency == "host") {
                 options.embedding_residency = EmbeddingResidency::Host;
             } else {
-                throw std::invalid_argument("--embedding-residency must be device or host");
+                throw std::invalid_argument("--embedding-residency must be auto, device or host");
             }
             continue;
         }
@@ -1770,7 +1813,8 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (arg == "--temperature") {
             options.sampling_overrides.temperature =
-                parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
+                parse_float_in(require_value("--temperature"), "temperature", 0.0f,
+                               std::numeric_limits<float>::max());
             continue;
         }
         if (arg == "--top-p") {
@@ -1780,7 +1824,10 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (arg == "--top-k") {
             const int top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
-            if (top_k > 20) { throw std::invalid_argument("top-k must be in [0,20]"); }
+            if (top_k > kSamplingTopKCap) {
+                throw std::invalid_argument("top-k must be in [0," +
+                                            std::to_string(kSamplingTopKCap) + "]");
+            }
             options.sampling_overrides.top_k = top_k;
             continue;
         }
@@ -1791,12 +1838,14 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (arg == "--presence-penalty") {
             options.sampling_overrides.presence_penalty = parse_float_in(
-                require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);
+                require_value("--presence-penalty"), "presence-penalty",
+                -std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
             continue;
         }
         if (arg == "--frequency-penalty") {
             options.sampling_overrides.frequency_penalty = parse_float_in(
-                require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
+                require_value("--frequency-penalty"), "frequency-penalty",
+                -std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
             continue;
         }
         if (arg == "--seed") {
@@ -2041,7 +2090,23 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                                       "--kv-capacity must be at least --max-context");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("--max-concurrency must be in [1,8]");
+        throw std::invalid_argument("--max-concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "] or auto");
+    }
+    if (options.speculative.backend != SpeculativeBackend::None) {
+        if (options.max_concurrency_auto) {
+            options.max_concurrency = std::min(options.max_concurrency, kMaximumSpeculativeRows);
+        } else if (options.max_concurrency > kMaximumSpeculativeRows) {
+            throw product::OptionConflict(
+                {"spec", "max-concurrency"},
+                "--spec runs at most " + std::to_string(kMaximumSpeculativeRows) +
+                    " requests at once; past that a round of drafts costs more than it saves. "
+                    "Use --max-concurrency " + std::to_string(kMaximumSpeculativeRows) +
+                    " or less, or --spec none");
+        }
+    }
+    if (!options.max_pending_requests_given) {
+        options.max_pending_requests = std::max(16U, options.max_concurrency);
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");

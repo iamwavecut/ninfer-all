@@ -36,6 +36,19 @@ struct KvCapacityPolicy {
     }
 };
 
+// Qwen3.5 family, one device (`--kv-host-mib`): the KV pool continues past what device memory
+// holds into pinned host memory at the pool's highest pages, which the device reads and writes
+// across the bus in place. Requests take device pages first. Output is unchanged; a step that
+// attends over host pages reads them over the bus each time. Off by default.
+struct KvHostTier {
+    // Host bytes the pool may extend into; zero is off unless automatic.
+    std::size_t bytes = 0;
+    // As many host pages as let every lane reach max_context, within the host's available memory.
+    bool automatic = false;
+
+    [[nodiscard]] constexpr bool enabled() const noexcept { return automatic || bytes != 0; }
+};
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP, DFlash and DFlash2 1..15 (query width K+1).
@@ -79,9 +92,11 @@ struct SpeculativeOptions {
     std::size_t ngram_archive_bytes = 0;
     std::size_t ngram_session_bytes = 128ULL << 20;
     // MTP only: the draft head attends to its first 64 keys and the newest this many keys before
-    // its query instead of the whole history; target verification keeps full attention, so the
-    // committed tokens do not depend on it. Zero reads the whole history.
-    std::uint32_t mtp_attention_window = 0;
+    // its query instead of the whole history; target verification keeps full attention and alone
+    // chooses the committed tokens. Zero reads the whole history. nullopt leaves it to the Engine:
+    // a Qwen3.5-core model's MTP draft reads the newest 4096 keys from position 32768 on, others
+    // read the whole history.
+    std::optional<std::uint32_t> mtp_attention_window;
     // The backend was left to the Engine (no --spec): a MoE model whose artifact carries a drafter
     // drafts with it, since a verification window's routes share the layer's missing experts:
     // Qwen3.8-Flash-Next with host experts with its DFlash2 drafter, kAutomaticDFlash2Tokens a
@@ -171,7 +186,8 @@ private:
 struct HybridPrefixCacheOptions {
     // Device StateImage slots holding inactive snapshots (and tap/endpoint staging). Total Device
     // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
-    // lane plus two (a staging slot and one for a shared prefix or another conversation).
+    // lane up to kDefaultCheckpointImages lanes, plus two (a staging slot and one for a shared
+    // prefix or another conversation).
     std::optional<std::uint32_t> device_snapshot_slots;
     // Whether startup may lower device_snapshot_slots, down to one, when the KV capacity asked
     // for (an explicit one, or one --max-context window beside the automatic headroom) would not
@@ -221,16 +237,17 @@ struct SlotAutoSaveOptions {
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,7) and L=2 (4 with automatic anchors);
-    // Engine::options() returns those effective values.
+    // defaults are H=min(C,8) (kDefaultCheckpointImages), R=8, Host KV=8 GiB, P=2C, S=max(C,7)
+    // and L=2 (4 with automatic anchors); Engine::options() returns those effective values.
     bool enabled = true;
     ContextCacheMode mode = ContextCacheMode::Legacy;
     HybridPrefixCacheOptions hybrid;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
-    // Legacy mode, Qwen3.5-core models: one more Device StateImage for each of the C requests,
-    // outside the catalog, keeps the state at the token where a stop string's match began, so a
-    // turn that the stop string ends rounds later resumes its next turn from there. A startup
+    // Legacy mode, Qwen3.5-core models: min(C,8) more Device StateImages, outside the catalog,
+    // keep the state at the token where a stop string's match began, so a turn that the stop
+    // string ends rounds later resumes its next turn from there. Past eight requests the requests
+    // share them, and one that finds none free resumes such a turn from its prompt. A startup
     // whose KV capacity does not fit beside them drops them, and Engine::options() reports it.
     // The hybrid cache keeps that state in a snapshot slot.
     bool stop_hold_images = true;
@@ -307,8 +324,10 @@ struct ContextCacheOptions {
     // (4096 tokens, or the prefill chunk when larger), extended at decode-round boundaries, rather
     // than prompt plus the whole max_tokens budget. When the pool cannot extend it, idle retained
     // owners are released least recently used first; if the smallest step still does not fit, the
-    // answer ends with finish_reason length before max_tokens. Off by default for that reason.
-    bool kv_lease_growth = false;
+    // answer ends with finish_reason length before max_tokens. Default: on past eight requests
+    // (a reservation of every request's whole output budget would hold most of the pool out of
+    // use), off otherwise for that reason; Engine::options() reports the value.
+    std::optional<bool> kv_lease_growth;
     // The engine anchors message boundaries itself: every request offers private long anchors at
     // up to L message boundaries, on the grid long_anchor_min_spacing_tokens sets, so a later
     // request that rewrites history there resumes from the anchor instead of root. L then defaults
@@ -440,6 +459,17 @@ struct HybridExpertOptions {
     // uncached expert that all its tokens rank past this many places of their top ten, without
     // giving its router weight to the others (lossy); 0 (default) serves every miss.
     std::uint32_t tail_skip_rank = 0;
+    // Host and disk experts: 0..1 added to the routing score of each expert the device holds (its
+    // cache, lent banks or disk pools) when a decode or verification call ranks a layer's experts,
+    // the chosen experts keeping the weights of their unbiased scores (lossy: which experts a call
+    // takes, and so its results, depend on what the device holds). The score is the one each
+    // router weights its experts by: the softmax probability (Qwen3.5/3.6 MoE, Gemma 4, Flash-Next,
+    // Edge0), the sigmoid (Flint; Inkling 2 with its selection bias) or DeepSeek-V4.1's
+    // sqrt-softplus with its selection bias. 0 (default): routing as trained.
+    float route_bias = 0.0F;
+    // With route_bias, also the prompt chunks' calls (ninfer-perplexity, whose scores then carry
+    // the bias at every token).
+    bool route_bias_prompts = false;
     // GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts
     // into. 2 copies the next layer's while this layer's experts run, and takes the second
     // buffer's memory from the expert cache; 1 keeps one. 0 (default) takes two with the automatic
@@ -574,11 +604,11 @@ struct EngineOptions {
     bool structured_output = false;
     // Every sampled request draws its tokens by Gumbel-max over keyed noise
     // (ResolvedSamplingParameters::gumbel) instead of by inverse CDF, and its chained drafts (an
-    // MTP block, Gemma 4's assistant) become the drafter's own draws under the noise of the
-    // positions they fill instead of its argmax, so a draft matches the verified token whenever
-    // the drafter and the target rank the drawn token first. The draws differ from the default's
-    // for the same seed; greedy requests are unaffected. DSpark drafts stay the drafter's argmax,
-    // and DFlash2 drafts keep their rejection-sampled verification.
+    // MTP block, Gemma 4's assistant, the DSpark drafters of Inkling 2 and DeepSeek-V4.1) become
+    // the drafter's own draws under the noise of the positions they fill instead of its argmax,
+    // so a draft matches the verified token whenever the drafter and the target rank the drawn
+    // token first. The draws differ from the default's for the same seed; greedy requests are
+    // unaffected. DFlash2 drafts keep their rejection-sampled verification.
     bool gumbel_sampling = false;
     // Admit waiting requests to free lanes while other requests prefill, instead of holding
     // admission until the staged prefill finishes.
@@ -596,7 +626,12 @@ struct EngineOptions {
     bool wddm_evictable_budget         = false;
     ModelSuspendOptions suspend;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    KvHostTier kv_host_tier;
     std::uint32_t max_concurrency      = 1;
+    // --max-concurrency auto (Qwen3.5-core generation): max_concurrency is the most requests, and
+    // startup lowers it to the most whose recurrent states and one --max-context KV window each
+    // fit on the devices beside the weights, at least one. Engine::options() reports the count.
+    bool max_concurrency_auto          = false;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     // Prompt tokens per prefill chunk; 0 is automatic: 1024, or 4096 for a native Qwen3.5-family MoE
@@ -672,8 +707,9 @@ struct EngineOptions {
     bool embedding_q6                      = false;
     // Qwen3.5 family: keep the token embedding in mapped host RAM (`--embedding-residency
     // host`). Output is unchanged (the same gather reads the same stored bytes); excludes
-    // embedding_q4/q6, which only shrink the device copy.
-    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
+    // embedding_q4/q6, which only shrink the device copy. Auto resolves at startup, and
+    // options() reports the result; the other families resolve it to Device.
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Auto;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.

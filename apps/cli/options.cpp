@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/hub/hub.h"
 #include "product/kv_resident_options.h"
 #include "product/loop_kv_options.h"
 #include "product/launch_config/launch_config.h"
@@ -18,6 +19,7 @@
 #include <limits>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -172,7 +174,8 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>) [options]\n"
            "\n"
            "Runs one generation: the answer streams to stdout, reasoning and diagnostics\n"
-           "to stderr.\n"
+           "to stderr.\n" +
+           std::string(ninfer::product::hub::kArtifactReferenceHelp) +
            "  --help, -h                    show this help and exit\n"
            "  --version                     print the build version and exit\n"
            "  --config FILE                 read options from a launch configuration file\n"
@@ -243,6 +246,10 @@ std::string usage_text(const char* argv0) {
            "                                " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
+           "  --kv-host-mib N|auto          Qwen3.5 family, one device, Linux: extend the KV\n"
+           "                                pool past the device by N MiB of pinned host\n"
+           "                                memory the GPU reads across the bus (default 0,\n"
+           "                                off); auto: enough for --max-context\n"
            "  --kv-dtype T                  bf16 (default), int8, fp8, rk8v4, rk4v4,\n"
            "                                rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
            "                                fp16: Flash-Next, Gemma 4 and Flint; mxfp8:\n"
@@ -263,20 +270,22 @@ std::string usage_text(const char* argv0) {
            "                                drafter, else none; dspark: the release's\n"
            "                                DSpark drafter\n"
            "                                (DeepSeek-V4.1, Inkling 2); dflash2 on Inkling 2:\n"
-           "                                incoai's DFlash2 drafter;\n"
+           "                                incoai's DFlash2 drafter; dflash and dspark on\n"
+           "                                the Gemma 4 31B: the artifact's DFlash or DSpark\n"
+           "                                drafter;\n"
            "                                dspine: the DSpine drafter --draft-model names)\n"
            "  --draft-model PATH            dspine: the DSpine drafter artifact, trained for\n"
            "                                this model\n"
            "  --draft-tokens N              drafts per round, 1..15 (Flash-Next dflash2: 1..7;\n"
            "                                Inkling 2 dflash2: 1..7, 7 the default;\n"
            "                                dspark: up to its block of 5, the default, 7 for\n"
-           "                                Inkling 2; dspine:\n"
-           "                                up to its block less one, 7 for Gemma 4, Flint\n"
-           "                                and DeepSeek-V4.1)\n"
+           "                                Inkling 2; Gemma 4 dflash and dspark: 1..7;\n"
+           "                                dspine: up to its block less one, 7 for Gemma 4,\n"
+           "                                Flint and DeepSeek-V4.1)\n"
            "  --draft-min-p P               confidence floor 0..1 of Flash-Next MTP, DFlash2\n"
            "                                or DSpine, of DSpine on Gemma 4, Flint or\n"
-           "                                DeepSeek-V4.1 and of DSpark or DFlash2 on\n"
-           "                                Inkling 2: a round\n"
+           "                                DeepSeek-V4.1, of DSpark on Gemma 4 and of\n"
+           "                                DSpark or DFlash2 on Inkling 2: a round\n"
            "                                ends after its first draft at or below P\n"
            "                                (default 0 with --spec, 0.5 when\n"
            "                                the engine chooses MTP or Inkling 2's DSpark,\n"
@@ -291,10 +300,11 @@ std::string usage_text(const char* argv0) {
            "                                the artifact must store (the default when it does)\n"
            "  --full-draft-head             draft with the full output head even when the\n"
            "                                artifact stores a proposal head\n"
-           "  --mtp-attention-window N      the MTP draft head attends to its first 64 keys\n"
+           "  --mtp-attention-window auto|N the MTP draft head attends to its first 64 keys\n"
            "                                and the newest N before its query, not the\n"
-           "                                whole history; verification is unchanged\n"
-           "                                (default 0: whole history)\n"
+           "                                whole history; verification is unchanged; 0\n"
+           "                                reads the whole history (default auto: Qwen3.5-\n"
+           "                                core models the newest 4096 from position 32768)\n"
            "  --ngram-draft-tokens 0..63    copy up to that many tokens per round from\n"
            "                                earlier prompt, tool-result or output text that\n"
            "                                the last --ngram-min-match tokens match,\n"
@@ -350,24 +360,25 @@ std::string usage_text(const char* argv0) {
            "                                memory, committing arenas at startup\n"
            "\n"
            "SAMPLING\n"
-           "  --temperature F               0..2\n"
+           "  --temperature F               0 or more\n"
            "  --top-p F                     0..1\n"
-           "  --top-k N                     0..20\n"
+           "  --top-k N                     0..64\n"
            "  --min-p F                     0..1\n"
-           "  --presence-penalty F          -2..2\n"
-           "  --frequency-penalty F         -2..2\n"
+           "  --presence-penalty F          any finite value\n"
+           "  --frequency-penalty F         any finite value\n"
            "  --seed N                      fixed random seed\n"
            "  --greedy                      force temperature 0 (exact argmax)\n"
            "  --gumbel-sampling             draw sampled tokens by Gumbel-max over keyed\n"
-           "                                noise, and MTP-style drafts as the drafter's\n"
-           "                                draws under the same noise: other tokens than\n"
-           "                                the default draw for the same seed (default off)\n"
+           "                                noise, and MTP-style and DSpark drafts as the\n"
+           "                                drafter's draws under the same noise: other\n"
+           "                                tokens than the default draw for the same seed\n"
+           "                                (default off)\n"
            "  --post-thinking               sample the answer of a thinking request with the\n"
            "                                post-thinking preset (temperature 0.2) from the\n"
            "                                token after its reasoning closes (default off)\n"
-           "  --post-thinking-temperature F 0..2; implies --post-thinking\n"
+           "  --post-thinking-temperature F 0 or more; implies --post-thinking\n"
            "  --post-thinking-top-p F       0..1; implies --post-thinking\n"
-           "  --post-thinking-top-k N       0..20; implies --post-thinking\n"
+           "  --post-thinking-top-k N       0..64; implies --post-thinking\n"
            "  --post-thinking-sampler temp=F,top_p=F,top_k=N[,min_p=F,presence=F,frequency=F]\n"
            "                                the same fields in one flag\n"
            "  --stop-token-id N             stop on this token id; repeatable\n"
@@ -472,6 +483,17 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                 throw std::invalid_argument(std::string(arg) + " is out of range");
             }
             kv_headroom_mib = static_cast<std::size_t>(mib);
+        } else if (arg == "--kv-host-mib") {
+            const char* tier = value(arg);
+            if (std::string_view(tier) == "auto") {
+                options.kv_host_tier = KvHostTier{.bytes = 0, .automatic = true};
+            } else {
+                const std::uint64_t mib = parse_u64(tier, "kv-host-mib");
+                if (mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
+                    throw std::invalid_argument("--kv-host-mib is out of range");
+                }
+                options.kv_host_tier = KvHostTier{.bytes = static_cast<std::size_t>(mib << 20)};
+            }
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -595,8 +617,11 @@ Options parse_arguments(const std::vector<std::string>& arguments,
         } else if (arg == "--lookup-ngram") {
             options.speculative.lookup_ngram = parse_u32(value("--lookup-ngram"), "lookup-ngram");
         } else if (arg == "--mtp-attention-window") {
+            const char* text = value(arg);
             options.speculative.mtp_attention_window =
-                parse_u32(value(arg), "mtp-attention-window", true);
+                std::string_view(text) == "auto"
+                    ? std::nullopt
+                    : std::optional(parse_u32(text, "mtp-attention-window", true));
         } else if (product::switch_option(arg, "prefill-cublas",
                                           [&](bool on) { options.prefill_cublas = on; })) {
         } else if (product::switch_option(arg, "prefill-cublas-projections", [&](bool on) {
@@ -698,21 +723,27 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                 .channel = arg == "--stop" ? OutputChannel::Content : OutputChannel::Reasoning,
             });
         } else if (arg == "--temperature") {
-            options.sampling.temperature = parse_float(value(arg), "temperature", 0.0F, 2.0F);
+            options.sampling.temperature = parse_float(value(arg), "temperature", 0.0F,
+                                                       std::numeric_limits<float>::max());
         } else if (arg == "--top-p") {
             options.sampling.top_p = parse_float(value(arg), "top-p", 0.0F, 1.0F);
         } else if (arg == "--top-k") {
             const std::uint32_t top_k = parse_u32(value(arg), "top-k", true);
-            if (top_k > 20) { throw std::invalid_argument("--top-k must be in [0,20]"); }
+            if (top_k > static_cast<std::uint32_t>(kSamplingTopKCap)) {
+                throw std::invalid_argument("--top-k must be in [0," +
+                                            std::to_string(kSamplingTopKCap) + "]");
+            }
             options.sampling.top_k = static_cast<std::int32_t>(top_k);
         } else if (arg == "--min-p") {
             options.sampling.min_p = parse_float(value(arg), "min-p", 0.0F, 1.0F);
         } else if (arg == "--presence-penalty") {
             options.sampling.presence_penalty =
-                parse_float(value(arg), "presence-penalty", -2.0F, 2.0F);
+                parse_float(value(arg), "presence-penalty", -std::numeric_limits<float>::max(),
+                            std::numeric_limits<float>::max());
         } else if (arg == "--frequency-penalty") {
             options.sampling.frequency_penalty =
-                parse_float(value(arg), "frequency-penalty", -2.0F, 2.0F);
+                parse_float(value(arg), "frequency-penalty", -std::numeric_limits<float>::max(),
+                            std::numeric_limits<float>::max());
         } else if (arg == "--seed") {
             options.sampling.seed = parse_u64(value(arg), "seed");
         } else if (product::switch_option(arg, "greedy", [&](bool on) { options.greedy = on; })) {

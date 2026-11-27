@@ -16,11 +16,12 @@ namespace ninfer::ops {
  * the one holding position max(0, p0 - window_keys) on, where p0 is the row's first live position.
  * Positions shift down by the pages skipped, so every live key a query sees keeps its offset in
  * its page and a new K/V row still lands in its own page. A row whose window starts inside its
- * sink keeps its table and positions.
+ * sink, or whose p0 is below from_position, keeps its table and positions.
  *
  * Math / indexing, for row b with table row r = table_rows[b], live columns V = valid_columns[b]
  * (W when valid_columns is empty), p0 = positions[0,b] when V > 0 and 0 otherwise:
- *   first  = max(0, p0 - window_keys) >> 6, shift = max(0, first - sink_pages);
+ *   first  = p0 >= from_position ? max(0, p0 - window_keys) >> 6 : 0,
+ *   shift  = max(0, first - sink_pages);
  *   window_tables[j,b] = block_tables[j < sink_pages ? j : j + shift, r] for j + shift < P,
  *                        block_tables[j, r] otherwise (never addressed);
  *   window_positions[c,b] = positions[c,b] - 64 * shift (unchanged when smaller than that);
@@ -32,7 +33,7 @@ namespace ninfer::ops {
  *   contiguous device tensors; outputs do not alias inputs.
  *
  * Numeric:
- *   sink_pages >= 0 and window_keys > 0.
+ *   sink_pages >= 0, window_keys > 0 and from_position >= 0.
  *
  * Effects:
  *   Writes the three outputs completely.
@@ -42,7 +43,8 @@ namespace ninfer::ops {
  */
 void paged_kv_window_rows(const Tensor& block_tables, const Tensor& table_rows,
                           const Tensor& positions, const Tensor& valid_columns,
-                          std::int32_t sink_pages, std::int32_t window_keys, Tensor& window_tables,
-                          Tensor& window_rows, Tensor& window_positions, cudaStream_t stream);
+                          std::int32_t sink_pages, std::int32_t window_keys,
+                          std::int32_t from_position, Tensor& window_tables, Tensor& window_rows,
+                          Tensor& window_positions, cudaStream_t stream);
 
 } // namespace ninfer::ops

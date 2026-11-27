@@ -12,8 +12,11 @@ or against each other as a benchmark. [Send a report](#send-a-report) to add a c
 | RTX 4090, 24 GB | Windows | Qwen3.8-27B GSQ-RCO IQ3_S, Swift 1.5 IQ3_S | Qwen Code sessions with DFlash2 5 and 7 | [RTX 4090: DFlash2](#rtx-4090-qwen-code-with-dflash2) |
 | RTX 4090, 24 GB | Windows | Swift Qwen3.8 GSQ-RCO IQ3_S | agent traffic with MTP 3, four lanes and the hybrid prefix cache | [RTX 4090: MTP 3](#rtx-4090-agent-traffic-with-mtp-3-and-the-hybrid-prefix-cache) |
 | RTX 4080 and RTX 4090 | Windows 11 | Qwen3.8-27B GSQ-RCO IQ3_S | Hermes Desktop | [RTX 4080 and 4090](#rtx-4080-and-rtx-4090-windows-11) |
+| RTX 4090, 24 GB | not given | Qwen3.8-27B UD-Q3_K_XL, GSQ-RCO IQ3_S | llmprobe's hard suite, 50 questions | [RTX 4090: llmprobe](#rtx-4090-llmprobe-hard-suite) |
 | RTX 5060 Ti, 16 GB, two and four | Linux | Qwen3.8-27B NVFP4 | `--tensor-parallel` prompts to 28.8K tokens, KV capacity | [RTX 5060 Ti](#rtx-5060-ti-two-and-four-cards) |
 | Tesla T10, 16 GB, two | Linux | Inkling 2 Mini UD-IQ4_XS | `--tensor-parallel` without peer access, retrieval prompts to 261,760 tokens, against llama.cpp | [Tesla T10](#tesla-t10-two-cards) |
+| RTX 3070 Ti, 8 GB | Windows 11 | Inkling 2 Mini UD-IQ4_XS | experts in host memory, the largest context with `rk4v4`, a 168K-token retrieval prompt | [RTX 3070 Ti](#rtx-3070-ti-windows-11) |
+| RTX 3060, 12 GB | Windows 11, WSL2 | Inkling 2 Mini GSQ-RCO IQ2_S | a 3,038-token prompt with experts in host memory, two releases | [RTX 3060](#rtx-3060-wsl2) |
 
 ## RTX 5070 Ti, Windows 11
 
@@ -295,6 +298,24 @@ Reported by @jabbor in [iamwavecut/ninfer-all#70](https://github.com/iamwavecut/
 each machine with 64 GB of RAM, served to Hermes Desktop. The reporter found it much faster than
 llama.cpp, with larger contexts. The report gives no rates.
 
+## RTX 4090: llmprobe hard suite
+
+Reported by @lin16303 in
+[iamwavecut/ninfer-all#471](https://github.com/iamwavecut/ninfer-all/issues/471), 25 November
+2026: [llmprobe](https://github.com/ddalcu/llmprobe) `--eval --eval-suite hard` on an RTX 4090, 50
+questions from GPQA Diamond, SuperGPQA, AIME 2025 and COMPSEC subsets, against two Qwen3.8-27B
+artifacts. llmprobe reports the decode rate and the time to the first token for information only.
+
+| Artifact | Decode | First token | Correct | Out of tokens | Tokens in / out | Wall time |
+|---|---:|---:|---:|---:|---:|---:|
+| Unsloth's UD-Q3_K_XL, converted by the reporter with `tools.convert` | 143.6 tok/s | 85 ms | 41 / 50 | 2 | 129,258 / 590,283 | 70 min 51 s |
+| `Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3` | 153.8 tok/s | 81 ms | 38 / 50 | 7 | 129,296 / 785,371 | 86 min 7 s |
+
+Three questions (6 points) separate the two scores; the standard error of the difference between
+two independent 50-question scores at these rates is about 8 points, and the report has no
+per-question results for a paired comparison. The OS, build, command, drafter, sampling settings and
+power limit are not in the report.
+
 ## RTX 5060 Ti, two and four cards
 
 Reported by @sean640112 and @mmknet2025 in
@@ -390,6 +411,68 @@ layers and an F16 KV cache reached first content in 98.21 s (prefill 334 tok/s),
 tensor-parallel llama.cpp configuration with IQ4_NL and an F16 KV cache in 111.87 s (293 tok/s).
 Their weights and KV formats differ from NInfer's. Visible-text throughput, latency percentiles and
 DSpark at 131K and 261K tokens were not measured.
+
+## RTX 3070 Ti, Windows 11
+
+Reported by @cedrik-fuoco in
+[iamwavecut/ninfer-all#451](https://github.com/iamwavecut/ninfer-all/issues/451) and
+[#467](https://github.com/iamwavecut/ninfer-all/pull/467), 24 November 2026.
+
+- RTX 3070 Ti 8 GB (`sm_86`), Windows 11 with the WDDM driver.
+- The change of #467 (`83e37de`), an `86` build with CUDA 12.9 and Visual Studio 2022 Build Tools
+  17.14 (MSVC 14.44.35207): `cmake -G Ninja -DCMAKE_CUDA_ARCHITECTURES=86` in vcpkg manifest mode.
+- `Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer`.
+
+```bat
+ninfer-serve Inkling-2-Mini-UD-IQ4_XS-ninfer-v3.ninfer --model-id inkling-2-mini ^
+  --host 127.0.0.1 --port 8094 --max-context 243200 --kv-dtype rk4v4 --expert-residency host
+```
+
+The build measured here ran Inkling 2's passes with host experts eagerly under WDDM, without CUDA
+Graphs, and kept no memory free beside them. Inkling 2 now keeps its CUDA Graphs there
+([Windows build](../build-windows.md#build)) and the 320 MiB it keeps free for them, about 37,400
+tokens of `rk4v4` context (8.75 KiB a token) below the ceiling measured here.
+
+- **Largest context.** On the 128-token grid the largest `--max-context` that started was 243,200
+  tokens; 243,712 was refused. At 243,200 the server took 6.99 GiB and left 81 MiB of the card free.
+- **Decode.** 52.4 tok/s on a 512-token answer.
+- **Long prompt.** A 168,201-token prompt with a needle at half its depth: the answer named the
+  needle; prefill ran at 409 tok/s and decode at 20 to 33 tok/s.
+- **Same text.** A fixed prompt at temperature 0 (seed 1234, 512 tokens) gave the same text at
+  212,992 and 243,200 tokens of context, and the same text as a build without #467.
+
+The CPU, host memory, driver version and power limit are not in the report. Prefill and decode at
+other prompt lengths and the other KV formats were not measured.
+
+## RTX 3060, WSL2
+
+Reported by @NeuroCloud-Activate in
+[iamwavecut/ninfer-all#500](https://github.com/iamwavecut/ninfer-all/issues/500), 27 November 2026.
+
+- RTX 3060 12 GB (`sm_86`), Windows 11, Docker Desktop with WSL2; the published CUDA 13.4 images
+  and source builds with `ARCHS=86`.
+- Inkling 2 Mini converted from ISTA-DASLab's GSQ-RCO IQ2_S GGUF, its perplexity checked against the
+  published artifact's.
+
+```bash
+ninfer-serve Inkling-2-Mini-GSQ-RCO-IQ2_S-ninfer.ninfer --max-context 32768 --kv-dtype rk4v4 \
+  --loop-kv last-full --expert-residency host --expert-cache-mib 4480 \
+  --spec dflash2 --draft-tokens 6 --lookup-ngram 3
+```
+
+One 3,038-token prompt, nothing reused, one request at a time:
+
+| Build | Prefill (tok/s) | TTFT (s) | Decode (tok/s) |
+|---|---:|---:|---:|
+| `9ba127602246` image | 1,153.0 | 2.63 | 117.7 |
+| `2a981ff602aa`, source build, three flag variants | 780.3 to 877.7 | 3.46 to 3.89 | 109.2 to 137.4 |
+| `9ba127602246` + the reporter's serve patch, `--loop-kv per-pass` | 1,178 | 2.58 | 107 |
+| `2a981ff602aa` + the same patch | 883 | 3.44 | 112 |
+
+The newer build delivers host experts with CUDA Graphs under WSL2, its copies running as a kernel
+([Windows build](../build-windows.md#build)); the older one ran those passes eagerly with the copy
+engine. The runs were short and not interleaved, so the reporter treats the percentages as
+approximate.
 
 ## Send a report
 

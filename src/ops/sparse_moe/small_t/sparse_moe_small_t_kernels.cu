@@ -81,7 +81,8 @@ constexpr int kS2Threads = 128;
 __global__ void sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores,
                                              int* __restrict__ token_ids,
                                              float* __restrict__ token_alpha,
-                                             float* __restrict__ shared_scale) {
+                                             float* __restrict__ shared_scale,
+                                             ExpertRouteBias held) {
     __shared__ float scores[kRouterRows];
     __shared__ float selected_logits[kTopK];
     const int tid   = static_cast<int>(threadIdx.x);
@@ -102,7 +103,7 @@ __global__ void sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_s
 
     if (tid < 32) {
         sparse_moe_select_top8_warp(scores, token_ids + token * kTopK, token_alpha + token * kTopK,
-                                    shared_scale + token, selected_logits);
+                                    shared_scale + token, selected_logits, held);
     }
 }
 
@@ -116,10 +117,10 @@ void launch_s1(const __nv_bfloat16* x, const __nv_bfloat16* router, float* parti
 }
 
 void launch_s2(const float* partial_scores, int* token_ids, float* token_alpha, float* shared_scale,
-               std::int32_t tokens, cudaStream_t stream) {
+               std::int32_t tokens, cudaStream_t stream, const ExpertRouteBias& held = {}) {
     CUDA_CHECK(pdl::launch_dependent(
         {dim3(static_cast<unsigned int>(tokens)), dim3(kS2Threads), 0, stream},
-        sparse_moe_small_t_s2_kernel, partial_scores, token_ids, token_alpha, shared_scale));
+        sparse_moe_small_t_s2_kernel, partial_scores, token_ids, token_alpha, shared_scale, held));
 }
 
 void launch_s3_tiled(const Tensor& x, const SparseMoeWeights& weights,
@@ -291,12 +292,13 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 } // namespace
 
 void sparse_moe_stream_route(const Tensor& x, const Weight& router,
-                              const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
+                              const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
+                              const ExpertRouteBias& held) {
     if (x.ne[1] < 1 || x.ne[1] > kSparseMoeSmallTMax) {
         throw std::invalid_argument("streamed SparseMoe routes one to 46 columns per call");
     }
     if (x.ne[1] == 1) {
-        sparse_moe_stream_decode_route(x, router, workspace, stream);
+        sparse_moe_stream_decode_route(x, router, workspace, stream, held);
         return;
     }
     dispatch_tokens(x.ne[1], [&]<int Tokens>() {
@@ -307,7 +309,7 @@ void sparse_moe_stream_route(const Tensor& x, const Weight& router,
     launch_s2(static_cast<const float*>(workspace.scratch.data),
               static_cast<int*>(workspace.token_ids.data),
               static_cast<float*>(workspace.token_alpha.data),
-              static_cast<float*>(workspace.shared_scale.data), x.ne[1], stream);
+              static_cast<float*>(workspace.shared_scale.data), x.ne[1], stream, held);
 }
 
 void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,

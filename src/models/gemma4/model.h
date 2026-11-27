@@ -8,6 +8,7 @@
 #include "core/device.h"
 #include "core/expert_delivery.h"
 #include "core/startup.h"
+#include "models/dflash/drafter.h"
 #include "models/dspine/model.h"
 #include "models/gemma4/config.h"
 #include "models/qwen3_5/frontend/resources.h"
@@ -20,6 +21,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::artifact {
@@ -120,6 +122,17 @@ struct LoadOptions {
     // Loads the standalone DSpine drafter artifact at this path (--spec dspine --draft-model) on
     // rank 0, the head's device; empty for none. It excludes the assistant.
     std::filesystem::path dspine;
+    // Binds the artifact's `dflash` or `dspark` drafter component, which must then exist
+    // (--spec dflash, --spec dspark), on rank 0; empty for none. It excludes the assistant and a
+    // DSpine drafter.
+    std::string dflash;
+};
+
+// A DFlash or DSpark drafter the artifact carries (LoadOptions::dflash).
+struct DFlashDrafter {
+    std::string component;
+    dflash::Config config;
+    dflash::Operands operands;
 };
 
 class Model {
@@ -181,6 +194,11 @@ public:
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
     // The standalone DSpine drafter when the model was loaded with one (LoadOptions::dspine).
     [[nodiscard]] const dspine::Model* dspine() const noexcept { return dspine_.get(); }
+    // The artifact's DFlash or DSpark drafter when the model was loaded with one
+    // (LoadOptions::dflash).
+    [[nodiscard]] const DFlashDrafter* dflash() const noexcept {
+        return dflash_ ? &*dflash_ : nullptr;
+    }
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
     }
@@ -214,6 +232,7 @@ private:
     std::vector<ExpertBanks> expert_banks_;
     std::vector<std::filesystem::path> expert_files_;
     std::unique_ptr<dspine::Model> dspine_;
+    std::optional<DFlashDrafter> dflash_;
 };
 
 // Whether the artifact's text component is Gemma 4.
@@ -222,6 +241,8 @@ private:
 [[nodiscard]] bool has_assistant(const artifact::Reader& reader);
 // Whether it also holds the vision tower.
 [[nodiscard]] bool has_vision(const artifact::Reader& reader);
+// Whether it also holds a DFlash drafter component of this name (`dflash` or `dspark`).
+[[nodiscard]] bool has_dflash(const artifact::Reader& reader, std::string_view component);
 
 [[nodiscard]] std::unique_ptr<Model> load_model(const artifact::Reader& reader,
                                                 const LoadOptions& options, DeviceContext& device,
@@ -229,7 +250,7 @@ private:
 
 // Expert parallelism's split of the routed experts when none is given: by `speed`, within each
 // rank's `free_bytes` beside what the load of `options` puts on it (models::default_expert_split),
-// a DSpine drafter on rank 0 included.
+// a DSpine or DFlash drafter on rank 0 included.
 [[nodiscard]] std::vector<double> default_expert_split(const artifact::Reader& reader,
                                                        const LoadOptions& options,
                                                        std::span<const std::uint64_t> free_bytes,

@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "core/expert_route_bias.h"
 #include "models/inkling2/kv_format.h"
 
 namespace ninfer::models::inkling2::kernels {
@@ -150,15 +151,18 @@ __device__ __forceinline__ int physical(const Rows& r, int t) {
     return r.chunk ? r.first + t : r.positions[t];
 }
 
-// Q and the relative feature of each row from the [Q; gate; relative] product (FP32 rows
-// `stride` apart, Q at column 0, the relative feature at `relative_column`): per head
+// Q and the relative feature of each row from the [Q; gate; relative] product (Q: FP32 rows
+// `stride` apart from `qgr`; the relative feature: FP32 rows `relative_stride` apart from
+// `relative`, the same rows at a later column or a plane of their own): per head
 //   q = clip(q * query_clip[h], qk_clip) * tau,   r = clip(r * relative_clip[h], relative_clip) * tau
 // where clip(x, c) = x * min(1, c / (|x| + 1e-6)) and tau = 1 + alpha log(max(1, (p + 1) / floor))
 // at the row's logical position p (1 without `log_scale`). q_out FP32 [T][heads][128], r_out
 // FP32 [T][heads][16].
 struct QueryArgs {
     const float* qgr = nullptr;
-    std::int64_t stride = 0, relative_column = 0;
+    std::int64_t stride = 0;
+    const float* relative = nullptr;
+    std::int64_t relative_stride = 0;
     int tokens = 0, heads = 0;
     const float* query_clip    = nullptr; // [heads][128]
     const float* relative_clip = nullptr; // [heads][16]
@@ -312,7 +316,8 @@ struct RouteSort {
 };
 
 // The router of each row x (FP32 [T][hidden]): p = sigmoid(router . x), the top_k experts by
-// p + bias (lower id first on equal values), weighted p / (sum of the chosen p + 1e-20) * scale *
+// p + bias (lower id first on equal values), plus held.bias for an expert the device holds
+// (core/expert_route_bias.h), weighted p / (sum of the chosen p + 1e-20) * scale *
 // down_scale[e] (when given); pair_scale[t * top_k + k] = gate_up_scale[e] (1 without). ids and
 // weights [T][top_k]; `logits` the router's FP32 products [T][experts] (gemm_f32).
 struct RouteArgs {
@@ -336,6 +341,7 @@ struct RouteArgs {
     // none.
     unsigned long long* zero = nullptr;
     std::int64_t zero_count  = 0;
+    ExpertRouteBias held;
 };
 inline constexpr int kSortedRouteRows    = 8;
 inline constexpr int kSortedRouteExperts = 128;
@@ -362,6 +368,15 @@ void bf16_expert_rows(const void* const* table, int rows, int k, const std::int3
                       const std::int32_t* sorted, const std::int32_t* active,
                       const std::int32_t* active_count, int max_active, const __nv_bfloat16* x,
                       int x_div, float* out, cudaStream_t stream);
+
+// MXFP8 expert products: bf16_expert_rows's sums over W_e decoded from `rows` rows of k E4M3 codes
+// at codes_table[e] (8-byte aligned) and of k / 32 E8M0 scales at scales_table[e], k % 32 == 0.
+// Weights equal to a BF16 bank's give that bank's bits.
+void mxfp8_expert_rows(const void* const* codes_table, const void* const* scales_table, int rows,
+                       int k, const std::int32_t* bounds, const std::int32_t* sorted,
+                       const std::int32_t* active, const std::int32_t* active_count,
+                       int max_active, const __nv_bfloat16* x, int x_div, float* out,
+                       cudaStream_t stream);
 
 // Rows ids[0, rows) of a BF16 table [*][k] as FP32 rows `out_stride` apart, exactly.
 void bf16_rows_f32(const __nv_bfloat16* table, int k, const std::int32_t* ids, int rows,
@@ -460,11 +475,14 @@ void spark_candidates(const float* base, std::int64_t stride, int vocab, int row
 //   joint  = W [state; embed[prev]; hidden[row]; context] + bias     (W FP32 [768][512 + 2 hidden])
 //   logits = cap tanh((base[row][v] + c[v] + M[v] tanh(joint[512:768])) / cap)
 //            over the row's candidates v (spark_candidates of the block's rows 1..)
-//   prev   = the first maximum (the lowest id among equal logits); confidence[row - 1] = its
-//            probability over the candidates; drafts[row - 1] = prev
+//   prev   = the first maximum (the lowest id among equal logits), or with `sampled` the id there;
+//            confidence[row - 1] = its probability over the candidates; drafts[row - 1] = prev
 //   state  = tanh(joint[256:512]) + sigmoid(joint[0:256]) (state - tanh(joint[256:512]))
 // The context is the ring row of the position before the block's first (rows.positions[0] - 1) of
 // rows.sequences[0]. `joint` and `logits` are scratch (spark_step_floats).
+// spark_step runs spark_score, then spark_take. A sampled step runs spark_score with `scores`, a
+// row of `vocab` floats that it fills with -inf beside the candidates' logits; the caller then
+// draws a candidate id from that row into `sampled` (one int on the device) and runs spark_take.
 struct SparkStepArgs {
     const float* weight = nullptr;
     const float* bias   = nullptr;
@@ -488,9 +506,14 @@ struct SparkStepArgs {
     float* confidence = nullptr;     // [block - 1]
     float* joint = nullptr;
     float* logits = nullptr;
+    float* scores = nullptr;                 // [vocab], a sampled step's row, or null
+    int vocab = 0;
+    const std::int32_t* sampled = nullptr;   // [1], a sampled step's draw, or null
 };
 [[nodiscard]] std::size_t spark_step_floats();
 void spark_step(const SparkStepArgs& args, cudaStream_t stream);
+void spark_score(const SparkStepArgs& args, cudaStream_t stream);
+void spark_take(const SparkStepArgs& args, cudaStream_t stream);
 
 // sums[i] += products[i] for i < n when *flag is nonzero: the 2^-32 fixed-point sums of the
 // routed experts the CPU computed for a call (ExpertDelivery), added as the expert kernels add

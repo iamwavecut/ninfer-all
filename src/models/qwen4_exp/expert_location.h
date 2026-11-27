@@ -29,6 +29,7 @@ struct ExpertLocation {
     QType format           = QType::GGUF_Q8_0;
     std::int64_t row_bytes = 0;
     std::int32_t rows      = 0;
+    const std::byte* pinned_device = nullptr; // alias used when the GPU reads pinned bytes
 };
 
 } // namespace ninfer::models::qwen4_exp

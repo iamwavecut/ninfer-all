@@ -323,11 +323,11 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve compatible FP8/NVFP4/T2/Q2/Q8/GGUF source codes, scales, weight divisor and
+    """Preserve compatible FP8/NVFP4/T2/Q2/Q8/MXFP8/GGUF source codes, scales, weight divisor and
     stored input order."""
     if (
         request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "fp8_e4m3fn_row_fp16",
-                                      "t2_g128_fp16", "q2_g64_fp16", "q8_g32_fp16")
+                                      "t2_g128_fp16", "q2_g64_fp16", "q8_g32_fp16", "mxfp8")
         and request.target.format not in GGUF_FORMATS
     ) or len(request.target.shape) != 2:
         raise ValueError("import_encoded requires a known encoded matrix target")

@@ -267,6 +267,20 @@ void decode_slice(QType format, const std::uint8_t* row, int slice, GgufCpuSlice
         out.factor[1] = d * float(2 * (scale >> 4) + 1) * 0.125F;
         return;
     }
+    case QType::GGUF_IQ2_XS: {
+        // d, 32 16-bit words (a 9-bit grid index and a 7-bit sign index each), 8 scale bytes.
+        const std::uint8_t* qs = block + 2 + 8 * sub;
+        const unsigned scale   = block[66 + sub];
+        for (int l = 0; l < 4; ++l) {
+            const unsigned q     = load16(qs + 2 * l);
+            const unsigned signs = ksigns_iq2xs[q >> 9];
+            const auto* grid     = reinterpret_cast<const std::uint8_t*>(iq2xs_grid + (q & 511U));
+            for (int j = 0; j < 8; ++j) { out.weights[8 * l + j] = signed_by(grid[j], signs & (1U << j)); }
+        }
+        out.factor[0] = d * float(2 * (scale & 15U) + 1) * 0.125F;
+        out.factor[1] = d * float(2 * (scale >> 4) + 1) * 0.125F;
+        return;
+    }
     case QType::GGUF_IQ2_XXS: {
         // d, then per sub-block four grid-index bytes and a word of four 7-bit sign indices and a
         // 4-bit scale.
@@ -357,7 +371,8 @@ void rows_scalar(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_beg
     const int tokens = x.tokens();
     const int slices = w.k / 32;
     const bool q2    = w.format == QType::GGUF_Q2_0;
-    const bool two   = w.format == QType::GGUF_IQ2_S || w.format == QType::GGUF_IQ1_M;
+    const bool two   = w.format == QType::GGUF_IQ2_S || w.format == QType::GGUF_IQ2_XS ||
+                     w.format == QType::GGUF_IQ1_M;
     const bool delta = w.format == QType::GGUF_IQ1_S;
     const bool six   = w.format == QType::GGUF_Q6_K || w.format == QType::GGUF_Q3_K ||
                      w.format == QType::GGUF_NVFP4;
@@ -464,6 +479,66 @@ bool cpu_has_avx2() noexcept {
 #endif
 }
 
+bool cpu_has_avx_vnni() noexcept {
+#if defined(NINFER_CPU_EXPERT_X86) && defined(NINFER_GGUF_CPU_AVX_VNNI_BUILT) && \
+    (defined(__GNUC__) || defined(__clang__))
+    return cpu_has_avx2() && __builtin_cpu_supports("avxvnni");
+#elif defined(NINFER_CPU_EXPERT_X86) && defined(NINFER_GGUF_CPU_AVX_VNNI_BUILT) && defined(_MSC_VER)
+    // Leaf 7 subleaf 1 EAX bit 4.
+    if (!cpu_has_avx2()) { return false; }
+    int regs[4];
+    __cpuidex(regs, 7, 1);
+    return all_bits(static_cast<unsigned>(regs[0]), 1U << 4);
+#else
+    return false;
+#endif
+}
+
+bool cpu_has_avx512_vnni() noexcept {
+#if defined(NINFER_CPU_EXPERT_X86) && (defined(__GNUC__) || defined(__clang__))
+    return cpu_has_avx2() && __builtin_cpu_supports("avx512f") &&
+           __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512vnni");
+#elif defined(NINFER_CPU_EXPERT_X86) && defined(_MSC_VER)
+    // XCR0 opmask and ZMM state; leaf 7 EBX AVX512F and AVX512VL, ECX AVX512_VNNI.
+    if (!cpu_has_avx2()) { return false; }
+    const CpuFeatures cpu = cpu_features();
+    int regs[4];
+    __cpuidex(regs, 7, 0);
+    return (cpu.xcr0 & 0xE6U) == 0xE6U && all_bits(cpu.leaf7_ebx, (1U << 16) | (1U << 31)) &&
+           all_bits(static_cast<unsigned>(regs[2]), 1U << 11);
+#else
+    return false;
+#endif
+}
+
+// AMD's CPUs, whose AVX-VNNI rows of some formats measured slower than Intel's (gguf_cpu_rows_backend).
+bool cpu_is_amd() noexcept {
+#if defined(NINFER_CPU_EXPERT_X86) && (defined(__GNUC__) || defined(__clang__))
+    static const bool amd = __builtin_cpu_is("amd");
+    return amd;
+#elif defined(NINFER_CPU_EXPERT_X86) && defined(_MSC_VER)
+    static const bool amd = [] {
+        int regs[4];
+        __cpuid(regs, 0);
+        char vendor[12];
+        std::memcpy(vendor, &regs[1], 4); // EBX, EDX, ECX: "AuthenticAMD"
+        std::memcpy(vendor + 4, &regs[3], 4);
+        std::memcpy(vendor + 8, &regs[2], 4);
+        return std::memcmp(vendor, "AuthenticAMD", 12) == 0;
+    }();
+    return amd;
+#else
+    return false;
+#endif
+}
+
+GgufCpuBackend automatic_backend() noexcept {
+    if (cpu_has_avx_vnni()) { return GgufCpuBackend::AvxVnni; }
+    if (cpu_has_avx512_vnni()) { return GgufCpuBackend::Avx512Vnni; }
+    if (cpu_has_avx2()) { return GgufCpuBackend::Avx2; }
+    return GgufCpuBackend::Scalar;
+}
+
 } // namespace
 
 bool gguf_cpu_supported(QType format) noexcept {
@@ -480,6 +555,7 @@ bool gguf_cpu_supported(QType format) noexcept {
     case QType::GGUF_IQ1_S:
     case QType::GGUF_IQ1_M:
     case QType::GGUF_IQ2_XXS:
+    case QType::GGUF_IQ2_XS:
     case QType::GGUF_IQ2_S:
     case QType::GGUF_IQ3_XXS:
     case QType::GGUF_IQ3_S:
@@ -494,18 +570,53 @@ bool gguf_cpu_backend_available(GgufCpuBackend backend) noexcept {
     case GgufCpuBackend::Automatic:
     case GgufCpuBackend::Scalar: return true;
     case GgufCpuBackend::Avx2: return cpu_has_avx2();
+    case GgufCpuBackend::AvxVnni: return cpu_has_avx_vnni();
+    case GgufCpuBackend::Avx512Vnni: return cpu_has_avx512_vnni();
     }
     return false;
 }
 
 const char* gguf_cpu_backend_name(GgufCpuBackend backend) noexcept {
-    return gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2 ? "avx2" : "scalar";
+    switch (gguf_cpu_backend_selected(backend)) {
+    case GgufCpuBackend::Avx2: return "avx2";
+    case GgufCpuBackend::AvxVnni: return "avx-vnni";
+    case GgufCpuBackend::Avx512Vnni: return "avx512-vnni";
+    default: return "scalar";
+    }
 }
 
 GgufCpuBackend gguf_cpu_backend_selected(GgufCpuBackend requested) noexcept {
     if (requested != GgufCpuBackend::Automatic) { return requested; }
-    if (cpu_has_avx2()) { return GgufCpuBackend::Avx2; }
-    return GgufCpuBackend::Scalar;
+    static const GgufCpuBackend automatic = automatic_backend();
+    return automatic;
+}
+
+bool gguf_cpu_backend_avx2(GgufCpuBackend backend) noexcept {
+    const GgufCpuBackend selected = gguf_cpu_backend_selected(backend);
+    return selected == GgufCpuBackend::Avx2 || selected == GgufCpuBackend::AvxVnni ||
+           selected == GgufCpuBackend::Avx512Vnni;
+}
+
+GgufCpuBackend gguf_cpu_rows_backend(QType format, GgufCpuBackend backend) noexcept {
+    const GgufCpuBackend selected = gguf_cpu_backend_selected(backend);
+    if (selected != GgufCpuBackend::AvxVnni && selected != GgufCpuBackend::Avx512Vnni) { return selected; }
+    // AVX2's rows for the formats whose vpdpbusd rows measured slower (ninfer_gguf_cpu_rows_bench,
+    // 2026-11-27, medians of three rounds of 1, 4 and 8 tokens on one thread and one a core): Q8_0
+    // by 6-10% on one thread of a Ryzen 9 9950X and no faster on a Ryzen 7 7700X or a Core i5-12600K;
+    // IQ2_XXS and IQ2_S by 1-4% for 4 and 8 tokens on the 9950X, faster on the 12600K; with
+    // AVX512-VNNI, whose unit the compiler builds with other register moves, the grid formats with
+    // sign bytes by 1.5-6% for one token on the 7700X.
+    bool avx2_rows = false;
+    switch (format) {
+    case QType::GGUF_Q8_0: avx2_rows = true; break;
+    case QType::GGUF_IQ2_XXS:
+    case QType::GGUF_IQ2_S: avx2_rows = selected == GgufCpuBackend::Avx512Vnni || cpu_is_amd(); break;
+    case QType::GGUF_IQ1_S:
+    case QType::GGUF_IQ2_XS:
+    case QType::GGUF_IQ3_S: avx2_rows = selected == GgufCpuBackend::Avx512Vnni; break;
+    default: break;
+    }
+    return avx2_rows ? GgufCpuBackend::Avx2 : selected;
 }
 
 GgufCpuActivation::GgufCpuActivation(int token_capacity, int k)
@@ -631,8 +742,15 @@ void gguf_cpu_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_b
         throw std::invalid_argument("GGUF CPU expert: mismatched matrix, activation or rows");
     }
 #if defined(NINFER_CPU_EXPERT_X86)
-    if (gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2) {
-        return gguf_cpu_detail::rows_avx2(w, x, row_begin, row_end, y, y_stride);
+    switch (gguf_cpu_rows_backend(w.format, backend)) {
+    case GgufCpuBackend::Avx2: return gguf_cpu_detail::rows_avx2(w, x, row_begin, row_end, y, y_stride);
+#    if defined(NINFER_GGUF_CPU_AVX_VNNI_BUILT)
+    case GgufCpuBackend::AvxVnni:
+        return gguf_cpu_detail::rows_avx_vnni(w, x, row_begin, row_end, y, y_stride);
+#    endif
+    case GgufCpuBackend::Avx512Vnni:
+        return gguf_cpu_detail::rows_avx512_vnni(w, x, row_begin, row_end, y, y_stride);
+    default: break;
     }
 #endif
     gguf_cpu_detail::rows_scalar(w, x, row_begin, row_end, y, y_stride);
@@ -641,7 +759,7 @@ void gguf_cpu_rows(const GgufCpuMatrix& w, const GgufCpuActivation& x, int row_b
 void gguf_cpu_swiglu_bf16(const float* gate, const float* up, std::size_t count, std::uint16_t* out,
                           [[maybe_unused]] GgufCpuBackend backend) {
 #if defined(NINFER_CPU_EXPERT_X86)
-    if (gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2) {
+    if (gguf_cpu_backend_avx2(backend)) {
         return gguf_cpu_detail::swiglu_avx2(gate, up, count, out);
     }
 #endif
@@ -651,7 +769,7 @@ void gguf_cpu_swiglu_bf16(const float* gate, const float* up, std::size_t count,
 void gguf_cpu_geglu_bf16(const float* gate, const float* up, std::size_t count, std::uint16_t* out,
                          [[maybe_unused]] GgufCpuBackend backend) {
 #if defined(NINFER_CPU_EXPERT_X86)
-    if (gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2) {
+    if (gguf_cpu_backend_avx2(backend)) {
         return gguf_cpu_detail::geglu_avx2(gate, up, count, out);
     }
 #endif
@@ -662,7 +780,7 @@ void gguf_cpu_clamped_swiglu_bf16(const float* gate, const float* up, std::size_
                                   float limit, std::uint16_t* out,
                                   [[maybe_unused]] GgufCpuBackend backend) {
 #if defined(NINFER_CPU_EXPERT_X86)
-    if (gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2) {
+    if (gguf_cpu_backend_avx2(backend)) {
         return gguf_cpu_detail::clamped_swiglu_avx2(gate, up, count, scale, limit, out);
     }
 #endif
