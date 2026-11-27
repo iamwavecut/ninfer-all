@@ -1,8 +1,10 @@
+#include "ops/common/device_route.h"
 #include "ops/linear/linear_test_common.h"
 
 #include <array>
 #include <exception>
 #include <iostream>
+#include <string>
 
 namespace {
 
@@ -41,6 +43,27 @@ int t2_a8_conformance() {
     return failures;
 }
 
+// The 64-column small-T schedules a device profile may name for 33..64 columns, forced on the
+// shapes Ternary Bonsai 2 runs, against the same oracle.
+int t2_a8_wide_schedules() {
+    int failures = 0;
+    constexpr std::array kWidths{a8(24), a8(33), a8(40), a8(48), a8(57), a8(64), a8(65), a8(100)};
+    for (const char* schedule : {"r32c64", "r32c64w1", "r16c64w1"}) {
+        const std::string name = std::string("T2_A8 ") + schedule;
+        {
+            const ops::DeviceRouteForce force("t2_i8_small/34816x5120", schedule);
+            failures += run_shape(name.c_str(), ActivationCompute::A8, make_t2_g128_fp16_weight,
+                                  {34816, 5120, 313U, Comparison::SampledRows, false, kWidths});
+        }
+        {
+            const ops::DeviceRouteForce force("t2_i8_small/5120x17408", schedule);
+            failures += run_shape(name.c_str(), ActivationCompute::A8, make_t2_g128_fp16_weight,
+                                  {5120, 17408, 315U, Comparison::Full, false, kWidths});
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -50,7 +73,7 @@ int main() {
     }
 
     try {
-        const int failures = t2_a8_conformance();
+        const int failures = t2_a8_conformance() + t2_a8_wide_schedules();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " T2_A8 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
