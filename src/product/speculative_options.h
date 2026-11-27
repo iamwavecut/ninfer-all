@@ -114,9 +114,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         throw OptionConflict({"ngram-draft-tokens", "spec"},
                              "ngram drafting requires --spec mtp|dflash|dflash2|dspine");
     }
-    if (options.mtp_attention_window != 0 &&
+    if (options.mtp_attention_window.value_or(0) != 0 &&
         (options.backend != SpeculativeBackend::Mtp ||
-         options.mtp_attention_window < options.draft_tokens + 1)) {
+         *options.mtp_attention_window < options.draft_tokens + 1)) {
         throw OptionConflict(
             {"mtp-attention-window", "spec", "draft-tokens"},
             "--mtp-attention-window requires --spec mtp and at least --draft-tokens + 1 keys");

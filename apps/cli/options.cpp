@@ -19,6 +19,7 @@
 #include <limits>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -293,10 +294,11 @@ std::string usage_text(const char* argv0) {
            "                                the artifact must store (the default when it does)\n"
            "  --full-draft-head             draft with the full output head even when the\n"
            "                                artifact stores a proposal head\n"
-           "  --mtp-attention-window N      the MTP draft head attends to its first 64 keys\n"
+           "  --mtp-attention-window auto|N the MTP draft head attends to its first 64 keys\n"
            "                                and the newest N before its query, not the\n"
-           "                                whole history; verification is unchanged\n"
-           "                                (default 0: whole history)\n"
+           "                                whole history; verification is unchanged; 0\n"
+           "                                reads the whole history (default auto: Qwen3.5-\n"
+           "                                core models the newest 4096 from position 32768)\n"
            "  --ngram-draft-tokens 0..63    copy up to that many tokens per round from\n"
            "                                earlier prompt, tool-result or output text that\n"
            "                                the last --ngram-min-match tokens match,\n"
@@ -597,8 +599,11 @@ Options parse_arguments(const std::vector<std::string>& arguments,
         } else if (arg == "--lookup-ngram") {
             options.speculative.lookup_ngram = parse_u32(value("--lookup-ngram"), "lookup-ngram");
         } else if (arg == "--mtp-attention-window") {
+            const char* text = value(arg);
             options.speculative.mtp_attention_window =
-                parse_u32(value(arg), "mtp-attention-window", true);
+                std::string_view(text) == "auto"
+                    ? std::nullopt
+                    : std::optional(parse_u32(text, "mtp-attention-window", true));
         } else if (product::switch_option(arg, "prefill-cublas",
                                           [&](bool on) { options.prefill_cublas = on; })) {
         } else if (product::switch_option(arg, "prefill-cublas-projections", [&](bool on) {

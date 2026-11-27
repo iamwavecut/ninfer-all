@@ -1943,9 +1943,17 @@ int main() {
                 parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
                        "--mtp-attention-window", "4096"})
                             .speculative.mtp_attention_window == 4096 &&
-                    parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"})
-                            .speculative.mtp_attention_window == 0,
-                "--mtp-attention-window was not an off-by-default MTP option");
+                    !parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3"})
+                         .speculative.mtp_attention_window &&
+                    !parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                            "--mtp-attention-window", "auto"})
+                         .speculative.mtp_attention_window &&
+                    parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                           "--mtp-attention-window", "0"})
+                            .speculative.mtp_attention_window == 0U &&
+                    parse({"ninfer-serve", "model.ninfer", "--mtp-attention-window", "0"})
+                            .speculative.mtp_attention_window == 0U,
+                "--mtp-attention-window did not take auto (the default), 0 or a width");
             for (const std::vector<std::string>& bad :
                  {std::vector<std::string>{"--mtp-attention-window", "4096"},
                   std::vector<std::string>{"--spec", "mtp", "--draft-tokens", "5",

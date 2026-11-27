@@ -116,7 +116,7 @@ ConstructedFlint construct_flint(const EngineOptions& options, DeviceContext& de
         throw std::invalid_argument("Flint verifies 1 to 7 drafts a round (--draft-tokens)");
     }
     if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine) ||
-        speculative.mtp_attention_window != 0 || speculative.ngram_draft_tokens != 0 ||
+        speculative.mtp_attention_window.value_or(0) != 0 || speculative.ngram_draft_tokens != 0 ||
         speculative.ngram_archive_bytes != 0 ||
         speculative.proposal_head == ProposalHead::Optimized ||
         (speculative.proposal_head != ProposalHead::Auto && !dspine) ||

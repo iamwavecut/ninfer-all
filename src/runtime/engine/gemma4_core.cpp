@@ -133,7 +133,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
                                     " requires --draft-tokens in [1,7]");
     }
     if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine) ||
-        speculative.mtp_attention_window != 0 || speculative.ngram_archive_bytes != 0 ||
+        speculative.mtp_attention_window.value_or(0) != 0 || speculative.ngram_archive_bytes != 0 ||
         speculative.proposal_head == ProposalHead::Optimized ||
         (speculative.proposal_head != ProposalHead::Auto && !dspine)) {
         throw std::invalid_argument("Gemma 4 has no n-gram archive, --mtp-attention-window or "

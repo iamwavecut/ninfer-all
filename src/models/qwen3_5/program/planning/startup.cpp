@@ -811,7 +811,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             scratch(share_layout,
                     execution::attention_projection_workspace_bytes(p, tokens, tokens));
             (void)workspace::mtp_attention_results(share_layout, share, tokens);
-            if (plan.mtp_attention_window != 0) {
+            if (plan.mtp_attention_window.keys != 0) {
                 (void)workspace::paged_kv_window(
                     share_layout, static_cast<std::int32_t>(page_count(plan.capacity)), width,
                     batch);
@@ -835,7 +835,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(layout, execution::mtp_projection_workspace_bytes(parameters.mtp->projection,
                                                                   tokens, tokens));
         (void)workspace::mtp_attention_results(layout, config, tokens);
-        if (plan.mtp_attention_window != 0) {
+        if (plan.mtp_attention_window.keys != 0) {
             (void)workspace::paged_kv_window(
                 layout, static_cast<std::int32_t>(page_count(plan.capacity)), tokens, 1);
         }
@@ -1045,7 +1045,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 scratch(layout, execution::mtp_projection_workspace_bytes(
                                     parameters.mtp->projection, tokens, tokens));
                 (void)workspace::mtp_attention_results(layout, config, tokens);
-                if (plan.mtp_attention_window != 0) {
+                if (plan.mtp_attention_window.keys != 0) {
                     (void)workspace::paged_kv_window(
                         layout, static_cast<std::int32_t>(page_count(plan.capacity)), width, batch);
                 }
@@ -1488,7 +1488,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     default:
         throw std::invalid_argument("unknown kv_capacity policy");
     }
-    if (options.speculative.mtp_attention_window != 0 &&
+    if (options.speculative.mtp_attention_window.value_or(0) != 0 &&
         options.speculative.backend != SpeculativeBackend::Mtp) {
         throw std::invalid_argument("an MTP attention window requires the MTP backend");
     }
@@ -1512,8 +1512,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
             throw std::invalid_argument("MTP draft window must be in [1,15]");
         }
-        if (options.speculative.mtp_attention_window != 0 &&
-            options.speculative.mtp_attention_window < options.speculative.draft_tokens + 1) {
+        if (options.speculative.mtp_attention_window.value_or(0) != 0 &&
+            *options.speculative.mtp_attention_window < options.speculative.draft_tokens + 1) {
             throw std::invalid_argument(
                 "MTP attention window must hold at least draft_tokens + 1 keys");
         }
@@ -1935,6 +1935,16 @@ ops::RopeYarn planned_rope_yarn(const execution::Parameters& parameters,
         .yarn;
 }
 
+// An explicit --mtp-attention-window applies from the first position; auto applies
+// kAutomaticMtpAttentionWindow when MTP drafts and a context can pass its threshold.
+MtpAttentionWindow planned_mtp_attention_window(const EngineOptions& options) {
+    const auto& speculative = options.speculative;
+    if (speculative.backend != SpeculativeBackend::Mtp) { return {}; }
+    if (speculative.mtp_attention_window) { return {*speculative.mtp_attention_window, 0}; }
+    return options.max_context > kAutomaticMtpAttentionWindow.from ? kAutomaticMtpAttentionWindow
+                                                                     : MtpAttentionWindow{};
+}
+
 // Every chunk but a prompt's last one has the effective width, so it is chosen near the request
 // where the prompt-attention grid of this device leaves the least of a last wave idle.
 // NINFER_PREFILL_ALIGN=0 keeps the requested chunk.
@@ -1975,7 +1985,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .kv_storage                 = options.kv_cache,
         .proposal_head = models::planned_proposal_head(options.speculative.proposal_head),
         .rope_yarn                  = planned_rope_yarn(parameters, options),
-        .mtp_attention_window       = options.speculative.mtp_attention_window,
+        .mtp_attention_window       = planned_mtp_attention_window(options),
         .features                   = models::load_options(options),
         .expert_cache_bytes         = options.expert_cache_bytes,
         .use_cuda_graph             = options.use_cuda_graph,

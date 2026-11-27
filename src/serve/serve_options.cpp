@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -548,10 +549,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                --draft-tokens or half of them; with DSpark or\n"
            "                                DFlash2 on Inkling 2 a lone request's round takes\n"
            "                                1..--draft-tokens drafts\n"
-           "  --mtp-attention-window N      the MTP draft head attends to its first 64 keys\n"
+           "  --mtp-attention-window auto|N the MTP draft head attends to its first 64 keys\n"
            "                                and the newest N before its query, not the\n"
-           "                                whole history; verification is unchanged\n"
-           "                                (default 0: whole history)\n"
+           "                                whole history; verification is unchanged; 0\n"
+           "                                reads the whole history (default auto: Qwen3.5-\n"
+           "                                core models the newest 4096 from position 32768)\n"
            "  --ngram-draft-tokens N        copy up to N tokens (1..63) per round from\n"
            "                                earlier prompt, tool-result or output text,\n"
            "                                verified alongside --spec; on with 15 whenever\n"
@@ -1573,9 +1575,11 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             continue;
         }
         if (arg == "--mtp-attention-window") {
+            const char* text = require_value("--mtp-attention-window");
             options.speculative.mtp_attention_window =
-                static_cast<std::uint32_t>(parse_nonnegative_int(
-                    require_value("--mtp-attention-window"), "mtp-attention-window"));
+                std::string_view(text) == "auto" ? std::nullopt
+                               : std::optional(static_cast<std::uint32_t>(
+                                     parse_nonnegative_int(text, "mtp-attention-window")));
             continue;
         }
         if (product::switch_option(arg, "lm-head-q4", [&](bool on) { options.lm_head_q4 = on; })) {

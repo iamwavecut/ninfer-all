@@ -849,7 +849,10 @@ std::string format_server_start_json(
         {"speculative_draft_window", engine_options.speculative.draft_tokens},
         {"mtp_policy",
          engine_options.speculative.mtp_policy == MtpDraftPolicy::Adaptive ? "adaptive" : "fixed"},
-        {"mtp_attention_window", engine_options.speculative.mtp_attention_window},
+        {"mtp_attention_window",
+         engine_options.speculative.mtp_attention_window
+             ? Json(*engine_options.speculative.mtp_attention_window)
+             : Json("auto")},
         {"ngram_draft_window", engine_options.speculative.ngram_draft_tokens},
         {"ngram_min_match", engine_options.speculative.ngram_min_match},
         {"ngram_archive_bytes", engine_options.speculative.ngram_archive_bytes},

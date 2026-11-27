@@ -79,9 +79,11 @@ struct SpeculativeOptions {
     std::size_t ngram_archive_bytes = 0;
     std::size_t ngram_session_bytes = 128ULL << 20;
     // MTP only: the draft head attends to its first 64 keys and the newest this many keys before
-    // its query instead of the whole history; target verification keeps full attention, so the
-    // committed tokens do not depend on it. Zero reads the whole history.
-    std::uint32_t mtp_attention_window = 0;
+    // its query instead of the whole history; target verification keeps full attention and alone
+    // chooses the committed tokens. Zero reads the whole history. nullopt leaves it to the Engine:
+    // a Qwen3.5-core model's MTP draft reads the newest 4096 keys from position 32768 on, others
+    // read the whole history.
+    std::optional<std::uint32_t> mtp_attention_window;
     // The backend was left to the Engine (no --spec): a MoE model whose artifact carries a drafter
     // drafts with it, since a verification window's routes share the layer's missing experts:
     // Qwen3.8-Flash-Next with host experts with its DFlash2 drafter, kAutomaticDFlash2Tokens a

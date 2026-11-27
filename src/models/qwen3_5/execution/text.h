@@ -183,7 +183,9 @@ public:
 
     // Keys before its first query that the MTP draft attention reads past its one-page sink;
     // zero reads the whole history.
-    void set_mtp_attention_window(std::uint32_t keys) noexcept { mtp_attention_window_ = keys; }
+    void set_mtp_attention_window(MtpAttentionWindow window) noexcept {
+        mtp_attention_window_ = window;
+    }
 
     // Present when the model is split over several devices; see StageRuntime.
     void set_stage_runtime(StageRuntime* runtime) noexcept { stage_runtime_ = runtime; }
@@ -505,7 +507,7 @@ private:
     std::int32_t readout_count_                 = 0;
     std::function<void()> first_token_hook_;
     ops::RopeYarn rope_yarn_;
-    std::uint32_t mtp_attention_window_         = 0;
+    MtpAttentionWindow mtp_attention_window_;
     const MtpParameters* mtp_                   = nullptr;
     StageRuntime* stage_runtime_                = nullptr;
     const SteeringView* steering_               = nullptr;

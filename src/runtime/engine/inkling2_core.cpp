@@ -151,7 +151,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     }
     if ((speculative.draft_min_p.value_or(0.0F) != 0 && !dspine && !block) ||
         speculative.draft_confidence.has_value() ||
-        speculative.mtp_attention_window != 0 ||
+        speculative.mtp_attention_window.value_or(0) != 0 ||
         (speculative.ngram_draft_tokens != 0 && !dflash2) || speculative.ngram_archive_bytes != 0 ||
         speculative.proposal_head == ProposalHead::Optimized ||
         (speculative.proposal_head != ProposalHead::Auto && !dspine) ||

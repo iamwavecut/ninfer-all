@@ -967,7 +967,7 @@ public:
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
     const ops::RopeYarn rope_yarn;
-    const std::uint32_t mtp_attention_window;
+    const MtpAttentionWindow mtp_attention_window;
 
     // A checkpoint captured under one execution profile (backend, proposal head, KV coding) must
     // never be replayed under another. Capture and reuse-lookup derive the tag from this one place:
