@@ -6360,8 +6360,8 @@ struct Executor::Impl {
             }
         }
         // Batches of several sequences run eagerly: their first passes load the kernels of their
-        // widths now, a plain step of every batch size, then a verification of every sequence at
-        // the full width with the drafts before it.
+        // widths now, a plain step of every batch size, then a verification of the widest round
+        // (at most kMaximumSpeculativeRows sequences) at the full width with the drafts before it.
         std::vector<std::uint32_t> batch{sequence};
         for (std::uint32_t s = 1; s < options.sequences; ++s) {
             reset(s);
@@ -6371,15 +6371,19 @@ struct Executor::Impl {
                 decode(batch, std::vector<std::int32_t>(batch.size(), kToken));
             }
         }
-        const bool round = batch.size() > 1 && (mtp || drafter) &&
-                           std::all_of(batch.begin(), batch.end(), [&](std::uint32_t s) {
-                               return can_draft(s) && fits(s, verify_width);
-                           });
+        const std::span<const std::uint32_t> verified_batch =
+            std::span(batch).first(std::min<std::size_t>(batch.size(), speculative_rows()));
+        const bool round = verified_batch.size() > 1 && (mtp || drafter) &&
+                           std::all_of(verified_batch.begin(), verified_batch.end(),
+                                       [&](std::uint32_t s) {
+                                           return can_draft(s) && fits(s, verify_width);
+                                       });
         if (round) {
-            std::vector<std::int32_t> batch_drafts(batch.size() * options.draft_tokens);
-            draft(batch, std::vector<std::int32_t>(batch.size(), kToken), batch_drafts);
-            verify(batch, std::vector<std::int32_t>(batch.size() * verify_width, kToken));
-            commit(batch, std::vector<std::uint32_t>(batch.size(), 1));
+            const std::size_t rows = verified_batch.size();
+            std::vector<std::int32_t> batch_drafts(rows * options.draft_tokens);
+            draft(verified_batch, std::vector<std::int32_t>(rows, kToken), batch_drafts);
+            verify(verified_batch, std::vector<std::int32_t>(rows * verify_width, kToken));
+            commit(verified_batch, std::vector<std::uint32_t>(rows, 1));
         }
         for (const std::uint32_t s : batch) { reset(s); }
         for (auto& rank : ranks) {
