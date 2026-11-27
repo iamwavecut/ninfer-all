@@ -361,8 +361,8 @@ std::string serve_usage_text(const char* argv0) {
            "KV CACHE\n"
            "  --kv-capacity N|auto          shared KV capacity in tokens (default auto with\n"
            "                                the hybrid prefix cache, --max-context with the\n"
-           "                                checkpoint catalog); auto sizes the pool from\n"
-           "                                free memory\n"
+           "                                checkpoint catalog up to 8 requests, auto past\n"
+           "                                them); auto sizes the pool from free memory\n"
            "  --kv-headroom-mib N           memory --kv-capacity auto leaves free (default\n"
            "                                " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
@@ -1921,8 +1921,12 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             : ContextCacheMode::Legacy;
     if (!kv_capacity_explicit) {
         // The hybrid cache turns every Device page no active request holds into block cache, so
-        // it sizes the KV pool to free VRAM unless a capacity is given.
-        options.kv_capacity = options.context_cache.mode == ContextCacheMode::Hybrid
+        // it sizes the KV pool to free VRAM unless a capacity is given. The checkpoint catalog
+        // shares one --max-context window among up to eight requests; past eight that window
+        // holds too few pages to give each request one (2048 tokens are 32 pages of 64), so the
+        // pool takes free VRAM too, up to a window per request.
+        options.kv_capacity = options.context_cache.mode == ContextCacheMode::Hybrid ||
+                                      options.max_concurrency > kMaximumSpeculativeRows
                                   ? KvCapacityPolicy::automatic()
                                   : KvCapacityPolicy::explicit_capacity(options.max_context);
     }

@@ -1188,6 +1188,28 @@ int main() {
                           catalog.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           catalog.kv_capacity.explicit_tokens == catalog.max_context,
                       "the checkpoint catalog must keep the explicit max-context KV capacity");
+    // Past eight requests one window holds too few pages for each request to have one.
+    for (const char* requests : {"8", "9", "64"}) {
+        const ServeOptions wide = parse({"ninfer-serve", "model.ninfer", "--devices", "0,1",
+                                         "--max-concurrency", requests});
+        const bool automatic   = std::string_view(requests) != "8";
+        const std::string message =
+            std::string("the checkpoint catalog at ") + requests +
+            (automatic ? " requests must size its KV pool to free memory"
+                       : " requests must keep the explicit max-context KV capacity");
+        const ninfer::KvCapacityPolicy& kv = wide.kv_capacity;
+        const bool held = automatic ? kv.mode == ninfer::KvCapacityMode::Automatic
+                                    : kv.mode == ninfer::KvCapacityMode::Explicit &&
+                                          kv.explicit_tokens == wide.max_context;
+        failures += check(wide.context_cache.mode == ninfer::ContextCacheMode::Legacy && held,
+                          message.c_str());
+    }
+    const ServeOptions wide_explicit =
+        parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--max-concurrency", "64",
+               "--kv-capacity", "131072"});
+    failures += check(wide_explicit.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          wide_explicit.kv_capacity.explicit_tokens == 131072,
+                      "a given --kv-capacity must stand past eight requests");
     // Without a named mode, what only the checkpoint catalog serves selects it: one of its
     // options, pipeline stages, disabled prefix reuse or a graft.
     for (const std::vector<std::string>& catalog_selector :
