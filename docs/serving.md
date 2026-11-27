@@ -1333,8 +1333,10 @@ would, and is read as a call: Gemma 4 can open `<|tool_call>` without writing `<
 Each of these models opens a call with one token. DeepSeek-V4.1 opens a calls block with several
 tokens of text, so a block inside its reasoning stays reasoning.
 
-Messages enter the selected template in their input order. The maintained Qwen templates keep
-system/developer messages at their original positions. With `--assistant-prefill` a final assistant
+Messages enter the selected template in their input order, except that a Gemma 4 assistant message
+with both text and tool calls enters it as two messages of one turn, so that its text renders before
+the calls ([Gemma 4](gemma4.md)). The maintained Qwen templates keep system/developer messages at
+their original positions. With `--assistant-prefill` a final assistant
 message is an assistant prefill, as on `/v1/messages`: generation continues that turn in place
 instead of opening a new assistant turn after it. The prefill must be text only, and a prefill whose
 thinking is not explicitly disabled (top-level or `chat_template_kwargs` `enable_thinking`, or
