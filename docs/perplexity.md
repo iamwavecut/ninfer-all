@@ -45,7 +45,9 @@ The evaluator also takes the server's `--devices` (one pipeline stage per GPU, o
 `--tensor-parallel-prompt-partials` a share of every layer per GPU),
 `--invariant-attention`, its
 MoE residency options (`--expert-residency`, `--expert-cache-mib`) for native Qwen, Gemma 4, Flint,
-DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next, its Qwen3.8-Flash-Next n-gram options (`--ngram-table`,
+DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next, `--expert-route-bias` (which here biases every
+scored chunk, where the CLI and server bias only decode and verification calls:
+[route bias](cli.md#route-bias-toward-held-experts)), its Qwen3.8-Flash-Next n-gram options (`--ngram-table`,
 `--ngram-residency`, `--ngram-io`, `--ngram-io-depth`, `--ngram-hot-profile`, `--ngram-ram-mib`,
 `--ngram-lock`, `--ngram-dedupe`, `--no-ngram-table`; DeepSeek-V4.1's Engram table takes them
 too) and `--kv-resident` (streamed sparse-attention KV), and its

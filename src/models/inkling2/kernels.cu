@@ -2426,8 +2426,8 @@ __global__ void __launch_bounds__(kRowBlock) keep_products_kernel(ResidualArgs a
 
 constexpr int kRouteThreads = 256; // at least the experts
 
-// Block per row: thread e the expert. The top_k by p + bias, lower id first: expert e is chosen
-// k-th when k experts precede it in that order.
+// Block per row: thread e the expert. The top_k by p + bias (+ held.bias when held), lower id
+// first: expert e is chosen k-th when k experts precede it in that order.
 // The call's fixed-point expert sums from zero, over every thread of the route launch.
 __device__ __forceinline__ void zero_sums(const RouteArgs& a) {
     const std::int64_t step = std::int64_t(gridDim.x) * blockDim.x;
@@ -2446,7 +2446,8 @@ __global__ void route_kernel(RouteArgs a) {
     __shared__ float chosen_p[8];
     const float logit = e < a.experts ? a.logits[std::int64_t(t) * a.experts + e] : 0.0f;
     const float p     = sigmoidf(logit);
-    const float selection = e < a.experts ? p + a.bias[e] : -INFINITY;
+    const float selection =
+        e < a.experts ? p + a.bias[e] + expert_route_bonus(a.held, e) : -INFINITY;
     selections[e]         = selection;
     __syncthreads();
     if (e < a.experts) {
@@ -2493,7 +2494,7 @@ __global__ void __launch_bounds__(kSortedRouteRows * kSortedRouteExperts)
     const bool expert = e < a.experts;
     const float logit = expert ? a.logits[std::int64_t(t) * a.experts + e] : 0.0f;
     const float p     = sigmoidf(logit);
-    const float selection = expert ? p + a.bias[e] : -INFINITY;
+    const float selection = expert ? p + a.bias[e] + expert_route_bonus(a.held, e) : -INFINITY;
     selections[t][e]      = selection;
     __syncthreads();
     int rank = -1;

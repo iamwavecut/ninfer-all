@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/expert_route_bias.h"
+
 // The routed experts a layer's call needs but its device cache lacks, served while the cached ones
 // run. After a layer's routing a kernel splits its pairs: the cached ones run at once from the
 // device tables.
@@ -181,6 +183,9 @@ public:
     void raise_failure();
     // The layer's cached blocks changed (the cache grew); the device copy the kernels read follows.
     void set_resident(std::size_t layer, const ExpertCache::Ranges& resident);
+    // The route bias `bias` toward layer `layer`'s experts in its cached blocks (the gate table's
+    // entries in the device ranges set_resident keeps).
+    [[nodiscard]] ExpertRouteBias route_bias(std::size_t layer, float bias) const;
     [[nodiscard]] MissStats stats() const;
     [[nodiscard]] bool cpu_enabled() const noexcept;
     // With a CPU share: its threads and vector backend, e.g. "15 pinned threads, avx2"; else

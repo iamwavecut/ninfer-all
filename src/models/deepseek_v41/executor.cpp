@@ -449,6 +449,9 @@ struct Executor::Impl {
     std::unique_ptr<dspine::Runtime> spine;
     DeviceBuffer spine_stage;
     bool in_branches = false;
+    // The pass whose blocks run is a prompt chunk's (a decode or verification pass's routers take
+    // the route bias, ExecutorOptions::expert_route_bias).
+    bool prompt_pass = false;
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(std::move(o)), config(m.config()),
@@ -2700,8 +2703,13 @@ struct Executor::Impl {
         kernels::gemm_f32(e, t, hidden, p.router, x32, logits, stream);
         auto* ids     = alloc<std::int32_t>(pairs);
         auto* weights = alloc<float>(pairs);
+        const ExpertRouteBias held =
+            p.delivery_layer >= 0 && options.expert_route_bias > 0 &&
+                    (!prompt_pass || options.expert_route_bias_prompts)
+                ? delivery->route_bias(std::size_t(p.delivery_layer), options.expert_route_bias)
+                : ExpertRouteBias{};
         kernels::route(logits, p.router_bias, t, e, k, config.routed_scaling_factor, ids, weights,
-                       stream, p.image_bias, p.image_bias != nullptr ? image_mask : nullptr);
+                       stream, p.image_bias, p.image_bias != nullptr ? image_mask : nullptr, held);
         const auto* xb   = static_cast<const __nv_bfloat16*>(x.data);
         if (p.stq) {
             // An STQ drafter block's resident experts: a pair per routed expert of a row through its
@@ -3087,6 +3095,7 @@ struct Executor::Impl {
     // Engram rows copied).
     void run(const Pass& s) {
         const int t = s.t;
+        prompt_pass = s.chunk;
         image_mask  = step_images.empty() ? nullptr : static_cast<const std::uint8_t*>(d_image.p) + s.row;
         workspace->reset();
         auto scope = workspace->scope();
@@ -3377,6 +3386,7 @@ struct Executor::Impl {
         };
         // The span's rows a DSpine drafter keeps.
         const int spine_row = spine_start(first, n, state_at);
+        prompt_pass         = true;
         for (std::size_t l = 0; l < layers.size(); ++l) {
             const LayerPlan& p = layers[l];
             const int from     = p.decoder ? decoder_row : 0;

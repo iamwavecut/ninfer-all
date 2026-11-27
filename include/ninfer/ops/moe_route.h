@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/expert_route_bias.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -33,8 +34,13 @@ namespace ninfer::ops {
  * uses at the same time; the call leaves it at zero. With it, a call of up to eight tokens selects
  * without a launch of its own. ids, weights and shared have the same bits either way.
  */
+/**
+ * With `held` (the route bias, core/expert_route_bias.h), ids are the 10 largest p + held.bias for
+ * a held expert (p alone for the others), weighted as without.
+ */
 void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
                WorkspaceArena& workspace, Tensor& ids, Tensor& weights, Tensor& shared,
-               cudaStream_t stream, std::uint32_t* done = nullptr);
+               cudaStream_t stream, std::uint32_t* done = nullptr,
+               const ExpertRouteBias& held = {});
 
 } // namespace ninfer::ops

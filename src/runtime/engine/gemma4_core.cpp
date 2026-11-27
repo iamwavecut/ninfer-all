@@ -157,6 +157,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
+    check_expert_route_bias(options);
     if (options.tensor_parallel ? device.size() < 2 : device.size() != 1) {
         throw std::invalid_argument("Gemma 4 runs on one device, or divides its routed experts "
                                     "over several with --tensor-parallel");
@@ -227,6 +228,8 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     executor.kv_cache      = options.kv_cache;
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
+    executor.expert_route_bias  = hybrid.route_bias;
+    executor.expert_route_bias_prompts = hybrid.route_bias_prompts;
     executor.expert_cpu_threads = hybrid.cpu_threads;
     executor.expert_disk        = {hybrid.mirror, hybrid.direct};
     executor.sampled_drafts     = options.gumbel_sampling;

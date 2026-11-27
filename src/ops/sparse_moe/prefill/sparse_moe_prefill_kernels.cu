@@ -219,7 +219,8 @@ __global__ void
 sparse_moe_prefill_select_count_kernel(const float* __restrict__ scores, int* __restrict__ ids,
                                        float* __restrict__ alpha, float* __restrict__ shared_scale,
                                        int* __restrict__ local_rank, int* __restrict__ tile_counts,
-                                       int tokens, SparseMoeShareArgs share) {
+                                       int tokens, SparseMoeShareArgs share,
+                                       ExpertRouteBias held) {
     __shared__ int counts[kExperts];
     __shared__ float selected_logits[kSparseMoeRouteTileTokens][kTopK];
     const int tid  = static_cast<int>(threadIdx.x);
@@ -233,7 +234,7 @@ sparse_moe_prefill_select_count_kernel(const float* __restrict__ scores, int* __
         sparse_moe_select_top8_warp(scores + static_cast<std::int64_t>(token) *
                                                  kSparseMoeRouterScoreRows,
                                     ids + token * kTopK, alpha + token * kTopK,
-                                    shared_scale + token, selected_logits[warp]);
+                                    shared_scale + token, selected_logits[warp], held);
         __syncwarp();
         if (lane == 0) {
             // A device's share counts its own experts under their bank ids; another device's
@@ -415,7 +416,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_small_ro
     int* __restrict__ tile_bases, int* __restrict__ expert_offsets,
     int* __restrict__ route_job_experts, int* __restrict__ route_job_columns,
     int* __restrict__ route_job_count, int* __restrict__ packed_index,
-    int* __restrict__ packed_token, int job_bn, int tokens) {
+    int* __restrict__ packed_token, int job_bn, int tokens, ExpertRouteBias held) {
     __shared__ int counts[kExperts];
     __shared__ int prefix[kExperts];
     __shared__ int warp_totals[kExperts / 32];
@@ -431,7 +432,8 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_small_ro
     if (warp < tokens) {
         sparse_moe_select_top8_warp(
             scores + static_cast<std::int64_t>(warp) * kSparseMoeRouterScoreRows,
-            ids + warp * kTopK, alpha + warp * kTopK, shared_scale + warp, selected_logits[warp]);
+            ids + warp * kTopK, alpha + warp * kTopK, shared_scale + warp, selected_logits[warp],
+            held);
         __syncwarp();
         if (lane == 0) {
 #pragma unroll
@@ -1964,9 +1966,16 @@ void sparse_moe_prefill_launch_impl(const Tensor& x, const SparseMoeWeights& wei
                                     Tensor& destination, const SparseMoePrefillPlan& plan,
                                     const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
                                     ExpertDelivery* delivery, std::size_t layer,
-                                    const SparseMoeShareArgs& share = {}) {
+                                    const SparseMoeShareArgs& share = {}, float route_bias = 0) {
     // A device's share (expert parallelism) writes share.partial, not destination.
     const bool whole = share.partial == nullptr;
+    // The route bias toward the delivery's held experts (core/expert_route_bias.h).
+    ExpertRouteBias held;
+    if constexpr (Indirect) {
+        if (route_bias > 0) { held = delivery->route_bias(layer, route_bias); }
+    } else {
+        (void)route_bias;
+    }
     if (x.ne[1] != plan.tokens || (whole && destination.ne[1] != plan.tokens) ||
         plan.slice_tokens < 1) {
         throw std::invalid_argument("sparse_moe prefill: launch plan does not match tensors");
@@ -2058,7 +2067,7 @@ void sparse_moe_prefill_launch_impl(const Tensor& x, const SparseMoeWeights& wei
         const bool fused_route = nvfp4 && tokens <= kSparseMoeRouteTileTokens;
         if (!fused_route) {
             sparse_moe_prefill_select_count_kernel<<<route_tiles, kRouterThreads, 0, stream>>>(
-                scores, ids, alpha, shared_scale, local_rank, tile_counts, tokens, share);
+                scores, ids, alpha, shared_scale, local_rank, tile_counts, tokens, share, held);
         }
         CUDA_CHECK(cudaGetLastError());
 
@@ -2109,7 +2118,7 @@ void sparse_moe_prefill_launch_impl(const Tensor& x, const SparseMoeWeights& wei
                 sparse_moe_prefill_small_route_kernel<<<1, kExpertThreads, 0, stream>>>(
                     scores, ids, alpha, shared_scale, local_rank, tile_counts, tile_bases, offsets,
                     route_job_experts, route_job_columns, route_job_count, packed_index,
-                    packed_token, route_job_bn, tokens);
+                    packed_token, route_job_bn, tokens, held);
             } else {
                 sparse_moe_prefill_index_kernel<false><<<index_blocks, kExpertThreads, 0, stream>>>(
                     ids, local_rank, packed_index, tile_bases, packed_token, assignments, nullptr);
@@ -2280,8 +2289,9 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 void sparse_moe_stream_prefill(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
                                const SparseMoePrefillWorkspace& workspace, ExpertDelivery& delivery,
-                               std::size_t layer, cudaStream_t stream) {
-    sparse_moe_prefill_launch_impl<true>(x, weights, destination, plan, workspace, stream, &delivery, layer);
+                               std::size_t layer, cudaStream_t stream, float route_bias) {
+    sparse_moe_prefill_launch_impl<true>(x, weights, destination, plan, workspace, stream, &delivery,
+                                         layer, {}, route_bias);
 }
 
 } // namespace ninfer::ops::detail

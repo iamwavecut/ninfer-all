@@ -27,6 +27,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "core/expert_route_bias.h"
+
 namespace ninfer::models::deepseek_v41::kernels {
 
 // out[t][m] = sum_k w[m][k] x[t][k] in FP32 for w row-major [m][k] and x [n][k]: up to eight rows
@@ -265,11 +267,13 @@ void attention_output(const __nv_bfloat16* o, int tokens, int heads, int groups,
                       __nv_bfloat16* out, cudaStream_t stream);
 
 // The router: scores s = sqrt(softplus(logits)), the top_k experts by s + bias (lower id first on
-// equal values), each weighted s / (sum of the chosen s + 1e-20) * scale. ids/weights [T][top_k].
-// With `image` (a flag per token), an image token's bias is image_bias.
+// equal values), plus held.bias for an expert the device holds (core/expert_route_bias.h), each
+// weighted s / (sum of the chosen s + 1e-20) * scale. ids/weights [T][top_k]. With `image` (a flag
+// per token), an image token's bias is image_bias.
 void route(const float* logits, const float* bias, int tokens, int experts, int top_k, float scale,
            std::int32_t* ids, float* weights, cudaStream_t stream,
-           const float* image_bias = nullptr, const std::uint8_t* image = nullptr);
+           const float* image_bias = nullptr, const std::uint8_t* image = nullptr,
+           const ExpertRouteBias& held = {});
 
 // out[r][i] = bf16(silu(min(g, limit)) * clamp(u, -limit, limit)) for rows of [g (width);
 // u (width)] FP32 x, `x_stride` apart, g and u first multiplied by scale[r / per_token] (when

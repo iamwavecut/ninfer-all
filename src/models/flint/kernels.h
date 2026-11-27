@@ -3,6 +3,7 @@
 // Flint's own normalization, attention-input, routing and decode-attention kernels. Activations are
 // token-major: an FP32 residual h[t][i], BF16 projection inputs x[t][k] (a [K, T] Tensor).
 
+#include "core/expert_route_bias.h"
 #include "models/flint/kv_format.h"
 
 #include <cuda_bf16.h>
@@ -136,9 +137,11 @@ void decode_attention(const DecodeAttentionArgs& args, cudaStream_t stream);
 // The router of a MoE block over its input rows x (FP32 [T][H]): logits = router . x (FP32 router
 // [E][H]); the top_k experts by logit (lower id first on equal logits), weighted by their sigmoid
 // scores renormalized over the top_k (s / (sum + 1e-20)). ids/weights [T][top_k]; logits is FP32
-// scratch [T][E].
+// scratch [T][E]. With `held` (core/expert_route_bias.h), the top_k by sigmoid score plus
+// held.bias for a held expert, weighted as without.
 void route(const float* x, int hidden, int tokens, const float* router, int experts, int top_k,
-           float* logits, std::int32_t* ids, float* weights, cudaStream_t stream);
+           float* logits, std::int32_t* ids, float* weights, cudaStream_t stream,
+           const ExpertRouteBias& held = {});
 
 // route() for at most 8 tokens in one launch (the same logits, experts and weights bit for bit),
 // with the pairs also grouped by expert into the arrays of a gguf::MoeRouting (bounds [E + 1],
@@ -147,7 +150,8 @@ void route(const float* x, int hidden, int tokens, const float* router, int expe
 void route_select(const float* x, int hidden, int tokens, const float* router, int experts,
                   int top_k, float* logits, std::int32_t* ids, float* weights,
                   std::int32_t* bounds, std::int32_t* sorted, std::int32_t* active,
-                  std::int32_t* active_count, std::uint32_t* done, cudaStream_t stream);
+                  std::int32_t* active_count, std::uint32_t* done, cudaStream_t stream,
+                  const ExpertRouteBias& held = {});
 
 // A matrix activation that keeps each 32 values' sum in F16 (Q4_K, Q5_K and the like,
 // gguf::matrix_activation_f16_sums) is kept to sums of at most this magnitude: a row or column with

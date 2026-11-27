@@ -129,7 +129,7 @@ std::string usage_text() {
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
            "       [--expert-dma-share F] [--expert-cpu-threads N] [--expert-cache-adaptive]\n"
            "       [--expert-misses staged|mapped] [--expert-tail-skip N]\n"
-           "       [--expert-prefill-buffers 1|2] [--expert-host-mib N]\n"
+           "       [--expert-prefill-buffers 1|2] [--expert-host-mib N] [--expert-route-bias B]\n"
            "       [--ngram-table PATH] [--ngram-residency disk|ram|ram-hot] [--ngram-lock]\n"
            "       [--ngram-io buffered|direct|mmap] [--ngram-io-depth N] [--ngram-ram-mib N]\n"
            "       [--ngram-hot-profile PATH] [--no-ngram-table] [--ngram-dedupe on|off]\n"
@@ -508,6 +508,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.expert_residency              = options.expert_residency;
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
     engine_options.hybrid_experts                = options.hybrid_experts;
+    // Scoring runs prompt chunks: a route bias then shapes every scored token, as it shapes each
+    // token a reply generates.
+    engine_options.hybrid_experts.route_bias_prompts = options.hybrid_experts.route_bias > 0;
     engine_options.ngram_table                   = options.ngram_table;
     engine_options.kv_resident_positions         = options.kv_resident;
     engine_options.max_context      = options.context;

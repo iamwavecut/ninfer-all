@@ -66,6 +66,17 @@ public:
     void set_keep_free_bytes(std::uint64_t bytes);
     // With a CPU share: its threads and vector backend, e.g. "15 pinned threads, avx2"; else empty.
     [[nodiscard]] std::string cpu_description() const;
+    // The route bias toward the experts the device holds (HybridExpertOptions::route_bias) of
+    // decode and verification calls, with `prompts` also of prompt chunks.
+    void set_route_bias(float bias, bool prompts) noexcept {
+        route_bias_         = bias;
+        route_bias_prompts_ = prompts;
+    }
+    // The bias a call of the Verify phase (decode, verification) or else of the Prefill phase
+    // takes; 0 for none.
+    [[nodiscard]] float route_bias(bool verify) const noexcept {
+        return verify || route_bias_prompts_ ? route_bias_ : 0.0F;
+    }
 
 private:
     struct Handle { std::size_t rank, local; };
@@ -74,6 +85,8 @@ private:
     std::vector<std::unique_ptr<ExpertDelivery>> ranks_;
     NativeExpertProfile profile_;
     bool elastic_ = false;
+    float route_bias_        = 0.0F;
+    bool route_bias_prompts_ = false;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

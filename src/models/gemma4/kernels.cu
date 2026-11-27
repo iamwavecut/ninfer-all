@@ -1011,19 +1011,62 @@ __global__ void route_logits_small_kernel(const float* __restrict__ x, int hidde
 }
 
 // One block per token, one thread per expert: each expert's rank among the logits (larger first,
-// lower id on ties) selects the top_k; their softmax times expert_scale.
+// lower id on ties) selects the top_k; their softmax times expert_scale. With `held` (the route
+// bias, core/expert_route_bias.h) the rank is among the softmax probabilities, plus held.bias for
+// a held expert; the weights stay the chosen logits' softmax.
 constexpr int kTopkMaxExperts = 256;
+
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) { v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFFu, v, o)); }
+    return v;
+}
+
+// The softmax probabilities of a token's logits v[0, experts) in place, plus held.bias for each
+// held expert, by the warps of the block in turn over tokens [0, tokens) (row stride `stride`).
+__device__ void held_probabilities(float* v, int stride, int tokens, int experts,
+                                   const ExpertRouteBias& held) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    for (int t = warp; t < tokens; t += warps) {
+        float* row = v + std::int64_t(t) * stride;
+        float top  = -INFINITY;
+        for (int j = lane; j < experts; j += 32) { top = fmaxf(top, row[j]); }
+        top       = warp_max(top);
+        float sum = 0.0f;
+        for (int j = lane; j < experts; j += 32) { sum += expf(row[j] - top); }
+        sum = warp_sum(sum);
+        for (int j = lane; j < experts; j += 32) {
+            row[j] = expf(row[j] - top) / sum + expert_route_bonus(held, j);
+        }
+    }
+}
+
+// The renormalized softmax weight of chosen[k] among chosen[0, top_k) (the logits of one token's
+// choices), relative to the largest of them: chosen[0] unless a route bias reordered them.
+__device__ __forceinline__ float chosen_softmax(const float* chosen, int top_k, int k) {
+    float top = chosen[0];
+    for (int j = 1; j < top_k; ++j) { top = fmaxf(top, chosen[j]); }
+    float sum = 0.0f;
+    for (int j = 0; j < top_k; ++j) { sum += expf(chosen[j] - top); }
+    return expf(chosen[k] - top) / sum;
+}
 
 __global__ void route_topk_kernel(const float* __restrict__ logits, int experts, int top_k,
                                   const float* __restrict__ expert_scale,
-                                  std::int32_t* __restrict__ ids, float* __restrict__ weights) {
+                                  std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                                  ExpertRouteBias held) {
     ninfer::pdl::arch_enter_glue();
     __shared__ float v[kTopkMaxExperts];
     __shared__ float chosen[8];
     __shared__ int chosen_id[8];
     const int t = blockIdx.x, e = threadIdx.x;
-    if (e < experts) { v[e] = ops::route_order(logits[std::int64_t(t) * experts + e]); }
+    const float logit = e < experts ? ops::route_order(logits[std::int64_t(t) * experts + e]) : 0.0f;
+    if (e < experts) { v[e] = logit; }
     __syncthreads();
+    if (held.enabled()) {
+        if (threadIdx.x < 32) { held_probabilities(v, 0, 1, experts, held); }
+        __syncthreads();
+    }
     if (e < experts) {
         const float mine = v[e];
         int rank         = 0;
@@ -1032,17 +1075,15 @@ __global__ void route_topk_kernel(const float* __restrict__ logits, int experts,
             rank += (other > mine || (other == mine && j < e)) ? 1 : 0;
         }
         if (rank < top_k) {
-            chosen[rank]    = mine;
+            chosen[rank]    = logit;
             chosen_id[rank] = e;
         }
     }
     __syncthreads();
     if (e < top_k) {
-        float sum = 0.0f;
-        for (int k = 0; k < top_k; ++k) { sum += expf(chosen[k] - chosen[0]); }
         ids[std::int64_t(t) * top_k + e]     = chosen_id[e];
         weights[std::int64_t(t) * top_k + e] =
-            expf(chosen[e] - chosen[0]) / sum * expert_scale[chosen_id[e]];
+            chosen_softmax(chosen, top_k, e) * expert_scale[chosen_id[e]];
     }
 }
 
@@ -1075,7 +1116,8 @@ __global__ void route_select_kernel(const float* __restrict__ logits, int tokens
                                     std::int32_t* __restrict__ bounds,
                                     std::int32_t* __restrict__ sorted,
                                     std::int32_t* __restrict__ active,
-                                    std::int32_t* __restrict__ active_count) {
+                                    std::int32_t* __restrict__ active_count,
+                                    ExpertRouteBias held) {
     ninfer::pdl::arch_enter_glue();
     __shared__ __align__(16) float v[kRouteTokens][kTopkMaxExperts];
     __shared__ float chosen[kRouteTokens * 8];
@@ -1089,12 +1131,17 @@ __global__ void route_select_kernel(const float* __restrict__ logits, int tokens
         v[t][j] = j < experts ? ops::route_order(logits[std::int64_t(t) * experts + j]) : -INFINITY;
     }
     __syncthreads();
+    if (held.enabled()) {
+        held_probabilities(&v[0][0], kTopkMaxExperts, tokens, experts, held);
+        __syncthreads();
+    }
     if (e < experts) {
         for (int t = 0; t < tokens; ++t) {
             const float mine = v[t][e];
             const int rank   = rank_among(v[t], mine, e, quads);
             if (rank < top_k) {
-                chosen[t * top_k + rank]    = mine;
+                chosen[t * top_k + rank] =
+                    held.enabled() ? ops::route_order(logits[std::int64_t(t) * experts + e]) : mine;
                 chosen_id[t * top_k + rank] = e;
             }
         }
@@ -1103,10 +1150,8 @@ __global__ void route_select_kernel(const float* __restrict__ logits, int tokens
     const int pairs = tokens * top_k;
     if (e < pairs) {
         const int base = (e / top_k) * top_k;
-        float sum      = 0.0f;
-        for (int k = 0; k < top_k; ++k) { sum += expf(chosen[base + k] - chosen[base]); }
         ids[e]     = chosen_id[e];
-        weights[e] = expf(chosen[e] - chosen[base]) / sum * expert_scale[chosen_id[e]];
+        weights[e] = chosen_softmax(chosen + base, top_k, e - base) * expert_scale[chosen_id[e]];
     }
     // Exclusive scans over the experts of their pair counts and of whether they have any.
     int count = 0;
@@ -1476,7 +1521,7 @@ void attn_residual(const AttnResidualArgs& args, cudaStream_t stream) {
 
 void route(const float* x, int hidden, int tokens, const float* router, const float* expert_scale,
            int experts, int top_k, float* logits, std::int32_t* ids, float* weights,
-           cudaStream_t stream) {
+           cudaStream_t stream, const ExpertRouteBias& held) {
     if (top_k > 8 || top_k > experts || experts > kTopkMaxExperts || hidden % 4 != 0) {
         throw std::invalid_argument("gemma4 route: at most 8 of 256 experts over whole float4s");
     }
@@ -1490,14 +1535,15 @@ void route(const float* x, int hidden, int tokens, const float* router, const fl
     }
     check_launch("route logits");
     ninfer::pdl::launch_arch(tokens, (experts + 31) / 32 * 32, 0, stream, route_topk_kernel, logits,
-                             experts, top_k, expert_scale, ids, weights);
+                             experts, top_k, expert_scale, ids, weights, held);
     check_launch("route top-k");
 }
 
 void route_select(const float* x, int hidden, int tokens, const float* router,
                   const float* expert_scale, int experts, int top_k, float* logits,
                   std::int32_t* ids, float* weights, std::int32_t* bounds, std::int32_t* sorted,
-                  std::int32_t* active, std::int32_t* active_count, cudaStream_t stream) {
+                  std::int32_t* active, std::int32_t* active_count, cudaStream_t stream,
+                  const ExpertRouteBias& held) {
     if (tokens > kRouteTokens || top_k > 8 || top_k > experts || experts > kTopkMaxExperts ||
         hidden % 4 != 0) {
         throw std::invalid_argument("gemma4 route_select: at most 8 tokens, 8 of 256 experts");
@@ -1508,7 +1554,7 @@ void route_select(const float* x, int hidden, int tokens, const float* router,
     const int threads = (std::max(experts, tokens * top_k) + 31) / 32 * 32;
     ninfer::pdl::launch_arch(1, threads, 0, stream, route_select_kernel, logits, tokens, experts,
                              top_k, expert_scale, ids, weights, bounds, sorted, active,
-                             active_count);
+                             active_count, held);
     check_launch("route select");
 }
 

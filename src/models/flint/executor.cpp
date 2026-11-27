@@ -178,6 +178,9 @@ struct Executor::Impl {
     // the prompt chunk's mask grow as far as the sequences reach: the expert cache gives memory
     // back when they need it and takes it again when a sequence is reset.
     bool growing = false;
+    // The blocks run a prompt chunk (forward), not a decode or verification pass, whose routers
+    // take the route bias (ExecutorOptions::expert_route_bias).
+    bool prompt_pass = false;
     std::vector<KvArea*> sequence_areas, chunk_areas;
     std::atomic<std::uint64_t> kv_backed{0};
     std::uint64_t kv_fixed = 0; // the caches' bytes that do not grow
@@ -1343,6 +1346,11 @@ struct Executor::Impl {
         auto* logits   = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * e * 4).data);
         void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
         const bool vector   = t <= gguf::kMaxVectorColumns;
+        const ExpertRouteBias held =
+            delivery && p.delivery_layer >= 0 && options.expert_route_bias > 0 &&
+                    (!prompt_pass || options.expert_route_bias_prompts)
+                ? delivery->route_bias(std::size_t(p.delivery_layer), options.expert_route_bias)
+                : ExpertRouteBias{};
         gguf::MoeRouting routing;
         if (vector) {
             auto* base = static_cast<std::int32_t*>(routing_space);
@@ -1352,9 +1360,9 @@ struct Executor::Impl {
             routing.active_count = base + e + 1 + pairs + e;
             kernels::route_select(router_x, hidden, t, p.router, e, k, logits, ids, weights, base,
                                   base + e + 1, base + e + 1 + pairs, base + e + 1 + pairs + e,
-                                  static_cast<std::uint32_t*>(route_done.p), stream);
+                                  static_cast<std::uint32_t*>(route_done.p), stream, held);
         } else {
-            kernels::route(router_x, hidden, t, p.router, e, k, logits, ids, weights, stream);
+            kernels::route(router_x, hidden, t, p.router, e, k, logits, ids, weights, stream, held);
             if (!model.expert_parallel()) {
                 routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
             }
@@ -1543,6 +1551,7 @@ struct Executor::Impl {
             throw std::invalid_argument("flint forward: context capacity exceeded");
         }
         back(sequence, first + std::uint32_t(t), true);
+        prompt_pass = true;
         std::vector<std::int32_t> pos(t);
         for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
         // A branch pass: each branch row rotates at its branch's position, and takes the cache
@@ -1764,6 +1773,7 @@ struct Executor::Impl {
     // `keep` (a decode step) each row's drafter taps go into its sequence's lane; a verification
     // keeps them for commit().
     void decode_body(int b, bool keep) {
+        prompt_pass = false;
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);
