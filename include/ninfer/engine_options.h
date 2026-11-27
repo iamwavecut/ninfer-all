@@ -36,6 +36,19 @@ struct KvCapacityPolicy {
     }
 };
 
+// Qwen3.5 family, one device (`--kv-host-mib`): the KV pool continues past what device memory
+// holds into pinned host memory at the pool's highest pages, which the device reads and writes
+// across the bus in place. Requests take device pages first. Output is unchanged; a step that
+// attends over host pages reads them over the bus each time. Off by default.
+struct KvHostTier {
+    // Host bytes the pool may extend into; zero is off unless automatic.
+    std::size_t bytes = 0;
+    // As many host pages as let every lane reach max_context, within the host's available memory.
+    bool automatic = false;
+
+    [[nodiscard]] constexpr bool enabled() const noexcept { return automatic || bytes != 0; }
+};
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP, DFlash and DFlash2 1..15 (query width K+1).
@@ -598,6 +611,7 @@ struct EngineOptions {
     bool wddm_evictable_budget         = false;
     ModelSuspendOptions suspend;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    KvHostTier kv_host_tier;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

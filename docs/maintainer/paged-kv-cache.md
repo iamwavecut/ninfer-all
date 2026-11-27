@@ -187,6 +187,24 @@ Main 与 selected backend 的 Host replicas共用一个 startup-fixed pinned `Ho
 携带自己的 typed page layout。Host capacity 按实际 packed bytes 和 allocator extent geometry计费；
 它不扩大 Device active entitlement 或单 sequence context ceiling。
 
+### 3.6 Host tier（`--kv-host-mib`）
+
+Host tier 扩大 Main 与 MTP pool 的 Device capacity 本身，与 3.5 的 Host replicas 无关。启用时，
+`EvictableKVPool` 把每个 page-major plane 的末尾 `kv_host_pages` 个 page 所在的整 granule 用
+`cuMemCreate(CU_MEM_LOCATION_TYPE_HOST)` 的 pinned host memory 映射在同一 VA 上（`vmm::create_host`）；
+plane 的地址、block table 与 CUDA Graph 不变，kernel 经 PCIe 原地读写这些 page，因此输出与全部在
+Device 时逐位相同。跨越 device/host 边界的 granule 留在 Device，容量计算为此预留每个 plane 最多
+两个 granule（`2·granularity·planes`）。
+
+- `DeviceKVPagePool::set_host_tier(first_host_page)` 记录边界；`materialize` 优先放在
+  `device_page_limit()` 以下，Device page 用尽时才取 host page。
+- 借出（Vision window、expert cache 的 KV loan）只取 Device page：`device_free_runs` 截到边界，
+  `collect_loan_granules` 跳过 host granule，`EvictableKVPool::lease` 与 `release_granules` 拒绝它们。
+- 只支持一个 device、Device experts、无 DFlash full-attention pool（其 head-major plane 没有连续的
+  page 尾部），且仅 native Linux driver（Windows 与 WSL2 的 WDDM 把 pinned memory 计入 GPU 共享段）。
+- 一个 request 在 host page 上的 position 每个 decode step 都跨总线读一次，prompt chunk 的
+  attention 读得更多；实测代价见 [CLI](../cli.md#context-and-memory)。
+
 ---
 
 ## 4. Page group 与物理 layout

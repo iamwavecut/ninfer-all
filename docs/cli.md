@@ -338,6 +338,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--rope-scaling-original-context N` | the interpolation threshold | the native window |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--kv-headroom-mib N` | device memory in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto`. `--vram-headroom-mib` is accepted as an alias | `1024` |
+| `--kv-host-mib N\|auto` | Qwen3.5 family on one device under Linux: continue the KV pool into N MiB of pinned host memory that the GPU reads in place, exact but slower for the part of a context there ([KV host tier](#kv-host-tier)); `auto` sizes it for `--max-context` | `0` (off) |
 | `--prefill-chunk N` | text-prefill chunk, in multiples of 128; with an `int8` or `rk*` KV cache a Qwen3.5-core model runs the nearby multiple of 128 that best fills the GPU's prompt-attention waves, up to 256 tokens more (see [device profiles](device-profiles.md)) | `1024`; `4096` for native MoE experts in host memory or files; `2048` for Qwen3.8-Flash-Next with `--tensor-parallel` when every device has room ([prompt pieces](maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next)); `2048` for DeepSeek-V4.1, which takes at most `4096` and a narrower chunk where the card lacks room ([its prompt chunks](deepseek-v41.md#prompt-spans)) |
 | `--prefill-tail exact\|full\|N` | DeepSeek-V4.1: the prompt rows that blocks 21 to 39, which keep no compressed cache, run: `exact` runs those the kept state and the last token's logits depend on, from the prompt chunk at or below them, so the output is `full`'s; `full` runs every row; `N` (at least 128) runs the last `N` rows before each kept state, a lossy mode: the output changes ([the prefill tail](deepseek-v41.md#the-prefill-tail)) | `exact` |
 | `--max-new N` | requested output-token limit | `128` |
@@ -691,6 +692,49 @@ requests, and 353,536 instead of 328,704 with MTP 3; an RTX 5070 Ti now starts M
 requests at `--max-context 40960`. It does not probe allocations or resize the pool at request time.
 The single-request CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
+
+### KV host tier
+
+`--kv-host-mib N|auto` continues the Qwen3.5 family's KV pool past the device into N MiB of pinned
+host memory. The pool's last pages are host memory mapped at the same device addresses, and the
+kernels read and write them across the bus in place, so the answers are the ones the all-device
+pool gives, byte for byte. `auto` adds the pages that every request needs to reach
+`--max-context` (`--kv-capacity` when given), within the host's available memory less 4 GiB, the
+hybrid cache's host budget and the media caches. Requests take device pages first: a request runs at
+full speed until its context outgrows the device pages, and from then on every decode step reads the
+host part across the bus once, and every prompt chunk reads it several times.
+
+Measured with Qwen3.8-27B GSQ-RCO IQ3_S, `--kv-dtype rk8v4 --gdn-state-fp16`, one request,
+128 greedy tokens (2026-11-27):
+
+| Card, bus | Pool | Prompt | Of it on the host | Prefill | Decode |
+|---|---|---:|---:|---:|---:|
+| RTX 3090, PCIe 4.0 x16 | device only, 455,104 tokens | 162,840 | — | 1,138 tok/s | 44.6 tok/s |
+| RTX 3090, PCIe 4.0 x16 | `--kv-headroom-mib 7168 --kv-host-mib auto`: 64,000 of 262,144 on the host | 162,840 | 0 | 1,136 tok/s | 44.6 tok/s |
+| RTX 3090, PCIe 4.0 x16 | `--kv-headroom-mib 10240 --kv-host-mib auto`: 187,392 of 262,144 on the host | 162,840 | 88,088 | 488 tok/s | 8.6 tok/s |
+| RTX 5070 Ti 16 GB, PCIe 5.0 x16 | `--kv-host-mib auto`: 145,472 of 262,144 on the host | 97,867 | 0 | 1,954 tok/s | 52.6 tok/s |
+| RTX 5070 Ti 16 GB, PCIe 5.0 x16 | the same | 203,563 | 86,891 | 255 tok/s | 11.2 tok/s |
+| RTX 5070 Ti 16 GB, PCIe 5.0 x16 | the same with `--spec mtp --draft-tokens 3 --mtp-attention-window 0`: 203,840 on the host | 203,563 | 145,259 | 230 tok/s | 28.1 tok/s |
+| RTX 5070 Ti 16 GB, PCIe 5.0 x16 | the same with the default [MTP attention window](serving.md#mtp-attention-window) | 203,563 | 145,259 | 230 tok/s | 29.9 tok/s |
+| RTX 3090, PCIe 4.0 x16 | `--spec dflash2 --draft-tokens 5`, device only, 291,072 tokens | 81,528 | — | 1,351 tok/s | 116.8 tok/s |
+| RTX 3090, PCIe 4.0 x16 | the same with `--kv-headroom-mib 6144 --kv-host-mib auto`: 186,944 of 262,144 on the host | 81,528 | 6,328 | 1,340 tok/s | 114.2 tok/s |
+| RTX 3090, PCIe 4.0 x16 | DFlash2 5, device only | 105,897 | — | 1,279 tok/s | 97.2 tok/s |
+| RTX 3090, PCIe 4.0 x16 | DFlash2 5 with the tier | 105,897 | 30,697 | 1,078 tok/s | 61.9 tok/s |
+
+Each 1,000 tokens on the host add about 1.1 ms to a decode step on PCIe 4.0, and about 0.8 ms on
+PCIe 5.0 (against an all-device step extrapolated from the 97,867-token row). MTP pays that read
+once per round for all the tokens the round verifies: with three drafts the RTX 5070 Ti decodes
+2.5 times as fast as without, although its larger Program leaves 58,304 tokens on the device instead
+of 116,672.
+DFlash2 pays the read once per round: 0.8 ms more a round with 6,328 tokens on the host and 20.3
+ms more with 30,697. The answers of the first three RTX 3090 rows are identical, and so are the
+answers of each DFlash2 pair. Without the tier the RTX 5070 Ti does not
+start this model at `--max-context 131072`. A smaller KV format holds more on the device at full
+speed for a quality cost (`rk4v4`, `rk2v4-e8` above); the tier keeps the format's exact values. The
+tier runs on one device with the routed experts on the GPU, under a native Linux driver (not Windows
+or WSL2), and refuses a DFlash drafter with full-attention layers (Qwen3.6-35B-A3B's), whose
+head-major pool has no page tail to place in host memory; MTP and DFlash2 run with it. Vision windows
+and the expert cache borrow device pages only.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program workspace, and a separate CUDA Graph driver allowance. With Vision enabled, that one

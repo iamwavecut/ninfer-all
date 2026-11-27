@@ -2115,7 +2115,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 
 std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
-                            std::uint32_t main_page_groups) {
+                            std::uint32_t main_page_groups, std::uint32_t kv_host_pages) {
     if (planner == nullptr || planner->minimum == nullptr) {
         throw std::invalid_argument("Qwen3.5 sequence planner is empty");
     }
@@ -2137,6 +2137,15 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
                 "Qwen3.5 physical sequence layout is not affine in Main KV page capacity on a "
                 "further device");
         }
+    }
+    if (kv_host_pages != 0) {
+        if (kv_host_pages > main_page_groups || !plan->extra_rank_reservation_bytes.empty() ||
+            (plan->persistent.dflash && plan->persistent.dflash->full)) {
+            throw std::invalid_argument(
+                "the KV host tier needs one device, page-major KV pools and host pages within the "
+                "Main pool");
+        }
+        plan->kv_host_pages = kv_host_pages;
     }
     return plan;
 }

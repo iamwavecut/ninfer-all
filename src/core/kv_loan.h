@@ -38,6 +38,18 @@ inline constexpr std::uint32_t kMaxLoanUnitPages = 256;
     return unit;
 }
 
+// The free runs below the pool's host tier, clipped to it: the pages a loan may take.
+[[nodiscard]] inline std::vector<KVPageRun> device_free_runs(const DeviceKVPagePool& pages) {
+    const std::uint32_t limit = pages.device_page_limit();
+    std::vector<KVPageRun> out;
+    for (const KVPageRun& run : pages.free_runs()) {
+        const auto begin = static_cast<std::uint32_t>(run.begin);
+        if (begin >= limit) { break; }
+        out.push_back({.begin = run.begin, .count = std::min(begin + run.count, limit) - begin});
+    }
+    return out;
+}
+
 // Granules of the arena that the given page range covers entirely, across every lendable plane.
 inline void collect_loan_granules(const EvictableKVPool& arena, const DeviceKVPagePool& pages,
                                   std::int32_t begin, std::uint32_t count,
@@ -56,7 +68,10 @@ inline void collect_loan_granules(const EvictableKVPool& arena, const DeviceKVPa
         const std::size_t first = (offset + granularity - 1) / granularity;
         const std::size_t last  = (offset + range.bytes) / granularity;
         for (std::size_t granule = first; granule < last; ++granule) {
-            if (granule < arena.lendable_granules()) { out.push_back(granule); }
+            // Host-tier granules hold host memory: lending one would lend no device memory.
+            if (granule < arena.lendable_granules() && !arena.host_granule(granule)) {
+                out.push_back(granule);
+            }
         }
     }
 }
@@ -76,7 +91,8 @@ inline void collect_loan_granules(const EvictableKVPool& arena, const DeviceKVPa
     const std::uint32_t available = pages.unpromised_free_pages();
     if (available == 0) { return plan; }
 
-    const std::span<const KVPageRun> free_runs = pages.free_runs();
+    // Device pages only: a host-tier page lends no device memory.
+    const std::vector<KVPageRun> free_runs = device_free_runs(pages);
     std::vector<std::size_t> collected;
     for (auto run = free_runs.rbegin(); run != free_runs.rend() && plan.granules.size() < want;
          ++run) {

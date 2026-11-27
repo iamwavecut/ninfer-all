@@ -364,6 +364,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
+           "  --kv-host-mib N|auto          Qwen3.5 family, one device, Linux: extend the KV\n"
+           "                                pool past the device by N MiB of pinned host\n"
+           "                                memory the GPU reads across the bus (default 0,\n"
+           "                                off); auto: enough for every request to reach\n"
+           "                                --max-context, within the host's free memory\n"
            "  --kv-dtype T                  KV storage: bf16 (default), int8, fp8, rk8v4,\n"
            "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4 or bf16p;\n"
            "                                fp16: Flash-Next, Gemma 4 and Flint; mxfp8:\n"
@@ -856,6 +861,19 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                 throw std::invalid_argument(arg + " is out of range");
             }
             kv_headroom_mib = static_cast<std::size_t>(mib);
+            continue;
+        }
+        if (arg == "--kv-host-mib") {
+            const std::string value = require_value("--kv-host-mib");
+            if (value == "auto") {
+                options.kv_host_tier = KvHostTier{.bytes = 0, .automatic = true};
+                continue;
+            }
+            const std::uint64_t mib = parse_u64(value.c_str(), "kv-host-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--kv-host-mib is out of range");
+            }
+            options.kv_host_tier = KvHostTier{.bytes = static_cast<std::size_t>(mib << 20)};
             continue;
         }
         if (arg == "--max-concurrency") {

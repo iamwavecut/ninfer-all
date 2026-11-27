@@ -205,6 +205,8 @@ public:
     // What each further device reserves (device 1 first). Empty on one device.
     [[nodiscard]] std::span<const std::size_t> extra_rank_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
+    // Pages at the end of the Main and MTP pools that live in pinned host memory (KV host tier).
+    [[nodiscard]] std::uint32_t kv_host_pages() const noexcept;
     // The context-cache shape this plan was frozen with. An engaged host RAM budget has already
     // resolved the Host state slots, Host KV bytes and long-anchor count here, so a reader that
     // reports or enforces capacity must take them from the plan rather than from raw options.
@@ -230,7 +232,17 @@ public:
     SequencePlanner& operator=(const SequencePlanner&) = delete;
 
     [[nodiscard]] const runtime::SequenceCapacityCurve& capacity_curve() const noexcept;
-    [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups) &&;
+    [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups,
+                                        std::uint32_t kv_host_pages = 0) &&;
+    // The KV host tier's view of the layout: device bytes one Main page group adds across every
+    // pool that grows with it (Main and MTP), and how many page-major KV planes those pools hold,
+    // each of which may keep up to two partial granules of its host pages on the device. Zero
+    // planes when the plan cannot take a tier (several devices, or a head-major draft pool).
+    struct HostTierShape {
+        std::size_t page_bytes = 0;
+        std::size_t planes     = 0;
+    };
+    [[nodiscard]] HostTierShape host_tier_shape() const;
 
 public:
     explicit SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept;
