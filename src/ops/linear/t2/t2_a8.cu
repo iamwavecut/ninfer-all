@@ -1,7 +1,7 @@
 // T2G128 row-split weights with int8 activations. Three registered input widths (the hidden 5120,
 // the attention/GDN mixer output 6144 and the MLP intermediate 17408) and any row count that is a
 // whole number of 128-row blocks (64 with NINFER_T2_A8_TILE=off). Inside the small-T band (T <= 192
-// by default, in launches of at most 32 columns) the ternary small-T kernel of t2_small_t_i8.cuh,
+// by default, in launches of at most 64 columns) the ternary small-T kernel of t2_small_t_i8.cuh,
 // where the A16 kernels are tensor-rate bound at every width; from t2_a8_min_tokens() up the tile
 // GEMM of t2_prefill_i8.cuh, with T padded to a multiple of 64 and its own activation contract (one
 // binary16 scale per token and 128-wide group). NINFER_T2_A8_TILE=off puts the shared prefill GEMM
@@ -136,6 +136,9 @@ void small_gemm(const T2A8Activations& x, SmallColumns span, const SmallParent<E
 using SmallSchedule8  = T2SmallTI8Schedule<8, 1, 1, 2, 4, 2>;
 using SmallSchedule16 = T2SmallTI8Schedule<8, 1, 2, 2, 4, 2>;
 using SmallSchedule32 = T2SmallTI8Schedule<4, 1, 4, 2, 3, 2>;
+// 33 to 64 columns (a decode round of that many requests) in one pass over the weights rather
+// than two launches of 32.
+using SmallSchedule64 = T2SmallTI8Schedule<4, 1, 8, 2, 2, 2>;
 // Alternatives a device profile can route to ("t2_i8_small/<rows>x<K>"): other row counts per CTA,
 // K-warp splits, ring depths and code words per lane, for parts whose SM count or memory system
 // moves the balance the RTX 3090 tables above were measured at.
@@ -183,9 +186,9 @@ std::string small_route_key(const Weight& first, const Weight* second, std::int3
     return key + "x" + std::to_string(input_rows);
 }
 
-// Launches of at most 32 columns each: from 33 columns the weights stream once per launch, and six
-// launches (192 columns) still beat the A16 route and the prefill GEMM's 256-column tile on the
-// text-layer shapes (the padded GEMM reloads its activation columns in every 64-row CTA).
+// Launches of at most 64 columns each: the weights stream once per launch, and three launches
+// (192 columns) still beat the A16 route and the prefill GEMM's 256-column tile on the text-layer
+// shapes (the padded GEMM reloads its activation columns in every 64-row CTA).
 template <class Epilogue>
 void small_route(const T2A8Activations& x, const SmallParent<Epilogue>& first,
                  const SmallParent<Epilogue>* second, cudaStream_t stream) {
@@ -199,8 +202,10 @@ void small_route(const T2A8Activations& x, const SmallParent<Epilogue>& first,
             small_gemm<SmallSchedule8>(x, span, first, second, stream);
         } else if (span.cols <= 16) {
             small_gemm<SmallSchedule16>(x, span, first, second, stream);
-        } else {
+        } else if (span.cols <= 32) {
             small_gemm<SmallSchedule32>(x, span, first, second, stream);
+        } else {
+            small_gemm<SmallSchedule64>(x, span, first, second, stream);
         }
     }
 }
