@@ -129,6 +129,57 @@ Runtime::Plan dflash2_plan(const dflash2::Config& c, const dflash2::Operands& p,
     return plan;
 }
 
+Runtime::Plan dflash_plan(const dflash::Config& c, const dflash::Operands& p, DType logits,
+                          const RuntimeOptions& o) {
+    require_options(o, c.block_size);
+    Runtime::Plan plan;
+    plan.geometry = {.hidden            = c.hidden_size,
+                     .vocab             = c.vocab_size,
+                     .layers            = c.num_hidden_layers,
+                     .block_size        = c.block_size,
+                     .num_target_layers = c.num_target_layers,
+                     .kv_heads          = static_cast<std::int32_t>(c.num_key_value_heads),
+                     .head_dim          = static_cast<std::int32_t>(c.head_dim),
+                     .target_layer_ids  = c.target_layer_ids};
+    const std::uint32_t full = dflash::full_window(c, o.max_context, o.draft_tokens + 1);
+    for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
+        plan.layer_window.push_back(dflash::layer_capacity(c, l, full));
+    }
+    plan.window = *std::max_element(plan.layer_window.begin(), plan.layer_window.end());
+    const Shapes shape = shapes(o, plan.window);
+    plan.context_piece = dflash::Drafter::context_workspace_bytes(
+        c, p, full, static_cast<std::int32_t>(shape.piece), 1);
+    plan.context_rows = dflash::Drafter::context_workspace_bytes(
+        c, p, full, 1, static_cast<std::int32_t>(o.commit_rows));
+    plan.proposal = dflash::Drafter::proposal_workspace_bytes(c, p, logits, full, o.max_context,
+                                                              shape.width, shape.rows,
+                                                              o.head_bytes);
+    return plan;
+}
+
+// The rings: one per capacity, in the order the layers first read them, with each layer's ring
+// and its index there.
+struct Rings {
+    std::vector<std::uint32_t> capacity, layers;
+    std::vector<std::pair<std::size_t, std::uint32_t>> of_layer;
+};
+
+Rings rings(const Runtime::Plan& plan) {
+    Rings r;
+    for (std::uint32_t l = 0; l < plan.geometry.layers; ++l) {
+        const std::uint32_t capacity =
+            plan.layer_window.empty() ? plan.window : plan.layer_window.at(l);
+        const auto at = std::find(r.capacity.begin(), r.capacity.end(), capacity);
+        const auto ring = static_cast<std::size_t>(at - r.capacity.begin());
+        if (at == r.capacity.end()) {
+            r.capacity.push_back(capacity);
+            r.layers.push_back(0);
+        }
+        r.of_layer.emplace_back(ring, r.layers[ring]++);
+    }
+    return r;
+}
+
 // The device allocations of a runtime with these options.
 struct Sizes {
     std::uint32_t lanes = 0;
@@ -139,10 +190,13 @@ Sizes sizes(const Runtime::Plan& plan, const RuntimeOptions& o) {
     const Runtime::Geometry& g = plan.geometry;
     Sizes s;
     s.lanes = o.sequences * (1 + o.kept_states);
-    LayoutBuilder builder;
-    (void)plan_cyclic_kv_cache(builder, g.layers, plan.window, g.kv_heads, g.head_dim,
-                               static_cast<std::int32_t>(s.lanes));
-    s.ring     = builder.finish(kAlign, "drafter context ring");
+    const Rings r = rings(plan);
+    for (std::size_t i = 0; i < r.capacity.size(); ++i) {
+        LayoutBuilder builder;
+        (void)plan_cyclic_kv_cache(builder, r.layers[i], r.capacity[i], g.kv_heads, g.head_dim,
+                                   static_cast<std::int32_t>(s.lanes));
+        s.ring += builder.finish(kAlign, "drafter context ring");
+    }
     s.features = aligned(g.target_layer_ids.size() * std::size_t(g.hidden) * o.feature_columns * 2);
     s.operands = operand_layout(o.draft_tokens, o.draft_rows).bytes;
     const std::uint32_t piece = shapes(o, plan.window).piece;
@@ -188,17 +242,21 @@ void Runtime::allocate(const Plan& plan) {
     for (std::size_t t = 0; t < g.target_layer_ids.size(); ++t) {
         tap_of_.at(g.target_layer_ids[t]) = static_cast<int>(t);
     }
-    LayoutBuilder builder;
-    const CyclicKVCacheLayout layout =
-        plan_cyclic_kv_cache(builder, g.layers, window_, g.kv_heads, g.head_dim,
-                             static_cast<std::int32_t>(s.lanes));
-    ring_backing_ = DeviceBuffer(builder.finish(kAlign, "drafter context ring"));
-    // Finite values in every slot before a lane's positions reach it.
-    ring_backing_.fill(0);
-    ring_ = std::make_unique<CyclicKVCache>(DeviceSpan{ring_backing_.p, ring_backing_.bytes},
-                                            layout);
-    for (std::uint32_t l = 0; l < ring_->layer_count(); ++l) {
-        views_.push_back(ring_->layer_view(l));
+    const Rings r = rings(plan);
+    for (std::size_t i = 0; i < r.capacity.size(); ++i) {
+        LayoutBuilder builder;
+        const CyclicKVCacheLayout layout =
+            plan_cyclic_kv_cache(builder, r.layers[i], r.capacity[i], g.kv_heads, g.head_dim,
+                                 static_cast<std::int32_t>(s.lanes));
+        DeviceBuffer& backing =
+            ring_backings_.emplace_back(builder.finish(kAlign, "drafter context ring"));
+        // Finite values in every slot before a lane's positions reach it.
+        backing.fill(0);
+        rings_.push_back(
+            std::make_unique<CyclicKVCache>(DeviceSpan{backing.p, backing.bytes}, layout));
+    }
+    for (const auto& [ring, index] : r.of_layer) {
+        views_.push_back(rings_[ring]->layer_view(index));
     }
     if (plan.table != 0) { table_ = DeviceBuffer(plan.table); }
     features_ = DeviceBuffer(s.features);
@@ -218,6 +276,18 @@ void Runtime::allocate(const Plan& plan) {
         staging_bytes(options_.draft_tokens, options_.draft_rows));
 }
 
+Runtime::Runtime(const dflash::Config& config, dflash::Operands operands, Target target,
+                 RuntimeOptions options)
+    : options_(options) {
+    const Plan plan = dflash_plan(config, operands, target.logits, options_);
+    allocate(plan);
+    dflash_ = std::make_unique<dflash::Drafter>(
+        config, std::move(operands), std::move(target),
+        dflash::full_window(config, options_.max_context, options_.draft_tokens + 1),
+        options_.max_context, static_cast<std::int32_t>(options_.draft_rows),
+        static_cast<std::int32_t>(options_.draft_tokens + 1));
+}
+
 Runtime::~Runtime() = default;
 
 int Runtime::tap_of(std::uint32_t layer) const noexcept {
@@ -232,8 +302,9 @@ std::uint32_t Runtime::lane(std::uint32_t sequence, std::uint32_t state) const {
 }
 
 std::uint64_t Runtime::device_bytes() const noexcept {
-    return ring_backing_.bytes + table_.bytes + features_.bytes + operands_.bytes +
-           workspace_backing_.bytes;
+    std::uint64_t rings = 0;
+    for (const auto& backing : ring_backings_) { rings += backing.bytes; }
+    return rings + table_.bytes + features_.bytes + operands_.bytes + workspace_backing_.bytes;
 }
 
 std::uint64_t Runtime::planned_bytes(const Model& model, DType logits,
@@ -247,6 +318,14 @@ std::uint64_t Runtime::planned_bytes(const dflash2::Config& config,
                                      const dflash2::Operands& operands, DType logits,
                                      const RuntimeOptions& options) {
     const Plan plan = dflash2_plan(config, operands, logits, options);
+    const Sizes s   = sizes(plan, options);
+    return s.ring + s.features + s.operands + s.workspace;
+}
+
+std::uint64_t Runtime::planned_bytes(const dflash::Config& config,
+                                     const dflash::Operands& operands, DType logits,
+                                     const RuntimeOptions& options) {
+    const Plan plan = dflash_plan(config, operands, logits, options);
     const Sizes s   = sizes(plan, options);
     return s.ring + s.features + s.operands + s.workspace;
 }
@@ -289,7 +368,7 @@ void Runtime::store_tap(std::uint32_t tap, const Tensor& rows, std::uint32_t col
 void Runtime::commit(std::uint32_t lane, std::uint32_t position, std::uint32_t column,
                      std::uint32_t count, cudaStream_t stream) {
     if (count == 0) { return; }
-    require(lane < std::uint32_t(ring_->lane_capacity()) &&
+    require(lane < std::uint32_t(rings_.front()->lane_capacity()) &&
                 std::uint64_t(column) + count <= options_.feature_columns &&
                 std::uint64_t(position) + count <= options_.max_context,
             "a commit names a lane, feature columns and positions in range");
@@ -354,6 +433,8 @@ void Runtime::commit_rows(const Tensor& lanes, const Tensor& positions, std::uin
 void Runtime::materialize(const ContextCall& call, cudaStream_t stream) {
     if (dflash2_) {
         dflash2_->materialize(call, views_, *work_, stream);
+    } else if (dflash_) {
+        dflash_->materialize(call, views_, *work_, stream);
     } else {
         drafter_->materialize(call, views_, *work_, stream);
     }
@@ -369,7 +450,7 @@ void Runtime::draft(std::span<const std::uint32_t> lanes, std::span<const std::i
                 confidence.size() == b * k,
             "a draft names 1..draft_rows rows of 1..draft_tokens drafts");
     for (std::size_t j = 0; j < b; ++j) {
-        require(lanes[j] < std::uint32_t(ring_->lane_capacity()) && anchors[j] >= 0 &&
+        require(lanes[j] < std::uint32_t(rings_.front()->lane_capacity()) && anchors[j] >= 0 &&
                     anchors[j] < std::int32_t(geometry_.vocab) &&
                     std::uint64_t(positions[j]) + k <= options_.max_context,
                 "a row names a lane, an anchor and a position in range");
@@ -410,6 +491,8 @@ void Runtime::draft(std::span<const std::uint32_t> lanes, std::span<const std::i
                        .confidence = out_confidence};
     if (dflash2_) {
         dflash2_->propose(call, views_, *work_, stream);
+    } else if (dflash_) {
+        dflash_->propose(call, views_, *work_, stream);
     } else {
         drafter_->propose(call, views_, *work_, stream);
     }
@@ -425,29 +508,37 @@ void Runtime::draft(std::span<const std::uint32_t> lanes, std::span<const std::i
 
 void Runtime::copy_lane(std::uint32_t from, std::uint32_t to, cudaStream_t stream) {
     if (from == to) { return; }
-    require(from < std::uint32_t(ring_->lane_capacity()) &&
-                to < std::uint32_t(ring_->lane_capacity()),
+    require(from < std::uint32_t(rings_.front()->lane_capacity()) &&
+                to < std::uint32_t(rings_.front()->lane_capacity()),
             "a lane copy names two lanes");
-    const CyclicKVCacheSlotView source = ring_->slot_view(static_cast<std::int32_t>(from));
-    const CyclicKVCacheSlotView target = ring_->slot_view(static_cast<std::int32_t>(to));
-    for (std::uint32_t layer = 0; layer < source.layers; ++layer) {
-        const auto* k = static_cast<const std::uint8_t*>(source.k_layer0.data) +
-                        std::ptrdiff_t(layer) * source.k_layer_pitch_bytes;
-        const auto* v = static_cast<const std::uint8_t*>(source.v_layer0.data) +
-                        std::ptrdiff_t(layer) * source.v_layer_pitch_bytes;
-        auto* dk = static_cast<std::uint8_t*>(target.k_layer0.data) +
-                   std::ptrdiff_t(layer) * target.k_layer_pitch_bytes;
-        auto* dv = static_cast<std::uint8_t*>(target.v_layer0.data) +
-                   std::ptrdiff_t(layer) * target.v_layer_pitch_bytes;
-        CUDA_CHECK(cudaMemcpyAsync(dk, k, source.k_layer_bytes, cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(dv, v, source.v_layer_bytes, cudaMemcpyDeviceToDevice, stream));
+    for (const auto& ring : rings_) {
+        const CyclicKVCacheSlotView source = ring->slot_view(static_cast<std::int32_t>(from));
+        const CyclicKVCacheSlotView target = ring->slot_view(static_cast<std::int32_t>(to));
+        for (std::uint32_t layer = 0; layer < source.layers; ++layer) {
+            const auto* k = static_cast<const std::uint8_t*>(source.k_layer0.data) +
+                            std::ptrdiff_t(layer) * source.k_layer_pitch_bytes;
+            const auto* v = static_cast<const std::uint8_t*>(source.v_layer0.data) +
+                            std::ptrdiff_t(layer) * source.v_layer_pitch_bytes;
+            auto* dk = static_cast<std::uint8_t*>(target.k_layer0.data) +
+                       std::ptrdiff_t(layer) * target.k_layer_pitch_bytes;
+            auto* dv = static_cast<std::uint8_t*>(target.v_layer0.data) +
+                       std::ptrdiff_t(layer) * target.v_layer_pitch_bytes;
+            CUDA_CHECK(cudaMemcpyAsync(dk, k, source.k_layer_bytes, cudaMemcpyDeviceToDevice,
+                                       stream));
+            CUDA_CHECK(cudaMemcpyAsync(dv, v, source.v_layer_bytes, cudaMemcpyDeviceToDevice,
+                                       stream));
+        }
     }
 }
 
 std::uint64_t Runtime::image_bytes(std::uint32_t position) const noexcept {
-    const std::uint64_t used = std::min<std::uint64_t>(position, window_);
-    return used * std::uint64_t(ring_->head_dim()) * 2 * std::uint64_t(ring_->num_kv_heads()) *
-           2 * ring_->layer_count();
+    std::uint64_t bytes = 0;
+    for (const auto& ring : rings_) {
+        const std::uint64_t used = std::min<std::uint64_t>(position, ring->capacity());
+        bytes += used * std::uint64_t(ring->head_dim()) * 2 * std::uint64_t(ring->num_kv_heads()) *
+                 2 * ring->layer_count();
+    }
+    return bytes;
 }
 
 } // namespace ninfer::models::dspine

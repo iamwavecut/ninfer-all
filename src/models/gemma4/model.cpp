@@ -4,6 +4,7 @@
 #include "artifact/reader.h"
 #include "core/qtype.h"
 #include "core/tensor_split.h"
+#include "core/weight_view.h"
 #include "models/expert_parallel.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/load/bindings.h"
@@ -148,7 +149,8 @@ std::vector<double> default_expert_split(const artifact::Reader& reader, const L
         reader,
         [&](std::string_view name) {
             return name.starts_with("text/") || (options.assistant && name.starts_with("mtp/")) ||
-                   (options.vision == VisionPlacement::Device && name.starts_with("vision/"));
+                   (options.vision == VisionPlacement::Device && name.starts_with("vision/")) ||
+                   (!options.dflash.empty() && name.starts_with(options.dflash + "/"));
         },
         [](std::string_view name) {
             return name.ends_with("/moe/gate_up") || name.ends_with("/moe/down");
@@ -174,6 +176,17 @@ bool has_vision(const artifact::Reader& reader) {
     return is_gemma4(reader) && reader.directory().components.contains("vision");
 }
 
+bool has_dflash(const artifact::Reader& reader, std::string_view component) {
+    if (!is_gemma4(reader) || (component != "dflash" && component != "dspark")) { return false; }
+    const auto& components = reader.directory().components;
+    const auto found       = components.find(std::string(component));
+    if (found == components.end()) { return false; }
+    const auto& config = found->second.config;
+    return config.is_object() && config.contains("architectures") &&
+           config.at("architectures").is_array() && config.at("architectures").size() == 1 &&
+           config.at("architectures")[0] == "Gemma4DFlashDraftModel";
+}
+
 std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOptions& options,
                                   DeviceContext& device, const StartupObserver* observer) {
     if (!is_gemma4(reader)) {
@@ -187,6 +200,31 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         }
         dspine::check_target(dspine::read_config(options.dspine), config.hidden_size,
                              config.vocab_size, config.num_hidden_layers, "Gemma 4");
+    }
+    std::optional<dflash::Config> dflash_config;
+    if (!options.dflash.empty()) {
+        if (options.assistant || !options.dspine.empty()) {
+            throw std::invalid_argument("Gemma 4 drafts with one drafter: its assistant, a DSpine "
+                                        "drafter or its " + options.dflash + " drafter");
+        }
+        if (!has_dflash(reader, options.dflash)) {
+            throw artifact::ArtifactError(
+                "the artifact holds no Gemma 4 " + options.dflash + " drafter (convert with "
+                "--components text," + options.dflash + " --source " + options.dflash + "=DIR)");
+        }
+        const dflash::Config& fc = dflash_config.emplace(
+            dflash::parse_config(reader.directory().component(options.dflash).config));
+        // Tap position p is block p's output: the hidden state after it.
+        dflash::check_target(fc, config.hidden_size, config.vocab_size, config.num_hidden_layers,
+                             "Gemma 4");
+        if ((fc.markov_rank != 0) != (options.dflash == "dspark")) {
+            throw artifact::ArtifactError("Gemma 4 " + options.dflash + ": a dspark drafter has "
+                                          "the Markov head, a dflash drafter none");
+        }
+        if (fc.logit_softcap != config.final_logit_softcapping) {
+            throw artifact::ArtifactError("Gemma 4 " + options.dflash + ": the drafter's soft cap "
+                                          "is not the model's");
+        }
     }
     const bool vision = options.vision != VisionPlacement::None;
     if (vision && !has_vision(reader)) {
@@ -390,6 +428,54 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         vision_parts.weights   = std::move(vw_);
         vision_parts.placement = options.vision;
     }
+    // A DFlash or DSpark drafter on rank 0: its projections in the formats the converter chose,
+    // its norms and Markov tables BF16.
+    struct DFlashLayerIds {
+        WeightId input_norm, post_attention_norm, query_norm, key_norm;
+        WeightId query, key, value, output, gate, up, down;
+    };
+    struct DFlashIds {
+        WeightId context_norm, final_norm, feature_projection;
+        std::optional<WeightId> markov_embedding, markov_output;
+        std::vector<DFlashLayerIds> layers;
+    };
+    std::optional<DFlashIds> dflash_ids;
+    if (dflash_config) {
+        const dflash::Config& fc = *dflash_config;
+        const std::uint64_t dq = fc.query_width(), dkv = fc.key_width();
+        const std::uint64_t inner = fc.intermediate_size;
+        const auto bf16 = [&](const std::string& name, artifact::Shape shape) {
+            return b.direct(name, std::move(shape), QType::BF16);
+        };
+        DFlashIds& ids = dflash_ids.emplace();
+        const std::string n = options.dflash + "/";
+        ids.context_norm    = bf16(n + "context_norm", {h});
+        ids.final_norm      = bf16(n + "final_norm", {h});
+        ids.feature_projection =
+            b.parameter(n + "feature_projection", {h, std::uint64_t(fc.taps()) * h},
+                        {n + "target_features"});
+        if (fc.markov_rank != 0) {
+            ids.markov_embedding = bf16(n + "markov/embedding", {fc.vocab_size, fc.markov_rank});
+            ids.markov_output    = bf16(n + "markov/output", {fc.vocab_size, fc.markov_rank});
+        }
+        for (std::uint32_t i = 0; i < fc.num_hidden_layers; ++i) {
+            const std::string p = n + "layers/" + std::to_string(i) + "/";
+            const std::string a = p + "attention/";
+            DFlashLayerIds layer;
+            layer.input_norm          = bf16(p + "input_norm", {h});
+            layer.post_attention_norm = bf16(p + "post_attention_norm", {h});
+            layer.query_norm          = bf16(a + "query_norm", {fc.head_dim});
+            layer.key_norm            = bf16(a + "key_norm", {fc.head_dim});
+            layer.query  = b.parameter(a + "query", {dq, h}, {p + "attention_input"});
+            layer.key    = b.parameter(a + "key", {dkv, h}, {p + "attention_input"});
+            layer.value  = b.parameter(a + "value", {dkv, h}, {p + "attention_input"});
+            layer.output = b.parameter(a + "output", {h, dq}, {a + "output_input"});
+            layer.gate   = b.parameter(p + "mlp/gate", {inner, h}, {p + "mlp_input"});
+            layer.up     = b.parameter(p + "mlp/up", {inner, h}, {p + "mlp_input"});
+            layer.down   = b.parameter(p + "mlp/down", {h, inner}, {p + "mlp_product"});
+            ids.layers.push_back(layer);
+        }
+    }
     InstanceInfo info;
     info.name            = reader.directory().metadata.value("name", std::string("Gemma 4"));
     info.metadata_json   = reader.directory().metadata.dump();
@@ -432,6 +518,47 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     }
     if (!options.dspine.empty()) {
         model->dspine_ = dspine::load_model(options.dspine, device, observer);
+    }
+    if (dflash_ids) {
+        const auto tensor = [&](WeightId id, std::initializer_list<std::int32_t> extents) {
+            const Tensor t = weight_tensor(model->weight(id).view, extents);
+            if (t.dtype != DType::BF16) {
+                throw artifact::ArtifactError(model->weight(id).name + ": must be BF16");
+            }
+            return t;
+        };
+        const auto linear = [&](WeightId id) {
+            return ops::prepare_linear_weight(model->input(id));
+        };
+        DFlashDrafter& drafter = model->dflash_.emplace();
+        drafter.component      = options.dflash;
+        drafter.config         = std::move(*dflash_config);
+        const dflash::Config& fc = drafter.config;
+        const auto hh = std::int32_t(h), d = std::int32_t(fc.head_dim);
+        dflash::Operands& p  = drafter.operands;
+        p.context_norm       = tensor(dflash_ids->context_norm, {hh});
+        p.final_norm         = tensor(dflash_ids->final_norm, {hh});
+        p.feature_projection = linear(dflash_ids->feature_projection);
+        if (dflash_ids->markov_embedding) {
+            const auto rank = std::int32_t(fc.markov_rank), rows = std::int32_t(fc.vocab_size);
+            p.markov_embedding = tensor(*dflash_ids->markov_embedding, {rank, rows});
+            p.markov_output    = tensor(*dflash_ids->markov_output, {rank, rows});
+        }
+        for (const auto& lw : dflash_ids->layers) {
+            dflash::LayerOperands l;
+            l.input_norm          = tensor(lw.input_norm, {hh});
+            l.post_attention_norm = tensor(lw.post_attention_norm, {hh});
+            l.query_norm          = tensor(lw.query_norm, {d});
+            l.key_norm            = tensor(lw.key_norm, {d});
+            l.query               = linear(lw.query);
+            l.key                 = linear(lw.key);
+            l.value               = linear(lw.value);
+            l.output              = linear(lw.output);
+            l.gate                = linear(lw.gate);
+            l.up                  = linear(lw.up);
+            l.down                = linear(lw.down);
+            p.layers.push_back(std::move(l));
+        }
     }
     return model;
 }

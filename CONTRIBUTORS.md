@@ -104,6 +104,12 @@ two-stage GDN prefill, parallel query tiles, MX FP8 MMA and Minnnn's column-band
   DSpine support follows Tencent's reference implementation
   ([Tencent/DSpine](https://github.com/Tencent/DSpine), Apache-2.0) and its paper,
   [arXiv 2609.36173](https://arxiv.org/abs/2609.36173).
+- The Gemma 4 31B heretic artifact combines coder3101's heretic tune of Google's Gemma 4 31B it
+  (made with p-e-w's [Heretic](https://github.com/p-e-w/heretic)) in mradermacher's i1-IQ4_XS GGUF,
+  manateelazycat's DFlash drafter and Hikari07jp's DSpark drafter, built on z-lab's
+  gemma-4-31B-it-DFlash, all Apache-2.0. The drafters follow z-lab's DFlash drafter
+  ([z-lab/dflash](https://github.com/z-lab/dflash)); DSpark adds Hikari07jp's Markov head
+  ([hikarioyama/dspark-gemma4-31b](https://github.com/hikarioyama/dspark-gemma4-31b)).
 - The SiLU shared by the GPU's GGUF expert kernels and the CPU's expert products evaluates e^x with
   the single-precision polynomial of Stephen L. Moshier's Cephes Math Library.
 - llama.cpp's GGUF block kernels are vendored in `third_party/ggml-quants` under their MIT license;

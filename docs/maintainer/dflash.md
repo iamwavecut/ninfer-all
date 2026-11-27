@@ -404,6 +404,72 @@ equals its own keyed draw, so the output is plain decoding's at any temperature;
 The window bounds what the drafter sees: an answer that copies text from more than 2048 positions
 back is drafted from the last 2048 only ([measurements](../inkling2.md#measurements)).
 
+## Gemma 4
+
+Gemma 4 31B carries z-lab-layout DFlash drafters as optional components beside the text model:
+`dflash` (a drafter without a Markov head, such as manateelazycat's
+[Gemma-4-31B-IT-Heretic-Draft-DFlash](https://huggingface.co/manateelazycat/Gemma-4-31B-IT-Heretic-Draft-DFlash))
+and `dspark` (the same backbone with a vanilla Markov head of rank 256, such as Hikari07jp's
+[DSpark-Gemma-4-31B-draft](https://huggingface.co/Hikari07jp/DSpark-Gemma-4-31B-draft)). The
+converter takes each from its `DFlashDraftModel` directory (`--source dflash=DIR`,
+`--source dspark=DIR`, `--components text,dflash,dspark`), and `--spec dflash` or `--spec dspark`
+loads one of them.
+
+| Quantity | Gemma 4 31B DFlash and DSpark |
+|---|---:|
+| Hidden width H | 5376 (the target's) |
+| Draft layers | 5: four sliding-window layers, then one full-attention layer |
+| Intermediate width | 10752 |
+| Q heads / KV heads / head dimension | 64 / 8 / 128 |
+| Target layer ids | `[1,12,23,35,46,57]` of 60 tap positions |
+| Trained block | 16 (the anchor and 15 masks); Gemma 4 verifies up to 7 drafts |
+| Sliding window | 2048 |
+| Norm epsilon / RoPE theta | `1e-6` / `1e6` (NeoX, the full head) |
+| Mask token | 4 |
+| Head | the target's tied head under its final soft cap of 30 |
+| Markov head (`dspark`) | `markov_w1`, `markov_w2`: BF16 [262144, 256] each |
+
+Tap position p is the output of target block p (Hugging Face's `hidden_states[p + 1]`), the
+residual after the block's layer scalar, which the executor stores after each tapped block. The
+anchor and the mask token take the target's token rows scaled by the square root of H, as the
+target's embeddings are. The converter refuses a checkpoint whose width, token rows, tap count,
+soft cap or layer types differ from the target's, a Markov head of another rank or type, a
+confidence head, and any tensor the drafter does not implement; it keeps the norms and the Markov
+tables in BF16 and stores the projections as Q8_G32 rows.
+
+[`models/dflash`](../../src/models/dflash/drafter.h) composes the drafter from the runtime-shape
+Ops:
+
+- Context: c = rmsnorm(fc(taps), hidden_norm) per committed position; each layer's own key and
+  value matrices project it, its key norm and RoPE at the position follow, and
+  `kv_cache_append_prefix` stores the K/V in that layer's ring.
+- Block: [anchor, mask x K] at positions L..L+K through Qwen 3 layers (input norm, Q/K norms per
+  head, RoPE, attention at scale 1/sqrt(128), SiLU MLP), non-causal inside the block
+  (`SlidingWindowMask::Symmetric`), then the final norm and the target's head over the mask
+  columns.
+- 64 query heads: the attention Op takes 32 query heads over 8 KV heads (group 4). A layer runs it
+  twice: call g gathers heads 8 j + 4 g .. 8 j + 4 g + 3 of every KV head j into a 32-head query
+  (one `cudaMemcpy2DAsync` of 1 KiB rows at a 2 KiB pitch), and its output returns to the same
+  slots before the output projection. Each call's group of four reads the KV head that the
+  drafter's group of eight reads, so the result is the 64-head attention.
+- Rings: the sliding-window layers read rings of 2048 positions; the full-attention layer reads a
+  ring of the smallest capacity of 2048, 4096 or 8192 that holds `--max-context` and a block.
+  Past 8192 positions that layer sees the last 8192 only, which changes the drafts but not the
+  output. `dspine::Runtime` holds one ring per capacity. A lane of one sequence at
+  `--max-context` 4096: 4 layers * 2048 + 1 layer * 8192 positions * 8 heads * 128 * 4 bytes =
+  64 MiB.
+- Candidates: the 16 best rows of the head's logits without the soft cap (`candidate_topk`), then
+  the soft cap on their scores (monotone, so the 16 rows stay the best). A `dflash` drafter drafts
+  each row's first candidate, its confidence the candidate's softmax weight over the 16 capped
+  scores. A `dspark` drafter adds the Markov bias W2[c] . W1[previous] to each capped score and
+  chains greedily from the anchor: that is `candidate_selector_path` with W1 as the predecessor
+  codebook, W2 as the successor codebook, a projected hidden state of ones and no edge soft cap.
+  The truncation to 16 candidates changes only the drafts.
+
+In the Engine both are masked block drafters, as a DSpine drafter is: up to 7 drafts a round,
+`--lookup-ngram` beside them, and the coupled verification, so every committed token is the
+target's own draw at any temperature and the output equals plain decoding's.
+
 ## Execution flow
 
 ```mermaid

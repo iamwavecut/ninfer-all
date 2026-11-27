@@ -21,6 +21,13 @@ assistant (Gemma4AssistantForCausalLM, llama.cpp architecture `gemma4-assistant`
 component, its blocks imported the same way: a four-block drafter that reads the target's last
 sliding-window and full-attention KV and its final hidden state.
 
+`--components text,dflash --source dflash=DIR` adds a DFlash drafter (z-lab's `DFlashDraftModel`
+layout in a safetensors directory: the masked block drafter over the target's tapped hidden states)
+as the `dflash` component, and `--components text,dspark --source dspark=DIR` a DSpark drafter (the
+same backbone with a rank-256 `vanilla` Markov head, `markov_rank` in its config.json) as the
+`dspark` component. Both read the target's token rows and head; their projections become Q8_G32 rows
+(grouped absmax), their norms and the Markov tables stay BF16 as stored.
+
 `--components text,vision --source vision=MMPROJ.gguf` adds the vision tower (Gemma4VisionModel and
 the projection into the text model, llama.cpp's `clip` file with projector `gemma4v`) as the
 `vision` component: its BF16 matrices as `bf16`, its norms FP32, the patch embedding (llama.cpp's
@@ -40,13 +47,20 @@ import torch
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
 from .gguf_blocks import block_source
-from .methods import cast_direct, import_encoded
+from .methods import cast_direct, grouped_absmax, import_encoded
 from .resources import token_domain
 from .sources.gguf import GGUFFile
 from .sources.logical import LogicalSource, array_source
+from .sources.safetensors import SafetensorsSource, tensor_source
 from .ternary import rows
 
 ARCHITECTURES = ("Gemma4ForConditionalGeneration", "Gemma4ForCausalLM")
+# The masked block drafters a Gemma 4 artifact can carry: DFlash, and DSpark (DFlash's backbone with
+# a Markov head over the drafted chain).
+DRAFTERS = ("dflash", "dspark")
+DRAFTER_ARCHITECTURE = "Gemma4DFlashDraftModel"
+DRAFTER_Q8 = "q8_g32_fp16"
+MARKOV_RANKS = (256,)
 TEXT_RESOURCES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -326,11 +340,138 @@ def assistant_config(mtp: GGUFFile, target: dict) -> dict:
     return out
 
 
+def drafter_config(store: SafetensorsSource, target: dict, component: str) -> dict:
+    """The `dflash` or `dspark` component's config from a DFlashDraftModel directory, checked
+    against the target whose token rows, head and tapped hidden states it reads. `dspark` requires
+    the vanilla Markov head (`markov_rank` 256, `markov_head_type` vanilla), `dflash` its absence.
+    The fields are flat; layer_types names each layer's attention."""
+
+    source, where = store.config, component
+    if source.get("architectures") != ["DFlashDraftModel"] or source.get("model_type") != "qwen3":
+        raise ValueError(f"--source {component} must be a DFlashDraftModel (qwen3) directory")
+    for key, expected in (("hidden_act", "silu"), ("attention_bias", False),
+                          ("hidden_size", target["hidden_size"]),
+                          ("vocab_size", target["vocab_size"]),
+                          ("num_target_layers", target["num_hidden_layers"])):
+        if source.get(key, False if key == "attention_bias" else None) != expected:
+            raise ValueError(f"{where}.{key} is {source.get(key)!r}, expected {expected!r}")
+    if source.get("tie_word_embeddings", True) is not True:
+        raise ValueError(f"{where}: the drafter reads the target's tied token rows and head")
+    if source.get("rope_scaling") not in (None, {}) or (
+            (source.get("rope_parameters") or {}).get("rope_type", "default") != "default"):
+        raise ValueError(f"{where}: only the default rotation is implemented")
+    out = {"architectures": [DRAFTER_ARCHITECTURE], "model_type": "gemma4_dflash"}
+    for key in ("hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
+                "num_key_value_heads", "head_dim", "vocab_size", "num_target_layers",
+                "block_size", "sliding_window"):
+        out[key] = _int(source.get(key), f"{where}.{key}")
+    layers = source.get("layer_types")
+    if (not isinstance(layers, list) or len(layers) != out["num_hidden_layers"]
+            or any(kind not in ("sliding_attention", "full_attention") for kind in layers)):
+        raise ValueError(f"{where}.layer_types must name every layer's attention")
+    out["layer_types"] = list(layers)
+    out["rms_norm_eps"] = float(source.get("rms_norm_eps", 1e-6))
+    theta = (source.get("rope_parameters") or {}).get("rope_theta", source.get("rope_theta"))
+    if not isinstance(theta, (int, float)) or theta <= 0:
+        raise ValueError(f"{where}.rope_theta must be positive")
+    out["rope_theta"] = float(theta)
+    draft = source.get("dflash_config")
+    if not isinstance(draft, dict):
+        raise ValueError(f"{where}: config.json has no dflash_config")
+    taps = draft.get("target_layer_ids")
+    if (not isinstance(taps, list) or not taps or taps != sorted(set(taps))
+            or any(type(v) is not int or not 0 <= v < target["num_hidden_layers"] for v in taps)):
+        raise ValueError(f"{where}.dflash_config.target_layer_ids must name distinct target "
+                         "blocks in order")
+    out["target_layer_ids"] = list(taps)
+    mask = draft.get("mask_token_id")
+    if type(mask) is not int or not 0 <= mask < target["vocab_size"]:
+        raise ValueError(f"{where}.dflash_config.mask_token_id lies outside the vocabulary")
+    out["mask_token_id"] = mask
+    # The drafter's logits are the target head's under the target's final soft cap.
+    cap = float(source.get("final_logit_softcapping") or 0.0)
+    if cap != target["final_logit_softcapping"]:
+        raise ValueError(f"{where}.final_logit_softcapping is {cap}, the target's "
+                         f"{target['final_logit_softcapping']}")
+    out["logit_softcap"] = cap
+    rank = source.get("markov_rank", 0) or 0
+    if component == "dspark":
+        if rank not in MARKOV_RANKS or source.get("markov_head_type", "vanilla") != "vanilla":
+            raise ValueError("--source dspark must carry the vanilla Markov head of rank 256 "
+                             "(markov_rank, markov_head_type)")
+        if source.get("confidence_head_with_markov") or source.get("confidence_head"):
+            raise ValueError("dspark: a confidence head is not implemented")
+    elif rank:
+        raise ValueError("--source dflash carries a Markov head: convert it as dspark")
+    out["markov_rank"] = int(rank)
+    return out
+
+
+def _drafter_tensors(config: dict) -> dict:
+    """The checkpoint tensor of every drafter parameter (suffix after the component's prefix),
+    with its logical shape and inputs (projections only)."""
+
+    h, d = config["hidden_size"], config["head_dim"]
+    q, kv = config["num_attention_heads"] * d, config["num_key_value_heads"] * d
+    inner, vocab = config["intermediate_size"], config["vocab_size"]
+    taps = len(config["target_layer_ids"])
+    out = {"feature_projection": ("fc.weight", (h, taps * h), ("target_features",)),
+           "context_norm": ("hidden_norm.weight", (h,), ()),
+           "final_norm": ("norm.weight", (h,), ())}
+    if config["markov_rank"]:
+        r = config["markov_rank"]
+        out["markov/embedding"] = ("markov_head.markov_w1.weight", (vocab, r), ())
+        out["markov/output"] = ("markov_head.markov_w2.weight", (vocab, r), ())
+    for i in range(config["num_hidden_layers"]):
+        g, p = f"layers.{i}.", f"layers/{i}/"
+        a = p + "attention/"
+        out |= {
+            p + "input_norm": (g + "input_layernorm.weight", (h,), ()),
+            p + "post_attention_norm": (g + "post_attention_layernorm.weight", (h,), ()),
+            a + "query_norm": (g + "self_attn.q_norm.weight", (d,), ()),
+            a + "key_norm": (g + "self_attn.k_norm.weight", (d,), ()),
+            a + "query": (g + "self_attn.q_proj.weight", (q, h), (p + "attention_input",)),
+            a + "key": (g + "self_attn.k_proj.weight", (kv, h), (p + "attention_input",)),
+            a + "value": (g + "self_attn.v_proj.weight", (kv, h), (p + "attention_input",)),
+            a + "output": (g + "self_attn.o_proj.weight", (h, q), (a + "output_input",)),
+            p + "mlp/gate": (g + "mlp.gate_proj.weight", (inner, h), (p + "mlp_input",)),
+            p + "mlp/up": (g + "mlp.up_proj.weight", (inner, h), (p + "mlp_input",)),
+            p + "mlp/down": (g + "mlp.down_proj.weight", (h, inner), (p + "mlp_product",)),
+        }
+    return out
+
+
+def _drafter(model, store: SafetensorsSource, component: str, config: dict) -> None:
+    """A drafter's parameters as the checkpoint stores them (BF16); a checkpoint with any other
+    tensor (its own token rows or head, a gate or confidence head) is refused."""
+
+    from .model import Parameter
+
+    wanted = _drafter_tensors(config)
+    stored = {tensor for tensor, _, _ in wanted.values()}
+    extra = sorted(set(store.weight_map) - stored)
+    if extra:
+        raise ValueError(f"{component}: tensors the drafter does not implement: {extra[:6]}")
+    for suffix, (tensor, shape, inputs) in wanted.items():
+        if not store.has(tensor):
+            raise ValueError(f"{component}: the checkpoint has no {tensor}")
+        info = store.describe(tensor)
+        if info.dtype != "BF16" or tuple(info.shape) != shape:
+            raise ValueError(f"{component}/{tensor}: stored {info.dtype} {info.shape}, expected "
+                             f"BF16 {shape}")
+        name = f"{component}/{suffix}"
+        model.add(Parameter(name, shape, tensor_source(store, tensor, shape),
+                            inputs=tuple(f"{component}/{i}" for i in inputs),
+                            residency=component))
+
+
 def build_model(base, gguf: GGUFFile, *, mtp: GGUFFile | None = None,
-                vision: GGUFFile | None = None, resource_overrides=None):
+                vision: GGUFFile | None = None, drafters: dict | None = None,
+                resource_overrides=None):
     """The text component of a Gemma 4 GGUF, every parameter's source the GGUF, with `mtp` the
-    assistant's component from its own GGUF and with `vision` the vision tower's from an mmproj
-    GGUF."""
+    assistant's component from its own GGUF, with `vision` the vision tower's from an mmproj
+    GGUF and with `drafters` ({"dflash" or "dspark": SafetensorsSource}) masked block drafters
+    from their safetensors directories."""
 
     from .model import Model, Parameter
 
@@ -344,8 +485,16 @@ def build_model(base, gguf: GGUFFile, *, mtp: GGUFFile | None = None,
     if vision is not None:
         records["vision"] = {"config": vision_config(vision, base.config, config),
                              "resources": references["vision"], "target": "text"}
+    drafters = dict(drafters or {})
+    if set(drafters) - set(DRAFTERS):
+        raise ValueError(f"Gemma 4 drafters are {DRAFTERS}")
+    for component, store in drafters.items():
+        records[component] = {"config": drafter_config(store, config, component),
+                              "target": "text"}
     model = Model(records, resources=payloads, token_count=count, special_token_ids=special,
                   resource_edits={"tokenizer.json": {"glitch_tokens": edit}})
+    for component, store in drafters.items():
+        _drafter(model, store, component, records[component]["config"])
 
     def matrix(name, tensor, shape, inputs, source=gguf):
         model.add(Parameter(name, shape, _matrix(source, tensor, shape), inputs=tuple(inputs),
@@ -466,12 +615,21 @@ def build_model(base, gguf: GGUFFile, *, mtp: GGUFFile | None = None,
 def gemma4_gguf(model, recipe, sources):
     """Every matrix keeps its GGUF blocks; vectors are FP32. Q, K and V of a layer share one parent
     when the GGUF stores them in one format (a mixed-format quantization such as Q4_K_M keeps V
-    apart), and the dense FFN's gate and up rows share one."""
+    apart), and the dense FFN's gate and up rows share one. A DFlash or DSpark drafter's
+    projections become Q8_G32 rows (grouped absmax, FP16 scales); its norms and Markov tables stay
+    BF16 as stored."""
 
     if model.config.get("architectures") != ["Gemma4ForCausalLM"]:
         raise ValueError("the gemma4_gguf recipe requires a Gemma 4 model")
     formats = {}
     for name, parameter in model.parameters.items():
+        if name.split("/", 1)[0] in DRAFTERS:
+            if parameter.projection:
+                recipe.assign(name, format=DRAFTER_Q8, method=grouped_absmax,
+                              source=parameter.source)
+            else:
+                recipe.assign(name, format="bf16", method=cast_direct, source=parameter.source)
+            continue
         if name.startswith("vision/"):
             # The tower's BF16 weights as they are; its norms and standardization FP32.
             fmt = formats[name] = "bf16" if parameter.projection else parameter.direct_format

@@ -39,7 +39,9 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   target verifies them in one pass and every token it keeps is its own sample, so the output is
   what plain decoding produces. See [below](#speculative-decoding-with-the-assistant). With
   `--gumbel-sampling` a sampled request drafts the assistant's own draws
-  ([coupled draws](cli.md#speculative-decoding)).
+  ([coupled draws](cli.md#speculative-decoding)). The 31B also drafts with z-lab-layout DFlash and
+  DSpark drafters converted into its artifact (`--spec dflash`, `--spec dspark`; see
+  [below](#dflash-and-dspark-drafters-for-the-31b)).
 - **Images and video.** The release's vision tower (27 blocks of width 1152) turns each picture or
   video frame into soft tokens in the prompt, on the GPU, streamed from pinned host memory, or on
   CPU threads (`--vision-residency`); see [below](#images-and-video).
@@ -432,6 +434,73 @@ A [DSpine](maintainer/dspine.md) drafter trained for this model can take the ass
 `--spec dspine --draft-model PATH --draft-tokens N` (1 to 7) loads it, and the assistant stays
 unloaded. Its rounds verify the same way, and `--draft-min-p P` verifies through the first draft
 whose confidence is at or below P. No DSpine drafter for Gemma 4 is published yet.
+
+### DFlash and DSpark drafters for the 31B
+
+The 31B artifact can also carry z-lab-layout block drafters as its `dflash` and `dspark`
+components ([DFlash](maintainer/dflash.md#gemma-4)): `--spec dflash --draft-tokens N` or
+`--spec dspark --draft-tokens N` (1 to 7) drafts with one of them in the assistant's place, and
+the output stays the one plain decoding gives. Both drafters have five layers over six of the
+target's 60 blocks and draft from one forward pass a round; `dspark` adds a Markov head that
+conditions each draft on the previous one. Converting the heretic 31B in mradermacher's i1-IQ4_XS
+GGUF with manateelazycat's heretic DFlash drafter and Hikari07jp's DSpark drafter (trained on the
+original 31B). The heretic release's chat template is an older copy of Google's, without its
+fixes for tool-calling turns, so the template comes from the 31B release:
+
+```bash
+hf download coder3101/gemma-4-31B-it-heretic config.json tokenizer.json tokenizer_config.json \
+  generation_config.json --local-dir models/gemma4-31b-heretic/hf
+hf download google/gemma-4-31B-it chat_template.jinja \
+  --revision 842da3794eaa0b77d5f08bae87a17459d91ff475 --local-dir models/gemma4-31b-heretic/hf
+hf download mradermacher/gemma-4-31B-it-heretic-i1-GGUF gemma-4-31B-it-heretic.i1-IQ4_XS.gguf \
+  --local-dir models/gemma4-31b-heretic
+hf download manateelazycat/Gemma-4-31B-IT-Heretic-Draft-DFlash config.json model.safetensors \
+  --local-dir models/gemma4-31b-heretic/dflash
+hf download Hikari07jp/DSpark-Gemma-4-31B-draft config.json model.safetensors \
+  --local-dir models/gemma4-31b-heretic/dspark
+
+python -m tools.convert --model models/gemma4-31b-heretic/hf --recipe gemma4_gguf \
+  --components text,dflash,dspark \
+  --source gguf=models/gemma4-31b-heretic/gemma-4-31B-it-heretic.i1-IQ4_XS.gguf \
+  --source dflash=models/gemma4-31b-heretic/dflash --source dspark=models/gemma4-31b-heretic/dspark \
+  --name Gemma-4-31B-it-heretic-i1-IQ4_XS-DFlash-DSpark --device cpu \
+  --out models/gemma-4-31B-it-heretic-i1-IQ4_XS-dflash-dspark.ninfer
+
+ninfer models/gemma-4-31B-it-heretic-i1-IQ4_XS-dflash-dspark.ninfer --prompt "..." \
+  --spec dspark --draft-tokens 3
+```
+
+The conversion takes 87 seconds and writes one 18.9 GiB file, published as
+[WaveCut/gemma-4-31B-it-heretic-i1-IQ4_XS-DFlash-DSpark-NInfer-v3](https://huggingface.co/WaveCut/gemma-4-31B-it-heretic-i1-IQ4_XS-DFlash-DSpark-NInfer-v3):
+the GGUF's blocks as stored and each drafter's projections as Q8_G32 rows (1.5 GiB each). A run
+loads only the drafter it names: the weights take 15.6 GiB on the GPU without one, 17.1 GiB with
+DFlash and 17.3 GiB with DSpark (its Markov tables), and the drafter's rings, features and
+workspace 245 MiB at `--max-context 4096`.
+
+Five greedy answers of up to 256 tokens from the `ninfer` CLI on an RTX 3090 (`--no-thinking
+--max-context 4096`, a CUDA 13.4 build); every speculative answer is byte for byte the plain one:
+
+| Decode tok/s | plain | dflash, 7 drafts | dspark, 7 | dflash, 3 | dspark, 3 |
+|---|---:|---:|---:|---:|---:|
+| Python function with doctests | 45.1 | 113.3 | 111.8 | 95.3 | 100.3 |
+| Explanation of RoPE | 45.1 | 53.3 | 56.3 | 68.2 | 69.7 |
+| Translation into French and German | 45.3 | 48.2 | 46.7 | 58.5 | 56.4 |
+| Short story in Russian | 45.1 | 30.7 | 30.6 | 40.1 | 40.1 |
+| First 25 primes and their sum | 45.1 | 154.3 | 161.0 | 108.1 | 109.6 |
+
+A round costs about 47 ms with 7 drafts and 36 ms with 3, against 22 ms for one plain step: the
+target verifies 8 or 4 rows of IQ4_XS blocks in one pass. Seven drafts pay on code and other
+predictable text (5.2 to 7.5 tokens a round); on English prose the drafters keep 2.0 to 2.7
+tokens a round, where three drafts are faster. Both drafters were trained on English-heavy data:
+on the Russian story they keep 1.44 tokens a round, and plain decoding is faster. Five drafts fall
+between (dflash: 99.8, 58.7, 51.9, 33.1 and 130.3 tok/s in the table's order). With `--spec
+dspark`, `--draft-min-p P` ends a round after its first draft whose confidence is at or below P:
+at P 0.3 and 7 drafts the explanation decodes at 59.8 tok/s and the Russian story at 37.6, the
+others as without it. The command line refuses `--draft-min-p` with `--spec dflash`, and Gemma 4
+refuses `--draft-confidence` and `--draft-experts`, the DSpark options of DeepSeek-V4.1 and
+Inkling 2. Through `ninfer-serve`, a request with a tool and the follow-up after the tool's
+response return the same call and the same answer with `--spec none` and with either drafter at 3
+and 7 drafts.
 
 Ten chat requests one at a time to `ninfer-serve` (code in Python and C++, an explanation, a
 summary of a 1,000-token source excerpt, a factual question, a translation, a math word problem, a

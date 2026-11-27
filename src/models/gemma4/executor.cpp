@@ -327,11 +327,12 @@ struct Executor::Impl {
         if (options.draft_tokens > 0 && !options.dspine && !model.assistant()) {
             throw std::invalid_argument("gemma4 executor: drafting needs the model's assistant");
         }
-        if (options.dspine && (model.dspine() == nullptr || model.assistant() ||
-                               options.draft_tokens == 0 ||
-                               options.draft_tokens + 1 > model.dspine()->config().block_size)) {
-            throw std::invalid_argument("gemma4 executor: DSpine drafting needs the model's DSpine "
-                                        "drafter alone and 1 to its block less one drafts a round");
+        if (options.dspine &&
+            ((model.dspine() == nullptr) == (model.dflash() == nullptr) || model.assistant() ||
+             options.draft_tokens == 0 || options.draft_tokens + 1 > spine_block())) {
+            throw std::invalid_argument("gemma4 executor: masked-block drafting needs the model's "
+                                        "DSpine or DFlash drafter alone and 1 to its block less "
+                                        "one drafts a round");
         }
         // A verification writes a round's drafts past the window before keeping only some: the
         // ring holds them without overwriting a key the window still needs.
@@ -407,8 +408,12 @@ struct Executor::Impl {
             // The prompt chunk's full-attention mask (plan_workspace()).
             needed += staging + chunk_bytes + std::size_t(options.prefill_chunk) * global_slots * 2;
             if (options.dspine) {
-                needed += dspine::Runtime::planned_bytes(*model.dspine(), DType::FP32,
-                                                         spine_options()) +
+                needed += (model.dflash() != nullptr
+                               ? dspine::Runtime::planned_bytes(model.dflash()->config,
+                                                                model.dflash()->operands,
+                                                                DType::FP32, spine_options())
+                               : dspine::Runtime::planned_bytes(*model.dspine(), DType::FP32,
+                                                                spine_options())) +
                           spine_embed_bytes();
             }
             std::size_t free_bytes = 0, total_bytes = 0;
@@ -1030,9 +1035,28 @@ struct Executor::Impl {
     // Its state: a lane per sequence and one per checkpoint; the taps of a prompt chunk's last
     // window of rows or of a decode or verification call's rows; and proposals for up to eight
     // sequences at once.
+    // The drafter's trained block.
+    [[nodiscard]] std::uint32_t spine_block() const {
+        if (model.dflash() != nullptr) { return model.dflash()->config.block_size; }
+        return model.dspine() != nullptr ? model.dspine()->config().block_size : 0;
+    }
+
+    // The widest ring the drafter reads: a DSpine drafter's ring capacity, or a DFlash drafter's
+    // full window (its sliding window without full-attention layers).
+    [[nodiscard]] std::uint32_t spine_window() const {
+        if (model.dflash() != nullptr) {
+            const dflash::Config& c = model.dflash()->config;
+            return c.has_full_attention()
+                       ? std::max(c.sliding_window,
+                                  dflash::full_window(c, options.max_context,
+                                                      options.draft_tokens + 1))
+                       : c.sliding_window;
+        }
+        return dspine::ring_capacity(model.dspine()->config(), options.max_context);
+    }
+
     [[nodiscard]] dspine::RuntimeOptions spine_options() const {
-        const dspine::Config& c    = model.dspine()->config();
-        const std::uint32_t window = dspine::ring_capacity(c, options.max_context);
+        const std::uint32_t window = spine_window();
         dspine::RuntimeOptions o;
         o.sequences       = options.sequences;
         o.kept_states     = options.checkpoints ? 1 : 0;
@@ -1086,8 +1110,14 @@ struct Executor::Impl {
             ops::detail::gguf_project(x, {&product, 1}, work, on);
         };
         spine_embed = DeviceBuffer(spine_embed_bytes());
-        spine = std::make_unique<dspine::Runtime>(*model.dspine(), std::move(target),
-                                                  spine_options());
+        if (model.dflash() != nullptr) {
+            spine = std::make_unique<dspine::Runtime>(model.dflash()->config,
+                                                      model.dflash()->operands, std::move(target),
+                                                      spine_options());
+        } else {
+            spine = std::make_unique<dspine::Runtime>(*model.dspine(), std::move(target),
+                                                      spine_options());
+        }
     }
 
     // Whether the drafter reads the last block's output (a chunk without logit rows would not
