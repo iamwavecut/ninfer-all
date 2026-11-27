@@ -51,6 +51,13 @@ using execution::dimension;
 namespace workspace = execution::workspace;
 
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
+// The device memory reserved for one MTP or DFlash graph topology class per 64 text layers on the
+// measured capabilities (SequencePlanningInputs::measured_graph_price). Every class is instantiated
+// and uploaded at startup (graphs.cpp), so cuda_graph_measured_bytes over the classes a
+// configuration captures is their whole cost (2026-11-27, one to four requests, MTP 3, adaptive MTP
+// 4 and DFlash2 5): Qwen3.8-27B (64 layers) at most 14.5 MiB a class on sm_86 and 7 MiB on sm_120,
+// Qwen3.6-35B-A3B (40 layers, host experts) 2.5 MiB on sm_120.
+constexpr std::size_t kMeasuredDraftGraphClassBytes = 24ULL * kMiB;
 constexpr std::size_t kArenaAlign = 256ULL;
 
 enum class GdnWorkspacePath : std::uint8_t {
@@ -1685,6 +1692,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             static_cast<std::int32_t>(text_attention.head_dim),
             static_cast<std::int32_t>(text_attention.num_attention_heads),
             static_cast<std::int32_t>(text_attention.num_key_value_heads)};
+        // On a measured capability every drafting class takes the measured price, scaled by the
+        // text layers past 64; elsewhere the earlier per-class allowances stand.
+        const std::size_t measured_draft_class =
+            kMeasuredDraftGraphClassBytes *
+            std::max<std::size_t>(impl->parameters->text.layers.size(), 64) / 64;
         if (impl->speculative_backend == SpeculativeBackend::None) {
             impl->graph_allowance_bytes = checked_mul(
                 graph_topology_allowance(
@@ -1701,7 +1713,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                        attention_geometry, impl->kv_storage);
                 return graph_topology_allowance(
                     profiles,
-                    [&](GraphExecutionProfile profile) {
+                    [&](GraphExecutionProfile profile) -> std::size_t {
+                        if (inputs.measured_graph_price) { return measured_draft_class; }
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity, static_cast<std::uint64_t>(profile.max) +
                                                 verify_window + impl->draft_window);
@@ -1748,7 +1761,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                                             impl->capacity, width, batch_size);
                 return graph_topology_allowance(
                     profiles,
-                    [&](GraphExecutionProfile profile) {
+                    [&](GraphExecutionProfile profile) -> std::size_t {
+                        if (inputs.measured_graph_price) { return measured_draft_class; }
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity, static_cast<std::uint64_t>(profile.max) + width + 1ULL);
                         return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
@@ -1945,6 +1959,16 @@ MtpAttentionWindow planned_mtp_attention_window(const EngineOptions& options) {
                                                                      : MtpAttentionWindow{};
 }
 
+// Whether every device's capability has a measured drafting graph price
+// (kMeasuredDraftGraphClassBytes).
+bool measured_graph_price(const DeviceContext& device) {
+    for (std::size_t rank = 0; rank < device.size(); ++rank) {
+        const int capability = device.rank(rank).compute_capability();
+        if (capability != 86 && capability != 120) { return false; }
+    }
+    return true;
+}
+
 // Every chunk but a prompt's last one has the effective width, so it is chosen near the request
 // where the prompt-attention grid of this device leaves the least of a last wave idle.
 // NINFER_PREFILL_ALIGN=0 keeps the requested chunk.
@@ -1990,6 +2014,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .expert_cache_bytes         = options.expert_cache_bytes,
         .use_cuda_graph             = options.use_cuda_graph,
         .cuda_graph_allowance_bytes = options.cuda_graph_allowance_bytes,
+        .measured_graph_price       = measured_graph_price(device),
         .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,
         .structured_output          = options.structured_output,
         .gumbel_sampling            = options.gumbel_sampling,

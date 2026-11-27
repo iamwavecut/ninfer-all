@@ -683,7 +683,12 @@ each device free for the kernels CUDA loads on their first launch. `--kv-capacit
 selected weights, measures the remaining GPU memory, and directly chooses the largest legal page
 capacity for the complete enabled runtime layout. This includes the selected speculative backend,
 fixed sequence state, unified workspace, and CUDA Graph allowance, while leaving the default 1 GiB
-automatic headroom unallocated. It does not probe allocations or resize the pool at request time.
+automatic headroom unallocated. The allowance prices each MTP or DFlash graph class at 24 MiB per 64
+text layers on compute 8.6 (RTX 30 series) and 12.0 (RTX 50 series, RTX PRO 6000 Blackwell), from
+startup measurements of at most 14.5 MiB a class; other cards keep 64 to 96 MiB a class. Qwen3.8-27B
+with `rk8v4` KV on an RTX 3090 holds 250,368 KV tokens instead of 142,464 with DFlash2 5 and four
+requests, and 353,536 instead of 328,704 with MTP 3; an RTX 5070 Ti now starts MTP 3 with four
+requests at `--max-context 40960`. It does not probe allocations or resize the pool at request time.
 The single-request CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
 
