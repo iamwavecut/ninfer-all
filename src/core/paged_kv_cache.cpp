@@ -1451,10 +1451,24 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
         DeviceBinding bind(replica_devices_[copy]);
         Tensor destination_row = row(row_handle, replica_ranks_[copy]);
         auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
-        CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
-                                   cudaMemcpyHostToDevice, streams[copy]));
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(streams[copy], &capture));
+        if (capture == cudaStreamCaptureStatusNone) {
+            // A synchronous copy: the execution tables name the pages every subsequent
+            // kernel reads, so the publication must be visible before any consumer on
+            // any stream is allowed to run. The copies are tens of bytes, once per
+            // request or per round, so the sync costs nothing measurable. (An async
+            // copy here raced the consumers and produced wrong pages for lanes past
+            // the first after a multi-chunk request.)
+            CUDA_CHECK(cudaMemcpy(destination, indices.data(), indices.size_bytes(),
+                                  cudaMemcpyHostToDevice));
+        } else {
+            // Inside a capture the async copy becomes a graph node; the persistent
+            // shadow it reads from is rewritten before every replay, so the replayed
+            // node still carries the current publication.
+            CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
+                                       cudaMemcpyHostToDevice, streams[copy]));
+        }
         if (capture != cudaStreamCaptureStatusNone) { continue; }
         RowFence& pending = fence(row_handle.row_, copy);
         CUDA_CHECK(cudaEventRecord(pending.event, streams[copy]));
