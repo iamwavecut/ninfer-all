@@ -207,7 +207,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("n-gram copy proposals are not available for "
                                     "Qwen3.8-Flash-Next");
     }
-    if (speculative.mtp_attention_window != 0 ||
+    if (speculative.mtp_attention_window.value_or(0) != 0 ||
         speculative.proposal_head == ProposalHead::Optimized || speculative.ngram_archive_bytes != 0) {
         throw std::invalid_argument("Qwen3.8-Flash-Next's MTP drafting has no "
                                     "--mtp-attention-window, --lm-head-draft or n-gram archive");

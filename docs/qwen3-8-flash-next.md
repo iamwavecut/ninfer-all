@@ -852,8 +852,8 @@ counts, but not its experts: only a draft reads the stack they leave. Up to eigh
 rounds together, one MTP pass for all of them per draft and one verification pass. A request decodes
 without drafts when its prompt ends with a media token, near the end of its context, with one token
 left in its output or thinking budget, and while a `--post-thinking` request still reasons. N-gram
-copy proposals (`--ngram-draft-tokens`) are not available for this model; `--mtp-attention-window` and
-`--lm-head-draft` are refused.
+copy proposals (`--ngram-draft-tokens`) are not available for this model; a nonzero
+`--mtp-attention-window` and `--lm-head-draft` are refused.
 
 With `--lookup-ngram N`, a request whose last `N` tokens (the token it feeds next last) appeared
 earlier in its sequence proposes what followed them then, up to the round's width (`--draft-tokens`,

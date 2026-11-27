@@ -45,7 +45,7 @@ Built and kept experimental, not published:
 
 DFlash2 drafts from the optional `dflash2` component ([DFlash and DFlash2](dflash.md#qwen38-flash-next)).
 Not supported: DFlash (PixelML's NVFP4 DFlash drafter is a research artifact for vLLM), n-gram copy
-proposals (`--ngram-draft-tokens`), `--lm-head-draft`, `--mtp-attention-window`, disk residency of
+proposals (`--ngram-draft-tokens`), `--lm-head-draft`, a nonzero `--mtp-attention-window`, disk residency of
 native banks. The Windows paths have not been run.
 
 ---

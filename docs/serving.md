@@ -166,13 +166,58 @@ request starts with drafts.
 ### MTP attention window
 
 Each MTP draft step attends over the whole history of its cache, so at a long context the draft
-reads as many keys as one target attention layer, once per draft. With `--mtp-attention-window N`
-the draft head attends to the first 64 keys and the newest `N` (at least `--draft-tokens + 1`,
-rounded out to whole 64-key pages) before its first query, which keeps its read constant as the
-context grows. Only the drafts see the window: target verification attends to everything and
-alone decides which tokens are committed, so greedy output is unchanged and only the acceptance
-rate can move. The Engine rebinds the draft's page table to those pages and shifts its positions,
-so the attention kernels are the unwindowed ones. `server_start` records the window.
+reads as many keys as one target attention layer, once per draft. A window keeps that read
+constant: the draft head attends to the first 64 keys and the newest `N` (at least
+`--draft-tokens + 1`, rounded out to whole 64-key pages) before its first query. By default
+(`--mtp-attention-window auto`) a Qwen3.5-core model's draft reads the newest 4096 keys from
+position 32768 on and the whole history before it; `--mtp-attention-window N` sets a window of `N`
+keys from the first position, and `0` reads the whole history everywhere. Other families' drafters
+read their whole history and refuse a nonzero window. The Engine rebinds the draft's page table to
+those pages and shifts its positions, so the attention kernels are the unwindowed ones.
+`server_start` records the window (`auto` or the width).
+
+Only the drafts see the window: target verification attends to everything and alone chooses the
+committed tokens. The window changes which drafts survive, and a round's verification arithmetic
+depends on how many drafts it holds, so where two candidates are nearly tied a greedy reply can
+differ from one without the window, as an MTP reply can differ from plain decoding.
+
+Qwen3.8-27B GSQ-RCO IQ3_S with `rk8v4` KV and three drafts on an RTX 3090, 128 decoded tokens
+after each prompt:
+
+| Prompt tokens | Whole history (tok/s) | Window 4096 (tok/s) | Change |
+|---:|---:|---:|---:|
+| 6,734 | 113.78 | 110.76 | −2.7% |
+| 53,423 | 103.69 | 104.72 | +1.0% |
+| 106,935 | 90.32 | 94.48 | +4.6% |
+| 162,840 | 85.87 | 90.79 | +5.7% |
+
+The window of this table starts at the first position; `auto` leaves a prompt below 32768 tokens
+whole. At 6,734 tokens `auto` and `0` decoded the same reply at 113.65 and 113.54 tok/s, and at
+40,704 tokens the same reply at 107.12 and 105.87 tok/s (+1.2%).
+
+The same model and card at 105,897 prompt tokens, `auto` against `0` per KV format, one run each (a
+round is three drafts and their verification):
+
+| KV format | Whole history (tok/s) | `auto` (tok/s) | Change | ms per round, whole / `auto` | Same reply |
+|---|---:|---:|---:|---:|---|
+| `bf16` | 82.10 | 82.41 | +0.4% | 40.0 / 37.9 | no |
+| `bf16p` | 59.59 | 63.68 | +6.9% | 55.1 / 49.0 | no |
+| `int8` | 79.78 | 90.37 | +13.3% | 31.5 / 30.6 | no |
+| `fp8` | 68.03 | 67.19 | −1.2% | 38.9 / 37.6 | no |
+| `k8v4` | 67.65 | 74.06 | +9.5% | 39.1 / 36.8 | no |
+| `nvfp4` | 69.96 | 80.79 | +15.5% | 36.8 / 35.7 | no |
+| `rk8v4` | 101.44 | 103.67 | +2.2% | 31.3 / 30.4 | no |
+| `rk4v4` | 93.87 | 100.93 | +7.5% | 32.0 / 31.2 | yes |
+| `rk4v4-e8` | 82.93 | 90.51 | +9.1% | 32.2 / 31.0 | no |
+| `rk2v4-e8` | 72.74 | 79.61 | +9.4% | 33.8 / 33.0 | no |
+
+Every format's round got shorter. Where the reply changed, its drafts survived at a different rate,
+which moves the decode rate either way: with `fp8` 49% of the drafts survived against 54% without
+the window, so it decoded 1.2% slower despite rounds 1.3 ms shorter.
+
+On an RTX 5070 Ti the same model with `rk8v4` and a window of 4096 from the first position decoded
+138.91 against 135.87 tok/s at 6,734 tokens (+2.2%) and 130.92 against 129.63 at 44,816 (+1.0%), with
+the same replies.
 
 ### Vision residency
 
@@ -2689,7 +2734,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
 | `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
 | `--adaptive-mtp` | MTP: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens` for a lone request, drafting only those, and up to three in a round of several), the width favored by the drafts' measured survival and the measured round cost; DFlash, DFlash2 and DSpine on Qwen3.5-core models: each round without a copy drafts and verifies `--draft-tokens` or half of them, chosen the same way; Inkling 2's DSpark and DFlash2: a lone request's round drafts 1..`--draft-tokens`, and the request decodes plainly while its measured rounds commit tokens slower; see [Adaptive MTP](#adaptive-mtp) | off |
-| `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
+| `--mtp-attention-window auto\|N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; `0` reads the whole history; see [MTP attention window](#mtp-attention-window) | `auto` (Qwen3.5-core models: 4096 from position 32768) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Qwen3.8-Flash-Next: `--spec mtp` or `dflash2`; Flint, which has no drafter, and Inkling 2 without it): the last `N` tokens are matched against the sequence so far and what followed is proposed, from the occurrence the sequence was already copying while it still matches, else from the newest; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`; with DFlash, DFlash2 or DSpine at least `--draft-tokens`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |

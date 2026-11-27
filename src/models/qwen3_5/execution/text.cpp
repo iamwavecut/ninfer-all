@@ -407,7 +407,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor position_batch = positions.view({width, active_sequence_batch_});
         Tensor table_rows     = *active_backend_kv_table_rows_;
         auto view             = batch_mtp_kv_->batch_layer_view(0);
-        if (mtp_attention_window_ != 0) {
+        if (mtp_attention_window_.keys != 0) {
             window_mtp_attention(view, table_rows, position_batch, *active_valid_columns_);
         }
         ops::causal_softmax_attention(
@@ -421,7 +421,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor position_rows = positions.view({T, 1});
         Tensor table_rows    = io_.backend_kv_table_row;
         auto view            = batch_mtp_kv_->batch_layer_view(0);
-        if (mtp_attention_window_ != 0) {
+        if (mtp_attention_window_.keys != 0) {
             window_mtp_attention(view, table_rows, position_rows, Tensor{});
         }
         ops::causal_softmax_attention(
@@ -874,7 +874,7 @@ void TextContext::mtp_divided_tail(Tensor& x, const Tensor& positions,
         Tensor table         = local[2];
         Tensor position_rows = local[0].view({width, sequences});
         const Tensor valid   = batch ? local[3] : Tensor{};
-        if (mtp_attention_window_ != 0) {
+        if (mtp_attention_window_.keys != 0) {
             window_mtp_attention(view, table, position_rows, valid);
         }
         if (batch) {
@@ -906,7 +906,8 @@ void TextContext::window_mtp_attention(PagedKVBatchLayerView& view, Tensor& tabl
     Tensor rows       = window.rows;
     Tensor shifted    = window.positions;
     ops::paged_kv_window_rows(view.block_tables, table_rows, positions, valid_columns, 1,
-                              static_cast<std::int32_t>(mtp_attention_window_), tables, rows,
+                              static_cast<std::int32_t>(mtp_attention_window_.keys),
+                              static_cast<std::int32_t>(mtp_attention_window_.from), tables, rows,
                               shifted, ctx_.stream);
     view.block_tables = tables;
     table_rows        = rows;

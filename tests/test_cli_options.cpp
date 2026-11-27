@@ -904,7 +904,16 @@ int run_tests() {
                       "--invariant-attention did not reach the options");
     failures += check(parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
                              "--draft-tokens", "3", "--mtp-attention-window", "2048"})
-                              .speculative.mtp_attention_window == 2048,
+                              .speculative.mtp_attention_window == 2048 &&
+                          !parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                  "--draft-tokens", "3"})
+                               .speculative.mtp_attention_window &&
+                          !parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                  "--draft-tokens", "3", "--mtp-attention-window", "auto"})
+                               .speculative.mtp_attention_window &&
+                          parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                 "--draft-tokens", "3", "--mtp-attention-window", "0"})
+                                  .speculative.mtp_attention_window == 0U,
                       "CLI --mtp-attention-window not parsed");
     failures += check(rejects([] {
                           (void)parse({"ninfer", "model.ninfer", "--prompt", "x",

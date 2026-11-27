@@ -24,7 +24,8 @@ struct Expected {
 Expected reference(const std::vector<std::int32_t>& tables, std::int32_t pages,
                    const std::vector<std::int32_t>& table_rows,
                    const std::vector<std::int32_t>& positions, std::int32_t width,
-                   const std::vector<std::int32_t>* valid, std::int32_t sink, std::int32_t window) {
+                   const std::vector<std::int32_t>* valid, std::int32_t sink, std::int32_t window,
+                   std::int32_t from) {
     const auto batch = static_cast<std::int32_t>(table_rows.size());
     Expected out;
     out.tables.resize(static_cast<std::size_t>(pages) * batch);
@@ -32,7 +33,7 @@ Expected reference(const std::vector<std::int32_t>& tables, std::int32_t pages,
     for (std::int32_t b = 0; b < batch; ++b) {
         const std::int32_t live  = valid != nullptr ? (*valid)[static_cast<std::size_t>(b)] : width;
         const std::int32_t p0    = live > 0 ? positions[static_cast<std::size_t>(b) * width] : 0;
-        const std::int32_t first = std::max(0, p0 - window) / 64;
+        const std::int32_t first = p0 >= from ? std::max(0, p0 - window) / 64 : 0;
         const std::int32_t shift = std::max(0, first - sink);
         const std::int32_t row   = table_rows[static_cast<std::size_t>(b)];
         for (std::int32_t j = 0; j < pages; ++j) {
@@ -53,14 +54,15 @@ Expected reference(const std::vector<std::int32_t>& tables, std::int32_t pages,
 int window_case(const char* name, std::int32_t pages, std::int32_t table_count,
                 const std::vector<std::int32_t>& table_rows,
                 const std::vector<std::int32_t>& positions, std::int32_t width,
-                const std::vector<std::int32_t>* valid, std::int32_t sink, std::int32_t window) {
+                const std::vector<std::int32_t>* valid, std::int32_t sink, std::int32_t window,
+                std::int32_t from = 0) {
     const auto batch = static_cast<std::int32_t>(table_rows.size());
     std::vector<std::int32_t> tables(static_cast<std::size_t>(pages) * table_count);
     for (std::size_t i = 0; i < tables.size(); ++i) {
         tables[i] = static_cast<std::int32_t>(1000 + (i * 7919) % 50021);
     }
     const Expected expected =
-        reference(tables, pages, table_rows, positions, width, valid, sink, window);
+        reference(tables, pages, table_rows, positions, width, valid, sink, window, from);
 
     GuardedDeviceBuffer d_tables(tables.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer d_rows(table_rows.size() * sizeof(std::int32_t));
@@ -86,8 +88,8 @@ int window_case(const char* name, std::int32_t pages, std::int32_t table_count,
     Tensor out_tables_t(out_tables.data(), DType::I32, {pages, batch});
     Tensor out_rows_t(out_rows.data(), DType::I32, {batch});
     Tensor out_positions_t(out_positions.data(), DType::I32, {width, batch});
-    ops::paged_kv_window_rows(tables_t, rows_t, positions_t, valid_t, sink, window, out_tables_t,
-                              out_rows_t, out_positions_t, nullptr);
+    ops::paged_kv_window_rows(tables_t, rows_t, positions_t, valid_t, sink, window, from,
+                              out_tables_t, out_rows_t, out_positions_t, nullptr);
     cuda_synchronize();
 
     const std::string label = std::string("paged_kv_window_rows ") + name;
@@ -128,6 +130,11 @@ int main() {
     // A window of exactly the draft width at a page boundary, and a sink of two pages.
     failures +=
         window_case("tight window", 1024, 1, {0}, {64 * 700, 64 * 700 + 1}, 2, nullptr, 2, 2);
+    // --mtp-attention-window auto: rows from position 32768 on take the window, rows before keep
+    // their tables; the boundary row itself is windowed.
+    const std::vector<std::int32_t> all{1, 1, 1};
+    failures += window_case("from threshold", 1024, 3, {0, 1, 2}, {32767, 32768, 50000}, 1, &all,
+                            1, 4096, 32768);
     if (failures == 0) { std::cout << "paged_kv_window_rows passed\n"; }
     return failures == 0 ? 0 : 1;
 }

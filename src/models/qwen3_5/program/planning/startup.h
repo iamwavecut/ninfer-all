@@ -133,7 +133,7 @@ struct SequencePlanningInputs {
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
     ops::RopeYarn rope_yarn;
-    std::uint32_t mtp_attention_window = 0;
+    MtpAttentionWindow mtp_attention_window;
     models::LoadOptions features;
     std::optional<std::uint64_t> expert_cache_bytes;
     bool use_cuda_graph    = true;
@@ -180,7 +180,7 @@ struct SequencePlanImpl {
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
     ops::RopeYarn rope_yarn;
-    std::uint32_t mtp_attention_window = 0;
+    MtpAttentionWindow mtp_attention_window;
     models::LoadOptions features;
     std::optional<std::uint64_t> expert_cache_bytes;
     bool use_cuda_graph    = true;
