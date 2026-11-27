@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "product/hub/hub.h"
 #include "product/kv_resident_options.h"
 #include "product/loop_kv_options.h"
 #include "product/option_layers.h"
@@ -201,7 +202,8 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [options]\n"
            "\n"
-           "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n"
+           "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n" +
+           std::string(product::hub::kArtifactReferenceHelp) +
            "  --help, -h                    show this help and exit\n"
            "  --version                     print the build version and exit\n"
            "  --config FILE                 read options from an INI or flat JSON launch file\n"

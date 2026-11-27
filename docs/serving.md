@@ -9,7 +9,9 @@ artifacts as a [router](#several-models-router), one Engine per loaded model.
 See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
 The options can also come from a file: `--config FILE` reads them, the command line overrides the
 file, and `configs/` holds one for each [launch recipe](recipes.md)
-([launch configuration files](cli.md#launch-configuration-files)).
+([launch configuration files](cli.md#launch-configuration-files)). A Hugging Face repository,
+`OWNER/REPO` or `OWNER/REPO:FILE`, may stand for the artifact's path: the server fetches the file
+into the Hub's cache before it starts ([artifacts from the Hub](cli.md#artifacts-from-the-hugging-face-hub)).
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \

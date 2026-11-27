@@ -7,6 +7,7 @@
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
+#include "product/hub/hub.h"
 #include "product/kv_resident_options.h"
 #include "product/loop_kv_options.h"
 #include "product/launch_config/launch_config.h"
@@ -118,6 +119,8 @@ struct Options {
 std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
+           "       (<model.ninfer> may also be OWNER/REPO or OWNER/REPO:FILE, a Hugging Face\n"
+           "        repository's artifact, fetched once into the Hub's cache)\n"
            "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
            "       [--tensor-parallel] [--tensor-split A,B,...]\n"
            "       [--tensor-attention heads|positions] [--invariant-attention]\n"
@@ -787,6 +790,9 @@ int main(int argc, char** argv) {
     logger->info("build {} ({})", NINFER_BUILD_ID, NINFER_TOOLCHAIN);
     ninfer::product::StartupLogRenderer startup_log(logging);
     try {
+        // OWNER/REPO[:FILE] names an artifact on the Hugging Face Hub, fetched into its cache.
+        options.artifact = ninfer::product::hub::resolve_artifact(
+            options.artifact.string(), [&](const std::string& line) { logger->info("{}", line); });
         return run(options, logger, startup_log, logging.terminal_progress());
     } catch (const std::exception& error) {
         logging.terminal_progress()->clear();

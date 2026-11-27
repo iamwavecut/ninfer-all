@@ -1,5 +1,6 @@
 #include "ninfer_build_id.h"
 #include "product/module_identity.h"
+#include "product/hub/hub.h"
 #include "product/logging/engine_diagnostics.h"
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
@@ -258,6 +259,16 @@ int main(int argc, char** argv) {
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
     ninfer::product::StartupLogRenderer startup_log(logging);
     ninfer::serve::OperationalLog operational_log(logger);
+    if (!options.router()) {
+        // OWNER/REPO[:FILE] names an artifact on the Hugging Face Hub, fetched into its cache.
+        try {
+            options.artifact_path = ninfer::product::hub::resolve_artifact(
+                options.artifact_path, [&](const std::string& line) { logger->info("{}", line); });
+        } catch (const std::exception& exception) {
+            logger->error("{}", exception.what());
+            return 1;
+        }
+    }
     // Stop prompts use the transient bottom line beneath the statistics panel; output without one
     // (redirected, or not a terminal) logs them instead.
     const std::shared_ptr<ninfer::product::TerminalProgress> console_line =
