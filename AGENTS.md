@@ -44,7 +44,7 @@ the share of a decode call's host or disk expert misses that CPU threads compute
 Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`,
 `src/models/qwen4_exp`) is a second, explicit family with its own load, executor and Engine core
 (`runtime/engine/qwen4_exp_core`); it shares the Qwen3.5 frontend and Vision tower, runs up to
-eight requests at once (one batched decode step between prompt chunks), and may keep its routed
+64 requests at once (one batched decode step between prompt chunks), and may keep its routed
 experts off the GPU, in pinned host memory with a device cache of the most used
 ones (`--expert-residency host`) or in the artifact's files, read into a device cache as each layer
 routes to them (`--expert-residency disk`). Its n-gram table is stored in the model's artifact or
@@ -65,7 +65,7 @@ Gemma 4 26B-A4B and the dense Gemma 4 31B (`Gemma4ForCausalLM`, the text compone
 explicit family converted from Google's QAT GGUFs (or a mixed-format GGUF of the same model) with
 their ggml blocks kept as stored.
 It shares the Qwen3.5 frontend (tokenizer, chat template, output channels and Gemma's tool-call
-markup), runs one to eight sequences in prompt chunks of 2048 tokens (narrower where memory is
+markup), runs one to 64 sequences in prompt chunks of 2048 tokens (narrower where memory is
 short) with an F16 KV cache or any
 `--kv-dtype` format, drafts with the release's multi-token-prediction assistant (the artifact's
 `mtp` component, `--spec mtp`),
@@ -76,7 +76,7 @@ which has none, runs on one GPU.
 Flint (`FlintForCausalLM`; `src/models/flint`, `runtime/engine/flint_core`) is a fourth explicit
 family converted from a llama.cpp GGUF of Recursive's release (Unsloth's UD-Q4_K_XL) with its ggml
 blocks kept as stored. It shares the Qwen3.5 frontend in a Flint dialect (its pre-tokenizer, the
-role-marker chat template, reasoning the model opens itself, GLM-4.7 tool calls), runs one to eight
+role-marker chat template, reasoning the model opens itself, GLM-4.7 tool calls), runs one to 64
 sequences in prompt chunks of 2048 tokens with an F16 KV cache (or its full-attention blocks in
 `int8`, `rk8v4` or `rk4v4` planes), drafts by context lookup only (`--lookup-ngram`; Recursive
 publishes no draft model), and has no vision, rotation scaling or pipeline stages; several GPUs
@@ -85,7 +85,7 @@ DeepSeek-V4.1-Flash (`DeepseekV41ForCausalLM`; `src/models/deepseek_v41`,
 `runtime/engine/deepseek_v41_core`) is a fifth explicit family converted from ISTA-DASLab's
 GSQ-RCO GGUF (IQ1_M) and its Engram table GGUF with the ggml blocks kept as stored. It shares the
 Qwen3.5 frontend in a DeepSeek dialect (the converter's transcription of the release's encoder as
-its chat template, DSML tool calls, reasoning opened by the prompt), runs one to eight sequences in
+its chat template, DSML tool calls, reasoning opened by the prompt), runs one to 64 sequences in
 prompt chunks of 2048 tokens with FP8/FP4 caches, keeps the release's FP8/FP4 attention roundings,
 drafts with the release's DSpark drafter (the `dspark` component, from beamster's STQ pack or
 Unsloth's GGUF; `--spec dspark`) or by context lookup, and keeps its routed experts in pinned host
@@ -104,7 +104,7 @@ Thinking Machines' release (Unsloth's UD-IQ4_XS) with its ggml blocks kept as st
 layers run as 48 visits, the core layers three times with the same weights, each visit with its own
 keys, values and convolution histories. It shares the Qwen3.5 frontend in an Inkling dialect (the
 release's message blocks, reasoning and JSON tool-call blocks that the model opens itself), runs
-one to eight sequences in prompt chunks of 2048 tokens with its full-attention visits' KV in MXFP8
+one to 64 sequences in prompt chunks of 2048 tokens with its full-attention visits' KV in MXFP8
 (the default), `int8`, `rk8v4` or `rk4v4` planes or F16, the windowed rings F16, drafts with the
 release's DSpark drafter (the `dspark` component; without `--spec` while one request runs) or by
 context lookup, encodes images with the release's vision tower (the `vision` component; resident or
@@ -142,11 +142,11 @@ the Native release workflow builds native multi-architecture executables but doe
 Generation uses one resident model on one GPU, or split into pipeline stages over up to eight
 (`--devices`; each stage owns whole layers with their KV and state, and the head,
 round state and sampling stay on the first device; design in
-`docs/maintainer/pipeline-stages.md`). It runs startup-fixed concurrency of one to eight
-requests, bounded FIFO ingress (whose one-token reads trade places by remaining work), no
-active-request preemption, and one compact decode batch per
-round. Tensor parallelism (`--tensor-parallel`) divides the GDN heads, the attention's KV heads
-with their cache and the dense FFN rows or routed experts of a Qwen3.5-core model over the devices
+`docs/maintainer/pipeline-stages.md`). It runs startup-fixed concurrency of one to 64
+requests (speculative rounds of at most eight), bounded FIFO ingress (whose one-token reads trade
+places by remaining work), no active-request preemption, and one compact decode batch per round.
+Tensor parallelism (`--tensor-parallel`) divides the GDN heads, the attention's KV heads with their
+cache and the dense FFN rows or routed experts of a Qwen3.5-core model over the devices
 in shares sized to each card (`--tensor-split`, or measured bandwidth and free memory), with the
 head, the shared expert and MTP on the first; Qwen3.8-Flash-Next divides its GDN key heads,
 sparse-attention KV heads and routed experts the same way, every device keeping the

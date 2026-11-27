@@ -45,7 +45,7 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
 - **Images and video.** The release's vision tower (27 blocks of width 1152) turns each picture or
   video frame into soft tokens in the prompt, on the GPU, streamed from pinned host memory, or on
   CPU threads (`--vision-residency`); see [below](#images-and-video).
-- **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
+- **Requests.** One to 64 concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens (1024 or 512 on a card without room for them, [below](#memory-and-context)), prefix
   reuse across turns and requests with host-memory images ([below](#prefix-reuse)), structured
   output, tool calls in Gemma's

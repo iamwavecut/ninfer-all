@@ -114,7 +114,7 @@ tokenization, the chat template, output parsing and the serving protocols.
   kernel and the far field one block a multiprocessor, and at 2.30k instead of 2.20k on another RTX
   3090 with two groups to a far-field block; after 114,754 tokens decode runs at 86.1 tok/s instead
   of 68.6 with the SIMT decode kernel ([measurements](#long-contexts)).
-- **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
+- **Requests.** One to 64 concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens, prefix reuse across turns and requests with host-memory images
   ([below](#prefix-reuse)), branched reads for [typed decisions](serving.md#typed-decisions) and
   reranking (the prompt opens the answer's text block, so the token read is the answer's: the
