@@ -246,7 +246,7 @@ struct AcceptExpected {
 constexpr int kSparsePhysicalRows = 248320;
 constexpr int kSparseTokenDomain  = 248077;
 constexpr int kSparseCandidates   = 16;
-constexpr int kTargetCandidateCap = 20;
+constexpr int kTargetCandidateCap = 64;
 
 struct SparseAcceptSuite {
     const int kSparseDrafts;
@@ -966,7 +966,7 @@ struct SparseAcceptSuite {
             const int kind        = (row + kSparseDrafts + variant) % 4;
             auto& cfg             = configs[row];
             cfg.temperature       = (kind == 1 || kind == 2) ? 0.0f : 0.75f;
-            cfg.top_k             = kind == 3 ? 13 : 20;
+            cfg.top_k             = kind == 3 ? 13 : kind == 0 ? 0 : 20;
             cfg.top_p             = kind == 3 ? 0.78f : 1.0f;
             cfg.min_p             = kind == 3 ? 0.3f : 0.0f;
             cfg.presence_penalty  = kind == 1 || kind == 3 ? 0.5f : 0.0f;

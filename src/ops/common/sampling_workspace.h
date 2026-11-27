@@ -18,29 +18,30 @@ inline constexpr int kSamplerTileItems           = 256;
 inline constexpr int kSamplerItemsPerThread      = 2;
 inline constexpr int kSamplerPartialTileItems    = kSamplerBlock * kSamplerItemsPerThread;
 inline constexpr int kSamplerGroupBlock          = 256;
-inline constexpr int kSamplerGroupItemsPerThread = 2;
-inline constexpr int kSamplerGroupTileItems      = kSamplerGroupBlock * kSamplerGroupItemsPerThread;
-inline constexpr int kSamplerPartialsPerGroup    = 25;
-inline constexpr int kSamplerFastCandidates      = 20;
-inline constexpr int kSamplerCandidateCap        = kSamplerFastCandidates;
+// Every merge level takes the top `cap` keys of up to one warp's worth of sorted lists: a group
+// merges this many partial tiles, and the last group merges the groups.
+inline constexpr int kSamplerPartialsPerGroup    = 32;
+// The public top-k cap: top_k<=0 or above it keeps this many candidates.
+inline constexpr int kSamplerCandidateCap        = 64;
 inline constexpr int kSamplerMaxColumns          = 16;
 inline constexpr int kSpeculativeSamplerMaxColumns = 64;
 
-static_assert(kSamplerPartialsPerGroup * kSamplerCandidateCap <= kSamplerGroupTileItems,
-              "group merge tile must hold one group's candidates");
+// One warp sorts 32 lanes x kSamplerItemsPerThread keys of a partial tile and keeps the first cap.
+static_assert(kSamplerCandidateCap <= 32 * kSamplerItemsPerThread,
+              "a warp's sorted tile slice must hold the candidate cap");
 
 __host__ __device__ inline int sampler_group_count(int partial_blocks) {
     return div_up(partial_blocks, kSamplerPartialsPerGroup);
 }
 
-// The multi-block route is deliberately finite. A single final merge tile must
-// hold every group candidate. Ordinary sampling retains its 16-column route;
-// speculative verification explicitly opts into up to 64 columns.
+// The multi-block route is deliberately finite: the last group merges every group's list in one
+// warp. Ordinary sampling retains its 16-column route; speculative verification explicitly opts
+// into up to 64 columns.
 __host__ __device__ inline bool sampler_multiblock_ok(int vocab, int cols, int partial_blocks,
                                                       int group_count,
                                                       int max_columns = kSamplerMaxColumns) {
     return vocab > kSamplerTileItems && cols > 0 && cols <= max_columns && partial_blocks > 0 &&
-           group_count > 0 && (group_count * kSamplerCandidateCap) <= kSamplerGroupTileItems;
+           group_count > 0 && group_count <= kSamplerPartialsPerGroup;
 }
 
 struct SamplingWorkspace {

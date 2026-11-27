@@ -46,11 +46,10 @@ std::optional<std::uint32_t> parse_thinking_budget_field(const RequestJson& body
 
 [[nodiscard]] bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept;
 
-// An optional `post_thinking` object: temperature (up to `max_temperature`), top_p, top_k, min_p,
-// presence_penalty, frequency_penalty and seed, applied from the token after the reasoning block
-// closes. Absent or null is nullopt; an empty object selects the post-thinking preset.
-[[nodiscard]] std::optional<SamplingParams> parse_post_thinking(const RequestJson& body,
-                                                                double max_temperature);
+// An optional `post_thinking` object: temperature, top_p, top_k, min_p, presence_penalty,
+// frequency_penalty and seed, applied from the token after the reasoning block closes. Absent or
+// null is nullopt; an empty object selects the post-thinking preset.
+[[nodiscard]] std::optional<SamplingParams> parse_post_thinking(const RequestJson& body);
 
 // Name of a JSON value's type for error messages ("string", "array", ...).
 [[nodiscard]] const char* request_json_type_name(const RequestJson& value) noexcept;

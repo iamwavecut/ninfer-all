@@ -68,8 +68,8 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   closes the channel with Qwen's early-close guidance and `<channel|>`, masks `<|channel>` for the
   rest of the response, and the model answers. `--reasoning-loop conclude` closes it the same way
   ([Serving](serving.md#openai-chat-completions)).
-- **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with
-  top-k held at the sampler's 20 candidates.
+- **Sampling defaults.** The release's `generation_config.json`: temperature 1.0, top-k 64, top-p
+  0.95.
 
 Not built for this family: DFlash and ngram copy drafts, pipeline stages over several GPUs, and of
 the context cache the shared paged KV pool. Several GPUs divide

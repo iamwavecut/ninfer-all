@@ -126,7 +126,7 @@ int test_request_envelope_and_sampling() {
     failures +=
         check(options(parse(post_thinking).generation).execution.post_thinking_sampling.has_value(),
               "an empty post_thinking object selects the preset");
-    for (const Json& bad : {Json(0.2), Json{{"temperature", 2.5}}, Json{{"top_k", -1}},
+    for (const Json& bad : {Json(0.2), Json{{"temperature", -2.5}}, Json{{"top_k", -1}},
                             Json{{"stop", "x"}}, Json{{"seed", 1.5}}}) {
         post_thinking["post_thinking"] = bad;
         failures +=
@@ -1265,15 +1265,24 @@ int test_stops_and_ranges() {
     failures += check(api_error([&] { (void)parse(body); }).param == "ignore_eos",
                       "a non-boolean ignore_eos is rejected");
 
-    // The translator owns the sampler value range. Above the 20-candidate domain it clamps, so a
-    // client carrying the llama.cpp/Ollama default of 40 is served; negative values stay errors.
+    // The translator owns the sampler value range. Above the 64-candidate domain it clamps;
+    // negative values stay errors. Temperature has no upper bound and penalties none at all.
     body                                 = base_request();
-    body["top_k"]                        = 40;
+    body["top_k"]                        = 100;
+    body["temperature"]                  = 3.5;
+    body["presence_penalty"]             = 4.0;
+    body["frequency_penalty"]            = -3.0;
     const GenerationRequest wide_top_k   = parse(body).generation;
-    failures += check(options(wide_top_k).execution.sampling.top_k == 20,
-                      "Engine translator did not clamp top_k to the candidate domain");
-    body["post_thinking"]                = Json{{"top_k", 64}};
-    failures += check(options(parse(body).generation).execution.post_thinking_sampling->top_k == 20,
+    failures += check(options(wide_top_k).execution.sampling.top_k == 64 &&
+                          options(wide_top_k).execution.sampling.temperature == 3.5F &&
+                          options(wide_top_k).execution.sampling.presence_penalty == 4.0F &&
+                          options(wide_top_k).execution.sampling.frequency_penalty == -3.0F,
+                      "Engine translator did not keep wide sampling values (top_k clamped to 64)");
+    body.erase("temperature");
+    body.erase("presence_penalty");
+    body.erase("frequency_penalty");
+    body["post_thinking"]                = Json{{"top_k", 65}};
+    failures += check(options(parse(body).generation).execution.post_thinking_sampling->top_k == 64,
                       "post_thinking top_k was not clamped to the candidate domain");
     body.erase("post_thinking");
     body["top_k"]                        = -3;

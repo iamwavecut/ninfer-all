@@ -45,7 +45,7 @@ enum SampleDraw : std::int32_t {
 // [token_domain] committed generated-token occurrence-count array used by both penalties.
 struct SamplingConfig {
     float temperature          = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
-    std::int32_t top_k         = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
+    std::int32_t top_k         = 20;   // runtime contract is [1,64]; Op defensively caps otherwise
     float top_p                = 1.0f; // >= 1 => disabled
     float min_p                = 0.0f; // <= 0 => disabled
     float presence_penalty     = 0.0f;
@@ -89,7 +89,7 @@ struct SamplingConfig {
  * A greedy row selects min argmax_v adjusted_v and skips filters and RNG. Candidates for a
  * positive-temperature row are sorted by adjusted_v descending with lower token id breaking
  * ties. Per-row top_k
- * in [1,19] keeps that many candidates; top_k<=0 or top_k>=20 keeps min(20,token_domain).
+ * in [1,63] keeps that many candidates; top_k<=0 or top_k>=64 keeps min(64,token_domain).
  * Candidate weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
  * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches
  * top_p times the pre-truncation candidate weight. At least the best candidate remains, the

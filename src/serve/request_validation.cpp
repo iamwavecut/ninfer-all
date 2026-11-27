@@ -178,7 +178,7 @@ std::string ascii_preview(std::string_view value, std::size_t limit) {
     return out;
 }
 
-std::optional<SamplingParams> parse_post_thinking(const RequestJson& body, double max_temperature) {
+std::optional<SamplingParams> parse_post_thinking(const RequestJson& body) {
     if (!body.contains("post_thinking") || body.at("post_thinking").is_null()) {
         return std::nullopt;
     }
@@ -200,12 +200,13 @@ std::optional<SamplingParams> parse_post_thinking(const RequestJson& body, doubl
         }
         return value;
     };
+    constexpr double kLargest = std::numeric_limits<float>::max();
     SamplingParams out;
-    out.temperature       = ranged("temperature", 0.0, max_temperature);
+    out.temperature       = ranged("temperature", 0.0, kLargest);
     out.top_p             = ranged("top_p", 0.0, 1.0);
     out.min_p             = ranged("min_p", 0.0, 1.0);
-    out.presence_penalty  = ranged("presence_penalty", -2.0, 2.0);
-    out.frequency_penalty = ranged("frequency_penalty", -2.0, 2.0);
+    out.presence_penalty  = ranged("presence_penalty", -kLargest, kLargest);
+    out.frequency_penalty = ranged("frequency_penalty", -kLargest, kLargest);
     out.top_k             = optional_int(object, "top_k");
     if (out.top_k && *out.top_k < 0) {
         bad_request("post_thinking.top_k must not be negative", "post_thinking.top_k");

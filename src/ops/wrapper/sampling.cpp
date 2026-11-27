@@ -3,11 +3,15 @@
 
 #include "ops/common/sampling_workspace.h"
 #include "ops/launcher/sampling.h" // detail::sample_batch_launch
+#include "ninfer/request.h"
 
 #include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops {
+
+static_assert(kSamplerCandidateCap == kSamplingTopKCap,
+              "the sampler keeps exactly the public top-k cap");
 
 std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::int32_t min_lanes,
                                               std::int32_t max_lanes) {

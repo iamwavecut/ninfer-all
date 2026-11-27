@@ -600,12 +600,12 @@ std::string serve_usage_text(const char* argv0) {
            "                                most 16)\n"
            "\n"
            "SAMPLING & THINKING\n"
-           "  --temperature F               0..2\n"
+           "  --temperature F               0 or more\n"
            "  --top-p F                     0..1\n"
-           "  --top-k N                     0..20\n"
+           "  --top-k N                     0..64\n"
            "  --min-p F                     0..1\n"
-           "  --presence-penalty F          -2..2\n"
-           "  --frequency-penalty F         -2..2\n"
+           "  --presence-penalty F          any finite value\n"
+           "  --frequency-penalty F         any finite value\n"
            "  --seed N                      seed of a request that sets none (default: fresh\n"
            "                                per request)\n"
            "  --greedy                      force temperature 0 (exact argmax)\n"
@@ -618,9 +618,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                post-thinking preset (temperature 0.2) from the\n"
            "                                token after its reasoning closes (default off;\n"
            "                                a request opts in with a post_thinking object)\n"
-           "  --post-thinking-temperature F 0..2; implies --post-thinking\n"
+           "  --post-thinking-temperature F 0 or more; implies --post-thinking\n"
            "  --post-thinking-top-p F       0..1; implies --post-thinking\n"
-           "  --post-thinking-top-k N       0..20; implies --post-thinking\n"
+           "  --post-thinking-top-k N       0..64; implies --post-thinking\n"
            "  --post-thinking-sampler temp=F,top_p=F,top_k=N[,min_p=F,presence=F,frequency=F]\n"
            "                                the same fields in one flag\n"
            "  --no-thinking                 disable thinking by default\n"
@@ -1800,7 +1800,8 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (arg == "--temperature") {
             options.sampling_overrides.temperature =
-                parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
+                parse_float_in(require_value("--temperature"), "temperature", 0.0f,
+                               std::numeric_limits<float>::max());
             continue;
         }
         if (arg == "--top-p") {
@@ -1810,7 +1811,10 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (arg == "--top-k") {
             const int top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
-            if (top_k > 20) { throw std::invalid_argument("top-k must be in [0,20]"); }
+            if (top_k > kSamplingTopKCap) {
+                throw std::invalid_argument("top-k must be in [0," +
+                                            std::to_string(kSamplingTopKCap) + "]");
+            }
             options.sampling_overrides.top_k = top_k;
             continue;
         }
@@ -1821,12 +1825,14 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (arg == "--presence-penalty") {
             options.sampling_overrides.presence_penalty = parse_float_in(
-                require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);
+                require_value("--presence-penalty"), "presence-penalty",
+                -std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
             continue;
         }
         if (arg == "--frequency-penalty") {
             options.sampling_overrides.frequency_penalty = parse_float_in(
-                require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
+                require_value("--frequency-penalty"), "frequency-penalty",
+                -std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
             continue;
         }
         if (arg == "--seed") {

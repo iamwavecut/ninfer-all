@@ -127,34 +127,38 @@ int test_envelope_and_field_policy() {
                       "max_tokens=0 was accepted as a false cache prewarm");
 
     body                = base_request();
-    body["temperature"] = 1.01;
+    body["temperature"] = 1.5;
+    failures += check(parse(body).generation.sampling.temperature == 1.5,
+                      "Anthropic temperature above 1 was refused");
+    body["temperature"] = -0.1;
     failures += check(api_param([&] { (void)parse(body); }) == "temperature",
-                      "Anthropic temperature range was not enforced");
-    // top_k above the sampler's 20-candidate domain is clamped, not refused: llama.cpp and Ollama
-    // default to 40. Negative values are still an error.
-    for (const auto& [requested, effective] : {std::pair{40, 20}, std::pair{20, 20}}) {
+                      "negative Anthropic temperature was accepted");
+    // top_k above the sampler's 64-candidate domain is clamped, not refused. Negative values are
+    // still an error.
+    for (const auto& [requested, effective] :
+         {std::pair{100, 64}, std::pair{64, 64}, std::pair{40, 40}}) {
         body          = base_request();
         body["top_k"] = requested;
         failures += check(parse(body).generation.sampling.top_k == effective,
-                          "top_k above the candidate domain was not clamped to 20");
+                          "top_k above the candidate domain was not clamped to 64");
     }
     body          = base_request();
     body["top_k"] = -1;
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
                       "negative top_k was accepted");
     body                  = base_request();
-    body["post_thinking"] = Json{{"top_k", 64}};
-    failures += check(parse(body).generation.post_thinking->top_k == 20,
-                      "post_thinking top_k above the candidate domain was not clamped to 20");
+    body["post_thinking"] = Json{{"top_k", 65}};
+    failures += check(parse(body).generation.post_thinking->top_k == 64,
+                      "post_thinking top_k above the candidate domain was not clamped to 64");
     body                     = base_request();
     body["post_thinking"]    = Json{{"temperature", 0.2}, {"top_p", 0.9}};
     const auto post_thinking = parse(body).generation.post_thinking;
     failures += check(post_thinking && post_thinking->temperature == 0.2 &&
                           post_thinking->top_p == 0.9 && !post_thinking->top_k,
                       "Anthropic post_thinking fields were not lowered");
-    body["post_thinking"] = Json{{"temperature", 1.5}};
+    body["post_thinking"] = Json{{"temperature", -1.5}};
     failures += check(api_param([&] { (void)parse(body); }) == "post_thinking.temperature",
-                      "Anthropic post_thinking temperature range was not enforced");
+                      "negative Anthropic post_thinking temperature was accepted");
     body = base_request();
     body["output_config"] =
         Json{{"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};

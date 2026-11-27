@@ -136,7 +136,8 @@ tokenization, the chat template, output parsing and the serving protocols.
   reached, the engine closes the open block with Qwen's early-close guidance and `<|end_message|>`,
   masks `<|content_thinking|>` for the rest of the response and decodes it without drafts.
   `--reasoning-loop conclude` closes it the same way ([Serving](serving.md#openai-chat-completions)).
-- **Sampling defaults.** The release's: temperature 1.0.
+- **Sampling defaults.** The release's: temperature 1.0 (top-k 64, the candidates the sampler
+  keeps).
 - **Speculative decoding.** The release's DSpark drafter (the artifact's `dspark` component,
   `--spec dspark`) proposes a block of up to 7 drafts from the target's tapped hidden states: three
   non-causal blocks over the anchor and mask rows, then a recurrent Markov head of rank 256 that

@@ -1413,16 +1413,14 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     }
 
     if (const std::optional<double> temperature = optional_number(body, "temperature")) {
-        if (*temperature < 0.0 || *temperature > 2.0) {
-            bad_request("temperature must be in [0,2]", "temperature");
-        }
+        if (*temperature < 0.0) { bad_request("temperature must not be negative", "temperature"); }
         out.prompt.generation.sampling.temperature = *temperature;
     }
     if (const std::optional<double> top_p = optional_number(body, "top_p")) {
         if (*top_p < 0.0 || *top_p > 1.0) { bad_request("top_p must be in [0,1]", "top_p"); }
         out.prompt.generation.sampling.top_p = *top_p;
     }
-    out.prompt.generation.post_thinking = parse_post_thinking(body, 2.0);
+    out.prompt.generation.post_thinking = parse_post_thinking(body);
     if (const std::optional<int> max_output = optional_int(body, "max_output_tokens")) {
         if (*max_output < 0) {
             bad_request("max_output_tokens must be non-negative", "max_output_tokens");

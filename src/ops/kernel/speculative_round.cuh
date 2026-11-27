@@ -428,8 +428,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_draf
     __shared__ float cand_val[kSamplerCandidateCap];
     __shared__ int cand_idx[kSamplerCandidateCap];
     __shared__ float prob[kSamplerCandidateCap];
-    __shared__ float merge_val[kSamplerBlock * kSamplerFastCandidates];
-    __shared__ int merge_idx[kSamplerBlock * kSamplerFastCandidates];
+    __shared__ SamplingBlockTopKStorage block_storage;
     __shared__ int n_support;
     __shared__ int a_sh;
     __shared__ int done_sh;
@@ -519,9 +518,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_draf
             sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val, red_idx,
                                            cand_val, cand_idx, prob, &n_support, row_drafts, i);
         } else {
-            sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg, merge_val,
-                                                merge_idx, cand_val, cand_idx, prob, &n_support,
-                                                row_drafts, i);
+            sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg,
+                                                block_storage, cand_val, cand_idx, prob,
+                                                &n_support, row_drafts, i);
         }
         // The loop leaves at the barrier below once the row is decided, so no thread reads the
         // shared flag here while thread 0 may be writing it.
@@ -691,13 +690,12 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 
     workspace = speculative_workspace_row(workspace, workspace_row_stride, row);
 
-    __shared__ SamplingTileTopKStorage topk_storage;
+    __shared__ SamplingMergeStorage merge_storage;
     __shared__ float cand_val[kSamplerCandidateCap];
     __shared__ int cand_idx[kSamplerCandidateCap];
     __shared__ float prob[kSamplerCandidateCap];
     __shared__ int n_support;
     __shared__ int is_last_group;
-    unsigned long long keys[kSamplerGroupItemsPerThread];
 
     const int cap = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     // The preceding partial launch initializes all caller-owned counters. CUDA
@@ -707,20 +705,9 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     int group_partials    = partial_blocks - group_begin;
     if (group_partials < 0) { group_partials = 0; }
     if (group_partials > kSamplerPartialsPerGroup) { group_partials = kSamplerPartialsPerGroup; }
-    const int group_n = group_partials * cap;
-#pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int p = item * blockDim.x + tid;
-        if (p < group_n) {
-            const int partial = group_begin + p / cap;
-            const int j       = p - (p / cap) * cap;
-            const int off     = sampling_partial_offset(workspace, col, partial, j);
-            keys[item]        = workspace.partial_keys[off];
-        } else {
-            keys[item] = 0ull;
-        }
-    }
-    sampling_store_tile_topk(keys, cap, workspace, col, partial_blocks + group, topk_storage);
+    sampling_merge_workspace_lists(workspace, col, group_begin, group_partials, cap,
+                                   merge_storage);
+    sampling_store_merged(workspace, col, partial_blocks + group, cap, merge_storage);
     __syncthreads();
 
     if (tid == 0) {
@@ -731,27 +718,11 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     __syncthreads();
     if (!is_last_group) { return; }
 
-    const int final_n = group_count * cap;
-#pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int p = item * blockDim.x + tid;
-        if (p < final_n) {
-            const int partial = partial_blocks + p / cap;
-            const int j       = p - (p / cap) * cap;
-            const int off     = sampling_partial_offset(workspace, col, partial, j);
-            keys[item]        = workspace.partial_keys[off];
-        } else {
-            keys[item] = 0ull;
-        }
-    }
-    sampling_store_tile_topk(keys, cap, workspace, col, partial_blocks + group, topk_storage);
-    __syncthreads();
-
+    sampling_merge_workspace_lists(workspace, col, partial_blocks, group_count, cap,
+                                   merge_storage);
     if (tid < cap) {
-        const int off = sampling_partial_offset(workspace, col, partial_blocks + group, tid);
-        const unsigned long long key = workspace.partial_keys[off];
-        cand_val[tid]                = sampling_key_float(key);
-        cand_idx[tid]                = sampling_key_index(key);
+        cand_val[tid] = sampling_key_float(merge_storage.merged[tid]);
+        cand_idx[tid] = sampling_key_index(merge_storage.merged[tid]);
     }
     __syncthreads();
 
