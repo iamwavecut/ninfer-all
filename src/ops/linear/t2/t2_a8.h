@@ -5,7 +5,9 @@
 // small-T kernel of t2_small_t_i8.cuh for T in [kT2I8SmallMinTokens, kT2I8SmallMaxTokens], and
 // above it, from t2_a8_min_tokens() up, the tile GEMM of t2_prefill_i8.cuh, which pads T to a
 // multiple of 64 internally (NINFER_T2_A8_TILE=off: the shared int8 GEMM of
-// ops/common/rowsplit_a8_mma.cuh with the ternary codec).
+// ops/common/rowsplit_a8_mma.cuh with the ternary codec). The prefill routes take the registered
+// input widths; the small-T kernel also takes any share of whole 32-row tiles and 512-k slabs, the
+// cuts a tensor-parallel rank's rows of gate and up and columns of down and the mixer outputs have.
 
 #include "core/arena.h"
 #include "core/layout.h"
@@ -30,8 +32,17 @@ inline constexpr std::int32_t kT2I8SmallMaxTokens = 64;
 // kT2A8MinTokens, or NINFER_T2_A8_MIN when it is set (benchmark A/B of the crossover).
 [[nodiscard]] std::int32_t t2_a8_min_tokens();
 
+// The small-T kernel's share tiles: rows a whole 32-row tile, K a whole 512-k slab.
+inline constexpr std::int32_t kT2A8SmallRows = 32;
+inline constexpr std::int32_t kT2A8SmallK    = 512;
+
 [[nodiscard]] bool t2_a8_admits(LinearPolicy policy);
+// A registered shape: every route, prefill included.
 [[nodiscard]] bool t2_a8_shape_supported(std::int32_t output_rows, std::int32_t input_rows);
+// A share the small-T kernel takes inside its band.
+[[nodiscard]] bool t2_a8_small_shape_supported(std::int32_t output_rows, std::int32_t input_rows);
+// Whether the route `tokens` takes serves w: the small-T band at a registered shape or a share,
+// the prefill routes at a registered shape.
 [[nodiscard]] bool t2_a8_supported(const Weight& w, std::int32_t tokens);
 // Activation planes for T in [1, max_tokens]; zero when no admitted call can take the route.
 [[nodiscard]] std::size_t t2_a8_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
@@ -76,8 +87,17 @@ struct T2A8Split {
 void t2_a8_project_split_pair(const T2A8Activations& x, const T2A8Split& a, const T2A8Split& b,
                               cudaStream_t stream);
 
+// out is BF16, or FP32 for an unrounded product (a tensor-parallel rank's partial sum).
 void t2_a8_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                   cudaStream_t stream);
+// w's rows at rows [row_offset, row_offset + w.n) of the BF16 plane out, from activations quantised
+// once for several weights (a rank's parts of an input projection).
+void t2_a8_project_rows(const T2A8Activations& x, const Weight& w, Tensor& out,
+                        std::int32_t row_offset, cudaStream_t stream);
+// A rank's gate and up rows over one quantisation of x into two unrounded FP32 planes: one launch
+// for both inside the small-T band, one GEMM each above it.
+void t2_a8_linear_pair(const Tensor& x, const Weight& gate, const Weight& up, Tensor& gate_out,
+                       Tensor& up_out, WorkspaceArena& workspace, cudaStream_t stream);
 void t2_a8_linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& workspace,
                       cudaStream_t stream);
 

@@ -5,6 +5,7 @@
 #include <exception>
 #include <iostream>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -64,6 +65,51 @@ int t2_a8_wide_schedules() {
     return failures;
 }
 
+// A tensor-parallel rank's shares: rows of gate and up at the hidden width (not a whole 128-row
+// prefill block, so past the small-T band the A16 route answers), and columns of down and of the
+// mixer outputs, into the FP32 partial the ranks add and into BF16. Down's share is an odd number
+// of 512-k slabs, which takes the one-word schedules at 8 and 16 columns.
+int t2_a8_shares() {
+    int failures = 0;
+    constexpr std::array kWidths{a8(1),  a8(2),  a8(4),  a8(7),  a8(8),  a8(9),  a8(16), a8(17),
+                                 a8(24), a8(32), a8(33), a8(48), a8(64), a8(65), a8(100)};
+    for (const DType out : {DType::FP32, DType::BF16}) {
+        ShapeCase rows{1056, 5120, 317U, Comparison::Full, false, kWidths};
+        rows.out = out;
+        failures += run_shape("T2_A8 share", ActivationCompute::A8, make_t2_g128_fp16_weight, rows);
+        ShapeCase down{5120, 8704, 319U, Comparison::SampledRows, false, kWidths};
+        down.out = out;
+        failures += run_shape("T2_A8 share", ActivationCompute::A8, make_t2_g128_fp16_weight, down);
+        ShapeCase mixer{5120, 3072, 321U, Comparison::SampledRows, false, kWidths};
+        mixer.out = out;
+        failures +=
+            run_shape("T2_A8 share", ActivationCompute::A8, make_t2_g128_fp16_weight, mixer);
+    }
+    // The registered input width into FP32: the small-T band and the prefill tile.
+    ShapeCase whole{1024, 5120, 323U, Comparison::Full, false, kWidths};
+    whole.out = DType::FP32;
+    failures += run_shape("T2_A8", ActivationCompute::A8, make_t2_g128_fp16_weight, whole);
+    // A declared interval covers every width in it, the shares' small-T planes included.
+    for (const auto [n, k] :
+         {std::pair{1056, 5120}, std::pair{5120, 8704}, std::pair{5120, 3072}}) {
+        for (const auto [first, last] : {std::pair{1, 8}, std::pair{1, 64}, std::pair{9, 129}}) {
+            const std::size_t capacity = ops::linear_workspace_capacity_bytes(
+                QType::T2_G128_FP16, n, k, ops::LinearPolicy::AllowA8Int, first, last);
+            for (std::int32_t t = first; t <= last; ++t) {
+                if (ops::linear_workspace_capacity_bytes(QType::T2_G128_FP16, n, k,
+                                                         ops::LinearPolicy::AllowA8Int, t,
+                                                         t) > capacity) {
+                    std::cerr << "T2_A8 share workspace [" << first << ',' << last
+                              << "] misses T=" << t << " at [" << n << ',' << k << "]\n";
+                    ++failures;
+                    break;
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -73,7 +119,7 @@ int main() {
     }
 
     try {
-        const int failures = t2_a8_conformance() + t2_a8_wide_schedules();
+        const int failures = t2_a8_conformance() + t2_a8_wide_schedules() + t2_a8_shares();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " T2_A8 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

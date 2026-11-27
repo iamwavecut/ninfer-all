@@ -1,7 +1,9 @@
 // T2G128 row-split weights with int8 activations. Three registered input widths (the hidden 5120,
 // the attention/GDN mixer output 6144 and the MLP intermediate 17408) and any row count that is a
-// whole number of 128-row blocks (64 with NINFER_T2_A8_TILE=off). Inside the small-T band (T <= 192
-// by default, in launches of at most 32 columns) the ternary small-T kernel of t2_small_t_i8.cuh,
+// whole number of 128-row blocks (64 with NINFER_T2_A8_TILE=off); inside the small-T band also any
+// whole 32-row, 512-column share of them (a tensor-parallel rank's rows or columns), the kernel
+// reading both dimensions at launch time. Inside the small-T band (T <= 192 by default, in launches
+// of at most 32 columns) the ternary small-T kernel of t2_small_t_i8.cuh,
 // where the A16 kernels are tensor-rate bound at every width; from t2_a8_min_tokens() up the tile
 // GEMM of t2_prefill_i8.cuh, with T padded to a multiple of 64 and its own activation contract (one
 // binary16 scale per token and 128-wide group). NINFER_T2_A8_TILE=off puts the shared prefill GEMM
@@ -216,6 +218,18 @@ void small_route(const T2A8Activations& x, const SmallParent<Epilogue>& first,
         col0 += span.cols;
         const std::string_view routed = device_route_schedule(key, span.cols);
         if (!routed.empty() && small_named(routed, x, span, first, second, stream)) { continue; }
+        // A share whose K is an odd number of 512-k slabs takes the one-word schedules of the same
+        // row tiles at 8 and 16 columns (the 32-column schedule already slabs 512).
+        if (x.input_rows % SmallSchedule8::kSlabK != 0) {
+            if (span.cols <= 8) {
+                small_gemm<SmallScheduleR16C8W1>(x, span, first, second, stream);
+            } else if (span.cols <= 16) {
+                small_gemm<SmallScheduleR16C16W1>(x, span, first, second, stream);
+            } else {
+                small_gemm<SmallSchedule32>(x, span, first, second, stream);
+            }
+            continue;
+        }
         if (span.cols <= 8) {
             small_gemm<SmallSchedule8>(x, span, first, second, stream);
         } else if (span.cols <= 16) {
@@ -247,6 +261,18 @@ struct SplitStoreEpilogue {
             second[static_cast<std::size_t>(token) * second_rows + (row - split) + second_offset] =
                 __float2bfloat16(value);
         }
+    }
+};
+
+// An unrounded FP32 product: a tensor-parallel rank's partial sum, which the ranks add before
+// rounding, or one parent of a rank's gate and up rows, which SwiGLU rounds once.
+struct StoreFp32Epilogue {
+    static constexpr bool kPaired = false;
+    float* dst;
+    std::int32_t dst_rows;
+
+    __device__ void operator()(std::int32_t row, std::int32_t token, float value) const {
+        dst[static_cast<std::size_t>(token) * dst_rows + row] = value;
     }
 };
 
@@ -418,11 +444,44 @@ bool t2_a8_shape_supported(std::int32_t output_rows, std::int32_t input_rows) {
            (input_rows == 5120 || input_rows == 6144 || input_rows == 17408);
 }
 
-bool t2_a8_supported(const Weight& w, std::int32_t tokens) {
-    return w.qtype == QType::T2_G128_FP16 && w.layout == QuantLayout::RowSplit &&
-           w.qdata != nullptr && w.scales != nullptr && t2_a8_shape_supported(w.n, w.k) &&
-           route(tokens) != Route::None;
+bool t2_a8_small_shape_supported(std::int32_t output_rows, std::int32_t input_rows) {
+    return output_rows > 0 && output_rows % kT2A8SmallRows == 0 && input_rows > 0 &&
+           input_rows % kT2A8SmallK == 0;
 }
+
+bool t2_a8_supported(const Weight& w, std::int32_t tokens) {
+    if (w.qtype != QType::T2_G128_FP16 || w.layout != QuantLayout::RowSplit || w.qdata == nullptr ||
+        w.scales == nullptr) {
+        return false;
+    }
+    switch (route(tokens)) {
+    case Route::SmallT:
+        return t2_a8_shape_supported(w.n, w.k) || t2_a8_small_shape_supported(w.n, w.k);
+    case Route::Prefill:
+        return t2_a8_shape_supported(w.n, w.k);
+    case Route::None:
+        break;
+    }
+    return false;
+}
+
+namespace {
+
+// The planes of every width up to max_tokens that the small-T kernel takes (the default band and
+// what a device profile routes to it).
+std::size_t small_activation_bytes(std::int32_t input_rows, std::int32_t max_tokens) {
+    const auto round    = [](std::size_t value) { return (value + 255) / 256 * 256; };
+    std::int32_t widest = 0;
+    for (std::int32_t tokens = 1; tokens <= std::min(max_tokens, kT2I8MaxColumns); ++tokens) {
+        if (route(tokens) == Route::SmallT) { widest = tokens; }
+    }
+    if (widest == 0) { return 0; }
+    return round(static_cast<std::size_t>(widest) * static_cast<std::size_t>(input_rows)) +
+           round(static_cast<std::size_t>(kT2I8MaxColumns) *
+                 static_cast<std::size_t>(input_rows / a8::kGroup) * sizeof(__half));
+}
+
+} // namespace
 
 std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tokens) {
     const auto round  = [](std::size_t value) { return (value + 255) / 256 * 256; };
@@ -475,8 +534,14 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
 
 std::size_t t2_a8_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                   LinearPolicy policy, std::int32_t max_tokens) {
-    if (!t2_a8_admits(policy) || !t2_a8_shape_supported(output_rows, input_rows)) { return 0; }
-    return t2_a8_activation_bytes(input_rows, max_tokens);
+    if (!t2_a8_admits(policy)) { return 0; }
+    if (t2_a8_shape_supported(output_rows, input_rows)) {
+        return t2_a8_activation_bytes(input_rows, max_tokens);
+    }
+    if (t2_a8_small_shape_supported(output_rows, input_rows)) {
+        return small_activation_bytes(input_rows, max_tokens);
+    }
+    return 0;
 }
 
 bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input_rows,
@@ -499,9 +564,14 @@ bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input
 T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaStream_t stream) {
     const std::int32_t input_rows = x.ne[0];
     const std::int32_t tokens     = x.ne[1];
+    const bool registered         = t2_a8_shape_supported(T2PrefillI8::kRows, input_rows);
+    const bool small = route(tokens) == Route::SmallT &&
+                       (registered || t2_a8_small_shape_supported(kT2A8SmallRows, input_rows));
     if (x.dtype != DType::BF16 || x.data == nullptr || !x.is_contiguous() || x.ne[2] != 1 ||
-        x.ne[3] != 1 || route(tokens) == Route::None || !t2_a8_shape_supported(T2PrefillI8::kRows, input_rows)) {
-        throw std::invalid_argument("t2 a8: x must be a contiguous BF16 [K, T] of a registered K");
+        x.ne[3] != 1 || route(tokens) == Route::None || !(registered || small)) {
+        throw std::invalid_argument(
+            "t2 a8: x must be a contiguous BF16 [K, T] of a registered K, or of a whole number of "
+            "512-k slabs inside the small-T band");
     }
     if (route(tokens) == Route::SmallT) {
         const DeviceSpan codes  = workspace.alloc_bytes(static_cast<std::size_t>(tokens) *
@@ -578,8 +648,49 @@ void t2_a8_project_split_pair(const T2A8Activations& x, const T2A8Split& a, cons
 
 void t2_a8_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                   cudaStream_t stream) {
+    if (out.dtype == DType::FP32) {
+        run(x, w, StoreFp32Epilogue{static_cast<float*>(out.data), w.n}, workspace, stream);
+        return;
+    }
     run(x, w, a8::StoreEpilogue{reinterpret_cast<__nv_bfloat16*>(out.data), w.n, 0}, workspace,
         stream);
+}
+
+void t2_a8_project_rows(const T2A8Activations& x, const Weight& w, Tensor& out,
+                        std::int32_t row_offset, cudaStream_t stream) {
+    require_plane(out, x.tokens, "destination");
+    if (row_offset < 0 || row_offset + w.n > out.ne[0]) {
+        throw std::invalid_argument("t2 a8: rows exceed their destination");
+    }
+    project(x, w,
+            a8::StoreEpilogue{reinterpret_cast<__nv_bfloat16*>(out.data), out.ne[0], row_offset},
+            stream);
+}
+
+void t2_a8_linear_pair(const Tensor& x, const Weight& gate, const Weight& up, Tensor& gate_out,
+                       Tensor& up_out, WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    for (const Tensor* plane : {&gate_out, &up_out}) {
+        if (plane->dtype != DType::FP32 || plane->data == nullptr || plane->ne[0] != gate.n ||
+            plane->ne[1] != tokens || plane->ne[2] != 1 || plane->ne[3] != 1) {
+            throw std::invalid_argument("t2 a8 pair: outputs must be FP32 [rows, T] planes");
+        }
+    }
+    if (gate.n != up.n || gate.k != up.k || !t2_a8_supported(gate, tokens) ||
+        !t2_a8_supported(up, tokens)) {
+        throw std::invalid_argument("t2 a8 pair: unsupported profile");
+    }
+    auto scope                = workspace.scope();
+    const T2A8Activations act = t2_a8_quantize(x, workspace, stream);
+    const StoreFp32Epilogue gate_store{static_cast<float*>(gate_out.data), gate.n};
+    const StoreFp32Epilogue up_store{static_cast<float*>(up_out.data), up.n};
+    if (route(tokens) == Route::SmallT) {
+        const SmallParent<StoreFp32Epilogue> other{&up, up_store};
+        small_route<StoreFp32Epilogue>(act, {&gate, gate_store}, &other, stream);
+        return;
+    }
+    project(act, gate, gate_store, stream);
+    project(act, up, up_store, stream);
 }
 
 void t2_a8_linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceArena& workspace,

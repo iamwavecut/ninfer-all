@@ -13,6 +13,7 @@
 #include "ops/linear/sm70/sm70_gemm.h"
 #include "ops/linear/sm70/sm70_integer.h"
 #include "ops/linear/sm70/sm70_project.h"
+#include "ops/linear/t2/t2_a8.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_int8_grouped.cuh"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
@@ -325,6 +326,16 @@ void linear_swiglu(const Tensor& x, const Weight& gate_weight, const Weight& up_
     auto scope  = ws.scope();
     Tensor gate = ws.alloc(DType::FP32, {gate_weight.n, x.ne[1]});
     Tensor up   = ws.alloc(DType::FP32, {up_weight.n, x.ne[1]});
+    // Ternary rows on the integer route: x quantised once for both parents, which share one launch
+    // inside the small-T band.
+    if (gate_weight.qtype == QType::T2_G128_FP16 && up_weight.qtype == QType::T2_G128_FP16 &&
+        !detail::sm70::covers(gate_weight, x.ne[1]) && detail::t2_a8_admits(policy) &&
+        detail::t2_a8_supported(gate_weight, x.ne[1]) &&
+        detail::t2_a8_supported(up_weight, x.ne[1]) && x.is_contiguous()) {
+        detail::t2_a8_linear_pair(x, gate_weight, up_weight, gate, up, ws, stream);
+        silu_mul(gate, up, out, stream);
+        return;
+    }
     linear(x, gate_weight, gate, policy, ws, stream);
     linear(x, up_weight, up, policy, ws, stream);
     silu_mul(gate, up, out, stream);
