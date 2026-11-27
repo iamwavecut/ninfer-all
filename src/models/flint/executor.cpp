@@ -16,6 +16,7 @@
 #include "models/dspine/runtime.h"
 #include "models/flint/kernels.h"
 #include "ops/kv_cache/row128_rotate.h"
+#include "ninfer/ops/batch_rows.h"
 #include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
@@ -491,7 +492,7 @@ struct Executor::Impl {
                                    growing, device_id);
                 }
             }
-            std::vector<std::int32_t> identity(gguf::kMaxVectorColumns);
+            std::vector<std::int32_t> identity(ops::kMaximumDecodeRows);
             std::iota(identity.begin(), identity.end(), 0);
             d_identity = DeviceBuffer(identity.size() * 4);
             d_identity.copy_from_host(identity.data(), identity.size() * 4);
@@ -548,7 +549,9 @@ struct Executor::Impl {
 
     // The DSpine drafter's state: a lane per sequence and one per checkpoint; a prompt chunk's
     // kept rows (the last window of them) or a decode or verification call's rows of taps; and
-    // proposals for up to eight sequences at once.
+    // proposals for up to eight sequences at once, which a decode step of more rows commits eight
+    // at a time.
+    static constexpr std::uint32_t kSpineRows = 8;
     [[nodiscard]] dspine::RuntimeOptions spine_options() const {
         const dspine::Config& c     = model.dspine()->config();
         const std::uint32_t window  = dspine::ring_capacity(c, options.max_context);
@@ -557,8 +560,8 @@ struct Executor::Impl {
         o.kept_states     = options.checkpoints ? 1 : 0;
         o.max_context     = options.max_context;
         o.draft_tokens    = options.draft_tokens;
-        o.draft_rows      = std::min<std::uint32_t>(options.sequences, 8);
-        o.commit_rows     = std::min<std::uint32_t>(options.sequences, 8);
+        o.draft_rows      = std::min(options.sequences, kSpineRows);
+        o.commit_rows     = std::min(options.sequences, kSpineRows);
         o.feature_columns = std::max<std::uint32_t>(std::min(options.prefill_chunk, window),
                                                     std::uint32_t(decode_rows()));
         const ops::detail::GgufShape shape{head.qtype, head.n, head.k};
@@ -887,10 +890,11 @@ struct Executor::Impl {
 
     static constexpr int kHeadRows = 64; // LM-head columns per FP32 plane pass
 
-    // Rows of a decode or verification call.
+    // Rows of a decode or verification call: a decode step of every sequence (up to
+    // ops::kMaximumDecodeRows), a verification of up to kMaxVectorColumns.
     [[nodiscard]] int decode_rows() const {
-        return std::min<int>(gguf::kMaxVectorColumns,
-                             std::max<int>(int(options.sequences), int(options.draft_tokens) + 1));
+        return std::max<int>(std::min<int>(int(options.sequences), ops::kMaximumDecodeRows),
+                             std::min<int>(gguf::kMaxVectorColumns, int(options.draft_tokens) + 1));
     }
 
     std::size_t plan_workspace() const {
@@ -1778,17 +1782,26 @@ struct Executor::Impl {
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);
         embed(b, h);
-        // Each block's normalized input rows in q8_1 form; after the last block, the final-normed
-        // rows.
-        const Q8Act xq = alloc_q8(hidden, b);
-        kernels::rms_norm(h, layers.front().input_norm, hidden, b, eps, nullptr, stream, xq.rows);
+        // Each block's normalized input rows in q8_1 form for the vector kernels; after the last
+        // block, the final-normed rows. A decode step of more rows (up to ops::kMaximumDecodeRows)
+        // takes BF16 rows and a prompt chunk's matrix kernels.
+        const bool q8 = b <= gguf::kMaxVectorColumns;
+        Q8Act xq;
+        Tensor x;
+        if (q8) {
+            xq = alloc_q8(hidden, b);
+        } else {
+            x = workspace->alloc(DType::BF16, {hidden, b});
+        }
+        kernels::rms_norm(h, layers.front().input_norm, hidden, b, eps,
+                          q8 ? nullptr : static_cast<__nv_bfloat16*>(x.data), stream, xq.rows);
         const int q_floats = query_heads * head_dim;
         for (std::size_t li = 0; li < layers.size(); ++li) {
             const LayerPlan& p = layers[li];
             auto layer_scope   = workspace->scope();
             auto* qkv = static_cast<float*>(
                 workspace->alloc_bytes(std::size_t(b) * p.qkv_rows * 4).data);
-            project_qkv(nullptr, &xq, p, b, qkv);
+            project_qkv(q8 ? nullptr : &x, q8 ? &xq : nullptr, p, b, qkv);
             auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * q_floats * 4).data);
             kernels::QkvArgs qa;
             qa.qkv         = qkv;
@@ -1835,7 +1848,13 @@ struct Executor::Impl {
             auto* partial    = static_cast<float*>(
                 workspace->alloc_bytes(kernels::decode_attention_workspace_floats(
                                            b, query_heads, head_dim, splits) * 4).data);
-            const Q8Act attn = alloc_q8(q_floats, b);
+            Q8Act attn;
+            Tensor attn_x;
+            if (q8) {
+                attn = alloc_q8(q_floats, b);
+            } else {
+                attn_x = workspace->alloc(DType::BF16, {q_floats, b});
+            }
             kernels::DecodeAttentionArgs da;
             da.q           = q;
             da.k_cache     = static_cast<const __half*>(p.k.p);
@@ -1856,17 +1875,37 @@ struct Executor::Impl {
             da.splits      = splits;
             da.scale       = 1.0f / std::sqrt(float(head_dim));
             da.partial     = partial;
-            da.out_q       = attn.rows;
+            if (q8) {
+                da.out_q = attn.rows;
+            } else {
+                da.out = static_cast<__nv_bfloat16*>(attn_x.data);
+            }
             kernels::decode_attention(da, stream);
-            vector_f32(attn, p.output, b, h, hidden, 0, true);
+            if (q8) {
+                vector_f32(attn, p.output, b, h, hidden, 0, true);
+            } else {
+                project_residual(attn_x, p.output, h, b);
+            }
             const bool last = li + 1 == layers.size();
-            block_tail(p, h, b, last ? final_norm : layers[li + 1].input_norm, nullptr, &xq);
+            block_tail(p, h, b, last ? final_norm : layers[li + 1].input_norm,
+                       q8 ? nullptr : static_cast<__nv_bfloat16*>(x.data), q8 ? &xq : nullptr);
             store_tap(li, h, 0, b);
         }
-        head_logits_q8(xq, b, b);
+        if (q8) {
+            head_logits_q8(xq, b, b);
+        } else {
+            head_logits(static_cast<const __nv_bfloat16*>(x.data), b, 0);
+        }
         if (spine && keep) {
-            spine->commit_rows(Tensor(d_sequences.p, DType::I32, {b}),
-                               Tensor(d_positions.p, DType::I32, {b}), 0, stream);
+            // At most commit_rows rows a call.
+            const int step = int(std::min(options.sequences, kSpineRows));
+            for (int at = 0; at < b; at += step) {
+                const int n = std::min(step, b - at);
+                spine->commit_rows(
+                    Tensor(static_cast<std::int32_t*>(d_sequences.p) + at, DType::I32, {n}),
+                    Tensor(static_cast<std::int32_t*>(d_positions.p) + at, DType::I32, {n}),
+                    std::uint32_t(at), stream);
+            }
         }
     }
 
@@ -1903,7 +1942,7 @@ struct Executor::Impl {
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
         const int b = int(sequences.size());
         if (b <= 0 || std::uint32_t(b) > options.sequences || tokens.size() != sequences.size() ||
-            b > gguf::kMaxVectorColumns) {
+            b > ops::kMaximumDecodeRows) {
             throw std::invalid_argument("flint decode: invalid batch");
         }
         std::vector<std::int32_t> pos(b), seq(b);
@@ -1919,7 +1958,12 @@ struct Executor::Impl {
         }
         for (int i = 0; i < b; ++i) { back(sequences[i], positions[sequences[i]] + 1, false); }
         stage(tokens, pos, seq);
-        run_graph(std::uint32_t(b), [&] { decode_body(b, true); });
+        // Steps of more rows than the vector kernels take launch without a graph.
+        if (b <= gguf::kMaxVectorColumns) {
+            run_graph(std::uint32_t(b), [&] { decode_body(b, true); });
+        } else {
+            decode_body(b, true);
+        }
         for (int i = 0; i < b; ++i) { positions[sequences[i]] += 1; }
     }
 

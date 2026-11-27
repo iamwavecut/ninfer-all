@@ -2772,8 +2772,10 @@ struct Qwen4ExpCore::Impl {
     // The drafts each request of a round of `b` may verify: every draft, or with round_tokens as
     // many as keep the round's verification within it (with 64 tokens, seven each for eight
     // requests); 0 past that, where the requests decode without drafts. A wider verification
-    // copies every missing expert to the GPU, and its drafts cost more than they keep.
+    // copies every missing expert to the GPU, and its drafts cost more than they keep. More than
+    // kMaximumSpeculativeRows requests decode without drafts.
     [[nodiscard]] std::uint32_t round_drafts(std::size_t b) const {
+        if (b > kMaximumSpeculativeRows) { return 0; }
         if (round_tokens == 0 || b == 0) { return drafts; }
         const auto width = round_tokens / static_cast<std::uint32_t>(b);
         return width > 1 ? std::min(drafts, width - 1) : 0;

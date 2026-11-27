@@ -16,6 +16,7 @@
 #include "models/deepseek_v41/vision.h"
 #include "models/divided_head.h"
 #include "models/dspine/runtime.h"
+#include "ninfer/ops/batch_rows.h"
 #include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/weight_input.h"
@@ -753,10 +754,10 @@ struct Executor::Impl {
         o.kept_states     = options.checkpoints ? 1 : 0;
         o.max_context     = options.max_context;
         o.draft_tokens    = options.draft_tokens;
-        o.draft_rows      = std::min<std::uint32_t>(options.sequences, 8);
-        o.commit_rows     = std::min<std::uint32_t>(options.sequences, 8);
+        o.draft_rows      = std::min(options.sequences, kSpineRows);
+        o.commit_rows     = std::min(options.sequences, kSpineRows);
         o.feature_columns = std::max<std::uint32_t>(std::min(step, window),
-                                                    std::uint32_t(gguf::kMaxVectorColumns));
+                                                    std::uint32_t(decode_rows()));
         const ops::detail::GgufShape shape{head.qtype, head.n, head.k};
         o.head_bytes = ops::detail::gguf_project_workspace_bytes(
                            {&shape, 1}, 1, static_cast<std::int32_t>(o.draft_tokens * o.draft_rows)) +
@@ -1662,10 +1663,18 @@ struct Executor::Impl {
 
     static constexpr int kHeadRows = 64; // LM-head columns per FP32 plane pass
 
+    // Rows of a decode or verification pass: a decode step of every sequence (up to
+    // ops::kMaximumDecodeRows), a verification of up to kMaxVectorColumns.
     [[nodiscard]] int decode_rows() const {
-        return std::min<int>(gguf::kMaxVectorColumns,
-                             int(options.sequences) * (int(options.draft_tokens) + 1));
+        return std::max<int>(
+            std::min<int>(int(options.sequences), ops::kMaximumDecodeRows),
+            std::min<int>(gguf::kMaxVectorColumns,
+                          int(options.sequences) * (int(options.draft_tokens) + 1)));
     }
+
+    // Proposals of a DSpine drafter for up to eight sequences at once; a decode step of more rows
+    // commits its rows to their lanes eight at a time.
+    static constexpr std::uint32_t kSpineRows = 8;
 
     // A span of `n` tokens' residual streams, both coefficient sites and index selections, as
     // forward_span allocates them.
@@ -3170,9 +3179,15 @@ struct Executor::Impl {
         if (!s.kv_only) { spine_tap(layers.size() - 1, h, spine_row, t, spine_row); }
         if (spine && !s.chunk && s.seed) {
             // A decode step's rows continue their sequences' lanes (a verification's wait for
-            // commit()).
-            spine->commit_rows(Tensor(d_sequences.p, DType::I32, {t}),
-                               Tensor(d_positions.p, DType::I32, {t}), 0, stream);
+            // commit()), at most commit_rows a call.
+            const int step = int(std::min(options.sequences, kSpineRows));
+            for (int at = 0; at < t; at += step) {
+                const int n = std::min(step, t - at);
+                spine->commit_rows(
+                    Tensor(static_cast<std::int32_t*>(d_sequences.p) + at, DType::I32, {n}),
+                    Tensor(static_cast<std::int32_t*>(d_positions.p) + at, DType::I32, {n}),
+                    std::uint32_t(at), stream);
+            }
         }
         if (tapped > 0 && s.seed) {
             const int from = s.row + tap_row;
@@ -3484,7 +3499,7 @@ struct Executor::Impl {
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens) {
         const int b = int(sequences.size());
         if (b <= 0 || std::uint32_t(b) > options.sequences || tokens.size() != sequences.size() ||
-            b > gguf::kMaxVectorColumns) {
+            b > ops::kMaximumDecodeRows) {
             throw std::invalid_argument("deepseek_v41 decode: invalid batch");
         }
         std::vector<std::int32_t> pos(b), seq(b);
@@ -3506,7 +3521,12 @@ struct Executor::Impl {
         Pass s;
         s.t          = b;
         s.logit_rows = b;
-        run_graph(std::uint32_t(b), [&] { run(s); });
+        // Steps of more rows than the vector kernels take launch without a graph.
+        if (b <= gguf::kMaxVectorColumns) {
+            run_graph(std::uint32_t(b), [&] { run(s); });
+        } else {
+            run(s);
+        }
         for (int i = 0; i < b; ++i) { positions[sequences[i]] += 1; }
     }
 

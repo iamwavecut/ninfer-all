@@ -599,7 +599,7 @@ public:
             return;
         }
         if (runtime::is_flint_artifact(options.artifact_path)) {
-            require_own_core_concurrency(options, "Flint", kMaximumSpeculativeRows);
+            require_own_core_concurrency(options, "Flint", kMaximumConcurrency);
             auto constructed    = runtime::construct_flint(options, device);
             flint               = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -614,7 +614,7 @@ public:
             return;
         }
         if (runtime::is_inkling2_artifact(options.artifact_path)) {
-            require_own_core_concurrency(options, "Inkling 2", kMaximumSpeculativeRows);
+            require_own_core_concurrency(options, "Inkling 2", kMaximumConcurrency);
             auto constructed    = runtime::construct_inkling2(options, device);
             inkling             = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -629,7 +629,7 @@ public:
             return;
         }
         if (runtime::is_deepseek_v41_artifact(options.artifact_path)) {
-            require_own_core_concurrency(options, "DeepSeek-V4.1-Flash", kMaximumSpeculativeRows);
+            require_own_core_concurrency(options, "DeepSeek-V4.1-Flash", kMaximumConcurrency);
             auto constructed    = runtime::construct_deepseek_v41(options, device);
             deepseek            = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -644,7 +644,7 @@ public:
             return;
         }
         if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
-            require_own_core_concurrency(options, "Qwen3.8-Flash-Next", kMaximumSpeculativeRows);
+            require_own_core_concurrency(options, "Qwen3.8-Flash-Next", kMaximumConcurrency);
             auto constructed    = runtime::construct_qwen4_exp(options, device);
             flash               = std::move(constructed.instance);
             load                = std::move(constructed.load);
